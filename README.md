@@ -17,7 +17,12 @@ supervisor, protocol, and plugin runtime.
 Dial9 CPU sampling. Closing the GUI writes `rho-gui-profile.0.bin.gz`, a
 symbolized Dial9 trace containing timestamped CPU stacks and
 typed `RhoGpuiLatencyV1` and `RhoGpuiDrawV1` events. It also writes `rho-gui-profile.bin.frames.json` with
-raw GPUI draw timings and p50/p95/p99/max summaries.
+raw GPUI draw timings and p50/p95/p99/max summaries, plus
+`rho-gui-profile.bin.editor.json` with numeric buffer/display-map stage timings,
+input and output row ranges, pending wrap batches, and map row totals. The same
+editor events are embedded in Dial9 as `RhoEditorStageV1`. Each row start/count
+pair describes the bounding half-open area `[start, start + count)` affected by
+that stage.
 
 `just profile-daemon` profiles the optimized daemon until SIGINT or SIGTERM
 and writes `rho-daemon-profile.0.bin.gz`. Both recipes accept a trace base

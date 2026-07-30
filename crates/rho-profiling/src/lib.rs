@@ -37,6 +37,23 @@ pub enum GpuiFrameSpanKind {
     Draw,
 }
 
+pub struct EditorStageSpan {
+    pub kind: u64,
+    pub start: Instant,
+    pub end: Instant,
+    pub tid: u64,
+    pub input_edits: u64,
+    pub input_start: u64,
+    pub input_rows: u64,
+    pub output_edits: u64,
+    pub output_start: u64,
+    pub output_rows: u64,
+    pub old_rows: u64,
+    pub new_rows: u64,
+    pub pending_batches: u64,
+    pub flags: u64,
+}
+
 #[derive(TraceEvent)]
 struct RhoProfileSession {
     #[traceevent(timestamp)]
@@ -64,6 +81,25 @@ struct RhoGpuiDrawV1 {
     frame: u64,
     window: u64,
     invalidations: u64,
+}
+
+#[derive(TraceEvent)]
+struct RhoEditorStageV1 {
+    #[traceevent(timestamp)]
+    timestamp_ns: u64,
+    duration_ns: u64,
+    tid: u64,
+    kind: u64,
+    input_edits: u64,
+    input_start: u64,
+    input_rows: u64,
+    output_edits: u64,
+    output_start: u64,
+    output_rows: u64,
+    old_rows: u64,
+    new_rows: u64,
+    pending_batches: u64,
+    flags: u64,
 }
 
 impl CpuProfiler {
@@ -113,7 +149,15 @@ impl CpuProfiler {
         self,
         spans: impl IntoIterator<Item = GpuiFrameSpan>,
     ) -> anyhow::Result<PathBuf> {
-        for span in spans {
+        self.finish_with_gui_spans(spans, [])
+    }
+
+    pub fn finish_with_gui_spans(
+        self,
+        frame_spans: impl IntoIterator<Item = GpuiFrameSpan>,
+        editor_spans: impl IntoIterator<Item = EditorStageSpan>,
+    ) -> anyhow::Result<PathBuf> {
+        for span in frame_spans {
             let timestamp_ns = instant_ns(span.start, self.start_instant, self.start_monotonic_ns);
             let duration_ns = duration_ns(span.end.saturating_duration_since(span.start));
             match span.kind {
@@ -140,6 +184,31 @@ impl CpuProfiler {
                     &self.handle,
                 ),
             }
+        }
+        for span in editor_spans {
+            record_event(
+                RhoEditorStageV1 {
+                    timestamp_ns: instant_ns(
+                        span.start,
+                        self.start_instant,
+                        self.start_monotonic_ns,
+                    ),
+                    duration_ns: duration_ns(span.end.saturating_duration_since(span.start)),
+                    tid: span.tid,
+                    kind: span.kind,
+                    input_edits: span.input_edits,
+                    input_start: span.input_start,
+                    input_rows: span.input_rows,
+                    output_edits: span.output_edits,
+                    output_start: span.output_start,
+                    output_rows: span.output_rows,
+                    old_rows: span.old_rows,
+                    new_rows: span.new_rows,
+                    pending_batches: span.pending_batches,
+                    flags: span.flags,
+                },
+                &self.handle,
+            );
         }
         self.guard
             .graceful_shutdown(Duration::from_secs(30))
@@ -258,15 +327,33 @@ mod tests {
         }
         let span_start = std::time::Instant::now();
         let output = profiler
-            .finish_with_gpui_spans([super::GpuiFrameSpan {
-                kind: super::GpuiFrameSpanKind::Draw,
-                start: span_start,
-                end: span_start + std::time::Duration::from_millis(1),
-                tid: super::current_tid(),
-                frame: 1,
-                window: 2,
-                invalidations: 3,
-            }])
+            .finish_with_gui_spans(
+                [super::GpuiFrameSpan {
+                    kind: super::GpuiFrameSpanKind::Draw,
+                    start: span_start,
+                    end: span_start + std::time::Duration::from_millis(1),
+                    tid: super::current_tid(),
+                    frame: 1,
+                    window: 2,
+                    invalidations: 3,
+                }],
+                [super::EditorStageSpan {
+                    kind: 5,
+                    start: span_start,
+                    end: span_start + std::time::Duration::from_millis(2),
+                    tid: super::current_tid(),
+                    input_edits: 1,
+                    input_start: 172,
+                    input_rows: 1,
+                    output_edits: 1,
+                    output_start: 0,
+                    output_rows: 173,
+                    old_rows: 172,
+                    new_rows: 173,
+                    pending_batches: 1,
+                    flags: 0,
+                }],
+            )
             .unwrap();
         assert_eq!(output, directory.path().join("cpu.0.bin.gz"));
         assert!(std::fs::metadata(output).unwrap().len() > 0);

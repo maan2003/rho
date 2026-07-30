@@ -175,6 +175,29 @@ impl WrapMap {
         edits: Vec<TabEdit>,
         cx: &mut Context<Self>,
     ) -> (WrapSnapshot, WrapPatch) {
+        let mut profile =
+            gpui::profiler::EditorTimingGuard::new(gpui::profiler::EditorTimingKind::WrapMapSync);
+        let old_rows = if profile.is_enabled() {
+            let input_start = edits
+                .iter()
+                .map(|edit| edit.new.start.row())
+                .min()
+                .unwrap_or(0) as u64;
+            let input_end = edits
+                .iter()
+                .map(|edit| edit.new.end.row())
+                .max()
+                .unwrap_or(0) as u64;
+            let input_rows = if edits.is_empty() {
+                0
+            } else {
+                input_end.saturating_sub(input_start) + 1
+            };
+            profile.input(edits.len(), input_start, input_rows);
+            u64::from(self.snapshot.max_point().row().0) + 1
+        } else {
+            0
+        };
         #[cfg(feature = "wrap-test-support")]
         let input_edits = edits.clone();
         #[cfg(feature = "wrap-test-support")]
@@ -195,6 +218,34 @@ impl WrapMap {
         }
 
         let output_edits = mem::take(&mut self.edits_since_sync);
+        if profile.is_enabled() {
+            let output_start = output_edits
+                .edits()
+                .iter()
+                .map(|edit| edit.new.start.0)
+                .min()
+                .unwrap_or(0) as u64;
+            let output_end = output_edits
+                .edits()
+                .iter()
+                .map(|edit| edit.new.end.0)
+                .max()
+                .unwrap_or(0) as u64;
+            let output_rows = if output_edits.edits().is_empty() {
+                0
+            } else {
+                output_end.saturating_sub(output_start)
+            };
+            profile.output(output_edits.edits().len(), output_start, output_rows);
+        }
+        profile.state(
+            old_rows,
+            u64::from(self.snapshot.max_point().row().0) + 1,
+            self.pending_edits.len(),
+            u64::from(self.snapshot.interpolated)
+                | (u64::from(self.background_task.is_some()) << 1)
+                | (u64::from(self.wrap_width.is_some()) << 2),
+        );
         #[cfg(feature = "wrap-test-support")]
         if !input_edits.is_empty() {
             self.sync_traces.push(WrapSyncTrace {
@@ -415,7 +466,45 @@ impl WrapMap {
                 self.snapshot = snapshot;
                 self.edits_since_sync = self.edits_since_sync.compose(&wrap_edits);
             } else {
+                let pending_batches = pending_edits.len();
                 let update = async move {
+                    let mut profile = gpui::profiler::EditorTimingGuard::new(
+                        gpui::profiler::EditorTimingKind::WrapMapUpdate,
+                    );
+                    // This wall-clock span may migrate across executor workers, so put it on a
+                    // synthetic asynchronous lane instead of attributing it to the first poll's
+                    // OS thread.
+                    profile.thread(0);
+                    let old_rows = if profile.is_enabled() {
+                        let input_edits = pending_edits
+                            .iter()
+                            .map(|(_, _, edits)| edits.len())
+                            .sum::<usize>();
+                        let input_start = pending_edits
+                            .iter()
+                            .flat_map(|(_, _, edits)| edits)
+                            .map(|edit| edit.new.start.row())
+                            .min()
+                            .unwrap_or(0) as u64;
+                        let input_end = pending_edits
+                            .iter()
+                            .flat_map(|(_, _, edits)| edits)
+                            .map(|edit| edit.new.end.row())
+                            .max()
+                            .unwrap_or(0) as u64;
+                        profile.input(
+                            input_edits,
+                            input_start,
+                            if input_edits == 0 {
+                                0
+                            } else {
+                                input_end.saturating_sub(input_start) + 1
+                            },
+                        );
+                        u64::from(snapshot.max_point().row().0) + 1
+                    } else {
+                        0
+                    };
                     let mut edits = Patch::default();
                     for (tab_snapshot, row_scales, tab_edits) in pending_edits {
                         let wrap_edits = snapshot
@@ -429,6 +518,35 @@ impl WrapMap {
                             .await;
                         edits = edits.compose(&wrap_edits);
                     }
+                    if profile.is_enabled() {
+                        let output_start = edits
+                            .edits()
+                            .iter()
+                            .map(|edit| edit.new.start.0)
+                            .min()
+                            .unwrap_or(0) as u64;
+                        let output_end = edits
+                            .edits()
+                            .iter()
+                            .map(|edit| edit.new.end.0)
+                            .max()
+                            .unwrap_or(0) as u64;
+                        profile.output(
+                            edits.edits().len(),
+                            output_start,
+                            if edits.is_empty() {
+                                0
+                            } else {
+                                output_end.saturating_sub(output_start)
+                            },
+                        );
+                    }
+                    profile.state(
+                        old_rows,
+                        u64::from(snapshot.max_point().row().0) + 1,
+                        pending_batches,
+                        1,
+                    );
                     (snapshot, edits)
                 };
 

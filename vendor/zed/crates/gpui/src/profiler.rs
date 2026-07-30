@@ -6,7 +6,7 @@ use std::{
     hash::{DefaultHasher, Hash, Hasher},
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     thread::ThreadId,
     time::Duration,
@@ -794,6 +794,204 @@ pub fn record_frame_timing(timing: FrameTiming) {
 /// cursor so each call to [`Self::collect_unseen`] returns only new entries.
 pub struct FrameTimingCollector {
     cursor: u64,
+}
+
+/// A timed text/display pipeline operation. Payloads are numeric by design so
+/// profiling never captures buffer contents or paths.
+#[derive(Debug, Copy, Clone)]
+#[expect(missing_docs)]
+pub struct EditorTiming {
+    pub kind: EditorTimingKind,
+    pub start: Instant,
+    pub end: Instant,
+    pub tid: u64,
+    pub input_edits: u64,
+    pub input_start: u64,
+    pub input_rows: u64,
+    pub output_edits: u64,
+    pub output_start: u64,
+    pub output_rows: u64,
+    pub old_rows: u64,
+    pub new_rows: u64,
+    pub pending_batches: u64,
+    pub flags: u64,
+}
+
+#[derive(Debug, Copy, Clone)]
+#[repr(u8)]
+#[expect(missing_docs)]
+pub enum EditorTimingKind {
+    BufferEdit = 1,
+    MultiBufferSync = 2,
+    FoldMapSync = 3,
+    TabMapSync = 4,
+    WrapMapSync = 5,
+    BlockMapSync = 6,
+    InlayMapSync = 7,
+    WrapMapUpdate = 8,
+}
+
+const MAX_EDITOR_TIMINGS: usize = (16 * 1024 * 1024) / core::mem::size_of::<EditorTiming>();
+
+struct EditorTimings {
+    timings: VecDeque<EditorTiming>,
+}
+
+static EDITOR_TIMINGS: spin::Mutex<EditorTimings> = spin::Mutex::new(EditorTimings {
+    timings: VecDeque::new(),
+});
+
+static EDITOR_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
+static EDITOR_TRACE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+#[expect(missing_docs)]
+pub fn set_editor_trace_enabled(enabled: bool) -> bool {
+    let mut timings = EDITOR_TIMINGS.lock();
+    if EDITOR_TRACE_ENABLED.load(Ordering::Relaxed) == enabled {
+        return false;
+    }
+    if enabled {
+        timings.timings.clear();
+        timings.timings.shrink_to_fit();
+    }
+    EDITOR_TRACE_GENERATION.fetch_add(1, Ordering::Relaxed);
+    EDITOR_TRACE_ENABLED.store(enabled, Ordering::Release);
+    true
+}
+
+#[expect(missing_docs)]
+pub fn editor_trace_enabled() -> bool {
+    EDITOR_TRACE_ENABLED.load(Ordering::Relaxed)
+}
+
+fn record_editor_timing(timing: EditorTiming, generation: u64) {
+    let mut timings = EDITOR_TIMINGS.lock();
+    if !EDITOR_TRACE_ENABLED.load(Ordering::Acquire) {
+        return;
+    }
+    if generation != EDITOR_TRACE_GENERATION.load(Ordering::Relaxed) {
+        return;
+    }
+    if timings.timings.len() >= MAX_EDITOR_TIMINGS {
+        timings.timings.pop_front();
+    }
+    timings.timings.push_back(timing);
+}
+
+/// Records elapsed time on drop, including early-return paths.
+pub struct EditorTimingGuard(Option<(EditorTiming, u64)>);
+
+#[expect(missing_docs)]
+impl EditorTimingGuard {
+    pub fn new(kind: EditorTimingKind) -> Self {
+        let generation = EDITOR_TRACE_GENERATION.load(Ordering::Relaxed);
+        Self(editor_trace_enabled().then(|| {
+            let now = Instant::now();
+            (
+                EditorTiming {
+                    kind,
+                    start: now,
+                    end: now,
+                    tid: editor_profile_tid(),
+                    input_edits: 0,
+                    input_start: 0,
+                    input_rows: 0,
+                    output_edits: 0,
+                    output_start: 0,
+                    output_rows: 0,
+                    old_rows: 0,
+                    new_rows: 0,
+                    pending_batches: 0,
+                    flags: 0,
+                },
+                generation,
+            )
+        }))
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.0.is_some()
+    }
+
+    pub fn input(&mut self, edits: usize, start: u64, rows: u64) {
+        if let Some((timing, _)) = &mut self.0 {
+            timing.input_edits = edits as u64;
+            timing.input_start = start;
+            timing.input_rows = rows;
+        }
+    }
+
+    pub fn output(&mut self, edits: usize, start: u64, rows: u64) {
+        if let Some((timing, _)) = &mut self.0 {
+            timing.output_edits = edits as u64;
+            timing.output_start = start;
+            timing.output_rows = rows;
+        }
+    }
+
+    pub fn state(&mut self, old_rows: u64, new_rows: u64, pending_batches: usize, flags: u64) {
+        if let Some((timing, _)) = &mut self.0 {
+            timing.old_rows = old_rows;
+            timing.new_rows = new_rows;
+            timing.pending_batches = pending_batches as u64;
+            timing.flags = flags;
+        }
+    }
+
+    pub fn thread(&mut self, tid: u64) {
+        if let Some((timing, _)) = &mut self.0 {
+            timing.tid = tid;
+        }
+    }
+}
+
+fn editor_profile_tid() -> u64 {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        // SAFETY: gettid has no arguments or memory-safety preconditions.
+        unsafe { libc::syscall(libc::SYS_gettid) as u64 }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    {
+        let mut hasher = DefaultHasher::new();
+        std::thread::current().id().hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+impl Drop for EditorTimingGuard {
+    fn drop(&mut self) {
+        if let Some((mut timing, generation)) = self.0.take() {
+            timing.end = Instant::now();
+            record_editor_timing(timing, generation);
+        }
+    }
+}
+
+#[expect(missing_docs)]
+pub struct EditorTimingCollector {
+    spare: VecDeque<EditorTiming>,
+}
+
+#[expect(missing_docs)]
+impl EditorTimingCollector {
+    pub fn new() -> Self {
+        Self {
+            spare: VecDeque::with_capacity(MAX_EDITOR_TIMINGS),
+        }
+    }
+
+    pub fn collect_unseen(&mut self) -> Vec<EditorTiming> {
+        let mut batch = std::mem::take(&mut self.spare);
+        {
+            let mut timings = EDITOR_TIMINGS.lock();
+            std::mem::swap(&mut timings.timings, &mut batch);
+        }
+        let unseen = batch.iter().copied().collect();
+        batch.clear();
+        self.spare = batch;
+        unseen
+    }
 }
 
 impl Default for FrameTimingCollector {

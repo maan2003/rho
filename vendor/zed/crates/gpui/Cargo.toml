@@ -64,6 +64,7 @@ http_client.workspace = true
 image.workspace = true
 inventory.workspace = true
 itertools.workspace = true
+libc.workspace = true
 log.workspace = true
 num_cpus = "1.13"
 parking = "2.0.0"

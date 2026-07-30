@@ -881,8 +881,36 @@ impl BlockMap {
         companion_view: Option<CompanionView>,
     ) {
         let buffer = wrap_snapshot.buffer_snapshot();
+        let mut profile =
+            gpui::profiler::EditorTimingGuard::new(gpui::profiler::EditorTimingKind::BlockMapSync);
+        let old_rows = if profile.is_enabled() {
+            u64::from(self.transforms.borrow().summary().output_rows.0)
+        } else {
+            0
+        };
+        let has_companion = companion_view.is_some();
 
         edits = self.deferred_edits.take().compose(edits);
+        if profile.is_enabled() {
+            let input_start = edits
+                .edits()
+                .iter()
+                .map(|edit| edit.new.start.0)
+                .min()
+                .unwrap_or(0) as u64;
+            let input_end = edits
+                .edits()
+                .iter()
+                .map(|edit| edit.new.end.0)
+                .max()
+                .unwrap_or(0) as u64;
+            let input_rows = if edits.edits().is_empty() {
+                0
+            } else {
+                input_end.saturating_sub(input_start)
+            };
+            profile.input(edits.edits().len(), input_start, input_rows);
+        }
 
         let max_point = wrap_snapshot.max_point();
 
@@ -923,6 +951,7 @@ impl BlockMap {
                     .reduce(|bounds, rows| bounds.start.min(rows.start)..bounds.end.max(rows.end))
             })
             .flatten();
+        let touched_elision = touched.is_some();
         if let Some(touched) = touched {
             // One edit, so there is nothing for it to overlap or sort against.
             // The rows outside the patch did not change, they only moved by a
@@ -1022,8 +1051,34 @@ impl BlockMap {
             edits = edits.compose(merged_edits);
         }
 
+        if profile.is_enabled() {
+            let output_start = edits
+                .edits()
+                .iter()
+                .map(|edit| edit.new.start.0)
+                .min()
+                .unwrap_or(0) as u64;
+            let output_end = edits
+                .edits()
+                .iter()
+                .map(|edit| edit.new.end.0)
+                .max()
+                .unwrap_or(0) as u64;
+            let output_rows = if edits.edits().is_empty() {
+                0
+            } else {
+                output_end.saturating_sub(output_start)
+            };
+            profile.output(edits.edits().len(), output_start, output_rows);
+        }
         let edits = edits.into_inner();
         if edits.is_empty() {
+            profile.state(
+                old_rows,
+                u64::from(self.transforms.borrow().summary().output_rows.0),
+                0,
+                u64::from(touched_elision) | (u64::from(has_companion) << 1),
+            );
             return;
         }
 
@@ -1351,6 +1406,12 @@ impl BlockMap {
 
         drop(cursor);
         *transforms = new_transforms;
+        profile.state(
+            old_rows,
+            u64::from(transforms.summary().output_rows.0),
+            0,
+            u64::from(touched_elision) | (u64::from(has_companion) << 1),
+        );
     }
 
     #[ztracing::instrument(skip_all)]

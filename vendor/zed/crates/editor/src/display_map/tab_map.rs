@@ -41,6 +41,58 @@ impl TabMap {
     pub fn sync(
         &mut self,
         fold_snapshot: FoldSnapshot,
+        fold_edits: Vec<FoldEdit>,
+        tab_size: NonZeroU32,
+    ) -> (TabSnapshot, Vec<TabEdit>) {
+        let mut profile =
+            gpui::profiler::EditorTimingGuard::new(gpui::profiler::EditorTimingKind::TabMapSync);
+        let old_rows = if profile.is_enabled() {
+            let input_start = fold_edits
+                .iter()
+                .map(|edit| edit.new.start.to_point(&fold_snapshot).row())
+                .min()
+                .unwrap_or(0) as u64;
+            let input_end = fold_edits
+                .iter()
+                .map(|edit| edit.new.end.to_point(&fold_snapshot).row())
+                .max()
+                .unwrap_or(0) as u64;
+            let input_rows = if fold_edits.is_empty() {
+                0
+            } else {
+                input_end.saturating_sub(input_start) + 1
+            };
+            profile.input(fold_edits.len(), input_start, input_rows);
+            u64::from(self.0.max_point().row()) + 1
+        } else {
+            0
+        };
+        let (snapshot, tab_edits) = self.sync_inner(fold_snapshot, fold_edits, tab_size);
+        if profile.is_enabled() {
+            let output_start = tab_edits
+                .iter()
+                .map(|edit| edit.new.start.row())
+                .min()
+                .unwrap_or(0) as u64;
+            let output_end = tab_edits
+                .iter()
+                .map(|edit| edit.new.end.row())
+                .max()
+                .unwrap_or(0) as u64;
+            let output_rows = if tab_edits.is_empty() {
+                0
+            } else {
+                output_end.saturating_sub(output_start) + 1
+            };
+            profile.output(tab_edits.len(), output_start, output_rows);
+        }
+        profile.state(old_rows, u64::from(snapshot.max_point().row()) + 1, 0, 0);
+        (snapshot, tab_edits)
+    }
+
+    fn sync_inner(
+        &mut self,
+        fold_snapshot: FoldSnapshot,
         mut fold_edits: Vec<FoldEdit>,
         tab_size: NonZeroU32,
     ) -> (TabSnapshot, Vec<TabEdit>) {

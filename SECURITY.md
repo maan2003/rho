@@ -23,6 +23,9 @@ AI APIs.
   transcripts.
 - Opt-in GUI and daemon Dial9 profiles contain thread names, function symbols,
   local source paths, precise activity timing, and frontend marker metadata.
+  GUI editor markers include numeric edit counts, affected row ranges, map row
+  totals, pending-batch counts, and display-stage flags, but not buffer text or
+  file paths.
   They do not intentionally include transcript data, but remain local
   diagnostic files whose destination and retention are the user's
   responsibility. On Linux, Dial9 normally samples through `perf_event_open`;

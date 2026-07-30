@@ -2861,6 +2861,41 @@ impl Buffer {
             return None;
         }
 
+        let mut profile =
+            gpui::profiler::EditorTimingGuard::new(gpui::profiler::EditorTimingKind::BufferEdit);
+        let old_profile_rows = if profile.is_enabled() {
+            let snapshot = self.snapshot();
+            let input_start = edits
+                .iter()
+                .map(|(range, _)| range.start.to_point(&snapshot).row as u64)
+                .min()
+                .unwrap_or(0);
+            let input_end = edits
+                .iter()
+                .map(|(range, _)| range.end.to_point(&snapshot).row)
+                .max()
+                .unwrap_or(0) as u64;
+            let input_rows = input_end.saturating_sub(input_start) + 1;
+            let output_end = edits
+                .iter()
+                .scan(0_i64, |row_delta, (range, text)| {
+                    let old_start = i64::from(range.start.to_point(&snapshot).row);
+                    let old_end = i64::from(range.end.to_point(&snapshot).row);
+                    let inserted_rows = text.bytes().filter(|byte| *byte == b'\n').count() as i64;
+                    let output_end = old_start + *row_delta + inserted_rows;
+                    *row_delta += inserted_rows - (old_end - old_start);
+                    Some(output_end.max(0) as u64)
+                })
+                .max()
+                .unwrap_or(input_start);
+            let output_rows = output_end.saturating_sub(input_start) + 1;
+            profile.input(edits.len(), input_start, input_rows);
+            profile.output(edits.len(), input_start, output_rows);
+            u64::from(snapshot.max_point().row) + 1
+        } else {
+            0
+        };
+
         self.start_transaction();
         self.pending_autoindent.take();
         let autoindent_request = autoindent_mode
@@ -2986,6 +3021,12 @@ impl Buffer {
 
         self.end_transaction(cx);
         self.send_operation(Operation::Buffer(edit_operation), true, cx);
+        profile.state(
+            old_profile_rows,
+            u64::from(self.max_point().row) + 1,
+            0,
+            u64::from(coalesce_adjacent),
+        );
         Some(edit_id)
     }
 

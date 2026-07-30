@@ -1,5 +1,6 @@
 //! rho-gui: a native GUI attached to a running rho daemon.
 
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
@@ -51,9 +52,12 @@ struct Args {
 struct GuiProfiler {
     cpu: rho_profiling::CpuProfiler,
     frames: gpui::profiler::FrameTimingCollector,
+    editor: Arc<Mutex<gpui::profiler::EditorTimingCollector>>,
     frame_path: PathBuf,
+    editor_path: PathBuf,
     draw_tid: u64,
     collected_frames: Arc<Mutex<Vec<gpui::profiler::FrameTiming>>>,
+    collected_editor: Arc<Mutex<Vec<gpui::profiler::EditorTiming>>>,
 }
 
 #[derive(serde::Serialize)]
@@ -77,6 +81,39 @@ struct FrameRecord {
     draw_ns: u64,
     dirty_to_draw_ns: Option<u64>,
     invalidations: u64,
+}
+
+#[derive(serde::Serialize)]
+struct EditorProfile {
+    event_count: usize,
+    stages: BTreeMap<&'static str, EditorStageSummary>,
+    events: Vec<EditorRecord>,
+}
+
+#[derive(serde::Serialize)]
+struct EditorStageSummary {
+    count: usize,
+    duration_ms: Distribution,
+    input_rows: Distribution,
+    output_rows: Distribution,
+}
+
+#[derive(serde::Serialize)]
+struct EditorRecord {
+    stage: &'static str,
+    start_ns: u64,
+    duration_ns: u64,
+    tid: u64,
+    input_edits: u64,
+    input_start: u64,
+    input_rows: u64,
+    output_edits: u64,
+    output_start: u64,
+    output_rows: u64,
+    old_rows: u64,
+    new_rows: u64,
+    pending_batches: u64,
+    flags: u64,
 }
 
 fn main() {
@@ -112,13 +149,18 @@ fn run() -> Result<()> {
         .map(|path| {
             let cpu = rho_profiling::CpuProfiler::start(path)?;
             let frame_path = rho_profiling::sidecar_path(cpu.path(), ".frames.json");
+            let editor_path = rho_profiling::sidecar_path(cpu.path(), ".editor.json");
             gpui::profiler::set_frame_trace_enabled(true);
+            gpui::profiler::set_editor_trace_enabled(true);
             Ok::<_, anyhow::Error>(GuiProfiler {
                 cpu,
                 frames: gpui::profiler::FrameTimingCollector::new(),
+                editor: Arc::new(Mutex::new(gpui::profiler::EditorTimingCollector::new())),
                 frame_path,
+                editor_path,
                 draw_tid: 0,
                 collected_frames: Arc::default(),
+                collected_editor: Arc::default(),
             })
         })
         .transpose()?;
@@ -133,14 +175,26 @@ fn run() -> Result<()> {
                 // foreground thread.
                 profiler.draw_tid = rho_profiling::current_tid();
                 let collected_frames = profiler.collected_frames.clone();
-                cx.spawn(async move |cx| {
+                let collected_editor = profiler.collected_editor.clone();
+                let editor = profiler.editor.clone();
+                let executor = cx.background_executor().clone();
+                cx.background_spawn(async move {
                     let mut collector = gpui::profiler::FrameTimingCollector::new();
                     loop {
-                        cx.background_executor().timer(Duration::from_secs(5)).await;
+                        executor.timer(Duration::from_secs(5)).await;
                         collected_frames
                             .lock()
                             .unwrap_or_else(|error| error.into_inner())
                             .extend(collector.collect_unseen());
+                        collected_editor
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .extend(
+                                editor
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner())
+                                    .collect_unseen(),
+                            );
                     }
                 })
                 .detach();
@@ -173,6 +227,7 @@ fn run() -> Result<()> {
 }
 
 fn finish_profiling(mut profiler: GuiProfiler) {
+    gpui::profiler::set_editor_trace_enabled(false);
     let mut frames = std::mem::take(
         &mut *profiler
             .collected_frames
@@ -182,11 +237,24 @@ fn finish_profiling(mut profiler: GuiProfiler) {
     frames.extend(profiler.frames.collect_unseen());
     frames.sort_unstable_by_key(|frame| (frame.draw_start, frame.window_id.as_u64()));
     frames.dedup_by_key(|frame| (frame.draw_start, frame.window_id.as_u64()));
+    let mut collected_editor = profiler
+        .collected_editor
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut editor_collector = profiler
+        .editor
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let mut editor = std::mem::take(&mut *collected_editor);
+    editor.extend(editor_collector.collect_unseen());
+    drop(editor_collector);
+    drop(collected_editor);
+    editor.sort_unstable_by_key(|event| (event.start, event.kind as u8));
     gpui::profiler::set_frame_trace_enabled(false);
-    match profiler
-        .cpu
-        .finish_with_gpui_spans(frame_timeline_spans(&frames, profiler.draw_tid))
-    {
+    match profiler.cpu.finish_with_gui_spans(
+        frame_timeline_spans(&frames, profiler.draw_tid),
+        editor_timeline_spans(&editor),
+    ) {
         Ok(path) => eprintln!("rho-gui: wrote CPU profile to {}", path.display()),
         Err(error) => eprintln!("rho-gui: failed to write CPU profile: {error:#}"),
     }
@@ -196,6 +264,13 @@ fn finish_profiling(mut profiler: GuiProfiler) {
             profiler.frame_path.display()
         ),
         Err(error) => eprintln!("rho-gui: failed to write frame profile: {error:#}"),
+    }
+    match export_editor_profile(&profiler.editor_path, editor) {
+        Ok(()) => eprintln!(
+            "rho-gui: wrote editor profile to {}",
+            profiler.editor_path.display()
+        ),
+        Err(error) => eprintln!("rho-gui: failed to write editor profile: {error:#}"),
     }
 }
 
@@ -223,6 +298,98 @@ fn frame_timeline_spans(
         ));
     }
     spans
+}
+
+fn editor_timeline_spans(
+    events: &[gpui::profiler::EditorTiming],
+) -> Vec<rho_profiling::EditorStageSpan> {
+    events
+        .iter()
+        .map(|event| rho_profiling::EditorStageSpan {
+            kind: event.kind as u8 as u64,
+            start: event.start,
+            end: event.end,
+            tid: event.tid,
+            input_edits: event.input_edits,
+            input_start: event.input_start,
+            input_rows: event.input_rows,
+            output_edits: event.output_edits,
+            output_start: event.output_start,
+            output_rows: event.output_rows,
+            old_rows: event.old_rows,
+            new_rows: event.new_rows,
+            pending_batches: event.pending_batches,
+            flags: event.flags,
+        })
+        .collect()
+}
+
+fn editor_stage_name(kind: gpui::profiler::EditorTimingKind) -> &'static str {
+    match kind {
+        gpui::profiler::EditorTimingKind::BufferEdit => "buffer_edit",
+        gpui::profiler::EditorTimingKind::MultiBufferSync => "multi_buffer_sync",
+        gpui::profiler::EditorTimingKind::InlayMapSync => "inlay_map_sync",
+        gpui::profiler::EditorTimingKind::FoldMapSync => "fold_map_sync",
+        gpui::profiler::EditorTimingKind::TabMapSync => "tab_map_sync",
+        gpui::profiler::EditorTimingKind::WrapMapSync => "wrap_map_sync",
+        gpui::profiler::EditorTimingKind::BlockMapSync => "block_map_sync",
+        gpui::profiler::EditorTimingKind::WrapMapUpdate => "wrap_map_update",
+    }
+}
+
+fn export_editor_profile(path: &Path, timings: Vec<gpui::profiler::EditorTiming>) -> Result<()> {
+    let anchor = timings.first().map(|timing| timing.start);
+    let events = timings
+        .into_iter()
+        .map(|timing| EditorRecord {
+            stage: editor_stage_name(timing.kind),
+            start_ns: anchor
+                .map(|anchor| duration_ns(timing.start.duration_since(anchor)))
+                .unwrap_or(0),
+            duration_ns: duration_ns(timing.end.duration_since(timing.start)),
+            tid: timing.tid,
+            input_edits: timing.input_edits,
+            input_start: timing.input_start,
+            input_rows: timing.input_rows,
+            output_edits: timing.output_edits,
+            output_start: timing.output_start,
+            output_rows: timing.output_rows,
+            old_rows: timing.old_rows,
+            new_rows: timing.new_rows,
+            pending_batches: timing.pending_batches,
+            flags: timing.flags,
+        })
+        .collect::<Vec<_>>();
+    let mut grouped = BTreeMap::<_, Vec<&EditorRecord>>::new();
+    for event in &events {
+        grouped.entry(event.stage).or_default().push(event);
+    }
+    let stages = grouped
+        .into_iter()
+        .map(|(stage, events)| {
+            (
+                stage,
+                EditorStageSummary {
+                    count: events.len(),
+                    duration_ms: distribution(
+                        events.iter().map(|event| event.duration_ns),
+                        1_000_000.0,
+                    ),
+                    input_rows: distribution(events.iter().map(|event| event.input_rows), 1.0),
+                    output_rows: distribution(events.iter().map(|event| event.output_rows), 1.0),
+                },
+            )
+        })
+        .collect();
+    let profile = EditorProfile {
+        event_count: events.len(),
+        stages,
+        events,
+    };
+    let file = File::create(path)
+        .with_context(|| format!("failed to create editor profile {}", path.display()))?;
+    serde_json::to_writer_pretty(BufWriter::new(file), &profile)
+        .with_context(|| format!("failed to write editor profile {}", path.display()))
 }
 
 fn export_frame_profile(path: &Path, timings: Vec<gpui::profiler::FrameTiming>) -> Result<()> {

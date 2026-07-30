@@ -616,7 +616,30 @@ impl FoldMap {
         inlay_snapshot: InlaySnapshot,
         inlay_edits: Vec<InlayEdit>,
     ) -> Vec<FoldEdit> {
-        if inlay_edits.is_empty() {
+        let mut profile =
+            gpui::profiler::EditorTimingGuard::new(gpui::profiler::EditorTimingKind::FoldMapSync);
+        let old_rows = if profile.is_enabled() {
+            let input_start = inlay_edits
+                .iter()
+                .map(|edit| inlay_snapshot.to_point(edit.new.start).row())
+                .min()
+                .unwrap_or(0) as u64;
+            let input_end = inlay_edits
+                .iter()
+                .map(|edit| inlay_snapshot.to_point(edit.new.end).row())
+                .max()
+                .unwrap_or(0) as u64;
+            let input_rows = if inlay_edits.is_empty() {
+                0
+            } else {
+                input_end.saturating_sub(input_start) + 1
+            };
+            profile.input(inlay_edits.len(), input_start, input_rows);
+            u64::from(self.snapshot.max_point().row()) + 1
+        } else {
+            0
+        };
+        let fold_edits = if inlay_edits.is_empty() {
             if self.snapshot.inlay_snapshot.version != inlay_snapshot.version {
                 self.snapshot.version += 1;
             }
@@ -853,7 +876,32 @@ impl FoldMap {
             self.snapshot.inlay_snapshot = inlay_snapshot;
             self.snapshot.version += 1;
             fold_edits
+        };
+        if profile.is_enabled() {
+            let output_start = fold_edits
+                .iter()
+                .map(|edit| edit.new.start.to_point(&self.snapshot).row())
+                .min()
+                .unwrap_or(0) as u64;
+            let output_end = fold_edits
+                .iter()
+                .map(|edit| edit.new.end.to_point(&self.snapshot).row())
+                .max()
+                .unwrap_or(0) as u64;
+            let output_rows = if fold_edits.is_empty() {
+                0
+            } else {
+                output_end.saturating_sub(output_start) + 1
+            };
+            profile.output(fold_edits.len(), output_start, output_rows);
         }
+        profile.state(
+            old_rows,
+            u64::from(self.snapshot.max_point().row()) + 1,
+            0,
+            0,
+        );
+        fold_edits
     }
 }
 

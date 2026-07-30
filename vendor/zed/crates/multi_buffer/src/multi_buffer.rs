@@ -2443,12 +2443,34 @@ impl MultiBuffer {
         if !changed {
             return;
         }
-        let edits = Self::sync_from_buffer_changes(
-            &mut self.snapshot.borrow_mut(),
-            &self.buffers,
-            &self.diffs,
-            cx,
+        let mut snapshot = self.snapshot.borrow_mut();
+        let mut profile = gpui::profiler::EditorTimingGuard::new(
+            gpui::profiler::EditorTimingKind::MultiBufferSync,
         );
+        let old_rows = profile
+            .is_enabled()
+            .then(|| u64::from(snapshot.max_point().row) + 1)
+            .unwrap_or(0);
+        let edits = Self::sync_from_buffer_changes(&mut snapshot, &self.buffers, &self.diffs, cx);
+        if profile.is_enabled() {
+            let output_start = edits
+                .iter()
+                .map(|edit| edit.new.start.to_point(&snapshot).row)
+                .min()
+                .unwrap_or(0) as u64;
+            let output_end = edits
+                .iter()
+                .map(|edit| edit.new.end.to_point(&snapshot).row)
+                .max()
+                .unwrap_or(0) as u64;
+            let output_rows = if edits.is_empty() {
+                0
+            } else {
+                output_end.saturating_sub(output_start) + 1
+            };
+            profile.output(edits.len(), output_start, output_rows);
+        }
+        profile.state(old_rows, u64::from(snapshot.max_point().row) + 1, 0, 0);
         if !edits.is_empty() {
             self.subscriptions.publish(edits);
         }
@@ -2460,7 +2482,33 @@ impl MultiBuffer {
         if !changed {
             return snapshot;
         }
+        let mut profile = gpui::profiler::EditorTimingGuard::new(
+            gpui::profiler::EditorTimingKind::MultiBufferSync,
+        );
+        let old_rows = profile
+            .is_enabled()
+            .then(|| u64::from(snapshot.max_point().row) + 1)
+            .unwrap_or(0);
         let edits = Self::sync_from_buffer_changes(snapshot, &self.buffers, &self.diffs, cx);
+        if profile.is_enabled() {
+            let output_start = edits
+                .iter()
+                .map(|edit| edit.new.start.to_point(snapshot).row)
+                .min()
+                .unwrap_or(0) as u64;
+            let output_end = edits
+                .iter()
+                .map(|edit| edit.new.end.to_point(snapshot).row)
+                .max()
+                .unwrap_or(0) as u64;
+            let output_rows = if edits.is_empty() {
+                0
+            } else {
+                output_end.saturating_sub(output_start) + 1
+            };
+            profile.output(edits.len(), output_start, output_rows);
+        }
+        profile.state(old_rows, u64::from(snapshot.max_point().row) + 1, 0, 0);
 
         if !edits.is_empty() {
             self.subscriptions.publish(edits);

@@ -577,6 +577,8 @@ impl InlayMap {
         buffer_snapshot: MultiBufferSnapshot,
         mut buffer_edits: Vec<text::Edit<MultiBufferOffset>>,
     ) -> (InlaySnapshot, Vec<InlayEdit>) {
+        let mut profile =
+            gpui::profiler::EditorTimingGuard::new(gpui::profiler::EditorTimingKind::InlayMapSync);
         let snapshot = &mut self.snapshot;
 
         if buffer_edits.is_empty()
@@ -589,7 +591,32 @@ impl InlayMap {
             });
         }
 
-        if buffer_edits.is_empty() {
+        if profile.is_enabled() {
+            let input_start = buffer_edits
+                .iter()
+                .map(|edit| buffer_snapshot.offset_to_point(edit.new.start).row)
+                .min()
+                .unwrap_or(0) as u64;
+            let input_end = buffer_edits
+                .iter()
+                .map(|edit| buffer_snapshot.offset_to_point(edit.new.end).row)
+                .max()
+                .unwrap_or(0) as u64;
+            let input_rows = if buffer_edits.is_empty() {
+                0
+            } else {
+                input_end.saturating_sub(input_start) + 1
+            };
+            profile.input(buffer_edits.len(), input_start, input_rows);
+            profile.state(
+                u64::from(snapshot.buffer.max_point().row + 1),
+                u64::from(buffer_snapshot.max_point().row + 1),
+                0,
+                u64::from(!self.inlays.is_empty()),
+            );
+        }
+
+        let result = if buffer_edits.is_empty() {
             if snapshot.buffer.edit_count() != buffer_snapshot.edit_count()
                 || snapshot.buffer.non_text_state_update_count()
                     != buffer_snapshot.non_text_state_update_count()
@@ -724,7 +751,29 @@ impl InlayMap {
             snapshot.check_invariants();
 
             (snapshot.clone(), inlay_edits.into_inner())
+        };
+
+        if profile.is_enabled() {
+            let output_start = result
+                .1
+                .iter()
+                .map(|edit| result.0.to_point(edit.new.start).row())
+                .min()
+                .unwrap_or(0) as u64;
+            let output_end = result
+                .1
+                .iter()
+                .map(|edit| result.0.to_point(edit.new.end).row())
+                .max()
+                .unwrap_or(0) as u64;
+            let output_rows = if result.1.is_empty() {
+                0
+            } else {
+                output_end.saturating_sub(output_start) + 1
+            };
+            profile.output(result.1.len(), output_start, output_rows);
         }
+        result
     }
 
     #[ztracing::instrument(skip_all)]
