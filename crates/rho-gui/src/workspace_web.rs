@@ -638,7 +638,16 @@ impl Render for Workspace {
                                 .items_center()
                                 .px_4()
                                 .text_color(text_muted)
-                                .child(if self.keyboard_visible { "⌄" } else { "⌨" })
+                                .child(
+                                    gpui::svg()
+                                        .path(if self.keyboard_visible {
+                                            "icons/chevron_down.svg"
+                                        } else {
+                                            "icons/keyboard.svg"
+                                        })
+                                        .size(px(20.))
+                                        .text_color(text_muted),
+                                )
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     this.keyboard_visible = !this.keyboard_visible;
                                     if this.keyboard_visible

@@ -135,8 +135,11 @@ fn layout_rows(width: f32) -> [Vec<(Key, f32, f32)>; 5] {
         })
         .collect();
 
+    // iOS widths: shift/backspace and the bottom-row side keys are ~1.35
+    // units, return ~2.8, with z–m centered leaving iOS's larger gap
+    // beside shift.
     let letters_margin = (width - 7. * unit - 6. * H_GAP) / 2.;
-    let edge_width = letters_margin - 2. * H_GAP;
+    let edge_width = 1.35 * unit;
     let mut shift_row = vec![(Key::Shift, H_GAP, edge_width)];
     shift_row.extend(
         ["z", "x", "c", "v", "b", "n", "m"]
@@ -146,8 +149,8 @@ fn layout_rows(width: f32) -> [Vec<(Key, f32, f32)>; 5] {
     );
     shift_row.push((Key::Backspace, width - H_GAP - edge_width, edge_width));
 
-    let side_width = 1.25 * unit;
-    let return_width = 2.5 * unit;
+    let side_width = 1.35 * unit;
+    let return_width = 2.8 * unit;
     let space_width = width - 5. * H_GAP - 2. * side_width - return_width;
     let mut x = H_GAP;
     let mut bottom_row = Vec::new();
@@ -486,7 +489,8 @@ impl TouchKeyboard {
     }
 
     /// A purely visual key face: hit testing happens on the keyboard
-    /// surface, so the painted rectangle can keep its gaps.
+    /// surface, so the painted rectangle can keep its gaps. Special keys
+    /// use SVG icons — the bundled fonts have no glyphs for ⇧/⌫/⏎.
     fn render_key(
         &self,
         key: Key,
@@ -495,14 +499,35 @@ impl TouchKeyboard {
         width: f32,
         colors: KeyboardStyle,
     ) -> Div {
-        let label = match key {
-            Key::Text(text) if self.shift != Shift::Off => shifted_text(text),
-            Key::Text(text) => text.into(),
-            Key::Shift if self.shift == Shift::Locked => "⇧ lock".into(),
-            Key::Shift => "⇧".into(),
-            Key::Backspace => "⌫".into(),
-            Key::Enter => "return".into(),
-            Key::Space => "space".into(),
+        // iOS shows shift state on the key face: highlighted when armed,
+        // and with the underlined icon when caps-locked.
+        let shift_active = matches!(key, Key::Shift) && self.shift != Shift::Off;
+        let face = match key {
+            Key::Text(text) if self.shift != Shift::Off => shifted_text(text).into_any_element(),
+            Key::Text(text) => text.into_any_element(),
+            Key::Shift if self.shift == Shift::Locked => gpui::svg()
+                .path("icons/shift.svg")
+                .size(px(18.))
+                .text_color(colors.text)
+                .border_b_2()
+                .border_color(colors.text)
+                .into_any_element(),
+            Key::Shift => gpui::svg()
+                .path("icons/shift.svg")
+                .size(px(18.))
+                .text_color(colors.text)
+                .into_any_element(),
+            Key::Backspace => gpui::svg()
+                .path("icons/backspace.svg")
+                .size(px(18.))
+                .text_color(colors.text)
+                .into_any_element(),
+            Key::Enter => gpui::svg()
+                .path("icons/return.svg")
+                .size(px(18.))
+                .text_color(colors.text)
+                .into_any_element(),
+            Key::Space => "space".into_any_element(),
         };
         div()
             .absolute()
@@ -514,7 +539,7 @@ impl TouchKeyboard {
             .items_center()
             .justify_center()
             .rounded_md()
-            .bg(if self.pressed == Some(position) {
+            .bg(if self.pressed == Some(position) || shift_active {
                 colors.key_pressed
             } else {
                 colors.key_background
@@ -522,7 +547,7 @@ impl TouchKeyboard {
             .border_1()
             .border_color(colors.key_border)
             .text_color(colors.text)
-            .child(label)
+            .child(face)
     }
 }
 
