@@ -174,6 +174,10 @@ pub struct Workspace {
     /// The dashboard: the rail as a real editor buffer, ambient chrome
     /// beside the active tree.
     dashboard: crate::dashboard::Dashboard,
+    /// The dashboard projection is regenerated only after its registry or
+    /// local composition state changes, never merely because another view
+    /// dirtied the window.
+    dashboard_dirty: bool,
     /// Read-only document shown when the synthetic Iris row is targeted.
     iris_preview: Entity<editor::Editor>,
     /// The completing-read strip at the bottom of the window, when open.
@@ -360,6 +364,7 @@ impl Workspace {
             surfaces: HashMap::new(),
             active_context: ContextId::Draft,
             dashboard,
+            dashboard_dirty: true,
             iris_preview,
             minibuffer: None,
             transient: None,
@@ -497,6 +502,9 @@ impl Workspace {
                 });
         }
 
+        if !changes.is_empty() {
+            self.dashboard_dirty = true;
+        }
         if live_changed {
             self.refresh_draft_agent_targets(cx);
         }
@@ -557,6 +565,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.dashboard_dirty = true;
         match event {
             ConnEvent::Ready {
                 workstreams,
@@ -934,6 +943,7 @@ impl Workspace {
         // Engagement bump: keeps display-time staleness correct between
         // topic refreshes (the daemon persists the same timestamp).
         self.registry.touch_agent(agent_id);
+        self.dashboard_dirty = true;
     }
 
     /// Submitting the compose surface creates the agent: the workdir field
@@ -1061,6 +1071,9 @@ impl Workspace {
                     _ => false,
                 }
             };
+            if dashboard_prompt && added {
+                self.dashboard_dirty = true;
+            }
             accepted += usize::from(added);
         }
         if accepted > 0 {
@@ -1073,7 +1086,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let cleared = if self.dashboard_mode(window, cx) {
+        let dashboard_mode = self.dashboard_mode(window, cx);
+        let cleared = if dashboard_mode {
             self.dashboard.clear_attachments(cx)
         } else {
             match &self.active_tree().focused().surface.view {
@@ -1087,6 +1101,9 @@ impl Workspace {
             }
         };
         if cleared {
+            if dashboard_mode {
+                self.dashboard_dirty = true;
+            }
             let agent_id = self.registry.selected_agent().copied();
             self.notice_on(
                 agent_id.as_ref(),
@@ -1732,6 +1749,7 @@ impl Workspace {
     pub(crate) fn mark_draft_active_from_edit(&mut self, cx: &mut Context<Self>) {
         if matches!(self.registry.active_pane(), ActivePane::Startup) {
             self.registry.enter_draft();
+            self.dashboard_dirty = true;
             cx.notify();
         }
     }
@@ -2048,6 +2066,7 @@ impl Workspace {
                 (ContextId::Draft, SurfaceKey::Draft)
             }
         };
+        self.dashboard_dirty = true;
         self.active_context = context;
         let surface = self.make_surface(key, window, cx);
         self.display_surface(surface);
@@ -2782,6 +2801,14 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn sync_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dashboard.sync(&self.registry, window, cx);
+        self.dashboard_dirty = false;
+    }
+
+    fn sync_dashboard_if_dirty(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dashboard_dirty {
+            self.dashboard.sync(&self.registry, window, cx);
+            self.dashboard_dirty = false;
+        }
     }
 
     #[cfg(test)]
@@ -2797,6 +2824,7 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn dashboard_open_reply(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
         self.dashboard.open_reply(agent_id, cx);
+        self.dashboard_dirty = true;
     }
 
     #[cfg(test)]
@@ -3070,6 +3098,7 @@ impl Workspace {
             .iris_context_agent
             .lock()
             .expect("Iris context mutex poisoned") = self.registry.selected_agent().copied();
+        self.dashboard_dirty = true;
         cx.notify();
     }
 
@@ -3685,6 +3714,7 @@ impl Workspace {
             .unwrap_or_else(|| "no project".to_owned());
         let summary = format!("{project} · {} · {}", draft.role, draft.workspace.label());
         self.dashboard.open_new_draft(summary, cx);
+        self.dashboard_dirty = true;
         let handle = self.dashboard.focus_handle(cx);
         window.focus(&handle, cx);
         self.dashboard_enter_insert(window, cx);
@@ -3718,7 +3748,9 @@ impl Workspace {
                 if !self.require_connected(cx) {
                     return;
                 }
-                if let Some(content) = self.dashboard.take_reply(agent_id, cx) {
+                let content = self.dashboard.take_reply(agent_id, cx);
+                self.dashboard_dirty = true;
+                if let Some(content) = content {
                     self.handle_submit(agent_id, content, cx);
                 }
                 // Removing the draft's excerpt would drop the cursor onto
@@ -3740,7 +3772,9 @@ impl Workspace {
                         return;
                     }
                 };
-                if let Some(content) = self.dashboard.take_new_draft(cx) {
+                let content = self.dashboard.take_new_draft(cx);
+                self.dashboard_dirty = true;
+                if let Some(content) = content {
                     self.create_inline_agent(content, start, role);
                 }
                 self.new_agent_draft = None;
@@ -3778,6 +3812,7 @@ impl Workspace {
             | Some(RowTarget::Agent(agent_id))
             | Some(RowTarget::Reply(agent_id)) => {
                 self.dashboard.open_reply(agent_id, cx);
+                self.dashboard_dirty = true;
                 self.dashboard_enter_insert(window, cx);
             }
             _ => {
@@ -4459,9 +4494,7 @@ impl Render for Workspace {
         let editor = self.active_editor(cx);
         let text_style = editor.update(cx, |editor, cx| editor.style(cx).text.clone());
         let connection_status = self.render_connection_status(&text_style, cx);
-        // Regenerate the dashboard listing whenever anything redraws; sync
-        // is cheap and a near no-op when nothing changed.
-        self.dashboard.sync(&self.registry, window, cx);
+        self.sync_dashboard_if_dirty(window, cx);
         div()
             .id("rho-gui")
             .size_full()
@@ -4510,6 +4543,7 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &DashboardToggleSubagents, _, cx| {
                 this.dashboard.toggle_subagents(cx);
+                this.dashboard_dirty = true;
             }))
             .on_action(cx.listener(|this, _: &TaskBoard, _window, cx| {
                 this.notice_on(
