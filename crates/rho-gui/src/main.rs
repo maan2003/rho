@@ -1,32 +1,5 @@
 //! rho-gui: a native GUI attached to a running rho daemon.
 
-mod agent_view;
-mod chime;
-mod commands;
-mod connection;
-mod dashboard;
-mod diff_view;
-mod draft_view;
-mod editor_config;
-mod highlights;
-mod minibuffer;
-mod native_realtime;
-mod pane;
-mod render;
-mod rho_assets;
-#[cfg(test)]
-mod sampler;
-mod shell_view;
-mod style;
-mod terminal_view;
-#[cfg(test)]
-mod tests;
-mod transcript;
-mod transient;
-mod visualization;
-mod workspace;
-mod zed_remote;
-
 use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::{Path, PathBuf};
@@ -35,70 +8,12 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use clap::Parser;
-use gpui::{App, AppContext as _, KeyBinding, WindowOptions, actions};
-// The registry and per-agent frame store live in a shared crate so the web
-// UI applies the same rail policy and state folding; the aliases keep this
-// crate's `crate::registry::` and `crate::store::` paths intact.
-use rho_registry as registry;
-use rho_registry::store;
+use gpui::{App, AppContext as _, KeyBinding, WindowOptions};
+use rho_gui::rho_assets::RhoAssets;
+use rho_gui::workspace::{AttachTarget, Workspace};
+use rho_gui::*;
 use settings::SettingsStore;
 use tracing_subscriber::EnvFilter;
-
-use crate::rho_assets::RhoAssets;
-use crate::workspace::{AttachTarget, Workspace};
-
-// Keep the `rho_gui` action namespace: the bundled keymaps bind these under
-// the `RhoGui > Editor` context.
-actions!(
-    rho_gui,
-    [
-        SubmitPrompt,
-        PastePrompt,
-        AgentPrevious,
-        AgentNext,
-        AgentNew,
-        AgentJumpAttention,
-        AgentDone,
-        AgentHide,
-        DashboardNewAgent,
-        DashboardReply,
-        DashboardToggleSubagents,
-        RoleCycle,
-        RoleCycleGroup,
-        TaskBoard,
-        FileSave,
-        PaneSplitRight,
-        PaneSplitDown,
-        PaneClose,
-        PaneFocusNext,
-        PaneBack,
-        RailFocus,
-        RailOpen,
-        RootTransient,
-        MinibufferConfirm,
-        MinibufferCancel,
-        MinibufferNext,
-        MinibufferPrevious,
-        MinibufferComplete,
-        GitApprovalAllow,
-        GitApprovalDeny,
-        TerminalPaste,
-        TerminalNormalMode,
-        TerminalRawMode,
-        TerminalScrollLineUp,
-        TerminalScrollLineDown,
-        TerminalScrollHalfPageUp,
-        TerminalScrollHalfPageDown,
-        TerminalScrollTop,
-        TerminalScrollBottom,
-        ShellInterrupt,
-        ShellEof,
-        ShellPagerMore,
-        ShellPagerAll,
-        ShellPagerQuit,
-        VoiceToggle
-    ]
-);
 
 #[derive(Parser)]
 #[command(

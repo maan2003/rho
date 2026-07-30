@@ -8,8 +8,8 @@
 
 use editor::{Editor, Inlay};
 use gpui::{Context, Entity};
+use language::InlayId;
 use multi_buffer::MultiBuffer;
-use project::InlayId;
 use text::Anchor;
 
 use crate::render::{InlayContent, format_running_duration};

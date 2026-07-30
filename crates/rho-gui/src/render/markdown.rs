@@ -4,6 +4,8 @@ use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
 
 use gpui::{App, Global};
+#[cfg(not(feature = "native"))]
+use language::LanguageRegistry;
 use language::{Buffer, Language, LanguageConfig, LanguageMatcher, LanguageQueries};
 use theme::ActiveTheme as _;
 
@@ -37,6 +39,26 @@ impl Markdown {
 struct MarkdownLanguagesRegistered;
 impl Global for MarkdownLanguagesRegistered {}
 
+#[cfg(not(feature = "native"))]
+struct BrowserLanguageRegistry(Arc<LanguageRegistry>);
+#[cfg(not(feature = "native"))]
+impl Global for BrowserLanguageRegistry {}
+
+#[cfg(not(feature = "native"))]
+fn language_registry(cx: &mut App) -> Arc<LanguageRegistry> {
+    if !cx.has_global::<BrowserLanguageRegistry>() {
+        let registry = Arc::new(LanguageRegistry::new(cx.background_executor().clone()));
+        registry.set_theme(cx.theme().clone());
+        cx.set_global(BrowserLanguageRegistry(registry));
+    }
+    cx.global::<BrowserLanguageRegistry>().0.clone()
+}
+
+#[cfg(feature = "native")]
+fn language_registry(cx: &mut App) -> Arc<language::LanguageRegistry> {
+    crate::zed_remote::language_registry(cx)
+}
+
 /// Gives an assistant-message buffer Zed's persistent, background Markdown
 /// syntax pipeline. Concealment is part of the resulting syntax generation;
 /// non-Markdown transcript records live in separate source buffers.
@@ -45,7 +67,7 @@ pub fn configure_buffer(buffer: &mut Buffer, cx: &mut gpui::Context<Buffer>) {
     let (Some(block), Some(inline)) = (markdown.block, markdown.inline) else {
         return;
     };
-    let registry = crate::zed_remote::language_registry(cx);
+    let registry = language_registry(cx);
     if !cx.has_global::<MarkdownLanguagesRegistered>() {
         registry.add(block.clone());
         registry.add(inline.clone());

@@ -16,9 +16,26 @@ use gpui::{
 };
 use theme::ActiveTheme as _;
 
-use crate::commands::Candidate;
 use crate::style::StyleClass;
 use crate::workspace::Workspace;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Candidate {
+    pub value: String,
+    pub description: String,
+}
+
+pub fn token_start(text_before_cursor: &str) -> usize {
+    text_before_cursor
+        .char_indices()
+        .rev()
+        .find_map(|(index, character)| {
+            character
+                .is_whitespace()
+                .then_some(index + character.len_utf8())
+        })
+        .unwrap_or(0)
+}
 
 /// How long an echoed message stays visible.
 pub const ECHO_DURATION: std::time::Duration = std::time::Duration::from_secs(6);
@@ -199,7 +216,7 @@ impl Minibuffer {
         };
         self.editor.update(cx, |editor, cx| {
             let text = editor.text(cx);
-            let start = crate::commands::token_start(&text);
+            let start = token_start(&text);
             let new_text = format!("{}{}", &text[..start], candidate.value);
             let end = multi_buffer::MultiBufferOffset(new_text.len());
             editor.set_text(new_text, window, cx);

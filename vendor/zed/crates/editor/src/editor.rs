@@ -168,7 +168,7 @@ use git::{
 pub(crate) use git::{DisplayDiffHunk, PhantomDiffReviewIndicator};
 #[cfg(feature = "native")]
 pub use hover_popover::hover_markdown_style;
-pub use inlays::Inlay;
+pub use inlays::{Inlay, InlayHighlight};
 #[cfg(feature = "native")]
 pub use items::MAX_TAB_TITLE_LEN;
 #[cfg(feature = "native")]

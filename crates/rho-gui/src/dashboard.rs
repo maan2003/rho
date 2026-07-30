@@ -16,16 +16,14 @@ use std::sync::{Arc, Mutex};
 use editor::display_map::{
     BlockContext, BlockStyle, CustomBlockId, DisplayRow, ToDisplayPoint as _,
 };
-use editor::hover_links::InlayHighlight;
 use editor::{
     DisplayElisionId, DisplayElisionProperties, Editor, EditorMode, HighlightKey, Inlay,
-    SizingBehavior,
+    InlayHighlight, SizingBehavior,
 };
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, Focusable as _, HighlightStyle, Window};
-use language::{Buffer, Capability, Point};
+use language::{Buffer, Capability, InlayId, Point};
 use multi_buffer::{MultiBuffer, PathKey};
-use project::InlayId;
 use rho_core::ContentPart;
 use rho_ui_proto::{AgentId, UiAttention, WorkstreamId};
 use text::BufferId;
@@ -144,6 +142,7 @@ impl Dashboard {
                     sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
                 },
                 multi_buffer.clone(),
+                #[cfg(feature = "native")]
                 None,
                 window,
                 cx,

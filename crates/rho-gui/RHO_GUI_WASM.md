@@ -64,3 +64,32 @@ equivalent downstream defaults) so existing native behavior does not change.
 - Inventory written before source or Cargo gating.
 - Browser connection target is direct iroh, matching `webui`; no transport
   abstraction is introduced.
+- Added a library target and made the unchanged native binary require the
+  default-on `native` feature. Actions and view modules now belong to the
+  library; the binary remains the native application/bootstrap owner.
+- The `native` feature owns native editor integration, Wayland/font-kit,
+  project/language loading, Tokio, native RPC, terminal/shell, audio/realtime,
+  profiling, CLI, persistence, and native command/search/Vim dependencies.
+- The no-default-features library retains the dashboard, agent transcript
+  preview, draft/editor configuration, render/Markdown, transcript,
+  highlights/style, minibuffer, pane model, assets, registry/store aliases,
+  and a disconnected browser `Workspace` root that mounts the real dashboard.
+  Stage 2 will populate this root using direct iroh; it is deliberately not a
+  transport abstraction.
+- Moved portable inlay model imports to `language::InlayId` and exported the
+  already-portable `InlayHighlight` model from `editor` instead of reaching
+  through editor's native-only hover-link service module.
+- Static Markdown language registration now has a wasm-local
+  `LanguageRegistry`; native keeps the full `zed_remote` registry and dynamic
+  language initialization.
+- `tree-sitter-md` additionally needs `<wchar.h>`, `isdigit`, and `strcmp`.
+  Extended Zed's existing minimal `tooling/tree_sitter_wasm/include` libc
+  provider with ASCII implementations; no grammar or parser behavior is
+  stubbed out.
+- Verification completed:
+  - `cargo check -p rho-gui`
+  - `cargo check -p vim -p editor`
+  - `PATH="$HOME/.rustup/toolchains/nightly-x86_64-unknown-linux-gnu/bin:$PATH" \
+    CC_wasm32_unknown_unknown=/nix/store/482i7k840pk0cmv6qhf4rf5gyah1lq8l-clang-21.1.8/bin/clang \
+    CFLAGS_wasm32_unknown_unknown=-I/home/maan2003/src/rho/vendor/zed/tooling/tree_sitter_wasm/include \
+    cargo check -p rho-gui --release --target wasm32-unknown-unknown --no-default-features`

@@ -22,14 +22,14 @@ use editor::{
 use futures::future::join_all;
 use gpui::prelude::*;
 use gpui::{Context, Entity, Subscription, Task, WeakEntity, Window};
-use language::{Buffer, BufferEvent, Capability, Point};
+use language::{Buffer, BufferEvent, Capability, InlayId, Point};
 use multi_buffer::{MultiBuffer, PathKey};
-use project::InlayId;
 use rho_core::ContentPart;
 use rho_ui_proto::AgentId;
 use rho_ui_proto::remote::UiAgentState;
 use text::{Buffer as TextBuffer, BufferId, ReplicaId};
 
+#[cfg(feature = "native")]
 use crate::commands::WorkspaceCompletionProvider;
 use crate::highlights::apply_class_highlights;
 use crate::store::FrameSummary;
@@ -74,7 +74,7 @@ pub struct AgentModel {
 impl AgentModel {
     pub fn new(
         workspace: WeakEntity<Workspace>,
-        visualization_client: crate::connection::VisualizationClient,
+        #[cfg(feature = "native")] visualization_client: crate::connection::VisualizationClient,
         cx: &mut Context<Self>,
     ) -> Self {
         let system_buffer = cx.new(|cx| {
@@ -106,6 +106,7 @@ impl AgentModel {
         let transcript = TranscriptModel::new(
             multi_buffer.clone(),
             document_multi_buffer.clone(),
+            #[cfg(feature = "native")]
             visualization_client,
         );
         Self {
@@ -217,6 +218,7 @@ impl AgentModel {
                     sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
                 },
                 multi_buffer,
+                #[cfg(feature = "native")]
                 None,
                 window,
                 cx,
@@ -256,6 +258,7 @@ impl AgentModel {
                     sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
                 },
                 multi_buffer,
+                #[cfg(feature = "native")]
                 None,
                 window,
                 cx,
@@ -264,6 +267,7 @@ impl AgentModel {
             editor.disable_bracket_colorization(cx);
             editor.disable_header_for_buffer(system_id, cx);
             editor.disable_header_for_buffer(prompt_id, cx);
+            #[cfg(feature = "native")]
             editor.set_completion_provider(Some(WorkspaceCompletionProvider::new(
                 workspace, None, None, None,
             )));

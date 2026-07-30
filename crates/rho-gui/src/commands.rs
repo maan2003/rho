@@ -7,13 +7,8 @@ use gpui::{Context, Entity, Task, WeakEntity, Window};
 use language::{Buffer, CodeLabel, ToOffset as _};
 use project::{Completion, CompletionDisplayOptions, CompletionResponse, CompletionSource};
 
+pub use crate::minibuffer::{Candidate, token_start};
 use crate::workspace::Workspace;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Candidate {
-    pub value: String,
-    pub description: String,
-}
 
 /// Workstream, group, and label names, feeding prompt completion.
 #[derive(Default)]
@@ -44,18 +39,6 @@ fn fuzzy_contains(value: &str, needle: &str) -> bool {
 
 fn last_token(text: &str) -> &str {
     &text[token_start(text)..]
-}
-
-pub fn token_start(text_before_cursor: &str) -> usize {
-    text_before_cursor
-        .char_indices()
-        .rev()
-        .find_map(|(index, character)| {
-            character
-                .is_whitespace()
-                .then_some(index + character.len_utf8())
-        })
-        .unwrap_or(0)
 }
 
 fn mention_prefix(text: &str) -> Option<&str> {

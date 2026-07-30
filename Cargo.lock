@@ -13685,6 +13685,7 @@ dependencies = [
  "editor",
  "fs",
  "futures 0.3.33",
+ "getrandom 0.2.17",
  "gpui",
  "gpui_platform",
  "gpui_tokio",

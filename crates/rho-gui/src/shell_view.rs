@@ -13,9 +13,8 @@ use editor::{Editor, EditorMode, HighlightKey, Inlay, SelectionEffects, SizingBe
 use futures::StreamExt as _;
 use gpui::prelude::*;
 use gpui::{Context, Entity, FontStyle, FontWeight, HighlightStyle, WeakEntity, Window, px};
-use language::{Buffer, Capability, Point};
+use language::{Buffer, Capability, InlayId, Point};
 use multi_buffer::{MultiBuffer, PathKey};
-use project::InlayId;
 use rho_ui_proto::shell::{
     MAX_STYLE_SPANS, ShellClientFrame, ShellColor, ShellServerFrame, ShellStyleSpan,
     ShellTextStyle, command_fits,
