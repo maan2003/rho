@@ -343,9 +343,7 @@ impl WrapMap {
             if cfg!(not(target_family = "wasm"))
                 && pending_edits.len() == 1
                 && let Some((_, _, tab_edits)) = pending_edits.back()
-                && let [edit] = &**tab_edits
-                && ((edit.new.end.row().saturating_sub(edit.new.start.row()) + 1) as usize)
-                    < WRAP_YIELD_ROW_INTERVAL
+                && affected_row_count(tab_edits) < WRAP_YIELD_ROW_INTERVAL
                 && let Some((tab_snapshot, row_scales, tab_edits)) = pending_edits.pop_back()
             {
                 let wrap_edits = gpui::block_on(snapshot.update(
@@ -410,6 +408,35 @@ impl WrapMap {
             self.pending_edits.drain(..to_remove_len);
         }
     }
+}
+
+/// Counts the rows that wrapping will actually recompute after neighboring
+/// edits are combined. Syntax concealment commonly produces several edits on
+/// one line; treating their raw count as a large update needlessly publishes
+/// an unwrapped interpolation while a background task repeats tiny work.
+fn affected_row_count(edits: &[TabEdit]) -> usize {
+    let mut edits = edits.iter();
+    let Some(first) = edits.next() else {
+        return 0;
+    };
+    let mut old_end = first.old.end.row() + 1;
+    let mut new_start = first.new.start.row();
+    let mut new_end = first.new.end.row() + 1;
+    let mut count = 0usize;
+
+    for edit in edits {
+        if edit.old.start.row() <= old_end {
+            old_end = old_end.max(edit.old.end.row() + 1);
+            new_end = new_end.max(edit.new.end.row() + 1);
+        } else {
+            count = count.saturating_add(new_end.saturating_sub(new_start) as usize);
+            old_end = edit.old.end.row() + 1;
+            new_start = edit.new.start.row();
+            new_end = edit.new.end.row() + 1;
+        }
+    }
+
+    count.saturating_add(new_end.saturating_sub(new_start) as usize)
 }
 
 impl WrapSnapshot {
@@ -1426,6 +1453,22 @@ mod tests {
     use std::{cmp, env, num::NonZeroU32};
     use text::Rope;
     use theme::LoadThemes;
+
+    #[test]
+    fn multiple_edits_on_one_line_are_one_wrap_row() {
+        let edits = [
+            TabEdit {
+                old: TabPoint::new(7, 2)..TabPoint::new(7, 4),
+                new: TabPoint::new(7, 2)..TabPoint::new(7, 3),
+            },
+            TabEdit {
+                old: TabPoint::new(7, 8)..TabPoint::new(7, 10),
+                new: TabPoint::new(7, 7)..TabPoint::new(7, 8),
+            },
+        ];
+
+        assert_eq!(affected_row_count(&edits), 1);
+    }
 
     #[gpui::test]
     async fn test_prev_row_boundary(cx: &mut gpui::TestAppContext) {

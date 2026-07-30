@@ -99,7 +99,6 @@ struct BlockRecord {
     gutter: Option<(StyleClass, Range<Anchor>)>,
     inlay: Option<InlayRecord>,
     styles: Vec<(StyleClass, Range<Anchor>)>,
-    markdown: bool,
     terminal_newline_supplied_by_excerpt: bool,
     visualizations: Vec<VisualizationAnchor>,
 }
@@ -159,7 +158,6 @@ type PlacedSpans = (
 
 struct UserMessageGutter;
 struct AgentMessageGutter;
-struct MarkdownConcealment;
 
 /// The document excerpt's tail policy. Replacing an excerpt gives it a
 /// new id (invalidating every anchor into it), so the tail changes shape
@@ -221,7 +219,7 @@ impl TranscriptModel {
 
         let mut chunks: Vec<(usize, bool, Vec<RenderedBlock>)> = Vec::new();
         for (block_index, rendered) in rendered_blocks.into_iter().enumerate() {
-            let markdown = matches!(rendered.kind, BlockKind::Response { .. });
+            let markdown = rendered.markdown;
             if chunks
                 .last()
                 .is_none_or(|(_, current_markdown, _)| markdown != *current_markdown)
@@ -510,7 +508,7 @@ impl TranscriptModel {
         let mut chunks: Vec<(usize, bool, Vec<RenderedBlock>)> = Vec::new();
         for (offset, rendered) in rendered_blocks.into_iter().enumerate() {
             let block_index = start + offset;
-            let markdown = matches!(rendered.kind, BlockKind::Response { .. });
+            let markdown = rendered.markdown;
             let starts_chunk = chunks
                 .last()
                 .is_none_or(|(_, current_markdown, _)| markdown != *current_markdown);
@@ -654,7 +652,6 @@ impl TranscriptModel {
                 gutter,
                 inlay,
                 styles,
-                markdown: rendered.markdown,
                 terminal_newline_supplied_by_excerpt,
                 visualizations,
             };
@@ -834,12 +831,6 @@ impl TranscriptModel {
             .iter()
             .flat_map(|record| record.visualizations.iter().cloned())
             .collect::<Vec<_>>();
-        let markdown_ranges = self
-            .records
-            .iter()
-            .filter(|record| record.markdown)
-            .map(|record| record.range.clone())
-            .collect::<Vec<_>>();
         let desired_visualization_ids = desired_visualizations
             .iter()
             .map(|visualization| visualization.id.as_str())
@@ -958,14 +949,6 @@ impl TranscriptModel {
                 cx,
             );
             elisions.apply(&mut attachment.elisions, multi_buffer, &editor, cx);
-            let snapshot = multi_buffer.read(cx).snapshot(cx);
-            let scopes = markdown_ranges
-                .iter()
-                .filter_map(|range| excerpt_range(&snapshot, range))
-                .collect();
-            editor.update(cx, |editor, cx| {
-                editor.set_syntax_concealment_ranges::<MarkdownConcealment>(scopes, cx)
-            });
             true
         });
     }
@@ -1068,7 +1051,6 @@ fn block_record(
         gutter,
         inlay,
         styles,
-        markdown: rendered.markdown,
         terminal_newline_supplied_by_excerpt,
         visualizations,
     }

@@ -35,10 +35,17 @@ pub struct SyntaxMap {
 #[derive(Clone)]
 pub struct SyntaxSnapshot {
     layers: SumTree<SyntaxLayerEntry>,
+    concealments: Arc<[ParsedConcealment]>,
     parsed_version: clock::Global,
     interpolated_version: clock::Global,
     language_registry_version: usize,
     update_count: usize,
+}
+
+#[derive(Clone)]
+struct ParsedConcealment {
+    range: Range<Anchor>,
+    context: Range<Anchor>,
 }
 
 // Dropping deep treesitter Trees can be quite slow due to deallocating lots of memory.
@@ -46,27 +53,31 @@ pub struct SyntaxSnapshot {
 #[cfg(not(target_family = "wasm"))]
 impl Drop for SyntaxSnapshot {
     fn drop(&mut self) {
-        static DROP_TX: std::sync::LazyLock<std::sync::mpsc::Sender<SumTree<SyntaxLayerEntry>>> =
-            std::sync::LazyLock::new(|| {
-                let (tx, rx) = std::sync::mpsc::channel();
-                std::thread::Builder::new()
-                    .name("SyntaxSnapshot::drop".into())
-                    .spawn(move || while let Ok(_) = rx.recv() {})
-                    .expect("failed to spawn drop thread");
-                tx
-            });
+        static DROP_TX: std::sync::LazyLock<
+            std::sync::mpsc::Sender<(SumTree<SyntaxLayerEntry>, Arc<[ParsedConcealment]>)>,
+        > = std::sync::LazyLock::new(|| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::Builder::new()
+                .name("SyntaxSnapshot::drop".into())
+                .spawn(move || while let Ok(_) = rx.recv() {})
+                .expect("failed to spawn drop thread");
+            tx
+        });
         // This does allocate a new Arc, but it's cheap and avoids blocking the main thread without needing to use an `Option` or `MaybeUninit`.
-        let _ = DROP_TX.send(std::mem::replace(
-            &mut self.layers,
-            SumTree::from_summary(SyntaxLayerSummary {
-                min_depth: Default::default(),
-                max_depth: Default::default(),
-                // Deliberately bogus anchors, doesn't matter in this context
-                range: Anchor::min_min_range_for_buffer(BufferId::new(1).unwrap()),
-                last_layer_range: Anchor::min_min_range_for_buffer(BufferId::new(1).unwrap()),
-                last_layer_language: Default::default(),
-                contains_unknown_injections: Default::default(),
-            }),
+        let _ = DROP_TX.send((
+            std::mem::replace(
+                &mut self.layers,
+                SumTree::from_summary(SyntaxLayerSummary {
+                    min_depth: Default::default(),
+                    max_depth: Default::default(),
+                    // Deliberately bogus anchors, doesn't matter in this context
+                    range: Anchor::min_min_range_for_buffer(BufferId::new(1).unwrap()),
+                    last_layer_range: Anchor::min_min_range_for_buffer(BufferId::new(1).unwrap()),
+                    last_layer_language: Default::default(),
+                    contains_unknown_injections: Default::default(),
+                }),
+            ),
+            std::mem::take(&mut self.concealments),
         ));
     }
 }
@@ -305,6 +316,7 @@ impl SyntaxSnapshot {
     fn new(text: &BufferSnapshot) -> Self {
         Self {
             layers: SumTree::new(text),
+            concealments: Arc::default(),
             parsed_version: clock::Global::default(),
             interpolated_version: clock::Global::default(),
             language_registry_version: 0,
@@ -325,6 +337,26 @@ impl SyntaxSnapshot {
 
     pub fn update_count(&self) -> usize {
         self.update_count
+    }
+
+    /// Returns concealments from this parsed syntax generation. Computing
+    /// the tree-sitter captures is part of parsing; consumers only filter and
+    /// resolve stable anchors for their composed excerpt boundaries.
+    pub fn concealed_ranges<'a>(
+        &'a self,
+        scan_range: Range<usize>,
+        eligible_range: Range<usize>,
+        text: &'a BufferSnapshot,
+    ) -> impl Iterator<Item = Range<usize>> + 'a {
+        self.concealments.iter().filter_map(move |concealment| {
+            let range = concealment.range.to_offset(text);
+            if range.start >= scan_range.end || range.end <= scan_range.start {
+                return None;
+            }
+            let context = concealment.context.to_offset(text);
+            (context.start >= eligible_range.start && context.end <= eligible_range.end)
+                .then_some(range)
+        })
     }
 
     #[ztracing::instrument(skip_all)]
@@ -528,8 +560,74 @@ impl SyntaxSnapshot {
             self.language_registry_version = registry.version();
         }
 
+        // Query materialization is part of the syntax product, but unlike
+        // parsing it is not currently budgeted. A bounded foreground parse
+        // must therefore fall back to the background when any resulting
+        // layer (including an injection) defines concealments.
+        if budget.is_some()
+            && self.languages(text, true).any(|language| {
+                language
+                    .grammar()
+                    .is_some_and(|grammar| grammar.concealments_config.is_some())
+            })
+        {
+            return Err(ParseTimeout);
+        }
+        self.refresh_concealments(text);
         self.update_count += 1;
         Ok(())
+    }
+
+    /// Materializes concealment query results while parsing is already on the
+    /// background executor. Anchors keep the last complete result coherent
+    /// while subsequent edits are being reparsed.
+    fn refresh_concealments(&mut self, text: &BufferSnapshot) {
+        let mut syntax_matches = self.matches(0..text.len(), text, |grammar| {
+            grammar
+                .concealments_config
+                .as_ref()
+                .map(|config| &config.query)
+        });
+        let configs = syntax_matches
+            .grammars()
+            .iter()
+            .map(|grammar| grammar.concealments_config.as_ref())
+            .collect::<Vec<_>>();
+        let mut concealments = Vec::new();
+
+        while let Some(mat) = syntax_matches.peek() {
+            if let Some(config) = configs[mat.grammar_index]
+                && let Some(capture) = mat
+                    .captures
+                    .iter()
+                    .find(|capture| capture.index == config.conceal_capture_ix)
+                && let Some(context) = mat
+                    .captures
+                    .iter()
+                    .find(|capture| capture.index == config.conceal_context_capture_ix)
+            {
+                let mut range = capture.node.byte_range();
+                if config.conceal_line_prefix_capture_ix.is_some_and(|ix| {
+                    mat.captures.iter().any(|line_capture| {
+                        line_capture.index == ix && line_capture.node.id() == capture.node.id()
+                    })
+                }) {
+                    for character in text.chars_at(range.end) {
+                        if !matches!(character, ' ' | '\t') {
+                            break;
+                        }
+                        range.end += character.len_utf8();
+                    }
+                }
+                concealments.push(ParsedConcealment {
+                    range: text.anchor_range_inside(range),
+                    context: text.anchor_range_inside(context.node.byte_range()),
+                });
+            }
+            syntax_matches.advance();
+        }
+
+        self.concealments = concealments.into();
     }
 
     #[ztracing::instrument(skip_all)]

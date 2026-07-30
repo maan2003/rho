@@ -184,7 +184,9 @@ impl AgentModel {
             };
             join_all(parsing).await;
             if this
-                .update(cx, |this, _| this.initial_load_ready = true)
+                .update(cx, |this, _| {
+                    this.initial_load_ready = true;
+                })
                 .is_err()
             {
                 return;

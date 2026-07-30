@@ -37,9 +37,9 @@ impl Markdown {
 struct MarkdownLanguagesRegistered;
 impl Global for MarkdownLanguagesRegistered {}
 
-/// Gives a transcript buffer Zed's persistent, background Markdown syntax
-/// pipeline. The transcript limits query-backed concealment to assistant
-/// message ranges at the editor layer.
+/// Gives an assistant-message buffer Zed's persistent, background Markdown
+/// syntax pipeline. Concealment is part of the resulting syntax generation;
+/// non-Markdown transcript records live in separate source buffers.
 pub fn configure_buffer(buffer: &mut Buffer, cx: &mut gpui::Context<Buffer>) {
     let markdown = Markdown::new(cx);
     let (Some(block), Some(inline)) = (markdown.block, markdown.inline) else {

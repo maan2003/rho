@@ -4026,8 +4026,7 @@ impl Workspace {
             .flatten();
         let preview = home
             .then(|| self.selected_preview_editor(iris, window, cx))
-            .flatten()
-            .map(|editor| div().size_full().overflow_hidden().child(editor));
+            .flatten();
         let mut leaf = |pane: &crate::pane::Pane<Surface>| -> gpui::AnyElement {
             let id = pane.id;
             let content = self.render_surface(&pane.surface);
@@ -4092,6 +4091,7 @@ impl Workspace {
                     .flex_col()
                     .child(
                         div()
+                            .flex()
                             .flex_1()
                             .min_w_0()
                             .min_h_0()

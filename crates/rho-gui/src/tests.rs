@@ -2151,10 +2151,10 @@ fn fenced_code_keeps_its_asterisks(cx: &mut TestAppContext) {
     assert!(display_text(&workspace, cx).contains("**bold**"));
 }
 
-/// A long transcript conceals the visible tail after its eager background
-/// parse; editor decoration remains viewport-bounded.
+/// Concealment changes display geometry, so it must remain stable when the
+/// viewport moves rather than being removed and recreated around the screen.
 #[gpui::test]
-fn long_transcripts_conceal_their_visible_tail_after_parsing(cx: &mut TestAppContext) {
+fn long_transcript_concealments_do_not_change_when_scrolling(cx: &mut TestAppContext) {
     let markup = (0..400)
         .map(|index| format!("line **{index}** of `history`\n"))
         .collect::<String>();
@@ -2183,6 +2183,33 @@ fn long_transcripts_conceal_their_visible_tail_after_parsing(cx: &mut TestAppCon
         buffer_text(&workspace, cx).contains("line **0** of `history`"),
         "the buffer keeps the markup either way"
     );
+
+    let editor = active_editor(&workspace, cx);
+    let folds = concealed_fold_ids(&workspace, &editor, cx);
+    assert!(
+        folds.len() >= 1_000,
+        "the whole transcript should be concealed"
+    );
+
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_scroll_position(gpui::point(0., 0.), window, cx);
+            });
+        })
+        .expect("scroll to transcript start");
+    cx.run_until_parked();
+    assert_eq!(concealed_fold_ids(&workspace, &editor, cx), folds);
+
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_scroll_position(gpui::point(0., 400.), window, cx);
+            });
+        })
+        .expect("scroll through transcript");
+    cx.run_until_parked();
+    assert_eq!(concealed_fold_ids(&workspace, &editor, cx), folds);
 }
 
 #[gpui::test]
@@ -2311,7 +2338,7 @@ fn plain_assistant_streaming_keeps_existing_concealment_folds(cx: &mut TestAppCo
     cx.run_until_parked();
 
     let after = concealed_fold_ids(&workspace, &editor, cx);
-    assert_eq!(after.len(), before.len());
+    assert_eq!(after, before, "streaming must not replace unchanged folds");
     let displayed = display_text(&workspace, cx);
     assert!(!displayed.contains("**bold**"));
     assert!(!displayed.contains("`code`"));
@@ -2519,7 +2546,7 @@ fn markdown_syntax_is_settled_independently_between_turns(cx: &mut TestAppContex
 }
 
 #[gpui::test]
-fn assistant_and_tool_segments_share_one_turn_buffer(cx: &mut TestAppContext) {
+fn markdown_and_tool_segments_use_separate_syntax_buffers(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     feed_frame(
         &workspace,
@@ -2544,20 +2571,25 @@ fn assistant_and_tool_segments_share_one_turn_buffer(cx: &mut TestAppContext) {
     workspace
         .update(cx, |_, _, cx| {
             let buffers = editor.read(cx).buffer().read(cx).all_buffers();
-            let first_turn = buffers
+            let first = buffers
                 .iter()
                 .find(|buffer| buffer.read(cx).text().contains("first assistant segment"))
-                .expect("first response turn buffer");
+                .expect("first Markdown buffer");
+            let second = buffers
+                .iter()
+                .find(|buffer| buffer.read(cx).text().contains("second assistant segment"))
+                .expect("second Markdown buffer");
+            let tool = buffers
+                .iter()
+                .find(|buffer| buffer.read(cx).text().contains("$ echo ok"))
+                .expect("tool buffer");
             assert!(
-                first_turn
-                    .read(cx)
-                    .text()
-                    .contains("second assistant segment"),
-                "assistant segments separated by a tool must share their turn buffer"
+                first.read(cx).language().is_some() && second.read(cx).language().is_some(),
+                "assistant messages must retain Markdown syntax"
             );
             assert!(
-                !first_turn.read(cx).text().contains("next turn response"),
-                "the next user turn must start a new response buffer"
+                tool.read(cx).language().is_none(),
+                "tool text must not inherit Markdown syntax or concealment"
             );
         })
         .expect("inspect transcript turn buffers");
