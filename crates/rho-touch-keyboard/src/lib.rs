@@ -7,15 +7,16 @@ use std::time::Duration;
 
 use gpui::prelude::*;
 use gpui::{
-    App, Bounds, Context, Div, Hsla, Keystroke, MouseButton, MouseDownEvent, Pixels, Point, Render,
-    Stateful, Task, WeakEntity, Window, div, point, px,
+    App, Bounds, Context, Div, EventEmitter, Hsla, Keystroke, MouseButton, MouseDownEvent, Pixels,
+    Point, Render, Stateful, Task, WeakEntity, Window, div, point, px,
 };
 use serde::{Deserialize, Serialize};
 
 const HEIGHT: f32 = 310.;
 const STRIP_HEIGHT: f32 = 34.;
-const ROW_HEIGHT: f32 = 41.;
-const GAP: f32 = 3.;
+const ROW_HEIGHT: f32 = 46.;
+const H_GAP: f32 = 5.;
+const V_GAP: f32 = 8.;
 const STORAGE_KEY: &str = "rho-touch-keyboard-telemetry-v1";
 const TELEMETRY_CAPACITY: usize = 2048;
 
@@ -60,6 +61,12 @@ pub struct TelemetryEntry {
     backspace_after_key: bool,
 }
 
+/// The owner decides when the keyboard is shown; the keyboard only reports
+/// what the user asked of it.
+pub enum KeyboardEvent {
+    Dismissed,
+}
+
 pub struct TouchKeyboard {
     plugin: Box<dyn KeyboardPlugin>,
     shift: Shift,
@@ -71,6 +78,15 @@ pub struct TouchKeyboard {
     _repeat: Option<Task<()>>,
 }
 
+/// Shift pairs punctuation with its iOS sibling rather than uppercasing.
+fn shifted_text(text: &str) -> String {
+    match text {
+        "," => "!".into(),
+        "." => "?".into(),
+        _ => text.to_uppercase(),
+    }
+}
+
 #[derive(Clone, Copy)]
 enum Key {
     Text(&'static str),
@@ -79,7 +95,6 @@ enum Key {
     Enter,
     Space,
     Dismiss,
-    Reserved,
 }
 
 impl TouchKeyboard {
@@ -151,19 +166,8 @@ impl TouchKeyboard {
                     false,
                 );
                 self.last_key = Some("dismiss".into());
-                window.blur();
+                cx.emit(KeyboardEvent::Dismissed);
                 cx.notify();
-                return None;
-            }
-            Key::Reserved => {
-                self.record(
-                    "reserved".into(),
-                    f32::from(event.position.x - center.x),
-                    f32::from(event.position.y - center.y),
-                    now,
-                    false,
-                );
-                self.last_key = Some("reserved".into());
                 return None;
             }
             _ => {}
@@ -172,7 +176,7 @@ impl TouchKeyboard {
         let (stroke, telemetry_key) = match key {
             Key::Text(text) => {
                 let text = if self.shift != Shift::Off {
-                    text.to_uppercase()
+                    shifted_text(text)
                 } else {
                     text.into()
                 };
@@ -277,14 +281,18 @@ impl TouchKeyboard {
             .w_full()
             .flex()
             .flex_col()
-            .gap(px(GAP))
-            .p(px(3.))
+            .gap(px(V_GAP))
             .border_t_1()
             .border_color(colors.border)
             .bg(colors.background);
 
         root = root.child(
-            div().h(px(STRIP_HEIGHT)).flex().items_center().children(
+            div()
+                .h(px(STRIP_HEIGHT))
+                .px(px(H_GAP))
+                .flex()
+                .items_center()
+                .children(
                 self.plugin
                     .context_chips()
                     .into_iter()
@@ -305,60 +313,75 @@ impl TouchKeyboard {
             ),
         );
 
-        let rows: [Vec<(Key, f32)>; 6] = [
-            ["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"]
+        // iOS grid: ten equal-width keys set the unit; the home row is offset
+        // half a pitch, z–m is centered with shift/backspace filling the edges,
+        // and the bottom row keeps space/return at their iOS positions so phone
+        // muscle memory transfers.
+        let unit = (width - 11. * H_GAP) / 10.;
+        let pitch = unit + H_GAP;
+        let row_of_ten = |keys: [&'static str; 10]| -> Vec<(Key, f32, f32)> {
+            keys.into_iter()
+                .enumerate()
+                .map(|(index, key)| (Key::Text(key), H_GAP + index as f32 * pitch, unit))
+                .collect()
+        };
+
+        let home_row = ["a", "s", "d", "f", "g", "h", "j", "k", "l"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, key)| {
+                (
+                    Key::Text(key),
+                    H_GAP + pitch / 2. + index as f32 * pitch,
+                    unit,
+                )
+            })
+            .collect();
+
+        let letters_margin = (width - 7. * unit - 6. * H_GAP) / 2.;
+        let edge_width = letters_margin - 2. * H_GAP;
+        let mut shift_row = vec![(Key::Shift, H_GAP, edge_width)];
+        shift_row.extend(
+            ["z", "x", "c", "v", "b", "n", "m"]
                 .into_iter()
-                .map(|key| (Key::Text(key), 1.))
-                .collect(),
-            ["q", "w", "e", "r", "t", "y", "u", "i", "o", "p"]
-                .into_iter()
-                .map(|key| (Key::Text(key), 1.))
-                .collect(),
-            ["a", "s", "d", "f", "g", "h", "j", "k", "l"]
-                .into_iter()
-                .map(|key| (Key::Text(key), 1.))
-                .collect(),
-            vec![
-                (Key::Shift, 1.35),
-                (Key::Text("z"), 1.),
-                (Key::Text("x"), 1.),
-                (Key::Text("c"), 1.),
-                (Key::Text("v"), 1.),
-                (Key::Text("b"), 1.),
-                (Key::Text("n"), 1.),
-                (Key::Text("m"), 1.),
-                (Key::Backspace, 1.55),
-            ],
-            vec![
-                (Key::Text("."), 1.),
-                (Key::Text(","), 1.),
-                (Key::Text("?"), 1.),
-                (Key::Reserved, 1.),
-                (Key::Enter, 2.),
-            ],
-            vec![(Key::Dismiss, 1.35), (Key::Space, 5.)],
+                .enumerate()
+                .map(|(index, key)| (Key::Text(key), letters_margin + index as f32 * pitch, unit)),
+        );
+        shift_row.push((Key::Backspace, width - H_GAP - edge_width, edge_width));
+
+        let side_width = 1.25 * unit;
+        let return_width = 2.5 * unit;
+        let space_width = width - 6. * H_GAP - 3. * side_width - return_width;
+        let mut x = H_GAP;
+        let mut bottom_row = Vec::new();
+        for (key, key_width) in [
+            (Key::Dismiss, side_width),
+            (Key::Text(","), side_width),
+            (Key::Space, space_width),
+            (Key::Text("."), side_width),
+            (Key::Enter, return_width),
+        ] {
+            bottom_row.push((key, x, key_width));
+            x += key_width + H_GAP;
+        }
+
+        let rows: [Vec<(Key, f32, f32)>; 5] = [
+            row_of_ten(["1", "2", "3", "4", "5", "6", "7", "8", "9", "0"]),
+            row_of_ten(["q", "w", "e", "r", "t", "y", "u", "i", "o", "p"]),
+            home_row,
+            shift_row,
+            bottom_row,
         ];
 
         for (row_index, row) in rows.into_iter().enumerate() {
-            let total_weight: f32 = row.iter().map(|(_, weight)| *weight).sum();
-            let available = width - 6. - GAP * (row.len().saturating_sub(1) as f32);
-            let unit = available / total_weight;
-            let mut x = 3.;
-            let mut row_div = div().h(px(ROW_HEIGHT)).w_full().flex().gap(px(GAP));
-            for (key_index, (key, weight)) in row.into_iter().enumerate() {
-                let key_width = unit * weight;
-                let center = point(
-                    px(x + key_width / 2.),
-                    px(top
-                        + STRIP_HEIGHT
-                        + GAP
-                        + row_index as f32 * (ROW_HEIGHT + GAP)
-                        + ROW_HEIGHT / 2.),
-                );
-                x += key_width + GAP;
+            let row_top = top + STRIP_HEIGHT + V_GAP + row_index as f32 * (ROW_HEIGHT + V_GAP);
+            let mut row_div = div().relative().h(px(ROW_HEIGHT)).w_full();
+            for (key_index, (key, key_x, key_width)) in row.into_iter().enumerate() {
+                let center = point(px(key_x + key_width / 2.), px(row_top + ROW_HEIGHT / 2.));
                 row_div = row_div.child(self.render_key(
                     key,
                     row_index * 16 + key_index,
+                    key_x,
                     key_width,
                     center,
                     cx.entity().downgrade(),
@@ -374,13 +397,14 @@ impl TouchKeyboard {
         &self,
         key: Key,
         key_ordinal: usize,
+        x: f32,
         width: f32,
         center: Point<Pixels>,
         owner: WeakEntity<TouchKeyboard>,
         colors: KeyboardStyle,
     ) -> Stateful<Div> {
         let label = match key {
-            Key::Text(text) if self.shift != Shift::Off => text.to_uppercase(),
+            Key::Text(text) if self.shift != Shift::Off => shifted_text(text),
             Key::Text(text) => text.into(),
             Key::Shift if self.shift == Shift::Locked => "⇧ lock".into(),
             Key::Shift => "⇧".into(),
@@ -388,13 +412,15 @@ impl TouchKeyboard {
             Key::Enter => "return".into(),
             Key::Space => "space".into(),
             Key::Dismiss => "hide".into(),
-            Key::Reserved => "·".into(),
         };
         let repeat_owner = owner.clone();
         let repeat_owner_on_down = repeat_owner.clone();
         let repeat_owner_out = repeat_owner.clone();
         div()
             .id(("touch-key", key_ordinal))
+            .absolute()
+            .left(px(x))
+            .top(px(0.))
             .w(px(width))
             .h(px(ROW_HEIGHT))
             .flex()
@@ -404,11 +430,7 @@ impl TouchKeyboard {
             .bg(colors.key_background)
             .border_1()
             .border_color(colors.key_border)
-            .text_color(if matches!(key, Key::Reserved) {
-                colors.text_disabled
-            } else {
-                colors.text
-            })
+            .text_color(colors.text)
             .active(|style| style.bg(colors.key_pressed))
             .child(label)
             .on_mouse_down(MouseButton::Left, move |event, window, cx| {
@@ -441,6 +463,8 @@ impl TouchKeyboard {
             })
     }
 }
+
+impl EventEmitter<KeyboardEvent> for TouchKeyboard {}
 
 impl Render for TouchKeyboard {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

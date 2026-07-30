@@ -11,7 +11,7 @@ use rho_registry::session::{
     AgentSubscriptions, INITIAL_AGENT_SUBSCRIPTIONS, recent_workstream_roots,
 };
 use rho_touch_keyboard::{
-    ContextChip, KeyboardPlugin, KeyboardStyle, TouchKeyboard, dump_telemetry,
+    ContextChip, KeyboardEvent, KeyboardPlugin, KeyboardStyle, TouchKeyboard, dump_telemetry,
 };
 use rho_ui_proto::{AgentId, ClientMessage, MessageDelivery, ServerMessage};
 use theme::ActiveTheme as _;
@@ -70,8 +70,15 @@ pub struct Workspace {
     /// the dashboard and the full agent transcript.
     agent_screen: bool,
     touch_keyboard: Entity<TouchKeyboard>,
+    /// The keyboard appears only on explicit intent to type: a tap that
+    /// lands in the transcript's editable prompt. It hides on a tap in the
+    /// read-only transcript, on the keyboard's own hide key, and after
+    /// sending a message.
+    keyboard_visible: bool,
     _event_task: Task<()>,
     _dashboard_subscription: Subscription,
+    _keyboard_subscription: Subscription,
+    _transcript_subscription: Option<Subscription>,
 }
 
 impl Workspace {
@@ -104,6 +111,16 @@ impl Workspace {
                 }
             },
         );
+        let touch_keyboard = cx.new(|_| TouchKeyboard::new(RhoKeyboardPlugin));
+        let keyboard_subscription =
+            cx.subscribe(&touch_keyboard, |this, _, event: &KeyboardEvent, cx| {
+                match event {
+                    KeyboardEvent::Dismissed => {
+                        this.keyboard_visible = false;
+                        cx.notify();
+                    }
+                }
+            });
         Self {
             connection,
             phase,
@@ -116,9 +133,12 @@ impl Workspace {
             preview: None,
             transcript: None,
             agent_screen: false,
-            touch_keyboard: cx.new(|_| TouchKeyboard::new(RhoKeyboardPlugin)),
+            touch_keyboard,
+            keyboard_visible: false,
             _event_task: event_task,
             _dashboard_subscription: dashboard_subscription,
+            _keyboard_subscription: keyboard_subscription,
+            _transcript_subscription: None,
         }
     }
 
@@ -294,7 +314,36 @@ impl Workspace {
                 Some((id, editor)) if *id == agent_id => editor.clone(),
                 _ => {
                     let editor = model.update(cx, |model, cx| model.build_editor(window, cx));
+                    // Chat editors disable click selection for the desktop's
+                    // keyboard-first navigation; on a phone the tap is the
+                    // only cursor, and it also drives keyboard visibility.
+                    editor.update(cx, |editor, cx| {
+                        editor.set_mouse_click_selection_enabled(true, cx)
+                    });
                     self.transcript = Some((agent_id, editor.clone()));
+                    // A pointer tap decides keyboard visibility by where it
+                    // lands: the editable prompt shows it, the read-only
+                    // transcript hides it. Keystroke-driven selection moves
+                    // (typing, submit clearing the prompt) leave it alone.
+                    self._transcript_subscription = Some(cx.subscribe_in(
+                        &editor,
+                        window,
+                        move |this, editor, event: &editor::EditorEvent, window, cx| {
+                            if matches!(
+                                event,
+                                editor::EditorEvent::SelectionsChanged { local: true }
+                            ) && !window.last_input_was_keyboard()
+                            {
+                                let in_prompt = this.models.get(&agent_id).is_some_and(|model| {
+                                    model.read(cx).selection_in_prompt(editor, cx)
+                                });
+                                if this.keyboard_visible != in_prompt {
+                                    this.keyboard_visible = in_prompt;
+                                    cx.notify();
+                                }
+                            }
+                        },
+                    ));
                     editor
                 }
             };
@@ -330,6 +379,7 @@ impl Workspace {
             delivery: MessageDelivery::NextRequest,
         });
         self.registry.touch_agent(agent_id);
+        self.keyboard_visible = false;
         cx.notify();
     }
 
@@ -404,24 +454,37 @@ impl Render for Workspace {
             colors.text_muted,
         );
         let narrow = window.viewport_size().width < px(700.);
-        let show_keyboard = coarse_pointer() && window.has_input_handler();
+        let show_keyboard = coarse_pointer() && narrow && self.agent_screen && self.keyboard_visible;
         window.set_direct_touch_region(
             show_keyboard.then(|| TouchKeyboard::region(window.viewport_size())),
         );
+        // Percent heights do not survive the flex_1 wrapper here (the agent
+        // screen collapsed to its header), so the phone transcript gets
+        // explicit pixel heights derived from the viewport.
+        let header_height = px(34.);
+        let content_height = window.viewport_size().height
+            - px(4.)
+            - if show_keyboard {
+                TouchKeyboard::height()
+            } else {
+                px(0.)
+            };
         let body = if narrow {
             if self.agent_screen && let Some((agent_id, transcript)) = self.transcript.clone() {
                 div()
                     .flex()
                     .flex_col()
-                    .size_full()
+                    .w_full()
+                    .h(content_height)
                     .key_context("RhoTranscript")
                     .child(
                         div()
                             .flex()
+                            .flex_none()
                             .items_center()
                             .gap_2()
+                            .h(header_height)
                             .px_1()
-                            .py_1()
                             .border_b_1()
                             .border_color(card_border)
                             .child(
@@ -435,6 +498,7 @@ impl Render for Workspace {
                                     .child("‹ agents")
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.agent_screen = false;
+                                        this.keyboard_visible = false;
                                         window.focus(
                                             &this.dashboard.editor().read(cx).focus_handle(cx),
                                             cx,
@@ -445,11 +509,18 @@ impl Render for Workspace {
                             .child(
                                 div()
                                     .text_color(text_muted)
+                                    .whitespace_nowrap()
                                     .overflow_hidden()
                                     .child(self.registry.agent_display_label(agent_id)),
                             ),
                     )
-                    .child(div().flex_1().overflow_hidden().child(transcript))
+                    .child(
+                        div()
+                            .w_full()
+                            .h(content_height - header_height)
+                            .overflow_hidden()
+                            .child(transcript),
+                    )
             } else {
                 div()
                     .size_full()
@@ -546,7 +617,9 @@ impl Render for Workspace {
             .bg(cx.theme().colors().editor_background)
             .key_context("RhoGui")
             .on_action(cx.listener(Self::submit_prompt))
-            .child(div().flex_1().overflow_hidden().child(body))
+            .child(
+                div().flex_1().overflow_hidden().child(body),
+            )
             .children(show_keyboard.then(|| self.touch_keyboard.clone().into_any_element()))
             .children(overlay)
     }

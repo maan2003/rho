@@ -21,7 +21,7 @@ use editor::{
 };
 use futures::future::join_all;
 use gpui::prelude::*;
-use gpui::{Context, Entity, Subscription, Task, WeakEntity, Window};
+use gpui::{App, Context, Entity, Subscription, Task, WeakEntity, Window};
 use language::{Buffer, BufferEvent, Capability, InlayId, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use rho_core::ContentPart;
@@ -350,6 +350,17 @@ impl AgentModel {
         self.update_prompt_chrome(cx);
         self.refresh_attachment_blocks(cx);
         Some(content)
+    }
+
+    /// Whether the newest selection head sits in the editable prompt tail of
+    /// the transcript. The phone layout shows the keyboard only then.
+    pub fn selection_in_prompt(&self, editor: &Entity<Editor>, cx: &App) -> bool {
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let Some(prompt_start) = snapshot.anchor_in_excerpt(self.prompt_end) else {
+            return false;
+        };
+        let head = editor.read(cx).selections.newest_anchor().head();
+        head.cmp(&prompt_start, &snapshot).is_ge()
     }
 
     pub fn add_image(&mut self, media_type: String, data: Vec<u8>, cx: &mut Context<Self>) {
