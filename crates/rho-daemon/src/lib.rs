@@ -2093,6 +2093,46 @@ fn ui_agent_usage_bucket(bucket: rho_agent::db::AgentUsageBucket) -> UiAgentUsag
     }
 }
 
+/// Reduces the indexed five-minute usage records to the hourly samples the
+/// usage-share chart renders. The persisted key begins with time, so the
+/// preceding database query is already a bounded range scan.
+fn hourly_global_usage_series(
+    usage: Vec<(AgentUsageModel, rho_agent::db::AgentUsageBucket)>,
+) -> Vec<AgentUsageSeries> {
+    const HOUR_MS: u64 = 60 * 60 * 1_000;
+
+    let mut hourly = BTreeMap::<(AgentUsageModel, u64), rho_agent::db::AgentUsageBucket>::new();
+    for (model, bucket) in usage {
+        let bucket_start_ms = bucket.bucket_start_ms / HOUR_MS * HOUR_MS;
+        hourly
+            .entry((model, bucket_start_ms))
+            .or_insert_with(|| rho_agent::db::AgentUsageBucket {
+                bucket_start_ms,
+                model,
+                ..rho_agent::db::AgentUsageBucket::default()
+            })
+            .add(&bucket);
+    }
+
+    [
+        AgentUsageModel::FABLE,
+        AgentUsageModel::GPT,
+        AgentUsageModel::OPUS,
+        AgentUsageModel::TERRA,
+        AgentUsageModel::LUNA,
+    ]
+    .into_iter()
+    .map(|model| AgentUsageSeries {
+        model: model.name().to_owned(),
+        buckets: hourly
+            .iter()
+            .filter(|((candidate, _), _)| *candidate == model)
+            .map(|(_, bucket)| ui_agent_usage_bucket(bucket.clone()))
+            .collect(),
+    })
+    .collect()
+}
+
 fn quota_history(db: &RhoDb) -> Vec<QuotaSeries> {
     let now = rho_core::UnixMs::now().0;
     let since = rho_core::UnixMs(now.saturating_sub(30 * 24 * 60 * 60 * 1_000));
@@ -2317,21 +2357,7 @@ async fn handle_message(
                 .db
                 .read()
                 .global_agent_usage(rho_core::UnixMs(since_ms));
-            let series = [
-                AgentUsageModel::GPT,
-                AgentUsageModel::OPUS,
-                AgentUsageModel::FABLE,
-            ]
-            .into_iter()
-            .map(|model| AgentUsageSeries {
-                model: model.name().to_owned(),
-                buckets: usage
-                    .iter()
-                    .filter(|(candidate, _)| *candidate == model)
-                    .map(|(_, bucket)| ui_agent_usage_bucket(bucket.clone()))
-                    .collect(),
-            })
-            .collect();
+            let series = hourly_global_usage_series(usage);
             let _ = outgoing_tx.send(ServerMessage::GlobalUsage { series });
             Ok(Refresh::None)
         }
@@ -3586,10 +3612,44 @@ mod tests {
     use rho_ui_proto::ServerMessage;
 
     use super::{
-        GitProviderClaim, GitTransportBroker, MAX_IMAGE_BASE64_BYTES, MAX_INPUT_IMAGES,
-        configure_octo_git_transport, quota_burn, quota_history, quota_summaries,
-        validate_image_content,
+        AgentUsageModel, GitProviderClaim, GitTransportBroker, MAX_IMAGE_BASE64_BYTES,
+        MAX_INPUT_IMAGES, configure_octo_git_transport, hourly_global_usage_series, quota_burn,
+        quota_history, quota_summaries, validate_image_content,
     };
+
+    #[test]
+    fn global_usage_response_rolls_five_minute_buckets_up_to_hours() {
+        let bucket = |model, bucket_start_ms, input_tokens| rho_agent::db::AgentUsageBucket {
+            bucket_start_ms,
+            model,
+            input_tokens,
+            requests: 1,
+            ..Default::default()
+        };
+        let series = hourly_global_usage_series(vec![
+            (
+                AgentUsageModel::FABLE,
+                bucket(AgentUsageModel::FABLE, 5 * 60 * 1_000, 10),
+            ),
+            (
+                AgentUsageModel::FABLE,
+                bucket(AgentUsageModel::FABLE, 55 * 60 * 1_000, 20),
+            ),
+            (
+                AgentUsageModel::GPT,
+                bucket(AgentUsageModel::GPT, 60 * 60 * 1_000, 30),
+            ),
+        ]);
+
+        assert_eq!(series.len(), 5);
+        assert_eq!(series[0].model, "fable");
+        assert_eq!(series[0].buckets.len(), 1);
+        assert_eq!(series[0].buckets[0].bucket_start_ms, 0);
+        assert_eq!(series[0].buckets[0].input_tokens, 30);
+        assert_eq!(series[0].buckets[0].requests, 2);
+        assert_eq!(series[1].model, "gpt");
+        assert_eq!(series[1].buckets[0].bucket_start_ms, 60 * 60 * 1_000);
+    }
 
     #[test]
     fn quota_burn_uses_net_change_within_each_reset_epoch() {

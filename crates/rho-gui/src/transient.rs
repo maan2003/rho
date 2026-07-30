@@ -226,15 +226,10 @@ impl Transient {
             let opus: Hsla = colors.terminal_ansi_magenta.into();
             let fable: Hsla = rgb(0xd97757).into();
             let terra: Hsla = colors.terminal_ansi_yellow.into();
+            let luna: Hsla = colors.terminal_ansi_blue.into();
             let grid: Hsla = colors.text_muted.opacity(0.22).into();
             let now = crate::workspace::now_ms();
             let since = now.saturating_sub(days * 24 * 60 * 60 * 1_000);
-            let gpt_cost = model_cost(&series, "gpt", since);
-            let luna_cost = model_cost(&series, "luna", since);
-            let opus_cost = model_cost(&series, "opus", since);
-            let fable_cost = model_cost(&series, "fable", since);
-            let terra_cost = model_cost(&series, "terra", since);
-            let total_cost = gpt_cost + luna_cost + opus_cost + fable_cost + terra_cost;
             let requests = series
                 .iter()
                 .flat_map(|series| &series.buckets)
@@ -246,15 +241,19 @@ impl Transient {
                 .flat_map(|series| &series.buckets)
                 .filter(|bucket| bucket.bucket_start_ms >= since)
                 .any(|bucket| bucket.approximate);
+            let latest_share = usage_share_points(&series, now, days)
+                .last()
+                .map(|(_, share)| *share)
+                .unwrap_or_default();
             return bottom_strip(text_style, cx)
                 .child(
                     div()
                         .px_2()
                         .font_weight(gpui::FontWeight::BOLD)
-                        .child(format!("model cost · last {days} days")),
+                        .child(format!("model usage share · last {days} days")),
                 )
                 .child(div().px_2().text_color(muted).child(format!(
-                    "${total_cost:.2} estimated API cost · {requests} requests{}",
+                    "input ×10 + cached input + output ×30 · {requests} requests{}",
                     if approximate {
                         " · includes approximate backfill"
                     } else {
@@ -269,19 +268,27 @@ impl Transient {
                         .child(
                             div()
                                 .text_color(fable)
-                                .child(format!("fable ${fable_cost:.2}")),
+                                .child(format!("fable {:.0}%", latest_share[0] * 100.0)),
                         )
                         .child(
                             div()
                                 .text_color(opus)
-                                .child(format!("opus ${opus_cost:.2}")),
+                                .child(format!("opus {:.0}%", latest_share[2] * 100.0)),
                         )
-                        .child(div().text_color(gpt).child(format!("gpt ${gpt_cost:.2}")))
-                        .child(div().text_color(gpt).child(format!("luna ${luna_cost:.2}")))
+                        .child(
+                            div()
+                                .text_color(gpt)
+                                .child(format!("gpt {:.0}%", latest_share[1] * 100.0)),
+                        )
+                        .child(
+                            div()
+                                .text_color(luna)
+                                .child(format!("luna {:.0}%", latest_share[4] * 100.0)),
+                        )
                         .child(
                             div()
                                 .text_color(terra)
-                                .child(format!("terra ${terra_cost:.2}")),
+                                .child(format!("terra {:.0}%", latest_share[3] * 100.0)),
                         ),
                 )
                 .child(
@@ -300,16 +307,16 @@ impl Transient {
                                     .flex_col()
                                     .items_end()
                                     .justify_between()
-                                    .child(format!("${total_cost:.2}"))
-                                    .child(format!("${:.2}", total_cost / 2.0))
-                                    .child("$0"),
+                                    .child("100%")
+                                    .child("50%")
+                                    .child("0%"),
                             )
                             .child(
                                 div()
                                     .flex()
                                     .flex_col()
-                                    .child(div().w(px(832.)).h(px(220.)).child(global_usage_chart(
-                                        series, now, days, gpt, opus, fable, terra, grid,
+                                    .child(div().w(px(832.)).h(px(220.)).child(usage_share_chart(
+                                        series, now, days, gpt, opus, fable, terra, luna, grid,
                                     )))
                                     .child(
                                         div()
@@ -489,12 +496,16 @@ pub fn usage_root_menu() -> Transient {
         .item("shift-r", "rate limit · 30d", |workspace, window, cx| {
             workspace.open_usage_transient(30, window, cx);
         })
-        .item("c", "model cost · 7d", |workspace, window, cx| {
+        .item("c", "model usage share · 7d", |workspace, window, cx| {
             workspace.open_global_usage_transient(7, window, cx);
         })
-        .item("shift-c", "model cost · 30d", |workspace, window, cx| {
-            workspace.open_global_usage_transient(30, window, cx);
-        })
+        .item(
+            "shift-c",
+            "model usage share · 30d",
+            |workspace, window, cx| {
+                workspace.open_global_usage_transient(30, window, cx);
+            },
+        )
 }
 
 pub fn usage_menu(series: Vec<rho_ui_proto::QuotaSeries>, days: u64) -> Transient {
@@ -505,7 +516,7 @@ pub fn usage_menu(series: Vec<rho_ui_proto::QuotaSeries>, days: u64) -> Transien
 }
 
 pub fn global_usage_menu(series: Vec<rho_ui_proto::AgentUsageSeries>, days: u64) -> Transient {
-    let mut menu = Transient::new("model cost");
+    let mut menu = Transient::new("model usage share");
     menu.global_usage = Some(series);
     menu.usage_days = days;
     menu
@@ -690,7 +701,7 @@ fn pchip_endpoint(width: f64, adjacent_width: f64, secant: f64, adjacent: f64) -
 }
 
 #[expect(clippy::too_many_arguments)]
-fn global_usage_chart(
+fn usage_share_chart(
     series: Vec<rho_ui_proto::AgentUsageSeries>,
     now: u64,
     days: u64,
@@ -698,135 +709,59 @@ fn global_usage_chart(
     opus: Hsla,
     fable: Hsla,
     terra: Hsla,
+    luna: Hsla,
     grid: Hsla,
 ) -> impl IntoElement {
     canvas(
         move |_, _, _| {},
         move |bounds, _, window, _| {
-            const BUCKET_MS: u64 = 5 * 60 * 1_000;
             const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
             let window_ms = days * DAY_MS;
             let start = now.saturating_sub(window_ms);
-            let mut costs = HashMap::<u64, [f64; 4]>::new();
-            for model in &series {
-                for bucket in &model.buckets {
-                    if bucket.bucket_start_ms < start {
-                        continue;
-                    }
-                    let entry = costs.entry(bucket.bucket_start_ms).or_default();
-                    let cost = bucket_cost_usd(bucket, &model.model);
-                    let index = match model.model.as_str() {
-                        "fable" => 0,
-                        "gpt" | "luna" => 1,
-                        "opus" => 2,
-                        "terra" => 3,
-                        _ => continue,
-                    };
-                    entry[index] += cost;
-                }
-            }
-
-            let max = costs
-                .values()
-                .map(|costs| costs.iter().sum::<f64>())
-                .sum::<f64>()
-                .max(f64::EPSILON);
-            let to_point = |at: u64, value: f64| {
+            let to_point = |at: u64, share: f64| {
                 let x = at.saturating_sub(start) as f64 / window_ms as f64;
-                let y = 1.0 - value / max;
+                let y = 1.0 - share;
                 point(
                     bounds.origin.x + bounds.size.width * x.clamp(0.0, 1.0) as f32,
                     bounds.origin.y + bounds.size.height * y.clamp(0.0, 1.0) as f32,
                 )
             };
-            let mut fable_total = 0.0;
-            let mut gpt_total = 0.0;
-            let mut opus_total = 0.0;
-            let mut terra_total = 0.0;
-            let mut points = vec![[to_point(start, 0.0); 4]];
-            let mut bucket_start = start.div_ceil(BUCKET_MS) * BUCKET_MS;
-            while bucket_start <= now {
-                points.push([
-                    to_point(bucket_start, fable_total),
-                    to_point(bucket_start, fable_total + gpt_total),
-                    to_point(bucket_start, fable_total + gpt_total + opus_total),
-                    to_point(
-                        bucket_start,
-                        fable_total + gpt_total + opus_total + terra_total,
-                    ),
-                ]);
-                if let Some([fable_cost, gpt_cost, opus_cost, terra_cost]) =
-                    costs.get(&bucket_start)
-                {
-                    fable_total += fable_cost;
-                    gpt_total += gpt_cost;
-                    opus_total += opus_cost;
-                    terra_total += terra_cost;
+            let points = usage_share_points(&series, now, days)
+                .into_iter()
+                .map(|(at, shares)| {
+                    let mut total = 0.0;
+                    std::array::from_fn(|index| {
+                        total += shares[index];
+                        to_point(at, total)
+                    })
+                })
+                .collect::<Vec<[Point<Pixels>; 5]>>();
+
+            for (index, color) in [fable, gpt, opus, terra, luna].into_iter().enumerate() {
+                let mut area = PathBuilder::fill();
+                if index == 0 {
+                    if let (Some(first), Some(last)) = (points.first(), points.last()) {
+                        area.move_to(point(first[0].x, bounds.bottom()));
+                        for point in &points {
+                            area.line_to(point[0]);
+                        }
+                        area.line_to(point(last[0].x, bounds.bottom()));
+                    }
+                } else {
+                    if let Some(first) = points.first() {
+                        area.move_to(first[index - 1]);
+                    }
+                    for point in &points {
+                        area.line_to(point[index]);
+                    }
+                    for point in points.iter().rev() {
+                        area.line_to(point[index - 1]);
+                    }
                 }
-                let end = bucket_start.saturating_add(BUCKET_MS).min(now);
-                points.push([
-                    to_point(end, fable_total),
-                    to_point(end, fable_total + gpt_total),
-                    to_point(end, fable_total + gpt_total + opus_total),
-                    to_point(end, fable_total + gpt_total + opus_total + terra_total),
-                ]);
-                bucket_start = bucket_start.saturating_add(BUCKET_MS);
-            }
-
-            let mut fable_area = PathBuilder::fill();
-            fable_area.move_to(point(bounds.origin.x, bounds.bottom()));
-            for points in &points {
-                fable_area.line_to(points[0]);
-            }
-            fable_area.line_to(point(bounds.right(), bounds.bottom()));
-            fable_area.close();
-            if let Ok(path) = fable_area.build() {
-                window.paint_path(path, fable.opacity(0.72));
-            }
-
-            let mut gpt_area = PathBuilder::fill();
-            if let Some(first) = points.first() {
-                gpt_area.move_to(first[1]);
-            }
-            for points in &points[1..] {
-                gpt_area.line_to(points[1]);
-            }
-            for points in points.iter().rev() {
-                gpt_area.line_to(points[0]);
-            }
-            gpt_area.close();
-            if let Ok(path) = gpt_area.build() {
-                window.paint_path(path, gpt.opacity(0.72));
-            }
-
-            let mut opus_area = PathBuilder::fill();
-            if let Some(first) = points.first() {
-                opus_area.move_to(first[2]);
-            }
-            for points in &points[1..] {
-                opus_area.line_to(points[2]);
-            }
-            for points in points.iter().rev() {
-                opus_area.line_to(points[1]);
-            }
-            opus_area.close();
-            if let Ok(path) = opus_area.build() {
-                window.paint_path(path, opus.opacity(0.72));
-            }
-
-            let mut terra_area = PathBuilder::fill();
-            if let Some(first) = points.first() {
-                terra_area.move_to(first[3]);
-            }
-            for points in &points[1..] {
-                terra_area.line_to(points[3]);
-            }
-            for points in points.iter().rev() {
-                terra_area.line_to(points[2]);
-            }
-            terra_area.close();
-            if let Ok(path) = terra_area.build() {
-                window.paint_path(path, terra.opacity(0.72));
+                area.close();
+                if let Ok(path) = area.build() {
+                    window.paint_path(path, color.opacity(0.72));
+                }
             }
 
             for step in 0..=4 {
@@ -858,6 +793,94 @@ fn global_usage_chart(
     .size_full()
 }
 
+/// Returns hourly exponentially-smoothed model shares. Usage is smoothed
+/// before division, so a low-volume hour has proportionally little influence.
+fn usage_share_points(
+    series: &[rho_ui_proto::AgentUsageSeries],
+    now: u64,
+    days: u64,
+) -> Vec<(u64, [f64; 5])> {
+    const HOUR_MS: u64 = 60 * 60 * 1_000;
+    const DAY_MS: u64 = 24 * HOUR_MS;
+    let start = now.saturating_sub(days * DAY_MS);
+    let start_bucket = start / HOUR_MS * HOUR_MS;
+    let end_bucket = now / HOUR_MS * HOUR_MS;
+    let half_life_hours = if days <= 7 { 12.0 } else { 48.0 };
+    let decay = 0.5_f64.powf(1.0 / half_life_hours);
+    let mut usage = HashMap::<u64, [f64; 5]>::new();
+    let mut first_bucket = start_bucket;
+
+    for model in series {
+        let Some(index) = usage_model_index(&model.model) else {
+            continue;
+        };
+        for bucket in &model.buckets {
+            let bucket_start = bucket.bucket_start_ms / HOUR_MS * HOUR_MS;
+            first_bucket = first_bucket.min(bucket_start);
+            usage.entry(bucket_start).or_default()[index] += bucket_usage_units(bucket);
+        }
+    }
+
+    let mut smoothed = [0.0; 5];
+    let mut bucket_start = first_bucket;
+    while bucket_start < start_bucket {
+        for value in &mut smoothed {
+            *value *= decay;
+        }
+        if let Some(values) = usage.get(&bucket_start) {
+            for (smoothed, value) in smoothed.iter_mut().zip(values) {
+                *smoothed += value;
+            }
+        }
+        bucket_start = bucket_start.saturating_add(HOUR_MS);
+    }
+
+    let mut points = Vec::new();
+    while bucket_start <= end_bucket {
+        for value in &mut smoothed {
+            *value *= decay;
+        }
+        if let Some(values) = usage.get(&bucket_start) {
+            for (smoothed, value) in smoothed.iter_mut().zip(values) {
+                *smoothed += value;
+            }
+        }
+        let total = smoothed.iter().sum::<f64>();
+        let shares = if total > 0.0 {
+            smoothed.map(|value| value / total)
+        } else {
+            [0.0; 5]
+        };
+        let at = bucket_start.saturating_add(HOUR_MS).min(now);
+        if let Some((last_at, last_share)) = points.last_mut()
+            && *last_at == at
+        {
+            *last_share = shares;
+        } else {
+            points.push((at, shares));
+        }
+        bucket_start = bucket_start.saturating_add(HOUR_MS);
+    }
+    points
+}
+
+fn usage_model_index(model: &str) -> Option<usize> {
+    match model {
+        "fable" => Some(0),
+        "gpt" => Some(1),
+        "opus" => Some(2),
+        "terra" => Some(3),
+        "luna" => Some(4),
+        _ => None,
+    }
+}
+
+fn bucket_usage_units(bucket: &rho_ui_proto::AgentUsageBucket) -> f64 {
+    10.0 * bucket.input_tokens as f64
+        + bucket.cache_read_tokens as f64
+        + 30.0 * bucket.output_tokens as f64
+}
+
 fn paint_grid_line(from: Point<Pixels>, to: Point<Pixels>, color: Hsla, window: &mut Window) {
     let mut builder = PathBuilder::stroke(px(1.));
     builder.move_to(from);
@@ -865,16 +888,6 @@ fn paint_grid_line(from: Point<Pixels>, to: Point<Pixels>, color: Hsla, window: 
     if let Ok(path) = builder.build() {
         window.paint_path(path, color);
     }
-}
-
-fn model_cost(series: &[rho_ui_proto::AgentUsageSeries], model: &str, since: u64) -> f64 {
-    series
-        .iter()
-        .filter(|series| series.model == model)
-        .flat_map(|series| &series.buckets)
-        .filter(|bucket| bucket.bucket_start_ms >= since)
-        .map(|bucket| bucket_cost_usd(bucket, model))
-        .sum()
 }
 
 pub(crate) fn bucket_cost_usd(bucket: &rho_ui_proto::AgentUsageBucket, model: &str) -> f64 {
@@ -1092,5 +1105,68 @@ mod tests {
                 assert!(value >= ys[index] && value <= ys[index + 1]);
             }
         }
+    }
+
+    #[test]
+    fn usage_share_is_weighted_before_smoothing_and_stays_stable_when_idle() {
+        const HOUR_MS: u64 = 60 * 60 * 1_000;
+        let series = vec![
+            rho_ui_proto::AgentUsageSeries {
+                model: "gpt".to_owned(),
+                buckets: vec![rho_ui_proto::AgentUsageBucket {
+                    bucket_start_ms: 0,
+                    input_tokens: 10,
+                    ..Default::default()
+                }],
+            },
+            rho_ui_proto::AgentUsageSeries {
+                model: "fable".to_owned(),
+                buckets: vec![rho_ui_proto::AgentUsageBucket {
+                    bucket_start_ms: 0,
+                    output_tokens: 10,
+                    ..Default::default()
+                }],
+            },
+        ];
+
+        let shares = usage_share_points(&series, 2 * HOUR_MS, 7);
+        let first = shares[0].1;
+        let idle = shares[1].1;
+        assert!((first[0] - 0.75).abs() < f64::EPSILON);
+        assert!((first[1] - 0.25).abs() < f64::EPSILON);
+        assert_eq!(first, idle, "an idle hour must not change the share");
+    }
+
+    #[test]
+    fn seven_day_share_reacts_faster_than_thirty_day_share() {
+        const HOUR_MS: u64 = 60 * 60 * 1_000;
+        let series = vec![
+            rho_ui_proto::AgentUsageSeries {
+                model: "gpt".to_owned(),
+                buckets: vec![rho_ui_proto::AgentUsageBucket {
+                    bucket_start_ms: 0,
+                    input_tokens: 10,
+                    ..Default::default()
+                }],
+            },
+            rho_ui_proto::AgentUsageSeries {
+                model: "fable".to_owned(),
+                buckets: vec![rho_ui_proto::AgentUsageBucket {
+                    bucket_start_ms: HOUR_MS,
+                    input_tokens: 10,
+                    ..Default::default()
+                }],
+            },
+        ];
+
+        let seven_day = usage_share_points(&series, 2 * HOUR_MS, 7)
+            .last()
+            .unwrap()
+            .1[0];
+        let thirty_day = usage_share_points(&series, 2 * HOUR_MS, 30)
+            .last()
+            .unwrap()
+            .1[0];
+        assert!(seven_day > thirty_day);
     }
 }

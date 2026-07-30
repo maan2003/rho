@@ -734,7 +734,7 @@ impl Workspace {
                 if self
                     .transient
                     .as_ref()
-                    .is_some_and(|transient| transient.title() == "model cost")
+                    .is_some_and(|transient| transient.title() == "model usage share")
                 {
                     self.transient = Some(crate::transient::global_usage_menu(
                         self.global_usage.clone(),
@@ -3584,8 +3584,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.global_usage_days = days;
+        let ema_warmup_days = if days <= 7 { 4 } else { 14 };
         self.connection.send(ClientMessage::GlobalUsage {
-            since_ms: now_ms().saturating_sub(30 * 24 * 60 * 60 * 1_000),
+            // Seed the EMA with seven half-lives before the visible range so
+            // its left edge represents actual prior usage rather than a reset.
+            since_ms: now_ms().saturating_sub((days + ema_warmup_days) * 24 * 60 * 60 * 1_000),
         });
         self.open_transient(
             crate::transient::global_usage_menu(self.global_usage.clone(), days),
