@@ -3318,6 +3318,7 @@ dependencies = [
  "async-compression",
  "futures",
  "iroh",
+ "n0-future",
  "rho-iroh-auth",
  "senax-encoder",
  "tokio",

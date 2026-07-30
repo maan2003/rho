@@ -180,3 +180,8 @@ inherits = "release"
 noq = { path = "vendor/noq/noq" }
 noq-proto = { path = "vendor/noq/noq-proto" }
 iroh = { path = "vendor/iroh/iroh" }
+# On wasm32-unknown-unknown this crate supplies libc (malloc et al.) for the
+# tree-sitter runtime and grammars. Upstream's wasm malloc is a bump allocator
+# for isolated scanner instances that corrupts linear memory when linked into a
+# binary sharing its heap with Rust; our fork forwards to Rust's allocator.
+tree-sitter-language = { path = "vendor/tree-sitter-language" }

@@ -15,7 +15,12 @@ fn main() {
         // settings, with the full rho theme assets loaded.
         let mut store = settings::SettingsStore::new(cx, rho_gui::rho_assets::RHO_DEFAULT_SETTINGS);
         store
-            .set_user_settings(r#"{"theme": "Rho OKSolar P3"}"#, cx)
+            .set_user_settings(
+                // Taller lines than the desktop default: rows double as touch
+                // targets in the browser client.
+                r#"{"theme": "Rho OKSolar P3", "buffer_line_height": {"custom": 1.8}}"#,
+                cx,
+            )
             .result()
             .expect("load web user settings");
         cx.set_global(store);

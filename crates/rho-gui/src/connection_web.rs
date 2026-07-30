@@ -92,15 +92,27 @@ fn remember_daemon(daemon: &str) {
     if let Some(storage) = local_storage() { let _ = storage.set_item(DAEMON_KEY, daemon); }
 }
 
+/// Progress breadcrumbs for the connect path; "Connecting…" is otherwise a
+/// black box when any await in here stalls.
+fn conn_log(message: &str) {
+    web_sys::console::log_1(&JsValue::from_str(&format!("[rho-conn] {message}")));
+}
+
 async fn run(daemon: &str, mut receiver: UnboundedReceiver<ClientMessage>, events: UnboundedSender<Event>) -> anyhow::Result<()> {
     let daemon = EndpointId::from_str(daemon.trim())
         .map_err(|error| anyhow::anyhow!("invalid daemon endpoint id: {error}"))?;
-    let endpoint = rho_rpc::bind_browser_iroh_client(passkey_secret(daemon).await?).await?;
+    conn_log("unlocking passkey identity");
+    let secret = passkey_secret(daemon).await?;
+    conn_log("passkey identity ready; binding browser iroh endpoint");
+    let endpoint = rho_rpc::bind_browser_iroh_client(secret).await?;
+    conn_log(&format!("endpoint bound as {}; dialing daemon", endpoint.id()));
     let connection = endpoint.connect(daemon, rho_ui_proto::IROH_ALPN).await
         .map_err(|error| anyhow::anyhow!("connect to daemon: {error}"))?;
+    conn_log("iroh connection established; authenticating");
     match rho_rpc::authenticate_iroh_client(&connection, endpoint.id()).await? {
-        rho_iroh_auth::ClientAuthResult::Approved => {}
+        rho_iroh_auth::ClientAuthResult::Approved => conn_log("authenticated as enrolled client"),
         rho_iroh_auth::ClientAuthResult::EnrollmentRequired(code) => {
+            conn_log(&format!("enrollment required, code {code}"));
             let _ = events.unbounded_send(Event::Phase(Phase::Enroll(code.to_string())));
             return Ok(());
         }
@@ -108,6 +120,7 @@ async fn run(daemon: &str, mut receiver: UnboundedReceiver<ClientMessage>, event
     }
     let (send, recv) = connection.open_bi().await
         .map_err(|error| anyhow::anyhow!("open stream: {error}"))?;
+    conn_log("control stream open; subscribing");
     send.set_priority(1).map_err(|error| anyhow::anyhow!("set control stream priority: {error}"))?;
     let mut send = rho_rpc::Writer::new(send);
     let mut recv = rho_rpc::Reader::new(recv);
@@ -177,9 +190,13 @@ async fn passkey_secret(daemon: EndpointId) -> anyhow::Result<iroh::SecretKey> {
         .and_then(|hex| decode_hex_vec(&hex))
         .filter(|id| id.len() <= MAX_CREDENTIAL_ID_LEN)
     {
-        Some(id) => id,
+        Some(id) => {
+            conn_log("using stored passkey credential");
+            id
+        }
         None => {
             let _ = storage.remove_item(CREDENTIAL_KEY);
+            conn_log("no stored credential; creating passkey (browser prompt)");
             let id = create_passkey().await?;
             storage
                 .set_item(CREDENTIAL_KEY, &encode_hex(&id))
@@ -191,6 +208,7 @@ async fn passkey_secret(daemon: EndpointId) -> anyhow::Result<iroh::SecretKey> {
     let mut input = Sha256::new();
     input.update(PRF_LABEL);
     input.update(daemon.as_bytes());
+    conn_log("evaluating passkey PRF (browser prompt)");
     let mut prf = evaluate_prf(&credential_id, &input.finalize()).await?;
     let hkdf = Hkdf::<Sha256>::new(Some(daemon.as_bytes()), &prf);
     let mut seed = [0u8; 32];

@@ -54,6 +54,9 @@ pub(crate) struct WebWindowInner {
     pub(crate) callbacks: RefCell<WebWindowCallbacks>,
     pub(crate) click_state: RefCell<ClickState>,
     pub(crate) pressed_button: Cell<Option<MouseButton>>,
+    pub(crate) touch_drag: RefCell<Option<crate::events::TouchDrag>>,
+    pub(crate) fling: RefCell<Option<crate::events::Fling>>,
+    pub(crate) raise_keyboard_after_draw: Cell<bool>,
     pub(crate) last_physical_size: Cell<(u32, u32)>,
     pub(crate) notify_scale: Cell<bool>,
     pub(crate) is_composing: Cell<bool>,
@@ -216,6 +219,9 @@ impl WebWindow {
             callbacks: RefCell::new(WebWindowCallbacks::default()),
             click_state: RefCell::new(ClickState::default()),
             pressed_button: Cell::new(None),
+            touch_drag: RefCell::new(None),
+            fling: RefCell::new(None),
+            raise_keyboard_after_draw: Cell::new(false),
             last_physical_size: Cell::new((0, 0)),
             notify_scale: Cell::new(false),
             is_composing: Cell::new(false),
@@ -387,6 +393,9 @@ impl WebWindowInner {
 
         let this = Rc::clone(self);
         let closure = Closure::new(move || {
+            // Momentum scroll before drawing so the frame reflects it.
+            this.process_fling();
+
             this.with_callback(
                 |callbacks| &mut callbacks.request_frame,
                 |callback| {
@@ -396,6 +405,17 @@ impl WebWindowInner {
                     })
                 },
             );
+
+            // Second half of the tap keyboard raise in events.rs: the draw
+            // above has installed the input handler a synthesized tap click
+            // focused, and the tap's user activation is typically still
+            // valid here, so focus() can raise the keyboard.
+            if this.raise_keyboard_after_draw.take()
+                && this.state.borrow().input_handler.is_some()
+                && !this.keyboard_input_focused()
+            {
+                this.keyboard_input_element.focus().ok();
+            }
 
             // Dismissal counterpart to the pointerup keyboard raise in
             // events.rs: the draw above has settled which view holds the

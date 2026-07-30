@@ -89,6 +89,48 @@ pub(crate) struct ClickState {
     current_count: usize,
 }
 
+/// An in-progress touch gesture. Touch pointers must not drive the mouse-drag
+/// path: a finger drag means scrolling, not text selection. The gesture stays
+/// undecided until the finger moves past a slop radius; a release before that
+/// is a tap and synthesizes a click.
+pub(crate) struct TouchDrag {
+    start: Point<Pixels>,
+    last: Point<Pixels>,
+    /// Smoothed finger velocity in px/ms, used to seed a fling on release.
+    velocity: (f32, f32),
+    last_time: f64,
+    scrolling: bool,
+}
+
+/// Momentum scrolling after a touch scroll release, decayed and dispatched
+/// once per animation frame by [`WebWindowInner::process_fling`].
+pub(crate) struct Fling {
+    position: Point<Pixels>,
+    /// px/ms
+    velocity: (f32, f32),
+    last_time: f64,
+}
+
+/// Movement under this many pixels is still a tap; past it the gesture
+/// becomes a scroll. Matches typical browser/platform touch slop.
+const TOUCH_SLOP: f32 = 8.0;
+
+/// Exponential fling decay time constant in ms; roughly matches platform
+/// scroll-view momentum feel.
+const FLING_DECAY_MS: f64 = 325.0;
+
+/// Flings slower than this (px/ms) stop; releases slower than this don't
+/// start one.
+const FLING_MIN_VELOCITY: f32 = 0.05;
+
+fn is_touch(event: &web_sys::PointerEvent) -> bool {
+    event.pointer_type() == "touch"
+}
+
+fn distance(a: Point<Pixels>, b: Point<Pixels>) -> f32 {
+    (f32::from(a.x) - f32::from(b.x)).hypot(f32::from(a.y) - f32::from(b.y))
+}
+
 impl Default for ClickState {
     fn default() -> Self {
         Self {
@@ -211,14 +253,33 @@ impl WebWindowInner {
             let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
             let time = js_sys::Date::now();
 
-            this.pressed_button.set(Some(button));
-            let click_count = this.click_state.borrow_mut().register_click(position, time);
-
             {
                 let mut current_state = this.state.borrow_mut();
                 current_state.mouse_position = position;
                 current_state.modifiers = modifiers;
             }
+
+            // Any new pointer contact stops an in-flight momentum scroll,
+            // like catching a scrolling list with a finger.
+            this.fling.borrow_mut().take();
+
+            // A touch gesture is undecided at this point: it may become a
+            // scroll or a tap. Dispatching MouseDown now would start a text
+            // selection drag, so the decision is deferred to pointermove
+            // (scroll) or pointerup (tap click).
+            if is_touch(&event) {
+                *this.touch_drag.borrow_mut() = Some(TouchDrag {
+                    start: position,
+                    last: position,
+                    velocity: (0.0, 0.0),
+                    last_time: time,
+                    scrolling: false,
+                });
+                return;
+            }
+
+            this.pressed_button.set(Some(button));
+            let click_count = this.click_state.borrow_mut().register_click(position, time);
 
             this.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
                 button,
@@ -240,21 +301,70 @@ impl WebWindowInner {
             let position = pointer_position_in_element(&event);
             let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
 
-            this.pressed_button.set(None);
-            let click_count = this.click_state.borrow().current_count;
-
             {
                 let mut current_state = this.state.borrow_mut();
                 current_state.mouse_position = position;
                 current_state.modifiers = modifiers;
             }
 
-            this.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
-                button,
-                position,
-                modifiers,
-                click_count,
-            }));
+            if is_touch(&event) {
+                let Some(drag) = this.touch_drag.borrow_mut().take() else {
+                    return;
+                };
+                if drag.scrolling {
+                    this.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        position,
+                        delta: ScrollDelta::Pixels(point(px(0.), px(0.))),
+                        modifiers,
+                        touch_phase: TouchPhase::Ended,
+                    }));
+                    if drag.velocity.0.hypot(drag.velocity.1) > FLING_MIN_VELOCITY {
+                        *this.fling.borrow_mut() = Some(Fling {
+                            position,
+                            velocity: drag.velocity,
+                            last_time: js_sys::Date::now(),
+                        });
+                    }
+                    // A scroll is not a click; also skip the keyboard raise
+                    // below so scrolling a transcript never pops the
+                    // keyboard.
+                    return;
+                }
+                // Tap: deliver the deferred press and release as one click.
+                let click_count = this
+                    .click_state
+                    .borrow_mut()
+                    .register_click(position, js_sys::Date::now());
+                this.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
+                    button: MouseButton::Left,
+                    position,
+                    modifiers,
+                    click_count,
+                    first_mouse: false,
+                }));
+                this.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
+                    button: MouseButton::Left,
+                    position,
+                    modifiers,
+                    click_count,
+                }));
+                // The click above installs an input handler only during the
+                // next draw, so the gesture-time raise below sees stale
+                // state on a first tap. The RAF tick re-checks once after
+                // that draw; browsers keep the user activation alive long
+                // enough for focus() to still raise the keyboard there.
+                this.raise_keyboard_after_draw.set(true);
+            } else {
+                this.pressed_button.set(None);
+                let click_count = this.click_state.borrow().current_count;
+
+                this.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
+                    button,
+                    position,
+                    modifiers,
+                    click_count,
+                }));
+            }
 
             // Raise the touch keyboard here, not when the input handler is
             // installed: iOS only honors a keyboard-raising focus() inside a
@@ -285,6 +395,50 @@ impl WebWindowInner {
                 current_state.modifiers = modifiers;
             }
 
+            // Touch movement scrolls instead of hovering/dragging. MouseMove
+            // is suppressed entirely: a finger has no hover state, and
+            // synthetic hover would flash hover styles mid-scroll.
+            if is_touch(&event) {
+                let scroll = {
+                    let mut drag_slot = this.touch_drag.borrow_mut();
+                    let Some(drag) = drag_slot.as_mut() else {
+                        return;
+                    };
+                    let time = js_sys::Date::now();
+                    let delta = point(position.x - drag.last.x, position.y - drag.last.y);
+                    let elapsed = (time - drag.last_time).max(1.0) as f32;
+                    let instant = (
+                        f32::from(delta.x) / elapsed,
+                        f32::from(delta.y) / elapsed,
+                    );
+                    // Weighted toward the newest sample so the fling picks up
+                    // the release-time velocity, not the whole gesture's mean.
+                    drag.velocity = (
+                        0.7 * instant.0 + 0.3 * drag.velocity.0,
+                        0.7 * instant.1 + 0.3 * drag.velocity.1,
+                    );
+                    drag.last = position;
+                    drag.last_time = time;
+                    if !drag.scrolling && distance(position, drag.start) > TOUCH_SLOP {
+                        drag.scrolling = true;
+                        Some((delta, TouchPhase::Started))
+                    } else if drag.scrolling {
+                        Some((delta, TouchPhase::Moved))
+                    } else {
+                        None
+                    }
+                };
+                if let Some((delta, touch_phase)) = scroll {
+                    this.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        position,
+                        delta: ScrollDelta::Pixels(delta),
+                        modifiers,
+                        touch_phase,
+                    }));
+                }
+                return;
+            }
+
             this.dispatch_input(PlatformInput::MouseMove(MouseMoveEvent {
                 position,
                 pressed_button: current_pressed,
@@ -293,10 +447,43 @@ impl WebWindowInner {
         })
     }
 
+    /// Applies one animation-frame step of touch momentum scrolling, if any.
+    /// Called from the RAF tick so decay follows real frame timing.
+    pub(crate) fn process_fling(&self) {
+        let step = {
+            let mut fling_slot = self.fling.borrow_mut();
+            let Some(fling) = fling_slot.as_mut() else {
+                return;
+            };
+            let now = js_sys::Date::now();
+            let elapsed = (now - fling.last_time).clamp(0.0, 100.0);
+            fling.last_time = now;
+            let delta = point(
+                px(fling.velocity.0 * elapsed as f32),
+                px(fling.velocity.1 * elapsed as f32),
+            );
+            let decay = (-elapsed / FLING_DECAY_MS).exp() as f32;
+            fling.velocity = (fling.velocity.0 * decay, fling.velocity.1 * decay);
+            let position = fling.position;
+            if fling.velocity.0.hypot(fling.velocity.1) < FLING_MIN_VELOCITY {
+                *fling_slot = None;
+            }
+            (position, delta)
+        };
+        let modifiers = self.state.borrow().modifiers;
+        self.dispatch_input(PlatformInput::ScrollWheel(ScrollWheelEvent {
+            position: step.0,
+            delta: ScrollDelta::Pixels(step.1),
+            modifiers,
+            touch_phase: TouchPhase::Moved,
+        }));
+    }
+
     fn register_pointer_leave(self: &Rc<Self>) -> EventListenerHandle {
         let this = Rc::clone(self);
         self.listen("pointerleave", move |event: JsValue| {
             let event: web_sys::PointerEvent = event.unchecked_into();
+            this.touch_drag.borrow_mut().take();
 
             let position = pointer_position_in_element(&event);
             let modifiers = modifiers_from_mouse_event(&event, this.is_mac);

@@ -26,6 +26,7 @@ anyhow.workspace = true
 async-compression.workspace = true
 iroh.workspace = true
 futures.workspace = true
+n0-future = "0.3"
 noq-proto = { workspace = true, optional = true }
 redb = { workspace = true, optional = true }
 rho-db = { workspace = true, optional = true }

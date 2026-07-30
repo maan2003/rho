@@ -26,6 +26,9 @@ pub struct Workspace {
     models: HashMap<AgentId, Entity<AgentModel>>,
     pending_syncs: HashMap<AgentId, FrameSummary>,
     preview: Option<Entity<editor::Editor>>,
+    /// On narrow (phone) viewports only one pane fits; this switches between
+    /// the dashboard and the transcript preview.
+    narrow_preview: bool,
     _event_task: Task<()>,
     _dashboard_subscription: Subscription,
 }
@@ -63,6 +66,7 @@ impl Workspace {
             models: HashMap::new(),
             pending_syncs: HashMap::new(),
             preview: None,
+            narrow_preview: false,
             _event_task: event_task,
             _dashboard_subscription: dashboard_subscription,
         }
@@ -148,7 +152,8 @@ impl Workspace {
     }
 
     fn dashboard_cursor_moved(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let agent_id = match self.dashboard.cursor_target(cx) {
+        let target = self.dashboard.cursor_target(cx);
+        let agent_id = match target {
             Some(RowTarget::Stream { root: Some(id), .. } | RowTarget::Agent(id)) => id,
             _ => return,
         };
@@ -156,7 +161,9 @@ impl Workspace {
     }
 
     pub fn open_agent(&mut self, agent_id: AgentId, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.registry.known_agents().any(|id| *id == agent_id) { return; }
+        if !self.registry.known_agents().any(|id| *id == agent_id) {
+            return;
+        }
         self.registry.select_agent(agent_id);
         let (subscribe, evicted) = self.subscriptions.touch(agent_id);
         if let Some(agent_id) = evicted {
@@ -168,6 +175,7 @@ impl Workspace {
         self.connection.send(ClientMessage::AgentStreamFocus { agent_id: Some(agent_id) });
         let (model, _) = self.ensure_agent_model(agent_id, window, cx);
         self.preview = Some(model.update(cx, |model, cx| model.preview_editor(window, cx)));
+        self.narrow_preview = true;
         cx.notify();
     }
 
@@ -204,9 +212,6 @@ impl Workspace {
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.dashboard.sync(&self.registry, window, cx);
-        let body = div().flex().size_full().gap_2()
-            .child(div().w(px(430.)).h_full().overflow_hidden().child(self.dashboard.editor().clone()))
-            .child(div().flex_1().h_full().overflow_hidden().children(self.preview.clone()));
         let colors = cx.theme().colors();
         let (overlay_bg, card_bg, card_border, text, text_muted) = (
             colors.editor_background,
@@ -215,6 +220,32 @@ impl Render for Workspace {
             colors.text,
             colors.text_muted,
         );
+        let narrow = window.viewport_size().width < px(700.);
+        let body = if narrow {
+            if self.narrow_preview && self.preview.is_some() {
+                div().flex().flex_col().size_full()
+                    .child(
+                        div().flex().items_center().px_1().py_1()
+                            .border_b_1().border_color(card_border)
+                            .child(
+                                div().id("back-to-agents").cursor_pointer()
+                                    .px_3().py_1().rounded_sm().text_color(text_muted)
+                                    .child("‹ agents")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.narrow_preview = false;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .child(div().flex_1().overflow_hidden().children(self.preview.clone()))
+            } else {
+                div().size_full().overflow_hidden().child(self.dashboard.editor().clone())
+            }
+        } else {
+            div().flex().size_full().gap_2()
+                .child(div().w(px(430.)).h_full().overflow_hidden().child(self.dashboard.editor().clone()))
+                .child(div().flex_1().h_full().overflow_hidden().children(self.preview.clone()))
+        };
         let card_style = move |content: gpui::Div| {
             content
                 .flex().flex_col().gap_2().max_w(px(420.)).m_4().p_4()

@@ -22,6 +22,10 @@ zed_actions = { path = "../../vendor/zed/crates/zed_actions" }
 iroh = { path = "../../vendor/iroh/iroh" }
 noq = { path = "../../vendor/noq/noq" }
 noq-proto = { path = "../../vendor/noq/noq-proto" }
+# Upstream's wasm malloc is a bump allocator for isolated scanner instances
+# that corrupts linear memory when linked into a binary sharing its heap with
+# Rust; our fork forwards to Rust's allocator.
+tree-sitter-language = { path = "../../vendor/tree-sitter-language" }
 
 [profile.release]
 opt-level = "s"

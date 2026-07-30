@@ -245,7 +245,7 @@ impl WrapMap {
                 self.snapshot = new_snapshot;
                 self.edits_since_sync = self.edits_since_sync.compose(&edits);
             } else {
-                let task = cx.background_spawn(async move {
+                let update = async move {
                     let edits = new_snapshot
                         .update(
                             tab_snapshot,
@@ -256,24 +256,36 @@ impl WrapMap {
                         )
                         .await;
                     (new_snapshot, edits)
-                });
+                };
 
-                #[cfg(not(target_family = "wasm"))]
-                match cx
-                    .foreground_executor()
-                    .block_with_timeout(Duration::from_millis(5), task)
+                // On wasm the text system lock must only ever be taken from the
+                // main thread: if a worker holds it while the main thread tries
+                // to lock, parking_lot falls back to Atomics.wait, which traps
+                // on the browser main thread. The update future yields every
+                // WRAP_YIELD_ROW_INTERVAL rows, so the foreground executor
+                // stays responsive.
+                #[cfg(target_family = "wasm")]
                 {
-                    Ok((snapshot, edits)) => {
-                        self.snapshot = snapshot;
-                        self.edits_since_sync = self.edits_since_sync.compose(&edits);
-                    }
-                    Err(wrap_task) => {
-                        let wrap_task = cx.background_spawn(wrap_task);
-                        self.finish_update_in_background(wrap_task, cx);
+                    let task = cx.foreground_executor().spawn(update);
+                    self.finish_update_in_background(task, cx);
+                }
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    let task = cx.background_spawn(update);
+                    match cx
+                        .foreground_executor()
+                        .block_with_timeout(Duration::from_millis(5), task)
+                    {
+                        Ok((snapshot, edits)) => {
+                            self.snapshot = snapshot;
+                            self.edits_since_sync = self.edits_since_sync.compose(&edits);
+                        }
+                        Err(wrap_task) => {
+                            let wrap_task = cx.background_spawn(wrap_task);
+                            self.finish_update_in_background(wrap_task, cx);
+                        }
                     }
                 }
-                #[cfg(target_family = "wasm")]
-                self.finish_update_in_background(task, cx);
             }
         } else {
             let old_rows = self.snapshot.transforms.summary().output.lines.row + 1;
@@ -356,7 +368,7 @@ impl WrapMap {
                 self.snapshot = snapshot;
                 self.edits_since_sync = self.edits_since_sync.compose(&wrap_edits);
             } else {
-                let update_task = cx.background_spawn(async move {
+                let update = async move {
                     let mut edits = Patch::default();
                     for (tab_snapshot, row_scales, tab_edits) in pending_edits {
                         let wrap_edits = snapshot
@@ -371,24 +383,32 @@ impl WrapMap {
                         edits = edits.compose(&wrap_edits);
                     }
                     (snapshot, edits)
-                });
+                };
 
-                #[cfg(not(target_family = "wasm"))]
-                match cx
-                    .foreground_executor()
-                    .block_with_timeout(Duration::from_millis(1), update_task)
+                // See rewrap: on wasm the text system must stay main-thread
+                // only to avoid Atomics.wait traps on the browser main thread.
+                #[cfg(target_family = "wasm")]
                 {
-                    Ok((snapshot, output_edits)) => {
-                        self.snapshot = snapshot;
-                        self.edits_since_sync = self.edits_since_sync.compose(&output_edits);
-                    }
-                    Err(update_task) => {
-                        let update_task = cx.background_spawn(update_task);
-                        self.finish_update_in_background(update_task, cx);
+                    let update_task = cx.foreground_executor().spawn(update);
+                    self.finish_update_in_background(update_task, cx);
+                }
+                #[cfg(not(target_family = "wasm"))]
+                {
+                    let update_task = cx.background_spawn(update);
+                    match cx
+                        .foreground_executor()
+                        .block_with_timeout(Duration::from_millis(1), update_task)
+                    {
+                        Ok((snapshot, output_edits)) => {
+                            self.snapshot = snapshot;
+                            self.edits_since_sync = self.edits_since_sync.compose(&output_edits);
+                        }
+                        Err(update_task) => {
+                            let update_task = cx.background_spawn(update_task);
+                            self.finish_update_in_background(update_task, cx);
+                        }
                     }
                 }
-                #[cfg(target_family = "wasm")]
-                self.finish_update_in_background(update_task, cx);
             }
         }
 

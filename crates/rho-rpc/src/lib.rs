@@ -75,7 +75,10 @@ pub async fn authenticate_iroh_client(
     connection: &iroh::endpoint::Connection,
     client_endpoint_id: iroh::EndpointId,
 ) -> anyhow::Result<rho_iroh_auth::ClientAuthResult> {
-    tokio::time::timeout(
+    // `n0_future::time` rather than `tokio::time`: browser clients run this
+    // path on wasm, where tokio's timer calls `std::time::Instant::now` and
+    // panics ("time not implemented on this platform").
+    n0_future::time::timeout(
         AUTH_TIMEOUT,
         rho_iroh_auth::authenticate_client(connection, client_endpoint_id),
     )
