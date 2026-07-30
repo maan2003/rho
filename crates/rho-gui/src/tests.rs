@@ -1432,6 +1432,260 @@ fn streaming_suffix_only_reaches_wrap_map_as_the_tail_row(cx: &mut TestAppContex
     assert_incremental_wrap(&batches, &width_changes, 160, 1);
 }
 
+#[gpui::test]
+fn document_preview_reconciles_decorations_when_appending_a_user_turn(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![user("do work")],
+            vec![assistant(
+                &long_working_text(),
+                Some(UiMessagePhase::Commentary),
+            )],
+        )),
+    );
+    let preview = workspace
+        .update(cx, |workspace, window, cx| {
+            let model = workspace.active_agent_model().expect("agent view");
+            model.update(cx, |model, cx| model.preview_editor(window, cx))
+        })
+        .expect("open document preview");
+    let folded_elisions = |cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |_, _, cx| {
+                preview.update(cx, |editor, cx| {
+                    let snapshot = editor.display_snapshot(cx);
+                    snapshot
+                        .folded_display_elisions_intersecting_range(
+                            multi_buffer::MultiBufferOffset(0)..snapshot.buffer_snapshot().len(),
+                            true,
+                        )
+                        .into_iter()
+                        .collect::<rustc_hash::FxHashSet<_>>()
+                })
+            })
+            .expect("inspect document preview elisions")
+    };
+    let initial_elisions = folded_elisions(cx);
+    assert_eq!(initial_elisions.len(), 1);
+
+    // The existing decorated response becomes an interior excerpt, but is not
+    // rebuilt. Its concrete editor decoration and reconciliation state must
+    // remain paired rather than inserting a duplicate.
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        AgentRemoteFrame::Diff {
+            blocks: UiBlocksDiff {
+                truncate_to: None,
+                updates: vec![UiBlockUpdate {
+                    index: 2,
+                    block: UiBlockDiff::Replace(user("continue")),
+                }],
+            },
+            status: None,
+            context_used: None,
+            usage: None,
+        },
+    );
+    assert_eq!(folded_elisions(cx), initial_elisions);
+}
+
+#[gpui::test]
+fn document_preview_preserves_decorations_across_invisible_tail_status_change(
+    cx: &mut TestAppContext,
+) {
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![user("do work")],
+            vec![
+                assistant(&long_working_text(), Some(UiMessagePhase::Commentary)),
+                UiBlock::Reasoning {
+                    text: String::new(),
+                },
+            ],
+        )),
+    );
+    let preview = workspace
+        .update(cx, |workspace, window, cx| {
+            let model = workspace.active_agent_model().expect("agent view");
+            model.update(cx, |model, cx| model.preview_editor(window, cx))
+        })
+        .expect("open document preview");
+    let folded_elisions = |cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |_, _, cx| {
+                preview.update(cx, |editor, cx| {
+                    let snapshot = editor.display_snapshot(cx);
+                    snapshot
+                        .folded_display_elisions_intersecting_range(
+                            multi_buffer::MultiBufferOffset(0)..snapshot.buffer_snapshot().len(),
+                            true,
+                        )
+                        .into_iter()
+                        .collect::<rustc_hash::FxHashSet<_>>()
+                })
+            })
+            .expect("inspect document preview elisions")
+    };
+    let initial_elisions = folded_elisions(cx);
+    assert_eq!(initial_elisions.len(), 1);
+
+    // Only the invisible terminal reasoning buffer is rebuilt. Cropping the
+    // preceding composed document tail must not discard decoration state for
+    // its surviving excerpt and insert a duplicate editor object.
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        AgentRemoteFrame::Diff {
+            blocks: UiBlocksDiff {
+                truncate_to: None,
+                updates: Vec::new(),
+            },
+            status: Some(UiAgentStatus::Idle),
+            context_used: None,
+            usage: None,
+        },
+    );
+    assert_eq!(folded_elisions(cx), initial_elisions);
+}
+
+#[gpui::test]
+fn suffix_rebuild_does_not_rewrap_settled_user_rows(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let user_text = (0..120)
+        .map(|row| format!("settled user row {row}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let response = (0..100)
+        .map(|row| format!("response row {row}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![user(&user_text)],
+            vec![assistant(&response, Some(UiMessagePhase::FinalAnswer))],
+        )),
+    );
+
+    let editor = active_editor(&workspace, cx);
+    let preview = workspace
+        .update(cx, |workspace, window, cx| {
+            let model = workspace.active_agent_model().expect("agent view");
+            model.update(cx, |model, cx| model.preview_editor(window, cx))
+        })
+        .expect("open document preview");
+    workspace
+        .update(cx, |_, _, cx| {
+            for editor in [&editor, &preview] {
+                editor.update(cx, |editor, cx| {
+                    editor.display_map.update(cx, |map, cx| {
+                        map.snapshot(cx);
+                        map.take_wrap_sync_traces(cx);
+                        map.take_wrap_width_changes(cx);
+                    });
+                });
+            }
+        })
+        .expect("clear initial wrap edits");
+
+    // Updating two blocks deliberately drops the single-block incremental hint and
+    // exercises transcript suffix reconstruction. The settled user excerpt must
+    // retain its identity.
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        AgentRemoteFrame::Diff {
+            blocks: UiBlocksDiff {
+                truncate_to: None,
+                updates: vec![
+                    UiBlockUpdate {
+                        index: 1,
+                        block: UiBlockDiff::AssistantText(UiTextDiff {
+                            keep_bytes: response.len(),
+                            value: "\nappended response".to_owned(),
+                        }),
+                    },
+                    UiBlockUpdate {
+                        index: 2,
+                        block: UiBlockDiff::Replace(UiBlock::Tool(tool(
+                            "tool-1",
+                            UiToolStatus::Running,
+                            Some(1),
+                            None,
+                        ))),
+                    },
+                ],
+            },
+            status: None,
+            context_used: None,
+            usage: None,
+        },
+    );
+
+    let (traces, width_changes) = workspace
+        .update(cx, |_, _, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.display_map.update(cx, |map, cx| {
+                    map.snapshot(cx);
+                    (
+                        map.take_wrap_sync_traces(cx),
+                        map.take_wrap_width_changes(cx),
+                    )
+                })
+            })
+        })
+        .expect("read suffix rebuild wrap edits");
+    assert!(width_changes.is_empty());
+    let edits = traces
+        .iter()
+        .flat_map(|trace| &trace.input)
+        .collect::<Vec<_>>();
+    assert!(!edits.is_empty(), "suffix rebuild did not reach WrapMap");
+    assert!(
+        edits
+            .iter()
+            .all(|edit| { edit.old.start.row() >= 120 && edit.new.start.row() >= 120 }),
+        "suffix rebuild invalidated settled user rows: {traces:#?}"
+    );
+
+    let preview_traces = workspace
+        .update(cx, |_, _, cx| {
+            preview.update(cx, |preview, cx| {
+                preview.display_map.update(cx, |map, cx| {
+                    map.snapshot(cx);
+                    assert!(map.take_wrap_width_changes(cx).is_empty());
+                    map.take_wrap_sync_traces(cx)
+                })
+            })
+        })
+        .expect("read document preview wrap edits");
+    let preview_edits = preview_traces
+        .iter()
+        .flat_map(|trace| &trace.input)
+        .collect::<Vec<_>>();
+    assert!(!preview_edits.is_empty());
+    assert!(
+        preview_edits
+            .iter()
+            .all(|edit| { edit.old.start.row() >= 120 && edit.new.start.row() >= 120 }),
+        "suffix rebuild invalidated settled document-preview rows: {preview_traces:#?}"
+    );
+}
+
 fn assert_incremental_wrap(
     traces: &[editor::display_map::WrapSyncTrace],
     width_changes: &[(Option<gpui::Pixels>, Option<gpui::Pixels>)],

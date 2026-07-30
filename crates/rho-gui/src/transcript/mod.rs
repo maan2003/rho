@@ -498,6 +498,11 @@ impl TranscriptModel {
         gutters_changed: &mut bool,
         cx: &mut Context<V>,
     ) {
+        let old_last_composed = self
+            .buffers
+            .iter()
+            .rfind(|turn| turn.composed)
+            .map(|turn| turn.start_block);
         let first_removed = self
             .buffers
             .iter()
@@ -584,10 +589,85 @@ impl TranscriptModel {
             .rev()
             .map(|turn| turn.buffer.clone())
             .collect::<Vec<_>>();
-        self.reset_full_excerpts(cx);
-        self.document_tail = None;
-        self.reset_document_excerpts(cx);
+        self.reset_rebuilt_excerpts(first_removed, old_last_composed, cx);
         Self::warm_syntax(new_buffers, cx);
+    }
+
+    /// Reinstalls only the excerpts replaced by a suffix rebuild.
+    /// Re-registering every path turns an otherwise local block replacement
+    /// into a whole-transcript edit and forces all settled rows through
+    /// fold, wrap, and block layout again.
+    fn reset_rebuilt_excerpts<V: 'static>(
+        &mut self,
+        first_rebuilt: usize,
+        old_last_composed: Option<usize>,
+        cx: &mut Context<V>,
+    ) {
+        let new_last_composed = self
+            .buffers
+            .iter()
+            .rfind(|turn| turn.composed)
+            .map(|turn| turn.start_block);
+        let tail_changed = old_last_composed != new_last_composed;
+        let mut new_document_tail = None;
+        let affected = self
+            .buffers
+            .iter()
+            .enumerate()
+            .filter(|(index, turn)| {
+                turn.composed
+                    && (*index >= first_rebuilt
+                        || tail_changed
+                            && (Some(turn.start_block) == old_last_composed
+                                || Some(turn.start_block) == new_last_composed))
+            })
+            .map(|(_, turn)| {
+                let buffer = turn.buffer.read(cx);
+                let full_end = if Some(turn.start_block) == new_last_composed {
+                    prompt_gap_excerpt_end(buffer)
+                } else {
+                    composed_excerpt_end(buffer)
+                };
+                let document_end = if Some(turn.start_block) == new_last_composed {
+                    let (tail, end) = desired_document_tail(buffer, self.turn_open);
+                    new_document_tail = Some(tail);
+                    end
+                } else {
+                    composed_excerpt_end(buffer)
+                };
+                (
+                    transcript_path(turn.start_block),
+                    turn.buffer.clone(),
+                    full_end,
+                    document_end,
+                )
+            })
+            .collect::<Vec<_>>();
+        self.multi_buffer.update(cx, |multi_buffer, cx| {
+            for (path, buffer, end, _) in &affected {
+                multi_buffer.set_excerpts_for_path(
+                    path.clone(),
+                    buffer.clone(),
+                    [Point::zero()..*end],
+                    0,
+                    cx,
+                );
+            }
+        });
+        self.document_multi_buffer.update(cx, |multi_buffer, cx| {
+            for (path, buffer, _, end) in &affected {
+                multi_buffer.set_excerpts_for_path(
+                    path.clone(),
+                    buffer.clone(),
+                    [Point::zero()..*end],
+                    0,
+                    cx,
+                );
+            }
+        });
+        if new_document_tail.is_some() || new_last_composed.is_none() {
+            self.document_tail = new_document_tail;
+        }
     }
 
     fn try_incremental_sync<V: 'static>(
@@ -757,34 +837,18 @@ impl TranscriptModel {
         });
     }
 
-    /// Aligns the document excerpt with the tail policy. Returns whether
-    /// the excerpt was replaced (its id changed): every anchor a document
-    /// attachment holds is stale then, and it needs a full re-apply.
+    /// Aligns the document excerpt with the tail policy. Returns whether the
+    /// excerpt range changed, so range-based styling can be fully reapplied.
     fn update_document_excerpt<V: 'static>(&mut self, cx: &mut Context<V>) -> bool {
         let Some(last) = self.buffers.iter().rev().find(|turn| turn.composed) else {
             return self.document_tail.take().is_some();
         };
         let buffer = last.buffer.read(cx);
-        let buffer_id = buffer.remote_id();
-        let desired = if self.turn_open {
-            DocumentTail::Growing(buffer_id)
-        } else {
-            let len = buffer.len();
-            let trailing = buffer
-                .as_rope()
-                .reversed_chars_at(len)
-                .take_while(|c| *c == '\n')
-                .count();
-            DocumentTail::Cropped(buffer_id, buffer.offset_to_point(len - trailing))
-        };
+        let (desired, end) = desired_document_tail(buffer, self.turn_open);
         if self.document_tail == Some(desired) {
             return false;
         }
         self.document_tail = Some(desired);
-        let end = match desired {
-            DocumentTail::Growing(_) => composed_excerpt_end(buffer),
-            DocumentTail::Cropped(_, end) => end,
-        };
         let buffer = last.buffer.clone();
         let path = transcript_path(last.start_block);
         self.document_multi_buffer.update(cx, |multi_buffer, cx| {
@@ -795,10 +859,9 @@ impl TranscriptModel {
 
     /// Brings every attached editor up to date with the model: changed
     /// highlight classes reapplied per region, gutters when they moved,
-    /// inlays and display elisions reconciled. Dead attachments prune
-    /// here. When the document excerpt was replaced, attachments over the
-    /// document multibuffer re-apply everything from scratch — their old
-    /// anchors all died with the excerpt.
+    /// inlays and display elisions reconciled. Dead attachments prune here.
+    /// A changed document range gets a full style re-apply, while concrete
+    /// decorations are retained, removed, or updated by anchor reconciliation.
     fn apply_to_attachments<V: 'static>(
         &mut self,
         now_ms: u64,
@@ -866,15 +929,6 @@ impl TranscriptModel {
                 return false;
             };
             let refresh = document_replaced && attachment.multi_buffer == *document_multi_buffer;
-            if refresh {
-                // The replaced excerpt took the placed inlays and display
-                // elisions with it; forget them so reconciliation places
-                // them anew with live anchors.
-                attachment.inlays.clear();
-                attachment.elisions = ElisionState::default();
-                #[cfg(feature = "native")]
-                attachment.visualizations.clear();
-            }
             // Scale rows before anything lays them out: the wrap map sizes a
             // row when it wraps it, and highlights, inlays and folds below
             // all take display snapshots.
@@ -1028,6 +1082,25 @@ fn transcript_path(start_block: usize) -> PathKey {
 fn composed_excerpt_end(buffer: &Buffer) -> Point {
     debug_assert!(buffer.as_rope().reversed_chars_at(buffer.len()).next() == Some('\n'));
     buffer.offset_to_point(buffer.len() - 1)
+}
+
+fn desired_document_tail(buffer: &Buffer, turn_open: bool) -> (DocumentTail, Point) {
+    let buffer_id = buffer.remote_id();
+    if turn_open {
+        (
+            DocumentTail::Growing(buffer_id),
+            composed_excerpt_end(buffer),
+        )
+    } else {
+        let len = buffer.len();
+        let trailing = buffer
+            .as_rope()
+            .reversed_chars_at(len)
+            .take_while(|c| *c == '\n')
+            .count();
+        let end = buffer.offset_to_point(len - trailing);
+        (DocumentTail::Cropped(buffer_id, end), end)
+    }
 }
 
 fn prompt_gap_excerpt_end(buffer: &Buffer) -> Point {
