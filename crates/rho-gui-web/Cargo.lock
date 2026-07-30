@@ -7315,6 +7315,7 @@ dependencies = [
  "rho-iroh-auth",
  "rho-registry",
  "rho-rpc",
+ "rho-touch-keyboard",
  "rho-ui-proto",
  "rust-embed",
  "rustc-hash 2.1.3",
@@ -7392,6 +7393,18 @@ dependencies = [
  "bytes",
  "senax-encoder",
  "tokio",
+]
+
+[[package]]
+name = "rho-touch-keyboard"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]

@@ -73,7 +73,12 @@ than by running a supervisor, extension protocol, or daemon process graph.
   discovery and receives only Rho role/team and workspace context on
   top of Claude Code's own harness prompt.
 - CLI and UI crates assemble concrete providers, tools, stores, and terminal
-  rendering. They should not own inference protocol details. The native GUI
+  rendering. They should not own inference protocol details. `rho-gui` uses
+  `rho-touch-keyboard` for the browser client's reusable in-canvas keyboard
+  core (layout, key dispatch, repeat, and local calibration telemetry).
+  `rho-gui` supplies its context strip, theme mapping, and focus/show policy,
+  while GPUI web owns only the immediate pointer-down routing region.
+  The native GUI
   exposes two deliberately separate daemon-owned process surfaces: an
   editor-native, Comint-style shell for ordinary commands and a raw terminal
   for programs that require a terminal screen. The editor shell starts a

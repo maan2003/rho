@@ -2,12 +2,16 @@
 //! used by the native GPUI client. Transport remains direct iroh.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use futures::StreamExt as _;
 use gpui::prelude::*;
-use gpui::{Context, Entity, Render, Subscription, Task, Window, div, px};
+use gpui::{App, Context, Entity, Render, Subscription, Task, Window, div, px};
 use rho_registry::session::{
     AgentSubscriptions, INITIAL_AGENT_SUBSCRIPTIONS, recent_workstream_roots,
+};
+use rho_touch_keyboard::{
+    ContextChip, KeyboardPlugin, KeyboardStyle, TouchKeyboard, dump_telemetry,
 };
 use rho_ui_proto::{AgentId, ClientMessage, ServerMessage};
 use theme::ActiveTheme as _;
@@ -17,6 +21,37 @@ use crate::connection_web::{Connection, Event, Phase, daemon_id_from_page};
 use crate::dashboard::{Dashboard, RowTarget};
 use crate::registry::AgentRegistry;
 use crate::store::{AgentStore, FrameSummary};
+
+struct RhoKeyboardPlugin;
+
+impl KeyboardPlugin for RhoKeyboardPlugin {
+    fn context_chips(&self) -> Vec<ContextChip> {
+        vec![ContextChip {
+            label: "dump typing data".into(),
+            on_select: Rc::new(|_, _| dump_telemetry()),
+        }]
+    }
+
+    fn style(&self, cx: &App) -> KeyboardStyle {
+        let colors = cx.theme().colors();
+        KeyboardStyle {
+            background: colors.editor_background.into(),
+            key_background: colors.element_background.into(),
+            key_pressed: colors.element_selected.into(),
+            border: colors.border.into(),
+            key_border: colors.border_variant.into(),
+            text: colors.text.into(),
+            text_muted: colors.text_muted.into(),
+            text_disabled: colors.text_disabled.into(),
+        }
+    }
+}
+
+fn coarse_pointer() -> bool {
+    web_sys::window()
+        .and_then(|window| window.match_media("(pointer: coarse)").ok().flatten())
+        .is_some_and(|query| query.matches())
+}
 
 pub struct Workspace {
     connection: Connection,
@@ -31,6 +66,7 @@ pub struct Workspace {
     /// On narrow (phone) viewports only one pane fits; this switches between
     /// the dashboard and the transcript preview.
     narrow_preview: bool,
+    touch_keyboard: Entity<TouchKeyboard>,
     _event_task: Task<()>,
     _dashboard_subscription: Subscription,
 }
@@ -76,6 +112,7 @@ impl Workspace {
             pending_syncs: HashMap::new(),
             preview: None,
             narrow_preview: false,
+            touch_keyboard: cx.new(|_| TouchKeyboard::new(RhoKeyboardPlugin)),
             _event_task: event_task,
             _dashboard_subscription: dashboard_subscription,
         }
@@ -324,6 +361,10 @@ impl Render for Workspace {
             colors.text_muted,
         );
         let narrow = window.viewport_size().width < px(700.);
+        let show_keyboard = coarse_pointer() && window.has_input_handler();
+        window.set_direct_touch_region(
+            show_keyboard.then(|| TouchKeyboard::region(window.viewport_size())),
+        );
         let body = if narrow {
             if self.narrow_preview && self.preview.is_some() {
                 div()
@@ -449,10 +490,13 @@ impl Render for Workspace {
             .id("rho-gui")
             .relative()
             .size_full()
+            .flex()
+            .flex_col()
             .p(px(2.))
             .bg(cx.theme().colors().editor_background)
             .key_context("RhoGui")
-            .child(body)
+            .child(div().flex_1().overflow_hidden().child(body))
+            .children(show_keyboard.then(|| self.touch_keyboard.clone().into_any_element()))
             .children(overlay)
     }
 }

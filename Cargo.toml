@@ -19,6 +19,7 @@ members = [
   "crates/rho-shell",
   "crates/rho-shell-proto",
   "crates/rho-gui",
+  "crates/rho-touch-keyboard",
   "crates/rho-inference",
   "crates/rho-iroh-auth",
   "crates/rho-pr-monitor",

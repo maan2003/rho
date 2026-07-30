@@ -1,0 +1,16 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "rho-touch-keyboard"
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false }
+js-sys = "0.3"
+serde.workspace = true
+serde_json.workspace = true
+wasm-bindgen = "0.2"
+web-sys = { version = "0.3", features = ["Storage", "Window", "console"] }

@@ -13710,6 +13710,7 @@ dependencies = [
  "rho-realtime",
  "rho-registry",
  "rho-rpc",
+ "rho-touch-keyboard",
  "rho-ui-proto",
  "rodio",
  "rust-embed",
@@ -13923,6 +13924,18 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "rho-touch-keyboard"
+version = "0.1.0"
+dependencies = [
+ "gpui",
+ "js-sys",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "web-sys",
 ]
 
 [[package]]
