@@ -10559,15 +10559,18 @@ impl Editor {
             return;
         }
         self.invalidate_syntax_concealments(None);
+        #[cfg(feature = "native")]
         if let Some(hovered_link_state) = self.hovered_link_state.as_mut() {
             hovered_link_state.symbol_range = None;
         }
+        #[cfg(feature = "native")]
         self.refresh_document_highlights(cx);
 
         let mut buffer_ids = HashSet::default();
         for update in updates {
             let buffer_id = update.buffer.read(cx).remote_id();
             buffer_ids.insert(buffer_id);
+            #[cfg(feature = "native")]
             if self.buffer.read(cx).diff_for(buffer_id).is_none()
                 && let Some(project) = &self.project
             {
@@ -10580,7 +10583,9 @@ impl Editor {
                 )
                 .detach();
             }
+            #[cfg(feature = "native")]
             self.update_lsp_data(Some(buffer_id), window, cx);
+            #[cfg(feature = "native")]
             self.semantic_token_state.invalidate_buffer(&buffer_id);
             cx.emit(EditorEvent::BufferRangesUpdated {
                 buffer: update.buffer.clone(),
@@ -10590,8 +10595,11 @@ impl Editor {
         }
 
         self.ensure_visible_buffer_syntax(cx);
+        #[cfg(feature = "native")]
         self.register_visible_buffers(cx);
+        #[cfg(feature = "native")]
         self.refresh_inlay_hints(InlayHintRefreshReason::NewLinesShown, cx);
+        #[cfg(feature = "native")]
         self.refresh_runnables(None, window, cx);
         self.bracket_fetched_tree_sitter_chunks
             .retain(|range, _| !buffer_ids.contains(&range.start.buffer_id));
@@ -12005,12 +12013,14 @@ impl Editor {
 
     fn ensure_visible_buffer_syntax(&mut self, cx: &mut Context<Self>) {
         let mut seen = HashSet::default();
-        for buffer in self.visible_buffers(cx) {
-            let buffer_id = buffer.read(cx).remote_id();
+        for (snapshot, _, _) in self.visible_buffer_ranges(cx) {
+            let buffer_id = snapshot.remote_id();
             if seen.insert(buffer_id) {
-                buffer.update(cx, |buffer, cx| {
-                    buffer.ensure_syntax_parsed(cx);
-                });
+                if let Some(buffer) = self.buffer().read(cx).buffer(buffer_id) {
+                    buffer.update(cx, |buffer, cx| {
+                        buffer.ensure_syntax_parsed(cx);
+                    });
+                }
             }
         }
     }

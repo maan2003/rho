@@ -1863,7 +1863,6 @@ impl Buffer {
     }
 
     /// Whether the buffer is being parsed in the background.
-    #[cfg(any(test, feature = "test-support"))]
     pub fn is_parsing(&self) -> bool {
         self.reparse.is_some()
     }

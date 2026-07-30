@@ -28,3 +28,8 @@ zed_actions = { path = "../../vendor/zed/crates/zed_actions" }
 [profile.release]
 opt-level = "s"
 lto = true
+
+[patch.crates-io]
+iroh = { path = "../../vendor/iroh/iroh" }
+noq = { path = "../../vendor/noq/noq" }
+noq-proto = { path = "../../vendor/noq/noq-proto" }
