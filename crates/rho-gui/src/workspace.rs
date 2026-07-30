@@ -782,9 +782,18 @@ impl Workspace {
                 if self
                     .transient
                     .as_ref()
-                    .is_some_and(|transient| transient.title() == "model usage share")
+                    .is_some_and(|transient| transient.title() == "model cost")
                 {
                     self.transient = Some(crate::transient::global_usage_menu(
+                        self.global_usage.clone(),
+                        self.global_usage_days,
+                    ));
+                } else if self
+                    .transient
+                    .as_ref()
+                    .is_some_and(|transient| transient.title() == "model usage share")
+                {
+                    self.transient = Some(crate::transient::usage_share_menu(
                         self.global_usage.clone(),
                         self.global_usage_days,
                     ));
@@ -3632,6 +3641,23 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.global_usage_days = days;
+        self.connection.send(ClientMessage::GlobalUsage {
+            since_ms: now_ms().saturating_sub(days * 24 * 60 * 60 * 1_000),
+        });
+        self.open_transient(
+            crate::transient::global_usage_menu(self.global_usage.clone(), days),
+            window,
+            cx,
+        );
+    }
+
+    pub(crate) fn open_usage_share_transient(
+        &mut self,
+        days: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.global_usage_days = days;
         let ema_warmup_days = if days <= 7 { 4 } else { 14 };
         self.connection.send(ClientMessage::GlobalUsage {
             // Seed the EMA with seven half-lives before the visible range so
@@ -3639,7 +3665,7 @@ impl Workspace {
             since_ms: now_ms().saturating_sub((days + ema_warmup_days) * 24 * 60 * 60 * 1_000),
         });
         self.open_transient(
-            crate::transient::global_usage_menu(self.global_usage.clone(), days),
+            crate::transient::usage_share_menu(self.global_usage.clone(), days),
             window,
             cx,
         );
