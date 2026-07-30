@@ -5754,26 +5754,16 @@ impl MultiBufferSnapshot {
         .map(|(range, _, _)| range)
     }
 
-    /// Returns syntax-query concealment ranges lifted into multibuffer
-    /// coordinates.
-    pub fn concealed_ranges<'a, T: ToOffset, U: ToOffset>(
-        &'a self,
-        scan_range: Range<T>,
-        eligible_range: Range<U>,
-    ) -> impl Iterator<Item = Range<MultiBufferOffset>> + 'a {
-        let scan_range = scan_range.start.to_offset(self)..scan_range.end.to_offset(self);
-        let eligible_range =
-            eligible_range.start.to_offset(self)..eligible_range.end.to_offset(self);
-        let eligible = self
-            .range_to_buffer_range(eligible_range)
-            .map(|(buffer, range)| (buffer.remote_id(), range));
-        self.lift_buffer_metadata(scan_range, move |buffer, range| {
-            let (buffer_id, eligible_range) = eligible.as_ref()?;
-            (*buffer_id == buffer.remote_id()).then(|| {
+    /// Returns every parsed concealment lifted into this multibuffer's
+    /// composition. Each excerpt is its own eligible syntax context, so a
+    /// capture that was cropped by composition cannot hide partial markup.
+    pub fn concealed_ranges(&self) -> impl Iterator<Item = Range<MultiBufferOffset>> + '_ {
+        self.lift_buffer_metadata(MultiBufferOffset(0)..self.len(), move |buffer, range| {
+            Some(
                 buffer
-                    .concealed_ranges(range, eligible_range.clone())
-                    .map(|range| (range, ()))
-            })
+                    .concealed_ranges(range.clone(), range)
+                    .map(|range| (range, ())),
+            )
         })
         .map(|(range, _, _)| range)
     }

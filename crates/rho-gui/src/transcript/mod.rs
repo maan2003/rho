@@ -67,7 +67,6 @@ pub struct TranscriptModel {
     /// in the live-turn region.
     turn_boundary: usize,
     buffers: Vec<TranscriptBuffer>,
-    history_concealments_ready: bool,
     elisions: ElisionSync,
     // Custom inlay ids share each editor's id space with the prompt
     // placeholder (id 0), so they start at 1. One counter serves every
@@ -100,7 +99,6 @@ struct BlockRecord {
     gutter: Option<(StyleClass, Range<Anchor>)>,
     inlay: Option<InlayRecord>,
     styles: Vec<(StyleClass, Range<Anchor>)>,
-    markdown: bool,
     terminal_newline_supplied_by_excerpt: bool,
     visualizations: Vec<VisualizationAnchor>,
 }
@@ -160,8 +158,6 @@ type PlacedSpans = (
 
 struct UserMessageGutter;
 struct AgentMessageGutter;
-struct MarkdownHistoryConcealment;
-struct MarkdownLiveConcealment;
 
 /// The document excerpt's tail policy. Replacing an excerpt gives it a
 /// new id (invalidating every anchor into it), so the tail changes shape
@@ -190,7 +186,6 @@ impl TranscriptModel {
             records: Vec::new(),
             turn_boundary: 0,
             buffers: Vec::new(),
-            history_concealments_ready: false,
             elisions: ElisionSync::default(),
             next_inlay_id: 1,
             visualization_client,
@@ -224,7 +219,7 @@ impl TranscriptModel {
 
         let mut chunks: Vec<(usize, bool, Vec<RenderedBlock>)> = Vec::new();
         for (block_index, rendered) in rendered_blocks.into_iter().enumerate() {
-            let markdown = matches!(rendered.kind, BlockKind::Response { .. });
+            let markdown = rendered.markdown;
             if chunks
                 .last()
                 .is_none_or(|(_, current_markdown, _)| markdown != *current_markdown)
@@ -345,31 +340,6 @@ impl TranscriptModel {
             parsing.push(buffer.read(cx).parsing_idle().boxed_local());
         }
         parsing
-    }
-
-    /// Installs settled-history concealments only after every initial syntax
-    /// tree is ready. Keeping these folds document-wide prevents scrolling
-    /// from changing line widths and restarting wrapping.
-    pub(crate) fn finish_initial_load<V: 'static>(&mut self, cx: &mut Context<V>) {
-        self.history_concealments_ready = true;
-        let ranges = self.records[..self.turn_boundary]
-            .iter()
-            .filter(|record| record.markdown)
-            .map(|record| record.range.clone())
-            .collect::<Vec<_>>();
-        for attachment in &self.attachments {
-            let Some(editor) = attachment.editor.upgrade() else {
-                continue;
-            };
-            let snapshot = attachment.multi_buffer.read(cx).snapshot(cx);
-            let scopes = ranges
-                .iter()
-                .filter_map(|range| excerpt_range(&snapshot, range))
-                .collect();
-            editor.update(cx, |editor, cx| {
-                editor.set_syntax_concealment_ranges::<MarkdownHistoryConcealment>(scopes, cx)
-            });
-        }
     }
 
     /// Attaches an editor showing this transcript (over whatever
@@ -538,7 +508,7 @@ impl TranscriptModel {
         let mut chunks: Vec<(usize, bool, Vec<RenderedBlock>)> = Vec::new();
         for (offset, rendered) in rendered_blocks.into_iter().enumerate() {
             let block_index = start + offset;
-            let markdown = matches!(rendered.kind, BlockKind::Response { .. });
+            let markdown = rendered.markdown;
             let starts_chunk = chunks
                 .last()
                 .is_none_or(|(_, current_markdown, _)| markdown != *current_markdown);
@@ -682,7 +652,6 @@ impl TranscriptModel {
                 gutter,
                 inlay,
                 styles,
-                markdown: rendered.markdown,
                 terminal_newline_supplied_by_excerpt,
                 visualizations,
             };
@@ -862,17 +831,6 @@ impl TranscriptModel {
             .iter()
             .flat_map(|record| record.visualizations.iter().cloned())
             .collect::<Vec<_>>();
-        let history_markdown_ranges = self.records[..self.turn_boundary]
-            .iter()
-            .filter(|record| record.markdown)
-            .map(|record| record.range.clone())
-            .collect::<Vec<_>>();
-        let live_markdown_ranges = self.records[self.turn_boundary..]
-            .iter()
-            .filter(|record| record.markdown)
-            .map(|record| record.range.clone())
-            .collect::<Vec<_>>();
-        let history_concealments_ready = self.history_concealments_ready;
         let desired_visualization_ids = desired_visualizations
             .iter()
             .map(|visualization| visualization.id.as_str())
@@ -991,23 +949,6 @@ impl TranscriptModel {
                 cx,
             );
             elisions.apply(&mut attachment.elisions, multi_buffer, &editor, cx);
-            let snapshot = multi_buffer.read(cx).snapshot(cx);
-            let live_scopes = live_markdown_ranges
-                .iter()
-                .filter_map(|range| excerpt_range(&snapshot, range))
-                .collect();
-            editor.update(cx, |editor, cx| {
-                editor.set_syntax_concealment_ranges::<MarkdownLiveConcealment>(live_scopes, cx)
-            });
-            if history_concealments_ready {
-                let scopes = history_markdown_ranges
-                    .iter()
-                    .filter_map(|range| excerpt_range(&snapshot, range))
-                    .collect();
-                editor.update(cx, |editor, cx| {
-                    editor.set_syntax_concealment_ranges::<MarkdownHistoryConcealment>(scopes, cx)
-                });
-            }
             true
         });
     }
@@ -1110,7 +1051,6 @@ fn block_record(
         gutter,
         inlay,
         styles,
-        markdown: rendered.markdown,
         terminal_newline_supplied_by_excerpt,
         visualizations,
     }

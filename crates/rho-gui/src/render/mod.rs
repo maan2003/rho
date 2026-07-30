@@ -65,7 +65,7 @@ pub struct RenderedBlock {
     /// Index of the span that should carry the user-message gutter accent.
     pub gutter_span: Option<usize>,
     pub inlay: Option<InlaySpec>,
-    /// Whether syntax-query concealment is enabled for this block.
+    /// Whether this block belongs to a Markdown syntax buffer.
     pub markdown: bool,
     /// Immutable visualization references embedded in this message.
     pub visualizations: Vec<VisualizationSpec>,

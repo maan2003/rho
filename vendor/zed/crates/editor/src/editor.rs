@@ -633,11 +633,7 @@ type BackgroundHighlight = (
 );
 type GutterHighlight = (fn(&App) -> Hsla, Vec<Range<Anchor>>);
 
-struct SyntaxConcealment {
-    scopes: Vec<Range<Anchor>>,
-    buffer_ids: HashSet<BufferId>,
-    dirty: bool,
-}
+struct SyntaxConcealment;
 
 #[derive(Default)]
 struct ScrollbarMarkerState {
@@ -1019,7 +1015,7 @@ pub struct Editor {
     highlight_order: usize,
     highlighted_rows: TypeIdHashMap<Vec<RowHighlight>>,
     background_highlights: HashMap<HighlightKey, BackgroundHighlight>,
-    syntax_concealments: HashMap<TypeId, SyntaxConcealment>,
+    syntax_concealments_dirty: bool,
     navigation_overlays: HashMap<NavigationOverlayKey, Arc<[NavigationTargetOverlay]>>,
     gutter_highlights: TypeIdHashMap<GutterHighlight>,
     allow_git_diff_scrollbar_markers: bool,
@@ -2335,7 +2331,7 @@ impl Editor {
             highlight_order: 0,
             highlighted_rows: Default::default(),
             background_highlights: HashMap::default(),
-            syntax_concealments: HashMap::default(),
+            syntax_concealments_dirty: true,
             navigation_overlays: HashMap::default(),
             gutter_highlights: Default::default(),
             allow_git_diff_scrollbar_markers: false,
@@ -9556,105 +9552,29 @@ impl Editor {
         results
     }
 
-    /// Conceals syntax-query captures inside the given multibuffer ranges.
-    ///
-    /// Concealment changes display geometry, so its ranges cover the supplied
-    /// scopes independently of the viewport and are published only from a
-    /// completed syntax snapshot.
-    pub fn set_syntax_concealment_ranges<T: 'static>(
-        &mut self,
-        mut scopes: Vec<Range<Anchor>>,
-        cx: &mut Context<Self>,
-    ) {
-        let type_id = TypeId::of::<T>();
-        if self
-            .syntax_concealments
-            .get(&type_id)
-            .is_some_and(|state| state.scopes == scopes)
-        {
-            return;
-        }
-        let snapshot = self.buffer.read(cx).snapshot(cx);
-        scopes.sort_by(|a, b| {
-            a.start
-                .cmp(&b.start, &snapshot)
-                .then_with(|| a.end.cmp(&b.end, &snapshot))
-        });
-        let buffer_ids: HashSet<BufferId> = scopes
-            .iter()
-            .flat_map(|scope| snapshot.buffer_ids_for_range(scope.clone()))
-            .collect();
-        let multi_buffer = self.buffer.read(cx);
-        let parse_pending = buffer_ids.iter().any(|buffer_id| {
-            multi_buffer
-                .buffer(*buffer_id)
-                .is_some_and(|buffer| buffer.read(cx).is_parsing())
-        });
-        let state = self
-            .syntax_concealments
-            .entry(type_id)
-            .or_insert_with(|| SyntaxConcealment {
-                scopes: Vec::new(),
-                buffer_ids: HashSet::default(),
-                dirty: !parse_pending,
-            });
-        if state.scopes == scopes {
-            return;
-        }
-
-        state.scopes = scopes;
-        state.buffer_ids = buffer_ids;
-        if !parse_pending {
-            state.dirty = true;
-            cx.notify();
-        }
-    }
-
-    fn invalidate_syntax_concealments(&mut self, buffer_id: Option<BufferId>) -> bool {
-        let mut invalidated = false;
-        for concealment in self.syntax_concealments.values_mut() {
-            if buffer_id.is_none_or(|buffer_id| concealment.buffer_ids.contains(&buffer_id)) {
-                concealment.dirty = true;
-                invalidated = true;
-            }
-        }
-        invalidated
+    fn invalidate_syntax_concealments(&mut self) -> bool {
+        let was_dirty = self.syntax_concealments_dirty;
+        self.syntax_concealments_dirty = true;
+        !was_dirty
     }
 
     fn refresh_syntax_concealments(&mut self, cx: &mut Context<Self>) {
-        if self.syntax_concealments.is_empty() {
+        if !self.syntax_concealments_dirty {
             return;
         }
         let snapshot = self.buffer.read(cx).snapshot(cx);
-
-        let mut updates = Vec::new();
-        for (type_id, state) in &mut self.syntax_concealments {
-            if !state.dirty {
-                continue;
-            }
-
-            let mut concealed = Vec::new();
-            for scope in &state.scopes {
-                let scope = scope.start.to_offset(&snapshot)..scope.end.to_offset(&snapshot);
-                concealed.extend(snapshot.concealed_ranges(scope.clone(), scope));
-            }
-            concealed.sort_unstable_by_key(|range| (range.start, range.end));
-            concealed.dedup();
-            state.dirty = false;
-            updates.push((*type_id, concealed));
-        }
-
+        let concealed = snapshot.concealed_ranges().collect::<Vec<_>>();
+        self.syntax_concealments_dirty = false;
+        let type_id = TypeId::of::<SyntaxConcealment>();
         let display_map = self.display_map.clone();
-        for (type_id, concealed) in updates {
-            let creases = concealed
-                .into_iter()
-                .filter(|range| !range.is_empty())
-                .map(|range| Crease::simple(range, FoldPlaceholder::concealed(type_id)))
-                .collect::<Vec<_>>();
-            display_map.update(cx, |display_map, cx| {
-                display_map.replace_folds_with_type(type_id, creases, cx);
-            });
-        }
+        let creases = concealed
+            .into_iter()
+            .filter(|range| !range.is_empty())
+            .map(|range| Crease::simple(range, FoldPlaceholder::concealed(type_id)))
+            .collect::<Vec<_>>();
+        display_map.update(cx, |display_map, cx| {
+            display_map.replace_folds_with_type(type_id, creases, cx);
+        });
     }
 
     /// Get the text ranges corresponding to the redaction query
@@ -9931,7 +9851,7 @@ impl Editor {
                 // parser publishes its replacement. Refreshing here would
                 // expose an intermediate fold set for every streamed edit.
                 if edited_buffer.is_none() {
-                    self.invalidate_syntax_concealments(None);
+                    self.invalidate_syntax_concealments();
                 }
                 self.scrollbar_marker_state.dirty = true;
                 self.active_indent_guides_state.dirty = true;
@@ -9982,7 +9902,7 @@ impl Editor {
                 ranges,
                 path_key,
             } => {
-                self.invalidate_syntax_concealments(None);
+                self.invalidate_syntax_concealments();
                 if let Some(hovered_link_state) = self.hovered_link_state.as_mut() {
                     hovered_link_state.symbol_range = None;
                 }
@@ -10057,7 +9977,7 @@ impl Editor {
                 });
             }
             multi_buffer::Event::Reparsed(buffer_id) => {
-                if self.invalidate_syntax_concealments(Some(*buffer_id)) {
+                if self.invalidate_syntax_concealments() {
                     cx.notify();
                 }
                 self.refresh_runnables(Some(*buffer_id), window, cx);
@@ -10071,7 +9991,7 @@ impl Editor {
                 self.refresh_runnables(None, window, cx);
             }
             multi_buffer::Event::LanguageChanged(buffer_id, is_fresh_language) => {
-                self.invalidate_syntax_concealments(Some(*buffer_id));
+                self.invalidate_syntax_concealments();
                 if !is_fresh_language {
                     self.registered_buffers.remove(&buffer_id);
                 }
@@ -10105,7 +10025,7 @@ impl Editor {
         if updates.is_empty() {
             return;
         }
-        self.invalidate_syntax_concealments(None);
+        self.invalidate_syntax_concealments();
         if let Some(hovered_link_state) = self.hovered_link_state.as_mut() {
             hovered_link_state.symbol_range = None;
         }

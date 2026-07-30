@@ -2546,7 +2546,7 @@ fn markdown_syntax_is_settled_independently_between_turns(cx: &mut TestAppContex
 }
 
 #[gpui::test]
-fn assistant_and_tool_segments_share_one_turn_buffer(cx: &mut TestAppContext) {
+fn markdown_and_tool_segments_use_separate_syntax_buffers(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     feed_frame(
         &workspace,
@@ -2571,20 +2571,25 @@ fn assistant_and_tool_segments_share_one_turn_buffer(cx: &mut TestAppContext) {
     workspace
         .update(cx, |_, _, cx| {
             let buffers = editor.read(cx).buffer().read(cx).all_buffers();
-            let first_turn = buffers
+            let first = buffers
                 .iter()
                 .find(|buffer| buffer.read(cx).text().contains("first assistant segment"))
-                .expect("first response turn buffer");
+                .expect("first Markdown buffer");
+            let second = buffers
+                .iter()
+                .find(|buffer| buffer.read(cx).text().contains("second assistant segment"))
+                .expect("second Markdown buffer");
+            let tool = buffers
+                .iter()
+                .find(|buffer| buffer.read(cx).text().contains("$ echo ok"))
+                .expect("tool buffer");
             assert!(
-                first_turn
-                    .read(cx)
-                    .text()
-                    .contains("second assistant segment"),
-                "assistant segments separated by a tool must share their turn buffer"
+                first.read(cx).language().is_some() && second.read(cx).language().is_some(),
+                "assistant messages must retain Markdown syntax"
             );
             assert!(
-                !first_turn.read(cx).text().contains("next turn response"),
-                "the next user turn must start a new response buffer"
+                tool.read(cx).language().is_none(),
+                "tool text must not inherit Markdown syntax or concealment"
             );
         })
         .expect("inspect transcript turn buffers");
