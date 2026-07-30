@@ -45,7 +45,9 @@ pub(crate) struct WebWindowMutableState {
 pub(crate) struct WebWindowInner {
     pub(crate) browser_window: web_sys::Window,
     pub(crate) canvas: web_sys::HtmlCanvasElement,
+    pub(crate) input_container: web_sys::HtmlElement,
     pub(crate) input_element: web_sys::HtmlInputElement,
+    pub(crate) keyboard_input_element: web_sys::HtmlInputElement,
     pub(crate) has_device_pixel_support: bool,
     pub(crate) is_mac: bool,
     pub(crate) state: RefCell<WebWindowMutableState>,
@@ -115,24 +117,53 @@ impl WebWindow {
         body.append_child(&canvas)
             .map_err(|e| anyhow::anyhow!("Failed to append canvas to body: {e:?}"))?;
 
-        let input_element: web_sys::HtmlInputElement = document
-            .create_element("input")
-            .map_err(|e| anyhow::anyhow!("Failed to create input element: {e:?}"))?
+        // Text input reaches the window through two hidden inputs, and the
+        // touch keyboard is controlled purely by which one holds DOM focus:
+        // Safari ignores dynamic `inputmode` edits until the element is
+        // refocused, so toggling one input's attributes cannot work, while a
+        // focus transfer between two inputs applies each one's mode reliably.
+        // `input_element` (inputmode=none) is the resting focus holder that
+        // relays hardware keys without raising a keyboard; focusing
+        // `keyboard_input_element` raises it. The keyboard listeners attach
+        // to this shared container so both inputs feed the same handlers.
+        let input_container: web_sys::HtmlElement = document
+            .create_element("div")
+            .map_err(|e| anyhow::anyhow!("Failed to create input container: {e:?}"))?
             .dyn_into()
-            .map_err(|e| anyhow::anyhow!("Created element is not an input: {e:?}"))?;
-        // The element only relays hardware key and IME events, and pointerdown
-        // refocuses it constantly; without this, touch browsers flicker their
-        // virtual keyboard open on every tap.
-        input_element.set_attribute("inputmode", "none").ok();
-        let input_style = input_element.style();
-        input_style.set_property("position", "fixed").ok();
-        input_style.set_property("top", "0").ok();
-        input_style.set_property("left", "0").ok();
-        input_style.set_property("width", "1px").ok();
-        input_style.set_property("height", "1px").ok();
-        input_style.set_property("opacity", "0").ok();
-        body.append_child(&input_element)
-            .map_err(|e| anyhow::anyhow!("Failed to append input to body: {e:?}"))?;
+            .map_err(|e| anyhow::anyhow!("Created element is not an html element: {e:?}"))?;
+        let make_input = |keyboard: bool| -> anyhow::Result<web_sys::HtmlInputElement> {
+            let input_element: web_sys::HtmlInputElement = document
+                .create_element("input")
+                .map_err(|e| anyhow::anyhow!("Failed to create input element: {e:?}"))?
+                .dyn_into()
+                .map_err(|e| anyhow::anyhow!("Created element is not an input: {e:?}"))?;
+            if keyboard {
+                // The raised keyboard types into the editor; predictive text
+                // and autocapitalization would corrupt it through composition
+                // events.
+                input_element.set_attribute("autocapitalize", "off").ok();
+                input_element.set_attribute("autocorrect", "off").ok();
+                input_element.set_attribute("autocomplete", "off").ok();
+                input_element.set_attribute("spellcheck", "false").ok();
+            } else {
+                input_element.set_attribute("inputmode", "none").ok();
+            }
+            let input_style = input_element.style();
+            input_style.set_property("position", "fixed").ok();
+            input_style.set_property("top", "0").ok();
+            input_style.set_property("left", "0").ok();
+            input_style.set_property("width", "1px").ok();
+            input_style.set_property("height", "1px").ok();
+            input_style.set_property("opacity", "0").ok();
+            input_container
+                .append_child(&input_element)
+                .map_err(|e| anyhow::anyhow!("Failed to append input to container: {e:?}"))?;
+            Ok(input_element)
+        };
+        let input_element = make_input(false)?;
+        let keyboard_input_element = make_input(true)?;
+        body.append_child(&input_container)
+            .map_err(|e| anyhow::anyhow!("Failed to append input container to body: {e:?}"))?;
         input_element.focus().ok();
 
         let device_size = Size {
@@ -176,7 +207,9 @@ impl WebWindow {
         let inner = Rc::new(WebWindowInner {
             browser_window,
             canvas,
+            input_container,
             input_element,
+            keyboard_input_element,
             has_device_pixel_support,
             is_mac,
             state: RefCell::new(mutable_state),
@@ -337,6 +370,17 @@ impl WebWindowInner {
         Some(result)
     }
 
+    /// Whether the keyboard-raising hidden input holds DOM focus, i.e.
+    /// whether the touch keyboard is (being) shown.
+    pub(crate) fn keyboard_input_focused(&self) -> bool {
+        self.browser_window
+            .document()
+            .and_then(|document| document.active_element())
+            .is_some_and(|active| {
+                js_sys::Object::is(active.as_ref(), self.keyboard_input_element.as_ref())
+            })
+    }
+
     fn create_raf_closure(self: &Rc<Self>) -> Closure<dyn FnMut()> {
         let raf_handle: Rc<RefCell<Option<js_sys::Function>>> = Rc::new(RefCell::new(None));
         let raf_handle_inner = Rc::clone(&raf_handle);
@@ -352,6 +396,18 @@ impl WebWindowInner {
                     })
                 },
             );
+
+            // Dismissal counterpart to the pointerup keyboard raise in
+            // events.rs: the draw above has settled which view holds the
+            // input handler, so a frame that ends without one parks focus
+            // back on the inputmode=none holder, dropping the touch
+            // keyboard. Unlike raising, dismissal is allowed outside a user
+            // gesture. take_input_handler cannot make this call — GPUI takes
+            // and re-installs the handler transiently during every draw, and
+            // reacting there made the keyboard flicker.
+            if this.state.borrow().input_handler.is_none() && this.keyboard_input_focused() {
+                this.input_element.focus().ok();
+            }
 
             // Re-schedule for the next frame
             if let Some(ref func) = *raf_handle_inner.borrow() {
@@ -518,8 +574,8 @@ impl Drop for WebWindow {
 
         let canvas: &web_sys::Element = self.inner.canvas.as_ref();
         canvas.remove();
-        let input_element: &web_sys::Element = self.inner.input_element.as_ref();
-        input_element.remove();
+        let input_container: &web_sys::Element = self.inner.input_container.as_ref();
+        input_container.remove();
     }
 }
 
@@ -638,10 +694,16 @@ impl PlatformWindow for WebWindow {
     }
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
+        // Deliberately DOM-neutral: iOS only raises a touch keyboard for a
+        // focus() inside a trusted user gesture, and this runs during the
+        // RAF draw. The pointerup listener in events.rs owns the raise, and
+        // the RAF tick owns dismissal.
         self.inner.state.borrow_mut().input_handler = Some(input_handler);
     }
 
     fn take_input_handler(&mut self) -> Option<PlatformInputHandler> {
+        // Also DOM-neutral: GPUI takes the handler transiently during every
+        // draw, and reacting here made the keyboard flicker.
         self.inner.state.borrow_mut().input_handler.take()
     }
 

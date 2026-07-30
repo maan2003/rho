@@ -153,12 +153,15 @@ impl WebWindowInner {
         EventListenerHandle::add(self.canvas.as_ref(), event_name, handler)
     }
 
+    /// Listens on the container of the two hidden inputs, so the handler
+    /// fires no matter which of them holds focus. Only bubbling events work
+    /// here (`focus`/`blur` do not; use `focusin`/`focusout`).
     fn listen_input(
         self: &Rc<Self>,
         event_name: &'static str,
         handler: impl FnMut(JsValue) + 'static,
     ) -> EventListenerHandle {
-        EventListenerHandle::add(self.input_element.as_ref(), event_name, handler)
+        EventListenerHandle::add(self.input_container.as_ref(), event_name, handler)
     }
 
     fn listen_non_passive(
@@ -189,7 +192,13 @@ impl WebWindowInner {
         self.listen("pointerdown", move |event: JsValue| {
             let event: web_sys::PointerEvent = event.unchecked_into();
             event.prevent_default();
-            this.input_element.focus().ok();
+            // Keep DOM focus on the hidden inputs so hardware keys and IME
+            // reach us, but don't yank it off the keyboard-bearing input:
+            // that would dismiss the touch keyboard on every tap. pointerup
+            // re-decides which input should hold focus.
+            if !this.keyboard_input_focused() {
+                this.input_element.focus().ok();
+            }
 
             // Capture the pointer so drags that leave the canvas keep
             // delivering pointermove/pointerup here; otherwise a release
@@ -246,6 +255,17 @@ impl WebWindowInner {
                 modifiers,
                 click_count,
             }));
+
+            // Raise the touch keyboard here, not when the input handler is
+            // installed: iOS only honors a keyboard-raising focus() inside a
+            // trusted user gesture, and handler installation happens during
+            // the RAF draw. By pointerup the draw triggered by pointerdown's
+            // focus change has settled whether a text view holds the
+            // handler, and pointerup is still a gesture. Dismissal happens
+            // on the RAF tick, which needs no gesture.
+            if this.state.borrow().input_handler.is_some() && !this.keyboard_input_focused() {
+                this.keyboard_input_element.focus().ok();
+            }
         })
     }
 
@@ -520,14 +540,19 @@ impl WebWindowInner {
                 handler.unmark_text();
             });
             this.input_element.set_value("");
+            this.keyboard_input_element.set_value("");
         })
     }
 
     fn register_focus(self: &Rc<Self>) -> EventListenerHandle {
         let this = Rc::clone(self);
-        self.listen_input("focus", move |_event: JsValue| {
+        // `focusin`, because plain `focus` does not bubble to the container.
+        self.listen_input("focusin", move |_event: JsValue| {
             {
                 let mut state = this.state.borrow_mut();
+                if state.is_active {
+                    return;
+                }
                 state.is_active = true;
             }
             this.with_callback(
@@ -539,9 +564,22 @@ impl WebWindowInner {
 
     fn register_blur(self: &Rc<Self>) -> EventListenerHandle {
         let this = Rc::clone(self);
-        self.listen_input("blur", move |_event: JsValue| {
+        self.listen_input("focusout", move |event: JsValue| {
+            // A focus transfer between the two hidden inputs (raising or
+            // dismissing the touch keyboard) is not a window deactivation.
+            let event: web_sys::FocusEvent = event.unchecked_into();
+            let stays_within_inputs = event
+                .related_target()
+                .and_then(|target| target.dyn_into::<web_sys::Node>().ok())
+                .is_some_and(|node| this.input_container.contains(Some(&node)));
+            if stays_within_inputs {
+                return;
+            }
             {
                 let mut state = this.state.borrow_mut();
+                if !state.is_active {
+                    return;
+                }
                 state.is_active = false;
             }
             this.with_callback(
