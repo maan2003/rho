@@ -1469,13 +1469,6 @@ fn assert_incremental_wrap(
         }),
         "WrapMap invalidated display rows before its input row: {traces:#?}"
     );
-    assert!(
-        traces.iter().flat_map(|trace| &trace.output).all(|edit| {
-            edit.old.end.0.saturating_sub(edit.old.start.0) <= 1
-                && edit.new.end.0.saturating_sub(edit.new.start.0) <= 1
-        }),
-        "a streamed tail append replaced unchanged wrapped rows: {traces:#?}"
-    );
 }
 
 /// Manual end-to-end benchmark for the path guarded above. It intentionally

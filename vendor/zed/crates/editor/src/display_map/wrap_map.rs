@@ -789,11 +789,9 @@ impl WrapSnapshot {
         let mut old_cursor = self.transforms.cursor::<TransformSummary>(());
         let mut new_cursor = new_snapshot.transforms.cursor::<TransformSummary>(());
         for mut tab_edit in tab_edits.iter().cloned() {
-            // Wrapping can change from the visual row containing the edit
-            // through the end of its physical row. Keep the precise start so
-            // unchanged visual rows earlier on a long physical row are not
-            // reported as replaced.
+            tab_edit.old.start.0.column = 0;
             tab_edit.old.end.0 += Point::new(1, 0);
+            tab_edit.new.start.0.column = 0;
             tab_edit.new.end.0 += Point::new(1, 0);
 
             old_cursor.seek(&tab_edit.old.start, Bias::Right);
