@@ -1,0 +1,28 @@
+[workspace]
+
+[package]
+name = "rho-gui-web"
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "GPL-3.0-or-later"
+
+[dependencies]
+console_error_panic_hook = "0.1"
+editor = { path = "../../vendor/zed/crates/editor", default-features = false }
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false }
+gpui_platform = { path = "../../vendor/zed/crates/gpui_platform", default-features = false }
+rho-gui = { path = "../rho-gui", default-features = false }
+settings = { path = "../../vendor/zed/crates/settings" }
+theme = { path = "../../vendor/zed/crates/theme" }
+theme_settings = { path = "../../vendor/zed/crates/theme_settings" }
+zed_actions = { path = "../../vendor/zed/crates/zed_actions" }
+
+[patch.crates-io]
+iroh = { path = "../../vendor/iroh/iroh" }
+noq = { path = "../../vendor/noq/noq" }
+noq-proto = { path = "../../vendor/noq/noq-proto" }
+
+[profile.release]
+opt-level = "s"
+lto = true

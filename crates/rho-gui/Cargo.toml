@@ -119,3 +119,15 @@ libc = "0.2"
 # Enables the browser entropy backend for the Zed language-model dependency
 # graph (the same compatibility edge used by the GPUI-web spike).
 getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
+console_error_panic_hook = "0.1"
+hkdf = "0.12"
+iroh = { workspace = true, features = ["tls-ring"] }
+js-sys = "0.3"
+rho-iroh-auth.workspace = true
+rho-rpc = { workspace = true, features = ["browser-client"] }
+sha2 = "0.10"
+tokio = { version = "1", default-features = false, features = ["sync"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Crypto", "Location", "Navigator", "Storage", "Window"] }
+zeroize = "1"

@@ -13681,6 +13681,7 @@ dependencies = [
  "clock",
  "collections",
  "command_palette",
+ "console_error_panic_hook",
  "dirs",
  "editor",
  "fs",
@@ -13689,7 +13690,9 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "gpui_tokio",
+ "hkdf",
  "iroh",
+ "js-sys",
  "json-stream",
  "language",
  "languages",
@@ -13717,6 +13720,7 @@ dependencies = [
  "serde",
  "serde_json",
  "settings",
+ "sha2 0.10.9",
  "text",
  "theme",
  "theme_settings",
@@ -13729,6 +13733,10 @@ dependencies = [
  "util",
  "vim",
  "vim_mode_setting",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+ "zeroize",
 ]
 
 [[package]]

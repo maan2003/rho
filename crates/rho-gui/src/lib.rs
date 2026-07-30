@@ -7,6 +7,8 @@ pub(crate) mod chime;
 pub(crate) mod commands;
 #[cfg(feature = "native")]
 pub(crate) mod connection;
+#[cfg(all(target_family = "wasm", not(feature = "native")))]
+pub(crate) mod connection_web;
 pub mod dashboard;
 #[cfg(feature = "native")]
 pub(crate) mod diff_view;

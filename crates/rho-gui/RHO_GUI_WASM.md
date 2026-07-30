@@ -93,3 +93,24 @@ equivalent downstream defaults) so existing native behavior does not change.
     CC_wasm32_unknown_unknown=/nix/store/482i7k840pk0cmv6qhf4rf5gyah1lq8l-clang-21.1.8/bin/clang \
     CFLAGS_wasm32_unknown_unknown=-I/home/maan2003/src/rho/vendor/zed/tooling/tree_sitter_wasm/include \
     cargo check -p rho-gui --release --target wasm32-unknown-unknown --no-default-features`
+
+## Stage 2 browser application
+
+`crates/rho-gui-web` is the thin Trunk entry point. It boots `gpui_web`, loads
+Rho's assets and editor settings, and mounts `rho_gui::workspace::Workspace`.
+The browser workspace uses direct iroh (ALPN `rho/ui/3`) with the same WebAuthn
+PRF identity/enrollment flow as the existing web UI. It applies streamed agent
+frames to the shared `rho-registry` store and feeds the existing dashboard,
+`AgentModel`, transcript model, and transcript preview.
+
+Build the static bundle (release is required) with:
+
+```sh
+nix shell nixpkgs#trunk -c sh -c \
+  'cd crates/rho-gui-web && trunk build --release'
+```
+
+Open `dist/index.html` through an HTTP server with the COOP/COEP headers from
+`Trunk.toml`, using `#daemon=<daemon-endpoint-id>`. Click the unlock prompt to
+perform WebAuthn. If enrollment is required, approve the displayed code with
+`rho iroh approve <code>` and reload.
