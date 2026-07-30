@@ -350,13 +350,12 @@ fn extension_prf_enabled(credential: &JsValue) -> anyhow::Result<()> {
 }
 
 fn random_bytes(len: usize) -> anyhow::Result<Vec<u8>> {
-    let crypto = web_sys::window()
-        .ok_or_else(|| anyhow::anyhow!("browser window unavailable"))?
-        .crypto()
-        .map_err(|_| anyhow::anyhow!("browser cryptography unavailable"))?;
+    // Not `crypto.getRandomValues` on the wasm memory directly: GPUI-web
+    // builds with threads, so wasm memory is a SharedArrayBuffer, and the
+    // WebCrypto spec rejects views of shared buffers. The getrandom crate
+    // copies through a non-shared scratch buffer.
     let mut bytes = vec![0u8; len];
-    crypto
-        .get_random_values_with_u8_array(&mut bytes)
+    getrandom_02::getrandom(&mut bytes)
         .map_err(|_| anyhow::anyhow!("browser random number generation failed"))?;
     Ok(bytes)
 }

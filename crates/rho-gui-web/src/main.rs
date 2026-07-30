@@ -6,10 +6,20 @@ use rho_gui::workspace::Workspace;
 fn main() {
     console_error_panic_hook::set_once();
     gpui_platform::web_init();
-    let app = gpui_platform::application().run_embedded(|cx: &mut App| {
+    let app = gpui_platform::application()
+        .with_assets(RhoAssets)
+        .run_embedded(|cx: &mut App| {
         RhoAssets.load_fonts(cx).expect("load embedded fonts");
-        settings::init(cx);
-        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        // Mirror the native client's settings: rho defaults (Rho Font buffer
+        // font) plus the same theme the native binary writes into fresh user
+        // settings, with the full rho theme assets loaded.
+        let mut store = settings::SettingsStore::new(cx, rho_gui::rho_assets::RHO_DEFAULT_SETTINGS);
+        store
+            .set_user_settings(r#"{"theme": "Rho OKSolar P3"}"#, cx)
+            .result()
+            .expect("load web user settings");
+        cx.set_global(store);
+        theme_settings::init(theme::LoadThemes::All(Box::new(RhoAssets)), cx);
         editor::init(cx);
         cx.bind_keys([
             KeyBinding::new("left", MoveLeft, Some("Editor")),

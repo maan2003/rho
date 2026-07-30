@@ -207,19 +207,46 @@ impl Render for Workspace {
         let body = div().flex().size_full().gap_2()
             .child(div().w(px(430.)).h_full().overflow_hidden().child(self.dashboard.editor().clone()))
             .child(div().flex_1().h_full().overflow_hidden().children(self.preview.clone()));
+        let colors = cx.theme().colors();
+        let (overlay_bg, card_bg, card_border, text, text_muted) = (
+            colors.editor_background,
+            colors.element_background,
+            colors.border_variant,
+            colors.text,
+            colors.text_muted,
+        );
+        let card_style = move |content: gpui::Div| {
+            content
+                .flex().flex_col().gap_2().max_w(px(420.)).m_4().p_4()
+                .rounded_md().border_1().border_color(card_border).bg(card_bg)
+                .text_color(text).text_sm()
+        };
+        let card = move |content: gpui::Div| {
+            div().absolute().inset_0().flex().items_center().justify_center()
+                .bg(overlay_bg)
+                .child(card_style(content))
+                .into_any_element()
+        };
+        let muted = move |line: String| div().text_color(text_muted).child(line);
         let overlay = match &self.phase {
             Phase::Online => None,
-            Phase::Unlock(daemon) => Some(div().absolute().inset_0().flex().items_center().justify_center()
-                .bg(cx.theme().colors().editor_background)
-                .child(div().id("unlock").p_4().border_1().cursor_pointer().on_click(cx.listener(Self::unlock))
-                    .child(format!("Unlock browser identity and connect to {daemon}")))),
-            Phase::Connecting => Some(div().absolute().inset_0().flex().items_center().justify_center()
-                .bg(cx.theme().colors().editor_background).child("Connecting to rho-daemon…")),
-            Phase::Enroll(code) => Some(div().absolute().inset_0().flex().items_center().justify_center()
-                .bg(cx.theme().colors().editor_background)
-                .child(format!("Approve enrollment code {code}, then reload this page"))),
-            Phase::Failed(error) => Some(div().absolute().inset_0().flex().items_center().justify_center()
-                .bg(cx.theme().colors().editor_background).child(error.clone())),
+            Phase::Unlock(daemon) => Some(
+                div().id("unlock").absolute().inset_0().flex().items_center().justify_center()
+                    .bg(overlay_bg)
+                    .cursor_pointer().on_click(cx.listener(Self::unlock))
+                    .child(card_style(div()
+                        .child("Connect to rho daemon")
+                        .child(muted(format!("daemon {}", shorten_id(daemon))))
+                        .child(muted("Tap to unlock with your browser identity".into()))))
+                    .into_any_element(),
+            ),
+            Phase::Connecting => Some(card(div().child("Connecting to rho daemon…"))),
+            Phase::Enroll(code) => Some(card(div()
+                .child("This browser is not enrolled yet")
+                .child(muted(format!("Run `rho iroh approve {code}`, then reload this page"))))),
+            Phase::Failed(error) => Some(card(div()
+                .child("Connection failed")
+                .child(muted(error.clone())))),
         };
         div().id("rho-gui").relative().size_full().p(px(2.))
             .bg(cx.theme().colors().editor_background).key_context("RhoGui")
@@ -229,4 +256,14 @@ impl Render for Workspace {
 
 pub fn now_ms() -> u64 {
     js_sys::Date::now() as u64
+}
+
+/// Endpoint ids are 64 hex chars; unbroken they defeat text wrapping, so the
+/// overlays show a recognizable abbreviation instead.
+fn shorten_id(id: &str) -> String {
+    if id.len() <= 12 {
+        id.to_owned()
+    } else {
+        format!("{}…{}", &id[..8], &id[id.len() - 4..])
+    }
 }
