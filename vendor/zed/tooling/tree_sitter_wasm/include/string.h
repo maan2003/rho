@@ -11,6 +11,14 @@ void *memmove(void *dst, const void *src, size_t count);
 
 void *memset(void *dst, int value, size_t count);
 
+static inline int strcmp(const char *left, const char *right) {
+  while (*left && *left == *right) {
+    ++left;
+    ++right;
+  }
+  return (unsigned char)*left - (unsigned char)*right;
+}
+
 int strncmp(const char *left, const char *right, size_t n);
 
 size_t strlen(const char *str);
