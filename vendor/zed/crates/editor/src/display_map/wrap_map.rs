@@ -398,21 +398,20 @@ impl WrapMap {
             let (font, font_size) = self.font_with_size.clone();
             let mut line_wrapper = text_system.line_wrapper(font, font_size);
             if cfg!(not(target_family = "wasm"))
-                && should_process_edits_synchronously(
-                    pending_edits.iter().map(|(_, _, edits)| edits.as_slice()),
-                )
+                && pending_edits.len() == 1
+                && affected_row_count(&pending_edits[0].2) < WRAP_YIELD_ROW_INTERVAL
             {
-                let mut wrap_edits = Patch::default();
-                for (tab_snapshot, row_scales, tab_edits) in pending_edits {
-                    let batch_edits = gpui::block_on(snapshot.update(
-                        tab_snapshot,
-                        &tab_edits,
-                        wrap_width,
-                        &row_scales,
-                        &mut line_wrapper,
-                    ));
-                    wrap_edits = wrap_edits.compose(&batch_edits);
-                }
+                let (tab_snapshot, row_scales, tab_edits) = pending_edits
+                    .into_iter()
+                    .next()
+                    .expect("pending_edits has one item");
+                let wrap_edits = gpui::block_on(snapshot.update(
+                    tab_snapshot,
+                    &tab_edits,
+                    wrap_width,
+                    &row_scales,
+                    &mut line_wrapper,
+                ));
                 self.snapshot = snapshot;
                 self.edits_since_sync = self.edits_since_sync.compose(&wrap_edits);
             } else {
@@ -505,19 +504,6 @@ fn affected_row_count(edits: &[TabEdit]) -> usize {
     }
 
     count.saturating_add(new_end.saturating_sub(new_start) as usize)
-}
-
-fn should_process_edits_synchronously<'a>(
-    batches: impl IntoIterator<Item = &'a [TabEdit]>,
-) -> bool {
-    let mut affected_rows = 0usize;
-    for edits in batches {
-        affected_rows = affected_rows.saturating_add(affected_row_count(edits));
-        if affected_rows >= WRAP_YIELD_ROW_INTERVAL {
-            return false;
-        }
-    }
-    true
 }
 
 impl WrapSnapshot {
@@ -1549,37 +1535,6 @@ mod tests {
         ];
 
         assert_eq!(affected_row_count(&edits), 1);
-    }
-
-    #[test]
-    fn small_queued_edit_batches_stay_on_the_synchronous_path() {
-        let first = [TabEdit {
-            old: TabPoint::new(7, 2)..TabPoint::new(7, 4),
-            new: TabPoint::new(7, 2)..TabPoint::new(7, 3),
-        }];
-        let second = [TabEdit {
-            old: TabPoint::new(7, 7)..TabPoint::new(7, 9),
-            new: TabPoint::new(7, 6)..TabPoint::new(7, 7),
-        }];
-
-        assert!(should_process_edits_synchronously([
-            first.as_slice(),
-            second.as_slice()
-        ]));
-
-        let within_budget = [TabEdit {
-            old: TabPoint::new(0, 0)..TabPoint::new(98, 0),
-            new: TabPoint::new(0, 0)..TabPoint::new(98, 0),
-        }];
-        assert!(should_process_edits_synchronously([
-            within_budget.as_slice()
-        ]));
-
-        let at_budget = [TabEdit {
-            old: TabPoint::new(0, 0)..TabPoint::new(99, 0),
-            new: TabPoint::new(0, 0)..TabPoint::new(99, 0),
-        }];
-        assert!(!should_process_edits_synchronously([at_budget.as_slice()]));
     }
 
     #[gpui::test]
