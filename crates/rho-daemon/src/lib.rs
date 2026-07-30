@@ -227,6 +227,13 @@ fn spawn_octo_server(
 pub use rho_workspaces::{PathOverrides, init_daemon_namespace};
 
 const EMBEDDED_DIRENV_PATH_BEFORE: Option<&str> = option_env!("RHO_DIRENV_PATH_BEFORE");
+const FIND_DENY_ROOTS_ENV: &str = "FIND_DENY_ROOTS";
+
+fn find_deny_roots() -> OsString {
+    let home = dirs::home_dir().expect("home directory must be available");
+    std::env::join_paths([PathBuf::from("/"), PathBuf::from("/nix/store"), home])
+        .expect("protected root paths must not contain a path separator")
+}
 
 /// Nix packages can embed a directory for direnv's post-`use_flake` PATH hook.
 /// This must run before the Tokio runtime starts, because mutating the process
@@ -236,6 +243,8 @@ pub fn configure_embedded_environment() {
         // SAFETY: called by rho-daemon's main before it creates the Tokio runtime.
         unsafe { std::env::set_var("RHO_DIRENV_PATH_BEFORE", path) };
     }
+    // SAFETY: called by rho-daemon's main before it creates the Tokio runtime.
+    unsafe { std::env::set_var(FIND_DENY_ROOTS_ENV, find_deny_roots()) };
 }
 
 #[derive(Clone, Debug, clap::Args)]
@@ -312,6 +321,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     if let Some(path) = EMBEDDED_DIRENV_PATH_BEFORE {
         user_environment.push(("RHO_DIRENV_PATH_BEFORE".into(), path.into()));
     }
+    user_environment.push((FIND_DENY_ROOTS_ENV.into(), find_deny_roots()));
     configure_octo_git_transport(&mut user_environment)?;
     let user_environment = rho_workspaces::UserEnvironment::new(user_environment);
 
