@@ -432,7 +432,7 @@ fn dashboard_quiet_tail_is_one_native_display_elision(cx: &mut TestAppContext) {
         .update(cx, |workspace, window, cx| {
             dashboard.update(cx, |editor, cx| {
                 let snapshot = editor.buffer().read(cx).snapshot(cx);
-                let offset = snapshot.text().find("task 4").expect("last listed row");
+                let offset = snapshot.text().find("task 9").expect("last listed row");
                 let anchor = snapshot.anchor_before(multi_buffer::MultiBufferOffset(offset));
                 editor.change_selections(Default::default(), window, cx, |selections| {
                     selections.select_anchor_ranges([anchor..anchor]);
@@ -446,7 +446,7 @@ fn dashboard_quiet_tail_is_one_native_display_elision(cx: &mut TestAppContext) {
             assert!(matches!(
                 workspace.dashboard_cursor_target(cx),
                 Some(crate::dashboard::RowTarget::Stream {
-                    workstream_id: WorkstreamId(4),
+                    workstream_id: WorkstreamId(9),
                     ..
                 })
             ));
