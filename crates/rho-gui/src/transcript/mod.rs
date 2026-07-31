@@ -102,7 +102,7 @@ struct BlockRecord {
     visible: bool,
     text: String,
     gutter: Option<(StyleClass, Range<Anchor>)>,
-    inlay: Option<InlayRecord>,
+    inlays: Vec<InlayRecord>,
     styles: Vec<(StyleClass, Range<Anchor>)>,
     terminal_newline_supplied_by_excerpt: bool,
     visualizations: Vec<VisualizationAnchor>,
@@ -157,7 +157,7 @@ struct PlacedVisualization {
 
 type PlacedSpans = (
     Vec<Range<Anchor>>,
-    Option<InlayRecord>,
+    Vec<InlayRecord>,
     Option<(StyleClass, Range<Anchor>)>,
     Vec<VisualizationAnchor>,
 );
@@ -716,7 +716,7 @@ impl TranscriptModel {
             let edit_end = block_start + edit.old_range.end;
             buffer.edit([(edit_start..edit_end, edit.inserted.clone())], None, cx);
 
-            let (span_ranges, inlay, gutter, visualizations) =
+            let (span_ranges, inlays, gutter, visualizations) =
                 spans_for_rendered(buffer, block_start, &rendered);
             let style_end = new_text
                 .len()
@@ -739,7 +739,7 @@ impl TranscriptModel {
                 visible: rendered.visible(),
                 text: new_text,
                 gutter,
-                inlay,
+                inlays,
                 styles,
                 terminal_newline_supplied_by_excerpt,
                 visualizations,
@@ -771,7 +771,8 @@ impl TranscriptModel {
     pub fn has_timers(&self) -> bool {
         self.records
             .iter()
-            .any(|record| record.inlay.as_ref().is_some_and(InlayRecord::ticks))
+            .flat_map(|record| record.inlays.iter())
+            .any(InlayRecord::ticks)
     }
 
     fn refresh_elision_plans(&mut self, state: &UiAgentState, first_changed_block: usize) {
@@ -895,7 +896,7 @@ impl TranscriptModel {
         let desired_inlays = self
             .records
             .iter()
-            .filter_map(|record| record.inlay.as_ref())
+            .flat_map(|record| record.inlays.iter())
             .filter_map(|inlay| inlay.desired(now_ms))
             .collect::<Vec<_>>();
         #[cfg(feature = "native")]
@@ -1121,7 +1122,8 @@ fn block_record(
     rendered: RenderedBlock,
     terminal_newline_supplied_by_excerpt: bool,
 ) -> BlockRecord {
-    let (span_ranges, inlay, gutter, visualizations) = spans_for_rendered(buffer, start, &rendered);
+    let (span_ranges, inlays, gutter, visualizations) =
+        spans_for_rendered(buffer, start, &rendered);
     let text = rendered_text(&rendered);
     let style_end = text
         .len()
@@ -1138,7 +1140,7 @@ fn block_record(
         visible: rendered.visible(),
         text,
         gutter,
-        inlay,
+        inlays,
         styles,
         terminal_newline_supplied_by_excerpt,
         visualizations,
@@ -1225,14 +1227,18 @@ fn changed_style_classes(
 
 fn spans_for_rendered(buffer: &Buffer, start: usize, rendered: &RenderedBlock) -> PlacedSpans {
     let mut ranges = Vec::with_capacity(rendered.spans.len());
-    let mut inlay = None;
+    let mut inlays = Vec::new();
     let mut gutter = None;
     let mut offset = start;
     for (index, span) in rendered.spans.iter().enumerate() {
         let end = offset + span.text.len();
         let range = buffer.anchor_before(offset)..buffer.anchor_before(end);
-        if let Some(spec) = rendered.inlay.filter(|spec| spec.span_index == index) {
-            inlay = Some(InlayRecord::new(range.start, spec.content));
+        if let Some(spec) = rendered
+            .inlay
+            .as_ref()
+            .filter(|spec| spec.span_index == index)
+        {
+            inlays.push(InlayRecord::new(range.start, spec.content.clone()));
         }
         if rendered.gutter_span == Some(index) {
             let trimmed = span.text.trim_end_matches('\n').len();
@@ -1244,6 +1250,12 @@ fn spans_for_rendered(buffer: &Buffer, start: usize, rendered: &RenderedBlock) -
         ranges.push(range);
         offset = end;
     }
+    inlays.extend(rendered.table_padding.iter().map(|padding| {
+        InlayRecord::text(
+            buffer.anchor_before(start + padding.position),
+            "\t".repeat(padding.tabs),
+        )
+    }));
     let visualizations = rendered
         .visualizations
         .iter()
@@ -1254,7 +1266,7 @@ fn spans_for_rendered(buffer: &Buffer, start: usize, rendered: &RenderedBlock) -
                 ..buffer.anchor_before(start + visualization.range.end),
         })
         .collect();
-    (ranges, inlay, gutter, visualizations)
+    (ranges, inlays, gutter, visualizations)
 }
 
 fn styles_for_rendered(

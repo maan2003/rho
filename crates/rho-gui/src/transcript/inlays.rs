@@ -32,16 +32,24 @@ impl InlayRecord {
         Self { position, content }
     }
 
+    pub fn text(position: Anchor, text: String) -> Self {
+        Self {
+            position,
+            content: InlayContent::Text(text),
+        }
+    }
+
     pub fn ticks(&self) -> bool {
-        matches!(self.content, InlayContent::RunningDuration { .. })
+        matches!(&self.content, InlayContent::RunningDuration { .. })
     }
 
     pub fn desired(&self, now_ms: u64) -> Option<(Anchor, String)> {
-        let text = match self.content {
+        let text = match &self.content {
             InlayContent::RunningDuration { started_at_ms } => {
-                format_running_duration(started_at_ms, now_ms)
+                format_running_duration(*started_at_ms, now_ms)
             }
-            InlayContent::Label(label) => label.to_owned(),
+            InlayContent::Label(label) => (*label).to_owned(),
+            InlayContent::Text(text) => text.clone(),
         };
         (!text.is_empty()).then_some((self.position, text))
     }

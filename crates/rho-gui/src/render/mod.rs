@@ -44,18 +44,20 @@ pub enum BlockKind {
 
 /// An inlay position: an empty span marking where the transcript places
 /// non-buffer text (a running tool's ticking duration, a queue label).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InlaySpec {
     pub span_index: usize,
     pub content: InlayContent,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum InlayContent {
     /// Refreshed once per second while the tool runs.
     RunningDuration { started_at_ms: u64 },
     /// Fixed text, e.g. a queued message's delivery label.
     Label(&'static str),
+    /// Display-only text anchored in a transcript record.
+    Text(String),
 }
 
 #[derive(Debug)]
@@ -69,6 +71,8 @@ pub struct RenderedBlock {
     pub markdown: bool,
     /// Immutable visualization references embedded in this message.
     pub visualizations: Vec<VisualizationSpec>,
+    /// Virtual tab padding that aligns source-visible Markdown table columns.
+    pub table_padding: Vec<TablePaddingSpec>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -76,6 +80,12 @@ pub struct VisualizationSpec {
     pub range: Range<usize>,
     pub id: String,
     pub rows: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TablePaddingSpec {
+    pub position: usize,
+    pub tabs: usize,
 }
 
 impl RenderedBlock {
@@ -237,7 +247,27 @@ pub fn render_block_with_agent_labels(
             if !text.ends_with('\n') {
                 text.push('\n');
             }
+            let table_padding = if text.contains('|') {
+                table_padding(&text)
+            } else {
+                Vec::new()
+            }
+            .into_iter()
+                .map(|mut padding| {
+                    padding.position += offset;
+                    padding
+                })
+                .collect();
             spans.push(Span::new(text, StyleClass::Default));
+            return RenderedBlock {
+                spans,
+                kind,
+                gutter_span,
+                inlay,
+                markdown,
+                visualizations,
+                table_padding,
+            };
         }
         UiBlock::Reasoning { .. } => return invisible(kind),
         UiBlock::Tool(tool) => {
@@ -313,6 +343,7 @@ pub fn render_block_with_agent_labels(
         inlay,
         markdown,
         visualizations,
+        table_padding: Vec::new(),
     }
 }
 
@@ -328,7 +359,120 @@ fn invisible(kind: BlockKind) -> RenderedBlock {
         inlay: None,
         markdown: false,
         visualizations: Vec::new(),
+        table_padding: Vec::new(),
     }
+}
+
+const TABLE_TAB_WIDTH: usize = 4;
+const MAX_TABLE_WIDTH: usize = 96;
+
+fn table_padding(text: &str) -> Vec<TablePaddingSpec> {
+    let mut parser = tree_sitter::Parser::new();
+    let Ok(()) = parser.set_language(&tree_sitter_md::LANGUAGE.into()) else {
+        return Vec::new();
+    };
+    let Some(tree) = parser.parse(text, None) else {
+        return Vec::new();
+    };
+    let mut padding = Vec::new();
+    collect_table_padding(text, tree.root_node(), &mut padding);
+    padding
+}
+
+fn collect_table_padding(
+    text: &str,
+    node: tree_sitter::Node<'_>,
+    padding: &mut Vec<TablePaddingSpec>,
+) {
+    if node.kind() == "pipe_table" {
+        padding.extend(table_padding_for_node(text, node));
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_table_padding(text, child, padding);
+    }
+}
+
+fn table_padding_for_node(text: &str, table: tree_sitter::Node<'_>) -> Vec<TablePaddingSpec> {
+    let mut rows = Vec::new();
+    let mut cursor = table.walk();
+    for row in table.children(&mut cursor).filter(|node| {
+        matches!(
+            node.kind(),
+            "pipe_table_header" | "pipe_table_delimiter_row" | "pipe_table_row"
+        )
+    }) {
+        let mut cells = row.walk();
+        let boundaries = row
+            .children(&mut cells)
+            .filter(|node| matches!(node.kind(), "pipe_table_cell" | "pipe_table_delimiter_cell"))
+            .filter_map(|cell| next_pipe(text, cell.end_byte(), row.end_byte()))
+            .collect::<Vec<_>>();
+        if !boundaries.is_empty() {
+            rows.push((row.start_byte(), boundaries));
+        }
+    }
+
+    let columns = rows.iter().map(|(_, row)| row.len()).min().unwrap_or(0);
+    if columns == 0 {
+        return Vec::new();
+    }
+
+    let mut targets = Vec::with_capacity(columns);
+    for column in 0..columns {
+        let widest = rows
+            .iter()
+            .map(|(line_start, boundaries)| {
+                let previous = column
+                    .checked_sub(1)
+                    .and_then(|previous| boundaries.get(previous).copied())
+                    .unwrap_or(*line_start);
+                display_columns(&text[previous..boundaries[column]])
+            })
+            .max()
+            .unwrap_or(0);
+        let start = targets.last().copied().unwrap_or(0);
+        let target = next_tab_stop(start + widest);
+        if target > MAX_TABLE_WIDTH {
+            return Vec::new();
+        }
+        targets.push(target);
+    }
+
+    rows.into_iter()
+        .flat_map(|(line_start, boundaries)| {
+            let mut previous_target = 0;
+            let mut previous_boundary = line_start;
+            boundaries
+                .into_iter()
+                .take(columns)
+                .zip(targets.iter().copied())
+                .filter_map(move |(boundary, target)| {
+                    let current =
+                        previous_target + display_columns(&text[previous_boundary..boundary]);
+                    previous_target = target;
+                    previous_boundary = boundary;
+                    let tabs = target.saturating_sub(current).div_ceil(TABLE_TAB_WIDTH);
+                    (tabs > 0).then_some(TablePaddingSpec {
+                        position: boundary,
+                        tabs,
+                    })
+                })
+        })
+        .collect()
+}
+
+fn next_pipe(text: &str, start: usize, end: usize) -> Option<usize> {
+    text.get(start..end)?.find('|').map(|offset| start + offset)
+}
+
+fn display_columns(text: &str) -> usize {
+    text.chars().count()
+}
+
+fn next_tab_stop(column: usize) -> usize {
+    column.div_ceil(TABLE_TAB_WIDTH) * TABLE_TAB_WIDTH
 }
 
 /// Renders one tool call line: `label status [duration]`.
@@ -493,6 +637,48 @@ mod tests {
 
     fn text_of(spans: &[Span]) -> String {
         spans.iter().map(|span| span.text.as_str()).collect()
+    }
+
+    #[test]
+    fn table_padding_aligns_pipe_columns_without_changing_source() {
+        let text = "## Results\n\n| Name | Outcome |\n| --- | --- |\n| one | passed |\n| longest name | failed |\n";
+        let padding = table_padding(text);
+        assert!(!padding.is_empty());
+
+        let mut columns = Vec::new();
+        let mut line_start = 0;
+        for (index, line) in text.split_inclusive('\n').enumerate() {
+            if index < 2 {
+                line_start += line.len();
+                continue;
+            }
+            let mut column = 0;
+            let mut pipes = Vec::new();
+            for (offset, character) in line.char_indices() {
+                if let Some(padding) = padding
+                    .iter()
+                    .find(|padding| padding.position == line_start + offset)
+                {
+                    for _ in 0..padding.tabs {
+                        column += TABLE_TAB_WIDTH - column % TABLE_TAB_WIDTH;
+                    }
+                }
+                if character == '|' {
+                    pipes.push(column);
+                }
+                column += 1;
+            }
+            columns.push(pipes);
+            line_start += line.len();
+        }
+        assert_eq!(columns[0], columns[1]);
+        assert_eq!(columns[1], columns[2]);
+        assert_eq!(columns[2], columns[3]);
+    }
+
+    #[test]
+    fn table_padding_ignores_incomplete_tables() {
+        assert!(table_padding("| Name | Outcome |\n").is_empty());
     }
 
     #[test]

@@ -1225,6 +1225,78 @@ fn markdown_markup_is_hidden_on_screen_but_kept_in_the_buffer(cx: &mut TestAppCo
 }
 
 #[gpui::test]
+fn markdown_tables_align_with_virtual_tabs_but_keep_their_source(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let table = "| Name | Outcome |\n| --- | --- |\n| one | passed |\n";
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![user("show a table")],
+            vec![assistant(table, Some(UiMessagePhase::FinalAnswer))],
+        )),
+    );
+    cx.run_until_parked();
+
+    let buffer = buffer_text(&workspace, cx);
+    assert!(
+        buffer.contains(table),
+        "source should remain unchanged: {buffer:?}"
+    );
+    assert_table_pipes_align(&workspace, 3, cx);
+
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        AgentRemoteFrame::Diff {
+            blocks: UiBlocksDiff {
+                truncate_to: None,
+                updates: vec![UiBlockUpdate {
+                    index: 1,
+                    block: UiBlockDiff::AssistantText(UiTextDiff {
+                        keep_bytes: table.len(),
+                        value: "| longest name | failed |\n".to_owned(),
+                    }),
+                }],
+            },
+            status: None,
+            context_used: None,
+            usage: None,
+        },
+    );
+    cx.run_until_parked();
+    assert_table_pipes_align(&workspace, 4, cx);
+}
+
+fn assert_table_pipes_align(
+    workspace: &WindowHandle<Workspace>,
+    expected_rows: usize,
+    cx: &mut TestAppContext,
+) {
+    let rows = display_text(workspace, cx)
+        .lines()
+        .filter(|line| line.starts_with('|'))
+        .map(|line| {
+            line.chars()
+                .enumerate()
+                .filter_map(|(column, character)| (character == '|').then_some(column))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        rows.len(),
+        expected_rows,
+        "the whole table should remain visible: {rows:?}"
+    );
+    assert!(
+        rows.windows(2).all(|rows| rows[0] == rows[1]),
+        "virtual tabs should align every source pipe: {rows:?}"
+    );
+}
+
+#[gpui::test]
 fn visualization_refs_become_inline_editor_blocks(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     let tag = "```visualization\nref=0123456789abcdef0123456789abcdef rows=12\n```";
