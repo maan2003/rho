@@ -82,6 +82,12 @@ impl AgentStore {
         self.states.get(agent_id)
     }
 
+    /// Drops a retained transcript. Unlike unloading, which keeps the
+    /// snapshot readable, this is for an agent whose daemon is gone.
+    pub fn forget(&mut self, agent_id: AgentId) {
+        self.states.remove(&agent_id);
+    }
+
     pub fn mark_unloaded(&mut self, agent_id: AgentId) -> FrameSummary {
         let state = self.states.entry(agent_id).or_insert_with(empty_state);
         let was_open = turn_open(state.status);

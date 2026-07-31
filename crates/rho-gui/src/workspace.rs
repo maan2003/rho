@@ -1,9 +1,15 @@
-//! Root entity: owns the daemon connection, the canonical agent states, the
+//! Root entity: owns the attached daemons, the canonical agent states, the
 //! registry, and one persistent [`AgentModel`] per opened agent.
 //!
 //! All protocol events flow through [`Workspace`]; queued frame runs are
 //! merged per agent, and views receive summarized changes rather than the
 //! protocol itself.
+//!
+//! Several daemons can be attached at once. Agent and workstream ids are
+//! already unique across machines, so the client-side state stays keyed by
+//! id alone; what the host is needed for is routing — which socket a command
+//! travels down — and for the few places where a daemon-side *name* (a
+//! repository path, a short agent label) is only unique within one machine.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -11,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::Utf8PathBuf;
 use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedReceiver;
 use gpui::prelude::*;
@@ -24,14 +30,17 @@ use theme::ActiveTheme as _;
 
 use crate::agent_view::AgentModel;
 use crate::chime::Chime;
-use crate::connection::{AgentFrameAllocation, ConnEvent, Connection, GitApprovalDecision};
+use crate::connection::{
+    AgentFrameAllocation, ConnEvent, Connection, GitApprovalDecision, HostEvent,
+};
 use crate::draft_view::DraftModel;
+use crate::hosts::{HostStatus, Hosts};
 use crate::minibuffer::{ECHO_DURATION, Echo, Minibuffer, bottom_strip};
 use crate::pane::{PaneTree, SplitAxis, SurfaceKey};
 use crate::registry::session::{
     AgentSubscriptions, INITIAL_AGENT_SUBSCRIPTIONS, recent_workstream_roots,
 };
-use crate::registry::{ActivePane, AgentRegistry};
+use crate::registry::{ActivePane, AgentRegistry, HostId};
 use crate::store::{AgentStore, FrameSummary};
 use crate::style::{RoleFamily, StyleClass};
 use crate::zed_remote::{FileView, RemoteProject};
@@ -117,17 +126,89 @@ pub enum AttachTarget {
     },
 }
 
+impl AttachTarget {
+    /// How the host reads in chrome and error text.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Unix(path) => path.display().to_string(),
+            Self::Iroh {
+                ssh_destination, ..
+            } => format!("iroh via {ssh_destination}"),
+        }
+    }
+}
+
+/// One daemon to attach: the short name it is known by in this client, and
+/// how to reach it.
+#[derive(Clone)]
+pub struct HostSpec {
+    pub name: String,
+    pub target: AttachTarget,
+}
+
+impl HostSpec {
+    /// Parses the one-line host form used both on the command line and in
+    /// the attach prompt: `<name>=unix:<socket>` or
+    /// `<name>=iroh:<endpoint-id>@<ssh-destination>`.
+    pub fn parse(text: &str, remote_rho: &str) -> Result<Self, String> {
+        let (name, target) = text
+            .trim()
+            .split_once('=')
+            .ok_or("expected <name>=unix:<socket> or <name>=iroh:<endpoint-id>@<ssh-dest>")?;
+        if name.is_empty() {
+            return Err("host name is empty".to_owned());
+        }
+        let target = match target.split_once(':') {
+            Some(("unix", path)) => AttachTarget::Unix(PathBuf::from(path)),
+            Some(("iroh", rest)) => {
+                let (endpoint_id, ssh_destination) = rest
+                    .split_once('@')
+                    .ok_or("iroh targets are <endpoint-id>@<ssh-dest>")?;
+                AttachTarget::Iroh {
+                    endpoint_id: endpoint_id
+                        .parse()
+                        .map_err(|error| format!("invalid iroh endpoint id: {error}"))?,
+                    ssh_destination: ssh_destination.to_owned(),
+                    remote_rho: remote_rho.to_owned(),
+                }
+            }
+            _ => return Err(format!("unknown host target scheme in `{target}`")),
+        };
+        Ok(Self {
+            name: name.to_owned(),
+            target,
+        })
+    }
+}
+
+/// A working directory on a specific daemon. Two machines can both offer
+/// `/home/you/src/rho`, so a bare path never identifies a project once more
+/// than one host is attached.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostPath {
+    pub host: HostId,
+    pub path: Utf8PathBuf,
+}
+
+/// A registered project, with the daemon that offers it.
+#[derive(Clone)]
+struct HostProject {
+    host: HostId,
+    project: rho_ui_proto::UiProject,
+}
+
 pub struct Workspace {
-    connection: Connection,
+    hosts: Hosts,
     subscriptions: AgentSubscriptions,
     store: AgentStore,
     registry: AgentRegistry,
     models: HashMap<AgentId, Entity<AgentModel>>,
-    /// Weak project cache keyed by daemon-side workspace identity. Artifact
-    /// surfaces hold the strong references; when the last file/diff closes,
-    /// the remote channel and cache entry naturally expire.
+    /// Weak project cache keyed by daemon-side workspace identity, qualified
+    /// by host — the same repository path on two machines is two projects.
+    /// Artifact surfaces hold the strong references; when the last file/diff
+    /// closes, the remote channel and cache entry naturally expire.
     remote_projects: HashMap<
-        rho_ui_proto::WorkspaceInfo,
+        (HostId, rho_ui_proto::WorkspaceInfo),
         gpui::WeakEntity<crate::zed_remote::RemoteProjectState>,
     >,
     pending_diff_loads: HashMap<AgentId, Task<()>>,
@@ -140,9 +221,9 @@ pub struct Workspace {
     pending_frames: Vec<PendingAgentFrame>,
     frame_flush_scheduled: bool,
     draft_model: Entity<DraftModel>,
-    /// Registered workdirs from the daemon; selection vocabulary for new
-    /// agents.
-    workdirs: Vec<rho_ui_proto::UiProject>,
+    /// Registered workdirs from every attached daemon; selection vocabulary
+    /// for new agents, and what decides which host a new agent lands on.
+    workdirs: Vec<HostProject>,
     /// Workstream the draft inherits context from: whichever was focused
     /// when the draft was entered. Only used to derive the default workdir —
     /// a submitted draft always founds its own workstream.
@@ -153,13 +234,19 @@ pub struct Workspace {
     /// A NewAgent request from the draft is in flight; the draft buffer is
     /// kept intact until the daemon confirms creation, so a rejected request
     /// (bad working directory, say) never loses the message.
-    awaiting_draft_agent: bool,
-    connected: bool,
-    connection_status: Option<ConnectionStatus>,
-    quota_summaries: Vec<rho_ui_proto::QuotaSummary>,
-    quota_history: Vec<rho_ui_proto::QuotaSeries>,
+    /// Which host the pending draft agent was sent to, so its confirmation
+    /// can be recognized and the compose surface reset.
+    awaiting_draft_agent: Option<HostId>,
+    /// Hosts that have delivered at least one `Ready`. A host attaches
+    /// blind; until it answers, its agents do not exist for this client.
+    ready_hosts: HashSet<HostId>,
+    /// Per-host quota and usage answers. The chrome merges them (the
+    /// binding constraint is whichever host has least headroom); keeping
+    /// them apart means one host's refresh never blanks another's.
+    quota_summaries: HashMap<HostId, Vec<rho_ui_proto::QuotaSummary>>,
+    quota_history: HashMap<HostId, Vec<rho_ui_proto::QuotaSeries>>,
     quota_history_days: u64,
-    global_usage: Vec<rho_ui_proto::AgentUsageSeries>,
+    global_usage: HashMap<HostId, Vec<rho_ui_proto::AgentUsageSeries>>,
     global_usage_days: u64,
     duration_timer: Option<Task<()>>,
     /// Attention chime output; lazily opened on the first play.
@@ -206,6 +293,11 @@ pub struct Workspace {
     realtime_task: Option<Task<()>>,
     realtime_stop: Option<tokio::sync::oneshot::Sender<()>>,
     iris_muted: bool,
+    /// The daemon running the voice session. Iris delegates to an agent by
+    /// id, and an id from another daemon means nothing there, so the session
+    /// binds to one host; selecting an agent elsewhere leaves it without
+    /// context rather than sending a foreign id.
+    iris_host: Option<HostId>,
     /// Current semantic agent context sampled by Iris when each utterance
     /// delegates. Shared with the long-lived realtime task.
     iris_context_agent: Arc<Mutex<Option<AgentId>>>,
@@ -221,11 +313,6 @@ struct PendingAgentFrame {
     allocation: Option<AgentFrameAllocation>,
 }
 
-enum ConnectionStatus {
-    Recovering(Duration),
-    Disconnected(String),
-}
-
 /// Which workstream operation a transient prompt collects a name for.
 #[derive(Clone, Copy)]
 pub enum WorkstreamPrompt {
@@ -238,7 +325,7 @@ pub enum WorkstreamPrompt {
 
 #[derive(Clone)]
 struct NewAgentDraft {
-    workdir: Option<Utf8PathBuf>,
+    workdir: Option<HostPath>,
     workspace: DraftWorkspace,
     role: String,
 }
@@ -304,12 +391,12 @@ impl WorkstreamPrompt {
 }
 
 impl Workspace {
-    pub fn new(attach_target: AttachTarget, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (connection, events) = crate::connection::spawn(attach_target, cx);
+    pub fn new(specs: Vec<HostSpec>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let (hosts, events) = Hosts::new();
         let workspace = cx.entity().downgrade();
         let draft_model = cx.new(|cx| DraftModel::new(workspace, cx));
         let event_task = cx.spawn(async move |this, cx| {
-            let mut events: UnboundedReceiver<ConnEvent> = events;
+            let mut events: UnboundedReceiver<HostEvent> = events;
             while let Some(event) = events.next().await {
                 let mut batch = vec![event];
                 while let Ok(event) = events.try_recv() {
@@ -351,7 +438,7 @@ impl Workspace {
             },
         );
         let mut this = Self {
-            connection,
+            hosts,
             subscriptions: AgentSubscriptions::default(),
             store: AgentStore::default(),
             registry: AgentRegistry::default(),
@@ -365,13 +452,12 @@ impl Workspace {
             workdirs: Vec::new(),
             draft_workstream: None,
             new_agent_draft: None,
-            awaiting_draft_agent: false,
-            connected: false,
-            connection_status: None,
-            quota_summaries: Vec::new(),
-            quota_history: Vec::new(),
+            awaiting_draft_agent: None,
+            ready_hosts: HashSet::new(),
+            quota_summaries: HashMap::new(),
+            quota_history: HashMap::new(),
             quota_history_days: 7,
-            global_usage: Vec::new(),
+            global_usage: HashMap::new(),
             global_usage_days: 7,
             duration_timer: None,
             chime: Chime::default(),
@@ -392,10 +478,14 @@ impl Workspace {
             realtime_task: None,
             realtime_stop: None,
             iris_muted: false,
+            iris_host: None,
             iris_context_agent: Arc::new(Mutex::new(None)),
             _event_task: event_task,
             _dashboard_subscription: dashboard_subscription,
         };
+        for spec in specs {
+            this.attach_host(spec, cx);
+        }
         let draft = this.make_surface(SurfaceKey::Draft, window, cx);
         this.display_surface(draft);
         this.seed_draft(false, window, cx);
@@ -403,6 +493,129 @@ impl Workspace {
         let dashboard_focus = this.dashboard.focus_handle(cx);
         window.focus(&dashboard_focus, cx);
         this
+    }
+
+    /// Attaches a daemon. The name is registered with the registry first so
+    /// that labels and chrome can qualify by host from the moment the host
+    /// exists, not only once it answers.
+    pub(crate) fn attach_host(&mut self, spec: HostSpec, cx: &App) -> HostId {
+        let host = self.hosts.attach(spec.name.clone(), spec.target, cx);
+        self.registry.attach_host(host, spec.name);
+        host
+    }
+
+    /// Forgets a daemon: its transcripts, surfaces, and cached projects go
+    /// with it, and its connection is torn down by the drop.
+    pub(crate) fn detach_host(
+        &mut self,
+        host: HostId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let departed = self
+            .registry
+            .known_agents()
+            .copied()
+            .filter(|agent_id| self.registry.host_of_agent(*agent_id) == Some(host))
+            .collect::<Vec<_>>();
+        let contexts = self
+            .registry
+            .workstreams()
+            .iter()
+            .filter(|workstream| workstream.host == host)
+            .map(|workstream| ContextId::Task(workstream.workstream_id))
+            .collect::<HashSet<_>>();
+        if self.iris_host == Some(host) {
+            self.stop_iris();
+        }
+        self.hosts.detach(host);
+        self.ready_hosts.remove(&host);
+        self.quota_summaries.remove(&host);
+        self.quota_history.remove(&host);
+        self.global_usage.remove(&host);
+        self.workdirs.retain(|workdir| workdir.host != host);
+        self.remote_projects.retain(|(owner, _), _| *owner != host);
+        self.registry.detach_host(host);
+        for agent_id in departed {
+            self.subscriptions.forget(agent_id);
+            self.store.forget(agent_id);
+            self.models.remove(&agent_id);
+            self.pending_syncs.remove(&agent_id);
+            self.pending_diff_loads.remove(&agent_id);
+        }
+        self.contexts
+            .retain(|context, _| !contexts.contains(context));
+        self.surfaces
+            .retain(|context, _| !contexts.contains(context));
+        if !self.contexts.contains_key(&self.active_context) {
+            self.active_context = ContextId::Draft;
+            let draft = self.make_surface(SurfaceKey::Draft, window, cx);
+            self.display_surface(draft);
+            self.focus_active_surface(window, cx);
+        }
+        self.refresh_draft_agent_targets(cx);
+        self.dashboard_dirty = true;
+        cx.notify();
+    }
+
+    /// The daemon an agent lives on. `None` only before its first summary or
+    /// creation notice has landed.
+    fn host_of(&self, agent_id: AgentId) -> Option<HostId> {
+        self.registry.host_of_agent(agent_id)
+    }
+
+    fn connection_for(&self, agent_id: AgentId) -> Option<&Connection> {
+        self.hosts.connection(self.host_of(agent_id)?)
+    }
+
+    /// Routes an agent-scoped command to the daemon that owns the agent.
+    /// Commands for an agent whose host is unknown or gone are dropped: the
+    /// daemon that could act on it is not there to hear them.
+    fn send_to_agent(&self, agent_id: AgentId, message: ClientMessage) {
+        if let Some(connection) = self.connection_for(agent_id) {
+            connection.send(message);
+        }
+    }
+
+    fn send_to_workstream(
+        &self,
+        workstream_id: rho_ui_proto::WorkstreamId,
+        message: ClientMessage,
+    ) {
+        if let Some(connection) = self
+            .registry
+            .host_of_workstream(workstream_id)
+            .and_then(|host| self.hosts.connection(host))
+        {
+            connection.send(message);
+        }
+    }
+
+    /// Whether the daemon behind an agent is answering. Acting on an agent
+    /// whose own host is down must fail even when other hosts are fine.
+    fn agent_online(&self, agent_id: AgentId) -> bool {
+        self.host_of(agent_id)
+            .is_some_and(|host| self.hosts.is_online(host))
+    }
+
+    /// Any daemon answering: the precondition for actions that choose their
+    /// host from user input rather than an existing agent.
+    fn connected(&self) -> bool {
+        self.hosts.any_online()
+    }
+
+    fn host_label(&self, host: HostId) -> String {
+        self.registry.host_name(host).to_owned()
+    }
+
+    /// Qualifies a daemon-side name with its host, but only when there is
+    /// more than one host for it to be confused with.
+    fn qualify(&self, host: HostId, name: &str) -> String {
+        if self.hosts.len() > 1 {
+            format!("{}/{name}", self.host_label(host))
+        } else {
+            name.to_owned()
+        }
     }
 
     fn active_tree(&self) -> &PaneTree<Surface> {
@@ -448,11 +661,11 @@ impl Workspace {
 
     pub(crate) fn handle_events(
         &mut self,
-        events: Vec<ConnEvent>,
+        events: Vec<HostEvent>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        for event in events {
+        for HostEvent { host, event } in events {
             match event {
                 ConnEvent::Frame {
                     agent_id,
@@ -461,9 +674,12 @@ impl Workspace {
                 } => self.queue_frame(agent_id, frame, allocation, window, cx),
                 event => {
                     // Preserve protocol order: a control event always sees
-                    // all preceding agent state before it is handled.
+                    // all preceding agent state before it is handled. Frames
+                    // are queued per agent and agents never move between
+                    // hosts, so batching across hosts cannot reorder one
+                    // agent's stream.
                     self.flush_pending_frames(window, cx);
-                    self.handle_event(event, window, cx);
+                    self.handle_event(host, event, window, cx);
                 }
             }
         }
@@ -609,6 +825,7 @@ impl Workspace {
 
     pub(crate) fn handle_event(
         &mut self,
+        host: HostId,
         event: ConnEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -622,8 +839,11 @@ impl Workspace {
                 machine_seed,
                 agent_counter,
             } => {
-                let first_ready = !self.connected;
+                let first_ready = self.ready_hosts.insert(host);
                 let retained_selection = self.registry.selected_agent().copied();
+                // Each host seeds its own initial subscriptions: a second
+                // daemon attaching later deserves the same warm start as the
+                // first, without disturbing what is already subscribed.
                 let initial_subscriptions = first_ready.then(|| {
                     recent_workstream_roots(
                         &workstreams,
@@ -632,13 +852,16 @@ impl Workspace {
                         INITIAL_AGENT_SUBSCRIPTIONS,
                     )
                 });
-                self.registry.set_machine_seed(machine_seed);
-                self.registry.set_agent_counter(agent_counter);
-                self.registry.set_data(workstreams, agents);
+                self.registry
+                    .set_host_data(host, machine_seed, agent_counter, workstreams, agents);
                 self.prune_contexts();
-                self.workdirs = workdirs;
-                self.connected = true;
-                self.connection_status = None;
+                self.workdirs.retain(|workdir| workdir.host != host);
+                self.workdirs.extend(
+                    workdirs
+                        .into_iter()
+                        .map(|project| HostProject { host, project }),
+                );
+                self.hosts.set_status(host, HostStatus::Online);
                 self.refresh_draft_agent_targets(cx);
                 if first_ready && matches!(self.registry.active_pane(), ActivePane::Startup) {
                     // The startup scaffold guessed before daemon data existed;
@@ -648,13 +871,13 @@ impl Workspace {
                 if let Some(agent_ids) = initial_subscriptions
                     && !agent_ids.is_empty()
                 {
-                    self.set_initial_subscriptions(agent_ids, cx);
+                    self.set_initial_subscriptions(host, agent_ids, cx);
                 }
                 self.update_statuses(cx);
                 cx.notify();
             }
             ConnEvent::WorkstreamCreated(workstream) => {
-                self.registry.add_workstream(workstream);
+                self.registry.add_workstream(host, workstream);
                 self.refresh_draft_agent_targets(cx);
                 cx.notify();
             }
@@ -662,10 +885,11 @@ impl Workspace {
                 agent_id,
                 workstream,
             } => {
-                self.registry.note_agent_workstream(agent_id, workstream);
+                self.registry
+                    .note_agent_workstream(host, agent_id, workstream);
                 self.registry.mark_known(agent_id);
-                if self.awaiting_draft_agent {
-                    self.awaiting_draft_agent = false;
+                if self.awaiting_draft_agent == Some(host) {
+                    self.awaiting_draft_agent = None;
                     self.subscribe_agent(agent_id, cx);
                     // The draft became this agent: reset the compose surface
                     // and follow the new agent.
@@ -770,45 +994,48 @@ impl Workspace {
                 used_percent,
                 reset_at_unix,
             } => {
-                self.quota_summaries = vec![rho_ui_proto::QuotaSummary {
-                    model: "gpt".to_owned(),
-                    remaining_percent: 100u8
-                        .saturating_sub(used_percent.clamp(0.0, 100.0).round() as u8),
-                    burn_10m: 0,
-                    burn_2h: 0,
-                    burn_1d: 0,
-                    burn_3d: 0,
-                    reset_at_unix: Some(reset_at_unix),
-                }];
+                self.quota_summaries.insert(
+                    host,
+                    vec![rho_ui_proto::QuotaSummary {
+                        model: "gpt".to_owned(),
+                        remaining_percent: 100u8
+                            .saturating_sub(used_percent.clamp(0.0, 100.0).round() as u8),
+                        burn_10m: 0,
+                        burn_2h: 0,
+                        burn_1d: 0,
+                        burn_3d: 0,
+                        reset_at_unix: Some(reset_at_unix),
+                    }],
+                );
                 cx.notify();
             }
             ConnEvent::QuotaUsage(summaries) => {
-                self.quota_summaries = summaries;
+                self.quota_summaries.insert(host, summaries);
                 cx.notify();
             }
             ConnEvent::QuotaHistory(series) => {
-                self.quota_history = series;
+                self.quota_history.insert(host, series);
                 if self
                     .transient
                     .as_ref()
                     .is_some_and(|transient| transient.title() == "rate limit")
                 {
                     self.transient = Some(crate::transient::usage_menu(
-                        self.quota_history.clone(),
+                        self.merged_quota_history(),
                         self.quota_history_days,
                     ));
                 }
                 cx.notify();
             }
             ConnEvent::GlobalUsage(series) => {
-                self.global_usage = series;
+                self.global_usage.insert(host, series);
                 if self
                     .transient
                     .as_ref()
                     .is_some_and(|transient| transient.title() == "model cost")
                 {
                     self.transient = Some(crate::transient::global_usage_menu(
-                        self.global_usage.clone(),
+                        self.merged_global_usage(),
                         self.global_usage_days,
                     ));
                 } else if self
@@ -817,7 +1044,7 @@ impl Workspace {
                     .is_some_and(|transient| transient.title() == "model usage share")
                 {
                     self.transient = Some(crate::transient::usage_share_menu(
-                        self.global_usage.clone(),
+                        self.merged_global_usage(),
                         self.global_usage_days,
                     ));
                 }
@@ -832,20 +1059,23 @@ impl Workspace {
             ConnEvent::ServerError(message) => {
                 // A failed creation keeps the draft buffers; the user fixes
                 // the workdir and submits again.
-                self.awaiting_draft_agent = false;
+                if self.awaiting_draft_agent == Some(host) {
+                    self.awaiting_draft_agent = None;
+                }
+                let source = self.error_source(host);
                 self.notice_on(
                     None,
-                    &format!("[rho daemon error: {message}]"),
+                    &format!("[{source} error: {message}]"),
                     StyleClass::SystemImportant,
                     cx,
                 );
             }
             ConnEvent::Recovering(elapsed) => {
-                self.connection_status = Some(ConnectionStatus::Recovering(elapsed));
+                self.hosts.set_status(host, HostStatus::Recovering(elapsed));
                 cx.notify();
             }
             ConnEvent::Recovered => {
-                self.connection_status = None;
+                self.hosts.set_status(host, HostStatus::Online);
                 cx.notify();
             }
             ConnEvent::Disconnected(reason) => {
@@ -858,9 +1088,20 @@ impl Workspace {
                 if had_git_approval {
                     self.finish_overlay_focus(window, cx);
                 }
-                self.connected = false;
-                self.connection_status = Some(ConnectionStatus::Disconnected(reason.clone()));
-                self.awaiting_draft_agent = false;
+                // The host's agents stay in the rail with their retained
+                // transcripts: losing a connection is not losing the work.
+                // Only detaching (`space h d`) forgets a daemon.
+                self.hosts
+                    .set_status(host, HostStatus::Disconnected(reason.clone()));
+                // A later reconnect is a fresh session for this host, and
+                // earns the same warm start its first `Ready` did.
+                self.ready_hosts.remove(&host);
+                if self.awaiting_draft_agent == Some(host) {
+                    self.awaiting_draft_agent = None;
+                }
+                if self.iris_host == Some(host) {
+                    self.stop_iris();
+                }
                 self.update_statuses(cx);
                 cx.notify();
             }
@@ -874,14 +1115,23 @@ impl Workspace {
                     || self.pending_git_approval.is_some()
                 {
                     let _ = response.send(GitApprovalDecision::Deny);
+                    let source = self.error_source(host);
                     self.notice_on(
                         None,
-                        "[SSH Git request denied: another prompt is active]",
+                        &format!(
+                            "[SSH Git request from {source} denied: another prompt is active]"
+                        ),
                         StyleClass::SystemImportant,
                         cx,
                     );
                     return;
                 }
+                // The prompt names its host: approving an SSH Git operation
+                // is a decision about which machine reaches out.
+                let prompt = match self.hosts.len() > 1 {
+                    true => format!("{}: {prompt}", self.host_label(host)),
+                    false => prompt,
+                };
                 self.pending_git_approval = Some(PendingGitApproval {
                     request_id,
                     prompt,
@@ -906,6 +1156,102 @@ impl Workspace {
                 }
             }
         }
+    }
+
+    /// How a daemon names itself in error text: bare when it is the only
+    /// one, otherwise by host.
+    fn error_source(&self, host: HostId) -> String {
+        match self.hosts.len() > 1 {
+            true => format!("rho daemon {}", self.host_label(host)),
+            false => "rho daemon".to_owned(),
+        }
+    }
+
+    /// Quota headroom across hosts. Hosts usually share one account and
+    /// report the same figures; where they differ, the binding constraint is
+    /// whichever has least left, so the masthead shows the minimum.
+    fn merged_quota_summaries(&self) -> Vec<rho_ui_proto::QuotaSummary> {
+        let mut merged: Vec<rho_ui_proto::QuotaSummary> = Vec::new();
+        for summary in self.quota_summaries.values().flatten() {
+            match merged
+                .iter_mut()
+                .find(|existing| existing.model == summary.model)
+            {
+                Some(existing) if summary.remaining_percent < existing.remaining_percent => {
+                    *existing = summary.clone();
+                }
+                Some(_) => {}
+                None => merged.push(summary.clone()),
+            }
+        }
+        merged
+    }
+
+    /// Per-model remaining-headroom history, again taking the tightest host
+    /// at each observation so the chart tracks the real constraint.
+    fn merged_quota_history(&self) -> Vec<rho_ui_proto::QuotaSeries> {
+        let mut merged: Vec<rho_ui_proto::QuotaSeries> = Vec::new();
+        for series in self.quota_history.values().flatten() {
+            let Some(existing) = merged
+                .iter_mut()
+                .find(|existing| existing.model == series.model)
+            else {
+                merged.push(series.clone());
+                continue;
+            };
+            for point in &series.points {
+                match existing
+                    .points
+                    .iter_mut()
+                    .find(|candidate| candidate.observed_at_ms == point.observed_at_ms)
+                {
+                    Some(candidate) if point.remaining_percent < candidate.remaining_percent => {
+                        *candidate = *point;
+                    }
+                    Some(_) => {}
+                    None => existing.points.push(*point),
+                }
+            }
+            existing.points.sort_by_key(|point| point.observed_at_ms);
+        }
+        merged
+    }
+
+    /// Spend and token usage sum across hosts: unlike quota headroom, cost
+    /// incurred on two machines is cost incurred twice.
+    fn merged_global_usage(&self) -> Vec<rho_ui_proto::AgentUsageSeries> {
+        let mut merged: Vec<rho_ui_proto::AgentUsageSeries> = Vec::new();
+        for series in self.global_usage.values().flatten() {
+            let Some(existing) = merged
+                .iter_mut()
+                .find(|existing| existing.model == series.model)
+            else {
+                merged.push(series.clone());
+                continue;
+            };
+            for bucket in &series.buckets {
+                match existing
+                    .buckets
+                    .iter_mut()
+                    .find(|candidate| candidate.bucket_start_ms == bucket.bucket_start_ms)
+                {
+                    Some(candidate) => {
+                        candidate.input_tokens += bucket.input_tokens;
+                        candidate.cache_read_tokens += bucket.cache_read_tokens;
+                        candidate.cache_write_tokens += bucket.cache_write_tokens;
+                        candidate.cache_write_1h_tokens += bucket.cache_write_1h_tokens;
+                        candidate.output_tokens += bucket.output_tokens;
+                        candidate.requests += bucket.requests;
+                        candidate.approximate |= bucket.approximate;
+                    }
+                    None => existing.buckets.push(bucket.clone()),
+                }
+            }
+            existing
+                .buckets
+                .sort_by_key(|bucket| bucket.bucket_start_ms);
+        }
+        merged
     }
 
     fn submit_prompt(&mut self, _: &SubmitPrompt, window: &mut Window, cx: &mut Context<Self>) {
@@ -940,27 +1286,89 @@ impl Workspace {
     fn toggle_voice(&mut self, _: &VoiceToggle, _: &mut Window, cx: &mut Context<Self>) {
         if self.realtime_task.is_some() {
             self.iris_muted = true;
-            if let Some(stop) = self.realtime_stop.take() {
-                let _ = stop.send(());
-            }
+            self.stop_iris();
             self.notice_on(None, "muting Iris…", StyleClass::SystemInfo, cx);
             return;
         }
         self.iris_muted = false;
-        self.start_iris(cx);
+        // Voice follows what the user is looking at: start Iris on the
+        // selected agent's daemon, so its delegations land where the work is.
+        let host = self
+            .registry
+            .selected_agent()
+            .copied()
+            .and_then(|agent_id| self.host_of(agent_id))
+            .filter(|host| self.hosts.is_online(*host))
+            .or_else(|| self.hosts.primary());
+        self.start_iris(host, cx);
     }
 
-    fn start_iris(&mut self, cx: &mut Context<Self>) {
+    fn stop_iris(&mut self) {
+        if let Some(stop) = self.realtime_stop.take() {
+            let _ = stop.send(());
+        }
+    }
+
+    /// Moves the voice session to another daemon: Iris delegates by agent id,
+    /// and an id minted on one daemon means nothing on another, so the
+    /// session is torn down and reopened rather than re-pointed.
+    pub(crate) fn cmd_iris_follow_selection(&mut self, cx: &mut Context<Self>) {
+        let Some(host) = self
+            .registry
+            .selected_agent()
+            .copied()
+            .and_then(|agent_id| self.host_of(agent_id))
+        else {
+            self.notice_on(
+                None,
+                "iris: no agent selected to follow",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        if self.iris_host == Some(host) {
+            return;
+        }
+        let name = self.host_label(host);
+        self.iris_muted = false;
+        if self.realtime_task.is_some() {
+            // The restart path in `start_iris` reopens on `iris_host`.
+            self.iris_host = Some(host);
+            self.stop_iris();
+        } else {
+            self.start_iris(Some(host), cx);
+        }
+        self.notice_on(
+            None,
+            &format!("moving Iris to {name}…"),
+            StyleClass::SystemInfo,
+            cx,
+        );
+    }
+
+    fn start_iris(&mut self, host: Option<HostId>, cx: &mut Context<Self>) {
         if self.realtime_task.is_some() {
             return;
         }
+        let Some(host) = host.or(self.iris_host).or_else(|| self.hosts.primary()) else {
+            self.notice_on(None, "iris: no daemon attached", StyleClass::SystemInfo, cx);
+            return;
+        };
+        let Some(connection) = self.hosts.connection(host) else {
+            return;
+        };
         let context_agent = Arc::clone(&self.iris_context_agent);
         let (stop, stop_rx) = tokio::sync::oneshot::channel();
-        let task = self
-            .connection
-            .start_native_realtime(context_agent, stop_rx, cx);
+        let task = connection.start_native_realtime(context_agent, stop_rx, cx);
+        self.iris_host = Some(host);
         self.realtime_stop = Some(stop);
-        self.notice_on(None, "starting Iris…", StyleClass::SystemInfo, cx);
+        self.sync_iris_context();
+        let starting = match self.hosts.len() > 1 {
+            true => format!("starting Iris on {}…", self.host_label(host)),
+            false => "starting Iris…".to_owned(),
+        };
+        self.notice_on(None, &starting, StyleClass::SystemInfo, cx);
         self.realtime_task = Some(cx.spawn(async move |this, cx| {
             let result = match task.await {
                 Ok(result) => result,
@@ -977,11 +1385,27 @@ impl Workspace {
                     Err(error) => format!("Iris failed: {error:#}"),
                 };
                 this.notice_on(None, &message, StyleClass::SystemInfo, cx);
-                if this.connected && !this.iris_muted {
-                    this.start_iris(cx);
+                let host = this.iris_host.filter(|host| this.hosts.is_online(*host));
+                if host.is_some() && !this.iris_muted {
+                    this.start_iris(host, cx);
                 }
             });
         }));
+    }
+
+    /// Publishes the selected agent to the running voice session, but only
+    /// when it lives on Iris's own daemon: sending an id the session's
+    /// daemon cannot resolve would delegate into nothing.
+    fn sync_iris_context(&self) {
+        let agent_id = self
+            .registry
+            .selected_agent()
+            .copied()
+            .filter(|agent_id| self.host_of(*agent_id) == self.iris_host);
+        *self
+            .iris_context_agent
+            .lock()
+            .expect("Iris context mutex poisoned") = agent_id;
     }
 
     fn shell_eof(&mut self, _: &ShellEof, _: &mut Window, cx: &mut Context<Self>) {
@@ -1006,7 +1430,7 @@ impl Workspace {
         content: Vec<ContentPart>,
         cx: &mut Context<Self>,
     ) {
-        if !self.connected {
+        if !self.connected() {
             self.notice_on(
                 Some(&agent_id),
                 "not connected to rho-daemon",
@@ -1015,11 +1439,14 @@ impl Workspace {
             );
             return;
         }
-        self.connection.send(ClientMessage::SendUserMessage {
+        self.send_to_agent(
             agent_id,
-            content,
-            delivery: MessageDelivery::NextRequest,
-        });
+            ClientMessage::SendUserMessage {
+                agent_id,
+                content,
+                delivery: MessageDelivery::NextRequest,
+            },
+        );
         // Engagement bump: keeps display-time staleness correct between
         // topic refreshes (the daemon persists the same timestamp).
         self.registry.touch_agent(agent_id);
@@ -1040,7 +1467,7 @@ impl Workspace {
             }
             return;
         };
-        if !self.connected {
+        if !self.connected() {
             self.notice_on(
                 None,
                 "not connected to rho-daemon",
@@ -1050,10 +1477,18 @@ impl Workspace {
             return;
         }
         let field = self.draft_model.read(cx).workdir_text(cx).trim().to_owned();
-        let working_directory = (!field.is_empty())
-            .then(|| self.resolve_workdir_path(Utf8PathBuf::from(field)))
-            .or_else(|| self.draft_default_workdir());
-        let start = {
+        let working_directory = if field.is_empty() {
+            self.draft_default_workdir()
+        } else {
+            match self.resolve_workdir(&field) {
+                Ok(workdir) => Some(workdir),
+                Err(message) => {
+                    self.notice_on(None, &message, StyleClass::SystemInfo, cx);
+                    return;
+                }
+            }
+        };
+        let (host, start) = {
             let draft = self.draft_model.read(cx);
             let mode = draft.start_mode();
             let target = draft.start_text(cx).trim().to_owned();
@@ -1072,15 +1507,18 @@ impl Workspace {
                 return;
             }
         };
-        self.awaiting_draft_agent = true;
+        self.awaiting_draft_agent = Some(host);
         // Every top-level agent founds its own workstream; the daemon names
         // it from the agent's generated title.
-        self.connection.send(ClientMessage::NewAgent {
-            workstream: None,
-            role,
-            start,
-            content: Some(content),
-        });
+        self.hosts.send(
+            host,
+            ClientMessage::NewAgent {
+                workstream: None,
+                role,
+                start,
+                content: Some(content),
+            },
+        );
     }
 
     fn paste_prompt(&mut self, _: &PastePrompt, window: &mut Window, cx: &mut Context<Self>) {
@@ -1205,8 +1643,8 @@ impl Workspace {
         &self,
         mode: crate::draft_view::StartFieldMode,
         target: &str,
-        workdir: Option<Utf8PathBuf>,
-    ) -> Result<rho_ui_proto::StartMode, String> {
+        workdir: Option<HostPath>,
+    ) -> Result<(HostId, rho_ui_proto::StartMode), String> {
         use rho_ui_proto::{JoinTarget, StartMode, WorkspaceInfo};
 
         use crate::draft_view::StartFieldMode;
@@ -1217,12 +1655,35 @@ impl Workspace {
                     .to_owned()
             })
         };
-        let workspace = self
-            .registry
-            .agent_by_label(target)
+        // An agent target settles the host by itself: the new agent shares
+        // that agent's repository, which only exists on that agent's daemon.
+        // Where the workdir also names a host, the two must agree — nothing
+        // downstream could reconcile a checkout on one machine with a base
+        // revision on another.
+        let base_agent = self.registry.agent_by_label(target);
+        let host = match (
+            base_agent.and_then(|agent_id| self.host_of(agent_id)),
+            &workdir,
+        ) {
+            (Some(base), Some(workdir)) if base != workdir.host => {
+                return Err(format!(
+                    "`{target}` is on {}, but the working directory is on {}: \
+                     an agent cannot start from a base on another host",
+                    self.host_label(base),
+                    self.host_label(workdir.host),
+                ));
+            }
+            (Some(base), _) => base,
+            (None, Some(workdir)) => workdir.host,
+            (None, None) => self
+                .hosts
+                .primary()
+                .ok_or_else(|| "not connected to rho-daemon".to_owned())?,
+        };
+        let workspace = base_agent
             .and_then(|agent_id| self.registry.agent_workspace(agent_id))
             .cloned();
-        Ok(match (mode, target, workspace) {
+        let start = match (mode, target, workspace) {
             (StartFieldMode::Sandbox, "", _) => {
                 return Err("pick a sandbox base: a revset like `@-` or an agent label".to_owned());
             }
@@ -1241,7 +1702,7 @@ impl Workspace {
                 }
             }
             (StartFieldMode::Sandbox, _, None) => StartMode::Sandbox {
-                repo: require_workdir()?,
+                repo: require_workdir()?.path,
                 revset: if target.eq_ignore_ascii_case(crate::draft_view::DEFAULT_START) {
                     crate::draft_view::AUTO_BASE_REVSET
                 } else {
@@ -1280,7 +1741,7 @@ impl Workspace {
                     return Err(format!("no agent named `{target}`"));
                 }
                 StartMode::NewOn {
-                    repo: require_workdir()?,
+                    repo: require_workdir()?.path,
                     revset: if target.eq_ignore_ascii_case(crate::draft_view::DEFAULT_START) {
                         crate::draft_view::AUTO_BASE_REVSET
                     } else {
@@ -1295,7 +1756,7 @@ impl Workspace {
             (StartFieldMode::Join, target, None) => {
                 if target.is_empty() || target.eq_ignore_ascii_case("user") {
                     StartMode::Join(JoinTarget::User {
-                        repo: require_workdir()?,
+                        repo: require_workdir()?.path,
                     })
                 } else {
                     return Err(format!(
@@ -1303,14 +1764,15 @@ impl Workspace {
                     ));
                 }
             }
-        })
+        };
+        Ok((host, start))
     }
 
     /// Every command a transient can run goes through one of these
     /// `cmd_*` methods: no textual grammar, no dispatch enum — the menu
     /// item closure is the command.
     fn require_connected(&mut self, cx: &mut Context<Self>) -> bool {
-        if !self.connected {
+        if !self.connected() {
             self.notice_on(
                 None,
                 "not connected to rho-daemon",
@@ -1318,7 +1780,21 @@ impl Workspace {
                 cx,
             );
         }
-        self.connected
+        self.connected()
+    }
+
+    /// The selected agent's daemon must be answering for an agent-scoped
+    /// command to mean anything; another host being up is no help.
+    fn require_agent_online(&mut self, agent_id: AgentId, cx: &mut Context<Self>) -> bool {
+        if !self.agent_online(agent_id) {
+            let host = self
+                .host_of(agent_id)
+                .map(|host| self.host_label(host))
+                .unwrap_or_else(|| "its daemon".to_owned());
+            let message = format!("not connected to {host}");
+            self.notice_on(Some(&agent_id), &message, StyleClass::SystemInfo, cx);
+        }
+        self.agent_online(agent_id)
     }
 
     /// The selected agent, or a `{verb}: no agent selected` notice.
@@ -1332,43 +1808,44 @@ impl Workspace {
     }
 
     pub(crate) fn cmd_agent_cancel(&mut self, cx: &mut Context<Self>) {
-        if !self.require_connected(cx) {
-            return;
-        }
         if let Some(agent_id) = self.selected_or_notice("cancel", cx) {
-            self.connection.send(ClientMessage::CancelTurn { agent_id });
+            if !self.require_agent_online(agent_id, cx) {
+                return;
+            }
+            self.send_to_agent(agent_id, ClientMessage::CancelTurn { agent_id });
         }
     }
 
     pub(crate) fn cmd_rewind(&mut self, turns: u32, cx: &mut Context<Self>) {
-        if !self.require_connected(cx) {
-            return;
-        }
         if let Some(agent_id) = self.selected_or_notice("rewind", cx) {
-            self.connection
-                .send(ClientMessage::RewindAgent { agent_id, turns });
+            if !self.require_agent_online(agent_id, cx) {
+                return;
+            }
+            self.send_to_agent(agent_id, ClientMessage::RewindAgent { agent_id, turns });
         }
     }
 
     pub(crate) fn cmd_continue_turn(&mut self, cx: &mut Context<Self>) {
-        if !self.require_connected(cx) {
-            return;
-        }
         if let Some(agent_id) = self.selected_or_notice("continue", cx) {
-            self.connection
-                .send(ClientMessage::ContinueTurn { agent_id });
+            if !self.require_agent_online(agent_id, cx) {
+                return;
+            }
+            self.send_to_agent(agent_id, ClientMessage::ContinueTurn { agent_id });
         }
     }
 
     pub(crate) fn cmd_compact(&mut self, cx: &mut Context<Self>) {
-        if !self.require_connected(cx) {
-            return;
-        }
         if let Some(agent_id) = self.selected_or_notice("compact", cx) {
-            self.connection.send(ClientMessage::CompactAgent {
+            if !self.require_agent_online(agent_id, cx) {
+                return;
+            }
+            self.send_to_agent(
                 agent_id,
-                delivery: rho_ui_proto::MessageDelivery::NextRequest,
-            });
+                ClientMessage::CompactAgent {
+                    agent_id,
+                    delivery: rho_ui_proto::MessageDelivery::NextRequest,
+                },
+            );
             self.notice_on(
                 Some(&agent_id),
                 "compacting context",
@@ -1379,12 +1856,11 @@ impl Workspace {
     }
 
     pub(crate) fn cmd_change_prompt_cache_key(&mut self, cx: &mut Context<Self>) {
-        if !self.require_connected(cx) {
-            return;
-        }
         if let Some(agent_id) = self.selected_or_notice("change-prompt-cache-key", cx) {
-            self.connection
-                .send(ClientMessage::ChangePromptCacheKey { agent_id });
+            if !self.require_agent_online(agent_id, cx) {
+                return;
+            }
+            self.send_to_agent(agent_id, ClientMessage::ChangePromptCacheKey { agent_id });
             self.notice_on(
                 Some(&agent_id),
                 "changed prompt cache key",
@@ -1399,16 +1875,19 @@ impl Workspace {
         intelligence: EngineerIntelligence,
         cx: &mut Context<Self>,
     ) {
-        if !self.require_connected(cx) {
-            return;
-        }
         let Some(agent_id) = self.selected_or_notice("change-role", cx) else {
             return;
         };
-        self.connection.send(ClientMessage::ChangeAgentRole {
+        if !self.require_agent_online(agent_id, cx) {
+            return;
+        }
+        self.send_to_agent(
             agent_id,
-            role: AgentRole::Engineer { intelligence },
-        });
+            ClientMessage::ChangeAgentRole {
+                agent_id,
+                role: AgentRole::Engineer { intelligence },
+            },
+        );
     }
 
     pub(crate) fn prompt_change_agent_role(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1492,10 +1971,13 @@ impl Workspace {
 
     pub(crate) fn cmd_workstream_rename(&mut self, name: String, cx: &mut Context<Self>) {
         if let Some(workstream_id) = self.focused_workstream_or_notice(cx) {
-            self.connection.send(ClientMessage::WorkstreamRename {
+            self.send_to_workstream(
                 workstream_id,
-                name,
-            });
+                ClientMessage::WorkstreamRename {
+                    workstream_id,
+                    name,
+                },
+            );
         }
     }
 
@@ -1524,11 +2006,14 @@ impl Workspace {
         label: String,
         add: bool,
     ) {
-        self.connection.send(ClientMessage::WorkstreamLabel {
+        self.send_to_workstream(
             workstream_id,
-            label,
-            add,
-        });
+            ClientMessage::WorkstreamLabel {
+                workstream_id,
+                label,
+                add,
+            },
+        );
     }
 
     pub(crate) fn cmd_agent_done(
@@ -1672,16 +2157,19 @@ impl Workspace {
             .map(|agent| agent.agent_id)
             .collect::<Vec<_>>();
         for agent_id in roots {
-            self.connection.send(ClientMessage::AgentMove {
+            self.send_to_agent(
                 agent_id,
-                target: rho_ui_proto::WorkstreamTarget::Existing(target),
-            });
+                ClientMessage::AgentMove {
+                    agent_id,
+                    target: rho_ui_proto::WorkstreamTarget::Existing(target),
+                },
+            );
         }
     }
 
     pub(crate) fn cmd_project_add(
         &mut self,
-        path: Utf8PathBuf,
+        path: String,
         name: Option<String>,
         description: String,
         cx: &mut Context<Self>,
@@ -1689,22 +2177,34 @@ impl Workspace {
         if !self.require_connected(cx) {
             return;
         }
-        self.connection.send(ClientMessage::ProjectSet {
-            path: self.resolve_workdir_path(path),
-            name,
-            description,
-        });
+        let workdir = match self.resolve_workdir(&path) {
+            Ok(workdir) => workdir,
+            Err(message) => {
+                self.notice_on(None, &message, StyleClass::SystemInfo, cx);
+                return;
+            }
+        };
+        self.hosts.send(
+            workdir.host,
+            ClientMessage::ProjectSet {
+                path: workdir.path,
+                name,
+                description,
+            },
+        );
     }
 
     pub(crate) fn cmd_project_remove(&mut self, path: String, cx: &mut Context<Self>) {
         if !self.require_connected(cx) {
             return;
         }
-        match resolve_workdir(&path, &self.workdir_table()) {
-            Some(path) => {
-                self.connection
-                    .send(ClientMessage::ProjectRemove { path: path.into() });
-            }
+        match self.registered_workdir(&path) {
+            Some(workdir) => self.hosts.send(
+                workdir.host,
+                ClientMessage::ProjectRemove {
+                    path: workdir.path.into(),
+                },
+            ),
             None => {
                 let message = format!("no registered project `{path}`");
                 self.notice_on(None, &message, StyleClass::SystemInfo, cx);
@@ -1713,12 +2213,12 @@ impl Workspace {
     }
 
     pub(crate) fn cmd_open(&mut self, path: Utf8PathBuf, cx: &mut Context<Self>) {
-        if !self.require_connected(cx) {
-            return;
-        }
         let Some(agent_id) = self.selected_or_notice("open", cx) else {
             return;
         };
+        if !self.require_agent_online(agent_id, cx) {
+            return;
+        }
         let Some(workspace) = self.registry.agent_workspace(agent_id).cloned() else {
             self.notice_on(
                 None,
@@ -1732,22 +2232,25 @@ impl Workspace {
     }
 
     pub(crate) fn cmd_shell(&mut self, cx: &mut Context<Self>) {
-        if !self.require_connected(cx) {
-            return;
-        }
         if let Some(agent_id) = self.selected_or_notice("shell", cx) {
+            if !self.require_agent_online(agent_id, cx) {
+                return;
+            }
             self.open_shell_surface(agent_id, cx);
         }
     }
 
     pub(crate) fn cmd_shell_close(&mut self, cx: &mut Context<Self>) {
-        if !self.require_connected(cx) {
-            return;
-        }
         let Some(agent_id) = self.selected_or_notice("close shell", cx) else {
             return;
         };
-        let task = self.connection.close_shell(agent_id.encoded(), cx);
+        if !self.require_agent_online(agent_id, cx) {
+            return;
+        }
+        let Some(connection) = self.connection_for(agent_id) else {
+            return;
+        };
+        let task = connection.close_shell(agent_id.encoded(), cx);
         cx.spawn(async move |this, cx| {
             let result = match task.await {
                 Ok(result) => result,
@@ -1769,21 +2272,21 @@ impl Workspace {
     }
 
     pub(crate) fn cmd_term(&mut self, new: bool, cx: &mut Context<Self>) {
-        if !self.require_connected(cx) {
-            return;
-        }
         if let Some(agent_id) = self.selected_or_notice("term", cx) {
+            if !self.require_agent_online(agent_id, cx) {
+                return;
+            }
             self.open_terminal_surface(agent_id, new, cx);
         }
     }
 
     pub(crate) fn cmd_diff(&mut self, cx: &mut Context<Self>) {
-        if !self.require_connected(cx) {
-            return;
-        }
         let Some(agent_id) = self.selected_or_notice("diff", cx) else {
             return;
         };
+        if !self.require_agent_online(agent_id, cx) {
+            return;
+        }
         let Some(workspace) = self.registry.agent_workspace(agent_id).cloned() else {
             self.notice_on(
                 None,
@@ -1798,6 +2301,115 @@ impl Workspace {
 
     pub(crate) fn cmd_version(&mut self, cx: &mut Context<Self>) {
         self.notice_on(None, env!("CARGO_PKG_VERSION"), StyleClass::SystemInfo, cx);
+    }
+
+    /// The attached daemons and how each is doing, as one notice line.
+    pub(crate) fn cmd_hosts(&mut self, cx: &mut Context<Self>) {
+        let listing = self
+            .hosts
+            .iter()
+            .map(|host| {
+                format!(
+                    "{} {} · {}",
+                    host.name,
+                    host.status.label(),
+                    host.target.describe()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.notice_on(None, &listing, StyleClass::SystemInfo, cx);
+    }
+
+    /// Attaches a daemon named on the spot, for a machine that is not worth
+    /// putting in the host list.
+    pub(crate) fn cmd_host_attach(&mut self, spec: &str, cx: &mut Context<Self>) {
+        let spec = match HostSpec::parse(spec, "rho") {
+            Ok(spec) => spec,
+            Err(error) => {
+                return self.notice_on(
+                    None,
+                    &format!("attach: {error}"),
+                    StyleClass::StatusError,
+                    cx,
+                );
+            }
+        };
+        if self.hosts.by_name(&spec.name).is_some() {
+            let message = format!("attach: host `{}` is already attached", spec.name);
+            return self.notice_on(None, &message, StyleClass::StatusError, cx);
+        }
+        let name = spec.name.clone();
+        self.attach_host(spec, cx);
+        self.notice_on(
+            None,
+            &format!("attaching {name}…"),
+            StyleClass::SystemInfo,
+            cx,
+        );
+    }
+
+    /// Detaches a daemon by name, dropping everything the client held for it.
+    pub(crate) fn cmd_host_detach(
+        &mut self,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(host) = self.hosts.by_name(name.trim()).map(|host| host.id) else {
+            let message = format!("detach: no host named `{}`", name.trim());
+            return self.notice_on(None, &message, StyleClass::StatusError, cx);
+        };
+        self.detach_host(host, window, cx);
+        self.notice_on(
+            None,
+            &format!("detached {}", name.trim()),
+            StyleClass::SystemInfo,
+            cx,
+        );
+    }
+
+    /// Prompt for `<name>=unix:<socket>` or `<name>=iroh:<id>@<ssh-dest>`.
+    pub(crate) fn prompt_host_attach(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let complete = std::rc::Rc::new(|_: &Workspace, _: &str, _: &gpui::App| Vec::new());
+        let on_submit = std::rc::Rc::new(
+            |workspace: &mut Workspace,
+             input: String,
+             _window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                if !input.trim().is_empty() {
+                    workspace.cmd_host_attach(&input, cx);
+                }
+            },
+        );
+        self.open_prompt("attach host:", complete, on_submit, window, cx);
+    }
+
+    /// Prompt (completing over attached hosts) for one to detach.
+    pub(crate) fn prompt_host_detach(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, _: &gpui::App| {
+            let needle = input.trim().to_lowercase();
+            workspace
+                .hosts
+                .iter()
+                .filter(|host| host.name.to_lowercase().contains(&needle))
+                .map(|host| crate::commands::Candidate {
+                    value: host.name.clone(),
+                    description: host.target.describe(),
+                })
+                .collect()
+        });
+        let on_submit = std::rc::Rc::new(
+            |workspace: &mut Workspace,
+             input: String,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                if !input.trim().is_empty() {
+                    workspace.cmd_host_detach(&input, window, cx);
+                }
+            },
+        );
+        self.open_prompt("detach host:", complete, on_submit, window, cx);
     }
 
     /// Opens the draft compose view. `working_directory` is an explicit
@@ -1816,9 +2428,15 @@ impl Workspace {
             self.draft_workstream = Some(workstream_id);
         }
         match working_directory {
-            Some(path) => {
-                let path = self.resolve_workdir_path(path);
-                let label = self.workdir_label(&path);
+            Some(argument) => {
+                let workdir = match self.resolve_workdir(argument.as_str()) {
+                    Ok(workdir) => workdir,
+                    Err(message) => {
+                        self.notice_on(None, &message, StyleClass::SystemInfo, cx);
+                        return;
+                    }
+                };
+                let label = self.workdir_label(&workdir);
                 let editor = self.focused_draft_editor();
                 self.draft_model.update(cx, |view, cx| {
                     view.seed(&label, true, editor.as_ref(), window, cx)
@@ -1837,34 +2455,50 @@ impl Workspace {
         }
     }
 
-    /// Manage this GUI's bounded transcript subscription set.
-    fn set_initial_subscriptions(&mut self, agent_ids: Vec<AgentId>, cx: &mut Context<Self>) {
-        let retained = agent_ids.iter().copied().collect::<HashSet<_>>();
-        let evicted = self
-            .subscriptions
-            .iter()
-            .filter(|agent_id| !retained.contains(agent_id))
-            .collect::<Vec<_>>();
-        self.subscriptions.reset(&agent_ids);
-        for agent_id in evicted {
-            self.release_agent_view_cache(agent_id, cx);
+    /// Seeds this GUI's bounded transcript subscription set for a host that
+    /// has just come up. The LRU is shared across hosts — it bounds this
+    /// client's memory, not any one daemon's — so a newly attached host adds
+    /// its warm set rather than resetting everyone else's.
+    fn set_initial_subscriptions(
+        &mut self,
+        host: HostId,
+        agent_ids: Vec<AgentId>,
+        cx: &mut Context<Self>,
+    ) {
+        for agent_id in &agent_ids {
+            let (_, evicted) = self.subscriptions.touch(*agent_id);
+            if let Some(evicted) = evicted {
+                self.send_to_agent(
+                    evicted,
+                    ClientMessage::UnsubscribeAgents {
+                        agent_ids: vec![evicted],
+                    },
+                );
+                self.release_agent_view_cache(evicted, cx);
+            }
         }
-        self.connection
-            .send(ClientMessage::SubscribeAgents { agent_ids });
+        self.hosts
+            .send(host, ClientMessage::SubscribeAgents { agent_ids });
     }
 
     fn subscribe_agent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
         let (subscribe, evicted) = self.subscriptions.touch(agent_id);
         if let Some(evicted) = evicted {
-            self.connection.send(ClientMessage::UnsubscribeAgents {
-                agent_ids: vec![evicted],
-            });
+            self.send_to_agent(
+                evicted,
+                ClientMessage::UnsubscribeAgents {
+                    agent_ids: vec![evicted],
+                },
+            );
             self.release_agent_view_cache(evicted, cx);
         }
         if subscribe {
-            self.connection.send(ClientMessage::SubscribeAgents {
-                agent_ids: vec![agent_id],
-            });
+            self.send_to_agent(
+                agent_id,
+                ClientMessage::SubscribeAgents {
+                    agent_ids: vec![agent_id],
+                },
+            );
         }
     }
 
@@ -1898,7 +2532,7 @@ impl Workspace {
     }
 
     pub fn open_agent(&mut self, agent_id: AgentId, window: &mut Window, cx: &mut Context<Self>) {
-        if self.connected && !self.subscriptions.contains(agent_id) {
+        if self.agent_online(agent_id) && !self.subscriptions.contains(agent_id) {
             self.subscribe_agent(agent_id, cx);
         }
         self.select_agent(Some(agent_id), window, cx);
@@ -1921,10 +2555,16 @@ impl Workspace {
             self.notice_on(None, &message, StyleClass::SystemInfo, cx);
             return None;
         };
-        self.connection.send(ClientMessage::SetAgentDisposition {
+        if !self.require_agent_online(agent_id, cx) {
+            return None;
+        }
+        self.send_to_agent(
             agent_id,
-            disposition,
-        });
+            ClientMessage::SetAgentDisposition {
+                agent_id,
+                disposition,
+            },
+        );
         Some(agent_id)
     }
 
@@ -2001,20 +2641,49 @@ impl Workspace {
     /// workstream's newest agent sets the precedent, else the first
     /// registered workdir. All daemon-side data — the GUI may run on another
     /// machine, so its own cwd is meaningless here.
-    fn draft_default_workdir(&self) -> Option<Utf8PathBuf> {
+    fn draft_default_workdir(&self) -> Option<HostPath> {
         self.draft_workstream
-            .and_then(|workstream_id| self.registry.last_working_directory(workstream_id))
-            .or_else(|| self.workdirs.first().map(|workdir| workdir.path.clone()))
+            .and_then(|workstream_id| {
+                Some(HostPath {
+                    host: self.registry.host_of_workstream(workstream_id)?,
+                    path: self.registry.last_working_directory(workstream_id)?,
+                })
+            })
+            .or_else(|| {
+                self.workdirs.first().map(|workdir| HostPath {
+                    host: workdir.host,
+                    path: workdir.project.path.clone(),
+                })
+            })
     }
 
-    /// How a path reads in the draft header: its registered project name
-    /// when it has one, else the full path.
-    fn workdir_label(&self, path: &Utf8Path) -> String {
-        self.workdirs
+    /// An agent's working directory as a host-qualified workdir: what a new
+    /// sibling agent should inherit.
+    fn agent_workdir(&self, agent_id: AgentId) -> Option<HostPath> {
+        Some(HostPath {
+            host: self.host_of(agent_id)?,
+            path: self.registry.working_directory(agent_id)?,
+        })
+    }
+
+    /// How a workdir reads in the draft header: its registered project name
+    /// when it has one, else the full path — qualified by host whenever more
+    /// than one daemon could be meant.
+    fn workdir_label(&self, workdir: &HostPath) -> String {
+        let name = self
+            .workdirs
             .iter()
-            .find(|workdir| workdir.path == path)
-            .map(|workdir| workdir.name.clone())
-            .unwrap_or_else(|| path.to_string())
+            .find(|candidate| {
+                candidate.host == workdir.host && candidate.project.path == workdir.path
+            })
+            .map(|candidate| candidate.project.name.clone());
+        match name {
+            Some(name) => self.qualify(workdir.host, &name),
+            None if self.hosts.len() > 1 => {
+                format!("{}:{}", self.host_label(workdir.host), workdir.path)
+            }
+            None => workdir.path.to_string(),
+        }
     }
 
     pub fn prompt_names(&self) -> crate::commands::PromptNames {
@@ -2035,23 +2704,86 @@ impl Workspace {
         }
     }
 
-    /// Registered workdirs as the `(name, path)` table the shared command
-    /// layer expects.
+    /// Registered workdirs as the `(name, description)` table the shared
+    /// command layer expects. Names carry their host once more than one is
+    /// attached, since two machines can register the same project name.
     pub fn workdir_table(&self) -> Vec<(String, String)> {
         self.workdirs
             .iter()
-            .map(|workdir| (workdir.name.clone(), workdir.path.to_string()))
+            .map(|workdir| {
+                (
+                    self.qualify(workdir.host, &workdir.project.name),
+                    match self.hosts.len() > 1 {
+                        true => {
+                            format!("{}:{}", self.host_label(workdir.host), workdir.project.path)
+                        }
+                        false => workdir.project.path.to_string(),
+                    },
+                )
+            })
             .collect()
     }
 
-    /// A registered project name resolves to its path; anything else passes
-    /// through untouched. Paths name directories on the daemon's machine,
-    /// so the GUI never joins its own cwd or expands its own home — the
-    /// daemon expands `~` and validates.
-    fn resolve_workdir_path(&self, path: Utf8PathBuf) -> Utf8PathBuf {
-        resolve_workdir(path.as_str(), &self.workdir_table())
-            .map(Utf8PathBuf::from)
-            .unwrap_or(path)
+    /// Matches an argument against the registered projects, by qualified
+    /// name, bare name, or path. A bare name that several hosts register is
+    /// ambiguous and matches nothing.
+    fn registered_workdir(&self, argument: &str) -> Option<HostPath> {
+        let workdir = |candidate: &HostProject| HostPath {
+            host: candidate.host,
+            path: candidate.project.path.clone(),
+        };
+        if let Some(exact) = self.workdirs.iter().find(|candidate| {
+            self.qualify(candidate.host, &candidate.project.name) == argument
+                || candidate.project.path == argument
+        }) {
+            return Some(workdir(exact));
+        }
+        let mut bare = self
+            .workdirs
+            .iter()
+            .filter(|candidate| candidate.project.name == argument);
+        let first = bare.next()?;
+        bare.next().is_none().then(|| workdir(first))
+    }
+
+    /// Resolves a workdir argument to a directory on a specific daemon. A
+    /// registered project name resolves to its registration; anything else
+    /// is a raw daemon-side path, which may name its host as `fern:/src/rho`.
+    /// Paths name directories on the daemon's machine, so the GUI never
+    /// joins its own cwd or expands its own home — the daemon expands `~`
+    /// and validates.
+    fn resolve_workdir(&self, argument: &str) -> Result<HostPath, String> {
+        if let Some(registered) = self.registered_workdir(argument) {
+            return Ok(registered);
+        }
+        // A Windows-style drive letter is not a thing on a daemon host, so a
+        // colon before any separator is unambiguously a host prefix.
+        if let Some((name, path)) = argument.split_once(':')
+            && !name.contains('/')
+        {
+            let host = self
+                .hosts
+                .by_name(name)
+                .ok_or_else(|| format!("no attached host named `{name}`"))?;
+            return Ok(HostPath {
+                host: host.id,
+                path: Utf8PathBuf::from(path),
+            });
+        }
+        let host = match self.hosts.len() {
+            0 => return Err("not connected to rho-daemon".to_owned()),
+            1 => self.hosts.iter().next().expect("one host").id,
+            _ => {
+                return Err(format!(
+                    "`{argument}` does not say which host: write `<host>:{argument}` \
+                     or use a registered project name"
+                ));
+            }
+        };
+        Ok(HostPath {
+            host,
+            path: Utf8PathBuf::from(argument),
+        })
     }
 
     /// Emacs `message`: the notice lands in the transcript (the durable
@@ -2109,7 +2841,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         if let Some(agent_id) = agent_id
-            && self.connected
+            && self.connected()
             && !self.subscriptions.contains(agent_id)
         {
             self.subscribe_agent(agent_id, cx);
@@ -2124,7 +2856,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.connected
+        if self.connected()
             && let Some(agent_id) = agent_id
         {
             // Selection is the strongest subscription signal. Touch it here
@@ -2156,11 +2888,9 @@ impl Workspace {
         if focus {
             self.focus_active_surface(window, cx);
         }
-        self.connection.focus_agent(agent_id);
-        *self
-            .iris_context_agent
-            .lock()
-            .expect("Iris context mutex poisoned") = agent_id;
+        self.hosts
+            .focus_agent(agent_id.and_then(|agent_id| Some((self.host_of(agent_id)?, agent_id))));
+        self.sync_iris_context();
         self.ensure_duration_timer(cx);
         cx.notify();
     }
@@ -2461,10 +3191,22 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let cached = self.cached_remote_project(&workspace);
+        let Some(host) = self.host_of(agent_id) else {
+            return;
+        };
+        let cached = self.cached_remote_project(host, &workspace);
         let project_task = cached.is_none().then(|| {
-            crate::zed_remote::open_remote_project(&self.connection, workspace.clone(), cx)
+            let connection = self.connection_for(agent_id)?;
+            Some(crate::zed_remote::open_remote_project(
+                connection,
+                workspace.clone(),
+                cx,
+            ))
         });
+        if matches!(project_task, Some(None)) {
+            return;
+        }
+        let project_task = project_task.flatten();
         cx.spawn(async move |this, cx| {
             let opened = match cached {
                 Some(project) => Ok(project),
@@ -2475,9 +3217,9 @@ impl Workspace {
             };
             let result = match opened {
                 Ok(project) => {
-                    let Ok(project) =
-                        this.update(cx, |this, _| this.cache_remote_project(workspace, project))
-                    else {
+                    let Ok(project) = this.update(cx, |this, _| {
+                        this.cache_remote_project(host, workspace, project)
+                    }) else {
                         return;
                     };
                     crate::zed_remote::open_file_buffer(&project, path, cx)
@@ -2520,7 +3262,10 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let task = self.connection.open_shell(agent_id.encoded(), cx);
+        let Some(connection) = self.connection_for(agent_id) else {
+            return;
+        };
+        let task = connection.open_shell(agent_id.encoded(), cx);
         cx.spawn(async move |this, cx| {
             let result = match task.await {
                 Ok(result) => result,
@@ -2559,13 +3304,15 @@ impl Workspace {
 
     fn cached_remote_project(
         &mut self,
+        host: HostId,
         workspace: &rho_ui_proto::WorkspaceInfo,
     ) -> Option<RemoteProject> {
-        let state = self.remote_projects.get(workspace)?.clone();
+        let key = (host, workspace.clone());
+        let state = self.remote_projects.get(&key)?.clone();
         match state.upgrade() {
             Some(state) => Some(RemoteProject { state }),
             _ => {
-                self.remote_projects.remove(workspace);
+                self.remote_projects.remove(&key);
                 None
             }
         }
@@ -2573,14 +3320,15 @@ impl Workspace {
 
     fn cache_remote_project(
         &mut self,
+        host: HostId,
         workspace: rho_ui_proto::WorkspaceInfo,
         opened: RemoteProject,
     ) -> RemoteProject {
-        if let Some(existing) = self.cached_remote_project(&workspace) {
+        if let Some(existing) = self.cached_remote_project(host, &workspace) {
             return existing;
         }
         self.remote_projects
-            .insert(workspace, opened.state.downgrade());
+            .insert((host, workspace), opened.state.downgrade());
         opened
     }
 
@@ -2605,11 +3353,17 @@ impl Workspace {
             return;
         }
 
-        let cached = self.cached_remote_project(&workspace);
+        let Some(host) = self.host_of(agent_id) else {
+            return;
+        };
+        let Some(diff_client) = self.connection_for(agent_id).map(Connection::diff_client) else {
+            return;
+        };
+        let cached = self.cached_remote_project(host, &workspace);
         let project_task = cached.is_none().then(|| {
-            crate::zed_remote::open_remote_project(&self.connection, workspace.clone(), cx)
+            let connection = self.connection_for(agent_id).expect("host still attached");
+            crate::zed_remote::open_remote_project(connection, workspace.clone(), cx)
         });
-        let diff_client = self.connection.diff_client();
         let task = cx.spawn(async move |this, cx| {
             let result: anyhow::Result<(RemoteProject, crate::diff_view::PreparedDiff)> = async {
                 let opened = match cached {
@@ -2621,7 +3375,7 @@ impl Workspace {
                 };
                 let project = this
                     .update(cx, |this, _| {
-                        this.cache_remote_project(workspace.clone(), opened)
+                        this.cache_remote_project(host, workspace.clone(), opened)
                     })
                     .map_err(|_| anyhow::anyhow!("GUI closed while loading diff"))?;
                 let live_paths = cx.update(|cx| crate::diff_view::dirty_paths(&project, cx));
@@ -2694,9 +3448,10 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let task = self
-            .connection
-            .open_terminal(agent_id.encoded(), new, 80, 24, cx);
+        let Some(connection) = self.connection_for(agent_id) else {
+            return;
+        };
+        let task = connection.open_terminal(agent_id.encoded(), new, 80, 24, cx);
         cx.spawn(async move |this, cx| {
             let result = match task.await {
                 Ok(result) => result,
@@ -2765,7 +3520,13 @@ impl Workspace {
             view
         } else {
             let workspace = cx.entity().downgrade();
-            let visualization_client = self.connection.visualization_client();
+            // Visualizations are fetched from the agent's own daemon; the
+            // client is bound here rather than looked up per artifact,
+            // because the agent's host never changes.
+            let visualization_client = self
+                .connection_for(agent_id)
+                .map(Connection::visualization_client)
+                .unwrap_or_else(crate::connection::VisualizationClient::detached);
             let view = cx.new(|cx| AgentModel::new(workspace, visualization_client, cx));
             self.refresh_view_status(&agent_id, &view, cx);
             self.models.insert(agent_id, view.clone());
@@ -3179,15 +3940,12 @@ impl Workspace {
             // Files keep whatever agent context was current.
             SurfaceKey::File { .. } => None,
         };
-        if self.connected
+        if self.connected()
             && let Some(agent_id) = selected
         {
             self.subscribe_agent(agent_id, cx);
         }
-        *self
-            .iris_context_agent
-            .lock()
-            .expect("Iris context mutex poisoned") = self.registry.selected_agent().copied();
+        self.sync_iris_context();
         self.dashboard_dirty = true;
         cx.notify();
     }
@@ -3563,7 +4321,7 @@ impl Workspace {
                 };
                 let name = tokens.next().map(str::to_owned);
                 let description = tokens.collect::<Vec<_>>().join(" ");
-                workspace.cmd_project_add(camino::Utf8PathBuf::from(path), name, description, cx);
+                workspace.cmd_project_add(path.to_owned(), name, description, cx);
             },
         );
         self.open_prompt("project path [name]:", complete, on_submit, window, cx);
@@ -3618,19 +4376,25 @@ impl Workspace {
                         ..
                     })
                     | Some(RowTarget::Agent(agent_id))
-                    | Some(RowTarget::Reply(agent_id)) => self.registry.working_directory(agent_id),
-                    Some(RowTarget::Stream { workstream_id, .. }) => {
-                        self.registry.last_working_directory(workstream_id)
-                    }
+                    | Some(RowTarget::Reply(agent_id)) => self.agent_workdir(agent_id),
+                    Some(RowTarget::Stream { workstream_id, .. }) => self
+                        .registry
+                        .host_of_workstream(workstream_id)
+                        .zip(self.registry.last_working_directory(workstream_id))
+                        .map(|(host, path)| HostPath { host, path }),
                     _ => None,
                 }
             } else {
                 self.registry
                     .selected_agent()
-                    .and_then(|agent_id| self.registry.working_directory(*agent_id))
+                    .copied()
+                    .and_then(|agent_id| self.agent_workdir(agent_id))
             };
             let workdir = contextual.or_else(|| match self.workdirs.as_slice() {
-                [workdir] => Some(workdir.path.clone()),
+                [workdir] => Some(HostPath {
+                    host: workdir.host,
+                    path: workdir.project.path.clone(),
+                }),
                 _ => None,
             });
             self.new_agent_draft = Some(NewAgentDraft {
@@ -3642,8 +4406,8 @@ impl Workspace {
         let draft = self.new_agent_draft.as_ref().expect("draft initialized");
         let project = draft
             .workdir
-            .as_deref()
-            .map(|path| self.workdir_label(path))
+            .as_ref()
+            .map(|workdir| self.workdir_label(workdir))
             .unwrap_or_else(|| "<choose>".to_owned());
         self.open_transient(
             crate::transient::new_agent_menu(project, draft.workspace.label(), draft.role.clone()),
@@ -3659,8 +4423,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.quota_history_days = days;
-        self.connection.send(ClientMessage::QuotaHistory);
-        let history = self.quota_history.clone();
+        self.hosts.broadcast(|| ClientMessage::QuotaHistory);
+        let history = self.merged_quota_history();
         self.open_transient(crate::transient::usage_menu(history, days), window, cx);
     }
 
@@ -3671,11 +4435,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.global_usage_days = days;
-        self.connection.send(ClientMessage::GlobalUsage {
+        self.hosts.broadcast(|| ClientMessage::GlobalUsage {
             since_ms: now_ms().saturating_sub(days * 24 * 60 * 60 * 1_000),
         });
         self.open_transient(
-            crate::transient::global_usage_menu(self.global_usage.clone(), days),
+            crate::transient::global_usage_menu(self.merged_global_usage(), days),
             window,
             cx,
         );
@@ -3689,13 +4453,13 @@ impl Workspace {
     ) {
         self.global_usage_days = days;
         let ema_warmup_days = if days <= 7 { 4 } else { 14 };
-        self.connection.send(ClientMessage::GlobalUsage {
+        self.hosts.broadcast(|| ClientMessage::GlobalUsage {
             // Seed the EMA with seven half-lives before the visible range so
             // its left edge represents actual prior usage rather than a reset.
             since_ms: now_ms().saturating_sub((days + ema_warmup_days) * 24 * 60 * 60 * 1_000),
         });
         self.open_transient(
-            crate::transient::usage_share_menu(self.global_usage.clone(), days),
+            crate::transient::usage_share_menu(self.merged_global_usage(), days),
             window,
             cx,
         );
@@ -3723,9 +4487,15 @@ impl Workspace {
              cx: &mut Context<Workspace>| {
                 let input = input.trim();
                 if !input.is_empty() {
-                    let path = workspace.resolve_workdir_path(Utf8PathBuf::from(input));
-                    if let Some(draft) = &mut workspace.new_agent_draft {
-                        draft.workdir = Some(path);
+                    match workspace.resolve_workdir(input) {
+                        Ok(workdir) => {
+                            if let Some(draft) = &mut workspace.new_agent_draft {
+                                draft.workdir = Some(workdir);
+                            }
+                        }
+                        Err(message) => {
+                            workspace.notice_on(None, &message, StyleClass::SystemInfo, cx)
+                        }
                     }
                 }
                 workspace.open_new_agent_transient(window, cx);
@@ -3819,8 +4589,8 @@ impl Workspace {
         };
         let project = draft
             .workdir
-            .as_deref()
-            .map(|path| self.workdir_label(path))
+            .as_ref()
+            .map(|workdir| self.workdir_label(workdir))
             .unwrap_or_else(|| "no project".to_owned());
         let summary = format!("{project} · {} · {}", draft.role, draft.workspace.label());
         self.dashboard.open_new_draft(summary, cx);
@@ -3830,15 +4600,15 @@ impl Workspace {
         self.dashboard_enter_insert(window, cx);
     }
 
-    fn new_agent_launch(&self) -> Result<(rho_ui_proto::StartMode, AgentRole), String> {
+    fn new_agent_launch(&self) -> Result<(HostId, rho_ui_proto::StartMode, AgentRole), String> {
         let draft = self
             .new_agent_draft
             .as_ref()
             .ok_or_else(|| "new agent has no launch configuration".to_owned())?;
         let (mode, target) = draft.workspace.mode_and_target();
-        let start = self.parse_start(mode, target, draft.workdir.clone())?;
+        let (host, start) = self.parse_start(mode, target, draft.workdir.clone())?;
         let role = parse_agent_role(&draft.role)?;
-        Ok((start, role))
+        Ok((host, start, role))
     }
 
     /// `enter` in the dashboard: act on the row under the cursor.
@@ -3875,7 +4645,7 @@ impl Workspace {
                 if !self.require_connected(cx) {
                     return;
                 }
-                let (start, role) = match self.new_agent_launch() {
+                let (host, start, role) = match self.new_agent_launch() {
                     Ok(launch) => launch,
                     Err(message) => {
                         self.notice_on(None, &message, StyleClass::SystemInfo, cx);
@@ -3885,7 +4655,7 @@ impl Workspace {
                 let content = self.dashboard.take_new_draft(cx);
                 self.dashboard_dirty = true;
                 if let Some(content) = content {
-                    self.create_inline_agent(content, start, role);
+                    self.create_inline_agent(host, content, start, role);
                 }
                 self.new_agent_draft = None;
                 self.dashboard_exit_insert(window, cx);
@@ -3896,16 +4666,20 @@ impl Workspace {
 
     fn create_inline_agent(
         &mut self,
+        host: HostId,
         content: Vec<ContentPart>,
         start: rho_ui_proto::StartMode,
         role: AgentRole,
     ) {
-        self.connection.send(ClientMessage::NewAgent {
-            workstream: None,
-            role,
-            start,
-            content: Some(content),
-        });
+        self.hosts.send(
+            host,
+            ClientMessage::NewAgent {
+                workstream: None,
+                role,
+                start,
+                content: Some(content),
+            },
+        );
     }
 
     /// `r` in the dashboard: splice an inline reply draft under the row —
@@ -4012,10 +4786,8 @@ impl Workspace {
                 .map(|seconds| format!(" {:.1}d", seconds / 86_400.0))
                 .unwrap_or_default()
         };
-        let gpt = self
-            .quota_summaries
-            .iter()
-            .find(|summary| summary.model == "gpt");
+        let summaries = self.merged_quota_summaries();
+        let gpt = summaries.iter().find(|summary| summary.model == "gpt");
         if let Some(gpt) = gpt {
             stats = stats.child(div().text_color(colors.terminal_ansi_cyan).child(format!(
                 "{}%{}",
@@ -4023,14 +4795,8 @@ impl Workspace {
                 format_reset(gpt.reset_at_unix)
             )));
         }
-        let opus = self
-            .quota_summaries
-            .iter()
-            .find(|summary| summary.model == "opus");
-        let fable = self
-            .quota_summaries
-            .iter()
-            .find(|summary| summary.model == "fable");
+        let opus = summaries.iter().find(|summary| summary.model == "opus");
+        let fable = summaries.iter().find(|summary| summary.model == "fable");
         if opus.is_some() || fable.is_some() {
             if gpt.is_some() {
                 stats = stats.child(div().text_color(text_style.color.opacity(0.55)).child("·"));
@@ -4357,13 +5123,25 @@ impl Workspace {
         }
     }
 
+    /// The bottom strip's connection notice. With several hosts attached the
+    /// unhealthiest one speaks, named — a daemon being down says nothing
+    /// about the others, and a nameless "disconnected" would imply it did.
     fn render_connection_status(
         &self,
         text_style: &gpui::TextStyle,
         cx: &Context<Self>,
     ) -> Option<gpui::AnyElement> {
-        let (text, class) = match self.connection_status.as_ref()? {
-            ConnectionStatus::Recovering(elapsed) => {
+        let (name, status) = self.hosts.worst_status()?;
+        let subject = match self.hosts.len() > 1 {
+            true => format!("{name} · "),
+            false => String::new(),
+        };
+        let (text, class) = match status {
+            HostStatus::Connecting => (
+                format!("{subject}connecting to rho daemon…"),
+                StyleClass::SystemInfo,
+            ),
+            HostStatus::Recovering(elapsed) => {
                 let seconds = elapsed.as_secs();
                 let elapsed = if seconds < 60 {
                     format!("{seconds}s")
@@ -4371,14 +5149,15 @@ impl Workspace {
                     format!("{}m {:02}s", seconds / 60, seconds % 60)
                 };
                 (
-                    format!("connection interrupted · recovering · {elapsed}"),
+                    format!("{subject}connection interrupted · recovering · {elapsed}"),
                     StyleClass::SystemImportant,
                 )
             }
-            ConnectionStatus::Disconnected(reason) => (
-                format!("disconnected from rho daemon · {reason}"),
+            HostStatus::Disconnected(reason) => (
+                format!("{subject}disconnected from rho daemon · {reason}"),
                 StyleClass::Disconnect,
             ),
+            HostStatus::Online => return None,
         };
         let mut strip = bottom_strip(text_style, cx);
         if let Some(color) = class.resolve(cx).color {
@@ -4389,11 +5168,11 @@ impl Workspace {
 
     #[cfg(test)]
     pub(crate) fn connection_status_label(&self) -> Option<String> {
-        match self.connection_status.as_ref()? {
-            ConnectionStatus::Recovering(elapsed) => {
-                Some(format!("recovering {}s", elapsed.as_secs()))
-            }
-            ConnectionStatus::Disconnected(reason) => Some(format!("disconnected {reason}")),
+        match self.hosts.worst_status()?.1 {
+            HostStatus::Connecting => Some("connecting".to_owned()),
+            HostStatus::Recovering(elapsed) => Some(format!("recovering {}s", elapsed.as_secs())),
+            HostStatus::Disconnected(reason) => Some(format!("disconnected {reason}")),
+            HostStatus::Online => None,
         }
     }
 
@@ -4839,14 +5618,6 @@ fn parse_duration_ms(text: &str) -> Option<u64> {
         _ => return None,
     };
     minutes.checked_mul(60 * 1000)
-}
-
-/// Resolves a workdir argument (registered name or path) to its path.
-fn resolve_workdir<'a>(argument: &str, workdirs: &'a [(String, String)]) -> Option<&'a str> {
-    workdirs
-        .iter()
-        .find(|(name, path)| name == argument || path == argument)
-        .map(|(_, path)| path.as_str())
 }
 
 #[cfg(test)]

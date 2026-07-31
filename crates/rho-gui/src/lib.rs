@@ -15,6 +15,8 @@ pub(crate) mod diff_view;
 pub mod draft_view;
 pub mod editor_config;
 pub mod highlights;
+#[cfg(feature = "native")]
+pub mod hosts;
 pub mod minibuffer;
 #[cfg(feature = "native")]
 pub(crate) mod native_realtime;

@@ -13,8 +13,9 @@ use rho_ui_proto::{
 };
 use settings::SettingsStore;
 
-use crate::connection::ConnEvent;
-use crate::workspace::{AttachTarget, Workspace};
+use crate::connection::{ConnEvent, HostEvent};
+use crate::registry::HostId;
+use crate::workspace::{AttachTarget, HostSpec, Workspace};
 
 #[test]
 fn frame_distribution_reports_nearest_rank_percentiles() {
@@ -57,7 +58,11 @@ fn bind_test_keymaps(cx: &mut App) {
 fn test_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace> {
     cx.update(init_test_app);
     let target = AttachTarget::Unix(std::env::temp_dir().join("rho-gui-test-nonexistent.sock"));
-    cx.add_window(|window, cx| Workspace::new(target, window, cx))
+    let specs = vec![HostSpec {
+        name: "local".to_owned(),
+        target,
+    }];
+    cx.add_window(|window, cx| Workspace::new(specs.clone(), window, cx))
 }
 
 #[gpui::test]
@@ -92,6 +97,7 @@ fn modal_overlays_preserve_dashboard_and_surface_modes(cx: &mut TestAppContext) 
             assert!(workspace.is_dashboard_mode(window, cx));
             let (response, _decision) = tokio::sync::oneshot::channel();
             workspace.handle_event(
+                HostId::default(),
                 ConnEvent::GitTransportApproval {
                     request_id: 1,
                     prompt: "approve dashboard Git operation".to_owned(),
@@ -119,6 +125,7 @@ fn modal_overlays_preserve_dashboard_and_surface_modes(cx: &mut TestAppContext) 
             assert!(!workspace.is_dashboard_mode(window, cx));
             let (response, _decision) = tokio::sync::oneshot::channel();
             workspace.handle_event(
+                HostId::default(),
                 ConnEvent::GitTransportApproval {
                     request_id: 2,
                     prompt: "approve surface Git operation".to_owned(),
@@ -128,7 +135,12 @@ fn modal_overlays_preserve_dashboard_and_surface_modes(cx: &mut TestAppContext) 
                 cx,
             );
             assert!(!workspace.is_dashboard_mode(window, cx));
-            workspace.handle_event(ConnEvent::GitTransportDone { request_id: 2 }, window, cx);
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::GitTransportDone { request_id: 2 },
+                window,
+                cx,
+            );
             assert!(!workspace.is_dashboard_mode(window, cx));
         })
         .expect("inspect restored surface mode");
@@ -160,6 +172,109 @@ fn agent_summary(id: u64, parent_agent: Option<AgentId>) -> UiAgentSummary {
     }
 }
 
+/// A second daemon's agents come from its own id space; fixtures for it
+/// must not reuse the default domain.
+fn remote_agent(id: u64) -> AgentId {
+    AgentId::from_counter(id, &rho_ui_proto::AgentIdDomain(7)).unwrap()
+}
+
+#[gpui::test]
+fn two_hosts_share_one_rail_and_detach_cleanly(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let fern = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace.attach_host(
+                HostSpec {
+                    name: "fern".to_owned(),
+                    target: AttachTarget::Unix(std::env::temp_dir().join("rho-gui-test-fern.sock")),
+                },
+                cx,
+            )
+        })
+        .expect("attach second host");
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Ready {
+                    workstreams: vec![UiWorkstream {
+                        workstream_id: WorkstreamId(1),
+                        name: "Local work".to_owned(),
+                        labels: Vec::new(),
+                    }],
+                    agents: vec![agent_summary(1, None)],
+                    projects: Vec::new(),
+                    machine_seed: 0,
+                    agent_counter: 1,
+                },
+                window,
+                cx,
+            );
+            workspace.handle_event(
+                fern,
+                ConnEvent::Ready {
+                    workstreams: vec![UiWorkstream {
+                        workstream_id: WorkstreamId(2),
+                        name: "Remote work".to_owned(),
+                        labels: Vec::new(),
+                    }],
+                    agents: vec![UiAgentSummary {
+                        agent_id: remote_agent(2),
+                        workstream: WorkstreamId(2),
+                        display_name: Some("remote agent".to_owned()),
+                        ..agent_summary(2, None)
+                    }],
+                    projects: Vec::new(),
+                    machine_seed: 7,
+                    agent_counter: 1,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+        })
+        .expect("install both hosts");
+    cx.run_until_parked();
+
+    let dashboard = workspace
+        .update(cx, |workspace, _, _| workspace.dashboard_editor())
+        .expect("dashboard editor");
+    workspace
+        .update(cx, |_, _, cx| {
+            dashboard.update(cx, |editor, cx| {
+                let text = editor.display_text(cx);
+                for expected in ["local", "  Local work", "fern", "  Remote work"] {
+                    assert!(
+                        text.contains(expected),
+                        "{expected:?} missing from {text:?}"
+                    );
+                }
+            });
+        })
+        .expect("inspect two-host dashboard");
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.detach_host(fern, window, cx);
+            workspace.sync_dashboard(window, cx);
+        })
+        .expect("detach the second host");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |_, _, cx| {
+            dashboard.update(cx, |editor, cx| {
+                let text = editor.display_text(cx);
+                assert!(!text.contains("Remote work"), "{text:?}");
+                // Alone again, the surviving host draws no header and its
+                // rows go back to sitting flush.
+                assert!(text.contains("Local work"), "{text:?}");
+                assert!(!text.contains("  Local work"), "{text:?}");
+            });
+        })
+        .expect("inspect single-host dashboard");
+}
+
 #[gpui::test]
 fn dashboard_elides_subagents_behind_inline_fold(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
@@ -167,6 +282,7 @@ fn dashboard_elides_subagents_behind_inline_fold(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(
+                HostId::default(),
                 ConnEvent::Ready {
                     workstreams: vec![UiWorkstream {
                         workstream_id: WorkstreamId(1),
@@ -214,6 +330,7 @@ fn startup_stays_on_the_first_dashboard_row(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(
+                HostId::default(),
                 ConnEvent::Ready {
                     workstreams: vec![UiWorkstream {
                         workstream_id: WorkstreamId(1),
@@ -236,6 +353,7 @@ fn startup_stays_on_the_first_dashboard_row(cx: &mut TestAppContext) {
             );
 
             workspace.handle_event(
+                HostId::default(),
                 ConnEvent::Frame {
                     agent_id: agent(1),
                     frame: snapshot_frame(state(vec![user("old transcript")], Vec::new())),
@@ -273,6 +391,7 @@ fn dashboard_quiet_tail_is_one_native_display_elision(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(
+                HostId::default(),
                 ConnEvent::Ready {
                     workstreams,
                     agents,
@@ -398,6 +517,7 @@ fn feed_frame(
                 workspace.select_agent(Some(agent_id), window, cx);
             }
             workspace.handle_event(
+                HostId::default(),
                 ConnEvent::Frame {
                     agent_id,
                     frame,
@@ -418,16 +538,19 @@ fn feed_frames(
 ) {
     let events: Vec<_> = frames
         .into_iter()
-        .map(|(agent_id, frame)| ConnEvent::Frame {
-            agent_id,
-            frame,
-            allocation: None,
+        .map(|(agent_id, frame)| HostEvent {
+            host: HostId::default(),
+            event: ConnEvent::Frame {
+                agent_id,
+                frame,
+                allocation: None,
+            },
         })
         .collect();
     workspace
         .update(cx, |workspace, window, cx| {
             if workspace.is_startup_pane()
-                && let Some(agent_id) = events.iter().find_map(|event| match event {
+                && let Some(agent_id) = events.iter().find_map(|event| match &event.event {
                     ConnEvent::Frame { agent_id, .. } => Some(*agent_id),
                     _ => None,
                 })
@@ -1039,6 +1162,7 @@ fn bench_rho_gui_flows(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(
+                HostId::default(),
                 ConnEvent::Ready {
                     workstreams: vec![UiWorkstream {
                         workstream_id: WorkstreamId(1),
@@ -2284,6 +2408,7 @@ fn frames_coalesce_while_subscribed_model_is_loading(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(
+                HostId::default(),
                 ConnEvent::Frame {
                     agent_id: agent(2),
                     frame: snapshot_frame(state(
@@ -2296,6 +2421,7 @@ fn frames_coalesce_while_subscribed_model_is_loading(cx: &mut TestAppContext) {
                 cx,
             );
             workspace.handle_event(
+                HostId::default(),
                 ConnEvent::Frame {
                     agent_id: agent(2),
                     frame: AgentRemoteFrame::Diff {
@@ -2442,7 +2568,12 @@ fn system_notices_survive_transcript_rerenders(cx: &mut TestAppContext) {
     );
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(ConnEvent::ServerError("boom".to_owned()), window, cx);
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::ServerError("boom".to_owned()),
+                window,
+                cx,
+            );
         })
         .expect("post notice");
     assert!(display_text(&workspace, cx).contains("[rho daemon error: boom]"));
@@ -2480,7 +2611,7 @@ fn turn_cancelled_ack_is_not_persisted_as_notice(cx: &mut TestAppContext) {
     );
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(ConnEvent::TurnCancelled, window, cx);
+            workspace.handle_event(HostId::default(), ConnEvent::TurnCancelled, window, cx);
         })
         .expect("handle cancellation acknowledgement");
 
@@ -2497,6 +2628,7 @@ fn connection_recovery_is_transient_workspace_chrome(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(
+                HostId::default(),
                 ConnEvent::Recovering(std::time::Duration::from_secs(17)),
                 window,
                 cx,
@@ -2505,9 +2637,14 @@ fn connection_recovery_is_transient_workspace_chrome(cx: &mut TestAppContext) {
                 workspace.connection_status_label().as_deref(),
                 Some("recovering 17s")
             );
-            workspace.handle_event(ConnEvent::Recovered, window, cx);
+            workspace.handle_event(HostId::default(), ConnEvent::Recovered, window, cx);
             assert_eq!(workspace.connection_status_label(), None);
-            workspace.handle_event(ConnEvent::Disconnected("timed out".to_owned()), window, cx);
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Disconnected("timed out".to_owned()),
+                window,
+                cx,
+            );
             assert_eq!(
                 workspace.connection_status_label().as_deref(),
                 Some("disconnected timed out")

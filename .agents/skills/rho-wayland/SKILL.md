@@ -25,7 +25,7 @@ its private `XDG_RUNTIME_DIR`, and pass the socket explicitly:
 
 ```bash
 rho_socket="$XDG_RUNTIME_DIR/rho/rho.sock"
-rho wayland --session gui start -- rho-gui --socket "$rho_socket"
+rho wayland --session gui start -- rho-gui --attach "local=unix:$rho_socket"
 ```
 
 Use distinct session names when operating more than one application. A session

@@ -528,6 +528,9 @@ pub fn root_menu() -> Transient {
                 workspace.cmd_voice(window, cx);
             },
         )
+        .item("shift-m", "iris follow selection", |workspace, _, cx| {
+            workspace.cmd_iris_follow_selection(cx);
+        })
         .item_when(
             Workspace::has_selected_agent,
             "a",
@@ -579,6 +582,9 @@ pub fn root_menu() -> Transient {
         })
         .item("p", "projects…", |workspace, window, cx| {
             workspace.open_transient(projects_menu(), window, cx);
+        })
+        .item("h", "hosts…", |workspace, window, cx| {
+            workspace.open_transient(hosts_menu(), window, cx);
         })
         .item("v", "version", |workspace, _, cx| {
             workspace.cmd_version(cx);
@@ -1226,6 +1232,21 @@ fn window_menu() -> Transient {
         })
         .item("b", "back", |workspace, window, cx| {
             workspace.pane_back(window, cx);
+        })
+}
+
+/// `space h`: the attached daemons. Attaching and detaching are rare, so
+/// they live one level down rather than on the root's crowded first row.
+fn hosts_menu() -> Transient {
+    Transient::new("hosts")
+        .item("l", "list", |workspace, _, cx| {
+            workspace.cmd_hosts(cx);
+        })
+        .item("a", "attach…", |workspace, window, cx| {
+            workspace.prompt_host_attach(window, cx);
+        })
+        .item("d", "detach…", |workspace, window, cx| {
+            workspace.prompt_host_detach(window, cx);
         })
 }
 

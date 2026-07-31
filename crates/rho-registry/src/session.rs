@@ -81,6 +81,15 @@ impl AgentSubscriptions {
     pub fn accepts_frames(&self, agent_id: AgentId) -> bool {
         !self.unloaded.contains(&agent_id)
     }
+
+    /// Drops an agent from this session entirely — for when its daemon is
+    /// detached, so nothing is left to reject frames from or resubscribe to.
+    pub fn forget(&mut self, agent_id: AgentId) {
+        if let Some(index) = self.lru.iter().position(|id| *id == agent_id) {
+            self.lru.remove(index);
+        }
+        self.unloaded.remove(&agent_id);
+    }
 }
 
 /// Agent state arrives on server-opened unidirectional streams that may be

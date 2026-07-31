@@ -30,7 +30,7 @@ use text::BufferId;
 use theme::ActiveTheme as _;
 use ui::div;
 
-use crate::registry::{AgentRegistry, Workstream};
+use crate::registry::{AgentRegistry, HostId, Workstream};
 use crate::workspace::Workspace;
 
 /// Highlight-key space for dashboard classes, clear of the transcript's
@@ -51,6 +51,11 @@ const DRAFT_TEXT_KEY: HighlightKey =
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum LineKey {
     Iris,
+    /// A daemon's section header, present only while several are attached.
+    Host {
+        host: HostId,
+        tail: bool,
+    },
     Group {
         name: String,
         tail: bool,
@@ -959,11 +964,13 @@ impl DashClass {
 /// One row of the assembled dashboard, in display order.
 #[derive(Debug, PartialEq)]
 pub enum RailRow<'a> {
+    /// A daemon's section starts; everything of its is nested beneath.
+    HostHeader(HostId),
     /// A workstream-group section starts; its member tasks follow.
-    GroupHeader(&'a str),
+    GroupHeader { name: &'a str, indent: usize },
     Task {
         topic: &'a Workstream,
-        grouped: bool,
+        indent: usize,
     },
 }
 
@@ -973,27 +980,53 @@ pub enum RailRow<'a> {
 /// A section anchors a group at its best-sorted member's position and gathers
 /// the rest of that section's group beneath it. Listed and quiet-tail rows
 /// are assembled separately so the tail remains one contiguous elision.
-fn rail_rows(display: Vec<&Workstream>) -> Vec<RailRow<'_>> {
+fn rail_rows(display: Vec<&Workstream>, multihost: bool) -> Vec<RailRow<'_>> {
+    if !multihost {
+        return group_rows(&display, 0);
+    }
+    // Hosts section exactly as groups do — anchored at their best-sorted
+    // workstream — so attaching a second daemon reorders nothing that was
+    // already urgent; it only draws a line around where each row lives.
+    let mut rows = Vec::new();
+    let mut seen_hosts = std::collections::BTreeSet::new();
+    for (index, topic) in display.iter().enumerate() {
+        if !seen_hosts.insert(topic.host) {
+            continue;
+        }
+        rows.push(RailRow::HostHeader(topic.host));
+        let members = display[index..]
+            .iter()
+            .copied()
+            .filter(|member| member.host == topic.host)
+            .collect::<Vec<_>>();
+        rows.extend(group_rows(&members, 1));
+    }
+    rows
+}
+
+/// One host's section (or the whole rail when only one is attached), with
+/// its group sections nested one level deeper than `indent`.
+fn group_rows<'a>(display: &[&'a Workstream], indent: usize) -> Vec<RailRow<'a>> {
     let mut rows = Vec::new();
     let mut seen_groups = std::collections::BTreeSet::new();
     for (index, topic) in display.iter().enumerate() {
         match &topic.group {
-            None => rows.push(RailRow::Task {
-                topic,
-                grouped: false,
-            }),
+            None => rows.push(RailRow::Task { topic, indent }),
             Some(group) => {
                 if !seen_groups.insert(group.clone()) {
                     continue;
                 }
-                rows.push(RailRow::GroupHeader(group));
+                rows.push(RailRow::GroupHeader {
+                    name: group,
+                    indent,
+                });
                 rows.extend(
                     display[index..]
                         .iter()
                         .filter(|member| member.group.as_ref() == Some(group))
                         .map(|member| RailRow::Task {
                             topic: member,
-                            grouped: true,
+                            indent: indent + 1,
                         }),
                 );
             }
@@ -1045,10 +1078,18 @@ fn generate_dashboard(registry: &AgentRegistry) -> Vec<Line> {
     iris.text.push_str("iris · listening");
     let mut lines = vec![iris];
     let (listed, folded) = registry.split_rows();
+    let multihost = registry.host_count() > 1;
     for (section, tail) in [(listed, false), (folded, true)] {
-        for row in rail_rows(section) {
+        for row in rail_rows(section, multihost) {
             match row {
-                RailRow::GroupHeader(name) => {
+                RailRow::HostHeader(host) => {
+                    let mut line = Line::new(LineKey::Host { host, tail }, RowTarget::None);
+                    let name = registry.host_name(host);
+                    line.span(Some(DashClass::Muted), |text| text.push_str(&name));
+                    line.tail = tail;
+                    lines.push(line);
+                }
+                RailRow::GroupHeader { name, indent } => {
                     let mut line = Line::new(
                         LineKey::Group {
                             name: name.to_owned(),
@@ -1056,12 +1097,15 @@ fn generate_dashboard(registry: &AgentRegistry) -> Vec<Line> {
                         },
                         RowTarget::None,
                     );
-                    line.span(Some(DashClass::Muted), |text| text.push_str(name));
+                    line.span(Some(DashClass::Muted), |text| {
+                        text.push_str(&"  ".repeat(indent));
+                        text.push_str(name);
+                    });
                     line.tail = tail;
                     lines.push(line);
                 }
-                RailRow::Task { topic, grouped } => {
-                    let mut task = task_lines(topic, grouped, registry);
+                RailRow::Task { topic, indent } => {
+                    let mut task = task_lines(topic, indent, registry);
                     task.iter_mut().for_each(|line| line.tail = tail);
                     lines.extend(task);
                 }
@@ -1151,7 +1195,7 @@ impl RowStatus<'_> {
 /// the container meaningful, so it becomes a header followed by explicit,
 /// human-named root rows. Every descendant is a normal actionable agent row;
 /// inline editor creases collapse each contiguous subtree onto its parent.
-fn task_lines(topic: &Workstream, grouped: bool, registry: &AgentRegistry) -> Vec<Line> {
+fn task_lines(topic: &Workstream, indent: usize, registry: &AgentRegistry) -> Vec<Line> {
     let tree = registry.ordered_workstream_tree(topic);
     let roots = tree
         .iter()
@@ -1181,7 +1225,7 @@ fn task_lines(topic: &Workstream, grouped: bool, registry: &AgentRegistry) -> Ve
     if roots.is_empty() {
         return vec![workstream_line(
             topic,
-            grouped,
+            indent,
             None,
             RowStatus::bare(aggregate),
         )];
@@ -1191,7 +1235,7 @@ fn task_lines(topic: &Workstream, grouped: bool, registry: &AgentRegistry) -> Ve
     let mut lines = if singleton {
         vec![workstream_line(
             topic,
-            grouped,
+            indent,
             Some(roots[0].agent_id),
             RowStatus {
                 attention: attention(roots[0].agent_id),
@@ -1201,7 +1245,7 @@ fn task_lines(topic: &Workstream, grouped: bool, registry: &AgentRegistry) -> Ve
     } else {
         vec![workstream_line(
             topic,
-            grouped,
+            indent,
             None,
             RowStatus::bare(aggregate),
         )]
@@ -1222,7 +1266,7 @@ fn task_lines(topic: &Workstream, grouped: bool, registry: &AgentRegistry) -> Ve
             },
             ..RowStatus::for_agent(registry, agent.agent_id)
         };
-        lines.push(agent_line(agent, grouped, row_depth, status, registry));
+        lines.push(agent_line(agent, indent, row_depth, status, registry));
     }
 
     for (index, (agent, depth)) in tree.iter().enumerate() {
@@ -1249,7 +1293,7 @@ fn task_lines(topic: &Workstream, grouped: bool, registry: &AgentRegistry) -> Ve
 
 fn workstream_line(
     topic: &Workstream,
-    grouped: bool,
+    indent: usize,
     root: Option<AgentId>,
     status: RowStatus<'_>,
 ) -> Line {
@@ -1269,8 +1313,8 @@ fn workstream_line(
     // Rows, headers, and reply drafts all sit flush at one level — the
     // container's margin does the breathing, not per-row indents. The
     // cursor is the selection indicator; rows carry no selected styling.
-    if grouped {
-        line.span(None, |text| text.push_str("  "));
+    if indent > 0 {
+        line.span(None, |text| text.push_str(&"  ".repeat(indent)));
     }
     if topic.pinned {
         line.span(None, |text| text.push_str("◆ "));
@@ -1281,7 +1325,7 @@ fn workstream_line(
 
 fn agent_line(
     agent: &rho_ui_proto::UiAgentSummary,
-    grouped: bool,
+    indent: usize,
     depth: usize,
     status: RowStatus<'_>,
     registry: &AgentRegistry,
@@ -1290,9 +1334,7 @@ fn agent_line(
         LineKey::Agent(agent.agent_id),
         RowTarget::Agent(agent.agent_id),
     );
-    line.span(None, |text| {
-        text.push_str(&"  ".repeat(depth + usize::from(grouped)))
-    });
+    line.span(None, |text| text.push_str(&"  ".repeat(depth + indent)));
     status.apply(&mut line, &registry.agent_human_name(agent.agent_id));
     line
 }
@@ -1342,6 +1384,7 @@ mod tests {
 
     fn topic(status: Status, agents: Vec<UiAgentSummary>) -> Workstream {
         Workstream {
+            host: HostId::default(),
             workstream_id: WorkstreamId(1),
             name: "topic".to_owned(),
             pinned: status == Status::Pinned,
@@ -1369,7 +1412,12 @@ mod tests {
     /// Bare workstream fixture for row-assembly tests: identity and group
     /// only, no members.
     fn stream(id: u64, group: Option<&str>) -> Workstream {
+        stream_on(HostId::default(), id, group)
+    }
+
+    fn stream_on(host: HostId, id: u64, group: Option<&str>) -> Workstream {
         Workstream {
+            host,
             workstream_id: WorkstreamId(id),
             name: format!("ws-{id}"),
             pinned: false,
@@ -1382,9 +1430,12 @@ mod tests {
     fn ids(rows: &[RailRow<'_>]) -> Vec<String> {
         rows.iter()
             .map(|row| match row {
-                RailRow::GroupHeader(group) => format!("[{group}]"),
-                RailRow::Task { topic, grouped } => {
-                    format!("{}{}", if *grouped { "  " } else { "" }, topic.name)
+                RailRow::HostHeader(host) => format!("<{host}>"),
+                RailRow::GroupHeader { name, indent } => {
+                    format!("{}[{name}]", "  ".repeat(*indent))
+                }
+                RailRow::Task { topic, indent } => {
+                    format!("{}{}", "  ".repeat(*indent), topic.name)
                 }
             })
             .collect()
@@ -1418,7 +1469,7 @@ mod tests {
             stream(3, None),
             stream(4, Some("infra")),
         ];
-        let assembled = rail_rows(rows.iter().collect());
+        let assembled = rail_rows(rows.iter().collect(), false);
         assert_eq!(
             ids(&assembled),
             ["ws-1", "[infra]", "  ws-2", "  ws-4", "ws-3"]
@@ -1458,16 +1509,54 @@ mod tests {
     }
 
     #[test]
+    fn hosts_section_the_rail_and_nest_their_groups() {
+        let rows = [
+            stream_on(HostId(0), 1, None),
+            stream_on(HostId(1), 2, Some("infra")),
+            stream_on(HostId(0), 3, Some("infra")),
+            stream_on(HostId(1), 4, None),
+        ];
+
+        let assembled = rail_rows(rows.iter().collect(), true);
+
+        // Each host anchors where its best-sorted workstream sits, and its
+        // groups indent one level inside the host's section.
+        assert_eq!(
+            ids(&assembled),
+            [
+                "<host0>",
+                "  ws-1",
+                "  [infra]",
+                "    ws-3",
+                "<host1>",
+                "  [infra]",
+                "    ws-2",
+                "  ws-4",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_single_host_draws_no_header() {
+        let rows = [stream(1, None), stream(2, Some("infra"))];
+
+        assert_eq!(
+            ids(&rail_rows(rows.iter().collect(), false)),
+            ["ws-1", "[infra]", "  ws-2"]
+        );
+    }
+
+    #[test]
     fn group_split_keeps_the_folded_section_contiguous() {
         let listed = [stream(1, Some("infra")), stream(2, None)];
         let folded = [stream(3, Some("infra"))];
 
         assert_eq!(
-            ids(&rail_rows(listed.iter().collect())),
+            ids(&rail_rows(listed.iter().collect(), false)),
             ["[infra]", "  ws-1", "ws-2"]
         );
         assert_eq!(
-            ids(&rail_rows(folded.iter().collect())),
+            ids(&rail_rows(folded.iter().collect(), false)),
             ["[infra]", "  ws-3"]
         );
     }
@@ -1475,9 +1564,9 @@ mod tests {
     #[test]
     fn empty_section_gets_no_rows() {
         let listed = [stream(1, None)];
-        let assembled = rail_rows(listed.iter().collect());
+        let assembled = rail_rows(listed.iter().collect(), false);
         assert_eq!(ids(&assembled), ["ws-1"]);
-        assert!(rail_rows(Vec::new()).is_empty());
+        assert!(rail_rows(Vec::new(), false).is_empty());
     }
 
     #[test]

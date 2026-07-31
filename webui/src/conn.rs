@@ -16,6 +16,7 @@ use iroh::EndpointId;
 use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
+use rho_registry::HostId;
 use rho_registry::session::{
     AgentStreamGenerations, INITIAL_AGENT_SUBSCRIPTIONS, recent_workstream_roots,
 };
@@ -303,9 +304,15 @@ fn handle(app: App, message: ServerMessage) {
                 )
             });
             app.mutate_registry(|registry| {
-                registry.set_machine_seed(machine_seed);
-                registry.set_agent_counter(agent_counter);
-                registry.set_data(workstreams, agents);
+                // One daemon per web session, so everything lands under the
+                // default host.
+                registry.set_host_data(
+                    HostId::default(),
+                    machine_seed,
+                    agent_counter,
+                    workstreams,
+                    agents,
+                );
             });
             app.projects.set(projects);
             if let Some(agent_ids) = initial_subscriptions
@@ -347,7 +354,7 @@ fn handle(app: App, message: ServerMessage) {
             workstream,
         } => {
             app.mutate_registry(|registry| {
-                registry.note_agent_workstream(agent_id, workstream);
+                registry.note_agent_workstream(HostId::default(), agent_id, workstream);
                 registry.mark_known(agent_id);
             });
             if app.show_new_agent.get_untracked() {
@@ -356,7 +363,7 @@ fn handle(app: App, message: ServerMessage) {
             }
         }
         ServerMessage::WorkstreamCreated { workstream } => {
-            app.mutate_registry(|registry| registry.add_workstream(workstream));
+            app.mutate_registry(|registry| registry.add_workstream(HostId::default(), workstream));
         }
         ServerMessage::AgentAttention {
             agent_id,

@@ -271,12 +271,16 @@ AI APIs.
   their aggregate disk usage.
   Enrollment approval is also accepted from already
   trusted remote clients (they are fully privileged anyway).
-- `rho-gui --endpoint <id>` generates its client key in process memory and
-  never persists it. With `--ssh <destination>`, it runs the user's OpenSSH
-  client to execute `rho iroh trust-in-memory <endpoint-id>` on the daemon host
-  before connecting, so no enrollment code or rejected connection is needed.
-  `--ssh` is required for native iroh connections because an ephemeral GUI key
-  cannot survive a manual approval/restart cycle. The SSH host
+- An iroh host attached by `rho-gui`
+  (`--attach <name>=iroh:<endpoint-id>@<ssh-dest>`) generates its client key
+  in process memory and never persists it. Before connecting, it runs the user's
+  OpenSSH client to execute `rho iroh trust-in-memory <endpoint-id>` on the
+  daemon host, so no enrollment code or rejected connection is needed. An SSH
+  destination is required for native iroh connections because an ephemeral GUI
+  key cannot survive a manual approval/restart cycle. One GUI process binds a
+  single client identity and reuses it for every daemon it attaches, so each
+  daemon sees the same public key and each enrolls it separately over its own
+  SSH login; no daemon gains anything from another's enrollment. The SSH host
   configuration and host-key verification are the authorization boundary and
   insecure fallback is not attempted. Existing legacy key files are ignored
   and left untouched. Once the GUI process exits, the daemon retains only the

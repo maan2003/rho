@@ -18,7 +18,7 @@ use theme::ActiveTheme as _;
 use crate::agent_view::AgentModel;
 use crate::connection_web::{Connection, Event, Phase, daemon_id_from_page};
 use crate::dashboard::{Dashboard, RowTarget};
-use crate::registry::AgentRegistry;
+use crate::registry::{AgentRegistry, HostId};
 use crate::store::{AgentStore, FrameSummary};
 
 struct RhoKeyboardPlugin;
@@ -175,9 +175,15 @@ impl Workspace {
                         INITIAL_AGENT_SUBSCRIPTIONS,
                     )
                 });
-                self.registry.set_machine_seed(machine_seed);
-                self.registry.set_agent_counter(agent_counter);
-                self.registry.set_data(workstreams, agents);
+                // The web client attaches exactly one daemon, so everything
+                // lands under the default host.
+                self.registry.set_host_data(
+                    HostId::default(),
+                    machine_seed,
+                    agent_counter,
+                    workstreams,
+                    agents,
+                );
                 if let Some(agent_ids) = initial.filter(|ids| !ids.is_empty()) {
                     self.subscriptions.reset(&agent_ids);
                     self.connection
@@ -226,7 +232,7 @@ impl Workspace {
                 cx.notify();
             }
             ServerMessage::WorkstreamCreated { workstream } => {
-                self.registry.add_workstream(workstream);
+                self.registry.add_workstream(HostId::default(), workstream);
                 cx.notify();
             }
             ServerMessage::AgentAttention {

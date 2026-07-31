@@ -11,6 +11,22 @@ supervisor, protocol, and plugin runtime.
 - The `rho` terminal CLI.
 - A browser-based web UI.
 
+## Attaching the GUI to daemons
+
+`rho-gui` attaches one or more daemons at once and shows them in a single
+rail, each section headed by the host's name. With no arguments it attaches
+the local daemon socket; `--attach` is repeatable and names each host:
+
+```bash
+rho-gui --attach local=unix:/run/user/1000/rho/rho.sock \
+        --attach fern=iroh:<endpoint-id>@fern
+```
+
+`space h` attaches, detaches, or lists hosts while running. Agent labels stay
+bare while one host is attached and gain a `host/` prefix once several are
+(`fern/eng-h6u7`), as do project names; raw daemon paths are written
+`<host>:<path>`.
+
 ## Profiling
 
 `just profile-gui` builds with frame pointers and runs the optimized GUI with

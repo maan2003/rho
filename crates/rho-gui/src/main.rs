@@ -11,7 +11,7 @@ use anyhow::{Context as _, Result};
 use clap::Parser;
 use gpui::{App, AppContext as _, WindowOptions};
 use rho_gui::rho_assets::RhoAssets;
-use rho_gui::workspace::{AttachTarget, Workspace};
+use rho_gui::workspace::{AttachTarget, HostSpec, Workspace};
 use rho_gui::*;
 use settings::SettingsStore;
 use tracing_subscriber::EnvFilter;
@@ -19,28 +19,17 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(
     name = "rho-gui",
-    about = "Attach a native GUI to a running Rho daemon"
+    about = "Attach a native GUI to one or more running Rho daemons"
 )]
 struct Args {
-    /// Connect directly to this rho daemon Unix socket.
-    #[arg(long, conflicts_with = "endpoint")]
-    socket: Option<PathBuf>,
+    /// Attach a daemon as `<name>=unix:<socket>` or
+    /// `<name>=iroh:<endpoint-id>@<ssh-dest>`. Repeatable; the name labels
+    /// the host's agents and projects once more than one is attached.
+    /// Defaults to the local daemon socket.
+    #[arg(long, value_name = "NAME=TARGET")]
+    attach: Vec<String>,
 
-    /// Connect to this rho daemon iroh endpoint id.
-    #[arg(
-        long,
-        visible_alias = "iroh",
-        value_name = "ENDPOINT_ID",
-        requires = "ssh"
-    )]
-    endpoint: Option<iroh::EndpointId>,
-
-    /// Approve the in-memory iroh key by running rho through this SSH
-    /// destination.
-    #[arg(long, value_name = "DESTINATION", requires = "endpoint")]
-    ssh: Option<String>,
-
-    /// Rho executable on the SSH host.
+    /// Rho executable on SSH hosts.
     #[arg(long, value_name = "PATH", default_value = "rho")]
     remote_rho: String,
 
@@ -164,7 +153,7 @@ fn run() -> Result<()> {
             })
         })
         .transpose()?;
-    let attach_target = attach_target_from_args(args)?;
+    let specs = host_specs(&args)?;
 
     gpui_platform::application()
         .with_assets(RhoAssets)
@@ -216,7 +205,7 @@ fn run() -> Result<()> {
             cx.activate(true);
 
             if let Err(error) = cx.open_window(WindowOptions::default(), move |window, cx| {
-                cx.new(|cx| Workspace::new(attach_target.clone(), window, cx))
+                cx.new(|cx| Workspace::new(specs.clone(), window, cx))
             }) {
                 eprintln!("rho-gui: failed to open window: {error:#}");
                 cx.quit();
@@ -425,17 +414,27 @@ fn duration_ns(duration: std::time::Duration) -> u64 {
     duration.as_nanos().min(u128::from(u64::MAX)) as u64
 }
 
-fn attach_target_from_args(args: Args) -> Result<AttachTarget> {
-    if let Some(endpoint_id) = args.endpoint {
-        return Ok(AttachTarget::Iroh {
-            endpoint_id,
-            ssh_destination: args.ssh.context("--ssh is required with --endpoint")?,
-            remote_rho: args.remote_rho,
-        });
+/// The daemons to attach at startup, in the order they should be numbered.
+/// With no `--attach`, the local daemon socket is the whole list.
+fn host_specs(args: &Args) -> Result<Vec<HostSpec>> {
+    if args.attach.is_empty() {
+        return Ok(vec![HostSpec {
+            name: "local".to_owned(),
+            target: AttachTarget::Unix(rho_ui_proto::socket_path()?),
+        }]);
     }
-    Ok(AttachTarget::Unix(
-        args.socket.unwrap_or(rho_ui_proto::socket_path()?),
-    ))
+    let mut specs = Vec::new();
+    for host in &args.attach {
+        let spec = HostSpec::parse(host, &args.remote_rho)
+            .map_err(|error| anyhow::anyhow!("--attach {host}: {error}"))?;
+        anyhow::ensure!(
+            !specs.iter().any(|other: &HostSpec| other.name == spec.name),
+            "host {:?} is attached twice; names label agents and must be distinct",
+            spec.name
+        );
+        specs.push(spec);
+    }
+    Ok(specs)
 }
 
 fn init_app(cx: &mut App) -> Result<()> {

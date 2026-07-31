@@ -20,7 +20,38 @@ use rho_ui_proto::{
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+use crate::registry::HostId;
 use crate::workspace::AttachTarget;
+
+/// A connection event tagged with the daemon it came from. Every attached
+/// host feeds the same channel, so the workspace handles one ordered stream
+/// rather than polling several.
+pub struct HostEvent {
+    pub host: HostId,
+    pub event: ConnEvent,
+}
+
+/// One host's end of the shared event channel. Every IO task holds a clone
+/// and stamps its own [`HostId`] on whatever it sends.
+#[derive(Clone)]
+pub(crate) struct EventSink {
+    host: HostId,
+    events: futures_mpsc::UnboundedSender<HostEvent>,
+}
+
+impl EventSink {
+    /// Mirrors [`futures_mpsc::UnboundedSender::unbounded_send`]; the error
+    /// carries nothing, since a closed GUI channel means the same thing
+    /// whatever the event was.
+    pub(crate) fn unbounded_send(&self, event: ConnEvent) -> Result<(), ()> {
+        self.events
+            .unbounded_send(HostEvent {
+                host: self.host,
+                event,
+            })
+            .map_err(|_| ())
+    }
+}
 
 pub enum ConnEvent {
     Ready {
@@ -494,6 +525,15 @@ pub struct VisualizationClient {
 }
 
 impl VisualizationClient {
+    /// A client with no daemon behind it, for an agent whose host has been
+    /// detached: its retained transcript still renders, and asking for an
+    /// artifact reports the same "not connected" as a dropped connection.
+    pub fn detached() -> Self {
+        Self {
+            dialer: Arc::new(Mutex::new(None)),
+        }
+    }
+
     pub fn get(
         &self,
         id: String,
@@ -677,12 +717,16 @@ impl Connection {
     }
 }
 
+/// Attaches one daemon. Its events join `events`, tagged with `host`, so
+/// several daemons feed the workspace through a single ordered stream.
 pub fn spawn(
+    host: HostId,
     target: AttachTarget,
+    events: futures_mpsc::UnboundedSender<HostEvent>,
     cx: &App,
-) -> (Connection, futures_mpsc::UnboundedReceiver<ConnEvent>) {
+) -> Connection {
     let iroh = matches!(&target, AttachTarget::Iroh { .. });
-    let (event_tx, event_rx) = futures_mpsc::unbounded();
+    let event_tx = EventSink { host, events };
     let (command_tx, command_rx) = futures_mpsc::unbounded();
     let dialer = Arc::new(Mutex::new(None));
     let shell_requests = Arc::new(Mutex::new(ShellControlRequests::default()));
@@ -701,21 +745,18 @@ pub fn spawn(
             let _ = event_tx.unbounded_send(ConnEvent::Disconnected(format!("{error:#}")));
         }
     });
-    (
-        Connection {
-            commands: command_tx,
-            iroh,
-            dialer,
-            shell_requests,
-            _io_task: io_task,
-        },
-        event_rx,
-    )
+    Connection {
+        commands: command_tx,
+        iroh,
+        dialer,
+        shell_requests,
+        _io_task: io_task,
+    }
 }
 
 async fn run(
     target: AttachTarget,
-    events: &futures_mpsc::UnboundedSender<ConnEvent>,
+    events: &EventSink,
     mut commands: futures_mpsc::UnboundedReceiver<ClientMessage>,
     dialer: &Mutex<Option<ChannelDialer>>,
     shell_requests: &Mutex<ShellControlRequests>,
@@ -1021,7 +1062,7 @@ async fn run(
 }
 
 async fn request_git_approval(
-    events: &futures_mpsc::UnboundedSender<ConnEvent>,
+    events: &EventSink,
     request_id: u64,
     prompt: String,
 ) -> anyhow::Result<GitApprovalDecision> {
@@ -1044,7 +1085,7 @@ async fn run_git_transport_provider(
     request_id: u64,
     provider_id: u64,
     request: GitTransportRequest,
-    events: futures_mpsc::UnboundedSender<ConnEvent>,
+    events: EventSink,
 ) -> anyhow::Result<()> {
     if let Err(error) = validate_git_transport_request(&request) {
         report_git_transport_decision(dialer, request_id, provider_id, false).await?;
@@ -1336,10 +1377,7 @@ fn display_field(value: &str) -> String {
         .collect()
 }
 
-async fn run_agent_streams(
-    connection: iroh::endpoint::Connection,
-    events: futures_mpsc::UnboundedSender<ConnEvent>,
-) {
+async fn run_agent_streams(connection: iroh::endpoint::Connection, events: EventSink) {
     const AGENT_FRAME_ALLOCATION_BUDGET: usize = 128 * 1024 * 1024;
     let mut streams = tokio::task::JoinSet::new();
     let allocation_budget = Arc::new(AgentFrameAllocationBudget::new(
@@ -1485,7 +1523,7 @@ impl AgentFrameAllocationBudget {
     }
 }
 
-pub(crate) struct AgentFrameAllocation {
+pub struct AgentFrameAllocation {
     budget: Arc<AgentFrameAllocationBudget>,
     bytes: usize,
 }
@@ -1499,14 +1537,26 @@ impl Drop for AgentFrameAllocation {
     }
 }
 
+/// The client's iroh identity, bound once and shared by every attached
+/// daemon. One identity means one key for the user to recognize across
+/// hosts, and each host still enrolls it separately over its own SSH login.
+static CLIENT_ENDPOINT: tokio::sync::OnceCell<iroh::Endpoint> = tokio::sync::OnceCell::const_new();
+
+async fn client_endpoint() -> anyhow::Result<iroh::Endpoint> {
+    CLIENT_ENDPOINT
+        .get_or_try_init(rho_rpc::bind_ephemeral_iroh_client)
+        .await
+        .cloned()
+}
+
 async fn connect_iroh(
     daemon_id: iroh::EndpointId,
     ssh_destination: &str,
     remote_rho: &str,
 ) -> anyhow::Result<(rho_rpc::Stream, iroh::endpoint::Connection, iroh::Endpoint)> {
     // The native client's identity intentionally lives only as long as this
-    // process. The daemon can trust it in memory via an existing SSH login.
-    let endpoint = rho_rpc::bind_ephemeral_iroh_client().await?;
+    // process. Each daemon can trust it in memory via an existing SSH login.
+    let endpoint = client_endpoint().await?;
     tracing::info!(
         destination = ssh_destination,
         "trusting ephemeral iroh client over SSH"
