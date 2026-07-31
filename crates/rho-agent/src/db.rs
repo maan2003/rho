@@ -270,9 +270,9 @@ pub struct AgentEventPos {
     seq: u32,
 }
 
-/// One field in a model-derived presentation update. `Clear` is distinct
-/// from `Unchanged`: activity must disappear when a turn settles instead of
-/// lingering as an incorrect "currently doing" label.
+/// One field in a model-derived presentation update. `Clear` remains distinct
+/// from `Unchanged` for explicit cache maintenance, while normal turn
+/// settlement leaves the last model-derived activity intact.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum PresentationField {
     Unchanged,

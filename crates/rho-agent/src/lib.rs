@@ -25,8 +25,7 @@ use tokio::sync::{Notify, mpsc, oneshot};
 use crate::db::{
     AgentEventPos, AgentId, AgentPresentationCache, AgentPresentationUpdate,
     AgentProfileWriteTxnExt, AgentReadTxnExt, AgentRoleSessionProfile as _, AgentRuntime,
-    AgentWriteTxnExt, InferenceModel, InferenceProfile, PresentationField, SessionBinding,
-    UnixMillis,
+    AgentWriteTxnExt, InferenceModel, InferenceProfile, SessionBinding, UnixMillis,
 };
 use crate::lazy::Lazy;
 use crate::multi_agent_tools::MultiAgentTools;
@@ -1600,19 +1599,13 @@ impl AgentLoop {
                             }
                             self.presentation.task = None;
                             match result {
-                                Ok(Some(mut update)) => {
+                                Ok(Some(update)) => {
                                     // A newer native source already has a coalesced request
                                     // pending. Never let this older snapshot overwrite the
                                     // durable cache in the meantime.
                                     if self.last_presentation_source != Some(update.through) {
                                         self.schedule_presentation();
                                         continue;
-                                    }
-                                    // Provider completion can race a turn settlement.
-                                    // Decide whether activity is still meaningful at
-                                    // the same serialized boundary that persists it.
-                                    if !state.kind.is_working() {
-                                        update.activity = PresentationField::Clear;
                                     }
                                     let _ = self.persist_presentation(update).await;
                                 }
@@ -2108,11 +2101,9 @@ impl AgentLoop {
                 &previous_kind,
                 &state.kind,
                 self.execution_generation != previous_execution_generation,
-            ) {
-                self.clear_presentation_activity().await;
-                if let Some(pool) = self.pool_events.upgrade() {
-                    pool.settle_turn(self.persistence.agent_id).await;
-                }
+            ) && let Some(pool) = self.pool_events.upgrade()
+            {
+                pool.settle_turn(self.persistence.agent_id).await;
             }
             *self.state.write().expect("poison") = state.clone();
             self.notify.notify_waiters();
@@ -2153,29 +2144,6 @@ impl AgentLoop {
             );
         }
         Some(cache)
-    }
-
-    async fn clear_presentation_activity(&mut self) {
-        let Some(through) = self.last_presentation_source else {
-            return;
-        };
-        if self
-            .persistence
-            .db
-            .read()
-            .get_agent(self.persistence.agent_id)
-            .activity
-            .is_none()
-        {
-            return;
-        }
-        let _ = self
-            .persist_presentation(AgentPresentationUpdate {
-                generated_title: PresentationField::Unchanged,
-                activity: PresentationField::Clear,
-                through,
-            })
-            .await;
     }
 
     fn presentation_source_committed(&mut self, through: AgentEventPos) {

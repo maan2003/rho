@@ -35,8 +35,9 @@ const SET_STATUS: &str = "set_status";
 const INSTRUCTIONS: &str = "You maintain an agent's compact presentation from its recent XML \
 transcript. Set title only when it is missing or the conversation's subject materially changed. \
 A title is lowercase kebab-case, at most 30 characters, and names the subject rather than a task. \
-Set activity to a concise three or four word current-progress label, at most 50 bytes. When the \
-agent is no longer actively working, do not set activity. Use the tools; do not write prose.";
+Set activity to a concise three or four word current-progress label, at most 50 bytes. Use \
+lowercase words unless a type, function, or other code identifier needs its conventional casing. \
+When the agent is no longer actively working, do not set activity. Use the tools; do not write prose.";
 
 pub struct Watch {
     control: mpsc::UnboundedSender<crate::AgentControl>,
@@ -297,7 +298,7 @@ fn set_status_spec() -> ToolSpec {
     ToolSpec {
         name: SET_STATUS.try_into().expect("valid status tool name"),
         tool_type: ToolType::Function,
-        description: "Set a concise current activity label, at most 50 bytes.".to_owned(),
+        description: "Set a concise current activity label, at most 50 bytes; use lowercase except for code identifiers.".to_owned(),
         input_schema: serde_json::json!({"type":"object","properties":{"status":{"type":"string","maxLength":50}},"required":["status"],"additionalProperties":false}),
         format: None,
     }
