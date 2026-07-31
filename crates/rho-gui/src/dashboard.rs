@@ -1925,7 +1925,7 @@ mod tests {
     }
 
     #[test]
-    fn hidden_and_inactive_bucket_agents_move_to_the_folded_tail() {
+    fn hidden_and_inactive_agents_move_to_the_folded_tail() {
         let inactive = agent(1, Status::Normal, 10);
         let fresh = agent(2, Status::Normal, 10);
         let mut filed = agent(3, Status::Normal, 10);
@@ -1948,19 +1948,12 @@ mod tests {
 
         assert_eq!(
             active,
-            [13, 12, 11, 10, 9, 8, 7, 6, 5, 4].map(|id| AgentId::from_counter(
-                id,
-                &AgentIdDomain(0)
-            )
-            .unwrap())
+            [13, 12, 11, 10, 9].map(|id| AgentId::from_counter(id, &AgentIdDomain(0)).unwrap())
         );
         assert_eq!(
             folded,
-            [
-                AgentId::from_counter(1, &AgentIdDomain(0)).unwrap(),
-                AgentId::from_counter(2, &AgentIdDomain(0)).unwrap(),
-                AgentId::from_counter(3, &AgentIdDomain(0)).unwrap(),
-            ]
+            [1, 2, 3, 4, 5, 6, 7, 8]
+                .map(|id| AgentId::from_counter(id, &AgentIdDomain(0)).unwrap())
         );
     }
 

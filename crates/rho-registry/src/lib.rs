@@ -109,31 +109,15 @@ pub fn agent_pinned(agent: &UiAgentSummary) -> bool {
     agent.labels.iter().any(|label| label == PIN_LABEL)
 }
 
-/// The old rail's coarse active cohort: every colored item, plus enough
-/// recently engaged quiet items to fill five slots. Ordering inside the
-/// returned bucket is deliberately left to retained rail rank.
-fn active_bucket<K: Copy + Ord>(
-    mut candidates: Vec<(K, rho_ui_proto::UiAttention, rho_core::UnixMs)>,
-) -> BTreeSet<K> {
-    let colored_count = candidates
-        .iter()
-        .filter(|(_, attention, _)| *attention != rho_ui_proto::UiAttention::Quiet)
-        .count();
-    let recent_quiet_slots = 5usize.saturating_sub(colored_count);
-    let mut top = candidates
-        .iter()
-        .filter(|(_, attention, _)| *attention != rho_ui_proto::UiAttention::Quiet)
-        .map(|(key, _, _)| *key)
-        .collect::<BTreeSet<_>>();
-    candidates.sort_by_key(|(key, _, last_active)| (Reverse(*last_active), *key));
-    top.extend(
-        candidates
-            .into_iter()
-            .filter(|(_, attention, _)| *attention == rho_ui_proto::UiAttention::Quiet)
-            .take(recent_quiet_slots)
-            .map(|(key, _, _)| key),
-    );
-    top
+/// The rail's coarse active cohort: every item with non-quiet attention.
+/// Ordering inside the returned bucket is deliberately left to retained rail
+/// rank.
+fn active_bucket<K: Copy + Ord>(candidates: Vec<(K, rho_ui_proto::UiAttention)>) -> BTreeSet<K> {
+    candidates
+        .into_iter()
+        .filter(|(_, attention)| *attention != rho_ui_proto::UiAttention::Quiet)
+        .map(|(key, _)| key)
+        .collect()
 }
 
 fn derive_workstreams(
@@ -206,7 +190,7 @@ pub struct AgentRegistry {
     /// state changes rather than on every window draw.
     topic_rail_layouts: BTreeMap<WorkstreamId, TopicRailLayout>,
     /// When the user last engaged each agent: seeded from summaries, bumped
-    /// locally on send. Selects quiet agents for the active rail bucket.
+    /// locally on send. Seeds the retained order of newly seen agents.
     last_active: BTreeMap<AgentId, rho_core::UnixMs>,
     /// Every attached daemon's last `Ready` snapshot, in attachment order.
     /// Each host is refreshed independently; everything below is derived
@@ -294,8 +278,8 @@ impl<'a> TopicRailState<'a> {
             })
             .collect::<Vec<_>>();
         // Descendant attention belongs to its visible root in the dashboard.
-        // Build the same coarse active cohort the old agent rail used, but at
-        // root granularity so a large subtree cannot consume several slots.
+        // Build the active cohort at root granularity so a large subtree
+        // cannot consume several slots.
         let normal = roots
             .iter()
             .copied()
@@ -313,17 +297,7 @@ impl<'a> TopicRailState<'a> {
         let top_roots = active_bucket(
             normal
                 .into_iter()
-                .map(|root| {
-                    (
-                        root.agent_id,
-                        root_attention(root.agent_id),
-                        registry
-                            .last_active
-                            .get(&root.agent_id)
-                            .copied()
-                            .unwrap_or(root.last_active),
-                    )
-                })
+                .map(|root| (root.agent_id, root_attention(root.agent_id)))
                 .collect(),
         );
         let mut extra = roots
@@ -924,17 +898,7 @@ impl AgentRegistry {
                     .map(|agent| self.attention(agent.agent_id))
                     .max()
                     .unwrap_or_default();
-                let last_active = roots
-                    .iter()
-                    .map(|root| {
-                        self.last_active
-                            .get(&root.agent_id)
-                            .copied()
-                            .unwrap_or(root.last_active)
-                    })
-                    .max()
-                    .unwrap_or_default();
-                Some((workstream.workstream_id, attention, last_active))
+                Some((workstream.workstream_id, attention))
             })
             .collect::<Vec<_>>();
         active_bucket(normal)
@@ -1511,10 +1475,10 @@ mod tests {
         // not creation order.
         assert_eq!(order(&registry), [3, 1, 2]);
 
-        // Attention admits a row to the top bucket but retained order holds
-        // within it; a workstream-level pin outranks everything.
+        // Attention moves its row ahead of the quiet rows; a workstream-level
+        // pin still outranks everything.
         registry.set_attention(agent_id(2), UiAttention::NeedsInput);
-        assert_eq!(order(&registry), [3, 1, 2]);
+        assert_eq!(order(&registry), [3, 2, 1]);
         set_topics(
             &mut registry,
             vec![
@@ -1527,7 +1491,7 @@ mod tests {
     }
 
     #[test]
-    fn workstream_bucket_counts_roots_not_descendants() {
+    fn workstream_attention_bucket_counts_roots_not_descendants() {
         let mut registry = AgentRegistry::default();
         let root = agent(1, Status::Normal);
         let root_id = root.agent_id;
@@ -1550,8 +1514,7 @@ mod tests {
             .map(|workstream| workstream.workstream_id.0)
             .collect::<Vec<_>>();
 
-        // The five recent descendants belong to one old root. They neither
-        // consume all five row slots nor become that workstream's rank.
+        // Quiet descendants do not enter the attention bucket.
         assert_eq!(order, [6, 5, 4, 3, 2, 1]);
 
         for id in 100..=104 {
@@ -1562,9 +1525,8 @@ mod tests {
             .into_iter()
             .map(|workstream| workstream.workstream_id.0)
             .collect::<Vec<_>>();
-        // Five colored descendants still occupy one workstream slot, leaving
-        // four quiet rows in the five-row cohort.
-        assert_eq!(order, [6, 5, 4, 3, 1, 2]);
+        // Five colored descendants still occupy one workstream slot.
+        assert_eq!(order, [1, 6, 5, 4, 3, 2]);
     }
 
     #[test]
@@ -1603,9 +1565,8 @@ mod tests {
             registry.set_attention(child_id, UiAttention::Pending);
         }
 
-        // Root 1 crosses into the five-root active cohort, but retained rank
-        // keeps it behind the four already-higher roots instead of jumping.
-        assert_eq!(roots(&registry), [7, 6, 5, 4, 1, 3, 2].map(agent_id));
+        // Root 1 becomes the sole active root and leads the quiet roots.
+        assert_eq!(roots(&registry), [1, 7, 6, 5, 4, 3, 2].map(agent_id));
     }
 
     #[test]
@@ -1656,12 +1617,11 @@ mod tests {
     }
 
     #[test]
-    fn quiet_rows_beyond_bucket_and_tail_fold_until_attention_or_selection() {
+    fn quiet_rows_beyond_tail_fold_until_attention_or_selection() {
         use rho_ui_proto::UiAttention;
 
-        // Thirteen single-agent workstreams, engagement recency growing
-        // with id: the top bucket admits five quiet members, five more
-        // ride the extra tail, the oldest three fold.
+        // Thirteen quiet single-agent workstreams: five ride the extra tail
+        // and the rest fold.
         let mut registry = AgentRegistry::default();
         set_topics(
             &mut registry,
@@ -1671,13 +1631,13 @@ mod tests {
         );
 
         let (listed, folded) = registry.split_rows();
-        assert_eq!(listed.len(), 10);
+        assert_eq!(listed.len(), 5);
         assert_eq!(
             folded
                 .iter()
                 .map(|row| row.workstream_id.0)
                 .collect::<Vec<_>>(),
-            [3, 2, 1]
+            [8, 7, 6, 5, 4, 3, 2, 1]
         );
         // Members of folded rows fold with them (skipped by cycling).
         assert!(registry.agent_folded(agent_id(1)));
@@ -1782,7 +1742,7 @@ mod tests {
     }
 
     #[test]
-    fn attention_moves_agent_into_but_not_to_front_of_top_bucket() {
+    fn attention_moves_agent_to_the_active_bucket() {
         use rho_ui_proto::UiAttention;
 
         let mut registry = AgentRegistry::default();
@@ -1794,21 +1754,19 @@ mod tests {
             registry.mark_live(agent_id(id));
         }
 
-        // Seeded by engagement recency: 7, 6, 5, 4, 3 are the quiet top
-        // bucket; 2 and 1 remain visible as the extra tail.
+        // The five quiet extra rows are visible in retained order.
         registry.select_agent(agent_id(4));
         assert_eq!(registry.next_live_agent(1), Some(agent_id(3)));
         registry.select_agent(agent_id(3));
-        assert_eq!(registry.next_live_agent(1), Some(agent_id(2)));
+        assert_eq!(registry.next_live_agent(1), Some(agent_id(7)));
 
-        // Coloring agent 1 admits it to the top bucket, but stable retained
-        // order keeps it behind the already-top agents instead of jumping to
-        // row one.
+        // Coloring agent 1 makes it the sole active root, above every quiet
+        // root.
         registry.set_attention(agent_id(1), UiAttention::Working);
-        registry.select_agent(agent_id(4));
+        registry.select_agent(agent_id(2));
         assert_eq!(registry.next_live_agent(1), Some(agent_id(1)));
         registry.select_agent(agent_id(1));
-        assert_eq!(registry.next_live_agent(1), Some(agent_id(3)));
+        assert_eq!(registry.next_live_agent(1), Some(agent_id(7)));
     }
 
     #[test]
@@ -1827,14 +1785,14 @@ mod tests {
             registry.mark_live(agent_id(id));
         }
 
-        // Explicitly filed agents fold, and quiet agents outside the active
-        // bucket plus the five-agent tail fold automatically.
+        // Explicitly filed agents fold, and quiet agents outside the
+        // five-agent tail fold automatically.
         assert!(registry.agent_folded(agent_id(2)));
         assert!(registry.agent_folded(agent_id(1)));
 
         // Attention unfolds an otherwise folded agent: it needs the user, so it
         // rejoins cycling and can win the jump.
-        registry.select_agent(agent_id(10));
+        registry.select_agent(agent_id(9));
         registry.set_attention(agent_id(1), UiAttention::Pending);
         assert!(!registry.agent_folded(agent_id(1)));
         assert_eq!(registry.next_attention_agent(), Some(agent_id(1)));
@@ -1899,7 +1857,7 @@ mod tests {
     }
 
     #[test]
-    fn agents_outside_active_bucket_and_tail_fold_until_engaged_again() {
+    fn quiet_agents_outside_the_extra_tail_stay_folded_after_engagement() {
         let mut registry = AgentRegistry::default();
         let mut idle = agent(1, Status::Normal);
         idle.last_active = rho_core::UnixMs(0);
@@ -1909,13 +1867,13 @@ mod tests {
         agents.extend((3..=13).map(|id| agent(id, Status::Normal)));
         set_topics(&mut registry, vec![topic(1, Status::Normal, agents)]);
 
-        // The quiet tail beyond the active bucket plus five more folds away;
-        // pins and active bucket agents stay. Fresh engagement revives it.
+        // The quiet tail beyond the five extra rows folds away; fresh
+        // engagement alone does not revive it.
         assert!(registry.agent_folded(agent_id(1)));
         assert!(!registry.agent_folded(agent_id(2)));
         assert!(!registry.agent_folded(agent_id(13)));
         registry.touch_agent(agent_id(1));
-        assert!(!registry.agent_folded(agent_id(1)));
+        assert!(registry.agent_folded(agent_id(1)));
     }
 
     #[test]
