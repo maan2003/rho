@@ -31,10 +31,11 @@ pub fn configure(editor: &mut Editor, window: &mut Window, cx: &mut Context<Edit
 }
 
 /// Chrome and typography for the compact dashboard preview. Its text is
-/// deliberately half the size of a full editor without affecting pane editors.
+/// deliberately three quarters the size of a full editor without affecting pane
+/// editors.
 pub fn configure_preview(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
     configure(editor, window, cx);
-    let font_size = editor.style(cx).text.font_size.to_pixels(window.rem_size()) * 0.5;
+    let font_size = editor.style(cx).text.font_size.to_pixels(window.rem_size()) * 0.75;
     editor.set_text_style_refinement(TextStyleRefinement {
         font_size: Some(font_size.into()),
         ..Default::default()

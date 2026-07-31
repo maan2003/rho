@@ -3948,10 +3948,10 @@ impl Workspace {
             .text_color(text_style.color)
             .key_context("RhoDashboard");
         let container = container
-            // The boxed preview card carries the hierarchy, so it can take
-            // the wider share; transcripts are the text-dense side.
+            // The dashboard owns the preview card's reclaimed horizontal
+            // space, rather than leaving a blank wrapper beside the card.
             .w(if show_panes {
-                gpui::relative(0.4)
+                gpui::relative(0.55)
             } else {
                 gpui::relative(1.0)
             })
@@ -4143,9 +4143,9 @@ impl Workspace {
         let separator_color = cx.theme().colors().border_variant.opacity(0.6);
         let mut preview_text_style = text_style.clone();
         preview_text_style.font_size =
-            (text_style.font_size.to_pixels(window.rem_size()) * 0.5).into();
+            (text_style.font_size.to_pixels(window.rem_size()) * 0.75).into();
         preview_text_style.line_height =
-            (text_style.line_height_in_pixels(window.rem_size()) * 0.5).into();
+            (text_style.line_height_in_pixels(window.rem_size()) * 0.75).into();
         let preview_bar = (home && !iris)
             .then(|| self.render_preview_bar(&preview_text_style, cx))
             .flatten();
@@ -4198,7 +4198,7 @@ impl Workspace {
         };
         let panes = show_panes.then(|| {
             let element = div().flex_1().min_w_0().min_h_0();
-            // Home mode uses a half-size preview card, anchored to the
+            // Home mode uses a three-quarter-size preview card, anchored to the
             // bottom-right of the pane area rather than competing with the
             // dashboard for an equal split.
             // The sheet shows the agent's *document* editor: the same
@@ -4208,8 +4208,8 @@ impl Workspace {
             if home {
                 element.flex().flex_col().child(
                     div()
-                        .w(gpui::relative(0.5))
-                        .h(gpui::relative(0.5))
+                        .w_full()
+                        .h(gpui::relative(0.75))
                         .ml_auto()
                         .mt_auto()
                         .border_1()
