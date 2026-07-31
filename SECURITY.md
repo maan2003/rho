@@ -163,15 +163,18 @@ AI APIs.
   connection after sending a receive-pack request has an ambiguous outcome;
   callers must inspect the remote ref before retrying.
 - `rho-pr-monitor` uses Octo only for bounded authenticated GitHub API calls
-  behind `rho pr` on the normal daemon socket. Status is a stateless read for
-  any canonical HTTPS GitHub PR URL. PR commands need no agent identity;
+  behind `rho pr` on the normal daemon socket. Status and CI checks are
+  stateless reads for any canonical HTTPS GitHub PR URL. PR commands need no
+  agent identity;
   GitHub token permissions authorize mutations. Clients able to reach the
   privileged daemon socket already have equivalent control. The daemon stores
-  no PR subscriptions, runs no polling
-  loop, and never injects GitHub content into an agent conversation.
-  Feedback replies re-fetch the named PR snapshot and require the event id to
-  be present there. GitHub permissions govern mutations and GitHub retains its
-  edit history. Snapshots are capped at two pages per feedback surface, 100 CI
+  no PR subscriptions or polling loop and never injects GitHub content into an
+  agent conversation. `rho pr checks --watch` is client-local polling over
+  independent stateless reads, not a stored daemon subscription. GitHub
+  validates the PR/review-comment relationship for inline replies, which use
+  an explicit numeric GitHub comment ID. GitHub permissions govern mutations
+  and GitHub retains its edit history. Snapshots
+  are capped at two pages per feedback surface, 100 CI
   records per API family, and 4 MiB per GitHub JSON response. CI log archives
   are stream-limited to 48 MiB on
   both socket hops; extraction permits at most 1,000 files, 16 MiB per entry,

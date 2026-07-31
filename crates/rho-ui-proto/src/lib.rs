@@ -373,8 +373,14 @@ pub enum PrCommand {
     },
     Comment {
         url: String,
-        reply: Option<String>,
+        reply_comment: Option<u64>,
         body: String,
+    },
+    Comments {
+        url: String,
+    },
+    Checks {
+        url: String,
     },
     Rerun {
         url: String,
@@ -386,6 +392,7 @@ pub enum PrCommand {
     },
     Edit {
         url: String,
+        base: Option<String>,
         title: Option<String>,
         body: Option<String>,
     },
@@ -1083,6 +1090,7 @@ mod tests {
             agent_id: Some("eng-abcd".into()),
             command: PrCommand::Edit {
                 url: "https://github.com/acme/widgets/pull/1".into(),
+                base: Some("release".into()),
                 title: Some("Better title".into()),
                 body: Some("Better summary".into()),
             },

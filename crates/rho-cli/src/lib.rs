@@ -273,21 +273,34 @@ pub(crate) enum PrCliCommand {
     },
     /// Fetch the current PR, CI, and review snapshot.
     Status { url: String },
-    /// Edit a pull request's title or description.
+    /// Edit a pull request's title, description, or base branch.
     Edit {
         url: String,
+        #[arg(short = 'B', long)]
+        base: Option<String>,
         #[arg(short = 't', long)]
         title: Option<String>,
         #[arg(short = 'b', long, alias = "description")]
         body: Option<String>,
     },
-    /// Add a PR comment, optionally replying to a delivered feedback event.
+    /// Add a PR comment or reply to an inline review comment.
     Comment {
         url: String,
+        /// Numeric GitHub inline review-comment ID from `rho pr comments`.
         #[arg(long)]
-        reply: Option<String>,
+        reply_comment: Option<u64>,
         #[arg(short = 'b', long)]
         body: String,
+    },
+    /// List PR comments and their replyable GitHub IDs.
+    Comments { url: String },
+    /// Show CI checks for a pull request, optionally until they complete.
+    Checks {
+        url: String,
+        #[arg(long)]
+        watch: bool,
+        #[arg(long, default_value_t = 10)]
+        interval: u64,
     },
     /// Rerun failed jobs in a GitHub Actions workflow run.
     Rerun { url: String, run_id: u64 },

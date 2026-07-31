@@ -330,12 +330,13 @@ impl PrMonitor {
     pub async fn edit(
         &self,
         url: &str,
+        base: Option<String>,
         title: Option<String>,
         body: Option<String>,
     ) -> anyhow::Result<String> {
         anyhow::ensure!(
-            title.is_some() || body.is_some(),
-            "provide --title or --body"
+            base.is_some() || title.is_some() || body.is_some(),
+            "provide --base, --title, or --body"
         );
         let (owner, repo, number) = parse_pr_url(url)?;
         let response = self
@@ -344,7 +345,7 @@ impl PrMonitor {
                 &owner,
                 &repo,
                 number,
-                &octo_types::PrEditRequest { title, body },
+                &octo_types::PrEditRequest { base, title, body },
             )
             .await?;
         Ok(format!("updated pull request: {}", response.url))
@@ -353,37 +354,61 @@ impl PrMonitor {
     pub async fn comment(
         &self,
         url: &str,
+        reply_comment: Option<u64>,
         text: &str,
-        reply: Option<&str>,
     ) -> anyhow::Result<String> {
         anyhow::ensure!(!text.trim().is_empty(), "comment body cannot be empty");
         let (owner, repo, number) = parse_pr_url(url)?;
-        let Some(event_id) = reply else {
-            let body = format!("{}\n\n{OUTBOUND_MARKER}", text.trim());
-            let response = self.octo.comment(&owner, &repo, number, body).await?;
-            return Ok(format!("posted GitHub comment: {}", response.url));
-        };
-        let snapshot = self.octo.snapshot(&owner, &repo, number).await?;
-        let target = snapshot
-            .feedback
-            .iter()
-            .find(|feedback| feedback_key(feedback) == event_id)
-            .ok_or_else(|| anyhow::anyhow!("feedback event is not present on this PR"))?;
         let body = format!("{}\n\n{OUTBOUND_MARKER}", text.trim());
-        let response = if target.surface == "inline" {
-            self.octo
-                .reply(&owner, &repo, number, target.id, body)
-                .await?
-        } else {
-            self.octo.comment(&owner, &repo, number, body).await?
+        let response = match reply_comment {
+            Some(comment_id) => {
+                self.octo
+                    .reply(&owner, &repo, number, comment_id, body)
+                    .await?
+            }
+            None => self.octo.comment(&owner, &repo, number, body).await?,
         };
-        Ok(format!("posted GitHub reply: {}", response.url))
+        Ok(format!("posted GitHub comment: {}", response.url))
     }
 
     pub async fn status(&self, url: &str) -> anyhow::Result<String> {
         let (owner, repo, number) = parse_pr_url(url)?;
         let snapshot = self.octo.snapshot(&owner, &repo, number).await?;
         Ok(serde_json::to_string_pretty(&snapshot)?)
+    }
+
+    pub async fn comments(&self, url: &str) -> anyhow::Result<String> {
+        let (owner, repo, number) = parse_pr_url(url)?;
+        let snapshot = self.octo.snapshot(&owner, &repo, number).await?;
+        let comments = snapshot
+            .feedback
+            .into_iter()
+            .map(|feedback| {
+                let replyable = feedback.surface == "inline";
+                serde_json::json!({
+                    "id": feedback.id,
+                    "surface": feedback.surface,
+                    "replyable": replyable,
+                    "author": feedback.author,
+                    "body": feedback.body,
+                    "url": feedback.url,
+                    "path": feedback.path,
+                    "line": feedback.line,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(serde_json::to_string_pretty(&comments)?)
+    }
+
+    pub async fn checks(&self, url: &str) -> anyhow::Result<String> {
+        let (owner, repo, number) = parse_pr_url(url)?;
+        let snapshot = self.octo.snapshot(&owner, &repo, number).await?;
+        Ok(serde_json::to_string_pretty(&serde_json::json!({
+            "summary": ci_summary(&snapshot),
+            "pending": ci_pending(&snapshot),
+            "legacy_status": snapshot.legacy_status,
+            "runs": snapshot.runs,
+        }))?)
     }
 
     pub fn list(&self, subscriber: AgentId) -> anyhow::Result<String> {
@@ -583,6 +608,11 @@ fn ci_summary(snapshot: &PrSnapshot) -> String {
     }
 }
 
+fn ci_pending(snapshot: &PrSnapshot) -> bool {
+    snapshot.runs.iter().any(|run| run.status != "completed")
+        || snapshot.legacy_status.as_deref() == Some("pending")
+}
+
 fn is_ready(snapshot: &PrSnapshot) -> bool {
     ci_summary(snapshot) == "green"
         && snapshot.mergeable == Some(true)
@@ -698,7 +728,7 @@ fn render_update(
     ));
     if !feedback.is_empty() {
         message.push_str(
-            "\nAction: process_review_feedback\nAfter verifying the outcome, use `rho pr comment PR_URL --reply EVENT_ID --body ...` with this PR URL and the matching event id. Prefer `--reply` over a new top-level comment when responding to feedback. Send your parent a concise milestone so external chat stays informed.",
+            "\nAction: process_review_feedback\nAfter verifying the outcome, use `rho pr comment PR_URL --body ...`. Send your parent a concise milestone so external chat stays informed.",
         );
     }
     message
@@ -879,6 +909,21 @@ mod tests {
             ci_summary(&snapshot(vec![unknown], None)),
             "inconclusive: future-check"
         );
+    }
+
+    #[test]
+    fn ci_pending_only_tracks_nonterminal_work() {
+        assert!(!ci_pending(&snapshot(Vec::new(), None)));
+        assert!(ci_pending(&snapshot(Vec::new(), Some("pending"))));
+        let running = octo_types::WorkflowRun {
+            id: 1,
+            name: "build".into(),
+            kind: "workflow".into(),
+            url: String::new(),
+            status: "in_progress".into(),
+            conclusion: None,
+        };
+        assert!(ci_pending(&snapshot(vec![running], None)));
     }
 
     #[test]

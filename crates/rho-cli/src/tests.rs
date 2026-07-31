@@ -13,14 +13,14 @@ fn top_level_pr_init_parses() {
 }
 
 #[test]
-fn pr_comment_parses_with_optional_reply() {
+fn pr_comment_parses() {
     let args = Args::try_parse(
         [
             "pr",
             "comment",
             "https://github.com/acme/widgets/pull/1",
-            "--reply",
-            "inline:9:v1",
+            "--reply-comment",
+            "7",
             "--body",
             "addressed",
         ]
@@ -33,13 +33,30 @@ fn pr_comment_parses_with_optional_reply() {
         super::Command::Pr(super::PrArgs {
             command: super::PrCliCommand::Comment {
                 url,
-                reply: Some(reply),
+                reply_comment: Some(reply_comment),
                 body,
             },
             ..
         }) if url == "https://github.com/acme/widgets/pull/1"
-            && reply == "inline:9:v1"
+            && reply_comment == 7
             && body == "addressed"
+    ));
+}
+
+#[test]
+fn pr_comments_parses() {
+    let args = Args::try_parse(
+        ["pr", "comments", "https://github.com/acme/widgets/pull/1"]
+            .into_iter()
+            .map(str::to_owned),
+    )
+    .unwrap();
+    assert!(matches!(
+        args.command,
+        super::Command::Pr(super::PrArgs {
+            command: super::PrCliCommand::Comments { url },
+            ..
+        }) if url == "https://github.com/acme/widgets/pull/1"
     ));
 }
 
@@ -50,6 +67,8 @@ fn pr_edit_parses_title_and_description() {
             "pr",
             "edit",
             "https://github.com/acme/widgets/pull/1",
+            "--base",
+            "release",
             "--title",
             "Better title",
             "--description",
@@ -64,13 +83,43 @@ fn pr_edit_parses_title_and_description() {
         super::Command::Pr(super::PrArgs {
             command: super::PrCliCommand::Edit {
                 url,
+                base: Some(base),
                 title: Some(title),
                 body: Some(body),
             },
             ..
         }) if url == "https://github.com/acme/widgets/pull/1"
+            && base == "release"
             && title == "Better title"
             && body == "Better summary"
+    ));
+}
+
+#[test]
+fn pr_checks_parses_watch_interval() {
+    let args = Args::try_parse(
+        [
+            "pr",
+            "checks",
+            "https://github.com/acme/widgets/pull/1",
+            "--watch",
+            "--interval",
+            "5",
+        ]
+        .into_iter()
+        .map(str::to_owned),
+    )
+    .unwrap();
+    assert!(matches!(
+        args.command,
+        super::Command::Pr(super::PrArgs {
+            command: super::PrCliCommand::Checks {
+                url,
+                watch: true,
+                interval: 5,
+            },
+            ..
+        }) if url == "https://github.com/acme/widgets/pull/1"
     ));
 }
 

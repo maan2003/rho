@@ -2499,14 +2499,33 @@ async fn handle_message(
                         "persistent PR subscriptions were removed".to_owned(),
                         Vec::new(),
                     )),
-                    rho_ui_proto::PrCommand::Comment { url, reply, body } => agents
+                    rho_ui_proto::PrCommand::Comment {
+                        url,
+                        reply_comment,
+                        body,
+                    } => agents
                         .pr_monitor
-                        .comment(&url, &body, reply.as_deref())
+                        .comment(&url, reply_comment, &body)
                         .await
                         .map(|output| (output, Vec::new())),
-                    rho_ui_proto::PrCommand::Edit { url, title, body } => agents
+                    rho_ui_proto::PrCommand::Comments { url } => agents
                         .pr_monitor
-                        .edit(&url, title, body)
+                        .comments(&url)
+                        .await
+                        .map(|output| (output, Vec::new())),
+                    rho_ui_proto::PrCommand::Checks { url } => agents
+                        .pr_monitor
+                        .checks(&url)
+                        .await
+                        .map(|output| (output, Vec::new())),
+                    rho_ui_proto::PrCommand::Edit {
+                        url,
+                        base,
+                        title,
+                        body,
+                    } => agents
+                        .pr_monitor
+                        .edit(&url, base, title, body)
                         .await
                         .map(|output| (output, Vec::new())),
                     rho_ui_proto::PrCommand::Rerun { url, run_id } => agents

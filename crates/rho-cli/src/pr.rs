@@ -17,38 +17,58 @@ pub(crate) async fn run(args: PrArgs) -> anyhow::Result<()> {
         PrCliCommand::Logs { run_id, .. } => Some(*run_id),
         _ => None,
     };
+    let watch_interval = match &args.command {
+        PrCliCommand::Checks {
+            watch: true,
+            interval,
+            ..
+        } => {
+            anyhow::ensure!(*interval > 0, "--interval must be at least one second");
+            Some(std::time::Duration::from_secs(*interval))
+        }
+        _ => None,
+    };
     let command = command(args.command)?;
     let socket_path = args.socket_path.unwrap_or(default_socket_path()?);
     let mut daemon = connect_or_start_daemon(&socket_path, &args.auth).await?;
-    let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-    daemon
-        .send(&ClientMessage::PrCommand {
-            request_id,
-            agent_id: None,
-            command,
-        })
-        .await?;
     loop {
-        if let ServerMessage::PrCommandResult {
-            request_id: response_id,
-            output,
-            data,
-            is_error,
-        } = daemon.recv().await?
-            && response_id == request_id
-        {
-            if is_error {
-                bail!(output);
+        let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
+        daemon
+            .send(&ClientMessage::PrCommand {
+                request_id,
+                agent_id: None,
+                command: command.clone(),
+            })
+            .await?;
+        loop {
+            if let ServerMessage::PrCommandResult {
+                request_id: response_id,
+                output,
+                data,
+                is_error,
+            } = daemon.recv().await?
+                && response_id == request_id
+            {
+                if is_error {
+                    bail!(output);
+                }
+                if data.is_empty() {
+                    println!("{output}");
+                } else {
+                    extract_logs(
+                        &data,
+                        response_run_id.context("binary response for non-log command")?,
+                    )?;
+                }
+                if let Some(interval) = watch_interval {
+                    if !checks_pending(&output)? {
+                        return Ok(());
+                    }
+                    tokio::time::sleep(interval).await;
+                    break;
+                }
+                return Ok(());
             }
-            if data.is_empty() {
-                println!("{output}");
-            } else {
-                extract_logs(
-                    &data,
-                    response_run_id.context("binary response for non-log command")?,
-                )?;
-            }
-            return Ok(());
         }
     }
 }
@@ -77,17 +97,44 @@ fn command(command: PrCliCommand) -> anyhow::Result<PrCommand> {
             }
         }
         PrCliCommand::Status { url } => PrCommand::Status { url },
-        PrCliCommand::Edit { url, title, body } => {
+        PrCliCommand::Edit {
+            url,
+            base,
+            title,
+            body,
+        } => {
             anyhow::ensure!(
-                title.is_some() || body.is_some(),
-                "provide --title or --body"
+                base.is_some() || title.is_some() || body.is_some(),
+                "provide --base, --title, or --body"
             );
-            PrCommand::Edit { url, title, body }
+            PrCommand::Edit {
+                url,
+                base,
+                title,
+                body,
+            }
         }
-        PrCliCommand::Comment { url, reply, body } => PrCommand::Comment { url, reply, body },
+        PrCliCommand::Comment {
+            url,
+            reply_comment,
+            body,
+        } => PrCommand::Comment {
+            url,
+            reply_comment,
+            body,
+        },
+        PrCliCommand::Comments { url } => PrCommand::Comments { url },
+        PrCliCommand::Checks { url, .. } => PrCommand::Checks { url },
         PrCliCommand::Rerun { url, run_id } => PrCommand::Rerun { url, run_id },
         PrCliCommand::Logs { url, run_id } => PrCommand::Logs { url, run_id },
     })
+}
+
+fn checks_pending(output: &str) -> anyhow::Result<bool> {
+    serde_json::from_str::<serde_json::Value>(output)?
+        .get("pending")
+        .and_then(serde_json::Value::as_bool)
+        .context("CI checks response is missing pending state")
 }
 
 async fn init(args: PrArgs) -> anyhow::Result<()> {

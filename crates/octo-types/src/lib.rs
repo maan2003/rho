@@ -204,7 +204,11 @@ pub struct PrCreateResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PrEditRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub body: Option<String>,
 }
 
