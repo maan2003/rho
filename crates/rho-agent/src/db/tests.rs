@@ -700,6 +700,70 @@ async fn fork_agent_lineage_repoints_current_branch() {
 }
 
 #[tokio::test]
+async fn presentation_history_folds_by_source_reachability_after_rewind() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let workstream = write.create_workstream(UnixMs(1), "default".to_owned());
+    let agent_id = write.alloc_agent_id();
+    let first = write.create_agent(
+        UnixMs(1),
+        agent_id,
+        workstream,
+        None,
+        vec![test_workspace()],
+        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
+        test_agent_runtime(),
+        None,
+    );
+    let second = write.append_agent_event(first, &user_event("first"));
+    let third = write.append_agent_event(second, &user_event("later"));
+    let update = AgentPresentationUpdate {
+        generated_title: PresentationField::Set("first-subject".to_owned()),
+        activity: PresentationField::Set("reading first request".to_owned()),
+        through: first,
+    };
+    assert!(
+        write
+            .apply_agent_presentation(UnixMs(2), agent_id, &update)
+            .is_some()
+    );
+    write.append_agent_presentation_history(third, &update);
+    let fourth = write.append_agent_event(
+        third,
+        &AgentEvent::PresentationUpdated {
+            update: update.clone(),
+        },
+    );
+    write.append_agent_event(fourth, &user_event("even later"));
+
+    // Rewind before the second input. The update itself is on the abandoned
+    // branch, but its source (`first`) remains selected and must survive.
+    write.fork_agent_lineage(UnixMs(3), agent_id, second);
+    let cache = write.rebuild_agent_presentation_cache(UnixMs(3), agent_id);
+    assert_eq!(cache.generated_title.as_deref(), Some("first-subject"));
+    assert_eq!(cache.activity.as_deref(), Some("reading first request"));
+
+    // A completion based on the discarded input cannot write into the new
+    // lineage, even if it reaches the serialized loop after the rewind.
+    let stale = AgentPresentationUpdate {
+        generated_title: PresentationField::Set("discarded".to_owned()),
+        activity: PresentationField::Unchanged,
+        through: second,
+    };
+    assert!(
+        write
+            .apply_agent_presentation(UnixMs(4), agent_id, &stale)
+            .is_none()
+    );
+    write.commit();
+
+    let record = db.read().get_agent(agent_id);
+    assert_eq!(record.generated_title.as_deref(), Some("first-subject"));
+}
+
+#[tokio::test]
 async fn set_agent_workstream_moves_the_agent() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));

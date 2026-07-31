@@ -76,7 +76,7 @@ struct Dispatcher {
     runtime: tokio::runtime::Handle,
     /// `notify(...)` updates go to the agent loop, which queues them for the
     /// next request (or drops them when no turn is active).
-    control: mpsc::UnboundedSender<AgentControl>,
+    control: mpsc::WeakUnboundedSender<AgentControl>,
 }
 
 impl ToolDispatcher for Dispatcher {
@@ -129,14 +129,16 @@ impl ToolDispatcher for Dispatcher {
     }
 
     fn notify(&self, exec_call_id: ToolCallId, text: String) {
-        let _ = self.control.send(AgentControl::ToolUpdate(ToolUpdate {
-            call_id: exec_call_id,
-            // `exec` is a custom (freeform) tool, so its extra outputs replay
-            // as `custom_tool_call_output`.
-            tool_type: ToolType::Custom,
-            output: Arc::new(text),
-            at: UnixMs::now(),
-        }));
+        if let Some(control) = self.control.upgrade() {
+            let _ = control.send(AgentControl::ToolUpdate(ToolUpdate {
+                call_id: exec_call_id,
+                // `exec` is a custom (freeform) tool, so its extra outputs replay
+                // as `custom_tool_call_output`.
+                tool_type: ToolType::Custom,
+                output: Arc::new(text),
+                at: UnixMs::now(),
+            }));
+        }
     }
 }
 
@@ -145,7 +147,7 @@ pub(crate) fn start_session(
     shell_tools: &ShellTools,
     multi_agent: Option<&MultiAgentTools>,
     web_search: &WebSearchTools,
-    control: mpsc::UnboundedSender<AgentControl>,
+    control: mpsc::WeakUnboundedSender<AgentControl>,
 ) -> Result<CodeModeSession, String> {
     let dispatcher = Arc::new(Dispatcher {
         shell_tools: shell_tools.clone(),

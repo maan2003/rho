@@ -187,6 +187,7 @@ mod tests {
             last_active: rho_core::UnixMs(last_active),
             hidden: false,
             last_user_message_text: String::new(),
+            activity: None,
             workstream: WorkstreamId(workstream),
             labels: Vec::new(),
         }

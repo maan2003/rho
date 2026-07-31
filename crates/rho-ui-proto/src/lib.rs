@@ -541,12 +541,6 @@ pub enum ServerMessage {
         agent_id: AgentId,
         attention: UiAttention,
     },
-    /// Runtime-local, advisory activity text. It is not transcript content
-    /// and disappears when the daemon restarts.
-    AgentActivity {
-        agent_id: AgentId,
-        activity: String,
-    },
     LandLeaseQueued {
         repo: Utf8PathBuf,
         holder: Option<LandLeaseHolder>,
@@ -792,6 +786,10 @@ pub struct UiAgentSummary {
     /// What the work is about, for summaries and naming.
     #[senax(default)]
     pub last_user_message_text: String,
+    /// Durable, model-derived current activity. `None` means the agent is
+    /// idle or the sidecar has not produced a label yet.
+    #[senax(default)]
+    pub activity: Option<String>,
     /// The workstream this agent belongs to (exactly one).
     pub workstream: WorkstreamId,
     /// Free-form markers ("pin", …); semantics live in the client's view

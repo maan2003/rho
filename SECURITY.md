@@ -11,6 +11,13 @@ AI APIs.
   and tool inputs.
 - Inference APIs and streamed inference events are remote, semi-trusted inputs and
   must be parsed defensively.
+- A watched native-agent presentation sidecar sends a bounded (10 KiB total,
+  1 KiB per message), text-only recent transcript excerpt to Luna to derive a
+  title/activity cache. XML wrapping is structural context, not a trust
+  boundary: transcript text remains semi-trusted provider input. Requests are
+  globally bounded, cancelled when the last UI watch is released, and never
+  feed their output back into the agent transcript. Claude's separate one-shot
+  title fallback has the same provider-disclosure character.
 - Client-side web search sends the configured model and a bounded recent
   transcript excerpt to ChatGPT's first-party search endpoint using the same
   OAuth identity as inference. Search responses are remote, semi-trusted tool

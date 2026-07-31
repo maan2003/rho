@@ -23,14 +23,15 @@ use senax_encoder::{Decode, Encode, Pack, Unpack};
 use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::db::{
-    AgentEventPos, AgentId, AgentProfileWriteTxnExt, AgentReadTxnExt, AgentRoleSessionProfile as _,
-    AgentRuntime, AgentWriteTxnExt, InferenceModel, InferenceProfile, SessionBinding, UnixMillis,
+    AgentEventPos, AgentId, AgentPresentationCache, AgentPresentationUpdate,
+    AgentProfileWriteTxnExt, AgentReadTxnExt, AgentRoleSessionProfile as _, AgentRuntime,
+    AgentWriteTxnExt, InferenceModel, InferenceProfile, PresentationField, SessionBinding,
+    UnixMillis,
 };
 use crate::lazy::Lazy;
 use crate::multi_agent_tools::MultiAgentTools;
 use crate::pool::{AgentAssistantItemCompleted, AgentInputAccepted, AgentTurnCompleted};
 
-pub mod activity;
 mod claude;
 #[cfg(feature = "code-mode")]
 mod code_mode;
@@ -39,6 +40,7 @@ pub mod iris_tools;
 mod lazy;
 pub mod multi_agent_tools;
 pub mod pool;
+pub mod presentation;
 pub mod slack_tools;
 pub mod system_prompt;
 pub mod title;
@@ -47,6 +49,8 @@ pub mod title;
 type CodeModeSession = rho_code_mode::CodeModeSession;
 #[cfg(not(feature = "code-mode"))]
 struct CodeModeSession;
+
+const PRESENTATION_SOURCE_TAIL_BYTES: usize = 12 * 1024;
 
 /// Model-facing prompt and top-level tools for a newly created role. Dynamic
 /// agent identity/team text and stateful integration hosts are omitted.
@@ -108,6 +112,12 @@ pub enum AgentEvent<'a> {
     },
     /// All queued items were dropped (cancel).
     QueueCleared,
+    /// A model-derived presentation cache update. It never becomes inference
+    /// context; it is retained as history so caches can be rebuilt after a
+    /// native lineage fork.
+    PresentationUpdated {
+        update: AgentPresentationUpdate,
+    },
 }
 
 /// Stable identity for an accepted user input in an agent's persisted event
@@ -116,6 +126,22 @@ pub enum AgentEvent<'a> {
 pub struct AgentInputId {
     pub agent_id: AgentId,
     pub event_pos: AgentEventPos,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresentationSpeaker {
+    User,
+    Agent,
+    Assistant,
+}
+
+/// A text-only, durably committed native transcript source for Luna.
+#[derive(Clone, Debug)]
+pub struct PresentationSource {
+    pub agent_id: AgentId,
+    pub through: AgentEventPos,
+    pub speaker: PresentationSpeaker,
+    pub text: String,
 }
 
 /// Opaque tag for the surface that submitted an input.
@@ -465,6 +491,7 @@ fn restore_events(events: Vec<AgentEvent<'static>>) -> RestoredAgent {
                 }
             }
             AgentEvent::QueueCleared => queue.clear(),
+            AgentEvent::PresentationUpdated { .. } => {}
         }
     }
     let kind = match turn {
@@ -717,12 +744,13 @@ impl Agent {
             .collect::<Vec<_>>();
         let pool_events = pool;
         let (control, control_rx) = mpsc::unbounded_channel();
+        let execution_control = control.downgrade();
         let execution = Arc::new(Lazy::new({
             let view = Arc::clone(&view);
             let multi_agent = multi_agent.clone();
             let web_search = web_search.clone();
             let slack_tools = slack_tools.clone();
-            let control = control.clone();
+            let control = execution_control.clone();
             move || {
                 let view = Arc::clone(&view);
                 let multi_agent = multi_agent.clone();
@@ -750,6 +778,14 @@ impl Agent {
             }
         }));
         let total_usage = db.read().agent_usage_total(agent_id);
+        let last_presentation_source = {
+            let records = db
+                .read()
+                .agent_presentation_source_tail(agent_id, PRESENTATION_SOURCE_TAIL_BYTES);
+            presentation_sources(agent_id, &records)
+                .last()
+                .map(|source| source.through)
+        };
         let state = Arc::new(RwLock::new(AgentState {
             blocks: restored.blocks,
             queued_inputs: restored.queued_inputs,
@@ -766,12 +802,14 @@ impl Agent {
         let notify = Arc::new(Notify::new());
         let agent_loop = AgentLoop {
             inference_session,
+            presentation_inference: inference,
             model,
             auto_compaction_in_flight: false,
             pending_tools: FuturesUnordered::new(),
             state: Arc::clone(&state),
             notify: Arc::clone(&notify),
             control_rx,
+            control: control.downgrade(),
             execution,
             persistence: AgentPersistence {
                 db,
@@ -784,6 +822,14 @@ impl Agent {
             slack_tools,
             pool_events,
             execution_generation: 0,
+            last_presentation_source,
+            presentation: PresentationState {
+                watches: 0,
+                dirty: false,
+                generation: 0,
+                last_started: None,
+                task: None,
+            },
         };
         tokio::spawn(agent_loop.run());
         Self {
@@ -947,6 +993,14 @@ impl Agent {
             .map_err(|_| anyhow::anyhow!("agent control loop is closed"))?
     }
 
+    /// Keep the agent-owned Luna sidecar alive until the returned lease drops.
+    pub(crate) fn watch_presentation(&self) -> presentation::Watch {
+        let _ = self
+            .control
+            .send(AgentControl::PresentationWatch { watching: true });
+        presentation::Watch::new(self.control.clone())
+    }
+
     pub fn subscribe(&self) -> impl Stream<Item = AgentState> + use<> {
         let state = Arc::clone(&self.state);
         let notify = Arc::clone(&self.notify);
@@ -1058,7 +1112,7 @@ fn start_code_mode(
     shell_tools: &ShellTools,
     multi_agent: Option<&MultiAgentTools>,
     web_search: &WebSearchTools,
-    control: mpsc::UnboundedSender<AgentControl>,
+    control: mpsc::WeakUnboundedSender<AgentControl>,
 ) -> Option<Arc<CodeModeSession>> {
     if !enabled {
         return None;
@@ -1078,7 +1132,7 @@ fn start_code_mode(
     _shell_tools: &ShellTools,
     _multi_agent: Option<&MultiAgentTools>,
     _web_search: &WebSearchTools,
-    _control: mpsc::UnboundedSender<AgentControl>,
+    _control: mpsc::WeakUnboundedSender<AgentControl>,
 ) -> Option<Arc<CodeModeSession>> {
     None
 }
@@ -1114,12 +1168,24 @@ enum AgentControl {
         turns: u32,
         reply: oneshot::Sender<anyhow::Result<()>>,
     },
+    PresentationWatch {
+        watching: bool,
+    },
+    PresentationStarted {
+        generation: u64,
+        acknowledged: oneshot::Sender<bool>,
+    },
+    PresentationFinished {
+        generation: u64,
+        result: Result<Option<AgentPresentationUpdate>, String>,
+    },
     Cancel,
     ContinueUnfinished,
 }
 
 struct AgentLoop {
     inference_session: InferenceSession,
+    presentation_inference: Inference,
     model: InferenceModel,
     /// The active request includes a trigger injected by the automatic
     /// context-occupancy policy. A compaction-only response must continue the
@@ -1132,6 +1198,7 @@ struct AgentLoop {
     state: Arc<RwLock<AgentState>>,
     notify: Arc<Notify>,
     control_rx: mpsc::UnboundedReceiver<AgentControl>,
+    control: mpsc::WeakUnboundedSender<AgentControl>,
     execution: Arc<Lazy<ExecutionContext>>,
     persistence: AgentPersistence,
     /// Present on pooled agents: identity + `Weak` pool handle for the
@@ -1147,6 +1214,31 @@ struct AgentLoop {
     /// Incremented inside the serialized loop whenever a provider attempt is
     /// started, including attempts that fail before publishing Working.
     execution_generation: u64,
+    /// The newest text source in the selected lineage, used to clear stale
+    /// activity when the turn returns control to the user.
+    last_presentation_source: Option<AgentEventPos>,
+    presentation: PresentationState,
+}
+
+/// Scheduler state is intentionally local to the serialized agent loop: it
+/// observes committed native sources, owns cancellation, and is the only path
+/// that can persist a Luna result.
+struct PresentationState {
+    watches: usize,
+    dirty: bool,
+    generation: u64,
+    last_started: Option<tokio::time::Instant>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+const PRESENTATION_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
+impl Drop for AgentLoop {
+    fn drop(&mut self) {
+        if let Some(task) = self.presentation.task.take() {
+            task.abort();
+        }
+    }
 }
 
 struct ExecutionContext {
@@ -1171,7 +1263,7 @@ impl ExecutionContext {
         multi_agent: Option<&MultiAgentTools>,
         slack_tools: bool,
         projects: &[(camino::Utf8PathBuf, String)],
-        control: mpsc::UnboundedSender<AgentControl>,
+        control: mpsc::WeakUnboundedSender<AgentControl>,
     ) -> Self {
         let shell_tools = ShellTools::new(
             std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
@@ -1467,6 +1559,70 @@ impl AgentLoop {
                             write.commit();
                             self.inference_session.set_prompt_cache_key(prompt_cache_key);
                         }
+                        AgentControl::PresentationWatch { watching } => {
+                            if watching {
+                                let first_watch = self.presentation.watches == 0;
+                                self.presentation.watches += 1;
+                                if first_watch {
+                                    self.presentation.dirty = true;
+                                    self.schedule_presentation();
+                                }
+                            } else {
+                                self.presentation.watches = self.presentation.watches.saturating_sub(1);
+                                if self.presentation.watches == 0 {
+                                    if let Some(task) = self.presentation.task.take() {
+                                        task.abort();
+                                    }
+                                    self.presentation.generation = self.presentation.generation.wrapping_add(1);
+                                    self.presentation.dirty = false;
+                                    // A new UI observation is a fresh lease: its first
+                                    // proposal should not inherit a departed viewer's delay.
+                                    self.presentation.last_started = None;
+                                }
+                            }
+                        }
+                        AgentControl::PresentationStarted { generation, acknowledged } => {
+                            let accepted = self.presentation.generation == generation
+                                && self.presentation.watches > 0
+                                && self.presentation.task.is_some();
+                            if accepted {
+                                // Sources observed before this boundary are in the durable
+                                // snapshot about to be read; only later sources need another
+                                // coalesced request.
+                                self.presentation.dirty = false;
+                                self.presentation.last_started = Some(tokio::time::Instant::now());
+                            }
+                            let _ = acknowledged.send(accepted);
+                        }
+                        AgentControl::PresentationFinished { generation, result } => {
+                            if self.presentation.generation != generation {
+                                continue;
+                            }
+                            self.presentation.task = None;
+                            match result {
+                                Ok(Some(mut update)) => {
+                                    // A newer native source already has a coalesced request
+                                    // pending. Never let this older snapshot overwrite the
+                                    // durable cache in the meantime.
+                                    if self.last_presentation_source != Some(update.through) {
+                                        self.schedule_presentation();
+                                        continue;
+                                    }
+                                    // Provider completion can race a turn settlement.
+                                    // Decide whether activity is still meaningful at
+                                    // the same serialized boundary that persists it.
+                                    if !state.kind.is_working() {
+                                        update.activity = PresentationField::Clear;
+                                    }
+                                    let _ = self.persist_presentation(update).await;
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    eprintln!("rho-agent: presentation generation failed: {error}");
+                                }
+                            }
+                            self.schedule_presentation();
+                        }
                         AgentControl::Rewind { turns, reply } => {
                             let result = if turns == 0 {
                                 Err(anyhow::anyhow!(":rewind turns must be greater than zero"))
@@ -1526,6 +1682,10 @@ impl AgentLoop {
                                             agent_id,
                                             cursor,
                                         );
+                                        let cache = write.rebuild_agent_presentation_cache(
+                                            UnixMillis::now(),
+                                            agent_id,
+                                        );
                                         write.commit();
 
                                         let (loaded_next_event, events) =
@@ -1538,6 +1698,23 @@ impl AgentLoop {
                                         state.queued_inputs = restored.queued_inputs;
                                         self.inference_session.abort();
                                         self.persistence.next_event = next_event;
+                                        let records = db.read().agent_presentation_source_tail(
+                                            agent_id,
+                                            PRESENTATION_SOURCE_TAIL_BYTES,
+                                        );
+                                        self.last_presentation_source =
+                                            presentation_sources(agent_id, &records)
+                                                .last()
+                                                .map(|source| source.through);
+                                        self.reset_presentation();
+                                        self.schedule_presentation();
+                                        if let Some(pool) = self.pool_events.upgrade() {
+                                            pool.publish_presentation_changed(
+                                                agent_id,
+                                                cache.generated_title,
+                                                cache.activity,
+                                            );
+                                        }
                                         Ok(())
                                     }
                                 }
@@ -1681,12 +1858,16 @@ impl AgentLoop {
                                     })
                                     .collect();
                                 let final_text = calls.is_empty().then(|| final_answer_text(&items));
-                                self.persist_event(AgentEvent::InferenceResponse {
+                                let response_pos = self.persist_event(AgentEvent::InferenceResponse {
                                     items: Cow::Borrowed(&items),
                                     provider_response_id: provider_response_id.clone(),
                                     context_used,
                                 })
                                 .await;
+                                let text = assistant_text(&items);
+                                if !text.trim().is_empty() {
+                                    self.presentation_source_committed(response_pos);
+                                }
                                 if let Some(usage) = &usage {
                                     let turn_usage = db::AgentUsageBucket {
                                             input_tokens: usage
@@ -1927,9 +2108,11 @@ impl AgentLoop {
                 &previous_kind,
                 &state.kind,
                 self.execution_generation != previous_execution_generation,
-            ) && let Some(pool) = self.pool_events.upgrade()
-            {
-                pool.settle_turn(self.persistence.agent_id).await;
+            ) {
+                self.clear_presentation_activity().await;
+                if let Some(pool) = self.pool_events.upgrade() {
+                    pool.settle_turn(self.persistence.agent_id).await;
+                }
             }
             *self.state.write().expect("poison") = state.clone();
             self.notify.notify_waiters();
@@ -1943,6 +2126,128 @@ impl AgentLoop {
         persistence.next_event = write.append_agent_event(persistence.next_event, &event);
         write.commit();
         event_pos
+    }
+
+    async fn persist_presentation(
+        &mut self,
+        update: AgentPresentationUpdate,
+    ) -> Option<AgentPresentationCache> {
+        let persistence = &mut self.persistence;
+        let mut write = persistence.db.write().await;
+        let cache =
+            write.apply_agent_presentation(UnixMillis::now(), persistence.agent_id, &update)?;
+        let event_pos = persistence.next_event;
+        write.append_agent_presentation_history(event_pos, &update);
+        persistence.next_event = write.append_agent_event(
+            persistence.next_event,
+            &AgentEvent::PresentationUpdated {
+                update: update.clone(),
+            },
+        );
+        write.commit();
+        if let Some(pool) = self.pool_events.upgrade() {
+            pool.publish_presentation_changed(
+                persistence.agent_id,
+                cache.generated_title.clone(),
+                cache.activity.clone(),
+            );
+        }
+        Some(cache)
+    }
+
+    async fn clear_presentation_activity(&mut self) {
+        let Some(through) = self.last_presentation_source else {
+            return;
+        };
+        if self
+            .persistence
+            .db
+            .read()
+            .get_agent(self.persistence.agent_id)
+            .activity
+            .is_none()
+        {
+            return;
+        }
+        let _ = self
+            .persist_presentation(AgentPresentationUpdate {
+                generated_title: PresentationField::Unchanged,
+                activity: PresentationField::Clear,
+                through,
+            })
+            .await;
+    }
+
+    fn presentation_source_committed(&mut self, through: AgentEventPos) {
+        self.last_presentation_source = Some(through);
+        self.presentation.dirty = true;
+        self.schedule_presentation();
+    }
+
+    fn reset_presentation(&mut self) {
+        if let Some(task) = self.presentation.task.take() {
+            task.abort();
+        }
+        self.presentation.generation = self.presentation.generation.wrapping_add(1);
+        self.presentation.last_started = None;
+        self.presentation.dirty = self.presentation.watches > 0;
+    }
+
+    fn schedule_presentation(&mut self) {
+        if self.presentation.watches == 0
+            || !self.presentation.dirty
+            || self.presentation.task.is_some()
+        {
+            return;
+        }
+        self.presentation.dirty = false;
+        self.presentation.generation = self.presentation.generation.wrapping_add(1);
+        let generation = self.presentation.generation;
+        let now = tokio::time::Instant::now();
+        let delay = self
+            .presentation
+            .last_started
+            .and_then(|started| PRESENTATION_MIN_INTERVAL.checked_sub(now.duration_since(started)))
+            .unwrap_or_default();
+        let db = self.persistence.db.clone();
+        let inference = self.presentation_inference.clone();
+        let agent_id = self.persistence.agent_id;
+        let control = self.control.clone();
+        self.presentation.task = Some(tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let result = if !presentation::has_input(&db, agent_id) {
+                Ok(None)
+            } else {
+                match presentation::acquire_request().await {
+                    Ok(permit) => {
+                        let (acknowledged, accepted) = oneshot::channel();
+                        let Some(control) = control.upgrade() else {
+                            return;
+                        };
+                        if control
+                            .send(AgentControl::PresentationStarted {
+                                generation,
+                                acknowledged,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        drop(control);
+                        if !accepted.await.unwrap_or(false) {
+                            return;
+                        }
+                        presentation::generate(db, inference, agent_id, permit)
+                            .await
+                            .map_err(|error| format!("{error:#}"))
+                    }
+                    Err(error) => Err(format!("{error:#}")),
+                }
+            };
+            if let Some(control) = control.upgrade() {
+                let _ = control.send(AgentControl::PresentationFinished { generation, result });
+            }
+        }));
     }
 
     /// Persist and queue an incoming message (user input or agent mail),
@@ -1986,6 +2291,9 @@ impl AgentLoop {
                 delivery,
                 source_id,
             });
+        }
+        if !rho_core::text_content(&content).trim().is_empty() {
+            self.presentation_source_committed(event_pos);
         }
         state.queued_inputs.push(item);
         if let Some(accepted) = accepted {
@@ -2369,6 +2677,69 @@ pub fn final_answer_text(items: &[InferenceResponseItem]) -> String {
     } else {
         final_text
     }
+}
+
+fn assistant_text(items: &[InferenceResponseItem]) -> String {
+    items
+        .iter()
+        .filter_map(|item| match item {
+            InferenceResponseItem::AssistantMessage { content, .. } => Some(
+                content
+                    .iter()
+                    .filter_map(|part| match part {
+                        ContentPart::Text { text } => Some(text.as_str()),
+                        ContentPart::Image { .. } => None,
+                    })
+                    .collect::<String>(),
+            ),
+            _ => None,
+        })
+        .filter(|text| !text.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub(crate) fn presentation_sources(
+    agent_id: AgentId,
+    records: &[(AgentEventPos, AgentEvent<'static>)],
+) -> Vec<PresentationSource> {
+    records
+        .iter()
+        .filter_map(|(through, event)| match event {
+            AgentEvent::Queued(QueuedItem {
+                kind:
+                    QueuedItemKind::UserMessage {
+                        sender, content, ..
+                    },
+                ..
+            }) => {
+                let text = rho_core::text_content(content);
+                (!text.trim().is_empty()).then_some(PresentationSource {
+                    agent_id,
+                    through: *through,
+                    speaker: match sender {
+                        MessageSender::User => PresentationSpeaker::User,
+                        MessageSender::Agent { .. } => PresentationSpeaker::Agent,
+                    },
+                    text,
+                })
+            }
+            AgentEvent::InferenceResponse { items, .. } => {
+                let text = assistant_text(items);
+                (!text.trim().is_empty()).then_some(PresentationSource {
+                    agent_id,
+                    through: *through,
+                    speaker: PresentationSpeaker::Assistant,
+                    text,
+                })
+            }
+            AgentEvent::ToolResult { .. }
+            | AgentEvent::Queued(_)
+            | AgentEvent::Dequeued { .. }
+            | AgentEvent::QueueCleared
+            | AgentEvent::PresentationUpdated { .. } => None,
+        })
+        .collect()
 }
 
 /// Receive mail when this agent has a mailbox; never resolves otherwise, and

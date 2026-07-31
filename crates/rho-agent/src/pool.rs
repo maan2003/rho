@@ -57,6 +57,7 @@ pub struct AgentPool {
     completed_assistant_items: broadcast::Sender<AgentAssistantItemCompleted>,
     /// Fires after a user input has been durably accepted into an agent log.
     accepted_inputs: broadcast::Sender<AgentInputAccepted>,
+    presentation_changes: broadcast::Sender<AgentPresentationChanged>,
     usage: Mutex<HashMap<(AgentId, u64), AgentUsageBucket>>,
     iris_tool_host: std::sync::RwLock<Option<crate::iris_tools::SharedIrisToolHost>>,
     slack_tool_host: std::sync::RwLock<Option<crate::slack_tools::SharedSlackToolHost>>,
@@ -94,6 +95,13 @@ pub struct AgentInputAccepted {
     pub content: Vec<rho_core::ContentPart>,
     pub delivery: MessageDelivery,
     pub source_id: Option<InputSourceId>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AgentPresentationChanged {
+    pub agent_id: AgentId,
+    pub generated_title: Option<String>,
+    pub activity: Option<String>,
 }
 
 /// One agent used as the execution backend for another agent runtime.
@@ -159,7 +167,7 @@ impl AgentPool {
         write.commit();
         let pool = Arc::new(Self {
             db,
-            inference,
+            inference: inference.clone(),
             path_overrides,
             user_environment,
             agents: Mutex::new(HashMap::new()),
@@ -170,6 +178,7 @@ impl AgentPool {
             completed_turns: broadcast::channel(64).0,
             completed_assistant_items: broadcast::channel(64).0,
             accepted_inputs: broadcast::channel(64).0,
+            presentation_changes: broadcast::channel(64).0,
             usage: Mutex::new(HashMap::new()),
             iris_tool_host: std::sync::RwLock::new(None),
             slack_tool_host: std::sync::RwLock::new(None),
@@ -231,6 +240,23 @@ impl AgentPool {
         self.completed_assistant_items.subscribe()
     }
 
+    pub fn subscribe_presentation_changes(&self) -> broadcast::Receiver<AgentPresentationChanged> {
+        self.presentation_changes.subscribe()
+    }
+
+    /// Keeps native Luna work for this agent alive while the returned handle
+    /// exists. Dropping the last handle cancels any in-flight provider call.
+    pub async fn watch_presentation(
+        &self,
+        agent_id: AgentId,
+    ) -> Option<crate::presentation::Watch> {
+        self.agents
+            .lock()
+            .await
+            .get(&agent_id)
+            .and_then(RunningAgent::watch_presentation)
+    }
+
     pub fn subscribe_accepted_inputs(&self) -> broadcast::Receiver<AgentInputAccepted> {
         self.accepted_inputs.subscribe()
     }
@@ -274,6 +300,19 @@ impl AgentPool {
 
     pub fn publish_accepted_input(&self, accepted: AgentInputAccepted) {
         let _ = self.accepted_inputs.send(accepted);
+    }
+
+    pub(crate) fn publish_presentation_changed(
+        &self,
+        agent_id: AgentId,
+        generated_title: Option<String>,
+        activity: Option<String>,
+    ) {
+        let _ = self.presentation_changes.send(AgentPresentationChanged {
+            agent_id,
+            generated_title,
+            activity,
+        });
     }
 
     pub fn db(&self) -> &RhoDb {
@@ -769,6 +808,13 @@ pub enum RunningAgent {
 }
 
 impl RunningAgent {
+    pub(crate) fn watch_presentation(&self) -> Option<crate::presentation::Watch> {
+        match self {
+            Self::Rho(agent) => Some(agent.watch_presentation()),
+            Self::Claude(_) => None,
+        }
+    }
+
     pub fn state(&self) -> AgentState {
         match self {
             Self::Rho(agent) => agent.state(),

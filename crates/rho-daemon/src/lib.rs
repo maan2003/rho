@@ -10,7 +10,8 @@ use camino::{Utf8Path, Utf8PathBuf};
 use futures::{FutureExt as _, StreamExt as _};
 use rho_agent::db::{
     AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole, AgentRuntime, AgentUsageModel,
-    AgentWriteTxnExt as _, QuotaModel, QuotaObservationRecord, QuotaProvider, WorkstreamId,
+    AgentWriteTxnExt as _, PendingPresentationWorkstream, QuotaModel, QuotaObservationRecord,
+    QuotaProvider, WorkstreamId,
 };
 use rho_agent::pool::{AgentPool, RunningAgent};
 use rho_agent::{AgentStateKind, MessageDelivery};
@@ -359,11 +360,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         .await?,
     );
     agents.install_iris_tool_host();
-    spawn_activity_summarizer(
-        agents.pool.clone(),
-        agents.inference.clone(),
-        agents.events.clone(),
-    );
+    spawn_presentation_projection(Arc::clone(&agents));
     spawn_chatgpt_quota_poller(quota_auth_name, agents.db.clone(), agents.events.clone());
     let quota_environment = agents.user_environment.clone();
     spawn_claude_quota_recorder(
@@ -1117,11 +1114,12 @@ impl AgentRegistry {
                 created_at: agent.created_at,
                 updated_at: agent.updated_at,
                 workspace: agent.primary_workdir().clone(),
-                display_name: agent.display_name,
+                display_name: agent.display_name.or(agent.generated_title),
                 attention: attention_level(kinds.get(&agent_id), agent.disposition),
                 last_active: agent.last_user_message.max(agent.created_at),
                 hidden: agent.disposition == AgentDisposition::Hidden,
                 last_user_message_text: agent.last_user_message_text,
+                activity: agent.activity,
                 workstream: agent.workstream,
                 labels: agent.labels,
             })
@@ -1525,16 +1523,23 @@ impl AgentRegistry {
     /// background. Policy: only fills an empty `display_name` — a manual
     /// rename, before or during generation, always wins — and at most one
     /// generation runs per agent at a time. Every connection gets a `Ready`
-    /// refresh when the title lands. A workstream the agent founded
-    /// (`retitle`: its id plus the provisional name it was created under)
-    /// takes the same title, unless someone renamed it meanwhile.
+    /// refresh when the title lands. A self-founded provisional workstream is
+    /// associated durably with the agent and takes the same title unless it
+    /// was moved or renamed meanwhile.
     async fn maybe_generate_title(
         self: &Arc<Self>,
         agent_id: AgentId,
         text: String,
-        retitle: Option<(WorkstreamId, String)>,
+        _retitle: Option<(WorkstreamId, String)>,
     ) {
-        if text.trim().is_empty() || self.db.read().get_agent(agent_id).display_name.is_some() {
+        let record = self.db.read().get_agent(agent_id);
+        // Claude has no native durable event cursor. Keep the established
+        // one-shot fallback for that runtime while native agents use the
+        // agent-owned, cursor-validated presentation sidecar.
+        if !matches!(record.runtime, AgentRuntime::Claude { .. })
+            || text.trim().is_empty()
+            || record.display_name.is_some()
+        {
             return;
         }
         if !self.title_tasks.lock().await.insert(agent_id) {
@@ -1546,22 +1551,8 @@ impl AgentRegistry {
             match tokio::time::timeout(std::time::Duration::from_secs(60), generate).await {
                 Ok(Ok(title)) => {
                     let mut write = registry.db.write().await;
-                    // The write txn is the single writer, so this read can't
-                    // race a rename committing between check and set.
-                    if registry
-                        .db
-                        .read()
-                        .get_agent(agent_id)
-                        .display_name
-                        .is_none()
+                    if write.apply_claude_generated_title(rho_core::UnixMs::now(), agent_id, title)
                     {
-                        let now = rho_core::UnixMs::now();
-                        write.set_agent_display_name(now, agent_id, title.clone());
-                        if let Some((workstream_id, provisional)) = retitle
-                            && registry.db.read().get_workstream(workstream_id).name == provisional
-                        {
-                            write.set_workstream_name(now, workstream_id, title);
-                        }
                         write.commit();
                         // Titles show on every client's rail, so the refresh
                         // fans out instead of following the acting connection.
@@ -1781,6 +1772,7 @@ where
     let mut events_rx = agents.events.subscribe();
     let _ = outgoing_tx.send(agents.ready_message().await);
     let mut local_subscriptions = HashMap::new();
+    let mut presentation_watches = HashMap::new();
 
     // Announce every agent created in the pool — by clients or by other
     // agents spawning children — so it shows up on this connection.
@@ -1854,6 +1846,7 @@ where
             land_holder.clone(),
             agent_streams.as_ref(),
             &mut local_subscriptions,
+            &mut presentation_watches,
             message,
         )
         .await
@@ -1975,68 +1968,20 @@ fn attention_level(kind: Option<&AgentStateKind>, disposition: AgentDisposition)
     }
 }
 
-/// Builds ephemeral, advisory activity labels from the text-only portions of
-/// live Rho transcripts. The sidecar owns no agent state and never feeds a
-/// result back into an agent conversation.
-fn spawn_activity_summarizer(
-    pool: Arc<AgentPool>,
-    inference: Inference,
-    events: broadcast::Sender<ServerMessage>,
-) {
+/// Durable presentation changes refresh the normal snapshot for every
+/// connection. Broadcast loss is harmless because `Ready` is reconstructed
+/// from the agent cache, including after daemon restart.
+fn spawn_presentation_projection(agents: Arc<AgentRegistry>) {
+    let mut changes = agents.pool.subscribe_presentation_changes();
+    let agents = Arc::downgrade(&agents);
     tokio::spawn(async move {
-        let mut inputs = pool.subscribe_accepted_inputs();
-        let mut assistant_items = pool.subscribe_completed_assistant_items();
-        let mut sessions = HashMap::new();
-        loop {
-            let (agent_id, speaker, text) = tokio::select! {
-                result = inputs.recv() => match result {
-                    Ok(input) => (
-                        input.input_id.agent_id,
-                        match input.sender {
-                            rho_core::MessageSender::User => rho_agent::activity::ActivitySpeaker::User,
-                            rho_core::MessageSender::Agent { .. } => rho_agent::activity::ActivitySpeaker::Agent,
-                        },
-                        activity_text(&input.content),
-                    ),
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
-                },
-                result = assistant_items.recv() => match result {
-                    Ok(item) => (
-                        item.agent_id,
-                        rho_agent::activity::ActivitySpeaker::Assistant,
-                        item.text,
-                    ),
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
-                },
+        while let Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) = changes.recv().await {
+            let Some(agents) = agents.upgrade() else {
+                break;
             };
-            let session = sessions
-                .entry(agent_id)
-                .or_insert_with(|| rho_agent::activity::ActivitySession::new(inference.clone()));
-            if !session.push(speaker, &text) {
-                continue;
-            }
-            match tokio::time::timeout(std::time::Duration::from_secs(30), session.update()).await {
-                Ok(Ok(Some(activity))) => {
-                    let _ = events.send(ServerMessage::AgentActivity { agent_id, activity });
-                }
-                Ok(Ok(None)) => {}
-                Ok(Err(error)) => eprintln!("rho-daemon: activity generation failed: {error:#}"),
-                Err(_) => eprintln!("rho-daemon: activity generation timed out"),
-            }
+            let _ = agents.events.send(agents.ready_message().await);
         }
     });
-}
-
-fn activity_text(content: &[ContentPart]) -> String {
-    content
-        .iter()
-        .filter_map(|part| match part {
-            ContentPart::Text { text } => Some(text.as_str()),
-            ContentPart::Image { .. } => None,
-        })
-        .collect()
 }
 
 /// Watches one running agent for the daemon itself (not any particular
@@ -2385,6 +2330,7 @@ async fn handle_message(
     land_holder: Option<LandLeaseHolder>,
     agent_streams: Option<&IrohAgentStreams>,
     local_subscriptions: &mut HashMap<AgentId, tokio::task::JoinHandle<()>>,
+    presentation_watches: &mut HashMap<AgentId, rho_agent::presentation::Watch>,
     message: ClientMessage,
 ) -> anyhow::Result<Refresh> {
     match message {
@@ -2652,6 +2598,17 @@ async fn handle_message(
             // Subscription and the AgentCreated announcement ride the pool's
             // creation broadcast (all connections, including this one).
             let (agent_id, agent) = agents.create(workstream, role, start).await?;
+            if let Some((workstream_id, provisional_name)) = &founded {
+                let mut write = agents.db.write().await;
+                write.set_pending_presentation_workstream(
+                    agent_id,
+                    Some(PendingPresentationWorkstream {
+                        workstream_id: *workstream_id,
+                        provisional_name: provisional_name.clone(),
+                    }),
+                );
+                write.commit();
+            }
             if let Some(content) = content {
                 let text = text_content(&content);
                 // The agent is fresh, so the lanes are equivalent here.
@@ -2728,6 +2685,7 @@ async fn handle_message(
                 outgoing_tx,
                 agent_streams,
                 local_subscriptions,
+                presentation_watches,
                 [agent_id],
             )
             .await?;
@@ -2740,6 +2698,7 @@ async fn handle_message(
                 outgoing_tx,
                 agent_streams,
                 local_subscriptions,
+                presentation_watches,
                 agent_ids,
             )
             .await?;
@@ -2755,6 +2714,7 @@ async fn handle_message(
                     subscription.abort();
                     let _ = subscription.await;
                 }
+                presentation_watches.remove(&agent_id);
                 let _ = outgoing_tx.send(ServerMessage::AgentUnloaded {
                     agent_id,
                     reason: rho_ui_proto::AgentUnloadReason::Unsubscribed,
@@ -3612,6 +3572,7 @@ async fn subscribe_connection_agents(
     outgoing_tx: &mpsc::UnboundedSender<ServerMessage>,
     agent_streams: Option<&IrohAgentStreams>,
     local_subscriptions: &mut HashMap<AgentId, tokio::task::JoinHandle<()>>,
+    presentation_watches: &mut HashMap<AgentId, rho_agent::presentation::Watch>,
     agent_ids: impl IntoIterator<Item = AgentId>,
 ) -> anyhow::Result<()> {
     for agent_id in agent_ids {
@@ -3622,6 +3583,14 @@ async fn subscribe_connection_agents(
             local_subscriptions
                 .entry(agent_id)
                 .or_insert_with(|| subscribe_agent(agent_id, agent, outgoing_tx.clone()));
+        }
+        // `Ready` always includes the durable presentation cache for every
+        // dashboard row. This lease only permits a loaded native agent to
+        // refresh that cache with Luna while its transcript is observed.
+        if !presentation_watches.contains_key(&agent_id)
+            && let Some(watch) = agents.pool.watch_presentation(agent_id).await
+        {
+            presentation_watches.insert(agent_id, watch);
         }
         let _ = outgoing_tx.send(ServerMessage::AgentSubscribed { agent_id });
     }

@@ -54,10 +54,6 @@ pub enum ConnEvent {
         agent_id: AgentId,
         attention: rho_ui_proto::UiAttention,
     },
-    AgentActivity {
-        agent_id: AgentId,
-        activity: String,
-    },
     ChatGptUsage {
         used_percent: f64,
         reset_at_unix: i64,
@@ -844,9 +840,6 @@ async fn run(
                 agent_id,
                 attention,
             }),
-            ServerMessage::AgentActivity { agent_id, activity } => {
-                Some(ConnEvent::AgentActivity { agent_id, activity })
-            }
             ServerMessage::Error { message } => Some(ConnEvent::ServerError(message)),
             ServerMessage::ChatGptUsage {
                 used_percent,

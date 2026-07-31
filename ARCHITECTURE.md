@@ -17,7 +17,15 @@ than by running a supervisor, extension protocol, or daemon process graph.
   and persistence hooks. Loading restores that logical state cheaply; the
   workspace-backed execution context (view, prompt, and tools) initializes
   lazily at first inference. It depends directly on the concrete
-  `rho-inference` session.
+  `rho-inference` session. Its native-only presentation sidecar derives a
+  durable generated title and activity cache from committed text events. It
+  receives positions only after event persistence, validates every result's
+  source position in the serialized agent loop, and rebuilds after a lineage
+  fork. The same loop owns watched UI leases, source coalescing, cancellation,
+  a 30-second request cadence, and result persistence; `AgentPool` only
+  routes a lease to the loaded runtime. Claude
+  retains the daemon's one-shot title fallback because its external transcript
+  has no equivalent native event cursor.
 - `rho-claude-usage` is an isolated Claude Code subscription-quota adapter. It
   owns the hardened PTY process, `/usage` interaction, terminal emulation,
   parsing, polling cadence, and retry policy. The daemon only consumes parsed

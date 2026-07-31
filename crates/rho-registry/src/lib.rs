@@ -365,6 +365,15 @@ impl AgentRegistry {
             agent.hidden |= agent.labels.iter().any(|label| label == HIDE_LABEL);
         }
         self.attention.clear();
+        self.activities = agents
+            .iter()
+            .filter_map(|agent| {
+                agent
+                    .activity
+                    .clone()
+                    .map(|activity| (agent.agent_id, activity))
+            })
+            .collect();
         let mut unseen = Vec::new();
         for agent in &agents {
             self.agents
@@ -1108,6 +1117,7 @@ mod tests {
             last_active: rho_core::UnixMs(now_ms().saturating_sub(10_000).saturating_add(id)),
             hidden: false,
             last_user_message_text: String::new(),
+            activity: None,
             workstream: WorkstreamId(0),
             labels: status_labels(status),
         }

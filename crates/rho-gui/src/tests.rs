@@ -153,6 +153,7 @@ fn agent_summary(id: u64, parent_agent: Option<AgentId>) -> UiAgentSummary {
         last_active: UnixMs(id),
         hidden: false,
         last_user_message_text: String::new(),
+        activity: None,
         workstream: WorkstreamId(1),
         labels: Vec::new(),
     }

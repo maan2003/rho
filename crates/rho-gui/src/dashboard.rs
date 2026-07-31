@@ -1377,6 +1377,7 @@ mod tests {
             last_active: UnixMs(crate::workspace::now_ms() + id),
             hidden: false,
             last_user_message_text: String::new(),
+            activity: None,
             workstream: WorkstreamId(1),
             labels: match status {
                 Status::Normal => Vec::new(),

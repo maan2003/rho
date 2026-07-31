@@ -23,6 +23,11 @@ const LINEAGE_PARENTS: TableDefinition<AgentLineageId, AgentEventPos> =
     TableDefinition::new("lineage_parents");
 const AGENT_EVENTS: TableDefinition<AgentEventPos, Sen<AgentEvent<'static>>> =
     TableDefinition::new("agent_events");
+/// A compact index of presentation history. Keeping it separate from the
+/// full transcript lets rewind repair inspect only sidecar updates.
+const PRESENTATION_EVENTS: TableDefinition<AgentEventPos, Sen<AgentPresentationUpdate>> =
+    TableDefinition::new("agent_presentation_events");
+const MAX_PRESENTATION_SOURCE_SCANNED_EVENTS: usize = 256;
 const AGENTS: TableDefinition<AgentId, Sen<AgentRecord>> = TableDefinition::new("agents");
 const WORKSTREAMS: TableDefinition<WorkstreamId, Sen<WorkstreamRecord>> =
     TableDefinition::new("workstreams");
@@ -265,6 +270,39 @@ pub struct AgentEventPos {
     seq: u32,
 }
 
+/// One field in a model-derived presentation update. `Clear` is distinct
+/// from `Unchanged`: activity must disappear when a turn settles instead of
+/// lingering as an incorrect "currently doing" label.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub enum PresentationField {
+    Unchanged,
+    Set(String),
+    Clear,
+}
+
+/// A sidecar-derived title/activity update. `through` is a durable native
+/// transcript position, not the position where this update happens to be
+/// recorded. That distinction makes a late result harmless after rewind.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct AgentPresentationUpdate {
+    pub generated_title: PresentationField,
+    pub activity: PresentationField,
+    pub through: AgentEventPos,
+}
+
+/// The durable cache projected to the UI and used to seed a fresh Luna turn.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentPresentationCache {
+    pub generated_title: Option<String>,
+    pub activity: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct PendingPresentationWorkstream {
+    pub workstream_id: WorkstreamId,
+    pub provisional_name: String,
+}
+
 impl AgentEventPos {
     fn root(lineage_id: AgentLineageId) -> Self {
         Self { lineage_id, seq: 0 }
@@ -286,6 +324,17 @@ pub type UnixMillis = UnixMs;
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct AgentRecord {
     pub display_name: Option<String>,
+    /// The sidecar title. A manual `display_name` always takes precedence.
+    #[senax(default)]
+    pub generated_title: Option<String>,
+    /// The last durable, model-derived activity label.
+    #[senax(default)]
+    pub activity: Option<String>,
+    /// A self-founded workstream that should take the first generated title.
+    /// Keeping this association with the agent makes rename recovery
+    /// independent of lossy daemon broadcasts and daemon restarts.
+    #[senax(default)]
+    pub pending_presentation_workstream: Option<PendingPresentationWorkstream>,
     /// The agent's working set: where it works, primary workdir first.
     /// Fixed at spawn — never removed or reordered, because accumulated
     /// model context assumes the entries stay valid. Managed workspace ids
@@ -631,6 +680,17 @@ pub trait AgentReadTxnExt {
         &self,
         agent_id: AgentId,
     ) -> (AgentEventPos, Vec<(AgentEventPos, AgentEvent<'static>)>);
+    /// Historical presentation events whose source position remains reachable
+    /// from the selected lineage. Their own event positions intentionally do
+    /// not decide reachability: a result may arrive after newer input.
+    fn agent_presentation_updates(&self, agent_id: AgentId) -> Vec<AgentPresentationUpdate>;
+    /// Newest text-bearing event records, read from the selected lineage in
+    /// reverse and bounded before decoding/building a Luna request.
+    fn agent_presentation_source_tail(
+        &self,
+        agent_id: AgentId,
+        max_source_bytes: usize,
+    ) -> Vec<(AgentEventPos, AgentEvent<'static>)>;
     /// Samples for one model, bounded to the horizon plus its preceding
     /// baseline.
     fn quota_observations(
@@ -689,6 +749,40 @@ pub trait AgentWriteTxnExt {
     fn remove_project(&mut self, path: &str);
 
     fn append_agent_event(&mut self, at: AgentEventPos, event: &AgentEvent<'_>) -> AgentEventPos;
+    fn append_agent_presentation_history(
+        &mut self,
+        at: AgentEventPos,
+        update: &AgentPresentationUpdate,
+    );
+
+    /// Applies an update only when its source is still in the selected
+    /// lineage. The returned cache is the acknowledged source of truth for a
+    /// sidecar session; `None` means its result was made stale by rewind.
+    fn apply_agent_presentation(
+        &mut self,
+        now: UnixMillis,
+        agent_id: AgentId,
+        update: &AgentPresentationUpdate,
+    ) -> Option<AgentPresentationCache>;
+    /// Rebuilds the denormalized cache after a lineage fork.
+    fn rebuild_agent_presentation_cache(
+        &mut self,
+        now: UnixMillis,
+        agent_id: AgentId,
+    ) -> AgentPresentationCache;
+    fn set_pending_presentation_workstream(
+        &mut self,
+        agent_id: AgentId,
+        workstream: Option<PendingPresentationWorkstream>,
+    );
+    /// Commits Claude's fallback title and its provisional workstream rename
+    /// together. A moved/deleted provisional workstream is harmless.
+    fn apply_claude_generated_title(
+        &mut self,
+        now: UnixMillis,
+        agent_id: AgentId,
+        title: String,
+    ) -> bool;
 
     fn fork_agent_lineage(
         &mut self,
@@ -772,6 +866,9 @@ impl AgentProfileWriteTxnExt for WriteTxn {
         });
         let agent = AgentRecord {
             display_name,
+            generated_title: None,
+            activity: None,
+            pending_presentation_workstream: None,
             workdirs,
             created_at: now,
             updated_at: now,
@@ -917,6 +1014,62 @@ impl AgentReadTxnExt for ReadTxn {
         (next, events)
     }
 
+    fn agent_presentation_updates(&self, agent_id: AgentId) -> Vec<AgentPresentationUpdate> {
+        let agent = self.get_agent(agent_id);
+        self.open_table(PRESENTATION_EVENTS)
+            .iter()
+            .map(|(_, update)| update.value().into_owned())
+            .filter(|update| agent_event_visible_read(self, &agent, update.through))
+            .collect()
+    }
+
+    fn agent_presentation_source_tail(
+        &self,
+        agent_id: AgentId,
+        max_source_bytes: usize,
+    ) -> Vec<(AgentEventPos, AgentEvent<'static>)> {
+        let agent = self.get_agent(agent_id);
+        let segments = agent_lineage_segments_read(self, &agent);
+        let events = self.open_table(AGENT_EVENTS);
+        let mut selected = Vec::new();
+        let mut source_bytes = 0_usize;
+        let mut scanned_events = 0_usize;
+        for (lineage_id, end_seq) in segments {
+            for (position, value) in events
+                .range(
+                    AgentEventPos::root(lineage_id)..=AgentEventPos {
+                        lineage_id,
+                        seq: end_seq,
+                    },
+                )
+                .rev()
+            {
+                let position = position.value();
+                if position.seq == end_seq && end_seq != u32::MAX {
+                    continue;
+                }
+                if scanned_events >= MAX_PRESENTATION_SOURCE_SCANNED_EVENTS {
+                    selected.reverse();
+                    return selected;
+                }
+                scanned_events += 1;
+                let event = value.value().into_owned();
+                let bytes = presentation_event_text_bytes(&event);
+                if bytes == 0 {
+                    continue;
+                }
+                source_bytes = source_bytes.saturating_add(bytes.min(1024));
+                selected.push((position, event));
+                if source_bytes >= max_source_bytes {
+                    selected.reverse();
+                    return selected;
+                }
+            }
+        }
+        selected.reverse();
+        selected
+    }
+
     fn quota_observations(
         &self,
         model: QuotaModel,
@@ -995,6 +1148,7 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(FORMAT);
         self.open_table(LINEAGE_PARENTS);
         self.open_table(AGENT_EVENTS);
+        self.open_table(PRESENTATION_EVENTS);
         self.open_table(AGENTS);
         self.open_table(WORKSTREAMS);
         self.open_table(PROJECTS);
@@ -1169,6 +1323,157 @@ impl AgentWriteTxnExt for WriteTxn {
         at.next()
     }
 
+    fn append_agent_presentation_history(
+        &mut self,
+        at: AgentEventPos,
+        update: &AgentPresentationUpdate,
+    ) {
+        self.open_table(PRESENTATION_EVENTS)
+            .insert(&at, SenValue::borrowed(update));
+    }
+
+    fn apply_agent_presentation(
+        &mut self,
+        now: UnixMillis,
+        agent_id: AgentId,
+        update: &AgentPresentationUpdate,
+    ) -> Option<AgentPresentationCache> {
+        if !agent_event_visible_write(self, agent_id, update.through) {
+            return None;
+        }
+        let mut rename_workstream = None;
+        let cache = {
+            let mut agents = self.open_table(AGENTS);
+            let mut agent = agents
+                .get(&agent_id)
+                .expect("agent id missing")
+                .value()
+                .into_owned();
+            match &update.generated_title {
+                PresentationField::Unchanged => {}
+                PresentationField::Set(title) if agent.display_name.is_none() => {
+                    agent.generated_title = Some(title.clone());
+                    if let Some(pending) = agent.pending_presentation_workstream.take() {
+                        rename_workstream = Some((pending, title.clone()));
+                    }
+                }
+                PresentationField::Set(_) | PresentationField::Clear => {}
+            }
+            match &update.activity {
+                PresentationField::Unchanged => {}
+                PresentationField::Set(activity) => agent.activity = Some(activity.clone()),
+                PresentationField::Clear => agent.activity = None,
+            }
+            agent.updated_at = agent.updated_at.max(now);
+            let cache = AgentPresentationCache {
+                generated_title: agent.generated_title.clone(),
+                activity: agent.activity.clone(),
+            };
+            agents.insert(&agent_id, SenValue::borrowed(&agent));
+            cache
+        };
+        if let Some((pending, title)) = rename_workstream
+            && self
+                .open_table(WORKSTREAMS)
+                .get(&pending.workstream_id)
+                .is_some_and(|value| value.value().into_owned().name == pending.provisional_name)
+        {
+            self.set_workstream_name(now, pending.workstream_id, title);
+        }
+        Some(cache)
+    }
+
+    fn rebuild_agent_presentation_cache(
+        &mut self,
+        now: UnixMillis,
+        agent_id: AgentId,
+    ) -> AgentPresentationCache {
+        let updates = self
+            .open_table(PRESENTATION_EVENTS)
+            .iter()
+            .map(|(_, update)| update.value().into_owned())
+            .collect::<Vec<_>>();
+        let updates = updates
+            .into_iter()
+            .filter(|update| agent_event_visible_write(self, agent_id, update.through))
+            .collect::<Vec<_>>();
+        let mut cache = AgentPresentationCache::default();
+        for update in updates {
+            match update.generated_title {
+                PresentationField::Set(title) => cache.generated_title = Some(title),
+                PresentationField::Clear => cache.generated_title = None,
+                PresentationField::Unchanged => {}
+            }
+            match update.activity {
+                PresentationField::Set(activity) => cache.activity = Some(activity),
+                PresentationField::Clear => cache.activity = None,
+                PresentationField::Unchanged => {}
+            }
+        }
+        let mut agents = self.open_table(AGENTS);
+        let mut agent = agents
+            .get(&agent_id)
+            .expect("agent id missing")
+            .value()
+            .into_owned();
+        agent.generated_title = cache.generated_title.clone();
+        agent.activity = cache.activity.clone();
+        agent.updated_at = agent.updated_at.max(now);
+        agents.insert(&agent_id, SenValue::borrowed(&agent));
+        cache
+    }
+
+    fn set_pending_presentation_workstream(
+        &mut self,
+        agent_id: AgentId,
+        workstream: Option<PendingPresentationWorkstream>,
+    ) {
+        let mut agents = self.open_table(AGENTS);
+        let mut agent = agents
+            .get(&agent_id)
+            .expect("agent id missing")
+            .value()
+            .into_owned();
+        agent.pending_presentation_workstream = workstream;
+        agents.insert(&agent_id, SenValue::borrowed(&agent));
+    }
+
+    fn apply_claude_generated_title(
+        &mut self,
+        now: UnixMillis,
+        agent_id: AgentId,
+        title: String,
+    ) -> bool {
+        let pending = {
+            let mut agents = self.open_table(AGENTS);
+            let mut agent = agents
+                .get(&agent_id)
+                .expect("agent id missing")
+                .value()
+                .into_owned();
+            if agent.display_name.is_some() {
+                return false;
+            }
+            agent.display_name = Some(title.clone());
+            agent.updated_at = agent.updated_at.max(now);
+            let pending = agent.pending_presentation_workstream.take();
+            agents.insert(&agent_id, SenValue::borrowed(&agent));
+            pending
+        };
+        // `set_workstream_name` already tolerates a colliding generated name;
+        // unlike `get_workstream`, this lookup also tolerates a move having
+        // deleted the provisional stream before the fallback completed.
+        if let Some(pending) = pending
+            && self
+                .open_table(WORKSTREAMS)
+                .get(&pending.workstream_id)
+                .is_some_and(|value| value.value().into_owned().name == pending.provisional_name)
+        {
+            self.set_workstream_name(now, pending.workstream_id, title);
+        }
+        true
+    }
+
     fn record_agent_turn_end(&mut self, agent_id: AgentId) {
         let mut agents = self.open_table(AGENTS);
         let mut agent = agents
@@ -1336,6 +1641,93 @@ impl AgentWriteTxnExt for WriteTxn {
             total.bucket_start_ms = 0;
             totals.insert(&agent_id, SenValue::borrowed(&total));
         }
+    }
+}
+
+fn agent_lineage_segments_read(read: &ReadTxn, agent: &AgentRecord) -> Vec<(AgentLineageId, u32)> {
+    let mut segments = Vec::new();
+    let mut lineage_id = agent.current_lineage;
+    let mut end_seq = u32::MAX;
+    let lineage_parents = read.open_table(LINEAGE_PARENTS);
+    loop {
+        segments.push((lineage_id, end_seq));
+        let Some(parent) = lineage_parents.get(&lineage_id) else {
+            break;
+        };
+        let parent = parent.value();
+        lineage_id = parent.lineage_id;
+        end_seq = parent.seq;
+    }
+    segments
+}
+
+fn agent_event_visible_read(read: &ReadTxn, agent: &AgentRecord, position: AgentEventPos) -> bool {
+    agent_lineage_segments_read(read, agent)
+        .into_iter()
+        .find_map(|(lineage_id, end_seq)| (lineage_id == position.lineage_id).then_some(end_seq))
+        .is_some_and(|end_seq| end_seq == u32::MAX || position.seq < end_seq)
+}
+
+fn agent_event_visible_write(
+    write: &mut WriteTxn,
+    agent_id: AgentId,
+    position: AgentEventPos,
+) -> bool {
+    let agent = write
+        .open_table(AGENTS)
+        .get(&agent_id)
+        .expect("agent id missing")
+        .value()
+        .into_owned();
+    let mut lineage_id = agent.current_lineage;
+    let mut end_seq = u32::MAX;
+    let lineage_parents = write.open_table(LINEAGE_PARENTS);
+    loop {
+        if lineage_id == position.lineage_id {
+            return end_seq == u32::MAX || position.seq < end_seq;
+        }
+        let Some(parent) = lineage_parents.get(&lineage_id) else {
+            break;
+        };
+        let parent = parent.value();
+        lineage_id = parent.lineage_id;
+        end_seq = parent.seq;
+    }
+    false
+}
+
+fn presentation_event_text_bytes(event: &AgentEvent<'_>) -> usize {
+    match event {
+        AgentEvent::Queued(crate::QueuedItem {
+            kind: crate::QueuedItemKind::UserMessage { content, .. },
+            ..
+        }) => content
+            .iter()
+            .filter_map(|part| match part {
+                rho_core::ContentPart::Text { text } => Some(text.len()),
+                rho_core::ContentPart::Image { .. } => None,
+            })
+            .sum(),
+        AgentEvent::InferenceResponse { items, .. } => items
+            .iter()
+            .filter_map(|item| match item {
+                crate::InferenceResponseItem::AssistantMessage { content, .. } => Some(
+                    content
+                        .iter()
+                        .filter_map(|part| match part {
+                            rho_core::ContentPart::Text { text } => Some(text.len()),
+                            rho_core::ContentPart::Image { .. } => None,
+                        })
+                        .sum::<usize>(),
+                ),
+                _ => None,
+            })
+            .sum(),
+        AgentEvent::ToolResult { .. }
+        | AgentEvent::Queued(_)
+        | AgentEvent::Dequeued { .. }
+        | AgentEvent::QueueCleared
+        | AgentEvent::PresentationUpdated { .. } => 0,
     }
 }
 
