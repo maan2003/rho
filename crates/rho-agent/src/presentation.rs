@@ -1,8 +1,9 @@
 //! Durable, watch-scoped Luna presentation sidecar.
 //!
-//! Native transcript sources are observed only after their event commits.
-//! Every provider attempt rebuilds from that durable source of truth, so a
-//! rewind cannot leave a session summarizing an abandoned branch.
+//! Sources are observed only after their event commits. Native agents write
+//! them directly; Claude mirrors confirmed external transcript text. Every
+//! provider attempt rebuilds from that durable source of truth, so a rewind
+//! cannot leave a session summarizing an abandoned branch.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, OnceLock};
@@ -15,7 +16,7 @@ use rho_core::{
 };
 use rho_db::RhoDb;
 use rho_inference::{Inference, InferenceSession, PromptCacheKey};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::db::{AgentId, AgentPresentationUpdate, AgentReadTxnExt as _, PresentationField};
 use crate::{
@@ -29,6 +30,7 @@ const MAX_STATUS_BYTES: usize = 50;
 const MAX_TURNS: usize = 8;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONCURRENT_REQUESTS: usize = 2;
+pub(crate) const MIN_INTERVAL: Duration = Duration::from_secs(15);
 const SET_TITLE: &str = "set_title";
 const SET_STATUS: &str = "set_status";
 
@@ -40,20 +42,22 @@ lowercase words unless a type, function, or other code identifier needs its conv
 When the agent is no longer actively working, do not set activity. Use the tools; do not write prose.";
 
 pub struct Watch {
-    control: mpsc::UnboundedSender<crate::AgentControl>,
+    release: Option<Box<dyn FnOnce() + Send>>,
 }
 
 impl Drop for Watch {
     fn drop(&mut self) {
-        let _ = self
-            .control
-            .send(crate::AgentControl::PresentationWatch { watching: false });
+        if let Some(release) = self.release.take() {
+            release();
+        }
     }
 }
 
 impl Watch {
-    pub(crate) fn new(control: mpsc::UnboundedSender<crate::AgentControl>) -> Self {
-        Self { control }
+    pub(crate) fn new(release: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            release: Some(Box::new(release)),
+        }
     }
 }
 
@@ -63,13 +67,31 @@ fn request_semaphore() -> Arc<Semaphore> {
 }
 
 /// Generate one presentation proposal from the committed lineage. Persistence
-/// remains in the owning `AgentLoop` so completion cannot race native events.
+/// remains in the owning runtime loop so completion cannot race source events.
 pub(crate) async fn acquire_request() -> anyhow::Result<OwnedSemaphorePermit> {
     Ok(request_semaphore().acquire_owned().await?)
 }
 
 pub(crate) fn has_input(db: &RhoDb, agent_id: AgentId) -> bool {
     presentation_input(db, agent_id).is_some()
+}
+
+/// Canonical durable representation of one external Claude transcript item.
+/// Keeping the cap at the mirror boundary prevents an unbounded JSONL record
+/// from becoming a second unbounded local persistence path.
+pub(crate) fn canonical_source_text(text: &str) -> Option<String> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let mut capped = String::new();
+    for character in text.chars() {
+        if capped.len() + character.len_utf8() > MAX_MESSAGE_BYTES {
+            break;
+        }
+        capped.push(character);
+    }
+    Some(capped)
 }
 
 pub(crate) async fn generate(
@@ -98,9 +120,6 @@ fn presentation_input(db: &RhoDb, agent_id: AgentId) -> Option<(Seed, Vec<Presen
     let (seed, sources) = {
         let read = db.read();
         let record = read.get_agent(agent_id);
-        if !matches!(record.runtime, crate::db::AgentRuntime::Rho { .. }) {
-            return None;
-        }
         let records = read.agent_presentation_source_tail(agent_id, PRESENTATION_SOURCE_TAIL_BYTES);
         (
             Seed {
@@ -399,7 +418,9 @@ fn xml_escape_capped(text: &str, max_bytes: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_STATUS_BYTES, bounded_status, bounded_title};
+    use super::{
+        MAX_MESSAGE_BYTES, MAX_STATUS_BYTES, bounded_status, bounded_title, canonical_source_text,
+    };
 
     #[test]
     fn presentation_fields_are_bounded() {
@@ -413,5 +434,13 @@ mod tests {
             Some("a".repeat(MAX_STATUS_BYTES))
         );
         assert_eq!(bounded_status(&"a".repeat(MAX_STATUS_BYTES + 1)), None);
+    }
+
+    #[test]
+    fn canonical_source_text_trims_and_caps_unicode() {
+        assert_eq!(canonical_source_text("  \n "), None);
+        let text = canonical_source_text(&"é".repeat(MAX_MESSAGE_BYTES)).unwrap();
+        assert!(text.len() <= MAX_MESSAGE_BYTES);
+        assert!(text.is_char_boundary(text.len()));
     }
 }

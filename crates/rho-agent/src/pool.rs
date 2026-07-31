@@ -244,7 +244,7 @@ impl AgentPool {
         self.presentation_changes.subscribe()
     }
 
-    /// Keeps native Luna work for this agent alive while the returned handle
+    /// Keeps Luna work for this agent alive while the returned handle
     /// exists. Dropping the last handle cancels any in-flight provider call.
     pub async fn watch_presentation(
         &self,
@@ -421,6 +421,7 @@ impl AgentPool {
             | SessionBinding::ClaudeAdvisor { .. } => {
                 let (agent_id, agent) = ClaudeAgent::create(
                     self.db.clone(),
+                    self.inference.clone(),
                     workstream,
                     display_name,
                     start,
@@ -741,9 +742,14 @@ impl AgentPool {
                 Arc::downgrade(self),
             )),
             AgentRuntime::Claude { .. } => {
-                let agent =
-                    ClaudeAgent::load(self.db.clone(), agent_id, view, Arc::downgrade(self))
-                        .await?;
+                let agent = ClaudeAgent::load(
+                    self.db.clone(),
+                    self.inference.clone(),
+                    agent_id,
+                    view,
+                    Arc::downgrade(self),
+                )
+                .await?;
                 RunningAgent::Claude(agent)
             }
         };
@@ -811,7 +817,7 @@ impl RunningAgent {
     pub(crate) fn watch_presentation(&self) -> Option<crate::presentation::Watch> {
         match self {
             Self::Rho(agent) => Some(agent.watch_presentation()),
-            Self::Claude(_) => None,
+            Self::Claude(agent) => Some(agent.watch_presentation()),
         }
     }
 

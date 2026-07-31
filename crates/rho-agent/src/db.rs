@@ -280,9 +280,9 @@ pub enum PresentationField {
     Clear,
 }
 
-/// A sidecar-derived title/activity update. `through` is a durable native
-/// transcript position, not the position where this update happens to be
-/// recorded. That distinction makes a late result harmless after rewind.
+/// A sidecar-derived title/activity update. `through` is a durable source
+/// position, not the position where this update happens to be recorded. That
+/// distinction makes a late result harmless after rewind.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct AgentPresentationUpdate {
     pub generated_title: PresentationField,
@@ -308,7 +308,7 @@ impl AgentEventPos {
         Self { lineage_id, seq: 0 }
     }
 
-    fn next(self) -> Self {
+    pub(crate) fn next(self) -> Self {
         Self {
             lineage_id: self.lineage_id,
             seq: self
@@ -775,15 +775,6 @@ pub trait AgentWriteTxnExt {
         agent_id: AgentId,
         workstream: Option<PendingPresentationWorkstream>,
     );
-    /// Commits Claude's fallback title and its provisional workstream rename
-    /// together. A moved/deleted provisional workstream is harmless.
-    fn apply_claude_generated_title(
-        &mut self,
-        now: UnixMillis,
-        agent_id: AgentId,
-        title: String,
-    ) -> bool;
-
     fn fork_agent_lineage(
         &mut self,
         now: UnixMillis,
@@ -1438,42 +1429,6 @@ impl AgentWriteTxnExt for WriteTxn {
         agents.insert(&agent_id, SenValue::borrowed(&agent));
     }
 
-    fn apply_claude_generated_title(
-        &mut self,
-        now: UnixMillis,
-        agent_id: AgentId,
-        title: String,
-    ) -> bool {
-        let pending = {
-            let mut agents = self.open_table(AGENTS);
-            let mut agent = agents
-                .get(&agent_id)
-                .expect("agent id missing")
-                .value()
-                .into_owned();
-            if agent.display_name.is_some() {
-                return false;
-            }
-            agent.display_name = Some(title.clone());
-            agent.updated_at = agent.updated_at.max(now);
-            let pending = agent.pending_presentation_workstream.take();
-            agents.insert(&agent_id, SenValue::borrowed(&agent));
-            pending
-        };
-        // `set_workstream_name` already tolerates a colliding generated name;
-        // unlike `get_workstream`, this lookup also tolerates a move having
-        // deleted the provisional stream before the fallback completed.
-        if let Some(pending) = pending
-            && self
-                .open_table(WORKSTREAMS)
-                .get(&pending.workstream_id)
-                .is_some_and(|value| value.value().into_owned().name == pending.provisional_name)
-        {
-            self.set_workstream_name(now, pending.workstream_id, title);
-        }
-        true
-    }
-
     fn record_agent_turn_end(&mut self, agent_id: AgentId) {
         let mut agents = self.open_table(AGENTS);
         let mut agent = agents
@@ -1723,6 +1678,7 @@ fn presentation_event_text_bytes(event: &AgentEvent<'_>) -> usize {
                 _ => None,
             })
             .sum(),
+        AgentEvent::ClaudePresentationSource { text, .. } => text.len(),
         AgentEvent::ToolResult { .. }
         | AgentEvent::Queued(_)
         | AgentEvent::Dequeued { .. }

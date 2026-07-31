@@ -944,9 +944,6 @@ struct AgentRegistry {
     /// The database's machine seed, announced in `Ready` so clients can
     /// encode agent IDs.
     machine_seed: u64,
-    /// Agents with a title generation in flight, so a burst of messages to an
-    /// untitled agent starts at most one task.
-    title_tasks: Mutex<HashSet<AgentId>>,
     land_locks: Mutex<HashMap<Utf8PathBuf, Arc<TokioMutex<()>>>>,
     land_holders: Mutex<HashMap<Utf8PathBuf, LandLeaseHolder>>,
     land_statuses: Mutex<HashMap<Utf8PathBuf, (Option<AgentId>, LandStatus)>>,
@@ -1000,7 +997,6 @@ impl AgentRegistry {
             visualizations,
             inference,
             machine_seed,
-            title_tasks: Mutex::new(HashSet::new()),
             land_locks: Mutex::new(HashMap::new()),
             land_holders: Mutex::new(HashMap::new()),
             land_statuses: Mutex::new(HashMap::new()),
@@ -1517,53 +1513,6 @@ impl AgentRegistry {
         write.agent_label(rho_core::UnixMs::now(), agent_id, &label, add);
         write.commit();
         Ok(())
-    }
-
-    /// Titles an untitled agent from its first user message, in the
-    /// background. Policy: only fills an empty `display_name` — a manual
-    /// rename, before or during generation, always wins — and at most one
-    /// generation runs per agent at a time. Every connection gets a `Ready`
-    /// refresh when the title lands. A self-founded provisional workstream is
-    /// associated durably with the agent and takes the same title unless it
-    /// was moved or renamed meanwhile.
-    async fn maybe_generate_title(
-        self: &Arc<Self>,
-        agent_id: AgentId,
-        text: String,
-        _retitle: Option<(WorkstreamId, String)>,
-    ) {
-        let record = self.db.read().get_agent(agent_id);
-        // Claude has no native durable event cursor. Keep the established
-        // one-shot fallback for that runtime while native agents use the
-        // agent-owned, cursor-validated presentation sidecar.
-        if !matches!(record.runtime, AgentRuntime::Claude { .. })
-            || text.trim().is_empty()
-            || record.display_name.is_some()
-        {
-            return;
-        }
-        if !self.title_tasks.lock().await.insert(agent_id) {
-            return;
-        }
-        let registry = Arc::clone(self);
-        tokio::spawn(async move {
-            let generate = rho_agent::title::generate_title(&registry.inference, &text);
-            match tokio::time::timeout(std::time::Duration::from_secs(60), generate).await {
-                Ok(Ok(title)) => {
-                    let mut write = registry.db.write().await;
-                    if write.apply_claude_generated_title(rho_core::UnixMs::now(), agent_id, title)
-                    {
-                        write.commit();
-                        // Titles show on every client's rail, so the refresh
-                        // fans out instead of following the acting connection.
-                        let _ = registry.events.send(registry.ready_message().await);
-                    }
-                }
-                Ok(Err(error)) => eprintln!("rho-daemon: title generation failed: {error:#}"),
-                Err(_) => eprintln!("rho-daemon: title generation timed out"),
-            }
-            registry.title_tasks.lock().await.remove(&agent_id);
-        });
     }
 
     async fn rename_agent(&self, agent_id: AgentId, name: String) -> anyhow::Result<()> {
@@ -2620,12 +2569,10 @@ async fn handle_message(
                 write.commit();
             }
             if let Some(content) = content {
-                let text = text_content(&content);
                 // The agent is fresh, so the lanes are equivalent here.
                 agent
                     .send_user_content_accepted(content, MessageDelivery::NextRequest, None)
                     .await?;
-                agents.maybe_generate_title(agent_id, text, founded).await;
             }
             Ok(Refresh::Ready)
         }
@@ -2748,11 +2695,9 @@ async fn handle_message(
                 .get(agent_id)
                 .await
                 .ok_or_else(|| anyhow::anyhow!("agent is not loaded: {agent_id:?}"))?;
-            let text = text_content(&content);
             agent
                 .send_user_content_accepted(content, delivery, None)
                 .await?;
-            agents.maybe_generate_title(agent_id, text, None).await;
             Ok(Refresh::None)
         }
         ClientMessage::CompactAgent { agent_id, delivery } => {
@@ -3636,7 +3581,7 @@ async fn subscribe_connection_agents(
                 .or_insert_with(|| subscribe_agent(agent_id, agent, outgoing_tx.clone()));
         }
         // `Ready` always includes the durable presentation cache for every
-        // dashboard row. This lease only permits a loaded native agent to
+        // dashboard row. This lease only permits a loaded agent to
         // refresh that cache with Luna while its transcript is observed.
         if !presentation_watches.contains_key(&agent_id)
             && let Some(watch) = agents.pool.watch_presentation(agent_id).await

@@ -3,7 +3,8 @@
 //! `rho-claude` owns the Claude Code protocol. This module owns the projection
 //! from Claude protocol/transcript messages into Rho agent vocabulary.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::borrow::Cow;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::io::Write as _;
 use std::num::NonZeroU64;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -16,25 +17,28 @@ use camino::Utf8PathBuf;
 use futures::Stream;
 use rho_claude::{ClaudeCode, ClaudeCodeOptions, Effort, Model, Session};
 use rho_core::{ContentPart, ContextBlock, ContextItemEvent, PendingInferenceResponse};
-use rho_db::RhoDb;
+use rho_db::{RhoDb, WriteTxn};
+use rho_inference::Inference;
 use tokio::sync::{Notify, mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::db::{
-    AgentId, AgentProfileWriteTxnExt, AgentReadTxnExt, AgentRole, AgentRoleSessionProfile as _,
+    AgentEventPos, AgentId, AgentPresentationCache, AgentPresentationUpdate,
+    AgentProfileWriteTxnExt, AgentReadTxnExt, AgentRole, AgentRoleSessionProfile as _,
     AgentRuntime, AgentWriteTxnExt, ClaudeRewind, EngineerIntelligence, SessionBinding, UnixMillis,
     WorkstreamId,
 };
 use crate::multi_agent_tools::MultiAgentTools;
 use crate::{
-    AgentState, AgentStateKind, FailedInferenceResponse, InputQueues, MessageDelivery, QueuedItem,
-    QueuedItemKind, StartWorkdir, system_prompt,
+    AgentEvent, AgentState, AgentStateKind, FailedInferenceResponse, InputQueues, MessageDelivery,
+    PresentationSpeaker, QueuedItem, QueuedItemKind, StartWorkdir, system_prompt,
 };
 
 mod projection;
 
 use projection::{
-    ClaudeStreamItem, assistant_message_to_block, transcript_messages_to_context,
+    ClaudeStreamItem, assistant_message_to_block, assistant_presentation_source,
+    presentation_source, queued_user_presentation_source, transcript_messages_to_context,
     user_output_to_block,
 };
 
@@ -54,6 +58,7 @@ impl ClaudeAgent {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn create(
         db: RhoDb,
+        inference: Inference,
         workstream: WorkstreamId,
         display_name: Option<String>,
         start: Vec<StartWorkdir>,
@@ -73,7 +78,7 @@ impl ClaudeAgent {
         let entries = crate::materialize_workdirs(start).await?;
         let view = rho_workspaces::View::new(entries.clone())?;
         let session_id = Uuid::new_v4();
-        write.create_agent(
+        let next_event = write.create_agent(
             UnixMillis::now(),
             agent_id,
             workstream,
@@ -111,6 +116,7 @@ impl ClaudeAgent {
             agent_id,
             Self::new(
                 db,
+                inference,
                 agent_id,
                 Arc::new(Lazy::ready(view)),
                 model,
@@ -122,12 +128,15 @@ impl ClaudeAgent {
                 multi_agent,
                 pool_events,
                 role,
+                next_event,
+                HashSet::new(),
             ),
         ))
     }
 
     pub(crate) async fn load(
         db: RhoDb,
+        inference: Inference,
         agent_id: AgentId,
         view: Arc<Lazy<Arc<rho_workspaces::View>>>,
         pool: std::sync::Weak<crate::pool::AgentPool>,
@@ -226,6 +235,13 @@ impl ClaudeAgent {
                 rho_claude::read_session_context_used_by_id(session_id, &primary_repo).await?;
             (session_id, messages, start_mode, false, context_used)
         };
+        let (next_event, known_presentation_sources, _, rebuilt_cache) =
+            reconcile_claude_presentation_sources(&db, agent_id, &messages).await?;
+        if let Some(cache) = rebuilt_cache
+            && let Some(pool) = pool.upgrade()
+        {
+            pool.publish_presentation_changed(agent_id, cache.generated_title, cache.activity);
+        }
         let blocks = transcript_messages_to_context(&messages)?;
         let state = AgentState {
             blocks,
@@ -244,6 +260,7 @@ impl ClaudeAgent {
         let pool_events = pool.clone();
         Ok(Self::new(
             db,
+            inference,
             agent_id,
             view,
             model,
@@ -256,12 +273,15 @@ impl ClaudeAgent {
                 .map(|_| MultiAgentTools::new(pool, agent_id, record.parent_agent)),
             pool_events,
             record.role,
+            next_event,
+            known_presentation_sources,
         ))
     }
 
     #[expect(clippy::too_many_arguments)]
     fn new(
         db: RhoDb,
+        inference: Inference,
         agent_id: AgentId,
         view: Arc<Lazy<Arc<rho_workspaces::View>>>,
         model: Model,
@@ -273,6 +293,8 @@ impl ClaudeAgent {
         multi_agent: Option<MultiAgentTools>,
         pool_events: std::sync::Weak<crate::pool::AgentPool>,
         role: crate::db::AgentRole,
+        next_event: AgentEventPos,
+        known_presentation_sources: HashSet<Uuid>,
     ) -> Self {
         let state = Arc::new(RwLock::new(state));
         let notify = Arc::new(Notify::new());
@@ -280,8 +302,17 @@ impl ClaudeAgent {
         let wait_baseline_seq = Arc::new(AtomicU64::new(0));
         let input_notify = Arc::new(Notify::new());
         let (control, control_rx) = mpsc::unbounded_channel();
+        let last_presentation_source = {
+            let records = db
+                .read()
+                .agent_presentation_source_tail(agent_id, crate::PRESENTATION_SOURCE_TAIL_BYTES);
+            crate::presentation_sources(agent_id, &records)
+                .last()
+                .map(|source| source.through)
+        };
         let loop_state = ClaudeLoop {
             db,
+            presentation_inference: inference,
             agent_id,
             view,
             model,
@@ -302,9 +333,14 @@ impl ClaudeAgent {
             wait_baseline_seq: Arc::clone(&wait_baseline_seq),
             input_notify: Arc::clone(&input_notify),
             control_rx,
+            presentation_control: control.downgrade(),
             multi_agent,
             pool_events,
             role,
+            next_event,
+            known_presentation_sources,
+            presentation: ClaudePresentationState::default(),
+            last_presentation_source,
         };
         tokio::spawn(loop_state.run());
         Self {
@@ -430,6 +466,16 @@ impl ClaudeAgent {
             .map_err(|_| anyhow::anyhow!("Claude agent control loop is closed"))?
     }
 
+    pub(crate) fn watch_presentation(&self) -> crate::presentation::Watch {
+        let _ = self
+            .control
+            .send(ClaudeControl::PresentationWatch { watching: true });
+        let control = self.control.clone();
+        crate::presentation::Watch::new(move || {
+            let _ = control.send(ClaudeControl::PresentationWatch { watching: false });
+        })
+    }
+
     pub fn subscribe(&self) -> impl Stream<Item = AgentState> + use<> {
         let state = Arc::clone(&self.state);
         let notify = Arc::clone(&self.notify);
@@ -479,10 +525,22 @@ enum ClaudeControl {
         turns: u32,
         reply: oneshot::Sender<anyhow::Result<()>>,
     },
+    PresentationWatch {
+        watching: bool,
+    },
+    PresentationStarted {
+        generation: u64,
+        acknowledged: oneshot::Sender<bool>,
+    },
+    PresentationFinished {
+        generation: u64,
+        result: Result<Option<AgentPresentationUpdate>, String>,
+    },
 }
 
 struct ClaudeLoop {
     db: RhoDb,
+    presentation_inference: Inference,
     agent_id: AgentId,
     view: Arc<Lazy<Arc<rho_workspaces::View>>>,
     model: Model,
@@ -507,15 +565,186 @@ struct ClaudeLoop {
     wait_baseline_seq: Arc<AtomicU64>,
     input_notify: Arc<Notify>,
     control_rx: mpsc::UnboundedReceiver<ClaudeControl>,
+    presentation_control: mpsc::WeakUnboundedSender<ClaudeControl>,
     multi_agent: Option<MultiAgentTools>,
     pool_events: std::sync::Weak<crate::pool::AgentPool>,
     role: crate::db::AgentRole,
+    next_event: AgentEventPos,
+    known_presentation_sources: HashSet<Uuid>,
+    presentation: ClaudePresentationState,
+    last_presentation_source: Option<AgentEventPos>,
+}
+
+#[derive(Default)]
+struct ClaudePresentationState {
+    watches: usize,
+    dirty: bool,
+    generation: u64,
+    last_started: Option<tokio::time::Instant>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for ClaudeLoop {
+    fn drop(&mut self) {
+        if let Some(task) = self.presentation.task.take() {
+            task.abort();
+        }
+    }
 }
 
 struct ClaudeTurn {
     uuid: String,
     input_seq: u64,
     content: Arc<Vec<ContentPart>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ClaudePresentationSource {
+    source_id: Uuid,
+    speaker: PresentationSpeaker,
+    text: String,
+}
+
+struct ClaudePresentationReconciliation {
+    sources: Vec<ClaudePresentationSource>,
+    persisted: Vec<(AgentEventPos, ClaudePresentationSource)>,
+    common: usize,
+    next_event: AgentEventPos,
+    previous_cache: AgentPresentationCache,
+}
+
+fn claude_presentation_sources(
+    messages: &[rho_claude::SessionMessage],
+) -> anyhow::Result<Vec<ClaudePresentationSource>> {
+    messages
+        .iter()
+        .filter_map(|message| presentation_source(message).transpose())
+        .filter_map(|source| match source {
+            Ok((source_id, speaker, text)) => crate::presentation::canonical_source_text(&text)
+                .map(|text| {
+                    Ok(ClaudePresentationSource {
+                        source_id,
+                        speaker,
+                        text,
+                    })
+                }),
+            Err(error) => Some(Err(error)),
+        })
+        .collect()
+}
+
+/// Plan reconciliation of the selected external Claude JSONL chain into
+/// durable, bounded source events. A crash between Claude's JSONL write and
+/// our event write is repaired on load; a shortened/diverged selected chain
+/// forks the same lineage that validates Luna cache updates.
+fn prepare_claude_presentation_reconciliation(
+    db: &RhoDb,
+    agent_id: AgentId,
+    messages: &[rho_claude::SessionMessage],
+) -> anyhow::Result<ClaudePresentationReconciliation> {
+    let sources = claude_presentation_sources(messages)?;
+    let read = db.read();
+    let record = read.get_agent(agent_id);
+    let previous_cache = AgentPresentationCache {
+        generated_title: record.generated_title,
+        activity: record.activity,
+    };
+    let (next_event, records) = read.agent_event_records(agent_id);
+    let persisted = records
+        .iter()
+        .filter_map(|(position, event)| match event {
+            AgentEvent::ClaudePresentationSource {
+                source_id,
+                speaker,
+                text,
+            } => Some((
+                *position,
+                ClaudePresentationSource {
+                    source_id: *source_id,
+                    speaker: *speaker,
+                    text: text.to_string(),
+                },
+            )),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let common = persisted
+        .iter()
+        .zip(&sources)
+        .take_while(|((_, persisted), source)| persisted == *source)
+        .count();
+    Ok(ClaudePresentationReconciliation {
+        sources,
+        persisted,
+        common,
+        next_event,
+        previous_cache,
+    })
+}
+
+impl ClaudePresentationReconciliation {
+    fn apply(
+        &self,
+        write: &mut WriteTxn,
+        now: UnixMillis,
+        agent_id: AgentId,
+    ) -> (AgentEventPos, Option<AgentPresentationCache>) {
+        let (mut next_event, rebuilt_cache) = if self.common < self.persisted.len() {
+            let next = write.fork_agent_lineage(now, agent_id, self.persisted[self.common].0);
+            let cache = write.rebuild_agent_presentation_cache(now, agent_id);
+            (next, (cache != self.previous_cache).then_some(cache))
+        } else {
+            (self.next_event, None)
+        };
+        for source in self.sources.iter().skip(self.common) {
+            next_event = write.append_agent_event(
+                next_event,
+                &AgentEvent::ClaudePresentationSource {
+                    source_id: source.source_id,
+                    speaker: source.speaker,
+                    text: Cow::Borrowed(&source.text),
+                },
+            );
+        }
+        (next_event, rebuilt_cache)
+    }
+
+    fn state(
+        &self,
+        db: &RhoDb,
+        agent_id: AgentId,
+        next_event: AgentEventPos,
+    ) -> (AgentEventPos, HashSet<Uuid>, Option<AgentEventPos>) {
+        let records = db
+            .read()
+            .agent_presentation_source_tail(agent_id, crate::PRESENTATION_SOURCE_TAIL_BYTES);
+        let last = crate::presentation_sources(agent_id, &records)
+            .last()
+            .map(|source| source.through);
+        (
+            next_event,
+            self.sources.iter().map(|source| source.source_id).collect(),
+            last,
+        )
+    }
+}
+
+async fn reconcile_claude_presentation_sources(
+    db: &RhoDb,
+    agent_id: AgentId,
+    messages: &[rho_claude::SessionMessage],
+) -> anyhow::Result<(
+    AgentEventPos,
+    HashSet<Uuid>,
+    Option<AgentEventPos>,
+    Option<AgentPresentationCache>,
+)> {
+    let reconciliation = prepare_claude_presentation_reconciliation(db, agent_id, messages)?;
+    let mut write = db.write().await;
+    let (next_event, rebuilt_cache) = reconciliation.apply(&mut write, UnixMillis::now(), agent_id);
+    write.commit();
+    let (next_event, known_sources, last_source) = reconciliation.state(db, agent_id, next_event);
+    Ok((next_event, known_sources, last_source, rebuilt_cache))
 }
 
 impl ClaudeLoop {
@@ -724,7 +953,177 @@ impl ClaudeLoop {
             ClaudeControl::Rewind { turns, reply } => {
                 let _ = reply.send(self.rewind(turns).await);
             }
+            ClaudeControl::PresentationWatch { watching } => {
+                if watching {
+                    let first_watch = self.presentation.watches == 0;
+                    self.presentation.watches += 1;
+                    if first_watch {
+                        self.presentation.dirty = true;
+                        self.schedule_presentation();
+                    }
+                } else {
+                    self.presentation.watches = self.presentation.watches.saturating_sub(1);
+                    if self.presentation.watches == 0 {
+                        if let Some(task) = self.presentation.task.take() {
+                            task.abort();
+                        }
+                        self.presentation.generation = self.presentation.generation.wrapping_add(1);
+                        self.presentation.dirty = false;
+                        self.presentation.last_started = None;
+                    }
+                }
+            }
+            ClaudeControl::PresentationStarted {
+                generation,
+                acknowledged,
+            } => {
+                let accepted = self.presentation.generation == generation
+                    && self.presentation.watches > 0
+                    && self.presentation.task.is_some();
+                if accepted {
+                    self.presentation.dirty = false;
+                    self.presentation.last_started = Some(tokio::time::Instant::now());
+                }
+                let _ = acknowledged.send(accepted);
+            }
+            ClaudeControl::PresentationFinished { generation, result } => {
+                if self.presentation.generation != generation {
+                    return;
+                }
+                self.presentation.task = None;
+                match result {
+                    Ok(Some(update)) if self.last_presentation_source == Some(update.through) => {
+                        let _ = self.persist_presentation(update).await;
+                    }
+                    Ok(Some(_)) | Ok(None) => {}
+                    Err(error) => {
+                        eprintln!("rho-agent: Claude presentation generation failed: {error}");
+                    }
+                }
+                self.schedule_presentation();
+            }
         }
+    }
+
+    async fn persist_presentation(
+        &mut self,
+        update: AgentPresentationUpdate,
+    ) -> Option<AgentPresentationCache> {
+        let mut write = self.db.write().await;
+        let cache = write.apply_agent_presentation(UnixMillis::now(), self.agent_id, &update)?;
+        let event_pos = self.next_event;
+        write.append_agent_presentation_history(event_pos, &update);
+        self.next_event = write.append_agent_event(
+            self.next_event,
+            &AgentEvent::PresentationUpdated {
+                update: update.clone(),
+            },
+        );
+        write.commit();
+        if let Some(pool) = self.pool_events.upgrade() {
+            pool.publish_presentation_changed(
+                self.agent_id,
+                cache.generated_title.clone(),
+                cache.activity.clone(),
+            );
+        }
+        Some(cache)
+    }
+
+    async fn persist_presentation_source(
+        &mut self,
+        source_id: Uuid,
+        speaker: PresentationSpeaker,
+        text: String,
+    ) {
+        let Some(text) = crate::presentation::canonical_source_text(&text) else {
+            return;
+        };
+        if !self.known_presentation_sources.insert(source_id) {
+            return;
+        }
+        let event_pos = self.next_event;
+        let mut write = self.db.write().await;
+        self.next_event = write.append_agent_event(
+            self.next_event,
+            &AgentEvent::ClaudePresentationSource {
+                source_id,
+                speaker,
+                text: Cow::Borrowed(&text),
+            },
+        );
+        write.commit();
+        self.last_presentation_source = Some(event_pos);
+        self.presentation.dirty = true;
+        self.schedule_presentation();
+    }
+
+    fn reset_presentation(&mut self) {
+        if let Some(task) = self.presentation.task.take() {
+            task.abort();
+        }
+        self.presentation.generation = self.presentation.generation.wrapping_add(1);
+        self.presentation.last_started = None;
+        self.presentation.dirty = self.presentation.watches > 0;
+    }
+
+    fn schedule_presentation(&mut self) {
+        if self.presentation.watches == 0
+            || !self.presentation.dirty
+            || self.presentation.task.is_some()
+        {
+            return;
+        }
+        self.presentation.dirty = false;
+        self.presentation.generation = self.presentation.generation.wrapping_add(1);
+        let generation = self.presentation.generation;
+        let now = tokio::time::Instant::now();
+        let delay = self
+            .presentation
+            .last_started
+            .and_then(|started| {
+                crate::presentation::MIN_INTERVAL.checked_sub(now.duration_since(started))
+            })
+            .unwrap_or_default();
+        let db = self.db.clone();
+        let inference = self.presentation_inference.clone();
+        let agent_id = self.agent_id;
+        let control = self.presentation_control.clone();
+        self.presentation.task = Some(tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let result = if !crate::presentation::has_input(&db, agent_id) {
+                Ok(None)
+            } else {
+                match crate::presentation::acquire_request().await {
+                    Ok(permit) => {
+                        let (acknowledged, accepted) = oneshot::channel();
+                        let Some(control) = control.upgrade() else {
+                            return;
+                        };
+                        if control
+                            .send(ClaudeControl::PresentationStarted {
+                                generation,
+                                acknowledged,
+                            })
+                            .is_err()
+                        {
+                            return;
+                        }
+                        drop(control);
+                        if !accepted.await.unwrap_or(false) {
+                            return;
+                        }
+                        crate::presentation::generate(db, inference, agent_id, permit)
+                            .await
+                            .map_err(|error| format!("{error:#}"))
+                    }
+                    Err(error) => Err(format!("{error:#}")),
+                }
+            };
+            if let Some(control) = control.upgrade() {
+                let _ = control.send(ClaudeControl::PresentationFinished { generation, result });
+            }
+        }));
     }
 
     async fn close_process(&mut self) {
@@ -989,6 +1388,8 @@ impl ClaudeLoop {
         };
         let (messages, resume_at) =
             rho_claude::rewind_session_messages(&messages, turns).context("nothing to rewind")?;
+        let reconciliation =
+            prepare_claude_presentation_reconciliation(&self.db, self.agent_id, &messages)?;
         let blocks = transcript_messages_to_context(&messages)?;
         let context_used =
             rho_claude::last_assistant_usage(&messages).map(|usage| usage.context_total());
@@ -1008,6 +1409,7 @@ impl ClaudeLoop {
             None => ClaudeStartMode::New,
         };
         let mut write = self.db.write().await;
+        let (next_event, _) = reconciliation.apply(&mut write, UnixMillis::now(), self.agent_id);
         write.set_agent_claude_rewind(
             self.agent_id,
             Some(ClaudeRewind {
@@ -1017,6 +1419,21 @@ impl ClaudeLoop {
             }),
         );
         write.commit();
+        let (next_event, known_sources, last_source) =
+            reconciliation.state(&self.db, self.agent_id, next_event);
+        self.next_event = next_event;
+        self.known_presentation_sources = known_sources;
+        self.last_presentation_source = last_source;
+        self.reset_presentation();
+        self.schedule_presentation();
+        if let Some(pool) = self.pool_events.upgrade() {
+            let record = self.db.read().get_agent(self.agent_id);
+            pool.publish_presentation_changed(
+                self.agent_id,
+                record.generated_title,
+                record.activity,
+            );
+        }
         self.pending_rewind = true;
 
         {
@@ -1204,11 +1621,23 @@ impl ClaudeLoop {
             }
             rho_claude::ClaudeEvent::ControlResponse(_) => {}
             rho_claude::ClaudeEvent::Assistant(message) => {
+                let source = assistant_presentation_source(&message);
                 match assistant_message_to_block(message) {
                     Ok(block) => {
                         self.pending_response = PendingInferenceResponse::default();
                         self.stream_items.clear();
                         self.persist_inference_block(&block).await;
+                        match source {
+                            Ok(Some((source_id, speaker, text))) => {
+                                self.persist_presentation_source(source_id, speaker, text)
+                                    .await;
+                            }
+                            Ok(None) => {}
+                            Err(error) => {
+                                self.fail(error);
+                                return;
+                            }
+                        }
                         self.push_block(block);
                         self.set_streaming_kind();
                     }
@@ -1216,7 +1645,13 @@ impl ClaudeLoop {
                 }
             }
             rho_claude::ClaudeEvent::User(message) => {
-                let promoted_queued = self.activate_turn_from_user_echo(message.uuid.as_deref());
+                let source_id = message
+                    .uuid
+                    .as_deref()
+                    .and_then(|uuid| Uuid::parse_str(uuid).ok());
+                let promoted_queued = self
+                    .activate_turn_from_user_echo(message.uuid.as_deref(), source_id)
+                    .await;
                 if promoted_queued {
                     return;
                 }
@@ -1320,13 +1755,16 @@ impl ClaudeLoop {
             }
             rho_claude::ClaudeEvent::RateLimitEvent(_) => {}
             rho_claude::ClaudeEvent::CommandLifecycle(message) => {
-                self.handle_command_lifecycle(message);
+                self.handle_command_lifecycle(message).await;
             }
             rho_claude::ClaudeEvent::Other => {}
         }
     }
 
-    fn handle_command_lifecycle(&mut self, message: rho_claude::protocol::CommandLifecycleMessage) {
+    async fn handle_command_lifecycle(
+        &mut self,
+        message: rho_claude::protocol::CommandLifecycleMessage,
+    ) {
         match message.state.as_str() {
             "queued" | "started" => {}
             "completed" | "cancelled" | "discarded" => {
@@ -1345,6 +1783,13 @@ impl ClaudeLoop {
                 if message.state == "completed" {
                     self.wait_baseline_seq
                         .store(turn.input_seq, Ordering::Release);
+                    if let Some(source_id) = Uuid::parse_str(&message.command_uuid).ok()
+                        && let Some((source_id, speaker, text)) =
+                            queued_user_presentation_source(source_id, &turn.content)
+                    {
+                        self.persist_presentation_source(source_id, speaker, text)
+                            .await;
+                    }
                     let mut state = self.state.write().expect("poison");
                     promote_queued_user_message(&mut state, &turn.content);
                 } else {
@@ -1441,7 +1886,11 @@ impl ClaudeLoop {
         }
     }
 
-    fn activate_turn_from_user_echo(&mut self, uuid: Option<&str>) -> bool {
+    async fn activate_turn_from_user_echo(
+        &mut self,
+        uuid: Option<&str>,
+        source_id: Option<Uuid>,
+    ) -> bool {
         let Some(uuid) = uuid else { return false };
         let Some(index) = self.queued_turns.iter().position(|turn| turn.uuid == uuid) else {
             return false;
@@ -1452,6 +1901,13 @@ impl ClaudeLoop {
             .expect("index came from position");
         self.wait_baseline_seq
             .store(turn.input_seq, Ordering::Release);
+
+        if let Some((source_id, speaker, text)) = source_id
+            .and_then(|source_id| queued_user_presentation_source(source_id, &turn.content))
+        {
+            self.persist_presentation_source(source_id, speaker, text)
+                .await;
+        }
 
         let mut state = self.state.write().expect("poison");
         promote_queued_user_message(&mut state, &turn.content);
@@ -1660,7 +2116,172 @@ fn is_compact_command(content: &[ContentPart]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use rho_db::RhoDb;
+    use rho_inference::PromptCacheKey;
+    use rho_workspaces::{WorkspaceId, WorkspaceIdDomain, WorkspaceInfo};
+    use serde_json::json;
+
     use super::*;
+
+    async fn presentation_test_agent() -> (tempfile::TempDir, RhoDb, AgentId) {
+        let temp = tempfile::tempdir().unwrap();
+        let db = RhoDb::open(temp.path().join("rho.redb"));
+        let mut write = db.write().await;
+        write.init_agent_tables();
+        let workstream = write.create_workstream(rho_core::UnixMs(1), "default".to_owned());
+        let agent_id = write.alloc_agent_id();
+        write.create_agent(
+            rho_core::UnixMs(1),
+            agent_id,
+            workstream,
+            None,
+            vec![WorkspaceInfo::Workspace {
+                repo: "/home/user/src/rho".into(),
+                id: WorkspaceId::from_counter(1, &WorkspaceIdDomain(0)).unwrap(),
+            }],
+            SessionBinding::ResponsesSol(crate::db::InferenceProfile::default()),
+            AgentRuntime::Rho {
+                prompt_cache_key: PromptCacheKey::generate(),
+            },
+            None,
+        );
+        write.commit();
+        (temp, db, agent_id)
+    }
+
+    fn presentation_message(
+        kind: rho_claude::SessionMessageKind,
+        uuid: Uuid,
+        text: &str,
+    ) -> rho_claude::SessionMessage {
+        rho_claude::SessionMessage {
+            kind,
+            uuid,
+            session_id: uuid::uuid!("00000000-0000-4000-8000-000000000099"),
+            message: json!({
+                "role": match kind {
+                    rho_claude::SessionMessageKind::User => "user",
+                    rho_claude::SessionMessageKind::Assistant => "assistant",
+                    rho_claude::SessionMessageKind::System => "system",
+                },
+                "content": [{"type": "text", "text": text}],
+            }),
+            parent_tool_use_id: None,
+            timestamp: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn reconciliation_appends_only_the_missing_suffix() {
+        let (_temp, db, agent_id) = presentation_test_agent().await;
+        let first = presentation_message(
+            rho_claude::SessionMessageKind::User,
+            uuid::uuid!("00000000-0000-4000-8000-000000000001"),
+            "first",
+        );
+        let second = presentation_message(
+            rho_claude::SessionMessageKind::Assistant,
+            uuid::uuid!("00000000-0000-4000-8000-000000000002"),
+            "second",
+        );
+        reconcile_claude_presentation_sources(&db, agent_id, std::slice::from_ref(&first))
+            .await
+            .unwrap();
+        let (_, sources, _, rebuilt) =
+            reconcile_claude_presentation_sources(&db, agent_id, &[first, second])
+                .await
+                .unwrap();
+
+        assert!(rebuilt.is_none());
+        assert_eq!(sources.len(), 2);
+        assert_eq!(
+            db.read()
+                .agent_event_records(agent_id)
+                .1
+                .into_iter()
+                .filter(|(_, event)| matches!(event, AgentEvent::ClaudePresentationSource { .. }))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn reconciliation_divergence_rebuilds_cache_and_discards_stale_updates() {
+        let (_temp, db, agent_id) = presentation_test_agent().await;
+        let first = presentation_message(
+            rho_claude::SessionMessageKind::User,
+            uuid::uuid!("00000000-0000-4000-8000-000000000001"),
+            "first",
+        );
+        let discarded = presentation_message(
+            rho_claude::SessionMessageKind::Assistant,
+            uuid::uuid!("00000000-0000-4000-8000-000000000002"),
+            "discarded",
+        );
+        let replacement = presentation_message(
+            rho_claude::SessionMessageKind::Assistant,
+            uuid::uuid!("00000000-0000-4000-8000-000000000003"),
+            "replacement",
+        );
+        let (next, _, _, _) =
+            reconcile_claude_presentation_sources(&db, agent_id, &[first.clone(), discarded])
+                .await
+                .unwrap();
+        let discarded_position = db
+            .read()
+            .agent_event_records(agent_id)
+            .1
+            .into_iter()
+            .find_map(|(position, event)| match event {
+                AgentEvent::ClaudePresentationSource { source_id, .. }
+                    if source_id == uuid::uuid!("00000000-0000-4000-8000-000000000002") =>
+                {
+                    Some(position)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let update = AgentPresentationUpdate {
+            generated_title: crate::db::PresentationField::Set("discarded-title".to_owned()),
+            activity: crate::db::PresentationField::Unchanged,
+            through: discarded_position,
+        };
+        let mut write = db.write().await;
+        assert!(
+            write
+                .apply_agent_presentation(rho_core::UnixMs(2), agent_id, &update)
+                .is_some()
+        );
+        write.append_agent_presentation_history(next, &update);
+        write.append_agent_event(
+            next,
+            &AgentEvent::PresentationUpdated {
+                update: update.clone(),
+            },
+        );
+        write.commit();
+
+        let (_, _, _, rebuilt) =
+            reconcile_claude_presentation_sources(&db, agent_id, &[first.clone(), replacement])
+                .await
+                .unwrap();
+        assert_eq!(rebuilt, Some(AgentPresentationCache::default()));
+        assert!(db.read().agent_presentation_updates(agent_id).is_empty());
+        let mut write = db.write().await;
+        assert!(
+            write
+                .apply_agent_presentation(rho_core::UnixMs(3), agent_id, &update)
+                .is_none()
+        );
+        write.commit();
+
+        let (_, sources, _, rebuilt) =
+            reconcile_claude_presentation_sources(&db, agent_id, &[first])
+                .await
+                .unwrap();
+        assert_eq!(sources.len(), 1);
+        assert!(rebuilt.is_none());
+    }
 
     #[test]
     fn raw_image_queue_matches_claude_textual_echo() {

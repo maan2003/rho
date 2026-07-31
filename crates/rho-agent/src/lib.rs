@@ -42,7 +42,6 @@ pub mod pool;
 pub mod presentation;
 pub mod slack_tools;
 pub mod system_prompt;
-pub mod title;
 
 #[cfg(feature = "code-mode")]
 type CodeModeSession = rho_code_mode::CodeModeSession;
@@ -117,6 +116,14 @@ pub enum AgentEvent<'a> {
     PresentationUpdated {
         update: AgentPresentationUpdate,
     },
+    /// A text-only message confirmed in Claude Code's external transcript.
+    /// It gives the shared Luna presentation sidecar a durable, rewindable
+    /// source without treating Claude's protocol state as native inference.
+    ClaudePresentationSource {
+        source_id: uuid::Uuid,
+        speaker: PresentationSpeaker,
+        text: Cow<'a, str>,
+    },
 }
 
 /// Stable identity for an accepted user input in an agent's persisted event
@@ -127,7 +134,7 @@ pub struct AgentInputId {
     pub event_pos: AgentEventPos,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum PresentationSpeaker {
     User,
     Agent,
@@ -490,7 +497,8 @@ fn restore_events(events: Vec<AgentEvent<'static>>) -> RestoredAgent {
                 }
             }
             AgentEvent::QueueCleared => queue.clear(),
-            AgentEvent::PresentationUpdated { .. } => {}
+            AgentEvent::PresentationUpdated { .. }
+            | AgentEvent::ClaudePresentationSource { .. } => {}
         }
     }
     let kind = match turn {
@@ -997,7 +1005,10 @@ impl Agent {
         let _ = self
             .control
             .send(AgentControl::PresentationWatch { watching: true });
-        presentation::Watch::new(self.control.clone())
+        let control = self.control.clone();
+        presentation::Watch::new(move || {
+            let _ = control.send(AgentControl::PresentationWatch { watching: false });
+        })
     }
 
     pub fn subscribe(&self) -> impl Stream<Item = AgentState> + use<> {
@@ -1229,8 +1240,6 @@ struct PresentationState {
     last_started: Option<tokio::time::Instant>,
     task: Option<tokio::task::JoinHandle<()>>,
 }
-
-const PRESENTATION_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 impl Drop for AgentLoop {
     fn drop(&mut self) {
@@ -2175,7 +2184,7 @@ impl AgentLoop {
         let delay = self
             .presentation
             .last_started
-            .and_then(|started| PRESENTATION_MIN_INTERVAL.checked_sub(now.duration_since(started)))
+            .and_then(|started| presentation::MIN_INTERVAL.checked_sub(now.duration_since(started)))
             .unwrap_or_default();
         let db = self.persistence.db.clone();
         let inference = self.presentation_inference.clone();
@@ -2701,6 +2710,13 @@ pub(crate) fn presentation_sources(
                     text,
                 })
             }
+            AgentEvent::ClaudePresentationSource { speaker, text, .. } => (!text.trim().is_empty())
+                .then_some(PresentationSource {
+                    agent_id,
+                    through: *through,
+                    speaker: *speaker,
+                    text: text.to_string(),
+                }),
             AgentEvent::ToolResult { .. }
             | AgentEvent::Queued(_)
             | AgentEvent::Dequeued { .. }
@@ -3224,6 +3240,11 @@ mod encoding_tests {
                 boundary: MessageDelivery::NextRequest,
             },
             AgentEvent::QueueCleared,
+            AgentEvent::ClaudePresentationSource {
+                source_id: uuid::uuid!("00000000-0000-4000-8000-000000000001"),
+                speaker: PresentationSpeaker::Assistant,
+                text: Cow::Borrowed("confirmed response"),
+            },
         ];
         for event in events {
             let mut buffer = bytes::BytesMut::new();

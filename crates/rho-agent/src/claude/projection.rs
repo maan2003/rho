@@ -352,6 +352,95 @@ fn project_tool_result(content: &Value) -> anyhow::Result<Option<ToolResult>> {
     }))
 }
 
+/// Text-only, transcript-confirmed input for the shared Luna presentation
+/// sidecar. Tool results and hidden Claude protocol messages are omitted.
+pub(super) fn presentation_source(
+    message: &rho_claude::SessionMessage,
+) -> anyhow::Result<Option<(Uuid, crate::PresentationSpeaker, String)>> {
+    presentation_source_parts(message.kind, message.uuid, &message.message)
+}
+
+/// Projects a live assistant notification with the exact rules used when its
+/// JSONL transcript entry is reconciled after restart.
+pub(super) fn assistant_presentation_source(
+    message: &rho_claude::protocol::AssistantMessage,
+) -> anyhow::Result<Option<(Uuid, crate::PresentationSpeaker, String)>> {
+    let Some(source_id) = message
+        .uuid
+        .as_deref()
+        .and_then(|uuid| Uuid::parse_str(uuid).ok())
+    else {
+        return Ok(None);
+    };
+    presentation_source_parts(
+        rho_claude::SessionMessageKind::Assistant,
+        source_id,
+        &serde_json::to_value(&message.message)?,
+    )
+}
+
+/// Projects original queued content after a live echo confirms its UUID.
+/// Claude can rewrite image input into a marker in that echo, while its JSONL
+/// retains the image part; use the original text-only content so live and
+/// reload projection agree.
+pub(super) fn queued_user_presentation_source(
+    source_id: Uuid,
+    content: &[ContentPart],
+) -> Option<(Uuid, crate::PresentationSpeaker, String)> {
+    let text = content
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Text { text } => Some(text.as_str()),
+            ContentPart::Image { .. } => None,
+        })
+        .filter(|text| !is_auxiliary_user_text(text))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.trim().is_empty()).then_some((source_id, crate::PresentationSpeaker::User, text))
+}
+
+fn presentation_source_parts(
+    kind: rho_claude::SessionMessageKind,
+    source_id: Uuid,
+    message: &Value,
+) -> anyhow::Result<Option<(Uuid, crate::PresentationSpeaker, String)>> {
+    let speaker = match kind {
+        rho_claude::SessionMessageKind::User => crate::PresentationSpeaker::User,
+        rho_claude::SessionMessageKind::Assistant => crate::PresentationSpeaker::Assistant,
+        rho_claude::SessionMessageKind::System => return Ok(None),
+    };
+    let text = message_content(message)
+        .into_iter()
+        .filter(|content| {
+            content
+                .get("type")
+                .and_then(Value::as_str)
+                .is_none_or(|kind| kind == "text")
+        })
+        .filter_map(|content| {
+            content
+                .get("text")
+                .or_else(|| content.get("content"))
+                .and_then(Value::as_str)
+        })
+        .filter(|text| {
+            kind != rho_claude::SessionMessageKind::User || !is_auxiliary_user_text(text)
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if text.trim().is_empty() {
+        return Ok(None);
+    };
+    Ok(Some((source_id, speaker, text)))
+}
+
+fn is_auxiliary_user_text(text: &str) -> bool {
+    let text = text.trim_start();
+    text.starts_with("<command-name>")
+        || text.starts_with("<local-command-stdout>")
+        || text.starts_with("<task-notification>")
+}
+
 #[cfg(test)]
 mod tests {
     use rho_core::text_content;
@@ -402,6 +491,118 @@ mod tests {
         };
         assert_eq!(text_content(content), "inspect\n[image: PNG]");
         assert!(!text_content(content).contains("RAW_BASE64"));
+    }
+
+    #[test]
+    fn presentation_source_keeps_only_user_text() {
+        let source = presentation_source(&session_message(
+            rho_claude::SessionMessageKind::User,
+            json!({"role": "user", "content": [
+                {"type": "text", "text": "inspect"},
+                {"type": "image", "source": {"type": "base64", "data": "RAW_BASE64_MUST_NOT_PROJECT"}},
+                {"type": "tool_result", "content": "also not input"}
+            ]}),
+        ))
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(source.2, "inspect");
+    }
+
+    #[test]
+    fn presentation_source_omits_auxiliary_user_output() {
+        let source = presentation_source(&session_message(
+            rho_claude::SessionMessageKind::User,
+            json!({"role": "user", "content": "<task-notification>done</task-notification>"}),
+        ))
+        .unwrap();
+
+        assert!(source.is_none());
+    }
+
+    #[test]
+    fn queued_user_presentation_source_matches_jsonl_projection() {
+        let source_id = uuid::uuid!("00000000-0000-4000-8000-000000000001");
+        let queued = vec![
+            ContentPart::Text {
+                text: "inspect".to_owned(),
+            },
+            ContentPart::Image {
+                media_type: "image/png".to_owned(),
+                data: Vec::new(),
+            },
+        ];
+        let jsonl = session_message(
+            rho_claude::SessionMessageKind::User,
+            json!({"role": "user", "content": [
+                {"type": "text", "text": "inspect"},
+                {"type": "image", "source": {"type": "base64", "data": "RAW_BASE64_MUST_NOT_PROJECT"}}
+            ]}),
+        );
+        // The echoed message has flattened the image into a marker, so it is
+        // intentionally not used as the source text.
+        let echo: rho_claude::protocol::UserOutputMessage = serde_json::from_value(json!({
+            "uuid": source_id,
+            "message": {"role": "user", "content": "inspect\n[image: PNG]"}
+        }))
+        .unwrap();
+        let echoed = user_output_to_block(echo).unwrap().unwrap();
+        let ContextBlock::UserMessage { content, .. } = echoed.as_ref() else {
+            panic!("expected user echo");
+        };
+        assert_eq!(text_content(content), "inspect\n[image: PNG]");
+        assert_eq!(
+            queued_user_presentation_source(source_id, &queued),
+            presentation_source(&jsonl).unwrap()
+        );
+
+        for (content, jsonl_content) in [
+            (
+                vec![ContentPart::Text {
+                    text: "peer report".to_owned(),
+                }],
+                json!([{"type": "text", "text": "peer report"}]),
+            ),
+            (
+                vec![ContentPart::Text {
+                    text: "<local-command-stdout>ignored</local-command-stdout>".to_owned(),
+                }],
+                json!("<local-command-stdout>ignored</local-command-stdout>"),
+            ),
+        ] {
+            let jsonl = session_message(
+                rho_claude::SessionMessageKind::User,
+                json!({"role": "user", "content": jsonl_content}),
+            );
+            assert_eq!(
+                queued_user_presentation_source(source_id, &content),
+                presentation_source(&jsonl).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn live_assistant_presentation_source_matches_jsonl_projection() {
+        let raw = json!({
+            "session_id": "00000000-0000-4000-8000-000000000002",
+            "uuid": "00000000-0000-4000-8000-000000000001",
+            "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "first"},
+                {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}},
+                {"type": "text", "text": "second"}
+            ]}
+        });
+        let live: rho_claude::protocol::AssistantMessage =
+            serde_json::from_value(raw.clone()).unwrap();
+        let jsonl = session_message(
+            rho_claude::SessionMessageKind::Assistant,
+            raw["message"].clone(),
+        );
+
+        assert_eq!(
+            assistant_presentation_source(&live).unwrap(),
+            presentation_source(&jsonl).unwrap()
+        );
     }
 
     #[test]
