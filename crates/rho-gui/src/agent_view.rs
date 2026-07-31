@@ -223,7 +223,7 @@ impl AgentModel {
                 window,
                 cx,
             );
-            crate::editor_config::configure(&mut editor, window, cx);
+            crate::editor_config::configure_preview(&mut editor, window, cx);
             editor.disable_bracket_colorization(cx);
             editor.disable_header_for_buffer(system_id, cx);
             editor.set_read_only(true);

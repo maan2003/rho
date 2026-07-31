@@ -332,7 +332,7 @@ impl Workspace {
         });
         let iris_preview = cx.new(|cx| {
             let mut editor = editor::Editor::for_buffer(iris_buffer, None, window, cx);
-            crate::editor_config::configure(&mut editor, window, cx);
+            crate::editor_config::configure_preview(&mut editor, window, cx);
             editor.set_read_only(true);
             editor
         });
@@ -4141,8 +4141,13 @@ impl Workspace {
         let rail = home.then(|| self.render_rail(show_panes, text_style, cx));
         // Same hairline the rail uses against the panes.
         let separator_color = cx.theme().colors().border_variant.opacity(0.6);
+        let mut preview_text_style = text_style.clone();
+        preview_text_style.font_size =
+            (text_style.font_size.to_pixels(window.rem_size()) * 0.5).into();
+        preview_text_style.line_height =
+            (text_style.line_height_in_pixels(window.rem_size()) * 0.5).into();
         let preview_bar = (home && !iris)
-            .then(|| self.render_preview_bar(text_style, cx))
+            .then(|| self.render_preview_bar(&preview_text_style, cx))
             .flatten();
         let preview = home
             .then(|| self.selected_preview_editor(iris, window, cx))
@@ -4193,32 +4198,37 @@ impl Workspace {
         };
         let panes = show_panes.then(|| {
             let element = div().flex_1().min_w_0().min_h_0();
-            // Home mode boxes the preview — a sheet hanging from a top
-            // inset, flush with the bottom and right window edges, visibly
-            // a card showing what the cursor points at, not an equal half.
+            // Home mode uses a half-size preview card, anchored to the
+            // bottom-right of the pane area rather than competing with the
+            // dashboard for an equal split.
             // The sheet shows the agent's *document* editor: the same
             // transcript buffers composed without the prompt, ending where
             // the words end. Its bottom bar carries the context the prompt
             // row shows in work mode.
             if home {
-                element
-                    .mt(gpui::relative(0.02))
-                    .border_1()
-                    .border_color(separator_color)
-                    .rounded_t_md()
-                    .overflow_hidden()
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .flex()
-                            .flex_1()
-                            .min_w_0()
-                            .min_h_0()
-                            .overflow_hidden()
-                            .children(preview),
-                    )
-                    .children(preview_bar)
+                element.flex().flex_col().child(
+                    div()
+                        .w(gpui::relative(0.5))
+                        .h(gpui::relative(0.5))
+                        .ml_auto()
+                        .mt_auto()
+                        .border_1()
+                        .border_color(separator_color)
+                        .rounded_t_md()
+                        .overflow_hidden()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_1()
+                                .min_w_0()
+                                .min_h_0()
+                                .overflow_hidden()
+                                .children(preview),
+                        )
+                        .children(preview_bar),
+                )
             } else {
                 element
                     .h_full()

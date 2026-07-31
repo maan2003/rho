@@ -3,7 +3,7 @@
 //! file editors keep them but shed the same chrome.
 
 use editor::Editor;
-use gpui::{Context, Window};
+use gpui::{Context, TextStyleRefinement, Window};
 
 #[allow(unused_variables)]
 pub fn configure(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
@@ -28,6 +28,17 @@ pub fn configure(editor: &mut Editor, window: &mut Window, cx: &mut Context<Edit
     editor.set_show_edit_predictions(Some(false), window, cx);
     editor.set_use_selection_highlight(false);
     editor.disable_expand_excerpt_buttons(cx);
+}
+
+/// Chrome and typography for the compact dashboard preview. Its text is
+/// deliberately half the size of a full editor without affecting pane editors.
+pub fn configure_preview(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
+    configure(editor, window, cx);
+    let font_size = editor.style(cx).text.font_size.to_pixels(window.rem_size()) * 0.5;
+    editor.set_text_style_refinement(TextStyleRefinement {
+        font_size: Some(font_size.into()),
+        ..Default::default()
+    });
 }
 
 /// Chrome for file buffers: a real code editor dressed as a rho buffer.
