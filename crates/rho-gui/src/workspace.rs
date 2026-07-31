@@ -4143,9 +4143,9 @@ impl Workspace {
         let separator_color = cx.theme().colors().border_variant.opacity(0.6);
         let mut preview_text_style = text_style.clone();
         preview_text_style.font_size =
-            (text_style.font_size.to_pixels(window.rem_size()) * 0.75).into();
+            (text_style.font_size.to_pixels(window.rem_size()) * 0.85).into();
         preview_text_style.line_height =
-            (text_style.line_height_in_pixels(window.rem_size()) * 0.75).into();
+            (text_style.line_height_in_pixels(window.rem_size()) * 0.85).into();
         let preview_bar = (home && !iris)
             .then(|| self.render_preview_bar(&preview_text_style, cx))
             .flatten();
