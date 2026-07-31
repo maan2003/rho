@@ -150,7 +150,9 @@ fn layout_rows(width: f32) -> [Vec<(Key, f32, f32)>; 5] {
     shift_row.push((Key::Backspace, width - H_GAP - edge_width, edge_width));
 
     let side_width = 1.35 * unit;
-    let return_width = 2.4 * unit;
+    // iOS shrinks return to ~2 letter units in layouts that put a period key
+    // next to it (web-search "Go"), vs ~2.8 units on the standard layout.
+    let return_width = 2.0 * unit;
     let space_width = width - 5. * H_GAP - 2. * side_width - return_width;
     let mut x = H_GAP;
     let mut bottom_row = Vec::new();
