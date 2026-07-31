@@ -315,10 +315,12 @@ pub async fn open_file_buffer(
     if let Some(buffer) = cx.update(|cx| remote.state.read(cx).existing_buffer(&path)) {
         return Ok(buffer);
     }
-    let response = cx.update(|cx| {
-        remote
+    let (read_epoch, response) = cx.update(|cx| {
+        let read_epoch = remote.state.read(cx).change_epoch();
+        let response = remote
             .state
-            .update(cx, |state, _| state.read(path.clone(), false))
+            .update(cx, |state, _| state.read(path.clone(), false));
+        (read_epoch, response)
     });
     let response = response.await.context("workspace channel closed")?;
     let (text, revision, utf8_bom, deleted) = match response {
@@ -353,14 +355,18 @@ pub async fn open_file_buffer(
         })
     });
 
-    // Close the read/install watcher race with one fresh generation-gated
-    // read now that the path is registered for notifications.
-    let (generation, reload) = cx.update(|cx| {
-        remote
-            .state
-            .update(cx, |state, _| state.begin_reload(path.clone()))
+    // Close the read/install watcher race only when an invalidation arrived
+    // while the buffer had no registration. The former unconditional reload
+    // added a second serialized workspace round trip for every newly opened
+    // diff file.
+    let reload = cx.update(|cx| {
+        remote.state.update(cx, |state, _| {
+            (state.change_epoch != read_epoch).then(|| state.begin_reload(path.clone()))
+        })
     });
-    if let Ok(result) = reload.await {
+    if let Some((generation, reload)) = reload
+        && let Ok(result) = reload.await
+    {
         apply_reload_result(&remote.state, &path, generation, result, None, cx);
     }
 
