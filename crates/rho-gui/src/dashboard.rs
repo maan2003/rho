@@ -1160,7 +1160,7 @@ fn generate_dashboard(registry: &AgentRegistry) -> Vec<Line> {
                 RailRow::HostHeader(host) => {
                     let mut line = Line::new(LineKey::Host { host, tail }, RowTarget::None);
                     let name = registry.host_name(host);
-                    line.span(Some(DashClass::Muted), |text| text.push_str(&name));
+                    line.span(Some(DashClass::Muted), |text| text.push_str(name));
                     line.tail = tail;
                     lines.push(line);
                 }

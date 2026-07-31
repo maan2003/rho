@@ -2202,7 +2202,7 @@ impl Workspace {
             Some(workdir) => self.hosts.send(
                 workdir.host,
                 ClientMessage::ProjectRemove {
-                    path: workdir.path.into(),
+                    path: workdir.path,
                 },
             ),
             None => {
