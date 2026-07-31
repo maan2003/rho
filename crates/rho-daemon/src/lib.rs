@@ -1681,6 +1681,16 @@ where
         return serve_diff_snapshot(agents, writer, workspace, known_commit_id, include_paths)
             .await;
     }
+    if let ClientMessage::DiffBaseContents {
+        workspace,
+        operation_id,
+        commit_id,
+        paths,
+    } = first
+    {
+        return serve_diff_base_contents(agents, writer, workspace, operation_id, commit_id, paths)
+            .await;
+    }
     if let ClientMessage::VisualizationGet { id } = first {
         let mut writer = writer;
         let response = match agents.visualizations.get(&id) {
@@ -2912,6 +2922,7 @@ async fn handle_message(
             anyhow::bail!("RealtimeOpen must be the first frame on a dedicated stream")
         }
         ClientMessage::DiffSnapshot { .. }
+        | ClientMessage::DiffBaseContents { .. }
         | ClientMessage::VisualizationGet { .. }
         | ClientMessage::TerminalCreate { .. }
         | ClientMessage::TerminalAttach { .. }
@@ -3174,6 +3185,46 @@ fn rho_pager_program() -> std::ffi::OsString {
         }
     }
     "rho-pager".into()
+}
+
+/// Loads one bounded parent-content batch from an already immutable diff
+/// operation. This intentionally does not snapshot the working copy.
+async fn serve_diff_base_contents<W>(
+    agents: Arc<AgentRegistry>,
+    mut writer: W,
+    workspace: WorkspaceInfo,
+    operation_id: String,
+    commit_id: String,
+    paths: Vec<Utf8PathBuf>,
+) -> anyhow::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    static DIFF_LOADS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+    let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        let _permit = DIFF_LOADS.acquire().await.context("diff loader closed")?;
+        let workspace = agents.pool.open_workspace(&workspace).await?;
+        workspace
+            .diff_base_contents(&operation_id, &commit_id, &paths)
+            .await
+    })
+    .await
+    .context("deferred diff content timed out after 30 seconds")
+    .and_then(|result| result);
+    match result {
+        Ok(contents) => {
+            write_frame(&mut writer, &ServerMessage::DiffBaseContents { contents }).await
+        }
+        Err(error) => {
+            write_frame(
+                &mut writer,
+                &ServerMessage::DiffRefused {
+                    reason: format!("{error:#}"),
+                },
+            )
+            .await
+        }
+    }
 }
 
 /// Persists one jj working-copy snapshot and serves its bounded parent-side

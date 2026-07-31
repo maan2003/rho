@@ -2609,9 +2609,16 @@ impl Workspace {
                     .await
                     .map_err(|error| anyhow::anyhow!("diff dial task failed: {error}"))??
                     .context("initial diff snapshot unexpectedly unchanged")?;
-                let prepared =
-                    crate::diff_view::PreparedDiff::load(&project, snapshot, live_paths, cx)
-                        .await?;
+                let prepared = crate::diff_view::PreparedDiff::load(
+                    &project,
+                    &diff_client,
+                    workspace.clone(),
+                    snapshot,
+                    live_paths,
+                    None,
+                    cx,
+                )
+                .await?;
                 Ok((project, prepared))
             }
             .await;

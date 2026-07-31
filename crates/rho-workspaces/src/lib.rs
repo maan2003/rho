@@ -36,8 +36,8 @@ mod sandbox;
 
 pub use ns::init_daemon_namespace;
 pub use rho_workspaces_types::{
-    WorkspaceDiffContent, WorkspaceDiffFile, WorkspaceDiffSnapshot, WorkspaceDiffStatus,
-    WorkspaceDiffTarget, WorkspaceId, WorkspaceIdDomain, WorkspaceInfo,
+    WorkspaceDiffBaseContent, WorkspaceDiffContent, WorkspaceDiffFile, WorkspaceDiffSnapshot,
+    WorkspaceDiffStatus, WorkspaceDiffTarget, WorkspaceId, WorkspaceIdDomain, WorkspaceInfo,
 };
 
 fn workspace_handle(id: WorkspaceId) -> String {
@@ -881,6 +881,71 @@ impl Workspace {
         .await
         .context("jj diff reader panicked")?
     }
+
+    /// Materializes bounded parent-side content from a previously returned
+    /// immutable jj operation. This never snapshots the live working copy.
+    pub async fn diff_base_contents(
+        &self,
+        operation_id: &str,
+        commit_id: &str,
+        paths: &[Utf8PathBuf],
+    ) -> anyhow::Result<Vec<WorkspaceDiffBaseContent>> {
+        anyhow::ensure!(
+            self.repo.is_jj,
+            "diff view requires a jj repository: {}",
+            self.repo.root
+        );
+        anyhow::ensure!(
+            paths.len() <= 64,
+            "too many deferred diff paths: {}",
+            paths.len()
+        );
+        anyhow::ensure!(
+            paths
+                .iter()
+                .try_fold(0_usize, |total, path| total
+                    .checked_add(path.as_str().len()))
+                .is_some_and(|total| total <= 1024 * 1024),
+            "deferred diff paths exceed the 1 MiB path budget"
+        );
+        static DIFF_READERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+        let permit = DIFF_READERS
+            .acquire()
+            .await
+            .context("diff readers closed")?;
+        let checkout = self.checkout.clone();
+        let repo = Arc::clone(&self.repo);
+        let operation_id = operation_id.to_owned();
+        let commit_id = commit_id.to_owned();
+        let paths = paths.to_vec();
+        let environment = self
+            .repo
+            .user_environment
+            .as_ref()
+            .map(UserEnvironment::values)
+            .unwrap_or_else(|| std::env::vars_os().collect());
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let _guard = repo.jj_lock.blocking_lock();
+            futures::executor::block_on(async {
+                let epoch = jj_cli::cli_util::workspace_snapshot_at_operation_with_environment(
+                    checkout.as_std_path(),
+                    &operation_id,
+                    environment,
+                )
+                .await
+                .map_err(|error| anyhow::anyhow!(error.error.to_string()))?;
+                let captured = diff::capture(epoch).await?;
+                anyhow::ensure!(
+                    captured.commit_id_hex() == commit_id,
+                    "diff snapshot revision is no longer available"
+                );
+                diff::load_base_contents(captured, &paths).await
+            })
+        })
+        .await
+        .context("jj deferred diff reader panicked")?
+    }
 }
 
 /// One agent's view of the filesystem: a working set of workdir entries
@@ -1453,8 +1518,17 @@ mod tests {
         let first = workspace.diff_snapshot(None, &[]).await.unwrap().unwrap();
         assert_eq!(first.files.len(), 1);
         assert_eq!(first.files[0].status, WorkspaceDiffStatus::Modified);
+        assert_eq!(first.files[0].base, WorkspaceDiffContent::Deferred);
+        let base_contents = workspace
+            .diff_base_contents(
+                &first.operation_id,
+                &first.commit_id,
+                &[Utf8PathBuf::from("file.txt")],
+            )
+            .await
+            .unwrap();
         assert_eq!(
-            first.files[0].base,
+            base_contents[0].content,
             WorkspaceDiffContent::Text("parent\n".to_owned())
         );
         assert_eq!(
@@ -1474,10 +1548,7 @@ mod tests {
             .find(|file| file.path == Utf8Path::new("unchanged.txt"))
             .unwrap();
         assert_eq!(unchanged.status, WorkspaceDiffStatus::Modified);
-        assert_eq!(
-            unchanged.base,
-            WorkspaceDiffContent::Text("same\n".to_owned())
-        );
+        assert_eq!(unchanged.base, WorkspaceDiffContent::Deferred);
         assert!(
             workspace
                 .diff_snapshot(Some(&first.commit_id), &[])

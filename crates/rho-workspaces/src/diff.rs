@@ -4,6 +4,7 @@ use anyhow::Context as _;
 use camino::Utf8PathBuf;
 use futures::{AsyncReadExt as _, StreamExt as _};
 use jj_lib::backend::TreeValue;
+use jj_lib::conflict_labels::ConflictLabels;
 use jj_lib::conflicts::{MaterializedTreeValue, materialize_tree_value};
 use jj_lib::matchers::EverythingMatcher;
 use jj_lib::merge::MergedTreeValue;
@@ -12,8 +13,8 @@ use jj_lib::object_id::ObjectId as _;
 use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::RepoPath;
 use rho_workspaces_types::{
-    WorkspaceDiffContent, WorkspaceDiffFile, WorkspaceDiffSnapshot, WorkspaceDiffStatus,
-    WorkspaceDiffTarget,
+    WorkspaceDiffBaseContent, WorkspaceDiffContent, WorkspaceDiffFile, WorkspaceDiffSnapshot,
+    WorkspaceDiffStatus, WorkspaceDiffTarget,
 };
 
 /// Resource limits for one diff snapshot. The dedicated UI channel has a
@@ -21,6 +22,8 @@ use rho_workspaces_types::{
 const MAX_FILES: usize = 2_048;
 const MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_IO_BYTES: usize = 48 * 1024 * 1024;
+/// One deferred-content reply stays small enough to render progressively.
+const MAX_BASE_REPLY_BYTES: usize = 8 * 1024 * 1024;
 /// Conservative aggregate bound for every variable-size wire field. The
 /// protocol frame limit is 64 MiB; this leaves ample senax overhead.
 const MAX_PAYLOAD_BYTES: usize = 40 * 1024 * 1024;
@@ -101,7 +104,6 @@ pub async fn load(
         let path = repo_path_to_utf8(entry.path);
         seen_paths.insert(path.clone());
         let Some(file) = materialize_file(
-            &base_tree,
             &target_tree,
             path,
             values.before,
@@ -139,7 +141,6 @@ pub async fn load(
             .await
             .context("read included path from target tree")?;
         let Some(file) = materialize_file(
-            &base_tree,
             &target_tree,
             path,
             before,
@@ -177,7 +178,6 @@ fn target_variable_len(target: &WorkspaceDiffTarget) -> usize {
 }
 
 async fn materialize_file(
-    base_tree: &MergedTree,
     target_tree: &MergedTree,
     path: Utf8PathBuf,
     before: MergedTreeValue,
@@ -196,7 +196,7 @@ async fn materialize_file(
     };
     let repo_path = RepoPath::from_internal_string(path.as_str())
         .context("diff produced an invalid repository path")?;
-    let mut base = materialize_content(base_tree, repo_path, before, io_budget).await?;
+    let mut base = describe_base(before, target_tree.labels());
     let target_executable = after.as_normal().and_then(|value| match value {
         TreeValue::File { executable, .. } => Some(*executable),
         _ => None,
@@ -298,11 +298,65 @@ fn content_variable_len(content: &WorkspaceDiffContent) -> usize {
         | WorkspaceDiffContent::GitSubmodule(value)
         | WorkspaceDiffContent::AccessDenied(value)
         | WorkspaceDiffContent::OtherConflict(value) => value.len(),
-        WorkspaceDiffContent::Absent
+        WorkspaceDiffContent::Deferred
+        | WorkspaceDiffContent::Absent
         | WorkspaceDiffContent::Binary { .. }
         | WorkspaceDiffContent::TooLarge { .. }
         | WorkspaceDiffContent::BudgetExhausted => 0,
     }
+}
+
+fn describe_base(value: MergedTreeValue, labels: &ConflictLabels) -> MaterializedContent {
+    let executable = value.as_normal().and_then(|value| match value {
+        TreeValue::File { executable, .. } => Some(*executable),
+        _ => None,
+    });
+    let content = if value.is_absent() {
+        WorkspaceDiffContent::Absent
+    } else if value.as_resolved().is_none() {
+        WorkspaceDiffContent::OtherConflict(bounded_message(value.describe(labels)))
+    } else {
+        // Do not read object content while enumerating the manifest. The
+        // immutable operation id lets a later request materialize this exact
+        // parent side without racing the live working copy.
+        WorkspaceDiffContent::Deferred
+    };
+    MaterializedContent {
+        content,
+        executable,
+    }
+}
+
+/// Materializes a bounded batch of parent-side values from a captured epoch.
+pub async fn load_base_contents(
+    captured: CapturedDiff,
+    paths: &[Utf8PathBuf],
+) -> anyhow::Result<Vec<WorkspaceDiffBaseContent>> {
+    let CapturedDiff { base_tree, .. } = captured;
+    let mut io_budget = MAX_BASE_REPLY_BYTES;
+    let mut paths = paths.to_vec();
+    paths.sort();
+    paths.dedup();
+    let mut contents = Vec::with_capacity(paths.len());
+    for path in paths {
+        let repo_path = RepoPath::from_internal_string(path.as_str())
+            .context("deferred diff path is not a valid repository path")?;
+        let value = base_tree
+            .path_value(repo_path)
+            .await
+            .context("read deferred path from parent tree")?;
+        let materialized =
+            materialize_content(&base_tree, repo_path, value, &mut io_budget).await?;
+        contents.push(WorkspaceDiffBaseContent {
+            path,
+            content: materialized.content,
+            executable: materialized.executable,
+        });
+        if io_budget == 0 {
+            break;
+        }
+    }
+    Ok(contents)
 }
 
 async fn materialize_content(

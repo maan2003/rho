@@ -40,6 +40,8 @@ pub struct PreparedDiff {
     metadata_only: Vec<String>,
     live_paths: Vec<Utf8PathBuf>,
     change_epoch: u64,
+    deferred_paths: Vec<Utf8PathBuf>,
+    incremental: bool,
 }
 
 struct PreparedEntry {
@@ -51,19 +53,79 @@ struct PreparedEntry {
 impl PreparedDiff {
     pub async fn load(
         remote: &RemoteProject,
+        client: &DiffClient,
+        workspace: WorkspaceInfo,
         snapshot: WorkspaceDiffSnapshot,
         live_paths: Vec<Utf8PathBuf>,
+        requested_paths: Option<Vec<Utf8PathBuf>>,
         cx: &mut AsyncApp,
     ) -> Result<Self> {
+        // The manifest deliberately contains no parent file bodies. Ask only
+        // for base values that can produce a text diff, in one bounded batch.
+        // The operation and commit ids bind this to the manifest even if the
+        // user edits the checkout while this RPC is in flight.
+        let deferred_paths = snapshot
+            .files
+            .iter()
+            .filter_map(|file| {
+                (matches!(file.base, WorkspaceDiffContent::Deferred)
+                    && matches!(
+                        file.target,
+                        WorkspaceDiffTarget::Text { .. } | WorkspaceDiffTarget::Absent
+                    ))
+                .then(|| file.path.clone())
+            })
+            .collect::<Vec<_>>();
+        let incremental = requested_paths.is_some();
+        // Render the first page immediately. Subsequent pages are requested
+        // after the model exists, so opening a large diff never waits for all
+        // historical bodies.
+        let requested_paths =
+            requested_paths.unwrap_or_else(|| deferred_paths.iter().take(32).cloned().collect());
+        let requested = requested_paths.iter().collect::<HashSet<_>>();
+        let remaining_paths = deferred_paths
+            .iter()
+            .filter(|path| !requested.contains(path))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut base_contents = HashMap::new();
+        for paths in requested_paths.chunks(64) {
+            let request = cx.update(|cx| {
+                client.base_contents(
+                    workspace.clone(),
+                    snapshot.operation_id.clone(),
+                    snapshot.commit_id.clone(),
+                    paths.to_vec(),
+                    cx,
+                )
+            });
+            let contents = request
+                .await
+                .context("deferred diff request task failed")??;
+            base_contents.extend(
+                contents
+                    .into_iter()
+                    .map(|content| (content.path.clone(), content)),
+            );
+        }
         let mut entries = Vec::new();
         let mut omitted = 0;
         let mut metadata_only = Vec::new();
         let mut live_budget = MAX_LIVE_BYTES;
 
         for file in &snapshot.files {
-            let base_text = match &file.base {
-                WorkspaceDiffContent::Text(text) => Some(Arc::<str>::from(text.as_str())),
-                WorkspaceDiffContent::Absent => None,
+            let base = match &file.base {
+                WorkspaceDiffContent::Deferred => base_contents
+                    .get(&file.path)
+                    .map(|content| &content.content),
+                content => Some(content),
+            };
+            let base_text = match base {
+                Some(WorkspaceDiffContent::Text(text)) => Some(Arc::<str>::from(text.as_str())),
+                Some(WorkspaceDiffContent::Absent) => None,
+                // A later bounded page will append this entry. It is not an
+                // unsupported file and must not be reported as omitted.
+                None if matches!(file.base, WorkspaceDiffContent::Deferred) => continue,
                 _ => {
                     omitted += 1;
                     continue;
@@ -138,11 +200,14 @@ impl PreparedDiff {
                 let snapshot = buffer.read(cx).snapshot();
                 diff.snapshot(cx).hunks(&snapshot).next().is_some()
             });
-            if !has_hunks && file.base_executable != file.target_executable {
+            let base_executable = base_contents
+                .get(&file.path)
+                .map_or(file.base_executable, |content| content.executable);
+            if !has_hunks && base_executable != file.target_executable {
                 metadata_only.push(format!(
                     "{}  executable {} → {}",
                     file.path,
-                    mode_label(file.base_executable),
+                    mode_label(base_executable),
                     mode_label(file.target_executable)
                 ));
             }
@@ -161,6 +226,8 @@ impl PreparedDiff {
             metadata_only,
             live_paths,
             change_epoch,
+            deferred_paths: remaining_paths,
+            incremental,
         })
     }
 }
@@ -189,6 +256,7 @@ pub struct DiffModel {
     refresh_again: bool,
     refresh_generation: u64,
     refresh_task: Option<Task<()>>,
+    deferred_task: Option<Task<()>>,
     debounce_task: Option<Task<()>>,
     _project_subscription: Subscription,
 }
@@ -232,6 +300,7 @@ impl DiffModel {
             refresh_again: false,
             refresh_generation: 0,
             refresh_task: None,
+            deferred_task: None,
             debounce_task: None,
             _project_subscription: project_subscription,
         };
@@ -326,12 +395,17 @@ impl DiffModel {
             cx,
         );
         let remote = self.remote.clone();
+        let client = self.client.clone();
+        let workspace = self.workspace.clone();
         self.refresh_task = Some(cx.spawn(async move |this, cx| {
             let result: Result<Option<PreparedDiff>> = async {
                 let snapshot = request.await.context("diff refresh task failed")??;
                 match snapshot {
                     Some(snapshot) => Ok(Some(
-                        PreparedDiff::load(&remote, snapshot, live_paths, cx).await?,
+                        PreparedDiff::load(
+                            &remote, &client, workspace, snapshot, live_paths, None, cx,
+                        )
+                        .await?,
                     )),
                     None => Ok(None),
                 }
@@ -363,6 +437,9 @@ impl DiffModel {
 
     fn apply(&mut self, prepared: PreparedDiff, cx: &mut Context<Self>) {
         let status = status_text(&prepared);
+        let incremental = prepared.incremental;
+        let deferred_paths = prepared.deferred_paths.clone();
+        let deferred_snapshot = prepared.snapshot.clone();
         let commit_id = prepared.snapshot.commit_id.clone();
         let live_paths = prepared.live_paths.clone();
         let next_paths = prepared
@@ -376,7 +453,7 @@ impl DiffModel {
             .filter(|path| !next_paths.contains(*path))
             .cloned()
             .collect::<Vec<_>>();
-        for path in removed {
+        for path in (!incremental).then_some(removed).unwrap_or_default() {
             if self
                 .entries
                 .get(&path)
@@ -441,6 +518,9 @@ impl DiffModel {
         self.commit_id = commit_id;
         self.live_paths = live_paths;
         self.status = status;
+        if !incremental && !deferred_paths.is_empty() {
+            self.load_deferred(deferred_snapshot, deferred_paths, cx);
+        }
         if dirty_paths(&self.remote, cx) != self.live_paths {
             // The dirty set can change while the manifest and remote buffers
             // are loading. Reconcile again rather than leaving an obsolete
@@ -448,6 +528,52 @@ impl DiffModel {
             self.schedule_refresh(cx);
         }
         cx.notify();
+    }
+
+    fn load_deferred(
+        &mut self,
+        snapshot: WorkspaceDiffSnapshot,
+        paths: Vec<Utf8PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
+        let generation = self.refresh_generation;
+        let remote = self.remote.clone();
+        let client = self.client.clone();
+        let workspace = self.workspace.clone();
+        let live_paths = self.live_paths.clone();
+        self.deferred_task = Some(cx.spawn(async move |this, cx| {
+            for paths in paths.chunks(64) {
+                let prepared = PreparedDiff::load(
+                    &remote,
+                    &client,
+                    workspace.clone(),
+                    snapshot.clone(),
+                    live_paths.clone(),
+                    Some(paths.to_vec()),
+                    cx,
+                )
+                .await;
+                let continue_loading = this.update(cx, |this, cx| {
+                    if this.refresh_generation != generation || this.commit_id != snapshot.commit_id
+                    {
+                        return false;
+                    }
+                    match prepared {
+                        Ok(prepared) => this.apply(prepared, cx),
+                        Err(error) => {
+                            this.status =
+                                format!("{} · deferred load failed: {error:#}", this.status);
+                            cx.notify();
+                            return false;
+                        }
+                    }
+                    true
+                });
+                if !continue_loading.unwrap_or(false) {
+                    break;
+                }
+            }
+        }));
     }
 
     fn recalculate(&mut self, path: &Utf8Path, cx: &mut Context<Self>) {

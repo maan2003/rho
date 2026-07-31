@@ -12,8 +12,8 @@ pub use rho_core::{
     MessageDelivery, WorkstreamId,
 };
 pub use rho_workspaces_types::{
-    WorkspaceDiffContent, WorkspaceDiffFile, WorkspaceDiffSnapshot, WorkspaceDiffStatus,
-    WorkspaceDiffTarget, WorkspaceId, WorkspaceIdDomain, WorkspaceInfo,
+    WorkspaceDiffBaseContent, WorkspaceDiffContent, WorkspaceDiffFile, WorkspaceDiffSnapshot,
+    WorkspaceDiffStatus, WorkspaceDiffTarget, WorkspaceId, WorkspaceIdDomain, WorkspaceInfo,
 };
 use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 
@@ -327,6 +327,15 @@ pub enum ClientMessage {
     /// Stop state updates for these agents on this UI connection.
     UnsubscribeAgents {
         agent_ids: Vec<AgentId>,
+    },
+    /// Loads parent-side contents from the immutable operation returned by
+    /// [`ClientMessage::DiffSnapshot`]. Replies are bounded and never
+    /// snapshot the live working copy.
+    DiffBaseContents {
+        workspace: WorkspaceInfo,
+        operation_id: String,
+        commit_id: String,
+        paths: Vec<Utf8PathBuf>,
     },
 }
 
@@ -693,6 +702,9 @@ pub enum ServerMessage {
     AgentUnloaded {
         agent_id: AgentId,
         reason: AgentUnloadReason,
+    },
+    DiffBaseContents {
+        contents: Vec<WorkspaceDiffBaseContent>,
     },
 }
 
@@ -1298,6 +1310,19 @@ mod tests {
         let decoded = senax_encoder::unpack(&mut slice).unwrap();
         assert_eq!(request, decoded);
 
+        let request = ClientMessage::DiffBaseContents {
+            workspace: WorkspaceInfo::UserCheckout {
+                repo: Utf8PathBuf::from("/repo"),
+            },
+            operation_id: "operation".to_owned(),
+            commit_id: "commit".to_owned(),
+            paths: vec![Utf8PathBuf::from("src/lib.rs")],
+        };
+        let bytes = senax_encoder::pack(&request).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(request, decoded);
+
         let response = ServerMessage::DiffSnapshot {
             snapshot: WorkspaceDiffSnapshot {
                 operation_id: "operation".to_owned(),
@@ -1305,7 +1330,7 @@ mod tests {
                 files: vec![WorkspaceDiffFile {
                     path: Utf8PathBuf::from("src/lib.rs"),
                     status: WorkspaceDiffStatus::Modified,
-                    base: WorkspaceDiffContent::Text("old".to_owned()),
+                    base: WorkspaceDiffContent::Deferred,
                     target: WorkspaceDiffTarget::Text { bytes: 3 },
                     base_executable: Some(false),
                     target_executable: Some(false),

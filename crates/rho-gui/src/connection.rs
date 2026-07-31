@@ -256,6 +256,31 @@ async fn dial_diff_snapshot(
     }
 }
 
+async fn dial_diff_base_contents(
+    dialer: ChannelDialer,
+    workspace: WorkspaceInfo,
+    operation_id: String,
+    commit_id: String,
+    paths: Vec<Utf8PathBuf>,
+) -> anyhow::Result<Vec<rho_ui_proto::WorkspaceDiffBaseContent>> {
+    let mut stream = dial_bulk_stream(dialer).await?;
+    write_frame(
+        &mut stream,
+        &ClientMessage::DiffBaseContents {
+            workspace,
+            operation_id,
+            commit_id,
+            paths,
+        },
+    )
+    .await?;
+    match read_frame::<_, ServerMessage>(&mut stream).await? {
+        ServerMessage::DiffBaseContents { contents } => Ok(contents),
+        ServerMessage::DiffRefused { reason } => anyhow::bail!("{reason}"),
+        _ => anyhow::bail!("unexpected reply to DiffBaseContents"),
+    }
+}
+
 async fn dial_visualization(
     dialer: ChannelDialer,
     id: String,
@@ -497,6 +522,23 @@ impl DiffClient {
         Tokio::spawn(cx, async move {
             let dialer = dialer.context("not connected to rho-daemon")?;
             dial_diff_snapshot(dialer, workspace, known_commit_id, include_paths).await
+        })
+    }
+
+    pub fn base_contents(
+        &self,
+        workspace: WorkspaceInfo,
+        operation_id: String,
+        commit_id: String,
+        paths: Vec<Utf8PathBuf>,
+        cx: &App,
+    ) -> Task<
+        Result<anyhow::Result<Vec<rho_ui_proto::WorkspaceDiffBaseContent>>, gpui_tokio::JoinError>,
+    > {
+        let dialer = self.dialer.lock().unwrap().clone();
+        Tokio::spawn(cx, async move {
+            let dialer = dialer.context("not connected to rho-daemon")?;
+            dial_diff_base_contents(dialer, workspace, operation_id, commit_id, paths).await
         })
     }
 }
@@ -945,6 +987,7 @@ async fn run(
             | ServerMessage::ShellOpened
             | ServerMessage::ShellAttachRefused { .. }
             | ServerMessage::DiffSnapshot { .. }
+            | ServerMessage::DiffBaseContents { .. }
             | ServerMessage::DiffUnchanged { .. }
             | ServerMessage::DiffRefused { .. }
             | ServerMessage::RealtimeOpened { .. }

@@ -89,6 +89,13 @@ pub struct WorkspaceDiffSnapshot {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct WorkspaceDiffBaseContent {
+    pub path: Utf8PathBuf,
+    pub content: WorkspaceDiffContent,
+    pub executable: Option<bool>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct WorkspaceDiffFile {
     /// Repository-relative path. A rename is represented losslessly as one
     /// deletion and one addition; copy presentation can be layered on later
@@ -112,10 +119,16 @@ pub enum WorkspaceDiffStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum WorkspaceDiffContent {
+    /// File body is available from the immutable snapshot on demand.
+    Deferred,
     Absent,
     Text(String),
-    Binary { bytes: u64 },
-    TooLarge { bytes_at_least: u64 },
+    Binary {
+        bytes: u64,
+    },
+    TooLarge {
+        bytes_at_least: u64,
+    },
     BudgetExhausted,
     Symlink(String),
     GitSubmodule(String),

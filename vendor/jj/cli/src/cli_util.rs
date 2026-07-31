@@ -1173,6 +1173,8 @@ pub struct WorkspaceSnapshotEpoch {
 enum EmbeddedSnapshotCommand {
     #[command(name = "snapshot-workspace-descendants", hide = true)]
     SnapshotWorkspaceDescendants,
+    #[command(name = "snapshot-workspace-at-operation", hide = true)]
+    SnapshotWorkspaceAtOperation,
 }
 
 impl SnapshotWorkingCopyError {
@@ -5550,6 +5552,45 @@ pub async fn snapshot_workspace_descendants_at_with_environment(
         .borrow_mut()
         .take()
         .ok_or_else(|| internal_error("embedded snapshot produced no repository epoch"))
+}
+
+/// Loads a previously recorded immutable operation without inspecting or
+/// snapshotting the live working copy. Embedders use this to resolve values
+/// referenced by a durable operation id.
+pub async fn workspace_snapshot_at_operation_with_environment(
+    workspace_path: &Path,
+    operation_id: &str,
+    environment: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Result<WorkspaceSnapshotEpoch, CommandError> {
+    let output = Rc::new(RefCell::new(None));
+    let output_for_dispatch = output.clone();
+    let runner = CliRunner::init_embedded().add_subcommand::<EmbeddedSnapshotCommand, _>(
+        async move |ui, command, _command| {
+            let workspace_command = command.workspace_helper_no_snapshot(ui).await?;
+            *output_for_dispatch.borrow_mut() = Some(WorkspaceSnapshotEpoch {
+                repo: workspace_command.repo().clone(),
+                workspace_name: workspace_command.workspace_name().to_owned(),
+                stats: SnapshotStats::default(),
+            });
+            Ok(())
+        },
+    );
+    runner
+        .run_with_args_and_environment(
+            workspace_path,
+            [
+                OsString::from("jj"),
+                OsString::from("--at-operation"),
+                OsString::from(operation_id),
+                OsString::from("snapshot-workspace-at-operation"),
+            ],
+            environment,
+        )
+        .await?;
+    output
+        .borrow_mut()
+        .take()
+        .ok_or_else(|| internal_error("embedded operation lookup produced no repository epoch"))
 }
 
 fn map_clap_cli_error(err: clap::Error, ui: &Ui, config: &StackedConfig) -> CommandError {
