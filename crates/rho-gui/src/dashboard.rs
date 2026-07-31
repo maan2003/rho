@@ -1200,7 +1200,7 @@ fn visible_lines(lines: Vec<Line>, expanded: &HashSet<AgentId>) -> Vec<Line> {
 }
 
 /// The leading state glyph and status text of a row. State reads down one
-/// fixed glyph column — `?` needs you, `!` blocked, `✓` FYI, `▸` working,
+/// fixed glyph column — `?` needs you, `!` blocked, `✓` FYI, `⋯` working,
 /// `·` quiet — while the title stays plain: working rows show activity,
 /// finished rows show the turn report's summary, and only that suffix dims.
 struct RowStatus<'a> {
@@ -1233,7 +1233,7 @@ impl RowStatus<'_> {
                 Some(report) if !report.needs_you => (DashClass::Muted, "✓ "),
                 _ => (DashClass::Plain, "? "),
             },
-            UiAttention::Working => (DashClass::Muted, "▸ "),
+            UiAttention::Working => (DashClass::Muted, "⋯ "),
             UiAttention::Quiet => (DashClass::Muted, "· "),
         }
     }
@@ -1758,7 +1758,7 @@ mod tests {
             lines[0]
                 .glyph
                 .as_ref()
-                .is_some_and(|glyph| glyph.text == "▸ ")
+                .is_some_and(|glyph| glyph.text == "⋯ ")
         );
     }
 
