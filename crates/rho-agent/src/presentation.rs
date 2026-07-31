@@ -52,9 +52,11 @@ title is lowercase kebab-case, at most 30 characters, and names the subject rath
 activity to a concise three or four word current-progress label, at most 50 bytes; when the \
 agent is no longer actively working, do not set activity. When the newest input is a \
 <turn_ended> block, classify its final message instead: call report_needs_you when it asks the \
-user a question, requests review or a decision, reports being blocked, failed, or unfinished, \
-or otherwise leaves the next step with the user; call report_fyi when the work finished cleanly \
-and nothing is asked of the user — a trailing offer of optional follow-up work is still fyi. \
+user a question, answers a question the user asked, requests review or a decision, reports \
+being blocked, failed, or unfinished, or otherwise leaves the next step with the user — an \
+answer in a discussion expects the user's reply, so it is needs_you even when complete; call \
+report_fyi only when delegated work finished cleanly and nothing is asked of the user — a \
+trailing offer of optional follow-up work is still fyi. \
 summary is a concise few-word label of the outcome — for report_needs_you, of what is being \
 asked — at most 50 bytes, the same shape as activity. Use lowercase except for types, \
 functions, and other code identifiers; no trailing period. Use the tools; do not write prose.";
