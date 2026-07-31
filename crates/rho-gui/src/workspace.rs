@@ -4200,9 +4200,9 @@ impl Workspace {
         };
         let panes = show_panes.then(|| {
             let element = div().flex_1().min_w_0().min_h_0();
-            // Home mode uses a three-quarter-size preview card, anchored to the
-            // bottom-right of the pane area rather than competing with the
-            // dashboard for an equal split.
+            // Home mode uses a narrow preview card with the original top
+            // inset, anchored to the bottom-right of the pane area rather
+            // than competing with the dashboard for an equal split.
             // The sheet shows the agent's *document* editor: the same
             // transcript buffers composed without the prompt, ending where
             // the words end. Its bottom bar carries the context the prompt
@@ -4211,7 +4211,7 @@ impl Workspace {
                 element.flex().flex_col().child(
                     div()
                         .w_full()
-                        .h(gpui::relative(0.75))
+                        .h(gpui::relative(0.98))
                         .ml_auto()
                         .mt_auto()
                         .border_1()
