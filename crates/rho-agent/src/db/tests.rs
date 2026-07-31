@@ -808,7 +808,7 @@ async fn turn_end_and_user_message_set_dispositions() {
         test_agent_runtime(),
         None,
     );
-    write.record_agent_turn_end(agent_id);
+    write.record_agent_turn_end(UnixMs(2), agent_id);
     write.commit();
     assert_eq!(
         db.read().get_agent(agent_id).disposition,
@@ -822,6 +822,46 @@ async fn turn_end_and_user_message_set_dispositions() {
     assert_eq!(agent.disposition, AgentDisposition::Done);
     assert_eq!(agent.last_user_message, UnixMs(5));
     assert_eq!(agent.last_user_message_text, "please check the claims");
+    assert!(agent.user_interacted);
+
+    // An unexpired snooze holds across a turn end; an expired one does not.
+    let mut write = db.write().await;
+    write.set_agent_disposition(agent_id, AgentDisposition::Snoozed { until: UnixMs(100) });
+    write.record_agent_turn_end(UnixMs(50), agent_id);
+    write.commit();
+    assert_eq!(
+        db.read().get_agent(agent_id).disposition,
+        AgentDisposition::Snoozed { until: UnixMs(100) }
+    );
+    let mut write = db.write().await;
+    write.record_agent_turn_end(UnixMs(150), agent_id);
+    write.commit();
+    assert_eq!(
+        db.read().get_agent(agent_id).disposition,
+        AgentDisposition::Pending
+    );
+
+    // A new user message overrides any verdict: snooze and the stale turn
+    // report both give way to Done.
+    let mut write = db.write().await;
+    write.set_agent_disposition(
+        agent_id,
+        AgentDisposition::Snoozed {
+            until: UnixMs(1_000),
+        },
+    );
+    write.record_agent_turn_report(
+        agent_id,
+        &crate::db::TurnReport {
+            needs_you: false,
+            one_liner: "tests pass".to_owned(),
+        },
+    );
+    write.record_agent_user_message(UnixMs(200), agent_id, "next task");
+    write.commit();
+    let agent = db.read().get_agent(agent_id);
+    assert_eq!(agent.disposition, AgentDisposition::Done);
+    assert_eq!(agent.turn_report, None);
 }
 
 #[tokio::test]

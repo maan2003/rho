@@ -54,6 +54,10 @@ pub enum ConnEvent {
         agent_id: AgentId,
         attention: rho_ui_proto::UiAttention,
     },
+    AgentTurnReport {
+        agent_id: AgentId,
+        report: rho_ui_proto::UiTurnReport,
+    },
     ChatGptUsage {
         used_percent: f64,
         reset_at_unix: i64,
@@ -882,6 +886,9 @@ async fn run(
                 agent_id,
                 attention,
             }),
+            ServerMessage::AgentTurnReport { agent_id, report } => {
+                Some(ConnEvent::AgentTurnReport { agent_id, report })
+            }
             ServerMessage::Error { message } => Some(ConnEvent::ServerError(message)),
             ServerMessage::ChatGptUsage {
                 used_percent,

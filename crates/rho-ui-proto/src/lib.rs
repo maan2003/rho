@@ -550,6 +550,12 @@ pub enum ServerMessage {
         agent_id: AgentId,
         attention: UiAttention,
     },
+    /// The turn-report one-shot classified an agent's finished turn.
+    /// Broadcast so rails can split pending rows into needs-you and FYI.
+    AgentTurnReport {
+        agent_id: AgentId,
+        report: UiTurnReport,
+    },
     LandLeaseQueued {
         repo: Utf8PathBuf,
         holder: Option<LandLeaseHolder>,
@@ -802,11 +808,26 @@ pub struct UiAgentSummary {
     /// idle or the sidecar has not produced a label yet.
     #[senax(default)]
     pub activity: Option<String>,
+    /// Model-derived classification of the last finished turn; kept current
+    /// afterwards by [`ServerMessage::AgentTurnReport`]. `None` until the
+    /// one-shot lands or after the user re-engages.
+    #[senax(default)]
+    pub turn_report: Option<UiTurnReport>,
     /// The workstream this agent belongs to (exactly one).
     pub workstream: WorkstreamId,
     /// Free-form markers ("pin", …); semantics live in the client's view
     /// layer.
     pub labels: Vec<String>,
+}
+
+/// What a finished turn asks of the user, derived by a small model from the
+/// turn's final message. `needs_you` splits the Pending lamp in two: a lit
+/// row that wants engagement versus a dim, dismissable FYI.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct UiTurnReport {
+    pub needs_you: bool,
+    /// One row-sized line summarizing the outcome of the turn.
+    pub one_liner: String,
 }
 
 /// How urgently an agent wants the user, in ascending order — the rail's
@@ -817,8 +838,8 @@ pub struct UiAgentSummary {
     Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Encode, Decode, Pack, Unpack,
 )]
 pub enum UiAttention {
-    /// Done, snoozed, never finished a turn, or a sub-agent (whose turns are
-    /// its parent's court, not the user's).
+    /// Done, snoozed, never finished a turn, or an unengaged sub-agent
+    /// (whose turns are its parent's court, not the user's).
     #[default]
     Quiet,
     /// A turn is running; the agent's court.

@@ -1,13 +1,17 @@
 //! Durable, watch-scoped Luna presentation sidecar.
 //!
 //! Sources are observed only after their event commits. Native agents write
-//! them directly; Claude mirrors confirmed external transcript text. Every
-//! provider attempt rebuilds from that durable source of truth, so a rewind
-//! cannot leave a session summarizing an abandoned branch.
+//! them directly; Claude mirrors confirmed external transcript text. Each
+//! agent has one lazily created persistent session that appends new durable
+//! sources incrementally, keeping one prompt prefix warm across activity
+//! updates and turn reports. Appending is position-checked against the
+//! durable tail: a rewind forks the lineage, the positions stop matching,
+//! and the session rebuilds from scratch — so it can never keep summarizing
+//! an abandoned branch.
 
-use std::collections::VecDeque;
-use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use rho_core::{
     ContentPart, ContextBlock, InferenceEvent, InferenceRequest, InferenceResponseItem,
@@ -16,9 +20,12 @@ use rho_core::{
 };
 use rho_db::RhoDb;
 use rho_inference::{Inference, InferenceSession, PromptCacheKey};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
 
-use crate::db::{AgentId, AgentPresentationUpdate, AgentReadTxnExt as _, PresentationField};
+use crate::db::{
+    AgentEventPos, AgentId, AgentPresentationUpdate, AgentReadTxnExt as _, PresentationField,
+    TurnReport,
+};
 use crate::{
     PRESENTATION_SOURCE_TAIL_BYTES, PresentationSource, PresentationSpeaker, presentation_sources,
 };
@@ -33,13 +40,25 @@ const MAX_CONCURRENT_REQUESTS: usize = 2;
 pub(crate) const MIN_INTERVAL: Duration = Duration::from_secs(15);
 const SET_TITLE: &str = "set_title";
 const SET_STATUS: &str = "set_status";
+const REPORT_FYI: &str = "report_fyi";
+const REPORT_NEEDS_YOU: &str = "report_needs_you";
+const MAX_ONE_LINER_BYTES: usize = 100;
+const MAX_FINAL_MESSAGE_BYTES: usize = 4 * 1024;
 
-const INSTRUCTIONS: &str = "You maintain an agent's compact presentation from its recent XML \
-transcript. Set title only when it is missing or the conversation's subject materially changed. \
-A title is lowercase kebab-case, at most 30 characters, and names the subject rather than a task. \
-Set activity to a concise three or four word current-progress label, at most 50 bytes. Use \
-lowercase words unless a type, function, or other code identifier needs its conventional casing. \
-When the agent is no longer actively working, do not set activity. Use the tools; do not write prose.";
+const INSTRUCTIONS: &str = "You maintain a coding agent's compact presentation from its \
+incrementally appended XML transcript, so a dashboard row can direct the user's attention. \
+Set title when it is missing — always name a titleless conversation — and change it only when \
+the subject materially changed or a clearer understanding of the work suggests a truer name. A \
+title is lowercase kebab-case, at most 30 characters, and names the subject rather than a task. Set \
+activity to a concise three or four word current-progress label, at most 50 bytes; when the \
+agent is no longer actively working, do not set activity. When the newest input is a \
+<turn_ended> block, classify its final message instead: call report_needs_you when it asks the \
+user a question, requests review or a decision, reports being blocked, failed, or unfinished, \
+or otherwise leaves the next step with the user; call report_fyi when the work finished cleanly \
+and nothing is asked of the user — a trailing offer of optional follow-up work is still fyi. \
+one_liner is at most 80 characters summarizing the outcome (for report_needs_you, what is \
+being asked). Use lowercase except for types, functions, and other code identifiers; no \
+trailing period. Use the tools; do not write prose.";
 
 pub struct Watch {
     release: Option<Box<dyn FnOnce() + Send>>,
@@ -64,6 +83,46 @@ impl Watch {
 fn request_semaphore() -> Arc<Semaphore> {
     static REQUESTS: OnceLock<Arc<Semaphore>> = OnceLock::new();
     Arc::clone(REQUESTS.get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS))))
+}
+
+/// How many idle per-agent sessions stay resident before least-recently-used
+/// eviction. Eviction only forgets the map entry: a task still holding the
+/// Arc finishes safely, and the next use lazily rebuilds from durable
+/// sources.
+const MAX_SESSIONS: usize = 64;
+
+struct SessionSlot {
+    session: Arc<TokioMutex<Session>>,
+    last_used: Instant,
+}
+
+fn session_map() -> &'static Mutex<HashMap<AgentId, SessionSlot>> {
+    static SESSIONS: OnceLock<Mutex<HashMap<AgentId, SessionSlot>>> = OnceLock::new();
+    SESSIONS.get_or_init(Default::default)
+}
+
+/// The agent's one persistent sidecar session, created lazily on first use.
+/// The per-agent mutex serializes activity updates against turn reports so
+/// the timeline stays a single coherent conversation.
+fn agent_session(inference: &Inference, agent_id: AgentId) -> Arc<TokioMutex<Session>> {
+    let mut map = session_map().lock().expect("poison");
+    let now = Instant::now();
+    let slot = map.entry(agent_id).or_insert_with(|| SessionSlot {
+        session: Arc::new(TokioMutex::new(Session::new(inference.clone()))),
+        last_used: now,
+    });
+    slot.last_used = now;
+    let session = Arc::clone(&slot.session);
+    if map.len() > MAX_SESSIONS
+        && let Some(oldest) = map
+            .iter()
+            .filter(|(id, _)| **id != agent_id)
+            .min_by_key(|(_, slot)| slot.last_used)
+            .map(|(id, _)| *id)
+    {
+        map.remove(&oldest);
+    }
+    session
 }
 
 /// Generate one presentation proposal from the committed lineage. Persistence
@@ -100,39 +159,52 @@ pub(crate) async fn generate(
     agent_id: AgentId,
     _permit: OwnedSemaphorePermit,
 ) -> anyhow::Result<Option<AgentPresentationUpdate>> {
-    if presentation_input(&db, agent_id).is_none() {
-        return Ok(None);
-    }
     let Some((seed, sources)) = presentation_input(&db, agent_id) else {
         return Ok(None);
     };
-    let mut session = Session::new(inference, seed);
-    for source in sources {
-        session.push(source);
-    }
-    let Some(update) = tokio::time::timeout(REQUEST_TIMEOUT, session.update()).await?? else {
-        return Ok(None);
-    };
-    Ok(Some(update))
+    let session = agent_session(&inference, agent_id);
+    let mut session = session.lock().await;
+    session.sync(seed, sources);
+    session.update().await
+}
+
+/// Classify one finished turn on the agent's persistent session — same
+/// instructions, same tool list, same source timeline as activity updates —
+/// with a `<turn_ended>` block appended, so both request kinds share one
+/// prompt prefix instead of forking the cache.
+pub async fn turn_report(
+    db: RhoDb,
+    inference: Inference,
+    agent_id: AgentId,
+    final_message: &str,
+) -> anyhow::Result<Option<TurnReport>> {
+    let _permit = acquire_request().await?;
+    let (seed, sources) = presentation_context(&db, agent_id);
+    let session = agent_session(&inference, agent_id);
+    let mut session = session.lock().await;
+    session.sync(seed, sources);
+    session.report(final_message).await
 }
 
 fn presentation_input(db: &RhoDb, agent_id: AgentId) -> Option<(Seed, Vec<PresentationSource>)> {
-    let (seed, sources) = {
-        let read = db.read();
-        let record = read.get_agent(agent_id);
-        let records = read.agent_presentation_source_tail(agent_id, PRESENTATION_SOURCE_TAIL_BYTES);
-        (
-            Seed {
-                title: record
-                    .display_name
-                    .map(|title| (title, true))
-                    .or_else(|| record.generated_title.map(|title| (title, false))),
-                activity: record.activity,
-            },
-            presentation_sources(agent_id, &records),
-        )
-    };
+    let (seed, sources) = presentation_context(db, agent_id);
     (!sources.is_empty()).then_some((seed, sources))
+}
+
+fn presentation_context(db: &RhoDb, agent_id: AgentId) -> (Seed, Vec<PresentationSource>) {
+    let read = db.read();
+    let record = read.get_agent(agent_id);
+    let records = read.agent_presentation_source_tail(agent_id, PRESENTATION_SOURCE_TAIL_BYTES);
+    (
+        Seed {
+            title: record
+                .display_name
+                .map(|title| (title, true))
+                .or_else(|| record.generated_title.map(|title| (title, false))),
+            activity: record.activity,
+        },
+        presentation_sources(agent_id, &records),
+    )
 }
 
 struct Seed {
@@ -153,25 +225,57 @@ struct Session {
     timeline: Vec<Arc<ContextBlock>>,
     source_bytes: usize,
     turns: usize,
+    last_through: Option<AgentEventPos>,
 }
 
 impl Session {
-    fn new(inference: Inference, seed: Seed) -> Self {
+    fn new(inference: Inference) -> Self {
         let session = inference.status_session(PromptCacheKey::generate());
-        let mut this = Self {
+        Self {
             inference,
             session,
-            seed,
+            seed: Seed {
+                title: None,
+                activity: None,
+            },
             sources: VecDeque::new(),
             timeline: Vec::new(),
             source_bytes: 0,
             turns: 0,
+            last_through: None,
+        }
+    }
+
+    /// Bring the session up to date with the durable source tail. When the
+    /// tail contains the last position this session consumed, only the
+    /// sources after it are appended, preserving the warm prompt prefix.
+    /// Otherwise — fresh session, rewound lineage, or a tail window that
+    /// moved past us — the session rebuilds from scratch on a fresh cache
+    /// key.
+    fn sync(&mut self, seed: Seed, tail: Vec<PresentationSource>) {
+        let resume_at = self.last_through.and_then(|pos| {
+            tail.iter()
+                .position(|source| source.through == pos)
+                .map(|index| index + 1)
+        });
+        let Some(resume_at) = resume_at else {
+            self.seed = seed;
+            self.sources.clear();
+            self.source_bytes = 0;
+            self.last_through = None;
+            self.reset();
+            for source in tail {
+                self.push(source);
+            }
+            return;
         };
-        this.timeline.push(presentation_block(&this.seed));
-        this
+        for source in tail.into_iter().skip(resume_at) {
+            self.push(source);
+        }
     }
 
     fn push(&mut self, source: PresentationSource) {
+        self.last_through = Some(source.through);
         let text = source.text.trim();
         if text.is_empty() {
             return;
@@ -206,11 +310,56 @@ impl Session {
         let Some(through) = self.sources.back().map(|source| source.source.through) else {
             return Ok(None);
         };
+        let items = self.complete().await?;
+        let (title, activity) = fields_from_items(&items);
+        Ok(
+            (title != PresentationField::Unchanged || activity != PresentationField::Unchanged)
+                .then_some(AgentPresentationUpdate {
+                    generated_title: title,
+                    activity,
+                    through,
+                }),
+        )
+    }
+
+    async fn report(&mut self, final_message: &str) -> anyhow::Result<Option<TurnReport>> {
+        self.timeline.push(turn_ended_block(final_message));
+        let items = self.complete().await?;
+        Ok(report_from_items(&items))
+    }
+
+    /// One provider round, bounded by [`REQUEST_TIMEOUT`]. A timeout or
+    /// inference failure leaves the underlying session in an unknown state,
+    /// so the session resets — fresh cache key, timeline rebuilt from
+    /// sources — before the error propagates.
+    async fn complete(&mut self) -> anyhow::Result<Vec<InferenceResponseItem>> {
+        match tokio::time::timeout(REQUEST_TIMEOUT, self.exchange()).await {
+            Ok(Ok(items)) => Ok(items),
+            Ok(Err(error)) => {
+                self.reset();
+                Err(error)
+            }
+            Err(_) => {
+                self.reset();
+                anyhow::bail!("presentation request timed out")
+            }
+        }
+    }
+
+    /// One provider round with the session's single stable prompt shape:
+    /// the same instructions and full tool list for every request, so
+    /// activity updates and turn reports share one cacheable prefix.
+    async fn exchange(&mut self) -> anyhow::Result<Vec<InferenceResponseItem>> {
         self.session.request(InferenceRequest {
             instructions: Arc::from(INSTRUCTIONS),
             input: self.timeline.clone(),
             agent_id_labels: std::collections::BTreeMap::new(),
-            tools: Arc::from([set_title_spec(), set_status_spec()]),
+            tools: Arc::from([
+                set_title_spec(),
+                set_status_spec(),
+                report_fyi_spec(),
+                report_needs_you_spec(),
+            ]),
         });
         let mut pending = PendingInferenceResponse::default();
         let (items, provider_response_id) = loop {
@@ -229,11 +378,10 @@ impl Session {
                 | InferenceEvent::Quota { .. } => {}
             }
         };
-        let (title, activity) = fields_from_items(&items);
         let results = tool_results(&items);
         self.timeline
             .push(Arc::new(ContextBlock::InferenceResponse {
-                items,
+                items: items.clone(),
                 provider_response_id,
             }));
         if !results.is_empty() {
@@ -241,14 +389,7 @@ impl Session {
                 .push(Arc::new(ContextBlock::ToolResults { results }));
         }
         self.turns += 1;
-        Ok(
-            (title != PresentationField::Unchanged || activity != PresentationField::Unchanged)
-                .then_some(AgentPresentationUpdate {
-                    generated_title: title,
-                    activity,
-                    through,
-                }),
-        )
+        Ok(items)
     }
 
     fn reset(&mut self) {
@@ -303,6 +444,21 @@ fn source_block(xml: &str) -> Arc<ContextBlock> {
     })
 }
 
+/// The turn-end marker carries the final message itself rather than trusting
+/// the mirrored source tail to already contain it: settlement can race the
+/// source commit, and redundancy here is harmless.
+fn turn_ended_block(final_message: &str) -> Arc<ContextBlock> {
+    Arc::new(ContextBlock::UserMessage {
+        sender: MessageSender::User,
+        content: vec![ContentPart::Text {
+            text: format!(
+                "<turn_ended><final_message>{}</final_message></turn_ended>",
+                xml_escape_capped(final_message, MAX_FINAL_MESSAGE_BYTES)
+            ),
+        }],
+    })
+}
+
 fn set_title_spec() -> ToolSpec {
     ToolSpec {
         name: SET_TITLE.try_into().expect("valid title tool name"),
@@ -321,6 +477,45 @@ fn set_status_spec() -> ToolSpec {
         input_schema: serde_json::json!({"type":"object","properties":{"status":{"type":"string","maxLength":50}},"required":["status"],"additionalProperties":false}),
         format: None,
     }
+}
+
+fn report_fyi_spec() -> ToolSpec {
+    ToolSpec {
+        name: REPORT_FYI.try_into().expect("valid report tool name"),
+        tool_type: ToolType::Function,
+        description: "The turn finished cleanly; nothing is asked of the user.".to_owned(),
+        input_schema: serde_json::json!({"type":"object","properties":{"one_liner":{"type":"string","maxLength":80}},"required":["one_liner"],"additionalProperties":false}),
+        format: None,
+    }
+}
+
+fn report_needs_you_spec() -> ToolSpec {
+    ToolSpec {
+        name: REPORT_NEEDS_YOU.try_into().expect("valid report tool name"),
+        tool_type: ToolType::Function,
+        description: "The turn leaves the next step with the user: a question, review request, \
+blocker, or failure."
+            .to_owned(),
+        input_schema: serde_json::json!({"type":"object","properties":{"one_liner":{"type":"string","maxLength":80}},"required":["one_liner"],"additionalProperties":false}),
+        format: None,
+    }
+}
+
+/// Trimmed and byte-capped on a char boundary: an overlong line from the
+/// model is still a usable row, unlike a rejected one.
+fn bounded_one_liner(one_liner: &str) -> Option<String> {
+    let one_liner = one_liner.trim();
+    if one_liner.is_empty() {
+        return None;
+    }
+    let mut capped = String::new();
+    for character in one_liner.chars() {
+        if capped.len() + character.len_utf8() > MAX_ONE_LINER_BYTES {
+            break;
+        }
+        capped.push(character);
+    }
+    Some(capped)
 }
 
 fn fields_from_items(items: &[InferenceResponseItem]) -> (PresentationField, PresentationField) {
@@ -356,6 +551,28 @@ fn fields_from_items(items: &[InferenceResponseItem]) -> (PresentationField, Pre
     (title, activity)
 }
 
+fn report_from_items(items: &[InferenceResponseItem]) -> Option<TurnReport> {
+    items.iter().find_map(|item| {
+        let InferenceResponseItem::ToolCall {
+            name, arguments, ..
+        } = item
+        else {
+            return None;
+        };
+        let needs_you = match name.as_str() {
+            REPORT_FYI => false,
+            REPORT_NEEDS_YOU => true,
+            _ => return None,
+        };
+        let value = serde_json::from_str::<serde_json::Value>(arguments).ok()?;
+        let one_liner = bounded_one_liner(value.get("one_liner")?.as_str()?)?;
+        Some(TurnReport {
+            needs_you,
+            one_liner,
+        })
+    })
+}
+
 fn bounded_title(title: &str) -> Option<String> {
     let title = title.trim();
     (!title.is_empty()
@@ -378,7 +595,11 @@ fn tool_results(items: &[InferenceResponseItem]) -> Vec<ToolResult> {
                 name,
                 tool_type,
                 ..
-            } if name.as_str() == SET_TITLE || name.as_str() == SET_STATUS => {
+            } if matches!(
+                name.as_str(),
+                SET_TITLE | SET_STATUS | REPORT_FYI | REPORT_NEEDS_YOU
+            ) =>
+            {
                 let now = UnixMs::now();
                 Some(ToolResult {
                     call_id: id.clone(),
@@ -419,7 +640,8 @@ fn xml_escape_capped(text: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_MESSAGE_BYTES, MAX_STATUS_BYTES, bounded_status, bounded_title, canonical_source_text,
+        MAX_MESSAGE_BYTES, MAX_ONE_LINER_BYTES, MAX_STATUS_BYTES, bounded_one_liner,
+        bounded_status, bounded_title, canonical_source_text,
     };
 
     #[test]
@@ -434,6 +656,18 @@ mod tests {
             Some("a".repeat(MAX_STATUS_BYTES))
         );
         assert_eq!(bounded_status(&"a".repeat(MAX_STATUS_BYTES + 1)), None);
+    }
+
+    #[test]
+    fn one_liner_is_trimmed_and_capped_not_rejected() {
+        assert_eq!(bounded_one_liner("  \n "), None);
+        assert_eq!(
+            bounded_one_liner(" tests pass "),
+            Some("tests pass".to_owned())
+        );
+        let capped = bounded_one_liner(&"é".repeat(MAX_ONE_LINER_BYTES)).unwrap();
+        assert!(capped.len() <= MAX_ONE_LINER_BYTES);
+        assert!(capped.is_char_boundary(capped.len()));
     }
 
     #[test]

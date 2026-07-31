@@ -730,13 +730,36 @@ impl Workspace {
                 agent_id,
                 attention,
             } => {
-                // Chime on the rising edge into the user's court, like the
-                // lamp turning on — but not for the agent already on screen,
-                // whose turn end the user is watching anyway.
+                // Chime on the rising edge into the user's court only when
+                // the agent is blocked or a needs-you report is already in
+                // hand (snooze expiry resurfacing a classified turn); a
+                // plain turn end waits for its report, which decides between
+                // a needs-you chime and a silent FYI. Never for the agent
+                // already on screen, whose turn end the user is watching.
                 let before = self.registry.attention(agent_id);
                 self.registry.set_attention(agent_id, attention);
+                let needs_you = attention >= rho_ui_proto::UiAttention::NeedsInput
+                    || self
+                        .registry
+                        .agent_turn_report(agent_id)
+                        .is_some_and(|report| report.needs_you);
                 if attention >= rho_ui_proto::UiAttention::Pending
                     && before < rho_ui_proto::UiAttention::Pending
+                    && needs_you
+                    && self.registry.selected_agent() != Some(&agent_id)
+                {
+                    self.chime.play();
+                }
+                cx.notify();
+            }
+            ConnEvent::AgentTurnReport { agent_id, report } => {
+                // The attention gate keeps snoozed agents silent: their
+                // reports arrive while attention is Quiet and surface only
+                // at snooze expiry.
+                let needs_you = report.needs_you;
+                self.registry.set_turn_report(agent_id, report);
+                if needs_you
+                    && self.registry.attention(agent_id) >= rho_ui_proto::UiAttention::Pending
                     && self.registry.selected_agent() != Some(&agent_id)
                 {
                     self.chime.play();

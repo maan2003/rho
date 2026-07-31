@@ -375,6 +375,23 @@ pub struct AgentRecord {
     /// from this plus live agent state, never stored.
     #[senax(default)]
     pub disposition: AgentDisposition,
+    /// One-shot classification of the last finished turn. Cleared when the
+    /// user replies — the report describes a ball that is no longer in the
+    /// user's court.
+    #[senax(default)]
+    pub turn_report: Option<TurnReport>,
+    /// The user has messaged this agent directly (agent mail doesn't count).
+    /// Sticky: once engaged, the agent's turn ends are the user's court even
+    /// for a sub-agent, so it gets attention and turn reports like a root.
+    #[senax(default)]
+    pub user_interacted: bool,
+}
+
+/// What a finished turn asks of the user, derived from its final message.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+pub struct TurnReport {
+    pub needs_you: bool,
+    pub one_liner: String,
 }
 
 impl AgentRecord {
@@ -783,8 +800,15 @@ pub trait AgentWriteTxnExt {
     ) -> AgentEventPos;
 
     /// Records a turn end for attention purposes; resets the disposition to
-    /// `Pending` — every finished turn demands a fresh disposition.
-    fn record_agent_turn_end(&mut self, agent_id: AgentId);
+    /// `Pending` — every finished turn demands a fresh disposition. An
+    /// unexpired snooze survives: "quiet until T" holds across turn ends and
+    /// the expiry broadcast resurfaces whatever finished meanwhile.
+    fn record_agent_turn_end(&mut self, now: UnixMillis, agent_id: AgentId);
+
+    /// Stores the one-shot classification of the last finished turn. The
+    /// caller checks the disposition is still `Pending` so a late result
+    /// never describes a turn the user already answered.
+    fn record_agent_turn_report(&mut self, agent_id: AgentId, report: &TurnReport);
 
     /// Stamps the user's engagement with an agent (rail recency), keeps a
     /// one-line snippet of the message, and clears its disposition:
@@ -875,6 +899,8 @@ impl AgentProfileWriteTxnExt for WriteTxn {
             workstream,
             labels: Vec::new(),
             disposition: AgentDisposition::Done,
+            turn_report: None,
+            user_interacted: false,
         };
         self.open_table(AGENTS)
             .insert(&agent_id, SenValue::borrowed(&agent));
@@ -1429,7 +1455,7 @@ impl AgentWriteTxnExt for WriteTxn {
         agents.insert(&agent_id, SenValue::borrowed(&agent));
     }
 
-    fn record_agent_turn_end(&mut self, agent_id: AgentId) {
+    fn record_agent_turn_end(&mut self, now: UnixMillis, agent_id: AgentId) {
         let mut agents = self.open_table(AGENTS);
         let mut agent = agents
             .get(&agent_id)
@@ -1438,7 +1464,25 @@ impl AgentWriteTxnExt for WriteTxn {
             .into_owned();
         // A turn end puts the ball back in the user's court; it says
         // nothing about engagement, so `last_user_message` stays.
-        agent.disposition = AgentDisposition::Pending;
+        agent.disposition = match agent.disposition {
+            AgentDisposition::Snoozed { until } if until > now => {
+                AgentDisposition::Snoozed { until }
+            }
+            _ => AgentDisposition::Pending,
+        };
+        // The previous turn's report describes a superseded final message.
+        agent.turn_report = None;
+        agents.insert(&agent_id, SenValue::borrowed(&agent));
+    }
+
+    fn record_agent_turn_report(&mut self, agent_id: AgentId, report: &TurnReport) {
+        let mut agents = self.open_table(AGENTS);
+        let mut agent = agents
+            .get(&agent_id)
+            .expect("agent id missing")
+            .value()
+            .into_owned();
+        agent.turn_report = Some(report.clone());
         agents.insert(&agent_id, SenValue::borrowed(&agent));
     }
 
@@ -1451,10 +1495,12 @@ impl AgentWriteTxnExt for WriteTxn {
             .into_owned();
         agent.last_user_message = now;
         agent.last_user_message_text = message_snippet(text);
+        agent.user_interacted = true;
         // Replying is a verdict like acking — the ball moves to the agent's
         // court even if the turn hasn't started yet (queued delivery), so a
         // pending lamp must not linger.
         agent.disposition = AgentDisposition::Done;
+        agent.turn_report = None;
         agents.insert(&agent_id, SenValue::borrowed(&agent));
     }
 

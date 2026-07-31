@@ -281,15 +281,17 @@ impl AgentPool {
         let _ = self.completed_turns.send(completed);
     }
 
-    /// Persist that execution stopped and the top-level agent is back in the
-    /// user's court. Runtimes call this from their non-coalescing state
-    /// machines only when no newer queued turn took over, or on terminal
-    /// failure where queued work cannot proceed.
+    /// Persist that execution stopped and the agent is back in the user's
+    /// court. Runtimes call this from their non-coalescing state machines
+    /// only when no newer queued turn took over, or on terminal failure
+    /// where queued work cannot proceed. Sub-agent turn ends are the
+    /// parent's court unless the user has personally engaged the agent.
     pub async fn settle_turn(&self, agent_id: AgentId) {
         self.flush_agent_usage(Some(agent_id)).await;
-        if self.db.read().get_agent(agent_id).parent_agent.is_none() {
+        let record = self.db.read().get_agent(agent_id);
+        if record.parent_agent.is_none() || record.user_interacted {
             let mut write = self.db.write().await;
-            write.record_agent_turn_end(agent_id);
+            write.record_agent_turn_end(crate::db::UnixMillis::now(), agent_id);
             write.commit();
         }
     }

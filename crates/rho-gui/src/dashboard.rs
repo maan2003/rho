@@ -18,7 +18,7 @@ use editor::display_map::{
 };
 use editor::{
     DisplayElisionId, DisplayElisionProperties, Editor, EditorMode, HighlightKey, Inlay,
-    InlayHighlight, SizingBehavior,
+    SizingBehavior,
 };
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, Focusable as _, HighlightStyle, Window};
@@ -37,11 +37,11 @@ use crate::workspace::Workspace;
 /// semantic and syntax key ranges.
 const DASHBOARD_KEY_BASE: usize = usize::MAX - 200;
 
-/// Inlay id space for reply-draft placeholders, clear of the lamp ids.
+/// Inlay id space for reply-draft placeholders.
 const PLACEHOLDER_ID_BASE: usize = 1_000_000;
 
 /// Highlight key for draft text (the user-message accent), past the
-/// class and lamp key ranges.
+/// class key range.
 const DRAFT_TEXT_KEY: HighlightKey =
     HighlightKey::SyntaxTreeView(DASHBOARD_KEY_BASE + 2 * DashClass::ALL.len());
 
@@ -114,8 +114,6 @@ pub struct Dashboard {
     /// Move the cursor into this key's buffer on the next sync — how a
     /// freshly opened reply draft receives the cursor.
     pending_cursor: Option<LineKey>,
-    /// Attention lamps currently spliced in, for replacement on sync.
-    lamp_ids: Vec<InlayId>,
     /// Reply placeholder inlays currently spliced in.
     placeholder_ids: Vec<InlayId>,
     /// Projected descendant rows keyed by their stable parent identity.
@@ -167,7 +165,6 @@ impl Dashboard {
             attachment_blocks: Vec::new(),
             attachments_dirty: false,
             pending_cursor: None,
-            lamp_ids: Vec::new(),
             placeholder_ids: Vec::new(),
             folds: HashMap::new(),
             expanded_folds: Arc::new(Mutex::new(HashSet::new())),
@@ -374,7 +371,7 @@ impl Dashboard {
 
     /// Regenerates the listing from the registry: per-line buffers are
     /// created or edited as needed, arranged (with reply drafts after
-    /// their rows), and highlights and lamps reapplied. The cursor
+    /// their rows), and highlights reapplied. The cursor
     /// follows its line's buffer through the rearrangement.
     pub fn sync(
         &mut self,
@@ -568,7 +565,6 @@ impl Dashboard {
         self.apply_folds(&lines);
         self.apply_rail_tail_elision(rail_tail, order_changed, cx);
         self.apply_highlights(&lines, cx);
-        self.apply_lamps(&lines, cx);
         self.apply_reply_chrome(registry, cx);
         self.apply_attachment_blocks(cx);
     }
@@ -763,59 +759,6 @@ impl Dashboard {
         });
     }
 
-    /// Splices status indicators at each row's end — state chrome the cursor
-    /// never lands on — and distinguishes activity from attention by shape.
-    fn apply_lamps(&mut self, lines: &[Line], cx: &mut Context<Workspace>) {
-        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
-        let to_remove = std::mem::take(&mut self.lamp_ids);
-        let mut inlays = Vec::new();
-        let mut by_class: Vec<(DashClass, Vec<InlayHighlight>)> = [
-            DashClass::Working,
-            DashClass::Pending,
-            DashClass::NeedsInput,
-        ]
-        .into_iter()
-        .map(|class| (class, Vec::new()))
-        .collect();
-        for (index, line) in lines.iter().enumerate() {
-            let Some(class) = line.lamp.and_then(DashClass::lamp) else {
-                continue;
-            };
-            let indicator = class.indicator();
-            let Some(buffer) = self.buffers.get(&line.key) else {
-                continue;
-            };
-            let buffer_snapshot = buffer.read(cx).snapshot();
-            let Some(position) =
-                snapshot.anchor_in_excerpt(buffer_snapshot.anchor_before(buffer_snapshot.len()))
-            else {
-                continue;
-            };
-            let inlay = Inlay::custom(index, position, indicator);
-            if let Some((_, highlights)) = by_class.iter_mut().find(|(entry, _)| *entry == class) {
-                highlights.push(InlayHighlight {
-                    inlay: inlay.id,
-                    inlay_position: position,
-                    range: 0..indicator.len(),
-                });
-            }
-            self.lamp_ids.push(inlay.id);
-            inlays.push(inlay);
-        }
-        self.editor.update(cx, |editor, cx| {
-            editor.splice_inlays(&to_remove, inlays, cx);
-            for (class, highlights) in by_class {
-                // `highlight_inlays` only ever inserts per inlay id; without
-                // the clear, an indicator that changes state keeps its old
-                // highlight entry after the attention moves on.
-                editor.clear_highlights(class.lamp_key(), cx);
-                if !highlights.is_empty() {
-                    editor.highlight_inlays(class.lamp_key(), highlights, class.style(cx), cx);
-                }
-            }
-        });
-    }
-
     fn apply_attachment_blocks(&mut self, cx: &mut Context<Workspace>) {
         if !self.attachments_dirty {
             return;
@@ -955,8 +898,8 @@ impl Dashboard {
     }
 }
 
-/// Dashboard text classes: lamps and muted chrome. The cursor itself is
-/// the selection indicator — rows carry no selected styling.
+/// The quiet-tail placeholder row. The cursor itself is the selection
+/// indicator — rows carry no selected styling.
 fn render_rail_tail(cx: &mut BlockContext<'_, '_>) -> impl IntoElement {
     let text_style = cx.editor_style.text.clone();
     let color = if cx.selected {
@@ -980,71 +923,35 @@ fn render_rail_tail(cx: &mut BlockContext<'_, '_>) -> impl IntoElement {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DashClass {
     Muted,
-    Working,
-    Pending,
-    NeedsInput,
-    /// Attention at pending or above. The adjacent lamp carries the emphasis.
+    /// A finished turn awaiting the user; with the lamps gone, the row text
+    /// itself carries the emphasis.
     Urgent,
+    /// Blocked on the user (error or unfinished turn): error color and a
+    /// trailing glyph instead of spelling it out.
+    Blocked,
 }
 
 impl DashClass {
-    const ALL: [DashClass; 5] = [
-        DashClass::Muted,
-        DashClass::Working,
-        DashClass::Pending,
-        DashClass::NeedsInput,
-        DashClass::Urgent,
-    ];
+    const ALL: [DashClass; 3] = [DashClass::Muted, DashClass::Urgent, DashClass::Blocked];
 
     fn key(self) -> HighlightKey {
         let slot = match self {
             DashClass::Muted => 0,
-            DashClass::Working => 1,
-            DashClass::Pending => 2,
-            DashClass::NeedsInput => 3,
-            DashClass::Urgent => 4,
+            DashClass::Urgent => 1,
+            DashClass::Blocked => 2,
         };
         HighlightKey::SyntaxTreeView(DASHBOARD_KEY_BASE + slot)
     }
 
-    /// A parallel key space for lamp inlay highlights.
-    fn lamp_key(self) -> HighlightKey {
-        let HighlightKey::SyntaxTreeView(slot) = self.key() else {
-            unreachable!("dashboard keys are syntax-tree-view keys");
-        };
-        HighlightKey::SyntaxTreeView(slot + DashClass::ALL.len())
-    }
-
     fn style(self, cx: &App) -> HighlightStyle {
-        let colors = cx.theme().colors();
         let color = match self {
-            DashClass::Muted => colors.text_muted,
-            DashClass::Working => colors.text_muted,
-            DashClass::Pending => colors.text_accent.opacity(0.65),
-            DashClass::NeedsInput => colors.text_accent,
-            DashClass::Urgent => return HighlightStyle::default(),
+            DashClass::Muted => cx.theme().colors().text_muted,
+            DashClass::Urgent => cx.theme().colors().text_accent,
+            DashClass::Blocked => cx.theme().status().error,
         };
         HighlightStyle {
             color: Some(color.into()),
             ..HighlightStyle::default()
-        }
-    }
-
-    fn lamp(attention: UiAttention) -> Option<DashClass> {
-        match attention {
-            UiAttention::Quiet => None,
-            UiAttention::Working => Some(DashClass::Working),
-            UiAttention::Pending => Some(DashClass::Pending),
-            UiAttention::NeedsInput => Some(DashClass::NeedsInput),
-        }
-    }
-
-    fn indicator(self) -> &'static str {
-        match self {
-            DashClass::Working => " …",
-            DashClass::Pending => " ●",
-            DashClass::NeedsInput => " ◆",
-            DashClass::Muted | DashClass::Urgent => "",
         }
     }
 }
@@ -1096,12 +1003,11 @@ fn rail_rows(display: Vec<&Workstream>) -> Vec<RailRow<'_>> {
 }
 
 /// One generated dashboard line: its identity, text, spans (offsets
-/// relative to the line), lamp, and what acting on it means.
+/// relative to the line), and what acting on it means.
 struct Line {
     key: LineKey,
     text: String,
     spans: Vec<(DashClass, Range<usize>)>,
-    lamp: Option<UiAttention>,
     target: RowTarget,
     fold: Option<FoldSpec>,
     tail: bool,
@@ -1113,7 +1019,6 @@ impl Line {
             key,
             text: String::new(),
             spans: Vec::new(),
-            lamp: None,
             target,
             fold: None,
             tail: false,
@@ -1179,6 +1084,69 @@ fn visible_lines(lines: Vec<Line>, expanded: &HashSet<AgentId>) -> Vec<Line> {
         .collect()
 }
 
+/// The status text and emphasis a row carries in place of the old attention
+/// lamp: working rows show activity, finished rows show the turn report's
+/// one-liner — lit when it needs the user, dimmed for a dismissable FYI.
+struct RowStatus<'a> {
+    attention: UiAttention,
+    activity: Option<&'a str>,
+    report: Option<&'a rho_ui_proto::UiTurnReport>,
+}
+
+impl RowStatus<'_> {
+    fn for_agent(registry: &AgentRegistry, agent_id: AgentId) -> RowStatus<'_> {
+        RowStatus {
+            attention: registry.attention(agent_id),
+            activity: registry.agent_activity(agent_id),
+            report: registry.agent_turn_report(agent_id),
+        }
+    }
+
+    fn bare(attention: UiAttention) -> RowStatus<'static> {
+        RowStatus {
+            attention,
+            activity: None,
+            report: None,
+        }
+    }
+
+    fn title_class(&self) -> Option<DashClass> {
+        match self.attention {
+            UiAttention::NeedsInput => Some(DashClass::Blocked),
+            UiAttention::Pending => match self.report {
+                Some(report) if !report.needs_you => Some(DashClass::Muted),
+                _ => Some(DashClass::Urgent),
+            },
+            UiAttention::Working | UiAttention::Quiet => None,
+        }
+    }
+
+    fn suffix(&self) -> Option<(DashClass, String)> {
+        let activity = || {
+            self.activity
+                .map(|activity| (DashClass::Muted, format!(" · {activity}")))
+        };
+        match self.attention {
+            UiAttention::NeedsInput => Some((DashClass::Blocked, " ◆".to_owned())),
+            UiAttention::Pending => match self.report {
+                Some(report) if report.needs_you => {
+                    Some((DashClass::Muted, format!(" · {}", report.one_liner)))
+                }
+                Some(report) => Some((DashClass::Muted, format!(" ✓ {}", report.one_liner))),
+                None => activity(),
+            },
+            UiAttention::Working | UiAttention::Quiet => activity(),
+        }
+    }
+
+    fn apply(&self, line: &mut Line, title: &str) {
+        line.span(self.title_class(), |text| text.push_str(title));
+        if let Some((class, suffix)) = self.suffix() {
+            line.span(Some(class), |text| text.push_str(&suffix));
+        }
+    }
+}
+
 /// A workstream is flat in the common single-root case. Multiple roots make
 /// the container meaningful, so it becomes a header followed by explicit,
 /// human-named root rows. Every descendant is a normal actionable agent row;
@@ -1211,7 +1179,12 @@ fn task_lines(topic: &Workstream, grouped: bool, registry: &AgentRegistry) -> Ve
         .unwrap_or(UiAttention::Quiet);
 
     if roots.is_empty() {
-        return vec![workstream_line(topic, grouped, None, aggregate, None)];
+        return vec![workstream_line(
+            topic,
+            grouped,
+            None,
+            RowStatus::bare(aggregate),
+        )];
     }
 
     let singleton = roots.len() == 1;
@@ -1220,11 +1193,18 @@ fn task_lines(topic: &Workstream, grouped: bool, registry: &AgentRegistry) -> Ve
             topic,
             grouped,
             Some(roots[0].agent_id),
-            attention(roots[0].agent_id),
-            registry.agent_activity(roots[0].agent_id),
+            RowStatus {
+                attention: attention(roots[0].agent_id),
+                ..RowStatus::for_agent(registry, roots[0].agent_id)
+            },
         )]
     } else {
-        vec![workstream_line(topic, grouped, None, aggregate, None)]
+        vec![workstream_line(
+            topic,
+            grouped,
+            None,
+            RowStatus::bare(aggregate),
+        )]
     };
     let mut agent_line_indexes = Vec::with_capacity(tree.len());
     for (index, (agent, depth)) in tree.iter().enumerate() {
@@ -1234,17 +1214,15 @@ fn task_lines(topic: &Workstream, grouped: bool, registry: &AgentRegistry) -> Ve
         }
         let row_depth = if singleton { *depth } else { depth + 1 };
         agent_line_indexes.push(lines.len());
-        lines.push(agent_line(
-            agent,
-            grouped,
-            row_depth,
-            if *depth == 0 {
+        let status = RowStatus {
+            attention: if *depth == 0 {
                 attention(agent.agent_id)
             } else {
                 registry.attention(agent.agent_id)
             },
-            registry,
-        ));
+            ..RowStatus::for_agent(registry, agent.agent_id)
+        };
+        lines.push(agent_line(agent, grouped, row_depth, status, registry));
     }
 
     for (index, (agent, depth)) in tree.iter().enumerate() {
@@ -1273,8 +1251,7 @@ fn workstream_line(
     topic: &Workstream,
     grouped: bool,
     root: Option<AgentId>,
-    attention: UiAttention,
-    activity: Option<&str>,
+    status: RowStatus<'_>,
 ) -> Line {
     let title = if topic.name.trim().is_empty() {
         "Untitled workstream".to_owned()
@@ -1298,19 +1275,7 @@ fn workstream_line(
     if topic.pinned {
         line.span(None, |text| text.push_str("◆ "));
     }
-    let title_class = (attention >= UiAttention::Pending).then_some(DashClass::Urgent);
-    line.span(title_class, |text| text.push_str(&title));
-    if let Some(activity) = activity {
-        line.span(Some(DashClass::Muted), |text| {
-            text.push_str(" · ");
-            text.push_str(activity);
-        });
-    }
-
-    // The attention lamp hangs off the row's right end as an inlay.
-    if attention > UiAttention::Quiet {
-        line.lamp = Some(attention);
-    }
+    status.apply(&mut line, &title);
     line
 }
 
@@ -1318,7 +1283,7 @@ fn agent_line(
     agent: &rho_ui_proto::UiAgentSummary,
     grouped: bool,
     depth: usize,
-    attention: UiAttention,
+    status: RowStatus<'_>,
     registry: &AgentRegistry,
 ) -> Line {
     let mut line = Line::new(
@@ -1328,19 +1293,7 @@ fn agent_line(
     line.span(None, |text| {
         text.push_str(&"  ".repeat(depth + usize::from(grouped)))
     });
-    let class = (attention >= UiAttention::Pending).then_some(DashClass::Urgent);
-    line.span(class, |text| {
-        text.push_str(&registry.agent_human_name(agent.agent_id))
-    });
-    if let Some(activity) = registry.agent_activity(agent.agent_id) {
-        line.span(Some(DashClass::Muted), |text| {
-            text.push_str(" · ");
-            text.push_str(activity);
-        });
-    }
-    if attention > UiAttention::Quiet {
-        line.lamp = Some(attention);
-    }
+    status.apply(&mut line, &registry.agent_human_name(agent.agent_id));
     line
 }
 
@@ -1378,6 +1331,7 @@ mod tests {
             hidden: false,
             last_user_message_text: String::new(),
             activity: None,
+            turn_report: None,
             workstream: WorkstreamId(1),
             labels: match status {
                 Status::Normal => Vec::new(),
@@ -1527,7 +1481,7 @@ mod tests {
     }
 
     #[test]
-    fn listing_lines_carry_targets_and_lamp_state() {
+    fn listing_lines_carry_targets_and_status() {
         let root = agent(1, Status::Normal, 10);
         let root_id = root.agent_id;
         let mut urgent_child = agent(2, Status::Normal, 10);
@@ -1544,7 +1498,7 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].text.contains("topic"));
         assert_eq!(lines[0].key, LineKey::Stream(WorkstreamId(1)));
-        assert_eq!(lines[0].lamp, Some(UiAttention::NeedsInput));
+        assert!(lines[0].text.ends_with(" ◆"));
         assert!(matches!(
             lines[0].target,
             RowTarget::Stream {
@@ -1554,7 +1508,7 @@ mod tests {
             if agent_id == root_id
         ));
         assert_eq!(lines[1].target, RowTarget::Agent(child_id));
-        assert_eq!(lines[1].lamp, Some(UiAttention::NeedsInput));
+        assert!(lines[1].text.ends_with(" ◆"));
         assert_eq!(
             lines[0].fold,
             Some(FoldSpec {
@@ -1564,6 +1518,54 @@ mod tests {
                 descendant_count: 1,
             })
         );
+    }
+
+    #[test]
+    fn pending_rows_split_on_turn_report() {
+        let root = agent(1, Status::Normal, 10);
+        let root_id = root.agent_id;
+        let topic = topic(Status::Normal, vec![root]);
+        let mut registry = AgentRegistry::default();
+        install(&mut registry, &topic);
+        registry.set_attention(root_id, UiAttention::Pending);
+
+        // Pending without a report: emphasized title, nothing else.
+        let lines = generate(&registry);
+        assert!(lines[0].spans.iter().any(|(class, range)| {
+            *class == DashClass::Urgent && lines[0].text[range.clone()].contains("topic")
+        }));
+
+        registry.set_turn_report(
+            root_id,
+            rho_ui_proto::UiTurnReport {
+                needs_you: true,
+                one_liner: "asking: delete old migration?".to_owned(),
+            },
+        );
+        let lines = generate(&registry);
+        assert!(lines[0].text.contains("· asking: delete old migration?"));
+        assert!(lines[0].spans.iter().any(|(class, range)| {
+            *class == DashClass::Urgent && lines[0].text[range.clone()].contains("topic")
+        }));
+
+        // An FYI dims the whole row and swaps the separator for a check.
+        registry.set_turn_report(
+            root_id,
+            rho_ui_proto::UiTurnReport {
+                needs_you: false,
+                one_liner: "tests pass, pushed".to_owned(),
+            },
+        );
+        let lines = generate(&registry);
+        assert!(lines[0].text.contains("✓ tests pass, pushed"));
+        assert!(lines[0].spans.iter().any(|(class, range)| {
+            *class == DashClass::Muted && lines[0].text[range.clone()].contains("topic")
+        }));
+
+        // A new turn retires the report: the row is back to activity text.
+        registry.set_attention(root_id, UiAttention::Working);
+        let lines = generate(&registry);
+        assert!(!lines[0].text.contains("tests pass"));
     }
 
     #[test]
@@ -1581,7 +1583,7 @@ mod tests {
 
         let lines = generate(&registry);
         assert_eq!(lines.len(), 1);
-        assert_eq!(lines[0].lamp, None);
+        assert!(!lines[0].text.ends_with(" ◆"));
         assert!(matches!(
             lines[0].target,
             RowTarget::Stream {

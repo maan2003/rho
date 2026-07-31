@@ -236,6 +236,10 @@ impl Workspace {
                 self.registry.set_attention(agent_id, attention);
                 cx.notify();
             }
+            ServerMessage::AgentTurnReport { agent_id, report } => {
+                self.registry.set_turn_report(agent_id, report);
+                cx.notify();
+            }
             ServerMessage::AgentUnloaded { agent_id, reason } => {
                 if self.subscriptions.mark_unloaded(agent_id, reason) {
                     self.registry.mark_not_live(agent_id);

@@ -171,6 +171,9 @@ pub struct AgentRegistry {
     attention: BTreeMap<AgentId, rho_ui_proto::UiAttention>,
     /// Ephemeral activity text delivered separately from durable summaries.
     activities: BTreeMap<AgentId, String>,
+    /// Turn-report overlay: broadcasts land here between `Ready` refreshes,
+    /// which re-seed it from the summaries' snapshot.
+    turn_reports: BTreeMap<AgentId, rho_ui_proto::UiTurnReport>,
     /// Retained top-to-bottom rail order. Bucket changes are applied with a
     /// stable sort, so agents only move when their coarse rail bucket changes
     /// or when they are first seen.
@@ -374,6 +377,15 @@ impl AgentRegistry {
                     .map(|activity| (agent.agent_id, activity))
             })
             .collect();
+        self.turn_reports = agents
+            .iter()
+            .filter_map(|agent| {
+                agent
+                    .turn_report
+                    .clone()
+                    .map(|report| (agent.agent_id, report))
+            })
+            .collect();
         let mut unseen = Vec::new();
         for agent in &agents {
             self.agents
@@ -427,6 +439,18 @@ impl AgentRegistry {
 
     pub fn agent_activity(&self, agent_id: AgentId) -> Option<&str> {
         self.activities.get(&agent_id).map(String::as_str)
+    }
+
+    pub fn set_turn_report(&mut self, agent_id: AgentId, report: rho_ui_proto::UiTurnReport) {
+        self.turn_reports.insert(agent_id, report);
+    }
+
+    /// The last finished turn's classification, shown only while that turn
+    /// still awaits the user — attention transitions retire it, no cleanup.
+    pub fn agent_turn_report(&self, agent_id: AgentId) -> Option<&rho_ui_proto::UiTurnReport> {
+        (self.attention(agent_id) == rho_ui_proto::UiAttention::Pending)
+            .then(|| self.turn_reports.get(&agent_id))
+            .flatten()
     }
 
     pub fn attention(&self, agent_id: AgentId) -> rho_ui_proto::UiAttention {
@@ -1118,6 +1142,7 @@ mod tests {
             hidden: false,
             last_user_message_text: String::new(),
             activity: None,
+            turn_report: None,
             workstream: WorkstreamId(0),
             labels: status_labels(status),
         }

@@ -24,7 +24,7 @@ use rho_ui_proto::{
     AgentUsageBucket as UiAgentUsageBucket, AgentUsageSeries, ClientMessage, JoinTarget,
     LandLeaseHolder, LandStatus, McpAgentToolRequest, McpAgentToolResponse, QuotaPoint,
     QuotaSeries, QuotaSummary, ServerMessage, StartMode, UiAgentSummary, UiAttention, UiProject,
-    UiWorkstream, WorkspaceInfo, WorkstreamTarget, read_frame, write_frame,
+    UiTurnReport, UiWorkstream, WorkspaceInfo, WorkstreamTarget, read_frame, write_frame,
 };
 use tokio::sync::{Mutex, Mutex as TokioMutex, OwnedMutexGuard, broadcast, mpsc, oneshot, watch};
 
@@ -361,6 +361,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     );
     agents.install_iris_tool_host();
     spawn_presentation_projection(Arc::clone(&agents));
+    spawn_turn_report_projection(Arc::clone(&agents));
     spawn_chatgpt_quota_poller(quota_auth_name, agents.db.clone(), agents.events.clone());
     let quota_environment = agents.user_environment.clone();
     spawn_claude_quota_recorder(
@@ -1116,6 +1117,10 @@ impl AgentRegistry {
                 hidden: agent.disposition == AgentDisposition::Hidden,
                 last_user_message_text: agent.last_user_message_text,
                 activity: agent.activity,
+                turn_report: agent.turn_report.map(|report| UiTurnReport {
+                    needs_you: report.needs_you,
+                    one_liner: report.one_liner,
+                }),
                 workstream: agent.workstream,
                 labels: agent.labels,
             })
@@ -1907,8 +1912,9 @@ fn is_blocked(kind: &AgentStateKind) -> bool {
 /// Attention = f(live state, disposition). The live half (working, blocked)
 /// is read off the running agent — `None` for unloaded agents, which render
 /// as idle. The persisted half is the user's verdict on the last turn end;
-/// sub-agent turn ends never set it to Pending (see the watcher), so
-/// children stay quiet by construction.
+/// sub-agent turn ends only set it to Pending once the user has personally
+/// engaged the agent (see `settle_turn`), so untouched children stay quiet
+/// by construction.
 fn attention_level(kind: Option<&AgentStateKind>, disposition: AgentDisposition) -> UiAttention {
     if kind.is_some_and(AgentStateKind::is_working) {
         return UiAttention::Working;
@@ -1943,12 +1949,92 @@ fn spawn_presentation_projection(agents: Arc<AgentRegistry>) {
     });
 }
 
+/// Classifies each finished top-level turn from its final message and
+/// broadcasts the result, splitting Pending into needs-you and FYI rows.
+/// Generation runs on its own task so a slow provider call never delays the
+/// next completed turn; the disposition re-check at persist time drops a
+/// result the user already answered.
+fn spawn_turn_report_projection(agents: Arc<AgentRegistry>) {
+    let mut completed = agents.pool.subscribe_completed_turns();
+    let agents = Arc::downgrade(&agents);
+    tokio::spawn(async move {
+        loop {
+            let turn = match completed.recv().await {
+                Ok(turn) => turn,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            };
+            let Some(agents) = agents.upgrade() else {
+                break;
+            };
+            let final_answer = turn.final_answer.trim().to_owned();
+            if final_answer.is_empty() {
+                continue;
+            }
+            let record = agents.db.read().get_agent(turn.agent_id);
+            // Sub-agent turns are the parent's court unless the user has
+            // personally messaged the agent, and Iris is not a rail row;
+            // neither gets a report. Not gated on any client watching: the
+            // report decides row ordering, so it must exist before a client
+            // looks.
+            if (record.parent_agent.is_some() && !record.user_interacted)
+                || record.role == AgentRole::Iris
+                || record
+                    .labels
+                    .iter()
+                    .any(|label| label == rho_agent::iris_tools::LABEL)
+            {
+                continue;
+            }
+            let agent_id = turn.agent_id;
+            tokio::spawn(async move {
+                let report = match rho_agent::presentation::turn_report(
+                    agents.db.clone(),
+                    agents.inference.clone(),
+                    agent_id,
+                    &final_answer,
+                )
+                .await
+                {
+                    Ok(Some(report)) => report,
+                    Ok(None) => return,
+                    Err(error) => {
+                        eprintln!("rho-daemon: turn report failed: {error:#}");
+                        return;
+                    }
+                };
+                // Pending still wants the report; so does snoozed — the turn
+                // finished inside the quiet window and the expiry broadcast
+                // will resurface this row, one-liner and all. Done and Hidden
+                // mean the user already moved on.
+                match agents.db.read().get_agent(agent_id).disposition {
+                    AgentDisposition::Pending | AgentDisposition::Snoozed { .. } => {}
+                    AgentDisposition::Done | AgentDisposition::Hidden => return,
+                }
+                {
+                    let mut write = agents.db.write().await;
+                    write.record_agent_turn_report(agent_id, &report);
+                    write.commit();
+                }
+                let _ = agents.events.send(ServerMessage::AgentTurnReport {
+                    agent_id,
+                    report: UiTurnReport {
+                        needs_you: report.needs_you,
+                        one_liner: report.one_liner,
+                    },
+                });
+            });
+        }
+    });
+}
+
 /// Watches one running agent for the daemon itself (not any particular
 /// connection): records turn ends and broadcasts attention level changes to
 /// every client. Spawned exactly once per activated agent.
 ///
 /// Sub-agents (a parent spawned them) get Working broadcasts but no turn-end
-/// records: their finished turns are the parent's court, not the user's.
+/// records until the user personally engages them: their finished turns are
+/// the parent's court, not the user's.
 async fn spawn_attention_watcher(
     pool: Arc<AgentPool>,
     db: RhoDb,
