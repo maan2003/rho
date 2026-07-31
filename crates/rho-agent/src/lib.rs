@@ -30,6 +30,7 @@ use crate::lazy::Lazy;
 use crate::multi_agent_tools::MultiAgentTools;
 use crate::pool::{AgentAssistantItemCompleted, AgentInputAccepted, AgentTurnCompleted};
 
+pub mod activity;
 mod claude;
 #[cfg(feature = "code-mode")]
 mod code_mode;

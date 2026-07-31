@@ -1211,7 +1211,7 @@ fn task_lines(topic: &Workstream, grouped: bool, registry: &AgentRegistry) -> Ve
         .unwrap_or(UiAttention::Quiet);
 
     if roots.is_empty() {
-        return vec![workstream_line(topic, grouped, None, aggregate)];
+        return vec![workstream_line(topic, grouped, None, aggregate, None)];
     }
 
     let singleton = roots.len() == 1;
@@ -1221,9 +1221,10 @@ fn task_lines(topic: &Workstream, grouped: bool, registry: &AgentRegistry) -> Ve
             grouped,
             Some(roots[0].agent_id),
             attention(roots[0].agent_id),
+            registry.agent_activity(roots[0].agent_id),
         )]
     } else {
-        vec![workstream_line(topic, grouped, None, aggregate)]
+        vec![workstream_line(topic, grouped, None, aggregate, None)]
     };
     let mut agent_line_indexes = Vec::with_capacity(tree.len());
     for (index, (agent, depth)) in tree.iter().enumerate() {
@@ -1273,6 +1274,7 @@ fn workstream_line(
     grouped: bool,
     root: Option<AgentId>,
     attention: UiAttention,
+    activity: Option<&str>,
 ) -> Line {
     let title = if topic.name.trim().is_empty() {
         "Untitled workstream".to_owned()
@@ -1298,6 +1300,12 @@ fn workstream_line(
     }
     let title_class = (attention >= UiAttention::Pending).then_some(DashClass::Urgent);
     line.span(title_class, |text| text.push_str(&title));
+    if let Some(activity) = activity {
+        line.span(Some(DashClass::Muted), |text| {
+            text.push_str(" · ");
+            text.push_str(activity);
+        });
+    }
 
     // The attention lamp hangs off the row's right end as an inlay.
     if attention > UiAttention::Quiet {
@@ -1324,6 +1332,12 @@ fn agent_line(
     line.span(class, |text| {
         text.push_str(&registry.agent_human_name(agent.agent_id))
     });
+    if let Some(activity) = registry.agent_activity(agent.agent_id) {
+        line.span(Some(DashClass::Muted), |text| {
+            text.push_str(" · ");
+            text.push_str(activity);
+        });
+    }
     if attention > UiAttention::Quiet {
         line.lamp = Some(attention);
     }

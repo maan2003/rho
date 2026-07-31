@@ -169,6 +169,8 @@ pub struct AgentRegistry {
     /// Live attention overlay: broadcasts land here between `Ready`
     /// refreshes, which re-seed it from the summaries' snapshot.
     attention: BTreeMap<AgentId, rho_ui_proto::UiAttention>,
+    /// Ephemeral activity text delivered separately from durable summaries.
+    activities: BTreeMap<AgentId, String>,
     /// Retained top-to-bottom rail order. Bucket changes are applied with a
     /// stable sort, so agents only move when their coarse rail bucket changes
     /// or when they are first seen.
@@ -408,6 +410,14 @@ impl AgentRegistry {
         if self.attention.insert(agent_id, attention) != Some(attention) {
             self.rebuild_topic_rail_layouts();
         }
+    }
+
+    pub fn set_activity(&mut self, agent_id: AgentId, activity: String) {
+        self.activities.insert(agent_id, activity);
+    }
+
+    pub fn agent_activity(&self, agent_id: AgentId) -> Option<&str> {
+        self.activities.get(&agent_id).map(String::as_str)
     }
 
     pub fn attention(&self, agent_id: AgentId) -> rho_ui_proto::UiAttention {

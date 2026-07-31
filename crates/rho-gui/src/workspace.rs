@@ -743,6 +743,11 @@ impl Workspace {
                 }
                 cx.notify();
             }
+            ConnEvent::AgentActivity { agent_id, activity } => {
+                self.registry.set_activity(agent_id, activity);
+                self.dashboard_dirty = true;
+                cx.notify();
+            }
             ConnEvent::ChatGptUsage {
                 used_percent,
                 reset_at_unix,

@@ -236,6 +236,11 @@ impl Workspace {
                 self.registry.set_attention(agent_id, attention);
                 cx.notify();
             }
+            ServerMessage::AgentActivity { agent_id, activity } => {
+                self.registry.set_activity(agent_id, activity);
+                self.dashboard_dirty = true;
+                cx.notify();
+            }
             ServerMessage::AgentUnloaded { agent_id, reason } => {
                 if self.subscriptions.mark_unloaded(agent_id, reason) {
                     self.registry.mark_not_live(agent_id);
@@ -471,7 +476,9 @@ impl Render for Workspace {
                 px(0.)
             };
         let body = if narrow {
-            if self.agent_screen && let Some((agent_id, transcript)) = self.transcript.clone() {
+            if self.agent_screen
+                && let Some((agent_id, transcript)) = self.transcript.clone()
+            {
                 div()
                     .flex()
                     .flex_col()
@@ -621,9 +628,7 @@ impl Render for Workspace {
             .bg(cx.theme().colors().editor_background)
             .key_context("RhoGui")
             .on_action(cx.listener(Self::submit_prompt))
-            .child(
-                div().flex_1().overflow_hidden().child(body),
-            )
+            .child(div().flex_1().overflow_hidden().child(body))
             .children(show_keyboard.then(|| self.touch_keyboard.clone().into_any_element()))
             .children(phone.then(|| {
                 let mut bar = div()

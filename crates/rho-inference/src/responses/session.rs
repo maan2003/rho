@@ -182,6 +182,7 @@ struct SessionTask {
 pub(crate) enum InferenceSessionMode {
     Deep(InferenceProfile),
     Title,
+    Status,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -223,6 +224,10 @@ impl ResponsesConfig {
             text_verbosity: TextVerbosity::Low,
             service_tier: ServiceTier::Priority,
         }
+    }
+
+    fn status() -> Self {
+        Self::title()
     }
 }
 
@@ -367,6 +372,16 @@ impl InferenceSession {
         })
     }
 
+    pub(crate) fn new_status(inference: Inference, prompt_cache_key: PromptCacheKey) -> Self {
+        Self::new(SessionConfig {
+            base_url: DEFAULT_CHATGPT_BASE_URL.to_owned(),
+            inference,
+            mode: InferenceSessionMode::Status,
+            responses_config: ResponsesConfig::status(),
+            prompt_cache_key,
+        })
+    }
+
     fn new(config: SessionConfig) -> Self {
         let (events_tx, events) = tokio::sync::mpsc::unbounded_channel();
         Self {
@@ -386,7 +401,7 @@ impl InferenceSession {
                 self.config.responses_config = ResponsesConfig::deep(config, model.into());
                 true
             }
-            InferenceSessionMode::Title => false,
+            InferenceSessionMode::Title | InferenceSessionMode::Status => false,
         }
     }
 

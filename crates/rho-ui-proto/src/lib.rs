@@ -541,6 +541,12 @@ pub enum ServerMessage {
         agent_id: AgentId,
         attention: UiAttention,
     },
+    /// Runtime-local, advisory activity text. It is not transcript content
+    /// and disappears when the daemon restarts.
+    AgentActivity {
+        agent_id: AgentId,
+        activity: String,
+    },
     LandLeaseQueued {
         repo: Utf8PathBuf,
         holder: Option<LandLeaseHolder>,

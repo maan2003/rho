@@ -359,6 +359,11 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         .await?,
     );
     agents.install_iris_tool_host();
+    spawn_activity_summarizer(
+        agents.pool.clone(),
+        agents.inference.clone(),
+        agents.events.clone(),
+    );
     spawn_chatgpt_quota_poller(quota_auth_name, agents.db.clone(), agents.events.clone());
     let quota_environment = agents.user_environment.clone();
     spawn_claude_quota_recorder(
@@ -1968,6 +1973,70 @@ fn attention_level(kind: Option<&AgentStateKind>, disposition: AgentDisposition)
         (true, true) => UiAttention::NeedsInput,
         (true, false) => UiAttention::Pending,
     }
+}
+
+/// Builds ephemeral, advisory activity labels from the text-only portions of
+/// live Rho transcripts. The sidecar owns no agent state and never feeds a
+/// result back into an agent conversation.
+fn spawn_activity_summarizer(
+    pool: Arc<AgentPool>,
+    inference: Inference,
+    events: broadcast::Sender<ServerMessage>,
+) {
+    tokio::spawn(async move {
+        let mut inputs = pool.subscribe_accepted_inputs();
+        let mut assistant_items = pool.subscribe_completed_assistant_items();
+        let mut sessions = HashMap::new();
+        loop {
+            let (agent_id, speaker, text) = tokio::select! {
+                result = inputs.recv() => match result {
+                    Ok(input) => (
+                        input.input_id.agent_id,
+                        match input.sender {
+                            rho_core::MessageSender::User => rho_agent::activity::ActivitySpeaker::User,
+                            rho_core::MessageSender::Agent { .. } => rho_agent::activity::ActivitySpeaker::Agent,
+                        },
+                        activity_text(&input.content),
+                    ),
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                result = assistant_items.recv() => match result {
+                    Ok(item) => (
+                        item.agent_id,
+                        rho_agent::activity::ActivitySpeaker::Assistant,
+                        item.text,
+                    ),
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+            };
+            let session = sessions
+                .entry(agent_id)
+                .or_insert_with(|| rho_agent::activity::ActivitySession::new(inference.clone()));
+            if !session.push(speaker, &text) {
+                continue;
+            }
+            match tokio::time::timeout(std::time::Duration::from_secs(30), session.update()).await {
+                Ok(Ok(Some(activity))) => {
+                    let _ = events.send(ServerMessage::AgentActivity { agent_id, activity });
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => eprintln!("rho-daemon: activity generation failed: {error:#}"),
+                Err(_) => eprintln!("rho-daemon: activity generation timed out"),
+            }
+        }
+    });
+}
+
+fn activity_text(content: &[ContentPart]) -> String {
+    content
+        .iter()
+        .filter_map(|part| match part {
+            ContentPart::Text { text } => Some(text.as_str()),
+            ContentPart::Image { .. } => None,
+        })
+        .collect()
 }
 
 /// Watches one running agent for the daemon itself (not any particular

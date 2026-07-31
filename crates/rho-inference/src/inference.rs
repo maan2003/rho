@@ -58,6 +58,13 @@ impl Inference {
         InferenceSession::new_title(self.clone(), prompt_cache_key)
     }
 
+    /// A small, runtime-local session for deriving display activity from an
+    /// agent transcript. It deliberately has no relationship to the agent's
+    /// persisted conversation.
+    pub fn status_session(&self, prompt_cache_key: PromptCacheKey) -> InferenceSession {
+        InferenceSession::new_status(self.clone(), prompt_cache_key)
+    }
+
     /// Watch the account's quota. Yields immediately with whatever is known,
     /// which is `None` until the provider first mentions it.
     pub fn quota(&self) -> watch::Receiver<Option<QuotaObservation>> {

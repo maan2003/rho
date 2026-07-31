@@ -44,6 +44,21 @@ fn title_session_uses_luna_fast_profile() {
 }
 
 #[test]
+fn status_session_uses_luna_fast_profile() {
+    let (_temp, auth) = test_oauth_file("token", None);
+    let session = InferenceSession::new_status(Inference::new(auth), PromptCacheKey::generate());
+
+    assert_eq!(
+        session.config.responses_config.model,
+        ResponsesModel::Gpt56Luna
+    );
+    assert_eq!(
+        session.config.responses_config.service_tier,
+        ServiceTier::Priority
+    );
+}
+
+#[test]
 fn builds_responses_request_with_tools_and_item_timeline() {
     let (_temp, auth) = test_oauth_file("token", None);
     let session = test_inference_service_with(
