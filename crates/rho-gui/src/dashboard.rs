@@ -18,7 +18,7 @@ use editor::display_map::{
 };
 use editor::{
     DisplayElisionId, DisplayElisionProperties, Editor, EditorMode, HighlightKey, Inlay,
-    SizingBehavior,
+    InlayHighlight, SizingBehavior,
 };
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, Focusable as _, HighlightStyle, Window};
@@ -121,6 +121,8 @@ pub struct Dashboard {
     pending_cursor: Option<LineKey>,
     /// Reply placeholder inlays currently spliced in.
     placeholder_ids: Vec<InlayId>,
+    /// Row state glyphs currently spliced in, for replacement on sync.
+    glyph_ids: Vec<InlayId>,
     /// Projected descendant rows keyed by their stable parent identity.
     folds: HashMap<AgentId, FoldSpec>,
     /// Expansion state keyed by stable parent identity.
@@ -171,6 +173,7 @@ impl Dashboard {
             attachments_dirty: false,
             pending_cursor: None,
             placeholder_ids: Vec::new(),
+            glyph_ids: Vec::new(),
             folds: HashMap::new(),
             expanded_folds: Arc::new(Mutex::new(HashSet::new())),
             rail_tail: None,
@@ -570,6 +573,7 @@ impl Dashboard {
         self.apply_folds(&lines);
         self.apply_rail_tail_elision(rail_tail, order_changed, cx);
         self.apply_highlights(&lines, cx);
+        self.apply_glyphs(&lines, cx);
         self.apply_reply_chrome(registry, cx);
         self.apply_attachment_blocks(cx);
     }
@@ -764,6 +768,57 @@ impl Dashboard {
         });
     }
 
+    /// Splices each row's leading state glyph in as an inlay — chrome the
+    /// cursor never lands on — so state reads down one fixed column instead
+    /// of from row color.
+    fn apply_glyphs(&mut self, lines: &[Line], cx: &mut Context<Workspace>) {
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let to_remove = std::mem::take(&mut self.glyph_ids);
+        let mut inlays = Vec::new();
+        let mut by_class: Vec<(DashClass, Vec<InlayHighlight>)> = DashClass::ALL
+            .into_iter()
+            .map(|class| (class, Vec::new()))
+            .collect();
+        for (index, line) in lines.iter().enumerate() {
+            let Some(glyph) = &line.glyph else {
+                continue;
+            };
+            let Some(buffer) = self.buffers.get(&line.key) else {
+                continue;
+            };
+            let buffer_snapshot = buffer.read(cx).snapshot();
+            let Some(position) = snapshot.anchor_in_excerpt(
+                buffer_snapshot.anchor_before(glyph.at.min(buffer_snapshot.len())),
+            ) else {
+                continue;
+            };
+            let inlay = Inlay::custom(index, position, glyph.text);
+            if let Some((_, highlights)) =
+                by_class.iter_mut().find(|(entry, _)| *entry == glyph.class)
+            {
+                highlights.push(InlayHighlight {
+                    inlay: inlay.id,
+                    inlay_position: position,
+                    range: 0..glyph.text.len(),
+                });
+            }
+            self.glyph_ids.push(inlay.id);
+            inlays.push(inlay);
+        }
+        self.editor.update(cx, |editor, cx| {
+            editor.splice_inlays(&to_remove, inlays, cx);
+            for (class, highlights) in by_class {
+                // `highlight_inlays` only ever inserts per inlay id; without
+                // the clear, a glyph that changes state keeps its old
+                // highlight entry after the attention moves on.
+                editor.clear_highlights(class.glyph_key(), cx);
+                if !highlights.is_empty() {
+                    editor.highlight_inlays(class.glyph_key(), highlights, class.style(cx), cx);
+                }
+            }
+        });
+    }
+
     fn apply_attachment_blocks(&mut self, cx: &mut Context<Workspace>) {
         if !self.attachments_dirty {
             return;
@@ -928,31 +983,34 @@ fn render_rail_tail(cx: &mut BlockContext<'_, '_>) -> impl IntoElement {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum DashClass {
     Muted,
-    /// A finished turn awaiting the user; with the lamps gone, the row text
-    /// itself carries the emphasis.
-    Urgent,
-    /// Blocked on the user (error or unfinished turn): error color and a
-    /// trailing glyph instead of spelling it out.
-    Blocked,
+    /// Default text color, spelled out because glyph inlays would otherwise
+    /// inherit the editor's hint styling.
+    Plain,
 }
 
 impl DashClass {
-    const ALL: [DashClass; 3] = [DashClass::Muted, DashClass::Urgent, DashClass::Blocked];
+    const ALL: [DashClass; 2] = [DashClass::Muted, DashClass::Plain];
 
     fn key(self) -> HighlightKey {
         let slot = match self {
             DashClass::Muted => 0,
-            DashClass::Urgent => 1,
-            DashClass::Blocked => 2,
+            DashClass::Plain => 1,
         };
         HighlightKey::SyntaxTreeView(DASHBOARD_KEY_BASE + slot)
+    }
+
+    /// A parallel key space for glyph inlay highlights.
+    fn glyph_key(self) -> HighlightKey {
+        let HighlightKey::SyntaxTreeView(slot) = self.key() else {
+            unreachable!()
+        };
+        HighlightKey::SyntaxTreeView(slot + DashClass::ALL.len())
     }
 
     fn style(self, cx: &App) -> HighlightStyle {
         let color = match self {
             DashClass::Muted => cx.theme().colors().text_muted,
-            DashClass::Urgent => cx.theme().colors().text_accent,
-            DashClass::Blocked => cx.theme().status().error,
+            DashClass::Plain => cx.theme().colors().text,
         };
         HighlightStyle {
             color: Some(color.into()),
@@ -1041,9 +1099,21 @@ struct Line {
     key: LineKey,
     text: String,
     spans: Vec<(DashClass, Range<usize>)>,
+    /// The row's leading state glyph, spliced in as an inlay so the cursor
+    /// never lands on it.
+    glyph: Option<Glyph>,
     target: RowTarget,
     fold: Option<FoldSpec>,
     tail: bool,
+}
+
+/// A one-character state marker at `at` bytes into the row (after the
+/// indent), forming a fixed scannable column.
+#[derive(Debug, PartialEq)]
+struct Glyph {
+    class: DashClass,
+    text: &'static str,
+    at: usize,
 }
 
 impl Line {
@@ -1052,6 +1122,7 @@ impl Line {
             key,
             text: String::new(),
             spans: Vec::new(),
+            glyph: None,
             target,
             fold: None,
             tail: false,
@@ -1128,9 +1199,10 @@ fn visible_lines(lines: Vec<Line>, expanded: &HashSet<AgentId>) -> Vec<Line> {
         .collect()
 }
 
-/// The status text and emphasis a row carries in place of the old attention
-/// lamp: working rows show activity, finished rows show the turn report's
-/// one-liner — lit when it needs the user, dimmed for a dismissable FYI.
+/// The leading state glyph and status text of a row. State reads down one
+/// fixed glyph column — `?` needs you, `!` blocked, `✓` FYI, `·` otherwise —
+/// while the text stays uncolored: working rows show activity, finished rows
+/// show the turn report's summary, and only FYI rows dim.
 struct RowStatus<'a> {
     attention: UiAttention,
     activity: Option<&'a str>,
@@ -1154,36 +1226,48 @@ impl RowStatus<'_> {
         }
     }
 
-    fn title_class(&self) -> Option<DashClass> {
+    fn glyph(&self) -> (DashClass, &'static str) {
         match self.attention {
-            UiAttention::NeedsInput => Some(DashClass::Blocked),
+            UiAttention::NeedsInput => (DashClass::Plain, "! "),
             UiAttention::Pending => match self.report {
-                Some(report) if !report.needs_you => Some(DashClass::Muted),
-                _ => Some(DashClass::Urgent),
+                Some(report) if !report.needs_you => (DashClass::Muted, "✓ "),
+                _ => (DashClass::Plain, "? "),
             },
-            UiAttention::Working | UiAttention::Quiet => None,
+            UiAttention::Working | UiAttention::Quiet => (DashClass::Muted, "· "),
         }
     }
 
-    fn suffix(&self) -> Option<(DashClass, String)> {
-        let activity = || {
-            self.activity
-                .map(|activity| (DashClass::Muted, format!(" · {activity}")))
-        };
+    fn title_class(&self) -> Option<DashClass> {
         match self.attention {
-            UiAttention::NeedsInput => Some((DashClass::Blocked, " ◆".to_owned())),
             UiAttention::Pending => match self.report {
-                Some(report) if report.needs_you => {
-                    Some((DashClass::Muted, format!(" · {}", report.one_liner)))
-                }
-                Some(report) => Some((DashClass::Muted, format!(" ✓ {}", report.one_liner))),
-                None => activity(),
+                Some(report) if !report.needs_you => Some(DashClass::Muted),
+                _ => None,
             },
-            UiAttention::Working | UiAttention::Quiet => activity(),
+            _ => None,
+        }
+    }
+
+    /// Activity shows only while actually working: a settled row keeping its
+    /// last progress label would read as still running.
+    fn suffix(&self) -> Option<(DashClass, String)> {
+        match self.attention {
+            UiAttention::Working => self
+                .activity
+                .map(|activity| (DashClass::Muted, format!(" · {activity}"))),
+            UiAttention::Pending => self
+                .report
+                .map(|report| (DashClass::Muted, format!(" · {}", report.summary))),
+            UiAttention::NeedsInput | UiAttention::Quiet => None,
         }
     }
 
     fn apply(&self, line: &mut Line, title: &str) {
+        let (class, text) = self.glyph();
+        line.glyph = Some(Glyph {
+            class,
+            text,
+            at: line.text.len(),
+        });
         line.span(self.title_class(), |text| text.push_str(title));
         if let Some((class, suffix)) = self.suffix() {
             line.span(Some(class), |text| text.push_str(&suffix));
@@ -1587,7 +1671,12 @@ mod tests {
         assert_eq!(lines.len(), 2);
         assert!(lines[0].text.contains("topic"));
         assert_eq!(lines[0].key, LineKey::Stream(WorkstreamId(1)));
-        assert!(lines[0].text.ends_with(" ◆"));
+        assert!(
+            lines[0]
+                .glyph
+                .as_ref()
+                .is_some_and(|glyph| glyph.text == "! ")
+        );
         assert!(matches!(
             lines[0].target,
             RowTarget::Stream {
@@ -1597,7 +1686,12 @@ mod tests {
             if agent_id == root_id
         ));
         assert_eq!(lines[1].target, RowTarget::Agent(child_id));
-        assert!(lines[1].text.ends_with(" ◆"));
+        assert!(
+            lines[1]
+                .glyph
+                .as_ref()
+                .is_some_and(|glyph| glyph.text == "! ")
+        );
         assert_eq!(
             lines[0].fold,
             Some(FoldSpec {
@@ -1618,43 +1712,62 @@ mod tests {
         install(&mut registry, &topic);
         registry.set_attention(root_id, UiAttention::Pending);
 
-        // Pending without a report: emphasized title, nothing else.
+        // Pending without a report: the needs-you glyph, plain title.
         let lines = generate(&registry);
-        assert!(lines[0].spans.iter().any(|(class, range)| {
-            *class == DashClass::Urgent && lines[0].text[range.clone()].contains("topic")
-        }));
+        assert!(
+            lines[0]
+                .glyph
+                .as_ref()
+                .is_some_and(|glyph| glyph.text == "? ")
+        );
+        assert!(lines[0].spans.is_empty());
 
         registry.set_turn_report(
             root_id,
             rho_ui_proto::UiTurnReport {
                 needs_you: true,
-                one_liner: "asking: delete old migration?".to_owned(),
+                summary: "asking: delete old migration?".to_owned(),
             },
         );
         let lines = generate(&registry);
         assert!(lines[0].text.contains("· asking: delete old migration?"));
-        assert!(lines[0].spans.iter().any(|(class, range)| {
-            *class == DashClass::Urgent && lines[0].text[range.clone()].contains("topic")
-        }));
+        assert!(
+            lines[0]
+                .glyph
+                .as_ref()
+                .is_some_and(|glyph| glyph.text == "? ")
+        );
 
-        // An FYI dims the whole row and swaps the separator for a check.
+        // An FYI dims the whole row and swaps the glyph for a check.
         registry.set_turn_report(
             root_id,
             rho_ui_proto::UiTurnReport {
                 needs_you: false,
-                one_liner: "tests pass, pushed".to_owned(),
+                summary: "tests pass, pushed".to_owned(),
             },
         );
         let lines = generate(&registry);
-        assert!(lines[0].text.contains("✓ tests pass, pushed"));
+        assert!(lines[0].text.contains("· tests pass, pushed"));
+        assert!(
+            lines[0]
+                .glyph
+                .as_ref()
+                .is_some_and(|glyph| glyph.text == "✓ ")
+        );
         assert!(lines[0].spans.iter().any(|(class, range)| {
             *class == DashClass::Muted && lines[0].text[range.clone()].contains("topic")
         }));
 
-        // A new turn retires the report: the row is back to activity text.
+        // A new turn retires the report: the row is back to the working dot.
         registry.set_attention(root_id, UiAttention::Working);
         let lines = generate(&registry);
         assert!(!lines[0].text.contains("tests pass"));
+        assert!(
+            lines[0]
+                .glyph
+                .as_ref()
+                .is_some_and(|glyph| glyph.text == "· ")
+        );
     }
 
     #[test]
@@ -1672,7 +1785,12 @@ mod tests {
 
         let lines = generate(&registry);
         assert_eq!(lines.len(), 1);
-        assert!(!lines[0].text.ends_with(" ◆"));
+        assert!(
+            lines[0]
+                .glyph
+                .as_ref()
+                .is_some_and(|glyph| glyph.text != "! ")
+        );
         assert!(matches!(
             lines[0].target,
             RowTarget::Stream {

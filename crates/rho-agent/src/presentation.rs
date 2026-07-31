@@ -42,7 +42,7 @@ const SET_TITLE: &str = "set_title";
 const SET_STATUS: &str = "set_status";
 const REPORT_FYI: &str = "report_fyi";
 const REPORT_NEEDS_YOU: &str = "report_needs_you";
-const MAX_ONE_LINER_BYTES: usize = 100;
+const MAX_SUMMARY_BYTES: usize = MAX_STATUS_BYTES;
 const MAX_FINAL_MESSAGE_BYTES: usize = 4 * 1024;
 
 const INSTRUCTIONS: &str = "You maintain a coding agent's compact presentation from its \
@@ -56,9 +56,9 @@ agent is no longer actively working, do not set activity. When the newest input 
 user a question, requests review or a decision, reports being blocked, failed, or unfinished, \
 or otherwise leaves the next step with the user; call report_fyi when the work finished cleanly \
 and nothing is asked of the user — a trailing offer of optional follow-up work is still fyi. \
-one_liner is at most 80 characters summarizing the outcome (for report_needs_you, what is \
-being asked). Use lowercase except for types, functions, and other code identifiers; no \
-trailing period. Use the tools; do not write prose.";
+summary is a concise few-word label of the outcome — for report_needs_you, of what is being \
+asked — at most 50 bytes, the same shape as activity. Use lowercase except for types, \
+functions, and other code identifiers; no trailing period. Use the tools; do not write prose.";
 
 pub struct Watch {
     release: Option<Box<dyn FnOnce() + Send>>,
@@ -484,7 +484,7 @@ fn report_fyi_spec() -> ToolSpec {
         name: REPORT_FYI.try_into().expect("valid report tool name"),
         tool_type: ToolType::Function,
         description: "The turn finished cleanly; nothing is asked of the user.".to_owned(),
-        input_schema: serde_json::json!({"type":"object","properties":{"one_liner":{"type":"string","maxLength":80}},"required":["one_liner"],"additionalProperties":false}),
+        input_schema: serde_json::json!({"type":"object","properties":{"summary":{"type":"string","maxLength":50}},"required":["summary"],"additionalProperties":false}),
         format: None,
     }
 }
@@ -496,21 +496,21 @@ fn report_needs_you_spec() -> ToolSpec {
         description: "The turn leaves the next step with the user: a question, review request, \
 blocker, or failure."
             .to_owned(),
-        input_schema: serde_json::json!({"type":"object","properties":{"one_liner":{"type":"string","maxLength":80}},"required":["one_liner"],"additionalProperties":false}),
+        input_schema: serde_json::json!({"type":"object","properties":{"summary":{"type":"string","maxLength":50}},"required":["summary"],"additionalProperties":false}),
         format: None,
     }
 }
 
 /// Trimmed and byte-capped on a char boundary: an overlong line from the
 /// model is still a usable row, unlike a rejected one.
-fn bounded_one_liner(one_liner: &str) -> Option<String> {
-    let one_liner = one_liner.trim();
-    if one_liner.is_empty() {
+fn bounded_summary(summary: &str) -> Option<String> {
+    let summary = summary.trim();
+    if summary.is_empty() {
         return None;
     }
     let mut capped = String::new();
-    for character in one_liner.chars() {
-        if capped.len() + character.len_utf8() > MAX_ONE_LINER_BYTES {
+    for character in summary.chars() {
+        if capped.len() + character.len_utf8() > MAX_SUMMARY_BYTES {
             break;
         }
         capped.push(character);
@@ -565,11 +565,8 @@ fn report_from_items(items: &[InferenceResponseItem]) -> Option<TurnReport> {
             _ => return None,
         };
         let value = serde_json::from_str::<serde_json::Value>(arguments).ok()?;
-        let one_liner = bounded_one_liner(value.get("one_liner")?.as_str()?)?;
-        Some(TurnReport {
-            needs_you,
-            one_liner,
-        })
+        let summary = bounded_summary(value.get("summary")?.as_str()?)?;
+        Some(TurnReport { needs_you, summary })
     })
 }
 
@@ -640,8 +637,8 @@ fn xml_escape_capped(text: &str, max_bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_MESSAGE_BYTES, MAX_ONE_LINER_BYTES, MAX_STATUS_BYTES, bounded_one_liner,
-        bounded_status, bounded_title, canonical_source_text,
+        MAX_MESSAGE_BYTES, MAX_STATUS_BYTES, MAX_SUMMARY_BYTES, bounded_status, bounded_summary,
+        bounded_title, canonical_source_text,
     };
 
     #[test]
@@ -659,14 +656,14 @@ mod tests {
     }
 
     #[test]
-    fn one_liner_is_trimmed_and_capped_not_rejected() {
-        assert_eq!(bounded_one_liner("  \n "), None);
+    fn summary_is_trimmed_and_capped_not_rejected() {
+        assert_eq!(bounded_summary("  \n "), None);
         assert_eq!(
-            bounded_one_liner(" tests pass "),
+            bounded_summary(" tests pass "),
             Some("tests pass".to_owned())
         );
-        let capped = bounded_one_liner(&"é".repeat(MAX_ONE_LINER_BYTES)).unwrap();
-        assert!(capped.len() <= MAX_ONE_LINER_BYTES);
+        let capped = bounded_summary(&"é".repeat(MAX_SUMMARY_BYTES)).unwrap();
+        assert!(capped.len() <= MAX_SUMMARY_BYTES);
         assert!(capped.is_char_boundary(capped.len()));
     }
 

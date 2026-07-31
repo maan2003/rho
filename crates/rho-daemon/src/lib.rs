@@ -1119,7 +1119,7 @@ impl AgentRegistry {
                 activity: agent.activity,
                 turn_report: agent.turn_report.map(|report| UiTurnReport {
                     needs_you: report.needs_you,
-                    one_liner: report.one_liner,
+                    summary: report.summary,
                 }),
                 workstream: agent.workstream,
                 labels: agent.labels,
@@ -2020,7 +2020,7 @@ fn spawn_turn_report_projection(agents: Arc<AgentRegistry>) {
                     agent_id,
                     report: UiTurnReport {
                         needs_you: report.needs_you,
-                        one_liner: report.one_liner,
+                        summary: report.summary,
                     },
                 });
             });

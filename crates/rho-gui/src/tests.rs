@@ -244,7 +244,7 @@ fn two_hosts_share_one_rail_and_detach_cleanly(cx: &mut TestAppContext) {
         .update(cx, |_, _, cx| {
             dashboard.update(cx, |editor, cx| {
                 let text = editor.display_text(cx);
-                for expected in ["local", "  Local work", "fern", "  Remote work"] {
+                for expected in ["local", "  · Local work", "fern", "  · Remote work"] {
                     assert!(
                         text.contains(expected),
                         "{expected:?} missing from {text:?}"

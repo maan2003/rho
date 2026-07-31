@@ -854,7 +854,7 @@ async fn turn_end_and_user_message_set_dispositions() {
         agent_id,
         &crate::db::TurnReport {
             needs_you: false,
-            one_liner: "tests pass".to_owned(),
+            summary: "tests pass".to_owned(),
         },
     );
     write.record_agent_user_message(UnixMs(200), agent_id, "next task");

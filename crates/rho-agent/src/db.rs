@@ -391,7 +391,10 @@ pub struct AgentRecord {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct TurnReport {
     pub needs_you: bool,
-    pub one_liner: String,
+    /// Activity-shaped few-word label of the outcome. Defaulted so records
+    /// written before the rename from `one_liner` still decode.
+    #[senax(default)]
+    pub summary: String,
 }
 
 impl AgentRecord {
@@ -1470,8 +1473,10 @@ impl AgentWriteTxnExt for WriteTxn {
             }
             _ => AgentDisposition::Pending,
         };
-        // The previous turn's report describes a superseded final message.
+        // The previous turn's report describes a superseded final message,
+        // and the activity label describes work that just stopped.
         agent.turn_report = None;
+        agent.activity = None;
         agents.insert(&agent_id, SenValue::borrowed(&agent));
     }
 

@@ -826,8 +826,8 @@ pub struct UiAgentSummary {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct UiTurnReport {
     pub needs_you: bool,
-    /// One row-sized line summarizing the outcome of the turn.
-    pub one_liner: String,
+    /// Activity-shaped few-word label of the turn's outcome.
+    pub summary: String,
 }
 
 /// How urgently an agent wants the user, in ascending order — the rail's
