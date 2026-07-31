@@ -266,6 +266,9 @@ pub struct Workspace {
     /// The dashboard: the rail as a real editor buffer, ambient chrome
     /// beside the active tree.
     dashboard: crate::dashboard::Dashboard,
+    /// Agent shown beside the dashboard cursor. Kept separate from the
+    /// focused task so cursor previews do not rebuild or reorder the rail.
+    dashboard_preview: Option<AgentId>,
     /// The dashboard projection is regenerated only after its registry or
     /// local composition state changes, never merely because another view
     /// dirtied the window.
@@ -465,6 +468,7 @@ impl Workspace {
             surfaces: HashMap::new(),
             active_context: ContextId::Draft,
             dashboard,
+            dashboard_preview: None,
             dashboard_dirty: true,
             iris_preview,
             minibuffer: None,
@@ -2841,22 +2845,33 @@ impl Workspace {
         self.select_agent_inner(agent_id, true, window, cx);
     }
 
-    /// Selects and displays an agent (or the draft) without moving keyboard
-    /// focus: the dashboard's preview — the cursor stays home, the panes
-    /// follow it.
+    /// Shows an agent beside the dashboard cursor without changing the
+    /// focused task or the dashboard's layout.
     fn preview_agent(
         &mut self,
         agent_id: Option<AgentId>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.dashboard_preview == agent_id {
+            return;
+        }
         if let Some(agent_id) = agent_id
             && self.connected()
             && !self.subscriptions.contains(agent_id)
         {
             self.subscribe_agent(agent_id, cx);
         }
-        self.select_agent_inner(agent_id, false, window, cx);
+        if let Some(agent_id) = &agent_id {
+            let view = self.materialize_model(agent_id, window, cx);
+            view.update(cx, |view, cx| view.tick_timers(now_ms(), cx));
+        }
+        self.dashboard_preview = agent_id;
+        self.hosts.focus_agent(
+            agent_id.and_then(|agent_id| Some((self.host_of(agent_id)?, agent_id))),
+        );
+        self.ensure_duration_timer(cx);
+        cx.notify();
     }
 
     fn select_agent_inner(
@@ -2923,7 +2938,7 @@ impl Workspace {
                 }
                 | RowTarget::Agent(agent_id)
                 | RowTarget::Reply(agent_id),
-            ) if self.registry.selected_agent() != Some(&agent_id) => {
+            ) if self.dashboard_preview != Some(agent_id) => {
                 self.preview_agent(Some(agent_id), window, cx);
             }
             Some(
@@ -2932,7 +2947,7 @@ impl Workspace {
             // Rows with no agent behind them (group headers, the fold
             // toggle, drafts-in-progress) preview nothing.
             _ => {
-                if self.registry.selected_agent().is_some() {
+                if self.dashboard_preview.is_some() {
                     self.preview_agent(None, window, cx);
                 }
             }
@@ -3668,6 +3683,21 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn dashboard_is_dirty(&self) -> bool {
         self.dashboard_dirty
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preview_dashboard_agent(
+        &mut self,
+        agent_id: AgentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.preview_agent(Some(agent_id), window, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dashboard_preview_agent(&self) -> Option<AgentId> {
+        self.dashboard_preview
     }
 
     fn sync_dashboard_if_dirty(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -4870,7 +4900,7 @@ impl Workspace {
         text_style: &gpui::TextStyle,
         cx: &Context<Self>,
     ) -> Option<gpui::AnyElement> {
-        let agent_id = self.registry.selected_agent().copied()?;
+        let agent_id = self.dashboard_preview?;
         let spans = self
             .models
             .get(&agent_id)
@@ -4920,7 +4950,7 @@ impl Workspace {
         if iris {
             return Some(self.iris_preview.clone());
         }
-        let agent_id = self.registry.selected_agent().copied()?;
+        let agent_id = self.dashboard_preview?;
         let model = self.models.get(&agent_id)?.clone();
         Some(model.update(cx, |model, cx| model.preview_editor(window, cx)))
     }
@@ -4943,7 +4973,7 @@ impl Workspace {
                 Some(crate::dashboard::RowTarget::Iris)
             );
         self.sync_diff_visibility(!home, cx);
-        let show_panes = !home || iris || self.registry.selected_agent().is_some();
+        let show_panes = !home || iris || self.dashboard_preview.is_some();
         let rail = home.then(|| self.render_rail(show_panes, text_style, cx));
         // Same hairline the rail uses against the panes.
         let separator_color = cx.theme().colors().border_variant.opacity(0.6);

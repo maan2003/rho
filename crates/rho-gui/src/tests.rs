@@ -371,6 +371,13 @@ fn startup_stays_on_the_first_dashboard_row(cx: &mut TestAppContext) {
                 !workspace.dashboard_is_dirty(),
                 "transcript frames must not rebuild the dashboard"
             );
+
+            workspace.preview_dashboard_agent(agent(1), window, cx);
+            assert_eq!(workspace.dashboard_preview_agent(), Some(agent(1)));
+            assert!(
+                !workspace.dashboard_is_dirty(),
+                "dashboard cursor previews must not rebuild the dashboard"
+            );
         })
         .expect("start on dashboard");
 }
