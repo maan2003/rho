@@ -766,9 +766,6 @@ impl Workspace {
                 });
         }
 
-        if !changes.is_empty() {
-            self.dashboard_dirty = true;
-        }
         if live_changed {
             self.refresh_draft_agent_targets(cx);
         }
@@ -830,7 +827,20 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.dashboard_dirty = true;
+        // Transcript frames are delivered independently of rail state and
+        // can arrive for every streamed token. Rebuilding the dashboard's
+        // editor excerpts and inlays for them makes the rail visibly flicker.
+        // Only events that can change its projection invalidate it.
+        if matches!(
+            &event,
+            ConnEvent::Ready { .. }
+                | ConnEvent::WorkstreamCreated(_)
+                | ConnEvent::AgentCreated { .. }
+                | ConnEvent::AgentAttention { .. }
+                | ConnEvent::AgentTurnReport { .. }
+        ) {
+            self.dashboard_dirty = true;
+        }
         match event {
             ConnEvent::Ready {
                 workstreams,
@@ -3653,6 +3663,11 @@ impl Workspace {
     pub(crate) fn sync_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dashboard.sync(&self.registry, window, cx);
         self.dashboard_dirty = false;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dashboard_is_dirty(&self) -> bool {
+        self.dashboard_dirty
     }
 
     fn sync_dashboard_if_dirty(&mut self, window: &mut Window, cx: &mut Context<Self>) {

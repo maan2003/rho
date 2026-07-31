@@ -367,6 +367,10 @@ fn startup_stays_on_the_first_dashboard_row(cx: &mut TestAppContext) {
                 workspace.dashboard_cursor_target(cx),
                 Some(crate::dashboard::RowTarget::Iris)
             );
+            assert!(
+                !workspace.dashboard_is_dirty(),
+                "transcript frames must not rebuild the dashboard"
+            );
         })
         .expect("start on dashboard");
 }
