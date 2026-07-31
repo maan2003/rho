@@ -310,9 +310,12 @@ impl ClaudeAgent {
                 .last()
                 .map(|source| source.through)
         };
+        let presentation_session = Arc::new(tokio::sync::Mutex::new(
+            crate::presentation::Session::new(inference),
+        ));
         let loop_state = ClaudeLoop {
             db,
-            presentation_inference: inference,
+            presentation_session,
             agent_id,
             view,
             model,
@@ -540,7 +543,9 @@ enum ClaudeControl {
 
 struct ClaudeLoop {
     db: RhoDb,
-    presentation_inference: Inference,
+    /// The agent's one persistent Luna session, shared by activity updates
+    /// and turn reports so both keep one prompt prefix warm.
+    presentation_session: Arc<tokio::sync::Mutex<crate::presentation::Session>>,
     agent_id: AgentId,
     view: Arc<Lazy<Arc<rho_workspaces::View>>>,
     model: Model,
@@ -1086,7 +1091,7 @@ impl ClaudeLoop {
             })
             .unwrap_or_default();
         let db = self.db.clone();
-        let inference = self.presentation_inference.clone();
+        let session = Arc::clone(&self.presentation_session);
         let agent_id = self.agent_id;
         let control = self.presentation_control.clone();
         self.presentation.task = Some(tokio::spawn(async move {
@@ -1113,7 +1118,7 @@ impl ClaudeLoop {
                         if !accepted.await.unwrap_or(false) {
                             return;
                         }
-                        crate::presentation::generate(db, inference, agent_id, permit)
+                        crate::presentation::generate(db, session, agent_id, permit)
                             .await
                             .map_err(|error| format!("{error:#}"))
                     }
@@ -1680,6 +1685,13 @@ impl ClaudeLoop {
                         })
                         .await;
                     }
+                    crate::presentation::spawn_turn_report(
+                        self.db.clone(),
+                        self.pool_events.clone(),
+                        Arc::clone(&self.presentation_session),
+                        self.agent_id,
+                        &final_text,
+                    );
                     self.mail_parent(
                         if final_text.is_empty() {
                             "(turn finished with no text response)".to_owned()

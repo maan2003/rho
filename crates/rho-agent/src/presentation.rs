@@ -2,16 +2,15 @@
 //!
 //! Sources are observed only after their event commits. Native agents write
 //! them directly; Claude mirrors confirmed external transcript text. Each
-//! agent has one lazily created persistent session that appends new durable
-//! sources incrementally, keeping one prompt prefix warm across activity
-//! updates and turn reports. Appending is position-checked against the
-//! durable tail: a rewind forks the lineage, the positions stop matching,
-//! and the session rebuilds from scratch — so it can never keep summarizing
-//! an abandoned branch.
+//! runtime loop owns its agent's persistent session, shared by activity
+//! updates and turn reports so one prompt prefix stays warm across both.
+//! Appending is position-checked against the durable tail: a rewind forks
+//! the lineage, the positions stop matching, and the session rebuilds from
+//! scratch — so it can never keep summarizing an abandoned branch.
 
-use std::collections::{HashMap, VecDeque};
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::collections::VecDeque;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use rho_core::{
     ContentPart, ContextBlock, InferenceEvent, InferenceRequest, InferenceResponseItem,
@@ -23,8 +22,8 @@ use rho_inference::{Inference, InferenceSession, PromptCacheKey};
 use tokio::sync::{Mutex as TokioMutex, OwnedSemaphorePermit, Semaphore};
 
 use crate::db::{
-    AgentEventPos, AgentId, AgentPresentationUpdate, AgentReadTxnExt as _, PresentationField,
-    TurnReport,
+    AgentDisposition, AgentEventPos, AgentId, AgentPresentationUpdate, AgentReadTxnExt as _,
+    AgentRole, AgentWriteTxnExt as _, PresentationField, TurnReport,
 };
 use crate::{
     PRESENTATION_SOURCE_TAIL_BYTES, PresentationSource, PresentationSpeaker, presentation_sources,
@@ -85,46 +84,6 @@ fn request_semaphore() -> Arc<Semaphore> {
     Arc::clone(REQUESTS.get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_REQUESTS))))
 }
 
-/// How many idle per-agent sessions stay resident before least-recently-used
-/// eviction. Eviction only forgets the map entry: a task still holding the
-/// Arc finishes safely, and the next use lazily rebuilds from durable
-/// sources.
-const MAX_SESSIONS: usize = 64;
-
-struct SessionSlot {
-    session: Arc<TokioMutex<Session>>,
-    last_used: Instant,
-}
-
-fn session_map() -> &'static Mutex<HashMap<AgentId, SessionSlot>> {
-    static SESSIONS: OnceLock<Mutex<HashMap<AgentId, SessionSlot>>> = OnceLock::new();
-    SESSIONS.get_or_init(Default::default)
-}
-
-/// The agent's one persistent sidecar session, created lazily on first use.
-/// The per-agent mutex serializes activity updates against turn reports so
-/// the timeline stays a single coherent conversation.
-fn agent_session(inference: &Inference, agent_id: AgentId) -> Arc<TokioMutex<Session>> {
-    let mut map = session_map().lock().expect("poison");
-    let now = Instant::now();
-    let slot = map.entry(agent_id).or_insert_with(|| SessionSlot {
-        session: Arc::new(TokioMutex::new(Session::new(inference.clone()))),
-        last_used: now,
-    });
-    slot.last_used = now;
-    let session = Arc::clone(&slot.session);
-    if map.len() > MAX_SESSIONS
-        && let Some(oldest) = map
-            .iter()
-            .filter(|(id, _)| **id != agent_id)
-            .min_by_key(|(_, slot)| slot.last_used)
-            .map(|(id, _)| *id)
-    {
-        map.remove(&oldest);
-    }
-    session
-}
-
 /// Generate one presentation proposal from the committed lineage. Persistence
 /// remains in the owning runtime loop so completion cannot race source events.
 pub(crate) async fn acquire_request() -> anyhow::Result<OwnedSemaphorePermit> {
@@ -155,35 +114,82 @@ pub(crate) fn canonical_source_text(text: &str) -> Option<String> {
 
 pub(crate) async fn generate(
     db: RhoDb,
-    inference: Inference,
+    session: Arc<TokioMutex<Session>>,
     agent_id: AgentId,
     _permit: OwnedSemaphorePermit,
 ) -> anyhow::Result<Option<AgentPresentationUpdate>> {
     let Some((seed, sources)) = presentation_input(&db, agent_id) else {
         return Ok(None);
     };
-    let session = agent_session(&inference, agent_id);
     let mut session = session.lock().await;
     session.sync(seed, sources);
     session.update().await
 }
 
-/// Classify one finished turn on the agent's persistent session — same
-/// instructions, same tool list, same source timeline as activity updates —
-/// with a `<turn_ended>` block appended, so both request kinds share one
-/// prompt prefix instead of forking the cache.
-pub async fn turn_report(
+/// Classify one finished turn on the loop-owned session — same instructions,
+/// same tool list, same source timeline as activity updates — with a
+/// `<turn_ended>` block appended, so both request kinds share one prompt
+/// prefix instead of forking the cache. Detached from the calling loop: a
+/// slow provider call never delays the runtime and the report still lands if
+/// the agent unloads meanwhile. Not gated on any client watching: the report
+/// decides row ordering, so it must exist before a client looks.
+pub(crate) fn spawn_turn_report(
     db: RhoDb,
-    inference: Inference,
+    pool: std::sync::Weak<crate::pool::AgentPool>,
+    session: Arc<TokioMutex<Session>>,
     agent_id: AgentId,
-    final_message: &str,
-) -> anyhow::Result<Option<TurnReport>> {
-    let _permit = acquire_request().await?;
-    let (seed, sources) = presentation_context(&db, agent_id);
-    let session = agent_session(&inference, agent_id);
-    let mut session = session.lock().await;
-    session.sync(seed, sources);
-    session.report(final_message).await
+    final_answer: &str,
+) {
+    let final_message = final_answer.trim().to_owned();
+    if final_message.is_empty() {
+        return;
+    }
+    // Sub-agent turns are the parent's court unless the user has personally
+    // messaged the agent, and Iris is not a rail row; neither gets a report.
+    let record = db.read().get_agent(agent_id);
+    if (record.parent_agent.is_some() && !record.user_interacted)
+        || record.role == AgentRole::Iris
+        || record
+            .labels
+            .iter()
+            .any(|label| label == crate::iris_tools::LABEL)
+    {
+        return;
+    }
+    tokio::spawn(async move {
+        let report = async {
+            let _permit = acquire_request().await?;
+            let (seed, sources) = presentation_context(&db, agent_id);
+            let mut session = session.lock().await;
+            session.sync(seed, sources);
+            session.report(&final_message).await
+        }
+        .await;
+        let report = match report {
+            Ok(Some(report)) => report,
+            Ok(None) => return,
+            Err(error) => {
+                eprintln!("rho-agent: turn report failed: {error:#}");
+                return;
+            }
+        };
+        // Pending still wants the report; so does snoozed — the turn
+        // finished inside the quiet window and the expiry broadcast will
+        // resurface this row, summary and all. Done and Hidden mean the
+        // user already moved on.
+        match db.read().get_agent(agent_id).disposition {
+            AgentDisposition::Pending | AgentDisposition::Snoozed { .. } => {}
+            AgentDisposition::Done | AgentDisposition::Hidden => return,
+        }
+        {
+            let mut write = db.write().await;
+            write.record_agent_turn_report(agent_id, &report);
+            write.commit();
+        }
+        if let Some(pool) = pool.upgrade() {
+            pool.publish_turn_report(agent_id, report);
+        }
+    });
 }
 
 fn presentation_input(db: &RhoDb, agent_id: AgentId) -> Option<(Seed, Vec<PresentationSource>)> {
@@ -217,7 +223,7 @@ struct SourceMessage {
     xml: String,
 }
 
-struct Session {
+pub(crate) struct Session {
     inference: Inference,
     session: InferenceSession,
     seed: Seed,
@@ -229,7 +235,7 @@ struct Session {
 }
 
 impl Session {
-    fn new(inference: Inference) -> Self {
+    pub(crate) fn new(inference: Inference) -> Self {
         let session = inference.status_session(PromptCacheKey::generate());
         Self {
             inference,

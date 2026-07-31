@@ -807,9 +807,12 @@ impl Agent {
             quota_observation: None,
         }));
         let notify = Arc::new(Notify::new());
+        let presentation_session = Arc::new(tokio::sync::Mutex::new(presentation::Session::new(
+            inference,
+        )));
         let agent_loop = AgentLoop {
             inference_session,
-            presentation_inference: inference,
+            presentation_session,
             model,
             auto_compaction_in_flight: false,
             pending_tools: FuturesUnordered::new(),
@@ -1195,7 +1198,9 @@ enum AgentControl {
 
 struct AgentLoop {
     inference_session: InferenceSession,
-    presentation_inference: Inference,
+    /// The agent's one persistent Luna session, shared by activity updates
+    /// and turn reports so both keep one prompt prefix warm.
+    presentation_session: Arc<tokio::sync::Mutex<presentation::Session>>,
     model: InferenceModel,
     /// The active request includes a trigger injected by the automatic
     /// context-occupancy policy. A compaction-only response must continue the
@@ -1916,6 +1921,13 @@ impl AgentLoop {
                                         })
                                         .await;
                                     }
+                                    presentation::spawn_turn_report(
+                                        self.persistence.db.clone(),
+                                        self.pool_events.clone(),
+                                        Arc::clone(&self.presentation_session),
+                                        self.persistence.agent_id,
+                                        &final_text,
+                                    );
                                     self.mail_parent(
                                         if final_text.is_empty() {
                                             "(turn finished with no text response)".to_owned()
@@ -2187,7 +2199,7 @@ impl AgentLoop {
             .and_then(|started| presentation::MIN_INTERVAL.checked_sub(now.duration_since(started)))
             .unwrap_or_default();
         let db = self.persistence.db.clone();
-        let inference = self.presentation_inference.clone();
+        let session = Arc::clone(&self.presentation_session);
         let agent_id = self.persistence.agent_id;
         let control = self.control.clone();
         self.presentation.task = Some(tokio::spawn(async move {
@@ -2214,7 +2226,7 @@ impl AgentLoop {
                         if !accepted.await.unwrap_or(false) {
                             return;
                         }
-                        presentation::generate(db, inference, agent_id, permit)
+                        presentation::generate(db, session, agent_id, permit)
                             .await
                             .map_err(|error| format!("{error:#}"))
                     }

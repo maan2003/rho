@@ -58,6 +58,7 @@ pub struct AgentPool {
     /// Fires after a user input has been durably accepted into an agent log.
     accepted_inputs: broadcast::Sender<AgentInputAccepted>,
     presentation_changes: broadcast::Sender<AgentPresentationChanged>,
+    turn_reports: broadcast::Sender<AgentTurnReported>,
     usage: Mutex<HashMap<(AgentId, u64), AgentUsageBucket>>,
     iris_tool_host: std::sync::RwLock<Option<crate::iris_tools::SharedIrisToolHost>>,
     slack_tool_host: std::sync::RwLock<Option<crate::slack_tools::SharedSlackToolHost>>,
@@ -102,6 +103,13 @@ pub struct AgentPresentationChanged {
     pub agent_id: AgentId,
     pub generated_title: Option<String>,
     pub activity: Option<String>,
+}
+
+/// Broadcast after a runtime persisted a turn report, for client fan-out.
+#[derive(Clone, Debug)]
+pub struct AgentTurnReported {
+    pub agent_id: AgentId,
+    pub report: crate::db::TurnReport,
 }
 
 /// One agent used as the execution backend for another agent runtime.
@@ -179,6 +187,7 @@ impl AgentPool {
             completed_assistant_items: broadcast::channel(64).0,
             accepted_inputs: broadcast::channel(64).0,
             presentation_changes: broadcast::channel(64).0,
+            turn_reports: broadcast::channel(64).0,
             usage: Mutex::new(HashMap::new()),
             iris_tool_host: std::sync::RwLock::new(None),
             slack_tool_host: std::sync::RwLock::new(None),
@@ -242,6 +251,16 @@ impl AgentPool {
 
     pub fn subscribe_presentation_changes(&self) -> broadcast::Receiver<AgentPresentationChanged> {
         self.presentation_changes.subscribe()
+    }
+
+    pub fn subscribe_turn_reports(&self) -> broadcast::Receiver<AgentTurnReported> {
+        self.turn_reports.subscribe()
+    }
+
+    pub(crate) fn publish_turn_report(&self, agent_id: AgentId, report: crate::db::TurnReport) {
+        let _ = self
+            .turn_reports
+            .send(AgentTurnReported { agent_id, report });
     }
 
     /// Keeps Luna work for this agent alive while the returned handle

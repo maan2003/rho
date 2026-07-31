@@ -1949,80 +1949,28 @@ fn spawn_presentation_projection(agents: Arc<AgentRegistry>) {
     });
 }
 
-/// Classifies each finished top-level turn from its final message and
-/// broadcasts the result, splitting Pending into needs-you and FYI rows.
-/// Generation runs on its own task so a slow provider call never delays the
-/// next completed turn; the disposition re-check at persist time drops a
-/// result the user already answered.
+/// Relays turn reports to every client. Classification and persistence
+/// happen runtime-side at turn end; broadcast loss is harmless because
+/// `Ready` snapshots carry the persisted report.
 fn spawn_turn_report_projection(agents: Arc<AgentRegistry>) {
-    let mut completed = agents.pool.subscribe_completed_turns();
+    let mut reports = agents.pool.subscribe_turn_reports();
     let agents = Arc::downgrade(&agents);
     tokio::spawn(async move {
         loop {
-            let turn = match completed.recv().await {
-                Ok(turn) => turn,
+            let reported = match reports.recv().await {
+                Ok(reported) => reported,
                 Err(broadcast::error::RecvError::Lagged(_)) => continue,
                 Err(broadcast::error::RecvError::Closed) => break,
             };
             let Some(agents) = agents.upgrade() else {
                 break;
             };
-            let final_answer = turn.final_answer.trim().to_owned();
-            if final_answer.is_empty() {
-                continue;
-            }
-            let record = agents.db.read().get_agent(turn.agent_id);
-            // Sub-agent turns are the parent's court unless the user has
-            // personally messaged the agent, and Iris is not a rail row;
-            // neither gets a report. Not gated on any client watching: the
-            // report decides row ordering, so it must exist before a client
-            // looks.
-            if (record.parent_agent.is_some() && !record.user_interacted)
-                || record.role == AgentRole::Iris
-                || record
-                    .labels
-                    .iter()
-                    .any(|label| label == rho_agent::iris_tools::LABEL)
-            {
-                continue;
-            }
-            let agent_id = turn.agent_id;
-            tokio::spawn(async move {
-                let report = match rho_agent::presentation::turn_report(
-                    agents.db.clone(),
-                    agents.inference.clone(),
-                    agent_id,
-                    &final_answer,
-                )
-                .await
-                {
-                    Ok(Some(report)) => report,
-                    Ok(None) => return,
-                    Err(error) => {
-                        eprintln!("rho-daemon: turn report failed: {error:#}");
-                        return;
-                    }
-                };
-                // Pending still wants the report; so does snoozed — the turn
-                // finished inside the quiet window and the expiry broadcast
-                // will resurface this row, one-liner and all. Done and Hidden
-                // mean the user already moved on.
-                match agents.db.read().get_agent(agent_id).disposition {
-                    AgentDisposition::Pending | AgentDisposition::Snoozed { .. } => {}
-                    AgentDisposition::Done | AgentDisposition::Hidden => return,
-                }
-                {
-                    let mut write = agents.db.write().await;
-                    write.record_agent_turn_report(agent_id, &report);
-                    write.commit();
-                }
-                let _ = agents.events.send(ServerMessage::AgentTurnReport {
-                    agent_id,
-                    report: UiTurnReport {
-                        needs_you: report.needs_you,
-                        summary: report.summary,
-                    },
-                });
+            let _ = agents.events.send(ServerMessage::AgentTurnReport {
+                agent_id: reported.agent_id,
+                report: UiTurnReport {
+                    needs_you: reported.report.needs_you,
+                    summary: reported.report.summary,
+                },
             });
         }
     });
