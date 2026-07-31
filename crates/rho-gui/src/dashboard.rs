@@ -1200,9 +1200,9 @@ fn visible_lines(lines: Vec<Line>, expanded: &HashSet<AgentId>) -> Vec<Line> {
 }
 
 /// The leading state glyph and status text of a row. State reads down one
-/// fixed glyph column — `?` needs you, `!` blocked, `✓` FYI, `·` otherwise —
-/// while the text stays uncolored: working rows show activity, finished rows
-/// show the turn report's summary, and only FYI rows dim.
+/// fixed glyph column — `?` needs you, `!` blocked, `✓` FYI, `▸` working,
+/// `·` quiet — while the title stays plain: working rows show activity,
+/// finished rows show the turn report's summary, and only that suffix dims.
 struct RowStatus<'a> {
     attention: UiAttention,
     activity: Option<&'a str>,
@@ -1233,17 +1233,8 @@ impl RowStatus<'_> {
                 Some(report) if !report.needs_you => (DashClass::Muted, "✓ "),
                 _ => (DashClass::Plain, "? "),
             },
-            UiAttention::Working | UiAttention::Quiet => (DashClass::Muted, "· "),
-        }
-    }
-
-    fn title_class(&self) -> Option<DashClass> {
-        match self.attention {
-            UiAttention::Pending => match self.report {
-                Some(report) if !report.needs_you => Some(DashClass::Muted),
-                _ => None,
-            },
-            _ => None,
+            UiAttention::Working => (DashClass::Muted, "▸ "),
+            UiAttention::Quiet => (DashClass::Muted, "· "),
         }
     }
 
@@ -1268,7 +1259,7 @@ impl RowStatus<'_> {
             text,
             at: line.text.len(),
         });
-        line.span(self.title_class(), |text| text.push_str(title));
+        line.span(None, |text| text.push_str(title));
         if let Some((class, suffix)) = self.suffix() {
             line.span(Some(class), |text| text.push_str(&suffix));
         }
@@ -1738,7 +1729,8 @@ mod tests {
                 .is_some_and(|glyph| glyph.text == "? ")
         );
 
-        // An FYI dims the whole row and swaps the glyph for a check.
+        // An FYI swaps the glyph for a check; the title stays plain and only
+        // the summary suffix dims.
         registry.set_turn_report(
             root_id,
             rho_ui_proto::UiTurnReport {
@@ -1754,11 +1746,11 @@ mod tests {
                 .as_ref()
                 .is_some_and(|glyph| glyph.text == "✓ ")
         );
-        assert!(lines[0].spans.iter().any(|(class, range)| {
+        assert!(!lines[0].spans.iter().any(|(class, range)| {
             *class == DashClass::Muted && lines[0].text[range.clone()].contains("topic")
         }));
 
-        // A new turn retires the report: the row is back to the working dot.
+        // A new turn retires the report: the row is back to the working glyph.
         registry.set_attention(root_id, UiAttention::Working);
         let lines = generate(&registry);
         assert!(!lines[0].text.contains("tests pass"));
@@ -1766,7 +1758,7 @@ mod tests {
             lines[0]
                 .glyph
                 .as_ref()
-                .is_some_and(|glyph| glyph.text == "· ")
+                .is_some_and(|glyph| glyph.text == "▸ ")
         );
     }
 

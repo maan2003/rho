@@ -2122,9 +2122,13 @@ impl AgentLoop {
                 &previous_kind,
                 &state.kind,
                 self.execution_generation != previous_execution_generation,
-            ) && let Some(pool) = self.pool_events.upgrade()
-            {
-                pool.settle_turn(self.persistence.agent_id).await;
+            ) {
+                // The activity throttle coalesces within a turn; the next
+                // turn's first update should not inherit this one's spacing.
+                self.presentation.last_started = None;
+                if let Some(pool) = self.pool_events.upgrade() {
+                    pool.settle_turn(self.persistence.agent_id).await;
+                }
             }
             *self.state.write().expect("poison") = state.clone();
             self.notify.notify_waiters();

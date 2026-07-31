@@ -822,12 +822,16 @@ impl ClaudeLoop {
                 &initial_kind,
                 &kind,
                 self.execution_generation != initial_execution_generation,
-            ) && let Some(pool) = self.pool_events.upgrade()
-            {
-                pool.settle_turn(self.agent_id).await;
-                // set_kind notified before the durable disposition changed;
-                // wake projections again so they observe the settled pair.
-                self.notify.notify_waiters();
+            ) {
+                // The activity throttle coalesces within a turn; the next
+                // turn's first update should not inherit this one's spacing.
+                self.presentation.last_started = None;
+                if let Some(pool) = self.pool_events.upgrade() {
+                    pool.settle_turn(self.agent_id).await;
+                    // set_kind notified before the durable disposition changed;
+                    // wake projections again so they observe the settled pair.
+                    self.notify.notify_waiters();
+                }
             }
         }
     }
