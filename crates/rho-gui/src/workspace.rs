@@ -2849,27 +2849,23 @@ impl Workspace {
     /// focused task or the dashboard's layout.
     fn preview_agent(
         &mut self,
-        agent_id: Option<AgentId>,
+        agent_id: AgentId,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.dashboard_preview == agent_id {
+        if self.dashboard_preview == Some(agent_id) {
             return;
         }
-        if let Some(agent_id) = agent_id
-            && self.connected()
+        if self.connected()
             && !self.subscriptions.contains(agent_id)
         {
             self.subscribe_agent(agent_id, cx);
         }
-        if let Some(agent_id) = &agent_id {
-            let view = self.materialize_model(agent_id, window, cx);
-            view.update(cx, |view, cx| view.tick_timers(now_ms(), cx));
-        }
-        self.dashboard_preview = agent_id;
-        self.hosts.focus_agent(
-            agent_id.and_then(|agent_id| Some((self.host_of(agent_id)?, agent_id))),
-        );
+        let view = self.materialize_model(&agent_id, window, cx);
+        view.update(cx, |view, cx| view.tick_timers(now_ms(), cx));
+        self.dashboard_preview = Some(agent_id);
+        self.hosts
+            .focus_agent(self.host_of(agent_id).map(|host| (host, agent_id)));
         self.ensure_duration_timer(cx);
         cx.notify();
     }
@@ -2939,18 +2935,15 @@ impl Workspace {
                 | RowTarget::Agent(agent_id)
                 | RowTarget::Reply(agent_id),
             ) if self.dashboard_preview != Some(agent_id) => {
-                self.preview_agent(Some(agent_id), window, cx);
+                self.preview_agent(agent_id, window, cx);
             }
             Some(
                 RowTarget::Stream { root: Some(_), .. } | RowTarget::Agent(_) | RowTarget::Reply(_),
             ) => {}
-            // Rows with no agent behind them (group headers, the fold
-            // toggle, drafts-in-progress) preview nothing.
-            _ => {
-                if self.dashboard_preview.is_some() {
-                    self.preview_agent(None, window, cx);
-                }
-            }
+            // Headers and the folded tail retain the last preview. Clearing
+            // it here would remove the preview pane, resize the dashboard,
+            // and visibly rewrap its rows on ordinary cursor motion.
+            _ => {}
         }
     }
 
@@ -3692,7 +3685,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.preview_agent(Some(agent_id), window, cx);
+        self.preview_agent(agent_id, window, cx);
     }
 
     #[cfg(test)]

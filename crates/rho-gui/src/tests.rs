@@ -378,6 +378,21 @@ fn startup_stays_on_the_first_dashboard_row(cx: &mut TestAppContext) {
                 !workspace.dashboard_is_dirty(),
                 "dashboard cursor previews must not rebuild the dashboard"
             );
+
+            let dashboard = workspace.dashboard_editor();
+            dashboard.update(cx, |editor, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let offset = snapshot.text().find("settled").expect("settled header");
+                let anchor = snapshot.anchor_before(multi_buffer::MultiBufferOffset(offset));
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_anchor_ranges([anchor..anchor]);
+                });
+            });
+            assert_eq!(
+                workspace.dashboard_preview_agent(),
+                Some(agent(1)),
+                "inert dashboard rows must retain the preview's layout"
+            );
         })
         .expect("start on dashboard");
 }
