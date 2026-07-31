@@ -60,6 +60,10 @@ enum LineKey {
         name: String,
         tail: bool,
     },
+    /// Separates attention-bearing workstreams from settled ones.
+    Section {
+        settled: bool,
+    },
     Stream(WorkstreamId),
     Agent(AgentId),
     Reply(AgentId),
@@ -1145,7 +1149,11 @@ impl Line {
 /// Serializes the registry into the dashboard listing.
 #[cfg(test)]
 fn generate(registry: &AgentRegistry) -> Vec<Line> {
-    generate_dashboard(registry).into_iter().skip(1).collect()
+    generate_dashboard(registry)
+        .into_iter()
+        .skip(1)
+        .filter(|line| !matches!(line.key, LineKey::Section { .. }))
+        .collect()
 }
 
 fn generate_dashboard(registry: &AgentRegistry) -> Vec<Line> {
@@ -1154,40 +1162,75 @@ fn generate_dashboard(registry: &AgentRegistry) -> Vec<Line> {
     let mut lines = vec![iris];
     let (listed, folded) = registry.split_rows();
     let multihost = registry.host_count() > 1;
-    for (section, tail) in [(listed, false), (folded, true)] {
-        for row in rail_rows(section, multihost) {
-            match row {
-                RailRow::HostHeader(host) => {
-                    let mut line = Line::new(LineKey::Host { host, tail }, RowTarget::None);
-                    let name = registry.host_name(host);
-                    line.span(Some(DashClass::Muted), |text| text.push_str(name));
-                    line.tail = tail;
-                    lines.push(line);
-                }
-                RailRow::GroupHeader { name, indent } => {
-                    let mut line = Line::new(
-                        LineKey::Group {
-                            name: name.to_owned(),
-                            tail,
-                        },
-                        RowTarget::None,
-                    );
-                    line.span(Some(DashClass::Muted), |text| {
-                        text.push_str(&"  ".repeat(indent));
-                        text.push_str(name);
-                    });
-                    line.tail = tail;
-                    lines.push(line);
-                }
-                RailRow::Task { topic, indent } => {
-                    let mut task = task_lines(topic, indent, registry);
-                    task.iter_mut().for_each(|line| line.tail = tail);
-                    lines.extend(task);
-                }
+    let (active, settled): (Vec<_>, Vec<_>) = listed.into_iter().partition(|topic| {
+        topic
+            .agents
+            .iter()
+            .any(|agent| !agent.hidden && registry.attention(agent.agent_id) != UiAttention::Quiet)
+    });
+    for (settled_section, section, tail) in [
+        (false, active, false),
+        (true, settled, false),
+        (true, folded, true),
+    ] {
+        if !tail && section.is_empty() {
+            continue;
+        }
+        if !tail {
+            let mut header = Line::new(
+                LineKey::Section {
+                    settled: settled_section,
+                },
+                RowTarget::None,
+            );
+            header.span(Some(DashClass::Muted), |text| {
+                text.push_str(if settled_section { "settled" } else { "active" });
+            });
+            lines.push(header);
+        }
+        append_rail_rows(&mut lines, section, multihost, tail, registry);
+    }
+    lines
+}
+
+fn append_rail_rows(
+    lines: &mut Vec<Line>,
+    section: Vec<&Workstream>,
+    multihost: bool,
+    tail: bool,
+    registry: &AgentRegistry,
+) {
+    for row in rail_rows(section, multihost) {
+        match row {
+            RailRow::HostHeader(host) => {
+                let mut line = Line::new(LineKey::Host { host, tail }, RowTarget::None);
+                let name = registry.host_name(host);
+                line.span(Some(DashClass::Muted), |text| text.push_str(name));
+                line.tail = tail;
+                lines.push(line);
+            }
+            RailRow::GroupHeader { name, indent } => {
+                let mut line = Line::new(
+                    LineKey::Group {
+                        name: name.to_owned(),
+                        tail,
+                    },
+                    RowTarget::None,
+                );
+                line.span(Some(DashClass::Muted), |text| {
+                    text.push_str(&"  ".repeat(indent));
+                    text.push_str(name);
+                });
+                line.tail = tail;
+                lines.push(line);
+            }
+            RailRow::Task { topic, indent } => {
+                let mut task = task_lines(topic, indent, registry);
+                task.iter_mut().for_each(|line| line.tail = tail);
+                lines.extend(task);
             }
         }
     }
-    lines
 }
 
 fn visible_lines(lines: Vec<Line>, expanded: &HashSet<AgentId>) -> Vec<Line> {
@@ -1532,7 +1575,48 @@ mod tests {
         assert_eq!(lines[0].key, LineKey::Iris);
         assert_eq!(lines[0].text, "iris · listening");
         assert_eq!(lines[0].target, RowTarget::Iris);
-        assert!(matches!(lines[1].target, RowTarget::Stream { .. }));
+        assert_eq!(lines[1].key, LineKey::Section { settled: true });
+        assert_eq!(lines[1].text, "settled");
+        assert_eq!(lines[1].target, RowTarget::None);
+        assert!(matches!(lines[2].target, RowTarget::Stream { .. }));
+    }
+
+    #[test]
+    fn active_section_precedes_settled() {
+        let active = agent(1, Status::Normal, 10);
+        let mut settled = agent(2, Status::Normal, 10);
+        settled.workstream = WorkstreamId(2);
+        let mut registry = AgentRegistry::default();
+        registry.set_data(
+            vec![
+                UiWorkstream {
+                    workstream_id: WorkstreamId(1),
+                    name: "active work".to_owned(),
+                    labels: Vec::new(),
+                },
+                UiWorkstream {
+                    workstream_id: WorkstreamId(2),
+                    name: "settled work".to_owned(),
+                    labels: Vec::new(),
+                },
+            ],
+            vec![active.clone(), settled],
+        );
+        registry.set_attention(active.agent_id, UiAttention::Working);
+
+        assert_eq!(
+            generate_dashboard(&registry)
+                .into_iter()
+                .map(|line| line.text)
+                .collect::<Vec<_>>(),
+            [
+                "iris · listening",
+                "active",
+                "active work",
+                "settled",
+                "settled work"
+            ]
+        );
     }
 
     fn split_agents<'a>(
