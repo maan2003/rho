@@ -177,11 +177,14 @@ pub(crate) fn spawn_turn_report(
         };
         // Pending still wants the report; so does snoozed — the turn
         // finished inside the quiet window and the expiry broadcast will
-        // resurface this row, summary and all. Done and Hidden mean the
-        // user already moved on.
+        // resurface this row, summary and all. A Done row keeps showing its
+        // settled summary, so a raced ack persists too; only Hidden means
+        // the user does not want the row at all.
         match db.read().get_agent(agent_id).disposition {
-            AgentDisposition::Pending | AgentDisposition::Snoozed { .. } => {}
-            AgentDisposition::Done | AgentDisposition::Hidden => return,
+            AgentDisposition::Pending
+            | AgentDisposition::Snoozed { .. }
+            | AgentDisposition::Done => {}
+            AgentDisposition::Hidden => return,
         }
         {
             let mut write = db.write().await;

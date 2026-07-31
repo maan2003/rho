@@ -1504,6 +1504,11 @@ impl AgentWriteTxnExt for WriteTxn {
             .value()
             .into_owned();
         agent.turn_report = Some(report.clone());
+        // An FYI asks nothing of the user; settle it like a pressed Done so
+        // it carries no attention weight while the row keeps its summary.
+        if !report.needs_you {
+            agent.disposition = AgentDisposition::Done;
+        }
         agents.insert(&agent_id, SenValue::borrowed(&agent));
     }
 

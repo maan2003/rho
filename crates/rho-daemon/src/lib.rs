@@ -1972,6 +1972,18 @@ fn spawn_turn_report_projection(agents: Arc<AgentRegistry>) {
                     summary: reported.report.summary,
                 },
             });
+            // An FYI settled the row Done as it persisted; tell clients the
+            // level moved, exactly as a user verdict would.
+            if !reported.report.needs_you {
+                let kind = agents
+                    .get(reported.agent_id)
+                    .await
+                    .map(|agent| agent.state().kind);
+                let _ = agents.events.send(ServerMessage::AgentAttention {
+                    agent_id: reported.agent_id,
+                    attention: attention_level(kind.as_ref(), AgentDisposition::Done),
+                });
+            }
         }
     });
 }

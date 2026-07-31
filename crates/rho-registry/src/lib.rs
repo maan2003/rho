@@ -637,12 +637,16 @@ impl AgentRegistry {
         self.turn_reports.insert(agent_id, report);
     }
 
-    /// The last finished turn's classification, shown only while that turn
-    /// still awaits the user — attention transitions retire it, no cleanup.
+    /// The last finished turn's classification, shown while that turn still
+    /// awaits the user or was settled — a settled row keeps its summary. A
+    /// new turn (Working) retires it, no cleanup.
     pub fn agent_turn_report(&self, agent_id: AgentId) -> Option<&rho_ui_proto::UiTurnReport> {
-        (self.attention(agent_id) == rho_ui_proto::UiAttention::Pending)
-            .then(|| self.turn_reports.get(&agent_id))
-            .flatten()
+        matches!(
+            self.attention(agent_id),
+            rho_ui_proto::UiAttention::Pending | rho_ui_proto::UiAttention::Quiet
+        )
+        .then(|| self.turn_reports.get(&agent_id))
+        .flatten()
     }
 
     pub fn attention(&self, agent_id: AgentId) -> rho_ui_proto::UiAttention {

@@ -853,6 +853,34 @@ async fn turn_end_and_user_message_set_dispositions() {
         AgentDisposition::Pending
     );
 
+    // A needs-you report leaves the verdict alone; an FYI settles like a
+    // pressed Done while the summary stays for the row.
+    let mut write = db.write().await;
+    write.record_agent_turn_report(
+        agent_id,
+        &crate::db::TurnReport {
+            needs_you: true,
+            summary: "which migration to drop?".to_owned(),
+        },
+    );
+    write.commit();
+    assert_eq!(
+        db.read().get_agent(agent_id).disposition,
+        AgentDisposition::Pending
+    );
+    let mut write = db.write().await;
+    write.record_agent_turn_report(
+        agent_id,
+        &crate::db::TurnReport {
+            needs_you: false,
+            summary: "tests pass".to_owned(),
+        },
+    );
+    write.commit();
+    let agent = db.read().get_agent(agent_id);
+    assert_eq!(agent.disposition, AgentDisposition::Done);
+    assert!(agent.turn_report.is_some());
+
     // A new user message overrides any verdict: snooze and the stale turn
     // report both give way to Done.
     let mut write = db.write().await;
@@ -865,8 +893,8 @@ async fn turn_end_and_user_message_set_dispositions() {
     write.record_agent_turn_report(
         agent_id,
         &crate::db::TurnReport {
-            needs_you: false,
-            summary: "tests pass".to_owned(),
+            needs_you: true,
+            summary: "which migration to drop?".to_owned(),
         },
     );
     write.record_agent_user_message(UnixMs(200), agent_id, "next task");

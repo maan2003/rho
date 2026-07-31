@@ -1204,9 +1204,10 @@ fn visible_lines(lines: Vec<Line>, expanded: &HashSet<AgentId>) -> Vec<Line> {
 }
 
 /// The leading state glyph and status text of a row. State reads down one
-/// fixed glyph column — `?` needs you, `!` blocked, `✓` FYI, `⋯` working,
-/// `·` quiet — while the title stays plain: working rows show activity,
-/// finished rows show the turn report's summary, and only that suffix dims.
+/// fixed glyph column — `?` needs you, `!` blocked, `✓` settled with a
+/// report, `~` working, `·` quiet — while the title stays plain: working
+/// rows show activity, finished rows keep the turn report's summary, and
+/// only that suffix dims.
 struct RowStatus<'a> {
     attention: UiAttention,
     activity: Option<&'a str>,
@@ -1237,7 +1238,8 @@ impl RowStatus<'_> {
                 Some(report) if !report.needs_you => (DashClass::Muted, "✓ "),
                 _ => (DashClass::Plain, "? "),
             },
-            UiAttention::Working => (DashClass::Muted, "⋯ "),
+            UiAttention::Working => (DashClass::Muted, "~ "),
+            UiAttention::Quiet if self.report.is_some() => (DashClass::Muted, "✓ "),
             UiAttention::Quiet => (DashClass::Muted, "· "),
         }
     }
@@ -1249,10 +1251,10 @@ impl RowStatus<'_> {
             UiAttention::Working => self
                 .activity
                 .map(|activity| (DashClass::Muted, format!(" · {activity}"))),
-            UiAttention::Pending => self
+            UiAttention::Pending | UiAttention::Quiet => self
                 .report
                 .map(|report| (DashClass::Muted, format!(" · {}", report.summary))),
-            UiAttention::NeedsInput | UiAttention::Quiet => None,
+            UiAttention::NeedsInput => None,
         }
     }
 
@@ -1754,6 +1756,18 @@ mod tests {
             *class == DashClass::Muted && lines[0].text[range.clone()].contains("topic")
         }));
 
+        // Settling (FYI auto-done or a pressed Done) keeps the check and
+        // summary on the quiet row.
+        registry.set_attention(root_id, UiAttention::Quiet);
+        let lines = generate(&registry);
+        assert!(lines[0].text.contains("· tests pass, pushed"));
+        assert!(
+            lines[0]
+                .glyph
+                .as_ref()
+                .is_some_and(|glyph| glyph.text == "✓ ")
+        );
+
         // A new turn retires the report: the row is back to the working glyph.
         registry.set_attention(root_id, UiAttention::Working);
         let lines = generate(&registry);
@@ -1762,7 +1776,7 @@ mod tests {
             lines[0]
                 .glyph
                 .as_ref()
-                .is_some_and(|glyph| glyph.text == "⋯ ")
+                .is_some_and(|glyph| glyph.text == "~ ")
         );
     }
 
