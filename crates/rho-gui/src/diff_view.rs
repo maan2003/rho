@@ -67,14 +67,14 @@ impl PreparedDiff {
         let deferred_paths = snapshot
             .files
             .iter()
-            .filter_map(|file| {
-                (matches!(file.base, WorkspaceDiffContent::Deferred)
+            .filter(|file| {
+                matches!(file.base, WorkspaceDiffContent::Deferred)
                     && matches!(
                         file.target,
                         WorkspaceDiffTarget::Text { .. } | WorkspaceDiffTarget::Absent
-                    ))
-                .then(|| file.path.clone())
+                    )
             })
+            .map(|file| file.path.clone())
             .collect::<Vec<_>>();
         let incremental = requested_paths.is_some();
         // Render the first page immediately. Subsequent pages are requested
@@ -453,7 +453,7 @@ impl DiffModel {
             .filter(|path| !next_paths.contains(*path))
             .cloned()
             .collect::<Vec<_>>();
-        for path in (!incremental).then_some(removed).unwrap_or_default() {
+        for path in if !incremental { removed } else { Vec::new() } {
             if self
                 .entries
                 .get(&path)
