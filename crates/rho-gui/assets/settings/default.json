@@ -51,7 +51,7 @@
   //           "custom": 2
   //         },
   "buffer_line_height": {
-    "custom": 1.2,
+    "custom": 1.4,
   },
   // The name of a font to use for rendering text in the UI.
   // The same bundled "Rho Font" the buffers use: rho's chrome is a

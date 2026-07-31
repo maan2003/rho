@@ -52,7 +52,7 @@
   //           "custom": 2
   //         },
   "buffer_line_height": {
-    "custom": 1.2,
+    "custom": 1.4,
   },
   // The name of a font to use for rendering text in the UI
   // You can set this to ".SystemUIFont" to use the system font

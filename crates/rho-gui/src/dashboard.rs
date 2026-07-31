@@ -154,7 +154,7 @@ impl Dashboard {
             );
             crate::editor_config::configure(&mut editor, window, cx);
             editor.set_text_style_refinement(gpui::TextStyleRefinement {
-                line_height: Some(gpui::relative(1.6)),
+                line_height: Some(gpui::relative(1.8)),
                 ..Default::default()
             });
             // Unlike the chat editors, clicking a row to put the cursor on
