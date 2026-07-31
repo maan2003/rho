@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::io::{BufRead, Write};
+use std::io::{BufRead, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
@@ -363,6 +363,104 @@ impl HttpHelper {
             }
         }
     }
+
+    fn bridge_stateless_connect(self, output: &mut impl Write) -> Result<()> {
+        let Self {
+            mut child,
+            mut input,
+            output: mut child_output,
+        } = self;
+        anyhow::ensure!(
+            relay_protocol_v2_message(&mut child_output, output, false)?,
+            "git-remote-http closed before its protocol-v2 advertisement"
+        );
+        let stdin = std::io::stdin();
+        let upload = std::thread::spawn(move || -> Result<()> {
+            std::io::copy(&mut stdin.lock(), &mut input)
+                .context("relay protocol-v2 requests to git-remote-http")?;
+            Ok(())
+        });
+        let download = (|| -> Result<()> {
+            while relay_protocol_v2_message(&mut child_output, output, true)? {}
+            Ok(())
+        })();
+        let upload = upload
+            .join()
+            .map_err(|_| anyhow::anyhow!("protocol-v2 upload relay panicked"))?;
+        let status = child.wait().context("wait for git-remote-http")?;
+        download?;
+        upload?;
+        anyhow::ensure!(status.success(), "git-remote-http exited with {status}");
+        Ok(())
+    }
+}
+
+/// `git-remote-http` emits smart-HTTP payloads directly. Flush each complete
+/// protocol-v2 message as it crosses the remote-helper boundary so Git can
+/// start its next stateless RPC request without waiting for the stream to end.
+fn relay_protocol_v2_message(
+    input: &mut impl Read,
+    output: &mut impl Write,
+    response: bool,
+) -> Result<bool> {
+    let mut header = [0; 4];
+    let read = input.read(&mut header).context("read protocol-v2 packet")?;
+    if read == 0 {
+        return Ok(false);
+    }
+    input
+        .read_exact(&mut header[read..])
+        .context("truncated protocol-v2 packet")?;
+
+    let mut service_announcement = false;
+    let mut flushes = 0;
+    loop {
+        output
+            .write_all(&header)
+            .context("write protocol-v2 packet")?;
+        let length = usize::from_str_radix(
+            std::str::from_utf8(&header).context("invalid protocol-v2 packet length")?,
+            16,
+        )
+        .context("invalid protocol-v2 packet length")?;
+        anyhow::ensure!(
+            length == 0 || length >= 4 || length == 1 || length == 2,
+            "invalid protocol-v2 packet length"
+        );
+
+        match length {
+            0 => {
+                flushes += 1;
+                if !response && (!service_announcement || flushes == 2) {
+                    output.flush().context("flush protocol-v2 advertisement")?;
+                    return Ok(true);
+                }
+            }
+            2 => {
+                anyhow::ensure!(
+                    response && flushes > 0,
+                    "unexpected protocol-v2 response end"
+                );
+                output.flush().context("flush protocol-v2 response")?;
+                return Ok(true);
+            }
+            1 => {}
+            _ => {
+                let mut payload = vec![0; length - 4];
+                input
+                    .read_exact(&mut payload)
+                    .context("truncated protocol-v2 packet")?;
+                service_announcement |= payload.starts_with(b"# service=");
+                output
+                    .write_all(&payload)
+                    .context("write protocol-v2 packet")?;
+            }
+        }
+
+        input
+            .read_exact(&mut header)
+            .context("truncated protocol-v2 packet")?;
+    }
 }
 
 #[derive(Default)]
@@ -442,7 +540,7 @@ fn run_http_helper(remote_name: &str, remote: &Remote) -> Result<()> {
             stdout.flush()?;
             break;
         }
-        if !matches!(capability.as_str(), "stateless-connect" | "get") {
+        if capability != "get" {
             writeln!(stdout, "{capability}")?;
         }
     }
@@ -473,6 +571,20 @@ fn run_http_helper(remote_name: &str, remote: &Remote) -> Result<()> {
             let batch = collect_batch(command, &mut commands)?;
             send_batch(&mut helper, &batch)?;
             helper.relay_until_blank(&mut stdout)?;
+            continue;
+        }
+        if matches!(
+            command.as_str(),
+            "stateless-connect git-upload-pack" | "stateless-connect git-receive-pack"
+        ) {
+            helper.send_line(&command)?;
+            let response = helper.read_line()?;
+            writeln!(stdout, "{response}")?;
+            stdout.flush()?;
+            if response.is_empty() {
+                drop(commands);
+                return helper.bridge_stateless_connect(&mut stdout);
+            }
             continue;
         }
         if command.starts_with("push ") {
@@ -989,5 +1101,18 @@ mod tests {
                 "--force-with-lease=refs/heads/new:".to_owned(),
             ]
         );
+    }
+
+    #[test]
+    fn stateless_connect_relays_and_flushes_v2_messages() {
+        let advertisement = b"001e# service=git-upload-pack\n0000000eversion 2\n0000";
+        let mut output = Vec::new();
+        assert!(relay_protocol_v2_message(&mut &advertisement[..], &mut output, false).unwrap());
+        assert_eq!(output, advertisement);
+
+        let response = b"0009hello00000002";
+        output.clear();
+        assert!(relay_protocol_v2_message(&mut &response[..], &mut output, true).unwrap());
+        assert_eq!(output, response);
     }
 }
