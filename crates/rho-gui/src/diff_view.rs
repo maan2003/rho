@@ -39,6 +39,7 @@ pub struct PreparedDiff {
     omitted: usize,
     metadata_only: Vec<String>,
     live_paths: Vec<Utf8PathBuf>,
+    change_epoch: u64,
 }
 
 struct PreparedEntry {
@@ -152,12 +153,14 @@ impl PreparedDiff {
             });
         }
 
+        let change_epoch = cx.update(|cx| remote.state.read(cx).change_epoch());
         Ok(Self {
             snapshot,
             entries,
             omitted,
             metadata_only,
             live_paths,
+            change_epoch,
         })
     }
 }
@@ -232,7 +235,14 @@ impl DiffModel {
             debounce_task: None,
             _project_subscription: project_subscription,
         };
+        let change_epoch = prepared.change_epoch;
         model.apply(prepared, cx);
+        if model.remote.state.read(cx).change_epoch() != change_epoch {
+            // The asynchronous watcher can finish while the initial manifest
+            // and live buffers are loading. Events emitted before the model
+            // subscribed are otherwise lossy; reconcile once on activation.
+            model.schedule_refresh(cx);
+        }
         model
     }
 

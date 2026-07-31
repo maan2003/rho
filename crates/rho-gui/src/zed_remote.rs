@@ -33,6 +33,10 @@ pub enum RemoteProjectEvent {
 pub struct RemoteProjectState {
     outgoing: Sender<WorkspaceClientFrame>,
     next_request_id: u64,
+    /// Monotonically advances for each daemon filesystem invalidation. Diff
+    /// preparation samples this so a watcher event that arrives before its
+    /// model subscribes cannot be lost.
+    change_epoch: u64,
     pending: HashMap<u64, Pending>,
     saving: std::collections::HashSet<Utf8PathBuf>,
     buffers: HashMap<Utf8PathBuf, OpenBuffer>,
@@ -61,6 +65,10 @@ enum Pending {
 impl gpui::EventEmitter<RemoteProjectEvent> for RemoteProjectState {}
 
 impl RemoteProjectState {
+    pub fn change_epoch(&self) -> u64 {
+        self.change_epoch
+    }
+
     pub fn opened_buffers(&self, _cx: &App) -> Vec<(Utf8PathBuf, Entity<Buffer>)> {
         self.buffers
             .iter()
@@ -179,6 +187,7 @@ impl RemoteProjectState {
                 }
             }
             WorkspaceServerFrame::Changed { paths, rescan } => {
+                self.change_epoch = self.change_epoch.wrapping_add(1);
                 cx.emit(RemoteProjectEvent::FilesChanged);
                 let paths = if rescan {
                     self.buffers.keys().cloned().collect::<Vec<_>>()
@@ -270,6 +279,7 @@ pub fn open_remote_project(
             cx.new(|_| RemoteProjectState {
                 outgoing,
                 next_request_id: 1,
+                change_epoch: 0,
                 pending: HashMap::new(),
                 saving: std::collections::HashSet::new(),
                 buffers: HashMap::new(),

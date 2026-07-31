@@ -4,13 +4,13 @@ use std::fs::File;
 use std::io::{Read as _, Write as _};
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::Component;
+use std::path::{Component, Path};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context as _, ensure};
 use camino::{Utf8Path, Utf8PathBuf};
-use notify::{RecursiveMode, Watcher as _};
+use notify::{Config, EventKindMask, RecursiveMode, Watcher as _};
 use rho_ui_proto::workspace::{FileReadResult, FileSaveResult, MAX_FILE_LEN};
 use sha2::{Digest as _, Sha256};
 
@@ -20,7 +20,20 @@ const MAX_CHANGED_PATHS: usize = 256;
 
 pub(super) enum WatchChange {
     Path(Utf8PathBuf),
+    Directory(Utf8PathBuf),
     Rescan,
+}
+
+/// A native watcher whose non-recursive directory registrations complete in
+/// the background.
+///
+/// A workspace snapshot is the authoritative diff barrier. File events only
+/// invalidate GUI state after that barrier, so the channel must not make its
+/// initial handshake wait for an O(directory-count) native registration.
+pub(super) struct WatcherSetup {
+    pub changes: tokio::sync::mpsc::Receiver<WatchChange>,
+    pub overflowed: Arc<AtomicBool>,
+    pub ready: tokio::task::JoinHandle<anyhow::Result<notify::RecommendedWatcher>>,
 }
 
 #[repr(C)]
@@ -303,19 +316,17 @@ impl WorkspaceFiles {
         }
     }
 
-    pub(super) fn watcher(
-        &self,
-    ) -> anyhow::Result<(
-        notify::RecommendedWatcher,
-        tokio::sync::mpsc::Receiver<WatchChange>,
-        Arc<AtomicBool>,
-    )> {
+    pub(super) fn start_watcher(&self) -> anyhow::Result<WatcherSetup> {
         let root = self.root.clone();
+        let event_root = root.clone();
         let (tx, rx) = tokio::sync::mpsc::channel(CHANGE_QUEUE);
         let overflowed = Arc::new(AtomicBool::new(false));
         let callback_overflowed = overflowed.clone();
-        let mut watcher =
-            notify::recommended_watcher(move |result: Result<notify::Event, notify::Error>| {
+        // notify's default subscribes to access (open/close) events. Workspace
+        // reads would then invalidate their own buffers and can overflow the
+        // event queue while a diff is loading. Zed uses this same core mask.
+        let watcher = notify::RecommendedWatcher::new(
+            move |result: Result<notify::Event, notify::Error>| {
                 let Ok(event) = result else {
                     callback_overflowed.store(true, Ordering::Release);
                     let _ = tx.try_send(WatchChange::Rescan);
@@ -329,23 +340,108 @@ impl WorkspaceFiles {
                     callback_overflowed.store(true, Ordering::Release);
                     let _ = tx.try_send(WatchChange::Rescan);
                 }
+                let watch_new_directories = matches!(
+                    event.kind,
+                    notify::EventKind::Create(_)
+                        | notify::EventKind::Modify(notify::event::ModifyKind::Name(_))
+                );
                 for path in event.paths {
-                    let Ok(relative) = path.strip_prefix(root.as_std_path()) else {
+                    let Ok(relative) = path.strip_prefix(event_root.as_std_path()) else {
                         continue;
                     };
                     let Ok(relative) = Utf8PathBuf::from_path_buf(relative.to_owned()) else {
                         continue;
                     };
-                    if validate_path(&relative).is_ok()
-                        && tx.try_send(WatchChange::Path(relative)).is_err()
+                    if validate_path(&relative).is_err() || is_workspace_metadata_path(&relative) {
+                        continue;
+                    }
+                    if watch_new_directories
+                        && path_is_directory(&path)
+                        && tx
+                            .try_send(WatchChange::Directory(relative.clone()))
+                            .is_err()
                     {
                         callback_overflowed.store(true, Ordering::Release);
                     }
+                    if tx.try_send(WatchChange::Path(relative)).is_err() {
+                        callback_overflowed.store(true, Ordering::Release);
+                    }
                 }
-            })?;
-        watcher.watch(self.root.as_std_path(), RecursiveMode::Recursive)?;
-        Ok((watcher, rx, overflowed))
+            },
+            Config::default().with_event_kinds(EventKindMask::CORE),
+        )?;
+        let ready = tokio::task::spawn_blocking(move || {
+            let mut watcher = watcher;
+            watch_directory_tree(&mut watcher, root.as_std_path())?;
+            Ok(watcher)
+        });
+        Ok(WatcherSetup {
+            changes: rx,
+            overflowed,
+            ready,
+        })
     }
+
+    /// Register a directory created after initial discovery and all of its
+    /// descendants. This is intentionally non-recursive on every platform:
+    /// it has Linux's cheap native-watch semantics while retaining coverage
+    /// where a platform's backend treats a root watch recursively.
+    pub(super) fn watch_directory_tree(
+        &self,
+        watcher: &mut notify::RecommendedWatcher,
+        relative: &Utf8Path,
+    ) -> anyhow::Result<()> {
+        let path = self.root.join(relative);
+        watch_directory_tree(watcher, path.as_std_path())
+    }
+}
+
+fn watch_directory_tree(
+    watcher: &mut notify::RecommendedWatcher,
+    root: &Path,
+) -> anyhow::Result<()> {
+    let mut directories = vec![root.to_owned()];
+    while let Some(directory) = directories.pop() {
+        watcher
+            .watch(&directory, RecursiveMode::NonRecursive)
+            .with_context(|| format!("watch workspace directory {}", directory.display()))?;
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("read workspace directory {}", directory.display()));
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("read workspace entry in {}", directory.display())
+                    });
+                }
+            };
+            let file_type = match entry.file_type() {
+                Ok(file_type) => file_type,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("inspect workspace entry {}", entry.path().display())
+                    });
+                }
+            };
+            if file_type.is_dir() && !is_workspace_metadata_name(&entry.file_name()) {
+                directories.push(entry.path());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn path_is_directory(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
 }
 
 fn watcher_event_requires_rescan(kind: &notify::EventKind) -> bool {
@@ -356,15 +452,31 @@ fn watcher_event_requires_rescan(kind: &notify::EventKind) -> bool {
     )
 }
 
+/// jj and colocated Git administration are not workspace-file edits. In
+/// particular, a diff's own jj snapshot must not schedule another diff refresh.
+fn is_workspace_metadata_path(path: &Utf8Path) -> bool {
+    path.as_str()
+        .split('/')
+        .any(|component| is_workspace_metadata_name(std::ffi::OsStr::new(component)))
+}
+
+fn is_workspace_metadata_name(name: &std::ffi::OsStr) -> bool {
+    matches!(name.to_str(), Some(".jj" | ".git"))
+}
+
 pub(super) fn drain_changes(
     first: WatchChange,
     rx: &mut tokio::sync::mpsc::Receiver<WatchChange>,
-) -> (Vec<Utf8PathBuf>, bool) {
+) -> (Vec<Utf8PathBuf>, Vec<Utf8PathBuf>, bool) {
     let mut paths = BTreeSet::new();
+    let mut directories = BTreeSet::new();
     let mut rescan = false;
     match first {
         WatchChange::Path(path) => {
             paths.insert(path);
+        }
+        WatchChange::Directory(path) => {
+            directories.insert(path);
         }
         WatchChange::Rescan => rescan = true,
     }
@@ -374,10 +486,17 @@ pub(super) fn drain_changes(
             WatchChange::Path(path) => {
                 paths.insert(path);
             }
+            WatchChange::Directory(path) => {
+                directories.insert(path);
+            }
             WatchChange::Rescan => rescan = true,
         }
     }
-    (paths.into_iter().collect(), rescan)
+    (
+        paths.into_iter().collect(),
+        directories.into_iter().collect(),
+        rescan,
+    )
 }
 
 fn validate_path(path: &Utf8Path) -> anyhow::Result<()> {
@@ -612,13 +731,43 @@ mod tests {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         tx.try_send(WatchChange::Path(Utf8PathBuf::from("a")))
             .unwrap();
+        tx.try_send(WatchChange::Directory(Utf8PathBuf::from("new")))
+            .unwrap();
         tx.try_send(WatchChange::Rescan).unwrap();
         tx.try_send(WatchChange::Path(Utf8PathBuf::from("b")))
             .unwrap();
         let first = rx.try_recv().unwrap();
-        let (paths, rescan) = drain_changes(first, &mut rx);
+        let (paths, directories, rescan) = drain_changes(first, &mut rx);
         assert_eq!(paths, [Utf8PathBuf::from("a"), Utf8PathBuf::from("b")]);
+        assert_eq!(directories, [Utf8PathBuf::from("new")]);
         assert!(rescan);
+    }
+
+    #[test]
+    fn directory_tree_watches_each_directory_non_recursively() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("src/nested")).unwrap();
+        std::fs::create_dir_all(root.path().join(".jj/repo")).unwrap();
+        let mut watcher = notify::RecommendedWatcher::new(
+            |_| {},
+            Config::default().with_event_kinds(EventKindMask::CORE),
+        )
+        .unwrap();
+
+        watch_directory_tree(&mut watcher, root.path()).unwrap();
+
+        let watched = watcher.watched_paths().unwrap();
+        assert!(
+            watched
+                .iter()
+                .all(|(_, mode)| *mode == RecursiveMode::NonRecursive)
+        );
+        assert!(watched.iter().any(|(path, _)| path.ends_with("src/nested")));
+        assert!(
+            !watched
+                .iter()
+                .any(|(path, _)| path.starts_with(root.path().join(".jj")))
+        );
     }
 
     #[test]
@@ -634,5 +783,17 @@ mod tests {
         assert!(!watcher_event_requires_rescan(&notify::EventKind::Modify(
             ModifyKind::Data(notify::event::DataChange::Content)
         )));
+    }
+
+    #[test]
+    fn watcher_ignores_vcs_metadata_paths() {
+        assert!(is_workspace_metadata_path(Utf8Path::new(
+            ".jj/repo/op_heads"
+        )));
+        assert!(is_workspace_metadata_path(Utf8Path::new(
+            "nested/.git/index"
+        )));
+        assert!(!is_workspace_metadata_path(Utf8Path::new("src/.gitignore")));
+        assert!(!is_workspace_metadata_path(Utf8Path::new("src/main.rs")));
     }
 }

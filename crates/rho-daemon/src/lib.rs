@@ -3398,7 +3398,7 @@ where
             return Err(error);
         }
     };
-    let (_watcher, mut changes, changes_overflowed) = match files.watcher() {
+    let watcher_setup = match files.start_watcher() {
         Ok(watcher) => watcher,
         Err(error) => {
             let _ = write_frame(
@@ -3414,8 +3414,51 @@ where
     write_frame(&mut writer, &ServerMessage::ChannelOpened).await?;
 
     use rho_ui_proto::workspace::{WorkspaceClientFrame, WorkspaceServerFrame};
+    let mut changes = watcher_setup.changes;
+    let changes_overflowed = watcher_setup.overflowed;
+    let mut watcher_ready = Some(watcher_setup.ready);
+    // Keep the watcher alive after its asynchronous directory registration
+    // completes. The leading underscore documents that ownership is the only
+    // purpose of this value.
+    let mut _watcher = None;
+    let mut pending_watch_directories = std::collections::BTreeSet::<camino::Utf8PathBuf>::new();
     loop {
         tokio::select! {
+            result = async { watcher_ready.as_mut().expect("watcher setup is enabled").await }, if watcher_ready.is_some() => {
+                // Drop the completed JoinHandle before retaining its watcher.
+                watcher_ready.take();
+                match result {
+                    Ok(Ok(watcher)) => {
+                        _watcher = Some(watcher);
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "workspace watcher registration failed");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "workspace watcher registration task failed");
+                    }
+                }
+                if let Some(watcher) = _watcher.as_mut() {
+                    for directory in std::mem::take(&mut pending_watch_directories) {
+                        if let Err(error) = files.watch_directory_tree(watcher, &directory) {
+                            tracing::warn!(%directory, %error, "watch newly created workspace directory");
+                        }
+                    }
+                }
+                // A watcher cannot report changes made before its directory
+                // registration completed. Treat that window like overflow; the
+                // GUI already reconciles it by reloading open buffers and
+                // scheduling a fresh jj semantic barrier.
+                rho_ui_proto::write_frame_limited(
+                    &mut writer,
+                    &WorkspaceServerFrame::Changed {
+                        paths: Vec::new(),
+                        rescan: true,
+                    },
+                    rho_ui_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
+                )
+                .await?;
+            }
             frame = rho_ui_proto::read_frame_limited::<_, WorkspaceClientFrame>(
                 &mut reader,
                 rho_ui_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
@@ -3454,8 +3497,16 @@ where
                 .await?;
             }
             Some(first) = changes.recv() => {
-                let (paths, explicit_rescan) =
+                let (paths, directories, explicit_rescan) =
                     workspace_channel::drain_changes(first, &mut changes);
+                pending_watch_directories.extend(directories);
+                if let Some(watcher) = _watcher.as_mut() {
+                    for directory in std::mem::take(&mut pending_watch_directories) {
+                        if let Err(error) = files.watch_directory_tree(watcher, &directory) {
+                            tracing::warn!(%directory, %error, "watch newly created workspace directory");
+                        }
+                    }
+                }
                 let overflowed = changes_overflowed.swap(false, Ordering::AcqRel);
                 let rescan = explicit_rescan || overflowed;
                 rho_ui_proto::write_frame_limited(
