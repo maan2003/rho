@@ -582,7 +582,10 @@ fn report_from_items(items: &[InferenceResponseItem]) -> Option<TurnReport> {
 }
 
 fn bounded_title(title: &str) -> Option<String> {
-    let title = title.trim();
+    // Luna occasionally calls `set_title` with lowercase words separated by
+    // whitespace despite the tool contract. Canonicalize that harmless form
+    // before enforcing the persisted kebab-case representation.
+    let title = title.split_whitespace().collect::<Vec<_>>().join("-");
     (!title.is_empty()
         && title.chars().count() <= MAX_TITLE_CHARS
         && title
@@ -657,6 +660,10 @@ mod tests {
         assert_eq!(
             bounded_title("daemon-socket"),
             Some("daemon-socket".to_owned())
+        );
+        assert_eq!(
+            bounded_title("ci lockfile fix"),
+            Some("ci-lockfile-fix".to_owned())
         );
         assert_eq!(bounded_title("Not kebab"), None);
         assert_eq!(
