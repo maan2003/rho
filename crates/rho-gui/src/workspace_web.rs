@@ -5,7 +5,9 @@ use std::collections::HashMap;
 
 use futures::StreamExt as _;
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, Focusable as _, Render, Subscription, Task, Window, div, px};
+use gpui::{
+    App, Context, Entity, Focusable as _, Pixels, Render, Subscription, Task, Window, div, px,
+};
 use rho_registry::session::{
     AgentSubscriptions, INITIAL_AGENT_SUBSCRIPTIONS, recent_workstream_roots,
 };
@@ -441,7 +443,11 @@ impl Render for Workspace {
         // hosts quick actions and doubles as clearance for the iPhone's
         // rounded corners and home indicator in PWA mode.
         let phone = coarse_pointer() && narrow;
-        let bar_height = px(40.);
+        let (inset_top, inset_right, inset_bottom, inset_left) = safe_area();
+        // The bar's button row stays 40px; the bottom safe-area inset extends
+        // it so the buttons clear the iPhone's home indicator and rounded
+        // corners while the bar background fills the screen edge.
+        let bar_height = px(40.) + inset_bottom;
         let show_keyboard = phone && self.agent_screen && self.keyboard_visible;
         window.set_direct_touch_region(
             show_keyboard.then(|| TouchKeyboard::region(window.viewport_size(), bar_height)),
@@ -457,6 +463,7 @@ impl Render for Workspace {
         let header_height = px(34.);
         let content_height = window.viewport_size().height
             - px(4.)
+            - inset_top
             - if phone { bar_height } else { px(0.) }
             - if show_keyboard {
                 TouchKeyboard::height()
@@ -608,6 +615,9 @@ impl Render for Workspace {
             .flex()
             .flex_col()
             .p(px(2.))
+            .pt(px(2.) + inset_top)
+            .pl(px(2.) + inset_left)
+            .pr(px(2.) + inset_right)
             .bg(cx.theme().colors().editor_background)
             .key_context("RhoGui")
             .on_action(cx.listener(Self::submit_prompt))
@@ -680,6 +690,30 @@ impl Render for Workspace {
 
 pub fn now_ms() -> u64 {
     js_sys::Date::now() as u64
+}
+
+/// Safe-area insets (top, right, bottom, left) of the display cutouts —
+/// status bar, rounded corners, home indicator — read from index.html's CSS
+/// env() probe. The canvas spans the full screen; the app pads around these.
+fn safe_area() -> (Pixels, Pixels, Pixels, Pixels) {
+    use wasm_bindgen::JsCast as _;
+    let zero = (px(0.), px(0.), px(0.), px(0.));
+    let Some(window) = web_sys::window() else {
+        return zero;
+    };
+    let window: &wasm_bindgen::JsValue = window.as_ref();
+    let Ok(hook) = js_sys::Reflect::get(window, &"__rhoSafeArea".into()) else {
+        return zero;
+    };
+    let Some(hook) = hook.dyn_ref::<js_sys::Function>() else {
+        return zero;
+    };
+    let Ok(values) = hook.call0(&wasm_bindgen::JsValue::NULL) else {
+        return zero;
+    };
+    let values = js_sys::Array::from(&values);
+    let inset = |index| px(values.get(index).as_f64().unwrap_or(0.) as f32);
+    (inset(0), inset(1), inset(2), inset(3))
 }
 
 /// Moves the index.html haptic switch overlay over the keyboard (negative
