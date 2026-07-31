@@ -249,7 +249,9 @@ it.
 The `eng-mini` tier uses the GPT-5.6 Luna Responses model with xhigh reasoning,
 fast mode, and direct tools instead of code mode. Engineers spawned by an
 `eng-mini` parent are also `eng-mini`; Engineers spawned by an `eng-alt`
-parent are `eng-cheap`.
+parent are `eng-cheap`. An `eng-cheap` parent spawns `eng-cheap` Engineers and
+`advisor-cheap` Advisors; `advisor-cheap` uses GPT-5.6 Terra with xhigh
+reasoning.
 PMs run with the normal direct tool surface (never code mode), coordinate
 exclusively through collaboration tools, and do not receive shell command,
 process-input, or patch tools. Their prompts omit repository `AGENTS.md` content

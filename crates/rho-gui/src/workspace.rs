@@ -5367,6 +5367,7 @@ fn agent_role_label(config: AgentRole) -> RoleLabel {
             text: match intelligence {
                 AdvisorIntelligence::Medium => "advisor",
                 AdvisorIntelligence::High => "advisor-high",
+                AdvisorIntelligence::Cheap => "advisor-cheap",
             }
             .to_owned(),
             family: if intelligence == AdvisorIntelligence::High {

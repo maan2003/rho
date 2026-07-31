@@ -35,7 +35,7 @@ enum DebugCommand {
     /// Render the system prompt and top-level model-facing tools for a role.
     RenderPrompt {
         /// Role text: eng, eng-mini, eng-low, eng-cheap, eng-high, eng-ultra,
-        /// eng-alt, pm, advisor, or advisor-high.
+        /// eng-alt, pm, advisor, advisor-cheap, or advisor-high.
         role: String,
     },
 }
@@ -119,11 +119,14 @@ fn parse_role(text: &str) -> anyhow::Result<AgentRole> {
         "advisor" => AgentRole::Advisor {
             intelligence: AdvisorIntelligence::Medium,
         },
+        "advisor-cheap" => AgentRole::Advisor {
+            intelligence: AdvisorIntelligence::Cheap,
+        },
         "advisor-high" => AgentRole::Advisor {
             intelligence: AdvisorIntelligence::High,
         },
         _ => anyhow::bail!(
-            "unknown role `{text}`; use eng, eng-mini, eng-low, eng-cheap, eng-high, eng-ultra, eng-alt, pm, advisor, or advisor-high"
+            "unknown role `{text}`; use eng, eng-mini, eng-low, eng-cheap, eng-high, eng-ultra, eng-alt, pm, advisor, advisor-cheap, or advisor-high"
         ),
     })
 }
@@ -360,6 +363,7 @@ fn config_name(config: rho_agent::db::AgentRole) -> String {
             match intelligence {
                 rho_agent::db::AdvisorIntelligence::Medium => "medium",
                 rho_agent::db::AdvisorIntelligence::High => "high",
+                rho_agent::db::AdvisorIntelligence::Cheap => "cheap",
             }
         ),
         AgentRole::Engineer { intelligence } | AgentRole::WorkflowEngineer { intelligence, .. } => {

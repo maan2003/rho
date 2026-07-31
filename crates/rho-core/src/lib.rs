@@ -122,6 +122,7 @@ pub enum EngineerIntelligence {
 pub enum AdvisorIntelligence {
     Medium,
     High,
+    Cheap,
 }
 
 impl Default for AgentRole {

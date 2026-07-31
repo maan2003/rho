@@ -320,6 +320,18 @@ fn agent_role_resolves_opinionated_bindings() {
         })
     ));
     assert!(matches!(
+        AgentRole::Advisor {
+            intelligence: AdvisorIntelligence::Cheap,
+        }
+        .session_profile()
+        .unwrap(),
+        SessionBinding::AdvisorTerra(InferenceProfile {
+            effort: ReasoningEffort::Xhigh,
+            fast_mode: false,
+            code_mode: true,
+        })
+    ));
+    assert!(matches!(
         AgentRole::pm().session_profile().unwrap(),
         SessionBinding::CoordinatorSol(InferenceProfile {
             effort: ReasoningEffort::Low,

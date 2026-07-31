@@ -458,6 +458,9 @@ pub(crate) enum SessionBinding {
     },
     /// Sol-backed advisory agent.
     AdvisorSol(InferenceProfile),
+    /// Terra-backed cheap advisory agent. Appended so persisted modes keep
+    /// decoding.
+    AdvisorTerra(InferenceProfile),
 }
 
 pub(crate) trait AgentRoleSessionProfile {
@@ -548,6 +551,9 @@ impl AgentRoleSessionProfile for AgentRole {
                 intelligence: AdvisorIntelligence::Medium,
             } => SessionBinding::AdvisorSol(deep(ReasoningEffort::Xhigh)),
             AgentRole::Advisor {
+                intelligence: AdvisorIntelligence::Cheap,
+            } => SessionBinding::AdvisorTerra(deep(ReasoningEffort::Xhigh)),
+            AgentRole::Advisor {
                 intelligence: AdvisorIntelligence::High,
             } => SessionBinding::ClaudeAdvisor {
                 effort: ClaudeEffort::High,
@@ -575,6 +581,10 @@ impl SessionBinding {
             return AgentRole::Advisor {
                 intelligence: AdvisorIntelligence::Medium,
             };
+        } else if matches!(self, Self::AdvisorTerra(_)) {
+            return AgentRole::Advisor {
+                intelligence: AdvisorIntelligence::Cheap,
+            };
         }
         let intelligence = match self {
             Self::ResponsesLuna(_) => EngineerIntelligence::Mini,
@@ -601,7 +611,8 @@ impl SessionBinding {
             | Self::ResponsesTerra(config)
             | Self::CoordinatorTerra(config)
             | Self::CoordinatorSol(config)
-            | Self::AdvisorSol(config) => match config.effort {
+            | Self::AdvisorSol(config)
+            | Self::AdvisorTerra(config) => match config.effort {
                 ReasoningEffort::Low => EngineerIntelligence::Low,
                 ReasoningEffort::Medium => EngineerIntelligence::Medium,
                 ReasoningEffort::High => EngineerIntelligence::High,
@@ -621,7 +632,8 @@ impl SessionBinding {
             | Self::ResponsesTerra(config)
             | Self::CoordinatorTerra(config)
             | Self::CoordinatorSol(config)
-            | Self::AdvisorSol(config) => Some(config),
+            | Self::AdvisorSol(config)
+            | Self::AdvisorTerra(config) => Some(config),
             Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeAdvisor { .. } => None,
         }
     }
@@ -631,7 +643,9 @@ impl SessionBinding {
             Self::ResponsesGpt55(_) => Some(InferenceModel::Gpt55),
             Self::ResponsesSol(_) | Self::AdvisorSol(_) => Some(InferenceModel::Gpt56Sol),
             Self::ResponsesLuna(_) => Some(InferenceModel::Gpt56Luna),
-            Self::ResponsesTerra(_) | Self::CoordinatorTerra(_) => Some(InferenceModel::Gpt56Terra),
+            Self::ResponsesTerra(_) | Self::CoordinatorTerra(_) | Self::AdvisorTerra(_) => {
+                Some(InferenceModel::Gpt56Terra)
+            }
             Self::CoordinatorSol(_) => Some(InferenceModel::Gpt56Sol),
             Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeAdvisor { .. } => None,
         }
@@ -647,7 +661,8 @@ impl SessionBinding {
             | Self::ResponsesTerra(_)
             | Self::CoordinatorTerra(_)
             | Self::CoordinatorSol(_)
-            | Self::AdvisorSol(_) => None,
+            | Self::AdvisorSol(_)
+            | Self::AdvisorTerra(_) => None,
         }
     }
 
@@ -663,7 +678,8 @@ impl SessionBinding {
             | Self::ResponsesTerra(_)
             | Self::CoordinatorTerra(_)
             | Self::CoordinatorSol(_)
-            | Self::AdvisorSol(_) => None,
+            | Self::AdvisorSol(_)
+            | Self::AdvisorTerra(_) => None,
         }
     }
 

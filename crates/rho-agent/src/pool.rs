@@ -422,7 +422,8 @@ impl AgentPool {
             | SessionBinding::ResponsesTerra(_)
             | SessionBinding::CoordinatorTerra(_)
             | SessionBinding::CoordinatorSol(_)
-            | SessionBinding::AdvisorSol(_) => {
+            | SessionBinding::AdvisorSol(_)
+            | SessionBinding::AdvisorTerra(_) => {
                 let (agent_id, agent) = Agent::create(
                     self.db.clone(),
                     self.inference.clone(),
@@ -796,6 +797,30 @@ fn child_role(parent: AgentRole, child: AgentRole) -> AgentRole {
         },
         (
             AgentRole::Engineer {
+                intelligence: EngineerIntelligence::Cheap,
+            }
+            | AgentRole::WorkflowEngineer {
+                intelligence: EngineerIntelligence::Cheap,
+                ..
+            },
+            AgentRole::Engineer { .. } | AgentRole::WorkflowEngineer { .. },
+        ) => AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Cheap,
+        },
+        (
+            AgentRole::Engineer {
+                intelligence: EngineerIntelligence::Cheap,
+            }
+            | AgentRole::WorkflowEngineer {
+                intelligence: EngineerIntelligence::Cheap,
+                ..
+            },
+            AgentRole::Advisor { .. },
+        ) => AgentRole::Advisor {
+            intelligence: crate::db::AdvisorIntelligence::Cheap,
+        },
+        (
+            AgentRole::Engineer {
                 intelligence: EngineerIntelligence::Mini,
             }
             | AgentRole::WorkflowEngineer {
@@ -1110,6 +1135,26 @@ mod tests {
                 AgentRole::default(),
             ),
             cheap
+        );
+    }
+
+    #[test]
+    fn cheap_engineers_spawn_cheap_agents() {
+        let cheap = AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Cheap,
+        };
+
+        assert_eq!(child_role(cheap, AgentRole::default()), cheap);
+        assert_eq!(
+            child_role(
+                cheap,
+                AgentRole::Advisor {
+                    intelligence: crate::db::AdvisorIntelligence::Medium,
+                },
+            ),
+            AgentRole::Advisor {
+                intelligence: crate::db::AdvisorIntelligence::Cheap,
+            }
         );
     }
 }
