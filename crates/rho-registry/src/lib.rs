@@ -2000,7 +2000,7 @@ mod tests {
 
     #[test]
     fn one_hosts_refresh_leaves_the_others_live_state_alone() {
-        let (mut registry, local, remote) = two_hosts();
+        let (mut registry, local, _remote) = two_hosts();
         registry.set_attention(remote_agent_id(2), rho_ui_proto::UiAttention::NeedsInput);
         registry.set_attention(agent_id(1), rho_ui_proto::UiAttention::NeedsInput);
 
