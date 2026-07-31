@@ -22,7 +22,7 @@ than by running a supervisor, extension protocol, or daemon process graph.
   receives positions only after event persistence, validates every result's
   source position in the serialized agent loop, and rebuilds after a lineage
   fork. The same loop owns watched UI leases, source coalescing, cancellation,
-  a 30-second request cadence, and result persistence; `AgentPool` only
+  a 15-second request cadence, and result persistence; `AgentPool` only
   routes a lease to the loaded runtime. Claude
   retains the daemon's one-shot title fallback because its external transcript
   has no equivalent native event cursor.

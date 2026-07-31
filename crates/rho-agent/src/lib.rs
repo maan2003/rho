@@ -1230,7 +1230,7 @@ struct PresentationState {
     task: Option<tokio::task::JoinHandle<()>>,
 }
 
-const PRESENTATION_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+const PRESENTATION_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
 
 impl Drop for AgentLoop {
     fn drop(&mut self) {
