@@ -2,6 +2,7 @@
 //! used by the native GPUI client. Transport remains direct iroh.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use futures::StreamExt as _;
 use gpui::prelude::*;
@@ -71,6 +72,10 @@ pub struct Workspace {
     /// keyboard toggle. It hides on a tap in the read-only transcript, the
     /// toggle again, and after sending a message.
     keyboard_visible: bool,
+    realtime_task: Option<Task<()>>,
+    realtime_stop: Option<tokio::sync::oneshot::Sender<()>>,
+    iris_context_agent: Arc<Mutex<Option<AgentId>>>,
+    voice_error: Option<String>,
     _event_task: Task<()>,
     _dashboard_subscription: Subscription,
     _transcript_subscription: Option<Subscription>,
@@ -121,6 +126,10 @@ impl Workspace {
             agent_screen: false,
             touch_keyboard,
             keyboard_visible: false,
+            realtime_task: None,
+            realtime_stop: None,
+            iris_context_agent: Arc::new(Mutex::new(None)),
+            voice_error: None,
             _event_task: event_task,
             _dashboard_subscription: dashboard_subscription,
             _transcript_subscription: None,
@@ -145,6 +154,11 @@ impl Workspace {
     fn handle_event(&mut self, event: Event, window: &mut Window, cx: &mut Context<Self>) {
         match event {
             Event::Phase(phase) => {
+                if phase != Phase::Online
+                    && let Some(stop) = self.realtime_stop.take()
+                {
+                    let _ = stop.send(());
+                }
                 self.phase = phase;
                 cx.notify();
             }
@@ -279,6 +293,10 @@ impl Workspace {
     fn dashboard_cursor_moved(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let target = self.dashboard.cursor_target(cx);
         let agent_id = match target {
+            Some(RowTarget::Iris) => {
+                self.toggle_voice(&crate::VoiceToggle, window, cx);
+                return;
+            }
             Some(RowTarget::Stream { root: Some(id), .. } | RowTarget::Agent(id)) => id,
             _ => return,
         };
@@ -290,6 +308,10 @@ impl Workspace {
             return;
         }
         self.registry.select_agent(agent_id);
+        *self
+            .iris_context_agent
+            .lock()
+            .expect("Iris context mutex poisoned") = Some(agent_id);
         let (subscribe, evicted) = self.subscriptions.touch(agent_id);
         if let Some(agent_id) = evicted {
             self.connection.send(ClientMessage::UnsubscribeAgents {
@@ -376,6 +398,38 @@ impl Workspace {
         });
         self.registry.touch_agent(agent_id);
         self.keyboard_visible = false;
+        cx.notify();
+    }
+
+    fn toggle_voice(&mut self, _: &crate::VoiceToggle, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(stop) = self.realtime_stop.take() {
+            let _ = stop.send(());
+            self.voice_error = None;
+            cx.notify();
+            return;
+        }
+        if self.phase != Phase::Online || self.realtime_task.is_some() {
+            return;
+        }
+        let dialer = self.connection.realtime_dialer();
+        let context_agent = Arc::clone(&self.iris_context_agent);
+        let (stop, stop_rx) = tokio::sync::oneshot::channel();
+        self.realtime_stop = Some(stop);
+        self.voice_error = None;
+        self.realtime_task = Some(cx.spawn(async move |this, cx| {
+            let result = crate::realtime_client::run(
+                move |offer_sdp| async move { dialer.open(offer_sdp).await },
+                context_agent,
+                stop_rx,
+            )
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                this.realtime_task = None;
+                this.realtime_stop = None;
+                this.voice_error = result.err().map(|error| format!("{error:#}"));
+                cx.notify();
+            });
+        }));
         cx.notify();
     }
 
@@ -634,6 +688,7 @@ impl Render for Workspace {
             .bg(cx.theme().colors().editor_background)
             .key_context("RhoGui")
             .on_action(cx.listener(Self::submit_prompt))
+            .on_action(cx.listener(Self::toggle_voice))
             .child(div().flex_1().overflow_hidden().child(body))
             .children(show_keyboard.then(|| self.touch_keyboard.clone().into_any_element()))
             .children(phone.then(|| {
@@ -646,7 +701,31 @@ impl Render for Workspace {
                     .justify_between()
                     .px_1()
                     .border_t_1()
-                    .border_color(card_border);
+                    .border_color(card_border)
+                    .child(
+                        div()
+                            .id("voice-toggle")
+                            .cursor_pointer()
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .px_4()
+                            .text_color(if self.voice_error.is_some() {
+                                cx.theme().status().error
+                            } else {
+                                text_muted
+                            })
+                            .child(if self.realtime_task.is_some() {
+                                "iris · stop"
+                            } else if self.voice_error.is_some() {
+                                "iris · retry"
+                            } else {
+                                "iris · listen"
+                            })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_voice(&crate::VoiceToggle, window, cx);
+                            })),
+                    );
                 if self.agent_screen {
                     bar = bar
                         .child(

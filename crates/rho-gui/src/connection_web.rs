@@ -5,14 +5,17 @@ use std::rc::Rc;
 use std::str::FromStr as _;
 use std::sync::Arc;
 
-use futures::StreamExt as _;
 use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use futures::channel::oneshot;
+use futures::{SinkExt as _, StreamExt as _};
 use hkdf::Hkdf;
 use iroh::EndpointId;
 use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
 use rho_registry::session::AgentStreamGenerations;
+use rho_ui_proto::realtime::{RealtimeClientFrame, RealtimeServerFrame};
 use rho_ui_proto::{ClientMessage, ServerMessage};
 use sha2::{Digest as _, Sha256};
+use tokio::io::AsyncWriteExt as _;
 use wasm_bindgen::{JsCast as _, JsValue};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use zeroize::Zeroize as _;
@@ -41,9 +44,40 @@ pub enum Phase {
 }
 
 pub struct Connection {
-    commands: UnboundedSender<ClientMessage>,
-    receiver: Rc<RefCell<Option<UnboundedReceiver<ClientMessage>>>>,
+    commands: UnboundedSender<Command>,
+    receiver: Rc<RefCell<Option<UnboundedReceiver<Command>>>>,
     events: UnboundedSender<Event>,
+}
+
+enum Command {
+    Control(ClientMessage),
+    Realtime {
+        offer_sdp: String,
+        response: oneshot::Sender<anyhow::Result<crate::realtime_client::RealtimeChannel>>,
+    },
+}
+
+#[derive(Clone)]
+pub(crate) struct RealtimeDialer {
+    commands: UnboundedSender<Command>,
+}
+
+impl RealtimeDialer {
+    pub(crate) async fn open(
+        &self,
+        offer_sdp: String,
+    ) -> anyhow::Result<crate::realtime_client::RealtimeChannel> {
+        let (response, reply) = oneshot::channel();
+        self.commands
+            .unbounded_send(Command::Realtime {
+                offer_sdp,
+                response,
+            })
+            .map_err(|_| anyhow::anyhow!("daemon connection closed"))?;
+        reply
+            .await
+            .map_err(|_| anyhow::anyhow!("daemon connection closed"))?
+    }
 }
 
 impl Connection {
@@ -61,7 +95,13 @@ impl Connection {
     }
 
     pub fn send(&self, message: ClientMessage) {
-        let _ = self.commands.unbounded_send(message);
+        let _ = self.commands.unbounded_send(Command::Control(message));
+    }
+
+    pub(crate) fn realtime_dialer(&self) -> RealtimeDialer {
+        RealtimeDialer {
+            commands: self.commands.clone(),
+        }
     }
 
     pub fn connect(&self, daemon: String) {
@@ -118,7 +158,7 @@ fn conn_log(message: &str) {
 
 async fn run(
     daemon: &str,
-    mut receiver: UnboundedReceiver<ClientMessage>,
+    mut receiver: UnboundedReceiver<Command>,
     events: UnboundedSender<Event>,
 ) -> anyhow::Result<()> {
     let daemon = EndpointId::from_str(daemon.trim())
@@ -157,13 +197,27 @@ async fn run(
     let mut send = rho_rpc::Writer::new(send);
     let mut recv = rho_rpc::Reader::new(recv);
     rho_ui_proto::write_frame(&mut send, &ClientMessage::Subscribe).await?;
+    let channel_connection = connection.clone();
     spawn_local(async move {
-        while let Some(message) = receiver.next().await {
-            if rho_ui_proto::write_frame(&mut send, &message)
-                .await
-                .is_err()
-            {
-                break;
+        while let Some(command) = receiver.next().await {
+            match command {
+                Command::Control(message) => {
+                    if rho_ui_proto::write_frame(&mut send, &message)
+                        .await
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+                Command::Realtime {
+                    offer_sdp,
+                    response,
+                } => {
+                    let connection = channel_connection.clone();
+                    spawn_local(async move {
+                        let _ = response.send(dial_realtime(connection, offer_sdp).await);
+                    });
+                }
             }
         }
     });
@@ -172,6 +226,50 @@ async fn run(
         read_agent_streams(events.clone(), connection)
     )?;
     Ok(())
+}
+
+async fn dial_realtime(
+    connection: iroh::endpoint::Connection,
+    offer_sdp: String,
+) -> anyhow::Result<crate::realtime_client::RealtimeChannel> {
+    let mut stream = rho_rpc::Dialer::Iroh(connection).open(Some(50)).await?;
+    rho_ui_proto::write_frame(&mut stream, &ClientMessage::RealtimeOpen { offer_sdp }).await?;
+    let answer_sdp = match rho_ui_proto::read_frame::<_, ServerMessage>(&mut stream).await? {
+        ServerMessage::RealtimeOpened { answer_sdp } => answer_sdp,
+        ServerMessage::RealtimeRefused { reason } => anyhow::bail!(reason),
+        _ => anyhow::bail!("unexpected reply to RealtimeOpen"),
+    };
+    let (mut reader, mut writer) = stream.into_split();
+    let (requests, mut request_rx) = mpsc::channel::<RealtimeClientFrame>(32);
+    let (mut reply_tx, replies) = mpsc::channel::<anyhow::Result<RealtimeServerFrame>>(32);
+    let mut writer_errors = reply_tx.clone();
+    spawn_local(async move {
+        while let Some(frame) = request_rx.next().await {
+            if let Err(error) =
+                rho_ui_proto::write_frame_limited(&mut writer, &frame, rho_ui_proto::MAX_FRAME_LEN)
+                    .await
+            {
+                let _ = writer_errors.send(Err(error)).await;
+                break;
+            }
+        }
+        let _ = writer.shutdown().await;
+    });
+    spawn_local(async move {
+        loop {
+            let result =
+                rho_ui_proto::read_frame_limited(&mut reader, rho_ui_proto::MAX_FRAME_LEN).await;
+            let failed = result.is_err();
+            if reply_tx.send(result).await.is_err() || failed {
+                break;
+            }
+        }
+    });
+    Ok(crate::realtime_client::RealtimeChannel {
+        answer_sdp,
+        requests,
+        replies,
+    })
 }
 
 async fn read_loop(

@@ -19,9 +19,9 @@ provider and an unwrapped clang.
 | Source | Classification | Boundary and coupled consumers |
 | --- | --- | --- |
 | `main.rs` | native entry point | CLI, tracing subscriber, profiling files, rustls provider, Wayland app boot, daemon attachment, native initialization. Its module declarations must move to `lib.rs` so the library is the source of truth. |
-| `connection.rs` | mixed, port after views | Tokio/`gpui_tokio`, Unix channels and native RPC features are native; iroh itself is the browser transport too. Its channel types are consumed throughout `workspace.rs`, `zed_remote.rs`, `terminal_view.rs`, `shell_view.rs`, and `native_realtime.rs`; those payload paths must be gated together until the direct iroh wasm source path is enabled. Keep the browser connection direct, not behind a new abstraction. |
+| `connection.rs` | mixed, port after views | Tokio/`gpui_tokio`, Unix channels and native RPC features are native; iroh itself is the browser transport too. Its channel types are consumed throughout `workspace.rs`, `zed_remote.rs`, `terminal_view.rs`, `shell_view.rs`, and `realtime_client.rs`; those payload paths must be gated together until the direct iroh wasm source path is enabled. Keep the browser connection direct, not behind a new abstraction. |
 | `zed_remote.rs` | connection-coupled | Remote buffer/project synchronization and language registry setup are driven by the connection. Markdown's portable static grammar registration must not depend on this module. |
-| `native_realtime.rs`, `chime.rs`, `sampler.rs` | native | Native WebRTC/media and rodio output. The workspace voice state/actions and tests are their consumers and must be gated together. |
+| `realtime_client.rs` | portable orchestration | Delegation/request mapping, response routing, transcript-tail flush, and the dedicated daemon channel are shared. `rho-realtime` supplies target-specific native or browser media. |
 | `terminal_view.rs`, `shell_view.rs` | native | Long-lived daemon channels and terminal/shell payloads. Workspace surface variants/actions that construct or operate these views are matching consumers. |
 | `commands.rs` | native integration | Project-backed completion provider uses `project`. Generic candidate/token matching needed by the minibuffer can remain portable or move to its portable owner. Draft/agent editor completion setup is the consumer. |
 | `diff_view.rs` | native integration | Remote project diff/save behavior depends on `zed_remote`; workspace diff surface and actions are its consumers. Pure diff preparation is portable in principle but is not needed by the stage-1 dashboard/transcript client. |
@@ -45,7 +45,7 @@ provider and an unwrapped clang.
 
 Native-only feature members: `clap`, `dirs`, `gpui_tokio`, `fs`, `project`,
 `node_runtime`, `languages/load-grammars`, `rho-iroh-auth`, `rho-profiling`,
-`rho-realtime`, `rho-rpc/native-client`, `rustls`, `rodio`, `search`,
+`rho-rpc/native-client`, `rustls`, `rodio`, `search`,
 `command_palette`, `tokio`, `tracing-subscriber`, `vim`, `vim_mode_setting`,
 `prefix-id/redb`, and Wayland/font-kit GPUI platform features. `connection.rs`,
 native views, and `zed_remote.rs` are the source owners of those dependencies.
@@ -64,6 +64,10 @@ equivalent downstream defaults) so existing native behavior does not change.
 - Inventory written before source or Cargo gating.
 - Browser connection target is direct iroh; no transport
   abstraction is introduced.
+- Browser realtime opens a dedicated stream on that already-authenticated iroh
+  connection. Provider media remains direct between the browser WebRTC peer and
+  ChatGPT; the shared Iris driver alone forwards typed delegation state through
+  the daemon.
 - Added a library target and made the unchanged native binary require the
   default-on `native` feature. Actions and view modules now belong to the
   library; the binary remains the native application/bootstrap owner.

@@ -1,5 +1,6 @@
 //! GUI integration for the provider-independent `rho-realtime` session.
 
+use std::future::Future;
 use std::sync::{Arc, Mutex};
 
 use anyhow::bail;
@@ -12,17 +13,44 @@ use rho_ui_proto::realtime::{
     RealtimeClientFrame, RealtimeRequestId, RealtimeResponsePhase, RealtimeServerFrame,
 };
 
+#[cfg(feature = "native")]
 use crate::connection::{ChannelDialer, dial_realtime};
 
-pub(crate) async fn run(
+pub(crate) struct RealtimeChannel {
+    pub(crate) answer_sdp: String,
+    pub(crate) requests: futures::channel::mpsc::Sender<RealtimeClientFrame>,
+    pub(crate) replies: futures::channel::mpsc::Receiver<anyhow::Result<RealtimeServerFrame>>,
+    #[cfg(feature = "native")]
+    pub(crate) _transport: rho_rpc::ChannelTask,
+}
+
+#[cfg(feature = "native")]
+pub(crate) async fn run_native(
     dialer: ChannelDialer,
     context_agent: Arc<Mutex<Option<AgentId>>>,
-    mut stop: tokio::sync::oneshot::Receiver<()>,
+    stop: tokio::sync::oneshot::Receiver<()>,
 ) -> anyhow::Result<()> {
-    tracing::info!("starting native Iris realtime session");
+    run(
+        move |offer_sdp| dial_realtime(dialer, offer_sdp),
+        context_agent,
+        stop,
+    )
+    .await
+}
+
+pub(crate) async fn run<D, F>(
+    dial: D,
+    context_agent: Arc<Mutex<Option<AgentId>>>,
+    mut stop: tokio::sync::oneshot::Receiver<()>,
+) -> anyhow::Result<()>
+where
+    D: FnOnce(String) -> F,
+    F: Future<Output = anyhow::Result<RealtimeChannel>>,
+{
+    tracing::info!("starting Iris realtime session");
     let (channel_tx, channel_rx) = tokio::sync::oneshot::channel();
     let mut session = RealtimeSession::connect(move |offer_sdp| async move {
-        let channel = dial_realtime(dialer, offer_sdp.into_string()).await?;
+        let channel = dial(offer_sdp.into_string()).await?;
         let answer_sdp = channel.answer_sdp.clone();
         channel_tx
             .send(channel)
@@ -31,7 +59,7 @@ pub(crate) async fn run(
     })
     .await?;
     let mut channel = channel_rx.await?;
-    tracing::info!("native realtime client session established");
+    tracing::info!("realtime client session established");
     let mut next_request_id = 1_u64;
     let mut requests = Vec::new();
     const MAX_OUTSTANDING_DELEGATIONS: usize = 16;
@@ -68,7 +96,7 @@ pub(crate) async fn run(
             }
             Some(RealtimeEvent::Error(error)) => bail!("realtime provider error: {error}"),
             Some(RealtimeEvent::Closed) | None => {
-                tracing::info!("native realtime peer closed");
+                tracing::info!("realtime peer closed");
                 break;
             }
         },
@@ -135,7 +163,7 @@ pub(crate) async fn run(
     }
     let _ = channel.requests.send(RealtimeClientFrame::Close).await;
     result?;
-    tracing::info!("native realtime client session ended");
+    tracing::info!("realtime client session ended");
     Ok(())
 }
 

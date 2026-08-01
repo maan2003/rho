@@ -182,18 +182,10 @@ pub struct ShellSubmission {
     pub accepted: tokio::sync::oneshot::Sender<u64>,
 }
 
-pub struct RealtimeChannel {
-    pub answer_sdp: String,
-    pub requests: futures_mpsc::Sender<rho_ui_proto::realtime::RealtimeClientFrame>,
-    pub replies:
-        futures_mpsc::Receiver<anyhow::Result<rho_ui_proto::realtime::RealtimeServerFrame>>,
-    _transport: rho_rpc::ChannelTask,
-}
-
 pub(crate) async fn dial_realtime(
     dialer: ChannelDialer,
     offer_sdp: String,
-) -> anyhow::Result<RealtimeChannel> {
+) -> anyhow::Result<crate::realtime_client::RealtimeChannel> {
     let mut stream = dial_stream(dialer).await?;
     write_frame(&mut stream, &ClientMessage::RealtimeOpen { offer_sdp }).await?;
     let answer_sdp = match read_frame::<_, ServerMessage>(&mut stream).await? {
@@ -208,7 +200,7 @@ pub(crate) async fn dial_realtime(
         rx_capacity: 32,
     });
     let (requests, replies, transport) = channel.into_parts();
-    Ok(RealtimeChannel {
+    Ok(crate::realtime_client::RealtimeChannel {
         answer_sdp,
         requests,
         replies,
@@ -712,7 +704,7 @@ impl Connection {
         let dialer = self.dialer.lock().unwrap().clone();
         Tokio::spawn(cx, async move {
             let dialer = dialer.context("not connected to rho-daemon")?;
-            crate::native_realtime::run(dialer, context_agent, stop).await
+            crate::realtime_client::run_native(dialer, context_agent, stop).await
         })
     }
 }

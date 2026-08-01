@@ -146,11 +146,12 @@ than by running a supervisor, extension protocol, or daemon process graph.
   text, validates response ordering and bounds, sanitizes output, and exposes
   only canonical structured state to clients.
 - `rho-realtime` is a provider-protocol crate outside the text inference
-  contract. It owns libwebrtc-based native media (including audio processing,
-  codec handling, and jitter buffering), microphone/playback, and the typed
+  contract. It owns target-specific WebRTC media—libwebrtc-based native media
+  (including audio processing, codec handling, and jitter buffering) and the
+  browser's WebRTC/media APIs—microphone/playback, and the typed
   realtime provider protocol, and exposes a `RealtimeSession` whose public
   event stream includes typed input/output transcript deltas, completed
-  transcript parts, and delegation requests. The native GUI owns media and
+  transcript parts, and delegation requests. Each GUI client owns media and
   provider events, retains the active role-bearing conversation snapshot, and
   forwards each request with that snapshot and the current semantic agent
   context. Unhandled user transcript tails are flushed when the session ends.

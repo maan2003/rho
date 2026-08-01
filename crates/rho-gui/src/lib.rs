@@ -18,9 +18,8 @@ pub mod highlights;
 #[cfg(feature = "native")]
 pub mod hosts;
 pub mod minibuffer;
-#[cfg(feature = "native")]
-pub(crate) mod native_realtime;
 pub mod pane;
+pub(crate) mod realtime_client;
 pub mod render;
 pub mod rho_assets;
 #[cfg(all(test, feature = "native"))]

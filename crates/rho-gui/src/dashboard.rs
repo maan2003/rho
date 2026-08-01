@@ -1158,7 +1158,7 @@ fn generate(registry: &AgentRegistry) -> Vec<Line> {
 
 fn generate_dashboard(registry: &AgentRegistry) -> Vec<Line> {
     let mut iris = Line::new(LineKey::Iris, RowTarget::Iris);
-    iris.text.push_str("iris · listening");
+    iris.text.push_str("iris · listen");
     let mut lines = vec![iris];
     let (listed, folded) = registry.split_rows();
     let multihost = registry.host_count() > 1;
@@ -1573,7 +1573,7 @@ mod tests {
 
         let lines = generate_dashboard(&registry);
         assert_eq!(lines[0].key, LineKey::Iris);
-        assert_eq!(lines[0].text, "iris · listening");
+        assert_eq!(lines[0].text, "iris · listen");
         assert_eq!(lines[0].target, RowTarget::Iris);
         assert_eq!(lines[1].key, LineKey::Section { settled: true });
         assert_eq!(lines[1].text, "settled");
@@ -1610,7 +1610,7 @@ mod tests {
                 .map(|line| line.text)
                 .collect::<Vec<_>>(),
             [
-                "iris · listening",
+                "iris · listen",
                 "active",
                 "active work",
                 "settled",

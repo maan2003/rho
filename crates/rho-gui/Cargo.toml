@@ -33,7 +33,6 @@ native = [
   "dep:release_channel",
   "dep:rho-iroh-auth",
   "dep:rho-profiling",
-  "dep:rho-realtime",
   "dep:rho-rpc",
   "dep:rodio",
   "dep:rustls",
@@ -80,7 +79,7 @@ release_channel = { path = "../../vendor/zed/crates/release_channel", optional =
 rho-core.workspace = true
 rho-iroh-auth = { workspace = true, optional = true }
 rho-profiling = { workspace = true, optional = true }
-rho-realtime = { workspace = true, optional = true }
+rho-realtime.workspace = true
 rho-registry.workspace = true
 rho-rpc = { workspace = true, optional = true }
 rho-ui-proto.workspace = true

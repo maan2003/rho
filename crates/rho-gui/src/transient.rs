@@ -521,13 +521,9 @@ pub fn root_menu() -> Transient {
         .item("i", "input…", |workspace, window, cx| {
             workspace.open_transient(input_menu(), window, cx);
         })
-        .item(
-            "m",
-            "iris microphone · listening",
-            |workspace, window, cx| {
-                workspace.cmd_voice(window, cx);
-            },
-        )
+        .item("m", "iris microphone · toggle", |workspace, window, cx| {
+            workspace.cmd_voice(window, cx);
+        })
         .item("shift-m", "iris follow selection", |workspace, _, cx| {
             workspace.cmd_iris_follow_selection(cx);
         })

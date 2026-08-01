@@ -492,14 +492,17 @@ metadata; it performs no inference and creates no agent or workspace.
 
 ## Realtime voice provider (`rho-realtime`)
 
-- The native GUI starts Iris after its first daemon-ready snapshot, so
-  microphone audio begins leaving the machine without a separate per-launch
-  action. The always-visible `iris · listening` dashboard row communicates
-  that policy, and `Space m` stops or restarts the session. `rho-realtime`
-  captures and plays audio locally;
+- A GUI starts Iris only after the user activates its Iris control. The
+  always-visible Iris dashboard row exposes that control, and the native
+  `Space m` binding stops or restarts the session. Browser microphone access
+  additionally remains subject to secure-context, permission, and user-
+  activation policy. `rho-realtime` captures and plays audio on the client;
   encoded media flows directly between the GUI-owned WebRTC peer and ChatGPT,
   never through the daemon. Dropping the GUI session closes its data channel,
-  peer connection, microphone task, and playback sink.
+  peer connection, microphone capture, and playback resources. Mobile browser
+  suspension may end the session; canonical Iris and agent state remains
+  daemon-owned and the client must reconnect rather than relying on background
+  execution.
 - The OAuth bearer token remains daemon-side. The GUI sends a bounded SDP
   offer over a dedicated authenticated UI stream; the daemon resolves the
   existing ChatGPT OAuth credential and calls the realtime signaling endpoint.
