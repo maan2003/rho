@@ -993,3 +993,64 @@ async fn agent_ids_allocate_before_records_exist() {
     assert_eq!(read.get_agent(agent_id).workdirs, vec![test_workspace()]);
     assert_eq!(read.list_agents().len(), 1);
 }
+
+#[tokio::test]
+async fn response_subscriptions_are_persistent_edges() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let subscriber = write.alloc_agent_id();
+    let target = write.alloc_agent_id();
+    write.set_agent_response_subscription(subscriber, target, true);
+    write.commit();
+
+    assert!(db.read().is_agent_response_subscribed(subscriber, target));
+    assert_eq!(db.read().agent_response_subscribers(target), [subscriber]);
+
+    let mut write = db.write().await;
+    write.set_agent_response_subscription(subscriber, target, false);
+    write.commit();
+    assert!(!db.read().is_agent_response_subscribed(subscriber, target));
+    assert!(db.read().agent_response_subscribers(target).is_empty());
+}
+
+#[tokio::test]
+async fn migrates_existing_parent_edges_to_response_subscriptions() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let workstream = write.create_workstream(UnixMs(1), "migration".to_owned());
+    let parent = write.alloc_agent_id();
+    write.create_agent(
+        UnixMs(1),
+        parent,
+        workstream,
+        None,
+        vec![test_workspace()],
+        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
+        test_agent_runtime(),
+        None,
+    );
+    let child = write.alloc_agent_id();
+    write.create_agent(
+        UnixMs(2),
+        child,
+        workstream,
+        None,
+        vec![test_workspace()],
+        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
+        test_agent_runtime(),
+        Some(parent),
+    );
+    write.open_table(FORMAT).insert(&(), &"7c5e2a91".to_owned());
+    write.commit();
+
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    write.commit();
+
+    assert_eq!(db.read().agent_response_subscribers(child), [parent]);
+}

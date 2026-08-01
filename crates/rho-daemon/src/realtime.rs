@@ -126,7 +126,6 @@ where
             } => {
                 match event {
                     Ok(IrisBackendEvent::Item { phase, text }) => {
-                        let Some(request_id) = active_request else { continue; };
                         let Some(text) = bounded_output(
                             &text,
                             &mut output_bytes,
@@ -136,25 +135,40 @@ where
                             MessagePhase::Commentary => RealtimeResponsePhase::Commentary,
                             MessagePhase::FinalAnswer => RealtimeResponsePhase::Speakable,
                         };
-                        write_frame(
-                            &mut writer,
-                            &RealtimeServerFrame::DelegatedItem { request_id, phase, text },
-                        ).await?;
+                        let frame = match active_request {
+                            Some(request_id) => RealtimeServerFrame::DelegatedItem {
+                                request_id,
+                                phase,
+                                text,
+                            },
+                            None => RealtimeServerFrame::StandaloneItem { phase, text },
+                        };
+                        write_frame(&mut writer, &frame).await?;
                     }
                     Ok(IrisBackendEvent::Completed { remaining_final }) => {
-                        let Some(request_id) = active_request.take() else { continue; };
                         let text = bounded_output(
                             &remaining_final,
                             &mut output_bytes,
                             &mut output_truncated,
                         ).unwrap_or_default();
-                        write_frame(
-                        &mut writer,
-                        &RealtimeServerFrame::Delegated {
-                            request_id,
-                            text,
-                        },
-                        ).await?;
+                        match active_request.take() {
+                            Some(request_id) => {
+                                write_frame(
+                                    &mut writer,
+                                    &RealtimeServerFrame::Delegated { request_id, text },
+                                ).await?;
+                            }
+                            None if !text.is_empty() => {
+                                write_frame(
+                                    &mut writer,
+                                    &RealtimeServerFrame::StandaloneItem {
+                                        phase: RealtimeResponsePhase::Speakable,
+                                        text,
+                                    },
+                                ).await?;
+                            }
+                            None => {}
+                        }
                         output_bytes = 0;
                         output_truncated = false;
                     }

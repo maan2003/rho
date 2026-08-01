@@ -198,7 +198,11 @@ AI APIs.
   delivery survives daemon restart. Claude acknowledges only after writing the
   input to its live CLI process, but has no separate RhoDB mailbox; a daemon or
   CLI crash after that write but before Claude records the input may lose that
-  rare message by design.
+  rare message by design. Agent-response subscriptions use the same delivery
+  path: native recipients acknowledge after queue persistence, while Claude
+  recipients retain the weaker acceptance guarantee above. A crash before a
+  response is queued, or a transient delivery failure, can lose that response;
+  subscriptions are not an outbox and do not replay missed deliveries.
 
 ## Remote UI transports (iroh and web UI)
 

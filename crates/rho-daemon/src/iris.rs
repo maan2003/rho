@@ -368,6 +368,10 @@ async fn call_iris_tool(registry: &Arc<AgentRegistry>, call: ToolCall) -> anyhow
                     },
                 )
                 .await?;
+            registry
+                .pool
+                .set_response_subscription(active_iris_id(registry).await?, agent_id, true)
+                .await?;
             agent
                 .send_user_content_accepted(
                     vec![rho_core::ContentPart::Text {
@@ -399,6 +403,10 @@ async fn call_iris_tool(registry: &Arc<AgentRegistry>, call: ToolCall) -> anyhow
                 !is_iris(registry, agent_id),
                 "cannot message Iris through a fleet tool"
             );
+            registry
+                .pool
+                .set_response_subscription(active_iris_id(registry).await?, agent_id, true)
+                .await?;
             let (_, agent, _) = registry.pool.load(agent_id).await?;
             let delivery = match args.delivery.as_deref() {
                 None | Some("immediate") => MessageDelivery::Immediate,
@@ -416,6 +424,38 @@ async fn call_iris_tool(registry: &Arc<AgentRegistry>, call: ToolCall) -> anyhow
                 .await?;
             refresh_clients(registry).await;
             Ok(format!("Sent to {}.", registry.display_agent_id(agent_id)))
+        }
+        "iris_unsubscribe_agent" => {
+            let args: TargetArgs = parse(&call)?;
+            let agent_id = registry.resolve_display_agent_id(&args.agent)?;
+            registry
+                .pool
+                .set_response_subscription(active_iris_id(registry).await?, agent_id, false)
+                .await?;
+            Ok(format!(
+                "Unsubscribed from {}.",
+                registry.display_agent_id(agent_id)
+            ))
+        }
+        "iris_get_agent_reply" => {
+            let args: TargetArgs = parse(&call)?;
+            let agent_id = registry.resolve_display_agent_id(&args.agent)?;
+            let subscribed = registry
+                .pool
+                .is_response_subscribed(active_iris_id(registry).await?, agent_id);
+            let (_, agent, _) = registry.pool.load(agent_id).await?;
+            let Some(text) = latest_transcript_reply(&agent.state()) else {
+                return Ok(format!(
+                    "{} has no transcript response. subscribed={subscribed}",
+                    registry.display_agent_id(agent_id)
+                ));
+            };
+            Ok(format!(
+                "{} | subscribed={}\n{}",
+                registry.display_agent_id(agent_id),
+                subscribed,
+                text
+            ))
         }
         "iris_cancel_agent" => {
             let args: TargetArgs = parse(&call)?;
@@ -507,6 +547,32 @@ fn escape_xml(text: &str) -> String {
 fn is_iris(registry: &AgentRegistry, agent_id: AgentId) -> bool {
     let agent = registry.db.read().get_agent(agent_id);
     agent.role == AgentRole::Iris || agent.labels.iter().any(|label| label == IRIS_LABEL)
+}
+
+fn latest_transcript_reply(state: &rho_agent::AgentState) -> Option<String> {
+    state.blocks.iter().rev().find_map(|block| {
+        let rho_core::ContextBlock::InferenceResponse { items, .. } = &**block else {
+            return None;
+        };
+        let text = rho_agent::final_answer_text(items);
+        (!text.trim().is_empty()).then_some(text)
+    })
+}
+
+async fn active_iris_id(registry: &AgentRegistry) -> anyhow::Result<AgentId> {
+    if let Some(agent_id) = *registry.iris_agent.lock().await {
+        return Ok(agent_id);
+    }
+    registry
+        .db
+        .read()
+        .list_agents()
+        .into_iter()
+        .find(|(_, agent)| {
+            agent.role == AgentRole::Iris || agent.labels.iter().any(|label| label == IRIS_LABEL)
+        })
+        .map(|(agent_id, _)| agent_id)
+        .ok_or_else(|| anyhow::anyhow!("Iris coordinator does not exist"))
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(call: &ToolCall) -> anyhow::Result<T> {
@@ -626,6 +692,8 @@ mod tests {
                 "iris_list_workstreams",
                 "iris_start_agent",
                 "iris_send_agent",
+                "iris_unsubscribe_agent",
+                "iris_get_agent_reply",
                 "iris_cancel_agent",
                 "iris_continue_agent",
                 "iris_rename_agent",

@@ -73,6 +73,13 @@ pub(crate) async fn run(
             }
         },
             reply = channel.replies.next() => match reply.transpose()? {
+                Some(RealtimeServerFrame::StandaloneItem { phase, text }) => {
+                    let channel = match phase {
+                        RealtimeResponsePhase::Commentary => DelegateResponseChannel::Commentary,
+                        RealtimeResponsePhase::Speakable => DelegateResponseChannel::Speakable,
+                    };
+                    session.append_context(channel, &text).await?;
+                }
                 Some(RealtimeServerFrame::DelegatedItem { request_id, phase, text }) => {
                     let provider_id = requests
                         .iter()

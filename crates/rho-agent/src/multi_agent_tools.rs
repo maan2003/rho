@@ -86,18 +86,6 @@ impl MultiAgentTools {
             .upgrade()
             .ok_or_else(|| anyhow::anyhow!("agent pool is shutting down"))
     }
-
-    /// Mail the parent agent, if any, as a fire-and-forget task (the parent
-    /// may need loading). Failure means the parent is gone; nothing useful
-    /// to do about it here.
-    pub(crate) fn mail_parent(&self, body: String, delivery: MessageDelivery) {
-        let Some(parent) = self.parent else { return };
-        let Ok(pool) = self.pool() else { return };
-        let from = self.self_id;
-        tokio::spawn(async move {
-            let _ = pool.deliver_mail(from, parent, body, delivery).await;
-        });
-    }
 }
 
 pub const SPAWN_ENGINEER_TOOL_NAME: &str = "spawn_engineer";

@@ -549,6 +549,28 @@ impl RealtimeSession {
         Ok(())
     }
 
+    /// Append output that is not associated with a provider delegation to the
+    /// active realtime session.
+    pub async fn append_context(
+        &self,
+        channel: DelegateResponseChannel,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        for chunk in utf8_chunks(text, CONTEXT_APPEND_MAX_BYTES) {
+            let command = ProviderCommand::SessionContextAppend {
+                channel: match channel {
+                    DelegateResponseChannel::Commentary => DelegationChannel::Commentary,
+                    DelegateResponseChannel::Speakable => DelegationChannel::Speakable,
+                },
+                content: vec![ProviderCommandContent::InputText {
+                    text: chunk.to_owned(),
+                }],
+            };
+            self.data_channel.send(&command.to_json()?, false)?;
+        }
+        Ok(())
+    }
+
     pub fn take_transcript_tail(&self) -> Option<String> {
         self.transcript
             .lock()
@@ -683,6 +705,11 @@ enum ProviderCommand {
     #[serde(rename = "delegation.context.append")]
     DelegationContextAppend {
         delegation_item_id: String,
+        channel: DelegationChannel,
+        content: Vec<ProviderCommandContent>,
+    },
+    #[serde(rename = "session.context.append")]
+    SessionContextAppend {
         channel: DelegationChannel,
         content: Vec<ProviderCommandContent>,
     },
@@ -955,6 +982,20 @@ mod tests {
         assert_eq!(
             String::from_utf8(command.to_json().unwrap()).unwrap(),
             r#"{"type":"delegation.context.append","delegation_item_id":"d1","channel":"speakable","content":[{"type":"input_text","text":"done"}]}"#
+        );
+    }
+
+    #[test]
+    fn encodes_typed_session_context() {
+        let command = ProviderCommand::SessionContextAppend {
+            channel: DelegationChannel::Commentary,
+            content: vec![ProviderCommandContent::InputText {
+                text: "working".to_owned(),
+            }],
+        };
+        assert_eq!(
+            String::from_utf8(command.to_json().unwrap()).unwrap(),
+            r#"{"type":"session.context.append","channel":"commentary","content":[{"type":"input_text","text":"working"}]}"#
         );
     }
 

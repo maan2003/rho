@@ -39,6 +39,11 @@ pub enum RealtimeClientFrame {
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum RealtimeServerFrame {
+    /// Iris output produced without a corresponding provider delegation.
+    StandaloneItem {
+        phase: RealtimeResponsePhase,
+        text: String,
+    },
     DelegatedItem {
         request_id: RealtimeRequestId,
         phase: RealtimeResponsePhase,

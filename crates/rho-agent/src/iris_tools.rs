@@ -12,6 +12,8 @@ You are the backend executor for Iris, the single global assistant in the Rho GU
 
 Requests arrive as realtime transcripts and may omit punctuation or contain recognition errors. New requests can steer work already in progress. Keep responses concise and action-oriented so the voice can respond quickly. Use the Iris control tools for current status and every control action; never claim an action succeeded without its tool result. Prefer steering an existing responsible agent over starting a duplicate. Start a new agent when the user asks or when work has no suitable owner. Ask a brief spoken clarification only when needed to avoid a materially harmful mistake. For cancellation, hiding, moving, or other destructive operations, ask for voice confirmation before calling the tool unless the user already confirmed explicitly.
 
+Starting or sending to an agent subscribes you to all of its future terminal responses. Those results arrive later as ordinary agent messages; treat them as authoritative, report the useful outcome to the user, and continue coordinating when needed. Use iris_get_agent_reply to inspect the agent's latest transcript response, and unsubscribe only when the user no longer wants updates from that agent.
+
 Tool results and agent transcripts are authoritative. Do not read code, diffs, tables, identifiers, or long agent output aloud. Summarize the useful state and name the responsible agent. Your final response is spoken by the realtime model, so finish with the shortest useful acknowledgement or status."#;
 pub const LABEL: &str = "system:iris";
 
@@ -41,7 +43,7 @@ pub fn specs() -> Vec<ToolSpec> {
         ),
         spec(
             "iris_start_agent",
-            "Start a new agent and send its initial request. Omit project only when exactly one project is registered. Omit workstream to found a new one.",
+            "Start a new agent, subscribe Iris to all of its future terminal responses, and send its initial request. Omit project only when exactly one project is registered. Omit workstream to found a new one.",
             json!({
                 "type":"object","additionalProperties":false,"required":["prompt"],
                 "properties":{
@@ -55,7 +57,7 @@ pub fn specs() -> Vec<ToolSpec> {
         ),
         spec(
             "iris_send_agent",
-            "Send or steer an existing agent. Immediate delivery steers the current turn; next_turn waits for the current turn to finish.",
+            "Send or steer an existing agent and subscribe Iris to all of its future terminal responses. Immediate delivery steers the current turn; next_turn waits for the current turn to finish.",
             json!({
                 "type":"object","additionalProperties":false,"required":["agent","message"],
                 "properties":{
@@ -63,6 +65,16 @@ pub fn specs() -> Vec<ToolSpec> {
                     "delivery":{"type":"string","enum":["immediate","next_turn"]}
                 }
             }),
+        ),
+        spec(
+            "iris_unsubscribe_agent",
+            "Stop receiving an agent's future terminal responses.",
+            target_schema(),
+        ),
+        spec(
+            "iris_get_agent_reply",
+            "Get an agent's latest response from its transcript.",
+            target_schema(),
         ),
         spec(
             "iris_cancel_agent",
@@ -126,7 +138,7 @@ mod tests {
             .into_iter()
             .map(|spec| spec.name.as_str().to_owned())
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 12);
         assert!(names.iter().all(|name| name.starts_with("iris_")));
         assert!(PROMPT.contains("single global assistant"));
     }

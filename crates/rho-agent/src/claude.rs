@@ -798,7 +798,8 @@ impl ClaudeLoop {
                             if mid_turn {
                                 self.fail(anyhow::anyhow!(
                                     "Claude Code exited before finishing the turn"
-                                ));
+                                ))
+                                .await;
                             }
                         }
                         Err(error) => {
@@ -806,7 +807,7 @@ impl ClaudeLoop {
                             self.remove_claude_runtime_files();
                             self.recover_pending_rewind().await;
                             self.queued_turns.clear();
-                            self.fail(error);
+                            self.fail(error).await;
                         }
                     },
                 }
@@ -863,7 +864,7 @@ impl ClaudeLoop {
                     if let Some(accepted) = accepted {
                         let _ = accepted.send(Err(anyhow::anyhow!("{error:#}")));
                     }
-                    self.fail(error);
+                    self.fail(error).await;
                     return;
                 }
                 // Every message mirrors into the queue until its
@@ -914,7 +915,7 @@ impl ClaudeLoop {
                     if let Some(accepted) = accepted {
                         let _ = accepted.send(Err(anyhow::anyhow!("{error:#}")));
                     }
-                    self.fail(error);
+                    self.fail(error).await;
                 } else if let Some(accepted) = accepted {
                     let _ = accepted.send(Ok(()));
                 }
@@ -1643,14 +1644,14 @@ impl ClaudeLoop {
                             }
                             Ok(None) => {}
                             Err(error) => {
-                                self.fail(error);
+                                self.fail(error).await;
                                 return;
                             }
                         }
                         self.push_block(block);
                         self.set_streaming_kind();
                     }
-                    Err(error) => self.fail(error),
+                    Err(error) => self.fail(error).await,
                 }
             }
             rho_claude::ClaudeEvent::User(message) => {
@@ -1667,7 +1668,7 @@ impl ClaudeLoop {
                 match user_output_to_block(message) {
                     Ok(Some(block)) => self.handle_user_block(block),
                     Ok(None) => {}
-                    Err(error) => self.fail(error),
+                    Err(error) => self.fail(error).await,
                 }
             }
             rho_claude::ClaudeEvent::Result(message) => {
@@ -1677,10 +1678,9 @@ impl ClaudeLoop {
                     self.stream_items.clear();
                     self.set_kind(AgentStateKind::Idle);
                 } else if message.is_error {
-                    self.fail(anyhow::anyhow!("{}", message.errors.join("\n")));
+                    self.fail(anyhow::anyhow!("{}", message.errors.join("\n")))
+                        .await;
                 } else {
-                    // A child's finished turn is its report: mail the result
-                    // to the parent so it can react.
                     let final_text = message.result.unwrap_or_default();
                     if let Some(pool) = self.pool_events.upgrade() {
                         pool.publish_completed_turn(crate::pool::AgentTurnCompleted {
@@ -1695,14 +1695,6 @@ impl ClaudeLoop {
                         Arc::clone(&self.presentation_session),
                         self.agent_id,
                         &final_text,
-                    );
-                    self.mail_parent(
-                        if final_text.is_empty() {
-                            "(turn finished with no text response)".to_owned()
-                        } else {
-                            final_text
-                        },
-                        MessageDelivery::NextRequest,
                     );
                     // Queued sends run next inside the CLI: staying in the
                     // streaming state avoids a false turn end between them.
@@ -1728,7 +1720,8 @@ impl ClaudeLoop {
                     && let Err(error) = self.complete_rewind().await
                 {
                     self.rotate_pending_rewind().await;
-                    self.fail(error.context("finalize rewound Claude session"));
+                    self.fail(error.context("finalize rewound Claude session"))
+                        .await;
                 }
             }
             rho_claude::ClaudeEvent::StreamEvent(event) => {
@@ -1737,7 +1730,7 @@ impl ClaudeLoop {
                     rho_claude::protocol::MessageStreamEvent::MessageStop
                 );
                 if let Err(error) = self.handle_stream_event(event.event) {
-                    self.fail(error);
+                    self.fail(error).await;
                 } else if message_stopped && let Some(usage) = self.turn_usage.take() {
                     let turn_usage = crate::db::AgentUsageBucket {
                         model: match self.model {
@@ -1978,20 +1971,11 @@ impl ClaudeLoop {
         });
     }
 
-    /// Mail the parent agent, if any (fire-and-forget).
-    fn mail_parent(&self, body: String, delivery: MessageDelivery) {
-        if let Some(multi_agent) = &self.multi_agent {
-            multi_agent.mail_parent(body, delivery);
+    async fn fail(&mut self, error: anyhow::Error) {
+        if let Some(pool) = self.pool_events.upgrade() {
+            pool.publish_failed_turn(self.agent_id, error.to_string())
+                .await;
         }
-    }
-
-    fn fail(&self, error: anyhow::Error) {
-        // A silently stuck child is the failure mode worth surfacing: errors
-        // wake the parent.
-        self.mail_parent(
-            format!("Agent hit an error and stopped: {error}"),
-            MessageDelivery::NextRequest,
-        );
         self.set_kind(AgentStateKind::Error(FailedInferenceResponse {
             partial_response: self.pending_response.clone(),
             attempt_count: NonZeroU64::MIN,

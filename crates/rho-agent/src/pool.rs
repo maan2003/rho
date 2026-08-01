@@ -295,9 +295,61 @@ impl AgentPool {
         })
     }
 
-    pub async fn publish_completed_turn(&self, completed: AgentTurnCompleted) {
+    pub async fn publish_completed_turn(self: &Arc<Self>, completed: AgentTurnCompleted) {
         self.flush_agent_usage(Some(completed.agent_id)).await;
+        self.deliver_response(
+            completed.agent_id,
+            if completed.final_answer.is_empty() {
+                "(turn finished with no text response)".to_owned()
+            } else {
+                completed.final_answer.clone()
+            },
+        )
+        .await;
         let _ = self.completed_turns.send(completed);
+    }
+
+    pub async fn publish_failed_turn(self: &Arc<Self>, agent_id: AgentId, error: String) {
+        self.deliver_response(agent_id, format!("Agent hit an error and stopped: {error}"))
+            .await;
+    }
+
+    async fn deliver_response(self: &Arc<Self>, target: AgentId, body: String) {
+        let subscribers = self.db.read().agent_response_subscribers(target);
+        for subscriber in subscribers {
+            let _ = self
+                .deliver_mail(
+                    target,
+                    subscriber,
+                    body.clone(),
+                    MessageDelivery::NextRequest,
+                )
+                .await;
+        }
+    }
+
+    pub async fn set_response_subscription(
+        &self,
+        subscriber: AgentId,
+        target: AgentId,
+        subscribed: bool,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(subscriber != target, "an agent cannot subscribe to itself");
+        anyhow::ensure!(
+            self.agent_exists(subscriber),
+            "subscriber agent does not exist"
+        );
+        anyhow::ensure!(self.agent_exists(target), "target agent does not exist");
+        let mut write = self.db.write().await;
+        write.set_agent_response_subscription(subscriber, target, subscribed);
+        write.commit();
+        Ok(())
+    }
+
+    pub fn is_response_subscribed(&self, subscriber: AgentId, target: AgentId) -> bool {
+        self.db
+            .read()
+            .is_agent_response_subscribed(subscriber, target)
     }
 
     /// Persist that execution stopped and the agent is back in the user's
@@ -552,6 +604,8 @@ impl AgentPool {
         let config = child_role(parent_role, config);
         let (child_id, child) = self
             .create_with_parent(workstream, config, Some(task_name), start, Some(parent))
+            .await?;
+        self.set_response_subscription(parent, child_id, true)
             .await?;
         let parent_label = self.agent_handle(parent);
         child

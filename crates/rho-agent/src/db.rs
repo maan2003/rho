@@ -29,6 +29,8 @@ const PRESENTATION_EVENTS: TableDefinition<AgentEventPos, Sen<AgentPresentationU
     TableDefinition::new("agent_presentation_events");
 const MAX_PRESENTATION_SOURCE_SCANNED_EVENTS: usize = 256;
 const AGENTS: TableDefinition<AgentId, Sen<AgentRecord>> = TableDefinition::new("agents");
+const AGENT_RESPONSE_SUBSCRIPTIONS: TableDefinition<AgentResponseSubscription, ()> =
+    TableDefinition::new("agent_response_subscriptions");
 const WORKSTREAMS: TableDefinition<WorkstreamId, Sen<WorkstreamRecord>> =
     TableDefinition::new("workstreams");
 const PROJECTS: TableDefinition<String, Sen<ProjectRecord>> = TableDefinition::new("projects");
@@ -43,7 +45,7 @@ const AGENT_USAGE_TOTALS: TableDefinition<AgentId, Sen<AgentUsageBucket>> =
     TableDefinition::new("agent_usage_totals");
 const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBucket>> =
     TableDefinition::new("agent_usage_by_time_provider");
-const CURRENT_AGENT_DB_FORMAT: &str = "7c5e2a91";
+const CURRENT_AGENT_DB_FORMAT: &str = "a84f3c19";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 struct AgentDbMigration {
@@ -52,7 +54,11 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
+    from: "7c5e2a91",
+    to: "a84f3c19",
+    migrate: migrate_parent_response_subscriptions,
+}];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -63,6 +69,14 @@ impl CounterKey {
     /// Formerly the topic and then tag id counter; workstreams continue
     /// its sequence.
     pub const LAST_WORKSTREAM_ID: Self = Self(3);
+}
+
+/// A persistent relationship that routes every future terminal response from
+/// `target` into `subscriber` as ordinary agent mail.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
+struct AgentResponseSubscription {
+    target: AgentId,
+    subscriber: AgentId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue, Encode, Decode)]
@@ -711,6 +725,8 @@ pub trait AgentReadTxnExt {
     fn get_agent(&self, agent_id: AgentId) -> AgentRecord;
     fn list_agents(&self) -> Vec<(AgentId, AgentRecord)>;
     fn list_projects(&self) -> Vec<(Utf8PathBuf, ProjectRecord)>;
+    fn agent_response_subscribers(&self, target: AgentId) -> Vec<AgentId>;
+    fn is_agent_response_subscribed(&self, subscriber: AgentId, target: AgentId) -> bool;
     fn agent_events(&self, agent_id: AgentId) -> (AgentEventPos, Vec<AgentEvent<'static>>);
     fn agent_event_records(
         &self,
@@ -839,6 +855,12 @@ pub trait AgentWriteTxnExt {
     fn delete_workstream(&mut self, workstream_id: WorkstreamId);
 
     fn set_agent_disposition(&mut self, agent_id: AgentId, disposition: AgentDisposition);
+    fn set_agent_response_subscription(
+        &mut self,
+        subscriber: AgentId,
+        target: AgentId,
+        subscribed: bool,
+    );
     /// Records a changed whole-percentage weekly quota sample.
     fn record_quota_observation(&mut self, observation: QuotaObservationRecord) -> bool;
     fn add_agent_usage(&mut self, agent_id: AgentId, bucket: &AgentUsageBucket);
@@ -999,6 +1021,22 @@ impl AgentReadTxnExt for ReadTxn {
             .iter()
             .map(|(key, value)| (Utf8PathBuf::from(key.value()), value.value().into_owned()))
             .collect()
+    }
+
+    fn agent_response_subscribers(&self, target: AgentId) -> Vec<AgentId> {
+        self.open_table(AGENT_RESPONSE_SUBSCRIPTIONS)
+            .iter()
+            .filter_map(|(key, _)| {
+                let key = key.value();
+                (key.target == target).then_some(key.subscriber)
+            })
+            .collect()
+    }
+
+    fn is_agent_response_subscribed(&self, subscriber: AgentId, target: AgentId) -> bool {
+        self.open_table(AGENT_RESPONSE_SUBSCRIPTIONS)
+            .get(&AgentResponseSubscription { target, subscriber })
+            .is_some()
     }
 
     fn agent_events(&self, agent_id: AgentId) -> (AgentEventPos, Vec<AgentEvent<'static>>) {
@@ -1186,6 +1224,7 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(AGENT_EVENTS);
         self.open_table(PRESENTATION_EVENTS);
         self.open_table(AGENTS);
+        self.open_table(AGENT_RESPONSE_SUBSCRIPTIONS);
         self.open_table(WORKSTREAMS);
         self.open_table(PROJECTS);
         self.open_table(VIEW_CONFIG);
@@ -1541,6 +1580,22 @@ impl AgentWriteTxnExt for WriteTxn {
         agents.insert(&agent_id, SenValue::borrowed(&agent));
     }
 
+    fn set_agent_response_subscription(
+        &mut self,
+        subscriber: AgentId,
+        target: AgentId,
+        subscribed: bool,
+    ) {
+        assert_ne!(subscriber, target, "an agent cannot subscribe to itself");
+        let key = AgentResponseSubscription { target, subscriber };
+        let mut subscriptions = self.open_table(AGENT_RESPONSE_SUBSCRIPTIONS);
+        if subscribed {
+            subscriptions.insert(&key, &());
+        } else {
+            subscriptions.remove(&key);
+        }
+    }
+
     fn fork_agent_lineage(
         &mut self,
         now: UnixMillis,
@@ -1786,6 +1841,24 @@ fn migrate_agent_db_format(write: &mut WriteTxn) {
     }
 
     write.open_table(FORMAT).insert(&(), &current.to_owned());
+}
+
+fn migrate_parent_response_subscriptions(write: &mut WriteTxn) {
+    let parent_edges = write
+        .open_table(AGENTS)
+        .iter()
+        .filter_map(|(child, record)| {
+            record
+                .value()
+                .into_owned()
+                .parent_agent
+                .map(|parent| (parent, child.value()))
+        })
+        .collect::<Vec<_>>();
+    let mut subscriptions = write.open_table(AGENT_RESPONSE_SUBSCRIPTIONS);
+    for (subscriber, target) in parent_edges {
+        subscriptions.insert(&AgentResponseSubscription { target, subscriber }, &());
+    }
 }
 
 /// Workstream names are unique (so a name identifies a workstream); a

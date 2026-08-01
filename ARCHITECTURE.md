@@ -26,7 +26,9 @@ than by running a supervisor, extension protocol, or daemon process graph.
   source position in the serialized agent loop, and rebuilds after a lineage
   fork. The same loop owns watched UI leases, source coalescing, cancellation,
   a 15-second request cadence, and result persistence; `AgentPool` only
-  routes a lease to the loaded runtime.
+  routes a lease to the loaded runtime. `AgentPool` also owns persistent
+  agent-response subscription edges: terminal successes and failures are
+  delivered to current subscribers as normal agent mail.
 - `rho-claude-usage` is an isolated Claude Code subscription-quota adapter. It
   owns the hardened PTY process, `/usage` interaction, terminal emulation,
   parsing, polling cadence, and retry policy. The daemon only consumes parsed
@@ -156,13 +158,16 @@ than by running a supervisor, extension protocol, or daemon process graph.
   to Iris: a hidden persisted first-class `AgentRole::Iris` coordinator. Its
   prompt and typed tool schemas are built into `rho-agent`; the daemon hosts
   the stateful operations for listing, starting, steering, cancelling, moving,
-  renaming, and hiding agents and workstreams. Additional requests steer the
-  active Iris turn; each completed commentary or final assistant item returns
-  once on its corresponding provider channel. Session startup includes a
-  bounded visible-fleet snapshot. Iris is
-  projected as a synthetic dashboard
-  row, not an ordinary agent or workstream member. The daemon resolves OAuth
-  and exchanges SDP through the same dedicated stream.
+  renaming, and hiding agents and workstreams. Starting or steering an agent
+  persistently subscribes Iris to that agent's future terminal responses;
+  Iris can unsubscribe or inspect the agent's latest transcript response.
+  Additional requests steer the active Iris turn; each completed commentary
+  or final assistant item returns once on its corresponding provider channel.
+  Output without an active delegation uses the provider's session-level
+  context append with the same commentary or speakable channel. Session
+  startup includes a bounded visible-fleet snapshot. Iris is projected as a
+  synthetic dashboard row, not an ordinary agent or workstream member. The
+  daemon resolves OAuth and exchanges SDP through the same dedicated stream.
   Media flows directly between the GUI and provider and never traverses the
   daemon or `rho-core` transcript vocabulary.
 - Store crates own concrete persistence formats. Tool crates own concrete tool

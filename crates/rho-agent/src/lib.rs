@@ -1798,12 +1798,13 @@ impl AgentLoop {
                             self.auto_compaction_in_flight = false;
                             let attempt_count = previous_attempt
                                 .map_or(NonZeroU64::MIN, |a| a.attempt_count.saturating_add(1));
-                            // A silently stuck child is the failure mode worth
-                            // surfacing: errors wake the parent.
-                            self.mail_parent(
-                                format!("Agent hit an error and stopped: {error}"),
-                                MessageDelivery::NextRequest,
-                            );
+                            if let Some(pool) = self.pool_events.upgrade() {
+                                pool.publish_failed_turn(
+                                    self.persistence.agent_id,
+                                    error.to_string(),
+                                )
+                                .await;
+                            }
                             state.kind = AgentStateKind::Error(FailedInferenceResponse {
                                 partial_response: pending_response,
                                 attempt_count,
@@ -1820,10 +1821,13 @@ impl AgentLoop {
                             Err(error) => {
                                 let attempt_count = previous_attempt
                                     .map_or(NonZeroU64::MIN, |a| a.attempt_count.saturating_add(1));
-                                self.mail_parent(
-                                    format!("Agent hit an error and stopped: {error}"),
-                                    MessageDelivery::NextRequest,
-                                );
+                                if let Some(pool) = self.pool_events.upgrade() {
+                                    pool.publish_failed_turn(
+                                        self.persistence.agent_id,
+                                        error.to_string(),
+                                    )
+                                    .await;
+                                }
                                 state.kind = AgentStateKind::Error(FailedInferenceResponse {
                                     partial_response: pending_response,
                                     attempt_count,
@@ -1910,9 +1914,6 @@ impl AgentLoop {
                                     .await;
                                     self.start_request(&mut state, None).await;
                                 } else if calls.is_empty() {
-                                    // A child's finished turn is its report:
-                                    // mail the result to the parent so it can
-                                    // react.
                                     let final_text = final_text.unwrap_or_default();
                                     if let Some(pool) = self.pool_events.upgrade() {
                                         pool.publish_completed_turn(AgentTurnCompleted {
@@ -1927,14 +1928,6 @@ impl AgentLoop {
                                         Arc::clone(&self.presentation_session),
                                         self.persistence.agent_id,
                                         &final_text,
-                                    );
-                                    self.mail_parent(
-                                        if final_text.is_empty() {
-                                            "(turn finished with no text response)".to_owned()
-                                        } else {
-                                            final_text
-                                        },
-                                        MessageDelivery::NextRequest,
                                     );
                                     // Turn complete: commit the checkout's
                                     // state so the user's jj view follows the
@@ -2298,13 +2291,6 @@ impl AgentLoop {
         self.maybe_resolve_wait(state).await;
     }
 
-    /// Mail the parent agent, if any (fire-and-forget).
-    fn mail_parent(&self, body: String, delivery: MessageDelivery) {
-        if let Some(multi_agent) = &self.multi_agent {
-            multi_agent.mail_parent(body, delivery);
-        }
-    }
-
     /// Fold a finished tool call into the current batch; when the batch is
     /// done (no running tools, no armed wait) commit the results and continue
     /// the turn.
@@ -2514,10 +2500,15 @@ impl AgentLoop {
         let execution = match self.execution.get().await {
             Ok(execution) => execution,
             Err(error) => {
+                let error = format!("failed to initialize agent execution: {error:#}");
+                if let Some(pool) = self.pool_events.upgrade() {
+                    pool.publish_failed_turn(self.persistence.agent_id, error.clone())
+                        .await;
+                }
                 state.kind = AgentStateKind::Error(FailedInferenceResponse {
                     partial_response: PendingInferenceResponse::default(),
                     attempt_count: NonZeroU64::MIN,
-                    error: Arc::new(format!("failed to initialize agent execution: {error:#}")),
+                    error: Arc::new(error),
                 });
                 return false;
             }
