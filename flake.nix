@@ -172,9 +172,30 @@
             wasm32-unknown = (flakeboxLib.mkStdTargets { }).wasm32-unknown;
           };
         };
-        webuiRustPlatform = pkgs.makeRustPlatform {
-          cargo = webuiToolchain.toolchain;
-          rustc = webuiToolchain.toolchain;
+        # Cargo reads rust-src's workspace lock while building std. It is
+        # generated independently of this application and can select a stale
+        # shared dependency, so provide a lock-free copy through a stable
+        # sysroot wrapper for both Crane's dependency and application builds.
+        webuiRustSysroot = pkgs.runCommand "rho-gui-web-rust-sysroot" { } ''
+          mkdir -p $out/lib/rustlib/src
+          cp -a ${webuiToolchain.toolchain}/lib/rustlib/src/rust \
+            $out/lib/rustlib/src/
+          chmod -R u+w $out/lib/rustlib/src/rust
+          rm $out/lib/rustlib/src/rust/library/Cargo.lock
+        '';
+        webuiRustc = pkgs.writeShellScript "rho-gui-web-rustc" ''
+          if [ "$#" -eq 2 ] && [ "$1" = "--print" ] && [ "$2" = "sysroot" ]; then
+            echo ${webuiRustSysroot}
+            exit 0
+          fi
+          exec ${webuiToolchain.toolchain}/bin/rustc "$@"
+        '';
+        webuiVendorSrc = flakeboxLib.filterSubPaths {
+          root = builtins.path {
+            name = projectName;
+            path = ./.;
+          };
+          paths = [ "vendor" ];
         };
 
         # Trunk requires the wasm-bindgen CLI version to exactly match the
@@ -191,6 +212,19 @@
             hash = "sha256-VucqkXbCi4qtQzY/HrXiDnbSURsagPsdNVMn1Tw3UiY=";
           };
         };
+        webuiCargoVendorRaw = pkgs.rustPlatform.fetchCargoVendor {
+          pname = "rho-gui-web";
+          version = "0.1.0";
+          src = ./crates/rho-gui-web;
+          hash = "sha256-SlZQKOVhxs4MUXmDdgWuz3JhunjIPO8LmF1QxGqFkaI=";
+        };
+        # `fetchCargoVendor` groups sources by registry. Crane expects the
+        # conventional flat cargo-vendor layout.
+        webuiCargoVendor = pkgs.runCommand "rho-gui-web-cargo-vendor" { } ''
+          mkdir $out
+          find ${webuiCargoVendorRaw} -mindepth 2 -maxdepth 2 -type d \
+            -exec ln -s {} $out/ \;
+        '';
 
         # Adds CSP hash sources for the inline scripts trunk injects into
         # index.html; the meta-tag policy would otherwise block the wasm
@@ -215,23 +249,17 @@
               f.write(new)
         '';
 
-        webui = webuiRustPlatform.buildRustPackage {
+        webuiCrane = webuiToolchain.craneLib.overrideArgs {
           pname = "rho-gui-web";
           version = "0.1.0";
           src = buildSrc;
-          sourceRoot = "source/crates/rho-gui-web";
-          cargoLock = {
-            lockFile = ./crates/rho-gui-web/Cargo.lock;
-            outputHashes = {
-              "trash-5.2.5" = "sha256-jLEttaISqOns3AZO6yI9Nk/szsOsU4HnP389gOsP3A8=";
-              "tree-sitter-md-0.3.2" = "sha256-q2/aJx+385B8HiU0soZ1vtRvjkE21ABGzIyR1qwKFOU=";
-              "wasm_thread-0.3.3" = "sha256-+lRLCIk0S6Y5ORYjDKsYYHia2FtoSoh+rWkQh7mnPBE=";
-            };
-          };
+          cargoToml = ./crates/rho-gui-web/Cargo.toml;
+          cargoLock = ./crates/rho-gui-web/Cargo.lock;
+          cargoVendorDir = webuiCargoVendor;
+          CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
+          CFLAGS_wasm32_unknown_unknown =
+            "${webuiToolchain.commonArgs.CFLAGS_wasm32_unknown_unknown} -matomics -mbulk-memory -I${buildSrc}/vendor/zed/tooling/tree_sitter_wasm/include";
           nativeBuildInputs = [
-            pkgs.trunk
-            wasmBindgenCli
-            pkgs.binaryen
             pkgs.lld
             pkgs.python3
             pkgs.protobuf
@@ -240,55 +268,58 @@
           # for wasm32. Do not use Nix's wrapped clang, which injects host
           # flags that produce unlinkable objects.
           env = {
-            CFLAGS_wasm32_unknown_unknown = "-matomics -mbulk-memory -I${buildSrc}/vendor/zed/tooling/tree_sitter_wasm/include";
+            RUSTC = webuiRustc;
+            TRUNK_OFFLINE = "true";
+            TRUNK_SKIP_VERSION_CHECK = "true";
           };
-          preBuild = ''
-            substituteInPlace .cargo/config.toml \
+          postPatch = ''
+            substituteInPlace crates/rho-gui-web/.cargo/config.toml \
               --replace-fail 'value = "toolchain/clang", relative = true, force = true' \
               'value = "${pkgs.llvmPackages.clang-unwrapped}/bin/clang", force = true'
-
-            # Cargo reads the rust-src workspace lock when it builds `std`.
-            # That lock is generated independently of this application and
-            # can pin an older shared build dependency. Give Cargo a writable
-            # Nix-provided source copy without the nested lock; it resolves
-            # against the application lock vendored above instead.
-            rust_sysroot="$TMPDIR/rust-sysroot"
-            mkdir -p "$rust_sysroot/lib/rustlib/src"
-            cp -a ${webuiToolchain.toolchain}/lib/rustlib/src/rust \
-              "$rust_sysroot/lib/rustlib/src/"
-            chmod -R u+w "$rust_sysroot/lib/rustlib/src/rust"
-            rm "$rust_sysroot/lib/rustlib/src/rust/library/Cargo.lock"
-            cat > "$TMPDIR/rustc" <<'EOF'
-            #!${pkgs.runtimeShell}
-            if [ "$#" -eq 2 ] && [ "$1" = "--print" ] && [ "$2" = "sysroot" ]; then
-              echo "$RHO_WEBUI_RUST_SYSROOT"
-              exit 0
-            fi
-            exec ${webuiToolchain.toolchain}/bin/rustc "$@"
-            EOF
-            chmod +x "$TMPDIR/rustc"
-            export RHO_WEBUI_RUST_SYSROOT="$rust_sysroot"
-            export RUSTC="$TMPDIR/rustc"
           '';
-          buildPhase = ''
-            runHook preBuild
-            export TRUNK_OFFLINE=true
-            export TRUNK_SKIP_VERSION_CHECK=true
-            export XDG_CACHE_HOME=$TMPDIR/cache
-            # Relative public URL: GitHub Pages serves project sites under a
-            # /<repo>/ subpath.
-            trunk build --release --dist dist --public-url ./
+          postConfigure = ''
+            cat >> "$CARGO_HOME/config.toml" <<'EOF'
+            [source."git+https://github.com/zed-industries/trash-rs?rev=41c6c800d884a89351f3b8856d12894cccee261d#41c6c800d884a89351f3b8856d12894cccee261d"]
+            git = "https://github.com/zed-industries/trash-rs"
+            rev = "41c6c800d884a89351f3b8856d12894cccee261d"
+            replace-with = "nix-sources"
+            [source."git+https://github.com/tree-sitter-grammars/tree-sitter-markdown?rev=9a23c1a96c0513d8fc6520972beedd419a973539#9a23c1a96c0513d8fc6520972beedd419a973539"]
+            git = "https://github.com/tree-sitter-grammars/tree-sitter-markdown"
+            rev = "9a23c1a96c0513d8fc6520972beedd419a973539"
+            replace-with = "nix-sources"
+            [source."git+https://github.com/zed-industries/wasm_thread?rev=0cf96c7708dfb97ccf3da50347e25edcf75d6937#0cf96c7708dfb97ccf3da50347e25edcf75d6937"]
+            git = "https://github.com/zed-industries/wasm_thread"
+            rev = "0cf96c7708dfb97ccf3da50347e25edcf75d6937"
+            replace-with = "nix-sources"
+            EOF
+          '';
+          preBuild = ''
+            cd crates/rho-gui-web
+          '';
+        };
+        webuiDeps = webuiCrane.buildDepsOnly {
+          # Crane's dummy path crates intentionally differ from the real
+          # sources, so Cargo must refresh its dummy lock without networking.
+          cargoExtraArgs = "--offline";
+          # Direct path dependencies in vendor must keep their real sources so
+          # Crane can reuse their artifacts in the final Trunk build.
+          extraDummyScript = ''
+            rm -rf $out/vendor
+            cp -r --no-preserve=mode,ownership ${webuiVendorSrc}/vendor $out/vendor
+            cp ${./crates/rho-gui-web/Cargo.lock} $out/crates/rho-gui-web/Cargo.lock
+          '';
+        };
+        webui = webuiCrane.buildTrunkPackage {
+          cargoArtifacts = webuiDeps;
+          wasm-bindgen-cli = wasmBindgenCli;
+          # Relative public URL: GitHub Pages serves project sites under a
+          # /<repo>/ subpath.
+          trunkExtraBuildArgs = "--dist dist --public-url ./";
+          postBuild = ''
             # Allow the trunk-injected inline bootstrap script through the
             # CSP by hash; static hosts cannot use nonces.
             python3 ${webuiCspHash} dist/index.html
-            runHook postBuild
           '';
-          installPhase = ''
-            runHook preInstall
-            cp -r dist $out
-            runHook postInstall
-          '';
-          doCheck = false;
         };
 
         guiNativeBuildInputs = [
