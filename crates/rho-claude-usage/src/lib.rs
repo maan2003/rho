@@ -431,8 +431,6 @@ where
 
 #[cfg(test)]
 mod tests {
-    use chrono::TimeZone as _;
-
     use super::*;
 
     #[test]
