@@ -18,12 +18,12 @@ use gpui::{
 };
 use language::{Buffer, BufferEvent, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey};
+use path::rel_path::RelPath;
 use rho_ui_proto::{
     WorkspaceDiffContent, WorkspaceDiffSnapshot, WorkspaceDiffTarget, WorkspaceInfo,
 };
 use text::OffsetRangeExt as _;
 use theme::ActiveTheme as _;
-use util::rel_path::RelPath;
 
 use crate::connection::DiffClient;
 use crate::zed_remote::RemoteProject;
@@ -99,9 +99,7 @@ impl PreparedDiff {
                     cx,
                 )
             });
-            let contents = request
-                .await
-                .context("deferred diff request task failed")??;
+            let contents = request.await.context("deferred diff request failed")?;
             base_contents.extend(
                 contents
                     .into_iter()
@@ -399,7 +397,7 @@ impl DiffModel {
         let workspace = self.workspace.clone();
         self.refresh_task = Some(cx.spawn(async move |this, cx| {
             let result: Result<Option<PreparedDiff>> = async {
-                let snapshot = request.await.context("diff refresh task failed")??;
+                let snapshot = request.await.context("diff refresh failed")?;
                 match snapshot {
                     Some(snapshot) => Ok(Some(
                         PreparedDiff::load(
@@ -719,14 +717,25 @@ fn build_editor(
     cx: &mut App,
 ) -> Entity<editor::Editor> {
     cx.new(|cx| {
-        let mut editor = editor::Editor::for_multibuffer(multibuffer, None, window, cx);
+        let mut editor = editor::Editor::new(
+            editor::EditorMode::full(),
+            multibuffer,
+            #[cfg(feature = "native")]
+            None,
+            window,
+            cx,
+        );
         crate::editor_config::configure_diff(&mut editor, window, cx);
+        #[cfg(feature = "native")]
         editor.set_diff_hunk_delegate(
             Some(Arc::new(editor::RestoreOnlyUnstagedDiffHunkDelegate)),
             cx,
         );
-        editor.disable_diagnostics(cx);
-        editor.set_expand_all_diff_hunks(cx);
+        #[cfg(feature = "native")]
+        {
+            editor.disable_diagnostics(cx);
+            editor.set_expand_all_diff_hunks(cx);
+        }
         editor
     })
 }

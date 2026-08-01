@@ -41,14 +41,12 @@ use rho_ui_proto::AgentId;
 use rho_ui_proto::remote::UiAgentState;
 use text::{Anchor, Buffer as TextBuffer, ToOffset as _};
 
-#[cfg(feature = "native")]
 use crate::connection::VisualizationClient;
 use crate::highlights::{apply_class_highlights, excerpt_range};
 use crate::render::elision::ElisionPlan;
 use crate::render::{BlockKind, RenderedBlock, render_block_with_agent_labels};
 use crate::store::{FrameSummary, IncrementalUpdate};
 use crate::style::{Region, StyleClass};
-#[cfg(feature = "native")]
 use crate::visualization::Visualization;
 
 pub struct TranscriptModel {
@@ -74,9 +72,7 @@ pub struct TranscriptModel {
     // placeholder (id 0), so they start at 1. One counter serves every
     // attachment: ids only need uniqueness within an editor.
     next_inlay_id: usize,
-    #[cfg(feature = "native")]
     visualization_client: VisualizationClient,
-    #[cfg(feature = "native")]
     visualization_cache: HashMap<String, Entity<Visualization>>,
     attachments: Vec<Attachment>,
 }
@@ -91,7 +87,6 @@ struct Attachment {
     multi_buffer: Entity<MultiBuffer>,
     elisions: ElisionState,
     inlays: Vec<PlacedInlay>,
-    #[cfg(feature = "native")]
     visualizations: Vec<PlacedVisualization>,
 }
 
@@ -147,7 +142,6 @@ struct VisualizationAnchor {
     range: Range<Anchor>,
 }
 
-#[cfg(feature = "native")]
 struct PlacedVisualization {
     id: String,
     rows: u32,
@@ -182,7 +176,7 @@ impl TranscriptModel {
     pub fn new(
         multi_buffer: Entity<MultiBuffer>,
         document_multi_buffer: Entity<MultiBuffer>,
-        #[cfg(feature = "native")] visualization_client: VisualizationClient,
+        visualization_client: VisualizationClient,
     ) -> Self {
         Self {
             multi_buffer,
@@ -194,9 +188,7 @@ impl TranscriptModel {
             buffers: Vec::new(),
             elisions: ElisionSync::default(),
             next_inlay_id: 1,
-            #[cfg(feature = "native")]
             visualization_client,
-            #[cfg(feature = "native")]
             visualization_cache: HashMap::new(),
             attachments: Vec::new(),
         }
@@ -373,7 +365,6 @@ impl TranscriptModel {
             multi_buffer: editor.read(cx).buffer().clone(),
             elisions: ElisionState::default(),
             inlays: Vec::new(),
-            #[cfg(feature = "native")]
             visualizations: Vec::new(),
         });
         let history = classes_in(&self.records[..self.turn_boundary]);
@@ -899,18 +890,15 @@ impl TranscriptModel {
             .flat_map(|record| record.inlays.iter())
             .filter_map(|inlay| inlay.desired(now_ms))
             .collect::<Vec<_>>();
-        #[cfg(feature = "native")]
         let desired_visualizations = self
             .records
             .iter()
             .flat_map(|record| record.visualizations.iter().cloned())
             .collect::<Vec<_>>();
-        #[cfg(feature = "native")]
         let desired_visualization_ids = desired_visualizations
             .iter()
             .map(|visualization| visualization.id.as_str())
             .collect::<HashSet<_>>();
-        #[cfg(feature = "native")]
         self.visualization_cache
             .retain(|id, _| desired_visualization_ids.contains(id.as_str()));
 
@@ -919,9 +907,7 @@ impl TranscriptModel {
             next_inlay_id,
             attachments,
             elisions,
-            #[cfg(feature = "native")]
             visualization_client,
-            #[cfg(feature = "native")]
             visualization_cache,
             ..
         } = self;
@@ -1009,7 +995,6 @@ impl TranscriptModel {
                 &editor,
                 cx,
             );
-            #[cfg(feature = "native")]
             reconcile_visualizations(
                 &desired_visualizations,
                 &mut attachment.visualizations,
@@ -1291,7 +1276,6 @@ fn styles_for_rendered(
         .collect()
 }
 
-#[cfg(feature = "native")]
 fn reconcile_visualizations<V: 'static>(
     desired: &[VisualizationAnchor],
     placed: &mut Vec<PlacedVisualization>,
@@ -1376,7 +1360,6 @@ fn reconcile_visualizations<V: 'static>(
     }
 }
 
-#[cfg(feature = "native")]
 fn visualization_key(
     id: &str,
     rows: u32,

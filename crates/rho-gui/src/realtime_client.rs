@@ -13,8 +13,7 @@ pub(crate) struct RealtimeChannel {
     pub(crate) answer_sdp: String,
     pub(crate) requests: futures::channel::mpsc::Sender<RealtimeClientFrame>,
     pub(crate) replies: futures::channel::mpsc::Receiver<anyhow::Result<RealtimeServerFrame>>,
-    #[cfg(feature = "native")]
-    pub(crate) _transport: rho_rpc::ChannelTask,
+    pub(crate) _transport: crate::connection::ChannelTask,
 }
 
 #[cfg(feature = "native")]

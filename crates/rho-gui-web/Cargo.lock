@@ -2041,7 +2041,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ccc2776f0c61eca1ca32528f85548abd1a4be8fb53d1b21c013e4f18da1e7090"
 dependencies = [
  "data-encoding",
- "syn 2.0.119",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -7873,11 +7873,12 @@ dependencies = [
  "json-stream",
  "language",
  "multi_buffer",
+ "path",
  "rho-core",
  "rho-iroh-auth",
- "rho-realtime",
  "rho-registry",
  "rho-rpc",
+ "rho-rtc",
  "rho-touch-keyboard",
  "rho-ui-proto",
  "rust-embed",
@@ -7925,24 +7926,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rho-realtime"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "futures",
- "js-sys",
- "libwebrtc",
- "rodio",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
-]
-
-[[package]]
 name = "rho-registry"
 version = "0.1.0"
 dependencies = [
@@ -7965,6 +7948,24 @@ dependencies = [
  "rho-iroh-auth",
  "senax-encoder",
  "tokio",
+ "wasm-bindgen-futures",
+]
+
+[[package]]
+name = "rho-rtc"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "futures",
+ "gloo-timers",
+ "js-sys",
+ "libwebrtc",
+ "rodio",
+ "tokio",
+ "tracing",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]
@@ -10529,7 +10530,6 @@ dependencies = [
 [[package]]
 name = "wasm_thread"
 version = "0.3.3"
-source = "git+https://github.com/zed-industries/wasm_thread?rev=0cf96c7708dfb97ccf3da50347e25edcf75d6937#0cf96c7708dfb97ccf3da50347e25edcf75d6937"
 dependencies = [
  "futures",
  "js-sys",

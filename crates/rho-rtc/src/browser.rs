@@ -232,6 +232,10 @@ impl Drop for RtcSession {
     }
 }
 
+fn send_event(sender: &EventSender, event: RtcEvent) {
+    let _ = sender.borrow_mut().try_send(event);
+}
+
 fn cleanup_peer(peer: &RtcPeerConnection, remote_audio: &Rc<RefCell<Option<HtmlAudioElement>>>) {
     peer.set_onicegatheringstatechange(None);
     peer.set_onconnectionstatechange(None);

@@ -74,7 +74,7 @@ pub struct AgentModel {
 impl AgentModel {
     pub fn new(
         workspace: WeakEntity<Workspace>,
-        #[cfg(feature = "native")] visualization_client: crate::connection::VisualizationClient,
+        visualization_client: crate::connection::VisualizationClient,
         cx: &mut Context<Self>,
     ) -> Self {
         let system_buffer = cx.new(|cx| {
@@ -106,7 +106,6 @@ impl AgentModel {
         let transcript = TranscriptModel::new(
             multi_buffer.clone(),
             document_multi_buffer.clone(),
-            #[cfg(feature = "native")]
             visualization_client,
         );
         Self {

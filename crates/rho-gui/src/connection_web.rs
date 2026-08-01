@@ -1,28 +1,134 @@
 //! Direct browser iroh connection to the daemon's `rho/ui/3` protocol.
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::str::FromStr as _;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use camino::Utf8PathBuf;
 use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures::channel::oneshot;
 use futures::{SinkExt as _, StreamExt as _};
+use gpui::App;
 use hkdf::Hkdf;
 use iroh::EndpointId;
 use js_sys::{Array, Function, Object, Promise, Reflect, Uint8Array};
 use rho_registry::session::AgentStreamGenerations;
 use rho_ui_proto::realtime::{RealtimeClientFrame, RealtimeServerFrame};
-use rho_ui_proto::{ClientMessage, ServerMessage};
+use rho_ui_proto::remote::AgentRemoteFrame;
+use rho_ui_proto::{
+    AgentId, ClientMessage, ServerMessage, UiAgentSummary, UiProject, UiWorkstream, WorkspaceInfo,
+};
 use sha2::{Digest as _, Sha256};
 use tokio::io::AsyncWriteExt as _;
 use wasm_bindgen::{JsCast as _, JsValue};
 use wasm_bindgen_futures::{JsFuture, spawn_local};
 use zeroize::Zeroize as _;
 
+#[derive(Clone, Debug)]
+pub enum AttachTarget {
+    Iroh(EndpointId),
+}
+
+impl AttachTarget {
+    pub fn iroh(endpoint: impl AsRef<str>) -> anyhow::Result<Self> {
+        Ok(Self::Iroh(
+            EndpointId::from_str(endpoint.as_ref().trim())
+                .map_err(|error| anyhow::anyhow!("invalid daemon endpoint id: {error}"))?,
+        ))
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Iroh(endpoint) => endpoint.to_string(),
+        }
+    }
+
+    fn endpoint(&self) -> EndpointId {
+        match self {
+            Self::Iroh(endpoint) => *endpoint,
+        }
+    }
+}
+
+pub struct HostEvent {
+    pub host: crate::registry::HostId,
+    pub event: ConnEvent,
+}
+
+pub enum ConnEvent {
+    Ready {
+        workstreams: Vec<UiWorkstream>,
+        agents: Vec<UiAgentSummary>,
+        projects: Vec<UiProject>,
+        machine_seed: u64,
+        agent_counter: u64,
+    },
+    WorkstreamCreated(UiWorkstream),
+    AgentCreated {
+        agent_id: AgentId,
+        workstream: rho_ui_proto::WorkstreamId,
+    },
+    AgentSubscribed(AgentId),
+    AgentUnloaded {
+        agent_id: AgentId,
+        reason: rho_ui_proto::AgentUnloadReason,
+    },
+    Frame {
+        agent_id: AgentId,
+        frame: AgentRemoteFrame,
+        allocation: Option<AgentFrameAllocation>,
+    },
+    TurnCancelled,
+    AgentAttention {
+        agent_id: AgentId,
+        attention: rho_ui_proto::UiAttention,
+    },
+    AgentTurnReport {
+        agent_id: AgentId,
+        report: rho_ui_proto::UiTurnReport,
+    },
+    ChatGptUsage {
+        used_percent: f64,
+        reset_at_unix: i64,
+    },
+    QuotaUsage(Vec<rho_ui_proto::QuotaSummary>),
+    QuotaHistory(Vec<rho_ui_proto::QuotaSeries>),
+    GlobalUsage(Vec<rho_ui_proto::AgentUsageSeries>),
+    ServerError(String),
+    Recovering(std::time::Duration),
+    Recovered,
+    Disconnected(String),
+    AuthorizationRequired,
+    EnrollmentRequired(String),
+}
+
+/// Keeps the connection-wide decompressed-frame budget reserved until the
+/// workspace applies or discards the event.
+pub struct AgentFrameAllocation {
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+#[derive(Clone)]
+struct HostSink {
+    host: crate::registry::HostId,
+    events: UnboundedSender<HostEvent>,
+}
+
+impl HostSink {
+    fn send(&self, event: ConnEvent) {
+        let _ = self.events.unbounded_send(HostEvent {
+            host: self.host,
+            event,
+        });
+    }
+}
+
 const CREDENTIAL_KEY: &str = "rho-gui-web-passkey-credential";
 const LEGACY_SECRET_KEY: &str = "rho-gui-web-secret";
 const DAEMON_KEY: &str = "rho-gui-web-daemon";
+const DAEMONS_KEY: &str = "rho-gui-web-daemons";
 const AUTHENTICATOR_KEY: &str = "rho-gui-web-authenticator";
 const PRF_LABEL: &[u8] = b"rho webui iroh prf v1";
 const HKDF_INFO: &[u8] = b"rho webui iroh ed25519 seed v1";
@@ -47,6 +153,10 @@ pub struct Connection {
     commands: UnboundedSender<Command>,
     receiver: Rc<RefCell<Option<UnboundedReceiver<Command>>>>,
     events: UnboundedSender<Event>,
+    host_sink: Option<HostSink>,
+    target: Option<AttachTarget>,
+    shell_requests: Arc<Mutex<ShellControlRequests>>,
+    dialer: Rc<RefCell<Option<rho_rpc::Dialer>>>,
 }
 
 enum Command {
@@ -80,7 +190,512 @@ impl RealtimeDialer {
     }
 }
 
+/// Owns both pumps of a dedicated typed stream.
+pub type ChannelTask = rho_rpc::ChannelTask;
+
+/// One workspace file channel. Dropping the owner cancels the transport and
+/// its daemon-side watcher.
+pub struct WorkspaceChannel {
+    pub outgoing: mpsc::Sender<rho_ui_proto::WorkspaceClientFrame>,
+    pub incoming: mpsc::Receiver<anyhow::Result<rho_ui_proto::WorkspaceServerFrame>>,
+    pub transport: ChannelTask,
+}
+
+pub struct VisualizationArtifact {
+    pub mime_type: String,
+    pub content: Vec<u8>,
+}
+
+#[derive(Clone)]
+pub struct VisualizationClient {
+    dialer: Rc<RefCell<Option<rho_rpc::Dialer>>>,
+}
+
+impl VisualizationClient {
+    pub fn detached() -> Self {
+        Self {
+            dialer: Rc::new(RefCell::new(None)),
+        }
+    }
+
+    pub fn get(&self, id: String, cx: &App) -> gpui::Task<anyhow::Result<VisualizationArtifact>> {
+        let dialer = self.dialer.borrow().clone();
+        cx.spawn(async move |_| {
+            let dialer = dialer.ok_or_else(|| anyhow::anyhow!("not connected to rho-daemon"))?;
+            dial_visualization(dialer, id).await
+        })
+    }
+}
+
+#[derive(Clone)]
+pub struct DiffClient {
+    dialer: Rc<RefCell<Option<rho_rpc::Dialer>>>,
+}
+
+impl DiffClient {
+    pub fn snapshot(
+        &self,
+        workspace: WorkspaceInfo,
+        known_commit_id: Option<String>,
+        include_paths: Vec<Utf8PathBuf>,
+        cx: &App,
+    ) -> gpui::Task<anyhow::Result<Option<rho_ui_proto::WorkspaceDiffSnapshot>>> {
+        let dialer = self.dialer.borrow().clone();
+        cx.spawn(async move |_| {
+            let dialer = dialer.ok_or_else(|| anyhow::anyhow!("not connected to rho-daemon"))?;
+            dial_diff_snapshot(dialer, workspace, known_commit_id, include_paths).await
+        })
+    }
+
+    pub fn base_contents(
+        &self,
+        workspace: WorkspaceInfo,
+        operation_id: String,
+        commit_id: String,
+        paths: Vec<Utf8PathBuf>,
+        cx: &App,
+    ) -> gpui::Task<anyhow::Result<Vec<rho_ui_proto::WorkspaceDiffBaseContent>>> {
+        let dialer = self.dialer.borrow().clone();
+        cx.spawn(async move |_| {
+            let dialer = dialer.ok_or_else(|| anyhow::anyhow!("not connected to rho-daemon"))?;
+            dial_diff_base_contents(dialer, workspace, operation_id, commit_id, paths).await
+        })
+    }
+}
+
+pub struct TerminalChannel {
+    pub terminal_id: u64,
+    pub frames: mpsc::Receiver<anyhow::Result<rho_ui_proto::term::TermServerFrame>>,
+    pub input: mpsc::Sender<rho_ui_proto::term::TermClientFrame>,
+    pub transport: ChannelTask,
+}
+
+pub struct ShellChannel {
+    pub frames: mpsc::Receiver<rho_ui_proto::shell::ShellServerFrame>,
+    pub submit: tokio::sync::mpsc::Sender<ShellSubmission>,
+    pub control: tokio::sync::mpsc::Sender<rho_ui_proto::shell::ShellClientFrame>,
+}
+
+pub struct ShellSubmission {
+    pub command: String,
+    pub accepted: tokio::sync::oneshot::Sender<u64>,
+}
+
+enum ShellControlReply {
+    Started,
+    List(Vec<rho_ui_proto::shell::ShellInfo>),
+    Closed,
+    Failed(String),
+}
+
+struct ShellControlRequests {
+    next: u64,
+    pending: HashMap<u64, oneshot::Sender<ShellControlReply>>,
+}
+
+impl Default for ShellControlRequests {
+    fn default() -> Self {
+        Self {
+            next: 1,
+            pending: HashMap::new(),
+        }
+    }
+}
+
+async fn shell_control_request(
+    commands: &UnboundedSender<Command>,
+    requests: &Arc<Mutex<ShellControlRequests>>,
+    make_message: impl FnOnce(u64) -> ClientMessage,
+) -> anyhow::Result<ShellControlReply> {
+    let (request_id, receiver) = {
+        let mut requests = requests.lock().unwrap();
+        let request_id = requests.next;
+        requests.next = requests
+            .next
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("shell request ids exhausted"))?;
+        let (sender, receiver) = oneshot::channel();
+        requests.pending.insert(request_id, sender);
+        (request_id, receiver)
+    };
+    if commands
+        .unbounded_send(Command::Control(make_message(request_id)))
+        .is_err()
+    {
+        requests.lock().unwrap().pending.remove(&request_id);
+        anyhow::bail!("daemon control connection closed");
+    }
+    receiver
+        .await
+        .map_err(|_| anyhow::anyhow!("shell lifecycle request was dropped"))
+}
+
+fn handle_host_message(
+    sink: Option<&HostSink>,
+    shell_requests: &Mutex<ShellControlRequests>,
+    message: &ServerMessage,
+) {
+    match message {
+        ServerMessage::ShellStarted { request_id } => {
+            if let Some(tx) = shell_requests.lock().unwrap().pending.remove(request_id) {
+                let _ = tx.send(ShellControlReply::Started);
+            }
+        }
+        ServerMessage::ShellList { request_id, shells } => {
+            if let Some(tx) = shell_requests.lock().unwrap().pending.remove(request_id) {
+                let _ = tx.send(ShellControlReply::List(shells.clone()));
+            }
+        }
+        ServerMessage::ShellClosed { request_id } => {
+            if let Some(tx) = shell_requests.lock().unwrap().pending.remove(request_id) {
+                let _ = tx.send(ShellControlReply::Closed);
+            }
+        }
+        ServerMessage::ShellRequestFailed { request_id, reason } => {
+            if let Some(tx) = shell_requests.lock().unwrap().pending.remove(request_id) {
+                let _ = tx.send(ShellControlReply::Failed(reason.clone()));
+            }
+        }
+        _ => {}
+    }
+    let Some(sink) = sink else { return };
+    let event = match message {
+        ServerMessage::Ready {
+            workstreams,
+            agents,
+            projects,
+            machine_seed,
+            agent_counter,
+            ..
+        } => Some(ConnEvent::Ready {
+            workstreams: workstreams.clone(),
+            agents: agents.clone(),
+            projects: projects.clone(),
+            machine_seed: *machine_seed,
+            agent_counter: *agent_counter,
+        }),
+        ServerMessage::WorkstreamCreated { workstream } => {
+            Some(ConnEvent::WorkstreamCreated(workstream.clone()))
+        }
+        ServerMessage::AgentCreated {
+            agent_id,
+            workstream,
+        } => Some(ConnEvent::AgentCreated {
+            agent_id: *agent_id,
+            workstream: *workstream,
+        }),
+        ServerMessage::AgentSubscribed { agent_id } => Some(ConnEvent::AgentSubscribed(*agent_id)),
+        ServerMessage::AgentUnloaded { agent_id, reason } => Some(ConnEvent::AgentUnloaded {
+            agent_id: *agent_id,
+            reason: reason.clone(),
+        }),
+        ServerMessage::Agent { agent_id, frame } => Some(ConnEvent::Frame {
+            agent_id: *agent_id,
+            frame: frame.clone(),
+            allocation: None,
+        }),
+        ServerMessage::TurnCancelled { .. } => Some(ConnEvent::TurnCancelled),
+        ServerMessage::AgentAttention {
+            agent_id,
+            attention,
+        } => Some(ConnEvent::AgentAttention {
+            agent_id: *agent_id,
+            attention: attention.clone(),
+        }),
+        ServerMessage::AgentTurnReport { agent_id, report } => Some(ConnEvent::AgentTurnReport {
+            agent_id: *agent_id,
+            report: report.clone(),
+        }),
+        ServerMessage::ChatGptUsage {
+            used_percent,
+            reset_at_unix,
+        } => Some(ConnEvent::ChatGptUsage {
+            used_percent: *used_percent,
+            reset_at_unix: *reset_at_unix,
+        }),
+        ServerMessage::QuotaUsage { summaries } => Some(ConnEvent::QuotaUsage(summaries.clone())),
+        ServerMessage::QuotaHistory { series } => Some(ConnEvent::QuotaHistory(series.clone())),
+        ServerMessage::GlobalUsage { series } => Some(ConnEvent::GlobalUsage(series.clone())),
+        ServerMessage::Error { message } => Some(ConnEvent::ServerError(message.clone())),
+        _ => None,
+    };
+    if let Some(event) = event {
+        sink.send(event);
+    }
+}
+
+/// Creates a locked browser host. Call Connection::authorize from the
+/// corresponding user gesture; hosts are never authorized in a batch.
+pub fn spawn(
+    host: crate::registry::HostId,
+    target: AttachTarget,
+    events: UnboundedSender<HostEvent>,
+    _cx: &App,
+) -> Connection {
+    let (commands, receiver) = mpsc::unbounded();
+    let (legacy, _legacy_rx) = mpsc::unbounded();
+    let sink = HostSink { host, events };
+    sink.send(ConnEvent::AuthorizationRequired);
+    Connection {
+        commands,
+        receiver: Rc::new(RefCell::new(Some(receiver))),
+        events: legacy,
+        host_sink: Some(sink),
+        target: Some(target),
+        shell_requests: Arc::new(Mutex::new(ShellControlRequests::default())),
+        dialer: Rc::new(RefCell::new(None)),
+    }
+}
+
+async fn dial_channel(
+    dialer: rho_rpc::Dialer,
+    workspace: WorkspaceInfo,
+) -> anyhow::Result<WorkspaceChannel> {
+    let mut stream = dialer.open(None).await?;
+    rho_ui_proto::write_frame(&mut stream, &ClientMessage::ChannelOpen { workspace }).await?;
+    match rho_ui_proto::read_frame::<_, ServerMessage>(&mut stream).await? {
+        ServerMessage::ChannelOpened => {}
+        ServerMessage::ChannelClosed { reason } => {
+            anyhow::bail!("daemon refused workspace file channel: {reason}")
+        }
+        _ => anyhow::bail!("unexpected reply to ChannelOpen"),
+    }
+    let channel = stream.into_channel(rho_rpc::ChannelConfig {
+        tx_limit: rho_ui_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
+        rx_limit: rho_ui_proto::workspace::MAX_WORKSPACE_FRAME_LEN,
+        tx_capacity: 16,
+        rx_capacity: 32,
+    });
+    let (outgoing, incoming, transport) = channel.into_parts();
+    Ok(WorkspaceChannel {
+        outgoing,
+        incoming,
+        transport,
+    })
+}
+
+async fn dial_diff_snapshot(
+    dialer: rho_rpc::Dialer,
+    workspace: WorkspaceInfo,
+    known_commit_id: Option<String>,
+    include_paths: Vec<Utf8PathBuf>,
+) -> anyhow::Result<Option<rho_ui_proto::WorkspaceDiffSnapshot>> {
+    let mut stream = dialer.open(None).await?;
+    rho_ui_proto::write_frame(
+        &mut stream,
+        &ClientMessage::DiffSnapshot {
+            workspace,
+            known_commit_id,
+            include_paths,
+        },
+    )
+    .await?;
+    match rho_ui_proto::read_frame::<_, ServerMessage>(&mut stream).await? {
+        ServerMessage::DiffSnapshot { snapshot } => Ok(Some(snapshot)),
+        ServerMessage::DiffUnchanged { .. } => Ok(None),
+        ServerMessage::DiffRefused { reason } => anyhow::bail!(reason),
+        _ => anyhow::bail!("unexpected reply to DiffSnapshot"),
+    }
+}
+
+async fn dial_diff_base_contents(
+    dialer: rho_rpc::Dialer,
+    workspace: WorkspaceInfo,
+    operation_id: String,
+    commit_id: String,
+    paths: Vec<Utf8PathBuf>,
+) -> anyhow::Result<Vec<rho_ui_proto::WorkspaceDiffBaseContent>> {
+    let mut stream = dialer.open(None).await?;
+    rho_ui_proto::write_frame(
+        &mut stream,
+        &ClientMessage::DiffBaseContents {
+            workspace,
+            operation_id,
+            commit_id,
+            paths,
+        },
+    )
+    .await?;
+    match rho_ui_proto::read_frame::<_, ServerMessage>(&mut stream).await? {
+        ServerMessage::DiffBaseContents { contents } => Ok(contents),
+        ServerMessage::DiffRefused { reason } => anyhow::bail!(reason),
+        _ => anyhow::bail!("unexpected reply to DiffBaseContents"),
+    }
+}
+
+async fn dial_visualization(
+    dialer: rho_rpc::Dialer,
+    id: String,
+) -> anyhow::Result<VisualizationArtifact> {
+    let mut stream = dialer.open(None).await?;
+    rho_ui_proto::write_frame(
+        &mut stream,
+        &ClientMessage::VisualizationGet { id: id.clone() },
+    )
+    .await?;
+    match rho_ui_proto::read_frame::<_, ServerMessage>(&mut stream).await? {
+        ServerMessage::VisualizationContent {
+            id: response_id,
+            mime_type,
+            content,
+        } if response_id == id => Ok(VisualizationArtifact { mime_type, content }),
+        ServerMessage::VisualizationRefused { reason } => anyhow::bail!(reason),
+        _ => anyhow::bail!("unexpected reply to VisualizationGet"),
+    }
+}
+
+async fn dial_terminal(
+    dialer: rho_rpc::Dialer,
+    agent: String,
+    new: bool,
+    cols: u16,
+    rows: u16,
+) -> anyhow::Result<TerminalChannel> {
+    let mut list = dialer.open(Some(50)).await?;
+    rho_ui_proto::write_frame(
+        &mut list,
+        &ClientMessage::TerminalList {
+            agent: Some(agent.clone()),
+        },
+    )
+    .await?;
+    let running = match rho_ui_proto::read_frame::<_, ServerMessage>(&mut list).await? {
+        ServerMessage::TerminalList { terminals } => terminals,
+        ServerMessage::TerminalRefused { reason } => anyhow::bail!(reason),
+        _ => anyhow::bail!("unexpected reply to TerminalList"),
+    };
+    let (terminal_id, create) = if new {
+        (
+            running
+                .iter()
+                .map(|info| info.terminal_id.saturating_add(1))
+                .max()
+                .unwrap_or(0),
+            true,
+        )
+    } else {
+        running
+            .first()
+            .map(|info| (info.terminal_id, false))
+            .unwrap_or((0, true))
+    };
+    let open = if create {
+        ClientMessage::TerminalCreate {
+            agent,
+            terminal_id,
+            attach: true,
+            cols,
+            rows,
+        }
+    } else {
+        ClientMessage::TerminalAttach {
+            agent,
+            terminal_id,
+            cols,
+            rows,
+        }
+    };
+    let mut stream = dialer.open(Some(50)).await?;
+    rho_ui_proto::write_frame(&mut stream, &open).await?;
+    match rho_ui_proto::read_frame::<_, ServerMessage>(&mut stream).await? {
+        ServerMessage::TerminalOpened { .. } => {}
+        ServerMessage::TerminalRefused { reason } => anyhow::bail!(reason),
+        _ => anyhow::bail!("unexpected reply on terminal stream"),
+    }
+    let channel = stream.into_channel(rho_rpc::ChannelConfig {
+        tx_limit: rho_ui_proto::MAX_FRAME_LEN,
+        rx_limit: rho_ui_proto::MAX_FRAME_LEN,
+        tx_capacity: 64,
+        rx_capacity: 256,
+    });
+    let (input, frames, transport) = channel.into_parts();
+    Ok(TerminalChannel {
+        terminal_id,
+        frames,
+        input,
+        transport,
+    })
+}
+
+async fn dial_shell(dialer: rho_rpc::Dialer, agent: String) -> anyhow::Result<ShellChannel> {
+    let mut stream = dialer.open(Some(50)).await?;
+    rho_ui_proto::write_frame(&mut stream, &ClientMessage::ShellAttach { agent }).await?;
+    match rho_ui_proto::read_frame::<_, ServerMessage>(&mut stream).await? {
+        ServerMessage::ShellOpened => {}
+        ServerMessage::ShellAttachRefused { reason } => anyhow::bail!(reason),
+        _ => anyhow::bail!("unexpected reply on shell stream"),
+    }
+    let (mut reader, mut writer) = stream.into_split();
+    let (mut frames_tx, frames) = mpsc::channel(32);
+    let (submit, mut submit_rx) = tokio::sync::mpsc::channel::<ShellSubmission>(8);
+    let (control, mut control_rx) = tokio::sync::mpsc::channel(8);
+    let pending = Arc::new(Mutex::new(
+        HashMap::<u64, tokio::sync::oneshot::Sender<u64>>::new(),
+    ));
+    let reader_pending = Arc::clone(&pending);
+    spawn_local(async move {
+        while let Ok(frame) =
+            rho_ui_proto::read_frame::<_, rho_ui_proto::shell::ShellServerFrame>(&mut reader).await
+        {
+            match frame {
+                rho_ui_proto::shell::ShellServerFrame::Accepted {
+                    submission,
+                    execution,
+                } => {
+                    if let Some(tx) = reader_pending.lock().unwrap().remove(&submission) {
+                        let _ = tx.send(execution);
+                    }
+                }
+                frame => {
+                    if frames_tx.send(frame).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        }
+        reader_pending.lock().unwrap().clear();
+    });
+    spawn_local(async move {
+        let mut next = 1_u64;
+        loop {
+            let result = tokio::select! {
+                biased;
+                Some(frame) = control_rx.recv() => rho_ui_proto::write_frame(&mut writer, &frame).await,
+                Some(submission) = submit_rx.recv() => {
+                    let id = next;
+                    next = next.wrapping_add(1).max(1);
+                    pending.lock().unwrap().insert(id, submission.accepted);
+                    rho_ui_proto::write_frame(&mut writer, &rho_ui_proto::shell::ShellClientFrame::Submit { submission: id, command: submission.command }).await
+                }
+                else => break,
+            };
+            if result.is_err() {
+                break;
+            }
+        }
+        pending.lock().unwrap().clear();
+        let _ = writer.shutdown().await;
+    });
+    Ok(ShellChannel {
+        frames,
+        submit,
+        control,
+    })
+}
+
 impl Connection {
+    pub fn visualization_client(&self) -> VisualizationClient {
+        VisualizationClient {
+            dialer: Rc::clone(&self.dialer),
+        }
+    }
+
+    pub fn diff_client(&self) -> DiffClient {
+        DiffClient {
+            dialer: Rc::clone(&self.dialer),
+        }
+    }
+
     pub fn new() -> (Self, UnboundedReceiver<Event>) {
         let (commands, receiver) = mpsc::unbounded();
         let (events, event_rx) = mpsc::unbounded();
@@ -89,6 +704,10 @@ impl Connection {
                 commands,
                 receiver: Rc::new(RefCell::new(Some(receiver))),
                 events,
+                host_sink: None,
+                target: None,
+                shell_requests: Arc::new(Mutex::new(ShellControlRequests::default())),
+                dialer: Rc::new(RefCell::new(None)),
             },
             event_rx,
         )
@@ -98,6 +717,102 @@ impl Connection {
         let _ = self.commands.unbounded_send(Command::Control(message));
     }
 
+    pub fn focus_agent(&self, agent_id: Option<AgentId>) {
+        self.send(ClientMessage::AgentStreamFocus { agent_id });
+    }
+
+    pub fn open_channel(
+        &self,
+        workspace: WorkspaceInfo,
+        cx: &App,
+    ) -> gpui::Task<anyhow::Result<WorkspaceChannel>> {
+        let dialer = self.dialer.borrow().clone();
+        cx.spawn(async move |_| {
+            let dialer = dialer.ok_or_else(|| anyhow::anyhow!("not connected to rho-daemon"))?;
+            dial_channel(dialer, workspace).await
+        })
+    }
+
+    pub fn open_terminal_task(
+        &self,
+        agent: String,
+        new: bool,
+        cols: u16,
+        rows: u16,
+        cx: &App,
+    ) -> gpui::Task<anyhow::Result<TerminalChannel>> {
+        let dialer = self.dialer.borrow().clone();
+        cx.spawn(async move |_| {
+            let dialer = dialer.ok_or_else(|| anyhow::anyhow!("not connected to rho-daemon"))?;
+            dial_terminal(dialer, agent, new, cols, rows).await
+        })
+    }
+
+    pub fn open_shell_task(
+        &self,
+        agent: String,
+        cx: &App,
+    ) -> gpui::Task<anyhow::Result<ShellChannel>> {
+        let dialer = self.dialer.borrow().clone();
+        let commands = self.commands.clone();
+        let requests = Arc::clone(&self.shell_requests);
+        cx.spawn(async move |_| {
+            let dialer = dialer.ok_or_else(|| anyhow::anyhow!("not connected to rho-daemon"))?;
+            let reply = shell_control_request(&commands, &requests, |request_id| {
+                ClientMessage::ShellList {
+                    request_id,
+                    agent: Some(agent.clone()),
+                }
+            })
+            .await?;
+            let running = match reply {
+                ShellControlReply::List(shells) => !shells.is_empty(),
+                ShellControlReply::Failed(reason) => anyhow::bail!(reason),
+                _ => anyhow::bail!("unexpected shell list reply"),
+            };
+            if !running {
+                match shell_control_request(&commands, &requests, |request_id| {
+                    ClientMessage::ShellStart {
+                        request_id,
+                        agent: agent.clone(),
+                    }
+                })
+                .await?
+                {
+                    ShellControlReply::Started => {}
+                    ShellControlReply::Failed(reason) => anyhow::bail!(reason),
+                    _ => anyhow::bail!("unexpected shell start reply"),
+                }
+            }
+            dial_shell(dialer, agent).await
+        })
+    }
+
+    pub fn close_shell_task(&self, agent: String, cx: &App) -> gpui::Task<anyhow::Result<()>> {
+        let commands = self.commands.clone();
+        let requests = Arc::clone(&self.shell_requests);
+        cx.spawn(async move |_| {
+            match shell_control_request(&commands, &requests, |request_id| {
+                ClientMessage::ShellClose { request_id, agent }
+            })
+            .await?
+            {
+                ShellControlReply::Closed => Ok(()),
+                ShellControlReply::Failed(reason) => anyhow::bail!(reason),
+                _ => anyhow::bail!("unexpected shell close reply"),
+            }
+        })
+    }
+
+    pub(crate) fn open_realtime_task(
+        &self,
+        offer_sdp: String,
+        cx: &App,
+    ) -> gpui::Task<anyhow::Result<crate::realtime_client::RealtimeChannel>> {
+        let dialer = self.realtime_dialer();
+        cx.spawn(async move |_| dialer.open(offer_sdp).await)
+    }
+
     pub(crate) fn realtime_dialer(&self) -> RealtimeDialer {
         RealtimeDialer {
             commands: self.commands.clone(),
@@ -105,43 +820,137 @@ impl Connection {
     }
 
     pub fn connect(&self, daemon: String) {
+        let endpoint = match EndpointId::from_str(daemon.trim()) {
+            Ok(endpoint) => endpoint,
+            Err(error) => {
+                self.emit_phase(Phase::Failed(format!(
+                    "invalid daemon endpoint id: {error}"
+                )));
+                return;
+            }
+        };
+        remember_daemon(&daemon);
+        self.start(endpoint);
+    }
+
+    pub fn authorize(&self) {
+        if let Some(target) = &self.target {
+            self.start(target.endpoint());
+        }
+    }
+
+    fn start(&self, daemon: EndpointId) {
         let Some(receiver) = self.receiver.borrow_mut().take() else {
             return;
         };
-        remember_daemon(&daemon);
         let events = self.events.clone();
-        let _ = events.unbounded_send(Event::Phase(Phase::Connecting));
+        let host_sink = self.host_sink.clone();
+        let shell_requests = Arc::clone(&self.shell_requests);
+        let dialer = Rc::clone(&self.dialer);
+        self.emit_phase(Phase::Connecting);
         spawn_local(async move {
-            if let Err(error) = run(&daemon, receiver, events.clone()).await {
-                let _ = events.unbounded_send(Event::Phase(Phase::Failed(format!("{error:#}"))));
+            if let Err(error) = run(
+                daemon,
+                receiver,
+                events.clone(),
+                host_sink.clone(),
+                shell_requests,
+                dialer,
+            )
+            .await
+            {
+                let reason = format!("{error:#}");
+                let _ = events.unbounded_send(Event::Phase(Phase::Failed(reason.clone())));
+                if let Some(sink) = host_sink {
+                    sink.send(ConnEvent::Disconnected(reason));
+                }
             }
         });
+    }
+
+    fn emit_phase(&self, phase: Phase) {
+        let _ = self.events.unbounded_send(Event::Phase(phase.clone()));
+        if let Some(sink) = &self.host_sink {
+            match phase {
+                Phase::Unlock(_) => sink.send(ConnEvent::AuthorizationRequired),
+                Phase::Enroll(code) => sink.send(ConnEvent::EnrollmentRequired(code)),
+                Phase::Failed(reason) => sink.send(ConnEvent::Disconnected(reason)),
+                Phase::Connecting | Phase::Online => {}
+            }
+        }
     }
 }
 
 pub fn daemon_id_from_page() -> Option<String> {
-    let window = web_sys::window()?;
-    let storage = window.local_storage().ok()??;
+    daemon_targets_from_page()
+        .ok()?
+        .into_iter()
+        .next()
+        .map(|(_, target)| target.describe())
+}
+
+/// Reads every repeated `daemon=` query/fragment value. A value may be an
+/// endpoint id (named `daemon`, `daemon-2`, …) or `name@endpoint-id`. The
+/// non-secret list is remembered in local storage; the legacy single-daemon
+/// key remains a fallback for existing installations.
+pub fn daemon_targets_from_page() -> anyhow::Result<Vec<(String, AttachTarget)>> {
+    let window = web_sys::window().ok_or_else(|| anyhow::anyhow!("browser window unavailable"))?;
+    let storage = window
+        .local_storage()
+        .ok()
+        .flatten()
+        .ok_or_else(|| anyhow::anyhow!("local storage unavailable"))?;
     let location = window.location();
-    let daemon = [
+    let mut values = [
         location.hash().ok().map(|s| (s, '#')),
         location.search().ok().map(|s| (s, '?')),
     ]
     .into_iter()
     .flatten()
-    .find_map(|(part, prefix)| {
+    .flat_map(|(part, prefix)| {
         part.trim_start_matches(prefix)
             .split('&')
-            .find_map(|pair| pair.strip_prefix("daemon="))
+            .filter_map(|pair| pair.strip_prefix("daemon="))
             .filter(|daemon| !daemon.is_empty())
             .map(str::to_owned)
-    });
-    if let Some(daemon) = daemon {
-        let _ = storage.set_item(DAEMON_KEY, &daemon);
-        Some(daemon)
+            .collect::<Vec<_>>()
+    })
+    .collect::<Vec<_>>();
+    if values.is_empty() {
+        values = storage
+            .get_item(DAEMONS_KEY)
+            .ok()
+            .flatten()
+            .and_then(|json| serde_json::from_str(&json).ok())
+            .or_else(|| {
+                storage
+                    .get_item(DAEMON_KEY)
+                    .ok()
+                    .flatten()
+                    .map(|value| vec![value])
+            })
+            .unwrap_or_default();
     } else {
-        storage.get_item(DAEMON_KEY).ok().flatten()
+        let _ = storage.set_item(DAEMONS_KEY, &serde_json::to_string(&values)?);
+        if let Some(first) = values.first() {
+            let endpoint = first.rsplit_once('@').map_or(first.as_str(), |(_, id)| id);
+            let _ = storage.set_item(DAEMON_KEY, endpoint);
+        }
     }
+    let multiple = values.len() > 1;
+    values
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let (name, endpoint) = match value.split_once('@') {
+                Some((name, endpoint)) if !name.is_empty() => (name.to_owned(), endpoint),
+                Some(_) => anyhow::bail!("daemon host name is empty"),
+                None if multiple => (format!("daemon-{}", index + 1), value.as_str()),
+                None => ("daemon".to_owned(), value.as_str()),
+            };
+            Ok((name, AttachTarget::iroh(endpoint)?))
+        })
+        .collect()
 }
 
 fn remember_daemon(daemon: &str) {
@@ -157,12 +966,13 @@ fn conn_log(message: &str) {
 }
 
 async fn run(
-    daemon: &str,
+    daemon: EndpointId,
     mut receiver: UnboundedReceiver<Command>,
     events: UnboundedSender<Event>,
+    host_sink: Option<HostSink>,
+    shell_requests: Arc<Mutex<ShellControlRequests>>,
+    dialer: Rc<RefCell<Option<rho_rpc::Dialer>>>,
 ) -> anyhow::Result<()> {
-    let daemon = EndpointId::from_str(daemon.trim())
-        .map_err(|error| anyhow::anyhow!("invalid daemon endpoint id: {error}"))?;
     conn_log("unlocking passkey identity");
     let secret = passkey_secret(daemon).await?;
     conn_log("passkey identity ready; binding browser iroh endpoint");
@@ -180,13 +990,18 @@ async fn run(
         rho_iroh_auth::ClientAuthResult::Approved => conn_log("authenticated as enrolled client"),
         rho_iroh_auth::ClientAuthResult::EnrollmentRequired(code) => {
             conn_log(&format!("enrollment required, code {code}"));
-            let _ = events.unbounded_send(Event::Phase(Phase::Enroll(code.to_string())));
+            let code = code.to_string();
+            let _ = events.unbounded_send(Event::Phase(Phase::Enroll(code.clone())));
+            if let Some(sink) = &host_sink {
+                sink.send(ConnEvent::EnrollmentRequired(code));
+            }
             return Ok(());
         }
         rho_iroh_auth::ClientAuthResult::Unavailable => {
             anyhow::bail!("daemon cannot accept another enrollment right now")
         }
     }
+    *dialer.borrow_mut() = Some(rho_rpc::Dialer::Iroh(connection.clone()));
     let (send, recv) = connection
         .open_bi()
         .await
@@ -222,8 +1037,8 @@ async fn run(
         }
     });
     futures::try_join!(
-        read_loop(&events, &mut recv),
-        read_agent_streams(events.clone(), connection)
+        read_loop(&events, host_sink.as_ref(), &shell_requests, &mut recv),
+        read_agent_streams(events.clone(), host_sink.clone(), connection)
     )?;
     Ok(())
 }
@@ -239,53 +1054,39 @@ async fn dial_realtime(
         ServerMessage::RealtimeRefused { reason } => anyhow::bail!(reason),
         _ => anyhow::bail!("unexpected reply to RealtimeOpen"),
     };
-    let (mut reader, mut writer) = stream.into_split();
-    let (requests, mut request_rx) = mpsc::channel::<RealtimeClientFrame>(32);
-    let (mut reply_tx, replies) = mpsc::channel::<anyhow::Result<RealtimeServerFrame>>(32);
-    let mut writer_errors = reply_tx.clone();
-    spawn_local(async move {
-        while let Some(frame) = request_rx.next().await {
-            if let Err(error) =
-                rho_ui_proto::write_frame_limited(&mut writer, &frame, rho_ui_proto::MAX_FRAME_LEN)
-                    .await
-            {
-                let _ = writer_errors.send(Err(error)).await;
-                break;
-            }
-        }
-        let _ = writer.shutdown().await;
+    let channel = stream.into_channel(rho_rpc::ChannelConfig {
+        tx_limit: rho_ui_proto::MAX_FRAME_LEN,
+        rx_limit: rho_ui_proto::MAX_FRAME_LEN,
+        tx_capacity: 32,
+        rx_capacity: 32,
     });
-    spawn_local(async move {
-        loop {
-            let result =
-                rho_ui_proto::read_frame_limited(&mut reader, rho_ui_proto::MAX_FRAME_LEN).await;
-            let failed = result.is_err();
-            if reply_tx.send(result).await.is_err() || failed {
-                break;
-            }
-        }
-    });
+    let (requests, replies, transport) = channel.into_parts();
     Ok(crate::realtime_client::RealtimeChannel {
         answer_sdp,
         requests,
         replies,
+        _transport: transport,
     })
 }
 
 async fn read_loop(
     events: &UnboundedSender<Event>,
+    host_sink: Option<&HostSink>,
+    shell_requests: &Mutex<ShellControlRequests>,
     recv: &mut rho_rpc::Reader,
 ) -> anyhow::Result<()> {
     loop {
         let message = rho_ui_proto::read_frame(recv)
             .await
             .map_err(|error| anyhow::anyhow!("daemon connection lost: {error}"))?;
+        handle_host_message(host_sink, shell_requests, &message);
         let _ = events.unbounded_send(Event::Message(message));
     }
 }
 
 async fn read_agent_streams(
     events: UnboundedSender<Event>,
+    host_sink: Option<HostSink>,
     connection: iroh::endpoint::Connection,
 ) -> anyhow::Result<()> {
     const FRAME_BUDGET: usize = 64 * 1024 * 1024;
@@ -299,8 +1100,11 @@ async fn read_agent_streams(
         let events = events.clone();
         let budget = Arc::clone(&budget);
         let generations = Rc::clone(&generations);
+        let host_sink = host_sink.clone();
         spawn_local(async move {
-            if let Err(error) = read_agent_stream(events.clone(), recv, budget, generations).await {
+            if let Err(error) =
+                read_agent_stream(events.clone(), host_sink, recv, budget, generations).await
+            {
                 let _ = events.unbounded_send(Event::Phase(Phase::Failed(format!(
                     "agent stream closed: {error:#}"
                 ))));
@@ -311,12 +1115,13 @@ async fn read_agent_streams(
 
 async fn read_agent_stream(
     events: UnboundedSender<Event>,
+    host_sink: Option<HostSink>,
     recv: iroh::endpoint::RecvStream,
     budget: Arc<tokio::sync::Semaphore>,
     generations: Rc<RefCell<AgentStreamGenerations>>,
 ) -> anyhow::Result<()> {
     let mut recv = rho_rpc::Reader::new(recv);
-    let header = read_budgeted(&mut recv, &budget)
+    let (header, _header_allocation) = read_budgeted(&mut recv, &budget)
         .await?
         .ok_or_else(|| anyhow::anyhow!("agent stream closed before its header"))?;
     let ServerMessage::AgentStreamOpened { agent_id } = header else {
@@ -324,7 +1129,7 @@ async fn read_agent_stream(
     };
     let generation = generations.borrow_mut().open(agent_id);
     loop {
-        let Some(message) = read_budgeted(&mut recv, &budget).await? else {
+        let Some((message, allocation)) = read_budgeted(&mut recv, &budget).await? else {
             return Ok(());
         };
         let ServerMessage::Agent {
@@ -336,6 +1141,15 @@ async fn read_agent_stream(
         };
         anyhow::ensure!(*frame_agent_id == agent_id, "agent stream id changed");
         if generations.borrow().is_current(agent_id, generation) {
+            if let Some(sink) = &host_sink {
+                if let ServerMessage::Agent { agent_id, frame } = &message {
+                    sink.send(ConnEvent::Frame {
+                        agent_id: *agent_id,
+                        frame: frame.clone(),
+                        allocation: Some(allocation),
+                    });
+                }
+            }
             let _ = events.unbounded_send(Event::Message(message));
         }
     }
@@ -344,13 +1158,17 @@ async fn read_agent_stream(
 async fn read_budgeted(
     recv: &mut rho_rpc::Reader,
     budget: &Arc<tokio::sync::Semaphore>,
-) -> anyhow::Result<Option<ServerMessage>> {
+) -> anyhow::Result<Option<(ServerMessage, AgentFrameAllocation)>> {
     let message =
         rho_rpc::read_frame_allocated_optional(recv, rho_ui_proto::MAX_FRAME_LEN, |len| {
             Arc::clone(budget).acquire_many_owned(len as u32)
         })
         .await?;
-    Ok(message.map(|(message, _allocation, _)| message))
+    let Some((message, permit, _)) = message else {
+        return Ok(None);
+    };
+    let permit = permit.map_err(|_| anyhow::anyhow!("agent frame budget closed"))?;
+    Ok(Some((message, AgentFrameAllocation { _permit: permit })))
 }
 
 async fn passkey_secret(daemon: EndpointId) -> anyhow::Result<iroh::SecretKey> {

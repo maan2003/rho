@@ -7,9 +7,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::ops::Range;
 
-use editor::hover_links::InlayHighlight;
 use editor::scroll::AutoscrollStrategy;
-use editor::{Editor, EditorMode, HighlightKey, Inlay, SelectionEffects, SizingBehavior};
+use editor::{
+    Editor, EditorMode, HighlightKey, Inlay, InlayHighlight, SelectionEffects, SizingBehavior,
+};
 use futures::StreamExt as _;
 use gpui::prelude::*;
 use gpui::{Context, Entity, FontStyle, FontWeight, HighlightStyle, WeakEntity, Window, px};
@@ -140,6 +141,7 @@ impl ShellModel {
                     sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
                 },
                 multi_buffer,
+                #[cfg(feature = "native")]
                 None,
                 window,
                 cx,

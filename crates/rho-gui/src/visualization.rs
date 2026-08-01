@@ -43,7 +43,7 @@ impl Visualization {
             let result = async {
                 let artifact = request
                     .await
-                    .map_err(|error| anyhow::anyhow!(error.to_string()))??;
+                    .map_err(|error| anyhow::anyhow!(error.to_string()))?;
                 anyhow::ensure!(
                     artifact.mime_type == "image/svg+xml",
                     "unsupported visualization type {}",

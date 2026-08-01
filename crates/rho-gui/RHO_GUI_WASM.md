@@ -102,10 +102,15 @@ equivalent downstream defaults) so existing native behavior does not change.
 
 `crates/rho-gui-web` is the thin Trunk entry point. It boots `gpui_web`, loads
 Rho's assets and editor settings, and mounts `rho_gui::workspace::Workspace`.
-The browser workspace uses direct iroh (ALPN `rho/ui/3`) with the same WebAuthn
-PRF identity/enrollment flow. It applies streamed agent
-frames to the shared `rho-registry` store and feeds the existing dashboard,
-`AgentModel`, transcript model, and transcript preview.
+GPUI retains its multithreaded dispatcher. Its CSP-safe local `wasm_thread`
+bootstrap uses module workers and the Trunk-emitted module-preload shim URL
+without JavaScript `eval`; COOP/COEP remain required for shared wasm memory.
+The canonical `Workspace` now lives in `workspace.rs` on both targets and owns
+the registry, store, subscriptions, model cache, and lifecycle transitions.
+Its browser child contains only browser transport/chrome, touch layout, and
+render state. The browser uses direct iroh (ALPN `rho/ui/3`) with the same
+WebAuthn PRF identity/enrollment flow and feeds frames into the same workspace
+state and `AgentModel` synchronization path as native.
 
 Build the static bundle (release is required) with:
 
@@ -117,3 +122,22 @@ Open `dist/index.html` through an HTTP server with the COOP/COEP headers from
 `Trunk.toml`, using `#daemon=<daemon-endpoint-id>`. Click the unlock prompt to
 perform WebAuthn. If enrollment is required, approve the displayed code with
 `rho iroh approve <code>` and reload.
+
+## Multi-host connection integration
+
+`hosts::Hosts` and the target-selected concrete `connection::Connection` are
+now shared by native and wasm. The browser still dials iroh directly; there is
+no connection trait or transport enum. `daemon_targets_from_page` accepts
+repeated query or fragment values. Plain endpoint ids receive generated names,
+while `daemon=<name>@<endpoint-id>` supplies a stable display name. The list is
+remembered in local storage, with the old single-daemon key retained as a
+fallback.
+
+Attaching a browser host deliberately leaves it locked and emits
+`AuthorizationRequired`. UI code must call `Hosts::authorize(host_id)` from a
+user gesture for that one host; it must not batch WebAuthn prompts. Enrollment,
+status, control messages, focused-agent stream priority, and agent frames are
+tagged with `HostId`. Terminal, shell, and realtime attachments each open a
+dedicated stream on the selected host connection. Their `ChannelTask` uses a
+browser-local abortable pump on wasm, so dropping the owning model cancels both
+directions just as dropping the native Tokio-backed owner does.

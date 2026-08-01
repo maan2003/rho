@@ -308,8 +308,12 @@ AI APIs.
   derived enrolled key and thereby gain persistent daemon access. Deploy the
   page on a dedicated origin without third-party scripts and treat its build
   and publishing pipeline as security-critical. The page refuses to run when
-  framed and ships a restrictive meta CSP; production hosting must additionally
-  send `Content-Security-Policy: frame-ancestors 'none'` as an HTTP header.
+  framed and ships a restrictive meta CSP. GPUI background work runs in module
+  workers created from same-page blobs; `worker-src` permits those blobs, while
+  the locally carried `wasm_thread` bootstrap avoids JavaScript `eval` and
+  imports only the build's same-origin wasm-bindgen shim. Production hosting
+  must additionally send `Content-Security-Policy: frame-ancestors 'none'` as
+  an HTTP header.
   Besides user-authored text, the page sends bounded agent creation choices
   (topic, registered workdir, role, base revset, and workspace mode).
   A compromised origin can register a persistent service worker as well as

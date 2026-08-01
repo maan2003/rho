@@ -3,19 +3,19 @@
 pub mod agent_view;
 #[cfg(feature = "native")]
 pub(crate) mod chime;
-#[cfg(feature = "native")]
 pub(crate) mod commands;
 #[cfg(feature = "native")]
 pub(crate) mod connection;
 #[cfg(all(target_family = "wasm", not(feature = "native")))]
-pub(crate) mod connection_web;
+#[path = "connection_web.rs"]
+pub(crate) mod connection;
+#[cfg(all(target_family = "wasm", not(feature = "native")))]
+pub(crate) use connection as connection_web;
 pub mod dashboard;
-#[cfg(feature = "native")]
 pub(crate) mod diff_view;
 pub mod draft_view;
 pub mod editor_config;
 pub mod highlights;
-#[cfg(feature = "native")]
 pub mod hosts;
 pub mod minibuffer;
 pub mod pane;
@@ -24,22 +24,13 @@ pub mod render;
 pub mod rho_assets;
 #[cfg(all(test, feature = "native"))]
 mod sampler;
-#[cfg(feature = "native")]
 pub(crate) mod shell_view;
 pub mod style;
-#[cfg(feature = "native")]
 pub(crate) mod terminal_view;
 pub mod transcript;
-#[cfg(feature = "native")]
 pub mod transient;
-#[cfg(feature = "native")]
 pub(crate) mod visualization;
-#[cfg(feature = "native")]
 pub mod workspace;
-#[cfg(not(feature = "native"))]
-#[path = "workspace_web.rs"]
-pub mod workspace;
-#[cfg(feature = "native")]
 pub(crate) mod zed_remote;
 
 // The registry and per-agent frame store live in a shared crate. These aliases

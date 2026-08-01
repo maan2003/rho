@@ -38,6 +38,9 @@ tokio = { version = "1", features = ["io-util", "rt", "sync", "time"] }
 [target.'cfg(unix)'.dependencies]
 tokio = { version = "1", features = ["net"] }
 
+[target.'cfg(target_family = "wasm")'.dependencies]
+wasm-bindgen-futures = "0.4"
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

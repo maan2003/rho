@@ -23,6 +23,10 @@ use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use crate::registry::HostId;
 use crate::workspace::AttachTarget;
 
+/// Owns the transport pumps for a dedicated stream. Dropping it cancels both
+/// directions on every target.
+pub type ChannelTask = rho_rpc::ChannelTask;
+
 /// A connection event tagged with the daemon it came from. Every attached
 /// host feeds the same channel, so the workspace handles one ordered stream
 /// rather than polling several.
@@ -122,7 +126,7 @@ pub enum GitApprovalDecision {
 pub struct WorkspaceChannel {
     pub outgoing: futures_mpsc::Sender<rho_ui_proto::WorkspaceClientFrame>,
     pub incoming: futures_mpsc::Receiver<anyhow::Result<rho_ui_proto::WorkspaceServerFrame>>,
-    pub transport: rho_rpc::ChannelTask,
+    pub transport: ChannelTask,
 }
 
 /// How to dial an extra workspace-file stream to the daemon: locally a
@@ -526,15 +530,15 @@ impl VisualizationClient {
         }
     }
 
-    pub fn get(
-        &self,
-        id: String,
-        cx: &App,
-    ) -> Task<Result<anyhow::Result<VisualizationArtifact>, gpui_tokio::JoinError>> {
+    pub fn get(&self, id: String, cx: &App) -> Task<anyhow::Result<VisualizationArtifact>> {
         let dialer = self.dialer.lock().unwrap().clone();
-        Tokio::spawn(cx, async move {
+        let task = Tokio::spawn(cx, async move {
             let dialer = dialer.context("not connected to rho-daemon")?;
             dial_visualization(dialer, id).await
+        });
+        cx.spawn(async move |_| {
+            task.await
+                .map_err(|error| anyhow::anyhow!("visualization task failed: {error}"))?
         })
     }
 }
@@ -551,13 +555,15 @@ impl DiffClient {
         known_commit_id: Option<String>,
         include_paths: Vec<Utf8PathBuf>,
         cx: &App,
-    ) -> Task<
-        Result<anyhow::Result<Option<rho_ui_proto::WorkspaceDiffSnapshot>>, gpui_tokio::JoinError>,
-    > {
+    ) -> Task<anyhow::Result<Option<rho_ui_proto::WorkspaceDiffSnapshot>>> {
         let dialer = self.dialer.lock().unwrap().clone();
-        Tokio::spawn(cx, async move {
+        let task = Tokio::spawn(cx, async move {
             let dialer = dialer.context("not connected to rho-daemon")?;
             dial_diff_snapshot(dialer, workspace, known_commit_id, include_paths).await
+        });
+        cx.spawn(async move |_| {
+            task.await
+                .map_err(|error| anyhow::anyhow!("diff snapshot task failed: {error}"))?
         })
     }
 
@@ -568,18 +574,89 @@ impl DiffClient {
         commit_id: String,
         paths: Vec<Utf8PathBuf>,
         cx: &App,
-    ) -> Task<
-        Result<anyhow::Result<Vec<rho_ui_proto::WorkspaceDiffBaseContent>>, gpui_tokio::JoinError>,
-    > {
+    ) -> Task<anyhow::Result<Vec<rho_ui_proto::WorkspaceDiffBaseContent>>> {
         let dialer = self.dialer.lock().unwrap().clone();
-        Tokio::spawn(cx, async move {
+        let task = Tokio::spawn(cx, async move {
             let dialer = dialer.context("not connected to rho-daemon")?;
             dial_diff_base_contents(dialer, workspace, operation_id, commit_id, paths).await
+        });
+        cx.spawn(async move |_| {
+            task.await
+                .map_err(|error| anyhow::anyhow!("diff contents task failed: {error}"))?
         })
     }
 }
 
 impl Connection {
+    /// Target-neutral GPUI task API used by portable terminal surfaces.
+    pub fn open_terminal_task(
+        &self,
+        agent: String,
+        new: bool,
+        cols: u16,
+        rows: u16,
+        cx: &App,
+    ) -> Task<anyhow::Result<TerminalChannel>> {
+        let dialer = self.dialer.lock().unwrap().clone();
+        cx.spawn(async move |_| {
+            let dialer = dialer.context("not connected to rho-daemon")?;
+            dial_terminal(dialer, agent, new, cols, rows).await
+        })
+    }
+
+    /// Target-neutral GPUI task API used by portable shell surfaces.
+    pub fn open_shell_task(&self, agent: String, cx: &App) -> Task<anyhow::Result<ShellChannel>> {
+        let dialer = self.dialer.lock().unwrap().clone();
+        let commands = self.commands.clone();
+        let requests = Arc::clone(&self.shell_requests);
+        cx.spawn(async move |_| {
+            let dialer = dialer.context("not connected to rho-daemon")?;
+            let reply = shell_control_request(&commands, &requests, |request_id| {
+                ClientMessage::ShellList {
+                    request_id,
+                    agent: Some(agent.clone()),
+                }
+            })
+            .await?;
+            let running = match reply {
+                ShellControlReply::List(shells) => !shells.is_empty(),
+                ShellControlReply::Failed(reason) => anyhow::bail!(reason),
+                _ => anyhow::bail!("unexpected shell list reply"),
+            };
+            if !running {
+                match shell_control_request(&commands, &requests, |request_id| {
+                    ClientMessage::ShellStart {
+                        request_id,
+                        agent: agent.clone(),
+                    }
+                })
+                .await?
+                {
+                    ShellControlReply::Started => {}
+                    ShellControlReply::Failed(reason) => anyhow::bail!(reason),
+                    _ => anyhow::bail!("unexpected shell start reply"),
+                }
+            }
+            dial_shell(dialer, agent).await
+        })
+    }
+
+    pub fn close_shell_task(&self, agent: String, cx: &App) -> Task<anyhow::Result<()>> {
+        let commands = self.commands.clone();
+        let requests = Arc::clone(&self.shell_requests);
+        cx.spawn(async move |_| {
+            match shell_control_request(&commands, &requests, |request_id| {
+                ClientMessage::ShellClose { request_id, agent }
+            })
+            .await?
+            {
+                ShellControlReply::Closed => Ok(()),
+                ShellControlReply::Failed(reason) => anyhow::bail!(reason),
+                _ => anyhow::bail!("unexpected shell close reply"),
+            }
+        })
+    }
+
     pub fn visualization_client(&self) -> VisualizationClient {
         VisualizationClient {
             dialer: self.dialer.clone(),
@@ -687,11 +764,15 @@ impl Connection {
         &self,
         workspace: WorkspaceInfo,
         cx: &App,
-    ) -> Task<Result<anyhow::Result<WorkspaceChannel>, gpui_tokio::JoinError>> {
+    ) -> Task<anyhow::Result<WorkspaceChannel>> {
         let dialer = self.dialer.lock().unwrap().clone();
-        Tokio::spawn(cx, async move {
+        let task = Tokio::spawn(cx, async move {
             let dialer = dialer.context("not connected to rho-daemon")?;
             dial_channel(dialer, workspace).await
+        });
+        cx.spawn(async move |_| {
+            task.await
+                .map_err(|error| anyhow::anyhow!("workspace channel task failed: {error}"))?
         })
     }
 

@@ -410,7 +410,7 @@ impl Stream {
         let (mut reader, mut writer) = self.into_split();
         let (outgoing, mut outgoing_rx) = futures::channel::mpsc::channel(config.tx_capacity);
         let (mut incoming_tx, incoming) = futures::channel::mpsc::channel(config.rx_capacity);
-        let task = tokio::spawn(async move {
+        let channel_future = async move {
             let mut writer_errors = incoming_tx.clone();
             let reader_loop = async move {
                 loop {
@@ -440,11 +440,31 @@ impl Stream {
             // The loops are independently polled: backpressure in either
             // direction never disables progress in the reverse direction.
             let _: anyhow::Result<((), ())> = tokio::try_join!(reader_loop, writer_loop);
-        });
+        };
+        #[cfg(not(target_family = "wasm"))]
+        let task = tokio::spawn(channel_future);
+        #[cfg(target_family = "wasm")]
+        let task = {
+            let (abort, registration) = futures::future::AbortHandle::new_pair();
+            let (done, joined) = futures::channel::oneshot::channel();
+            wasm_bindgen_futures::spawn_local(async move {
+                let result = futures::future::Abortable::new(channel_future, registration).await;
+                let _ = done.send(result);
+            });
+            BrowserChannelTask {
+                abort,
+                joined: Some(joined),
+            }
+        };
         FramedChannel {
             outgoing,
             incoming,
-            task: ChannelTask { task: Some(task) },
+            task: ChannelTask {
+                #[cfg(not(target_family = "wasm"))]
+                task: Some(task),
+                #[cfg(target_family = "wasm")]
+                task,
+            },
         }
     }
 }
@@ -477,21 +497,46 @@ impl<Tx, Rx> FramedChannel<Tx, Rx> {
 
 /// Aborts both channel directions when the owning application surface drops.
 pub struct ChannelTask {
+    #[cfg(not(target_family = "wasm"))]
     task: Option<tokio::task::JoinHandle<()>>,
+    #[cfg(target_family = "wasm")]
+    task: BrowserChannelTask,
+}
+
+#[cfg(target_family = "wasm")]
+struct BrowserChannelTask {
+    abort: futures::future::AbortHandle,
+    joined: Option<futures::channel::oneshot::Receiver<Result<(), futures::future::Aborted>>>,
 }
 
 impl ChannelTask {
     /// Waits for a sender-driven graceful half-close and peer EOF.
+    #[cfg(not(target_family = "wasm"))]
     pub async fn join(mut self) -> Result<(), tokio::task::JoinError> {
         self.task.take().expect("channel task already joined").await
+    }
+
+    /// Waits for a browser-local channel pump to finish or be aborted.
+    #[cfg(target_family = "wasm")]
+    pub async fn join(mut self) -> anyhow::Result<()> {
+        self.task
+            .joined
+            .take()
+            .expect("channel task already joined")
+            .await
+            .map_err(|_| anyhow::anyhow!("channel task completion dropped"))?
+            .map_err(|_| anyhow::anyhow!("channel task aborted"))
     }
 }
 
 impl Drop for ChannelTask {
     fn drop(&mut self) {
+        #[cfg(not(target_family = "wasm"))]
         if let Some(task) = &self.task {
             task.abort();
         }
+        #[cfg(target_family = "wasm")]
+        self.task.abort.abort();
     }
 }
 

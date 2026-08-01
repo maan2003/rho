@@ -34,6 +34,17 @@ fn wait_async_supported() -> bool {
     wait_async.is_function()
 }
 
+#[cfg(feature = "multithreaded")]
+fn wasm_bindgen_shim_url(window: &web_sys::Window) -> Option<String> {
+    let link = window
+        .document()?
+        .query_selector("link[rel='modulepreload']")
+        .ok()??;
+    js_sys::Reflect::get(link.as_ref(), &JsValue::from_str("href"))
+        .ok()?
+        .as_string()
+}
+
 enum MainThreadItem {
     Runnable(RunnableVariant),
     Delayed {
@@ -167,6 +178,12 @@ impl WebDispatcher {
             && wait_async_supported();
 
         if supports_threads {
+            let shim_url = wasm_bindgen_shim_url(&browser_window).expect(
+                "multithreaded GPUI requires a modulepreload link for the wasm-bindgen shim",
+            );
+            wasm_thread::Builder::new()
+                .wasm_bindgen_shim_url(shim_url)
+                .set_default();
             main_thread_mailbox.run_waker_loop(browser_window.clone());
         } else if cfg!(feature = "multithreaded") && allow_threads {
             log::warn!(

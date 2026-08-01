@@ -73,6 +73,7 @@ languages = { path = "../../vendor/zed/crates/languages", optional = true }
 multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
 node_runtime = { path = "../../vendor/zed/crates/node_runtime", optional = true }
 octo-types = { workspace = true, optional = true }
+path = { path = "../../vendor/zed/crates/path" }
 prefix-id = { workspace = true, optional = true }
 project = { path = "../../vendor/zed/crates/project", optional = true }
 release_channel = { path = "../../vendor/zed/crates/release_channel", optional = true }

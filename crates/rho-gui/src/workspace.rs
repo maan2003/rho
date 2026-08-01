@@ -11,9 +11,15 @@
 //! travels down — and for the few places where a daemon-side *name* (a
 //! repository path, a short agent label) is only unique within one machine.
 
+#[cfg(all(target_family = "wasm", not(feature = "native")))]
+#[path = "workspace_web.rs"]
+mod web;
+
 use std::collections::{HashMap, HashSet};
+#[cfg(feature = "native")]
 use std::path::PathBuf;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+#[cfg(feature = "native")]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use camino::Utf8PathBuf;
@@ -28,10 +34,11 @@ use rho_ui_proto::{
 use theme::ActiveTheme as _;
 
 use crate::agent_view::AgentModel;
+#[cfg(feature = "native")]
 use crate::chime::Chime;
-use crate::connection::{
-    AgentFrameAllocation, ConnEvent, Connection, GitApprovalDecision, HostEvent,
-};
+#[cfg(feature = "native")]
+use crate::connection::GitApprovalDecision;
+use crate::connection::{AgentFrameAllocation, ConnEvent, Connection, HostEvent};
 use crate::draft_view::DraftModel;
 use crate::hosts::{HostStatus, Hosts};
 use crate::minibuffer::{ECHO_DURATION, Echo, Minibuffer, bottom_strip};
@@ -69,6 +76,7 @@ pub struct Surface {
     _focus_follow: Option<std::rc::Rc<gpui::Subscription>>,
 }
 
+#[cfg(feature = "native")]
 struct PendingGitApproval {
     request_id: u64,
     prompt: String,
@@ -115,6 +123,7 @@ enum ContextId {
 /// socket may be forwarded from another machine, so the GUI's own cwd and
 /// home mean nothing to the daemon and must never leak into agent working
 /// directories.
+#[cfg(feature = "native")]
 #[derive(Clone)]
 pub enum AttachTarget {
     Unix(PathBuf),
@@ -125,6 +134,7 @@ pub enum AttachTarget {
     },
 }
 
+#[cfg(feature = "native")]
 impl AttachTarget {
     /// How the host reads in chrome and error text.
     pub fn describe(&self) -> String {
@@ -139,12 +149,14 @@ impl AttachTarget {
 
 /// One daemon to attach: the short name it is known by in this client, and
 /// how to reach it.
+#[cfg(feature = "native")]
 #[derive(Clone)]
 pub struct HostSpec {
     pub name: String,
     pub target: AttachTarget,
 }
 
+#[cfg(feature = "native")]
 impl HostSpec {
     /// Parses the one-line host form used both on the command line and in
     /// the attach prompt: `<name>=unix:<socket>` or
@@ -249,6 +261,7 @@ pub struct Workspace {
     global_usage_days: u64,
     duration_timer: Option<Task<()>>,
     /// Attention chime output; lazily opened on the first play.
+    #[cfg(feature = "native")]
     chime: Chime,
     /// Per-context split trees of viewports over surfaces. The rail is
     /// ambient chrome beside the active tree, not a pane in it.
@@ -283,6 +296,7 @@ pub struct Workspace {
     /// quit-one) before a final escape closes the strip.
     transient_stack: Vec<crate::transient::Transient>,
     transient_focus: gpui::FocusHandle,
+    #[cfg(feature = "native")]
     git_approval_focus: gpui::FocusHandle,
     /// Focus beneath the single modal overlay. Transients, minibuffers, and
     /// Git approval hand this target between them so borrowing keyboard
@@ -291,6 +305,7 @@ pub struct Workspace {
     /// The last system notice, flashed in the bottom strip (emacs echo
     /// area). Cleared by its own timer or when the minibuffer opens.
     echo: Option<Echo>,
+    #[cfg(feature = "native")]
     pending_git_approval: Option<PendingGitApproval>,
     realtime_task: Option<Task<()>>,
     realtime_stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -302,6 +317,214 @@ pub struct Workspace {
     iris_host: Option<HostId>,
     _event_task: Task<()>,
     _dashboard_subscription: gpui::Subscription,
+    #[cfg(all(target_family = "wasm", not(feature = "native")))]
+    web: web::WebUi,
+}
+
+/// Target-independent application state transitions. Transport adapters feed
+/// these methods; native and browser layout code only decide when to render
+/// the resulting canonical registry/store/model state.
+impl Workspace {
+    fn ensure_agent_model(
+        &mut self,
+        agent_id: AgentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Entity<AgentModel>, bool) {
+        let model = if let Some(model) = self.models.get(&agent_id).cloned() {
+            model
+        } else {
+            let workspace = cx.entity().downgrade();
+            let visualization_client = self
+                .connection_for(agent_id)
+                .map(Connection::visualization_client)
+                .unwrap_or_else(crate::connection::VisualizationClient::detached);
+            let model = cx.new(|cx| AgentModel::new(workspace, visualization_client, cx));
+            #[cfg(feature = "native")]
+            self.refresh_view_status(&agent_id, &model, cx);
+            self.models.insert(agent_id, model.clone());
+            model
+        };
+        let started = self.start_initial_agent_load(agent_id, &model, cx);
+        model.update(cx, |model, cx| {
+            model.preview_editor(window, cx);
+        });
+        (model, started)
+    }
+
+    pub(crate) fn finish_initial_agent_load(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
+        self.finish_agent_load(agent_id, cx);
+        #[cfg(feature = "native")]
+        if let Some(model) = self.models.get(&agent_id).cloned() {
+            self.refresh_view_status(&agent_id, &model, cx);
+        }
+        cx.notify();
+    }
+
+    fn apply_workstream_created(&mut self, host: HostId, workstream: rho_ui_proto::UiWorkstream) {
+        self.registry.add_workstream(host, workstream);
+    }
+
+    fn apply_agent_subscribed(&mut self, agent_id: AgentId) {
+        self.registry.mark_known(agent_id);
+    }
+
+    fn apply_attention(
+        &mut self,
+        agent_id: AgentId,
+        attention: rho_ui_proto::UiAttention,
+    ) -> rho_ui_proto::UiAttention {
+        let before = self.registry.attention(agent_id);
+        self.registry.set_attention(agent_id, attention);
+        before
+    }
+
+    fn apply_turn_report(&mut self, agent_id: AgentId, report: rho_ui_proto::UiTurnReport) -> bool {
+        let needs_you = report.needs_you;
+        self.registry.set_turn_report(agent_id, report);
+        needs_you
+    }
+
+    fn apply_ready(
+        &mut self,
+        host: HostId,
+        machine_seed: u64,
+        agent_counter: u64,
+        workstreams: Vec<rho_ui_proto::UiWorkstream>,
+        agents: Vec<rho_ui_proto::UiAgentSummary>,
+    ) -> (bool, Option<Vec<AgentId>>) {
+        let first_ready = self.ready_hosts.insert(host);
+        let initial = first_ready.then(|| {
+            recent_workstream_roots(
+                &workstreams,
+                &agents,
+                self.registry.selected_agent().copied(),
+                INITIAL_AGENT_SUBSCRIPTIONS,
+            )
+        });
+        self.registry
+            .set_host_data(host, machine_seed, agent_counter, workstreams, agents);
+        (first_ready, initial)
+    }
+
+    fn note_agent_created(
+        &mut self,
+        host: HostId,
+        agent_id: AgentId,
+        workstream: rho_ui_proto::WorkstreamId,
+    ) {
+        self.registry
+            .note_agent_workstream(host, agent_id, workstream);
+        self.registry.mark_known(agent_id);
+    }
+
+    fn apply_frame_state(
+        &mut self,
+        agent_id: AgentId,
+        frame: rho_ui_proto::remote::AgentRemoteFrame,
+    ) -> Option<(FrameSummary, Option<u64>, bool, bool)> {
+        if !self.subscriptions.accepts_frames(agent_id) {
+            return None;
+        }
+        let old_context = self
+            .store
+            .get(&agent_id)
+            .and_then(|state| state.context_used);
+        let old_usage = self.store.get(&agent_id).map(|state| state.usage.clone());
+        let summary = self.store.apply(agent_id, frame);
+        let usage_changed = old_usage.as_ref() != self.store.get(&agent_id).map(|s| &s.usage);
+        let live_changed = self.registry.mark_live(agent_id);
+        Some((summary, old_context, usage_changed, live_changed))
+    }
+
+    fn start_initial_agent_load(
+        &self,
+        agent_id: AgentId,
+        model: &Entity<AgentModel>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if model.read(cx).initial_load_started() {
+            return false;
+        }
+        let Some(state) = self.store.get(&agent_id).cloned() else {
+            return false;
+        };
+        let labels = self
+            .registry
+            .known_agents()
+            .copied()
+            .map(|id| (id, self.registry.agent_display_label(id)))
+            .collect();
+        model.update(cx, |model, cx| {
+            model.start_initial_load(agent_id, state, labels, now_ms(), cx)
+        });
+        true
+    }
+
+    fn sync_agent_model(
+        &mut self,
+        agent_id: AgentId,
+        model: &Entity<AgentModel>,
+        summary: FrameSummary,
+        started: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if started {
+            return;
+        }
+        if !model.read(cx).initial_load_ready() {
+            self.pending_syncs
+                .entry(agent_id)
+                .and_modify(|pending| *pending = pending.merge(summary))
+                .or_insert(summary);
+        } else if let Some(state) = self.store.get(&agent_id) {
+            model.update(cx, |model, cx| {
+                model.sync(
+                    state,
+                    summary,
+                    now_ms(),
+                    &|id| self.registry.agent_display_label(id),
+                    cx,
+                )
+            });
+        }
+    }
+
+    fn apply_agent_unloaded(
+        &mut self,
+        agent_id: AgentId,
+        reason: rho_ui_proto::AgentUnloadReason,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.subscriptions.mark_unloaded(agent_id, reason) {
+            return false;
+        }
+        self.registry.mark_not_live(agent_id);
+        let summary = self.store.mark_unloaded(agent_id);
+        if let Some(model) = self.models.get(&agent_id).cloned() {
+            self.sync_agent_model(agent_id, &model, summary, false, cx);
+        }
+        true
+    }
+
+    fn finish_agent_load(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
+        let Some(model) = self.models.get(&agent_id).cloned() else {
+            return;
+        };
+        if let Some(summary) = self.pending_syncs.remove(&agent_id)
+            && let Some(state) = self.store.get(&agent_id)
+        {
+            model.update(cx, |model, cx| {
+                model.sync(
+                    state,
+                    summary,
+                    now_ms(),
+                    &|id| self.registry.agent_display_label(id),
+                    cx,
+                )
+            });
+        }
+    }
 }
 
 struct PendingAgentFrame {
@@ -390,6 +613,7 @@ impl WorkstreamPrompt {
 }
 
 impl Workspace {
+    #[cfg(feature = "native")]
     pub fn new(specs: Vec<HostSpec>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (hosts, events) = Hosts::new();
         let workspace = cx.entity().downgrade();
@@ -497,6 +721,7 @@ impl Workspace {
     /// Attaches a daemon. The name is registered with the registry first so
     /// that labels and chrome can qualify by host from the moment the host
     /// exists, not only once it answers.
+    #[cfg(feature = "native")]
     pub(crate) fn attach_host(&mut self, spec: HostSpec, cx: &App) -> HostId {
         let host = self.hosts.attach(spec.name.clone(), spec.target, cx);
         self.registry.attach_host(host, spec.name);
@@ -744,15 +969,12 @@ impl Workspace {
             if !self.subscriptions.accepts_frames(agent_id) {
                 continue;
             }
-            let old_context = self
-                .store
-                .get(&agent_id)
-                .and_then(|state| state.context_used);
-            let old_usage = self.store.get(&agent_id).map(|state| state.usage.clone());
-            let summary = self.store.apply(agent_id, frame);
-            let usage_changed =
-                old_usage.as_ref() != self.store.get(&agent_id).map(|state| &state.usage);
-            live_changed |= self.registry.mark_live(agent_id);
+            let Some((summary, old_context, usage_changed, became_live)) =
+                self.apply_frame_state(agent_id, frame)
+            else {
+                continue;
+            };
+            live_changed |= became_live;
             changes
                 .entry(agent_id)
                 .and_modify(|(pending, _, refresh_usage)| {
@@ -790,24 +1012,7 @@ impl Workspace {
         for agent_id in order {
             let summary = changes[&agent_id].0;
             let (view, started) = self.ensure_agent_model(agent_id, window, cx);
-            if started || !view.read(cx).initial_load_ready() {
-                if !started {
-                    self.pending_syncs
-                        .entry(agent_id)
-                        .and_modify(|pending| *pending = pending.merge(summary))
-                        .or_insert(summary);
-                }
-            } else if let Some(state) = self.store.get(&agent_id) {
-                view.update(cx, |view, cx| {
-                    view.sync(
-                        state,
-                        summary,
-                        now_ms(),
-                        &|id| self.registry.agent_display_label(id),
-                        cx,
-                    )
-                });
-            }
+            self.sync_agent_model(agent_id, &view, summary, started, cx);
         }
 
         self.ensure_duration_timer(cx);
@@ -848,21 +1053,8 @@ impl Workspace {
                 machine_seed,
                 agent_counter,
             } => {
-                let first_ready = self.ready_hosts.insert(host);
-                let retained_selection = self.registry.selected_agent().copied();
-                // Each host seeds its own initial subscriptions: a second
-                // daemon attaching later deserves the same warm start as the
-                // first, without disturbing what is already subscribed.
-                let initial_subscriptions = first_ready.then(|| {
-                    recent_workstream_roots(
-                        &workstreams,
-                        &agents,
-                        retained_selection,
-                        INITIAL_AGENT_SUBSCRIPTIONS,
-                    )
-                });
-                self.registry
-                    .set_host_data(host, machine_seed, agent_counter, workstreams, agents);
+                let (first_ready, initial_subscriptions) =
+                    self.apply_ready(host, machine_seed, agent_counter, workstreams, agents);
                 self.prune_contexts();
                 self.workdirs.retain(|workdir| workdir.host != host);
                 self.workdirs.extend(
@@ -871,6 +1063,8 @@ impl Workspace {
                         .map(|project| HostProject { host, project }),
                 );
                 self.hosts.set_status(host, HostStatus::Online);
+                #[cfg(all(target_family = "wasm", not(feature = "native")))]
+                self.web.online(host);
                 self.refresh_draft_agent_targets(cx);
                 if first_ready && matches!(self.registry.active_pane(), ActivePane::Startup) {
                     // The startup scaffold guessed before daemon data existed;
@@ -886,7 +1080,7 @@ impl Workspace {
                 cx.notify();
             }
             ConnEvent::WorkstreamCreated(workstream) => {
-                self.registry.add_workstream(host, workstream);
+                self.apply_workstream_created(host, workstream);
                 self.refresh_draft_agent_targets(cx);
                 cx.notify();
             }
@@ -894,9 +1088,7 @@ impl Workspace {
                 agent_id,
                 workstream,
             } => {
-                self.registry
-                    .note_agent_workstream(host, agent_id, workstream);
-                self.registry.mark_known(agent_id);
+                self.note_agent_created(host, agent_id, workstream);
                 if self.awaiting_draft_agent == Some(host) {
                     self.awaiting_draft_agent = None;
                     self.subscribe_agent(agent_id, cx);
@@ -918,34 +1110,12 @@ impl Workspace {
                 cx.notify();
             }
             ConnEvent::AgentSubscribed(agent_id) => {
-                self.registry.mark_known(agent_id);
+                self.apply_agent_subscribed(agent_id);
                 cx.notify();
             }
             ConnEvent::AgentUnloaded { agent_id, reason } => {
-                if !self.subscriptions.mark_unloaded(agent_id, reason) {
+                if !self.apply_agent_unloaded(agent_id, reason, cx) {
                     return;
-                }
-                self.registry.mark_not_live(agent_id);
-                let summary = self.store.mark_unloaded(agent_id);
-                if let Some(view) = self.models.get(&agent_id).cloned() {
-                    if view.read(cx).initial_load_ready()
-                        && let Some(state) = self.store.get(&agent_id)
-                    {
-                        view.update(cx, |view, cx| {
-                            view.sync(
-                                state,
-                                summary,
-                                now_ms(),
-                                &|id| self.registry.agent_display_label(id),
-                                cx,
-                            )
-                        });
-                    } else {
-                        self.pending_syncs
-                            .entry(agent_id)
-                            .and_modify(|pending| *pending = pending.merge(summary))
-                            .or_insert(summary);
-                    }
                 }
                 self.release_agent_view_cache(agent_id, cx);
                 self.refresh_draft_agent_targets(cx);
@@ -969,8 +1139,7 @@ impl Workspace {
                 // plain turn end waits for its report, which decides between
                 // a needs-you chime and a silent FYI. Never for the agent
                 // already on screen, whose turn end the user is watching.
-                let before = self.registry.attention(agent_id);
-                self.registry.set_attention(agent_id, attention);
+                let before = self.apply_attention(agent_id, attention);
                 let needs_you = attention >= rho_ui_proto::UiAttention::NeedsInput
                     || self
                         .registry
@@ -981,6 +1150,7 @@ impl Workspace {
                     && needs_you
                     && self.registry.selected_agent() != Some(&agent_id)
                 {
+                    #[cfg(feature = "native")]
                     self.chime.play();
                 }
                 cx.notify();
@@ -989,12 +1159,12 @@ impl Workspace {
                 // The attention gate keeps snoozed agents silent: their
                 // reports arrive while attention is Quiet and surface only
                 // at snooze expiry.
-                let needs_you = report.needs_you;
-                self.registry.set_turn_report(agent_id, report);
+                let needs_you = self.apply_turn_report(agent_id, report);
                 if needs_you
                     && self.registry.attention(agent_id) >= rho_ui_proto::UiAttention::Pending
                     && self.registry.selected_agent() != Some(&agent_id)
                 {
+                    #[cfg(feature = "native")]
                     self.chime.play();
                 }
                 cx.notify();
@@ -1088,12 +1258,14 @@ impl Workspace {
                 cx.notify();
             }
             ConnEvent::Disconnected(reason) => {
+                #[cfg(feature = "native")]
                 let had_git_approval = if let Some(pending) = self.pending_git_approval.take() {
                     let _ = pending.response.send(GitApprovalDecision::Done);
                     true
                 } else {
                     false
                 };
+                #[cfg(feature = "native")]
                 if had_git_approval {
                     self.finish_overlay_focus(window, cx);
                 }
@@ -1114,6 +1286,7 @@ impl Workspace {
                 self.update_statuses(cx);
                 cx.notify();
             }
+            #[cfg(feature = "native")]
             ConnEvent::GitTransportApproval {
                 request_id,
                 prompt,
@@ -1151,6 +1324,7 @@ impl Workspace {
                 self.echo = None;
                 cx.notify();
             }
+            #[cfg(feature = "native")]
             ConnEvent::GitTransportDone { request_id } => {
                 if self
                     .pending_git_approval
@@ -1163,6 +1337,16 @@ impl Workspace {
                     self.finish_overlay_focus(window, cx);
                     cx.notify();
                 }
+            }
+            #[cfg(all(target_family = "wasm", not(feature = "native")))]
+            ConnEvent::AuthorizationRequired => {
+                self.web.authorization_required(host);
+                cx.notify();
+            }
+            #[cfg(all(target_family = "wasm", not(feature = "native")))]
+            ConnEvent::EnrollmentRequired(code) => {
+                self.web.enrollment_required(host, code);
+                cx.notify();
             }
         }
     }
@@ -1369,7 +1553,22 @@ impl Workspace {
             return;
         };
         let (stop, stop_rx) = tokio::sync::oneshot::channel();
+        #[cfg(feature = "native")]
         let task = connection.start_native_realtime(stop_rx, cx);
+        #[cfg(all(target_family = "wasm", not(feature = "native")))]
+        let task = {
+            let dialer = connection.realtime_dialer();
+            cx.spawn(async move |_, cx| {
+                crate::realtime_client::run(
+                    move |offer_sdp| {
+                        let dialer = dialer.clone();
+                        async move { dialer.open(offer_sdp).await }
+                    },
+                    stop_rx,
+                )
+                .await
+            })
+        };
         self.realtime_stop = Some(stop);
         let starting = match self.hosts.len() > 1 {
             true => format!("starting Iris on {}…", self.host_label(host)),
@@ -1377,12 +1576,17 @@ impl Workspace {
         };
         self.notice_on(None, &starting, StyleClass::SystemInfo, cx);
         self.realtime_task = Some(cx.spawn(async move |this, cx| {
+            #[cfg(feature = "native")]
             let result = match task.await {
                 Ok(result) => result,
                 Err(error) => Err(anyhow::anyhow!("realtime task failed: {error}")),
             };
+            #[cfg(all(target_family = "wasm", not(feature = "native")))]
+            let result = task.await;
             if result.is_err() {
-                cx.background_executor().timer(Duration::from_secs(2)).await;
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(2))
+                    .await;
             }
             let _ = this.update(cx, |this, cx| {
                 this.realtime_task = None;
@@ -2240,12 +2444,9 @@ impl Workspace {
         let Some(connection) = self.connection_for(agent_id) else {
             return;
         };
-        let task = connection.close_shell(agent_id.encoded(), cx);
+        let task = connection.close_shell_task(agent_id.encoded(), cx);
         cx.spawn(async move |this, cx| {
-            let result = match task.await {
-                Ok(result) => result,
-                Err(error) => Err(anyhow::anyhow!("shell close failed: {error}")),
-            };
+            let result = task.await;
             let _ = this.update(cx, |this, cx| match result {
                 Ok(()) => {
                     this.notice_on(Some(&agent_id), "shell closed", StyleClass::SystemInfo, cx)
@@ -2313,6 +2514,7 @@ impl Workspace {
 
     /// Attaches a daemon named on the spot, for a machine that is not worth
     /// putting in the host list.
+    #[cfg(feature = "native")]
     pub(crate) fn cmd_host_attach(&mut self, spec: &str, cx: &mut Context<Self>) {
         let spec = match HostSpec::parse(spec, "rho") {
             Ok(spec) => spec,
@@ -2334,6 +2536,16 @@ impl Workspace {
         self.notice_on(
             None,
             &format!("attaching {name}…"),
+            StyleClass::SystemInfo,
+            cx,
+        );
+    }
+
+    #[cfg(all(target_family = "wasm", not(feature = "native")))]
+    pub(crate) fn cmd_host_attach(&mut self, _: &str, cx: &mut Context<Self>) {
+        self.notice_on(
+            None,
+            "attach: browser hosts come from the page URL",
             StyleClass::SystemInfo,
             cx,
         );
@@ -3251,12 +3463,9 @@ impl Workspace {
         let Some(connection) = self.connection_for(agent_id) else {
             return;
         };
-        let task = connection.open_shell(agent_id.encoded(), cx);
+        let task = connection.open_shell_task(agent_id.encoded(), cx);
         cx.spawn(async move |this, cx| {
-            let result = match task.await {
-                Ok(result) => result,
-                Err(join_error) => Err(anyhow::anyhow!("shell dial failed: {join_error}")),
-            };
+            let result = task.await;
             match result {
                 Ok(channel) => {
                     let _ = this.update_in(cx, |this, window, cx| {
@@ -3369,8 +3578,7 @@ impl Workspace {
                     diff_client.snapshot(workspace.clone(), None, live_paths.clone(), cx)
                 });
                 let snapshot = snapshot_task
-                    .await
-                    .map_err(|error| anyhow::anyhow!("diff dial task failed: {error}"))??
+                    .await?
                     .context("initial diff snapshot unexpectedly unchanged")?;
                 let prepared = crate::diff_view::PreparedDiff::load(
                     &project,
@@ -3437,12 +3645,9 @@ impl Workspace {
         let Some(connection) = self.connection_for(agent_id) else {
             return;
         };
-        let task = connection.open_terminal(agent_id.encoded(), new, 80, 24, cx);
+        let task = connection.open_terminal_task(agent_id.encoded(), new, 80, 24, cx);
         cx.spawn(async move |this, cx| {
-            let result = match task.await {
-                Ok(result) => result,
-                Err(join_error) => Err(anyhow::anyhow!("terminal dial failed: {join_error}")),
-            };
+            let result = task.await;
             match result {
                 Ok(channel) => {
                     let _ = this.update_in(cx, |this, window, cx| {
@@ -3496,53 +3701,6 @@ impl Workspace {
         self.select_agent(Some(agent_id), window, cx);
     }
 
-    fn ensure_agent_model(
-        &mut self,
-        agent_id: AgentId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> (Entity<AgentModel>, bool) {
-        let view = if let Some(view) = self.models.get(&agent_id).cloned() {
-            view
-        } else {
-            let workspace = cx.entity().downgrade();
-            // Visualizations are fetched from the agent's own daemon; the
-            // client is bound here rather than looked up per artifact,
-            // because the agent's host never changes.
-            let visualization_client = self
-                .connection_for(agent_id)
-                .map(Connection::visualization_client)
-                .unwrap_or_else(crate::connection::VisualizationClient::detached);
-            let view = cx.new(|cx| AgentModel::new(workspace, visualization_client, cx));
-            self.refresh_view_status(&agent_id, &view, cx);
-            self.models.insert(agent_id, view.clone());
-            view
-        };
-
-        let mut started = false;
-        if !view.read(cx).initial_load_started()
-            && let Some(state) = self.store.get(&agent_id).cloned()
-        {
-            let labels = self
-                .registry
-                .known_agents()
-                .copied()
-                .map(|id| (id, self.registry.agent_display_label(id)))
-                .collect();
-            view.update(cx, |view, cx| {
-                view.start_initial_load(agent_id, state, labels, now_ms(), cx)
-            });
-            started = true;
-        }
-        // The bounded subscription cache owns one warm dashboard editor per
-        // agent. Pane editors remain pane-owned because their cursor, scroll,
-        // and fold state are independent.
-        view.update(cx, |view, cx| {
-            view.preview_editor(window, cx);
-        });
-        (view, started)
-    }
-
     fn materialize_model(
         &mut self,
         agent_id: &AgentId,
@@ -3567,27 +3725,6 @@ impl Workspace {
             });
         }
         view
-    }
-
-    pub(crate) fn finish_initial_agent_load(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
-        let Some(view) = self.models.get(&agent_id).cloned() else {
-            return;
-        };
-        if let Some(summary) = self.pending_syncs.remove(&agent_id)
-            && let Some(state) = self.store.get(&agent_id)
-        {
-            view.update(cx, |view, cx| {
-                view.sync(
-                    state,
-                    summary,
-                    now_ms(),
-                    &|id| self.registry.agent_display_label(id),
-                    cx,
-                )
-            });
-        }
-        self.refresh_view_status(&agent_id, &view, cx);
-        cx.notify();
     }
 
     /// Recomputes the right-prompt status chips for one agent's view.
@@ -4032,6 +4169,7 @@ impl Workspace {
         }
     }
 
+    #[cfg(feature = "native")]
     fn finish_git_approval(
         &mut self,
         decision: GitApprovalDecision,
@@ -4085,7 +4223,16 @@ impl Workspace {
     }
 
     fn has_modal_overlay(&self) -> bool {
-        self.minibuffer.is_some() || self.transient.is_some() || self.pending_git_approval.is_some()
+        self.minibuffer.is_some() || self.transient.is_some() || {
+            #[cfg(feature = "native")]
+            {
+                self.pending_git_approval.is_some()
+            }
+            #[cfg(not(feature = "native"))]
+            {
+                false
+            }
+        }
     }
 
     /// Captures normal focus on the first overlay in a chain. Replacements
@@ -4779,10 +4926,7 @@ impl Workspace {
         cx: &Context<Self>,
     ) -> gpui::AnyElement {
         let colors = cx.theme().colors();
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or(Duration::ZERO)
-            .as_secs() as f64;
+        let now = now_ms() as f64 / 1_000.0;
         let mut stats = div().flex().items_center().gap(px(6.));
         let format_reset = |reset_at_unix: Option<i64>| {
             reset_at_unix
@@ -5242,7 +5386,9 @@ impl Workspace {
         }
         self.duration_timer = Some(cx.spawn(async move |this, cx| {
             loop {
-                cx.background_executor().timer(Duration::from_secs(1)).await;
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(1))
+                    .await;
                 let keep_going = this.update(cx, |this, cx| {
                     let Some(view) = this.active_agent_model() else {
                         return false;
@@ -5406,6 +5552,7 @@ fn agent_role_label(config: AgentRole) -> RoleLabel {
     }
 }
 
+#[cfg(feature = "native")]
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = self.active_editor(cx);
@@ -5603,11 +5750,17 @@ impl Render for Workspace {
     }
 }
 
+#[cfg(feature = "native")]
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+#[cfg(not(feature = "native"))]
+pub fn now_ms() -> u64 {
+    js_sys::Date::now().max(0.0) as u64
 }
 
 /// `30m`, `2h`, `1d`; a bare number means minutes.

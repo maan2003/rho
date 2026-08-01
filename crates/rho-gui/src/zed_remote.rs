@@ -273,7 +273,7 @@ pub fn open_remote_project(
             transport,
         } = channel_task
             .await
-            .context("workspace channel dial task failed")??;
+            .context("workspace channel dial failed")?;
         let languages = cx.update(language_registry);
         let state = cx.update(|cx| {
             cx.new(|_| RemoteProjectState {
@@ -747,7 +747,15 @@ impl FileView {
         cx: &mut Context<Self>,
     ) -> Self {
         let editor = cx.new(|cx| {
-            let mut editor = editor::Editor::for_buffer(buffer.clone(), None, window, cx);
+            let multibuffer = cx.new(|cx| multi_buffer::MultiBuffer::singleton(buffer.clone(), cx));
+            let mut editor = editor::Editor::new(
+                editor::EditorMode::full(),
+                multibuffer,
+                #[cfg(feature = "native")]
+                None,
+                window,
+                cx,
+            );
             crate::editor_config::configure_file(&mut editor, window, cx);
             editor
         });
@@ -789,17 +797,21 @@ impl gpui::Global for RemoteLanguageRegistry {}
 
 pub(crate) fn language_registry(cx: &mut App) -> Arc<language::LanguageRegistry> {
     if !cx.has_global::<RemoteLanguageRegistry>() {
-        let fs: Arc<dyn fs::Fs> = Arc::new(fs::RealFs::new(None, cx.background_executor().clone()));
         let languages = Arc::new(language::LanguageRegistry::new(
             cx.background_executor().clone(),
         ));
         languages.set_theme(cx.theme().clone());
-        languages::init(
-            languages.clone(),
-            fs,
-            node_runtime::NodeRuntime::unavailable(),
-            cx,
-        );
+        #[cfg(feature = "native")]
+        {
+            let fs: Arc<dyn fs::Fs> =
+                Arc::new(fs::RealFs::new(None, cx.background_executor().clone()));
+            languages::init(
+                languages.clone(),
+                fs,
+                node_runtime::NodeRuntime::unavailable(),
+                cx,
+            );
+        }
         cx.observe_global::<GlobalTheme>({
             let languages = languages.clone();
             move |cx| languages.set_theme(cx.theme().clone())

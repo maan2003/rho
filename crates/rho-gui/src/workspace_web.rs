@@ -1,25 +1,18 @@
-//! Browser owner for the same dashboard, registry store, and transcript model
-//! used by the native GPUI client. Transport remains direct iroh.
+//! Browser layout and gesture adapter for the canonical workspace.
 
 use std::collections::HashMap;
 
 use futures::StreamExt as _;
 use gpui::prelude::*;
-use gpui::{
-    App, Context, Entity, Focusable as _, Pixels, Render, Subscription, Task, Window, div, px,
-};
-use rho_registry::session::{
-    AgentSubscriptions, INITIAL_AGENT_SUBSCRIPTIONS, recent_workstream_roots,
-};
+use gpui::{App, Context, Focusable as _, Pixels, Render, Window, div, px};
 use rho_touch_keyboard::{ContextChip, KeyboardPlugin, KeyboardStyle, TouchKeyboard};
-use rho_ui_proto::{AgentId, ClientMessage, MessageDelivery, ServerMessage};
 use theme::ActiveTheme as _;
 
-use crate::agent_view::AgentModel;
-use crate::connection_web::{Connection, Event, Phase, daemon_id_from_page};
-use crate::dashboard::{Dashboard, RowTarget};
+use super::{ContextId, SurfaceKey, Workspace};
+use crate::connection::daemon_targets_from_page;
+use crate::hosts::Hosts;
 use crate::registry::{AgentRegistry, HostId};
-use crate::store::{AgentStore, FrameSummary};
+use crate::store::AgentStore;
 
 struct RhoKeyboardPlugin;
 
@@ -49,54 +42,74 @@ fn coarse_pointer() -> bool {
         .is_some_and(|query| query.matches())
 }
 
-pub struct Workspace {
-    connection: Connection,
-    phase: Phase,
-    dashboard: Dashboard,
-    registry: AgentRegistry,
-    subscriptions: AgentSubscriptions,
-    store: AgentStore,
-    models: HashMap<AgentId, Entity<AgentModel>>,
-    pending_syncs: HashMap<AgentId, FrameSummary>,
-    preview: Option<Entity<editor::Editor>>,
-    /// The full transcript editor (prompt included) for the phone layout,
-    /// kept per selected agent so reopening does not rebuild it.
-    transcript: Option<(AgentId, Entity<editor::Editor>)>,
-    /// On narrow (phone) viewports only one pane fits; this switches between
-    /// the dashboard and the full agent transcript.
-    agent_screen: bool,
-    touch_keyboard: Entity<TouchKeyboard>,
-    /// The keyboard appears only on explicit intent to type: a tap that
-    /// lands in the transcript's editable prompt, or the action bar's
-    /// keyboard toggle. It hides on a tap in the read-only transcript, the
-    /// toggle again, and after sending a message.
+#[derive(Clone)]
+enum Authorization {
+    Required,
+    Connecting,
+    Enrollment(String),
+}
+
+pub(super) struct WebUi {
+    authorizations: HashMap<HostId, Authorization>,
+    target_error: Option<String>,
+    touch_keyboard: gpui::Entity<TouchKeyboard>,
     keyboard_visible: bool,
-    realtime_task: Option<Task<()>>,
-    realtime_stop: Option<tokio::sync::oneshot::Sender<()>>,
-    voice_error: Option<String>,
-    _event_task: Task<()>,
-    _dashboard_subscription: Subscription,
-    _transcript_subscription: Option<Subscription>,
+}
+
+impl WebUi {
+    pub(super) fn authorization_required(&mut self, host: HostId) {
+        self.authorizations.insert(host, Authorization::Required);
+    }
+
+    pub(super) fn enrollment_required(&mut self, host: HostId, code: String) {
+        self.authorizations
+            .insert(host, Authorization::Enrollment(code));
+    }
+
+    pub(super) fn online(&mut self, host: HostId) {
+        self.authorizations.remove(&host);
+    }
 }
 
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (connection, mut events) = Connection::new();
-        let phase = daemon_id_from_page().map_or_else(
-            || Phase::Failed("Open this page with #daemon=<daemon-endpoint-id>".into()),
-            Phase::Unlock,
-        );
+        let (mut hosts, events) = Hosts::new();
+        let mut registry = AgentRegistry::default();
+        let mut authorizations = HashMap::new();
+        let target_error = match daemon_targets_from_page() {
+            Ok(targets) if targets.is_empty() => {
+                Some("Open this page with #daemon=<daemon-endpoint-id>".to_owned())
+            }
+            Ok(targets) => {
+                for (name, target) in targets {
+                    let host = hosts.attach(name.clone(), target, cx);
+                    registry.attach_host(host, name);
+                    authorizations.insert(host, Authorization::Required);
+                }
+                None
+            }
+            Err(error) => Some(format!("{error:#}")),
+        };
+
+        let workspace = cx.entity().downgrade();
+        let draft_model = cx.new(|cx| crate::draft_view::DraftModel::new(workspace, cx));
         let event_task = cx.spawn(async move |this, cx| {
+            let mut events = events;
             while let Some(event) = events.next().await {
+                let mut batch = vec![event];
+                while let Ok(event) = events.try_recv() {
+                    batch.push(event);
+                }
                 if this
-                    .update_in(cx, |this, window, cx| this.handle_event(event, window, cx))
+                    .update_in(cx, |this, window, cx| this.handle_events(batch, window, cx))
                     .is_err()
                 {
                     break;
                 }
             }
         });
-        let dashboard = Dashboard::new(window, cx);
+
+        let dashboard = crate::dashboard::Dashboard::new(window, cx);
         let dashboard_subscription = cx.subscribe_in(
             dashboard.editor(),
             window,
@@ -109,402 +122,112 @@ impl Workspace {
                 }
             },
         );
-        let touch_keyboard = cx.new(|_| TouchKeyboard::new(RhoKeyboardPlugin));
-        Self {
-            connection,
-            phase,
-            dashboard,
-            registry: AgentRegistry::default(),
-            subscriptions: AgentSubscriptions::default(),
+        let iris_buffer = cx.new(|cx| {
+            let mut buffer = language::Buffer::local("iris\n\nlistening", cx);
+            buffer.set_capability(language::Capability::Read, cx);
+            buffer
+        });
+        let iris_multi_buffer = cx.new(|cx| multi_buffer::MultiBuffer::singleton(iris_buffer, cx));
+        let iris_preview = cx.new(|cx| {
+            let mut editor = editor::Editor::new(
+                editor::EditorMode::Full {
+                    scale_ui_elements_with_buffer_font_size: true,
+                    show_active_line_background: false,
+                    sizing_behavior: editor::SizingBehavior::ExcludeOverscrollMargin,
+                },
+                iris_multi_buffer,
+                window,
+                cx,
+            );
+            crate::editor_config::configure_preview(&mut editor, window, cx);
+            editor.set_read_only(true);
+            editor
+        });
+
+        let mut this = Self {
+            hosts,
+            subscriptions: Default::default(),
             store: AgentStore::default(),
+            registry,
             models: HashMap::new(),
+            remote_projects: HashMap::new(),
+            pending_diff_loads: HashMap::new(),
             pending_syncs: HashMap::new(),
-            preview: None,
-            transcript: None,
-            agent_screen: false,
-            touch_keyboard,
-            keyboard_visible: false,
+            pending_frames: Vec::new(),
+            frame_flush_scheduled: false,
+            draft_model,
+            workdirs: Vec::new(),
+            draft_workstream: None,
+            new_agent_draft: None,
+            awaiting_draft_agent: None,
+            ready_hosts: Default::default(),
+            quota_summaries: HashMap::new(),
+            quota_history: HashMap::new(),
+            quota_history_days: 7,
+            global_usage: HashMap::new(),
+            global_usage_days: 7,
+            duration_timer: None,
+            contexts: HashMap::new(),
+            surfaces: HashMap::new(),
+            active_context: ContextId::Draft,
+            dashboard,
+            dashboard_preview: None,
+            dashboard_dirty: true,
+            iris_preview,
+            minibuffer: None,
+            transient: None,
+            transient_stack: Vec::new(),
+            transient_focus: cx.focus_handle(),
+            overlay_return_focus: None,
+            echo: None,
             realtime_task: None,
             realtime_stop: None,
-            voice_error: None,
+            iris_muted: false,
+            iris_host: None,
             _event_task: event_task,
             _dashboard_subscription: dashboard_subscription,
-            _transcript_subscription: None,
-        }
+            web: WebUi {
+                authorizations,
+                target_error,
+                touch_keyboard: cx.new(|_| TouchKeyboard::new(RhoKeyboardPlugin)),
+                keyboard_visible: false,
+            },
+        };
+        let draft = this.make_surface(SurfaceKey::Draft, window, cx);
+        this.display_surface(draft);
+        this.seed_draft(false, window, cx);
+        window.focus(&this.dashboard.focus_handle(cx), cx);
+        this
     }
 
-    pub fn registry_mut(&mut self) -> &mut AgentRegistry {
-        &mut self.registry
-    }
-    pub fn dashboard(&self) -> &Dashboard {
-        &self.dashboard
-    }
-
-    fn unlock(&mut self, _: &gpui::ClickEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if let Phase::Unlock(daemon) = self.phase.clone() {
-            self.connection.connect(daemon);
-            self.phase = Phase::Connecting;
-            cx.notify();
-        }
-    }
-
-    fn handle_event(&mut self, event: Event, window: &mut Window, cx: &mut Context<Self>) {
-        match event {
-            Event::Phase(phase) => {
-                if phase != Phase::Online
-                    && let Some(stop) = self.realtime_stop.take()
-                {
-                    let _ = stop.send(());
-                }
-                self.phase = phase;
-                cx.notify();
-            }
-            Event::Message(message) => self.handle_message(message, window, cx),
-        }
-    }
-
-    fn handle_message(
+    fn authorize_host(
         &mut self,
-        message: ServerMessage,
-        window: &mut Window,
+        host: HostId,
+        _: &gpui::ClickEvent,
+        _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match message {
-            ServerMessage::Ready {
-                workstreams,
-                agents,
-                machine_seed,
-                agent_counter,
-                ..
-            } => {
-                let first_ready = self.phase != Phase::Online;
-                let initial = first_ready.then(|| {
-                    recent_workstream_roots(
-                        &workstreams,
-                        &agents,
-                        self.registry.selected_agent().copied(),
-                        INITIAL_AGENT_SUBSCRIPTIONS,
-                    )
-                });
-                // The web client attaches exactly one daemon, so everything
-                // lands under the default host.
-                self.registry.set_host_data(
-                    HostId::default(),
-                    machine_seed,
-                    agent_counter,
-                    workstreams,
-                    agents,
-                );
-                if let Some(agent_ids) = initial.filter(|ids| !ids.is_empty()) {
-                    self.subscriptions.reset(&agent_ids);
-                    self.connection
-                        .send(ClientMessage::SubscribeAgents { agent_ids });
-                }
-                self.phase = Phase::Online;
-                cx.notify();
-            }
-            ServerMessage::Agent { agent_id, frame } => {
-                if !self.subscriptions.accepts_frames(agent_id) {
-                    return;
-                }
-                let summary = self.store.apply(agent_id, frame);
-                self.registry.mark_live(agent_id);
-                let (model, started) = self.ensure_agent_model(agent_id, window, cx);
-                if started || !model.read(cx).initial_load_ready() {
-                    if !started {
-                        self.pending_syncs
-                            .entry(agent_id)
-                            .and_modify(|pending| *pending = pending.merge(summary))
-                            .or_insert(summary);
-                    }
-                } else if let Some(state) = self.store.get(&agent_id) {
-                    model.update(cx, |model, cx| {
-                        model.sync(
-                            state,
-                            summary,
-                            now_ms(),
-                            &|id| self.registry.agent_display_label(id),
-                            cx,
-                        )
-                    });
-                }
-                cx.notify();
-            }
-            ServerMessage::AgentSubscribed { agent_id } => {
-                self.registry.mark_known(agent_id);
-                cx.notify();
-            }
-            ServerMessage::AgentCreated {
-                agent_id,
-                workstream,
-            } => {
-                self.registry
-                    .note_agent_workstream(HostId::default(), agent_id, workstream);
-                self.registry.mark_known(agent_id);
-                cx.notify();
-            }
-            ServerMessage::WorkstreamCreated { workstream } => {
-                self.registry.add_workstream(HostId::default(), workstream);
-                cx.notify();
-            }
-            ServerMessage::AgentAttention {
-                agent_id,
-                attention,
-            } => {
-                self.registry.set_attention(agent_id, attention);
-                cx.notify();
-            }
-            ServerMessage::AgentTurnReport { agent_id, report } => {
-                self.registry.set_turn_report(agent_id, report);
-                cx.notify();
-            }
-            ServerMessage::AgentUnloaded { agent_id, reason } => {
-                if self.subscriptions.mark_unloaded(agent_id, reason) {
-                    self.registry.mark_not_live(agent_id);
-                    let summary = self.store.mark_unloaded(agent_id);
-                    if let (Some(model), Some(state)) =
-                        (self.models.get(&agent_id), self.store.get(&agent_id))
-                        && model.read(cx).initial_load_ready()
-                    {
-                        model.update(cx, |model, cx| {
-                            model.sync(
-                                state,
-                                summary,
-                                now_ms(),
-                                &|id| self.registry.agent_display_label(id),
-                                cx,
-                            )
-                        });
-                    }
-                    cx.notify();
-                }
-            }
-            ServerMessage::Error { message } => {
-                self.phase = Phase::Failed(message);
-                cx.notify();
-            }
-            _ => {}
-        }
-    }
-
-    fn dashboard_cursor_moved(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let target = self.dashboard.cursor_target(cx);
-        let agent_id = match target {
-            Some(RowTarget::Iris) => {
-                self.toggle_voice(&crate::VoiceToggle, window, cx);
-                return;
-            }
-            Some(RowTarget::Stream { root: Some(id), .. } | RowTarget::Agent(id)) => id,
-            _ => return,
-        };
-        self.open_agent(agent_id, window, cx);
-    }
-
-    pub fn open_agent(&mut self, agent_id: AgentId, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.registry.known_agents().any(|id| *id == agent_id) {
-            return;
-        }
-        self.registry.select_agent(agent_id);
-        let (subscribe, evicted) = self.subscriptions.touch(agent_id);
-        if let Some(agent_id) = evicted {
-            self.connection.send(ClientMessage::UnsubscribeAgents {
-                agent_ids: vec![agent_id],
-            });
-        }
-        if subscribe {
-            self.connection.send(ClientMessage::SubscribeAgents {
-                agent_ids: vec![agent_id],
-            });
-        }
-        self.connection.send(ClientMessage::AgentStreamFocus {
-            agent_id: Some(agent_id),
-        });
-        let (model, _) = self.ensure_agent_model(agent_id, window, cx);
-        if window.viewport_size().width < px(700.) {
-            let editor = match &self.transcript {
-                Some((id, editor)) if *id == agent_id => editor.clone(),
-                _ => {
-                    let editor = model.update(cx, |model, cx| model.build_editor(window, cx));
-                    // Chat editors disable click selection for the desktop's
-                    // keyboard-first navigation; on a phone the tap is the
-                    // only cursor, and it also drives keyboard visibility.
-                    editor.update(cx, |editor, cx| {
-                        editor.set_mouse_click_selection_enabled(true, cx)
-                    });
-                    self.transcript = Some((agent_id, editor.clone()));
-                    // A pointer tap decides keyboard visibility by where it
-                    // lands: the editable prompt shows it, the read-only
-                    // transcript hides it. Keystroke-driven selection moves
-                    // (typing, submit clearing the prompt) leave it alone.
-                    self._transcript_subscription = Some(cx.subscribe_in(
-                        &editor,
-                        window,
-                        move |this, editor, event: &editor::EditorEvent, window, cx| {
-                            if matches!(
-                                event,
-                                editor::EditorEvent::SelectionsChanged { local: true }
-                            ) && !window.last_input_was_keyboard()
-                            {
-                                let in_prompt = this.models.get(&agent_id).is_some_and(|model| {
-                                    model.read(cx).selection_in_prompt(editor, cx)
-                                });
-                                if this.keyboard_visible != in_prompt {
-                                    this.keyboard_visible = in_prompt;
-                                    cx.notify();
-                                }
-                            }
-                        },
-                    ));
-                    editor
-                }
-            };
-            window.focus(&editor.read(cx).focus_handle(cx), cx);
-        } else {
-            self.preview = Some(model.update(cx, |model, cx| model.preview_editor(window, cx)));
-        }
-        self.agent_screen = true;
+        self.hosts.authorize(host);
+        self.web
+            .authorizations
+            .insert(host, Authorization::Connecting);
         cx.notify();
     }
-
-    fn submit_prompt(
-        &mut self,
-        _: &crate::SubmitPrompt,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.phase != Phase::Online {
-            return;
-        }
-        let Some(agent_id) = self.registry.selected_agent().copied() else {
-            return;
-        };
-        let Some(model) = self.models.get(&agent_id).cloned() else {
-            return;
-        };
-        let Some(content) = model.update(cx, |model, cx| model.take_prompt(cx)) else {
-            return;
-        };
-        self.connection.send(ClientMessage::SendUserMessage {
-            agent_id,
-            content,
-            delivery: MessageDelivery::NextRequest,
-        });
-        self.registry.touch_agent(agent_id);
-        self.keyboard_visible = false;
-        cx.notify();
-    }
-
-    fn toggle_voice(&mut self, _: &crate::VoiceToggle, _: &mut Window, cx: &mut Context<Self>) {
-        if let Some(stop) = self.realtime_stop.take() {
-            let _ = stop.send(());
-            self.voice_error = None;
-            cx.notify();
-            return;
-        }
-        if self.phase != Phase::Online || self.realtime_task.is_some() {
-            return;
-        }
-        let dialer = self.connection.realtime_dialer();
-        let (stop, stop_rx) = tokio::sync::oneshot::channel();
-        self.realtime_stop = Some(stop);
-        self.voice_error = None;
-        self.realtime_task = Some(cx.spawn(async move |this, cx| {
-            let result = crate::realtime_client::run(
-                move |offer_sdp| async move { dialer.open(offer_sdp).await },
-                stop_rx,
-            )
-            .await;
-            let _ = this.update(cx, |this, cx| {
-                this.realtime_task = None;
-                this.realtime_stop = None;
-                this.voice_error = result.err().map(|error| format!("{error:#}"));
-                cx.notify();
-            });
-        }));
-        cx.notify();
-    }
-
-    fn ensure_agent_model(
-        &mut self,
-        agent_id: AgentId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> (Entity<AgentModel>, bool) {
-        let model = self
-            .models
-            .entry(agent_id)
-            .or_insert_with(|| {
-                let workspace = cx.entity().downgrade();
-                cx.new(|cx| AgentModel::new(workspace, cx))
-            })
-            .clone();
-        let mut started = false;
-        if !model.read(cx).initial_load_started()
-            && let Some(state) = self.store.get(&agent_id).cloned()
-        {
-            let labels = self
-                .registry
-                .known_agents()
-                .copied()
-                .map(|id| (id, self.registry.agent_display_label(id)))
-                .collect();
-            model.update(cx, |model, cx| {
-                model.start_initial_load(agent_id, state, labels, now_ms(), cx)
-            });
-            started = true;
-        }
-        model.update(cx, |model, cx| {
-            model.preview_editor(window, cx);
-        });
-        (model, started)
-    }
-
-    pub(crate) fn finish_initial_agent_load(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
-        let Some(model) = self.models.get(&agent_id).cloned() else {
-            return;
-        };
-        if let Some(summary) = self.pending_syncs.remove(&agent_id)
-            && let Some(state) = self.store.get(&agent_id)
-        {
-            model.update(cx, |model, cx| {
-                model.sync(
-                    state,
-                    summary,
-                    now_ms(),
-                    &|id| self.registry.agent_display_label(id),
-                    cx,
-                )
-            });
-        }
-        cx.notify();
-    }
-
-    pub(crate) fn mark_draft_active_from_edit(&mut self, _cx: &mut Context<Self>) {}
-    pub(crate) fn refresh_minibuffer(&mut self, _cx: &mut Context<Self>) {}
 }
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.dashboard.sync(&self.registry, window, cx);
-        let colors = cx.theme().colors();
-        let (overlay_bg, card_bg, card_border, text, text_muted) = (
-            colors.editor_background,
-            colors.element_background,
-            colors.border_variant,
-            colors.text,
-            colors.text_muted,
-        );
+        let editor = self.active_editor(cx);
+        let text_style = editor.update(cx, |editor, cx| editor.style(cx).text.clone());
+        let connection_status = self.render_connection_status(&text_style, cx);
+        self.sync_dashboard_if_dirty(window, cx);
+
         let narrow = window.viewport_size().width < px(700.);
-        // The phone gets a persistent action bar along the very bottom: it
-        // hosts quick actions and doubles as clearance for the iPhone's
-        // rounded corners and home indicator in PWA mode.
         let phone = coarse_pointer() && narrow;
+        let home = self.dashboard_mode(window, cx);
         let (inset_top, inset_right, inset_bottom, inset_left) = safe_area();
-        // The bar's button row stays 40px; the bottom safe-area inset extends
-        // it so the buttons clear the iPhone's home indicator and rounded
-        // corners while the bar background fills the screen edge.
         let bar_height = px(40.) + inset_bottom;
-        let show_keyboard = phone && self.agent_screen && self.keyboard_visible;
+        let show_keyboard = phone && !home && self.web.keyboard_visible;
         window.set_direct_touch_region(
             show_keyboard.then(|| TouchKeyboard::region(window.viewport_size(), bar_height)),
         );
@@ -513,160 +236,47 @@ impl Render for Workspace {
         } else {
             -1.
         });
-        // Percent heights do not survive the flex_1 wrapper here (the agent
-        // screen collapsed to its header), so the phone transcript gets
-        // explicit pixel heights derived from the viewport.
-        let header_height = px(34.);
-        let content_height = window.viewport_size().height
-            - px(4.)
-            - inset_top
-            - if phone { bar_height } else { px(0.) }
-            - if show_keyboard {
-                TouchKeyboard::height()
-            } else {
-                px(0.)
-            };
+
         let body = if narrow {
-            if self.agent_screen
-                && let Some((agent_id, transcript)) = self.transcript.clone()
-            {
-                div()
-                    .flex()
-                    .flex_col()
-                    .w_full()
-                    .h(content_height)
-                    .key_context("RhoTranscript")
-                    .child(
-                        div()
-                            .flex()
-                            .flex_none()
-                            .items_center()
-                            .gap_2()
-                            .h(header_height)
-                            .px_1()
-                            .border_b_1()
-                            .border_color(card_border)
-                            .child(
-                                div()
-                                    .id("back-to-agents")
-                                    .cursor_pointer()
-                                    .px_3()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .text_color(text_muted)
-                                    .child("‹ agents")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.agent_screen = false;
-                                        this.keyboard_visible = false;
-                                        window.focus(
-                                            &this.dashboard.editor().read(cx).focus_handle(cx),
-                                            cx,
-                                        );
-                                        cx.notify();
-                                    })),
-                            )
-                            .child(
-                                div()
-                                    .text_color(text_muted)
-                                    .whitespace_nowrap()
-                                    .overflow_hidden()
-                                    .child(self.registry.agent_display_label(agent_id)),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .w_full()
-                            .h(content_height - header_height)
-                            .overflow_hidden()
-                            .child(transcript),
-                    )
-            } else {
+            if home {
                 div()
                     .size_full()
                     .overflow_hidden()
                     .child(self.dashboard.editor().clone())
+                    .into_any_element()
+            } else {
+                let surface = self.active_tree().focused().surface.clone();
+                div()
+                    .size_full()
+                    .overflow_hidden()
+                    .child(self.render_surface(&surface))
+                    .into_any_element()
             }
         } else {
-            div()
-                .flex()
-                .size_full()
-                .gap_2()
-                .child(
-                    div()
-                        .w(px(430.))
-                        .h_full()
-                        .overflow_hidden()
-                        .child(self.dashboard.editor().clone()),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .h_full()
-                        .overflow_hidden()
-                        .children(self.preview.clone()),
-                )
+            self.render_panes(window, &text_style, cx)
         };
-        let card_style = move |content: gpui::Div| {
-            content
-                .flex()
-                .flex_col()
-                .gap_2()
-                .max_w(px(420.))
-                .m_4()
-                .p_4()
-                .rounded_md()
-                .border_1()
-                .border_color(card_border)
-                .bg(card_bg)
-                .text_color(text)
-                .text_sm()
-        };
-        let card = move |content: gpui::Div| {
-            div()
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(overlay_bg)
-                .child(card_style(content))
-                .into_any_element()
-        };
-        let muted = move |line: String| div().text_color(text_muted).child(line);
-        let overlay = match &self.phase {
-            Phase::Online => None,
-            Phase::Unlock(daemon) => Some(
+
+        let auth_overlay = self.render_web_authorizations(cx);
+        let bottom = match (
+            &self.minibuffer,
+            &self.transient,
+            connection_status,
+            &self.echo,
+        ) {
+            (Some(minibuffer), _, _, _) => Some(minibuffer.render(&text_style, cx)),
+            (None, Some(transient), _, _) => Some(
                 div()
-                    .id("unlock")
-                    .absolute()
-                    .inset_0()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .bg(overlay_bg)
-                    .cursor_pointer()
-                    .on_click(cx.listener(Self::unlock))
-                    .child(card_style(
-                        div()
-                            .child("Connect to rho daemon")
-                            .child(muted(format!("daemon {}", shorten_id(daemon))))
-                            .child(muted("Tap to unlock with your browser identity".into())),
-                    ))
+                    .track_focus(&self.transient_focus)
+                    .on_key_down(cx.listener(Self::transient_key))
+                    .child(transient.render(&text_style, cx))
                     .into_any_element(),
             ),
-            Phase::Connecting => Some(card(div().child("Connecting to rho daemon…"))),
-            Phase::Enroll(code) => {
-                Some(card(div().child("This browser is not enrolled yet").child(
-                    muted(format!(
-                        "Run `rho iroh approve {code}`, then reload this page"
-                    )),
-                )))
-            }
-            Phase::Failed(error) => Some(card(
-                div().child("Connection failed").child(muted(error.clone())),
-            )),
+            (None, None, Some(status), _) => Some(status),
+            (None, None, None, Some(echo)) => Some(echo.render(&text_style, cx)),
+            (None, None, None, None) => None,
         };
-        div()
+
+        let mut root = div()
             .id("rho-gui")
             .relative()
             .size_full()
@@ -679,11 +289,48 @@ impl Render for Workspace {
             .bg(cx.theme().colors().editor_background)
             .key_context("RhoGui")
             .on_action(cx.listener(Self::submit_prompt))
+            .on_action(cx.listener(Self::paste_prompt))
             .on_action(cx.listener(Self::toggle_voice))
+            .on_action(cx.listener(|this, _: &crate::RootTransient, window, cx| {
+                this.open_transient(crate::transient::root_menu(), window, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &crate::MinibufferConfirm, window, cx| {
+                    this.minibuffer_confirm(window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::MinibufferCancel, window, cx| {
+                    this.minibuffer_cancel(window, cx);
+                }),
+            )
+            .on_action(cx.listener(|this, _: &crate::MinibufferNext, _, cx| {
+                if let Some(minibuffer) = &mut this.minibuffer {
+                    minibuffer.select_by_delta(1);
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &crate::MinibufferPrevious, _, cx| {
+                if let Some(minibuffer) = &mut this.minibuffer {
+                    minibuffer.select_by_delta(-1);
+                    cx.notify();
+                }
+            }))
+            .on_action(
+                cx.listener(|this, _: &crate::MinibufferComplete, window, cx| {
+                    if let Some(mut minibuffer) = this.minibuffer.take() {
+                        minibuffer.complete_selected(window, cx);
+                        this.minibuffer = Some(minibuffer);
+                    }
+                }),
+            )
             .child(div().flex_1().overflow_hidden().child(body))
-            .children(show_keyboard.then(|| self.touch_keyboard.clone().into_any_element()))
-            .children(phone.then(|| {
-                let mut bar = div()
+            .children(show_keyboard.then(|| self.web.touch_keyboard.clone().into_any_element()));
+
+        if phone {
+            let text_muted = cx.theme().colors().text_muted;
+            root = root.child(
+                div()
                     .flex_none()
                     .h(bar_height)
                     .w_full()
@@ -692,90 +339,129 @@ impl Render for Workspace {
                     .justify_between()
                     .px_1()
                     .border_t_1()
-                    .border_color(card_border)
+                    .border_color(cx.theme().colors().border_variant)
                     .child(
                         div()
-                            .id("voice-toggle")
+                            .id("home-toggle")
                             .cursor_pointer()
                             .h_full()
                             .flex()
                             .items_center()
                             .px_4()
-                            .text_color(if self.voice_error.is_some() {
-                                cx.theme().status().error
+                            .text_color(text_muted)
+                            .child(if home { "work" } else { "agents" })
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if this.dashboard_mode(window, cx) {
+                                    this.focus_active_surface(window, cx);
+                                } else {
+                                    window.focus(&this.dashboard.focus_handle(cx), cx);
+                                    this.web.keyboard_visible = false;
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .id("kbd-toggle")
+                            .cursor_pointer()
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .px_4()
+                            .text_color(text_muted)
+                            .child(if show_keyboard {
+                                "hide keyboard"
                             } else {
-                                text_muted
-                            })
-                            .child(if self.realtime_task.is_some() {
-                                "iris · stop"
-                            } else if self.voice_error.is_some() {
-                                "iris · retry"
-                            } else {
-                                "iris · listen"
+                                "keyboard"
                             })
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.toggle_voice(&crate::VoiceToggle, window, cx);
+                                this.web.keyboard_visible = !this.web.keyboard_visible;
+                                if this.web.keyboard_visible {
+                                    this.focus_active_surface(window, cx);
+                                }
+                                cx.notify();
                             })),
-                    );
-                if self.agent_screen {
-                    bar = bar
-                        .child(
-                            div()
-                                .id("kbd-toggle")
-                                .cursor_pointer()
-                                .h_full()
-                                .flex()
-                                .items_center()
-                                .px_4()
-                                .text_color(text_muted)
-                                .child(
-                                    gpui::svg()
-                                        .path(if self.keyboard_visible {
-                                            "icons/chevron_down.svg"
-                                        } else {
-                                            "icons/keyboard.svg"
-                                        })
-                                        .size(px(20.))
-                                        .text_color(text_muted),
-                                )
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.keyboard_visible = !this.keyboard_visible;
-                                    if this.keyboard_visible
-                                        && let Some((_, editor)) = this.transcript.clone()
-                                    {
-                                        window.focus(&editor.read(cx).focus_handle(cx), cx);
-                                    }
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            div()
-                                .id("send-prompt")
-                                .cursor_pointer()
-                                .h_full()
-                                .flex()
-                                .items_center()
-                                .px_4()
-                                .text_color(text_muted)
-                                .child("send")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.submit_prompt(&crate::SubmitPrompt, window, cx);
-                                })),
-                        );
-                }
-                bar
-            }))
-            .children(overlay)
+                    )
+                    .child(
+                        div()
+                            .id("send-prompt")
+                            .cursor_pointer()
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .px_4()
+                            .text_color(text_muted)
+                            .child("send")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.submit_prompt(&crate::SubmitPrompt, window, cx);
+                                this.web.keyboard_visible = false;
+                            })),
+                    ),
+            );
+        }
+        root.children(bottom).children(auth_overlay)
     }
 }
 
-pub fn now_ms() -> u64 {
-    js_sys::Date::now() as u64
+impl Workspace {
+    fn render_web_authorizations(&self, cx: &Context<Self>) -> Option<gpui::AnyElement> {
+        if self.web.authorizations.is_empty() && self.web.target_error.is_none() {
+            return None;
+        }
+        let colors = cx.theme().colors();
+        let mut cards = div().flex().flex_col().gap_3().max_w(px(460.));
+        if let Some(error) = &self.web.target_error {
+            cards = cards.child(div().child("No rho daemon").child(error.clone()));
+        }
+        for (host, authorization) in &self.web.authorizations {
+            let name = self.host_label(*host);
+            let host_id = *host;
+            let card = match authorization {
+                Authorization::Required => div()
+                    .id(("authorize-host", host.0 as usize))
+                    .cursor_pointer()
+                    .child(format!("Connect to {name}"))
+                    .child("Tap to unlock with your browser identity")
+                    .on_click(cx.listener(move |this, event, window, cx| {
+                        this.authorize_host(host_id, event, window, cx)
+                    }))
+                    .into_any_element(),
+                Authorization::Connecting => div()
+                    .child(format!("Connecting to {name}…"))
+                    .into_any_element(),
+                Authorization::Enrollment(code) => div()
+                    .child(format!("{name} is not enrolled yet"))
+                    .child(format!(
+                        "Run `rho iroh approve {code}`, then reload this page"
+                    ))
+                    .into_any_element(),
+            };
+            cards = cards.child(
+                div()
+                    .p_4()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(colors.border_variant)
+                    .bg(colors.element_background)
+                    .child(card),
+            );
+        }
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(colors.editor_background.opacity(0.92))
+                .text_color(colors.text)
+                .child(cards)
+                .into_any_element(),
+        )
+    }
 }
 
-/// Safe-area insets (top, right, bottom, left) of the display cutouts —
-/// status bar, rounded corners, home indicator — read from index.html's CSS
-/// env() probe. The canvas spans the full screen; the app pads around these.
+/// Safe-area insets (top, right, bottom, left) of the display cutouts.
 fn safe_area() -> (Pixels, Pixels, Pixels, Pixels) {
     use wasm_bindgen::JsCast as _;
     let zero = (px(0.), px(0.), px(0.), px(0.));
@@ -797,10 +483,6 @@ fn safe_area() -> (Pixels, Pixels, Pixels, Pixels) {
     (inset(0), inset(1), inset(2), inset(3))
 }
 
-/// Moves the index.html haptic switch overlay over the keyboard (negative
-/// hides it). iOS 26.5 blocks scripted switch clicks, so key haptics come
-/// from the finger's genuine tap toggling an invisible switch there; the
-/// overlay forwards cloned pointer events to the canvas.
 fn set_haptic_region(top: f32) {
     use wasm_bindgen::JsCast as _;
     let Some(window) = web_sys::window() else {
@@ -811,15 +493,5 @@ fn set_haptic_region(top: f32) {
         && let Some(hook) = hook.dyn_ref::<js_sys::Function>()
     {
         let _ = hook.call1(&wasm_bindgen::JsValue::NULL, &top.into());
-    }
-}
-
-/// Endpoint ids are 64 hex chars; unbroken they defeat text wrapping, so the
-/// overlays show a recognizable abbreviation instead.
-fn shorten_id(id: &str) -> String {
-    if id.len() <= 12 {
-        id.to_owned()
-    } else {
-        format!("{}…{}", &id[..8], &id[id.len() - 4..])
     }
 }
