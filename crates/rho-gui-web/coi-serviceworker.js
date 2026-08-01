@@ -21,7 +21,13 @@ self.addEventListener("fetch", (event) => {
     const headers = new Headers(response.headers);
     headers.set("Cross-Origin-Opener-Policy", "same-origin");
     headers.set("Cross-Origin-Embedder-Policy", "require-corp");
-    return new Response(response.body, {
+    // Fetch can expose a stream even for statuses whose responses are
+    // required to have a null body. Passing that stream back to the Response
+    // constructor rejects respondWith() (notably for conditional 304s).
+    const body = [101, 103, 204, 205, 304].includes(response.status)
+      ? null
+      : response.body;
+    return new Response(body, {
       status: response.status,
       statusText: response.statusText,
       headers,
