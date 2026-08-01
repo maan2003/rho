@@ -359,19 +359,29 @@
             craneLib = craneLibBase.overrideArgs {
               inherit cargoVendorDir;
             };
-          in
-          rec {
-            workspaceDeps = craneLib.buildWorkspaceDepsOnly {
+            packageCargoExtraArgs = "-p rho-cli -p rho-daemon -p rho-shell -p git-remote-octo -p jj-cli";
+            extraDummyScript = ''
               # Crane stubs every local package while caching workspace
               # dependencies. The patched noq crates are dependencies of iroh,
               # so they must retain their implementations in the dummy source.
-              extraDummyScript = ''
-                rm -rf $out/vendor/brush $out/vendor/noq $out/vendor/tree-sitter-language
-                cp -r --no-preserve=mode,ownership ${buildSrc}/vendor/brush $out/vendor/brush
-                cp -r --no-preserve=mode,ownership ${buildSrc}/vendor/noq $out/vendor/noq
-                cp -r --no-preserve=mode,ownership ${buildSrc}/vendor/tree-sitter-language \
-                  $out/vendor/tree-sitter-language
-              '';
+              rm -rf $out/vendor/brush $out/vendor/noq $out/vendor/tree-sitter-language
+              cp -r --no-preserve=mode,ownership ${buildSrc}/vendor/brush $out/vendor/brush
+              cp -r --no-preserve=mode,ownership ${buildSrc}/vendor/noq $out/vendor/noq
+              cp -r --no-preserve=mode,ownership ${buildSrc}/vendor/tree-sitter-language \
+                $out/vendor/tree-sitter-language
+            '';
+          in
+          rec {
+            workspaceDeps = craneLib.buildWorkspaceDepsOnly {
+              inherit extraDummyScript;
+            };
+
+            # `rho` ships only these binaries. Keeping this cache separate
+            # avoids building the GUI/Zed and other workspace-only dependency
+            # graphs when users run `nix build .#rho`.
+            packageDeps = craneLib.buildDepsOnly {
+              inherit extraDummyScript;
+              cargoExtraArgs = packageCargoExtraArgs;
             };
 
             workspace = craneLib.buildWorkspace {
@@ -379,8 +389,8 @@
             };
 
             package = craneLib.buildPackage {
-              cargoArtifacts = workspaceDeps;
-              cargoExtraArgs = "-p rho-cli -p rho-daemon -p rho-shell -p git-remote-octo -p jj-cli";
+              cargoArtifacts = packageDeps;
+              cargoExtraArgs = packageCargoExtraArgs;
               doCheck = false;
               env.RHO_BUNDLED_SKILLS_DIR = "${builtins.placeholder "out"}/share/rho/skills";
               env.RHO_DIRENV_PATH_BEFORE = "${findutils}/bin";
