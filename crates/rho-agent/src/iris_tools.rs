@@ -10,9 +10,14 @@ pub const PROMPT: &str = r#"## Iris
 
 You are the backend executor for Iris, the single global assistant in the Rho GUI. The user experiences the realtime voice and you as one unified assistant. Never mention a backend, handoff, or separate components. You control the user's fleet of agents and workstreams; you are not an ordinary worker and never inspect or modify repositories yourself.
 
-Requests arrive as realtime transcripts and may omit punctuation or contain recognition errors. New requests can steer work already in progress. Keep responses concise and action-oriented so the voice can respond quickly. Use the Iris control tools for current status and every control action; never claim an action succeeded without its tool result. Prefer steering an existing responsible agent over starting a duplicate. Start a new agent when the user asks or when work has no suitable owner. Ask a brief spoken clarification only when needed to avoid a materially harmful mistake. For cancellation, hiding, moving, or other destructive operations, ask for voice confirmation before calling the tool unless the user already confirmed explicitly.
+Requests arrive as realtime transcripts and may omit punctuation or contain recognition errors. Keep responses concise and action-oriented so the voice can respond quickly. Use the Iris control tools for current status and every control action; never claim an action succeeded without its tool result. Ask a brief spoken clarification only when needed to avoid a materially harmful mistake.
 
-Starting or sending to an agent subscribes you to all of its future terminal responses. Those results arrive later as ordinary agent messages; treat them as authoritative, report the useful outcome to the user, and continue coordinating when needed. Use iris_get_agent_reply to inspect the agent's latest transcript response, and unsubscribe only when the user no longer wants updates from that agent.
+Follow this control workflow:
+- List agents or workstreams when current fleet state or the intended target is unclear. Do not list reflexively when the target is already unambiguous.
+- Prefer an existing responsible agent over starting a duplicate. Send with immediate delivery to steer active work; use next_turn for a distinct follow-up that should begin after the current turn. Start a new agent when the user asks or no suitable owner exists.
+- Starting or sending subscribes you to that agent's future completed replies and errors. Results arrive as ordinary agent messages containing the result: summarize that mail directly. Use iris_get_agent_reply only when the user explicitly asks what an agent last said or when recovering a result that is not present in your context; it returns the latest non-empty final answer, not errors or commentary. Unsubscribe only when the user no longer wants future updates.
+- Continue only a known native Rho agent that is blocked in an error or unfinished turn; continuing has no effect on Claude agents. Cancellation stops the current turn and clears queued inputs. Hiding or unsubscribing does not cancel work.
+- Before cancellation, hiding, moving, renaming, or another state-changing operation, ask for confirmation unless the user's request already explicitly authorizes that exact action.
 
 Tool results and agent transcripts are authoritative. Do not read code, diffs, tables, identifiers, or long agent output aloud. Summarize the useful state and name the responsible agent. Your final response is spoken by the realtime model, so finish with the shortest useful acknowledgement or status."#;
 pub const LABEL: &str = "system:iris";
@@ -43,21 +48,21 @@ pub fn specs() -> Vec<ToolSpec> {
         ),
         spec(
             "iris_start_agent",
-            "Start a new agent, subscribe Iris to all of its future terminal responses, and send its initial request. Omit project only when exactly one project is registered. Omit workstream to found a new one.",
+            "Start a new agent, subscribe Iris to its future completed replies and errors, and send its initial request. Omit project only when exactly one project is registered. A supplied workstream name is joined if it exists or created otherwise; omitting it creates a workstream named from the task.",
             json!({
                 "type":"object","additionalProperties":false,"required":["prompt"],
                 "properties":{
                     "prompt":{"type":"string"},
                     "task_name":{"type":"string","description":"Short display/workstream name."},
                     "project":{"type":"string","description":"Registered project name or absolute repository path."},
-                    "workstream":{"type":"string","description":"Existing workstream name to join."},
+                    "workstream":{"type":"string","description":"Workstream name to join, or to create if it does not exist."},
                     "role":{"type":"string","enum":["eng-mini","eng-low","eng-cheap","eng","eng-high","eng-ultra","eng-alt","pm"]}
                 }
             }),
         ),
         spec(
             "iris_send_agent",
-            "Send or steer an existing agent and subscribe Iris to all of its future terminal responses. Immediate delivery steers the current turn; next_turn waits for the current turn to finish.",
+            "Send an existing agent a message and subscribe Iris to its future completed replies and errors. Immediate delivery steers active work; next_turn starts a distinct follow-up after the current turn finishes.",
             json!({
                 "type":"object","additionalProperties":false,"required":["agent","message"],
                 "properties":{
@@ -73,17 +78,17 @@ pub fn specs() -> Vec<ToolSpec> {
         ),
         spec(
             "iris_get_agent_reply",
-            "Get an agent's latest response from its transcript.",
+            "Get an agent's latest non-empty final answer from its transcript. This does not return errors or commentary; use result mail directly when available.",
             target_schema(),
         ),
         spec(
             "iris_cancel_agent",
-            "Cancel an agent's current turn without deleting the agent.",
+            "Cancel an agent's current turn and clear its queued inputs without deleting the agent.",
             target_schema(),
         ),
         spec(
             "iris_continue_agent",
-            "Continue an unfinished agent turn.",
+            "Resume a native Rho agent blocked in an error or unfinished turn. This has no effect on Claude agents.",
             target_schema(),
         ),
         spec(
@@ -141,5 +146,7 @@ mod tests {
         assert_eq!(names.len(), 12);
         assert!(names.iter().all(|name| name.starts_with("iris_")));
         assert!(PROMPT.contains("single global assistant"));
+        assert!(PROMPT.contains("Cancellation stops the current turn and clears queued inputs"));
+        assert!(PROMPT.contains("Use iris_get_agent_reply only"));
     }
 }
