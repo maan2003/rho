@@ -707,15 +707,17 @@ impl Editor {
             return;
         }
 
-        self.display_map.update(cx, |display_map, cx| {
-            display_map.fold_buffers(ids_to_fold.clone(), cx)
-        });
-
+        // Interior anchors in a buffer stop resolving once that buffer is folded,
+        // so move its selections before updating the display map.
         let snapshot = self.display_snapshot(cx);
         self.selections.change_with(&snapshot, |selections| {
             for buffer_id in ids_to_fold.iter().copied() {
                 selections.remove_selections_from_buffer(buffer_id);
             }
+        });
+
+        self.display_map.update(cx, |display_map, cx| {
+            display_map.fold_buffers(ids_to_fold.clone(), cx)
         });
 
         cx.emit(EditorEvent::BufferFoldToggled {
