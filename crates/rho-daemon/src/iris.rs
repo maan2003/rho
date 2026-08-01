@@ -34,16 +34,7 @@ pub(crate) enum IrisBackendEvent {
 }
 
 impl IrisBackend {
-    pub(crate) fn submit(
-        &self,
-        text: String,
-        transcript_delta: &str,
-        context_agent: Option<AgentId>,
-        transcript_tail: bool,
-    ) {
-        let context = context_agent
-            .map(|agent_id| format!("\nGUI context agent: {}\n", agent_id.encoded()))
-            .unwrap_or_default();
+    pub(crate) fn submit(&self, text: String, transcript_delta: &str, transcript_tail: bool) {
         let transcript = if transcript_delta.trim().is_empty() {
             String::new()
         } else {
@@ -59,7 +50,7 @@ impl IrisBackend {
         };
         self.agent.send_user_message_with_source(
             format!(
-                "<iris_voice_request>{context}{source}<transcript>{}</transcript>\n{transcript}</iris_voice_request>",
+                "<iris_voice_request>{source}<transcript>{}</transcript>\n{transcript}</iris_voice_request>",
                 escape_xml(&text)
             ),
             MessageDelivery::Immediate,
@@ -151,14 +142,11 @@ impl AgentRegistry {
         context
     }
 
-    pub(crate) async fn iris_backend(
-        self: &Arc<Self>,
-        context_agent: Option<AgentId>,
-    ) -> anyhow::Result<IrisBackend> {
+    pub(crate) async fn iris_backend(self: &Arc<Self>) -> anyhow::Result<IrisBackend> {
         self.install_iris_tool_host();
         let completed_items = self.pool.subscribe_completed_assistant_items();
         let completed_turns = self.pool.subscribe_completed_turns();
-        let agent_id = self.ensure_iris(context_agent).await?;
+        let agent_id = self.ensure_iris().await?;
         let (_, agent, _) = self.pool.load(agent_id).await?;
         Ok(IrisBackend {
             agent_id,
@@ -170,10 +158,7 @@ impl AgentRegistry {
         })
     }
 
-    async fn ensure_iris(
-        self: &Arc<Self>,
-        context_agent: Option<AgentId>,
-    ) -> anyhow::Result<AgentId> {
+    async fn ensure_iris(self: &Arc<Self>) -> anyhow::Result<AgentId> {
         let mut active = self.iris_agent.lock().await;
         if let Some(agent_id) = *active {
             return Ok(agent_id);
@@ -200,17 +185,10 @@ impl AgentRegistry {
         } else {
             let source = {
                 let read = self.db.read();
-                context_agent
-                    .filter(|agent_id| read.list_agents().iter().any(|(id, _)| id == agent_id))
-                    .map(|agent_id| read.get_agent(agent_id).primary_workdir().clone())
-                    .or_else(|| {
-                        read.list_agents()
-                            .into_iter()
-                            .find(|(_, record)| {
-                                !record.labels.iter().any(|label| label == IRIS_LABEL)
-                            })
-                            .map(|(_, record)| record.primary_workdir().clone())
-                    })
+                read.list_agents()
+                    .into_iter()
+                    .find(|(_, record)| !record.labels.iter().any(|label| label == IRIS_LABEL))
+                    .map(|(_, record)| record.primary_workdir().clone())
             };
 
             let workstream = self.create_workstream("iris".to_owned()).await;

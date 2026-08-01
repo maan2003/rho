@@ -2,7 +2,6 @@
 //! used by the native GPUI client. Transport remains direct iroh.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 
 use futures::StreamExt as _;
 use gpui::prelude::*;
@@ -74,7 +73,6 @@ pub struct Workspace {
     keyboard_visible: bool,
     realtime_task: Option<Task<()>>,
     realtime_stop: Option<tokio::sync::oneshot::Sender<()>>,
-    iris_context_agent: Arc<Mutex<Option<AgentId>>>,
     voice_error: Option<String>,
     _event_task: Task<()>,
     _dashboard_subscription: Subscription,
@@ -128,7 +126,6 @@ impl Workspace {
             keyboard_visible: false,
             realtime_task: None,
             realtime_stop: None,
-            iris_context_agent: Arc::new(Mutex::new(None)),
             voice_error: None,
             _event_task: event_task,
             _dashboard_subscription: dashboard_subscription,
@@ -308,10 +305,6 @@ impl Workspace {
             return;
         }
         self.registry.select_agent(agent_id);
-        *self
-            .iris_context_agent
-            .lock()
-            .expect("Iris context mutex poisoned") = Some(agent_id);
         let (subscribe, evicted) = self.subscriptions.touch(agent_id);
         if let Some(agent_id) = evicted {
             self.connection.send(ClientMessage::UnsubscribeAgents {
@@ -412,14 +405,12 @@ impl Workspace {
             return;
         }
         let dialer = self.connection.realtime_dialer();
-        let context_agent = Arc::clone(&self.iris_context_agent);
         let (stop, stop_rx) = tokio::sync::oneshot::channel();
         self.realtime_stop = Some(stop);
         self.voice_error = None;
         self.realtime_task = Some(cx.spawn(async move |this, cx| {
             let result = crate::realtime_client::run(
                 move |offer_sdp| async move { dialer.open(offer_sdp).await },
-                context_agent,
                 stop_rx,
             )
             .await;

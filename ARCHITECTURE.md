@@ -145,32 +145,26 @@ than by running a supervisor, extension protocol, or daemon process graph.
   protocol as untrusted: it assigns execution ids, retains accepted command
   text, validates response ordering and bounds, sanitizes output, and exposes
   only canonical structured state to clients.
-- `rho-realtime` is a provider-protocol crate outside the text inference
-  contract. It owns target-specific WebRTC media—libwebrtc-based native media
-  (including audio processing, codec handling, and jitter buffering) and the
-  browser's WebRTC/media APIs—microphone/playback, and the typed
-  realtime provider protocol, and exposes a `RealtimeSession` whose public
-  event stream includes typed input/output transcript deltas, completed
-  transcript parts, and delegation requests. Each GUI client owns media and
-  provider events, retains the active role-bearing conversation snapshot, and
-  forwards each request with that snapshot and the current semantic agent
-  context. Unhandled user transcript tails are flushed when the session ends.
-  The daemon enforces one global voice lease and routes requests
-  to Iris: a hidden persisted first-class `AgentRole::Iris` coordinator. Its
-  prompt and typed tool schemas are built into `rho-agent`; the daemon hosts
-  the stateful operations for listing, starting, steering, cancelling, moving,
-  renaming, and hiding agents and workstreams. Starting or steering an agent
-  persistently subscribes Iris to that agent's future terminal responses;
-  Iris can unsubscribe or inspect the agent's latest transcript response.
-  Additional requests steer the active Iris turn; each completed commentary
-  or final assistant item returns once on its corresponding provider channel.
-  Output without an active delegation uses the provider's session-level
-  context append with the same commentary or speakable channel. Session
-  startup includes a bounded visible-fleet snapshot. Iris is projected as a
-  synthetic dashboard row, not an ordinary agent or workstream member. The
-  daemon resolves OAuth and exchanges SDP through the same dedicated stream.
-  Media flows directly between the GUI and provider and never traverses the
-  daemon or `rho-core` transcript vocabulary.
+- `rho-rtc` owns only target-specific WebRTC media and audio devices: native
+  libwebrtc plus microphone/playback, and browser WebRTC plus `getUserMedia` and
+  HTML audio playback. They negotiate audio only and create no WebRTC data
+  channel. Audio capture remains disabled until the daemon confirms that the
+  provider sideband is connected.
+  `rho-openai-realtime` separately owns the typed OpenAI realtime wire protocol
+  and authenticated sideband WebSocket. The daemon resolves OAuth, exchanges
+  SDP, extracts the call id, connects that sideband, retains the bounded
+  role-bearing transcript snapshot, and routes delegation requests directly to
+  Iris: a hidden persisted first-class `AgentRole::Iris` coordinator. Its prompt
+  and typed tool schemas are built into `rho-agent`; the daemon hosts the
+  stateful fleet and workstream operations. Additional requests steer the
+  active Iris turn. Commentary and final assistant items are appended directly
+  on the provider sideband using commentary or speakable channels; output
+  without an active delegation uses session-level context append. Sideband
+  failure is terminal. The dedicated GUI-daemon stream carries only SDP and
+  lifecycle messages. Session startup includes a bounded visible-fleet
+  snapshot. Iris is projected as a synthetic dashboard row, not an ordinary
+  agent or workstream member. Media flows directly between the GUI and provider
+  and never traverses the daemon or `rho-core` transcript vocabulary.
 - Store crates own concrete persistence formats. Tool crates own concrete tool
   execution.
 - `rho-visualizations` owns opaque immutable visualization records, ids, and

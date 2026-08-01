@@ -490,47 +490,36 @@ current workdir and prints the resulting prompt and model-facing Rho tool
 specifications. Its output may contain repository instructions and user skill
 metadata; it performs no inference and creates no agent or workspace.
 
-## Realtime voice provider (`rho-realtime`)
+## Realtime voice provider (`rho-rtc` / `rho-openai-realtime`)
 
-- A GUI starts Iris only after the user activates its Iris control. The
-  always-visible Iris dashboard row exposes that control, and the native
-  `Space m` binding stops or restarts the session. Browser microphone access
-  additionally remains subject to secure-context, permission, and user-
-  activation policy. `rho-realtime` captures and plays audio on the client;
-  encoded media flows directly between the GUI-owned WebRTC peer and ChatGPT,
-  never through the daemon. Dropping the GUI session closes its data channel,
-  peer connection, microphone capture, and playback resources. Mobile browser
-  suspension may end the session; canonical Iris and agent state remains
-  daemon-owned and the client must reconnect rather than relying on background
-  execution.
-- The OAuth bearer token remains daemon-side. The GUI sends a bounded SDP
-  offer over a dedicated authenticated UI stream; the daemon resolves the
-  existing ChatGPT OAuth credential and calls the realtime signaling endpoint.
-  Only the bounded SDP answer returns to the GUI.
-- Provider data-channel messages are remote, semi-trusted input. The realtime
-  crate accepts text messages no larger than 1 MiB, decodes delegation and
-  input/output transcript delta/done events into tagged Rust types, ignores
-  unknown top-level events, and reports malformed known events without
-  panicking. Provider commands are constructed from typed values and
-  delegation context is split on UTF-8 boundaries into at most 500-byte
-  chunks.
-- The GUI owns provider event parsing and attaches its current selected agent
-  only as semantic context. At signaling time the daemon also supplies a
-  bounded 16 KiB snapshot containing visible agent handles, names, workstreams,
-  and attention states; it excludes repository contents and agent transcript
-  text. The daemon admits one global Iris media lease and routes typed delegate
-  text plus the active role-bearing conversation snapshot to a hidden persisted
-  `AgentRole::Iris` coordinator. `rho-agent` gives that role only its built-in
-  Iris schemas—no shell, repository, web-search, Slack, or parent-scoped agent
-  tools—and dispatches them to the daemon's bounded typed fleet-control host.
-  The dedicated stream carries only request ids,
-  optional context agent ids, transcript snapshots and tails, phase-tagged
-  completed response items, completion text, and errors; the daemon does not receive
-  media or raw provider event payloads. Only one backend turn is active per
-  realtime stream; later delegated requests steer it and receive an immediate
-  acknowledgement instead of being rejected. Each completed commentary or
-  final assistant item is forwarded as one phase-tagged message, capped at
-  16 KiB per active handoff.
+- Native and browser Iris start when the user toggles voice. The dashboard row
+  and both clients' controls expose that voice-session state. `rho-rtc`
+  captures and plays audio using target-specific native or browser facilities.
+  Encoded media flows directly between the GUI-owned WebRTC peer and ChatGPT,
+  never through the daemon. Audio capture stays disabled until sideband
+  readiness. Rho creates no WebRTC data channel; all provider control traffic
+  uses the daemon sideband.
+- The OAuth bearer token remains daemon-side. A GUI sends a bounded SDP offer
+  over a dedicated authenticated UI stream. The daemon resolves ChatGPT OAuth,
+  calls the realtime signaling endpoint under a timeout, validates the returned
+  `rtc_*` call id, and returns only the bounded SDP answer. Delegation payloads
+  and responses never traverse the client link.
+- `rho-openai-realtime` connects an authenticated daemon-side WebSocket bound
+  to that call id. Sideband text messages are remote, semi-trusted input:
+  WebSocket frames and decoded events are capped at 1 MiB, known delegation and
+  transcript forms decode into tagged Rust types, unknown top-level events are
+  ignored, and malformed known events terminate the session without panicking.
+  Binary frames are rejected. Provider commands are typed, split on UTF-8
+  boundaries into at most 500-byte chunks, and sent under a timeout. Sideband
+  connection or closure is terminal; there is intentionally no WebRTC
+  data-channel fallback.
+- The daemon retains a bounded 16 KiB role-bearing conversation snapshot and a
+  bounded visible-fleet startup snapshot, then routes typed delegation text to
+  the hidden persisted `AgentRole::Iris` coordinator. `rho-agent` gives that
+  role only its built-in Iris schemas and dispatches them to the daemon's typed
+  fleet-control host. Only one backend turn is active per realtime call; later
+  delegations steer it and are acknowledged directly on the sideband. Iris
+  output is capped at 16 KiB per active handoff before provider append.
 
 ## AGENTS.md
 

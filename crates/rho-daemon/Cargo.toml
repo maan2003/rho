@@ -28,6 +28,7 @@ rho-core.workspace = true
 rho-db.workspace = true
 rho-shell-proto.workspace = true
 rho-inference.workspace = true
+rho-openai-realtime.workspace = true
 rho-iroh-auth = { workspace = true, features = ["server"] }
 rho-pr-monitor.workspace = true
 rho-profiling.workspace = true

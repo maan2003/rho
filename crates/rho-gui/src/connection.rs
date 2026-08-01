@@ -697,14 +697,13 @@ impl Connection {
 
     pub fn start_native_realtime(
         &self,
-        context_agent: Arc<Mutex<Option<AgentId>>>,
         stop: tokio::sync::oneshot::Receiver<()>,
         cx: &App,
     ) -> Task<Result<anyhow::Result<()>, gpui_tokio::JoinError>> {
         let dialer = self.dialer.lock().unwrap().clone();
         Tokio::spawn(cx, async move {
             let dialer = dialer.context("not connected to rho-daemon")?;
-            crate::realtime_client::run_native(dialer, context_agent, stop).await
+            crate::realtime_client::run_native(dialer, stop).await
         })
     }
 }

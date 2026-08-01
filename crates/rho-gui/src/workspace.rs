@@ -13,7 +13,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
@@ -301,9 +300,6 @@ pub struct Workspace {
     /// binds to one host; selecting an agent elsewhere leaves it without
     /// context rather than sending a foreign id.
     iris_host: Option<HostId>,
-    /// Current semantic agent context sampled by Iris when each utterance
-    /// delegates. Shared with the long-lived realtime task.
-    iris_context_agent: Arc<Mutex<Option<AgentId>>>,
     _event_task: Task<()>,
     _dashboard_subscription: gpui::Subscription,
 }
@@ -483,7 +479,6 @@ impl Workspace {
             realtime_stop: None,
             iris_muted: false,
             iris_host: None,
-            iris_context_agent: Arc::new(Mutex::new(None)),
             _event_task: event_task,
             _dashboard_subscription: dashboard_subscription,
         };
@@ -1369,15 +1364,13 @@ impl Workspace {
             self.notice_on(None, "iris: no daemon attached", StyleClass::SystemInfo, cx);
             return;
         };
+        self.iris_host = Some(host);
         let Some(connection) = self.hosts.connection(host) else {
             return;
         };
-        let context_agent = Arc::clone(&self.iris_context_agent);
         let (stop, stop_rx) = tokio::sync::oneshot::channel();
-        let task = connection.start_native_realtime(context_agent, stop_rx, cx);
-        self.iris_host = Some(host);
+        let task = connection.start_native_realtime(stop_rx, cx);
         self.realtime_stop = Some(stop);
-        self.sync_iris_context();
         let starting = match self.hosts.len() > 1 {
             true => format!("starting Iris on {}…", self.host_label(host)),
             false => "starting Iris…".to_owned(),
@@ -1405,21 +1398,6 @@ impl Workspace {
                 }
             });
         }));
-    }
-
-    /// Publishes the selected agent to the running voice session, but only
-    /// when it lives on Iris's own daemon: sending an id the session's
-    /// daemon cannot resolve would delegate into nothing.
-    fn sync_iris_context(&self) {
-        let agent_id = self
-            .registry
-            .selected_agent()
-            .copied()
-            .filter(|agent_id| self.host_of(*agent_id) == self.iris_host);
-        *self
-            .iris_context_agent
-            .lock()
-            .expect("Iris context mutex poisoned") = agent_id;
     }
 
     fn shell_eof(&mut self, _: &ShellEof, _: &mut Window, cx: &mut Context<Self>) {
@@ -2215,9 +2193,7 @@ impl Workspace {
         match self.registered_workdir(&path) {
             Some(workdir) => self.hosts.send(
                 workdir.host,
-                ClientMessage::ProjectRemove {
-                    path: workdir.path,
-                },
+                ClientMessage::ProjectRemove { path: workdir.path },
             ),
             None => {
                 let message = format!("no registered project `{path}`");
@@ -2847,18 +2823,11 @@ impl Workspace {
 
     /// Shows an agent beside the dashboard cursor without changing the
     /// focused task or the dashboard's layout.
-    fn preview_agent(
-        &mut self,
-        agent_id: AgentId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn preview_agent(&mut self, agent_id: AgentId, window: &mut Window, cx: &mut Context<Self>) {
         if self.dashboard_preview == Some(agent_id) {
             return;
         }
-        if self.connected()
-            && !self.subscriptions.contains(agent_id)
-        {
+        if self.connected() && !self.subscriptions.contains(agent_id) {
             self.subscribe_agent(agent_id, cx);
         }
         let view = self.materialize_model(&agent_id, window, cx);
@@ -2911,7 +2880,6 @@ impl Workspace {
         }
         self.hosts
             .focus_agent(agent_id.and_then(|agent_id| Some((self.host_of(agent_id)?, agent_id))));
-        self.sync_iris_context();
         self.ensure_duration_timer(cx);
         cx.notify();
     }
@@ -3983,7 +3951,6 @@ impl Workspace {
         {
             self.subscribe_agent(agent_id, cx);
         }
-        self.sync_iris_context();
         self.dashboard_dirty = true;
         cx.notify();
     }

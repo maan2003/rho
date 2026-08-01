@@ -1,27 +1,30 @@
-//! Signaling and transport bridge for GUI-owned realtime WebRTC peers.
+//! Daemon-owned OpenAI realtime signaling, sideband, and Iris execution.
 //!
-//! Provider event semantics remain in `rho-realtime` and the GUI. This module
-//! resolves OAuth, enforces the single Iris lease, relays signaling, and
-//! executes delegated requests through the global Iris coordinator.
+//! The GUI owns only WebRTC media. Provider control events and commands stay
+//! on the daemon's authenticated sideband connection.
 
 use std::sync::Arc;
 
 use anyhow::Context as _;
 use rho_core::MessagePhase;
 use rho_inference::ResolvedOAuth;
-use rho_ui_proto::realtime::{RealtimeClientFrame, RealtimeResponsePhase, RealtimeServerFrame};
+use rho_openai_realtime::{
+    ContextChannel, ProviderEvent, Sideband, SidebandConfig, TranscriptState, call_id_from_location,
+};
+use rho_ui_proto::realtime::{RealtimeClientFrame, RealtimeServerFrame};
 use rho_ui_proto::{ServerMessage, read_frame, write_frame};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 use crate::AgentRegistry;
+use crate::iris::{IrisBackend, IrisBackendEvent};
 
 const IRIS_OUTPUT_BUDGET_BYTES: usize = 16 * 1024;
 const OUTPUT_TRUNCATED: &str = "\n…output truncated…";
 const MAX_SDP_BYTES: usize = 256 * 1024;
+const SIGNALING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const CALL_URL: &str =
     "https://chatgpt.com/backend-api/codex/realtime/calls?intent=quicksilver&architecture=avas";
-use crate::iris::{IrisBackend, IrisBackendEvent};
 
 pub(crate) async fn serve<R, W>(
     agents: Arc<AgentRegistry>,
@@ -56,7 +59,7 @@ where
         create_call(credential, offer_sdp, startup_context).await
     }
     .await;
-    let answer_sdp = match opened {
+    let opened = match opened {
         Ok(opened) => opened,
         Err(error) => {
             write_frame(
@@ -70,52 +73,96 @@ where
         }
     };
 
-    write_frame(&mut writer, &ServerMessage::RealtimeOpened { answer_sdp }).await?;
+    write_frame(
+        &mut writer,
+        &ServerMessage::RealtimeOpened {
+            answer_sdp: opened.answer_sdp,
+        },
+    )
+    .await?;
+    let sideband_connect = Sideband::connect(&opened.sideband);
+    tokio::pin!(sideband_connect);
+    let mut sideband = tokio::select! {
+            result = &mut sideband_connect => match result {
+                Ok(sideband) => sideband,
+                Err(error) => {
+                    write_frame(
+                        &mut writer,
+                        &RealtimeServerFrame::Error(format!("{error:#}")),
+                    ).await?;
+                    return Ok(());
+                }
+            },
+            frame = read_frame::<_, RealtimeClientFrame>(&mut reader) => match frame {
+                Ok(RealtimeClientFrame::Close) | Err(_) => {
+                    let _ = write_frame(&mut writer, &RealtimeServerFrame::Closed).await;
+                    return Ok(());
+                }
+            }
+    };
+
+    write_frame(&mut writer, &RealtimeServerFrame::SidebandReady).await?;
+
     let mut backend: Option<IrisBackend> = None;
-    let mut active_request = None;
+    let mut active_delegation: Option<String> = None;
+    let mut transcript = TranscriptState::default();
     let mut output_bytes = 0;
     let mut output_truncated = false;
 
-    loop {
-        tokio::select! {
+    let result: anyhow::Result<()> = async {
+        loop {
+            tokio::select! {
             frame = read_frame::<_, RealtimeClientFrame>(&mut reader) => {
                 match frame {
-                    Ok(RealtimeClientFrame::Delegate {
-                        request_id,
-                        context_agent,
-                        text,
-                        transcript_delta,
-                    }) => {
+                    Ok(RealtimeClientFrame::Close) | Err(_) => break,
+                }
+            }
+            event = sideband.next_event() => {
+                match event {
+                    Ok(Some(ProviderEvent::DelegationCreated { id, text })) => {
+                        let transcript_delta = transcript.take_snapshot();
                         if backend.is_none() {
-                            backend = Some(agents.iris_backend(context_agent).await?);
+                            backend = Some(agents.iris_backend().await?);
                         }
                         backend.as_ref().expect("Iris backend initialized").submit(
                             text,
                             &transcript_delta,
-                            context_agent,
                             false,
                         );
-                        if active_request.is_some() {
-                            write_frame(
-                                &mut writer,
-                                &RealtimeServerFrame::Steered { request_id },
+                        if active_delegation.is_some() {
+                            sideband.append_delegation(
+                                &id,
+                                ContextChannel::Speakable,
+                                "This was sent to steer the work already in progress.",
                             ).await?;
                         } else {
-                            active_request = Some(request_id);
+                            active_delegation = Some(id);
                         }
                     }
-                    Ok(RealtimeClientFrame::TranscriptTail { context_agent, text }) => {
-                        if backend.is_none() {
-                            backend = Some(agents.iris_backend(context_agent).await?);
-                        }
-                        backend.as_ref().expect("Iris backend initialized").submit(
-                            text,
-                            "",
-                            context_agent,
-                            true,
-                        );
+                    Ok(Some(event @ (ProviderEvent::TranscriptDelta { .. } | ProviderEvent::TranscriptDone { .. }))) => {
+                        transcript.apply(&event);
                     }
-                    Ok(RealtimeClientFrame::Close) | Err(_) => break,
+                    Ok(Some(ProviderEvent::Error(error))) => {
+                        write_frame(&mut writer, &RealtimeServerFrame::Error(error)).await?;
+                        break;
+                    }
+                    Ok(Some(ProviderEvent::Other)) => {}
+                    Ok(None) => {
+                        write_frame(
+                            &mut writer,
+                            &RealtimeServerFrame::Error(
+                                "OpenAI realtime sideband closed unexpectedly".to_owned(),
+                            ),
+                        ).await?;
+                        break;
+                    }
+                    Err(error) => {
+                        write_frame(
+                            &mut writer,
+                            &RealtimeServerFrame::Error(format!("{error:#}")),
+                        ).await?;
+                        break;
+                    }
                 }
             }
             event = async {
@@ -131,19 +178,14 @@ where
                             &mut output_bytes,
                             &mut output_truncated,
                         ) else { continue; };
-                        let phase = match phase {
-                            MessagePhase::Commentary => RealtimeResponsePhase::Commentary,
-                            MessagePhase::FinalAnswer => RealtimeResponsePhase::Speakable,
+                        let channel = match phase {
+                            MessagePhase::Commentary => ContextChannel::Commentary,
+                            MessagePhase::FinalAnswer => ContextChannel::Speakable,
                         };
-                        let frame = match active_request {
-                            Some(request_id) => RealtimeServerFrame::DelegatedItem {
-                                request_id,
-                                phase,
-                                text,
-                            },
-                            None => RealtimeServerFrame::StandaloneItem { phase, text },
-                        };
-                        write_frame(&mut writer, &frame).await?;
+                        match active_delegation.as_deref() {
+                            Some(id) => sideband.append_delegation(id, channel, &text).await?,
+                            None => sideband.append_session(channel, &text).await?,
+                        }
                     }
                     Ok(IrisBackendEvent::Completed { remaining_final }) => {
                         let text = bounded_output(
@@ -151,48 +193,87 @@ where
                             &mut output_bytes,
                             &mut output_truncated,
                         ).unwrap_or_default();
-                        match active_request.take() {
-                            Some(request_id) => {
-                                write_frame(
-                                    &mut writer,
-                                    &RealtimeServerFrame::Delegated { request_id, text },
+                        match active_delegation.take() {
+                            Some(id) if !text.is_empty() => {
+                                sideband.append_delegation(
+                                    &id,
+                                    ContextChannel::Speakable,
+                                    &text,
                                 ).await?;
                             }
                             None if !text.is_empty() => {
-                                write_frame(
-                                    &mut writer,
-                                    &RealtimeServerFrame::StandaloneItem {
-                                        phase: RealtimeResponsePhase::Speakable,
-                                        text,
-                                    },
+                                sideband.append_session(
+                                    ContextChannel::Speakable,
+                                    &text,
                                 ).await?;
                             }
-                            None => {}
+                            _ => {}
                         }
                         output_bytes = 0;
                         output_truncated = false;
                     }
-                    Err(error) => write_frame(
-                        &mut writer,
-                        &RealtimeServerFrame::Error(format!("{error:#}")),
-                    ).await?,
+                    Err(error) => {
+                        write_frame(
+                            &mut writer,
+                            &RealtimeServerFrame::Error(format!("{error:#}")),
+                        ).await?;
+                        break;
+                    }
                 }
             }
+            }
+        }
+        Ok(())
+    }
+    .await;
+    let mut result = result;
+    if let Some(text) = transcript.take_tail() {
+        let tail_result: anyhow::Result<()> = async {
+            if backend.is_none() {
+                backend = Some(agents.iris_backend().await?);
+            }
+            backend
+                .as_ref()
+                .expect("Iris backend initialized")
+                .submit(text, "", true);
+            Ok(())
+        }
+        .await;
+        if result.is_ok() {
+            result = tail_result;
+        } else if let Err(error) = tail_result {
+            tracing::warn!(%error, "failed to hand off realtime transcript tail");
         }
     }
+    if let Err(error) = &result {
+        let _ = write_frame(
+            &mut writer,
+            &RealtimeServerFrame::Error(format!("{error:#}")),
+        )
+        .await;
+    }
     let _ = write_frame(&mut writer, &RealtimeServerFrame::Closed).await;
-    Ok(())
+    result
+}
+
+struct OpenedCall {
+    answer_sdp: String,
+    sideband: SidebandConfig,
 }
 
 async fn create_call(
     credential: ResolvedOAuth,
     offer_sdp: String,
     startup_context: String,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<OpenedCall> {
     let account_id = credential
         .account_id
         .context("realtime requires a ChatGPT account id")?;
     let session_id = uuid::Uuid::new_v4().to_string();
+    let thread_id = uuid::Uuid::new_v4().to_string();
+    let installation_id = uuid::Uuid::new_v4().to_string();
+    let originator = "rho_gui".to_owned();
+    let user_agent = "rho-gui".to_owned();
     let body = CreateCallRequest {
         sdp: offer_sdp,
         session: CreateCallSession {
@@ -219,22 +300,32 @@ async fn create_call(
             },
         },
     };
-    let mut response = reqwest::Client::new()
+    let client = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(SIGNALING_TIMEOUT)
+        .build()
+        .context("build realtime signaling client")?;
+    let mut response = client
         .post(CALL_URL)
-        .bearer_auth(credential.bearer_token)
-        .header("chatgpt-account-id", account_id)
+        .bearer_auth(&credential.bearer_token)
+        .header("chatgpt-account-id", &account_id)
         .header("openai-alpha", "quicksilver=v2")
         .header("x-session-id", &session_id)
         .header("session-id", &session_id)
-        .header("thread-id", uuid::Uuid::new_v4().to_string())
-        .header("x-codex-installation-id", uuid::Uuid::new_v4().to_string())
-        .header("originator", "rho_gui")
-        .header("user-agent", "rho-gui")
+        .header("thread-id", &thread_id)
+        .header("x-codex-installation-id", &installation_id)
+        .header("originator", &originator)
+        .header("user-agent", &user_agent)
         .json(&body)
         .send()
         .await
         .context("create realtime WebRTC call")?;
     let status = response.status();
+    let call_id = response
+        .headers()
+        .get(reqwest::header::LOCATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(call_id_from_location);
     let mut bytes = Vec::new();
     while let Some(chunk) = response
         .chunk()
@@ -254,9 +345,22 @@ async fn create_call(
             .unwrap_or_else(|| String::from_utf8_lossy(&bytes).chars().take(500).collect());
         anyhow::bail!("realtime call creation failed with {status}: {detail}");
     }
-    let answer = String::from_utf8(bytes).context("decode realtime SDP answer")?;
-    validate_sdp(&answer, "answer").context("provider returned an invalid SDP answer")?;
-    Ok(answer)
+    let answer_sdp = String::from_utf8(bytes).context("decode realtime SDP answer")?;
+    validate_sdp(&answer_sdp, "answer").context("provider returned an invalid SDP answer")?;
+    let call_id = call_id.context("realtime call response omitted a valid call id")?;
+    Ok(OpenedCall {
+        answer_sdp,
+        sideband: SidebandConfig {
+            call_id,
+            bearer_token: credential.bearer_token,
+            account_id,
+            session_id,
+            thread_id,
+            installation_id,
+            originator,
+            user_agent,
+        },
+    })
 }
 
 fn validate_sdp(value: &str, kind: &str) -> anyhow::Result<()> {
