@@ -416,15 +416,14 @@ ten-minute same-connection recovery window and raises the daemon's incoming
 bidirectional stream credit from its pre-authentication limit. Iroh already
 sends five-second transport heartbeats; after ten seconds without receiving an
 authenticated QUIC datagram, the native GUI presents a temporary bottom
-recovery strip until the same connection responds or finally closes. The web
-UI speaks the same native UI protocol over the same iroh ALPN, so both clients
-share one wire vocabulary and agent policy. It retains only its selected-agent
-subscription, accepts 16 concurrent daemon-initiated streams, and reserves
-decompressed frames against a 64 MiB aggregate allocation budget. The web UI
-page itself is a static
-Leptos/wasm app (`webui/` at the
-repo root, its own cargo workspace, hostable anywhere) that connects as an
-iroh client from the browser.
+recovery strip until the same connection responds or finally closes. The
+browser client speaks the same native UI protocol over the same iroh ALPN, so
+both clients share one wire vocabulary and agent policy. It retains only its
+selected-agent subscription, accepts 16 concurrent daemon-initiated streams,
+and reserves decompressed frames against a 64 MiB aggregate allocation budget.
+The page is a static GPUI/wasm bundle (`crates/rho-gui-web`, its own Cargo
+workspace) which boots the portable `rho-gui` dashboard and connects as an iroh
+client from the browser.
 
 Native GUI file and diff surfaces share one GUI-local remote-workspace registry
 per workspace, and therefore one Zed `language::Buffer` identity and dirty state

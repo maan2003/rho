@@ -6,7 +6,23 @@
     <meta name="theme-color" content="#111318" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src https: wss:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    />
     <title>Rho</title>
+    <!-- GitHub Pages cannot set COOP/COEP response headers. This worker adds
+         them to the next (controlled) navigation, then reloads this page. -->
+    <link data-trunk rel="copy-file" href="coi-serviceworker.js" />
+    <script>
+      if (!crossOriginIsolated && "serviceWorker" in navigator) {
+        navigator.serviceWorker.addEventListener(
+          "controllerchange", () => location.reload(), { once: true },
+        );
+        navigator.serviceWorker.register("./coi-serviceworker.js", { scope: "./" })
+          .catch((error) => console.error("Unable to enable cross-origin isolation", error));
+      }
+    </script>
     <link data-trunk rel="rust" data-bin="rho-gui-web" data-bindgen-target="web" data-wasm-opt="0" />
     <style>
       * { box-sizing: border-box; margin: 0; padding: 0; }

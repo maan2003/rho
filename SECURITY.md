@@ -292,7 +292,7 @@ AI APIs.
   `--remote-rho <path>` selects the remote executable (default `rho`) and
   accepts only a nonempty shell-safe path alphabet; it is not an arbitrary
   remote shell command.
-- The web UI (a static Leptos/wasm page in `webui/`, hostable anywhere) is
+- The browser UI (a static GPUI/wasm page in `crates/rho-gui-web`, hostable anywhere) is
   an iroh client like any other: it connects on the native UI ALPN and passes
   the same per-key enrollment before the daemon serves it. Its session uses
   the same framed native UI protocol and therefore has the same privileges as
@@ -300,7 +300,10 @@ AI APIs.
   PRF extension to derive a stable, daemon-specific iroh key on each connect;
   only the non-secret credential id and daemon id are kept in local storage.
   The PRF output and derived iroh key remain in browser memory and are never
-  persisted. The hosting origin and all JavaScript it serves are fully trusted:
+  persisted. The hosting origin and all JavaScript it serves are fully trusted.
+  On static hosts that cannot set response headers (including GitHub Pages),
+  the page's same-origin COI service worker adds COOP and COEP after its first
+  activation and reloads the page so threaded wasm can use `SharedArrayBuffer`:
   code running after the user approves the WebAuthn prompt can read the
   derived enrolled key and thereby gain persistent daemon access. Deploy the
   page on a dedicated origin without third-party scripts and treat its build

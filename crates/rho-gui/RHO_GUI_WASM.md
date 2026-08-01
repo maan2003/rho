@@ -10,16 +10,16 @@ rendering/state code, and the shared registry/store. Browser connection source
 porting may follow the view split, but the transport design remains direct iroh
 on both targets: do not introduce a connection trait/enum abstraction.
 
-The wasm toolchain must be the rustup nightly toolchain and release profile. The
+The wasm toolchain is the flake-pinned nightly toolchain and release profile. The
 tree-sitter C runtime and statically linked Markdown grammars use the wasm libc
-provider already established by the GPUI-web spike and an unwrapped clang.
+provider and an unwrapped clang.
 
 ## Full source inventory before the split
 
 | Source | Classification | Boundary and coupled consumers |
 | --- | --- | --- |
 | `main.rs` | native entry point | CLI, tracing subscriber, profiling files, rustls provider, Wayland app boot, daemon attachment, native initialization. Its module declarations must move to `lib.rs` so the library is the source of truth. |
-| `connection.rs` | mixed, port after views | Tokio/`gpui_tokio`, Unix channels and native RPC features are native; iroh itself is the browser transport too. Its channel types are consumed throughout `workspace.rs`, `zed_remote.rs`, `terminal_view.rs`, `shell_view.rs`, and `native_realtime.rs`; those payload paths must be gated together until the direct iroh wasm source path is enabled. Follow `webui/src/conn.rs`, not a new abstraction. |
+| `connection.rs` | mixed, port after views | Tokio/`gpui_tokio`, Unix channels and native RPC features are native; iroh itself is the browser transport too. Its channel types are consumed throughout `workspace.rs`, `zed_remote.rs`, `terminal_view.rs`, `shell_view.rs`, and `native_realtime.rs`; those payload paths must be gated together until the direct iroh wasm source path is enabled. Keep the browser connection direct, not behind a new abstraction. |
 | `zed_remote.rs` | connection-coupled | Remote buffer/project synchronization and language registry setup are driven by the connection. Markdown's portable static grammar registration must not depend on this module. |
 | `native_realtime.rs`, `chime.rs`, `sampler.rs` | native | Native WebRTC/media and rodio output. The workspace voice state/actions and tests are their consumers and must be gated together. |
 | `terminal_view.rs`, `shell_view.rs` | native | Long-lived daemon channels and terminal/shell payloads. Workspace surface variants/actions that construct or operate these views are matching consumers. |
@@ -49,8 +49,8 @@ Native-only feature members: `clap`, `dirs`, `gpui_tokio`, `fs`, `project`,
 `command_palette`, `tokio`, `tracing-subscriber`, `vim`, `vim_mode_setting`,
 `prefix-id/redb`, and Wayland/font-kit GPUI platform features. `connection.rs`,
 native views, and `zed_remote.rs` are the source owners of those dependencies.
-The wasm iroh/rho-rpc selection should mirror `webui/Cargo.toml`; it is not a
-new transport layer.
+The wasm iroh/rho-rpc selection belongs in `rho-gui` itself; it is not a new
+transport layer.
 
 Portable direct families: GPUI without a native platform feature, `editor`
 without its default `native` feature, language/text/multi-buffer/buffer-diff,
@@ -62,7 +62,7 @@ equivalent downstream defaults) so existing native behavior does not change.
 ## Execution log / handoff
 
 - Inventory written before source or Cargo gating.
-- Browser connection target is direct iroh, matching `webui`; no transport
+- Browser connection target is direct iroh; no transport
   abstraction is introduced.
 - Added a library target and made the unchanged native binary require the
   default-on `native` feature. Actions and view modules now belong to the
@@ -99,15 +99,14 @@ equivalent downstream defaults) so existing native behavior does not change.
 `crates/rho-gui-web` is the thin Trunk entry point. It boots `gpui_web`, loads
 Rho's assets and editor settings, and mounts `rho_gui::workspace::Workspace`.
 The browser workspace uses direct iroh (ALPN `rho/ui/3`) with the same WebAuthn
-PRF identity/enrollment flow as the existing web UI. It applies streamed agent
+PRF identity/enrollment flow. It applies streamed agent
 frames to the shared `rho-registry` store and feeds the existing dashboard,
 `AgentModel`, transcript model, and transcript preview.
 
 Build the static bundle (release is required) with:
 
 ```sh
-nix shell nixpkgs#trunk -c sh -c \
-  'cd crates/rho-gui-web && trunk build --release'
+nix build .#webui
 ```
 
 Open `dist/index.html` through an HTTP server with the COOP/COEP headers from

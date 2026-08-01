@@ -9,7 +9,7 @@ supervisor, protocol, and plugin runtime.
 - `rho-gui`, the native desktop application.
 - Slack integration.
 - The `rho` terminal CLI.
-- A browser-based web UI.
+- `rho-gui-web`, a browser client built from the native GPUI interface.
 
 ## Attaching the GUI to daemons
 

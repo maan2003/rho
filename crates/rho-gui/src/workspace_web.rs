@@ -227,7 +227,8 @@ impl Workspace {
                 agent_id,
                 workstream,
             } => {
-                self.registry.note_agent_workstream(agent_id, workstream);
+                self.registry
+                    .note_agent_workstream(HostId::default(), agent_id, workstream);
                 self.registry.mark_known(agent_id);
                 cx.notify();
             }

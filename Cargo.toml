@@ -37,14 +37,14 @@ members = [
   "crates/senax-encoder",
   "crates/senax-encoder/derive",
 ]
-# The web UI is its own workspace: it targets wasm32 and is built with trunk.
+# The GPUI browser client is its own workspace: it targets wasm32 and is built
+# with Trunk.
 exclude = [
   "crates/rho-gui-web",
   "vendor/brush",
   "vendor/jj",
   "vendor/noq",
   "vendor/zed",
-  "webui",
 ]
 resolver = "2"
 

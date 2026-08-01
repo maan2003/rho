@@ -157,35 +157,28 @@
           paths = buildPaths;
         };
 
-        # The web UI is its own cargo workspace targeting wasm32, built with
-        # trunk into a static bundle. Reproducible `nix build .#webui` output
-        # is the deployable artifact: anyone can rebuild and byte-compare
-        # against the hosted bundle. The source still needs the root
-        # workspace manifest and `crates`/`vendor` trees because the webui
-        # depends on `rho-iroh-auth` (workspace-inherited fields) and patches
-        # in the vendored `iroh`/`noq` forks.
-        webuiSrc = flakeboxLib.filterSubPaths {
-          root = builtins.path {
-            name = projectName;
-            path = ./.;
-          };
-          paths = buildPaths ++ [
-            "webui"
-            "crates/json-stream"
-            "crates/prefix-id"
-            "crates/rho-core"
-            "crates/rho-iroh-auth"
-            "crates/rho-registry"
-            "crates/rho-rpc"
-            "crates/rho-shell-proto"
-            "crates/rho-ui-proto"
-            "crates/rho-workspaces-types"
-            "crates/senax-encoder"
+        # The browser client is a GPUI application in its own wasm workspace.
+        # Keep its nightly toolchain separate from the native workspace's
+        # stable toolchain, while retaining a reproducible deployable bundle.
+        webuiToolchain = flakeboxLib.mkFenixToolchain {
+          channel = "complete";
+          componentTargetsChannelName = "latest";
+          components = [
+            "cargo"
+            "rustc"
+            "rust-src"
           ];
+          targets = {
+            wasm32-unknown = (flakeboxLib.mkStdTargets { }).wasm32-unknown;
+          };
+        };
+        webuiRustPlatform = pkgs.makeRustPlatform {
+          cargo = webuiToolchain.toolchain;
+          rustc = webuiToolchain.toolchain;
         };
 
         # Trunk requires the wasm-bindgen CLI version to exactly match the
-        # `wasm-bindgen` crate in webui/Cargo.lock.
+        # `wasm-bindgen` crate in crates/rho-gui-web/Cargo.lock.
         wasmBindgenCli = pkgs.buildWasmBindgenCli rec {
           src = pkgs.fetchCrate {
             pname = "wasm-bindgen-cli";
@@ -222,22 +215,61 @@
               f.write(new)
         '';
 
-        webui = pkgs.rustPlatform.buildRustPackage {
-          pname = "rho-webui";
+        webui = webuiRustPlatform.buildRustPackage {
+          pname = "rho-gui-web";
           version = "0.1.0";
-          src = webuiSrc;
-          sourceRoot = "source/webui";
-          cargoLock.lockFile = ./webui/Cargo.lock;
+          src = buildSrc;
+          sourceRoot = "source/crates/rho-gui-web";
+          cargoLock = {
+            lockFile = ./crates/rho-gui-web/Cargo.lock;
+            outputHashes = {
+              "trash-5.2.5" = "sha256-jLEttaISqOns3AZO6yI9Nk/szsOsU4HnP389gOsP3A8=";
+              "tree-sitter-md-0.3.2" = "sha256-q2/aJx+385B8HiU0soZ1vtRvjkE21ABGzIyR1qwKFOU=";
+              "wasm_thread-0.3.3" = "sha256-+lRLCIk0S6Y5ORYjDKsYYHia2FtoSoh+rWkQh7mnPBE=";
+            };
+          };
           nativeBuildInputs = [
             pkgs.trunk
             wasmBindgenCli
             pkgs.binaryen
             pkgs.lld
             pkgs.python3
+            pkgs.protobuf
           ];
-          # `ring` compiles C for wasm32; the wrapped clang injects host
+          # `ring` and the statically linked tree-sitter grammars compile C
+          # for wasm32. Do not use Nix's wrapped clang, which injects host
           # flags that produce unlinkable objects.
-          env.CC_wasm32_unknown_unknown = "${pkgs.llvmPackages.clang-unwrapped}/bin/clang";
+          env = {
+            CFLAGS_wasm32_unknown_unknown = "-matomics -mbulk-memory -I${buildSrc}/vendor/zed/tooling/tree_sitter_wasm/include";
+          };
+          preBuild = ''
+            substituteInPlace .cargo/config.toml \
+              --replace-fail 'value = "toolchain/clang", relative = true, force = true' \
+              'value = "${pkgs.llvmPackages.clang-unwrapped}/bin/clang", force = true'
+
+            # Cargo reads the rust-src workspace lock when it builds `std`.
+            # That lock is generated independently of this application and
+            # can pin an older shared build dependency. Give Cargo a writable
+            # Nix-provided source copy without the nested lock; it resolves
+            # against the application lock vendored above instead.
+            rust_sysroot="$TMPDIR/rust-sysroot"
+            mkdir -p "$rust_sysroot/lib/rustlib/src"
+            cp -a ${webuiToolchain.toolchain}/lib/rustlib/src/rust \
+              "$rust_sysroot/lib/rustlib/src/"
+            chmod -R u+w "$rust_sysroot/lib/rustlib/src/rust"
+            rm "$rust_sysroot/lib/rustlib/src/rust/library/Cargo.lock"
+            cat > "$TMPDIR/rustc" <<'EOF'
+            #!${pkgs.runtimeShell}
+            if [ "$#" -eq 2 ] && [ "$1" = "--print" ] && [ "$2" = "sysroot" ]; then
+              echo "$RHO_WEBUI_RUST_SYSROOT"
+              exit 0
+            fi
+            exec ${webuiToolchain.toolchain}/bin/rustc "$@"
+            EOF
+            chmod +x "$TMPDIR/rustc"
+            export RHO_WEBUI_RUST_SYSROOT="$rust_sysroot"
+            export RUSTC="$TMPDIR/rustc"
+          '';
           buildPhase = ''
             runHook preBuild
             export TRUNK_OFFLINE=true
