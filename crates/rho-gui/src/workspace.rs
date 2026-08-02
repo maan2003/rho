@@ -4816,6 +4816,19 @@ impl Workspace {
         }
     }
 
+    #[cfg(all(target_family = "wasm", not(feature = "native")))]
+    fn dashboard_open_clicked_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::dashboard::RowTarget;
+        match self.dashboard.cursor_target(cx) {
+            Some(RowTarget::Stream {
+                root: Some(agent_id),
+                ..
+            })
+            | Some(RowTarget::Agent(agent_id)) => self.open_agent(agent_id, window, cx),
+            _ => {}
+        }
+    }
+
     fn create_inline_agent(
         &mut self,
         host: HostId,
@@ -4909,14 +4922,18 @@ impl Workspace {
             .pl(px(24.))
             .pr(px(24.))
             .child(self.render_dashboard_header(text_style, cx));
-        container
-            .child(
-                div()
-                    .flex_grow(1.0)
-                    .min_h_0()
-                    .child(self.dashboard.editor().clone()),
-            )
-            .into_any_element()
+        let dashboard = div()
+            .id("dashboard-rail")
+            .flex_grow(1.0)
+            .min_h_0()
+            .child(self.dashboard.editor().clone());
+        #[cfg(all(target_family = "wasm", not(feature = "native")))]
+        let dashboard = dashboard.on_click(cx.listener(|this, _, window, cx| {
+            // Click bubbles after the editor has moved its cursor, so this
+            // resolves the row the user clicked rather than the previous one.
+            this.dashboard_open_clicked_agent(window, cx)
+        }));
+        container.child(dashboard).into_any_element()
     }
 
     /// The dashboard-only two-line masthead.

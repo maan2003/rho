@@ -240,8 +240,12 @@ impl Render for Workspace {
         let body = if narrow {
             if home {
                 div()
+                    .id("dashboard-narrow")
                     .size_full()
                     .overflow_hidden()
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.dashboard_open_clicked_agent(window, cx)
+                    }))
                     .child(self.dashboard.editor().clone())
                     .into_any_element()
             } else {
