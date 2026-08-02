@@ -4,7 +4,10 @@ use std::collections::HashMap;
 
 use futures::StreamExt as _;
 use gpui::prelude::*;
-use gpui::{App, Context, Focusable as _, Pixels, Render, Window, div, px};
+use gpui::{
+    App, Context, Focusable as _, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Render,
+    Window, div, px,
+};
 use rho_touch_keyboard::{ContextChip, KeyboardPlugin, KeyboardStyle, TouchKeyboard};
 use theme::ActiveTheme as _;
 
@@ -54,6 +57,7 @@ pub(super) struct WebUi {
     target_error: Option<String>,
     touch_keyboard: gpui::Entity<TouchKeyboard>,
     keyboard_visible: bool,
+    dashboard_press: Option<Point<Pixels>>,
 }
 
 impl WebUi {
@@ -191,6 +195,7 @@ impl Workspace {
                 target_error,
                 touch_keyboard: cx.new(|_| TouchKeyboard::new(RhoKeyboardPlugin)),
                 keyboard_visible: false,
+                dashboard_press: None,
             },
         };
         let draft = this.make_surface(SurfaceKey::Draft, window, cx);
@@ -212,6 +217,36 @@ impl Workspace {
             .authorizations
             .insert(host, Authorization::Connecting);
         cx.notify();
+    }
+
+    pub(super) fn dashboard_pointer_down(
+        &mut self,
+        event: &MouseDownEvent,
+        _: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+        self.web.dashboard_press =
+            (event.button == MouseButton::Left).then_some(event.position);
+    }
+
+    pub(super) fn dashboard_pointer_up(
+        &mut self,
+        event: &MouseUpEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(start) = self.web.dashboard_press.take() else {
+            return;
+        };
+        if event.button != MouseButton::Left
+            || (event.position.x - start.x).abs() > px(8.)
+            || (event.position.y - start.y).abs() > px(8.)
+        {
+            return;
+        }
+        cx.defer_in(window, |this, window, cx| {
+            this.dashboard_open_clicked_agent(window, cx)
+        });
     }
 }
 
@@ -243,9 +278,8 @@ impl Render for Workspace {
                     .id("dashboard-narrow")
                     .size_full()
                     .overflow_hidden()
-                    .on_click(cx.listener(|this, _, window, cx| {
-                        this.dashboard_open_clicked_agent(window, cx)
-                    }))
+                    .capture_any_mouse_down(cx.listener(Self::dashboard_pointer_down))
+                    .capture_any_mouse_up(cx.listener(Self::dashboard_pointer_up))
                     .child(self.dashboard.editor().clone())
                     .into_any_element()
             } else {

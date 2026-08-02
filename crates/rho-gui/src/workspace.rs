@@ -4928,11 +4928,11 @@ impl Workspace {
             .min_h_0()
             .child(self.dashboard.editor().clone());
         #[cfg(all(target_family = "wasm", not(feature = "native")))]
-        let dashboard = dashboard.on_click(cx.listener(|this, _, window, cx| {
-            // Click bubbles after the editor has moved its cursor, so this
-            // resolves the row the user clicked rather than the previous one.
-            this.dashboard_open_clicked_agent(window, cx)
-        }));
+        let dashboard = dashboard
+            // The editor consumes bubble-phase mouse events. Capture the
+            // press/release around it, then open after its cursor has moved.
+            .capture_any_mouse_down(cx.listener(Self::dashboard_pointer_down))
+            .capture_any_mouse_up(cx.listener(Self::dashboard_pointer_up));
         container.child(dashboard).into_any_element()
     }
 
