@@ -46,6 +46,7 @@ pub enum AuthArgs {
 }
 
 pub fn run_auth_cli(command: AuthArgs) -> Result<()> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     match command {
         AuthArgs::Add => {
             let name = prompt_with_default("Auth namespace", DEFAULT_AUTH_NAME)?;
@@ -454,6 +455,12 @@ struct RateLimitResetCredits {
 #[cfg(test)]
 mod usage_tests {
     use super::*;
+
+    #[test]
+    fn auth_cli_installs_the_tls_provider() {
+        assert!(run_auth_cli(AuthArgs::Status { name: "/".into() }).is_err());
+        reqwest::blocking::Client::builder().build().unwrap();
+    }
 
     #[test]
     fn finds_weekly_window_regardless_of_position() {
