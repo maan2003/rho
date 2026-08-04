@@ -729,8 +729,7 @@ impl Agent {
         // Role policy wins over persisted profiles created before PM code mode
         // was disabled.
         let code_mode_enabled = cfg!(feature = "code-mode") && config.code_mode && !role.is_pm();
-        let web_search =
-            WebSearchTools::new(inference.auth().clone(), agent_id.encoded().to_owned());
+        let web_search = WebSearchTools::new(inference.clone(), agent_id.encoded().to_owned());
         let inference_session = inference.deep_session(config, model, prompt_cache_key);
         let iris_tools = (role == db::AgentRole::Iris).then(|| {
             pool.upgrade()

@@ -560,6 +560,7 @@ pub enum WorkstreamPrompt {
 
 #[derive(Clone)]
 struct NewAgentDraft {
+    host: Option<HostId>,
     workdir: Option<HostPath>,
     workspace: DraftWorkspace,
     role: String,
@@ -1066,6 +1067,7 @@ impl Workspace {
                 workstreams,
                 agents,
                 projects: workdirs,
+                auth,
                 machine_seed,
                 agent_counter,
             } => {
@@ -1078,6 +1080,9 @@ impl Workspace {
                         .into_iter()
                         .map(|project| HostProject { host, project }),
                 );
+                if let Some(entry) = self.hosts.get_mut(host) {
+                    entry.auth = Some(auth);
+                }
                 self.hosts.set_status(host, HostStatus::Online);
                 #[cfg(all(target_family = "wasm", not(feature = "native")))]
                 self.web.online(host);
@@ -1093,6 +1098,12 @@ impl Workspace {
                     self.set_initial_subscriptions(host, agent_ids, cx);
                 }
                 self.update_statuses(cx);
+                cx.notify();
+            }
+            ConnEvent::AuthState(auth) => {
+                if let Some(entry) = self.hosts.get_mut(host) {
+                    entry.auth = Some(auth);
+                }
                 cx.notify();
             }
             ConnEvent::WorkstreamCreated(workstream) => {
@@ -1841,7 +1852,7 @@ impl Workspace {
             let draft = self.draft_model.read(cx);
             let mode = draft.start_mode();
             let target = draft.start_text(cx).trim().to_owned();
-            match self.parse_start(mode, &target, working_directory) {
+            match self.parse_start(mode, &target, working_directory, None) {
                 Ok(start) => start,
                 Err(message) => {
                     self.notice_on(None, &message, StyleClass::SystemInfo, cx);
@@ -1993,6 +2004,7 @@ impl Workspace {
         mode: crate::draft_view::StartFieldMode,
         target: &str,
         workdir: Option<HostPath>,
+        selected_host: Option<HostId>,
     ) -> Result<(HostId, rho_ui_proto::StartMode), String> {
         use rho_ui_proto::{JoinTarget, StartMode, WorkspaceInfo};
 
@@ -2010,10 +2022,24 @@ impl Workspace {
         // downstream could reconcile a checkout on one machine with a base
         // revision on another.
         let base_agent = self.registry.agent_by_label(target);
-        let host = match (
-            base_agent.and_then(|agent_id| self.host_of(agent_id)),
-            &workdir,
-        ) {
+        let base_host = base_agent.and_then(|agent_id| self.host_of(agent_id));
+        if let Some(selected) = selected_host {
+            if let Some(workdir) = &workdir
+                && workdir.host != selected
+            {
+                return Err("the selected project belongs to a different host".to_owned());
+            }
+            if let Some(base) = base_host
+                && base != selected
+            {
+                return Err(format!(
+                    "`{target}` is on {}, not the selected host {}",
+                    self.host_label(base),
+                    self.host_label(selected),
+                ));
+            }
+        }
+        let host = match (base_host, &workdir) {
             (Some(base), Some(workdir)) if base != workdir.host => {
                 return Err(format!(
                     "`{target}` is on {}, but the working directory is on {}: \
@@ -2024,9 +2050,8 @@ impl Workspace {
             }
             (Some(base), _) => base,
             (None, Some(workdir)) => workdir.host,
-            (None, None) => self
-                .hosts
-                .primary()
+            (None, None) => selected_host
+                .or_else(|| self.hosts.primary())
                 .ok_or_else(|| "not connected to rho-daemon".to_owned())?,
         };
         let workspace = base_agent
@@ -2767,6 +2792,105 @@ impl Workspace {
         self.open_prompt("detach host:", complete, on_submit, window, cx);
     }
 
+    pub(crate) fn open_host_auth_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.hosts.len() {
+            0 => self.notice_on(None, "no attached hosts", StyleClass::SystemInfo, cx),
+            1 => {
+                let host = self.hosts.iter().next().expect("one host").id;
+                self.prompt_host_auth_namespace(host, window, cx);
+            }
+            _ => self.prompt_host_auth(window, cx),
+        }
+    }
+
+    fn prompt_host_auth(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, _: &gpui::App| {
+            let needle = input.trim().to_lowercase();
+            workspace
+                .hosts
+                .iter()
+                .filter(|host| host.name.to_lowercase().contains(&needle))
+                .map(|host| crate::commands::Candidate {
+                    value: host.name.clone(),
+                    description: host.status.label(),
+                })
+                .collect()
+        });
+        let on_submit = std::rc::Rc::new(
+            |workspace: &mut Workspace,
+             input: String,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                let name = input.trim();
+                if let Some(host) = workspace.hosts.by_name(name).map(|host| host.id) {
+                    workspace.prompt_host_auth_namespace(host, window, cx);
+                } else if !name.is_empty() {
+                    workspace.notice_on(
+                        None,
+                        &format!("no attached host named `{name}`"),
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
+                }
+            },
+        );
+        self.open_prompt("host auth:", complete, on_submit, window, cx);
+    }
+
+    pub(crate) fn prompt_host_auth_namespace(
+        &mut self,
+        host: HostId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let complete =
+            std::rc::Rc::new(move |workspace: &Workspace, input: &str, _: &gpui::App| {
+                let needle = input.trim().to_lowercase();
+                workspace
+                    .hosts
+                    .get(host)
+                    .and_then(|host| host.auth.as_ref())
+                    .into_iter()
+                    .flat_map(|auth| &auth.namespaces)
+                    .filter(|name| name.to_lowercase().contains(&needle))
+                    .map(|name| crate::commands::Candidate {
+                        value: name.clone(),
+                        description: "auth namespace".to_owned(),
+                    })
+                    .collect()
+            });
+        let on_submit = std::rc::Rc::new(
+            move |workspace: &mut Workspace,
+                  input: String,
+                  _window: &mut Window,
+                  cx: &mut Context<Workspace>| {
+                let name = input.trim();
+                if name.is_empty() {
+                    return;
+                }
+                workspace.hosts.send(
+                    host,
+                    ClientMessage::SetAuthNamespace {
+                        name: name.to_owned(),
+                    },
+                );
+                workspace.notice_on(
+                    None,
+                    &format!("setting auth on {} to {name}", workspace.host_label(host)),
+                    StyleClass::SystemInfo,
+                    cx,
+                );
+            },
+        );
+        self.open_prompt(
+            format!("auth on {}:", self.host_label(host)),
+            complete,
+            on_submit,
+            window,
+            cx,
+        );
+    }
+
     /// Opens the draft compose view. `working_directory` is an explicit
     /// choice (`:agent new <path>`, rewrites the header even mid-draft);
     /// otherwise the scaffold default is derived from the inherited topic.
@@ -3135,6 +3259,24 @@ impl Workspace {
                 ));
             }
         };
+        Ok(HostPath {
+            host,
+            path: Utf8PathBuf::from(argument),
+        })
+    }
+
+    fn resolve_workdir_on_host(&self, argument: &str, host: HostId) -> Result<HostPath, String> {
+        if let Some(registered) = self.registered_workdir(argument) {
+            return (registered.host == host)
+                .then_some(registered)
+                .ok_or_else(|| "project belongs to a different host".to_owned());
+        }
+        if argument.contains(':') {
+            let workdir = self.resolve_workdir(argument)?;
+            return (workdir.host == host)
+                .then_some(workdir)
+                .ok_or_else(|| "project belongs to a different host".to_owned());
+        }
         Ok(HostPath {
             host,
             path: Utf8PathBuf::from(argument),
@@ -4745,19 +4887,32 @@ impl Workspace {
                 _ => None,
             });
             self.new_agent_draft = Some(NewAgentDraft {
+                host: workdir
+                    .as_ref()
+                    .map(|workdir| workdir.host)
+                    .or_else(|| self.hosts.primary()),
                 workdir,
                 workspace: DraftWorkspace::NewOn(DraftBase::Auto),
                 role: crate::draft_view::DEFAULT_ROLE.to_owned(),
             });
         }
         let draft = self.new_agent_draft.as_ref().expect("draft initialized");
+        let host = draft
+            .host
+            .map(|host| self.host_label(host))
+            .unwrap_or_else(|| "<choose>".to_owned());
         let project = draft
             .workdir
             .as_ref()
             .map(|workdir| self.workdir_label(workdir))
             .unwrap_or_else(|| "<choose>".to_owned());
         self.open_transient(
-            crate::transient::new_agent_menu(project, draft.workspace.label(), draft.role.clone()),
+            crate::transient::new_agent_menu(
+                host,
+                project,
+                draft.workspace.label(),
+                draft.role.clone(),
+            ),
             window,
             cx,
         );
@@ -4815,9 +4970,20 @@ impl Workspace {
     pub(crate) fn prompt_new_agent_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, _: &gpui::App| {
             let needle = input.trim().to_lowercase();
+            let selected_host = workspace
+                .new_agent_draft
+                .as_ref()
+                .and_then(|draft| draft.host);
             workspace
-                .workdir_table()
-                .into_iter()
+                .workdirs
+                .iter()
+                .filter(|workdir| selected_host.is_none_or(|host| workdir.host == host))
+                .map(|workdir| {
+                    (
+                        workdir.project.name.clone(),
+                        workdir.project.path.to_string(),
+                    )
+                })
                 .filter(|(name, path)| {
                     name.to_lowercase().contains(&needle) || path.to_lowercase().contains(&needle)
                 })
@@ -4834,9 +5000,18 @@ impl Workspace {
              cx: &mut Context<Workspace>| {
                 let input = input.trim();
                 if !input.is_empty() {
-                    match workspace.resolve_workdir(input) {
+                    let selected_host = workspace
+                        .new_agent_draft
+                        .as_ref()
+                        .and_then(|draft| draft.host);
+                    let resolved = match selected_host {
+                        Some(host) => workspace.resolve_workdir_on_host(input, host),
+                        None => workspace.resolve_workdir(input),
+                    };
+                    match resolved {
                         Ok(workdir) => {
                             if let Some(draft) = &mut workspace.new_agent_draft {
+                                draft.host = Some(workdir.host);
                                 draft.workdir = Some(workdir);
                             }
                         }
@@ -4857,6 +5032,46 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.open_transient(crate::transient::new_agent_workspace_menu(), window, cx);
+    }
+
+    pub(crate) fn prompt_new_agent_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, _: &gpui::App| {
+            let needle = input.trim().to_lowercase();
+            workspace
+                .hosts
+                .iter()
+                .filter(|host| host.name.to_lowercase().contains(&needle))
+                .map(|host| crate::commands::Candidate {
+                    value: host.name.clone(),
+                    description: host.status.label(),
+                })
+                .collect()
+        });
+        let on_submit = std::rc::Rc::new(
+            |workspace: &mut Workspace,
+             input: String,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                let name = input.trim();
+                if let Some(host) = workspace.hosts.by_name(name).map(|host| host.id) {
+                    if let Some(draft) = &mut workspace.new_agent_draft
+                        && draft.host != Some(host)
+                    {
+                        draft.host = Some(host);
+                        draft.workdir = None;
+                    }
+                } else if !name.is_empty() {
+                    workspace.notice_on(
+                        None,
+                        &format!("no attached host named `{name}`"),
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
+                }
+                workspace.open_new_agent_transient(window, cx);
+            },
+        );
+        self.open_prompt("host:", complete, on_submit, window, cx);
     }
 
     pub(crate) fn prompt_new_agent_workspace(
@@ -4939,7 +5154,15 @@ impl Workspace {
             .as_ref()
             .map(|workdir| self.workdir_label(workdir))
             .unwrap_or_else(|| "no project".to_owned());
-        let summary = format!("{project} · {} · {}", draft.role, draft.workspace.label());
+        let host = draft
+            .host
+            .map(|host| self.host_label(host))
+            .unwrap_or_else(|| "no host".to_owned());
+        let summary = format!(
+            "{host} · {project} · {} · {}",
+            draft.role,
+            draft.workspace.label()
+        );
         self.dashboard.open_new_draft(summary, cx);
         self.dashboard_dirty = true;
         let handle = self.dashboard.focus_handle(cx);
@@ -4953,7 +5176,7 @@ impl Workspace {
             .as_ref()
             .ok_or_else(|| "new agent has no launch configuration".to_owned())?;
         let (mode, target) = draft.workspace.mode_and_target();
-        let (host, start) = self.parse_start(mode, target, draft.workdir.clone())?;
+        let (host, start) = self.parse_start(mode, target, draft.workdir.clone(), draft.host)?;
         let role = parse_agent_role(&draft.role)?;
         Ok((host, start, role))
     }

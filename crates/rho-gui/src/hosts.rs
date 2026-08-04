@@ -56,6 +56,7 @@ pub struct Host {
     pub name: String,
     pub target: AttachTarget,
     pub status: HostStatus,
+    pub auth: Option<rho_ui_proto::AuthState>,
     connection: Connection,
 }
 
@@ -101,6 +102,7 @@ impl Hosts {
             name,
             target,
             status: HostStatus::Connecting,
+            auth: None,
             connection,
         });
         id

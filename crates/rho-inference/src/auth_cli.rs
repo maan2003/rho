@@ -197,6 +197,28 @@ fn list_credentials() -> io::Result<Vec<(String, &'static str)>> {
     Ok(providers)
 }
 
+/// Names of the OAuth credential namespaces available on this machine.
+pub fn auth_namespaces() -> io::Result<Vec<String>> {
+    let auth_dir = OAuthFile::default_auth_dir()?;
+    let entries = match std::fs::read_dir(&auth_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut namespaces = entries
+        .filter_map(|entry| {
+            let path = entry.ok()?.path();
+            if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+                return None;
+            }
+            path.file_stem()?.to_str().map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    namespaces.sort();
+    namespaces.dedup();
+    Ok(namespaces)
+}
+
 #[derive(Clone, Copy)]
 enum AuthStatus {
     Missing,
@@ -311,6 +333,11 @@ pub struct ChatGptUsage {
 /// report a weekly window return `None`.
 pub fn chatgpt_weekly_usage(name: impl AsRef<str>) -> Result<Option<ChatGptUsage>> {
     let auth = InferenceAuth::named(name)?;
+    chatgpt_weekly_usage_for_auth(auth)
+}
+
+/// Fetches the weekly window for an already selected OAuth namespace.
+pub fn chatgpt_weekly_usage_for_auth(auth: InferenceAuth) -> Result<Option<ChatGptUsage>> {
     let resolved = auth.resolve().context("resolving OAuth credentials")?;
     let status = fetch_rate_limit_status(&resolved.bearer_token, resolved.account_id.as_deref())
         .context("fetching ChatGPT rate limits")?;

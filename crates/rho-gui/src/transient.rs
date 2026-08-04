@@ -1169,8 +1169,11 @@ pub(crate) fn bucket_cost_usd(bucket: &rho_ui_proto::AgentUsageBucket, model: &s
         / 1_000_000.0
 }
 
-pub fn new_agent_menu(project: String, workspace: String, role: String) -> Transient {
+pub fn new_agent_menu(host: String, project: String, workspace: String, role: String) -> Transient {
     Transient::new("new agent")
+        .infix("h", "host", host, |workspace, window, cx| {
+            workspace.prompt_new_agent_host(window, cx);
+        })
         .infix("p", "project", project, |workspace, window, cx| {
             workspace.prompt_new_agent_project(window, cx);
         })
@@ -1243,6 +1246,9 @@ fn hosts_menu() -> Transient {
         })
         .item("d", "detach…", |workspace, window, cx| {
             workspace.prompt_host_detach(window, cx);
+        })
+        .item("u", "auth…", |workspace, window, cx| {
+            workspace.open_host_auth_transient(window, cx);
         })
 }
 

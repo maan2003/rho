@@ -62,9 +62,11 @@ pub enum ConnEvent {
         workstreams: Vec<UiWorkstream>,
         agents: Vec<UiAgentSummary>,
         projects: Vec<UiProject>,
+        auth: rho_ui_proto::AuthState,
         machine_seed: u64,
         agent_counter: u64,
     },
+    AuthState(rho_ui_proto::AuthState),
     WorkstreamCreated(UiWorkstream),
     /// The daemon created an agent this connection asked for. The workstream
     /// rides along so the agent's workstream context resolves before the
@@ -858,6 +860,7 @@ async fn run(
         workstreams,
         agents,
         projects,
+        auth,
         view_config: _,
         machine_seed,
         agent_counter,
@@ -870,6 +873,7 @@ async fn run(
             workstreams,
             agents,
             projects,
+            auth,
             machine_seed,
             agent_counter,
         })
@@ -960,6 +964,7 @@ async fn run(
                 workstreams,
                 agents,
                 projects,
+                auth,
                 view_config: _,
                 machine_seed,
                 agent_counter,
@@ -967,9 +972,11 @@ async fn run(
                 workstreams,
                 agents,
                 projects,
+                auth,
                 machine_seed,
                 agent_counter,
             }),
+            ServerMessage::AuthState { auth } => Some(ConnEvent::AuthState(auth)),
             ServerMessage::WorkstreamCreated { workstream } => {
                 Some(ConnEvent::WorkstreamCreated(workstream))
             }

@@ -119,6 +119,11 @@ pub enum ClientMessage {
     ViewConfigSet {
         data: Vec<u8>,
     },
+    /// Switches subsequent provider requests on this host to `name` and
+    /// persists it as the default for future daemon starts.
+    SetAuthNamespace {
+        name: String,
+    },
     /// The user's verdict on an agent's last finished turn. Attention is
     /// action-cleared: viewing an agent never clears it; `Done`, snoozing,
     /// replying, landing, or hiding do.
@@ -510,6 +515,7 @@ pub enum ServerMessage {
         workstreams: Vec<UiWorkstream>,
         agents: Vec<UiAgentSummary>,
         projects: Vec<UiProject>,
+        auth: AuthState,
         /// The client-owned view configuration blob, verbatim from the last
         /// [`ClientMessage::ViewConfigSet`] (empty if never set).
         view_config: Vec<u8>,
@@ -522,6 +528,11 @@ pub enum ServerMessage {
     },
     Error {
         message: String,
+    },
+    /// The host's active/default auth changed, or its available namespaces
+    /// were refreshed.
+    AuthState {
+        auth: AuthState,
     },
     PlatformStatus {
         running: bool,
@@ -858,6 +869,14 @@ pub struct UiProject {
     pub description: String,
 }
 
+/// Daemon-wide authentication settings presented by a GUI host.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct AuthState {
+    pub active: String,
+    pub default: String,
+    pub namespaces: Vec<String>,
+}
+
 /// Encode and write one length-prefixed senax frame.
 pub async fn write_frame<W, T>(writer: &mut W, value: &T) -> anyhow::Result<()>
 where
@@ -1136,6 +1155,29 @@ mod tests {
         let mut slice: &[u8] = &bytes;
         let decoded = senax_encoder::unpack(&mut slice).unwrap();
         assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn auth_settings_round_trip() {
+        let message = ClientMessage::SetAuthNamespace {
+            name: "work".to_owned(),
+        };
+        let bytes = senax_encoder::pack(&message).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded: ClientMessage = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(decoded, message);
+
+        let message = ServerMessage::AuthState {
+            auth: AuthState {
+                active: "work".to_owned(),
+                default: "default".to_owned(),
+                namespaces: vec!["default".to_owned(), "work".to_owned()],
+            },
+        };
+        let bytes = senax_encoder::pack(&message).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded: ServerMessage = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(decoded, message);
     }
 
     #[test]

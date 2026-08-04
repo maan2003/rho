@@ -29,7 +29,7 @@ pub(crate) async fn run(args: LandArgs) -> Result<()> {
     let mut lease = LandLease::acquire(
         repo_root.clone(),
         agent_id,
-        &args.auth,
+        args.auth.as_deref(),
         args.socket_path.as_deref(),
     )
     .await?;
@@ -125,7 +125,7 @@ impl LandLease {
     async fn acquire(
         repo: Utf8PathBuf,
         agent_id: Option<AgentId>,
-        auth: &str,
+        auth: Option<&str>,
         socket_path: Option<&Path>,
     ) -> Result<Self> {
         let socket_path = match socket_path {

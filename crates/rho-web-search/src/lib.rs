@@ -11,7 +11,7 @@ use rho_core::{
     ContentPart, ContextBlock, InferenceResponseItem, ToolCall, ToolExecutionContext, ToolName,
     ToolOutput, ToolOutputStatus, ToolSpec, ToolType,
 };
-use rho_inference::InferenceAuth;
+use rho_inference::Inference;
 
 use crate::schema::commands_schema;
 use crate::search::{
@@ -27,16 +27,16 @@ const APPROX_CHARS_PER_TOKEN: u64 = 4;
 
 #[derive(Clone)]
 pub struct WebSearchTools {
-    auth: InferenceAuth,
+    inference: Inference,
     session_id: Arc<str>,
     client: reqwest::Client,
     search_url: Arc<str>,
 }
 
 impl WebSearchTools {
-    pub fn new(auth: InferenceAuth, session_id: impl Into<Arc<str>>) -> Self {
+    pub fn new(inference: Inference, session_id: impl Into<Arc<str>>) -> Self {
         Self {
-            auth,
+            inference,
             session_id: session_id.into(),
             client: reqwest::Client::builder()
                 .timeout(Duration::from_secs(120))
@@ -82,7 +82,7 @@ impl WebSearchTools {
                 .map_err(|error| format!("invalid web search arguments: {error}"))?
         };
 
-        let auth = self.auth.clone();
+        let auth = self.inference.auth();
         let auth = tokio::task::spawn_blocking(move || auth.resolve_oauth())
             .await
             .map_err(|_| "OAuth credential resolution task failed".to_owned())?

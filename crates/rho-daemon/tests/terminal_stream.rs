@@ -29,7 +29,7 @@ async fn terminal_survives_detach_and_echoes() -> anyhow::Result<()> {
     }
 
     tokio::spawn(rho_daemon::run(rho_daemon::DaemonArgs {
-        auth: "default".to_owned(),
+        auth: Some("default".to_owned()),
         socket_path: Some(socket_path.clone()),
         iroh: false,
         cpu_profile: None,

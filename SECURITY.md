@@ -9,6 +9,14 @@ AI APIs.
 
 - Local users control prompts, session names/paths, inference auth setup/import,
   and tool inputs.
+- Authenticated GUI clients may select a daemon's OAuth namespace, which also
+  becomes its persisted restart default. The daemon exposes namespace names but never
+  credential contents, validates and resolves a selected namespace before
+  applying it, and broadcasts only the resulting names. An in-flight provider
+  request may finish under the previous namespace; subsequent inference, web
+  search, realtime, and quota requests use the replacement. The restart
+  default is stored in the local rho database; bearer and refresh tokens remain
+  only in the existing credential files.
 - Inference APIs and streamed inference events are remote, semi-trusted inputs and
   must be parsed defensively.
 - A watched agent presentation sidecar sends a bounded (10 KiB total, 1 KiB

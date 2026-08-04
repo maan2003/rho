@@ -6,7 +6,7 @@
 //! downstream should have to carry it from where it is noticed to where it is
 //! shown. Holding it here means it can be watched at the source instead.
 
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use rho_core::UnixMs;
 use tokio::sync::watch;
@@ -30,14 +30,14 @@ pub struct Inference(Arc<Account>);
 
 #[derive(Debug)]
 struct Account {
-    auth: InferenceAuth,
+    auth: RwLock<InferenceAuth>,
     quota: watch::Sender<Option<QuotaObservation>>,
 }
 
 impl Inference {
     pub fn new(auth: InferenceAuth) -> Self {
         Self(Arc::new(Account {
-            auth,
+            auth: RwLock::new(auth),
             quota: watch::Sender::new(None),
         }))
     }
@@ -76,8 +76,16 @@ impl Inference {
         *self.0.quota.borrow()
     }
 
-    pub fn auth(&self) -> &InferenceAuth {
-        &self.0.auth
+    pub fn auth(&self) -> InferenceAuth {
+        self.0.auth.read().unwrap().clone()
+    }
+
+    /// Changes the account used by existing and future sessions. An active
+    /// request finishes with the credentials it started with; the next
+    /// request observes the replacement and reconnects if necessary.
+    pub fn set_auth(&self, auth: InferenceAuth) {
+        *self.0.auth.write().unwrap() = auth;
+        self.0.quota.send_replace(None);
     }
 
     pub(crate) fn observe_quota(&self, used_percent: u8, reset_at_unix: Option<i64>) {
@@ -123,5 +131,14 @@ mod tests {
             account().latest_quota().is_none(),
             "a second account starts blank"
         );
+    }
+
+    #[test]
+    fn auth_changes_reach_existing_clones() {
+        let inference = account();
+        let clone = inference.clone();
+        let replacement = InferenceAuth::oauth_file("/replacement");
+        inference.set_auth(replacement.clone());
+        assert_eq!(clone.auth(), replacement);
     }
 }

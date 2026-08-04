@@ -11,7 +11,12 @@ than by running a supervisor, extension protocol, or daemon process graph.
   provider items. It should stay policy-light.
 - Inference crates, currently `rho-inference`, translate `rho-core` inference
   requests into provider-specific wire protocols and translate provider events
-  back into `rho-core` items and updates.
+  back into `rho-core` items and updates. One daemon-wide `Inference` account
+  is shared by loaded and future sessions. Its auth namespace is replaceable:
+  an in-flight request finishes with the credentials it resolved, while later
+  requests (including web search and realtime) resolve the replacement and
+  reconnect when needed. Selecting a namespace also persists it as the restart
+  default; an explicit `rho daemon --auth` remains a run-local override.
 - `rho-agent` owns the opinionated harness policy: queueing, retries/tool
   scheduling, streamed transcript handling, inference response block recording,
   and persistence hooks. Loading restores that logical state cheaply; the
@@ -87,6 +92,9 @@ than by running a supervisor, extension protocol, or daemon process graph.
   rendering. They should not own inference protocol details. `rho-gui` uses
   `rho-touch-keyboard` for the browser client's reusable in-canvas keyboard
   core (layout, key dispatch, repeat, and local calibration telemetry).
+  Each attached daemon is a named GUI host. Host-scoped settings and new-agent
+  creation route through that identity explicitly; choosing a project never
+  silently changes a draft's selected host.
   `rho-gui` supplies its context strip, theme mapping, and focus/show policy,
   while GPUI web owns only the immediate pointer-down routing region.
   The native GUI

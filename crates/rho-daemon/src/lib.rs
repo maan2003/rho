@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::num::NonZeroU16;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
 
 use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -21,7 +21,7 @@ use rho_inference::{Inference, InferenceAuth};
 use rho_ui_proto::remote::AgentRemoteEncoder;
 use rho_ui_proto::server::{Server, ServerConnection};
 use rho_ui_proto::{
-    AgentUsageBucket as UiAgentUsageBucket, AgentUsageSeries, ClientMessage, JoinTarget,
+    AgentUsageBucket as UiAgentUsageBucket, AgentUsageSeries, AuthState, ClientMessage, JoinTarget,
     LandLeaseHolder, LandStatus, McpAgentToolRequest, McpAgentToolResponse, QuotaPoint,
     QuotaSeries, QuotaSummary, ServerMessage, StartMode, UiAgentSummary, UiAttention, UiProject,
     UiTurnReport, UiWorkstream, WorkspaceInfo, WorkstreamTarget, read_frame, write_frame,
@@ -250,8 +250,9 @@ pub fn configure_embedded_environment() {
 
 #[derive(Clone, Debug, clap::Args)]
 pub struct DaemonArgs {
-    #[arg(long = "auth", default_value = "default")]
-    pub auth: String,
+    /// Override the persisted default auth namespace for this daemon run.
+    #[arg(long = "auth")]
+    pub auth: Option<String>,
     #[arg(long = "socket-path")]
     pub socket_path: Option<PathBuf>,
     /// Also listen for UI clients (including the web UI) over iroh
@@ -301,7 +302,6 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     // any code still depending on process cwd fails loudly.
     let _ = std::env::set_current_dir("/var/empty").or_else(|_| std::env::set_current_dir("/"));
 
-    let quota_auth_name = args.auth.clone();
     let default_socket_path = default_socket_path()?;
     let socket_path = args
         .socket_path
@@ -327,7 +327,12 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     let user_environment = rho_workspaces::UserEnvironment::new(user_environment);
 
     let db = RhoDb::open(default_db_path()?);
-    let inference = Inference::new(InferenceAuth::named(&args.auth)?);
+    let default_auth_name = db
+        .read()
+        .default_auth_namespace()
+        .unwrap_or_else(|| "default".to_owned());
+    let active_auth_name = args.auth.unwrap_or_else(|| default_auth_name.clone());
+    let inference = Inference::new(InferenceAuth::named(&active_auth_name)?);
     let path_overrides = PathOverrides {
         before: args
             .extra_before_path
@@ -356,13 +361,18 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             path_overrides,
             user_environment,
             platform_secrets,
+            active_auth_name,
         )
         .await?,
     );
     agents.install_iris_tool_host();
     spawn_presentation_projection(Arc::clone(&agents));
     spawn_turn_report_projection(Arc::clone(&agents));
-    spawn_chatgpt_quota_poller(quota_auth_name, agents.db.clone(), agents.events.clone());
+    spawn_chatgpt_quota_poller(
+        agents.inference.clone(),
+        agents.db.clone(),
+        agents.events.clone(),
+    );
     let quota_environment = agents.user_environment.clone();
     spawn_claude_quota_recorder(
         rho_claude_usage::spawn_poller(
@@ -942,6 +952,7 @@ struct AgentRegistry {
     db: RhoDb,
     visualizations: rho_visualizations::VisualizationStore,
     inference: Inference,
+    active_auth_name: RwLock<String>,
     /// The database's machine seed, announced in `Ready` so clients can
     /// encode agent IDs.
     machine_seed: u64,
@@ -980,6 +991,7 @@ impl AgentRegistry {
         path_overrides: PathOverrides,
         user_environment: rho_workspaces::UserEnvironment,
         platform_secrets: PlatformSecrets,
+        active_auth_name: String,
     ) -> anyhow::Result<Self> {
         let pool = AgentPool::new(
             db.clone(),
@@ -997,6 +1009,7 @@ impl AgentRegistry {
             db,
             visualizations,
             inference,
+            active_auth_name: RwLock::new(active_auth_name),
             machine_seed,
             land_locks: Mutex::new(HashMap::new()),
             land_holders: Mutex::new(HashMap::new()),
@@ -1143,11 +1156,54 @@ impl AgentRegistry {
         projects
     }
 
+    fn auth_state(&self) -> AuthState {
+        let active = self.active_auth_name.read().unwrap().clone();
+        let default = self
+            .db
+            .read()
+            .default_auth_namespace()
+            .unwrap_or_else(|| "default".to_owned());
+        let mut namespaces = rho_inference::auth_namespaces().unwrap_or_default();
+        namespaces.extend([active.clone(), default.clone()]);
+        namespaces.sort();
+        namespaces.dedup();
+        AuthState {
+            active,
+            default,
+            namespaces,
+        }
+    }
+
+    async fn validated_auth(name: &str) -> anyhow::Result<InferenceAuth> {
+        let name = name.trim();
+        let auth = InferenceAuth::named(name)?;
+        let candidate = auth.clone();
+        tokio::task::spawn_blocking(move || candidate.resolve_oauth())
+            .await
+            .context("join auth credential validation")??;
+        Ok(auth)
+    }
+
+    async fn set_auth_namespace(&self, name: &str) -> anyhow::Result<()> {
+        let auth = Self::validated_auth(name).await?;
+        let name = name.trim().to_owned();
+        let mut write = self.db.write().await;
+        write.set_default_auth_namespace(name.clone());
+        write.commit();
+        self.inference.set_auth(auth);
+        *self.active_auth_name.write().unwrap() = name;
+        let _ = self.events.send(ServerMessage::AuthState {
+            auth: self.auth_state(),
+        });
+        Ok(())
+    }
+
     async fn ready_message(&self) -> ServerMessage {
         ServerMessage::Ready {
             workstreams: self.ui_workstreams(),
             agents: self.ui_agents(&self.agent_state_kinds().await),
             projects: self.projects(),
+            auth: self.auth_state(),
             view_config: self.db.read().view_config(),
             machine_seed: self.machine_seed,
             agent_counter: self.db.read().last_agent_counter(),
@@ -2223,16 +2279,17 @@ fn quota_burn(samples: &[&QuotaObservationRecord], now: u64, duration_ms: u64) -
 }
 
 fn spawn_chatgpt_quota_poller(
-    auth_name: String,
+    inference: Inference,
     db: RhoDb,
     events: broadcast::Sender<ServerMessage>,
 ) {
     tokio::spawn(async move {
         loop {
-            let auth_name = auth_name.clone();
-            if let Ok(Ok(Some(usage))) =
-                tokio::task::spawn_blocking(move || rho_inference::chatgpt_weekly_usage(auth_name))
-                    .await
+            let auth = inference.auth();
+            if let Ok(Ok(Some(usage))) = tokio::task::spawn_blocking(move || {
+                rho_inference::chatgpt_weekly_usage_for_auth(auth)
+            })
+            .await
             {
                 let mut write = db.write().await;
                 let changed = write.record_quota_observation(QuotaObservationRecord {
@@ -2805,6 +2862,10 @@ async fn handle_message(
             let mut write = agents.db.write().await;
             write.set_view_config(data);
             write.commit();
+            Ok(Refresh::None)
+        }
+        ClientMessage::SetAuthNamespace { name } => {
+            agents.set_auth_namespace(&name).await?;
             Ok(Refresh::None)
         }
         ClientMessage::SetAgentDisposition {

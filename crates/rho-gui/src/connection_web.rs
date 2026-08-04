@@ -364,6 +364,7 @@ fn handle_host_message(
             workstreams,
             agents,
             projects,
+            auth,
             machine_seed,
             agent_counter,
             ..
@@ -371,9 +372,11 @@ fn handle_host_message(
             workstreams: workstreams.clone(),
             agents: agents.clone(),
             projects: projects.clone(),
+            auth: auth.clone(),
             machine_seed: *machine_seed,
             agent_counter: *agent_counter,
         }),
+        ServerMessage::AuthState { auth } => Some(ConnEvent::AuthState(auth.clone())),
         ServerMessage::WorkstreamCreated { workstream } => {
             Some(ConnEvent::WorkstreamCreated(workstream.clone()))
         }

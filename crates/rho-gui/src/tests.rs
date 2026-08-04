@@ -178,6 +178,14 @@ fn remote_agent(id: u64) -> AgentId {
     AgentId::from_counter(id, &rho_ui_proto::AgentIdDomain(7)).unwrap()
 }
 
+fn auth_state() -> rho_ui_proto::AuthState {
+    rho_ui_proto::AuthState {
+        active: "default".to_owned(),
+        default: "default".to_owned(),
+        namespaces: vec!["default".to_owned()],
+    }
+}
+
 #[gpui::test]
 fn two_hosts_share_one_rail_and_detach_cleanly(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
@@ -205,6 +213,7 @@ fn two_hosts_share_one_rail_and_detach_cleanly(cx: &mut TestAppContext) {
                     }],
                     agents: vec![agent_summary(1, None)],
                     projects: Vec::new(),
+                    auth: auth_state(),
                     machine_seed: 0,
                     agent_counter: 1,
                 },
@@ -226,6 +235,7 @@ fn two_hosts_share_one_rail_and_detach_cleanly(cx: &mut TestAppContext) {
                         ..agent_summary(2, None)
                     }],
                     projects: Vec::new(),
+                    auth: auth_state(),
                     machine_seed: 7,
                     agent_counter: 1,
                 },
@@ -295,6 +305,7 @@ fn dashboard_elides_subagents_behind_inline_fold(cx: &mut TestAppContext) {
                         agent_summary(3, Some(root)),
                     ],
                     projects: Vec::new(),
+                    auth: auth_state(),
                     machine_seed: 0,
                     agent_counter: 3,
                 },
@@ -339,6 +350,7 @@ fn startup_stays_on_the_first_dashboard_row(cx: &mut TestAppContext) {
                     }],
                     agents: vec![agent_summary(1, None)],
                     projects: Vec::new(),
+                    auth: auth_state(),
                     machine_seed: 0,
                     agent_counter: 1,
                 },
@@ -422,6 +434,7 @@ fn dashboard_quiet_tail_is_one_native_display_elision(cx: &mut TestAppContext) {
                     workstreams,
                     agents,
                     projects: Vec::new(),
+                    auth: auth_state(),
                     machine_seed: 0,
                     agent_counter: 13,
                 },
@@ -1197,6 +1210,7 @@ fn bench_rho_gui_flows(cx: &mut TestAppContext) {
                     }],
                     agents,
                     projects: Vec::new(),
+                    auth: auth_state(),
                     machine_seed: 0,
                     agent_counter: 200,
                 },
