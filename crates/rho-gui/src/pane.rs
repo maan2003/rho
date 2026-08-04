@@ -31,6 +31,11 @@ pub enum SurfaceKey {
     Diff { agent_id: AgentId },
     /// A daemon-owned terminal attached over a dedicated stream.
     Terminal { agent_id: AgentId, terminal_id: u64 },
+    /// The Zulip inbox: streams and their unread topics.
+    ZulipInbox,
+    /// One Zulip conversation, identified by its narrow's label so the key
+    /// stays free of the client's own types (and of the native-only build).
+    ZulipNarrow { label: String },
 }
 
 impl SurfaceKey {

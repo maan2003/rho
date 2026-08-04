@@ -51,6 +51,8 @@ const DRAFT_TEXT_KEY: HighlightKey =
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum LineKey {
     Iris,
+    /// The client-local Zulip client.
+    Zulip,
     /// A daemon's section header, present only while several are attached.
     Host {
         host: HostId,
@@ -85,6 +87,8 @@ struct FoldSpec {
 pub enum RowTarget {
     /// The client-local Iris voice surface.
     Iris,
+    /// The client-local Zulip client.
+    Zulip,
     /// Group headers and other inert lines.
     None,
     Stream {
@@ -1151,15 +1155,22 @@ impl Line {
 fn generate(registry: &AgentRegistry) -> Vec<Line> {
     generate_dashboard(registry)
         .into_iter()
-        .skip(1)
+        .skip(CLIENT_ROWS)
         .filter(|line| !matches!(line.key, LineKey::Section { .. }))
         .collect()
 }
 
+/// The client-local rows at the top of every listing (Iris, Zulip), which
+/// belong to no daemon and are skipped by rail-content tests.
+#[cfg(test)]
+const CLIENT_ROWS: usize = 2;
+
 fn generate_dashboard(registry: &AgentRegistry) -> Vec<Line> {
     let mut iris = Line::new(LineKey::Iris, RowTarget::Iris);
     iris.text.push_str("iris · listen");
-    let mut lines = vec![iris];
+    let mut zulip = Line::new(LineKey::Zulip, RowTarget::Zulip);
+    zulip.text.push_str("zulip · chat");
+    let mut lines = vec![iris, zulip];
     let (listed, folded) = registry.split_rows();
     let multihost = registry.host_count() > 1;
     let (active, settled): (Vec<_>, Vec<_>) = listed.into_iter().partition(|topic| {
@@ -1566,7 +1577,7 @@ mod tests {
     }
 
     #[test]
-    fn iris_is_the_first_dashboard_target() {
+    fn client_rows_precede_the_rail() {
         let topic = topic(Status::Normal, vec![agent(1, Status::Normal, 10)]);
         let mut registry = AgentRegistry::default();
         install(&mut registry, &topic);
@@ -1575,10 +1586,13 @@ mod tests {
         assert_eq!(lines[0].key, LineKey::Iris);
         assert_eq!(lines[0].text, "iris · listen");
         assert_eq!(lines[0].target, RowTarget::Iris);
-        assert_eq!(lines[1].key, LineKey::Section { settled: true });
-        assert_eq!(lines[1].text, "settled");
-        assert_eq!(lines[1].target, RowTarget::None);
-        assert!(matches!(lines[2].target, RowTarget::Stream { .. }));
+        assert_eq!(lines[1].key, LineKey::Zulip);
+        assert_eq!(lines[1].text, "zulip · chat");
+        assert_eq!(lines[1].target, RowTarget::Zulip);
+        assert_eq!(lines[2].key, LineKey::Section { settled: true });
+        assert_eq!(lines[2].text, "settled");
+        assert_eq!(lines[2].target, RowTarget::None);
+        assert!(matches!(lines[3].target, RowTarget::Stream { .. }));
     }
 
     #[test]
@@ -1611,6 +1625,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "iris · listen",
+                "zulip · chat",
                 "active",
                 "active work",
                 "settled",

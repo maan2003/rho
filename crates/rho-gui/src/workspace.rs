@@ -56,7 +56,8 @@ use crate::{
     MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious,
     PaneBack, PaneClose, PaneFocusNext, PaneSplitDown, PaneSplitRight, PastePrompt, RailFocus,
     RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore,
-    ShellPagerQuit, SubmitPrompt, TaskBoard, VoiceToggle,
+    ShellPagerQuit, SubmitPrompt, TaskBoard, VoiceToggle, ZulipLoadOlder, ZulipNextUnread,
+    ZulipOpenRow, ZulipQuit,
 };
 
 /// What a pane shows: stable identity plus the live view. Surfaces live
@@ -102,6 +103,10 @@ enum SurfaceView {
     },
     Diff(Entity<crate::diff_view::DiffView>),
     Terminal(Entity<crate::terminal_view::TerminalView>),
+    #[cfg(feature = "native")]
+    ZulipInbox(Entity<rho_zulip::ui::InboxView>),
+    #[cfg(feature = "native")]
+    ZulipNarrow(Entity<rho_zulip::ui::NarrowView>),
 }
 
 impl PartialEq for Surface {
@@ -117,6 +122,10 @@ impl PartialEq for Surface {
 enum ContextId {
     Draft,
     Task(rho_ui_proto::WorkstreamId),
+    /// Zulip's own window arrangement: entering it from the dashboard
+    /// leaves the agent panes exactly as they were, and leaving it comes
+    /// back to them.
+    Zulip,
 }
 
 /// How to reach the daemon. Deliberately holds no client-local paths: the
@@ -287,6 +296,10 @@ pub struct Workspace {
     dashboard_dirty: bool,
     /// Read-only document shown when the synthetic Iris row is targeted.
     iris_preview: Entity<editor::Editor>,
+    /// The Zulip client, started the first time its dashboard row is
+    /// opened. Chat costs nothing until asked for.
+    #[cfg(feature = "native")]
+    zulip: Option<Entity<rho_zulip::session::Session>>,
     /// The completing-read strip at the bottom of the window, when open.
     minibuffer: Option<Minibuffer>,
     /// An open transient menu in the bottom strip; captures the keyboard
@@ -691,6 +704,7 @@ impl Workspace {
             dashboard_preview: None,
             dashboard_dirty: true,
             iris_preview,
+            zulip: None,
             minibuffer: None,
             transient: None,
             transient_stack: Vec::new(),
@@ -875,6 +889,8 @@ impl Workspace {
         let keep = |context: &ContextId| match context {
             ContextId::Draft => true,
             ContextId::Task(workstream_id) => live.contains(workstream_id),
+            // Zulip belongs to no daemon, so no workstream's death closes it.
+            ContextId::Zulip => true,
         };
         self.contexts.retain(|context, _| keep(context));
         self.surfaces.retain(|context, _| keep(context));
@@ -1452,6 +1468,14 @@ impl Workspace {
             model.clone().update(cx, |model, cx| model.submit(cx));
             return;
         }
+        #[cfg(feature = "native")]
+        if matches!(
+            self.active_tree().focused().surface.view,
+            SurfaceView::ZulipNarrow(_)
+        ) {
+            self.zulip_submit(cx);
+            return;
+        }
         match self.registry.selected_agent().copied() {
             Some(agent_id) => {
                 let Some(view) = self.models.get(&agent_id).cloned() else {
@@ -1602,6 +1626,135 @@ impl Workspace {
                 }
             });
         }));
+    }
+
+    /// `enter` on the dashboard's Zulip row: switch to the Zulip context
+    /// and show its inbox. The client starts on first entry.
+    #[cfg(feature = "native")]
+    pub(crate) fn open_zulip(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.zulip_session(cx);
+        self.active_context = ContextId::Zulip;
+        let surface = self.make_surface(SurfaceKey::ZulipInbox, window, cx);
+        self.display_surface(surface);
+        self.focus_active_surface(window, cx);
+        cx.notify();
+    }
+
+    #[cfg(feature = "native")]
+    fn zulip_session(&mut self, cx: &mut Context<Self>) -> Entity<rho_zulip::session::Session> {
+        self.zulip
+            .get_or_insert_with(|| cx.new(rho_zulip::session::Session::new))
+            .clone()
+    }
+
+    /// The host services the Zulip surfaces borrow: editor chrome and the
+    /// transcript's Markdown pipeline, so chat reads like every other
+    /// buffer in the frame.
+    #[cfg(feature = "native")]
+    fn zulip_hooks() -> rho_zulip::ui::Hooks {
+        rho_zulip::ui::Hooks {
+            configure_editor: crate::editor_config::configure,
+            configure_markdown: crate::render::markdown::configure_buffer,
+        }
+    }
+
+    /// Shows one Zulip conversation, marking the conversation being left
+    /// as read — a Gnus summary buffer's exit, which is what makes `n`
+    /// walk unreads down to nothing.
+    #[cfg(feature = "native")]
+    pub(crate) fn open_zulip_narrow(
+        &mut self,
+        narrow: rho_zulip::Narrow,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.leave_zulip_narrow(cx);
+        let key = SurfaceKey::ZulipNarrow {
+            label: narrow.label(),
+        };
+        self.active_context = ContextId::Zulip;
+        let surface = match self.find_surface(|surface| surface.key == key).cloned() {
+            Some(surface) => surface,
+            None => {
+                let session = self.zulip_session(cx);
+                let hooks = Self::zulip_hooks();
+                let view = cx.new(|cx| {
+                    rho_zulip::ui::NarrowView::new(session, narrow, hooks, window, cx)
+                });
+                Self::wrap_surface(key, SurfaceView::ZulipNarrow(view), window, cx)
+            }
+        };
+        self.display_surface(surface);
+        self.focus_active_surface(window, cx);
+        cx.notify();
+    }
+
+    /// Marks the conversation on screen read, if one is.
+    #[cfg(feature = "native")]
+    fn leave_zulip_narrow(&mut self, cx: &mut Context<Self>) {
+        if let SurfaceView::ZulipNarrow(view) = &self.active_tree().focused().surface.view {
+            view.clone().update(cx, |view, cx| view.mark_read(cx));
+        }
+    }
+
+    /// `enter` inside the Zulip inbox: open the conversation under the
+    /// cursor.
+    #[cfg(feature = "native")]
+    fn zulip_open_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let SurfaceView::ZulipInbox(view) = &self.active_tree().focused().surface.view else {
+            return;
+        };
+        let Some(narrow) = view.clone().update(cx, |view, cx| view.cursor_narrow(cx)) else {
+            return;
+        };
+        self.open_zulip_narrow(narrow, window, cx);
+    }
+
+    /// The reading loop: the next unread conversation anywhere, marking
+    /// the one being left as read. With nothing unread it returns to the
+    /// inbox rather than sitting on a read conversation.
+    #[cfg(feature = "native")]
+    fn zulip_next_unread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(session) = self.zulip.clone() else {
+            return;
+        };
+        let current = match &self.active_tree().focused().surface.view {
+            SurfaceView::ZulipNarrow(view) => Some(view.read(cx).narrow().clone()),
+            _ => None,
+        };
+        let next = session.read(cx).next_unread(current.as_ref());
+        match next {
+            Some(narrow) => self.open_zulip_narrow(narrow, window, cx),
+            None => {
+                self.leave_zulip_narrow(cx);
+                self.open_zulip(window, cx);
+            }
+        }
+    }
+
+    /// `q`: leave Zulip for the agent world it was entered from, marking
+    /// the conversation on screen read on the way out.
+    #[cfg(feature = "native")]
+    fn zulip_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.leave_zulip_narrow(cx);
+        let agent_id = self.registry.selected_agent().copied();
+        self.select_agent(agent_id, window, cx);
+    }
+
+    /// `P`: page further back in the conversation on screen.
+    #[cfg(feature = "native")]
+    fn zulip_load_older(&mut self, cx: &mut Context<Self>) {
+        if let SurfaceView::ZulipNarrow(view) = &self.active_tree().focused().surface.view {
+            view.clone().update(cx, |view, cx| view.load_older(cx));
+        }
+    }
+
+    /// `enter` in a Zulip conversation: send the composed message.
+    #[cfg(feature = "native")]
+    fn zulip_submit(&mut self, cx: &mut Context<Self>) {
+        if let SurfaceView::ZulipNarrow(view) = &self.active_tree().focused().surface.view {
+            view.clone().update(cx, |view, cx| view.submit(cx));
+        }
     }
 
     fn shell_eof(&mut self, _: &ShellEof, _: &mut Window, cx: &mut Context<Self>) {
@@ -3155,6 +3308,8 @@ impl Workspace {
                 "term {}/{terminal_id}",
                 self.registry.agent_id_label(*agent_id)
             ),
+            SurfaceKey::ZulipInbox => "zulip".to_owned(),
+            SurfaceKey::ZulipNarrow { label } => label.clone(),
         }
     }
 
@@ -3166,6 +3321,8 @@ impl Workspace {
             SurfaceKey::Shell(_) => "shell",
             SurfaceKey::Diff { .. } => "diff",
             SurfaceKey::Terminal { .. } => "terminal",
+            SurfaceKey::ZulipInbox => "zulip inbox",
+            SurfaceKey::ZulipNarrow { .. } => "zulip",
         }
     }
 
@@ -3864,6 +4021,10 @@ impl Workspace {
             SurfaceView::Terminal(_) => self
                 .any_draft_editor()
                 .expect("the draft context always holds a draft surface"),
+            #[cfg(feature = "native")]
+            SurfaceView::ZulipInbox(view) => view.read(cx).editor().clone(),
+            #[cfg(feature = "native")]
+            SurfaceView::ZulipNarrow(view) => view.read(cx).editor().clone(),
         }
     }
 
@@ -3897,6 +4058,10 @@ impl Workspace {
             SurfaceView::Shell { editor, .. } => editor.focus_handle(cx),
             SurfaceView::Diff(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::Terminal(view) => view.read(cx).focus_handle(cx),
+            #[cfg(feature = "native")]
+            SurfaceView::ZulipInbox(view) => view.read(cx).editor().focus_handle(cx),
+            #[cfg(feature = "native")]
+            SurfaceView::ZulipNarrow(view) => view.read(cx).editor().focus_handle(cx),
         }
     }
 
@@ -3948,6 +4113,19 @@ impl Workspace {
             }
             SurfaceKey::Terminal { .. } => {
                 unreachable!("terminal surfaces are created by open_terminal_surface")
+            }
+            #[cfg(feature = "native")]
+            SurfaceKey::ZulipInbox => {
+                let session = self.zulip_session(cx);
+                let hooks = Self::zulip_hooks();
+                SurfaceView::ZulipInbox(
+                    cx.new(|cx| rho_zulip::ui::InboxView::new(session, hooks, window, cx)),
+                )
+            }
+            #[cfg(not(feature = "native"))]
+            SurfaceKey::ZulipInbox => unreachable!("the Zulip client is native-only"),
+            SurfaceKey::ZulipNarrow { .. } => {
+                unreachable!("conversation surfaces are created by open_zulip_narrow")
             }
         };
         Self::wrap_surface(key, view, window, cx)
@@ -4011,6 +4189,11 @@ impl Workspace {
                 let view = cx.new(|cx| crate::terminal_view::TerminalView::new(model, cx));
                 Self::wrap_surface(surface.key.clone(), SurfaceView::Terminal(view), window, cx)
             }
+            // Chat surfaces hold one editor over one conversation: a split
+            // shows the same view rather than a second cursor over the
+            // same messages, which no one has ever wanted.
+            #[cfg(feature = "native")]
+            SurfaceView::ZulipInbox(_) | SurfaceView::ZulipNarrow(_) => surface.clone(),
         }
     }
 
@@ -4037,6 +4220,16 @@ impl Workspace {
             }
             // Terminals have no editor; the view itself carries focus.
             SurfaceView::Terminal(view) => (view.read(cx).focus_handle(cx), view.entity_id()),
+            #[cfg(feature = "native")]
+            SurfaceView::ZulipInbox(view) => {
+                let editor = view.read(cx).editor().clone();
+                (editor.focus_handle(cx), editor.entity_id())
+            }
+            #[cfg(feature = "native")]
+            SurfaceView::ZulipNarrow(view) => {
+                let editor = view.read(cx).editor().clone();
+                (editor.focus_handle(cx), editor.entity_id())
+            }
         };
         let focus_follow = cx.on_focus_in(&handle, window, move |this, _window, cx| {
             this.surface_focused(editor_id, cx);
@@ -4080,8 +4273,10 @@ impl Workspace {
                 self.registry.enter_draft();
                 None
             }
-            // Files keep whatever agent context was current.
-            SurfaceKey::File { .. } => None,
+            // Files and chat keep whatever agent context was current.
+            SurfaceKey::File { .. } | SurfaceKey::ZulipInbox | SurfaceKey::ZulipNarrow { .. } => {
+                None
+            }
         };
         if self.connected()
             && let Some(agent_id) = selected
@@ -4768,6 +4963,10 @@ impl Workspace {
         use crate::dashboard::RowTarget;
         match self.dashboard.cursor_target(cx) {
             Some(RowTarget::Iris) => self.cmd_voice(window, cx),
+            #[cfg(feature = "native")]
+            Some(RowTarget::Zulip) => self.open_zulip(window, cx),
+            #[cfg(not(feature = "native"))]
+            Some(RowTarget::Zulip) => {}
             Some(RowTarget::Stream {
                 root: Some(agent_id),
                 ..
@@ -5261,6 +5460,20 @@ impl Workspace {
                 .overflow_hidden()
                 .child(view.clone())
                 .into_any_element(),
+            #[cfg(feature = "native")]
+            SurfaceView::ZulipInbox(view) => div()
+                .id("rho-surface-zulip-inbox")
+                .size_full()
+                .overflow_hidden()
+                .child(view.clone())
+                .into_any_element(),
+            #[cfg(feature = "native")]
+            SurfaceView::ZulipNarrow(view) => div()
+                .id("rho-surface-zulip-narrow")
+                .size_full()
+                .overflow_hidden()
+                .child(view.clone())
+                .into_any_element(),
             SurfaceView::Shell { editor, .. } => div()
                 .id("rho-surface-shell")
                 .key_context("RhoShell")
@@ -5589,6 +5802,28 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::shell_interrupt))
             .on_action(cx.listener(Self::toggle_voice))
             .on_action(cx.listener(Self::shell_eof))
+            .on_action(cx.listener(|this, _: &ZulipOpenRow, window, cx| {
+                #[cfg(feature = "native")]
+                this.zulip_open_row(window, cx);
+                #[cfg(not(feature = "native"))]
+                let _ = window;
+            }))
+            .on_action(cx.listener(|this, _: &ZulipNextUnread, window, cx| {
+                #[cfg(feature = "native")]
+                this.zulip_next_unread(window, cx);
+                #[cfg(not(feature = "native"))]
+                let _ = window;
+            }))
+            .on_action(cx.listener(|this, _: &ZulipLoadOlder, _, cx| {
+                #[cfg(feature = "native")]
+                this.zulip_load_older(cx);
+            }))
+            .on_action(cx.listener(|this, _: &ZulipQuit, window, cx| {
+                #[cfg(feature = "native")]
+                this.zulip_quit(window, cx);
+                #[cfg(not(feature = "native"))]
+                let _ = window;
+            }))
             .on_action(cx.listener(|this, _: &ShellPagerMore, _, cx| {
                 this.shell_pager_action(rho_ui_proto::shell::PagerAction::Continue, cx);
             }))

@@ -88,7 +88,11 @@ actions!(
         ShellPagerMore,
         ShellPagerAll,
         ShellPagerQuit,
-        VoiceToggle
+        VoiceToggle,
+        ZulipOpenRow,
+        ZulipNextUnread,
+        ZulipLoadOlder,
+        ZulipQuit
     ]
 );
 
@@ -245,6 +249,31 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         KeyBinding::new("down", MinibufferNext, Some("RhoMinibuffer > Editor")),
         KeyBinding::new("up", MinibufferPrevious, Some("RhoMinibuffer > Editor")),
     ]);
+    // The Zulip surfaces read like Gnus: the inbox is a group buffer whose
+    // rows are acted on by single normal-mode keys, and `n` walks to the
+    // next unread conversation from anywhere in the client, marking the one
+    // you leave as read. `enter` in a conversation's compose region sends,
+    // matching the shell and transcript prompts.
+    cx.bind_keys([
+        KeyBinding::new("enter", ZulipOpenRow, Some("RhoZulipInbox > Editor")),
+        KeyBinding::new(
+            "enter",
+            SubmitPrompt,
+            Some("RhoZulipNarrow > Editor && vim_mode == insert"),
+        ),
+    ]);
+    for context in [
+        "RhoZulipInbox > Editor && vim_mode == normal",
+        "RhoZulipInbox > Editor && vim_mode == helix_normal",
+        "RhoZulipNarrow > Editor && vim_mode == normal",
+        "RhoZulipNarrow > Editor && vim_mode == helix_normal",
+    ] {
+        cx.bind_keys([
+            KeyBinding::new("n", ZulipNextUnread, Some(context)),
+            KeyBinding::new("shift-p", ZulipLoadOlder, Some(context)),
+            KeyBinding::new("q", ZulipQuit, Some(context)),
+        ]);
+    }
     cx.bind_keys([
         KeyBinding::new("shift-y", GitApprovalAllow, Some("RhoGitApproval")),
         KeyBinding::new("n", GitApprovalDeny, Some("RhoGitApproval")),
