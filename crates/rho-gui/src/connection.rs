@@ -600,9 +600,13 @@ impl Connection {
         cx: &App,
     ) -> Task<anyhow::Result<TerminalChannel>> {
         let dialer = self.dialer.lock().unwrap().clone();
-        cx.spawn(async move |_| {
+        let task = Tokio::spawn(cx, async move {
             let dialer = dialer.context("not connected to rho-daemon")?;
             dial_terminal(dialer, agent, new, cols, rows).await
+        });
+        cx.spawn(async move |_| {
+            task.await
+                .map_err(|error| anyhow::anyhow!("terminal task failed: {error}"))?
         })
     }
 
@@ -611,7 +615,7 @@ impl Connection {
         let dialer = self.dialer.lock().unwrap().clone();
         let commands = self.commands.clone();
         let requests = Arc::clone(&self.shell_requests);
-        cx.spawn(async move |_| {
+        let task = Tokio::spawn(cx, async move {
             let dialer = dialer.context("not connected to rho-daemon")?;
             let reply = shell_control_request(&commands, &requests, |request_id| {
                 ClientMessage::ShellList {
@@ -640,6 +644,10 @@ impl Connection {
                 }
             }
             dial_shell(dialer, agent).await
+        });
+        cx.spawn(async move |_| {
+            task.await
+                .map_err(|error| anyhow::anyhow!("shell task failed: {error}"))?
         })
     }
 
