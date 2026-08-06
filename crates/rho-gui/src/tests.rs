@@ -409,6 +409,55 @@ fn startup_stays_on_the_first_dashboard_row(cx: &mut TestAppContext) {
         .expect("start on dashboard");
 }
 
+/// `d`/`shift-d` fire from the dashboard, where no agent is open: triage
+/// must act on the row under the cursor instead of refusing.
+#[gpui::test]
+fn triage_targets_the_dashboard_row_under_the_cursor(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Ready {
+                    workstreams: vec![UiWorkstream {
+                        workstream_id: WorkstreamId(1),
+                        name: "Existing work".to_owned(),
+                        labels: Vec::new(),
+                    }],
+                    agents: vec![agent_summary(1, None)],
+                    projects: Vec::new(),
+                    auth: auth_state(),
+                    machine_seed: 0,
+                    agent_counter: 1,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+            assert!(workspace.is_dashboard_mode(window, cx));
+            assert_eq!(workspace.triage_target(cx), None);
+        })
+        .expect("start on dashboard");
+    cx.run_until_parked();
+
+    let dashboard = workspace
+        .update(cx, |workspace, _, _| workspace.dashboard_editor())
+        .expect("dashboard editor");
+    workspace
+        .update(cx, |workspace, window, cx| {
+            dashboard.update(cx, |editor, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let offset = snapshot.text().find("Existing work").expect("agent row");
+                let anchor = snapshot.anchor_before(multi_buffer::MultiBufferOffset(offset));
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_anchor_ranges([anchor..anchor]);
+                });
+            });
+            assert_eq!(workspace.triage_target(cx), Some(agent(1)));
+        })
+        .expect("park the cursor on the agent row");
+}
+
 #[gpui::test]
 fn dashboard_quiet_tail_is_one_native_display_elision(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);

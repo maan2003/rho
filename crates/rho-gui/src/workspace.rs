@@ -2404,8 +2404,8 @@ impl Workspace {
         } else {
             rho_ui_proto::AgentDisposition::Done
         };
-        let selected = self.registry.selected_agent().copied();
-        let agent_id = self.set_agent_disposition(selected, "done", disposition, cx);
+        let target = self.disposition_target(cx);
+        let agent_id = self.set_agent_disposition(target, "done", disposition, cx);
         // Hiding the open agent closes its tab, or it would stay
         // rail-visible through the selection exemption.
         if hide && agent_id.is_some() && agent_id.as_ref() == self.registry.selected_agent() {
@@ -2418,9 +2418,9 @@ impl Workspace {
             return;
         }
         let until = rho_core::UnixMs(now_ms().saturating_add(duration_ms));
-        let selected = self.registry.selected_agent().copied();
+        let target = self.disposition_target(cx);
         self.set_agent_disposition(
-            selected,
+            target,
             "snooze",
             rho_ui_proto::AgentDisposition::Snoozed { until },
             cx,
@@ -3021,6 +3021,24 @@ impl Workspace {
     /// attention; returns the agent it acted on. The daemon echoes the
     /// resulting attention level back as a broadcast, so the rail updates
     /// through the normal event path.
+    /// Triage targets the open agent, or — with none open, as when `d`
+    /// comes from the dashboard — the agent under the dashboard cursor.
+    fn disposition_target(&mut self, cx: &mut Context<Self>) -> Option<AgentId> {
+        use crate::dashboard::RowTarget;
+        if let Some(agent_id) = self.registry.selected_agent().copied() {
+            return Some(agent_id);
+        }
+        match self.dashboard.cursor_target(cx) {
+            Some(RowTarget::Stream {
+                root: Some(agent_id),
+                ..
+            })
+            | Some(RowTarget::Agent(agent_id))
+            | Some(RowTarget::Reply(agent_id)) => Some(agent_id),
+            _ => None,
+        }
+    }
+
     fn set_agent_disposition(
         &mut self,
         source_agent: Option<AgentId>,
@@ -4131,6 +4149,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Option<crate::dashboard::RowTarget> {
         self.dashboard.cursor_target(cx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn triage_target(&mut self, cx: &mut Context<Self>) -> Option<AgentId> {
+        self.disposition_target(cx)
     }
 
     #[cfg(test)]
