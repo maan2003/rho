@@ -1204,6 +1204,7 @@ impl Workspace {
                     host,
                     vec![rho_ui_proto::QuotaSummary {
                         model: "gpt".to_owned(),
+                        auth_namespace: None,
                         remaining_percent: 100u8
                             .saturating_sub(used_percent.clamp(0.0, 100.0).round() as u8),
                         burn_10m: 0,
@@ -1387,53 +1388,84 @@ impl Workspace {
         }
     }
 
-    /// Quota headroom across hosts. Hosts usually share one account and
-    /// report the same figures; where they differ, the binding constraint is
-    /// whichever has least left, so the masthead shows the minimum.
+    /// Quota headroom across hosts. ChatGPT namespaces remain independent;
+    /// Claude retains the historical binding-constraint merge.
     fn merged_quota_summaries(&self) -> Vec<rho_ui_proto::QuotaSummary> {
         let mut merged: Vec<rho_ui_proto::QuotaSummary> = Vec::new();
-        for summary in self.quota_summaries.values().flatten() {
-            match merged
-                .iter_mut()
-                .find(|existing| existing.model == summary.model)
-            {
-                Some(existing) if summary.remaining_percent < existing.remaining_percent => {
-                    *existing = summary.clone();
+        for (host, summaries) in &self.quota_summaries {
+            for summary in summaries {
+                if summary.model == "gpt" {
+                    let Some(namespace) = &summary.auth_namespace else {
+                        continue;
+                    };
+                    let mut summary = summary.clone();
+                    if self.hosts.len() > 1 {
+                        summary.auth_namespace =
+                            Some(format!("{}/{}", self.host_label(*host), namespace));
+                    }
+                    merged.push(summary);
+                    continue;
                 }
-                Some(_) => {}
-                None => merged.push(summary.clone()),
+                match merged
+                    .iter_mut()
+                    .find(|existing| existing.model == summary.model)
+                {
+                    Some(existing) if summary.remaining_percent < existing.remaining_percent => {
+                        *existing = summary.clone();
+                    }
+                    Some(_) => {}
+                    None => merged.push(summary.clone()),
+                }
             }
         }
+        merged.sort_by(|a, b| (&a.model, &a.auth_namespace).cmp(&(&b.model, &b.auth_namespace)));
         merged
     }
 
-    /// Per-model remaining-headroom history, again taking the tightest host
-    /// at each observation so the chart tracks the real constraint.
+    /// ChatGPT history is one line per host/namespace. Claude history keeps
+    /// the previous tightest-host merge because it has no named auth scope.
     fn merged_quota_history(&self) -> Vec<rho_ui_proto::QuotaSeries> {
         let mut merged: Vec<rho_ui_proto::QuotaSeries> = Vec::new();
-        for series in self.quota_history.values().flatten() {
-            let Some(existing) = merged
-                .iter_mut()
-                .find(|existing| existing.model == series.model)
-            else {
-                merged.push(series.clone());
-                continue;
-            };
-            for point in &series.points {
-                match existing
-                    .points
-                    .iter_mut()
-                    .find(|candidate| candidate.observed_at_ms == point.observed_at_ms)
-                {
-                    Some(candidate) if point.remaining_percent < candidate.remaining_percent => {
-                        *candidate = *point;
+        for (host, series_set) in &self.quota_history {
+            for series in series_set {
+                if series.model == "gpt" {
+                    let Some(namespace) = &series.auth_namespace else {
+                        continue;
+                    };
+                    let mut series = series.clone();
+                    if self.hosts.len() > 1 {
+                        series.auth_namespace =
+                            Some(format!("{}/{}", self.host_label(*host), namespace));
                     }
-                    Some(_) => {}
-                    None => existing.points.push(*point),
+                    merged.push(series);
+                    continue;
                 }
+                let Some(existing) = merged
+                    .iter_mut()
+                    .find(|existing| existing.model == series.model)
+                else {
+                    merged.push(series.clone());
+                    continue;
+                };
+                for point in &series.points {
+                    match existing
+                        .points
+                        .iter_mut()
+                        .find(|candidate| candidate.observed_at_ms == point.observed_at_ms)
+                    {
+                        Some(candidate)
+                            if point.remaining_percent < candidate.remaining_percent =>
+                        {
+                            *candidate = *point;
+                        }
+                        Some(_) => {}
+                        None => existing.points.push(*point),
+                    }
+                }
+                existing.points.sort_by_key(|point| point.observed_at_ms);
             }
-            existing.points.sort_by_key(|point| point.observed_at_ms);
         }
+        merged.sort_by(|a, b| (&a.model, &a.auth_namespace).cmp(&(&b.model, &b.auth_namespace)));
         merged
     }
 
@@ -5405,18 +5437,21 @@ impl Workspace {
                 .unwrap_or_default()
         };
         let summaries = self.merged_quota_summaries();
-        let gpt = summaries.iter().find(|summary| summary.model == "gpt");
-        if let Some(gpt) = gpt {
-            stats = stats.child(div().text_color(colors.terminal_ansi_cyan).child(format!(
-                "{}%{}",
-                gpt.remaining_percent,
-                format_reset(gpt.reset_at_unix)
-            )));
+        let gpt = summaries
+            .iter()
+            .filter(|summary| summary.model == "gpt")
+            .collect::<Vec<_>>();
+        for (index, summary) in gpt.iter().enumerate() {
+            stats = stats.child(
+                div()
+                    .text_color(crate::transient::quota_auth_color(index))
+                    .child(format!("{}%", summary.remaining_percent)),
+            );
         }
         let opus = summaries.iter().find(|summary| summary.model == "opus");
         let fable = summaries.iter().find(|summary| summary.model == "fable");
         if opus.is_some() || fable.is_some() {
-            if gpt.is_some() {
+            if !gpt.is_empty() {
                 stats = stats.child(div().text_color(text_style.color.opacity(0.55)).child("·"));
             }
             let mut claude = String::new();

@@ -158,10 +158,44 @@ impl Transient {
         if let Some(series) = &self.quota_usage {
             let series = series.clone();
             let days = self.usage_days;
-            let gpt: Hsla = colors.terminal_ansi_cyan.into();
             let opus: Hsla = colors.terminal_ansi_magenta.into();
             let fable: Hsla = rgb(0xd97757).into();
             let grid: Hsla = colors.text_muted.opacity(0.22).into();
+            let mut auth_names = series
+                .iter()
+                .filter(|series| series.model == "gpt")
+                .filter_map(|series| series.auth_namespace.clone())
+                .collect::<Vec<_>>();
+            auth_names.sort();
+            auth_names.dedup();
+            let mut legend = div().flex().gap_4().px_2();
+            for (index, name) in auth_names.iter().enumerate() {
+                let latest = series
+                    .iter()
+                    .find(|series| {
+                        series.model == "gpt"
+                            && series.auth_namespace.as_deref() == Some(name.as_str())
+                    })
+                    .and_then(|series| series.points.last());
+                let mut label = format!("gpt/{name}");
+                if let Some(latest) = latest {
+                    label.push_str(&format!(" {}%", latest.remaining_percent));
+                    if let Some(seconds) = latest
+                        .reset_at_unix
+                        .map(|reset| reset - crate::workspace::now_ms() as i64 / 1_000)
+                        .filter(|seconds| *seconds > 0)
+                    {
+                        label.push_str(&format!(" · {:.1}d", seconds as f64 / 86_400.0));
+                    }
+                }
+                legend = legend.child(div().text_color(quota_auth_color(index)).child(label));
+            }
+            if series.iter().any(|series| series.model == "opus") {
+                legend = legend.child(div().text_color(opus).child("opus"));
+            }
+            if series.iter().any(|series| series.model == "fable") {
+                legend = legend.child(div().text_color(fable).child("fable"));
+            }
             return bottom_strip(text_style, cx)
                 .child(
                     div()
@@ -169,15 +203,7 @@ impl Transient {
                         .font_weight(gpui::FontWeight::BOLD)
                         .child(format!("rate limit · last {days} days")),
                 )
-                .child(
-                    div()
-                        .flex()
-                        .gap_4()
-                        .px_2()
-                        .child(div().text_color(gpt).child("gpt"))
-                        .child(div().text_color(opus).child("opus"))
-                        .child(div().text_color(fable).child("fable")),
-                )
+                .child(legend)
                 .child(
                     div().px_2().pb_1().child(
                         div()
@@ -200,11 +226,9 @@ impl Transient {
                                 div()
                                     .flex()
                                     .flex_col()
-                                    .child(
-                                        div().w(px(832.)).h(px(240.)).child(usage_chart(
-                                            series, days, gpt, opus, fable, grid,
-                                        )),
-                                    )
+                                    .child(div().w(px(832.)).h(px(240.)).child(usage_chart(
+                                        series, days, auth_names, opus, fable, grid,
+                                    )))
                                     .child(
                                         div()
                                             .mt_1()
@@ -651,7 +675,7 @@ pub fn usage_share_menu(series: Vec<rho_ui_proto::AgentUsageSeries>, days: u64) 
 fn usage_chart(
     series: Vec<rho_ui_proto::QuotaSeries>,
     days: u64,
-    gpt: Hsla,
+    auth_names: Vec<String>,
     opus: Hsla,
     fable: Hsla,
     grid: Hsla,
@@ -693,7 +717,12 @@ fn usage_chart(
                 let color = match model.model.as_str() {
                     "opus" => opus,
                     "fable" => fable,
-                    _ => gpt,
+                    _ => model
+                        .auth_namespace
+                        .as_ref()
+                        .and_then(|name| auth_names.binary_search(name).ok())
+                        .map(quota_auth_color)
+                        .unwrap_or_else(|| quota_auth_color(0)),
                 };
                 let mut segment = Vec::new();
                 let mut previous: Option<&rho_ui_proto::QuotaPoint> = None;
@@ -725,6 +754,20 @@ fn usage_chart(
         },
     )
     .size_full()
+}
+
+/// Stable visual order for the alphabetically sorted auth namespaces shown
+/// in both the dashboard masthead and the rate-limit graph.
+pub(crate) fn quota_auth_color(index: usize) -> Hsla {
+    const COLORS: [u32; 6] = [
+        0x22d3ee, // cyan
+        0x60a5fa, // blue
+        0xa78bfa, // violet
+        0x34d399, // green
+        0xfbbf24, // amber
+        0xfb7185, // rose
+    ];
+    rgb(COLORS[index % COLORS.len()]).into()
 }
 
 fn paint_usage_segment(points: &[Point<Pixels>], color: Hsla, window: &mut Window) {

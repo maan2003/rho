@@ -736,6 +736,8 @@ pub enum AgentUnloadReason {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct QuotaSummary {
     pub model: String,
+    /// Daemon-local ChatGPT OAuth namespace; absent for Claude.
+    pub auth_namespace: Option<String>,
     pub remaining_percent: u8,
     pub burn_10m: u16,
     pub burn_2h: u16,
@@ -747,6 +749,8 @@ pub struct QuotaSummary {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct QuotaSeries {
     pub model: String,
+    /// Daemon-local ChatGPT OAuth namespace; absent for Claude.
+    pub auth_namespace: Option<String>,
     pub points: Vec<QuotaPoint>,
 }
 

@@ -17,6 +17,10 @@ AI APIs.
   search, realtime, and quota requests use the replacement. The restart
   default is stored in the local rho database; bearer and refresh tokens remain
   only in the existing credential files.
+- ChatGPT quota polling resolves every configured OAuth namespace roughly every
+  ten minutes so the GUI can compare their independent rate-limit histories.
+  Only namespace names, percentages, and reset times are persisted or sent to
+  GUI clients; credentials and provider account identifiers are not exposed.
 - Inference APIs and streamed inference events are remote, semi-trusted inputs and
   must be parsed defensively.
 - A watched agent presentation sidecar sends a bounded (10 KiB total, 1 KiB

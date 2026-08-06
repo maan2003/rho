@@ -17,6 +17,9 @@ than by running a supervisor, extension protocol, or daemon process graph.
   requests (including web search and realtime) resolve the replacement and
   reconnect when needed. Selecting a namespace also persists it as the restart
   default; an explicit `rho daemon --auth` remains a run-local override.
+  ChatGPT quota observations are attributed to that daemon-local namespace;
+  the daemon polls every configured namespace and the GUI keeps each
+  host/namespace history as an independent graph series.
 - `rho-agent` owns the opinionated harness policy: queueing, retries/tool
   scheduling, streamed transcript handling, inference response block recording,
   and persistence hooks. Loading restores that logical state cheaply; the

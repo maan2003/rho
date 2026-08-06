@@ -1,5 +1,7 @@
 //! Raw redb schema for persisted agents.
 
+use std::collections::BTreeMap;
+
 use camino::Utf8PathBuf;
 use redb::{TableDefinition, Value as _};
 use redb_derive::{Key, Value as RedbValue};
@@ -116,6 +118,9 @@ pub enum QuotaProvider {
 pub struct QuotaObservationRecord {
     pub provider: QuotaProvider,
     pub model: QuotaModel,
+    /// The daemon-local OAuth namespace for ChatGPT observations. Claude and
+    /// legacy observations are unscoped.
+    pub auth_namespace: Option<String>,
     pub observed_at: UnixMillis,
     pub used_percent: u8,
     pub reset_at_unix: Option<i64>,
@@ -1164,27 +1169,26 @@ impl AgentReadTxnExt for ReadTxn {
         since: UnixMillis,
     ) -> Vec<QuotaObservationRecord> {
         let table = self.open_table(QUOTA_OBSERVATIONS);
+        let mut before = BTreeMap::<Option<String>, QuotaObservationRecord>::new();
         let mut observations = Vec::new();
-        for (_, value) in table
-            .range(
-                QuotaObservationKey {
-                    model,
-                    observed_at: 0,
-                }..=QuotaObservationKey {
-                    model,
-                    observed_at: u64::MAX,
-                },
-            )
-            .rev()
-        {
+        for (_, value) in table.range(
+            QuotaObservationKey {
+                model,
+                observed_at: 0,
+            }..=QuotaObservationKey {
+                model,
+                observed_at: u64::MAX,
+            },
+        ) {
             let observation = value.value().into_owned();
-            let before_horizon = observation.observed_at < since;
-            observations.push(observation);
-            if before_horizon {
-                break;
+            if observation.observed_at < since {
+                before.insert(observation.auth_namespace.clone(), observation);
+            } else {
+                observations.push(observation);
             }
         }
-        observations.reverse();
+        observations.extend(before.into_values());
+        observations.sort_by_key(|observation| observation.observed_at);
         observations
     }
 
@@ -1637,12 +1641,12 @@ impl AgentWriteTxnExt for WriteTxn {
     }
 
     fn record_quota_observation(&mut self, observation: QuotaObservationRecord) -> bool {
-        let key = QuotaObservationKey {
+        let mut key = QuotaObservationKey {
             model: observation.model,
             observed_at: observation.observed_at.0,
         };
-        let unchanged = self
-            .open_table(QUOTA_OBSERVATIONS)
+        let mut table = self.open_table(QUOTA_OBSERVATIONS);
+        let unchanged = table
             .range(
                 QuotaObservationKey {
                     model: observation.model,
@@ -1652,14 +1656,19 @@ impl AgentWriteTxnExt for WriteTxn {
                     observed_at: u64::MAX,
                 },
             )
-            .next_back()
+            .rev()
             .map(|(_, value)| value.value().into_owned())
+            .find(|old| old.auth_namespace == observation.auth_namespace)
             .is_some_and(|old| quota_observation_unchanged(&old, &observation));
         if unchanged {
             return false;
         }
-        self.open_table(QUOTA_OBSERVATIONS)
-            .insert(&key, SenValue::borrowed(&observation));
+        // Different namespaces can be observed in the same millisecond. Keep
+        // the legacy fixed-width key compatible while avoiding replacement.
+        while table.get(&key).is_some() {
+            key.observed_at = key.observed_at.saturating_add(1);
+        }
+        table.insert(&key, SenValue::borrowed(&observation));
         true
     }
 

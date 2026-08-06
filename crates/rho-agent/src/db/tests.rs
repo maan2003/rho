@@ -7,6 +7,30 @@ use rho_workspaces::{WorkspaceId, WorkspaceIdDomain, WorkspaceInfo};
 
 use super::*;
 
+#[test]
+fn quota_observation_decodes_before_auth_namespaces() {
+    #[derive(senax_encoder::Encode)]
+    struct LegacyQuotaObservationRecord {
+        provider: QuotaProvider,
+        model: QuotaModel,
+        observed_at: UnixMs,
+        used_percent: u8,
+        reset_at_unix: Option<i64>,
+    }
+
+    let legacy = LegacyQuotaObservationRecord {
+        provider: QuotaProvider::ChatGpt,
+        model: QuotaModel::GPT,
+        observed_at: UnixMs(1),
+        used_percent: 20,
+        reset_at_unix: Some(100),
+    };
+    let mut encoded = bytes::BytesMut::new();
+    senax_encoder::encode_to(&legacy, &mut encoded).unwrap();
+    let decoded = <QuotaObservationRecord as senax_encoder::Decoder>::decode(&mut encoded).unwrap();
+    assert_eq!(decoded.auth_namespace, None);
+}
+
 #[tokio::test]
 async fn default_auth_namespace_is_optional_and_persistent() {
     let temp = tempfile::tempdir().unwrap();
@@ -165,6 +189,7 @@ async fn quota_history_deduplicates_unchanged_samples() {
     let sample = QuotaObservationRecord {
         provider: QuotaProvider::ChatGpt,
         model: QuotaModel::GPT,
+        auth_namespace: Some("work".to_owned()),
         observed_at: UnixMs(1),
         used_percent: 20,
         reset_at_unix: Some(100),
@@ -174,6 +199,11 @@ async fn quota_history_deduplicates_unchanged_samples() {
     assert!(write.record_quota_observation(sample.clone()));
     assert!(!write.record_quota_observation(QuotaObservationRecord {
         observed_at: UnixMs(2),
+        ..sample.clone()
+    }));
+    assert!(write.record_quota_observation(QuotaObservationRecord {
+        auth_namespace: Some("personal".to_owned()),
+        observed_at: UnixMs(1),
         ..sample.clone()
     }));
     assert!(!write.record_quota_observation(QuotaObservationRecord {
@@ -198,12 +228,14 @@ async fn quota_history_deduplicates_unchanged_samples() {
     }));
     assert!(write.record_quota_observation(QuotaObservationRecord {
         model: QuotaModel::OPUS,
+        auth_namespace: None,
         observed_at: UnixMs(3),
         used_percent: 30,
         ..sample.clone()
     }));
     assert!(write.record_quota_observation(QuotaObservationRecord {
         model: QuotaModel::FABLE,
+        auth_namespace: None,
         observed_at: UnixMs(3),
         used_percent: 40,
         ..sample
@@ -211,9 +243,9 @@ async fn quota_history_deduplicates_unchanged_samples() {
     write.commit();
 
     let history = db.read().quota_observations(QuotaModel::GPT, UnixMs(0));
-    assert_eq!(history.len(), 3);
+    assert_eq!(history.len(), 4);
     assert_eq!(history[0].used_percent, 20);
-    assert_eq!(history[2].used_percent, 22);
+    assert_eq!(history[3].used_percent, 22);
     assert_eq!(
         db.read().quota_observations(QuotaModel::OPUS, UnixMs(0))[0].used_percent,
         30
@@ -223,15 +255,15 @@ async fn quota_history_deduplicates_unchanged_samples() {
         40
     );
 
-    // A bounded reverse read returns only the horizon and one baseline,
-    // without crossing into another model's key range.
+    // A bounded read retains one baseline per auth namespace without crossing
+    // into another model's key range.
     let recent = db.read().quota_observations(QuotaModel::GPT, UnixMs(4));
     assert_eq!(
         recent
             .iter()
             .map(|sample| sample.observed_at)
             .collect::<Vec<_>>(),
-        vec![UnixMs(3), UnixMs(4)]
+        vec![UnixMs(1), UnixMs(3), UnixMs(4)]
     );
 }
 

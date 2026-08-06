@@ -368,11 +368,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     agents.install_iris_tool_host();
     spawn_presentation_projection(Arc::clone(&agents));
     spawn_turn_report_projection(Arc::clone(&agents));
-    spawn_chatgpt_quota_poller(
-        agents.inference.clone(),
-        agents.db.clone(),
-        agents.events.clone(),
-    );
+    spawn_chatgpt_quota_poller(Arc::clone(&agents));
     let quota_environment = agents.user_environment.clone();
     spawn_claude_quota_recorder(
         rho_claude_usage::spawn_poller(
@@ -953,6 +949,7 @@ struct AgentRegistry {
     visualizations: rho_visualizations::VisualizationStore,
     inference: Inference,
     active_auth_name: RwLock<String>,
+    quota_refresh: tokio::sync::Notify,
     /// The database's machine seed, announced in `Ready` so clients can
     /// encode agent IDs.
     machine_seed: u64,
@@ -1010,6 +1007,7 @@ impl AgentRegistry {
             visualizations,
             inference,
             active_auth_name: RwLock::new(active_auth_name),
+            quota_refresh: tokio::sync::Notify::new(),
             machine_seed,
             land_locks: Mutex::new(HashMap::new()),
             land_holders: Mutex::new(HashMap::new()),
@@ -1195,6 +1193,7 @@ impl AgentRegistry {
         let _ = self.events.send(ServerMessage::AuthState {
             auth: self.auth_state(),
         });
+        self.quota_refresh.notify_one();
         Ok(())
     }
 
@@ -2085,14 +2084,19 @@ async fn spawn_attention_watcher(
                         "opus" => QuotaModel::OPUS,
                         _ => continue,
                     };
+                    // ChatGPT quota is persisted by the namespace-aware
+                    // poller. A streamed observation does not carry the auth
+                    // used by its in-flight request and cannot be attributed
+                    // safely after an auth switch.
                     let provider = match observation.provider {
-                        rho_agent::QuotaProvider::ChatGpt => QuotaProvider::ChatGpt,
+                        rho_agent::QuotaProvider::ChatGpt => continue,
                         rho_agent::QuotaProvider::Claude => QuotaProvider::Claude,
                     };
                     let mut write = db.write().await;
                     let changed = write.record_quota_observation(QuotaObservationRecord {
                         provider,
                         model,
+                        auth_namespace: None,
                         observed_at: observation.observed_at,
                         used_percent: observation.used_percent,
                         reset_at_unix: observation.reset_at_unix,
@@ -2127,11 +2131,9 @@ async fn spawn_attention_watcher(
 fn quota_summaries(db: &RhoDb) -> Vec<QuotaSummary> {
     let now = rho_core::UnixMs::now().0;
     let since = rho_core::UnixMs(now.saturating_sub(3 * 24 * 60 * 60 * 1_000));
-    let read = db.read();
-    [QuotaModel::GPT, QuotaModel::OPUS, QuotaModel::FABLE]
+    quota_observation_groups(db, since)
         .into_iter()
-        .filter_map(|model| {
-            let observations = read.quota_observations(model, since);
+        .filter_map(|((model, auth_namespace), observations)| {
             let samples = observations.iter().collect::<Vec<_>>();
             let latest = samples.last()?;
             let reset_expired = latest
@@ -2146,6 +2148,7 @@ fn quota_summaries(db: &RhoDb) -> Vec<QuotaSummary> {
             };
             Some(QuotaSummary {
                 model: model.name().to_owned(),
+                auth_namespace,
                 remaining_percent: if reset_expired {
                     100
                 } else {
@@ -2221,12 +2224,10 @@ fn hourly_global_usage_series(
 fn quota_history(db: &RhoDb) -> Vec<QuotaSeries> {
     let now = rho_core::UnixMs::now().0;
     let since = rho_core::UnixMs(now.saturating_sub(30 * 24 * 60 * 60 * 1_000));
-    let read = db.read();
-    [QuotaModel::GPT, QuotaModel::OPUS, QuotaModel::FABLE]
+    quota_observation_groups(db, since)
         .into_iter()
-        .filter_map(|model| {
-            let points = read
-                .quota_observations(model, since)
+        .filter_map(|((model, auth_namespace), observations)| {
+            let points = observations
                 .into_iter()
                 .map(|sample| QuotaPoint {
                     observed_at_ms: sample.observed_at.0,
@@ -2236,10 +2237,32 @@ fn quota_history(db: &RhoDb) -> Vec<QuotaSeries> {
                 .collect::<Vec<_>>();
             (!points.is_empty()).then(|| QuotaSeries {
                 model: model.name().to_owned(),
+                auth_namespace,
                 points,
             })
         })
         .collect()
+}
+
+fn quota_observation_groups(
+    db: &RhoDb,
+    since: rho_core::UnixMs,
+) -> BTreeMap<(QuotaModel, Option<String>), Vec<QuotaObservationRecord>> {
+    let read = db.read();
+    let mut groups = BTreeMap::new();
+    for model in [QuotaModel::GPT, QuotaModel::OPUS, QuotaModel::FABLE] {
+        for observation in read.quota_observations(model, since) {
+            // Pre-namespace GPT history cannot be attributed safely.
+            if model == QuotaModel::GPT && observation.auth_namespace.is_none() {
+                continue;
+            }
+            groups
+                .entry((model, observation.auth_namespace.clone()))
+                .or_insert_with(Vec::new)
+                .push(observation);
+        }
+    }
+    groups
 }
 
 fn quota_burn(samples: &[&QuotaObservationRecord], now: u64, duration_ms: u64) -> u16 {
@@ -2278,35 +2301,40 @@ fn quota_burn(samples: &[&QuotaObservationRecord], now: u64, duration_ms: u64) -
         .saturating_sub(epoch_start.used_percent) as u16
 }
 
-fn spawn_chatgpt_quota_poller(
-    inference: Inference,
-    db: RhoDb,
-    events: broadcast::Sender<ServerMessage>,
-) {
+fn spawn_chatgpt_quota_poller(agents: Arc<AgentRegistry>) {
     tokio::spawn(async move {
         loop {
-            let auth = inference.auth();
-            if let Ok(Ok(Some(usage))) = tokio::task::spawn_blocking(move || {
-                rho_inference::chatgpt_weekly_usage_for_auth(auth)
-            })
-            .await
-            {
-                let mut write = db.write().await;
-                let changed = write.record_quota_observation(QuotaObservationRecord {
-                    provider: QuotaProvider::ChatGpt,
-                    model: QuotaModel::GPT,
-                    observed_at: rho_core::UnixMs::now(),
-                    used_percent: usage.used_percent.clamp(0.0, 100.0).round() as u8,
-                    reset_at_unix: Some(usage.reset_at_unix),
-                });
-                write.commit();
-                if changed {
-                    let _ = events.send(ServerMessage::QuotaUsage {
-                        summaries: quota_summaries(&db),
+            let auth = agents.auth_state();
+            let mut namespaces = auth.namespaces;
+            namespaces.sort_by_key(|name| (name != &auth.active, name.clone()));
+            let mut changed = false;
+            for namespace in namespaces {
+                let name = namespace.clone();
+                let usage =
+                    tokio::task::spawn_blocking(move || rho_inference::chatgpt_weekly_usage(name))
+                        .await;
+                if let Ok(Ok(Some(usage))) = usage {
+                    let mut write = agents.db.write().await;
+                    changed |= write.record_quota_observation(QuotaObservationRecord {
+                        provider: QuotaProvider::ChatGpt,
+                        model: QuotaModel::GPT,
+                        auth_namespace: Some(namespace),
+                        observed_at: rho_core::UnixMs::now(),
+                        used_percent: usage.used_percent.clamp(0.0, 100.0).round() as u8,
+                        reset_at_unix: Some(usage.reset_at_unix),
                     });
+                    write.commit();
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(10 * 60)).await;
+            if changed {
+                let _ = agents.events.send(ServerMessage::QuotaUsage {
+                    summaries: quota_summaries(&agents.db),
+                });
+            }
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_secs(10 * 60)) => {}
+                () = agents.quota_refresh.notified() => {}
+            }
         }
     });
 }
@@ -2330,6 +2358,7 @@ fn spawn_claude_quota_recorder(
             let mut changed = write.record_quota_observation(QuotaObservationRecord {
                 provider: QuotaProvider::Claude,
                 model: QuotaModel::OPUS,
+                auth_namespace: None,
                 observed_at,
                 used_percent: usage.all_models.used_percent,
                 reset_at_unix: Some(usage.all_models.reset_at_unix),
@@ -2337,6 +2366,7 @@ fn spawn_claude_quota_recorder(
             changed |= write.record_quota_observation(QuotaObservationRecord {
                 provider: QuotaProvider::Claude,
                 model: QuotaModel::FABLE,
+                auth_namespace: None,
                 observed_at,
                 used_percent: usage.fable.used_percent,
                 reset_at_unix: Some(usage.fable.reset_at_unix),
@@ -3877,6 +3907,7 @@ mod tests {
         let sample = |at, used_percent, reset_at_unix| QuotaObservationRecord {
             provider: QuotaProvider::ChatGpt,
             model: QuotaModel::GPT,
+            auth_namespace: None,
             observed_at: rho_core::UnixMs(at),
             used_percent,
             reset_at_unix,
@@ -3898,6 +3929,7 @@ mod tests {
         let sample = |at, used_percent| QuotaObservationRecord {
             provider: QuotaProvider::ChatGpt,
             model: QuotaModel::GPT,
+            auth_namespace: None,
             observed_at: rho_core::UnixMs(at),
             used_percent,
             reset_at_unix: Some(100),
@@ -3919,6 +3951,7 @@ mod tests {
         let sample = |at, used_percent, reset_at_unix| QuotaObservationRecord {
             provider: QuotaProvider::ChatGpt,
             model: QuotaModel::GPT,
+            auth_namespace: None,
             observed_at: rho_core::UnixMs(at),
             used_percent,
             reset_at_unix: Some(reset_at_unix),
@@ -3945,14 +3978,24 @@ mod tests {
             assert!(write.record_quota_observation(QuotaObservationRecord {
                 provider: QuotaProvider::ChatGpt,
                 model: QuotaModel::GPT,
+                auth_namespace: Some("work".to_owned()),
                 observed_at: rho_core::UnixMs(now - (4 - index) * 1_000),
                 used_percent: index as u8,
                 reset_at_unix: Some(123),
             }));
         }
         assert!(write.record_quota_observation(QuotaObservationRecord {
+            provider: QuotaProvider::ChatGpt,
+            model: QuotaModel::GPT,
+            auth_namespace: Some("personal".to_owned()),
+            observed_at: rho_core::UnixMs(now),
+            used_percent: 50,
+            reset_at_unix: Some(789),
+        }));
+        assert!(write.record_quota_observation(QuotaObservationRecord {
             provider: QuotaProvider::Claude,
             model: QuotaModel::OPUS,
+            auth_namespace: None,
             observed_at: rho_core::UnixMs(now),
             used_percent: 25,
             reset_at_unix: Some(456),
@@ -3960,7 +4003,12 @@ mod tests {
         write.commit();
 
         let history = quota_history(&db);
-        let gpt = history.iter().find(|series| series.model == "gpt").unwrap();
+        let gpt = history
+            .iter()
+            .find(|series| {
+                series.model == "gpt" && series.auth_namespace.as_deref() == Some("work")
+            })
+            .unwrap();
         assert_eq!(gpt.points.len(), 5);
         assert_eq!(
             gpt.points
@@ -3969,6 +4017,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             [100, 99, 98, 97, 96]
         );
+        let personal = history
+            .iter()
+            .find(|series| {
+                series.model == "gpt" && series.auth_namespace.as_deref() == Some("personal")
+            })
+            .unwrap();
+        assert_eq!(personal.points[0].remaining_percent, 50);
         let opus = history
             .iter()
             .find(|series| series.model == "opus")
@@ -3985,6 +4040,7 @@ mod tests {
         assert!(write.record_quota_observation(QuotaObservationRecord {
             provider: QuotaProvider::Claude,
             model: QuotaModel::FABLE,
+            auth_namespace: None,
             observed_at: now,
             used_percent: 99,
             reset_at_unix: Some(1),
