@@ -2404,11 +2404,11 @@ impl Workspace {
         } else {
             rho_ui_proto::AgentDisposition::Done
         };
-        let target = self.disposition_target(cx);
-        let agent_id = self.set_agent_disposition(target, "done", disposition, cx);
+        let targets = self.disposition_targets(cx);
+        let sent = self.set_agent_disposition(targets, "done", disposition, cx);
         // Hiding the open agent closes its tab, or it would stay
         // rail-visible through the selection exemption.
-        if hide && agent_id.is_some() && agent_id.as_ref() == self.registry.selected_agent() {
+        if hide && sent && self.registry.selected_agent().is_some() {
             self.select_agent(None, window, cx);
         }
     }
@@ -2418,9 +2418,9 @@ impl Workspace {
             return;
         }
         let until = rho_core::UnixMs(now_ms().saturating_add(duration_ms));
-        let target = self.disposition_target(cx);
+        let targets = self.disposition_targets(cx);
         self.set_agent_disposition(
-            target,
+            targets,
             "snooze",
             rho_ui_proto::AgentDisposition::Snoozed { until },
             cx,
@@ -3021,48 +3021,55 @@ impl Workspace {
     /// attention; returns the agent it acted on. The daemon echoes the
     /// resulting attention level back as a broadcast, so the rail updates
     /// through the normal event path.
-    /// Triage targets the open agent, or — with none open, as when `d`
-    /// comes from the dashboard — the agent under the dashboard cursor.
-    fn disposition_target(&mut self, cx: &mut Context<Self>) -> Option<AgentId> {
+    /// Whom a triage verdict speaks for: the open agent, or — with none
+    /// open, as when `d` comes from the dashboard — the row under the
+    /// cursor. Either way it covers everything the row's lamp aggregates,
+    /// which is the whole workstream for a stream row and the agent's
+    /// subtree for an agent row; acking only the root would leave the row
+    /// active on a child's lamp, and the row would never reach settled.
+    fn disposition_targets(&mut self, cx: &mut Context<Self>) -> Vec<AgentId> {
         use crate::dashboard::RowTarget;
         if let Some(agent_id) = self.registry.selected_agent().copied() {
-            return Some(agent_id);
+            return self.registry.agent_subtree(agent_id);
         }
         match self.dashboard.cursor_target(cx) {
-            Some(RowTarget::Stream {
-                root: Some(agent_id),
-                ..
-            })
-            | Some(RowTarget::Agent(agent_id))
-            | Some(RowTarget::Reply(agent_id)) => Some(agent_id),
-            _ => None,
+            Some(RowTarget::Stream { workstream_id, .. }) => {
+                self.registry.workstream_agents(workstream_id)
+            }
+            Some(RowTarget::Agent(agent_id)) | Some(RowTarget::Reply(agent_id)) => {
+                self.registry.agent_subtree(agent_id)
+            }
+            _ => Vec::new(),
         }
     }
 
+    /// Sends one verdict per agent of the row. All of them live on the same
+    /// daemon, so one online check covers the batch.
     fn set_agent_disposition(
         &mut self,
-        source_agent: Option<AgentId>,
+        targets: Vec<AgentId>,
         command: &str,
         disposition: rho_ui_proto::AgentDisposition,
         cx: &mut Context<Self>,
-    ) -> Option<AgentId> {
-        let Some(agent_id) = source_agent.or_else(|| self.registry.selected_agent().copied())
-        else {
-            let message = format!("{command}: no agent selected");
+    ) -> bool {
+        let Some(&first) = targets.first() else {
+            let message = format!("{command}: no agent under the cursor");
             self.notice_on(None, &message, StyleClass::SystemInfo, cx);
-            return None;
+            return false;
         };
-        if !self.require_agent_online(agent_id, cx) {
-            return None;
+        if !self.require_agent_online(first, cx) {
+            return false;
         }
-        self.send_to_agent(
-            agent_id,
-            ClientMessage::SetAgentDisposition {
+        for agent_id in targets {
+            self.send_to_agent(
                 agent_id,
-                disposition,
-            },
-        );
-        Some(agent_id)
+                ClientMessage::SetAgentDisposition {
+                    agent_id,
+                    disposition,
+                },
+            );
+        }
+        true
     }
 
     /// Jumps to the rail's most urgent agent (excluding the current one), so
@@ -4152,8 +4159,8 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn triage_target(&mut self, cx: &mut Context<Self>) -> Option<AgentId> {
-        self.disposition_target(cx)
+    pub(crate) fn triage_targets(&mut self, cx: &mut Context<Self>) -> Vec<AgentId> {
+        self.disposition_targets(cx)
     }
 
     #[cfg(test)]

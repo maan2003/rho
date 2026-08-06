@@ -410,12 +410,17 @@ fn startup_stays_on_the_first_dashboard_row(cx: &mut TestAppContext) {
 }
 
 /// `d`/`shift-d` fire from the dashboard, where no agent is open: triage
-/// must act on the row under the cursor instead of refusing.
+/// must act on the row under the cursor instead of refusing — and on every
+/// agent the row's lamp aggregates, or the row never reaches settled.
 #[gpui::test]
-fn triage_targets_the_dashboard_row_under_the_cursor(cx: &mut TestAppContext) {
+fn triage_targets_the_whole_dashboard_row_under_the_cursor(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
+            let mut root = agent_summary(1, None);
+            root.attention = UiAttention::Pending;
+            let mut child = agent_summary(2, Some(agent(1)));
+            child.attention = UiAttention::Pending;
             workspace.handle_event(
                 HostId::default(),
                 ConnEvent::Ready {
@@ -424,18 +429,19 @@ fn triage_targets_the_dashboard_row_under_the_cursor(cx: &mut TestAppContext) {
                         name: "Existing work".to_owned(),
                         labels: Vec::new(),
                     }],
-                    agents: vec![agent_summary(1, None)],
+                    agents: vec![root, child],
                     projects: Vec::new(),
                     auth: auth_state(),
                     machine_seed: 0,
-                    agent_counter: 1,
+                    agent_counter: 2,
                 },
                 window,
                 cx,
             );
             workspace.sync_dashboard(window, cx);
             assert!(workspace.is_dashboard_mode(window, cx));
-            assert_eq!(workspace.triage_target(cx), None);
+            // The cursor starts on the Iris row, which speaks for no agent.
+            assert_eq!(workspace.triage_targets(cx), Vec::new());
         })
         .expect("start on dashboard");
     cx.run_until_parked();
@@ -447,15 +453,109 @@ fn triage_targets_the_dashboard_row_under_the_cursor(cx: &mut TestAppContext) {
         .update(cx, |workspace, window, cx| {
             dashboard.update(cx, |editor, cx| {
                 let snapshot = editor.buffer().read(cx).snapshot(cx);
-                let offset = snapshot.text().find("Existing work").expect("agent row");
+                let offset = snapshot.text().find("Existing work").expect("stream row");
                 let anchor = snapshot.anchor_before(multi_buffer::MultiBufferOffset(offset));
                 editor.change_selections(Default::default(), window, cx, |selections| {
                     selections.select_anchor_ranges([anchor..anchor]);
                 });
             });
-            assert_eq!(workspace.triage_target(cx), Some(agent(1)));
+            let mut targets = workspace.triage_targets(cx);
+            targets.sort();
+            assert_eq!(
+                targets,
+                vec![agent(1), agent(2)],
+                "a stream row's verdict must cover the agents it aggregates"
+            );
         })
-        .expect("park the cursor on the agent row");
+        .expect("park the cursor on the stream row");
+}
+
+/// The row settles only once every agent it aggregates is quiet — the
+/// reason a verdict has to cover the whole row.
+#[gpui::test]
+fn a_row_reaches_settled_when_all_its_agents_go_quiet(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let mut root = agent_summary(1, None);
+            root.attention = UiAttention::Pending;
+            let mut child = agent_summary(2, Some(agent(1)));
+            child.attention = UiAttention::Pending;
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Ready {
+                    workstreams: vec![UiWorkstream {
+                        workstream_id: WorkstreamId(1),
+                        name: "Existing work".to_owned(),
+                        labels: Vec::new(),
+                    }],
+                    agents: vec![root, child],
+                    projects: Vec::new(),
+                    auth: auth_state(),
+                    machine_seed: 0,
+                    agent_counter: 2,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+        })
+        .expect("ready");
+    cx.run_until_parked();
+
+    let dashboard = workspace
+        .update(cx, |workspace, _, _| workspace.dashboard_editor())
+        .expect("dashboard editor");
+    let listing = |cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |_, _, cx| {
+                dashboard.update(cx, |editor, cx| editor.display_text(cx))
+            })
+            .expect("dashboard text")
+    };
+    assert!(
+        listing(cx).contains("active"),
+        "two pending agents keep the row active"
+    );
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::AgentAttention {
+                    agent_id: agent(1),
+                    attention: UiAttention::Quiet,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+        })
+        .expect("quiet the root");
+    assert!(
+        listing(cx).contains("active"),
+        "the child's lamp still holds the row active"
+    );
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::AgentAttention {
+                    agent_id: agent(2),
+                    attention: UiAttention::Quiet,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+        })
+        .expect("quiet the child");
+    let settled = listing(cx);
+    assert!(
+        settled.contains("settled") && !settled.contains("active"),
+        "the row settles once every agent it aggregates is quiet: {settled:?}"
+    );
 }
 
 #[gpui::test]
@@ -3807,3 +3907,4 @@ fn streaming_markdown_parses_the_edited_turn_without_revisiting_history(cx: &mut
         "emphasis flashed raw: {text:?}"
     );
 }
+

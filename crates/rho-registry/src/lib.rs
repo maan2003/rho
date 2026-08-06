@@ -694,6 +694,72 @@ impl AgentRegistry {
         }
     }
 
+    /// Every agent a rail row for `agent_id` speaks for: the agent itself
+    /// and its descendants, whose attention the row aggregates. A verdict on
+    /// the row has to cover all of them, or the row keeps the lamp of a
+    /// child the user just acked through its parent. Hidden agents carry no
+    /// lamp and are left out — a verdict must never resurrect one.
+    pub fn agent_subtree(&self, agent_id: AgentId) -> Vec<AgentId> {
+        let Some(workstream) = self
+            .workstream_of(agent_id)
+            .and_then(|workstream_id| self.workstream(workstream_id))
+        else {
+            return vec![agent_id];
+        };
+        let by_id = workstream
+            .agents
+            .iter()
+            .map(|agent| (agent.agent_id, agent))
+            .collect::<BTreeMap<_, _>>();
+        let mut subtree = workstream
+            .agents
+            .iter()
+            .filter(|agent| agent.agent_id != agent_id && !agent.hidden)
+            .map(|agent| agent.agent_id)
+            .filter(|candidate| {
+                let mut cursor = *candidate;
+                let mut seen = BTreeSet::new();
+                while seen.insert(cursor) {
+                    let Some(parent) = by_id.get(&cursor).and_then(|agent| agent.parent_agent)
+                    else {
+                        break;
+                    };
+                    if parent == agent_id {
+                        return true;
+                    }
+                    cursor = parent;
+                }
+                false
+            })
+            .collect::<Vec<_>>();
+        // The row's own agent is always covered, hidden or not: a hide
+        // verdict on an open agent has to reach it.
+        subtree.insert(0, agent_id);
+        subtree
+    }
+
+    /// Every listed agent in one workstream: what a verdict on the
+    /// workstream row covers, since the row aggregates all of them. Hidden
+    /// members are already put away and stay that way.
+    pub fn workstream_agents(&self, workstream_id: WorkstreamId) -> Vec<AgentId> {
+        self.workstream(workstream_id)
+            .map(|workstream| {
+                workstream
+                    .agents
+                    .iter()
+                    .filter(|agent| !agent.hidden)
+                    .map(|agent| agent.agent_id)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn workstream(&self, workstream_id: WorkstreamId) -> Option<&Workstream> {
+        self.workstreams
+            .iter()
+            .find(|workstream| workstream.workstream_id == workstream_id)
+    }
+
     /// Records the host and workstream announced with `AgentCreated`, so a
     /// freshly created agent can be addressed — and routed to the right
     /// daemon — before the next `Ready` carries its summary.
@@ -2039,5 +2105,51 @@ mod tests {
         );
         // The surviving host is alone again, so its labels lose the prefix.
         assert!(!registry.agent_id_label(agent_id(1)).contains('/'));
+    }
+
+    /// A verdict on a row covers the agents whose lamps that row shows:
+    /// descendants included, hidden members left alone.
+    #[test]
+    fn row_verdict_targets_cover_descendants_but_not_hidden_members() {
+        let mut registry = AgentRegistry::default();
+        let mut child = agent(2, Status::Normal);
+        child.parent_agent = Some(agent_id(1));
+        let mut grandchild = agent(3, Status::Normal);
+        grandchild.parent_agent = Some(agent_id(2));
+        let mut put_away = agent(4, Status::Normal);
+        put_away.parent_agent = Some(agent_id(1));
+        put_away.hidden = true;
+        let sibling_root = agent(5, Status::Normal);
+        set_topics(
+            &mut registry,
+            vec![topic(
+                1,
+                Status::Normal,
+                vec![
+                    agent(1, Status::Normal),
+                    child,
+                    grandchild,
+                    put_away,
+                    sibling_root,
+                ],
+            )],
+        );
+
+        let ids = |ids: &[u64]| ids.iter().map(|id| agent_id(*id)).collect::<BTreeSet<_>>();
+        assert_eq!(
+            registry
+                .agent_subtree(agent_id(1))
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            ids(&[1, 2, 3])
+        );
+        assert_eq!(
+            registry
+                .workstream_agents(WorkstreamId(1))
+                .into_iter()
+                .collect::<BTreeSet<_>>(),
+            ids(&[1, 2, 3, 5]),
+            "a stream row speaks for every listed member, including other roots"
+        );
     }
 }
