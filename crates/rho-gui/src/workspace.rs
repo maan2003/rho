@@ -3092,6 +3092,12 @@ impl Workspace {
         if !self.require_agent_online(first, cx) {
             return false;
         }
+        // Every verdict but a lapsed snooze puts the row down.
+        let quieting = match disposition {
+            rho_ui_proto::AgentDisposition::Done | rho_ui_proto::AgentDisposition::Hidden => true,
+            rho_ui_proto::AgentDisposition::Snoozed { until } => until.0 > now_ms(),
+            rho_ui_proto::AgentDisposition::Pending => false,
+        };
         for agent_id in targets {
             self.send_to_agent(
                 agent_id,
@@ -3100,7 +3106,19 @@ impl Workspace {
                     disposition,
                 },
             );
+            // Show the verdict now rather than waiting for the round trip.
+            // A still-working agent keeps its lamp: the daemon reads
+            // attention off the live runtime first, so predicting quiet
+            // there would flicker.
+            if quieting
+                && self.registry.attention(agent_id) != rho_ui_proto::UiAttention::Working
+            {
+                self.registry
+                    .expect_attention(agent_id, rho_ui_proto::UiAttention::Quiet);
+            }
         }
+        self.dashboard_dirty = true;
+        cx.notify();
         true
     }
 

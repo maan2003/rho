@@ -105,6 +105,11 @@ pub const PIN_LABEL: &str = "pin";
 /// The label prefix that shelves a workstream under a named group.
 pub const GROUP_LABEL_PREFIX: &str = "group:";
 
+/// How long a sent verdict outranks the summaries' attention. Long enough
+/// to cover a slow daemon answering over a remote link, short enough that a
+/// verdict whose answer was lost stops shadowing the truth.
+const VERDICT_GRACE_MS: u64 = 15_000;
+
 pub fn agent_pinned(agent: &UiAgentSummary) -> bool {
     agent.labels.iter().any(|label| label == PIN_LABEL)
 }
@@ -174,6 +179,13 @@ pub struct AgentRegistry {
     /// Live attention overlay: broadcasts land here between `Ready`
     /// refreshes, which re-seed it from the summaries' snapshot.
     attention: BTreeMap<AgentId, rho_ui_proto::UiAttention>,
+    /// Verdicts sent but not yet answered. A `Ready` is a snapshot of the
+    /// daemon at the moment it was built, which can be before a verdict the
+    /// user has already pressed; without this it would re-seed the lamp the
+    /// verdict just cleared, and the row would bounce back to active for no
+    /// reason the user can see. Cleared by the daemon's answer, or by
+    /// `VERDICT_GRACE_MS` if that answer never arrives.
+    pending_verdicts: BTreeMap<AgentId, (rho_ui_proto::UiAttention, rho_core::UnixMs)>,
     /// Ephemeral activity text delivered separately from durable summaries.
     activities: BTreeMap<AgentId, String>,
     /// Turn-report overlay: broadcasts land here between `Ready` refreshes,
@@ -521,9 +533,15 @@ impl AgentRegistry {
         // Summaries carry an attention, activity, and turn-report snapshot,
         // so for the host that just spoke they replace whatever its
         // broadcasts left behind. Agents no longer in any snapshot drop out
-        // entirely.
+        // entirely. A verdict still awaiting its answer is the exception:
+        // this snapshot may predate it.
+        let now = rho_core::UnixMs(now_ms());
+        self.pending_verdicts
+            .retain(|_, (_, sent_at)| now.0.saturating_sub(sent_at.0) < VERDICT_GRACE_MS);
+        let awaiting_answer = self.pending_verdicts.keys().copied().collect::<BTreeSet<_>>();
         self.attention.retain(|agent_id, _| {
-            self.agent_hosts.contains_key(agent_id) && !from_refreshed(agent_id)
+            self.agent_hosts.contains_key(agent_id)
+                && (!from_refreshed(agent_id) || awaiting_answer.contains(agent_id))
         });
         self.activities.retain(|agent_id, _| {
             self.agent_hosts.contains_key(agent_id) && !from_refreshed(agent_id)
@@ -594,6 +612,21 @@ impl AgentRegistry {
     }
 
     pub fn set_attention(&mut self, agent_id: AgentId, attention: rho_ui_proto::UiAttention) {
+        // The daemon has spoken about this agent, so whatever verdict was
+        // outstanding is answered — by this level or by a newer event that
+        // overtook it. Either way the broadcast is the fresher word.
+        self.pending_verdicts.remove(&agent_id);
+        if self.attention.insert(agent_id, attention) != Some(attention) {
+            self.rebuild_topic_rail_layouts();
+        }
+    }
+
+    /// Applies a verdict the client just sent, before its answer comes back:
+    /// the row settles under the hand that pressed it, and no `Ready` built
+    /// before the verdict can undo it (see `pending_verdicts`).
+    pub fn expect_attention(&mut self, agent_id: AgentId, attention: rho_ui_proto::UiAttention) {
+        self.pending_verdicts
+            .insert(agent_id, (attention, rho_core::UnixMs(now_ms())));
         if self.attention.insert(agent_id, attention) != Some(attention) {
             self.rebuild_topic_rail_layouts();
         }
@@ -2105,6 +2138,47 @@ mod tests {
         );
         // The surviving host is alone again, so its labels lose the prefix.
         assert!(!registry.agent_id_label(agent_id(1)).contains('/'));
+    }
+
+    /// A `Ready` is a snapshot of the daemon at the moment it was built,
+    /// which can predate a verdict the user already pressed. Re-seeding
+    /// attention from it would put back the lamp the verdict cleared.
+    #[test]
+    fn a_snapshot_older_than_a_verdict_does_not_put_its_lamp_back() {
+        use rho_ui_proto::UiAttention;
+
+        let mut registry = AgentRegistry::default();
+        let pending = || {
+            let mut agent = agent(1, Status::Normal);
+            agent.attention = UiAttention::Pending;
+            vec![agent]
+        };
+        set_topics(&mut registry, vec![topic(1, Status::Normal, pending())]);
+        assert_eq!(registry.attention(agent_id(1)), UiAttention::Pending);
+
+        registry.expect_attention(agent_id(1), UiAttention::Quiet);
+        assert_eq!(registry.attention(agent_id(1)), UiAttention::Quiet);
+
+        // The snapshot in flight still describes the world before the press.
+        set_topics(&mut registry, vec![topic(1, Status::Normal, pending())]);
+        assert_eq!(
+            registry.attention(agent_id(1)),
+            UiAttention::Quiet,
+            "a snapshot older than the verdict undid it"
+        );
+
+        // The daemon's own word outranks the verdict: a new turn end
+        // resurfaces the row, and later snapshots agree again.
+        registry.set_attention(agent_id(1), UiAttention::Pending);
+        assert_eq!(registry.attention(agent_id(1)), UiAttention::Pending);
+        registry.expect_attention(agent_id(1), UiAttention::Quiet);
+        registry.set_attention(agent_id(1), UiAttention::Quiet);
+        set_topics(&mut registry, vec![topic(1, Status::Normal, pending())]);
+        assert_eq!(
+            registry.attention(agent_id(1)),
+            UiAttention::Pending,
+            "an answered verdict must stop shadowing the snapshots"
+        );
     }
 
     /// A verdict on a row covers the agents whose lamps that row shows:
