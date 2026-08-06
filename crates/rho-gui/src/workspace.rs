@@ -5441,10 +5441,10 @@ impl Workspace {
             .iter()
             .filter(|summary| summary.model == "gpt")
             .collect::<Vec<_>>();
-        for (index, summary) in gpt.iter().enumerate() {
+        for summary in &gpt {
             stats = stats.child(
                 div()
-                    .text_color(crate::transient::quota_auth_color(index))
+                    .text_color(colors.terminal_ansi_cyan)
                     .child(format!("{}%", summary.remaining_percent)),
             );
         }

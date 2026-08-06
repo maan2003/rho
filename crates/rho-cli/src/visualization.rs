@@ -16,7 +16,7 @@ pub(crate) async fn run(args: RecordVisualizationArgs) -> anyhow::Result<()> {
     }
 
     let socket_path = args.socket_path.unwrap_or(default_socket_path()?);
-    let mut daemon = connect_or_start_daemon(&socket_path, args.auth.as_deref()).await?;
+    let mut daemon = connect_or_start_daemon(&socket_path).await?;
     daemon
         .send(&ClientMessage::RecordVisualization {
             mime_type: SVG_MIME_TYPE.to_owned(),

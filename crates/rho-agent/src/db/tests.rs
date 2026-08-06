@@ -1100,3 +1100,40 @@ async fn migrates_existing_parent_edges_to_response_subscriptions() {
 
     assert_eq!(db.read().agent_response_subscribers(child), [parent]);
 }
+
+#[tokio::test]
+async fn migrates_legacy_gpt_quota_to_default_auth_namespace() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    write.set_default_auth_namespace("work".to_owned());
+    assert!(write.record_quota_observation(QuotaObservationRecord {
+        provider: QuotaProvider::ChatGpt,
+        model: QuotaModel::GPT,
+        auth_namespace: None,
+        observed_at: UnixMs(1),
+        used_percent: 20,
+        reset_at_unix: Some(100),
+    }));
+    assert!(write.record_quota_observation(QuotaObservationRecord {
+        provider: QuotaProvider::Claude,
+        model: QuotaModel::OPUS,
+        auth_namespace: None,
+        observed_at: UnixMs(1),
+        used_percent: 30,
+        reset_at_unix: Some(100),
+    }));
+    write.open_table(FORMAT).insert(&(), &"a84f3c19".to_owned());
+    write.commit();
+
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    write.commit();
+
+    let read = db.read();
+    let gpt = read.quota_observations(QuotaModel::GPT, UnixMs(0));
+    assert_eq!(gpt[0].auth_namespace.as_deref(), Some("work"));
+    let opus = read.quota_observations(QuotaModel::OPUS, UnixMs(0));
+    assert_eq!(opus[0].auth_namespace, None);
+}

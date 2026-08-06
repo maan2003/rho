@@ -16,7 +16,7 @@ than by running a supervisor, extension protocol, or daemon process graph.
   an in-flight request finishes with the credentials it resolved, while later
   requests (including web search and realtime) resolve the replacement and
   reconnect when needed. Selecting a namespace also persists it as the restart
-  default; an explicit `rho daemon --auth` remains a run-local override.
+  default; daemon startup reads that database setting without a CLI override.
   ChatGPT quota observations are attributed to that daemon-local namespace;
   the daemon polls every configured namespace and the GUI keeps each
   host/namespace history as an independent graph series.

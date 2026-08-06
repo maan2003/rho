@@ -250,9 +250,6 @@ pub fn configure_embedded_environment() {
 
 #[derive(Clone, Debug, clap::Args)]
 pub struct DaemonArgs {
-    /// Override the persisted default auth namespace for this daemon run.
-    #[arg(long = "auth")]
-    pub auth: Option<String>,
     #[arg(long = "socket-path")]
     pub socket_path: Option<PathBuf>,
     /// Also listen for UI clients (including the web UI) over iroh
@@ -327,11 +324,18 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     let user_environment = rho_workspaces::UserEnvironment::new(user_environment);
 
     let db = RhoDb::open(default_db_path()?);
-    let default_auth_name = db
-        .read()
-        .default_auth_namespace()
-        .unwrap_or_else(|| "default".to_owned());
-    let active_auth_name = args.auth.unwrap_or_else(|| default_auth_name.clone());
+    let stored_auth_name = db.read().default_auth_namespace();
+    let default_auth_name = match stored_auth_name {
+        Some(name) => name,
+        None => {
+            let name = "default".to_owned();
+            let mut write = db.write().await;
+            write.set_default_auth_namespace(name.clone());
+            write.commit();
+            name
+        }
+    };
+    let active_auth_name = default_auth_name;
     let inference = Inference::new(InferenceAuth::named(&active_auth_name)?);
     let path_overrides = PathOverrides {
         before: args

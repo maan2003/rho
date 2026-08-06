@@ -26,13 +26,8 @@ pub(crate) async fn run(args: LandArgs) -> Result<()> {
     let repo_root =
         rho_workspaces::resolve_repo_root(&workspace_root).context("resolve origin repo")?;
     let agent_id = current_agent_id()?;
-    let mut lease = LandLease::acquire(
-        repo_root.clone(),
-        agent_id,
-        args.auth.as_deref(),
-        args.socket_path.as_deref(),
-    )
-    .await?;
+    let mut lease =
+        LandLease::acquire(repo_root.clone(), agent_id, args.socket_path.as_deref()).await?;
 
     let Some(config) = config::read_config(repo_root.as_std_path())? else {
         lease.status(LandStatus::Bounced).await.ok();
@@ -125,14 +120,13 @@ impl LandLease {
     async fn acquire(
         repo: Utf8PathBuf,
         agent_id: Option<AgentId>,
-        auth: Option<&str>,
         socket_path: Option<&Path>,
     ) -> Result<Self> {
         let socket_path = match socket_path {
             Some(path) => path.to_owned(),
             None => rho_daemon::default_socket_path()?,
         };
-        let mut client = connect_or_start_daemon(&socket_path, auth).await?;
+        let mut client = connect_or_start_daemon(&socket_path).await?;
         eprintln!("queued for land lease");
         client
             .send(&ClientMessage::AcquireLandLease {

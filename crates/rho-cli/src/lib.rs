@@ -118,10 +118,7 @@ async fn run_iroh(args: IrohArgs) -> Result<()> {
     }
 }
 
-pub(crate) async fn connect_or_start_daemon(
-    socket_path: &std::path::Path,
-    auth: Option<&str>,
-) -> Result<UiClient> {
+pub(crate) async fn connect_or_start_daemon(socket_path: &std::path::Path) -> Result<UiClient> {
     if let Ok(client) = UiClient::connect(socket_path).await {
         return Ok(client);
     }
@@ -129,9 +126,6 @@ pub(crate) async fn connect_or_start_daemon(
     let exe = std::env::current_exe()?;
     let mut command = std::process::Command::new(exe);
     command.arg("daemon");
-    if let Some(auth) = auth {
-        command.arg("--auth").arg(auth);
-    }
     command
         .arg("--socket-path")
         .arg(socket_path)
@@ -221,8 +215,6 @@ pub(crate) enum IrohCommand {
 
 #[derive(Clone, clap::Args)]
 pub(crate) struct SlackArgs {
-    #[arg(long = "auth")]
-    auth: Option<String>,
     #[arg(long = "socket-path")]
     socket_path: Option<PathBuf>,
     #[command(subcommand)]
@@ -241,8 +233,6 @@ pub(crate) enum SlackCommand {
 
 #[derive(Clone, clap::Args)]
 pub(crate) struct PrArgs {
-    #[arg(long = "auth")]
-    auth: Option<String>,
     #[arg(long = "socket-path")]
     socket_path: Option<PathBuf>,
     #[command(subcommand)]
@@ -251,8 +241,6 @@ pub(crate) struct PrArgs {
 
 #[derive(Clone, clap::Args)]
 pub(crate) struct RecordVisualizationArgs {
-    #[arg(long = "auth")]
-    auth: Option<String>,
     #[arg(long = "socket-path")]
     socket_path: Option<PathBuf>,
 }
@@ -314,16 +302,12 @@ pub(crate) enum PrCliCommand {
 pub(crate) struct McpAgentToolsArgs {
     #[arg(long = "agent-id")]
     agent_id: Option<String>,
-    #[arg(long = "auth")]
-    auth: Option<String>,
     #[arg(long = "socket-path")]
     socket_path: Option<PathBuf>,
 }
 
 #[derive(Clone, clap::Args)]
 pub(crate) struct LandArgs {
-    #[arg(long = "auth")]
-    auth: Option<String>,
     /// Checkout path to land from (defaults to the current directory).
     #[arg(default_value = ".")]
     path: PathBuf,

@@ -30,7 +30,7 @@ pub(crate) async fn run(args: PrArgs) -> anyhow::Result<()> {
     };
     let command = command(args.command)?;
     let socket_path = args.socket_path.unwrap_or(default_socket_path()?);
-    let mut daemon = connect_or_start_daemon(&socket_path, args.auth.as_deref()).await?;
+    let mut daemon = connect_or_start_daemon(&socket_path).await?;
     loop {
         let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
         daemon
@@ -140,7 +140,7 @@ fn checks_pending(output: &str) -> anyhow::Result<bool> {
 async fn init(args: PrArgs) -> anyhow::Result<()> {
     let token = prompt_token("GitHub token (ghp_/github_pat_/...): ")?;
     let socket_path = args.socket_path.unwrap_or(default_socket_path()?);
-    let mut daemon = connect_or_start_daemon(&socket_path, args.auth.as_deref()).await?;
+    let mut daemon = connect_or_start_daemon(&socket_path).await?;
     daemon
         .send(&ClientMessage::PlatformSecretsSet {
             secrets: vec![("GITHUB_TOKEN".to_owned(), token)],

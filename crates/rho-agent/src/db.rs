@@ -39,7 +39,7 @@ const PROJECTS: TableDefinition<String, Sen<ProjectRecord>> = TableDefinition::n
 /// Opaque client-owned view configuration (see
 /// [`AgentReadTxnExt::view_config`]).
 const VIEW_CONFIG: TableDefinition<(), Vec<u8>> = TableDefinition::new("view_config");
-/// The daemon-wide auth namespace selected when no startup override is given.
+/// The daemon-wide auth namespace selected at startup.
 const DEFAULT_AUTH_NAMESPACE: TableDefinition<(), String> =
     TableDefinition::new("default_auth_namespace");
 const QUOTA_OBSERVATIONS: TableDefinition<QuotaObservationKey, Sen<QuotaObservationRecord>> =
@@ -50,7 +50,7 @@ const AGENT_USAGE_TOTALS: TableDefinition<AgentId, Sen<AgentUsageBucket>> =
     TableDefinition::new("agent_usage_totals");
 const GLOBAL_AGENT_USAGE: TableDefinition<GlobalAgentUsageKey, Sen<AgentUsageBucket>> =
     TableDefinition::new("agent_usage_by_time_provider");
-const CURRENT_AGENT_DB_FORMAT: &str = "a84f3c19";
+const CURRENT_AGENT_DB_FORMAT: &str = "d37a6f02";
 const QUOTA_RESET_JITTER_SECONDS: u64 = 60;
 
 struct AgentDbMigration {
@@ -59,11 +59,18 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[AgentDbMigration {
-    from: "7c5e2a91",
-    to: "a84f3c19",
-    migrate: migrate_parent_response_subscriptions,
-}];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
+    AgentDbMigration {
+        from: "7c5e2a91",
+        to: "a84f3c19",
+        migrate: migrate_parent_response_subscriptions,
+    },
+    AgentDbMigration {
+        from: "a84f3c19",
+        to: "d37a6f02",
+        migrate: migrate_quota_auth_namespace,
+    },
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -1886,6 +1893,32 @@ fn migrate_parent_response_subscriptions(write: &mut WriteTxn) {
     let mut subscriptions = write.open_table(AGENT_RESPONSE_SUBSCRIPTIONS);
     for (subscriber, target) in parent_edges {
         subscriptions.insert(&AgentResponseSubscription { target, subscriber }, &());
+    }
+}
+
+fn migrate_quota_auth_namespace(write: &mut WriteTxn) {
+    let namespace = write
+        .open_table(DEFAULT_AUTH_NAMESPACE)
+        .get(&())
+        .map(|value| value.value())
+        .unwrap_or_else(|| "default".to_owned());
+    let observations = write
+        .open_table(QUOTA_OBSERVATIONS)
+        .iter()
+        .filter_map(|(key, value)| {
+            let mut observation = value.value().into_owned();
+            (observation.provider == QuotaProvider::ChatGpt
+                && observation.model == QuotaModel::GPT
+                && observation.auth_namespace.is_none())
+            .then(|| {
+                observation.auth_namespace = Some(namespace.clone());
+                (key.value(), observation)
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut table = write.open_table(QUOTA_OBSERVATIONS);
+    for (key, observation) in observations {
+        table.insert(&key, SenValue::borrowed(&observation));
     }
 }
 

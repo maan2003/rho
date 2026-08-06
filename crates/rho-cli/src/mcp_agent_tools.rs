@@ -21,7 +21,7 @@ pub(crate) async fn run(args: McpAgentToolsArgs) -> anyhow::Result<()> {
         Some(path) => path,
         None => rho_daemon::default_socket_path()?,
     };
-    let mut daemon = connect_or_start_daemon(&socket_path, args.auth.as_deref()).await?;
+    let mut daemon = connect_or_start_daemon(&socket_path).await?;
     daemon.send(&ClientMessage::Subscribe).await?;
     let ready = loop {
         if let ServerMessage::Ready {

@@ -29,7 +29,7 @@ async fn init(args: SlackArgs, dir: camino::Utf8PathBuf) -> Result<()> {
         Some(path) => path,
         None => default_socket_path()?,
     };
-    let mut client = connect_or_start_daemon(&socket_path, args.auth.as_deref()).await?;
+    let mut client = connect_or_start_daemon(&socket_path).await?;
     client
         .send(&ClientMessage::PlatformSecretsSet {
             secrets: vec![
