@@ -781,7 +781,6 @@ impl ClaudeLoop {
                         Ok(Some(event)) => self.handle_event(event).await,
                         Ok(None) => {
                             self.process = None;
-                            self.remove_claude_runtime_files();
                             self.recover_pending_rewind().await;
                             // Unechoed sends died with the process; a stale
                             // entry here would pin every later turn end in
@@ -804,7 +803,6 @@ impl ClaudeLoop {
                         }
                         Err(error) => {
                             self.process = None;
-                            self.remove_claude_runtime_files();
                             self.recover_pending_rewind().await;
                             self.queued_turns.clear();
                             self.fail(error).await;
@@ -813,7 +811,6 @@ impl ClaudeLoop {
                 }
             } else {
                 let Some(control) = self.control_rx.recv().await else {
-                    self.remove_claude_runtime_files();
                     return;
                 };
                 self.handle_control(control).await;
@@ -1138,7 +1135,6 @@ impl ClaudeLoop {
 
     async fn close_process(&mut self) {
         if let Some(process) = self.process.take() {
-            self.remove_claude_runtime_files();
             let _ = process.close().await;
         }
     }
@@ -1405,7 +1401,6 @@ impl ClaudeLoop {
             rho_claude::last_assistant_usage(&messages).map(|usage| usage.context_total());
 
         if let Some(process) = self.process.take() {
-            self.remove_claude_runtime_files();
             process.close().await?;
         }
 
@@ -1524,24 +1519,10 @@ impl ClaudeLoop {
             options.set_env("RHO_MCP_AGENT_ID", tools.display_id(tools.self_id()));
         }
         let file_mounts = self.write_claude_prompt_mount(&view)?.into_iter().collect();
-        let mut command = match options.command().await {
-            Ok(command) => command,
-            Err(error) => {
-                self.remove_claude_runtime_files();
-                return Err(error);
-            }
-        };
-        if let Err(error) = view.prepare_command(&mut command, None, file_mounts).await {
-            self.remove_claude_runtime_files();
-            return Err(error);
-        }
-        match ClaudeCode::spawn_command(command).await {
-            Ok(process) => self.process = Some(process),
-            Err(error) => {
-                self.remove_claude_runtime_files();
-                return Err(error);
-            }
-        }
+        let mut command = options.command().await?;
+        view.prepare_command(&mut command, None, file_mounts)
+            .await?;
+        self.process = Some(ClaudeCode::spawn_command(command).await?);
         if !self.pending_rewind {
             self.start_mode = ClaudeStartMode::Resume;
         }
@@ -1586,42 +1567,12 @@ impl ClaudeLoop {
             }
         }
         let prompt = system_prompt::claude_prompt(Some(view), self.multi_agent.as_ref(), self.role);
-        let mut source_file = tempfile::Builder::new()
-            .prefix("rho-claude-prompt-")
-            .suffix(".md")
-            .tempfile()
-            .context("create generated Claude prompt tempfile")?;
-        source_file
-            .write_all(prompt.as_bytes())
-            .context("write generated Claude prompt tempfile")?;
-        source_file
-            .flush()
-            .context("flush generated Claude prompt tempfile")?;
-        let source = Utf8PathBuf::try_from(source_file.path().to_owned())
-            .context("generated Claude prompt tempfile path is not valid UTF-8")?;
-        self.claude_prompt_path = Some(source_file.into_temp_path());
+        // Keep one source inode alive for the lifetime of the view namespace.
+        // Unlinking a bind-mounted source makes the target pathname disappear
+        // inside that namespace, so a later cold respawn cannot mount a new
+        // prompt over it (the pre-exec hook fails with ENOENT).
+        let source = write_claude_prompt_source(&mut self.claude_prompt_path, &prompt)?;
         Ok(Some((source, target)))
-    }
-
-    fn remove_claude_md(&mut self) {
-        let Some(path) = self.claude_prompt_path.take() else {
-            return;
-        };
-        let display_path = path.to_path_buf();
-        match path.close() {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => {
-                eprintln!(
-                    "rho-agent: remove generated Claude prompt {}: {error}",
-                    display_path.display()
-                )
-            }
-        }
-    }
-
-    fn remove_claude_runtime_files(&mut self) {
-        self.remove_claude_md();
     }
 
     async fn handle_event(&mut self, event: rho_claude::ClaudeEvent) {
@@ -2114,6 +2065,38 @@ fn is_compact_command(content: &[ContentPart]) -> bool {
     }
 }
 
+fn write_claude_prompt_source(
+    path: &mut Option<tempfile::TempPath>,
+    prompt: &str,
+) -> anyhow::Result<Utf8PathBuf> {
+    let (mut file, source) = if let Some(path) = path.as_ref() {
+        let source = Utf8PathBuf::try_from(path.to_path_buf())
+            .context("generated Claude prompt tempfile path is not valid UTF-8")?;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(path)
+            .context("reopen generated Claude prompt tempfile")?;
+        (file, source)
+    } else {
+        let source_file = tempfile::Builder::new()
+            .prefix("rho-claude-prompt-")
+            .suffix(".md")
+            .tempfile()
+            .context("create generated Claude prompt tempfile")?;
+        let source = Utf8PathBuf::try_from(source_file.path().to_owned())
+            .context("generated Claude prompt tempfile path is not valid UTF-8")?;
+        let (file, temp_path) = source_file.into_parts();
+        *path = Some(temp_path);
+        (file, source)
+    };
+    file.write_all(prompt.as_bytes())
+        .context("write generated Claude prompt tempfile")?;
+    file.flush()
+        .context("flush generated Claude prompt tempfile")?;
+    Ok(source)
+}
+
 #[cfg(test)]
 mod tests {
     use rho_db::RhoDb;
@@ -2281,6 +2264,16 @@ mod tests {
                 .unwrap();
         assert_eq!(sources.len(), 1);
         assert!(rebuilt.is_none());
+    }
+
+    #[test]
+    fn rewrites_claude_prompt_without_replacing_bind_source() {
+        let mut path = None;
+        let first = write_claude_prompt_source(&mut path, "ultra").unwrap();
+        let second = write_claude_prompt_source(&mut path, "alt").unwrap();
+
+        assert_eq!(second, first);
+        assert_eq!(std::fs::read_to_string(first).unwrap(), "alt");
     }
 
     #[test]
