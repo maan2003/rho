@@ -177,6 +177,7 @@ impl Workspace {
             dashboard_preview: None,
             dashboard_dirty: true,
             iris_preview,
+            iris_agents: HashMap::new(),
             minibuffer: None,
             transient: None,
             transient_stack: Vec::new(),

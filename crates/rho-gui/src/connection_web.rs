@@ -66,6 +66,7 @@ pub enum ConnEvent {
     DeskBindingChanged(rho_ui_proto::desk::DeskBinding),
     Ready {
         agents: Vec<UiAgentSummary>,
+        iris_agent: Option<AgentId>,
         projects: Vec<UiProject>,
         auth: rho_ui_proto::AuthState,
         machine_seed: u64,
@@ -367,6 +368,7 @@ fn handle_host_message(
     let event = match message {
         ServerMessage::Ready {
             agents,
+            iris_agent,
             projects,
             auth,
             machine_seed,
@@ -374,6 +376,7 @@ fn handle_host_message(
             ..
         } => Some(ConnEvent::Ready {
             agents: agents.clone(),
+            iris_agent: *iris_agent,
             projects: projects.clone(),
             auth: auth.clone(),
             machine_seed: *machine_seed,

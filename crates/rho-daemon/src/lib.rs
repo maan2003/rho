@@ -1097,6 +1097,21 @@ impl AgentRegistry {
             .collect()
     }
 
+    fn iris_agent_id(&self) -> Option<AgentId> {
+        self.db
+            .read()
+            .list_agents()
+            .into_iter()
+            .find(|(_, agent)| {
+                agent.role == AgentRole::Iris
+                    || agent
+                        .labels
+                        .iter()
+                        .any(|label| label == rho_agent::iris_tools::LABEL)
+            })
+            .map(|(agent_id, _)| agent_id)
+    }
+
     fn projects(&self) -> Vec<UiProject> {
         let mut projects = self
             .db
@@ -1159,6 +1174,7 @@ impl AgentRegistry {
     async fn ready_message(&self) -> ServerMessage {
         ServerMessage::Ready {
             agents: self.ui_agents(&self.agent_state_kinds().await),
+            iris_agent: self.iris_agent_id(),
             projects: self.projects(),
             auth: self.auth_state(),
             view_config: self.db.read().view_config(),

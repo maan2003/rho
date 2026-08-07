@@ -66,6 +66,7 @@ pub enum ConnEvent {
     DeskBindingChanged(rho_ui_proto::desk::DeskBinding),
     Ready {
         agents: Vec<UiAgentSummary>,
+        iris_agent: Option<AgentId>,
         projects: Vec<UiProject>,
         auth: rho_ui_proto::AuthState,
         machine_seed: u64,
@@ -866,6 +867,7 @@ async fn run(
     let message: ServerMessage = read_frame(&mut stream).await?;
     let ServerMessage::Ready {
         agents,
+        iris_agent,
         projects,
         auth,
         view_config: _,
@@ -878,6 +880,7 @@ async fn run(
     if events
         .unbounded_send(ConnEvent::Ready {
             agents,
+            iris_agent,
             projects,
             auth,
             machine_seed,
@@ -980,6 +983,7 @@ async fn run(
             }
             ServerMessage::Ready {
                 agents,
+                iris_agent,
                 projects,
                 auth,
                 view_config: _,
@@ -987,6 +991,7 @@ async fn run(
                 agent_counter,
             } => Some(ConnEvent::Ready {
                 agents,
+                iris_agent,
                 projects,
                 auth,
                 machine_seed,

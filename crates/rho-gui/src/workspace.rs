@@ -293,6 +293,10 @@ pub struct Workspace {
     dashboard_dirty: bool,
     /// Read-only document shown when the synthetic Iris row is targeted.
     iris_preview: Entity<editor::Editor>,
+    /// Each daemon's hidden persisted Iris coordinator. These identities stay
+    /// outside the ordinary registry so Iris never enters agent/workstream
+    /// lists, but still route transcript subscriptions to the owning host.
+    iris_agents: HashMap<HostId, AgentId>,
     /// The Zulip client, started the first time its dashboard row is
     /// opened. Chat costs nothing until asked for.
     #[cfg(feature = "native")]
@@ -397,6 +401,7 @@ impl Workspace {
         machine_seed: u64,
         agent_counter: u64,
         agents: Vec<rho_ui_proto::UiAgentSummary>,
+        iris_agent: Option<AgentId>,
     ) -> (bool, Option<Vec<AgentId>>) {
         let first_ready = self.ready_hosts.insert(host);
         let initial = first_ready.then(|| {
@@ -408,6 +413,14 @@ impl Workspace {
         });
         self.registry
             .set_host_data(host, machine_seed, agent_counter, agents);
+        match iris_agent {
+            Some(agent_id) => {
+                self.iris_agents.insert(host, agent_id);
+            }
+            None => {
+                self.iris_agents.remove(&host);
+            }
+        }
         (first_ready, initial)
     }
 
@@ -679,6 +692,7 @@ impl Workspace {
             dashboard_preview: None,
             dashboard_dirty: true,
             iris_preview,
+            iris_agents: HashMap::new(),
             zulip: None,
             minibuffer: None,
             transient: None,
@@ -725,12 +739,15 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let departed = self
+        let mut departed = self
             .registry
             .known_agents()
             .copied()
             .filter(|agent_id| self.registry.host_of_agent(*agent_id) == Some(host))
             .collect::<Vec<_>>();
+        if let Some(agent_id) = self.iris_agents.remove(&host) {
+            departed.push(agent_id);
+        }
         let contexts = departed
             .iter()
             .copied()
@@ -772,7 +789,11 @@ impl Workspace {
     /// The daemon an agent lives on. `None` only before its first summary or
     /// creation notice has landed.
     fn host_of(&self, agent_id: AgentId) -> Option<HostId> {
-        self.registry.host_of_agent(agent_id)
+        self.registry.host_of_agent(agent_id).or_else(|| {
+            self.iris_agents
+                .iter()
+                .find_map(|(host, iris_id)| (*iris_id == agent_id).then_some(*host))
+        })
     }
 
     fn connection_for(&self, agent_id: AgentId) -> Option<&Connection> {
@@ -1045,13 +1066,14 @@ impl Workspace {
             }
             ConnEvent::Ready {
                 agents,
+                iris_agent,
                 projects: workdirs,
                 auth,
                 machine_seed,
                 agent_counter,
             } => {
                 let (first_ready, initial_subscriptions) =
-                    self.apply_ready(host, machine_seed, agent_counter, agents);
+                    self.apply_ready(host, machine_seed, agent_counter, agents, iris_agent);
                 self.prune_contexts();
                 self.workdirs.retain(|workdir| workdir.host != host);
                 self.workdirs.extend(
@@ -1077,6 +1099,7 @@ impl Workspace {
                     self.set_initial_subscriptions(host, agent_ids, cx);
                 }
                 self.update_statuses(cx);
+                self.dashboard_cursor_moved(window, cx);
                 cx.notify();
             }
             ConnEvent::AuthState(auth) => {
@@ -3231,6 +3254,28 @@ impl Workspace {
         cx.notify();
     }
 
+    fn current_iris_agent(&self) -> Option<AgentId> {
+        let host = self.iris_host.or_else(|| self.hosts.primary())?;
+        self.iris_agents.get(&host).copied()
+    }
+
+    fn preview_iris(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(agent_id) = self.current_iris_agent() else {
+            self.hosts.focus_agent(None);
+            cx.notify();
+            return;
+        };
+        if self.agent_online(agent_id) && !self.subscriptions.contains(agent_id) {
+            self.subscribe_agent(agent_id, cx);
+        }
+        let view = self.materialize_model(&agent_id, window, cx);
+        view.update(cx, |view, cx| view.tick_timers(now_ms(), cx));
+        self.hosts
+            .focus_agent(self.host_of(agent_id).map(|host| (host, agent_id)));
+        self.ensure_duration_timer(cx);
+        cx.notify();
+    }
+
     fn select_agent_inner(
         &mut self,
         agent_id: Option<AgentId>,
@@ -3938,6 +3983,47 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn agent_model(&self, agent_id: &AgentId) -> Option<Entity<AgentModel>> {
         self.models.get(agent_id).cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dashboard_editor(&self) -> Entity<editor::Editor> {
+        self.dashboard.editor().clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn iris_preview_editor_for_test(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<editor::Editor> {
+        self.selected_preview_editor(true, window, cx)
+            .expect("Iris always has a preview")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sync_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dashboard.sync(&self.registry, window, cx);
+        self.dashboard_dirty = false;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dashboard_is_dirty(&self) -> bool {
+        self.dashboard_dirty
+    }
+
+    #[cfg(test)]
+    pub(crate) fn preview_dashboard_agent(
+        &mut self,
+        agent_id: AgentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.preview_agent(agent_id, window, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dashboard_preview_agent(&self) -> Option<AgentId> {
+        self.dashboard_preview
     }
 
     fn sync_dashboard_if_dirty(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5228,7 +5314,16 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Option<Entity<editor::Editor>> {
         if iris {
-            return Some(self.iris_preview.clone());
+            let Some(agent_id) = self.current_iris_agent() else {
+                return Some(self.iris_preview.clone());
+            };
+            if self.agent_online(agent_id) && !self.subscriptions.contains(agent_id) {
+                self.subscribe_agent(agent_id, cx);
+            }
+            let model = self.materialize_model(&agent_id, window, cx);
+            self.hosts
+                .focus_agent(self.host_of(agent_id).map(|host| (host, agent_id)));
+            return Some(model.update(cx, |model, cx| model.preview_editor(window, cx)));
         }
         let agent_id = self.dashboard_preview?;
         let model = self.models.get(&agent_id)?.clone();

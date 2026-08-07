@@ -510,6 +510,11 @@ pub enum ServerMessage {
     },
     Ready {
         agents: Vec<UiAgentSummary>,
+        /// The daemon's hidden Iris coordinator, when it has been created.
+        /// Kept separate from `agents` so clients can render Iris as a
+        /// synthetic surface without admitting it to ordinary agent lists.
+        #[senax(default)]
+        iris_agent: Option<AgentId>,
         projects: Vec<UiProject>,
         auth: AuthState,
         /// The client-owned view configuration blob, verbatim from the last
