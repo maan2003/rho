@@ -21,8 +21,8 @@ pub mod inlay_hints;
 use std::sync::OnceLock;
 
 use gpui::{Context, HighlightStyle, Hsla, Rgba, Task};
-use language::InlayId;
 use multi_buffer::Anchor;
+use language::InlayId;
 #[cfg(feature = "native")]
 use project::InlayHint;
 use text::Rope;

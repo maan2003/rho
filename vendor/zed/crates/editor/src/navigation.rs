@@ -59,9 +59,7 @@ impl Editor {
 
     pub fn move_up(&mut self, _: &MoveUp, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(feature = "native")]
-        if self.take_rename(true, window, cx).is_some() {
-            return;
-        }
+        if self.take_rename(true, window, cx).is_some() { return; }
 
         if self.mode.is_single_line() {
             cx.propagate();
@@ -101,9 +99,7 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         #[cfg(feature = "native")]
-        if self.take_rename(true, window, cx).is_some() {
-            return;
-        }
+        if self.take_rename(true, window, cx).is_some() { return; }
 
         if self.mode.is_single_line() {
             cx.propagate();
@@ -137,9 +133,7 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         #[cfg(feature = "native")]
-        if self.take_rename(true, window, cx).is_some() {
-            return;
-        }
+        if self.take_rename(true, window, cx).is_some() { return; }
 
         if self.mode.is_single_line() {
             cx.propagate();
@@ -220,9 +214,7 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         #[cfg(feature = "native")]
-        if self.take_rename(true, window, cx).is_some() {
-            return;
-        }
+        if self.take_rename(true, window, cx).is_some() { return; }
 
         #[cfg(feature = "native")]
         if self
@@ -281,9 +273,7 @@ impl Editor {
 
     pub fn move_down(&mut self, _: &MoveDown, window: &mut Window, cx: &mut Context<Self>) {
         #[cfg(feature = "native")]
-        if self.take_rename(true, window, cx).is_some() {
-            return;
-        }
+        if self.take_rename(true, window, cx).is_some() { return; }
 
         if self.mode.is_single_line() {
             cx.propagate();
@@ -342,9 +332,7 @@ impl Editor {
         cx: &mut Context<Self>,
     ) {
         #[cfg(feature = "native")]
-        if self.take_rename(true, window, cx).is_some() {
-            return;
-        }
+        if self.take_rename(true, window, cx).is_some() { return; }
 
         #[cfg(feature = "native")]
         if self
@@ -747,7 +735,11 @@ impl Editor {
         self.change_selections(Default::default(), window, cx, |s| {
             s.move_with(&mut |map, selection| {
                 selection.collapse_to(
-                    movement::start_of_excerpt(map, selection.head(), NavigationDirection::Prev),
+                    movement::start_of_excerpt(
+                        map,
+                        selection.head(),
+                        NavigationDirection::Prev,
+                    ),
                     SelectionGoal::None,
                 )
             });
@@ -768,7 +760,11 @@ impl Editor {
         self.change_selections(Default::default(), window, cx, |s| {
             s.move_with(&mut |map, selection| {
                 selection.collapse_to(
-                    movement::start_of_excerpt(map, selection.head(), NavigationDirection::Next),
+                    movement::start_of_excerpt(
+                        map,
+                        selection.head(),
+                        NavigationDirection::Next,
+                    ),
                     SelectionGoal::None,
                 )
             });
@@ -788,7 +784,11 @@ impl Editor {
         self.change_selections(Default::default(), window, cx, |s| {
             s.move_with(&mut |map, selection| {
                 selection.collapse_to(
-                    movement::end_of_excerpt(map, selection.head(), NavigationDirection::Next),
+                    movement::end_of_excerpt(
+                        map,
+                        selection.head(),
+                        NavigationDirection::Next,
+                    ),
                     SelectionGoal::None,
                 )
             });
@@ -808,7 +808,11 @@ impl Editor {
         self.change_selections(Default::default(), window, cx, |s| {
             s.move_with(&mut |map, selection| {
                 selection.collapse_to(
-                    movement::end_of_excerpt(map, selection.head(), NavigationDirection::Prev),
+                    movement::end_of_excerpt(
+                        map,
+                        selection.head(),
+                        NavigationDirection::Prev,
+                    ),
                     SelectionGoal::None,
                 )
             });
@@ -958,6 +962,7 @@ impl Editor {
             self.set_scroll_position(current_scroll_position, window, cx);
         }
     }
+
 }
 
 #[cfg(feature = "native")]

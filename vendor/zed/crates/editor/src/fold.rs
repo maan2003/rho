@@ -892,98 +892,96 @@ impl Editor {
             return;
         }
         #[cfg(feature = "native")]
-        if WorkspaceSettings::get(None, cx).restore_on_startup == RestoreOnStartupBehavior::EmptyTab
+        if WorkspaceSettings::get(None, cx).restore_on_startup
+            == RestoreOnStartupBehavior::EmptyTab
         {
             return;
         }
 
         #[cfg(feature = "native")]
         {
-            let display_snapshot = self
-                .display_map
-                .update(cx, |display_map, cx| display_map.snapshot(cx));
-            let Some(buffer_snapshot) = display_snapshot.buffer_snapshot().as_singleton() else {
-                return;
-            };
-            let inmemory_folds = display_snapshot
-                .folds_in_range(MultiBufferOffset(0)..display_snapshot.buffer_snapshot().len())
-                .map(|fold| {
-                    let start = fold.range.start.text_anchor_in(buffer_snapshot);
-                    let end = fold.range.end.text_anchor_in(buffer_snapshot);
-                    (start..end).to_point(buffer_snapshot)
-                })
-                .collect();
-            self.update_restoration_data(cx, |data| {
-                data.folds = inmemory_folds;
-            });
-            let Some(workspace_id) = self.workspace_serialization_id(cx) else {
-                return;
-            };
+        let display_snapshot = self
+            .display_map
+            .update(cx, |display_map, cx| display_map.snapshot(cx));
+        let Some(buffer_snapshot) = display_snapshot.buffer_snapshot().as_singleton() else {
+            return;
+        };
+        let inmemory_folds = display_snapshot
+            .folds_in_range(MultiBufferOffset(0)..display_snapshot.buffer_snapshot().len())
+            .map(|fold| {
+                let start = fold.range.start.text_anchor_in(buffer_snapshot);
+                let end = fold.range.end.text_anchor_in(buffer_snapshot);
+                (start..end).to_point(buffer_snapshot)
+            })
+            .collect();
+        self.update_restoration_data(cx, |data| {
+            data.folds = inmemory_folds;
+        });
+        let Some(workspace_id) = self.workspace_serialization_id(cx) else {
+            return;
+        };
 
-            // Get file path for path-based fold storage (survives tab close)
-            let Some(file_path) = self.buffer().read(cx).as_singleton().and_then(|buffer| {
-                project::File::from_dyn(buffer.read(cx).file())
-                    .map(|file| Arc::<Path>::from(file.abs_path(cx)))
-            }) else {
-                return;
-            };
+        // Get file path for path-based fold storage (survives tab close)
+        let Some(file_path) = self.buffer().read(cx).as_singleton().and_then(|buffer| {
+            project::File::from_dyn(buffer.read(cx).file())
+                .map(|file| Arc::<Path>::from(file.abs_path(cx)))
+        }) else {
+            return;
+        };
 
-            let background_executor = cx.background_executor().clone();
-            const FINGERPRINT_LEN: usize = 32;
-            let db_folds = display_snapshot
-                .folds_in_range(MultiBufferOffset(0)..display_snapshot.buffer_snapshot().len())
-                .map(|fold| {
-                    let start = fold
-                        .range
-                        .start
-                        .text_anchor_in(buffer_snapshot)
-                        .to_offset(buffer_snapshot);
-                    let end = fold
-                        .range
-                        .end
-                        .text_anchor_in(buffer_snapshot)
-                        .to_offset(buffer_snapshot);
+        let background_executor = cx.background_executor().clone();
+        const FINGERPRINT_LEN: usize = 32;
+        let db_folds = display_snapshot
+            .folds_in_range(MultiBufferOffset(0)..display_snapshot.buffer_snapshot().len())
+            .map(|fold| {
+                let start = fold
+                    .range
+                    .start
+                    .text_anchor_in(buffer_snapshot)
+                    .to_offset(buffer_snapshot);
+                let end = fold
+                    .range
+                    .end
+                    .text_anchor_in(buffer_snapshot)
+                    .to_offset(buffer_snapshot);
 
-                    // Extract fingerprints - content at fold boundaries for validation on restore
-                    // Both fingerprints must be INSIDE the fold to avoid capturing surrounding
-                    // content that might change independently.
-                    // start_fp: first min(32, fold_len) bytes of fold content
-                    // end_fp: last min(32, fold_len) bytes of fold content
-                    // Clip to character boundaries to handle multibyte UTF-8 characters.
-                    let fold_len = end - start;
-                    let start_fp_end = buffer_snapshot
-                        .clip_offset(start + std::cmp::min(FINGERPRINT_LEN, fold_len), Bias::Left);
-                    let start_fp: String = buffer_snapshot
-                        .text_for_range(start..start_fp_end)
-                        .collect();
-                    let end_fp_start = buffer_snapshot
-                        .clip_offset(end.saturating_sub(FINGERPRINT_LEN).max(start), Bias::Right);
-                    let end_fp: String =
-                        buffer_snapshot.text_for_range(end_fp_start..end).collect();
+                // Extract fingerprints - content at fold boundaries for validation on restore
+                // Both fingerprints must be INSIDE the fold to avoid capturing surrounding
+                // content that might change independently.
+                // start_fp: first min(32, fold_len) bytes of fold content
+                // end_fp: last min(32, fold_len) bytes of fold content
+                // Clip to character boundaries to handle multibyte UTF-8 characters.
+                let fold_len = end - start;
+                let start_fp_end = buffer_snapshot
+                    .clip_offset(start + std::cmp::min(FINGERPRINT_LEN, fold_len), Bias::Left);
+                let start_fp: String = buffer_snapshot
+                    .text_for_range(start..start_fp_end)
+                    .collect();
+                let end_fp_start = buffer_snapshot
+                    .clip_offset(end.saturating_sub(FINGERPRINT_LEN).max(start), Bias::Right);
+                let end_fp: String = buffer_snapshot.text_for_range(end_fp_start..end).collect();
 
-                    (start, end, start_fp, end_fp)
-                })
-                .collect::<Vec<_>>();
-            let db = EditorDb::global(cx);
-            self.serialize_folds = cx.background_spawn(async move {
-                background_executor.timer(SERIALIZATION_THROTTLE_TIME).await;
-                if db_folds.is_empty() {
-                    // No folds - delete any persisted folds for this file
-                    db.delete_file_folds(workspace_id, file_path)
-                        .await
-                        .with_context(|| {
-                            format!("deleting file folds for workspace {workspace_id:?}")
-                        })
-                        .log_err();
-                } else {
-                    db.save_file_folds(workspace_id, file_path, db_folds)
-                        .await
-                        .with_context(|| {
-                            format!("persisting file folds for workspace {workspace_id:?}")
-                        })
-                        .log_err();
-                }
-            });
+                (start, end, start_fp, end_fp)
+            })
+            .collect::<Vec<_>>();
+        let db = EditorDb::global(cx);
+        self.serialize_folds = cx.background_spawn(async move {
+            background_executor.timer(SERIALIZATION_THROTTLE_TIME).await;
+            if db_folds.is_empty() {
+                // No folds - delete any persisted folds for this file
+                db.delete_file_folds(workspace_id, file_path)
+                    .await
+                    .with_context(|| format!("deleting file folds for workspace {workspace_id:?}"))
+                    .log_err();
+            } else {
+                db.save_file_folds(workspace_id, file_path, db_folds)
+                    .await
+                    .with_context(|| {
+                        format!("persisting file folds for workspace {workspace_id:?}")
+                    })
+                    .log_err();
+            }
+        });
         }
     }
 

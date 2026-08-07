@@ -138,9 +138,7 @@ use std::{
 };
 
 use crate::{
-    EditorStyle, RowExt,
-    inlays::{Inlay, InlayHighlight},
-    movement::TextLayoutDetails,
+    EditorStyle, RowExt, inlays::{Inlay, InlayHighlight}, movement::TextLayoutDetails,
 };
 use block_map::{BlockPointCursor, BlockRow, BlockSnapshot};
 use fold_map::{FoldPointCursor, FoldSnapshot};

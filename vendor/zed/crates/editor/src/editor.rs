@@ -134,6 +134,7 @@ pub(crate) use edit_prediction::{
 pub(crate) use edit_prediction::{
     EditPredictionKeybindAction, EditPredictionKeybindSurface, edit_prediction_edit_text,
 };
+pub use language::Direction;
 #[cfg(feature = "native")]
 pub use edit_prediction_types::EditPredictionRequestTrigger;
 pub use editor_settings::{
@@ -142,13 +143,13 @@ pub use editor_settings::{
     ScrollBeyondLastLine, ScrollbarAxes, SearchSettings, ShowMinimap,
     ui_scrollbar_settings_from_raw,
 };
-#[cfg(feature = "native")]
-pub use element::file_status_label_color;
-#[cfg(feature = "native")]
-pub use element::render_breadcrumb_text;
 pub use element::{
     CursorLayout, EditorElement, HighlightedRange, HighlightedRangeLine, PointForPosition,
 };
+#[cfg(feature = "native")]
+pub use element::render_breadcrumb_text;
+#[cfg(feature = "native")]
+pub use element::file_status_label_color;
 #[cfg(feature = "native")]
 pub use git::blame::BlameRenderer;
 #[cfg(feature = "native")]
@@ -170,7 +171,6 @@ pub use hover_popover::hover_markdown_style;
 pub use inlays::{Inlay, InlayHighlight};
 #[cfg(feature = "native")]
 pub use items::MAX_TAB_TITLE_LEN;
-pub use language::Direction;
 #[cfg(feature = "native")]
 pub use linked_editing_ranges::LinkedEdits;
 #[cfg(feature = "native")]
@@ -250,8 +250,8 @@ use itertools::{Either, Itertools};
 use language::{
     AutoindentMode, BlockCommentConfig, BracketMatch, BracketPair, Buffer, BufferRow,
     BufferSnapshot, Capability, CharClassifier, CharKind, CharScopeContext, CodeLabel, CursorShape,
-    DiagnosticEntryRef, DiagnosticSeverityFilter as DiagnosticSeverity, DiffOptions,
-    EditPredictionsMode, EditPreview, HighlightedText, IndentKind, IndentSize, InlayId, Language,
+    DiagnosticEntryRef, DiffOptions, EditPredictionsMode, EditPreview, HighlightedText, IndentKind,
+    DiagnosticSeverityFilter as DiagnosticSeverity, IndentSize, InlayId, Language,
     LanguageAwareStyling, LanguageName, LanguageRegistry, LanguageScope, LanguageServerId,
     LocalFile, OffsetRangeExt, OutlineItem, Point, Selection, SelectionGoal, TextObject,
     TransactionId, TreeSitterOptions, WordsQuery,
@@ -328,6 +328,7 @@ use std::{
     sync::Arc,
     time::Duration,
 };
+use web_time::Instant;
 #[cfg(feature = "native")]
 use task::TaskVariables;
 use text::{BufferId, FromAnchor, OffsetUtf16, Rope, ToOffset as _, ToPoint as _};
@@ -341,7 +342,6 @@ use ui::{
 };
 use ui_input::ErasedEditor;
 use util::{RangeExt, ResultExt, TryFutureExt, maybe, post_inc};
-use web_time::Instant;
 #[cfg(feature = "native")]
 use workspace::{
     CollaboratorId, Item as WorkspaceItem, ItemId, ItemNavHistory, NavigationEntry, OpenInTerminal,
@@ -355,6 +355,11 @@ use workspace::{
 pub use zed_actions::editor::RevealInFileManager;
 use zed_actions::editor::{MoveDown, MoveUp};
 
+use crate::{
+    editor_settings::MultiCursorModifier,
+    scroll::{ScrollOffset, ScrollPixelOffset},
+    selections_collection::resolve_selections_wrapping_blocks,
+};
 #[cfg(feature = "native")]
 use crate::{
     code_context_menus::CompletionsMenuSource,
@@ -366,11 +371,6 @@ use crate::{
     runnables::{ResolvedTasks, RunnableData, RunnableTaskStatus, RunnableTasks},
     semantic_tokens::SemanticTokenState,
     signature_help::{SignatureHelpHiddenBy, SignatureHelpState},
-};
-use crate::{
-    editor_settings::MultiCursorModifier,
-    scroll::{ScrollOffset, ScrollPixelOffset},
-    selections_collection::resolve_selections_wrapping_blocks,
 };
 
 pub const FILE_HEADER_HEIGHT: u32 = 2;
@@ -2010,7 +2010,8 @@ impl Editor {
     pub fn new(
         mode: EditorMode,
         buffer: Entity<MultiBuffer>,
-        #[cfg(feature = "native")] project: Option<Entity<Project>>,
+        #[cfg(feature = "native")]
+        project: Option<Entity<Project>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -2099,7 +2100,8 @@ impl Editor {
     fn new_internal(
         mode: EditorMode,
         multi_buffer: Entity<MultiBuffer>,
-        #[cfg(feature = "native")] project: Option<Entity<Project>>,
+        #[cfg(feature = "native")]
+        project: Option<Entity<Project>>,
         display_map: Option<Entity<DisplayMap>>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2970,16 +2972,17 @@ impl Editor {
 
         // Disable vim contexts when a sub-editor (e.g. rename/inline assistant) is focused.
         if !self.focus_handle(cx).contains_focused(window, cx)
-            || (self.is_focused(window) || {
-                #[cfg(feature = "native")]
-                {
-                    self.mouse_menu_is_focused(window, cx)
-                }
-                #[cfg(not(feature = "native"))]
-                {
-                    false
-                }
-            })
+            || (self.is_focused(window)
+                || {
+                    #[cfg(feature = "native")]
+                    {
+                        self.mouse_menu_is_focused(window, cx)
+                    }
+                    #[cfg(not(feature = "native"))]
+                    {
+                        false
+                    }
+                })
         {
             for addon in self.addons.values() {
                 addon.extend_key_context(&mut key_context, cx)
@@ -4141,8 +4144,8 @@ impl Editor {
                             .collect::<String>();
                         match_ranges.extend(search_text.match_indices(&query_text).filter_map(
                             |(start, matched)| {
-                                let match_start =
-                                    buffer_snapshot.anchor_after(search_range.start + start);
+                                let match_start = buffer_snapshot
+                                    .anchor_after(search_range.start + start);
                                 let match_end = buffer_snapshot
                                     .anchor_before(search_range.start + start + matched.len());
                                 let range = multi_buffer_snapshot.anchor_in_buffer(match_start)?
@@ -5086,11 +5089,11 @@ impl Editor {
         #[cfg(feature = "native")]
         {
             !self.edit_prediction_preview_is_active()
-                && self
-                    .context_menu
-                    .borrow()
-                    .as_ref()
-                    .is_some_and(|menu| menu.visible())
+            && self
+                .context_menu
+                .borrow()
+                .as_ref()
+                .is_some_and(|menu| menu.visible())
         }
         #[cfg(not(feature = "native"))]
         {
@@ -5126,14 +5129,14 @@ impl Editor {
     ) -> Option<AnyElement> {
         #[cfg(feature = "native")]
         {
-            let menu = self.context_menu.borrow();
-            let menu = menu.as_ref()?;
-            if !menu.visible() {
-                return None;
-            };
-            self.style
-                .as_ref()
-                .map(|style| menu.render(style, max_height_in_lines, window, cx))
+        let menu = self.context_menu.borrow();
+        let menu = menu.as_ref()?;
+        if !menu.visible() {
+            return None;
+        };
+        self.style
+            .as_ref()
+            .map(|style| menu.render(style, max_height_in_lines, window, cx))
         }
         #[cfg(not(feature = "native"))]
         {
@@ -5149,13 +5152,13 @@ impl Editor {
     ) -> Option<AnyElement> {
         #[cfg(feature = "native")]
         {
-            self.context_menu.borrow_mut().as_mut().and_then(|menu| {
-                if menu.visible() {
-                    menu.render_aside(max_size, window, cx)
-                } else {
-                    None
-                }
-            })
+        self.context_menu.borrow_mut().as_mut().and_then(|menu| {
+            if menu.visible() {
+                menu.render_aside(max_size, window, cx)
+            } else {
+                None
+            }
+        })
         }
         #[cfg(not(feature = "native"))]
         {
@@ -8554,45 +8557,45 @@ impl Editor {
         }
         #[cfg(feature = "native")]
         {
-            let rename = self.pending_rename.take()?;
-            if rename.editor.focus_handle(cx).is_focused(window) {
-                window.focus(&self.focus_handle, cx);
-            }
+        let rename = self.pending_rename.take()?;
+        if rename.editor.focus_handle(cx).is_focused(window) {
+            window.focus(&self.focus_handle, cx);
+        }
 
-            self.remove_blocks(
-                [rename.block_id].into_iter().collect(),
-                Some(Autoscroll::fit()),
-                cx,
-            );
-            self.clear_highlights(HighlightKey::Rename, cx);
-            self.show_local_selections = true;
+        self.remove_blocks(
+            [rename.block_id].into_iter().collect(),
+            Some(Autoscroll::fit()),
+            cx,
+        );
+        self.clear_highlights(HighlightKey::Rename, cx);
+        self.show_local_selections = true;
 
-            if moving_cursor {
-                let cursor_in_rename_editor = rename.editor.update(cx, |editor, cx| {
-                    editor
-                        .selections
-                        .newest::<MultiBufferOffset>(&editor.display_snapshot(cx))
-                        .head()
-                });
+        if moving_cursor {
+            let cursor_in_rename_editor = rename.editor.update(cx, |editor, cx| {
+                editor
+                    .selections
+                    .newest::<MultiBufferOffset>(&editor.display_snapshot(cx))
+                    .head()
+            });
 
-                // Update the selection to match the position of the selection inside
-                // the rename editor.
-                let snapshot = self.buffer.read(cx).read(cx);
-                let rename_range = rename.range.to_offset(&snapshot);
-                let cursor_in_editor = snapshot
-                    .clip_offset(rename_range.start + cursor_in_rename_editor, Bias::Left)
-                    .min(rename_range.end);
-                drop(snapshot);
+            // Update the selection to match the position of the selection inside
+            // the rename editor.
+            let snapshot = self.buffer.read(cx).read(cx);
+            let rename_range = rename.range.to_offset(&snapshot);
+            let cursor_in_editor = snapshot
+                .clip_offset(rename_range.start + cursor_in_rename_editor, Bias::Left)
+                .min(rename_range.end);
+            drop(snapshot);
 
-                self.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
-                    s.select_ranges(vec![cursor_in_editor..cursor_in_editor])
-                });
-            } else {
-                #[cfg(feature = "native")]
-                self.refresh_document_highlights(cx);
-            }
+            self.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
+                s.select_ranges(vec![cursor_in_editor..cursor_in_editor])
+            });
+        } else {
+            #[cfg(feature = "native")]
+            self.refresh_document_highlights(cx);
+        }
 
-            Some(rename)
+        Some(rename)
         }
     }
 
@@ -10317,16 +10320,16 @@ impl Editor {
                 cx.emit(EditorEvent::BufferEdited);
                 #[cfg(feature = "native")]
                 {
-                    cx.emit(SearchEvent::MatchesInvalidated);
+                cx.emit(SearchEvent::MatchesInvalidated);
 
-                    let Some(project) = &self.project else { return };
-                    let (telemetry, is_via_ssh) = {
-                        let project = project.read(cx);
-                        let telemetry = project.client().telemetry().clone();
-                        let is_via_ssh = project.is_via_remote_server();
-                        (telemetry, is_via_ssh)
-                    };
-                    telemetry.log_edit_event("editor", is_via_ssh);
+                let Some(project) = &self.project else { return };
+                let (telemetry, is_via_ssh) = {
+                    let project = project.read(cx);
+                    let telemetry = project.client().telemetry().clone();
+                    let is_via_ssh = project.is_via_remote_server();
+                    (telemetry, is_via_ssh)
+                };
+                telemetry.log_edit_event("editor", is_via_ssh);
                 }
             }
             multi_buffer::Event::BufferRangesUpdated {
@@ -10392,11 +10395,11 @@ impl Editor {
                 for buffer_id in removed_buffer_ids {
                     #[cfg(feature = "native")]
                     {
-                        self.registered_buffers.remove(buffer_id);
-                        self.clear_runnables(Some(*buffer_id));
-                        self.semantic_token_state.invalidate_buffer(buffer_id);
-                        self.lsp_document_symbols.remove(buffer_id);
-                        self.lsp_document_links.per_buffer.remove(buffer_id);
+                    self.registered_buffers.remove(buffer_id);
+                    self.clear_runnables(Some(*buffer_id));
+                    self.semantic_token_state.invalidate_buffer(buffer_id);
+                    self.lsp_document_symbols.remove(buffer_id);
+                    self.lsp_document_links.per_buffer.remove(buffer_id);
                     }
                     self.display_map.update(cx, |display_map, cx| {
                         display_map.invalidate_semantic_highlights(*buffer_id);
@@ -10659,10 +10662,9 @@ impl Editor {
             )
         };
         #[cfg(feature = "native")]
-        {
-            self.buffer_serialization = self
-                .should_serialize_buffer()
-                .then(|| BufferSerialization::new(restore_unsaved_buffers));
+        { self.buffer_serialization = self
+            .should_serialize_buffer()
+            .then(|| BufferSerialization::new(restore_unsaved_buffers));
         }
 
         if self.mode.is_full() {
@@ -11830,24 +11832,19 @@ impl Editor {
                 buffer
                     .read(cx)
                     .snapshot()
-                    .resolve_file_path(
+                    .resolve_file_path({
+                        #[cfg(feature = "native")]
                         {
-                            #[cfg(feature = "native")]
-                            {
-                                self.project
-                                    .as_ref()
-                                    .map(|project| {
-                                        project.read(cx).visible_worktrees(cx).count() > 1
-                                    })
-                                    .unwrap_or_default()
-                            }
-                            #[cfg(not(feature = "native"))]
-                            {
-                                false
-                            }
-                        },
-                        cx,
-                    )
+                            self.project
+                                .as_ref()
+                                .map(|project| project.read(cx).visible_worktrees(cx).count() > 1)
+                                .unwrap_or_default()
+                        }
+                        #[cfg(not(feature = "native"))]
+                        {
+                            false
+                        }
+                    }, cx)
                     .unwrap_or_else(|| multi_buffer.title(cx).to_string())
             });
             vec![HighlightedText {

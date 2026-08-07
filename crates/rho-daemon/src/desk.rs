@@ -12,18 +12,21 @@ use rho_ui_proto::desk::{
 use senax_encoder::{Decode, Encode};
 use text::ReplicaId;
 
-const STATE: TableDefinition<(), Sen<PersistentState>> = TableDefinition::new("rho_desk_state_v3");
+// Persisted TypeNames include the Rust type path: `PersistentStateV3` is now a
+// wire-stable name and must not be renamed while the v3 table exists.
+const STATE: TableDefinition<(), Sen<PersistentStateV3>> =
+    TableDefinition::new("rho_desk_state_v3");
 const TEXT_OPS: TableDefinition<u64, Sen<DeskTextOpRecord>> =
     TableDefinition::new("rho_desk_text_ops_v2");
 
 #[derive(Clone, Debug, Encode, Decode)]
-struct PersistentState {
+struct PersistentStateV3 {
     snapshot: DeskSnapshot,
     next_text_sequence: u64,
     next_replica_id: u16,
 }
 
-impl Default for PersistentState {
+impl Default for PersistentStateV3 {
     fn default() -> Self {
         Self {
             snapshot: DeskSnapshot::default(),
@@ -127,6 +130,89 @@ impl DeskStore {
             return Err("invalid Desk text transaction".to_owned());
         }
         self.append_text(operation, transaction).await
+    }
+
+    /// Applies one atomic model-authored edit using a stable replica associated
+    /// with the agent. Every non-empty search string is resolved against the
+    /// same current document before anything is written.
+    pub async fn apply_agent_edits(
+        &self,
+        agent_id: rho_ui_proto::AgentId,
+        edits: &[(String, String)],
+    ) -> Result<DeskTextOpRecord, String> {
+        if edits.is_empty() {
+            return Err("Desk edit list must not be empty".to_owned());
+        }
+
+        let mut write = self.db.write().await;
+        let mut state = load_state(&mut write);
+        let replica_id = if let Some(replica) = state
+            .snapshot
+            .replicas
+            .iter()
+            .find(|replica| replica.author == DeskReplicaAuthor::Agent(agent_id))
+        {
+            replica.replica_id
+        } else {
+            let replica_id = state.next_replica_id;
+            state.next_replica_id = replica_id
+                .checked_add(1)
+                .ok_or_else(|| "Desk replica id space exhausted".to_owned())?;
+            state.snapshot.replicas.push(DeskReplica {
+                replica_id,
+                author: DeskReplicaAuthor::Agent(agent_id),
+            });
+            replica_id
+        };
+
+        let mut snapshot = state.snapshot.clone();
+        snapshot.operations = write
+            .open_table(TEXT_OPS)
+            .iter()
+            .map(|(_, value)| value.value().as_ref().operation.clone())
+            .collect();
+        let text = snapshot.document_text()?;
+        let mut replacements = Vec::with_capacity(edits.len());
+        for (index, (old_str, new_str)) in edits.iter().enumerate() {
+            if old_str.is_empty() {
+                replacements.push((text.len()..text.len(), new_str.clone()));
+                continue;
+            }
+            let mut matches = text.match_indices(old_str);
+            let Some((start, _)) = matches.next() else {
+                return Err(format!(
+                    "Desk edit {} failed: old_str was not found",
+                    index + 1
+                ));
+            };
+            if matches.next().is_some() {
+                return Err(format!(
+                    "Desk edit {} failed: old_str is ambiguous (more than one match)",
+                    index + 1
+                ));
+            }
+            replacements.push((start..start + old_str.len(), new_str.clone()));
+        }
+        for index in 0..replacements.len() {
+            for previous in 0..index {
+                let left = &replacements[previous].0;
+                let right = &replacements[index].0;
+                if left.start < right.end && right.start < left.end {
+                    return Err(format!(
+                        "Desk edit {} failed: replacement overlaps edit {}",
+                        index + 1,
+                        previous + 1
+                    ));
+                }
+            }
+        }
+
+        let mut buffer = snapshot.buffer(replica_id)?;
+        let operation = DeskOperation::from_text(&buffer.edit(replacements));
+        let record = append_text_in_txn(&mut write, &mut state, operation, None)?;
+        save_state(&mut write, &state);
+        write.commit();
+        Ok(record)
     }
 
     /// Atomically records the newly staffed agent in visible Desk text.
@@ -249,7 +335,7 @@ fn resolve_agent_handle(db: &RhoDb, handle: &str) -> Option<rho_ui_proto::AgentI
 
 fn append_text_in_txn(
     write: &mut rho_db::WriteTxn,
-    state: &mut PersistentState,
+    state: &mut PersistentStateV3,
     operation: DeskOperation,
     transaction: Option<DeskTransaction>,
 ) -> Result<DeskTextOpRecord, String> {
@@ -290,7 +376,7 @@ fn append_text_in_txn(
     Ok(record)
 }
 
-fn load_state(write: &mut rho_db::WriteTxn) -> PersistentState {
+fn load_state(write: &mut rho_db::WriteTxn) -> PersistentStateV3 {
     write
         .open_table(STATE)
         .get(&())
@@ -298,7 +384,7 @@ fn load_state(write: &mut rho_db::WriteTxn) -> PersistentState {
         .value()
         .into_owned()
 }
-fn save_state(write: &mut rho_db::WriteTxn, state: &PersistentState) {
+fn save_state(write: &mut rho_db::WriteTxn, state: &PersistentStateV3) {
     write
         .open_table(STATE)
         .insert(&(), SenValue::borrowed(state));
@@ -322,12 +408,15 @@ struct V2DeskSnapshot {
     next_id: u64,
 }
 #[derive(Clone, Debug, Encode, Decode)]
-struct V2PersistentState {
+// The redb value TypeName embeds this exact Rust path; the deployed v2 table
+// was created as `Sen<rho_daemon::desk::PersistentState>`, so the compat
+// struct must keep that name and module.
+struct PersistentState {
     snapshot: V2DeskSnapshot,
     next_text_sequence: u64,
     next_replica_id: u16,
 }
-const V2_STATE: TableDefinition<(), Sen<V2PersistentState>> =
+const V2_STATE: TableDefinition<(), Sen<PersistentState>> =
     TableDefinition::new("rho_desk_state_v2");
 
 /// Converts hidden v2 identity text into the visible binding contract. The
@@ -336,7 +425,7 @@ const V2_STATE: TableDefinition<(), Sen<V2PersistentState>> =
 fn migrate_v2(
     write: &mut rho_db::WriteTxn,
     agent_handles: &BTreeMap<rho_ui_proto::AgentId, String>,
-) -> Option<PersistentState> {
+) -> Option<PersistentStateV3> {
     let old = write.open_table(V2_STATE).get(&())?.value().into_owned();
     let mut materialized = DeskSnapshot {
         text: old.snapshot.text.clone(),
@@ -394,7 +483,7 @@ fn migrate_v2(
         migrated.push_str(newline);
     }
 
-    let mut state = PersistentState {
+    let mut state = PersistentStateV3 {
         snapshot: DeskSnapshot {
             text: old.snapshot.text,
             operations: old.snapshot.operations,
@@ -472,7 +561,7 @@ const OLD_TEXT_OPS: TableDefinition<u64, Sen<OldTextRecord>> =
 fn migrate_v1(
     write: &mut rho_db::WriteTxn,
     agent_handles: &BTreeMap<rho_ui_proto::AgentId, String>,
-) -> Option<PersistentState> {
+) -> Option<PersistentStateV3> {
     let old = write.open_table(OLD_STATE).get(&())?.value().into_owned();
     let mut histories: BTreeMap<OldNodeId, Vec<DeskOperation>> = BTreeMap::new();
     for (_, record) in write.open_table(OLD_TEXT_OPS).iter() {
@@ -571,7 +660,7 @@ fn migrate_v1(
     write
         .open_table(TEXT_OPS)
         .insert(&1, SenValue::borrowed(&record));
-    Some(PersistentState {
+    Some(PersistentStateV3 {
         snapshot: DeskSnapshot {
             text: String::new(),
             operations: Vec::new(),
@@ -764,7 +853,7 @@ mod tests {
         let mut write = db.write().await;
         write.open_table(V2_STATE).insert(
             &(),
-            SenValue::owned(V2PersistentState {
+            SenValue::owned(PersistentState {
                 snapshot: V2DeskSnapshot {
                     text: String::new(),
                     operations: Vec::new(),
