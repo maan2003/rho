@@ -16,14 +16,6 @@ pub use crate::minibuffer::{Candidate, token_start};
 #[cfg(feature = "native")]
 use crate::workspace::Workspace;
 
-/// Workstream, group, and label names, feeding prompt completion.
-#[derive(Default)]
-pub struct PromptNames {
-    pub workstreams: Vec<String>,
-    pub groups: Vec<String>,
-    pub labels: Vec<String>,
-}
-
 /// Completion candidates for the text before the cursor: `@` mentions of
 /// live agents. Values replace the current whitespace-delimited token.
 pub fn completions_for(text_before_cursor: &str, live_agents: &[Candidate]) -> Vec<Candidate> {

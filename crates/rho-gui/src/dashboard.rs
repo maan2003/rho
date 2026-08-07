@@ -11,12 +11,11 @@ use gpui::prelude::*;
 use gpui::{App, Context, Entity, Focusable as _, Window};
 use language::{Buffer, BufferEvent, Capability, InlayId, Point};
 use multi_buffer::{MultiBuffer, PathKey};
-use rho_core::ContentPart;
 use rho_ui_proto::desk::{
     DeskBinding, DeskClock, DeskNode, DeskNodeId, DeskNodeText, DeskOperation, DeskSnapshot,
     DeskStructureOpRecord, DeskTextOpRecord, DeskTransaction,
 };
-use rho_ui_proto::{AgentId, ClientMessage, WorkstreamId};
+use rho_ui_proto::{AgentId, ClientMessage};
 use text::{BufferId, ReplicaId};
 use theme::ActiveTheme as _;
 use ui::div;
@@ -53,16 +52,8 @@ pub fn parse_heading_line(text: &str) -> (Option<ParsedHeadingState>, &str) {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RowTarget {
-    Iris,
-    Zulip,
     None,
-    Stream {
-        workstream_id: WorkstreamId,
-        root: Option<AgentId>,
-    },
     Agent(AgentId),
-    Reply(AgentId),
-    NewDraft,
 }
 
 struct HostDesk {
@@ -1013,62 +1004,6 @@ impl Dashboard {
         }
         cx.notify();
         true
-    }
-
-    pub(crate) fn toggle_subagents_for(
-        &mut self,
-        _parent: AgentId,
-        _cx: &mut Context<Workspace>,
-    ) -> bool {
-        false
-    }
-
-    pub fn cursor_to_agent(
-        &mut self,
-        _agent_id: AgentId,
-        _workstream_id: WorkstreamId,
-        _cx: &mut Context<Workspace>,
-    ) {
-    }
-
-    pub fn open_reply(&mut self, _agent_id: AgentId, _cx: &mut Context<Workspace>) {}
-    pub fn open_new_draft(&mut self, _summary: String, _cx: &mut Context<Workspace>) {}
-    pub fn take_new_draft(&mut self, _cx: &mut Context<Workspace>) -> Option<Vec<ContentPart>> {
-        None
-    }
-    pub fn take_reply(
-        &mut self,
-        _agent_id: AgentId,
-        _cx: &mut Context<Workspace>,
-    ) -> Option<Vec<ContentPart>> {
-        None
-    }
-    pub fn accepts_attachments(&self, _cx: &mut Context<Workspace>) -> bool {
-        false
-    }
-    pub fn clear_attachments(&mut self, _cx: &mut Context<Workspace>) -> bool {
-        false
-    }
-    pub fn add_image(
-        &mut self,
-        _media_type: String,
-        _data: Vec<u8>,
-        _cx: &mut Context<Workspace>,
-    ) -> bool {
-        false
-    }
-
-    #[cfg(test)]
-    pub(crate) fn fold_count(&self) -> usize {
-        self.collapsed.len()
-    }
-    #[cfg(test)]
-    pub(crate) fn rail_tail_id(&self) -> Option<editor::DisplayElisionId> {
-        None
-    }
-    #[cfg(test)]
-    pub(crate) fn rail_tail_ends_in_reply(&self, _agent_id: AgentId) -> bool {
-        false
     }
 }
 

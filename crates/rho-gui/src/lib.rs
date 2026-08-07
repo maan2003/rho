@@ -228,8 +228,8 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         KeyBinding::new("shift-g", TerminalScrollBottom, Some("RhoTerminalNormal")),
     ]);
     // The space leader: one binding, opening the root transient at once
-    // (invisible until the reveal delay). Every chord beneath it — panes,
-    // agent verbs, workstream triage — is a transient item, so practiced
+    // (invisible until the reveal delay). Every chord beneath it — panes
+    // and agent verbs — is a transient item, so practiced
     // sequences run at full speed without the menu ever flashing. Bound for
     // normal-mode editors (vim or helix flavor — helix reports
     // `vim_mode == helix_normal`); the dashboard is an editor too, so the

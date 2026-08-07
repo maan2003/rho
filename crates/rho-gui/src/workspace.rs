@@ -52,12 +52,12 @@ use crate::style::{RoleFamily, StyleClass};
 use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
     AgentDone, AgentHide, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, DashboardBack,
-    DashboardJump, DashboardNewAgent, DashboardNow, DashboardReply, DashboardStaff,
-    DashboardToggleSubagents, GitApprovalAllow, GitApprovalDeny, MinibufferCancel,
-    MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious, PaneBack, PaneClose,
-    PaneFocusNext, PaneSplitDown, PaneSplitRight, PastePrompt, RailFocus, RailOpen, RoleCycle,
-    RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit,
-    SubmitPrompt, TaskBoard, VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow, ZulipQuit,
+    DashboardJump, DashboardNow, DashboardStaff, DashboardToggleSubagents, GitApprovalAllow,
+    GitApprovalDeny, MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext,
+    MinibufferPrevious, PaneBack, PaneClose, PaneFocusNext, PaneSplitDown, PaneSplitRight,
+    PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt,
+    ShellPagerAll, ShellPagerMore, ShellPagerQuit, SubmitPrompt, TaskBoard, VoiceToggle,
+    ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow, ZulipQuit,
 };
 
 /// What a pane shows: stable identity plus the live view. Surfaces live
@@ -115,9 +115,8 @@ impl PartialEq for Surface {
     }
 }
 
-/// Which task's window arrangement fills the window. Every workstream
-/// keeps its own split tree, like emacs perspectives; the draft composer
-/// is its own context.
+/// Which task's window arrangement fills the window. The draft composer
+/// has its own context.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ContextId {
     Draft,
@@ -569,26 +568,12 @@ impl Subject {
         self.agent.is_some()
     }
 
-    pub fn has_workstream(&self) -> bool {
-        self.workstream.is_some()
-    }
-
     /// The unsubmitted draft belongs to a workstream that has no agents
     /// yet, so workstream commands can still name it.
     fn or_draft_workstream(mut self, draft: Option<rho_ui_proto::WorkstreamId>) -> Self {
         self.workstream = self.workstream.or(draft);
         self
     }
-}
-
-/// Which workstream operation a transient prompt collects a name for.
-#[derive(Clone, Copy)]
-pub enum WorkstreamPrompt {
-    Group,
-    Label,
-    Unlabel,
-    Rename,
-    Merge,
 }
 
 #[derive(Clone)]
@@ -635,26 +620,6 @@ impl DraftWorkspace {
             Self::NewOn(base) => format!("new on {}", base.target()),
             Self::Join(target) => format!("join {target}"),
             Self::Sandbox(base) => format!("sandbox on {}", base.target()),
-        }
-    }
-
-    fn mode_and_target(&self) -> (crate::draft_view::StartFieldMode, &str) {
-        match self {
-            Self::NewOn(base) => (crate::draft_view::StartFieldMode::NewOn, base.target()),
-            Self::Join(target) => (crate::draft_view::StartFieldMode::Join, target),
-            Self::Sandbox(base) => (crate::draft_view::StartFieldMode::Sandbox, base.target()),
-        }
-    }
-}
-
-impl WorkstreamPrompt {
-    fn prompt(self) -> &'static str {
-        match self {
-            WorkstreamPrompt::Group => "group:",
-            WorkstreamPrompt::Label => "label:",
-            WorkstreamPrompt::Unlabel => "unlabel:",
-            WorkstreamPrompt::Rename => "rename workstream:",
-            WorkstreamPrompt::Merge => "merge into:",
         }
     }
 }
@@ -862,20 +827,6 @@ impl Workspace {
         clock: rho_ui_proto::desk::DeskClock,
     ) {
         self.dashboard.mark_local_text_op(host, node_id, clock);
-    }
-
-    fn send_to_workstream(
-        &self,
-        workstream_id: rho_ui_proto::WorkstreamId,
-        message: ClientMessage,
-    ) {
-        if let Some(connection) = self
-            .registry
-            .host_of_workstream(workstream_id)
-            .and_then(|host| self.hosts.connection(host))
-        {
-            connection.send(message);
-        }
     }
 
     /// Whether the daemon behind an agent is answering. Acting on an agent
@@ -2000,7 +1951,6 @@ impl Workspace {
             return;
         };
         let dashboard_mode = self.dashboard_mode(window, cx);
-        let dashboard_prompt = dashboard_mode && self.dashboard.accepts_attachments(cx);
         let pane_prompt = matches!(
             self.active_tree().focused().surface.view,
             SurfaceView::Draft { .. } | SurfaceView::Transcript { .. }
@@ -2013,7 +1963,7 @@ impl Workspace {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        if (!dashboard_prompt && !pane_prompt) || images.is_empty() {
+        if !pane_prompt || images.is_empty() {
             let editor = if dashboard_mode {
                 self.dashboard.editor().clone()
             } else {
@@ -2039,29 +1989,21 @@ impl Workspace {
                     continue;
                 }
             };
-            let added = if dashboard_prompt {
-                self.dashboard
-                    .add_image(media_type.to_owned(), image.bytes.clone(), cx)
-            } else {
-                match &self.active_tree().focused().surface.view {
-                    SurfaceView::Draft { .. } => {
-                        self.draft_model.update(cx, |model, cx| {
-                            model.add_image(media_type.to_owned(), image.bytes.clone(), cx)
-                        });
-                        true
-                    }
-                    SurfaceView::Transcript { model, .. } => {
-                        model.update(cx, |model, cx| {
-                            model.add_image(media_type.to_owned(), image.bytes.clone(), cx)
-                        });
-                        true
-                    }
-                    _ => false,
+            let added = match &self.active_tree().focused().surface.view {
+                SurfaceView::Draft { .. } => {
+                    self.draft_model.update(cx, |model, cx| {
+                        model.add_image(media_type.to_owned(), image.bytes.clone(), cx)
+                    });
+                    true
                 }
+                SurfaceView::Transcript { model, .. } => {
+                    model.update(cx, |model, cx| {
+                        model.add_image(media_type.to_owned(), image.bytes.clone(), cx)
+                    });
+                    true
+                }
+                _ => false,
             };
-            if dashboard_prompt && added {
-                self.dashboard_dirty = true;
-            }
             accepted += usize::from(added);
         }
         if accepted > 0 {
@@ -2074,9 +2016,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let dashboard_mode = self.dashboard_mode(window, cx);
-        let cleared = if dashboard_mode {
-            self.dashboard.clear_attachments(cx)
+        let cleared = if self.dashboard_mode(window, cx) {
+            false
         } else {
             match &self.active_tree().focused().surface.view {
                 SurfaceView::Draft { .. } => self
@@ -2089,9 +2030,6 @@ impl Workspace {
             }
         };
         if cleared {
-            if dashboard_mode {
-                self.dashboard_dirty = true;
-            }
             let agent_id = self.registry.selected_agent().copied();
             self.notice_on(
                 agent_id.as_ref(),
@@ -2445,58 +2383,6 @@ impl Workspace {
         self.open_prompt("role:", complete, on_submit, window, cx);
     }
 
-    pub(crate) fn cmd_workstream_rename(
-        &mut self,
-        name: String,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(workstream_id) = self.subject_workstream_or_notice(window, cx) {
-            self.send_to_workstream(
-                workstream_id,
-                ClientMessage::WorkstreamRename {
-                    workstream_id,
-                    name,
-                },
-            );
-        }
-    }
-
-    /// The workstream the menus act on, or an echo-area notice saying why
-    /// there is none (not connected, or nothing in focus).
-    fn subject_workstream_or_notice(
-        &mut self,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> Option<rho_ui_proto::WorkstreamId> {
-        if !self.require_connected(cx) {
-            return None;
-        }
-        let focused = self.subject(window, cx).workstream;
-        if focused.is_none() {
-            self.notice_on(None, "no workstream in focus", StyleClass::SystemInfo, cx);
-        }
-        focused
-    }
-
-    /// Adds or removes one label on the focused workstream; the toggles
-    /// (pin, hide) and the free-form label prompt all come through here.
-    fn send_workstream_label(
-        &mut self,
-        workstream_id: rho_ui_proto::WorkstreamId,
-        label: String,
-        add: bool,
-    ) {
-        self.send_to_workstream(
-            workstream_id,
-            ClientMessage::WorkstreamLabel {
-                workstream_id,
-                label,
-                add,
-            },
-        );
-    }
-
     pub(crate) fn cmd_agent_done(
         &mut self,
         hide: bool,
@@ -2541,140 +2427,6 @@ impl Workspace {
             rho_ui_proto::AgentDisposition::Snoozed { until },
             cx,
         );
-    }
-
-    pub(crate) fn cmd_workstream_pin(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if let Some(workstream_id) = self.subject_workstream_or_notice(window, cx) {
-            let pinned = self
-                .registry
-                .workstream_labels(workstream_id)
-                .iter()
-                .any(|label| label == crate::registry::PIN_LABEL);
-            self.send_workstream_label(
-                workstream_id,
-                crate::registry::PIN_LABEL.to_owned(),
-                !pinned,
-            );
-        }
-    }
-
-    pub(crate) fn cmd_workstream_hide(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if let Some(workstream_id) = self.subject_workstream_or_notice(window, cx) {
-            let hidden = self
-                .registry
-                .workstream_labels(workstream_id)
-                .iter()
-                .any(|label| label == crate::registry::HIDE_LABEL);
-            self.send_workstream_label(
-                workstream_id,
-                crate::registry::HIDE_LABEL.to_owned(),
-                !hidden,
-            );
-        }
-    }
-
-    pub(crate) fn cmd_workstream_group(
-        &mut self,
-        name: String,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(workstream_id) = self.subject_workstream_or_notice(window, cx) {
-            self.send_workstream_label(
-                workstream_id,
-                format!("{}{name}", crate::registry::GROUP_LABEL_PREFIX),
-                true,
-            );
-        }
-    }
-
-    pub(crate) fn cmd_workstream_label(
-        &mut self,
-        name: String,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(workstream_id) = self.subject_workstream_or_notice(window, cx) {
-            self.send_workstream_label(workstream_id, name, true);
-        }
-    }
-
-    pub(crate) fn cmd_workstream_unlabel(
-        &mut self,
-        name: String,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(workstream_id) = self.subject_workstream_or_notice(window, cx) {
-            if !self
-                .registry
-                .workstream_labels(workstream_id)
-                .contains(&name)
-            {
-                let message = format!("no label named `{name}` on this workstream");
-                self.notice_on(None, &message, StyleClass::SystemInfo, cx);
-                return;
-            }
-            self.send_workstream_label(workstream_id, name, false);
-        }
-    }
-
-    /// Moves every agent of the focused workstream into the named one; the
-    /// daemon deletes the emptied source. Merging targets existing streams
-    /// only — a typo should not found a stream.
-    pub(crate) fn cmd_workstream_merge(
-        &mut self,
-        name: String,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(source_id) = self.subject_workstream_or_notice(window, cx) else {
-            return;
-        };
-        let Some(target) = self
-            .registry
-            .workstreams()
-            .iter()
-            .find(|workstream| workstream.name == name)
-            .map(|workstream| workstream.workstream_id)
-        else {
-            let message = format!("no workstream named `{name}`");
-            self.notice_on(None, &message, StyleClass::SystemInfo, cx);
-            return;
-        };
-        if target == source_id {
-            self.notice_on(None, "already that workstream", StyleClass::SystemInfo, cx);
-            return;
-        }
-        let Some(source) = self
-            .registry
-            .workstreams()
-            .iter()
-            .find(|workstream| workstream.workstream_id == source_id)
-        else {
-            return;
-        };
-        // Roots only: a moved agent brings its spawned subtree along.
-        let members = source.agent_ids().collect::<Vec<_>>();
-        let roots = source
-            .agents
-            .iter()
-            .filter(|agent| {
-                agent
-                    .parent_agent
-                    .is_none_or(|parent| !members.contains(&parent))
-            })
-            .map(|agent| agent.agent_id)
-            .collect::<Vec<_>>();
-        for agent_id in roots {
-            self.send_to_agent(
-                agent_id,
-                ClientMessage::AgentMove {
-                    agent_id,
-                    target: rho_ui_proto::WorkstreamTarget::Existing(target),
-                },
-            );
-        }
     }
 
     pub(crate) fn cmd_project_add(
@@ -3169,15 +2921,7 @@ impl Workspace {
             None
         };
         let subject = match row {
-            Some(RowTarget::Stream {
-                workstream_id,
-                root,
-            }) => Some(Subject {
-                agent: root,
-                workstream: Some(workstream_id),
-                agents: self.registry.workstream_agents(workstream_id),
-            }),
-            Some(RowTarget::Agent(agent_id)) | Some(RowTarget::Reply(agent_id)) => Some(Subject {
+            Some(RowTarget::Agent(agent_id)) => Some(Subject {
                 agent: Some(agent_id),
                 workstream: self.registry.workstream_of(agent_id),
                 agents: self.registry.agent_subtree(agent_id),
@@ -3370,24 +3114,6 @@ impl Workspace {
                 format!("{}:{}", self.host_label(workdir.host), workdir.path)
             }
             None => workdir.path.to_string(),
-        }
-    }
-
-    pub fn prompt_names(&self) -> crate::commands::PromptNames {
-        let workstreams = self.registry.workstreams();
-        let mut groups = workstreams
-            .iter()
-            .filter_map(|workstream| workstream.group.clone())
-            .collect::<Vec<_>>();
-        groups.sort();
-        groups.dedup();
-        crate::commands::PromptNames {
-            workstreams: workstreams
-                .iter()
-                .map(|workstream| workstream.name.clone())
-                .collect(),
-            groups,
-            labels: self.registry.workstream_label_names(),
         }
     }
 
@@ -3608,21 +3334,10 @@ impl Workspace {
             return;
         }
         match self.dashboard.cursor_target(cx) {
-            Some(RowTarget::Iris) => cx.notify(),
-            // A reply draft previews its addressee, same as the row above it.
-            Some(
-                RowTarget::Stream {
-                    root: Some(agent_id),
-                    ..
-                }
-                | RowTarget::Agent(agent_id)
-                | RowTarget::Reply(agent_id),
-            ) if self.dashboard_preview != Some(agent_id) => {
+            Some(RowTarget::Agent(agent_id)) if self.dashboard_preview != Some(agent_id) => {
                 self.preview_agent(agent_id, window, cx);
             }
-            Some(
-                RowTarget::Stream { root: Some(_), .. } | RowTarget::Agent(_) | RowTarget::Reply(_),
-            ) => {}
+            Some(RowTarget::Agent(_)) => {}
             // Headers and the folded tail retain the last preview. Clearing
             // it here would remove the preview pane, resize the dashboard,
             // and visibly rewrap its rows on ordinary cursor motion.
@@ -4274,81 +3989,11 @@ impl Workspace {
         self.models.get(agent_id).cloned()
     }
 
-    #[cfg(test)]
-    pub(crate) fn dashboard_editor(&self) -> Entity<editor::Editor> {
-        self.dashboard.editor().clone()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn sync_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.dashboard.sync(&self.registry, window, cx);
-        self.dashboard_dirty = false;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn dashboard_is_dirty(&self) -> bool {
-        self.dashboard_dirty
-    }
-
-    #[cfg(test)]
-    pub(crate) fn preview_dashboard_agent(
-        &mut self,
-        agent_id: AgentId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.preview_agent(agent_id, window, cx);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn dashboard_preview_agent(&self) -> Option<AgentId> {
-        self.dashboard_preview
-    }
-
     fn sync_dashboard_if_dirty(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.dashboard_dirty {
             self.dashboard.sync(&self.registry, window, cx);
             self.dashboard_dirty = false;
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn dashboard_fold_count(&self) -> usize {
-        self.dashboard.fold_count()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn dashboard_rail_tail_id(&self) -> Option<editor::DisplayElisionId> {
-        self.dashboard.rail_tail_id()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn dashboard_open_reply(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
-        self.dashboard.open_reply(agent_id, cx);
-        self.dashboard_dirty = true;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn dashboard_rail_tail_ends_in_reply(&self, agent_id: AgentId) -> bool {
-        self.dashboard.rail_tail_ends_in_reply(agent_id)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn dashboard_cursor_target(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> Option<crate::dashboard::RowTarget> {
-        self.dashboard.cursor_target(cx)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn echo_text_for_test(&self) -> Option<String> {
-        self.echo.as_ref().map(|echo| echo.text().to_owned())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn focus_rail_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.focus_rail(window, cx);
     }
 
     #[cfg(test)]
@@ -4914,53 +4559,6 @@ impl Workspace {
         self.open_prompt("snooze (30m/2h/1d):", complete, on_submit, window, cx);
     }
 
-    pub(crate) fn prompt_workstream(
-        &mut self,
-        kind: WorkstreamPrompt,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let names = {
-            let names = self.prompt_names();
-            match kind {
-                WorkstreamPrompt::Merge => names.workstreams,
-                WorkstreamPrompt::Group => names.groups,
-                WorkstreamPrompt::Label | WorkstreamPrompt::Unlabel => names.labels,
-                WorkstreamPrompt::Rename => Vec::new(),
-            }
-        };
-        let complete = std::rc::Rc::new(move |_: &Workspace, input: &str, _: &gpui::App| {
-            let needle = input.trim().to_lowercase();
-            names
-                .iter()
-                .filter(|name| name.to_lowercase().contains(&needle))
-                .map(|name| crate::commands::Candidate {
-                    value: name.clone(),
-                    description: String::new(),
-                })
-                .collect()
-        });
-        let on_submit = std::rc::Rc::new(
-            move |workspace: &mut Workspace,
-                  input: String,
-                  window: &mut Window,
-                  cx: &mut Context<Workspace>| {
-                let name = input.trim().to_owned();
-                if name.is_empty() {
-                    return;
-                }
-                match kind {
-                    WorkstreamPrompt::Merge => workspace.cmd_workstream_merge(name, window, cx),
-                    WorkstreamPrompt::Group => workspace.cmd_workstream_group(name, window, cx),
-                    WorkstreamPrompt::Label => workspace.cmd_workstream_label(name, window, cx),
-                    WorkstreamPrompt::Unlabel => workspace.cmd_workstream_unlabel(name, window, cx),
-                    WorkstreamPrompt::Rename => workspace.cmd_workstream_rename(name, window, cx),
-                }
-            },
-        );
-        self.open_prompt(kind.prompt(), complete, on_submit, window, cx);
-    }
-
     /// Prompt for a path to open from the current agent's workspace.
     pub(crate) fn prompt_open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let complete = std::rc::Rc::new(|_: &Workspace, _: &str, _: &gpui::App| Vec::new());
@@ -5346,129 +4944,17 @@ impl Workspace {
         self.open_new_agent_transient(window, cx);
     }
 
-    pub(crate) fn compose_new_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(draft) = &self.new_agent_draft else {
-            return;
-        };
-        let project = draft
-            .workdir
-            .as_ref()
-            .map(|workdir| self.workdir_label(workdir))
-            .unwrap_or_else(|| "no project".to_owned());
-        let host = draft
-            .host
-            .map(|host| self.host_label(host))
-            .unwrap_or_else(|| "no host".to_owned());
-        let summary = format!(
-            "{host} · {project} · {} · {}",
-            draft.role,
-            draft.workspace.label()
-        );
-        self.dashboard.open_new_draft(summary, cx);
-        self.dashboard_dirty = true;
-        let handle = self.dashboard.focus_handle(cx);
-        window.focus(&handle, cx);
-        self.dashboard_enter_insert(window, cx);
-    }
-
-    fn new_agent_launch(&self) -> Result<(HostId, rho_ui_proto::StartMode, AgentRole), String> {
-        let draft = self
-            .new_agent_draft
-            .as_ref()
-            .ok_or_else(|| "new agent has no launch configuration".to_owned())?;
-        let (mode, target) = draft.workspace.mode_and_target();
-        let (host, start) = self.parse_start(mode, target, draft.workdir.clone(), draft.host)?;
-        let role = parse_agent_role(&draft.role)?;
-        Ok((host, start, role))
-    }
-
-    /// `enter` in the dashboard: act on the row under the cursor.
+    /// `enter` on a staffed Desk heading opens its bound agent.
     fn dashboard_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        use crate::dashboard::RowTarget;
-        match self.dashboard.cursor_target(cx) {
-            Some(RowTarget::Iris) => self.cmd_voice(window, cx),
-            #[cfg(feature = "native")]
-            Some(RowTarget::Zulip) => self.open_zulip(window, cx),
-            #[cfg(not(feature = "native"))]
-            Some(RowTarget::Zulip) => {}
-            Some(RowTarget::Stream {
-                root: Some(agent_id),
-                ..
-            })
-            | Some(RowTarget::Agent(agent_id)) => self.open_agent(agent_id, window, cx),
-            // Enter sends the inline reply draft (and closes it); an empty
-            // draft just closes. Disconnected, the draft stays parked
-            // rather than being consumed into the void.
-            Some(RowTarget::Reply(agent_id)) => {
-                if !self.require_connected(cx) {
-                    return;
-                }
-                let content = self.dashboard.take_reply(agent_id, cx);
-                self.dashboard_dirty = true;
-                if let Some(content) = content {
-                    self.handle_submit(agent_id, content, cx);
-                }
-                // Removing the draft's excerpt would drop the cursor onto
-                // whatever text slid into the gap; park it back on the row
-                // the reply belonged to.
-                if let Some(workstream_id) = self.registry.workstream_of(agent_id) {
-                    self.dashboard.cursor_to_agent(agent_id, workstream_id, cx);
-                }
-                self.dashboard_exit_insert(window, cx);
-            }
-            Some(RowTarget::NewDraft) => {
-                if !self.require_connected(cx) {
-                    return;
-                }
-                let (host, start, role) = match self.new_agent_launch() {
-                    Ok(launch) => launch,
-                    Err(message) => {
-                        self.notice_on(None, &message, StyleClass::SystemInfo, cx);
-                        return;
-                    }
-                };
-                let content = self.dashboard.take_new_draft(cx);
-                self.dashboard_dirty = true;
-                if let Some(content) = content {
-                    self.create_inline_agent(host, content, start, role);
-                }
-                self.new_agent_draft = None;
-                self.dashboard_exit_insert(window, cx);
-            }
-            Some(RowTarget::Stream { root: None, .. }) | Some(RowTarget::None) | None => {}
+        if let Some(crate::dashboard::RowTarget::Agent(agent_id)) = self.dashboard.cursor_target(cx)
+        {
+            self.open_agent(agent_id, window, cx);
         }
     }
 
     #[cfg(all(target_family = "wasm", not(feature = "native")))]
     fn dashboard_open_clicked_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        use crate::dashboard::RowTarget;
-        match self.dashboard.cursor_target(cx) {
-            Some(RowTarget::Stream {
-                root: Some(agent_id),
-                ..
-            })
-            | Some(RowTarget::Agent(agent_id)) => self.open_agent(agent_id, window, cx),
-            _ => {}
-        }
-    }
-
-    fn create_inline_agent(
-        &mut self,
-        host: HostId,
-        content: Vec<ContentPart>,
-        start: rho_ui_proto::StartMode,
-        role: AgentRole,
-    ) {
-        self.hosts.send(
-            host,
-            ClientMessage::NewAgent {
-                workstream: None,
-                role,
-                start,
-                content: Some(content),
-                desk_node: None,
-            },
-        );
+        self.dashboard_open(window, cx);
     }
 
     fn staff_dashboard_node(&mut self, cx: &mut Context<Self>) {
@@ -5564,51 +5050,6 @@ impl Workspace {
             },
         );
         self.open_prompt("Desk heading:", complete, on_submit, window, cx);
-    }
-
-    /// `r` in the dashboard: splice an inline reply draft under the row —
-    /// the cursor moves into it, in insert mode, but never leaves the
-    /// dashboard. Drafts park where they are: wander off mid-thought and
-    /// come back later.
-    fn dashboard_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        use crate::dashboard::RowTarget;
-        match self.dashboard.cursor_target(cx) {
-            Some(RowTarget::Stream {
-                root: Some(agent_id),
-                ..
-            })
-            | Some(RowTarget::Agent(agent_id))
-            | Some(RowTarget::Reply(agent_id)) => {
-                self.dashboard.open_reply(agent_id, cx);
-                self.dashboard_dirty = true;
-                self.dashboard_enter_insert(window, cx);
-            }
-            _ => {
-                self.notice_on(
-                    None,
-                    "reply: no agent under the cursor",
-                    StyleClass::SystemInfo,
-                    cx,
-                );
-            }
-        }
-    }
-
-    /// A draft was just opened under the cursor: drop the editor into
-    /// insert mode so typing starts immediately (writing is the only
-    /// reason these drafts exist).
-    fn dashboard_enter_insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Ok(action) = cx.build_action("vim::InsertBefore", None) {
-            window.dispatch_action(action, cx);
-        }
-    }
-
-    /// Sending a draft ends the writing; the cursor goes back to being a
-    /// dashboard cursor, not an insertion point.
-    fn dashboard_exit_insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Ok(action) = cx.build_action("vim::SwitchToNormalMode", None) {
-            window.dispatch_action(action, cx);
-        }
     }
 
     /// The home-mode dashboard beside the active context's preview.
@@ -5817,11 +5258,7 @@ impl Workspace {
         // Modal overlays borrow keyboard focus; the frame stays in the mode
         // recorded beneath the overlay for its whole replacement chain.
         let home = self.dashboard_mode(window, cx);
-        let iris = home
-            && matches!(
-                self.dashboard.cursor_target(cx),
-                Some(crate::dashboard::RowTarget::Iris)
-            );
+        let iris = false;
         self.sync_diff_visibility(!home, cx);
         let show_panes = !home || iris || self.dashboard_preview.is_some();
         let rail = home.then(|| self.render_rail(show_panes, text_style, cx));
@@ -6370,7 +5807,7 @@ impl Render for Workspace {
                 this.switch_agent_by_delta(1, window, cx);
             }))
             .on_action(cx.listener(|this, _: &AgentNew, window, cx| {
-                this.open_new_agent_transient(window, cx);
+                this.select_agent(None, window, cx);
             }))
             .on_action(cx.listener(|this, _: &AgentJumpAttention, window, cx| {
                 this.jump_to_attention(window, cx);
@@ -6380,12 +5817,6 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &AgentHide, window, cx| {
                 this.cmd_agent_done(true, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &DashboardReply, window, cx| {
-                this.dashboard_reply(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &DashboardNewAgent, window, cx| {
-                this.open_new_agent_transient(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardStaff, _, cx| {
                 this.staff_dashboard_node(cx);

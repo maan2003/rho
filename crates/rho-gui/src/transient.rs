@@ -18,7 +18,7 @@ use gpui::{
 use theme::ActiveTheme as _;
 
 use crate::minibuffer::bottom_strip;
-use crate::workspace::{Subject, Workspace, WorkstreamPrompt};
+use crate::workspace::{Subject, Workspace};
 
 pub type TransientRun = Rc<dyn Fn(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
 
@@ -87,16 +87,6 @@ impl Transient {
         run: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
     ) -> Self {
         self.push(key, label, None, false, None, run)
-    }
-
-    /// An item that keeps the menu open after running.
-    fn toggle(
-        self,
-        key: &'static str,
-        label: impl Into<String>,
-        run: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
-    ) -> Self {
-        self.push(key, label, None, true, None, run)
     }
 
     /// A value-setting item. Like upstream Transient infixes, its current
@@ -539,9 +529,6 @@ fn display_key(spec: &str) -> String {
 /// down), so the whole vocabulary is discoverable by pausing.
 pub fn root_menu() -> Transient {
     Transient::new("rho")
-        .item("n", "new agent", |workspace, window, cx| {
-            workspace.open_new_agent_transient(window, cx);
-        })
         .item("i", "input…", |workspace, window, cx| {
             workspace.open_transient(input_menu(), window, cx);
         })
@@ -557,14 +544,6 @@ pub fn root_menu() -> Transient {
             "agent…",
             |workspace, window, cx| {
                 workspace.open_transient(agent_menu(), window, cx);
-            },
-        )
-        .item_when(
-            Subject::has_workstream,
-            "s",
-            "workstream…",
-            |workspace, window, cx| {
-                workspace.open_transient(workstream_menu(), window, cx);
             },
         )
         .item("w", "window…", |workspace, window, cx| {
@@ -1226,9 +1205,6 @@ pub fn new_agent_menu(host: String, project: String, workspace: String, role: St
         .infix_toggle("r", "role", role, |workspace, window, cx| {
             workspace.cycle_new_agent_role(window, cx);
         })
-        .item("c", "compose", |workspace, window, cx| {
-            workspace.compose_new_agent(window, cx);
-        })
 }
 
 pub fn new_agent_workspace_menu() -> Transient {
@@ -1358,33 +1334,6 @@ fn snooze_menu() -> Transient {
         })
         .item("c", "custom…", |workspace, window, cx| {
             workspace.prompt_snooze(window, cx);
-        })
-}
-
-/// `space s`: the focused workstream as the rail row the user is
-/// triaging — name it, keep it up, put it away, file it with its kin.
-fn workstream_menu() -> Transient {
-    Transient::new("workstream")
-        .item("r", "rename…", |workspace, window, cx| {
-            workspace.prompt_workstream(WorkstreamPrompt::Rename, window, cx);
-        })
-        .toggle("p", "pin", |workspace, window, cx| {
-            workspace.cmd_workstream_pin(window, cx);
-        })
-        .toggle("h", "hide", |workspace, window, cx| {
-            workspace.cmd_workstream_hide(window, cx);
-        })
-        .item("g", "group…", |workspace, window, cx| {
-            workspace.prompt_workstream(WorkstreamPrompt::Group, window, cx);
-        })
-        .item("l", "add label…", |workspace, window, cx| {
-            workspace.prompt_workstream(WorkstreamPrompt::Label, window, cx);
-        })
-        .item("u", "remove label…", |workspace, window, cx| {
-            workspace.prompt_workstream(WorkstreamPrompt::Unlabel, window, cx);
-        })
-        .item("m", "merge into…", |workspace, window, cx| {
-            workspace.prompt_workstream(WorkstreamPrompt::Merge, window, cx);
         })
 }
 

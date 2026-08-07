@@ -4,12 +4,10 @@ use editor::Editor;
 use editor::display_map::{Block, DisplayRow};
 use gpui::{App, AppContext as _, Entity, Focusable as _, TestAppContext, WindowHandle};
 use rho_core::UnixMs;
+use rho_ui_proto::AgentId;
 use rho_ui_proto::remote::{
     AgentRemoteFrame, UiAgentState, UiAgentStatus, UiBlock, UiBlockDiff, UiBlockUpdate,
     UiBlocksDiff, UiMessagePhase, UiTextDiff, UiTool, UiToolDiff, UiToolStatus,
-};
-use rho_ui_proto::{
-    AgentId, AgentRole, UiAgentSummary, UiAttention, UiWorkstream, WorkspaceInfo, WorkstreamId,
 };
 use settings::SettingsStore;
 
@@ -88,7 +86,7 @@ fn modal_overlays_preserve_dashboard_and_surface_modes(cx: &mut TestAppContext) 
     workspace
         .update(cx, |workspace, window, cx| {
             assert!(workspace.is_dashboard_mode(window, cx));
-            workspace.prompt_workstream(crate::workspace::WorkstreamPrompt::Rename, window, cx);
+            workspace.prompt_open_file(window, cx);
         })
         .expect("open dashboard prompt");
     cx.dispatch_action(*workspace, crate::MinibufferConfirm);
@@ -115,7 +113,7 @@ fn modal_overlays_preserve_dashboard_and_surface_modes(cx: &mut TestAppContext) 
             assert!(workspace.is_dashboard_mode(window, cx));
             workspace.select_agent(None, window, cx);
             assert!(!workspace.is_dashboard_mode(window, cx));
-            workspace.prompt_workstream(crate::workspace::WorkstreamPrompt::Rename, window, cx);
+            workspace.prompt_open_file(window, cx);
             assert!(!workspace.is_dashboard_mode(window, cx));
         })
         .expect("open surface prompt");
@@ -148,317 +146,6 @@ fn modal_overlays_preserve_dashboard_and_surface_modes(cx: &mut TestAppContext) 
 
 fn agent(id: u64) -> AgentId {
     AgentId::from_counter(id, &rho_ui_proto::AgentIdDomain(0)).unwrap()
-}
-
-fn agent_summary(id: u64, parent_agent: Option<AgentId>) -> UiAgentSummary {
-    UiAgentSummary {
-        agent_id: agent(id),
-        parent_agent,
-        role: AgentRole::default(),
-        created_at: UnixMs(id),
-        updated_at: UnixMs(id),
-        workspace: WorkspaceInfo::UserCheckout {
-            repo: "/tmp".into(),
-        },
-        display_name: Some(format!("agent {id}")),
-        attention: UiAttention::Quiet,
-        last_active: UnixMs(id),
-        hidden: false,
-        last_user_message_text: String::new(),
-        activity: None,
-        turn_report: None,
-        workstream: WorkstreamId(1),
-        labels: Vec::new(),
-    }
-}
-
-/// A second daemon's agents come from its own id space; fixtures for it
-/// must not reuse the default domain.
-fn remote_agent(id: u64) -> AgentId {
-    AgentId::from_counter(id, &rho_ui_proto::AgentIdDomain(7)).unwrap()
-}
-
-fn auth_state() -> rho_ui_proto::AuthState {
-    rho_ui_proto::AuthState {
-        active: "default".to_owned(),
-        default: "default".to_owned(),
-        namespaces: vec!["default".to_owned()],
-    }
-}
-
-#[gpui::test]
-fn two_hosts_share_one_rail_and_detach_cleanly(cx: &mut TestAppContext) {
-    let workspace = test_workspace(cx);
-    let fern = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace.attach_host(
-                HostSpec {
-                    name: "fern".to_owned(),
-                    target: AttachTarget::Unix(std::env::temp_dir().join("rho-gui-test-fern.sock")),
-                },
-                cx,
-            )
-        })
-        .expect("attach second host");
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::Ready {
-                    workstreams: vec![UiWorkstream {
-                        workstream_id: WorkstreamId(1),
-                        name: "Local work".to_owned(),
-                        labels: Vec::new(),
-                    }],
-                    agents: vec![agent_summary(1, None)],
-                    projects: Vec::new(),
-                    auth: auth_state(),
-                    machine_seed: 0,
-                    agent_counter: 1,
-                },
-                window,
-                cx,
-            );
-            workspace.handle_event(
-                fern,
-                ConnEvent::Ready {
-                    workstreams: vec![UiWorkstream {
-                        workstream_id: WorkstreamId(2),
-                        name: "Remote work".to_owned(),
-                        labels: Vec::new(),
-                    }],
-                    agents: vec![UiAgentSummary {
-                        agent_id: remote_agent(2),
-                        workstream: WorkstreamId(2),
-                        display_name: Some("remote agent".to_owned()),
-                        ..agent_summary(2, None)
-                    }],
-                    projects: Vec::new(),
-                    auth: auth_state(),
-                    machine_seed: 7,
-                    agent_counter: 1,
-                },
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
-        })
-        .expect("install both hosts");
-    cx.run_until_parked();
-
-    let dashboard = workspace
-        .update(cx, |workspace, _, _| workspace.dashboard_editor())
-        .expect("dashboard editor");
-    workspace
-        .update(cx, |_, _, cx| {
-            dashboard.update(cx, |editor, cx| {
-                let text = editor.display_text(cx);
-                for expected in ["local", "  · Local work", "fern", "  · Remote work"] {
-                    assert!(
-                        text.contains(expected),
-                        "{expected:?} missing from {text:?}"
-                    );
-                }
-            });
-        })
-        .expect("inspect two-host dashboard");
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.detach_host(fern, window, cx);
-            workspace.sync_dashboard(window, cx);
-        })
-        .expect("detach the second host");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |_, _, cx| {
-            dashboard.update(cx, |editor, cx| {
-                let text = editor.display_text(cx);
-                assert!(!text.contains("Remote work"), "{text:?}");
-                // Alone again, the surviving host draws no header and its
-                // rows go back to sitting flush.
-                assert!(text.contains("Local work"), "{text:?}");
-                assert!(!text.contains("  Local work"), "{text:?}");
-            });
-        })
-        .expect("inspect single-host dashboard");
-}
-
-/// `d`/`shift-d` fire from the dashboard, where no agent is open: triage
-/// must act on the row under the cursor instead of refusing — and on every
-/// agent the row's lamp aggregates, or the row never reaches settled.
-/// Triaging the rail while a conversation is open is the normal way to
-/// work: every command belongs to the row under the cursor, not to
-/// whatever tab happens to be open behind the dashboard.
-#[gpui::test]
-fn the_subject_of_a_command_is_the_row_under_the_cursor(cx: &mut TestAppContext) {
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            let mut root = agent_summary(1, None);
-            root.attention = UiAttention::Pending;
-            let mut other = agent_summary(3, None);
-            other.workstream = WorkstreamId(2);
-            other.attention = UiAttention::Pending;
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::Ready {
-                    workstreams: vec![
-                        UiWorkstream {
-                            workstream_id: WorkstreamId(1),
-                            name: "Existing work".to_owned(),
-                            labels: Vec::new(),
-                        },
-                        UiWorkstream {
-                            workstream_id: WorkstreamId(2),
-                            name: "Other work".to_owned(),
-                            labels: Vec::new(),
-                        },
-                    ],
-                    agents: vec![root, other],
-                    projects: Vec::new(),
-                    auth: auth_state(),
-                    machine_seed: 0,
-                    agent_counter: 3,
-                },
-                window,
-                cx,
-            );
-            workspace.select_agent(Some(agent(3)), window, cx);
-            workspace.sync_dashboard(window, cx);
-        })
-        .expect("open the other workstream's agent");
-    cx.run_until_parked();
-
-    let dashboard = workspace
-        .update(cx, |workspace, _, _| workspace.dashboard_editor())
-        .expect("dashboard editor");
-    workspace
-        .update(cx, |workspace, window, cx| {
-            // The open tab is the subject while it holds focus.
-            let subject = workspace.subject(window, cx);
-            assert_eq!(subject.agent, Some(agent(3)));
-            assert_eq!(subject.workstream, Some(WorkstreamId(2)));
-            assert_eq!(subject.agents, vec![agent(3)]);
-
-            workspace.focus_rail_for_test(window, cx);
-            dashboard.update(cx, |editor, cx| {
-                let snapshot = editor.buffer().read(cx).snapshot(cx);
-                let offset = snapshot.text().find("Existing work").expect("stream row");
-                let anchor = snapshot.anchor_before(multi_buffer::MultiBufferOffset(offset));
-                editor.change_selections(Default::default(), window, cx, |selections| {
-                    selections.select_anchor_ranges([anchor..anchor]);
-                });
-            });
-            let subject = workspace.subject(window, cx);
-            assert_eq!(
-                subject.agents,
-                vec![agent(1)],
-                "a verdict speaks for the row under the cursor"
-            );
-            assert_eq!(
-                subject.agent,
-                Some(agent(1)),
-                "single-agent commands take the row's root, the agent enter opens"
-            );
-            assert_eq!(
-                subject.workstream,
-                Some(WorkstreamId(1)),
-                "workstream commands follow the cursor, not the open tab"
-            );
-            // Both menu gates open on a row, with or without a tab behind it.
-            assert!(subject.has_agent() && subject.has_workstream());
-        })
-        .expect("command the rail row behind the open tab");
-}
-
-/// The row settles only once every agent it aggregates is quiet — the
-/// reason a verdict has to cover the whole row.
-#[gpui::test]
-fn a_row_reaches_settled_when_all_its_agents_go_quiet(cx: &mut TestAppContext) {
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            let mut root = agent_summary(1, None);
-            root.attention = UiAttention::Pending;
-            let mut child = agent_summary(2, Some(agent(1)));
-            child.attention = UiAttention::Pending;
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::Ready {
-                    workstreams: vec![UiWorkstream {
-                        workstream_id: WorkstreamId(1),
-                        name: "Existing work".to_owned(),
-                        labels: Vec::new(),
-                    }],
-                    agents: vec![root, child],
-                    projects: Vec::new(),
-                    auth: auth_state(),
-                    machine_seed: 0,
-                    agent_counter: 2,
-                },
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
-        })
-        .expect("ready");
-    cx.run_until_parked();
-
-    let dashboard = workspace
-        .update(cx, |workspace, _, _| workspace.dashboard_editor())
-        .expect("dashboard editor");
-    let listing = |cx: &mut TestAppContext| {
-        workspace
-            .update(cx, |_, _, cx| {
-                dashboard.update(cx, |editor, cx| editor.display_text(cx))
-            })
-            .expect("dashboard text")
-    };
-    assert!(
-        listing(cx).contains("active"),
-        "two pending agents keep the row active"
-    );
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::AgentAttention {
-                    agent_id: agent(1),
-                    attention: UiAttention::Quiet,
-                },
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
-        })
-        .expect("quiet the root");
-    assert!(
-        listing(cx).contains("active"),
-        "the child's lamp still holds the row active"
-    );
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::AgentAttention {
-                    agent_id: agent(2),
-                    attention: UiAttention::Quiet,
-                },
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
-        })
-        .expect("quiet the child");
-    let settled = listing(cx);
-    assert!(
-        settled.contains("settled") && !settled.contains("active"),
-        "the row settles once every agent it aggregates is quiet: {settled:?}"
-    );
 }
 
 fn snapshot_frame(state: UiAgentState) -> AgentRemoteFrame {
@@ -1117,45 +804,6 @@ fn bench_rho_gui_flows(cx: &mut TestAppContext) {
         );
     }
     phase("tool update", start.elapsed(), 50);
-
-    // The dashboard, listing every agent.
-    let agents: Vec<_> = (1..=200).map(|id| agent_summary(id, None)).collect();
-    let start = std::time::Instant::now();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::Ready {
-                    workstreams: vec![UiWorkstream {
-                        workstream_id: WorkstreamId(1),
-                        name: "bench".to_owned(),
-                        labels: Vec::new(),
-                    }],
-                    agents,
-                    projects: Vec::new(),
-                    auth: auth_state(),
-                    machine_seed: 0,
-                    agent_counter: 200,
-                },
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
-        })
-        .expect("sync dashboard");
-    phase("dashboard sync (200 agents)", start.elapsed(), 1);
-    crate::sampler::start(4000);
-    let start = std::time::Instant::now();
-    for _ in 0..10 {
-        workspace
-            .update(cx, |workspace, window, cx| {
-                workspace.sync_dashboard(window, cx)
-            })
-            .expect("resync dashboard");
-    }
-    phase("dashboard resync (200 agents)", start.elapsed(), 10);
-    let dashboard_samples = crate::sampler::stop();
-    crate::sampler::report(&dashboard_samples, "dashboard resync");
 
     crate::sampler::report(&switch_samples, "agent switch");
     crate::sampler::report(&typing_samples, "prompt keystroke");
