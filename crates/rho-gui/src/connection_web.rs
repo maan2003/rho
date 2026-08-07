@@ -62,9 +62,11 @@ pub enum ConnEvent {
         workstreams: Vec<UiWorkstream>,
         agents: Vec<UiAgentSummary>,
         projects: Vec<UiProject>,
+        auth: rho_ui_proto::AuthState,
         machine_seed: u64,
         agent_counter: u64,
     },
+    AuthState(rho_ui_proto::AuthState),
     WorkstreamCreated(UiWorkstream),
     AgentCreated {
         agent_id: AgentId,
