@@ -7,8 +7,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use prefix_id::{PrefixId, PrefixIdDomain};
-#[cfg(feature = "redb")]
-use redb::Value as _;
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -59,14 +57,6 @@ impl PrefixIdDomain for AgentIdDomain {
         self.0
     }
 }
-
-/// Plain sequential workstream id. User-facing surfaces normally address a
-/// workstream by its unique name and render this as `ws-{n}` when needed.
-#[derive(
-    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode, Pack, Unpack,
-)]
-#[cfg_attr(feature = "redb", derive(redb_derive::Key, redb_derive::Value))]
-pub struct WorkstreamId(pub u64);
 
 /// What the user did about an agent's last finished turn.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

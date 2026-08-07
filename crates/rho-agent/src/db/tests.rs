@@ -52,11 +52,9 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
     let mut write = db.write().await;
     write.init_agent_tables();
     let agent_id = write.alloc_agent_id();
-    let workstream = write.create_workstream(UnixMs(1), "usage".to_owned());
     write.create_agent(
         UnixMs(1),
         agent_id,
-        workstream,
         None,
         vec![test_workspace()],
         SessionBinding::ResponsesSol(InferenceProfile::default()),
@@ -82,7 +80,6 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
     write.create_agent(
         UnixMs(1),
         claude_id,
-        workstream,
         None,
         vec![test_workspace()],
         SessionBinding::ClaudeFable {
@@ -104,7 +101,6 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
     write.create_agent(
         UnixMs(1),
         opus_id,
-        workstream,
         None,
         vec![test_workspace()],
         SessionBinding::ClaudeOpus {
@@ -126,7 +122,6 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
     write.create_agent(
         UnixMs(1),
         terra_id,
-        workstream,
         None,
         vec![test_workspace()],
         SessionBinding::ResponsesTerra(InferenceProfile::default()),
@@ -146,7 +141,6 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
     write.create_agent(
         UnixMs(1),
         luna_id,
-        workstream,
         None,
         vec![test_workspace()],
         SessionBinding::ResponsesLuna(InferenceProfile::default()),
@@ -448,12 +442,10 @@ async fn claude_rewind_descriptor_round_trips_and_completes() {
     let resume_at = uuid::uuid!("00000000-0000-4000-8000-000000000003");
     let mut write = db.write().await;
     write.init_agent_tables();
-    let workstream = write.create_workstream(UnixMs(1), "team".to_owned());
     let agent_id = write.alloc_agent_id();
     write.create_agent(
         UnixMs(1),
         agent_id,
-        workstream,
         None,
         vec![test_workspace()],
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
@@ -481,47 +473,21 @@ async fn claude_rewind_descriptor_round_trips_and_completes() {
 }
 
 #[tokio::test]
-async fn workstream_names_are_uniquified_by_suffix() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    let first = write.create_workstream(UnixMs(1), "team".to_owned());
-    let second = write.create_workstream(UnixMs(2), "team".to_owned());
-    let third = write.create_workstream(UnixMs(3), "crew".to_owned());
-    // Renaming onto a taken name suffixes too; renaming to your own name
-    // does not.
-    write.set_workstream_name(UnixMs(4), third, "team".to_owned());
-    write.set_workstream_name(UnixMs(5), first, "team".to_owned());
-    write.commit();
-
-    let read = db.read();
-    assert_eq!(read.get_workstream(first).name, "team");
-    assert_eq!(read.get_workstream(second).name, "team-2");
-    assert_eq!(read.get_workstream(third).name, "team-3");
-}
-
-#[tokio::test]
 async fn labels_toggle_without_duplicates() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
     let mut write = db.write().await;
     write.init_agent_tables();
-    let workstream = write.create_workstream(UnixMs(1), "team".to_owned());
     let agent_id = write.alloc_agent_id();
     write.create_agent(
         UnixMs(1),
         agent_id,
-        workstream,
         None,
         vec![test_workspace()],
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         test_agent_runtime(),
         None,
     );
-    write.workstream_label(UnixMs(2), workstream, "pin", true);
-    write.workstream_label(UnixMs(3), workstream, "pin", true);
-    write.workstream_label(UnixMs(4), workstream, "group:team", true);
     write.agent_label(UnixMs(5), agent_id, "urgent", true);
     write.agent_label(UnixMs(6), agent_id, "urgent", true);
     write.agent_label(UnixMs(7), agent_id, "review", true);
@@ -529,10 +495,6 @@ async fn labels_toggle_without_duplicates() {
     write.commit();
 
     let read = db.read();
-    assert_eq!(
-        read.get_workstream(workstream).labels,
-        ["pin", "group:team"]
-    );
     assert_eq!(read.get_agent(agent_id).labels, ["review"]);
 }
 
@@ -542,12 +504,10 @@ async fn agent_spawned_by_is_stored_at_creation() {
     let db = RhoDb::open(temp.path().join("rho.redb"));
     let mut write = db.write().await;
     write.init_agent_tables();
-    let workstream = write.create_workstream(UnixMs(1), "team".to_owned());
     let pm = write.alloc_agent_id();
     write.create_agent(
         UnixMs(1),
         pm,
-        workstream,
         None,
         vec![test_workspace()],
         AgentRole::pm().session_profile().unwrap(),
@@ -558,7 +518,6 @@ async fn agent_spawned_by_is_stored_at_creation() {
     write.create_agent(
         UnixMs(2),
         engineer,
-        workstream,
         None,
         vec![test_workspace()],
         AgentRole::default().session_profile().unwrap(),
@@ -648,12 +607,10 @@ async fn create_agent_and_append_events_with_cursor() {
 
     let mut write = db.write().await;
     write.init_agent_tables();
-    let workstream = write.create_workstream(UnixMs(1), "default".to_owned());
     let agent_id = write.alloc_agent_id();
     let next = write.create_agent(
         UnixMs(1),
         agent_id,
-        workstream,
         Some("main".to_owned()),
         vec![test_workspace()],
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
@@ -667,7 +624,6 @@ async fn create_agent_and_append_events_with_cursor() {
     let read = db.read();
     let agent = read.get_agent(agent_id);
     assert_eq!(agent.display_name.as_deref(), Some("main"));
-    assert_eq!(agent.workstream, workstream);
 
     let (next, events) = read.agent_events(agent_id);
     assert_eq!(next.seq, 2);
@@ -682,12 +638,10 @@ async fn agent_events_read_lineage_parents() {
 
     let mut write = db.write().await;
     write.init_agent_tables();
-    let workstream = write.create_workstream(UnixMs(1), "default".to_owned());
     let agent_id = write.alloc_agent_id();
     let next = write.create_agent(
         UnixMs(1),
         agent_id,
-        workstream,
         Some("main".to_owned()),
         vec![test_workspace()],
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
@@ -730,12 +684,10 @@ async fn fork_agent_lineage_repoints_current_branch() {
 
     let mut write = db.write().await;
     write.init_agent_tables();
-    let workstream = write.create_workstream(UnixMs(1), "default".to_owned());
     let agent_id = write.alloc_agent_id();
     let next = write.create_agent(
         UnixMs(1),
         agent_id,
-        workstream,
         Some("main".to_owned()),
         vec![test_workspace()],
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
@@ -763,12 +715,10 @@ async fn presentation_history_folds_by_source_reachability_after_rewind() {
     let db = RhoDb::open(temp.path().join("rho.redb"));
     let mut write = db.write().await;
     write.init_agent_tables();
-    let workstream = write.create_workstream(UnixMs(1), "default".to_owned());
     let agent_id = write.alloc_agent_id();
     let first = write.create_agent(
         UnixMs(1),
         agent_id,
-        workstream,
         None,
         vec![test_workspace()],
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
@@ -822,44 +772,16 @@ async fn presentation_history_folds_by_source_reachability_after_rewind() {
 }
 
 #[tokio::test]
-async fn set_agent_workstream_moves_the_agent() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    let first = write.create_workstream(UnixMs(1), "default".to_owned());
-    let second = write.create_workstream(UnixMs(1), "infra".to_owned());
-    let agent_id = write.alloc_agent_id();
-    write.create_agent(
-        UnixMs(1),
-        agent_id,
-        first,
-        None,
-        vec![test_workspace()],
-        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
-        test_agent_runtime(),
-        None,
-    );
-    write.set_agent_workstream(UnixMs(2), agent_id, second);
-    write.commit();
-
-    assert_eq!(db.read().get_agent(agent_id).workstream, second);
-}
-
-#[tokio::test]
 async fn turn_end_and_user_message_set_dispositions() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));
 
     let mut write = db.write().await;
     write.init_agent_tables();
-    let workstream = write.create_workstream(UnixMs(1), "default".to_owned());
     let agent_id = write.alloc_agent_id();
     write.create_agent(
         UnixMs(1),
         agent_id,
-        workstream,
         None,
         vec![test_workspace()],
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
@@ -1017,7 +939,6 @@ async fn agent_ids_allocate_before_records_exist() {
 
     let mut write = db.write().await;
     write.init_agent_tables();
-    let workstream = write.create_workstream(UnixMs(1), "default".to_owned());
     // Only the second allocation gets a record, as when the first jj
     // checkout fails.
     let leaked_id = write.alloc_agent_id();
@@ -1026,7 +947,6 @@ async fn agent_ids_allocate_before_records_exist() {
     write.create_agent(
         UnixMs(2),
         agent_id,
-        workstream,
         None,
         vec![test_workspace()],
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
@@ -1068,12 +988,10 @@ async fn migrates_existing_parent_edges_to_response_subscriptions() {
     let db = RhoDb::open(temp.path().join("rho.redb"));
     let mut write = db.write().await;
     write.init_agent_tables();
-    let workstream = write.create_workstream(UnixMs(1), "migration".to_owned());
     let parent = write.alloc_agent_id();
     write.create_agent(
         UnixMs(1),
         parent,
-        workstream,
         None,
         vec![test_workspace()],
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
@@ -1084,7 +1002,6 @@ async fn migrates_existing_parent_edges_to_response_subscriptions() {
     write.create_agent(
         UnixMs(2),
         child,
-        workstream,
         None,
         vec![test_workspace()],
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),

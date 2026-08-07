@@ -15,7 +15,7 @@ prefix-id = { workspace = true, features = ["redb"] }
 rand.workspace = true
 redb.workspace = true
 redb-derive.workspace = true
-rho-core = { workspace = true, features = ["redb"] }
+rho-core.workspace = true
 rho-db.workspace = true
 rho-inference.workspace = true
 senax-encoder.workspace = true

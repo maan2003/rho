@@ -13572,8 +13572,6 @@ dependencies = [
  "bytes",
  "inventory",
  "prefix-id",
- "redb",
- "redb-derive",
  "senax-encoder",
  "serde",
  "serde_json",

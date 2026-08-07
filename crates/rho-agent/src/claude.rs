@@ -26,7 +26,6 @@ use crate::db::{
     AgentEventPos, AgentId, AgentPresentationCache, AgentPresentationUpdate,
     AgentProfileWriteTxnExt, AgentReadTxnExt, AgentRole, AgentRoleSessionProfile as _,
     AgentRuntime, AgentWriteTxnExt, ClaudeRewind, EngineerIntelligence, SessionBinding, UnixMillis,
-    WorkstreamId,
 };
 use crate::multi_agent_tools::MultiAgentTools;
 use crate::{
@@ -59,7 +58,6 @@ impl ClaudeAgent {
     pub(crate) async fn create(
         db: RhoDb,
         inference: Inference,
-        workstream: WorkstreamId,
         display_name: Option<String>,
         start: Vec<StartWorkdir>,
         mode: SessionBinding,
@@ -81,7 +79,6 @@ impl ClaudeAgent {
         let next_event = write.create_agent(
             UnixMillis::now(),
             agent_id,
-            workstream,
             display_name,
             entries
                 .iter()
@@ -2111,12 +2108,10 @@ mod tests {
         let db = RhoDb::open(temp.path().join("rho.redb"));
         let mut write = db.write().await;
         write.init_agent_tables();
-        let workstream = write.create_workstream(rho_core::UnixMs(1), "default".to_owned());
         let agent_id = write.alloc_agent_id();
         write.create_agent(
             rho_core::UnixMs(1),
             agent_id,
-            workstream,
             None,
             vec![WorkspaceInfo::Workspace {
                 repo: "/home/user/src/rho".into(),

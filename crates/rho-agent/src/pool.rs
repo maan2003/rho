@@ -22,7 +22,6 @@ use crate::db::{
     AGENT_USAGE_BUCKET_MS, AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole,
     AgentRoleSessionProfile as _, AgentRuntime, AgentUsageBucket, AgentWorkflow,
     AgentWriteTxnExt as _, EngineerIntelligence, InferenceModel, InferenceProfile, SessionBinding,
-    WorkstreamId,
 };
 use crate::lazy::Lazy;
 use crate::{Agent, AgentInputId, AgentState, InputSourceId, MessageDelivery, StartWorkdir};
@@ -66,7 +65,6 @@ pub struct AgentPool {
 /// Broadcast when any agent is created in the pool.
 #[derive(Clone)]
 pub struct AgentCreated {
-    pub workstream: WorkstreamId,
     pub agent_id: AgentId,
     pub agent: RunningAgent,
 }
@@ -439,18 +437,16 @@ impl AgentPool {
 
     pub async fn create(
         self: &Arc<Self>,
-        workstream: WorkstreamId,
         config: AgentRole,
         display_name: Option<String>,
         start: Vec<StartWorkdir>,
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
-        self.create_with_parent(workstream, config, display_name, start, None)
+        self.create_with_parent(config, display_name, start, None)
             .await
     }
 
     async fn create_with_parent(
         self: &Arc<Self>,
-        workstream: WorkstreamId,
         config: AgentRole,
         display_name: Option<String>,
         start: Vec<StartWorkdir>,
@@ -471,7 +467,6 @@ impl AgentPool {
                     self.inference.clone(),
                     mode,
                     config,
-                    workstream,
                     display_name,
                     start,
                     parent,
@@ -486,7 +481,6 @@ impl AgentPool {
                 let (agent_id, agent) = ClaudeAgent::create(
                     self.db.clone(),
                     self.inference.clone(),
-                    workstream,
                     display_name,
                     start,
                     mode,
@@ -502,7 +496,6 @@ impl AgentPool {
         self.observe_activation(agent_id, agent.clone()).await;
         if config != AgentRole::Iris {
             let _ = self.created.send(AgentCreated {
-                workstream,
                 agent_id,
                 agent: agent.clone(),
             });
@@ -510,8 +503,8 @@ impl AgentPool {
         Ok((agent_id, agent))
     }
 
-    /// Create a child agent for `parent` in the parent's mode, joining the
-    /// parent's workstream, and mail it its task. Returns once the child has
+    /// Create a child agent for `parent` in the parent's mode and mail it its
+    /// task. Returns once the child has
     /// accepted that task. An empty `workdirs` forks the parent's whole
     /// working set.
     pub async fn spawn_child(
@@ -523,10 +516,10 @@ impl AgentPool {
         config: AgentRole,
     ) -> anyhow::Result<AgentId> {
         self.enforce_spawn_limits(parent).await?;
-        let (workstream, parent_workdirs, parent_role) = {
+        let (parent_workdirs, parent_role) = {
             let read = self.db.read();
             let record = read.get_agent(parent);
-            (record.workstream, record.workdirs, record.role)
+            (record.workdirs, record.role)
         };
         let workdirs = if workdirs.is_empty() {
             parent_workdirs
@@ -593,7 +586,7 @@ impl AgentPool {
         }
         let config = child_role(parent_role, config);
         let (child_id, child) = self
-            .create_with_parent(workstream, config, Some(task_name), start, Some(parent))
+            .create_with_parent(config, Some(task_name), start, Some(parent))
             .await?;
         self.set_response_subscription(parent, child_id, true)
             .await?;

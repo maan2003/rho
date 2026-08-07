@@ -33,8 +33,6 @@ const MAX_PRESENTATION_SOURCE_SCANNED_EVENTS: usize = 256;
 const AGENTS: TableDefinition<AgentId, Sen<AgentRecord>> = TableDefinition::new("agents");
 const AGENT_RESPONSE_SUBSCRIPTIONS: TableDefinition<AgentResponseSubscription, ()> =
     TableDefinition::new("agent_response_subscriptions");
-const WORKSTREAMS: TableDefinition<WorkstreamId, Sen<WorkstreamRecord>> =
-    TableDefinition::new("workstreams");
 const PROJECTS: TableDefinition<String, Sen<ProjectRecord>> = TableDefinition::new("projects");
 /// Opaque client-owned view configuration (see
 /// [`AgentReadTxnExt::view_config`]).
@@ -78,9 +76,6 @@ struct CounterKey(u8);
 impl CounterKey {
     pub const LAST_AGENT_ID: Self = Self(1);
     pub const LAST_LINEAGE_ID: Self = Self(2);
-    /// Formerly the topic and then tag id counter; workstreams continue
-    /// its sequence.
-    pub const LAST_WORKSTREAM_ID: Self = Self(3);
 }
 
 /// A persistent relationship that routes every future terminal response from
@@ -261,23 +256,8 @@ fn quota_observation_unchanged(old: &QuotaObservationRecord, new: &QuotaObservat
 
 pub use rho_core::{
     AdvisorIntelligence, AgentDisposition, AgentId, AgentIdDomain, AgentRole, AgentWorkflow,
-    EngineerIntelligence, WorkstreamId,
+    EngineerIntelligence,
 };
-
-/// The persistent unit of work: the user's statement that its member
-/// agents belong together. Deliberately minimal — repos, attention, and
-/// everything else about a workstream is derived from its agents; how
-/// workstreams are grouped and sorted is the client's view layer, driven
-/// by labels.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct WorkstreamRecord {
-    pub name: String,
-    /// Free-form markers ("pin", …); semantics live in the
-    /// client's view layer, not here.
-    pub labels: Vec<String>,
-    pub created_at: UnixMillis,
-    pub updated_at: UnixMillis,
-}
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct ProjectRecord {
@@ -326,12 +306,6 @@ pub struct AgentPresentationCache {
     pub activity: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
-pub struct PendingPresentationWorkstream {
-    pub workstream_id: WorkstreamId,
-    pub provisional_name: String,
-}
-
 impl AgentEventPos {
     fn root(lineage_id: AgentLineageId) -> Self {
         Self { lineage_id, seq: 0 }
@@ -359,11 +333,6 @@ pub struct AgentRecord {
     /// The last durable, model-derived activity label.
     #[senax(default)]
     pub activity: Option<String>,
-    /// A self-founded workstream that should take the first generated title.
-    /// Keeping this association with the agent makes rename recovery
-    /// independent of lossy daemon broadcasts and daemon restarts.
-    #[senax(default)]
-    pub pending_presentation_workstream: Option<PendingPresentationWorkstream>,
     /// The agent's working set: where it works, primary workdir first.
     /// Fixed at spawn — never removed or reordered, because accumulated
     /// model context assumes the entries stay valid. Managed workspace ids
@@ -392,10 +361,6 @@ pub struct AgentRecord {
     /// user last asked without replaying the transcript.
     #[senax(default)]
     pub last_user_message_text: String,
-    /// The workstream this agent belongs to: exactly one, founded with the
-    /// top-level agent and inherited by its spawn tree.
-    #[senax(default)]
-    pub workstream: WorkstreamId,
     /// Free-form markers ("pin", …); semantics live in the client's view
     /// layer. Not copied on spawn.
     #[senax(default)]
@@ -732,8 +697,6 @@ pub trait AgentReadTxnExt {
     /// [`AgentWriteTxnExt::init_agent_tables`] has run.
     fn machine_seed(&self) -> u64;
     fn last_agent_counter(&self) -> u64;
-    fn get_workstream(&self, workstream_id: WorkstreamId) -> WorkstreamRecord;
-    fn list_workstreams(&self) -> Vec<(WorkstreamId, WorkstreamRecord)>;
     /// Opaque client-owned view configuration; the daemon stores and
     /// forwards it without interpreting a byte.
     fn view_config(&self) -> Vec<u8>;
@@ -775,32 +738,8 @@ pub trait AgentReadTxnExt {
 pub trait AgentWriteTxnExt {
     fn init_agent_tables(&mut self);
 
-    /// Creates a workstream; a colliding name gets a numeric suffix (names
-    /// are auto-generated from agent titles, so collisions must not fail).
-    fn create_workstream(&mut self, now: UnixMillis, name: String) -> WorkstreamId;
-
-    fn set_workstream_name(&mut self, now: UnixMillis, workstream_id: WorkstreamId, name: String);
-
-    /// Adds or removes one workstream label; adding twice is a no-op.
-    fn workstream_label(
-        &mut self,
-        now: UnixMillis,
-        workstream_id: WorkstreamId,
-        label: &str,
-        add: bool,
-    );
-
     /// Adds or removes one agent label; adding twice is a no-op.
     fn agent_label(&mut self, now: UnixMillis, agent_id: AgentId, label: &str, add: bool);
-
-    /// Moves an agent to another workstream (its spawn tree moves with it —
-    /// callers pass every member).
-    fn set_agent_workstream(
-        &mut self,
-        now: UnixMillis,
-        agent_id: AgentId,
-        workstream_id: WorkstreamId,
-    );
 
     fn set_view_config(&mut self, data: Vec<u8>);
     fn set_default_auth_namespace(&mut self, name: String);
@@ -839,11 +778,6 @@ pub trait AgentWriteTxnExt {
         now: UnixMillis,
         agent_id: AgentId,
     ) -> AgentPresentationCache;
-    fn set_pending_presentation_workstream(
-        &mut self,
-        agent_id: AgentId,
-        workstream: Option<PendingPresentationWorkstream>,
-    );
     fn fork_agent_lineage(
         &mut self,
         now: UnixMillis,
@@ -867,10 +801,6 @@ pub trait AgentWriteTxnExt {
     /// replying is as much a verdict as acking.
     fn record_agent_user_message(&mut self, now: UnixMillis, agent_id: AgentId, text: &str);
 
-    /// Removes a workstream record. Callers ensure no agent still points at
-    /// it — the daemon deletes only streams its moves emptied.
-    fn delete_workstream(&mut self, workstream_id: WorkstreamId);
-
     fn set_agent_disposition(&mut self, agent_id: AgentId, disposition: AgentDisposition);
     fn set_agent_response_subscription(
         &mut self,
@@ -893,7 +823,6 @@ pub(crate) trait AgentProfileWriteTxnExt {
         &mut self,
         now: UnixMillis,
         agent_id: AgentId,
-        workstream: WorkstreamId,
         display_name: Option<String>,
         workdirs: Vec<WorkspaceInfo>,
         mode: SessionBinding,
@@ -909,7 +838,6 @@ impl AgentProfileWriteTxnExt for WriteTxn {
         &mut self,
         now: UnixMillis,
         agent_id: AgentId,
-        workstream: WorkstreamId,
         display_name: Option<String>,
         workdirs: Vec<WorkspaceInfo>,
         mode: SessionBinding,
@@ -941,7 +869,6 @@ impl AgentProfileWriteTxnExt for WriteTxn {
             display_name,
             generated_title: None,
             activity: None,
-            pending_presentation_workstream: None,
             workdirs,
             created_at: now,
             updated_at: now,
@@ -954,7 +881,6 @@ impl AgentProfileWriteTxnExt for WriteTxn {
             claude_rewind: None,
             last_user_message: now,
             last_user_message_text: String::new(),
-            workstream,
             labels: Vec::new(),
             disposition: AgentDisposition::Done,
             turn_report: None,
@@ -991,21 +917,6 @@ impl AgentReadTxnExt for ReadTxn {
             .get(&CounterKey::LAST_AGENT_ID)
             .map(|counter| counter.value())
             .unwrap_or(0)
-    }
-
-    fn get_workstream(&self, workstream_id: WorkstreamId) -> WorkstreamRecord {
-        self.open_table(WORKSTREAMS)
-            .get(&workstream_id)
-            .expect("workstream id missing")
-            .value()
-            .into_owned()
-    }
-
-    fn list_workstreams(&self) -> Vec<(WorkstreamId, WorkstreamRecord)> {
-        self.open_table(WORKSTREAMS)
-            .iter()
-            .map(|(key, value)| (key.value(), value.value().into_owned()))
-            .collect()
     }
 
     fn view_config(&self) -> Vec<u8> {
@@ -1250,7 +1161,6 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(PRESENTATION_EVENTS);
         self.open_table(AGENTS);
         self.open_table(AGENT_RESPONSE_SUBSCRIPTIONS);
-        self.open_table(WORKSTREAMS);
         self.open_table(PROJECTS);
         self.open_table(VIEW_CONFIG);
         self.open_table(DEFAULT_AUTH_NAMESPACE);
@@ -1264,42 +1174,6 @@ impl AgentWriteTxnExt for WriteTxn {
         }
     }
 
-    fn create_workstream(&mut self, now: UnixMillis, name: String) -> WorkstreamId {
-        let workstream_id = WorkstreamId(next_counter(self, CounterKey::LAST_WORKSTREAM_ID));
-        let workstream = WorkstreamRecord {
-            name: unique_workstream_name(self, name, None),
-            labels: Vec::new(),
-            created_at: now,
-            updated_at: now,
-        };
-        self.open_table(WORKSTREAMS)
-            .insert(&workstream_id, SenValue::borrowed(&workstream));
-        workstream_id
-    }
-
-    fn delete_workstream(&mut self, workstream_id: WorkstreamId) {
-        self.open_table(WORKSTREAMS).remove(&workstream_id);
-    }
-
-    fn set_workstream_name(&mut self, now: UnixMillis, workstream_id: WorkstreamId, name: String) {
-        let name = unique_workstream_name(self, name, Some(workstream_id));
-        update_workstream(self, now, workstream_id, |workstream| {
-            workstream.name = name;
-        });
-    }
-
-    fn workstream_label(
-        &mut self,
-        now: UnixMillis,
-        workstream_id: WorkstreamId,
-        label: &str,
-        add: bool,
-    ) {
-        update_workstream(self, now, workstream_id, |workstream| {
-            edit_labels(&mut workstream.labels, label, add);
-        });
-    }
-
     fn agent_label(&mut self, now: UnixMillis, agent_id: AgentId, label: &str, add: bool) {
         let mut agents = self.open_table(AGENTS);
         let mut agent = agents
@@ -1308,23 +1182,6 @@ impl AgentWriteTxnExt for WriteTxn {
             .value()
             .into_owned();
         edit_labels(&mut agent.labels, label, add);
-        agent.updated_at = now;
-        agents.insert(&agent_id, SenValue::borrowed(&agent));
-    }
-
-    fn set_agent_workstream(
-        &mut self,
-        now: UnixMillis,
-        agent_id: AgentId,
-        workstream_id: WorkstreamId,
-    ) {
-        let mut agents = self.open_table(AGENTS);
-        let mut agent = agents
-            .get(&agent_id)
-            .expect("agent id missing")
-            .value()
-            .into_owned();
-        agent.workstream = workstream_id;
         agent.updated_at = now;
         agents.insert(&agent_id, SenValue::borrowed(&agent));
     }
@@ -1446,7 +1303,6 @@ impl AgentWriteTxnExt for WriteTxn {
         if !agent_event_visible_write(self, agent_id, update.through) {
             return None;
         }
-        let mut rename_workstream = None;
         let cache = {
             let mut agents = self.open_table(AGENTS);
             let mut agent = agents
@@ -1458,9 +1314,6 @@ impl AgentWriteTxnExt for WriteTxn {
                 PresentationField::Unchanged => {}
                 PresentationField::Set(title) if agent.display_name.is_none() => {
                     agent.generated_title = Some(title.clone());
-                    if let Some(pending) = agent.pending_presentation_workstream.take() {
-                        rename_workstream = Some((pending, title.clone()));
-                    }
                 }
                 PresentationField::Set(_) | PresentationField::Clear => {}
             }
@@ -1477,14 +1330,6 @@ impl AgentWriteTxnExt for WriteTxn {
             agents.insert(&agent_id, SenValue::borrowed(&agent));
             cache
         };
-        if let Some((pending, title)) = rename_workstream
-            && self
-                .open_table(WORKSTREAMS)
-                .get(&pending.workstream_id)
-                .is_some_and(|value| value.value().into_owned().name == pending.provisional_name)
-        {
-            self.set_workstream_name(now, pending.workstream_id, title);
-        }
         Some(cache)
     }
 
@@ -1526,21 +1371,6 @@ impl AgentWriteTxnExt for WriteTxn {
         agent.updated_at = agent.updated_at.max(now);
         agents.insert(&agent_id, SenValue::borrowed(&agent));
         cache
-    }
-
-    fn set_pending_presentation_workstream(
-        &mut self,
-        agent_id: AgentId,
-        workstream: Option<PendingPresentationWorkstream>,
-    ) {
-        let mut agents = self.open_table(AGENTS);
-        let mut agent = agents
-            .get(&agent_id)
-            .expect("agent id missing")
-            .value()
-            .into_owned();
-        agent.pending_presentation_workstream = workstream;
-        agents.insert(&agent_id, SenValue::borrowed(&agent));
     }
 
     fn record_agent_turn_end(&mut self, now: UnixMillis, agent_id: AgentId) {
@@ -1922,9 +1752,6 @@ fn migrate_quota_auth_namespace(write: &mut WriteTxn) {
     }
 }
 
-/// Workstream names are unique (so a name identifies a workstream); a
-/// colliding name gets a numeric suffix rather than failing, since names
-/// are auto-generated from agent titles.
 /// One display line from a user message: whitespace collapsed, cut at a
 /// character boundary. Long enough to recall what was asked, short enough
 /// for a summary row.
@@ -1935,43 +1762,6 @@ fn message_snippet(text: &str) -> String {
         snippet.push('\u{2026}');
     }
     snippet
-}
-
-fn unique_workstream_name(
-    write: &mut WriteTxn,
-    base: String,
-    exclude: Option<WorkstreamId>,
-) -> String {
-    let taken = write
-        .open_table(WORKSTREAMS)
-        .iter()
-        .filter(|(workstream_id, _)| Some(workstream_id.value()) != exclude)
-        .map(|(_, workstream)| workstream.value().into_owned().name)
-        .collect::<std::collections::HashSet<_>>();
-    if !taken.contains(&base) {
-        return base;
-    }
-    (2u64..)
-        .map(|n| format!("{base}-{n}"))
-        .find(|candidate| !taken.contains(candidate))
-        .expect("unbounded suffix search terminates")
-}
-
-fn update_workstream(
-    write: &mut WriteTxn,
-    now: UnixMillis,
-    workstream_id: WorkstreamId,
-    edit: impl FnOnce(&mut WorkstreamRecord),
-) {
-    let mut workstreams = write.open_table(WORKSTREAMS);
-    let mut workstream = workstreams
-        .get(&workstream_id)
-        .expect("workstream id missing")
-        .value()
-        .into_owned();
-    edit(&mut workstream);
-    workstream.updated_at = now;
-    workstreams.insert(&workstream_id, SenValue::borrowed(&workstream));
 }
 
 /// Adds or removes a label, keeping the set free of duplicates.

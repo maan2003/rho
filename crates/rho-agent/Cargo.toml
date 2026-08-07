@@ -25,7 +25,7 @@ redb-derive = "0.1"
 rho-claude.workspace = true
 rho-code-mode = { workspace = true, optional = true }
 rho-context-config.workspace = true
-rho-core = { workspace = true, features = ["redb"] }
+rho-core.workspace = true
 rho-db.workspace = true
 rho-inference.workspace = true
 rho-tool-shell.workspace = true

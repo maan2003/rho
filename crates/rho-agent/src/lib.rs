@@ -604,7 +604,6 @@ impl Agent {
         inference: Inference,
         mode: SessionBinding,
         role: db::AgentRole,
-        workstream: db::WorkstreamId,
         display_name: Option<String>,
         start: Vec<StartWorkdir>,
         parent: Option<AgentId>,
@@ -628,7 +627,6 @@ impl Agent {
         let next_event = write.create_agent(
             now,
             agent_id,
-            workstream,
             display_name,
             entries
                 .iter()
