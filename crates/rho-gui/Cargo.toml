@@ -106,6 +106,7 @@ tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
 tree-sitter = "0.26"
 tree-sitter-md = { git = "https://github.com/tree-sitter-grammars/tree-sitter-markdown", rev = "9a23c1a96c0513d8fc6520972beedd419a973539" }
+org-element = { version = "0.1.0", default-features = false }
 ui = { path = "../../vendor/zed/crates/ui" }
 util = { path = "../../vendor/zed/crates/util", optional = true }
 vim = { path = "../../vendor/zed/crates/vim", optional = true }

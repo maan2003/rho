@@ -53,31 +53,15 @@ pub enum ClientMessage {
     Subscribe,
     /// Subscribes to the daemon-owned Desk snapshot and live operation stream.
     DeskSubscribe,
-    /// Allocates a never-reused id and inserts a blank node atomically.
-    DeskInsert {
-        parent: Option<desk::DeskNodeId>,
-        order: desk::DeskOrderKey,
-    },
-    DeskStructureApply {
-        op: desk::DeskStructureOp,
-    },
-    DeskStructureUndo {
-        op_id: desk::DeskStructureOpId,
-    },
-    /// Appends a Zed text-buffer operation to one node. The operation's
+    /// Appends an ordinary Zed text-buffer operation. The operation's
     /// replica id must match the id assigned by `DeskSnapshot`.
     DeskTextApply {
-        node_id: desk::DeskNodeId,
         operation: desk::DeskOperation,
         transaction: Option<desk::DeskTransaction>,
     },
-    DeskTextUndo {
-        node_id: desk::DeskNodeId,
-        transaction_id: desk::DeskClock,
-    },
-    /// Sets the non-undoable principal binding for one Desk node.
+    /// Sets the non-undoable principal binding for an existing identity token.
     DeskBind {
-        node_id: desk::DeskNodeId,
+        token: desk::DeskIdToken,
         agent_id: AgentId,
     },
     NewAgent {
@@ -86,8 +70,9 @@ pub enum ClientMessage {
         /// the modes that need one).
         start: StartMode,
         content: Option<Vec<ContentPart>>,
-        /// When present, bind the newly allocated agent to this Desk node.
-        desk_node: Option<desk::DeskNodeId>,
+        /// When present, staff the heading beginning at this UTF-8 byte offset.
+        /// The daemon inserts identity text after agent creation.
+        desk_heading: Option<u64>,
     },
     SubscribeAgent {
         agent_id: AgentId,
@@ -516,9 +501,6 @@ pub enum ServerMessage {
         /// Zed replica id assigned to this user connection. Replica ids make
         /// body-operation attribution intrinsic to the CRDT history.
         replica_id: u16,
-    },
-    DeskStructureApplied {
-        record: desk::DeskStructureOpRecord,
     },
     DeskTextApplied {
         record: desk::DeskTextOpRecord,

@@ -10829,6 +10829,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "org-element"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5ea9f367f49faa358215919aa967e96a610b0cdd1acc167c35f2c9d2ba2a234"
+dependencies = [
+ "cc",
+ "once_cell",
+ "thiserror 1.0.69",
+ "tree-sitter",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "os_display"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13670,6 +13683,7 @@ dependencies = [
  "multi_buffer",
  "node_runtime",
  "octo-types",
+ "org-element",
  "path",
  "prefix-id",
  "project",

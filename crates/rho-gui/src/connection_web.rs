@@ -62,7 +62,6 @@ pub enum ConnEvent {
         snapshot: rho_ui_proto::desk::DeskSnapshot,
         replica_id: u16,
     },
-    DeskStructureApplied(rho_ui_proto::desk::DeskStructureOpRecord),
     DeskTextApplied(rho_ui_proto::desk::DeskTextOpRecord),
     DeskBindingChanged(rho_ui_proto::desk::DeskBinding),
     Ready {
@@ -424,9 +423,6 @@ fn handle_host_message(
             snapshot: snapshot.clone(),
             replica_id: *replica_id,
         }),
-        ServerMessage::DeskStructureApplied { record } => {
-            Some(ConnEvent::DeskStructureApplied(record.clone()))
-        }
         ServerMessage::DeskTextApplied { record } => {
             Some(ConnEvent::DeskTextApplied(record.clone()))
         }

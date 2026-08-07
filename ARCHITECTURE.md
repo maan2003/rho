@@ -98,6 +98,13 @@ than by running a supervisor, extension protocol, or daemon process graph.
   Each attached daemon is a named GUI host. Host-scoped settings and new-agent
   creation route through that identity explicitly; choosing a project never
   silently changes a draft's selected host.
+  The Desk is one daemon-owned Zed CRDT text document per attached host. Its
+  org-like headings derive structure rather than receiving structural RPCs;
+  only headings with a directly following `:id:` property carry durable
+  identity. Bindings key that token to an agent outside the undoable document,
+  with the first duplicate token in document order owning the join. Clients
+  project exactly one excerpt per host, so multibuffer seams coincide only
+  with daemon ownership boundaries.
   `rho-gui` supplies its context strip, theme mapping, and focus/show policy,
   while GPUI web owns only the immediate pointer-down routing region.
   The native GUI

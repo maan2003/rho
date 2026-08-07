@@ -2312,47 +2312,13 @@ async fn handle_message(
             });
             Ok(Refresh::None)
         }
-        ClientMessage::DeskInsert { parent, order } => {
-            let record = agents
-                .desk
-                .insert(parent, order)
-                .await
-                .map_err(anyhow::Error::msg)?;
-            let _ = agents
-                .events
-                .send(ServerMessage::DeskStructureApplied { record });
-            Ok(Refresh::None)
-        }
-        ClientMessage::DeskStructureApply { op } => {
-            let record = agents
-                .desk
-                .apply_structure(op)
-                .await
-                .map_err(anyhow::Error::msg)?;
-            let _ = agents
-                .events
-                .send(ServerMessage::DeskStructureApplied { record });
-            Ok(Refresh::None)
-        }
-        ClientMessage::DeskStructureUndo { op_id } => {
-            let record = agents
-                .desk
-                .undo_structure(op_id)
-                .await
-                .map_err(anyhow::Error::msg)?;
-            let _ = agents
-                .events
-                .send(ServerMessage::DeskStructureApplied { record });
-            Ok(Refresh::None)
-        }
         ClientMessage::DeskTextApply {
-            node_id,
             operation,
             transaction,
         } => {
             let record = agents
                 .desk
-                .apply_text(node_id, operation, transaction)
+                .apply_text(operation, transaction)
                 .await
                 .map_err(anyhow::Error::msg)?;
             let _ = agents
@@ -2360,21 +2326,7 @@ async fn handle_message(
                 .send(ServerMessage::DeskTextApplied { record });
             Ok(Refresh::None)
         }
-        ClientMessage::DeskTextUndo {
-            node_id,
-            transaction_id,
-        } => {
-            let record = agents
-                .desk
-                .undo_text(node_id, transaction_id)
-                .await
-                .map_err(anyhow::Error::msg)?;
-            let _ = agents
-                .events
-                .send(ServerMessage::DeskTextApplied { record });
-            Ok(Refresh::None)
-        }
-        ClientMessage::DeskBind { node_id, agent_id } => {
+        ClientMessage::DeskBind { token, agent_id } => {
             if !agents
                 .db
                 .read()
@@ -2386,7 +2338,7 @@ async fn handle_message(
             }
             let binding = agents
                 .desk
-                .bind(node_id, agent_id)
+                .bind(token, agent_id)
                 .await
                 .map_err(anyhow::Error::msg)?;
             let _ = agents
@@ -2608,7 +2560,7 @@ async fn handle_message(
             role,
             start,
             content,
-            desk_node,
+            desk_heading,
         } => {
             if let Some(content) = content.as_deref() {
                 validate_image_content(content)?;
@@ -2616,12 +2568,19 @@ async fn handle_message(
             // Subscription and the AgentCreated announcement ride the pool's
             // creation broadcast (all connections, including this one).
             let (agent_id, agent) = agents.create(role, start).await?;
-            if let Some(node_id) = desk_node {
-                let binding = agents
+            if let Some(heading_offset) = desk_heading {
+                let (record, binding) = agents
                     .desk
-                    .bind(node_id, agent_id)
+                    .staff_heading(
+                        usize::try_from(heading_offset)
+                            .map_err(|_| anyhow::anyhow!("Desk heading offset overflow"))?,
+                        agent_id,
+                    )
                     .await
                     .map_err(anyhow::Error::msg)?;
+                let _ = agents
+                    .events
+                    .send(ServerMessage::DeskTextApplied { record });
                 let _ = agents
                     .events
                     .send(ServerMessage::DeskBindingChanged { binding });

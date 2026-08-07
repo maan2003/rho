@@ -1,5 +1,5 @@
-//! The Desk: one editable Zed buffer per stable tree node, projected into a
-//! single multibuffer in depth-first order.
+//! The Desk: one org-like editable buffer per attached host, projected with
+//! exactly one multibuffer excerpt at each daemon ownership boundary.
 
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -12,8 +12,8 @@ use gpui::{App, Context, Entity, Focusable as _, Window};
 use language::{Buffer, BufferEvent, Capability, InlayId, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use rho_ui_proto::desk::{
-    DeskBinding, DeskClock, DeskNode, DeskNodeId, DeskNodeText, DeskOperation, DeskSnapshot,
-    DeskStructureOpRecord, DeskTextOpRecord, DeskTransaction,
+    DeskBinding, DeskClock, DeskHeading, DeskHeadingState, DeskOperation, DeskSnapshot,
+    DeskTextOpRecord, DeskTransaction, parse,
 };
 use rho_ui_proto::{AgentId, ClientMessage};
 use text::{BufferId, ReplicaId};
@@ -23,32 +23,10 @@ use ui::div;
 use crate::registry::{AgentRegistry, HostId};
 use crate::workspace::Workspace;
 
-const DEPTH_RAIL_KEY: HighlightKey = HighlightKey::SyntaxTreeView(usize::MAX - 1);
+const DECORATION_KEY: HighlightKey = HighlightKey::SyntaxTreeView(usize::MAX - 1);
+const ID_LINE_KEY: HighlightKey = HighlightKey::SyntaxTreeView(usize::MAX - 2);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ParsedHeadingState {
-    Todo,
-    Staffed,
-    Done,
-    Discarded,
-}
-
-pub fn parse_heading_line(text: &str) -> (Option<ParsedHeadingState>, &str) {
-    let line = text.lines().next().unwrap_or_default().trim();
-    for (keyword, state) in [
-        ("TODO", ParsedHeadingState::Todo),
-        ("STAFFED", ParsedHeadingState::Staffed),
-        ("DONE", ParsedHeadingState::Done),
-        ("DISCARDED", ParsedHeadingState::Discarded),
-    ] {
-        if let Some(title) = line.strip_prefix(keyword)
-            && (title.is_empty() || title.starts_with(char::is_whitespace))
-        {
-            return (Some(state), title.trim_start());
-        }
-    }
-    (None, line)
-}
+pub type ParsedHeadingState = DeskHeadingState;
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RowTarget {
@@ -58,13 +36,12 @@ pub enum RowTarget {
 
 struct HostDesk {
     snapshot: DeskSnapshot,
-    replica_id: u16,
 }
 
 #[derive(Clone)]
 struct NowItem {
     host: HostId,
-    node_id: DeskNodeId,
+    offset: usize,
     agent_id: AgentId,
     attention: rho_ui_proto::UiAttention,
     last_active: rho_core::UnixMs,
@@ -73,34 +50,31 @@ struct NowItem {
 
 struct DeskCaret {
     anchor: text::Anchor,
-    collapsed: HashSet<(HostId, DeskNodeId)>,
+    collapsed: HashSet<(HostId, usize)>,
 }
 
 struct HeadingEntry {
     label: String,
     description: String,
     host: HostId,
-    node_id: DeskNodeId,
+    offset: usize,
 }
 
 pub struct Dashboard {
     multi_buffer: Entity<MultiBuffer>,
     editor: Entity<Editor>,
     hosts: BTreeMap<HostId, HostDesk>,
-    buffers: HashMap<(HostId, DeskNodeId), Entity<Buffer>>,
-    subscriptions: HashMap<(HostId, DeskNodeId), gpui::Subscription>,
-    known_text_ops: HashSet<(HostId, DeskNodeId, DeskClock)>,
-    undone_text_transactions: HashSet<(HostId, DeskNodeId, DeskClock)>,
-    last_structure_op: HashMap<(HostId, DeskNodeId), (rho_ui_proto::desk::DeskStructureOpId, u64)>,
-    last_text_timestamp: HashMap<(HostId, DeskNodeId), u64>,
-    collapsed: HashSet<(HostId, DeskNodeId)>,
-    collapse_blocks: Vec<CustomBlockId>,
-    host_header_blocks: Vec<CustomBlockId>,
-    depth_inlays: Vec<InlayId>,
-    buffer_nodes: HashMap<BufferId, (HostId, DeskNodeId)>,
+    buffers: HashMap<HostId, Entity<Buffer>>,
+    subscriptions: HashMap<HostId, gpui::Subscription>,
+    buffer_hosts: HashMap<BufferId, HostId>,
+    known_ops: HashSet<(HostId, DeskClock)>,
     headers_disabled: HashSet<BufferId>,
     displayed_len: usize,
     next_buffer_id: u64,
+    collapsed: HashSet<(HostId, usize)>,
+    fold_blocks: Vec<CustomBlockId>,
+    host_header_blocks: Vec<CustomBlockId>,
+    decoration_inlays: Vec<InlayId>,
     now_items: Vec<NowItem>,
     now_block: Option<CustomBlockId>,
     now_cursor: Option<AgentId>,
@@ -133,18 +107,15 @@ impl Dashboard {
             hosts: BTreeMap::new(),
             buffers: HashMap::new(),
             subscriptions: HashMap::new(),
-            known_text_ops: HashSet::new(),
-            undone_text_transactions: HashSet::new(),
-            last_structure_op: HashMap::new(),
-            last_text_timestamp: HashMap::new(),
-            collapsed: HashSet::new(),
-            collapse_blocks: Vec::new(),
-            host_header_blocks: Vec::new(),
-            depth_inlays: Vec::new(),
-            buffer_nodes: HashMap::new(),
+            buffer_hosts: HashMap::new(),
+            known_ops: HashSet::new(),
             headers_disabled: HashSet::new(),
             displayed_len: 0,
             next_buffer_id: 1,
+            collapsed: HashSet::new(),
+            fold_blocks: Vec::new(),
+            host_header_blocks: Vec::new(),
+            decoration_inlays: Vec::new(),
             now_items: Vec::new(),
             now_block: None,
             now_cursor: None,
@@ -155,11 +126,9 @@ impl Dashboard {
     pub fn editor(&self) -> &Entity<Editor> {
         &self.editor
     }
-
     pub fn focus_handle(&self, cx: &App) -> gpui::FocusHandle {
         self.editor.read(cx).focus_handle(cx)
     }
-
     pub fn is_focused(&self, window: &Window, cx: &App) -> bool {
         self.focus_handle(cx).is_focused(window)
     }
@@ -171,71 +140,62 @@ impl Dashboard {
         replica_id: u16,
         cx: &mut Context<Workspace>,
     ) {
-        self.buffers.retain(|(candidate, _), _| *candidate != host);
-        self.subscriptions
-            .retain(|(candidate, _), _| *candidate != host);
-        self.buffer_nodes
-            .retain(|_, (candidate, _)| *candidate != host);
-        self.known_text_ops
-            .retain(|(candidate, _, _)| *candidate != host);
-        self.undone_text_transactions
-            .retain(|(candidate, _, _)| *candidate != host);
-        self.last_structure_op
-            .retain(|(candidate, _), _| *candidate != host);
-        self.last_text_timestamp
-            .retain(|(candidate, _), _| *candidate != host);
-        for text in &snapshot.texts {
-            for operation in &text.operations {
-                self.known_text_ops
-                    .insert((host, text.node_id, operation.timestamp()));
-            }
+        self.buffers.remove(&host);
+        self.subscriptions.remove(&host);
+        self.buffer_hosts.retain(|_, candidate| *candidate != host);
+        self.known_ops.retain(|(candidate, _)| *candidate != host);
+        self.known_ops
+            .extend(snapshot.operations.iter().map(|op| (host, op.timestamp())));
+        let operations = snapshot.operations.clone();
+        self.hosts.insert(host, HostDesk { snapshot });
+        let buffer_id = BufferId::new(self.next_buffer_id).expect("nonzero GUI buffer id");
+        self.next_buffer_id += 1;
+        let buffer = cx.new(|cx| {
+            let mut buffer = Buffer::remote(
+                buffer_id,
+                ReplicaId::new(replica_id),
+                Capability::ReadWrite,
+                "",
+            );
+            crate::desk_language::configure(&mut buffer, cx);
+            buffer.apply_ops(
+                operations
+                    .iter()
+                    .filter_map(|op| op.to_text().ok())
+                    .map(language::Operation::Buffer)
+                    .collect::<Vec<_>>(),
+                cx,
+            );
+            buffer
+        });
+        let subscription = cx.subscribe(&buffer, move |workspace, _, event, _| {
+            let BufferEvent::Operation {
+                operation: language::Operation::Buffer(operation),
+                is_local: true,
+            } = event
+            else {
+                return;
+            };
+            let operation = DeskOperation::from_text(operation);
+            let timestamp = operation.timestamp();
+            workspace.mark_desk_text_local(host, timestamp);
+            workspace.send_to_host(
+                host,
+                ClientMessage::DeskTextApply {
+                    operation,
+                    transaction: Some(DeskTransaction {
+                        id: timestamp,
+                        edit_ids: vec![timestamp],
+                    }),
+                },
+            );
+        });
+        self.buffer_hosts.insert(buffer.read(cx).remote_id(), host);
+        self.buffers.insert(host, buffer);
+        self.subscriptions.insert(host, subscription);
+        if self.text(host, cx).is_some_and(|text| text.is_empty()) {
+            self.buffers[&host].update(cx, |buffer, cx| buffer.edit([(0..0, "* \n")], None, cx));
         }
-        self.hosts.insert(
-            host,
-            HostDesk {
-                snapshot,
-                replica_id,
-            },
-        );
-        self.ensure_buffers(host, cx);
-        cx.notify();
-    }
-
-    pub fn apply_structure(
-        &mut self,
-        host: HostId,
-        record: DeskStructureOpRecord,
-        cx: &mut Context<Workspace>,
-    ) {
-        let Some(desk) = self.hosts.get_mut(&host) else {
-            return;
-        };
-        if desk.snapshot.apply_structure(&record.op).is_err() {
-            return;
-        }
-        desk.snapshot.last_structure_op_id = record.id.0;
-        if let Some(undone) = record.undo_of {
-            desk.snapshot.undone_structure_ops.push(undone);
-        }
-        if let Some(undone) = record.undo_of {
-            self.last_structure_op
-                .retain(|(candidate, _), (op_id, _)| *candidate != host || *op_id != undone);
-        } else {
-            match &record.op {
-                rho_ui_proto::desk::DeskStructureOp::Insert { nodes } => {
-                    for node in nodes {
-                        self.last_structure_op
-                            .insert((host, node.id), (record.id, record.timestamp_ms));
-                    }
-                }
-                rho_ui_proto::desk::DeskStructureOp::Remove { node_id }
-                | rho_ui_proto::desk::DeskStructureOp::Move { node_id, .. } => {
-                    self.last_structure_op
-                        .insert((host, *node_id), (record.id, record.timestamp_ms));
-                }
-            }
-        }
-        self.ensure_buffers(host, cx);
         cx.notify();
     }
 
@@ -245,45 +205,21 @@ impl Dashboard {
         record: DeskTextOpRecord,
         cx: &mut Context<Workspace>,
     ) {
-        let key = (host, record.node_id, record.operation.timestamp());
-        let already_known = !self.known_text_ops.insert(key);
+        if !self.known_ops.insert((host, record.operation.timestamp())) {
+            return;
+        }
         let Some(desk) = self.hosts.get_mut(&host) else {
             return;
         };
-        let text_index = desk
-            .snapshot
-            .texts
-            .iter()
-            .position(|text| text.node_id == record.node_id)
-            .unwrap_or_else(|| {
-                desk.snapshot.texts.push(DeskNodeText {
-                    node_id: record.node_id,
-                    operations: Vec::new(),
-                    transactions: Vec::new(),
-                });
-                desk.snapshot.texts.len() - 1
-            });
-        let text = &mut desk.snapshot.texts[text_index];
-        if !already_known {
-            text.operations.push(record.operation.clone());
-        }
+        desk.snapshot.operations.push(record.operation.clone());
         if let Some(transaction) = record.transaction {
-            self.last_text_timestamp
-                .insert((host, record.node_id), record.timestamp_ms);
-            text.transactions.push(transaction);
+            desk.snapshot.transactions.push(transaction);
         }
-        if let Some(transaction) = record.undo_of {
-            self.undone_text_transactions
-                .insert((host, record.node_id, transaction));
-        }
-        if already_known {
-            return;
-        }
-        if let Some(buffer) = self.buffers.get(&(host, record.node_id)).cloned()
+        if let Some(buffer) = self.buffers.get(&host)
             && let Ok(operation) = record.operation.to_text()
         {
             buffer.update(cx, |buffer, cx| {
-                buffer.apply_ops([language::Operation::Buffer(operation)], cx);
+                buffer.apply_ops([language::Operation::Buffer(operation)], cx)
             });
         }
     }
@@ -293,93 +229,18 @@ impl Dashboard {
             return;
         };
         desk.snapshot.bindings.retain(|candidate| {
-            candidate.node_id != binding.node_id && candidate.agent_id != binding.agent_id
+            candidate.token != binding.token && candidate.agent_id != binding.agent_id
         });
         desk.snapshot.bindings.push(binding);
     }
 
-    fn ensure_buffers(&mut self, host: HostId, cx: &mut Context<Workspace>) {
-        let Some(desk) = self.hosts.get(&host) else {
-            return;
-        };
-        let replica_id = desk.replica_id;
-        let nodes = desk.snapshot.nodes.clone();
-        let texts = desk
-            .snapshot
-            .texts
-            .iter()
-            .map(|text| (text.node_id, text.operations.clone()))
-            .collect::<HashMap<_, _>>();
-        for node in nodes {
-            let key = (host, node.id);
-            if self.buffers.contains_key(&key) {
-                continue;
-            }
-            let operations = texts.get(&node.id).cloned().unwrap_or_default();
-            let buffer_id = BufferId::new(self.next_buffer_id).expect("nonzero GUI buffer id");
-            self.next_buffer_id = self
-                .next_buffer_id
-                .checked_add(1)
-                .expect("GUI buffer ids exhausted");
-            let buffer = cx.new(|cx| {
-                let mut buffer = Buffer::remote(
-                    buffer_id,
-                    ReplicaId::new(replica_id),
-                    Capability::ReadWrite,
-                    "",
-                );
-                let operations = operations
-                    .iter()
-                    .filter_map(|operation| operation.to_text().ok())
-                    .map(language::Operation::Buffer)
-                    .collect::<Vec<_>>();
-                buffer.apply_ops(operations, cx);
-                buffer
-            });
-            let subscription = cx.subscribe(&buffer, move |workspace, _, event, _cx| {
-                let BufferEvent::Operation {
-                    operation: language::Operation::Buffer(operation),
-                    is_local: true,
-                } = event
-                else {
-                    return;
-                };
-                let operation = DeskOperation::from_text(operation);
-                let timestamp = operation.timestamp();
-                workspace.mark_desk_text_local(host, node.id, timestamp);
-                workspace.send_to_host(
-                    host,
-                    ClientMessage::DeskTextApply {
-                        node_id: node.id,
-                        operation,
-                        transaction: Some(DeskTransaction {
-                            id: timestamp,
-                            edit_ids: vec![timestamp],
-                        }),
-                    },
-                );
-            });
-            let buffer_id = buffer.read(cx).remote_id();
-            self.buffer_nodes.insert(buffer_id, key);
-            self.buffers.insert(key, buffer);
-            self.subscriptions.insert(key, subscription);
-        }
-        let live = self
-            .hosts
-            .get(&host)
-            .into_iter()
-            .flat_map(|desk| desk.snapshot.nodes.iter().map(|node| node.id))
-            .collect::<HashSet<_>>();
-        self.buffers
-            .retain(|(candidate, node), _| *candidate != host || live.contains(node));
-        self.subscriptions
-            .retain(|(candidate, node), _| *candidate != host || live.contains(node));
-        self.buffer_nodes
-            .retain(|_, (candidate, node)| *candidate != host || live.contains(node));
+    pub fn mark_local_text_op(&mut self, host: HostId, clock: DeskClock) {
+        self.known_ops.insert((host, clock));
     }
 
-    pub fn mark_local_text_op(&mut self, host: HostId, node_id: DeskNodeId, clock: DeskClock) {
-        self.known_text_ops.insert((host, node_id, clock));
+    fn text(&self, host: HostId, cx: &App) -> Option<String> {
+        let buffer = self.buffers.get(&host)?.read(cx);
+        Some(buffer.text_for_range(0..buffer.len()).collect())
     }
 
     pub fn sync(
@@ -388,25 +249,17 @@ impl Dashboard {
         _window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        let mut projection = Projection::default();
-        for (&host, desk) in &self.hosts {
-            project_depth_first(
-                &desk.snapshot.nodes,
-                None,
-                &self.collapsed,
-                host,
-                0,
-                false,
-                &mut projection,
-            );
-        }
-        let order = projection.order;
-        let live_buffers = order
-            .iter()
-            .filter_map(|key| self.buffers.get(key))
-            .map(|buffer| buffer.read(cx).remote_id())
+        let order = self
+            .hosts
+            .keys()
+            .copied()
+            .filter(|host| self.buffers.contains_key(host))
             .collect::<Vec<_>>();
-        let new_headers = live_buffers
+        let ids = order
+            .iter()
+            .map(|host| self.buffers[host].read(cx).remote_id())
+            .collect::<Vec<_>>();
+        let new_headers = ids
             .iter()
             .copied()
             .filter(|id| !self.headers_disabled.contains(id))
@@ -418,87 +271,275 @@ impl Dashboard {
         });
         self.headers_disabled.extend(new_headers);
         let old_len = self.displayed_len;
-        self.multi_buffer.update(cx, |multi_buffer, cx| {
-            for (index, key) in order.iter().enumerate() {
-                if let Some(buffer) = self.buffers.get(key) {
-                    multi_buffer.set_excerpts_for_path(
-                        PathKey::sorted(index as u64),
-                        buffer.clone(),
-                        [Point::zero()..buffer.read(cx).max_point()],
-                        0,
-                        cx,
-                    );
-                }
+        self.multi_buffer.update(cx, |multi, cx| {
+            for (index, host) in order.iter().enumerate() {
+                let buffer = &self.buffers[host];
+                multi.set_excerpts_for_path(
+                    PathKey::sorted(index as u64),
+                    buffer.clone(),
+                    [Point::zero()..buffer.read(cx).max_point()],
+                    0,
+                    cx,
+                );
             }
             for stale in order.len()..old_len {
-                multi_buffer.remove_excerpts(PathKey::sorted(stale as u64), cx);
+                multi.remove_excerpts(PathKey::sorted(stale as u64), cx);
             }
         });
         self.displayed_len = order.len();
-        self.sync_now_strip(registry, &order, cx);
-        self.sync_host_headers(registry, &order, cx);
-        self.sync_node_chrome(registry, &order, &projection.depths, cx);
-        self.sync_collapse_blocks(&order, projection.collapsed, cx);
+        self.sync_headers(registry, &order, cx);
+        self.sync_decorations(registry, &order, cx);
+        self.sync_folds(&order, cx);
+        self.sync_now(registry, &order, cx);
     }
 
-    fn sync_now_strip(
+    fn sync_headers(
         &mut self,
         registry: &AgentRegistry,
-        order: &[(HostId, DeskNodeId)],
+        order: &[HostId],
         cx: &mut Context<Workspace>,
     ) {
-        self.now_items = order
+        if !self.host_header_blocks.is_empty() {
+            self.editor.update(cx, |editor, cx| {
+                editor.remove_blocks(
+                    std::mem::take(&mut self.host_header_blocks)
+                        .into_iter()
+                        .collect(),
+                    None,
+                    cx,
+                )
+            });
+        }
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let props = order
             .iter()
-            .filter_map(|(host, node_id)| {
-                let desk = self.hosts.get(host)?;
-                let binding = desk
-                    .snapshot
-                    .bindings
-                    .iter()
-                    .find(|binding| binding.node_id == *node_id && !binding.orphaned)?;
+            .filter_map(|host| {
+                let position =
+                    snapshot.anchor_in_excerpt(self.buffers[host].read(cx).anchor_before(0))?;
+                let name = registry.host_name(*host).to_owned();
+                Some(BlockProperties {
+                    placement: BlockPlacement::Above(position),
+                    height: Some(1),
+                    style: BlockStyle::Flex,
+                    render: Arc::new(move |cx| {
+                        div()
+                            .w_full()
+                            .pt_2()
+                            .pb_1()
+                            .text_color(cx.app.theme().colors().text_muted)
+                            .child(format!("{name} · Desk"))
+                            .into_any_element()
+                    }),
+                    priority: 1,
+                })
+            })
+            .collect::<Vec<_>>();
+        self.host_header_blocks = self
+            .editor
+            .update(cx, |editor, cx| editor.insert_blocks(props, None, cx));
+    }
+
+    fn binding_for<'a>(desk: &'a HostDesk, heading: &DeskHeading) -> Option<&'a DeskBinding> {
+        let token = heading.token.as_ref()?;
+        if heading.duplicate_token {
+            return None;
+        }
+        desk.snapshot
+            .bindings
+            .iter()
+            .find(|binding| binding.token == *token && !binding.orphaned)
+    }
+
+    fn sync_decorations(
+        &mut self,
+        registry: &AgentRegistry,
+        order: &[HostId],
+        cx: &mut Context<Workspace>,
+    ) {
+        let multi = self.multi_buffer.read(cx).snapshot(cx);
+        let mut inlays = Vec::new();
+        let mut highlights = Vec::new();
+        let mut id_ranges = Vec::new();
+        for host in order {
+            let Some(text) = self.text(*host, cx) else {
+                continue;
+            };
+            let desk = &self.hosts[host];
+            let buffer = self.buffers[host].read(cx);
+            for heading in parse(&text) {
+                if let Some(range) = &heading.id_line_range
+                    && let (Some(start), Some(end)) = (
+                        multi.anchor_in_excerpt(buffer.anchor_before(range.start)),
+                        multi.anchor_in_excerpt(buffer.anchor_after(range.end)),
+                    )
+                {
+                    id_ranges.push(start..end);
+                }
+                let (position, label) = if heading.duplicate_token {
+                    (heading.heading_range.end, "  · duplicate id".to_owned())
+                } else if let Some(binding) = Self::binding_for(desk, &heading) {
+                    let attention = match registry.attention(binding.agent_id) {
+                        rho_ui_proto::UiAttention::Quiet => "idle",
+                        rho_ui_proto::UiAttention::Working => "working",
+                        rho_ui_proto::UiAttention::Pending => "pending",
+                        rho_ui_proto::UiAttention::NeedsInput => "needs you",
+                    };
+                    (
+                        heading.heading_range.end,
+                        format!(
+                            "  · {} · {attention}",
+                            registry.agent_human_name(binding.agent_id)
+                        ),
+                    )
+                } else {
+                    continue;
+                };
+                let Some(position) = multi.anchor_in_excerpt(buffer.anchor_before(position)) else {
+                    continue;
+                };
+                let inlay = Inlay::custom(inlays.len(), position, label.clone());
+                highlights.push(InlayHighlight {
+                    inlay: inlay.id,
+                    inlay_position: position,
+                    range: 0..label.len(),
+                });
+                inlays.push(inlay);
+            }
+        }
+        let removed = std::mem::take(&mut self.decoration_inlays);
+        self.decoration_inlays = inlays.iter().map(|inlay| inlay.id).collect();
+        self.editor.update(cx, |editor, cx| {
+            editor.splice_inlays(&removed, inlays, cx);
+            editor.clear_highlights(DECORATION_KEY, cx);
+            editor.highlight_inlays(
+                DECORATION_KEY,
+                highlights,
+                gpui::HighlightStyle {
+                    color: Some(cx.theme().colors().border_variant.into()),
+                    ..Default::default()
+                },
+                cx,
+            );
+            editor.highlight_text_key(
+                ID_LINE_KEY,
+                id_ranges,
+                gpui::HighlightStyle {
+                    color: Some(cx.theme().colors().text_muted.into()),
+                    ..Default::default()
+                },
+                false,
+                cx,
+            );
+        });
+    }
+
+    fn subtree_end(headings: &[DeskHeading], index: usize, text_len: usize) -> usize {
+        headings
+            .iter()
+            .skip(index + 1)
+            .find(|next| next.depth <= headings[index].depth)
+            .map_or(text_len, |next| next.heading_range.start)
+    }
+
+    fn sync_folds(&mut self, order: &[HostId], cx: &mut Context<Workspace>) {
+        if !self.fold_blocks.is_empty() {
+            self.editor.update(cx, |editor, cx| {
+                editor.remove_blocks(
+                    std::mem::take(&mut self.fold_blocks).into_iter().collect(),
+                    None,
+                    cx,
+                )
+            });
+        }
+        let multi = self.multi_buffer.read(cx).snapshot(cx);
+        let mut props = Vec::new();
+        for host in order {
+            let Some(text) = self.text(*host, cx) else {
+                continue;
+            };
+            let headings = parse(&text);
+            let buffer = self.buffers[host].read(cx);
+            for (index, heading) in headings.iter().enumerate() {
+                if !self
+                    .collapsed
+                    .contains(&(*host, heading.heading_range.start))
+                {
+                    continue;
+                }
+                let end = Self::subtree_end(&headings, index, text.len());
+                let start = heading.heading_range.end;
+                if start >= end {
+                    continue;
+                }
+                let (Some(start), Some(end)) = (
+                    multi.anchor_in_excerpt(buffer.anchor_before(start)),
+                    multi.anchor_in_excerpt(buffer.anchor_after(end)),
+                ) else {
+                    continue;
+                };
+                props.push(BlockProperties {
+                    placement: BlockPlacement::Replace(start..=end),
+                    height: Some(1),
+                    style: BlockStyle::Flex,
+                    render: Arc::new(move |_| {
+                        div().pl_2().child("▸ folded subtree").into_any_element()
+                    }),
+                    priority: 0,
+                });
+            }
+        }
+        self.fold_blocks = self
+            .editor
+            .update(cx, |editor, cx| editor.insert_blocks(props, None, cx));
+    }
+
+    fn sync_now(
+        &mut self,
+        registry: &AgentRegistry,
+        order: &[HostId],
+        cx: &mut Context<Workspace>,
+    ) {
+        self.now_items.clear();
+        for host in order {
+            let Some(text) = self.text(*host, cx) else {
+                continue;
+            };
+            for heading in parse(&text) {
+                let Some(binding) = Self::binding_for(&self.hosts[host], &heading) else {
+                    continue;
+                };
                 let attention = registry.attention(binding.agent_id);
                 if attention < rho_ui_proto::UiAttention::Pending {
-                    return None;
+                    continue;
                 }
-                let last_active = registry.agent_last_active(binding.agent_id)?;
-                let buffer = self.buffers.get(&(*host, *node_id))?.read(cx);
-                let text = buffer.text_for_range(0..buffer.len()).collect::<String>();
-                let (_, title) = parse_heading_line(&text);
-                Some(NowItem {
+                let Some(last_active) = registry.agent_last_active(binding.agent_id) else {
+                    continue;
+                };
+                self.now_items.push(NowItem {
                     host: *host,
-                    node_id: *node_id,
+                    offset: heading.heading_range.start,
                     agent_id: binding.agent_id,
                     attention,
                     last_active,
-                    title: title.to_owned(),
-                })
-            })
-            .collect();
+                    title: heading.title,
+                });
+            }
+        }
         self.now_items
             .sort_by_key(|item| (Reverse(item.last_active), item.agent_id));
-        if self
-            .now_cursor
-            .is_some_and(|agent| !self.now_items.iter().any(|item| item.agent_id == agent))
-        {
-            self.now_cursor = None;
-        }
-
         if let Some(block) = self.now_block.take() {
             self.editor.update(cx, |editor, cx| {
                 editor.remove_blocks([block].into_iter().collect(), None, cx)
             });
         }
-        let Some((first_host, first_node)) = order.first().copied() else {
+        let Some(host) = order.first() else {
             return;
         };
         if self.now_items.is_empty() {
             return;
         }
-        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
-        let Some(position) = self
-            .buffers
-            .get(&(first_host, first_node))
-            .and_then(|buffer| snapshot.anchor_in_excerpt(buffer.read(cx).anchor_before(0)))
+        let multi = self.multi_buffer.read(cx).snapshot(cx);
+        let Some(position) = multi.anchor_in_excerpt(self.buffers[host].read(cx).anchor_before(0))
         else {
             return;
         };
@@ -506,18 +547,19 @@ impl Dashboard {
             .now_items
             .iter()
             .map(|item| {
-                let reason = match item.attention {
-                    rho_ui_proto::UiAttention::NeedsInput => "needs input",
-                    _ => "pending response",
-                };
                 format!(
-                    "{} · {} · {reason}",
+                    "{} · {} · {}",
                     item.title,
-                    registry.agent_human_name(item.agent_id)
+                    registry.agent_human_name(item.agent_id),
+                    if item.attention == rho_ui_proto::UiAttention::NeedsInput {
+                        "needs input"
+                    } else {
+                        "pending response"
+                    }
                 )
             })
             .collect::<Vec<_>>();
-        let height = u32::try_from(lines.len()).unwrap_or(u32::MAX);
+        let height = lines.len() as u32;
         self.now_block = self
             .editor
             .update(cx, |editor, cx| {
@@ -551,234 +593,8 @@ impl Dashboard {
             .next();
     }
 
-    fn sync_host_headers(
-        &mut self,
-        registry: &AgentRegistry,
-        order: &[(HostId, DeskNodeId)],
-        cx: &mut Context<Workspace>,
-    ) {
-        if !self.host_header_blocks.is_empty() {
-            self.editor.update(cx, |editor, cx| {
-                editor.remove_blocks(
-                    std::mem::take(&mut self.host_header_blocks)
-                        .into_iter()
-                        .collect(),
-                    None,
-                    cx,
-                );
-            });
-        }
-
-        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
-        let mut seen = HashSet::new();
-        let properties = order
-            .iter()
-            .filter(|(host, _)| seen.insert(*host))
-            .filter_map(|(host, node)| {
-                let buffer = self.buffers.get(&(*host, *node))?;
-                let position = snapshot.anchor_in_excerpt(buffer.read(cx).anchor_before(0))?;
-                let name = match registry.host_name(*host) {
-                    "" => format!("Host {}", host.0 + 1),
-                    name => name.to_owned(),
-                };
-                Some(BlockProperties {
-                    placement: BlockPlacement::Above(position),
-                    height: Some(1),
-                    style: BlockStyle::Flex,
-                    render: Arc::new(move |cx| {
-                        div()
-                            .w_full()
-                            .pt_2()
-                            .pb_1()
-                            .text_color(cx.app.theme().colors().text_muted)
-                            .child(format!("{name} · Desk"))
-                            .into_any_element()
-                    }),
-                    priority: 1,
-                })
-            })
-            .collect::<Vec<_>>();
-        if !properties.is_empty() {
-            self.host_header_blocks = self
-                .editor
-                .update(cx, |editor, cx| editor.insert_blocks(properties, None, cx));
-        }
-    }
-
-    fn sync_node_chrome(
-        &mut self,
-        registry: &AgentRegistry,
-        order: &[(HostId, DeskNodeId)],
-        depths: &[usize],
-        cx: &mut Context<Workspace>,
-    ) {
-        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
-        let mut inlays = Vec::new();
-        let mut highlights = Vec::new();
-        for (key, depth) in order.iter().zip(depths).filter(|(_, depth)| **depth > 0) {
-            let Some(buffer) = self.buffers.get(key) else {
-                continue;
-            };
-            let buffer_snapshot = buffer.read(cx).snapshot();
-            for row in 0..=buffer_snapshot.max_point().row {
-                let Some(position) =
-                    snapshot.anchor_in_excerpt(buffer_snapshot.anchor_before(Point::new(row, 0)))
-                else {
-                    continue;
-                };
-                let text = if row == 0 {
-                    format!("{}├─ ", "│  ".repeat(depth - 1))
-                } else {
-                    "│  ".repeat(*depth)
-                };
-                let inlay = Inlay::custom(inlays.len(), position, text.clone());
-                highlights.push(InlayHighlight {
-                    inlay: inlay.id,
-                    inlay_position: position,
-                    range: 0..text.len(),
-                });
-                inlays.push(inlay);
-            }
-        }
-        for (host, node_id) in order {
-            let Some(binding) = self.hosts.get(host).and_then(|desk| {
-                desk.snapshot
-                    .bindings
-                    .iter()
-                    .find(|binding| binding.node_id == *node_id && !binding.orphaned)
-            }) else {
-                continue;
-            };
-            let Some(buffer) = self.buffers.get(&(*host, *node_id)) else {
-                continue;
-            };
-            let buffer_snapshot = buffer.read(cx).snapshot();
-            let heading_end = buffer_snapshot
-                .text_for_range(0..buffer_snapshot.len())
-                .collect::<String>()
-                .find('\n')
-                .unwrap_or(buffer_snapshot.len());
-            let Some(position) =
-                snapshot.anchor_in_excerpt(buffer_snapshot.anchor_before(heading_end))
-            else {
-                continue;
-            };
-            let attention = match registry.attention(binding.agent_id) {
-                rho_ui_proto::UiAttention::Quiet => "idle",
-                rho_ui_proto::UiAttention::Working => "working",
-                rho_ui_proto::UiAttention::Pending => "pending",
-                rho_ui_proto::UiAttention::NeedsInput => "needs you",
-            };
-            let text = format!(
-                "  · {} · {attention}",
-                registry.agent_human_name(binding.agent_id)
-            );
-            let inlay = Inlay::custom(inlays.len(), position, text.clone());
-            highlights.push(InlayHighlight {
-                inlay: inlay.id,
-                inlay_position: position,
-                range: 0..text.len(),
-            });
-            inlays.push(inlay);
-        }
-
-        let removed = std::mem::take(&mut self.depth_inlays);
-        self.depth_inlays = inlays.iter().map(|inlay| inlay.id).collect();
-        self.editor.update(cx, |editor, cx| {
-            editor.splice_inlays(&removed, inlays, cx);
-            editor.clear_highlights(DEPTH_RAIL_KEY, cx);
-            editor.highlight_inlays(
-                DEPTH_RAIL_KEY,
-                highlights,
-                gpui::HighlightStyle {
-                    color: Some(cx.theme().colors().border_variant.into()),
-                    ..Default::default()
-                },
-                cx,
-            );
-        });
-    }
-
-    fn sync_collapse_blocks(
-        &mut self,
-        order: &[(HostId, DeskNodeId)],
-        collapsed: Vec<((HostId, DeskNodeId), std::ops::Range<usize>)>,
-        cx: &mut Context<Workspace>,
-    ) {
-        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
-        let properties = collapsed
-            .into_iter()
-            .filter_map(|(_, range)| {
-                let Some(first) = self.buffers.get(&order[range.start]) else {
-                    return None;
-                };
-                let Some(last) = self.buffers.get(&order[range.end - 1]) else {
-                    return None;
-                };
-                let Some(start) = snapshot.anchor_in_excerpt(first.read(cx).anchor_before(0))
-                else {
-                    return None;
-                };
-                let Some(end) =
-                    snapshot.anchor_in_excerpt(last.read(cx).anchor_after(last.read(cx).len()))
-                else {
-                    return None;
-                };
-                let count = range.len();
-                Some(BlockProperties {
-                    placement: BlockPlacement::Replace(start..=end),
-                    height: Some(1),
-                    style: BlockStyle::Flex,
-                    render: Arc::new(move |_| {
-                        div()
-                            .pl_2()
-                            .child(format!("▸ {count} nested"))
-                            .into_any_element()
-                    }),
-                    priority: 0,
-                })
-            })
-            .collect::<Vec<_>>();
-
-        if !self.collapse_blocks.is_empty() {
-            self.editor.update(cx, |editor, cx| {
-                editor.remove_blocks(
-                    std::mem::take(&mut self.collapse_blocks)
-                        .into_iter()
-                        .collect(),
-                    None,
-                    cx,
-                )
-            });
-        }
-        if !properties.is_empty() {
-            self.collapse_blocks = self
-                .editor
-                .update(cx, |editor, cx| editor.insert_blocks(properties, None, cx));
-        }
-    }
-
-    fn cursor_node(&self, cx: &mut Context<Workspace>) -> Option<(HostId, DeskNodeId)> {
-        let buffer_id = self.editor.update(cx, |editor, cx| {
-            let head = editor
-                .selections
-                .newest::<Point>(&editor.display_snapshot(cx))
-                .head();
-            editor
-                .buffer()
-                .read(cx)
-                .snapshot(cx)
-                .point_to_buffer_offset(head)
-                .map(|(buffer, _)| buffer.remote_id())
-        })?;
-        self.buffer_nodes.get(&buffer_id).copied()
-    }
-
-    fn cursor_node_offset(
-        &self,
-        cx: &mut Context<Workspace>,
-    ) -> Option<(HostId, DeskNodeId, usize)> {
-        let (buffer_id, offset) = self.editor.update(cx, |editor, cx| {
+    fn cursor(&self, cx: &mut Context<Workspace>) -> Option<(HostId, usize)> {
+        let (id, offset) = self.editor.update(cx, |editor, cx| {
             let head = editor
                 .selections
                 .newest::<Point>(&editor.display_snapshot(cx))
@@ -790,139 +606,322 @@ impl Dashboard {
                 .point_to_buffer_offset(head)
                 .map(|(buffer, offset)| (buffer.remote_id(), offset.0))
         })?;
-        let (host, node_id) = self.buffer_nodes.get(&buffer_id).copied()?;
-        Some((host, node_id, offset))
+        Some((*self.buffer_hosts.get(&id)?, offset))
+    }
+
+    fn cursor_heading(
+        &self,
+        cx: &mut Context<Workspace>,
+    ) -> Option<(HostId, String, Vec<DeskHeading>, usize)> {
+        let (host, offset) = self.cursor(cx)?;
+        let text = self.text(host, cx)?;
+        let headings = parse(&text);
+        let index = headings
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, h)| h.heading_range.start <= offset)?
+            .0;
+        (offset < Self::subtree_end(&headings, index, text.len()))
+            .then_some((host, text, headings, index))
     }
 
     fn caret(&self, cx: &mut Context<Workspace>) -> Option<text::Anchor> {
-        self.editor.update(cx, |editor, cx| {
-            let head = editor
-                .selections
-                .newest::<Point>(&editor.display_snapshot(cx))
-                .head();
-            editor
-                .buffer()
-                .read(cx)
-                .snapshot(cx)
-                .point_to_buffer_offset(head)
-                .map(|(buffer, offset)| buffer.anchor_after(offset.0))
-        })
+        let (host, offset) = self.cursor(cx)?;
+        Some(self.buffers.get(&host)?.read(cx).anchor_after(offset))
     }
-
-    fn move_to_anchor(
+    fn move_to(
         &self,
-        anchor: text::Anchor,
+        host: HostId,
+        offset: usize,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> bool {
-        let Some(anchor) = self
-            .multi_buffer
-            .read(cx)
-            .snapshot(cx)
-            .anchor_in_excerpt(anchor)
-        else {
+        let anchor = self
+            .buffers
+            .get(&host)
+            .map(|buffer| buffer.read(cx).anchor_before(offset));
+        let Some(anchor) = anchor.and_then(|anchor| {
+            self.multi_buffer
+                .read(cx)
+                .snapshot(cx)
+                .anchor_in_excerpt(anchor)
+        }) else {
             return false;
         };
         self.editor.update(cx, |editor, cx| {
             editor.change_selections(Default::default(), window, cx, |selections| {
-                selections.select_anchor_ranges([anchor..anchor]);
-            });
+                selections.select_anchor_ranges([anchor..anchor])
+            })
         });
         true
     }
 
-    pub fn next_now(
-        &mut self,
-        registry: &AgentRegistry,
-        window: &mut Window,
-        cx: &mut Context<Workspace>,
-    ) -> Option<AgentId> {
-        let index = self
-            .now_cursor
-            .and_then(|agent| {
-                self.now_items
-                    .iter()
-                    .position(|item| item.agent_id == agent)
-            })
-            .map(|index| (index + 1) % self.now_items.len())
-            .unwrap_or(0);
-        let item = self.now_items.get(index)?.clone();
-        if let Some(anchor) = self.caret(cx) {
-            self.caret_stack.push(DeskCaret {
-                anchor,
-                collapsed: self.collapsed.clone(),
-            });
-        }
-        let desk = self.hosts.get(&item.host)?;
-        let mut current = desk
-            .snapshot
-            .node(item.node_id)
-            .and_then(|node| node.parent);
-        while let Some(parent) = current {
-            self.collapsed.remove(&(item.host, parent));
-            current = desk.snapshot.node(parent).and_then(|node| node.parent);
-        }
-        self.sync(registry, window, cx);
-        let buffer = self.buffers.get(&(item.host, item.node_id))?.read(cx);
-        if !self.move_to_anchor(buffer.anchor_before(0), window, cx) {
-            return None;
-        }
-        self.now_cursor = Some(item.agent_id);
-        Some(item.agent_id)
+    pub fn cursor_target(&self, cx: &mut Context<Workspace>) -> Option<RowTarget> {
+        let (host, _, headings, index) = self.cursor_heading(cx)?;
+        Self::binding_for(&self.hosts[&host], &headings[index])
+            .map(|binding| RowTarget::Agent(binding.agent_id))
+            .or(Some(RowTarget::None))
     }
 
-    pub fn back(
+    pub fn staffing_target(&self, cx: &mut Context<Workspace>) -> Option<(HostId, usize, String)> {
+        let (host, text, headings, index) = self.cursor_heading(cx)?;
+        if Self::binding_for(&self.hosts[&host], &headings[index]).is_some()
+            || headings[index].token.is_some()
+        {
+            return None;
+        }
+        let mut path = Vec::new();
+        let mut current = Some(index);
+        while let Some(at) = current {
+            path.push(at);
+            current = headings[at].parent;
+        }
+        path.reverse();
+        let brief = path
+            .into_iter()
+            .map(|at| {
+                let heading = &headings[at];
+                let body = text[heading.body_range.clone()].trim_end();
+                if body.is_empty() {
+                    heading.title.clone()
+                } else {
+                    format!("{}\n{}", heading.title, body)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        Some((host, headings[index].heading_range.start, brief))
+    }
+
+    pub fn set_heading_state(
         &mut self,
-        registry: &AgentRegistry,
+        host: HostId,
+        offset: usize,
+        state: ParsedHeadingState,
+        cx: &mut Context<Workspace>,
+    ) {
+        let Some(text) = self.text(host, cx) else {
+            return;
+        };
+        let Some(heading) = parse(&text)
+            .into_iter()
+            .find(|h| h.heading_range.start == offset)
+        else {
+            return;
+        };
+        let replacement = format!(
+            "{} {}{}",
+            "*".repeat(heading.depth),
+            state.keyword(),
+            if heading.title.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", heading.title)
+            }
+        );
+        self.buffers[&host].update(cx, |buffer, cx| {
+            buffer.edit([(heading.heading_range, replacement)], None, cx)
+        });
+    }
+    pub fn set_cursor_heading_state(
+        &mut self,
+        state: ParsedHeadingState,
+        cx: &mut Context<Workspace>,
+    ) {
+        if let Some((host, _, headings, index)) = self.cursor_heading(cx) {
+            self.set_heading_state(host, headings[index].heading_range.start, state, cx);
+        }
+    }
+    pub fn cursor_on_heading_line(&self, cx: &mut Context<Workspace>) -> bool {
+        let Some((_, offset)) = self.cursor(cx) else {
+            return false;
+        };
+        self.cursor_heading(cx)
+            .is_some_and(|(_, _, headings, index)| {
+                headings[index].heading_range.contains(&offset)
+                    || offset == headings[index].heading_range.end
+            })
+    }
+
+    pub fn insert_sibling(
+        &mut self,
+        above: bool,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> bool {
-        let Some(caret) = self.caret_stack.pop() else {
+        let Some((host, text, headings, index)) = self.cursor_heading(cx) else {
             return false;
         };
-        self.collapsed = caret.collapsed;
-        self.sync(registry, window, cx);
-        self.move_to_anchor(caret.anchor, window, cx)
+        let heading = &headings[index];
+        let at = if above {
+            heading.heading_range.start
+        } else {
+            Self::subtree_end(&headings, index, text.len())
+        };
+        let insertion = format!("{} \n", "*".repeat(heading.depth));
+        self.buffers[&host].update(cx, |buffer, cx| {
+            buffer.edit([(at..at, insertion.clone())], None, cx)
+        });
+        self.move_to(host, at + heading.depth + 1, window, cx)
     }
 
-    fn heading_entries(&self, registry: &AgentRegistry, cx: &App) -> Vec<HeadingEntry> {
-        let mut entries = Vec::new();
-        for (&host, desk) in &self.hosts {
-            let mut order = Vec::new();
-            let mut projection = Projection::default();
-            project_depth_first(
-                &desk.snapshot.nodes,
-                None,
-                &HashSet::new(),
-                host,
-                0,
-                false,
-                &mut projection,
-            );
-            order.extend(projection.order);
-            for (_, node_id) in order {
-                let Some(buffer) = self.buffers.get(&(host, node_id)) else {
-                    continue;
+    pub fn structure_move(
+        &mut self,
+        direction: StructureDirection,
+        cx: &mut Context<Workspace>,
+    ) -> bool {
+        let Some((host, text, headings, index)) = self.cursor_heading(cx) else {
+            return false;
+        };
+        let heading = &headings[index];
+        match direction {
+            StructureDirection::Demote => {
+                self.buffers[&host].update(cx, |buffer, cx| {
+                    buffer.edit(
+                        [(
+                            heading.heading_range.start..heading.heading_range.start,
+                            "*",
+                        )],
+                        None,
+                        cx,
+                    )
+                });
+            }
+            StructureDirection::Promote if heading.depth > 1 => {
+                self.buffers[&host].update(cx, |buffer, cx| {
+                    buffer.edit(
+                        [(
+                            heading.heading_range.start..heading.heading_range.start + 1,
+                            "",
+                        )],
+                        None,
+                        cx,
+                    )
+                });
+            }
+            StructureDirection::Promote => return false,
+            StructureDirection::Up => {
+                let Some(previous) = (0..index).rev().find(|at| {
+                    headings[*at].depth == heading.depth && headings[*at].parent == heading.parent
+                }) else {
+                    return false;
                 };
-                let buffer = buffer.read(cx);
-                let text = buffer.text_for_range(0..buffer.len()).collect::<String>();
-                let (_, title) = parse_heading_line(&text);
-                let title = if title.is_empty() {
-                    "(untitled)"
-                } else {
-                    title
+                let current_end = Self::subtree_end(&headings, index, text.len());
+                let prev_start = headings[previous].heading_range.start;
+                let prev_end = heading.heading_range.start;
+                let replacement = format!(
+                    "{}{}",
+                    &text[heading.heading_range.start..current_end],
+                    &text[prev_start..prev_end]
+                );
+                self.buffers[&host].update(cx, |buffer, cx| {
+                    buffer.edit([(prev_start..current_end, replacement)], None, cx)
+                });
+            }
+            StructureDirection::Down => {
+                let current_end = Self::subtree_end(&headings, index, text.len());
+                let Some(next) = headings
+                    .iter()
+                    .enumerate()
+                    .skip(index + 1)
+                    .find(|(_, h)| {
+                        h.heading_range.start >= current_end
+                            && h.depth == heading.depth
+                            && h.parent == heading.parent
+                    })
+                    .map(|(at, _)| at)
+                else {
+                    return false;
                 };
-                entries.push(HeadingEntry {
-                    label: format!("{title} · {} · #{}", registry.host_name(host), node_id.0),
-                    description: format!("{} · node {}", registry.host_name(host), node_id.0),
-                    host,
-                    node_id,
+                let next_end = Self::subtree_end(&headings, next, text.len());
+                let replacement = format!(
+                    "{}{}",
+                    &text[current_end..next_end],
+                    &text[heading.heading_range.start..current_end]
+                );
+                self.buffers[&host].update(cx, |buffer, cx| {
+                    buffer.edit(
+                        [(heading.heading_range.start..next_end, replacement)],
+                        None,
+                        cx,
+                    )
                 });
             }
         }
-        entries
+        true
     }
 
+    pub fn delete_empty(&mut self, cx: &mut Context<Workspace>) -> bool {
+        let Some((host, text, headings, index)) = self.cursor_heading(cx) else {
+            return false;
+        };
+        let heading = &headings[index];
+        let end = Self::subtree_end(&headings, index, text.len());
+        let has_child = headings
+            .get(index + 1)
+            .is_some_and(|next| next.heading_range.start < end && next.depth > heading.depth);
+        if has_child
+            || !heading.title.is_empty()
+            || !text[heading.body_range.clone()].trim().is_empty()
+            || heading.token.is_some()
+        {
+            return false;
+        }
+        self.buffers[&host].update(cx, |buffer, cx| {
+            buffer.edit([(heading.heading_range.start..end, "")], None, cx)
+        });
+        true
+    }
+
+    pub fn toggle_subagents(&mut self, cx: &mut Context<Workspace>) -> bool {
+        let Some((host, _, headings, index)) = self.cursor_heading(cx) else {
+            return false;
+        };
+        if !headings
+            .get(index + 1)
+            .is_some_and(|next| next.depth > headings[index].depth)
+        {
+            return false;
+        }
+        let key = (host, headings[index].heading_range.start);
+        if !self.collapsed.remove(&key) {
+            self.collapsed.insert(key);
+        }
+        cx.notify();
+        true
+    }
+
+    fn heading_entries(&self, registry: &AgentRegistry, cx: &App) -> Vec<HeadingEntry> {
+        self.hosts
+            .keys()
+            .flat_map(|host| {
+                self.text(*host, cx)
+                    .into_iter()
+                    .flat_map(|text| parse(&text))
+                    .map(|heading| HeadingEntry {
+                        label: format!(
+                            "{} · {} · @{}",
+                            if heading.title.is_empty() {
+                                "(untitled)"
+                            } else {
+                                &heading.title
+                            },
+                            registry.host_name(*host),
+                            heading.heading_range.start
+                        ),
+                        description: format!(
+                            "{} · level {}",
+                            registry.host_name(*host),
+                            heading.depth
+                        ),
+                        host: *host,
+                        offset: heading.heading_range.start,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect()
+    }
     pub fn heading_candidates(
         &self,
         registry: &AgentRegistry,
@@ -935,7 +934,6 @@ impl Dashboard {
             .map(|entry| (entry.label, entry.description))
             .collect()
     }
-
     pub fn jump_to_heading(
         &mut self,
         label: &str,
@@ -950,331 +948,66 @@ impl Dashboard {
         else {
             return false;
         };
-        let Some(desk) = self.hosts.get(&entry.host) else {
-            return false;
-        };
-        let mut current = desk
-            .snapshot
-            .node(entry.node_id)
-            .and_then(|node| node.parent);
-        while let Some(parent) = current {
-            self.collapsed.remove(&(entry.host, parent));
-            current = desk.snapshot.node(parent).and_then(|node| node.parent);
-        }
-        self.sync(registry, window, cx);
-        let Some(buffer) = self.buffers.get(&(entry.host, entry.node_id)) else {
-            return false;
-        };
-        let anchor = buffer.read(cx).anchor_before(0);
-        self.move_to_anchor(anchor, window, cx)
+        self.move_to(entry.host, entry.offset, window, cx)
     }
 
-    pub fn jump_to_node(
+    pub fn next_now(
         &mut self,
-        host: HostId,
-        node_id: DeskNodeId,
+        _registry: &AgentRegistry,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Option<AgentId> {
+        let index = self
+            .now_cursor
+            .and_then(|agent| {
+                self.now_items
+                    .iter()
+                    .position(|item| item.agent_id == agent)
+            })
+            .map(|at| (at + 1) % self.now_items.len())
+            .unwrap_or(0);
+        let item = self.now_items.get(index)?.clone();
+        if let Some(anchor) = self.caret(cx) {
+            self.caret_stack.push(DeskCaret {
+                anchor,
+                collapsed: self.collapsed.clone(),
+            });
+        }
+        self.move_to(item.host, item.offset, window, cx);
+        self.now_cursor = Some(item.agent_id);
+        Some(item.agent_id)
+    }
+    pub fn back(
+        &mut self,
+        _registry: &AgentRegistry,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) -> bool {
-        let Some(buffer) = self.buffers.get(&(host, node_id)) else {
+        let Some(caret) = self.caret_stack.pop() else {
             return false;
         };
-        let anchor = buffer.read(cx).anchor_before(0);
-        self.move_to_anchor(anchor, window, cx)
-    }
-
-    pub fn hint(&self, cx: &mut Context<Workspace>) -> &'static str {
-        let on_heading = self.editor.update(cx, |editor, cx| {
-            let head = editor
-                .selections
-                .newest::<Point>(&editor.display_snapshot(cx))
-                .head();
-            let snapshot = editor.buffer().read(cx).snapshot(cx);
-            snapshot
-                .point_to_buffer_offset(head)
-                .map(|(buffer, offset)| buffer.offset_to_point(offset.0).row == 0)
-                .unwrap_or(false)
+        self.collapsed = caret.collapsed;
+        let Some(anchor) = self
+            .multi_buffer
+            .read(cx)
+            .snapshot(cx)
+            .anchor_in_excerpt(caret.anchor)
+        else {
+            return false;
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_anchor_ranges([anchor..anchor])
+            })
         });
-        if on_heading {
+        true
+    }
+    pub fn hint(&self, cx: &mut Context<Workspace>) -> &'static str {
+        if self.cursor_on_heading_line(cx) {
             "o/O new heading · >>/<< demote/promote · Tab fold · s staff · d done · x discard · Alt-↑/↓ move · gn now · gh jump"
         } else {
             "vim editing · gn now · gb back · gh jump headings"
         }
-    }
-
-    pub fn cursor_target(&self, cx: &mut Context<Workspace>) -> Option<RowTarget> {
-        let (host, node_id) = self.cursor_node(cx)?;
-        self.hosts
-            .get(&host)?
-            .snapshot
-            .bindings
-            .iter()
-            .find(|binding| binding.node_id == node_id && !binding.orphaned)
-            .map(|binding| RowTarget::Agent(binding.agent_id))
-            .or(Some(RowTarget::None))
-    }
-
-    pub fn staffing_target(
-        &self,
-        cx: &mut Context<Workspace>,
-    ) -> Option<(HostId, DeskNodeId, String)> {
-        let (host, node_id) = self.cursor_node(cx)?;
-        let desk = self.hosts.get(&host)?;
-        if desk
-            .snapshot
-            .bindings
-            .iter()
-            .any(|binding| binding.node_id == node_id && !binding.orphaned)
-        {
-            return None;
-        }
-        let mut parts = Vec::new();
-        for path_node in node_path(&desk.snapshot.nodes, node_id)? {
-            let buffer = self.buffers.get(&(host, path_node))?.read(cx);
-            parts.push(buffer.text_for_range(0..buffer.len()).collect::<String>());
-        }
-        let text = parts.join("\n\n");
-        Some((host, node_id, text))
-    }
-
-    pub fn set_heading_state(
-        &mut self,
-        host: HostId,
-        node_id: DeskNodeId,
-        state: ParsedHeadingState,
-        cx: &mut Context<Workspace>,
-    ) {
-        let Some(buffer) = self.buffers.get(&(host, node_id)).cloned() else {
-            return;
-        };
-        buffer.update(cx, |buffer, cx| {
-            let text = buffer.text_for_range(0..buffer.len()).collect::<String>();
-            let heading_end = text.find('\n').unwrap_or(text.len());
-            let (_, title) = parse_heading_line(&text);
-            let keyword = match state {
-                ParsedHeadingState::Todo => "TODO",
-                ParsedHeadingState::Staffed => "STAFFED",
-                ParsedHeadingState::Done => "DONE",
-                ParsedHeadingState::Discarded => "DISCARDED",
-            };
-            let heading = if title.is_empty() {
-                keyword.to_owned()
-            } else {
-                format!("{keyword} {title}")
-            };
-            if text[..heading_end] != heading {
-                buffer.edit([(0..heading_end, heading)], None, cx);
-            }
-        });
-    }
-
-    pub fn set_cursor_heading_state(
-        &mut self,
-        state: ParsedHeadingState,
-        cx: &mut Context<Workspace>,
-    ) {
-        if let Some((host, node_id)) = self.cursor_node(cx) {
-            self.set_heading_state(host, node_id, state, cx);
-        }
-    }
-
-    /// True when the caret sits on a node's first line, where normal-mode
-    /// keys are Desk verbs instead of vim commands.
-    pub fn cursor_on_heading_line(&self, cx: &mut Context<Workspace>) -> bool {
-        let Some((host, node_id, offset)) = self.cursor_node_offset(cx) else {
-            return false;
-        };
-        let Some(buffer) = self.buffers.get(&(host, node_id)) else {
-            return false;
-        };
-        let buffer = buffer.read(cx);
-        let text = buffer.text_for_range(0..buffer.len()).collect::<String>();
-        offset <= text.find('\n').unwrap_or(text.len())
-    }
-
-    /// Sibling insertion point for `o`/`O` on a heading: the fractional order
-    /// directly below or above the caret's node.
-    pub fn insert_sibling(
-        &self,
-        above: bool,
-        cx: &mut Context<Workspace>,
-    ) -> Option<(HostId, Option<DeskNodeId>, rho_ui_proto::desk::DeskOrderKey)> {
-        let (host, node_id) = self.cursor_node(cx)?;
-        let desk = self.hosts.get(&host)?;
-        let node = desk.snapshot.node(node_id)?;
-        let mut siblings = desk
-            .snapshot
-            .nodes
-            .iter()
-            .filter(|candidate| candidate.parent == node.parent)
-            .collect::<Vec<_>>();
-        siblings.sort_by(|left, right| left.order.cmp(&right.order));
-        let index = siblings
-            .iter()
-            .position(|candidate| candidate.id == node_id)?;
-        let order = if above {
-            let lower = index
-                .checked_sub(1)
-                .and_then(|previous| siblings.get(previous))
-                .map(|candidate| &candidate.order);
-            rho_ui_proto::desk::DeskOrderKey::between(lower, Some(&node.order))?
-        } else {
-            let upper = siblings.get(index + 1).map(|candidate| &candidate.order);
-            rho_ui_proto::desk::DeskOrderKey::between(Some(&node.order), upper)?
-        };
-        Some((host, node.parent, order))
-    }
-
-    pub fn structure_move(
-        &self,
-        direction: StructureDirection,
-        cx: &mut Context<Workspace>,
-    ) -> Option<(HostId, rho_ui_proto::desk::DeskStructureOp)> {
-        let (host, node_id) = self.cursor_node(cx)?;
-        let desk = self.hosts.get(&host)?;
-        let node = desk.snapshot.node(node_id)?;
-        let (parent, order) = match direction {
-            StructureDirection::Demote => {
-                let siblings = sorted_children(&desk.snapshot.nodes, node.parent);
-                let index = siblings
-                    .iter()
-                    .position(|candidate| candidate.id == node_id)?;
-                let new_parent = siblings.get(index.checked_sub(1)?)?;
-                let children = sorted_children(&desk.snapshot.nodes, Some(new_parent.id));
-                let lower = children.last().map(|candidate| &candidate.order);
-                (
-                    Some(new_parent.id),
-                    rho_ui_proto::desk::DeskOrderKey::between(lower, None)?,
-                )
-            }
-            StructureDirection::Promote => {
-                let old_parent = desk.snapshot.node(node.parent?)?;
-                let siblings = sorted_children(&desk.snapshot.nodes, old_parent.parent);
-                let index = siblings
-                    .iter()
-                    .position(|candidate| candidate.id == old_parent.id)?;
-                let upper = siblings.get(index + 1).map(|candidate| &candidate.order);
-                (
-                    old_parent.parent,
-                    rho_ui_proto::desk::DeskOrderKey::between(Some(&old_parent.order), upper)?,
-                )
-            }
-            StructureDirection::Up | StructureDirection::Down => {
-                let siblings = sorted_children(&desk.snapshot.nodes, node.parent);
-                let index = siblings
-                    .iter()
-                    .position(|candidate| candidate.id == node_id)?;
-                let order = if direction == StructureDirection::Up {
-                    let previous = index.checked_sub(1)?;
-                    rho_ui_proto::desk::DeskOrderKey::between(
-                        previous
-                            .checked_sub(1)
-                            .and_then(|at| siblings.get(at))
-                            .map(|candidate| &candidate.order),
-                        siblings.get(previous).map(|candidate| &candidate.order),
-                    )?
-                } else {
-                    let next = index + 1;
-                    let lower = siblings.get(next)?;
-                    rho_ui_proto::desk::DeskOrderKey::between(
-                        Some(&lower.order),
-                        siblings.get(next + 1).map(|candidate| &candidate.order),
-                    )?
-                };
-                (node.parent, order)
-            }
-        };
-        Some((
-            host,
-            rho_ui_proto::desk::DeskStructureOp::Move {
-                node_id,
-                parent,
-                order,
-            },
-        ))
-    }
-
-    pub fn delete_empty(
-        &self,
-        cx: &mut Context<Workspace>,
-    ) -> Option<(HostId, rho_ui_proto::desk::DeskStructureOp)> {
-        let (host, node_id) = self.cursor_node(cx)?;
-        let desk = self.hosts.get(&host)?;
-        if desk.snapshot.nodes.len() <= 1
-            || desk
-                .snapshot
-                .nodes
-                .iter()
-                .any(|node| node.parent == Some(node_id))
-        {
-            return None;
-        }
-        let buffer = self.buffers.get(&(host, node_id))?.read(cx);
-        let text = buffer.text_for_range(0..buffer.len()).collect::<String>();
-        if !text.trim().is_empty() {
-            return None;
-        }
-        Some((
-            host,
-            rho_ui_proto::desk::DeskStructureOp::Remove { node_id },
-        ))
-    }
-
-    pub fn undo_target(&self, cx: &mut Context<Workspace>) -> Option<DeskUndoTarget> {
-        let (host, node_id) = self.cursor_node(cx)?;
-        let desk = self.hosts.get(&host)?;
-        let transaction = desk
-            .snapshot
-            .texts
-            .iter()
-            .find(|text| text.node_id == node_id)
-            .into_iter()
-            .flat_map(|text| text.transactions.iter().rev())
-            .find(|transaction| {
-                transaction.id.replica_id == desk.replica_id
-                    && !self
-                        .undone_text_transactions
-                        .contains(&(host, node_id, transaction.id))
-            });
-        let structure = self
-            .last_structure_op
-            .get(&(host, node_id))
-            .copied()
-            .filter(|(op_id, _)| !desk.snapshot.undone_structure_ops.contains(op_id));
-        if let Some((op_id, timestamp)) = structure
-            && timestamp
-                >= self
-                    .last_text_timestamp
-                    .get(&(host, node_id))
-                    .copied()
-                    .unwrap_or_default()
-        {
-            return Some(DeskUndoTarget::Structure(host, op_id));
-        }
-        if let Some(transaction) = transaction {
-            return Some(DeskUndoTarget::Text(host, node_id, transaction.id));
-        }
-        structure.map(|(op_id, _)| DeskUndoTarget::Structure(host, op_id))
-    }
-
-    pub fn toggle_subagents(&mut self, cx: &mut Context<Workspace>) -> bool {
-        let Some(node) = self.cursor_node(cx) else {
-            return false;
-        };
-        let has_children = self.hosts.get(&node.0).is_some_and(|desk| {
-            desk.snapshot
-                .nodes
-                .iter()
-                .any(|candidate| candidate.parent == Some(node.1))
-        });
-        if !has_children {
-            return false;
-        }
-        if !self.collapsed.remove(&node) {
-            self.collapsed.insert(node);
-        }
-        cx.notify();
-        true
     }
 }
 
@@ -1286,144 +1019,34 @@ pub enum StructureDirection {
     Down,
 }
 
-pub enum DeskUndoTarget {
-    Text(HostId, DeskNodeId, DeskClock),
-    Structure(HostId, rho_ui_proto::desk::DeskStructureOpId),
-}
-
-fn sorted_children(nodes: &[DeskNode], parent: Option<DeskNodeId>) -> Vec<&DeskNode> {
-    let mut children = nodes
-        .iter()
-        .filter(|candidate| candidate.parent == parent)
-        .collect::<Vec<_>>();
-    children.sort_by(|left, right| left.order.cmp(&right.order));
-    children
-}
-
-#[derive(Default)]
-struct Projection {
-    order: Vec<(HostId, DeskNodeId)>,
-    depths: Vec<usize>,
-    collapsed: Vec<((HostId, DeskNodeId), std::ops::Range<usize>)>,
-}
-
-fn project_depth_first(
-    nodes: &[DeskNode],
-    parent: Option<DeskNodeId>,
-    collapsed: &HashSet<(HostId, DeskNodeId)>,
-    host: HostId,
-    depth: usize,
-    ancestor_collapsed: bool,
-    projection: &mut Projection,
-) {
-    let mut children = nodes
-        .iter()
-        .filter(|node| node.parent == parent)
-        .collect::<Vec<_>>();
-    children.sort_by(|left, right| left.order.cmp(&right.order));
-    for node in children {
-        projection.order.push((host, node.id));
-        projection.depths.push(depth);
-        let descendants_start = projection.order.len();
-        let is_collapsed = collapsed.contains(&(host, node.id));
-        project_depth_first(
-            nodes,
-            Some(node.id),
-            collapsed,
-            host,
-            depth + 1,
-            ancestor_collapsed || is_collapsed,
-            projection,
-        );
-        let descendants_end = projection.order.len();
-        if !ancestor_collapsed && is_collapsed && descendants_start != descendants_end {
-            projection
-                .collapsed
-                .push(((host, node.id), descendants_start..descendants_end));
+fn fuzzy_contains(haystack: &str, needle: &str) -> bool {
+    let mut chars = needle.chars().flat_map(char::to_lowercase);
+    let mut wanted = chars.next();
+    if wanted.is_none() {
+        return true;
+    }
+    for candidate in haystack.chars().flat_map(char::to_lowercase) {
+        if Some(candidate) == wanted {
+            wanted = chars.next();
+            if wanted.is_none() {
+                return true;
+            }
         }
     }
-}
-
-fn node_path(nodes: &[DeskNode], node_id: DeskNodeId) -> Option<Vec<DeskNodeId>> {
-    let mut path = Vec::new();
-    let mut current = Some(node_id);
-    while let Some(node_id) = current {
-        let node = nodes.iter().find(|node| node.id == node_id)?;
-        path.push(node.id);
-        current = node.parent;
-    }
-    path.reverse();
-    Some(path)
-}
-
-fn fuzzy_contains(candidate: &str, query: &str) -> bool {
-    let mut candidate = candidate.chars().flat_map(char::to_lowercase);
-    query
-        .chars()
-        .flat_map(char::to_lowercase)
-        .all(|needle| candidate.by_ref().any(|character| character == needle))
+    false
 }
 
 #[cfg(test)]
 mod tests {
-    use rho_ui_proto::desk::DeskOrderKey;
-
     use super::*;
-
     #[test]
-    fn heading_state_comes_only_from_first_line() {
+    fn fold_range_ends_at_next_peer() {
+        let text = "* a\nbody\n** child\nchild body\n* b\n";
+        let headings = parse(text);
         assert_eq!(
-            parse_heading_line("TODO ship Desk\nDONE is body text"),
-            (Some(ParsedHeadingState::Todo), "ship Desk")
+            &text
+                [headings[0].heading_range.start..Dashboard::subtree_end(&headings, 0, text.len())],
+            "* a\nbody\n** child\nchild body\n"
         );
-        assert_eq!(parse_heading_line("TODOish title"), (None, "TODOish title"));
-        assert_eq!(
-            parse_heading_line("STAFFED"),
-            (Some(ParsedHeadingState::Staffed), "")
-        );
-        assert!(fuzzy_contains("Ship the Desk", "std"));
-        assert!(!fuzzy_contains("Ship the Desk", "xyz"));
-    }
-
-    #[test]
-    fn tree_projects_in_depth_first_order_and_marks_collapsed_subtrees() {
-        let root = DeskNodeId(1);
-        let child = DeskNodeId(2);
-        let sibling = DeskNodeId(3);
-        let nodes = vec![
-            DeskNode {
-                id: sibling,
-                parent: None,
-                order: DeskOrderKey(vec![192]),
-            },
-            DeskNode {
-                id: child,
-                parent: Some(root),
-                order: DeskOrderKey::first(),
-            },
-            DeskNode {
-                id: root,
-                parent: None,
-                order: DeskOrderKey::first(),
-            },
-        ];
-        let host = HostId::default();
-        let mut projection = Projection::default();
-        project_depth_first(
-            &nodes,
-            None,
-            &HashSet::from([(host, root)]),
-            host,
-            0,
-            false,
-            &mut projection,
-        );
-        assert_eq!(
-            projection.order,
-            vec![(host, root), (host, child), (host, sibling)]
-        );
-        assert_eq!(projection.collapsed, vec![((host, root), 1..2)]);
-        assert_eq!(projection.depths, vec![0, 1, 0]);
-        assert_eq!(node_path(&nodes, child), Some(vec![root, child]));
     }
 }
