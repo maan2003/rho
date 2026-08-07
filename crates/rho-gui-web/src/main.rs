@@ -1,6 +1,9 @@
 use editor::{Backspace, MoveLeft, MoveRight, MoveToBeginningOfLine, MoveToEndOfLine, Newline, Redo, Undo};
 use gpui::{App, AppContext as _, Bounds, KeyBinding, WindowBounds, WindowOptions, px, size};
-use rho_gui::SubmitPrompt;
+use rho_gui::{
+    AgentDone, AgentHide, DashboardNewAgent, DashboardReply, DashboardToggleSubagents, RailOpen,
+    SubmitPrompt,
+};
 use rho_gui::rho_assets::RhoAssets;
 use rho_gui::workspace::Workspace;
 
@@ -42,6 +45,21 @@ fn main() {
             // deeper context outranks the plain `Editor` Newline binding.
             KeyBinding::new("enter", SubmitPrompt, Some("RhoTranscript > Editor")),
             KeyBinding::new("shift-enter", Newline, Some("RhoTranscript > Editor")),
+            // Dashboard triage, as on the desktop: the listing is read-only,
+            // so plain letters act on the row under the cursor. The native
+            // client qualifies these with `vim_mode == normal`; there is no
+            // vim here, so the bare dashboard context is the whole of it —
+            // without them the browser client cannot triage a row at all.
+            KeyBinding::new("enter", RailOpen, Some("RhoDashboard > Editor")),
+            KeyBinding::new("r", DashboardReply, Some("RhoDashboard > Editor")),
+            KeyBinding::new("d", AgentDone, Some("RhoDashboard > Editor")),
+            KeyBinding::new("shift-d", AgentHide, Some("RhoDashboard > Editor")),
+            KeyBinding::new("n", DashboardNewAgent, Some("RhoDashboard > Editor")),
+            KeyBinding::new(
+                "tab",
+                DashboardToggleSubagents,
+                Some("RhoDashboard > Editor"),
+            ),
         ]);
         let bounds = Bounds::centered(None, size(px(1180.), px(720.)), cx);
         cx.open_window(
