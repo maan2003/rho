@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 
 use redb::TableDefinition;
+use rho_agent::db::AgentReadTxnExt as _;
 use rho_db::{RhoDb, Sen, SenValue};
 use rho_ui_proto::desk::{
     DeskBinding, DeskIdToken, DeskOperation, DeskReplica, DeskReplicaAuthor, DeskSnapshot,
@@ -154,32 +155,57 @@ impl DeskStore {
             .into_iter()
             .find(|heading| heading.heading_range.start == heading_offset)
             .ok_or_else(|| "Desk heading moved before staffing completed".to_owned())?;
-        if heading.token.is_some() {
-            return Err("Desk heading is already bound".to_owned());
+        let candidate = heading.token.as_ref().and_then(|token| {
+            snapshot
+                .bindings
+                .iter()
+                .find(|binding| binding.token == *token && !binding.orphaned)
+        });
+        let candidate_disposition = candidate.and_then(|candidate| {
+            self.db
+                .read()
+                .list_agents()
+                .into_iter()
+                .find_map(|(agent_id, agent)| {
+                    (agent_id == candidate.agent_id).then_some(agent.disposition)
+                })
+        });
+        if candidate.is_some_and(|binding| binding_is_live(binding, candidate_disposition)) {
+            return Err("Desk heading is already staffed by a live agent".to_owned());
         }
 
         let mut write = self.db.write().await;
         let mut state = load_state(&mut write);
-        let token = DeskIdToken(format!("h-{:x}", state.snapshot.next_id));
-        state.snapshot.next_id = state
-            .snapshot
-            .next_id
-            .checked_add(1)
-            .ok_or_else(|| "Desk identity space exhausted".to_owned())?;
+        let had_token = heading.token.is_some();
+        let token = if let Some(token) = heading.token {
+            token
+        } else {
+            let token = DeskIdToken(format!("h-{:x}", state.snapshot.next_id));
+            state.snapshot.next_id = state
+                .snapshot
+                .next_id
+                .checked_add(1)
+                .ok_or_else(|| "Desk identity space exhausted".to_owned())?;
+            token
+        };
         let mut buffer = snapshot.buffer(ReplicaId::REMOTE_SERVER.as_u16())?;
         let heading_text = format!("{} STAFFED {}", "*".repeat(heading.depth), heading.title);
-        let insertion = heading.heading_range.end
-            + usize::from(text.as_bytes().get(heading.heading_range.end) == Some(&b'\n'));
-        let operation = buffer.edit([
-            (heading.heading_range.clone(), heading_text),
-            (insertion..insertion, format!(":id: {}\n", token.0)),
-        ]);
+        let operation = if had_token {
+            buffer.edit([(heading.heading_range.clone(), heading_text)])
+        } else {
+            let insertion = heading.heading_range.end
+                + usize::from(text.as_bytes().get(heading.heading_range.end) == Some(&b'\n'));
+            buffer.edit([
+                (heading.heading_range.clone(), heading_text),
+                (insertion..insertion, format!(":id: {}\n", token.0)),
+            ])
+        };
         let operation = DeskOperation::from_text(&operation);
         let record = append_text_in_txn(&mut write, &mut state, operation, None)?;
         state
             .snapshot
             .bindings
-            .retain(|binding| binding.agent_id != agent_id);
+            .retain(|binding| binding.token != token && binding.agent_id != agent_id);
         let binding = DeskBinding {
             token,
             agent_id,
@@ -220,6 +246,20 @@ impl DeskStore {
                     && matches!(replica.author, DeskReplicaAuthor::User)
             })
     }
+}
+
+fn binding_is_live(
+    binding: &DeskBinding,
+    disposition: Option<rho_core::AgentDisposition>,
+) -> bool {
+    !binding.orphaned
+        && matches!(
+            disposition,
+            Some(
+                rho_core::AgentDisposition::Pending
+                    | rho_core::AgentDisposition::Snoozed { .. }
+            )
+        )
 }
 
 fn append_text_in_txn(
@@ -442,6 +482,61 @@ fn migrate_v1(write: &mut rho_db::WriteTxn) -> Option<PersistentState> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn agent(counter: u64) -> rho_core::AgentId {
+        rho_core::AgentId::from_counter(counter, &rho_core::AgentIdDomain(7)).unwrap()
+    }
+
+    #[test]
+    fn orphaned_and_done_bindings_are_not_live() {
+        let token = DeskIdToken("h-a".into());
+        let mut binding = DeskBinding {
+            token,
+            agent_id: agent(1),
+            orphaned: true,
+        };
+        assert!(!binding_is_live(
+            &binding,
+            Some(rho_core::AgentDisposition::Pending)
+        ));
+        binding.orphaned = false;
+        assert!(!binding_is_live(
+            &binding,
+            Some(rho_core::AgentDisposition::Done)
+        ));
+        assert!(binding_is_live(
+            &binding,
+            Some(rho_core::AgentDisposition::Pending)
+        ));
+    }
+
+    #[tokio::test]
+    async fn staffing_reuses_an_orphaned_heading_token() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = RhoDb::open(directory.path().join("desk.redb"));
+        let store = DeskStore::new(db.clone()).await;
+        let replica = store.allocate_user_replica().await.unwrap();
+        let mut buffer =
+            text::Buffer::new(ReplicaId::new(replica), text::BufferId::new(1).unwrap(), "");
+        let edit = buffer.edit([(0..0, "* TODO plan\n:id: h-a\nnotes\n")]);
+        store
+            .apply_text(DeskOperation::from_text(&edit), None)
+            .await
+            .unwrap();
+        store.bind(DeskIdToken("h-a".into()), agent(1)).await.unwrap();
+        let mut write = db.write().await;
+        let mut state = load_state(&mut write);
+        state.snapshot.bindings[0].orphaned = true;
+        save_state(&mut write, &state);
+        write.commit();
+
+        let (_, binding) = store.staff_heading(0, agent(2)).await.unwrap();
+
+        assert_eq!(binding.token.0, "h-a");
+        let snapshot = store.snapshot();
+        assert_eq!(snapshot.bindings, vec![binding]);
+        assert_eq!(snapshot.document_text().unwrap().matches(":id:").count(), 1);
+    }
 
     #[tokio::test]
     async fn persistence_round_trips_single_buffer_and_orphan_revive() {
