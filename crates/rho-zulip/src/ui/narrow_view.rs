@@ -10,19 +10,22 @@
 //! you reply from the topic you entered, the way a newsreader has you
 //! follow up inside a thread.
 
+use std::ops::Range;
+
 use editor::scroll::AutoscrollStrategy;
 use editor::{Editor, EditorMode, SelectionEffects, SizingBehavior};
 use gpui::prelude::*;
 use gpui::{Context, Entity, Window, div};
-use theme::ActiveTheme as _;
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey};
-use std::ops::Range;
 use text::Anchor;
+use theme::ActiveTheme as _;
 
 use crate::session::Session;
 use crate::types::Message;
-use crate::ui::{Class, Hooks, Span, apply_highlights, clock_time, crosses_day, day_label, lay_out};
+use crate::ui::{
+    Class, Hooks, Span, apply_highlights, clock_time, crosses_day, day_label, lay_out,
+};
 use crate::{Destination, Narrow};
 
 pub struct NarrowView {
@@ -176,7 +179,12 @@ impl NarrowView {
             let buffer = input.read(cx);
             buffer.anchor_after(buffer.len())
         };
-        let Some(anchor) = self.multi_buffer.read(cx).snapshot(cx).anchor_in_excerpt(end) else {
+        let Some(anchor) = self
+            .multi_buffer
+            .read(cx)
+            .snapshot(cx)
+            .anchor_in_excerpt(end)
+        else {
             return;
         };
         self.editor.update(cx, |editor, cx| {
@@ -199,7 +207,10 @@ impl NarrowView {
             (None, false) => None,
         };
         let me = session.model().me();
-        let ids = messages.iter().map(|message| message.id).collect::<Vec<_>>();
+        let ids = messages
+            .iter()
+            .map(|message| message.id)
+            .collect::<Vec<_>>();
 
         // The common case is a message arriving at the end of a
         // conversation already on screen, and a whole-buffer rewrite there
@@ -239,8 +250,10 @@ impl NarrowView {
                     let clamp = |offset: usize| (base + offset).min(snapshot.len());
                     (
                         class,
-                        vec![snapshot.anchor_before(clamp(range.start))
-                            ..snapshot.anchor_after(clamp(range.end))],
+                        vec![
+                            snapshot.anchor_before(clamp(range.start))
+                                ..snapshot.anchor_after(clamp(range.end)),
+                        ],
                     )
                 })
                 .collect::<Vec<(Class, Vec<Range<Anchor>>)>>()
@@ -302,7 +315,10 @@ fn render_messages(messages: &[Message], me: Option<u64>, previous: Option<i64>)
                 .collect::<Vec<_>>();
             names.sort_unstable();
             names.dedup();
-            spans.push(Span::styled(format!(":{}:\n", names.join(": :")), Class::Time));
+            spans.push(Span::styled(
+                format!(":{}:\n", names.join(": :")),
+                Class::Time,
+            ));
         }
         spans.push(Span::plain("\n"));
         last = Some(message.timestamp);

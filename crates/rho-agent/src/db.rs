@@ -272,7 +272,7 @@ pub use rho_core::{
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub struct WorkstreamRecord {
     pub name: String,
-    /// Free-form markers ("pin", "group:slack", …); semantics live in the
+    /// Free-form markers ("pin", …); semantics live in the
     /// client's view layer, not here.
     pub labels: Vec<String>,
     pub created_at: UnixMillis,

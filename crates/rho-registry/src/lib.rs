@@ -538,7 +538,11 @@ impl AgentRegistry {
         let now = rho_core::UnixMs(now_ms());
         self.pending_verdicts
             .retain(|_, (_, sent_at)| now.0.saturating_sub(sent_at.0) < VERDICT_GRACE_MS);
-        let awaiting_answer = self.pending_verdicts.keys().copied().collect::<BTreeSet<_>>();
+        let awaiting_answer = self
+            .pending_verdicts
+            .keys()
+            .copied()
+            .collect::<BTreeSet<_>>();
         self.attention.retain(|agent_id, _| {
             self.agent_hosts.contains_key(agent_id)
                 && (!from_refreshed(agent_id) || awaiting_answer.contains(agent_id))

@@ -206,10 +206,7 @@ mod tests {
     use super::*;
 
     fn sample() -> BTreeMap<String, String> {
-        BTreeMap::from([
-            ("SLACK_BOT_TOKEN".to_string(), "xoxb-test".to_string()),
-            ("SLACK_APP_TOKEN".to_string(), "xapp-test".to_string()),
-        ])
+        BTreeMap::from([("GITHUB_TOKEN".to_string(), "github_pat_test".to_string())])
     }
 
     #[test]
@@ -231,20 +228,20 @@ mod tests {
         // Not under systemd -> no-op.
         // SAFETY: test process is single-threaded at this point.
         unsafe { std::env::remove_var("NOTIFY_SOCKET") };
-        assert!(!store.stash_in_fd_store("slack").unwrap());
+        assert!(!store.stash_in_fd_store("platform-secrets").unwrap());
 
         unsafe { std::env::set_var("NOTIFY_SOCKET", &path) };
-        assert!(store.stash_in_fd_store("slack").unwrap());
+        assert!(store.stash_in_fd_store("platform-secrets").unwrap());
         unsafe { std::env::remove_var("NOTIFY_SOCKET") };
 
         let mut remove = [0u8; 256];
         let len = receiver.recv(&mut remove).unwrap();
         assert_eq!(
             std::str::from_utf8(&remove[..len]).unwrap(),
-            "FDSTOREREMOVE=1\nFDNAME=slack"
+            "FDSTOREREMOVE=1\nFDNAME=platform-secrets"
         );
         let (payload, fd) = recv_with_fd(&receiver);
-        assert_eq!(payload, "FDSTORE=1\nFDNAME=slack");
+        assert_eq!(payload, "FDSTORE=1\nFDNAME=platform-secrets");
         let restored = SecretStore::from_fd(fd);
         assert_eq!(restored.read().unwrap(), sample());
     }

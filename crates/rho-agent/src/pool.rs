@@ -61,7 +61,6 @@ pub struct AgentPool {
     turn_reports: broadcast::Sender<AgentTurnReported>,
     usage: Mutex<HashMap<(AgentId, u64), AgentUsageBucket>>,
     iris_tool_host: std::sync::RwLock<Option<crate::iris_tools::SharedIrisToolHost>>,
-    slack_tool_host: std::sync::RwLock<Option<crate::slack_tools::SharedSlackToolHost>>,
 }
 
 /// Broadcast when any agent is created in the pool.
@@ -190,7 +189,6 @@ impl AgentPool {
             turn_reports: broadcast::channel(64).0,
             usage: Mutex::new(HashMap::new()),
             iris_tool_host: std::sync::RwLock::new(None),
-            slack_tool_host: std::sync::RwLock::new(None),
         });
         let weak = Arc::downgrade(&pool);
         tokio::spawn(async move {
@@ -214,14 +212,6 @@ impl AgentPool {
 
     pub(crate) fn iris_tool_host(&self) -> Option<crate::iris_tools::SharedIrisToolHost> {
         self.iris_tool_host.read().expect("poison").clone()
-    }
-
-    pub fn set_slack_tool_host(&self, host: crate::slack_tools::SharedSlackToolHost) {
-        *self.slack_tool_host.write().expect("poison") = Some(host);
-    }
-
-    pub(crate) fn slack_tool_host(&self) -> Option<crate::slack_tools::SharedSlackToolHost> {
-        self.slack_tool_host.read().expect("poison").clone()
     }
 
     pub fn subscribe_created(&self) -> broadcast::Receiver<AgentCreated> {

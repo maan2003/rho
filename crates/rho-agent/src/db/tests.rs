@@ -521,7 +521,7 @@ async fn labels_toggle_without_duplicates() {
     );
     write.workstream_label(UnixMs(2), workstream, "pin", true);
     write.workstream_label(UnixMs(3), workstream, "pin", true);
-    write.workstream_label(UnixMs(4), workstream, "group:slack", true);
+    write.workstream_label(UnixMs(4), workstream, "group:team", true);
     write.agent_label(UnixMs(5), agent_id, "urgent", true);
     write.agent_label(UnixMs(6), agent_id, "urgent", true);
     write.agent_label(UnixMs(7), agent_id, "review", true);
@@ -531,7 +531,7 @@ async fn labels_toggle_without_duplicates() {
     let read = db.read();
     assert_eq!(
         read.get_workstream(workstream).labels,
-        ["pin", "group:slack"]
+        ["pin", "group:team"]
     );
     assert_eq!(read.get_agent(agent_id).labels, ["review"]);
 }

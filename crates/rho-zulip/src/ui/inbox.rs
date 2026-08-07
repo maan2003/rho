@@ -8,13 +8,14 @@
 //! rather than by line number, so an arriving message cannot move the
 //! selection out from under a keypress.
 
+use std::ops::Range;
+
 use editor::{Editor, EditorMode, SizingBehavior};
 use gpui::prelude::*;
 use gpui::{Context, Entity, Window, div};
-use theme::ActiveTheme as _;
 use language::{Buffer, Capability, Point};
-use std::ops::Range;
 use text::Anchor;
+use theme::ActiveTheme as _;
 
 use crate::Narrow;
 use crate::model::{InboxRow, InboxRowKind};

@@ -270,9 +270,7 @@ and skills as well as the working-directory Environment section; technical
 requests are delegated to Engineers carrying the user's instructions verbatim.
 PMs use judgment when routing follow-ups: they may reuse the responsible
 Engineer, but spawn a fresh one when warranted or requested or suggested by the
-user. Slack-bound PMs explicitly relay Engineer results and other user-facing
-responses through `slack_reply` because final responses are not posted to Slack
-automatically.
+user.
 PMs do not receive `wait_agent`: they end their turn after delegation and agent
 mail wakes them for the next request. Their prompt states this asynchronous
 delegate, acknowledge, end-turn, wake-on-mail, and relay flow explicitly.
@@ -285,24 +283,9 @@ their own; UI clients retain names for display and selection.
 
 `AgentRole` also carries a persistence-compatible workflow distinction:
 existing Engineer/PM variants are the default workflow, while appended
-workflow-bearing Engineer/PM variants carry `AgentWorkflow`. Slack creates PMs
-with the persistence-compatible `AgentWorkflow::PrFriendly` marker, and only
-Engineers spawned directly by those PMs inherit it. The marker activates
-`github-workflow` guidance without changing the visible role label or model
-binding.
-
-`rho-slack` is the in-process Slack surface. `SlackManager` is handed the
-daemon's `AgentPool` and `RhoDb` and owns everything Slack: sealed-memfd
-secret storage (`SecretStore`), the Socket Mode reconnect loop, the persisted
-Slack coordinator repository and Slack-thread → agent-session mapping, and a
-Slack-bound built-in `slack_reply` tool host for mapped coordinator agents. It also
-subscribes to generic accepted-input reports and mirrors non-Slack local user
-inputs into mapped Slack threads, using a private opaque source id to avoid
-echoing Slack-originated inputs. The daemon validates and installs Slack setup,
-resumes secrets from the systemd fd store on startup, and publishes generic
-agent turn-completion and accepted-input reports through `AgentPool`; Slack uses
-completed-turn reports for reaction cleanup, not automatic final-answer posting,
-and the daemon does not own Slack routing policy.
+workflow-bearing Engineer/PM variants carry `AgentWorkflow`. The
+`AgentWorkflow::PrFriendly` marker activates `github-workflow` guidance
+without changing the visible role label or model binding.
 
 `octo-server` is the daemon's authenticated GitHub API and constrained Git
 HTTP component. Rho runs it

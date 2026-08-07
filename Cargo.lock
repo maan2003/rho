@@ -13612,7 +13612,6 @@ dependencies = [
  "rho-rpc",
  "rho-shell",
  "rho-shell-proto",
- "rho-slack",
  "rho-ui-proto",
  "rho-visualizations",
  "rho-workspaces",
@@ -13874,30 +13873,6 @@ dependencies = [
  "bytes",
  "senax-encoder",
  "tokio",
-]
-
-[[package]]
-name = "rho-slack"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "bytes",
- "camino",
- "futures-util",
- "libc",
- "redb",
- "reqwest 0.12.28",
- "rho-agent",
- "rho-core",
- "rho-db",
- "rustls",
- "senax-encoder",
- "serde",
- "serde_json",
- "tempfile",
- "tokio",
- "tokio-tungstenite",
- "tracing",
 ]
 
 [[package]]

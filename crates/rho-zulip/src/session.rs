@@ -146,7 +146,12 @@ impl Session {
             let belongs = key == narrow
                 || key.accepts(message.stream_id, &message.topic)
                 || (matches!(key, Narrow::Mentions) && message.mentions_you());
-            if belongs && !conversation.messages.iter().any(|held| held.id == message_id) {
+            if belongs
+                && !conversation
+                    .messages
+                    .iter()
+                    .any(|held| held.id == message_id)
+            {
                 conversation.messages.push((**message).clone());
             }
         }

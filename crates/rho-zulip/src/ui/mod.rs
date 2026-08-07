@@ -7,16 +7,16 @@
 pub mod inbox;
 pub mod narrow_view;
 
+use std::ops::Range;
+
 use editor::{Editor, HighlightKey};
 use gpui::{App, Context, Entity, FontWeight, HighlightStyle, Window};
+pub use inbox::InboxView;
 use language::Buffer;
 use multi_buffer::MultiBuffer;
-use std::ops::Range;
+pub use narrow_view::NarrowView;
 use text::Anchor;
 use theme::ActiveTheme as _;
-
-pub use inbox::InboxView;
-pub use narrow_view::NarrowView;
 
 /// Host-supplied editor and buffer configuration.
 ///

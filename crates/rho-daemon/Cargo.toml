@@ -34,7 +34,6 @@ rho-iroh-auth = { workspace = true, features = ["server"] }
 rho-pr-monitor.workspace = true
 rho-profiling.workspace = true
 rho-rpc = { workspace = true, features = ["server"] }
-rho-slack.workspace = true
 rho-ui-proto.workspace = true
 rho-visualizations.workspace = true
 rho-workspaces.workspace = true

@@ -33,6 +33,7 @@ pub mod debug;
 mod desk;
 mod iris;
 mod realtime;
+mod secret_store;
 mod shell;
 mod terminal;
 mod workspace_channel;
@@ -142,13 +143,13 @@ fn set_environment_value(
 
 #[derive(Clone, Default)]
 struct PlatformSecrets {
-    store: Arc<std::sync::Mutex<Option<Arc<rho_slack::SecretStore>>>>,
+    store: Arc<std::sync::Mutex<Option<Arc<secret_store::SecretStore>>>>,
 }
 
 impl PlatformSecrets {
     fn from_fd_store() -> Self {
         let secrets = Self::default();
-        match rho_slack::SecretStore::take_from_listen_fds(PLATFORM_SECRETS_FD_STORE_NAME) {
+        match secret_store::SecretStore::take_from_listen_fds(PLATFORM_SECRETS_FD_STORE_NAME) {
             Ok(Some(store)) => {
                 tracing::info!("reclaimed platform secrets from fd store");
                 *secrets.store.lock().expect("platform secrets lock") = Some(Arc::new(store));
@@ -159,7 +160,7 @@ impl PlatformSecrets {
         secrets
     }
 
-    fn current_store(&self) -> Option<Arc<rho_slack::SecretStore>> {
+    fn current_store(&self) -> Option<Arc<secret_store::SecretStore>> {
         self.store.lock().expect("platform secrets lock").clone()
     }
 
@@ -186,13 +187,14 @@ impl PlatformSecrets {
     fn install_merge(
         &self,
         secrets: impl IntoIterator<Item = (String, String)>,
-    ) -> anyhow::Result<(Arc<rho_slack::SecretStore>, bool)> {
+    ) -> anyhow::Result<(Arc<secret_store::SecretStore>, bool)> {
         let mut merged = self.read().unwrap_or_default();
         for (key, value) in secrets {
             merged.insert(key, value);
         }
-        let store =
-            Arc::new(rho_slack::SecretStore::create(&merged).context("sealing platform secrets")?);
+        let store = Arc::new(
+            secret_store::SecretStore::create(&merged).context("sealing platform secrets")?,
+        );
         let stashed = store
             .stash_in_fd_store(PLATFORM_SECRETS_FD_STORE_NAME)
             .context("stashing platform secrets in the systemd fd store")?;
@@ -426,7 +428,6 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     for (agent_id, agent) in agents.loaded().await {
         activation_observer(agent_id, agent).await;
     }
-    agents.resume_platform_integrations();
     // Re-arm snooze wake-ups that were pending when the daemon last stopped.
     for (agent_id, agent) in agents.db.read().list_agents() {
         if let AgentDisposition::Snoozed { until } = agent.disposition
@@ -962,12 +963,9 @@ struct AgentRegistry {
     land_locks: Mutex<HashMap<Utf8PathBuf, Arc<TokioMutex<()>>>>,
     land_holders: Mutex<HashMap<Utf8PathBuf, LandLeaseHolder>>,
     land_statuses: Mutex<HashMap<Utf8PathBuf, (Option<AgentId>, LandStatus)>>,
-    /// In-process Slack connection and its thread sessions
-    /// (see [`rho_slack::SlackManager`]).
-    slack: Arc<rho_slack::SlackManager>,
     /// Stateless PR, CI, review, and comment operations.
     pr_monitor: Arc<rho_pr_monitor::PrMonitor>,
-    /// Shared sealed platform secret store used by Slack and Octo.
+    /// Sealed platform secret store used by Octo.
     platform_secrets: PlatformSecrets,
     /// Daemon-wide fanout for messages every client must hear regardless of
     /// which connection caused them (attention changes); each connection
@@ -1004,7 +1002,6 @@ impl AgentRegistry {
         )
         .await;
         let machine_seed = db.read().machine_seed();
-        let slack = rho_slack::SlackManager::new(pool.clone(), db.clone()).await;
         let pr_monitor = rho_pr_monitor::PrMonitor::new(pool.clone(), db.clone()).await?;
         let visualizations = rho_visualizations::VisualizationStore::new(db.clone()).await;
         let desk = desk::DeskStore::new(db.clone()).await;
@@ -1020,7 +1017,6 @@ impl AgentRegistry {
             land_locks: Mutex::new(HashMap::new()),
             land_holders: Mutex::new(HashMap::new()),
             land_statuses: Mutex::new(HashMap::new()),
-            slack,
             pr_monitor,
             platform_secrets,
             events: broadcast::channel(1024).0,
@@ -1032,22 +1028,6 @@ impl AgentRegistry {
             iris_voice_lease: Arc::new(TokioMutex::new(())),
         };
         Ok(registry)
-    }
-
-    fn resume_platform_integrations(self: &Arc<Self>) {
-        let Some(store) = self.platform_secrets.current_store() else {
-            return;
-        };
-        if store
-            .read()
-            .map(|secrets| {
-                secrets.contains_key("SLACK_BOT_TOKEN") && secrets.contains_key("SLACK_APP_TOKEN")
-            })
-            .unwrap_or(false)
-            && let Err(error) = self.slack.start_from_store(store)
-        {
-            tracing::error!(%error, "resuming slack from platform secrets");
-        }
     }
 
     /// Live state kinds of every loaded agent, for attention derivation.
@@ -2625,13 +2605,7 @@ async fn handle_message(
             agents.git_transport.register(outgoing_tx.clone()).await;
             Ok(Refresh::None)
         }
-        ClientMessage::PlatformSecretsSet {
-            secrets,
-            coordinator_repo,
-        } => {
-            let wants_slack = secrets
-                .iter()
-                .any(|(key, _)| key == "SLACK_BOT_TOKEN" || key == "SLACK_APP_TOKEN");
+        ClientMessage::PlatformSecretsSet { secrets } => {
             let wants_octo = secrets.iter().any(|(key, _)| key == "GITHUB_TOKEN");
             let (running, detail) = match agents.platform_secrets.install_merge(secrets) {
                 Ok((store, stashed)) => {
@@ -2640,22 +2614,7 @@ async fn handle_message(
                     } else {
                         " (no systemd notify socket: they will not survive a daemon restart)"
                     };
-                    if wants_slack {
-                        match coordinator_repo
-                            .ok_or_else(|| anyhow::anyhow!("Slack coordinator repo is required"))
-                            .and_then(validate_repo_root)
-                        {
-                            Ok(coordinator_repo) => match agents
-                                .slack
-                                .configure_and_start_from_store(store.clone(), coordinator_repo)
-                                .await
-                            {
-                                Ok(()) => (true, format!("slack secrets installed{persistence}")),
-                                Err(error) => (false, format!("{error:#}")),
-                            },
-                            Err(error) => (false, format!("{error:#}")),
-                        }
-                    } else if wants_octo && store.read()?.contains_key("GITHUB_TOKEN") {
+                    if wants_octo && store.read()?.contains_key("GITHUB_TOKEN") {
                         (true, format!("GitHub secrets installed{persistence}"))
                     } else {
                         (true, format!("platform secrets installed{persistence}"))

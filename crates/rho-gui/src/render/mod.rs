@@ -253,11 +253,11 @@ pub fn render_block_with_agent_labels(
                 Vec::new()
             }
             .into_iter()
-                .map(|mut padding| {
-                    padding.position += offset;
-                    padding
-                })
-                .collect();
+            .map(|mut padding| {
+                padding.position += offset;
+                padding
+            })
+            .collect();
             spans.push(Span::new(text, StyleClass::Default));
             return RenderedBlock {
                 spans,

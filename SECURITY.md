@@ -110,28 +110,12 @@ AI APIs.
 - Rho's packaged skills are immutable package data at a store path embedded
   when the final binaries are built. They are trusted prompt input, not a
   security boundary.
-- Messaging-platform/API secrets (e.g. Slack tokens and Octo's GitHub token)
-  reach the daemon over the UI socket (`rho slack init --dir <coordinator-repo>`
-  and `rho pr init` read them from stdin) — never via argv, exec-time
-  environment, or files. `rho_slack::SecretStore` holds them in a sealed memfd
+- Octo's GitHub token reaches the daemon over the UI socket (`rho pr init`
+  reads it from stdin) — never via argv, exec-time environment, or files. The
+  daemon's `SecretStore` holds it in a sealed memfd
   and stashes/reclaims it via the systemd fd store (`FDSTORE=1`/`$LISTEN_FDS`),
-  so tokens never touch disk and survive daemon restarts but not reboots. The
-  explicit Slack coordinator repo is persisted in the local rho database, and
-  Slack thread sessions always start PM agents there; cross-repo work
-  is model-directed delegation to spawned agents with explicit repo paths, not
-  first-message repo selection. Token values must not appear in logs or errors.
-  Inbound Slack Socket Mode frames are remote, semi-trusted input: malformed or
-  unexpected frames are skipped, never panicked on, and message text is handed to
-  agents as untrusted user content. Slack replies are posted only when a
-  Slack-mapped Rho agent explicitly calls its injected `slack_reply({text})`
-  tool, which re-checks the persisted agent→thread mapping at dispatch time;
-  completed-turn reports only clean up in-progress reactions. Slack-originated
-  inputs are tagged with a private in-memory source id so the Slack relay can
-  ignore its own accepted-input reports; other local-client user inputs to
-  Slack-mapped agents are mirrored into the mapped thread with conservative
-  attribution. Integration-internal control inputs (including PR-monitor
-  wakeups) carry a process-local internal source tag and are not mirrored
-  verbatim; the PM must relay an appropriate user-facing summary explicitly.
+  so the token never touches disk and survives daemon restarts but not reboots.
+  Token values must not appear in logs or errors.
 - The embedded Octo server listens only on its fixed per-user Unix socket and
   uses the sealed platform secret store as its GitHub API and constrained Git
   HTTP token source. It has no token argv/env/file/admin import path in Rho.

@@ -144,7 +144,6 @@ async fn init(args: PrArgs) -> anyhow::Result<()> {
     daemon
         .send(&ClientMessage::PlatformSecretsSet {
             secrets: vec![("GITHUB_TOKEN".to_owned(), token)],
-            coordinator_repo: None,
         })
         .await?;
     loop {

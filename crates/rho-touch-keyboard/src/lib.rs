@@ -454,25 +454,21 @@ impl TouchKeyboard {
                 .px(px(H_GAP))
                 .flex()
                 .items_center()
-                .children(
-                    self.plugin
-                        .context_chips()
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, chip)| {
-                            div()
-                                .id(("context-chip", index))
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .bg(colors.key_background)
-                                .text_color(colors.text_muted)
-                                .child(chip.label)
-                                .on_mouse_down(MouseButton::Left, move |_, window, cx| {
-                                    (chip.on_select)(window, cx);
-                                })
-                        }),
-                ),
+                .children(self.plugin.context_chips().into_iter().enumerate().map(
+                    |(index, chip)| {
+                        div()
+                            .id(("context-chip", index))
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
+                            .bg(colors.key_background)
+                            .text_color(colors.text_muted)
+                            .child(chip.label)
+                            .on_mouse_down(MouseButton::Left, move |_, window, cx| {
+                                (chip.on_select)(window, cx);
+                            })
+                    },
+                )),
         );
 
         for (row_index, row) in layout_rows(width).into_iter().enumerate() {

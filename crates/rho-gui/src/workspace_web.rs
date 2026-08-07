@@ -225,8 +225,7 @@ impl Workspace {
         _: &mut Window,
         _: &mut Context<Self>,
     ) {
-        self.web.dashboard_press =
-            (event.button == MouseButton::Left).then_some(event.position);
+        self.web.dashboard_press = (event.button == MouseButton::Left).then_some(event.position);
     }
 
     pub(super) fn dashboard_pointer_up(

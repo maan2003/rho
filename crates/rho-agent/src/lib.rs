@@ -40,7 +40,6 @@ mod lazy;
 pub mod multi_agent_tools;
 pub mod pool;
 pub mod presentation;
-pub mod slack_tools;
 pub mod system_prompt;
 
 #[cfg(feature = "code-mode")]
@@ -79,7 +78,7 @@ pub fn render_agent_surface(
     let agent_tools_enabled = true;
     Ok(RenderedAgentSurface {
         system_prompt: system_prompt::prompt(view.as_ref(), None, code_mode, role, &[]),
-        tools: agent_tool_specs(&shell_tools, agent_tools_enabled, code_mode, role, false),
+        tools: agent_tool_specs(&shell_tools, agent_tools_enabled, code_mode, role),
     })
 }
 
@@ -736,7 +735,6 @@ impl Agent {
                 .and_then(|pool| pool.iris_tool_host())
                 .expect("Iris role requires the daemon Iris tool host")
         });
-        let slack_tools = pool.upgrade().and_then(|pool| pool.slack_tool_host());
         let multi_agent = (role != db::AgentRole::Iris)
             .then(|| pool.upgrade())
             .flatten()
@@ -755,13 +753,11 @@ impl Agent {
             let view = Arc::clone(&view);
             let multi_agent = multi_agent.clone();
             let web_search = web_search.clone();
-            let slack_tools = slack_tools.clone();
             let control = execution_control.clone();
             move || {
                 let view = Arc::clone(&view);
                 let multi_agent = multi_agent.clone();
                 let web_search = web_search.clone();
-                let slack_tools = slack_tools.clone();
                 let control = control.clone();
                 let projects = projects.clone();
                 async move {
@@ -774,9 +770,6 @@ impl Agent {
                         code_mode_enabled,
                         agent_tools_enabled,
                         multi_agent.as_ref(),
-                        slack_tools
-                            .as_ref()
-                            .is_some_and(|host| host.has_agent(agent_id)),
                         &projects,
                         control,
                     ))
@@ -828,7 +821,6 @@ impl Agent {
             multi_agent,
             agent_tools_enabled,
             iris_tools,
-            slack_tools,
             pool_events,
             execution_generation: 0,
             last_presentation_source,
@@ -1090,7 +1082,6 @@ fn agent_tool_specs(
     multi_agent: bool,
     code_mode: bool,
     role: db::AgentRole,
-    slack_tools: bool,
 ) -> Arc<[ToolSpec]> {
     if role == db::AgentRole::Iris {
         return iris_tools::specs().into();
@@ -1108,9 +1099,6 @@ fn agent_tool_specs(
     };
     if multi_agent {
         specs.extend(multi_agent_tools::agent_tool_specs(role));
-    }
-    if slack_tools {
-        specs.push(slack_tools::spec());
     }
     specs.push(rho_web_search::web_search_spec());
     specs.into()
@@ -1223,7 +1211,6 @@ struct AgentLoop {
     agent_tools_enabled: bool,
     /// Stateful host for the built-in Iris role's global control tools.
     iris_tools: Option<iris_tools::SharedIrisToolHost>,
-    slack_tools: Option<slack_tools::SharedSlackToolHost>,
     pool_events: std::sync::Weak<pool::AgentPool>,
     /// Incremented inside the serialized loop whenever a provider attempt is
     /// started, including attempts that fail before publishing Working.
@@ -1273,7 +1260,6 @@ impl ExecutionContext {
         code_mode_enabled: bool,
         agent_tools_enabled: bool,
         multi_agent: Option<&MultiAgentTools>,
-        slack_tools: bool,
         projects: &[(camino::Utf8PathBuf, String)],
         control: mpsc::WeakUnboundedSender<AgentControl>,
     ) -> Self {
@@ -1294,7 +1280,6 @@ impl ExecutionContext {
             multi_agent.is_some() && agent_tools_enabled,
             code_mode.is_some(),
             role,
-            slack_tools,
         );
         let system_prompt = system_prompt::prompt(
             view.as_ref(),
@@ -2049,11 +2034,6 @@ impl AgentLoop {
                                             .then(|| self.iris_tools.clone())
                                             .flatten();
                                         let iris_role = self.iris_tools.is_some();
-                                        let slack_tools = (call.name.as_str()
-                                            == slack_tools::REPLY_TOOL_NAME)
-                                            .then(|| self.slack_tools.clone())
-                                            .flatten();
-                                        let agent_id = self.persistence.agent_id;
                                         self.pending_tools.push(Box::pin(async move {
                                             let call_id = call.id.clone();
                                             let tool_type = call.tool_type;
@@ -2061,8 +2041,6 @@ impl AgentLoop {
                                                 (web_search.call(call, context).await, None)
                                             } else if let Some(iris_tools) = iris_tools {
                                                 (iris_tools.call(call).await, None)
-                                            } else if let Some(slack_tools) = slack_tools {
-                                                (slack_tools.call(agent_id, call).await, None)
                                             } else if let Some(tools) = agent_tools {
                                                 (multi_agent_tools::call_agent_tool(tools, call).await, None)
                                             } else if iris_role {

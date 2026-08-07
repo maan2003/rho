@@ -128,7 +128,7 @@ pub enum ClientMessage {
         agent_id: AgentId,
     },
     /// Adds or removes one free-form label on a workstream; semantics
-    /// ("pin", "group:slack", …) live in the client's view layer.
+    /// ("pin", …) live in the client's view layer.
     WorkstreamLabel {
         workstream_id: WorkstreamId,
         label: String,
@@ -191,11 +191,9 @@ pub enum ClientMessage {
         self_agent_id: AgentId,
         request: McpAgentToolRequest,
     },
-    /// Install messaging-platform secrets (e.g. Slack tokens) into the
-    /// daemon's RAM-only store and (re)start the platform connection.
+    /// Install platform secrets into the daemon's RAM-only store.
     PlatformSecretsSet {
         secrets: Vec<(String, String)>,
-        coordinator_repo: Option<Utf8PathBuf>,
     },
     /// Approve a pending iroh client enrollment by its displayed code,
     /// trusting that client's endpoint key persistently.
@@ -830,7 +828,7 @@ pub struct AgentUsageSeries {
 pub struct UiWorkstream {
     pub workstream_id: WorkstreamId,
     pub name: String,
-    /// Free-form markers ("pin", "group:slack", …); semantics live in the
+    /// Free-form markers ("pin", …); semantics live in the
     /// client's view layer.
     pub labels: Vec<String>,
 }

@@ -7,7 +7,6 @@ supervisor, protocol, and plugin runtime.
 ## Surfaces
 
 - `rho-gui`, the native desktop application.
-- Slack integration.
 - The `rho` terminal CLI.
 - `rho-gui-web`, a browser client built from the native GPUI interface.
 

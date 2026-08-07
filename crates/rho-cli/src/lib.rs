@@ -1,14 +1,13 @@
 //! The `rho` command: daemon launcher and utility subcommands.
 //!
 //! Interactive use lives in rho-gui; this binary hosts the daemon itself
-//! plus the terminal-friendly plumbing around it — auth, land, PR and
-//! Slack bridges, debug tools.
+//! plus the terminal-friendly plumbing around it — auth, land, PR and debug
+//! tools.
 
 use std::io;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 use rho_daemon::debug::DebugArgs;
 use rho_daemon::{DaemonArgs, default_socket_path};
@@ -18,7 +17,6 @@ use rho_ui_proto::client::Client as UiClient;
 mod land;
 mod mcp_agent_tools;
 mod pr;
-mod slack;
 mod visualization;
 mod wayland;
 mod workstream;
@@ -71,7 +69,6 @@ async fn run(command: Command) -> Result<()> {
         Command::McpAgentTools(args) => mcp_agent_tools::run(args).await,
         Command::Pr(args) => pr::run(args).await,
         Command::RecordVisualization(args) => visualization::run(args).await,
-        Command::Slack(args) => slack::run(args).await,
         Command::Wayland(_) => unreachable!("wayland runs before the shared async runtime"),
         Command::Workstream(args) => workstream::run(args).await,
         Command::ProtocolLog(args) => {
@@ -160,7 +157,6 @@ enum Command {
     Pr(PrArgs),
     RecordVisualization(RecordVisualizationArgs),
     ProtocolLog(ProtocolLogArgs),
-    Slack(SlackArgs),
     Wayland(wayland::WaylandArgs),
     Workstream(WorkstreamArgs),
 }
@@ -187,7 +183,6 @@ enum CliCommand {
     /// Register an immutable SVG visualization read from stdin.
     RecordVisualization(RecordVisualizationArgs),
     ProtocolLog(ProtocolLogArgs),
-    Slack(SlackArgs),
     /// Run and control applications in an isolated headless Wayland session.
     Wayland(wayland::WaylandArgs),
     /// Inspect and edit workstreams: the persistent units of work.
@@ -211,24 +206,6 @@ pub(crate) enum IrohCommand {
     TrustInMemory { endpoint_id: String },
     /// Revoke a previously enrolled iroh client endpoint.
     Revoke { endpoint_id: String },
-}
-
-#[derive(Clone, clap::Args)]
-pub(crate) struct SlackArgs {
-    #[arg(long = "socket-path")]
-    socket_path: Option<PathBuf>,
-    #[command(subcommand)]
-    command: SlackCommand,
-}
-
-#[derive(Clone, Subcommand)]
-pub(crate) enum SlackCommand {
-    /// Install Slack tokens (read from stdin) and connect to Slack.
-    Init {
-        /// Repository where Slack coordinator agents should run.
-        #[arg(long = "dir")]
-        dir: Utf8PathBuf,
-    },
 }
 
 #[derive(Clone, clap::Args)]
@@ -370,7 +347,6 @@ impl Args {
             CliCommand::Pr(args) => Command::Pr(args),
             CliCommand::RecordVisualization(args) => Command::RecordVisualization(args),
             CliCommand::ProtocolLog(args) => Command::ProtocolLog(args),
-            CliCommand::Slack(args) => Command::Slack(args),
             CliCommand::Wayland(args) => Command::Wayland(args),
             CliCommand::Workstream(args) => Command::Workstream(args),
         };

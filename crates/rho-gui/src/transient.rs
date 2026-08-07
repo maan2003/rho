@@ -1335,9 +1335,13 @@ fn agent_menu() -> Transient {
         .item("shift-c", "continue turn", |workspace, window, cx| {
             workspace.cmd_continue_turn(window, cx);
         })
-        .item("shift-k", "new prompt cache key", |workspace, window, cx| {
-            workspace.cmd_change_prompt_cache_key(window, cx);
-        })
+        .item(
+            "shift-k",
+            "new prompt cache key",
+            |workspace, window, cx| {
+                workspace.cmd_change_prompt_cache_key(window, cx);
+            },
+        )
 }
 
 fn snooze_menu() -> Transient {
