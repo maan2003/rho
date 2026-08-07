@@ -4,11 +4,8 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use editor::display_map::BlockStyle;
-use editor::{
-    DisplayElisionId, DisplayElisionProperties, Editor, EditorMode, HighlightKey, Inlay,
-    InlayHighlight, SizingBehavior,
-};
+use editor::display_map::{BlockPlacement, BlockProperties, BlockStyle, CustomBlockId};
+use editor::{Editor, EditorMode, HighlightKey, Inlay, InlayHighlight, SizingBehavior};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, Focusable as _, Window};
 use language::{Buffer, BufferEvent, Capability, InlayId, Point};
@@ -80,7 +77,8 @@ pub struct Dashboard {
     subscriptions: HashMap<(HostId, DeskNodeId), gpui::Subscription>,
     known_text_ops: HashSet<(HostId, DeskNodeId, DeskClock)>,
     collapsed: HashSet<(HostId, DeskNodeId)>,
-    collapse_elisions: HashMap<(HostId, DeskNodeId), DisplayElisionId>,
+    collapse_blocks: Vec<CustomBlockId>,
+    host_header_blocks: Vec<CustomBlockId>,
     depth_inlays: Vec<InlayId>,
     buffer_nodes: HashMap<BufferId, (HostId, DeskNodeId)>,
     headers_disabled: HashSet<BufferId>,
@@ -115,7 +113,8 @@ impl Dashboard {
             subscriptions: HashMap::new(),
             known_text_ops: HashSet::new(),
             collapsed: HashSet::new(),
-            collapse_elisions: HashMap::new(),
+            collapse_blocks: Vec::new(),
+            host_header_blocks: Vec::new(),
             depth_inlays: Vec::new(),
             buffer_nodes: HashMap::new(),
             headers_disabled: HashSet::new(),
@@ -310,7 +309,7 @@ impl Dashboard {
 
     pub fn sync(
         &mut self,
-        _registry: &AgentRegistry,
+        registry: &AgentRegistry,
         _window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
@@ -361,8 +360,63 @@ impl Dashboard {
             }
         });
         self.displayed_len = order.len();
+        self.sync_host_headers(registry, &order, cx);
         self.sync_depth_rails(&order, &projection.depths, cx);
-        self.sync_collapse_elisions(&order, projection.collapsed, cx);
+        self.sync_collapse_blocks(&order, projection.collapsed, cx);
+    }
+
+    fn sync_host_headers(
+        &mut self,
+        registry: &AgentRegistry,
+        order: &[(HostId, DeskNodeId)],
+        cx: &mut Context<Workspace>,
+    ) {
+        if !self.host_header_blocks.is_empty() {
+            self.editor.update(cx, |editor, cx| {
+                editor.remove_blocks(
+                    std::mem::take(&mut self.host_header_blocks)
+                        .into_iter()
+                        .collect(),
+                    None,
+                    cx,
+                );
+            });
+        }
+
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let mut seen = HashSet::new();
+        let properties = order
+            .iter()
+            .filter(|(host, _)| seen.insert(*host))
+            .filter_map(|(host, node)| {
+                let buffer = self.buffers.get(&(*host, *node))?;
+                let position = snapshot.anchor_in_excerpt(buffer.read(cx).anchor_before(0))?;
+                let name = match registry.host_name(*host) {
+                    "" => format!("Host {}", host.0 + 1),
+                    name => name.to_owned(),
+                };
+                Some(BlockProperties {
+                    placement: BlockPlacement::Above(position),
+                    height: Some(1),
+                    style: BlockStyle::Flex,
+                    render: Arc::new(move |cx| {
+                        div()
+                            .w_full()
+                            .pt_2()
+                            .pb_1()
+                            .text_color(cx.app.theme().colors().text_muted)
+                            .child(format!("{name} · Desk"))
+                            .into_any_element()
+                    }),
+                    priority: 1,
+                })
+            })
+            .collect::<Vec<_>>();
+        if !properties.is_empty() {
+            self.host_header_blocks = self
+                .editor
+                .update(cx, |editor, cx| editor.insert_blocks(properties, None, cx));
+        }
     }
 
     fn sync_depth_rails(
@@ -417,35 +471,34 @@ impl Dashboard {
         });
     }
 
-    fn sync_collapse_elisions(
+    fn sync_collapse_blocks(
         &mut self,
         order: &[(HostId, DeskNodeId)],
         collapsed: Vec<((HostId, DeskNodeId), std::ops::Range<usize>)>,
         cx: &mut Context<Workspace>,
     ) {
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
-        let mut properties = Vec::new();
-        for (key, range) in collapsed {
-            let Some(first) = self.buffers.get(&order[range.start]) else {
-                continue;
-            };
-            let Some(last) = self.buffers.get(&order[range.end - 1]) else {
-                continue;
-            };
-            let Some(start) = snapshot.anchor_in_excerpt(first.read(cx).anchor_before(0)) else {
-                continue;
-            };
-            let Some(end) =
-                snapshot.anchor_in_excerpt(last.read(cx).anchor_after(last.read(cx).len()))
-            else {
-                continue;
-            };
-            let count = range.len();
-            properties.push((
-                key,
-                DisplayElisionProperties {
-                    range: start..end,
-                    tail_rows: 0,
+        let properties = collapsed
+            .into_iter()
+            .filter_map(|(_, range)| {
+                let Some(first) = self.buffers.get(&order[range.start]) else {
+                    return None;
+                };
+                let Some(last) = self.buffers.get(&order[range.end - 1]) else {
+                    return None;
+                };
+                let Some(start) = snapshot.anchor_in_excerpt(first.read(cx).anchor_before(0))
+                else {
+                    return None;
+                };
+                let Some(end) =
+                    snapshot.anchor_in_excerpt(last.read(cx).anchor_after(last.read(cx).len()))
+                else {
+                    return None;
+                };
+                let count = range.len();
+                Some(BlockProperties {
+                    placement: BlockPlacement::Replace(start..=end),
                     height: Some(1),
                     style: BlockStyle::Flex,
                     render: Arc::new(move |_| {
@@ -455,48 +508,25 @@ impl Dashboard {
                             .into_any_element()
                     }),
                     priority: 0,
-                    type_tag: None,
-                },
-            ));
-        }
-
-        let live = properties
-            .iter()
-            .map(|(key, _)| *key)
-            .collect::<HashSet<_>>();
-        let removed = self
-            .collapse_elisions
-            .extract_if(|key, _| !live.contains(key))
-            .map(|(_, id)| id)
+                })
+            })
             .collect::<Vec<_>>();
-        if !removed.is_empty() {
-            self.editor.update(cx, |editor, cx| {
-                editor.remove_display_elisions(removed.into_iter().collect(), None, cx)
-            });
-        }
 
-        let mut updates = Vec::new();
-        let mut inserts = Vec::new();
-        let mut insert_keys = Vec::new();
-        for (key, property) in properties {
-            if let Some(id) = self.collapse_elisions.get(&key).copied() {
-                updates.push((id, property));
-            } else {
-                insert_keys.push(key);
-                inserts.push(property);
-            }
-        }
-        if !updates.is_empty() {
+        if !self.collapse_blocks.is_empty() {
             self.editor.update(cx, |editor, cx| {
-                editor.update_display_elisions(updates, None, cx)
+                editor.remove_blocks(
+                    std::mem::take(&mut self.collapse_blocks)
+                        .into_iter()
+                        .collect(),
+                    None,
+                    cx,
+                )
             });
         }
-        if !inserts.is_empty() {
-            let ids = self.editor.update(cx, |editor, cx| {
-                editor.insert_display_elisions(inserts, None, cx)
-            });
-            self.collapse_elisions
-                .extend(insert_keys.into_iter().zip(ids));
+        if !properties.is_empty() {
+            self.collapse_blocks = self
+                .editor
+                .update(cx, |editor, cx| editor.insert_blocks(properties, None, cx));
         }
     }
 
