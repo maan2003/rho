@@ -57,18 +57,7 @@ struct AgentDbMigration {
     migrate: fn(&mut WriteTxn),
 }
 
-const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[
-    AgentDbMigration {
-        from: "7c5e2a91",
-        to: "a84f3c19",
-        migrate: migrate_parent_response_subscriptions,
-    },
-    AgentDbMigration {
-        from: "a84f3c19",
-        to: "d37a6f02",
-        migrate: migrate_quota_auth_namespace,
-    },
-];
+const AGENT_DB_MIGRATIONS: &[AgentDbMigration] = &[];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Key, RedbValue)]
 struct CounterKey(u8);
@@ -1706,50 +1695,6 @@ fn migrate_agent_db_format(write: &mut WriteTxn) {
     }
 
     write.open_table(FORMAT).insert(&(), &current.to_owned());
-}
-
-fn migrate_parent_response_subscriptions(write: &mut WriteTxn) {
-    let parent_edges = write
-        .open_table(AGENTS)
-        .iter()
-        .filter_map(|(child, record)| {
-            record
-                .value()
-                .into_owned()
-                .parent_agent
-                .map(|parent| (parent, child.value()))
-        })
-        .collect::<Vec<_>>();
-    let mut subscriptions = write.open_table(AGENT_RESPONSE_SUBSCRIPTIONS);
-    for (subscriber, target) in parent_edges {
-        subscriptions.insert(&AgentResponseSubscription { target, subscriber }, &());
-    }
-}
-
-fn migrate_quota_auth_namespace(write: &mut WriteTxn) {
-    let namespace = write
-        .open_table(DEFAULT_AUTH_NAMESPACE)
-        .get(&())
-        .map(|value| value.value())
-        .unwrap_or_else(|| "default".to_owned());
-    let observations = write
-        .open_table(QUOTA_OBSERVATIONS)
-        .iter()
-        .filter_map(|(key, value)| {
-            let mut observation = value.value().into_owned();
-            (observation.provider == QuotaProvider::ChatGpt
-                && observation.model == QuotaModel::GPT
-                && observation.auth_namespace.is_none())
-            .then(|| {
-                observation.auth_namespace = Some(namespace.clone());
-                (key.value(), observation)
-            })
-        })
-        .collect::<Vec<_>>();
-    let mut table = write.open_table(QUOTA_OBSERVATIONS);
-    for (key, observation) in observations {
-        table.insert(&key, SenValue::borrowed(&observation));
-    }
 }
 
 /// One display line from a user message: whitespace collapsed, cut at a
