@@ -4926,14 +4926,12 @@ impl Workspace {
     }
 
     fn staff_dashboard_node(&mut self, cx: &mut Context<Self>) {
-        let Some((host, heading_offset, text)) = self.dashboard.staffing_target(cx) else {
-            self.notice_on(
-                None,
-                "this Desk node is already staffed",
-                StyleClass::SystemInfo,
-                cx,
-            );
-            return;
+        let (host, heading_offset, text) = match self.dashboard.staffing_target(cx) {
+            Ok(target) => target,
+            Err(message) => {
+                self.notice_on(None, message, StyleClass::SystemInfo, cx);
+                return;
+            }
         };
         let workdir = self
             .workdirs

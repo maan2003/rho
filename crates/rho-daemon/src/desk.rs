@@ -248,17 +248,11 @@ impl DeskStore {
     }
 }
 
-fn binding_is_live(
-    binding: &DeskBinding,
-    disposition: Option<rho_core::AgentDisposition>,
-) -> bool {
+fn binding_is_live(binding: &DeskBinding, disposition: Option<rho_core::AgentDisposition>) -> bool {
     !binding.orphaned
         && matches!(
             disposition,
-            Some(
-                rho_core::AgentDisposition::Pending
-                    | rho_core::AgentDisposition::Snoozed { .. }
-            )
+            Some(rho_core::AgentDisposition::Pending | rho_core::AgentDisposition::Snoozed { .. })
         )
 }
 
@@ -523,7 +517,10 @@ mod tests {
             .apply_text(DeskOperation::from_text(&edit), None)
             .await
             .unwrap();
-        store.bind(DeskIdToken("h-a".into()), agent(1)).await.unwrap();
+        store
+            .bind(DeskIdToken("h-a".into()), agent(1))
+            .await
+            .unwrap();
         let mut write = db.write().await;
         let mut state = load_state(&mut write);
         state.snapshot.bindings[0].orphaned = true;

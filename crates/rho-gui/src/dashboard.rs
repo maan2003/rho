@@ -25,6 +25,12 @@ use crate::workspace::Workspace;
 
 const DECORATION_KEY: HighlightKey = HighlightKey::SyntaxTreeView(usize::MAX - 1);
 const ID_LINE_KEY: HighlightKey = HighlightKey::SyntaxTreeView(usize::MAX - 2);
+const WELCOME_DESK: &str = "* TODO Run work from this Desk\n\
+o/O add a sibling · >>/<< change depth · Tab folds a subtree\n\
+s staffs this heading; its title and body become the brief\n\
+d marks done · x discards · gn cycles NOW · gh jumps headings\n\
+Staffing adds the :id: identity line; keep it with the heading\n\
+Edit freely in normal Vim modes; Desk text syncs across clients\n";
 
 pub type ParsedHeadingState = DeskHeadingState;
 
@@ -140,6 +146,7 @@ impl Dashboard {
         replica_id: u16,
         cx: &mut Context<Workspace>,
     ) {
+        let should_seed = should_seed_snapshot(&snapshot);
         self.buffers.remove(&host);
         self.subscriptions.remove(&host);
         self.buffer_hosts.retain(|_, candidate| *candidate != host);
@@ -193,8 +200,10 @@ impl Dashboard {
         self.buffer_hosts.insert(buffer.read(cx).remote_id(), host);
         self.buffers.insert(host, buffer);
         self.subscriptions.insert(host, subscription);
-        if self.text(host, cx).is_some_and(|text| text.is_empty()) {
-            self.buffers[&host].update(cx, |buffer, cx| buffer.edit([(0..0, "* \n")], None, cx));
+        if should_seed {
+            self.buffers[&host].update(cx, |buffer, cx| {
+                buffer.edit([(0..0, WELCOME_DESK)], None, cx)
+            });
         }
         cx.notify();
     }
@@ -480,8 +489,7 @@ impl Dashboard {
             let headings = parse(&text);
             let buffer = self.buffers[host].read(cx);
             for (index, heading) in headings.iter().enumerate() {
-                if !collapsed_offsets.contains(&(*host, heading.heading_range.start))
-                {
+                if !collapsed_offsets.contains(&(*host, heading.heading_range.start)) {
                     continue;
                 }
                 let end = Self::subtree_end(&headings, index, text.len());
@@ -682,12 +690,15 @@ impl Dashboard {
             .or(Some(RowTarget::None))
     }
 
-    pub fn staffing_target(&self, cx: &mut Context<Workspace>) -> Option<(HostId, usize, String)> {
-        let (host, text, headings, index) = self.cursor_heading(cx)?;
-        if Self::binding_for(&self.hosts[&host], &headings[index]).is_some()
-            || headings[index].token.is_some()
-        {
-            return None;
+    pub fn staffing_target(
+        &self,
+        cx: &mut Context<Workspace>,
+    ) -> Result<(HostId, usize, String), &'static str> {
+        let (host, text, headings, index) = self
+            .cursor_heading(cx)
+            .ok_or("staff: put the cursor on a heading")?;
+        if headings[index].title.trim().is_empty() {
+            return Err("staff: give this heading a title first");
         }
         let mut path = Vec::new();
         let mut current = Some(index);
@@ -709,7 +720,7 @@ impl Dashboard {
             })
             .collect::<Vec<_>>()
             .join("\n\n");
-        Some((host, headings[index].heading_range.start, brief))
+        Ok((host, headings[index].heading_range.start, brief))
     }
 
     pub fn set_heading_state(
@@ -1054,6 +1065,10 @@ fn resolved_heading_offset(
         .then_some(offset)
 }
 
+fn should_seed_snapshot(snapshot: &DeskSnapshot) -> bool {
+    snapshot.text.is_empty() && snapshot.operations.is_empty()
+}
+
 fn fuzzy_contains(haystack: &str, needle: &str) -> bool {
     let mut chars = needle.chars().flat_map(char::to_lowercase);
     let mut wanted = chars.next();
@@ -1101,6 +1116,27 @@ mod tests {
         assert_eq!(
             resolved_heading_offset(anchor, &snapshot, &headings),
             Some("intro\n* parent\n".len())
+        );
+    }
+
+    #[test]
+    fn welcome_seed_is_only_for_a_never_edited_document() {
+        let empty = DeskSnapshot::default();
+        assert!(should_seed_snapshot(&empty));
+
+        let mut buffer = text::Buffer::new(ReplicaId::new(1), text::BufferId::new(1).unwrap(), "");
+        let mut edited_empty = DeskSnapshot::default();
+        edited_empty.operations.push(DeskOperation::from_text(
+            &buffer.edit([(0..0, "edited then deleted")]),
+        ));
+        assert!(!should_seed_snapshot(&edited_empty));
+
+        let headings = parse(WELCOME_DESK);
+        assert_eq!(headings.len(), 1);
+        assert_eq!(headings[0].state, Some(ParsedHeadingState::Todo));
+        assert_eq!(
+            WELCOME_DESK[headings[0].body_range.clone()].lines().count(),
+            5
         );
     }
 }
