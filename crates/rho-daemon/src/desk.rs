@@ -113,6 +113,89 @@ impl DeskStore {
         self.append_text(operation, transaction).await
     }
 
+    /// Applies one atomic model-authored edit using a stable replica associated
+    /// with the agent. Every non-empty search string is resolved against the
+    /// same current document before anything is written.
+    pub async fn apply_agent_edits(
+        &self,
+        agent_id: rho_ui_proto::AgentId,
+        edits: &[(String, String)],
+    ) -> Result<DeskTextOpRecord, String> {
+        if edits.is_empty() {
+            return Err("Desk edit list must not be empty".to_owned());
+        }
+
+        let mut write = self.db.write().await;
+        let mut state = load_state(&mut write);
+        let replica_id = if let Some(replica) = state
+            .snapshot
+            .replicas
+            .iter()
+            .find(|replica| replica.author == DeskReplicaAuthor::Agent(agent_id))
+        {
+            replica.replica_id
+        } else {
+            let replica_id = state.next_replica_id;
+            state.next_replica_id = replica_id
+                .checked_add(1)
+                .ok_or_else(|| "Desk replica id space exhausted".to_owned())?;
+            state.snapshot.replicas.push(DeskReplica {
+                replica_id,
+                author: DeskReplicaAuthor::Agent(agent_id),
+            });
+            replica_id
+        };
+
+        let mut snapshot = state.snapshot.clone();
+        snapshot.operations = write
+            .open_table(TEXT_OPS)
+            .iter()
+            .map(|(_, value)| value.value().as_ref().operation.clone())
+            .collect();
+        let text = snapshot.document_text()?;
+        let mut replacements = Vec::with_capacity(edits.len());
+        for (index, (old_str, new_str)) in edits.iter().enumerate() {
+            if old_str.is_empty() {
+                replacements.push((text.len()..text.len(), new_str.clone()));
+                continue;
+            }
+            let mut matches = text.match_indices(old_str);
+            let Some((start, _)) = matches.next() else {
+                return Err(format!(
+                    "Desk edit {} failed: old_str was not found",
+                    index + 1
+                ));
+            };
+            if matches.next().is_some() {
+                return Err(format!(
+                    "Desk edit {} failed: old_str is ambiguous (more than one match)",
+                    index + 1
+                ));
+            }
+            replacements.push((start..start + old_str.len(), new_str.clone()));
+        }
+        for index in 0..replacements.len() {
+            for previous in 0..index {
+                let left = &replacements[previous].0;
+                let right = &replacements[index].0;
+                if left.start < right.end && right.start < left.end {
+                    return Err(format!(
+                        "Desk edit {} failed: replacement overlaps edit {}",
+                        index + 1,
+                        previous + 1
+                    ));
+                }
+            }
+        }
+
+        let mut buffer = snapshot.buffer(replica_id)?;
+        let operation = DeskOperation::from_text(&buffer.edit(replacements));
+        let record = append_text_in_txn(&mut write, &mut state, operation, None)?;
+        save_state(&mut write, &state);
+        write.commit();
+        Ok(record)
+    }
+
     pub async fn bind(
         &self,
         token: DeskIdToken,
