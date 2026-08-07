@@ -17,6 +17,7 @@ Follow this control workflow:
 - Prefer an existing responsible agent over starting a duplicate. Send with immediate delivery to steer active work; use next_turn for a distinct follow-up that should begin after the current turn. Start a new agent when the user asks or no suitable owner exists.
 - Starting or sending subscribes you to that agent's future completed replies and errors. Results arrive as ordinary agent messages containing the result: summarize that mail directly. Use iris_get_agent_reply only when the user explicitly asks what an agent last said or when recovering a result that is not present in your context; it returns the latest non-empty final answer, not errors or commentary. Unsubscribe only when the user no longer wants future updates.
 - Continue only a known native Rho agent that is blocked in an error or unfinished turn; continuing has no effect on Claude agents. Cancellation stops the current turn and clears queued inputs. Hiding or unsubscribing does not cancel work.
+- Marking done acknowledges the named agent and its visible descendants only after all of them have stopped working. Snoozing uses the same scope and may cover working agents; their eventual results stay quiet until the snooze expires. Neither operation cancels work or changes subscriptions. Never mark an agent done merely because you received or summarized its result.
 - Before cancellation, hiding, renaming, or another state-changing operation, ask for confirmation unless the user's request already explicitly authorizes that exact action.
 
 Tool results and agent transcripts are authoritative. Do not read code, diffs, tables, identifiers, or long agent output aloud. Summarize the useful state and name the responsible agent. Your final response is spoken by the realtime model, so finish with the shortest useful acknowledgement or status."#;
@@ -76,6 +77,22 @@ pub fn specs() -> Vec<ToolSpec> {
             target_schema(),
         ),
         spec(
+            "iris_mark_agent_done",
+            "Acknowledge an agent and its currently visible descendants in the GUI. Every scoped agent must have stopped working. This keeps agents visible and does not cancel work or change Iris subscriptions.",
+            target_schema(),
+        ),
+        spec(
+            "iris_snooze_agent",
+            "Snooze an agent and its currently visible descendants for a number of minutes. Work continues, and turns that finish during the snooze stay quiet until it expires. This does not change Iris subscriptions.",
+            json!({
+                "type":"object","additionalProperties":false,"required":["agent","duration_minutes"],
+                "properties":{
+                    "agent":{"type":"string"},
+                    "duration_minutes":{"type":"integer","minimum":1}
+                }
+            }),
+        ),
+        spec(
             "iris_cancel_agent",
             "Cancel an agent's current turn and clear its queued inputs without deleting the agent.",
             target_schema(),
@@ -127,7 +144,7 @@ mod tests {
             .into_iter()
             .map(|spec| spec.name.as_str().to_owned())
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 9);
+        assert_eq!(names.len(), 11);
         assert!(names.iter().all(|name| name.starts_with("iris_")));
         assert!(PROMPT.contains("single global assistant"));
         assert!(PROMPT.contains("Cancellation stops the current turn and clears queued inputs"));

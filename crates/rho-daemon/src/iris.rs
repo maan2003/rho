@@ -361,6 +361,60 @@ async fn call_iris_tool(registry: &Arc<AgentRegistry>, call: ToolCall) -> anyhow
                 text
             ))
         }
+        "iris_mark_agent_done" => {
+            let args: TargetArgs = parse(&call)?;
+            let agent_id = registry.resolve_display_agent_id(&args.agent)?;
+            let targets = visible_agent_subtree(registry, agent_id)?;
+            let kinds = registry.agent_state_kinds().await;
+            let working = targets
+                .iter()
+                .filter(|agent_id| kinds.get(agent_id).is_some_and(|kind| kind.is_working()))
+                .copied()
+                .collect::<Vec<_>>();
+            anyhow::ensure!(
+                working.is_empty(),
+                "cannot mark done while {} is still working; wait for the turn to settle",
+                working
+                    .iter()
+                    .map(|agent_id| registry.display_agent_id(*agent_id))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+            registry
+                .set_dispositions(&targets, AgentDisposition::Done)
+                .await;
+            Ok(scope_result(
+                registry,
+                agent_id,
+                targets.len(),
+                "Marked",
+                "done",
+            ))
+        }
+        "iris_snooze_agent" => {
+            let args: SnoozeArgs = parse(&call)?;
+            anyhow::ensure!(
+                args.duration_minutes > 0,
+                "duration_minutes must be positive"
+            );
+            let duration_ms = args
+                .duration_minutes
+                .checked_mul(60 * 1_000)
+                .ok_or_else(|| anyhow::anyhow!("duration_minutes is too large"))?;
+            let agent_id = registry.resolve_display_agent_id(&args.agent)?;
+            let targets = visible_agent_subtree(registry, agent_id)?;
+            let until = rho_core::UnixMs(rho_core::UnixMs::now().0.saturating_add(duration_ms));
+            registry
+                .set_dispositions(&targets, AgentDisposition::Snoozed { until })
+                .await;
+            Ok(scope_result(
+                registry,
+                agent_id,
+                targets.len(),
+                "Snoozed",
+                &format!("for {} minutes", args.duration_minutes),
+            ))
+        }
         "iris_cancel_agent" => {
             let args: TargetArgs = parse(&call)?;
             let agent_id = registry.resolve_display_agent_id(&args.agent)?;
@@ -425,6 +479,79 @@ fn escape_xml(text: &str) -> String {
 fn is_iris(registry: &AgentRegistry, agent_id: AgentId) -> bool {
     let agent = registry.db.read().get_agent(agent_id);
     agent.role == AgentRole::Iris || agent.labels.iter().any(|label| label == IRIS_LABEL)
+}
+
+/// The daemon-side equivalent of pressing Done or Snooze on an agent row:
+/// the named agent plus every currently visible spawn descendant. Hidden
+/// members are excluded so a verdict never changes visibility as a side
+/// effect; a hidden root must be shown explicitly before it can be triaged.
+fn visible_agent_subtree(
+    registry: &AgentRegistry,
+    agent_id: AgentId,
+) -> anyhow::Result<Vec<AgentId>> {
+    let agents = registry.db.read().list_agents();
+    let (_, root) = agents
+        .iter()
+        .find(|(candidate, _)| *candidate == agent_id)
+        .ok_or_else(|| anyhow::anyhow!("agent is not known"))?;
+    anyhow::ensure!(
+        root.role != AgentRole::Iris && !root.labels.iter().any(|label| label == IRIS_LABEL),
+        "cannot triage Iris through a fleet tool"
+    );
+    anyhow::ensure!(
+        root.disposition != AgentDisposition::Hidden,
+        "agent is hidden; show it before marking it done or snoozing it"
+    );
+    Ok(spawn_subtree(&agents, agent_id)
+        .into_iter()
+        .filter(|member| {
+            agents
+                .iter()
+                .find(|(candidate, _)| candidate == member)
+                .is_some_and(|(_, record)| record.disposition != AgentDisposition::Hidden)
+        })
+        .collect())
+}
+
+fn spawn_subtree(
+    agents: &[(AgentId, rho_agent::db::AgentRecord)],
+    agent_id: AgentId,
+) -> Vec<AgentId> {
+    let mut members = vec![agent_id];
+    let mut frontier = vec![agent_id];
+    while let Some(parent) = frontier.pop() {
+        for (child, record) in agents {
+            if record.parent_agent == Some(parent) && !members.contains(child) {
+                members.push(*child);
+                frontier.push(*child);
+            }
+        }
+    }
+    members
+}
+
+fn scope_result(
+    registry: &AgentRegistry,
+    root: AgentId,
+    affected: usize,
+    verb: &str,
+    suffix: &str,
+) -> String {
+    match affected {
+        1 => format!("{verb} {} {suffix}.", registry.display_agent_id(root)),
+        _ => {
+            let descendants = affected - 1;
+            let noun = if descendants == 1 {
+                "descendant"
+            } else {
+                "descendants"
+            };
+            format!(
+                "{verb} {} and {descendants} visible {noun} {suffix}.",
+                registry.display_agent_id(root)
+            )
+        }
+    }
 }
 
 fn latest_transcript_reply(state: &rho_agent::AgentState) -> Option<String> {
@@ -518,6 +645,12 @@ struct TargetArgs {
 }
 
 #[derive(Deserialize)]
+struct SnoozeArgs {
+    agent: String,
+    duration_minutes: u64,
+}
+
+#[derive(Deserialize)]
 struct RenameArgs {
     agent: String,
     name: String,
@@ -547,6 +680,8 @@ mod tests {
                 "iris_send_agent",
                 "iris_unsubscribe_agent",
                 "iris_get_agent_reply",
+                "iris_mark_agent_done",
+                "iris_snooze_agent",
                 "iris_cancel_agent",
                 "iris_continue_agent",
                 "iris_rename_agent",

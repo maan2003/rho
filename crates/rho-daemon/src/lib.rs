@@ -1044,23 +1044,32 @@ impl AgentRegistry {
     /// Applies the user's verdict and tells every client the new level; for
     /// snoozes, arms the wake-up timer.
     async fn set_disposition(&self, agent_id: AgentId, disposition: AgentDisposition) {
+        self.set_dispositions(&[agent_id], disposition).await;
+    }
+
+    /// Applies one verdict atomically to a GUI-equivalent multi-agent scope.
+    async fn set_dispositions(&self, agent_ids: &[AgentId], disposition: AgentDisposition) {
         let mut write = self.db.write().await;
-        write.set_agent_disposition(agent_id, disposition);
-        write.commit();
-        if let AgentDisposition::Snoozed { until } = disposition {
-            spawn_snooze_timer(
-                self.db.clone(),
-                self.pool.clone(),
-                self.events.clone(),
-                agent_id,
-                until,
-            );
+        for agent_id in agent_ids {
+            write.set_agent_disposition(*agent_id, disposition);
         }
-        let kind = self.get(agent_id).await.map(|agent| agent.state().kind);
-        let _ = self.events.send(ServerMessage::AgentAttention {
-            agent_id,
-            attention: attention_level(kind.as_ref(), disposition),
-        });
+        write.commit();
+        let kinds = self.agent_state_kinds().await;
+        for agent_id in agent_ids {
+            if let AgentDisposition::Snoozed { until } = disposition {
+                spawn_snooze_timer(
+                    self.db.clone(),
+                    self.pool.clone(),
+                    self.events.clone(),
+                    *agent_id,
+                    until,
+                );
+            }
+            let _ = self.events.send(ServerMessage::AgentAttention {
+                agent_id: *agent_id,
+                attention: attention_level(kinds.get(agent_id), disposition),
+            });
+        }
     }
 
     fn ui_agents(&self, kinds: &HashMap<AgentId, AgentStateKind>) -> Vec<UiAgentSummary> {
