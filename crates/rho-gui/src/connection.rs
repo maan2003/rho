@@ -58,6 +58,12 @@ impl EventSink {
 }
 
 pub enum ConnEvent {
+    DeskSnapshot {
+        snapshot: rho_ui_proto::desk::DeskSnapshot,
+        replica_id: u16,
+    },
+    DeskStructureApplied(rho_ui_proto::desk::DeskStructureOpRecord),
+    DeskTextApplied(rho_ui_proto::desk::DeskTextOpRecord),
     Ready {
         workstreams: Vec<UiWorkstream>,
         agents: Vec<UiAgentSummary>,
@@ -891,6 +897,7 @@ async fn run(
     }
 
     write_frame(&mut stream, &ClientMessage::ChatGptUsage).await?;
+    write_frame(&mut stream, &ClientMessage::DeskSubscribe).await?;
 
     write_frame(&mut stream, &ClientMessage::GitTransportRegister).await?;
 
@@ -968,6 +975,17 @@ async fn run(
             }
         };
         let event = match message {
+            ServerMessage::DeskSnapshot {
+                snapshot,
+                replica_id,
+            } => Some(ConnEvent::DeskSnapshot {
+                snapshot,
+                replica_id,
+            }),
+            ServerMessage::DeskStructureApplied { record } => {
+                Some(ConnEvent::DeskStructureApplied(record))
+            }
+            ServerMessage::DeskTextApplied { record } => Some(ConnEvent::DeskTextApplied(record)),
             ServerMessage::Ready {
                 workstreams,
                 agents,
@@ -1129,12 +1147,7 @@ async fn run(
             | ServerMessage::RealtimeRefused { .. }
             | ServerMessage::AgentStreamOpened { .. }
             | ServerMessage::VisualizationContent { .. }
-            | ServerMessage::VisualizationRefused { .. }
-            // Desk projection is wired into the workspace in the Desk UI
-            // slice; keep older/minimal surfaces protocol-compatible.
-            | ServerMessage::DeskSnapshot { .. }
-            | ServerMessage::DeskStructureApplied { .. }
-            | ServerMessage::DeskTextApplied { .. } => None,
+            | ServerMessage::VisualizationRefused { .. } => None,
         };
         if let Some(event) = event
             && events.unbounded_send(event).is_err()

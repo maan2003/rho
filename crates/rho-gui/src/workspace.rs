@@ -849,6 +849,21 @@ impl Workspace {
         }
     }
 
+    pub(crate) fn send_to_host(&self, host: HostId, message: ClientMessage) {
+        if let Some(connection) = self.hosts.connection(host) {
+            connection.send(message);
+        }
+    }
+
+    pub(crate) fn mark_desk_text_local(
+        &mut self,
+        host: HostId,
+        node_id: rho_ui_proto::desk::DeskNodeId,
+        clock: rho_ui_proto::desk::DeskClock,
+    ) {
+        self.dashboard.mark_local_text_op(host, node_id, clock);
+    }
+
     fn send_to_workstream(
         &self,
         workstream_id: rho_ui_proto::WorkstreamId,
@@ -1088,6 +1103,9 @@ impl Workspace {
         if matches!(
             &event,
             ConnEvent::Ready { .. }
+                | ConnEvent::DeskSnapshot { .. }
+                | ConnEvent::DeskStructureApplied(_)
+                | ConnEvent::DeskTextApplied(_)
                 | ConnEvent::WorkstreamCreated(_)
                 | ConnEvent::AgentCreated { .. }
                 | ConnEvent::AgentAttention { .. }
@@ -1096,6 +1114,29 @@ impl Workspace {
             self.dashboard_dirty = true;
         }
         match event {
+            ConnEvent::DeskSnapshot {
+                snapshot,
+                replica_id,
+            } => {
+                let empty = snapshot.nodes.is_empty();
+                self.dashboard
+                    .apply_snapshot(host, snapshot, replica_id, cx);
+                if empty {
+                    self.send_to_host(
+                        host,
+                        ClientMessage::DeskInsert {
+                            parent: None,
+                            order: rho_ui_proto::desk::DeskOrderKey::first(),
+                        },
+                    );
+                }
+            }
+            ConnEvent::DeskStructureApplied(record) => {
+                self.dashboard.apply_structure(host, record, cx);
+            }
+            ConnEvent::DeskTextApplied(record) => {
+                self.dashboard.apply_text(host, record, cx);
+            }
             ConnEvent::Ready {
                 workstreams,
                 agents,
@@ -1754,9 +1795,8 @@ impl Workspace {
             None => {
                 let session = self.zulip_session(cx);
                 let hooks = Self::zulip_hooks();
-                let view = cx.new(|cx| {
-                    rho_zulip::ui::NarrowView::new(session, narrow, hooks, window, cx)
-                });
+                let view =
+                    cx.new(|cx| rho_zulip::ui::NarrowView::new(session, narrow, hooks, window, cx));
                 Self::wrap_surface(key, SurfaceView::ZulipNarrow(view), window, cx)
             }
         };
@@ -2285,7 +2325,8 @@ impl Workspace {
     }
 
     pub(crate) fn cmd_change_prompt_cache_key(&mut self, window: &Window, cx: &mut Context<Self>) {
-        if let Some(agent_id) = self.subject_agent_or_notice("change-prompt-cache-key", window, cx) {
+        if let Some(agent_id) = self.subject_agent_or_notice("change-prompt-cache-key", window, cx)
+        {
             if !self.require_agent_online(agent_id, cx) {
                 return;
             }
@@ -2399,7 +2440,12 @@ impl Workspace {
         self.open_prompt("role:", complete, on_submit, window, cx);
     }
 
-    pub(crate) fn cmd_workstream_rename(&mut self, name: String, window: &Window, cx: &mut Context<Self>) {
+    pub(crate) fn cmd_workstream_rename(
+        &mut self,
+        name: String,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(workstream_id) = self.subject_workstream_or_notice(window, cx) {
             self.send_to_workstream(
                 workstream_id,
@@ -2522,7 +2568,12 @@ impl Workspace {
         }
     }
 
-    pub(crate) fn cmd_workstream_group(&mut self, name: String, window: &Window, cx: &mut Context<Self>) {
+    pub(crate) fn cmd_workstream_group(
+        &mut self,
+        name: String,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(workstream_id) = self.subject_workstream_or_notice(window, cx) {
             self.send_workstream_label(
                 workstream_id,
@@ -2532,13 +2583,23 @@ impl Workspace {
         }
     }
 
-    pub(crate) fn cmd_workstream_label(&mut self, name: String, window: &Window, cx: &mut Context<Self>) {
+    pub(crate) fn cmd_workstream_label(
+        &mut self,
+        name: String,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(workstream_id) = self.subject_workstream_or_notice(window, cx) {
             self.send_workstream_label(workstream_id, name, true);
         }
     }
 
-    pub(crate) fn cmd_workstream_unlabel(&mut self, name: String, window: &Window, cx: &mut Context<Self>) {
+    pub(crate) fn cmd_workstream_unlabel(
+        &mut self,
+        name: String,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(workstream_id) = self.subject_workstream_or_notice(window, cx) {
             if !self
                 .registry
@@ -2556,7 +2617,12 @@ impl Workspace {
     /// Moves every agent of the focused workstream into the named one; the
     /// daemon deletes the emptied source. Merging targets existing streams
     /// only — a typo should not found a stream.
-    pub(crate) fn cmd_workstream_merge(&mut self, name: String, window: &Window, cx: &mut Context<Self>) {
+    pub(crate) fn cmd_workstream_merge(
+        &mut self,
+        name: String,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(source_id) = self.subject_workstream_or_notice(window, cx) else {
             return;
         };
@@ -3184,9 +3250,7 @@ impl Workspace {
             // A still-working agent keeps its lamp: the daemon reads
             // attention off the live runtime first, so predicting quiet
             // there would flicker.
-            if quieting
-                && self.registry.attention(agent_id) != rho_ui_proto::UiAttention::Working
-            {
+            if quieting && self.registry.attention(agent_id) != rho_ui_proto::UiAttention::Working {
                 self.registry
                     .expect_attention(agent_id, rho_ui_proto::UiAttention::Quiet);
             }
@@ -4820,7 +4884,6 @@ impl Workspace {
         cx.stop_propagation();
     }
 
-
     pub(crate) fn prompt_snooze(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let complete = std::rc::Rc::new(|_: &Workspace, _: &str, _: &gpui::App| Vec::new());
         let on_submit = std::rc::Rc::new(
@@ -5482,13 +5545,20 @@ impl Workspace {
             .flex_grow(1.0)
             .min_h_0()
             .child(self.dashboard.editor().clone());
+        let hint = div()
+            .flex_none()
+            .pt(px(4.))
+            .pb(px(2.))
+            .text_size(text_style.font_size)
+            .text_color(cx.theme().colors().text_muted)
+            .child(self.dashboard.hint(cx));
         #[cfg(all(target_family = "wasm", not(feature = "native")))]
         let dashboard = dashboard
             // The editor consumes bubble-phase mouse events. Capture the
             // press/release around it, then open after its cursor has moved.
             .capture_any_mouse_down(cx.listener(Self::dashboard_pointer_down))
             .capture_any_mouse_up(cx.listener(Self::dashboard_pointer_up));
-        container.child(dashboard).into_any_element()
+        container.child(dashboard).child(hint).into_any_element()
     }
 
     /// The dashboard-only two-line masthead.

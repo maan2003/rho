@@ -280,11 +280,8 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         KeyBinding::new("enter", GitApprovalDeny, Some("RhoGitApproval")),
         KeyBinding::new("escape", GitApprovalDeny, Some("RhoGitApproval")),
     ]);
-    // Dashboard: the listing is read-only, so normal-mode letters are free
-    // for acting on the row under the cursor — the magit trick. `enter`
-    // binds for every mode: on a row it opens, in a reply draft it sends
-    // (so enter in insert mode submits, like the transcript prompt).
-    // Bound after the vim keymaps so they beat vim's own motions.
+    // Desk heading verbs. Body editing remains ordinary editor input in
+    // insert mode; normal mode addresses the stable node under the caret.
     cx.bind_keys([KeyBinding::new(
         "enter",
         RailOpen,
@@ -295,10 +292,7 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         "RhoDashboard > Editor && vim_mode == helix_normal",
     ] {
         cx.bind_keys([
-            KeyBinding::new("r", DashboardReply, Some(context)),
             KeyBinding::new("d", AgentDone, Some(context)),
-            KeyBinding::new("shift-d", AgentHide, Some(context)),
-            KeyBinding::new("n", DashboardNewAgent, Some(context)),
             KeyBinding::new("tab", DashboardToggleSubagents, Some(context)),
         ]);
     }
