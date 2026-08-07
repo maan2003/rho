@@ -16,7 +16,7 @@ use rho_ui_proto::desk::{
     DeskTextOpRecord, DeskTransaction, parse,
 };
 use rho_ui_proto::{AgentId, ClientMessage};
-use text::{BufferId, ReplicaId};
+use text::{BufferId, ReplicaId, ToOffset as _};
 use theme::ActiveTheme as _;
 use ui::div;
 
@@ -50,7 +50,7 @@ struct NowItem {
 
 struct DeskCaret {
     anchor: text::Anchor,
-    collapsed: HashSet<(HostId, usize)>,
+    collapsed: HashSet<(HostId, text::Anchor)>,
 }
 
 struct HeadingEntry {
@@ -71,7 +71,7 @@ pub struct Dashboard {
     headers_disabled: HashSet<BufferId>,
     displayed_len: usize,
     next_buffer_id: u64,
-    collapsed: HashSet<(HostId, usize)>,
+    collapsed: HashSet<(HostId, text::Anchor)>,
     fold_blocks: Vec<CustomBlockId>,
     host_header_blocks: Vec<CustomBlockId>,
     decoration_inlays: Vec<InlayId>,
@@ -451,6 +451,26 @@ impl Dashboard {
                 )
             });
         }
+        let mut collapsed_offsets = HashSet::new();
+        let mut valid_collapsed = HashSet::new();
+        for host in order {
+            let Some(buffer) = self.buffers.get(host) else {
+                continue;
+            };
+            let buffer = buffer.read(cx);
+            let snapshot = buffer.text_snapshot();
+            let text = snapshot.text();
+            let headings = parse(&text);
+            for (collapsed_host, anchor) in &self.collapsed {
+                if collapsed_host == host
+                    && let Some(offset) = resolved_heading_offset(*anchor, &snapshot, &headings)
+                {
+                    collapsed_offsets.insert((*host, offset));
+                    valid_collapsed.insert((*host, *anchor));
+                }
+            }
+        }
+        self.collapsed = valid_collapsed;
         let multi = self.multi_buffer.read(cx).snapshot(cx);
         let mut props = Vec::new();
         for host in order {
@@ -460,9 +480,7 @@ impl Dashboard {
             let headings = parse(&text);
             let buffer = self.buffers[host].read(cx);
             for (index, heading) in headings.iter().enumerate() {
-                if !self
-                    .collapsed
-                    .contains(&(*host, heading.heading_range.start))
+                if !collapsed_offsets.contains(&(*host, heading.heading_range.start))
                 {
                     continue;
                 }
@@ -884,7 +902,12 @@ impl Dashboard {
         {
             return false;
         }
-        let key = (host, headings[index].heading_range.start);
+        let key = (
+            host,
+            self.buffers[&host]
+                .read(cx)
+                .anchor_before(headings[index].heading_range.start),
+        );
         if !self.collapsed.remove(&key) {
             self.collapsed.insert(key);
         }
@@ -1019,6 +1042,18 @@ pub enum StructureDirection {
     Down,
 }
 
+fn resolved_heading_offset(
+    anchor: text::Anchor,
+    snapshot: &text::BufferSnapshot,
+    headings: &[DeskHeading],
+) -> Option<usize> {
+    let offset = anchor.to_offset(snapshot);
+    headings
+        .iter()
+        .any(|heading| heading.heading_range.start == offset)
+        .then_some(offset)
+}
+
 fn fuzzy_contains(haystack: &str, needle: &str) -> bool {
     let mut chars = needle.chars().flat_map(char::to_lowercase);
     let mut wanted = chars.next();
@@ -1047,6 +1082,25 @@ mod tests {
             &text
                 [headings[0].heading_range.start..Dashboard::subtree_end(&headings, 0, text.len())],
             "* a\nbody\n** child\nchild body\n"
+        );
+    }
+
+    #[test]
+    fn collapsed_heading_anchor_tracks_edits_above_it() {
+        let mut buffer = text::Buffer::new(
+            ReplicaId::new(1),
+            text::BufferId::new(1).unwrap(),
+            "* parent\n** child\nbody\n",
+        );
+        let anchor = buffer.anchor_before("* parent\n".len());
+        buffer.edit([(0..0, "intro\n")]);
+        let snapshot = buffer.snapshot();
+        let text = snapshot.text();
+        let headings = parse(&text);
+
+        assert_eq!(
+            resolved_heading_offset(anchor, &snapshot, &headings),
+            Some("intro\n* parent\n".len())
         );
     }
 }
