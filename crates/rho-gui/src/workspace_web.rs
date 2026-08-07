@@ -1,6 +1,6 @@
 //! Browser layout and gesture adapter for the canonical workspace.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use futures::StreamExt as _;
 use gpui::prelude::*;
@@ -163,6 +163,8 @@ impl Workspace {
             workdirs: Vec::new(),
             new_agent_draft: None,
             awaiting_draft_agent: None,
+            pending_staffing: HashSet::new(),
+            pending_desk_insert: None,
             ready_hosts: Default::default(),
             quota_summaries: HashMap::new(),
             quota_history: HashMap::new(),

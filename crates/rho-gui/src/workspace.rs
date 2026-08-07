@@ -52,12 +52,13 @@ use crate::style::{RoleFamily, StyleClass};
 use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
     AgentDone, AgentHide, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, DashboardBack,
-    DashboardJump, DashboardNow, DashboardStaff, DashboardToggleSubagents, GitApprovalAllow,
-    GitApprovalDeny, MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext,
-    MinibufferPrevious, PaneBack, PaneClose, PaneFocusNext, PaneSplitDown, PaneSplitRight,
-    PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt,
-    ShellPagerAll, ShellPagerMore, ShellPagerQuit, SubmitPrompt, TaskBoard, VoiceToggle,
-    ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow, ZulipQuit,
+    DashboardDeleteEmpty, DashboardDemote, DashboardJump, DashboardMoveDown, DashboardMoveUp,
+    DashboardNow, DashboardPromote, DashboardStaff, DashboardToggleSubagents, DashboardUndo,
+    GitApprovalAllow, GitApprovalDeny, MinibufferCancel, MinibufferComplete, MinibufferConfirm,
+    MinibufferNext, MinibufferPrevious, PaneBack, PaneClose, PaneFocusNext, PaneSplitDown,
+    PaneSplitRight, PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof,
+    ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit, SubmitPrompt, TaskBoard,
+    VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow, ZulipQuit,
 };
 
 /// What a pane shows: stable identity plus the live view. Surfaces live
@@ -252,6 +253,11 @@ pub struct Workspace {
     /// Which host the pending draft agent was sent to, so its confirmation
     /// can be recognized and the compose surface reset.
     awaiting_draft_agent: Option<HostId>,
+    /// Staffing requests awaiting their durable node-agent binding. The
+    /// heading is marked STAFFED only after that confirmation, so a rejected
+    /// creation needs no compensating text edit.
+    pending_staffing: HashSet<(HostId, rho_ui_proto::desk::DeskNodeId)>,
+    pending_desk_insert: Option<HostId>,
     /// Hosts that have delivered at least one `Ready`. A host attaches
     /// blind; until it answers, its agents do not exist for this client.
     ready_hosts: HashSet<HostId>,
@@ -662,6 +668,8 @@ impl Workspace {
             workdirs: Vec::new(),
             new_agent_draft: None,
             awaiting_draft_agent: None,
+            pending_staffing: HashSet::new(),
+            pending_desk_insert: None,
             ready_hosts: HashSet::new(),
             quota_summaries: HashMap::new(),
             quota_history: HashMap::new(),
@@ -1048,13 +1056,35 @@ impl Workspace {
                 }
             }
             ConnEvent::DeskStructureApplied(record) => {
+                let inserted = match &record.op {
+                    rho_ui_proto::desk::DeskStructureOp::Insert { nodes } => {
+                        nodes.first().map(|node| node.id)
+                    }
+                    _ => None,
+                };
                 self.dashboard.apply_structure(host, record, cx);
+                if self.pending_desk_insert == Some(host)
+                    && let Some(node_id) = inserted
+                {
+                    self.pending_desk_insert = None;
+                    self.dashboard.sync(&self.registry, window, cx);
+                    self.dashboard.jump_to_node(host, node_id, window, cx);
+                }
             }
             ConnEvent::DeskTextApplied(record) => {
                 self.dashboard.apply_text(host, record, cx);
             }
             ConnEvent::DeskBindingChanged(binding) => {
+                let node_id = binding.node_id;
                 self.dashboard.apply_binding(host, binding);
+                if self.pending_staffing.remove(&(host, node_id)) {
+                    self.dashboard.set_heading_state(
+                        host,
+                        node_id,
+                        crate::dashboard::ParsedHeadingState::Staffed,
+                        cx,
+                    );
+                }
             }
             ConnEvent::Ready {
                 agents,
@@ -1252,6 +1282,11 @@ impl Workspace {
                 // the workdir and submits again.
                 if self.awaiting_draft_agent == Some(host) {
                     self.awaiting_draft_agent = None;
+                }
+                self.pending_staffing
+                    .retain(|(candidate, _)| *candidate != host);
+                if self.pending_desk_insert == Some(host) {
+                    self.pending_desk_insert = None;
                 }
                 let source = self.error_source(host);
                 self.notice_on(
@@ -2356,6 +2391,16 @@ impl Workspace {
             .selected_agent()
             .is_some_and(|agent_id| targets.contains(agent_id));
         let sent = self.set_agent_disposition(targets, "done", disposition, cx);
+        if sent && self.dashboard.is_focused(window, cx) {
+            self.dashboard.set_cursor_heading_state(
+                if hide {
+                    crate::dashboard::ParsedHeadingState::Discarded
+                } else {
+                    crate::dashboard::ParsedHeadingState::Done
+                },
+                cx,
+            );
+        }
         // Hiding the open agent closes its tab, or it would stay
         // rail-visible through the selection exemption.
         if hide && sent && hid_open_agent {
@@ -4877,6 +4922,11 @@ impl Workspace {
 
     /// `enter` on a staffed Desk heading opens its bound agent.
     fn dashboard_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((host, parent, order)) = self.dashboard.insert_sibling_at_heading_end(cx) {
+            self.pending_desk_insert = Some(host);
+            self.send_to_host(host, ClientMessage::DeskInsert { parent, order });
+            return;
+        }
         if let Some(crate::dashboard::RowTarget::Agent(agent_id)) = self.dashboard.cursor_target(cx)
         {
             self.open_agent(agent_id, window, cx);
@@ -4937,7 +4987,57 @@ impl Workspace {
                 desk_node: Some(node_id),
             },
         );
-        self.dashboard.mark_staffed(host, node_id, cx);
+        self.pending_staffing.insert((host, node_id));
+    }
+
+    fn dashboard_structure_move(
+        &mut self,
+        direction: crate::dashboard::StructureDirection,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((host, op)) = self.dashboard.structure_move(direction, cx) else {
+            return;
+        };
+        self.send_to_host(host, ClientMessage::DeskStructureApply { op });
+    }
+
+    fn dashboard_delete_empty(&mut self, cx: &mut Context<Self>) {
+        let Some((host, op)) = self.dashboard.delete_empty(cx) else {
+            self.notice_on(
+                None,
+                "delete: heading is not empty",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        self.send_to_host(host, ClientMessage::DeskStructureApply { op });
+    }
+
+    fn dashboard_undo(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.dashboard.undo_target(cx) else {
+            self.notice_on(
+                None,
+                "undo: nothing persisted here",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        match target {
+            crate::dashboard::DeskUndoTarget::Text(host, node_id, transaction_id) => {
+                self.send_to_host(
+                    host,
+                    ClientMessage::DeskTextUndo {
+                        node_id,
+                        transaction_id,
+                    },
+                );
+            }
+            crate::dashboard::DeskUndoTarget::Structure(host, op_id) => {
+                self.send_to_host(host, ClientMessage::DeskStructureUndo { op_id });
+            }
+        }
     }
 
     fn dashboard_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5763,6 +5863,24 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &DashboardToggleSubagents, _, cx| {
                 this.dashboard.toggle_subagents(cx);
                 this.dashboard_dirty = true;
+            }))
+            .on_action(cx.listener(|this, _: &DashboardDemote, _, cx| {
+                this.dashboard_structure_move(crate::dashboard::StructureDirection::Demote, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DashboardPromote, _, cx| {
+                this.dashboard_structure_move(crate::dashboard::StructureDirection::Promote, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DashboardMoveUp, _, cx| {
+                this.dashboard_structure_move(crate::dashboard::StructureDirection::Up, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DashboardMoveDown, _, cx| {
+                this.dashboard_structure_move(crate::dashboard::StructureDirection::Down, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DashboardDeleteEmpty, _, cx| {
+                this.dashboard_delete_empty(cx);
+            }))
+            .on_action(cx.listener(|this, _: &DashboardUndo, _, cx| {
+                this.dashboard_undo(cx);
             }))
             .on_action(cx.listener(|this, _: &TaskBoard, _window, cx| {
                 this.notice_on(

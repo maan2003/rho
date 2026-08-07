@@ -42,7 +42,7 @@ pub fn parse_heading_line(text: &str) -> (Option<ParsedHeadingState>, &str) {
         ("DISCARDED", ParsedHeadingState::Discarded),
     ] {
         if let Some(title) = line.strip_prefix(keyword)
-            && title.starts_with(char::is_whitespace)
+            && (title.is_empty() || title.starts_with(char::is_whitespace))
         {
             return (Some(state), title.trim_start());
         }
@@ -90,6 +90,9 @@ pub struct Dashboard {
     buffers: HashMap<(HostId, DeskNodeId), Entity<Buffer>>,
     subscriptions: HashMap<(HostId, DeskNodeId), gpui::Subscription>,
     known_text_ops: HashSet<(HostId, DeskNodeId, DeskClock)>,
+    undone_text_transactions: HashSet<(HostId, DeskNodeId, DeskClock)>,
+    last_structure_op: HashMap<(HostId, DeskNodeId), (rho_ui_proto::desk::DeskStructureOpId, u64)>,
+    last_text_timestamp: HashMap<(HostId, DeskNodeId), u64>,
     collapsed: HashSet<(HostId, DeskNodeId)>,
     collapse_blocks: Vec<CustomBlockId>,
     host_header_blocks: Vec<CustomBlockId>,
@@ -131,6 +134,9 @@ impl Dashboard {
             buffers: HashMap::new(),
             subscriptions: HashMap::new(),
             known_text_ops: HashSet::new(),
+            undone_text_transactions: HashSet::new(),
+            last_structure_op: HashMap::new(),
+            last_text_timestamp: HashMap::new(),
             collapsed: HashSet::new(),
             collapse_blocks: Vec::new(),
             host_header_blocks: Vec::new(),
@@ -172,6 +178,12 @@ impl Dashboard {
             .retain(|_, (candidate, _)| *candidate != host);
         self.known_text_ops
             .retain(|(candidate, _, _)| *candidate != host);
+        self.undone_text_transactions
+            .retain(|(candidate, _, _)| *candidate != host);
+        self.last_structure_op
+            .retain(|(candidate, _), _| *candidate != host);
+        self.last_text_timestamp
+            .retain(|(candidate, _), _| *candidate != host);
         for text in &snapshot.texts {
             for operation in &text.operations {
                 self.known_text_ops
@@ -204,6 +216,24 @@ impl Dashboard {
         desk.snapshot.last_structure_op_id = record.id.0;
         if let Some(undone) = record.undo_of {
             desk.snapshot.undone_structure_ops.push(undone);
+        }
+        if let Some(undone) = record.undo_of {
+            self.last_structure_op
+                .retain(|(candidate, _), (op_id, _)| *candidate != host || *op_id != undone);
+        } else {
+            match &record.op {
+                rho_ui_proto::desk::DeskStructureOp::Insert { nodes } => {
+                    for node in nodes {
+                        self.last_structure_op
+                            .insert((host, node.id), (record.id, record.timestamp_ms));
+                    }
+                }
+                rho_ui_proto::desk::DeskStructureOp::Remove { node_id }
+                | rho_ui_proto::desk::DeskStructureOp::Move { node_id, .. } => {
+                    self.last_structure_op
+                        .insert((host, *node_id), (record.id, record.timestamp_ms));
+                }
+            }
         }
         self.ensure_buffers(host, cx);
         cx.notify();
@@ -238,7 +268,13 @@ impl Dashboard {
             text.operations.push(record.operation.clone());
         }
         if let Some(transaction) = record.transaction {
+            self.last_text_timestamp
+                .insert((host, record.node_id), record.timestamp_ms);
             text.transactions.push(transaction);
+        }
+        if let Some(transaction) = record.undo_of {
+            self.undone_text_transactions
+                .insert((host, record.node_id, transaction));
         }
         if already_known {
             return;
@@ -738,6 +774,26 @@ impl Dashboard {
         self.buffer_nodes.get(&buffer_id).copied()
     }
 
+    fn cursor_node_offset(
+        &self,
+        cx: &mut Context<Workspace>,
+    ) -> Option<(HostId, DeskNodeId, usize)> {
+        let (buffer_id, offset) = self.editor.update(cx, |editor, cx| {
+            let head = editor
+                .selections
+                .newest::<Point>(&editor.display_snapshot(cx))
+                .head();
+            editor
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .point_to_buffer_offset(head)
+                .map(|(buffer, offset)| (buffer.remote_id(), offset.0))
+        })?;
+        let (host, node_id) = self.buffer_nodes.get(&buffer_id).copied()?;
+        Some((host, node_id, offset))
+    }
+
     fn caret(&self, cx: &mut Context<Workspace>) -> Option<text::Anchor> {
         self.editor.update(cx, |editor, cx| {
             let head = editor
@@ -913,6 +969,20 @@ impl Dashboard {
         self.move_to_anchor(anchor, window, cx)
     }
 
+    pub fn jump_to_node(
+        &mut self,
+        host: HostId,
+        node_id: DeskNodeId,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> bool {
+        let Some(buffer) = self.buffers.get(&(host, node_id)) else {
+            return false;
+        };
+        let anchor = buffer.read(cx).anchor_before(0);
+        self.move_to_anchor(anchor, window, cx)
+    }
+
     pub fn hint(&self, cx: &mut Context<Workspace>) -> &'static str {
         let on_heading = self.editor.update(cx, |editor, cx| {
             let head = editor
@@ -926,7 +996,7 @@ impl Dashboard {
                 .unwrap_or(false)
         });
         if on_heading {
-            "Tab fold · Enter open · s staff · d done · x discard · u undo · g jump · n NOW · b back"
+            "Enter new sibling · Tab/⇧Tab demote/promote · Alt-↑/↓ move · Backspace delete empty · z fold · u undo"
         } else {
             "edit text · Esc heading verbs"
         }
@@ -967,7 +1037,13 @@ impl Dashboard {
         Some((host, node_id, text))
     }
 
-    pub fn mark_staffed(&mut self, host: HostId, node_id: DeskNodeId, cx: &mut Context<Workspace>) {
+    pub fn set_heading_state(
+        &mut self,
+        host: HostId,
+        node_id: DeskNodeId,
+        state: ParsedHeadingState,
+        cx: &mut Context<Workspace>,
+    ) {
         let Some(buffer) = self.buffers.get(&(host, node_id)).cloned() else {
             return;
         };
@@ -975,15 +1051,190 @@ impl Dashboard {
             let text = buffer.text_for_range(0..buffer.len()).collect::<String>();
             let heading_end = text.find('\n').unwrap_or(text.len());
             let (_, title) = parse_heading_line(&text);
+            let keyword = match state {
+                ParsedHeadingState::Todo => "TODO",
+                ParsedHeadingState::Staffed => "STAFFED",
+                ParsedHeadingState::Done => "DONE",
+                ParsedHeadingState::Discarded => "DISCARDED",
+            };
             let heading = if title.is_empty() {
-                "STAFFED".to_owned()
+                keyword.to_owned()
             } else {
-                format!("STAFFED {title}")
+                format!("{keyword} {title}")
             };
             if text[..heading_end] != heading {
                 buffer.edit([(0..heading_end, heading)], None, cx);
             }
         });
+    }
+
+    pub fn set_cursor_heading_state(
+        &mut self,
+        state: ParsedHeadingState,
+        cx: &mut Context<Workspace>,
+    ) {
+        if let Some((host, node_id)) = self.cursor_node(cx) {
+            self.set_heading_state(host, node_id, state, cx);
+        }
+    }
+
+    pub fn insert_sibling_at_heading_end(
+        &self,
+        cx: &mut Context<Workspace>,
+    ) -> Option<(HostId, Option<DeskNodeId>, rho_ui_proto::desk::DeskOrderKey)> {
+        let (host, node_id, offset) = self.cursor_node_offset(cx)?;
+        let buffer = self.buffers.get(&(host, node_id))?.read(cx);
+        let text = buffer.text_for_range(0..buffer.len()).collect::<String>();
+        if offset != text.find('\n').unwrap_or(text.len()) {
+            return None;
+        }
+        let desk = self.hosts.get(&host)?;
+        let node = desk.snapshot.node(node_id)?;
+        let mut siblings = desk
+            .snapshot
+            .nodes
+            .iter()
+            .filter(|candidate| candidate.parent == node.parent)
+            .collect::<Vec<_>>();
+        siblings.sort_by(|left, right| left.order.cmp(&right.order));
+        let index = siblings
+            .iter()
+            .position(|candidate| candidate.id == node_id)?;
+        let upper = siblings.get(index + 1).map(|candidate| &candidate.order);
+        let order = rho_ui_proto::desk::DeskOrderKey::between(Some(&node.order), upper)?;
+        Some((host, node.parent, order))
+    }
+
+    pub fn structure_move(
+        &self,
+        direction: StructureDirection,
+        cx: &mut Context<Workspace>,
+    ) -> Option<(HostId, rho_ui_proto::desk::DeskStructureOp)> {
+        let (host, node_id) = self.cursor_node(cx)?;
+        let desk = self.hosts.get(&host)?;
+        let node = desk.snapshot.node(node_id)?;
+        let (parent, order) = match direction {
+            StructureDirection::Demote => {
+                let siblings = sorted_children(&desk.snapshot.nodes, node.parent);
+                let index = siblings
+                    .iter()
+                    .position(|candidate| candidate.id == node_id)?;
+                let new_parent = siblings.get(index.checked_sub(1)?)?;
+                let children = sorted_children(&desk.snapshot.nodes, Some(new_parent.id));
+                let lower = children.last().map(|candidate| &candidate.order);
+                (
+                    Some(new_parent.id),
+                    rho_ui_proto::desk::DeskOrderKey::between(lower, None)?,
+                )
+            }
+            StructureDirection::Promote => {
+                let old_parent = desk.snapshot.node(node.parent?)?;
+                let siblings = sorted_children(&desk.snapshot.nodes, old_parent.parent);
+                let index = siblings
+                    .iter()
+                    .position(|candidate| candidate.id == old_parent.id)?;
+                let upper = siblings.get(index + 1).map(|candidate| &candidate.order);
+                (
+                    old_parent.parent,
+                    rho_ui_proto::desk::DeskOrderKey::between(Some(&old_parent.order), upper)?,
+                )
+            }
+            StructureDirection::Up | StructureDirection::Down => {
+                let siblings = sorted_children(&desk.snapshot.nodes, node.parent);
+                let index = siblings
+                    .iter()
+                    .position(|candidate| candidate.id == node_id)?;
+                let order = if direction == StructureDirection::Up {
+                    let previous = index.checked_sub(1)?;
+                    rho_ui_proto::desk::DeskOrderKey::between(
+                        previous
+                            .checked_sub(1)
+                            .and_then(|at| siblings.get(at))
+                            .map(|candidate| &candidate.order),
+                        siblings.get(previous).map(|candidate| &candidate.order),
+                    )?
+                } else {
+                    let next = index + 1;
+                    let lower = siblings.get(next)?;
+                    rho_ui_proto::desk::DeskOrderKey::between(
+                        Some(&lower.order),
+                        siblings.get(next + 1).map(|candidate| &candidate.order),
+                    )?
+                };
+                (node.parent, order)
+            }
+        };
+        Some((
+            host,
+            rho_ui_proto::desk::DeskStructureOp::Move {
+                node_id,
+                parent,
+                order,
+            },
+        ))
+    }
+
+    pub fn delete_empty(
+        &self,
+        cx: &mut Context<Workspace>,
+    ) -> Option<(HostId, rho_ui_proto::desk::DeskStructureOp)> {
+        let (host, node_id) = self.cursor_node(cx)?;
+        let desk = self.hosts.get(&host)?;
+        if desk.snapshot.nodes.len() <= 1
+            || desk
+                .snapshot
+                .nodes
+                .iter()
+                .any(|node| node.parent == Some(node_id))
+        {
+            return None;
+        }
+        let buffer = self.buffers.get(&(host, node_id))?.read(cx);
+        let text = buffer.text_for_range(0..buffer.len()).collect::<String>();
+        if !text.trim().is_empty() {
+            return None;
+        }
+        Some((
+            host,
+            rho_ui_proto::desk::DeskStructureOp::Remove { node_id },
+        ))
+    }
+
+    pub fn undo_target(&self, cx: &mut Context<Workspace>) -> Option<DeskUndoTarget> {
+        let (host, node_id) = self.cursor_node(cx)?;
+        let desk = self.hosts.get(&host)?;
+        let transaction = desk
+            .snapshot
+            .texts
+            .iter()
+            .find(|text| text.node_id == node_id)
+            .into_iter()
+            .flat_map(|text| text.transactions.iter().rev())
+            .find(|transaction| {
+                transaction.id.replica_id == desk.replica_id
+                    && !self
+                        .undone_text_transactions
+                        .contains(&(host, node_id, transaction.id))
+            });
+        let structure = self
+            .last_structure_op
+            .get(&(host, node_id))
+            .copied()
+            .filter(|(op_id, _)| !desk.snapshot.undone_structure_ops.contains(op_id));
+        if let Some((op_id, timestamp)) = structure
+            && timestamp
+                >= self
+                    .last_text_timestamp
+                    .get(&(host, node_id))
+                    .copied()
+                    .unwrap_or_default()
+        {
+            return Some(DeskUndoTarget::Structure(host, op_id));
+        }
+        if let Some(transaction) = transaction {
+            return Some(DeskUndoTarget::Text(host, node_id, transaction.id));
+        }
+        structure.map(|(op_id, _)| DeskUndoTarget::Structure(host, op_id))
     }
 
     pub fn toggle_subagents(&mut self, cx: &mut Context<Workspace>) -> bool {
@@ -1005,6 +1256,28 @@ impl Dashboard {
         cx.notify();
         true
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StructureDirection {
+    Demote,
+    Promote,
+    Up,
+    Down,
+}
+
+pub enum DeskUndoTarget {
+    Text(HostId, DeskNodeId, DeskClock),
+    Structure(HostId, rho_ui_proto::desk::DeskStructureOpId),
+}
+
+fn sorted_children(nodes: &[DeskNode], parent: Option<DeskNodeId>) -> Vec<&DeskNode> {
+    let mut children = nodes
+        .iter()
+        .filter(|candidate| candidate.parent == parent)
+        .collect::<Vec<_>>();
+    children.sort_by(|left, right| left.order.cmp(&right.order));
+    children
 }
 
 #[derive(Default)]
@@ -1084,6 +1357,10 @@ mod tests {
             (Some(ParsedHeadingState::Todo), "ship Desk")
         );
         assert_eq!(parse_heading_line("TODOish title"), (None, "TODOish title"));
+        assert_eq!(
+            parse_heading_line("STAFFED"),
+            (Some(ParsedHeadingState::Staffed), "")
+        );
         assert!(fuzzy_contains("Ship the Desk", "std"));
         assert!(!fuzzy_contains("Ship the Desk", "xyz"));
     }

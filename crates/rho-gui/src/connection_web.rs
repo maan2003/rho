@@ -58,6 +58,13 @@ pub struct HostEvent {
 }
 
 pub enum ConnEvent {
+    DeskSnapshot {
+        snapshot: rho_ui_proto::desk::DeskSnapshot,
+        replica_id: u16,
+    },
+    DeskStructureApplied(rho_ui_proto::desk::DeskStructureOpRecord),
+    DeskTextApplied(rho_ui_proto::desk::DeskTextOpRecord),
+    DeskBindingChanged(rho_ui_proto::desk::DeskBinding),
     Ready {
         agents: Vec<UiAgentSummary>,
         projects: Vec<UiProject>,
@@ -410,10 +417,22 @@ fn handle_host_message(
         ServerMessage::QuotaHistory { series } => Some(ConnEvent::QuotaHistory(series.clone())),
         ServerMessage::GlobalUsage { series } => Some(ConnEvent::GlobalUsage(series.clone())),
         ServerMessage::Error { message } => Some(ConnEvent::ServerError(message.clone())),
-        ServerMessage::DeskSnapshot { .. }
-        | ServerMessage::DeskStructureApplied { .. }
-        | ServerMessage::DeskTextApplied { .. }
-        | ServerMessage::DeskBindingChanged { .. } => None,
+        ServerMessage::DeskSnapshot {
+            snapshot,
+            replica_id,
+        } => Some(ConnEvent::DeskSnapshot {
+            snapshot: snapshot.clone(),
+            replica_id: *replica_id,
+        }),
+        ServerMessage::DeskStructureApplied { record } => {
+            Some(ConnEvent::DeskStructureApplied(record.clone()))
+        }
+        ServerMessage::DeskTextApplied { record } => {
+            Some(ConnEvent::DeskTextApplied(record.clone()))
+        }
+        ServerMessage::DeskBindingChanged { binding } => {
+            Some(ConnEvent::DeskBindingChanged(binding.clone()))
+        }
         _ => None,
     };
     if let Some(event) = event {
@@ -1009,6 +1028,7 @@ async fn run(
     let mut send = rho_rpc::Writer::new(send);
     let mut recv = rho_rpc::Reader::new(recv);
     rho_ui_proto::write_frame(&mut send, &ClientMessage::Subscribe).await?;
+    rho_ui_proto::write_frame(&mut send, &ClientMessage::DeskSubscribe).await?;
     let channel_connection = connection.clone();
     spawn_local(async move {
         while let Some(command) = receiver.next().await {

@@ -59,6 +59,12 @@ actions!(
         DashboardJump,
         DashboardStaff,
         DashboardToggleSubagents,
+        DashboardDemote,
+        DashboardPromote,
+        DashboardMoveUp,
+        DashboardMoveDown,
+        DashboardDeleteEmpty,
+        DashboardUndo,
         RoleCycle,
         RoleCycleGroup,
         TaskBoard,
@@ -287,8 +293,8 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
     // Desk heading verbs. Body editing remains ordinary editor input in
     // insert mode; normal mode addresses the stable node under the caret.
     cx.bind_keys([KeyBinding::new(
-        "enter",
-        RailOpen,
+        "ctrl-z",
+        DashboardUndo,
         Some("RhoDashboard > Editor"),
     )]);
     for context in [
@@ -296,12 +302,20 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         "RhoDashboard > Editor && vim_mode == helix_normal",
     ] {
         cx.bind_keys([
+            KeyBinding::new("enter", RailOpen, Some(context)),
             KeyBinding::new("d", AgentDone, Some(context)),
+            KeyBinding::new("x", AgentHide, Some(context)),
             KeyBinding::new("n", DashboardNow, Some(context)),
             KeyBinding::new("b", DashboardBack, Some(context)),
             KeyBinding::new("g", DashboardJump, Some(context)),
             KeyBinding::new("s", DashboardStaff, Some(context)),
-            KeyBinding::new("tab", DashboardToggleSubagents, Some(context)),
+            KeyBinding::new("tab", DashboardDemote, Some(context)),
+            KeyBinding::new("shift-tab", DashboardPromote, Some(context)),
+            KeyBinding::new("alt-up", DashboardMoveUp, Some(context)),
+            KeyBinding::new("alt-down", DashboardMoveDown, Some(context)),
+            KeyBinding::new("backspace", DashboardDeleteEmpty, Some(context)),
+            KeyBinding::new("u", DashboardUndo, Some(context)),
+            KeyBinding::new("z", DashboardToggleSubagents, Some(context)),
         ]);
     }
 }
