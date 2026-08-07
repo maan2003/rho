@@ -424,7 +424,8 @@ fn handle_host_message(
         ServerMessage::Error { message } => Some(ConnEvent::ServerError(message.clone())),
         ServerMessage::DeskSnapshot { .. }
         | ServerMessage::DeskStructureApplied { .. }
-        | ServerMessage::DeskTextApplied { .. } => None,
+        | ServerMessage::DeskTextApplied { .. }
+        | ServerMessage::DeskBindingChanged { .. } => None,
         _ => None,
     };
     if let Some(event) = event {

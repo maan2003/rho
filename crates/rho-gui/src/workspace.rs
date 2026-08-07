@@ -52,12 +52,12 @@ use crate::style::{RoleFamily, StyleClass};
 use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
     AgentDone, AgentHide, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious,
-    DashboardNewAgent, DashboardReply, DashboardToggleSubagents, GitApprovalAllow, GitApprovalDeny,
-    MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious,
-    PaneBack, PaneClose, PaneFocusNext, PaneSplitDown, PaneSplitRight, PastePrompt, RailFocus,
-    RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore,
-    ShellPagerQuit, SubmitPrompt, TaskBoard, VoiceToggle, ZulipLoadOlder, ZulipNextUnread,
-    ZulipOpenRow, ZulipQuit,
+    DashboardNewAgent, DashboardReply, DashboardStaff, DashboardToggleSubagents, GitApprovalAllow,
+    GitApprovalDeny, MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext,
+    MinibufferPrevious, PaneBack, PaneClose, PaneFocusNext, PaneSplitDown, PaneSplitRight,
+    PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt,
+    ShellPagerAll, ShellPagerMore, ShellPagerQuit, SubmitPrompt, TaskBoard, VoiceToggle,
+    ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow, ZulipQuit,
 };
 
 /// What a pane shows: stable identity plus the live view. Surfaces live
@@ -1106,6 +1106,7 @@ impl Workspace {
                 | ConnEvent::DeskSnapshot { .. }
                 | ConnEvent::DeskStructureApplied(_)
                 | ConnEvent::DeskTextApplied(_)
+                | ConnEvent::DeskBindingChanged(_)
                 | ConnEvent::WorkstreamCreated(_)
                 | ConnEvent::AgentCreated { .. }
                 | ConnEvent::AgentAttention { .. }
@@ -1136,6 +1137,9 @@ impl Workspace {
             }
             ConnEvent::DeskTextApplied(record) => {
                 self.dashboard.apply_text(host, record, cx);
+            }
+            ConnEvent::DeskBindingChanged(binding) => {
+                self.dashboard.apply_binding(host, binding);
             }
             ConnEvent::Ready {
                 workstreams,
@@ -1982,6 +1986,7 @@ impl Workspace {
                 role,
                 start,
                 content: Some(content),
+                desk_node: None,
             },
         );
     }
@@ -5461,8 +5466,62 @@ impl Workspace {
                 role,
                 start,
                 content: Some(content),
+                desk_node: None,
             },
         );
+    }
+
+    fn staff_dashboard_node(&mut self, cx: &mut Context<Self>) {
+        let Some((host, node_id, text)) = self.dashboard.staffing_target(cx) else {
+            self.notice_on(
+                None,
+                "this Desk node is already staffed",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        let workdir = self
+            .workdirs
+            .iter()
+            .find(|workdir| workdir.host == host)
+            .map(|workdir| HostPath {
+                host,
+                path: workdir.project.path.clone(),
+            });
+        let (mode, target, role_text) = {
+            let draft = self.draft_model.read(cx);
+            (
+                draft.start_mode(),
+                draft.start_text(cx).trim().to_owned(),
+                draft.role_text(cx).trim().to_owned(),
+            )
+        };
+        let (_, start) = match self.parse_start(mode, &target, workdir, Some(host)) {
+            Ok(start) => start,
+            Err(message) => {
+                self.notice_on(None, &message, StyleClass::SystemInfo, cx);
+                return;
+            }
+        };
+        let role = match parse_agent_role(&role_text) {
+            Ok(role) => role,
+            Err(message) => {
+                self.notice_on(None, &message, StyleClass::SystemInfo, cx);
+                return;
+            }
+        };
+        self.send_to_host(
+            host,
+            ClientMessage::NewAgent {
+                workstream: None,
+                role,
+                start,
+                content: (!text.trim().is_empty()).then_some(vec![ContentPart::Text { text }]),
+                desk_node: Some(node_id),
+            },
+        );
+        self.dashboard.mark_staffed(host, node_id, cx);
     }
 
     /// `r` in the dashboard: splice an inline reply draft under the row —
@@ -6285,6 +6344,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &DashboardNewAgent, window, cx| {
                 this.open_new_agent_transient(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DashboardStaff, _, cx| {
+                this.staff_dashboard_node(cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardToggleSubagents, _, cx| {
                 this.dashboard.toggle_subagents(cx);

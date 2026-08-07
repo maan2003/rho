@@ -64,6 +64,7 @@ pub enum ConnEvent {
     },
     DeskStructureApplied(rho_ui_proto::desk::DeskStructureOpRecord),
     DeskTextApplied(rho_ui_proto::desk::DeskTextOpRecord),
+    DeskBindingChanged(rho_ui_proto::desk::DeskBinding),
     Ready {
         workstreams: Vec<UiWorkstream>,
         agents: Vec<UiAgentSummary>,
@@ -986,6 +987,9 @@ async fn run(
                 Some(ConnEvent::DeskStructureApplied(record))
             }
             ServerMessage::DeskTextApplied { record } => Some(ConnEvent::DeskTextApplied(record)),
+            ServerMessage::DeskBindingChanged { binding } => {
+                Some(ConnEvent::DeskBindingChanged(binding))
+            }
             ServerMessage::Ready {
                 workstreams,
                 agents,

@@ -75,6 +75,11 @@ pub enum ClientMessage {
         node_id: desk::DeskNodeId,
         transaction_id: desk::DeskClock,
     },
+    /// Sets the non-undoable principal binding for one Desk node.
+    DeskBind {
+        node_id: desk::DeskNodeId,
+        agent_id: AgentId,
+    },
     NewAgent {
         /// The workstream to join; `None` founds a fresh one, named
         /// provisionally until the agent's generated title lands.
@@ -84,6 +89,8 @@ pub enum ClientMessage {
         /// the modes that need one).
         start: StartMode,
         content: Option<Vec<ContentPart>>,
+        /// When present, bind the newly allocated agent to this Desk node.
+        desk_node: Option<desk::DeskNodeId>,
     },
     SubscribeAgent {
         agent_id: AgentId,
@@ -547,6 +554,9 @@ pub enum ServerMessage {
     },
     DeskTextApplied {
         record: desk::DeskTextOpRecord,
+    },
+    DeskBindingChanged {
+        binding: desk::DeskBinding,
     },
     Ready {
         workstreams: Vec<UiWorkstream>,

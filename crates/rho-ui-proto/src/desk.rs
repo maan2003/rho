@@ -323,7 +323,7 @@ impl DeskSnapshot {
     }
 
     pub fn apply_structure(&mut self, op: &DeskStructureOp) -> Result<DeskStructureOp, String> {
-        match op {
+        let inverse = match op {
             DeskStructureOp::Insert { nodes } => self.insert_nodes(nodes),
             DeskStructureOp::Remove { node_id } => self.remove_node(*node_id),
             DeskStructureOp::Move {
@@ -331,7 +331,31 @@ impl DeskSnapshot {
                 parent,
                 order,
             } => self.move_node(*node_id, *parent, order.clone()),
+        }?;
+        let visible = self
+            .nodes
+            .iter()
+            .map(|node| node.id)
+            .collect::<std::collections::BTreeSet<_>>();
+        for binding in &mut self.bindings {
+            binding.orphaned = !visible.contains(&binding.node_id);
         }
+        Ok(inverse)
+    }
+
+    pub fn bind(&mut self, node_id: DeskNodeId, agent_id: AgentId) -> Result<DeskBinding, String> {
+        if self.node(node_id).is_none() {
+            return Err(format!("unknown Desk node {}", node_id.0));
+        }
+        self.bindings
+            .retain(|binding| binding.node_id != node_id && binding.agent_id != agent_id);
+        let binding = DeskBinding {
+            node_id,
+            agent_id,
+            orphaned: false,
+        };
+        self.bindings.push(binding.clone());
+        Ok(binding)
     }
 
     fn insert_nodes(&mut self, inserted: &[DeskNode]) -> Result<DeskStructureOp, String> {

@@ -5,9 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use redb::TableDefinition;
 use rho_db::{RhoDb, Sen, SenValue};
 use rho_ui_proto::desk::{
-    DeskClock, DeskNode, DeskNodeId, DeskNodeText, DeskOperation, DeskOrderKey, DeskReplica,
-    DeskReplicaAuthor, DeskSnapshot, DeskStructureAuthor, DeskStructureOp, DeskStructureOpId,
-    DeskStructureOpRecord, DeskTextOpRecord, DeskTransaction,
+    DeskBinding, DeskClock, DeskNode, DeskNodeId, DeskNodeText, DeskOperation, DeskOrderKey,
+    DeskReplica, DeskReplicaAuthor, DeskSnapshot, DeskStructureAuthor, DeskStructureOp,
+    DeskStructureOpId, DeskStructureOpRecord, DeskTextOpRecord, DeskTransaction,
 };
 use senax_encoder::{Decode, Encode};
 use text::ReplicaId;
@@ -100,6 +100,19 @@ impl DeskStore {
         save_state(&mut write, &state);
         write.commit();
         Ok(replica_id)
+    }
+
+    pub async fn bind(
+        &self,
+        node_id: DeskNodeId,
+        agent_id: rho_ui_proto::AgentId,
+    ) -> Result<DeskBinding, String> {
+        let mut write = self.db.write().await;
+        let mut state = load_state_for_write(&mut write);
+        let binding = state.snapshot.bind(node_id, agent_id)?;
+        save_state(&mut write, &state);
+        write.commit();
+        Ok(binding)
     }
 
     pub async fn insert(
@@ -379,6 +392,8 @@ mod tests {
             )
             .await
             .unwrap();
+        let agent_id = rho_core::AgentId::from_counter(1, &rho_core::AgentIdDomain(7)).unwrap();
+        store.bind(node_id, agent_id).await.unwrap();
         assert_eq!(
             store.snapshot().texts[0].buffer(9).unwrap().text(),
             "TODO plan\nremember this"
@@ -386,10 +401,12 @@ mod tests {
         drop(store);
 
         let reopened = DeskStore::new(db).await;
+        assert_eq!(reopened.snapshot().bindings[0].agent_id, agent_id);
         reopened.undo_text(node_id, transaction.id).await.unwrap();
         assert_eq!(reopened.snapshot().texts[0].buffer(10).unwrap().text(), "");
         reopened.undo_structure(inserted.id).await.unwrap();
         assert!(reopened.snapshot().nodes.is_empty());
+        assert!(reopened.snapshot().bindings[0].orphaned);
         assert!(reopened.snapshot().next_node_id > node_id.0);
     }
 }

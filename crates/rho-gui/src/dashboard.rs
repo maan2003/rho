@@ -12,7 +12,7 @@ use language::{Buffer, BufferEvent, Capability, InlayId, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use rho_core::ContentPart;
 use rho_ui_proto::desk::{
-    DeskClock, DeskNode, DeskNodeId, DeskNodeText, DeskOperation, DeskSnapshot,
+    DeskBinding, DeskClock, DeskNode, DeskNodeId, DeskNodeText, DeskOperation, DeskSnapshot,
     DeskStructureOpRecord, DeskTextOpRecord, DeskTransaction,
 };
 use rho_ui_proto::{AgentId, ClientMessage, WorkstreamId};
@@ -228,6 +228,16 @@ impl Dashboard {
         }
     }
 
+    pub fn apply_binding(&mut self, host: HostId, binding: DeskBinding) {
+        let Some(desk) = self.hosts.get_mut(&host) else {
+            return;
+        };
+        desk.snapshot.bindings.retain(|candidate| {
+            candidate.node_id != binding.node_id && candidate.agent_id != binding.agent_id
+        });
+        desk.snapshot.bindings.push(binding);
+    }
+
     fn ensure_buffers(&mut self, host: HostId, cx: &mut Context<Workspace>) {
         let Some(desk) = self.hosts.get(&host) else {
             return;
@@ -361,7 +371,7 @@ impl Dashboard {
         });
         self.displayed_len = order.len();
         self.sync_host_headers(registry, &order, cx);
-        self.sync_depth_rails(&order, &projection.depths, cx);
+        self.sync_node_chrome(registry, &order, &projection.depths, cx);
         self.sync_collapse_blocks(&order, projection.collapsed, cx);
     }
 
@@ -419,8 +429,9 @@ impl Dashboard {
         }
     }
 
-    fn sync_depth_rails(
+    fn sync_node_chrome(
         &mut self,
+        registry: &AgentRegistry,
         order: &[(HostId, DeskNodeId)],
         depths: &[usize],
         cx: &mut Context<Workspace>,
@@ -452,6 +463,47 @@ impl Dashboard {
                 });
                 inlays.push(inlay);
             }
+        }
+        for (host, node_id) in order {
+            let Some(binding) = self.hosts.get(host).and_then(|desk| {
+                desk.snapshot
+                    .bindings
+                    .iter()
+                    .find(|binding| binding.node_id == *node_id && !binding.orphaned)
+            }) else {
+                continue;
+            };
+            let Some(buffer) = self.buffers.get(&(*host, *node_id)) else {
+                continue;
+            };
+            let buffer_snapshot = buffer.read(cx).snapshot();
+            let heading_end = buffer_snapshot
+                .text_for_range(0..buffer_snapshot.len())
+                .collect::<String>()
+                .find('\n')
+                .unwrap_or(buffer_snapshot.len());
+            let Some(position) =
+                snapshot.anchor_in_excerpt(buffer_snapshot.anchor_before(heading_end))
+            else {
+                continue;
+            };
+            let attention = match registry.attention(binding.agent_id) {
+                rho_ui_proto::UiAttention::Quiet => "idle",
+                rho_ui_proto::UiAttention::Working => "working",
+                rho_ui_proto::UiAttention::Pending => "pending",
+                rho_ui_proto::UiAttention::NeedsInput => "needs you",
+            };
+            let text = format!(
+                "  · {} · {attention}",
+                registry.agent_human_name(binding.agent_id)
+            );
+            let inlay = Inlay::custom(inlays.len(), position, text.clone());
+            highlights.push(InlayHighlight {
+                inlay: inlay.id,
+                inlay_position: position,
+                range: 0..text.len(),
+            });
+            inlays.push(inlay);
         }
 
         let removed = std::mem::take(&mut self.depth_inlays);
@@ -575,6 +627,44 @@ impl Dashboard {
             .find(|binding| binding.node_id == node_id && !binding.orphaned)
             .map(|binding| RowTarget::Agent(binding.agent_id))
             .or(Some(RowTarget::None))
+    }
+
+    pub fn staffing_target(
+        &self,
+        cx: &mut Context<Workspace>,
+    ) -> Option<(HostId, DeskNodeId, String)> {
+        let (host, node_id) = self.cursor_node(cx)?;
+        let desk = self.hosts.get(&host)?;
+        if desk
+            .snapshot
+            .bindings
+            .iter()
+            .any(|binding| binding.node_id == node_id && !binding.orphaned)
+        {
+            return None;
+        }
+        let buffer = self.buffers.get(&(host, node_id))?.read(cx);
+        let text = buffer.text_for_range(0..buffer.len()).collect();
+        Some((host, node_id, text))
+    }
+
+    pub fn mark_staffed(&mut self, host: HostId, node_id: DeskNodeId, cx: &mut Context<Workspace>) {
+        let Some(buffer) = self.buffers.get(&(host, node_id)).cloned() else {
+            return;
+        };
+        buffer.update(cx, |buffer, cx| {
+            let text = buffer.text_for_range(0..buffer.len()).collect::<String>();
+            let heading_end = text.find('\n').unwrap_or(text.len());
+            let (_, title) = parse_heading_line(&text);
+            let heading = if title.is_empty() {
+                "STAFFED".to_owned()
+            } else {
+                format!("STAFFED {title}")
+            };
+            if text[..heading_end] != heading {
+                buffer.edit([(0..heading_end, heading)], None, cx);
+            }
+        });
     }
 
     pub fn toggle_subagents(&mut self, cx: &mut Context<Workspace>) -> bool {

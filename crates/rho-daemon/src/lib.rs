@@ -2512,6 +2512,26 @@ async fn handle_message(
                 .send(ServerMessage::DeskTextApplied { record });
             Ok(Refresh::None)
         }
+        ClientMessage::DeskBind { node_id, agent_id } => {
+            if !agents
+                .db
+                .read()
+                .list_agents()
+                .iter()
+                .any(|(candidate, _)| *candidate == agent_id)
+            {
+                anyhow::bail!("unknown agent {agent_id:?}");
+            }
+            let binding = agents
+                .desk
+                .bind(node_id, agent_id)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            let _ = agents
+                .events
+                .send(ServerMessage::DeskBindingChanged { binding });
+            Ok(Refresh::None)
+        }
         ClientMessage::RecordVisualization { mime_type, content } => {
             let id = agents.visualizations.record(mime_type, content).await?;
             let _ = outgoing_tx.send(ServerMessage::VisualizationRecorded { id });
@@ -2748,6 +2768,7 @@ async fn handle_message(
             role,
             start,
             content,
+            desk_node,
         } => {
             if let Some(content) = content.as_deref() {
                 validate_image_content(content)?;
@@ -2772,6 +2793,16 @@ async fn handle_message(
             // Subscription and the AgentCreated announcement ride the pool's
             // creation broadcast (all connections, including this one).
             let (agent_id, agent) = agents.create(workstream, role, start).await?;
+            if let Some(node_id) = desk_node {
+                let binding = agents
+                    .desk
+                    .bind(node_id, agent_id)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+                let _ = agents
+                    .events
+                    .send(ServerMessage::DeskBindingChanged { binding });
+            }
             if let Some((workstream_id, provisional_name)) = &founded {
                 let mut write = agents.db.write().await;
                 write.set_pending_presentation_workstream(
