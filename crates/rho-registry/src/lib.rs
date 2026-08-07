@@ -859,6 +859,10 @@ impl AgentRegistry {
         self.agent_summary(agent_id).map(|agent| agent.role)
     }
 
+    pub fn agent_last_active(&self, agent_id: AgentId) -> Option<rho_core::UnixMs> {
+        self.agent_summary(agent_id).map(|agent| agent.last_active)
+    }
+
     /// A workstream's raw labels, from the snapshot.
     pub fn workstream_labels(&self, workstream_id: WorkstreamId) -> &[String] {
         self.raw_workstreams

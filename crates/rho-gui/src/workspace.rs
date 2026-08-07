@@ -51,13 +51,13 @@ use crate::store::{AgentStore, FrameSummary};
 use crate::style::{RoleFamily, StyleClass};
 use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
-    AgentDone, AgentHide, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious,
-    DashboardNewAgent, DashboardReply, DashboardStaff, DashboardToggleSubagents, GitApprovalAllow,
-    GitApprovalDeny, MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext,
-    MinibufferPrevious, PaneBack, PaneClose, PaneFocusNext, PaneSplitDown, PaneSplitRight,
-    PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt,
-    ShellPagerAll, ShellPagerMore, ShellPagerQuit, SubmitPrompt, TaskBoard, VoiceToggle,
-    ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow, ZulipQuit,
+    AgentDone, AgentHide, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, DashboardBack,
+    DashboardNewAgent, DashboardNow, DashboardReply, DashboardStaff, DashboardToggleSubagents,
+    GitApprovalAllow, GitApprovalDeny, MinibufferCancel, MinibufferComplete, MinibufferConfirm,
+    MinibufferNext, MinibufferPrevious, PaneBack, PaneClose, PaneFocusNext, PaneSplitDown,
+    PaneSplitRight, PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof,
+    ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit, SubmitPrompt, TaskBoard,
+    VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow, ZulipQuit,
 };
 
 /// What a pane shows: stable identity plus the live view. Surfaces live
@@ -5524,6 +5524,21 @@ impl Workspace {
         self.dashboard.mark_staffed(host, node_id, cx);
     }
 
+    fn dashboard_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(agent_id) = self.dashboard.next_now(&self.registry, window, cx) else {
+            self.notice_on(None, "NOW is clear", StyleClass::SystemInfo, cx);
+            return;
+        };
+        self.preview_agent(agent_id, window, cx);
+        window.focus(&self.dashboard.focus_handle(cx), cx);
+    }
+
+    fn dashboard_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dashboard.back(&self.registry, window, cx) {
+            window.focus(&self.dashboard.focus_handle(cx), cx);
+        }
+    }
+
     /// `r` in the dashboard: splice an inline reply draft under the row —
     /// the cursor moves into it, in insert mode, but never leaves the
     /// dashboard. Drafts park where they are: wander off mid-thought and
@@ -6347,6 +6362,12 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &DashboardStaff, _, cx| {
                 this.staff_dashboard_node(cx);
+            }))
+            .on_action(cx.listener(|this, _: &DashboardNow, window, cx| {
+                this.dashboard_now(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DashboardBack, window, cx| {
+                this.dashboard_back(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardToggleSubagents, _, cx| {
                 this.dashboard.toggle_subagents(cx);

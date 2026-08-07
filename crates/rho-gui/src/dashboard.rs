@@ -1,6 +1,7 @@
 //! The Desk: one editable Zed buffer per stable tree node, projected into a
 //! single multibuffer in depth-first order.
 
+use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
@@ -69,6 +70,21 @@ struct HostDesk {
     replica_id: u16,
 }
 
+#[derive(Clone)]
+struct NowItem {
+    host: HostId,
+    node_id: DeskNodeId,
+    agent_id: AgentId,
+    attention: rho_ui_proto::UiAttention,
+    last_active: rho_core::UnixMs,
+    title: String,
+}
+
+struct DeskCaret {
+    anchor: text::Anchor,
+    collapsed: HashSet<(HostId, DeskNodeId)>,
+}
+
 pub struct Dashboard {
     multi_buffer: Entity<MultiBuffer>,
     editor: Entity<Editor>,
@@ -83,6 +99,11 @@ pub struct Dashboard {
     buffer_nodes: HashMap<BufferId, (HostId, DeskNodeId)>,
     headers_disabled: HashSet<BufferId>,
     displayed_len: usize,
+    next_buffer_id: u64,
+    now_items: Vec<NowItem>,
+    now_block: Option<CustomBlockId>,
+    now_cursor: Option<AgentId>,
+    caret_stack: Vec<DeskCaret>,
 }
 
 impl Dashboard {
@@ -119,6 +140,11 @@ impl Dashboard {
             buffer_nodes: HashMap::new(),
             headers_disabled: HashSet::new(),
             displayed_len: 0,
+            next_buffer_id: 1,
+            now_items: Vec::new(),
+            now_block: None,
+            now_cursor: None,
+            caret_stack: Vec::new(),
         }
     }
 
@@ -256,9 +282,14 @@ impl Dashboard {
                 continue;
             }
             let operations = texts.get(&node.id).cloned().unwrap_or_default();
+            let buffer_id = BufferId::new(self.next_buffer_id).expect("nonzero GUI buffer id");
+            self.next_buffer_id = self
+                .next_buffer_id
+                .checked_add(1)
+                .expect("GUI buffer ids exhausted");
             let buffer = cx.new(|cx| {
                 let mut buffer = Buffer::remote(
-                    BufferId::new(node.id.0).expect("nonzero Desk node id"),
+                    buffer_id,
                     ReplicaId::new(replica_id),
                     Capability::ReadWrite,
                     "",
@@ -370,9 +401,120 @@ impl Dashboard {
             }
         });
         self.displayed_len = order.len();
+        self.sync_now_strip(registry, &order, cx);
         self.sync_host_headers(registry, &order, cx);
         self.sync_node_chrome(registry, &order, &projection.depths, cx);
         self.sync_collapse_blocks(&order, projection.collapsed, cx);
+    }
+
+    fn sync_now_strip(
+        &mut self,
+        registry: &AgentRegistry,
+        order: &[(HostId, DeskNodeId)],
+        cx: &mut Context<Workspace>,
+    ) {
+        self.now_items = order
+            .iter()
+            .filter_map(|(host, node_id)| {
+                let desk = self.hosts.get(host)?;
+                let binding = desk
+                    .snapshot
+                    .bindings
+                    .iter()
+                    .find(|binding| binding.node_id == *node_id && !binding.orphaned)?;
+                let attention = registry.attention(binding.agent_id);
+                if attention < rho_ui_proto::UiAttention::Pending {
+                    return None;
+                }
+                let last_active = registry.agent_last_active(binding.agent_id)?;
+                let buffer = self.buffers.get(&(*host, *node_id))?.read(cx);
+                let text = buffer.text_for_range(0..buffer.len()).collect::<String>();
+                let (_, title) = parse_heading_line(&text);
+                Some(NowItem {
+                    host: *host,
+                    node_id: *node_id,
+                    agent_id: binding.agent_id,
+                    attention,
+                    last_active,
+                    title: title.to_owned(),
+                })
+            })
+            .collect();
+        self.now_items
+            .sort_by_key(|item| (Reverse(item.last_active), item.agent_id));
+        if self
+            .now_cursor
+            .is_some_and(|agent| !self.now_items.iter().any(|item| item.agent_id == agent))
+        {
+            self.now_cursor = None;
+        }
+
+        if let Some(block) = self.now_block.take() {
+            self.editor.update(cx, |editor, cx| {
+                editor.remove_blocks([block].into_iter().collect(), None, cx)
+            });
+        }
+        let Some((first_host, first_node)) = order.first().copied() else {
+            return;
+        };
+        if self.now_items.is_empty() {
+            return;
+        }
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let Some(position) = self
+            .buffers
+            .get(&(first_host, first_node))
+            .and_then(|buffer| snapshot.anchor_in_excerpt(buffer.read(cx).anchor_before(0)))
+        else {
+            return;
+        };
+        let lines = self
+            .now_items
+            .iter()
+            .map(|item| {
+                let reason = match item.attention {
+                    rho_ui_proto::UiAttention::NeedsInput => "needs input",
+                    _ => "pending response",
+                };
+                format!(
+                    "{} · {} · {reason}",
+                    item.title,
+                    registry.agent_human_name(item.agent_id)
+                )
+            })
+            .collect::<Vec<_>>();
+        let height = u32::try_from(lines.len()).unwrap_or(u32::MAX);
+        self.now_block = self
+            .editor
+            .update(cx, |editor, cx| {
+                editor.insert_blocks(
+                    [BlockProperties {
+                        placement: BlockPlacement::Above(position),
+                        height: Some(height),
+                        style: BlockStyle::Sticky,
+                        render: Arc::new(move |cx| {
+                            div()
+                                .w_full()
+                                .flex()
+                                .flex_col()
+                                .border_b_1()
+                                .border_color(cx.app.theme().colors().border_variant)
+                                .children(
+                                    lines
+                                        .iter()
+                                        .cloned()
+                                        .map(|line| div().h_6().text_ellipsis().child(line)),
+                                )
+                                .into_any_element()
+                        }),
+                        priority: 2,
+                    }],
+                    None,
+                    cx,
+                )
+            })
+            .into_iter()
+            .next();
     }
 
     fn sync_host_headers(
@@ -596,6 +738,97 @@ impl Dashboard {
                 .map(|(buffer, _)| buffer.remote_id())
         })?;
         self.buffer_nodes.get(&buffer_id).copied()
+    }
+
+    fn caret(&self, cx: &mut Context<Workspace>) -> Option<text::Anchor> {
+        self.editor.update(cx, |editor, cx| {
+            let head = editor
+                .selections
+                .newest::<Point>(&editor.display_snapshot(cx))
+                .head();
+            editor
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .point_to_buffer_offset(head)
+                .map(|(buffer, offset)| buffer.anchor_after(offset.0))
+        })
+    }
+
+    fn move_to_anchor(
+        &self,
+        anchor: text::Anchor,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> bool {
+        let Some(anchor) = self
+            .multi_buffer
+            .read(cx)
+            .snapshot(cx)
+            .anchor_in_excerpt(anchor)
+        else {
+            return false;
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.select_anchor_ranges([anchor..anchor]);
+            });
+        });
+        true
+    }
+
+    pub fn next_now(
+        &mut self,
+        registry: &AgentRegistry,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Option<AgentId> {
+        let index = self
+            .now_cursor
+            .and_then(|agent| {
+                self.now_items
+                    .iter()
+                    .position(|item| item.agent_id == agent)
+            })
+            .map(|index| (index + 1) % self.now_items.len())
+            .unwrap_or(0);
+        let item = self.now_items.get(index)?.clone();
+        if let Some(anchor) = self.caret(cx) {
+            self.caret_stack.push(DeskCaret {
+                anchor,
+                collapsed: self.collapsed.clone(),
+            });
+        }
+        let desk = self.hosts.get(&item.host)?;
+        let mut current = desk
+            .snapshot
+            .node(item.node_id)
+            .and_then(|node| node.parent);
+        while let Some(parent) = current {
+            self.collapsed.remove(&(item.host, parent));
+            current = desk.snapshot.node(parent).and_then(|node| node.parent);
+        }
+        self.sync(registry, window, cx);
+        let buffer = self.buffers.get(&(item.host, item.node_id))?.read(cx);
+        if !self.move_to_anchor(buffer.anchor_before(0), window, cx) {
+            return None;
+        }
+        self.now_cursor = Some(item.agent_id);
+        Some(item.agent_id)
+    }
+
+    pub fn back(
+        &mut self,
+        registry: &AgentRegistry,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> bool {
+        let Some(caret) = self.caret_stack.pop() else {
+            return false;
+        };
+        self.collapsed = caret.collapsed;
+        self.sync(registry, window, cx);
+        self.move_to_anchor(caret.anchor, window, cx)
     }
 
     pub fn hint(&self, cx: &mut Context<Workspace>) -> &'static str {
