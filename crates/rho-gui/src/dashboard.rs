@@ -643,8 +643,12 @@ impl Dashboard {
         {
             return None;
         }
-        let buffer = self.buffers.get(&(host, node_id))?.read(cx);
-        let text = buffer.text_for_range(0..buffer.len()).collect();
+        let mut parts = Vec::new();
+        for path_node in node_path(&desk.snapshot.nodes, node_id)? {
+            let buffer = self.buffers.get(&(host, path_node))?.read(cx);
+            parts.push(buffer.text_for_range(0..buffer.len()).collect::<String>());
+        }
+        let text = parts.join("\n\n");
         Some((host, node_id, text))
     }
 
@@ -788,6 +792,18 @@ fn project_depth_first(
     }
 }
 
+fn node_path(nodes: &[DeskNode], node_id: DeskNodeId) -> Option<Vec<DeskNodeId>> {
+    let mut path = Vec::new();
+    let mut current = Some(node_id);
+    while let Some(node_id) = current {
+        let node = nodes.iter().find(|node| node.id == node_id)?;
+        path.push(node.id);
+        current = node.parent;
+    }
+    path.reverse();
+    Some(path)
+}
+
 #[cfg(test)]
 mod tests {
     use rho_ui_proto::desk::DeskOrderKey;
@@ -842,5 +858,6 @@ mod tests {
         );
         assert_eq!(projection.collapsed, vec![((host, root), 1..2)]);
         assert_eq!(projection.depths, vec![0, 1, 0]);
+        assert_eq!(node_path(&nodes, child), Some(vec![root, child]));
     }
 }
