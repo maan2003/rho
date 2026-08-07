@@ -30,6 +30,7 @@ use tokio::sync::{Mutex, Mutex as TokioMutex, OwnedMutexGuard, broadcast, mpsc, 
 
 mod agent_ui;
 pub mod debug;
+mod desk;
 mod iris;
 mod realtime;
 mod shell;
@@ -950,6 +951,7 @@ impl GitTransportBroker {
 struct AgentRegistry {
     pool: Arc<AgentPool>,
     db: RhoDb,
+    desk: desk::DeskStore,
     visualizations: rho_visualizations::VisualizationStore,
     inference: Inference,
     active_auth_name: RwLock<String>,
@@ -1005,9 +1007,11 @@ impl AgentRegistry {
         let slack = rho_slack::SlackManager::new(pool.clone(), db.clone()).await;
         let pr_monitor = rho_pr_monitor::PrMonitor::new(pool.clone(), db.clone()).await?;
         let visualizations = rho_visualizations::VisualizationStore::new(db.clone()).await;
+        let desk = desk::DeskStore::new(db.clone()).await;
         let registry = Self {
             pool,
             db,
+            desk,
             visualizations,
             inference,
             active_auth_name: RwLock::new(active_auth_name),
@@ -2432,6 +2436,80 @@ async fn handle_message(
     match message {
         ClientMessage::Ping => {
             let _ = outgoing_tx.send(ServerMessage::Pong);
+            Ok(Refresh::None)
+        }
+        ClientMessage::DeskSubscribe => {
+            let replica_id = agents
+                .desk
+                .allocate_user_replica()
+                .await
+                .map_err(anyhow::Error::msg)?;
+            let _ = outgoing_tx.send(ServerMessage::DeskSnapshot {
+                snapshot: agents.desk.snapshot(),
+                replica_id,
+            });
+            Ok(Refresh::None)
+        }
+        ClientMessage::DeskInsert { parent, order } => {
+            let record = agents
+                .desk
+                .insert(parent, order)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            let _ = agents
+                .events
+                .send(ServerMessage::DeskStructureApplied { record });
+            Ok(Refresh::None)
+        }
+        ClientMessage::DeskStructureApply { op } => {
+            let record = agents
+                .desk
+                .apply_structure(op)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            let _ = agents
+                .events
+                .send(ServerMessage::DeskStructureApplied { record });
+            Ok(Refresh::None)
+        }
+        ClientMessage::DeskStructureUndo { op_id } => {
+            let record = agents
+                .desk
+                .undo_structure(op_id)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            let _ = agents
+                .events
+                .send(ServerMessage::DeskStructureApplied { record });
+            Ok(Refresh::None)
+        }
+        ClientMessage::DeskTextApply {
+            node_id,
+            operation,
+            transaction,
+        } => {
+            let record = agents
+                .desk
+                .apply_text(node_id, operation, transaction)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            let _ = agents
+                .events
+                .send(ServerMessage::DeskTextApplied { record });
+            Ok(Refresh::None)
+        }
+        ClientMessage::DeskTextUndo {
+            node_id,
+            transaction_id,
+        } => {
+            let record = agents
+                .desk
+                .undo_text(node_id, transaction_id)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            let _ = agents
+                .events
+                .send(ServerMessage::DeskTextApplied { record });
             Ok(Refresh::None)
         }
         ClientMessage::RecordVisualization { mime_type, content } => {

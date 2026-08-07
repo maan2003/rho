@@ -19,6 +19,7 @@ use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 
 #[cfg(not(target_family = "wasm"))]
 pub mod client;
+pub mod desk;
 pub mod realtime;
 pub mod remote;
 #[cfg(not(target_family = "wasm"))]
@@ -50,6 +51,30 @@ pub fn socket_path() -> anyhow::Result<std::path::PathBuf> {
 pub enum ClientMessage {
     Ping,
     Subscribe,
+    /// Subscribes to the daemon-owned Desk snapshot and live operation stream.
+    DeskSubscribe,
+    /// Allocates a never-reused id and inserts a blank node atomically.
+    DeskInsert {
+        parent: Option<desk::DeskNodeId>,
+        order: desk::DeskOrderKey,
+    },
+    DeskStructureApply {
+        op: desk::DeskStructureOp,
+    },
+    DeskStructureUndo {
+        op_id: desk::DeskStructureOpId,
+    },
+    /// Appends a Zed text-buffer operation to one node. The operation's
+    /// replica id must match the id assigned by `DeskSnapshot`.
+    DeskTextApply {
+        node_id: desk::DeskNodeId,
+        operation: desk::DeskOperation,
+        transaction: Option<desk::DeskTransaction>,
+    },
+    DeskTextUndo {
+        node_id: desk::DeskNodeId,
+        transaction_id: desk::DeskClock,
+    },
     NewAgent {
         /// The workstream to join; `None` founds a fresh one, named
         /// provisionally until the agent's generated title lands.
@@ -511,6 +536,18 @@ pub struct LandLeaseHolder {
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub enum ServerMessage {
     Pong,
+    DeskSnapshot {
+        snapshot: desk::DeskSnapshot,
+        /// Zed replica id assigned to this user connection. Replica ids make
+        /// body-operation attribution intrinsic to the CRDT history.
+        replica_id: u16,
+    },
+    DeskStructureApplied {
+        record: desk::DeskStructureOpRecord,
+    },
+    DeskTextApplied {
+        record: desk::DeskTextOpRecord,
+    },
     Ready {
         workstreams: Vec<UiWorkstream>,
         agents: Vec<UiAgentSummary>,

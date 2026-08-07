@@ -1129,7 +1129,12 @@ async fn run(
             | ServerMessage::RealtimeRefused { .. }
             | ServerMessage::AgentStreamOpened { .. }
             | ServerMessage::VisualizationContent { .. }
-            | ServerMessage::VisualizationRefused { .. } => None,
+            | ServerMessage::VisualizationRefused { .. }
+            // Desk projection is wired into the workspace in the Desk UI
+            // slice; keep older/minimal surfaces protocol-compatible.
+            | ServerMessage::DeskSnapshot { .. }
+            | ServerMessage::DeskStructureApplied { .. }
+            | ServerMessage::DeskTextApplied { .. } => None,
         };
         if let Some(event) = event
             && events.unbounded_send(event).is_err()

@@ -422,6 +422,9 @@ fn handle_host_message(
         ServerMessage::QuotaHistory { series } => Some(ConnEvent::QuotaHistory(series.clone())),
         ServerMessage::GlobalUsage { series } => Some(ConnEvent::GlobalUsage(series.clone())),
         ServerMessage::Error { message } => Some(ConnEvent::ServerError(message.clone())),
+        ServerMessage::DeskSnapshot { .. }
+        | ServerMessage::DeskStructureApplied { .. }
+        | ServerMessage::DeskTextApplied { .. } => None,
         _ => None,
     };
     if let Some(event) = event {

@@ -13597,6 +13597,7 @@ dependencies = [
  "octo-server",
  "octo-types",
  "prefix-id",
+ "redb",
  "reqwest 0.12.28",
  "rho-agent",
  "rho-claude",
@@ -13621,6 +13622,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "text",
  "tokio",
  "tracing",
  "url",
@@ -13934,6 +13936,7 @@ dependencies = [
  "async-stream",
  "bytes",
  "camino",
+ "clock",
  "dirs",
  "futures 0.3.33",
  "rho-core",
@@ -13941,6 +13944,7 @@ dependencies = [
  "rho-shell-proto",
  "rho-workspaces-types",
  "senax-encoder",
+ "text",
  "tokio",
 ]
 

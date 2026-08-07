@@ -70,6 +70,7 @@ base64 = "0.22"
 bytes = "1"
 buffer_diff = { path = "vendor/zed/crates/buffer_diff" }
 camino = "1"
+clock = { path = "vendor/zed/crates/clock" }
 ciborium = "0.2"
 clap = { version = "4", features = ["derive", "env"] }
 deno_core = "0.407"
@@ -141,6 +142,7 @@ serde_json = "1"
 serde_yaml = "0.9"
 sha2 = "0.10"
 tempfile = { version = "3", default-features = false }
+text = { path = "vendor/zed/crates/text" }
 tokio = { version = "1", features = [
   "fs",
   "io-util",

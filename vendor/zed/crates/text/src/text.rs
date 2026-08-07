@@ -1370,6 +1370,26 @@ impl Buffer {
         Some(self.undo_or_redo(transaction))
     }
 
+    /// Creates and applies a native undo operation for persisted edit ids.
+    ///
+    /// Headless owners that persist the CRDT operation log may not retain the
+    /// process-local [`History`] stacks across restarts. This is the durable
+    /// counterpart to [`Buffer::undo_transaction`]: the caller persists a
+    /// transaction's edit ids, rebuilds the buffer from operations, and asks
+    /// the buffer to compute the correct next undo counts from its undo map.
+    pub fn undo_edit_ids(
+        &mut self,
+        edit_ids: impl IntoIterator<Item = clock::Lamport>,
+    ) -> Operation {
+        let id = self.lamport_clock.tick();
+        let start = self.version();
+        self.undo_or_redo(Transaction {
+            id,
+            edit_ids: edit_ids.into_iter().collect(),
+            start,
+        })
+    }
+
     pub fn undo_to_transaction(&mut self, transaction_id: TransactionId) -> Vec<Operation> {
         let transactions = self
             .history
