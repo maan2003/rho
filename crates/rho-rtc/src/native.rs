@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::future::Future;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -33,6 +34,7 @@ pub struct RtcSession {
     events: mpsc::Receiver<RtcEvent>,
     audio_source: Option<NativeAudioSource>,
     microphone_task: Option<tokio::task::JoinHandle<()>>,
+    input_muted: Arc<AtomicBool>,
     _output: MixerDeviceSink,
 }
 
@@ -189,6 +191,7 @@ impl RtcSession {
             events: event_rx,
             audio_source: Some(audio_source),
             microphone_task: None,
+            input_muted: Arc::new(AtomicBool::new(false)),
             _output: output,
         })
     }
@@ -203,9 +206,14 @@ impl RtcSession {
                 .audio_source
                 .take()
                 .context("RTC audio has already started")?;
-            self.microphone_task = Some(start_microphone(source)?);
+            self.microphone_task = Some(start_microphone(source, Arc::clone(&self.input_muted))?);
             tracing::info!("started realtime microphone after sideband readiness");
         }
+        Ok(())
+    }
+
+    pub fn set_input_muted(&mut self, muted: bool) -> anyhow::Result<()> {
+        self.input_muted.store(muted, Ordering::Relaxed);
         Ok(())
     }
 }
@@ -260,7 +268,10 @@ pub(crate) fn add_ice_candidates(
     Ok(completed)
 }
 
-fn start_microphone(source: NativeAudioSource) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+fn start_microphone(
+    source: NativeAudioSource,
+    input_muted: Arc<AtomicBool>,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let microphone = MicrophoneBuilder::new()
         .default_device()?
         .default_config()?
@@ -303,7 +314,10 @@ fn start_microphone(source: NativeAudioSource) -> anyhow::Result<tokio::task::Jo
             }
         })?;
     Ok(tokio::spawn(async move {
-        while let Some(samples) = rx.recv().await {
+        while let Some(mut samples) = rx.recv().await {
+            if input_muted.load(Ordering::Relaxed) {
+                samples.fill(0);
+            }
             let frame = AudioFrame {
                 data: samples.into(),
                 sample_rate: SAMPLE_RATE,

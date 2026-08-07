@@ -532,9 +532,13 @@ pub fn root_menu() -> Transient {
         .item("i", "input…", |workspace, window, cx| {
             workspace.open_transient(input_menu(), window, cx);
         })
-        .item("m", "iris microphone · toggle", |workspace, window, cx| {
-            workspace.cmd_voice(window, cx);
-        })
+        .item(
+            "m",
+            "iris microphone · mute/unmute",
+            |workspace, window, cx| {
+                workspace.cmd_voice(window, cx);
+            },
+        )
         .item("shift-m", "iris follow selection", |workspace, _, cx| {
             workspace.cmd_iris_follow_selection(cx);
         })
@@ -596,6 +600,16 @@ pub fn root_menu() -> Transient {
 
 fn input_menu() -> Transient {
     Transient::new("input")
+        .item(
+            "m",
+            "iris microphone · mute/unmute",
+            |workspace, window, cx| {
+                workspace.cmd_voice(window, cx);
+            },
+        )
+        .item("e", "iris session · end", |workspace, _, cx| {
+            workspace.cmd_end_iris(cx);
+        })
         .item("p", "paste clipboard", |workspace, window, cx| {
             workspace.cmd_paste_prompt(window, cx);
         })

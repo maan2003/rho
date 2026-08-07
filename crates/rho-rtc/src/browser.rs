@@ -23,6 +23,7 @@ pub struct RtcSession {
     peer: RtcPeerConnection,
     events: mpsc::Receiver<RtcEvent>,
     _microphone: Microphone,
+    input_muted: bool,
     remote_audio: Rc<RefCell<Option<HtmlAudioElement>>>,
     _callbacks: Callbacks,
 }
@@ -204,6 +205,7 @@ impl RtcSession {
             peer,
             events: event_rx,
             _microphone: microphone,
+            input_muted: true,
             remote_audio,
             _callbacks: Callbacks {
                 _ice: ice,
@@ -220,7 +222,16 @@ impl RtcSession {
     pub fn start_audio(&mut self) -> anyhow::Result<()> {
         for track in self._microphone.0.get_audio_tracks() {
             let track: MediaStreamTrack = track.dyn_into().map_err(js_error)?;
-            track.set_enabled(true);
+            track.set_enabled(!self.input_muted);
+        }
+        Ok(())
+    }
+
+    pub fn set_input_muted(&mut self, muted: bool) -> anyhow::Result<()> {
+        self.input_muted = muted;
+        for track in self._microphone.0.get_audio_tracks() {
+            let track: MediaStreamTrack = track.dyn_into().map_err(js_error)?;
+            track.set_enabled(!muted);
         }
         Ok(())
     }

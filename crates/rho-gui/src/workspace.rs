@@ -323,7 +323,9 @@ pub struct Workspace {
     pending_git_approval: Option<PendingGitApproval>,
     realtime_task: Option<Task<()>>,
     realtime_stop: Option<tokio::sync::oneshot::Sender<()>>,
-    iris_muted: bool,
+    realtime_input_muted: Option<tokio::sync::watch::Sender<bool>>,
+    iris_input_muted: bool,
+    iris_session_enabled: bool,
     /// The daemon running the voice session. Iris delegates to an agent by
     /// id, and an id from another daemon means nothing there, so the session
     /// binds to one host; selecting an agent elsewhere leaves it without
@@ -704,7 +706,9 @@ impl Workspace {
             pending_git_approval: None,
             realtime_task: None,
             realtime_stop: None,
-            iris_muted: false,
+            realtime_input_muted: None,
+            iris_input_muted: false,
+            iris_session_enabled: false,
             iris_host: None,
             _event_task: event_task,
             _dashboard_subscription: dashboard_subscription,
@@ -1539,12 +1543,18 @@ impl Workspace {
 
     fn toggle_voice(&mut self, _: &VoiceToggle, _: &mut Window, cx: &mut Context<Self>) {
         if self.realtime_task.is_some() {
-            self.iris_muted = true;
-            self.stop_iris();
-            self.notice_on(None, "muting Iris…", StyleClass::SystemInfo, cx);
+            self.iris_input_muted = !self.iris_input_muted;
+            if let Some(input_muted) = &self.realtime_input_muted {
+                input_muted.send_replace(self.iris_input_muted);
+            }
+            let message = match self.iris_input_muted {
+                true => "Iris microphone muted",
+                false => "Iris microphone unmuted",
+            };
+            self.notice_on(None, message, StyleClass::SystemInfo, cx);
             return;
         }
-        self.iris_muted = false;
+        self.iris_input_muted = false;
         // Voice follows what the user is looking at: start Iris on the
         // selected agent's daemon, so its delegations land where the work is.
         let host = self
@@ -1555,6 +1565,16 @@ impl Workspace {
             .filter(|host| self.hosts.is_online(*host))
             .or_else(|| self.hosts.primary());
         self.start_iris(host, cx);
+    }
+
+    pub(crate) fn cmd_end_iris(&mut self, cx: &mut Context<Self>) {
+        self.iris_session_enabled = false;
+        if self.realtime_task.is_some() {
+            self.stop_iris();
+            self.notice_on(None, "ending Iris session…", StyleClass::SystemInfo, cx);
+        } else {
+            self.notice_on(None, "Iris is not active", StyleClass::SystemInfo, cx);
+        }
     }
 
     fn stop_iris(&mut self) {
@@ -1585,7 +1605,6 @@ impl Workspace {
             return;
         }
         let name = self.host_label(host);
-        self.iris_muted = false;
         if self.realtime_task.is_some() {
             // The restart path in `start_iris` reopens on `iris_host`.
             self.iris_host = Some(host);
@@ -1610,12 +1629,14 @@ impl Workspace {
             return;
         };
         self.iris_host = Some(host);
+        self.iris_session_enabled = true;
         let Some(connection) = self.hosts.connection(host) else {
             return;
         };
         let (stop, stop_rx) = tokio::sync::oneshot::channel();
+        let (input_muted, input_muted_rx) = tokio::sync::watch::channel(self.iris_input_muted);
         #[cfg(feature = "native")]
-        let task = connection.start_native_realtime(stop_rx, cx);
+        let task = connection.start_native_realtime(stop_rx, input_muted_rx, cx);
         #[cfg(all(target_family = "wasm", not(feature = "native")))]
         let task = {
             let dialer = connection.realtime_dialer();
@@ -1626,11 +1647,13 @@ impl Workspace {
                         async move { dialer.open(offer_sdp).await }
                     },
                     stop_rx,
+                    input_muted_rx,
                 )
                 .await
             })
         };
         self.realtime_stop = Some(stop);
+        self.realtime_input_muted = Some(input_muted);
         let starting = match self.hosts.len() > 1 {
             true => format!("starting Iris on {}…", self.host_label(host)),
             false => "starting Iris…".to_owned(),
@@ -1652,13 +1675,14 @@ impl Workspace {
             let _ = this.update(cx, |this, cx| {
                 this.realtime_task = None;
                 this.realtime_stop = None;
+                this.realtime_input_muted = None;
                 let message = match result {
                     Ok(()) => "Iris stopped listening".to_owned(),
                     Err(error) => format!("Iris failed: {error:#}"),
                 };
                 this.notice_on(None, &message, StyleClass::SystemInfo, cx);
                 let host = this.iris_host.filter(|host| this.hosts.is_online(*host));
-                if host.is_some() && !this.iris_muted {
+                if host.is_some() && this.iris_session_enabled {
                     this.start_iris(host, cx);
                 }
             });

@@ -20,13 +20,20 @@ pub(crate) struct RealtimeChannel {
 pub(crate) async fn run_native(
     dialer: ChannelDialer,
     stop: tokio::sync::oneshot::Receiver<()>,
+    input_muted: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()> {
-    run(move |offer_sdp| dial_realtime(dialer, offer_sdp), stop).await
+    run(
+        move |offer_sdp| dial_realtime(dialer, offer_sdp),
+        stop,
+        input_muted,
+    )
+    .await
 }
 
 pub(crate) async fn run<D, F>(
     dial: D,
     mut stop: tokio::sync::oneshot::Receiver<()>,
+    mut input_muted: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<()>
 where
     D: FnOnce(String) -> F,
@@ -66,6 +73,7 @@ where
                 Some(RealtimeServerFrame::Closed) | None => anyhow::bail!("realtime sideband closed before becoming ready"),
             }
     }
+    session.set_input_muted(*input_muted.borrow())?;
     session.start_audio()?;
     tracing::info!("realtime client session established");
 
@@ -74,6 +82,12 @@ where
             tokio::select! {
                 biased;
                 _ = &mut stop => break,
+                changed = input_muted.changed() => {
+                    if changed.is_err() {
+                        break;
+                    }
+                    session.set_input_muted(*input_muted.borrow())?;
+                }
                 event = session.next_event() => match event {
                     Some(RtcEvent::Error(error)) => anyhow::bail!("realtime media failed: {error}"),
                     Some(RtcEvent::Closed) | None => anyhow::bail!("realtime peer closed unexpectedly"),
