@@ -59,6 +59,8 @@ actions!(
         DashboardJump,
         DashboardStaff,
         DashboardToggleSubagents,
+        DashboardHeadingBelow,
+        DashboardHeadingAbove,
         DashboardDemote,
         DashboardPromote,
         DashboardMoveUp,
@@ -290,8 +292,11 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         KeyBinding::new("enter", GitApprovalDeny, Some("RhoGitApproval")),
         KeyBinding::new("escape", GitApprovalDeny, Some("RhoGitApproval")),
     ]);
-    // Desk heading verbs. Body editing remains ordinary editor input in
-    // insert mode; normal mode addresses the stable node under the caret.
+    // Desk verbs, vim-native: text editing stays pure vim everywhere. Verbs
+    // bind only in normal mode; handlers for single-letter verbs act on a
+    // node's heading line and propagate to vim's own binding anywhere else,
+    // so `o`, `s`, `d`, `x`, and Tab keep their vim meaning in body text.
+    // Navigation uses vim-idiomatic `g`-prefixed gotos and works anywhere.
     cx.bind_keys([KeyBinding::new(
         "ctrl-z",
         DashboardUndo,
@@ -303,19 +308,22 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
     ] {
         cx.bind_keys([
             KeyBinding::new("enter", RailOpen, Some(context)),
+            KeyBinding::new("o", DashboardHeadingBelow, Some(context)),
+            KeyBinding::new("shift-o", DashboardHeadingAbove, Some(context)),
+            KeyBinding::new("s", DashboardStaff, Some(context)),
             KeyBinding::new("d", AgentDone, Some(context)),
             KeyBinding::new("x", AgentHide, Some(context)),
-            KeyBinding::new("n", DashboardNow, Some(context)),
-            KeyBinding::new("b", DashboardBack, Some(context)),
-            KeyBinding::new("g", DashboardJump, Some(context)),
-            KeyBinding::new("s", DashboardStaff, Some(context)),
-            KeyBinding::new("tab", DashboardDemote, Some(context)),
-            KeyBinding::new("shift-tab", DashboardPromote, Some(context)),
+            KeyBinding::new("tab", DashboardToggleSubagents, Some(context)),
+            KeyBinding::new("z a", DashboardToggleSubagents, Some(context)),
+            KeyBinding::new("> >", DashboardDemote, Some(context)),
+            KeyBinding::new("< <", DashboardPromote, Some(context)),
             KeyBinding::new("alt-up", DashboardMoveUp, Some(context)),
             KeyBinding::new("alt-down", DashboardMoveDown, Some(context)),
             KeyBinding::new("backspace", DashboardDeleteEmpty, Some(context)),
             KeyBinding::new("u", DashboardUndo, Some(context)),
-            KeyBinding::new("z", DashboardToggleSubagents, Some(context)),
+            KeyBinding::new("g n", DashboardNow, Some(context)),
+            KeyBinding::new("g b", DashboardBack, Some(context)),
+            KeyBinding::new("g h", DashboardJump, Some(context)),
         ]);
     }
 }

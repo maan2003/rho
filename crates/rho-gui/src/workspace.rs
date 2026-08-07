@@ -52,8 +52,9 @@ use crate::style::{RoleFamily, StyleClass};
 use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
     AgentDone, AgentHide, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, DashboardBack,
-    DashboardDeleteEmpty, DashboardDemote, DashboardJump, DashboardMoveDown, DashboardMoveUp,
-    DashboardNow, DashboardPromote, DashboardStaff, DashboardToggleSubagents, DashboardUndo,
+    DashboardDeleteEmpty, DashboardDemote, DashboardHeadingAbove, DashboardHeadingBelow,
+    DashboardJump, DashboardMoveDown, DashboardMoveUp, DashboardNow, DashboardPromote,
+    DashboardStaff, DashboardToggleSubagents, DashboardUndo,
     GitApprovalAllow, GitApprovalDeny, MinibufferCancel, MinibufferComplete, MinibufferConfirm,
     MinibufferNext, MinibufferPrevious, PaneBack, PaneClose, PaneFocusNext, PaneSplitDown,
     PaneSplitRight, PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof,
@@ -1069,6 +1070,10 @@ impl Workspace {
                     self.pending_desk_insert = None;
                     self.dashboard.sync(&self.registry, window, cx);
                     self.dashboard.jump_to_node(host, node_id, window, cx);
+                    // `o`/`O` end in insert mode on the empty title, like vim.
+                    if let Ok(action) = cx.build_action("vim::InsertBefore", None) {
+                        window.dispatch_action(action, cx);
+                    }
                 }
             }
             ConnEvent::DeskTextApplied(record) => {
@@ -4922,15 +4927,35 @@ impl Workspace {
 
     /// `enter` on a staffed Desk heading opens its bound agent.
     fn dashboard_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some((host, parent, order)) = self.dashboard.insert_sibling_at_heading_end(cx) {
-            self.pending_desk_insert = Some(host);
-            self.send_to_host(host, ClientMessage::DeskInsert { parent, order });
-            return;
-        }
         if let Some(crate::dashboard::RowTarget::Agent(agent_id)) = self.dashboard.cursor_target(cx)
         {
             self.open_agent(agent_id, window, cx);
         }
+    }
+
+    /// Vim-style `o`/`O` on a heading line: insert a sibling node below or
+    /// above. Anywhere else the action propagates so vim's own open-line
+    /// binding runs.
+    fn dashboard_insert_heading(
+        &mut self,
+        above: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.dashboard_verb_applies(window, cx) {
+            cx.propagate();
+            return;
+        }
+        if let Some((host, parent, order)) = self.dashboard.insert_sibling(above, cx) {
+            self.pending_desk_insert = Some(host);
+            self.send_to_host(host, ClientMessage::DeskInsert { parent, order });
+        }
+    }
+
+    /// Single-letter Desk verbs only apply on a heading line of the focused
+    /// Desk; otherwise the caller propagates the key back to vim.
+    fn dashboard_verb_applies(&mut self, window: &Window, cx: &mut Context<Self>) -> bool {
+        self.dashboard.is_focused(window, cx) && self.dashboard.cursor_on_heading_line(cx)
     }
 
     #[cfg(all(target_family = "wasm", not(feature = "native")))]
@@ -5843,13 +5868,35 @@ impl Render for Workspace {
                 this.jump_to_attention(window, cx);
             }))
             .on_action(cx.listener(|this, _: &AgentDone, window, cx| {
+                if this.dashboard.is_focused(window, cx)
+                    && !this.dashboard.cursor_on_heading_line(cx)
+                {
+                    cx.propagate();
+                    return;
+                }
                 this.cmd_agent_done(false, window, cx);
             }))
             .on_action(cx.listener(|this, _: &AgentHide, window, cx| {
+                if this.dashboard.is_focused(window, cx)
+                    && !this.dashboard.cursor_on_heading_line(cx)
+                {
+                    cx.propagate();
+                    return;
+                }
                 this.cmd_agent_done(true, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &DashboardStaff, _, cx| {
+            .on_action(cx.listener(|this, _: &DashboardStaff, window, cx| {
+                if !this.dashboard_verb_applies(window, cx) {
+                    cx.propagate();
+                    return;
+                }
                 this.staff_dashboard_node(cx);
+            }))
+            .on_action(cx.listener(|this, _: &DashboardHeadingBelow, window, cx| {
+                this.dashboard_insert_heading(false, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DashboardHeadingAbove, window, cx| {
+                this.dashboard_insert_heading(true, window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardNow, window, cx| {
                 this.dashboard_now(window, cx);
@@ -5860,14 +5907,26 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &DashboardJump, window, cx| {
                 this.prompt_dashboard_jump(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &DashboardToggleSubagents, _, cx| {
+            .on_action(cx.listener(|this, _: &DashboardToggleSubagents, window, cx| {
+                if !this.dashboard_verb_applies(window, cx) {
+                    cx.propagate();
+                    return;
+                }
                 this.dashboard.toggle_subagents(cx);
                 this.dashboard_dirty = true;
             }))
-            .on_action(cx.listener(|this, _: &DashboardDemote, _, cx| {
+            .on_action(cx.listener(|this, _: &DashboardDemote, window, cx| {
+                if !this.dashboard_verb_applies(window, cx) {
+                    cx.propagate();
+                    return;
+                }
                 this.dashboard_structure_move(crate::dashboard::StructureDirection::Demote, cx);
             }))
-            .on_action(cx.listener(|this, _: &DashboardPromote, _, cx| {
+            .on_action(cx.listener(|this, _: &DashboardPromote, window, cx| {
+                if !this.dashboard_verb_applies(window, cx) {
+                    cx.propagate();
+                    return;
+                }
                 this.dashboard_structure_move(crate::dashboard::StructureDirection::Promote, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardMoveUp, _, cx| {
@@ -5876,7 +5935,11 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &DashboardMoveDown, _, cx| {
                 this.dashboard_structure_move(crate::dashboard::StructureDirection::Down, cx);
             }))
-            .on_action(cx.listener(|this, _: &DashboardDeleteEmpty, _, cx| {
+            .on_action(cx.listener(|this, _: &DashboardDeleteEmpty, window, cx| {
+                if !this.dashboard_verb_applies(window, cx) {
+                    cx.propagate();
+                    return;
+                }
                 this.dashboard_delete_empty(cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardUndo, _, cx| {

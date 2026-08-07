@@ -996,9 +996,9 @@ impl Dashboard {
                 .unwrap_or(false)
         });
         if on_heading {
-            "Enter new sibling · Tab/⇧Tab demote/promote · Alt-↑/↓ move · Backspace delete empty · z fold · u undo"
+            "o/O new heading · >>/<< demote/promote · Tab fold · s staff · d done · x discard · Alt-↑/↓ move · gn now · gh jump"
         } else {
-            "edit text · Esc heading verbs"
+            "vim editing · gn now · gb back · gh jump headings"
         }
     }
 
@@ -1078,16 +1078,28 @@ impl Dashboard {
         }
     }
 
-    pub fn insert_sibling_at_heading_end(
+    /// True when the caret sits on a node's first line, where normal-mode
+    /// keys are Desk verbs instead of vim commands.
+    pub fn cursor_on_heading_line(&self, cx: &mut Context<Workspace>) -> bool {
+        let Some((host, node_id, offset)) = self.cursor_node_offset(cx) else {
+            return false;
+        };
+        let Some(buffer) = self.buffers.get(&(host, node_id)) else {
+            return false;
+        };
+        let buffer = buffer.read(cx);
+        let text = buffer.text_for_range(0..buffer.len()).collect::<String>();
+        offset <= text.find('\n').unwrap_or(text.len())
+    }
+
+    /// Sibling insertion point for `o`/`O` on a heading: the fractional order
+    /// directly below or above the caret's node.
+    pub fn insert_sibling(
         &self,
+        above: bool,
         cx: &mut Context<Workspace>,
     ) -> Option<(HostId, Option<DeskNodeId>, rho_ui_proto::desk::DeskOrderKey)> {
-        let (host, node_id, offset) = self.cursor_node_offset(cx)?;
-        let buffer = self.buffers.get(&(host, node_id))?.read(cx);
-        let text = buffer.text_for_range(0..buffer.len()).collect::<String>();
-        if offset != text.find('\n').unwrap_or(text.len()) {
-            return None;
-        }
+        let (host, node_id) = self.cursor_node(cx)?;
         let desk = self.hosts.get(&host)?;
         let node = desk.snapshot.node(node_id)?;
         let mut siblings = desk
@@ -1100,8 +1112,16 @@ impl Dashboard {
         let index = siblings
             .iter()
             .position(|candidate| candidate.id == node_id)?;
-        let upper = siblings.get(index + 1).map(|candidate| &candidate.order);
-        let order = rho_ui_proto::desk::DeskOrderKey::between(Some(&node.order), upper)?;
+        let order = if above {
+            let lower = index
+                .checked_sub(1)
+                .and_then(|previous| siblings.get(previous))
+                .map(|candidate| &candidate.order);
+            rho_ui_proto::desk::DeskOrderKey::between(lower, Some(&node.order))?
+        } else {
+            let upper = siblings.get(index + 1).map(|candidate| &candidate.order);
+            rho_ui_proto::desk::DeskOrderKey::between(Some(&node.order), upper)?
+        };
         Some((host, node.parent, order))
     }
 
