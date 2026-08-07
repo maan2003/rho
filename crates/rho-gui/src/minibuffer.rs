@@ -54,6 +54,11 @@ pub struct Echo {
 }
 
 impl Echo {
+    #[cfg(test)]
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
     pub fn new(text: &str, class: StyleClass, dismiss: gpui::Task<()>) -> Self {
         Self {
             text: text.to_owned(),

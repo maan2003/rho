@@ -3098,6 +3098,14 @@ impl Workspace {
             rho_ui_proto::AgentDisposition::Snoozed { until } => until.0 > now_ms(),
             rho_ui_proto::AgentDisposition::Pending => false,
         };
+        // Name what the press covered. A verdict is otherwise the one action
+        // whose success looks exactly like a key that did nothing, which is
+        // how a row that will not settle stays a mystery.
+        let subject = match targets.as_slice() {
+            [agent_id] => self.registry.agent_display_label(*agent_id),
+            agents => format!("{} agents", agents.len()),
+        };
+        self.echo(&format!("{command}: {subject}"), StyleClass::SystemInfo, cx);
         for agent_id in targets {
             self.send_to_agent(
                 agent_id,
@@ -4206,6 +4214,16 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Option<crate::dashboard::RowTarget> {
         self.dashboard.cursor_target(cx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn echo_text_for_test(&self) -> Option<String> {
+        self.echo.as_ref().map(|echo| echo.text().to_owned())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn focus_rail_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus_rail(window, cx);
     }
 
     #[cfg(test)]

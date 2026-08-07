@@ -3908,3 +3908,81 @@ fn streaming_markdown_parses_the_edited_turn_without_revisiting_history(cx: &mut
     );
 }
 
+
+/// Triage from the dashboard has to survive the modal editor: in helix
+/// normal mode `d` is a delete operator, and rho's row binding has to win.
+/// Reaching the daemon is what the test cannot do, so the "not connected"
+/// notice is the proof that the press dispatched.
+#[gpui::test]
+fn the_dashboard_done_key_dispatches_in_helix_normal_mode(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    cx.update(|cx| {
+        cx.global_mut::<SettingsStore>()
+            .override_global(vim_mode_setting::HelixModeSetting(true));
+    });
+    cx.update(bind_test_keymaps);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let mut summary = agent_summary(1, None);
+            summary.attention = UiAttention::Pending;
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Ready {
+                    workstreams: vec![UiWorkstream {
+                        workstream_id: WorkstreamId(1),
+                        name: "Existing work".to_owned(),
+                        labels: Vec::new(),
+                    }],
+                    agents: vec![summary],
+                    projects: Vec::new(),
+                    auth: auth_state(),
+                    machine_seed: 0,
+                    agent_counter: 1,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+            workspace.focus_rail_for_test(window, cx);
+        })
+        .expect("ready");
+    cx.run_until_parked();
+    let dashboard = workspace
+        .update(cx, |workspace, _, _| workspace.dashboard_editor())
+        .expect("dashboard editor");
+    workspace
+        .update(cx, |_, window, cx| {
+            dashboard.update(cx, |editor, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let offset = snapshot.text().find("Existing work").expect("stream row");
+                let anchor = snapshot.anchor_before(multi_buffer::MultiBufferOffset(offset));
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_anchor_ranges([anchor..anchor]);
+                });
+            });
+        })
+        .expect("park the cursor on the stream row");
+    cx.simulate_keystrokes(*workspace, "escape");
+    workspace
+        .update(cx, |_, window, _| {
+            let context = format!("{:?}", window.context_stack());
+            assert!(
+                context.contains("vim_mode=helix_normal"),
+                "the dashboard editor should be in helix normal mode: {context}"
+            );
+        })
+        .expect("check the editor mode");
+
+    cx.simulate_keystrokes(*workspace, "d");
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(
+                workspace.echo_text_for_test().as_deref(),
+                Some("not connected to rho-daemon"),
+                "`d` on a dashboard row must reach triage, not vim's delete"
+            );
+        })
+        .expect("inspect the echo area");
+}
