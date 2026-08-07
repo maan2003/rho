@@ -2436,21 +2436,30 @@ impl Workspace {
         } else {
             rho_ui_proto::AgentDisposition::Done
         };
-        let targets = self.disposition_targets(cx);
+        let targets = self.disposition_targets(window, cx);
+        let hid_open_agent = self
+            .registry
+            .selected_agent()
+            .is_some_and(|agent_id| targets.contains(agent_id));
         let sent = self.set_agent_disposition(targets, "done", disposition, cx);
         // Hiding the open agent closes its tab, or it would stay
         // rail-visible through the selection exemption.
-        if hide && sent && self.registry.selected_agent().is_some() {
+        if hide && sent && hid_open_agent {
             self.select_agent(None, window, cx);
         }
     }
 
-    pub(crate) fn cmd_agent_snooze(&mut self, duration_ms: u64, cx: &mut Context<Self>) {
+    pub(crate) fn cmd_agent_snooze(
+        &mut self,
+        duration_ms: u64,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.require_connected(cx) {
             return;
         }
         let until = rho_core::UnixMs(now_ms().saturating_add(duration_ms));
-        let targets = self.disposition_targets(cx);
+        let targets = self.disposition_targets(window, cx);
         self.set_agent_disposition(
             targets,
             "snooze",
@@ -3053,25 +3062,40 @@ impl Workspace {
     /// attention; returns the agent it acted on. The daemon echoes the
     /// resulting attention level back as a broadcast, so the rail updates
     /// through the normal event path.
-    /// Whom a triage verdict speaks for: the open agent, or — with none
-    /// open, as when `d` comes from the dashboard — the row under the
-    /// cursor. Either way it covers everything the row's lamp aggregates,
-    /// which is the whole workstream for a stream row and the agent's
-    /// subtree for an agent row; acking only the root would leave the row
-    /// active on a child's lamp, and the row would never reach settled.
-    fn disposition_targets(&mut self, cx: &mut Context<Self>) -> Vec<AgentId> {
-        use crate::dashboard::RowTarget;
-        if let Some(agent_id) = self.registry.selected_agent().copied() {
-            return self.registry.agent_subtree(agent_id);
+    /// Whom a triage verdict speaks for: the row under the dashboard cursor
+    /// when the press came from the dashboard, otherwise the open agent.
+    /// Which one is asking has to be read from focus, not from whether a tab
+    /// happens to be open — triaging the rail with a conversation open is
+    /// the normal way to work, and taking the tab's agent there would ack
+    /// something the user is not even looking at.
+    ///
+    /// Either way it covers everything the row's lamp aggregates: the whole
+    /// workstream for a stream row, the agent's subtree for an agent row.
+    /// Acking only the root would leave the row active on a child's lamp.
+    fn disposition_targets(&mut self, window: &Window, cx: &mut Context<Self>) -> Vec<AgentId> {
+        let selected = self
+            .registry
+            .selected_agent()
+            .copied()
+            .map(|agent_id| self.registry.agent_subtree(agent_id));
+        if !self.dashboard.focus_handle(cx).is_focused(window) {
+            return selected.unwrap_or_default();
         }
+        self.dashboard_row_targets(cx)
+            .or(selected)
+            .unwrap_or_default()
+    }
+
+    fn dashboard_row_targets(&mut self, cx: &mut Context<Self>) -> Option<Vec<AgentId>> {
+        use crate::dashboard::RowTarget;
         match self.dashboard.cursor_target(cx) {
             Some(RowTarget::Stream { workstream_id, .. }) => {
-                self.registry.workstream_agents(workstream_id)
+                Some(self.registry.workstream_agents(workstream_id))
             }
             Some(RowTarget::Agent(agent_id)) | Some(RowTarget::Reply(agent_id)) => {
-                self.registry.agent_subtree(agent_id)
+                Some(self.registry.agent_subtree(agent_id))
             }
-            _ => Vec::new(),
+            _ => None,
         }
     }
 
@@ -4227,8 +4251,12 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn triage_targets(&mut self, cx: &mut Context<Self>) -> Vec<AgentId> {
-        self.disposition_targets(cx)
+    pub(crate) fn triage_targets(
+        &mut self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AgentId> {
+        self.disposition_targets(window, cx)
     }
 
     #[cfg(test)]
@@ -4782,14 +4810,14 @@ impl Workspace {
         let on_submit = std::rc::Rc::new(
             |workspace: &mut Workspace,
              input: String,
-             _window: &mut Window,
+             window: &mut Window,
              cx: &mut Context<Workspace>| {
                 let input = input.trim();
                 if input.is_empty() {
                     return;
                 }
                 match parse_duration_ms(input) {
-                    Some(duration_ms) => workspace.cmd_agent_snooze(duration_ms, cx),
+                    Some(duration_ms) => workspace.cmd_agent_snooze(duration_ms, window, cx),
                     None => workspace.notice_on(
                         None,
                         &format!("snooze: bad duration `{input}` (30m, 2h, 1d)"),

@@ -1343,14 +1343,14 @@ fn agent_menu() -> Transient {
 fn snooze_menu() -> Transient {
     const MINUTE_MS: u64 = 60 * 1000;
     Transient::new("snooze")
-        .item("3", "30 minutes", |workspace, _, cx| {
-            workspace.cmd_agent_snooze(30 * MINUTE_MS, cx);
+        .item("3", "30 minutes", |workspace, window, cx| {
+            workspace.cmd_agent_snooze(30 * MINUTE_MS, window, cx);
         })
-        .item("h", "2 hours", |workspace, _, cx| {
-            workspace.cmd_agent_snooze(2 * 60 * MINUTE_MS, cx);
+        .item("h", "2 hours", |workspace, window, cx| {
+            workspace.cmd_agent_snooze(2 * 60 * MINUTE_MS, window, cx);
         })
-        .item("d", "1 day", |workspace, _, cx| {
-            workspace.cmd_agent_snooze(24 * 60 * MINUTE_MS, cx);
+        .item("d", "1 day", |workspace, window, cx| {
+            workspace.cmd_agent_snooze(24 * 60 * MINUTE_MS, window, cx);
         })
         .item("c", "custom…", |workspace, window, cx| {
             workspace.prompt_snooze(window, cx);

@@ -441,7 +441,7 @@ fn triage_targets_the_whole_dashboard_row_under_the_cursor(cx: &mut TestAppConte
             workspace.sync_dashboard(window, cx);
             assert!(workspace.is_dashboard_mode(window, cx));
             // The cursor starts on the Iris row, which speaks for no agent.
-            assert_eq!(workspace.triage_targets(cx), Vec::new());
+            assert_eq!(workspace.triage_targets(window, cx), Vec::new());
         })
         .expect("start on dashboard");
     cx.run_until_parked();
@@ -459,7 +459,7 @@ fn triage_targets_the_whole_dashboard_row_under_the_cursor(cx: &mut TestAppConte
                     selections.select_anchor_ranges([anchor..anchor]);
                 });
             });
-            let mut targets = workspace.triage_targets(cx);
+            let mut targets = workspace.triage_targets(window, cx);
             targets.sort();
             assert_eq!(
                 targets,
@@ -468,6 +468,75 @@ fn triage_targets_the_whole_dashboard_row_under_the_cursor(cx: &mut TestAppConte
             );
         })
         .expect("park the cursor on the stream row");
+}
+
+/// Triaging the rail while a conversation is open is the normal way to
+/// work: the verdict belongs to the row under the cursor, not to whatever
+/// tab happens to be open behind the dashboard.
+#[gpui::test]
+fn triage_from_the_dashboard_ignores_the_open_agent(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let mut root = agent_summary(1, None);
+            root.attention = UiAttention::Pending;
+            let mut other = agent_summary(3, None);
+            other.workstream = WorkstreamId(2);
+            other.attention = UiAttention::Pending;
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Ready {
+                    workstreams: vec![
+                        UiWorkstream {
+                            workstream_id: WorkstreamId(1),
+                            name: "Existing work".to_owned(),
+                            labels: Vec::new(),
+                        },
+                        UiWorkstream {
+                            workstream_id: WorkstreamId(2),
+                            name: "Other work".to_owned(),
+                            labels: Vec::new(),
+                        },
+                    ],
+                    agents: vec![root, other],
+                    projects: Vec::new(),
+                    auth: auth_state(),
+                    machine_seed: 0,
+                    agent_counter: 3,
+                },
+                window,
+                cx,
+            );
+            workspace.select_agent(Some(agent(3)), window, cx);
+            workspace.sync_dashboard(window, cx);
+        })
+        .expect("open the other workstream's agent");
+    cx.run_until_parked();
+
+    let dashboard = workspace
+        .update(cx, |workspace, _, _| workspace.dashboard_editor())
+        .expect("dashboard editor");
+    workspace
+        .update(cx, |workspace, window, cx| {
+            // The open tab still owns the verdict while it holds focus.
+            assert_eq!(workspace.triage_targets(window, cx), vec![agent(3)]);
+
+            workspace.focus_rail_for_test(window, cx);
+            dashboard.update(cx, |editor, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let offset = snapshot.text().find("Existing work").expect("stream row");
+                let anchor = snapshot.anchor_before(multi_buffer::MultiBufferOffset(offset));
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_anchor_ranges([anchor..anchor]);
+                });
+            });
+            assert_eq!(
+                workspace.triage_targets(window, cx),
+                vec![agent(1)],
+                "a dashboard verdict speaks for the row under the cursor"
+            );
+        })
+        .expect("triage the rail row behind the open tab");
 }
 
 /// The row settles only once every agent it aggregates is quiet — the
