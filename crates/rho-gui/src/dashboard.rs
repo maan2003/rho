@@ -85,6 +85,13 @@ struct DeskCaret {
     collapsed: HashSet<(HostId, DeskNodeId)>,
 }
 
+struct HeadingEntry {
+    label: String,
+    description: String,
+    host: HostId,
+    node_id: DeskNodeId,
+}
+
 pub struct Dashboard {
     multi_buffer: Entity<MultiBuffer>,
     editor: Entity<Editor>,
@@ -831,6 +838,90 @@ impl Dashboard {
         self.move_to_anchor(caret.anchor, window, cx)
     }
 
+    fn heading_entries(&self, registry: &AgentRegistry, cx: &App) -> Vec<HeadingEntry> {
+        let mut entries = Vec::new();
+        for (&host, desk) in &self.hosts {
+            let mut order = Vec::new();
+            let mut projection = Projection::default();
+            project_depth_first(
+                &desk.snapshot.nodes,
+                None,
+                &HashSet::new(),
+                host,
+                0,
+                false,
+                &mut projection,
+            );
+            order.extend(projection.order);
+            for (_, node_id) in order {
+                let Some(buffer) = self.buffers.get(&(host, node_id)) else {
+                    continue;
+                };
+                let buffer = buffer.read(cx);
+                let text = buffer.text_for_range(0..buffer.len()).collect::<String>();
+                let (_, title) = parse_heading_line(&text);
+                let title = if title.is_empty() {
+                    "(untitled)"
+                } else {
+                    title
+                };
+                entries.push(HeadingEntry {
+                    label: format!("{title} · {} · #{}", registry.host_name(host), node_id.0),
+                    description: format!("{} · node {}", registry.host_name(host), node_id.0),
+                    host,
+                    node_id,
+                });
+            }
+        }
+        entries
+    }
+
+    pub fn heading_candidates(
+        &self,
+        registry: &AgentRegistry,
+        input: &str,
+        cx: &App,
+    ) -> Vec<(String, String)> {
+        self.heading_entries(registry, cx)
+            .into_iter()
+            .filter(|entry| fuzzy_contains(&entry.label, input))
+            .map(|entry| (entry.label, entry.description))
+            .collect()
+    }
+
+    pub fn jump_to_heading(
+        &mut self,
+        label: &str,
+        registry: &AgentRegistry,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> bool {
+        let Some(entry) = self
+            .heading_entries(registry, cx)
+            .into_iter()
+            .find(|entry| entry.label == label)
+        else {
+            return false;
+        };
+        let Some(desk) = self.hosts.get(&entry.host) else {
+            return false;
+        };
+        let mut current = desk
+            .snapshot
+            .node(entry.node_id)
+            .and_then(|node| node.parent);
+        while let Some(parent) = current {
+            self.collapsed.remove(&(entry.host, parent));
+            current = desk.snapshot.node(parent).and_then(|node| node.parent);
+        }
+        self.sync(registry, window, cx);
+        let Some(buffer) = self.buffers.get(&(entry.host, entry.node_id)) else {
+            return false;
+        };
+        let anchor = buffer.read(cx).anchor_before(0);
+        self.move_to_anchor(anchor, window, cx)
+    }
+
     pub fn hint(&self, cx: &mut Context<Workspace>) -> &'static str {
         let on_heading = self.editor.update(cx, |editor, cx| {
             let head = editor
@@ -1037,6 +1128,14 @@ fn node_path(nodes: &[DeskNode], node_id: DeskNodeId) -> Option<Vec<DeskNodeId>>
     Some(path)
 }
 
+fn fuzzy_contains(candidate: &str, query: &str) -> bool {
+    let mut candidate = candidate.chars().flat_map(char::to_lowercase);
+    query
+        .chars()
+        .flat_map(char::to_lowercase)
+        .all(|needle| candidate.by_ref().any(|character| character == needle))
+}
+
 #[cfg(test)]
 mod tests {
     use rho_ui_proto::desk::DeskOrderKey;
@@ -1050,6 +1149,8 @@ mod tests {
             (Some(ParsedHeadingState::Todo), "ship Desk")
         );
         assert_eq!(parse_heading_line("TODOish title"), (None, "TODOish title"));
+        assert!(fuzzy_contains("Ship the Desk", "std"));
+        assert!(!fuzzy_contains("Ship the Desk", "xyz"));
     }
 
     #[test]

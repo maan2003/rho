@@ -52,12 +52,12 @@ use crate::style::{RoleFamily, StyleClass};
 use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
     AgentDone, AgentHide, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, DashboardBack,
-    DashboardNewAgent, DashboardNow, DashboardReply, DashboardStaff, DashboardToggleSubagents,
-    GitApprovalAllow, GitApprovalDeny, MinibufferCancel, MinibufferComplete, MinibufferConfirm,
-    MinibufferNext, MinibufferPrevious, PaneBack, PaneClose, PaneFocusNext, PaneSplitDown,
-    PaneSplitRight, PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof,
-    ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit, SubmitPrompt, TaskBoard,
-    VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow, ZulipQuit,
+    DashboardJump, DashboardNewAgent, DashboardNow, DashboardReply, DashboardStaff,
+    DashboardToggleSubagents, GitApprovalAllow, GitApprovalDeny, MinibufferCancel,
+    MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious, PaneBack, PaneClose,
+    PaneFocusNext, PaneSplitDown, PaneSplitRight, PastePrompt, RailFocus, RailOpen, RoleCycle,
+    RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit,
+    SubmitPrompt, TaskBoard, VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow, ZulipQuit,
 };
 
 /// What a pane shows: stable identity plus the live view. Surfaces live
@@ -5539,6 +5539,33 @@ impl Workspace {
         }
     }
 
+    fn prompt_dashboard_jump(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, cx: &gpui::App| {
+            workspace
+                .dashboard
+                .heading_candidates(&workspace.registry, input.trim(), cx)
+                .into_iter()
+                .map(|(value, description)| crate::commands::Candidate { value, description })
+                .collect()
+        });
+        let on_submit = std::rc::Rc::new(
+            |workspace: &mut Workspace,
+             input: String,
+             window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                if workspace.dashboard.jump_to_heading(
+                    input.trim(),
+                    &workspace.registry,
+                    window,
+                    cx,
+                ) {
+                    window.focus(&workspace.dashboard.focus_handle(cx), cx);
+                }
+            },
+        );
+        self.open_prompt("Desk heading:", complete, on_submit, window, cx);
+    }
+
     /// `r` in the dashboard: splice an inline reply draft under the row —
     /// the cursor moves into it, in insert mode, but never leaves the
     /// dashboard. Drafts park where they are: wander off mid-thought and
@@ -6368,6 +6395,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &DashboardBack, window, cx| {
                 this.dashboard_back(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DashboardJump, window, cx| {
+                this.prompt_dashboard_jump(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardToggleSubagents, _, cx| {
                 this.dashboard.toggle_subagents(cx);
