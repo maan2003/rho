@@ -63,7 +63,6 @@ pub enum ConnEvent {
         replica_id: u16,
     },
     DeskTextApplied(rho_ui_proto::desk::DeskTextOpRecord),
-    DeskBindingChanged(rho_ui_proto::desk::DeskBinding),
     Ready {
         agents: Vec<UiAgentSummary>,
         iris_agent: Option<AgentId>,
@@ -428,9 +427,6 @@ fn handle_host_message(
         }),
         ServerMessage::DeskTextApplied { record } => {
             Some(ConnEvent::DeskTextApplied(record.clone()))
-        }
-        ServerMessage::DeskBindingChanged { binding } => {
-            Some(ConnEvent::DeskBindingChanged(binding.clone()))
         }
         _ => None,
     };

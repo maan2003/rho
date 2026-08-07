@@ -356,6 +356,9 @@ impl AgentRegistry {
     pub fn agent_role(&self, agent_id: AgentId) -> Option<rho_ui_proto::AgentRole> {
         self.agent_summary(agent_id).map(|a| a.role)
     }
+    pub fn agent_disposition(&self, agent_id: AgentId) -> Option<rho_ui_proto::AgentDisposition> {
+        self.agent_summary(agent_id).map(|agent| agent.disposition)
+    }
     pub fn agent_last_active(&self, agent_id: AgentId) -> Option<rho_core::UnixMs> {
         self.last_active.get(&agent_id).copied()
     }

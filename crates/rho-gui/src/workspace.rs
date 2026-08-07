@@ -218,6 +218,33 @@ struct HostProject {
     project: rho_ui_proto::UiProject,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeskProjectResolution {
+    Use(usize),
+    Choose,
+    Missing,
+}
+
+fn resolve_desk_project(property: Option<&str>, projects: &[HostProject]) -> DeskProjectResolution {
+    if let Some(property) = property {
+        return projects
+            .iter()
+            .position(|candidate| {
+                candidate.project.name == property || candidate.project.path == property
+            })
+            .map_or(DeskProjectResolution::Missing, DeskProjectResolution::Use);
+    }
+    match projects.len() {
+        0 => DeskProjectResolution::Missing,
+        1 => DeskProjectResolution::Use(0),
+        _ => DeskProjectResolution::Choose,
+    }
+}
+
+fn updated_desk_brief(brief: &str) -> String {
+    format!("Updated brief from the Desk:\n\n{brief}")
+}
+
 pub struct Workspace {
     hosts: Hosts,
     subscriptions: AgentSubscriptions,
@@ -1047,7 +1074,6 @@ impl Workspace {
             ConnEvent::Ready { .. }
                 | ConnEvent::DeskSnapshot { .. }
                 | ConnEvent::DeskTextApplied(_)
-                | ConnEvent::DeskBindingChanged(_)
                 | ConnEvent::AgentCreated { .. }
                 | ConnEvent::AgentAttention { .. }
                 | ConnEvent::AgentTurnReport { .. }
@@ -1064,9 +1090,6 @@ impl Workspace {
             }
             ConnEvent::DeskTextApplied(record) => {
                 self.dashboard.apply_text(host, record, cx);
-            }
-            ConnEvent::DeskBindingChanged(binding) => {
-                self.dashboard.apply_binding(host, binding);
             }
             ConnEvent::Ready {
                 agents,
@@ -2378,7 +2401,7 @@ impl Workspace {
     ) {
         if desk_heading_without_agent(
             self.dashboard.is_focused(window, cx),
-            self.dashboard.cursor_target(cx),
+            self.dashboard.cursor_target(&self.registry, cx),
         ) {
             self.dashboard.set_cursor_heading_state(
                 if hide {
@@ -2922,7 +2945,7 @@ impl Workspace {
         use crate::dashboard::RowTarget;
 
         let row = if self.dashboard.focus_handle(cx).is_focused(window) {
-            self.dashboard.cursor_target(cx)
+            self.dashboard.cursor_target(&self.registry, cx)
         } else {
             None
         };
@@ -3353,7 +3376,7 @@ impl Workspace {
         if !self.dashboard.focus_handle(cx).is_focused(window) {
             return;
         }
-        match self.dashboard.cursor_target(cx) {
+        match self.dashboard.cursor_target(&self.registry, cx) {
             Some(RowTarget::Agent(agent_id)) if self.dashboard_preview != Some(agent_id) => {
                 self.preview_agent(agent_id, window, cx);
             }
@@ -4996,9 +5019,10 @@ impl Workspace {
         self.open_new_agent_transient(window, cx);
     }
 
-    /// `enter` on a staffed Desk heading opens its bound agent.
+    /// `enter` on a bound Desk heading opens its agent.
     fn dashboard_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(crate::dashboard::RowTarget::Agent(agent_id)) = self.dashboard.cursor_target(cx)
+        if let Some(crate::dashboard::RowTarget::Agent(agent_id)) =
+            self.dashboard.cursor_target(&self.registry, cx)
         {
             self.open_agent(agent_id, window, cx);
         }
@@ -5035,37 +5059,144 @@ impl Workspace {
         self.dashboard_open(window, cx);
     }
 
-    fn staff_dashboard_node(&mut self, cx: &mut Context<Self>) {
-        let (host, heading_offset, text) = match self.dashboard.staffing_target(cx) {
+    fn staff_dashboard_node(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (host, heading_offset, text, project) = match self.dashboard.staffing_target(cx) {
             Ok(target) => target,
             Err(message) => {
                 self.notice_on(None, message, StyleClass::SystemInfo, cx);
                 return;
             }
         };
-        let workdir = self
+        if let Some(crate::dashboard::RowTarget::Agent(agent_id)) =
+            self.dashboard.cursor_target(&self.registry, cx)
+            && matches!(
+                self.registry.agent_disposition(agent_id),
+                Some(
+                    rho_ui_proto::AgentDisposition::Pending
+                        | rho_ui_proto::AgentDisposition::Snoozed { .. }
+                )
+            )
+        {
+            self.send_to_host(
+                host,
+                ClientMessage::SendUserMessage {
+                    agent_id,
+                    content: vec![ContentPart::Text {
+                        text: updated_desk_brief(&text),
+                    }],
+                    delivery: rho_ui_proto::MessageDelivery::NextRequest,
+                },
+            );
+            self.notice_on(
+                Some(&agent_id),
+                &format!(
+                    "updated brief sent to {}",
+                    self.registry.agent_id_label(agent_id)
+                ),
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        }
+
+        let projects = self
             .workdirs
             .iter()
-            .find(|workdir| workdir.host == host)
-            .map(|workdir| HostPath {
-                host,
-                path: workdir.project.path.clone(),
-            });
-        let (mode, target, role_text) = {
-            let draft = self.draft_model.read(cx);
-            (
-                draft.start_mode(),
-                draft.start_text(cx).trim().to_owned(),
-                draft.role_text(cx).trim().to_owned(),
-            )
-        };
-        let (_, start) = match self.parse_start(mode, &target, workdir, Some(host)) {
-            Ok(start) => start,
-            Err(message) => {
-                self.notice_on(None, &message, StyleClass::SystemInfo, cx);
-                return;
+            .filter(|workdir| workdir.host == host)
+            .cloned()
+            .collect::<Vec<_>>();
+        match resolve_desk_project(project.as_deref(), &projects) {
+            DeskProjectResolution::Use(index) => {
+                self.spawn_dashboard_agent(host, heading_offset, text, projects[index].clone(), cx)
             }
-        };
+            DeskProjectResolution::Missing => self.notice_on(
+                None,
+                project
+                    .as_deref()
+                    .map_or(
+                        "staff: this host has no registered projects".to_owned(),
+                        |project| format!("staff: no project `{project}` on this host"),
+                    )
+                    .as_str(),
+                StyleClass::SystemInfo,
+                cx,
+            ),
+            DeskProjectResolution::Choose => {
+                let complete =
+                    std::rc::Rc::new(move |workspace: &Workspace, input: &str, _: &gpui::App| {
+                        let needle = input.trim().to_lowercase();
+                        workspace
+                            .workdirs
+                            .iter()
+                            .filter(|candidate| candidate.host == host)
+                            .filter(|candidate| {
+                                candidate.project.name.to_lowercase().contains(&needle)
+                                    || candidate
+                                        .project
+                                        .path
+                                        .as_str()
+                                        .to_lowercase()
+                                        .contains(&needle)
+                            })
+                            .map(|candidate| crate::commands::Candidate {
+                                value: candidate.project.name.clone(),
+                                description: candidate.project.path.to_string(),
+                            })
+                            .collect()
+                    });
+                let on_submit = std::rc::Rc::new(
+                    move |workspace: &mut Workspace,
+                          input: String,
+                          _window: &mut Window,
+                          cx: &mut Context<Workspace>| {
+                        let input = input.trim();
+                        let Some(workdir) = workspace
+                            .workdirs
+                            .iter()
+                            .find(|candidate| {
+                                candidate.host == host
+                                    && (candidate.project.name == input
+                                        || candidate.project.path == input)
+                            })
+                            .cloned()
+                        else {
+                            workspace.notice_on(
+                                None,
+                                "staff: choose a listed project",
+                                StyleClass::SystemInfo,
+                                cx,
+                            );
+                            return;
+                        };
+                        workspace.dashboard.set_heading_project(
+                            host,
+                            heading_offset,
+                            &workdir.project.name,
+                            cx,
+                        );
+                        workspace.spawn_dashboard_agent(
+                            host,
+                            heading_offset,
+                            text.clone(),
+                            workdir,
+                            cx,
+                        );
+                    },
+                );
+                self.open_prompt("Desk project:", complete, on_submit, window, cx);
+            }
+        }
+    }
+
+    fn spawn_dashboard_agent(
+        &mut self,
+        host: HostId,
+        heading_offset: usize,
+        text: String,
+        workdir: HostProject,
+        cx: &mut Context<Self>,
+    ) {
+        let role_text = self.draft_model.read(cx).role_text(cx).trim().to_owned();
         let role = match parse_agent_role(&role_text) {
             Ok(role) => role,
             Err(message) => {
@@ -5077,7 +5208,10 @@ impl Workspace {
             host,
             ClientMessage::NewAgent {
                 role,
-                start,
+                start: rho_ui_proto::StartMode::NewOn {
+                    repo: workdir.project.path,
+                    revset: crate::draft_view::AUTO_BASE_REVSET.to_owned(),
+                },
                 content: (!text.trim().is_empty()).then_some(vec![ContentPart::Text { text }]),
                 desk_heading: Some(heading_offset as u64),
             },
@@ -5950,7 +6084,7 @@ impl Render for Workspace {
                     cx.propagate();
                     return;
                 }
-                this.staff_dashboard_node(cx);
+                this.staff_dashboard_node(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardHeadingBelow, window, cx| {
                 this.dashboard_insert_heading(false, window, cx);
@@ -6214,5 +6348,49 @@ mod tests {
         ));
         assert!(!desk_heading_without_agent(false, Some(RowTarget::None)));
         assert!(!desk_heading_without_agent(true, None));
+    }
+
+    fn project(name: &str, path: &str) -> HostProject {
+        HostProject {
+            host: HostId(1),
+            project: rho_ui_proto::UiProject {
+                name: name.into(),
+                path: path.into(),
+                description: String::new(),
+            },
+        }
+    }
+
+    #[test]
+    fn desk_project_resolution_prefers_property_then_single_then_picker() {
+        let projects = vec![project("rho", "/src/rho"), project("zed", "/src/zed")];
+        assert_eq!(
+            resolve_desk_project(Some("zed"), &projects),
+            DeskProjectResolution::Use(1)
+        );
+        assert_eq!(
+            resolve_desk_project(Some("/src/rho"), &projects),
+            DeskProjectResolution::Use(0)
+        );
+        assert_eq!(
+            resolve_desk_project(None, &projects),
+            DeskProjectResolution::Choose
+        );
+        assert_eq!(
+            resolve_desk_project(None, &projects[..1]),
+            DeskProjectResolution::Use(0)
+        );
+        assert_eq!(
+            resolve_desk_project(Some("missing"), &projects),
+            DeskProjectResolution::Missing
+        );
+    }
+
+    #[test]
+    fn desk_reply_identifies_the_message_as_a_brief_update() {
+        assert_eq!(
+            updated_desk_brief("root\n\nchild"),
+            "Updated brief from the Desk:\n\nroot\n\nchild"
+        );
     }
 }

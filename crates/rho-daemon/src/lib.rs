@@ -1095,6 +1095,7 @@ impl AgentRegistry {
                 attention: attention_level(kinds.get(&agent_id), agent.disposition),
                 last_active: agent.last_user_message.max(agent.created_at),
                 hidden: agent.disposition == AgentDisposition::Hidden,
+                disposition: agent.disposition,
                 last_user_message_text: agent.last_user_message_text,
                 activity: agent.activity,
                 turn_report: agent.turn_report.map(|report| UiTurnReport {
@@ -2351,26 +2352,6 @@ async fn handle_message(
                 .send(ServerMessage::DeskTextApplied { record });
             Ok(Refresh::None)
         }
-        ClientMessage::DeskBind { token, agent_id } => {
-            if !agents
-                .db
-                .read()
-                .list_agents()
-                .iter()
-                .any(|(candidate, _)| *candidate == agent_id)
-            {
-                anyhow::bail!("unknown agent {agent_id:?}");
-            }
-            let binding = agents
-                .desk
-                .bind(token, agent_id)
-                .await
-                .map_err(anyhow::Error::msg)?;
-            let _ = agents
-                .events
-                .send(ServerMessage::DeskBindingChanged { binding });
-            Ok(Refresh::None)
-        }
         ClientMessage::RecordVisualization { mime_type, content } => {
             let id = agents.visualizations.record(mime_type, content).await?;
             let _ = outgoing_tx.send(ServerMessage::VisualizationRecorded { id });
@@ -2594,7 +2575,7 @@ async fn handle_message(
             // creation broadcast (all connections, including this one).
             let (agent_id, agent) = agents.create(role, start).await?;
             if let Some(heading_offset) = desk_heading {
-                let (record, binding) = agents
+                let record = agents
                     .desk
                     .staff_heading(
                         usize::try_from(heading_offset)
@@ -2606,9 +2587,6 @@ async fn handle_message(
                 let _ = agents
                     .events
                     .send(ServerMessage::DeskTextApplied { record });
-                let _ = agents
-                    .events
-                    .send(ServerMessage::DeskBindingChanged { binding });
             }
             if let Some(content) = content {
                 // The agent is fresh, so the lanes are equivalent here.

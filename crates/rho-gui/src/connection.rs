@@ -63,7 +63,6 @@ pub enum ConnEvent {
         replica_id: u16,
     },
     DeskTextApplied(rho_ui_proto::desk::DeskTextOpRecord),
-    DeskBindingChanged(rho_ui_proto::desk::DeskBinding),
     Ready {
         agents: Vec<UiAgentSummary>,
         iris_agent: Option<AgentId>,
@@ -979,9 +978,6 @@ async fn run(
                 replica_id,
             }),
             ServerMessage::DeskTextApplied { record } => Some(ConnEvent::DeskTextApplied(record)),
-            ServerMessage::DeskBindingChanged { binding } => {
-                Some(ConnEvent::DeskBindingChanged(binding))
-            }
             ServerMessage::Ready {
                 agents,
                 iris_agent,

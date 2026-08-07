@@ -59,11 +59,6 @@ pub enum ClientMessage {
         operation: desk::DeskOperation,
         transaction: Option<desk::DeskTransaction>,
     },
-    /// Sets the non-undoable principal binding for an existing identity token.
-    DeskBind {
-        token: desk::DeskIdToken,
-        agent_id: AgentId,
-    },
     NewAgent {
         role: AgentRole,
         /// Where the agent's working copy starts (including which repo, for
@@ -505,9 +500,6 @@ pub enum ServerMessage {
     DeskTextApplied {
         record: desk::DeskTextOpRecord,
     },
-    DeskBindingChanged {
-        binding: desk::DeskBinding,
-    },
     Ready {
         agents: Vec<UiAgentSummary>,
         /// The daemon's hidden Iris coordinator, when it has been created.
@@ -803,6 +795,9 @@ pub struct UiAgentSummary {
     /// The user filed this agent away (`AgentDisposition::Hidden`): fold it
     /// immediately instead of waiting out the rail's idle window.
     pub hidden: bool,
+    /// Durable verdict used by Desk bindings to distinguish replies from
+    /// restaffing without hidden identity state.
+    pub disposition: AgentDisposition,
     /// One-line snippet of the user's last message; empty if none yet.
     /// What the work is about, for summaries and naming.
     #[senax(default)]

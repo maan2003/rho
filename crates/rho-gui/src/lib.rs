@@ -12,7 +12,6 @@ pub(crate) mod connection;
 #[cfg(all(target_family = "wasm", not(feature = "native")))]
 pub(crate) use connection as connection_web;
 pub mod dashboard;
-mod desk_language;
 pub(crate) mod diff_view;
 pub mod draft_view;
 pub mod editor_config;

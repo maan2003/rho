@@ -9,13 +9,9 @@ use text::{Buffer, BufferId, EditOperation, FullOffset, Operation, UndoOperation
 
 use crate::AgentId;
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode, Pack, Unpack)]
-pub struct DeskIdToken(pub String);
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum DeskHeadingState {
     Todo,
-    Staffed,
     Done,
     Discarded,
 }
@@ -24,11 +20,19 @@ impl DeskHeadingState {
     pub fn keyword(self) -> &'static str {
         match self {
             Self::Todo => "TODO",
-            Self::Staffed => "STAFFED",
             Self::Done => "DONE",
             Self::Discarded => "DISCARDED",
         }
     }
+}
+
+/// A property line belonging to a heading. Ranges exclude the trailing newline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeskProperty {
+    pub key: String,
+    pub value: String,
+    pub line_range: Range<usize>,
+    pub value_range: Range<usize>,
 }
 
 /// A heading derived from Desk text. All ranges are UTF-8 byte ranges.
@@ -37,12 +41,19 @@ pub struct DeskHeading {
     pub depth: usize,
     pub state: Option<DeskHeadingState>,
     pub title: String,
-    pub token: Option<DeskIdToken>,
-    pub duplicate_token: bool,
+    /// The first `:agent:` value under this heading, whether or not it parses.
+    pub agent_value: Option<String>,
+    pub duplicate_agent: bool,
+    /// The first direct `:project:` value and its inherited resolution.
+    pub project: Option<String>,
+    pub resolved_project: Option<String>,
+    pub properties: Vec<DeskProperty>,
     pub parent: Option<usize>,
     pub heading_range: Range<usize>,
+    pub stars_range: Range<usize>,
+    pub state_range: Option<Range<usize>>,
+    pub title_range: Range<usize>,
     pub body_range: Range<usize>,
-    pub id_line_range: Option<Range<usize>>,
 }
 
 /// Parse an org-like Desk document. This deliberately has no error result:
@@ -87,8 +98,15 @@ pub fn parse(text: &str) -> Vec<DeskHeading> {
         if depth == 0 || line.text.as_bytes().get(depth) != Some(&b' ') {
             continue;
         }
-        let content = line.text[depth + 1..].trim_end();
+        let content_start = depth + 1;
+        let content = line.text[content_start..].trim_end();
         let (state, title) = parse_state(content);
+        let title_start = line.text.len() - line.text[content_start..].len()
+            + (title.as_ptr() as usize - content.as_ptr() as usize);
+        let state_range = state.map(|state| {
+            let start = line.start + content_start;
+            start..start + state.keyword().len()
+        });
         while stack
             .last()
             .is_some_and(|(ancestor_depth, _)| *ancestor_depth >= depth)
@@ -101,38 +119,56 @@ pub fn parse(text: &str) -> Vec<DeskHeading> {
             depth,
             state,
             title: title.to_owned(),
-            token: None,
-            duplicate_token: false,
+            agent_value: None,
+            duplicate_agent: false,
+            project: None,
+            resolved_project: None,
+            properties: Vec::new(),
             parent,
             heading_range: line.start..line.end,
+            stars_range: line.start..line.start + depth,
+            state_range,
+            title_range: line.start + title_start..line.start + title_start + title.len(),
             body_range: line.full_end..text.len(),
-            id_line_range: None,
         });
         heading_lines.push(line_index);
         stack.push((depth, index));
     }
 
-    let mut seen = std::collections::BTreeSet::new();
+    let mut seen_agents = std::collections::BTreeSet::new();
     for index in 0..headings.len() {
         let line_index = heading_lines[index];
         let end = heading_lines
             .get(index + 1)
             .map_or(text.len(), |next| lines[*next].start);
-        let mut body_start = lines[line_index].full_end;
-        if let Some(line) = lines.get(line_index + 1)
-            && line.start < end
-            && let Some(token) = parse_id_line(line.text)
+        for line in lines
+            .iter()
+            .skip(line_index + 1)
+            .take_while(|line| line.start < end)
         {
-            let token = DeskIdToken(token.to_owned());
-            // Paste may duplicate identity text. The first occurrence in
-            // document order owns the binding; later copies are decoration-
-            // only and are deliberately ignored by the binding join.
-            headings[index].duplicate_token = !seen.insert(token.clone());
-            headings[index].token = Some(token);
-            headings[index].id_line_range = Some(line.start..line.end);
-            body_start = line.full_end;
+            let Some((key, value, value_start)) = parse_property_line(line.text) else {
+                continue;
+            };
+            let property = DeskProperty {
+                key: key.to_owned(),
+                value: value.to_owned(),
+                line_range: line.start..line.end,
+                value_range: line.start + value_start..line.start + value_start + value.len(),
+            };
+            if key.eq_ignore_ascii_case("agent") && headings[index].agent_value.is_none() {
+                headings[index].agent_value = Some(value.to_owned());
+                headings[index].duplicate_agent = !seen_agents.insert(value.to_owned());
+            } else if key.eq_ignore_ascii_case("project") && headings[index].project.is_none() {
+                headings[index].project = Some(value.to_owned());
+            }
+            headings[index].properties.push(property);
         }
-        headings[index].body_range = body_start..end;
+        headings[index].body_range = lines[line_index].full_end..end;
+        headings[index].resolved_project = headings[index].project.clone().or_else(|| {
+            headings[index]
+                .parent
+                .and_then(|parent| headings[parent].resolved_project.clone())
+        });
     }
     headings
 }
@@ -140,7 +176,6 @@ pub fn parse(text: &str) -> Vec<DeskHeading> {
 fn parse_state(content: &str) -> (Option<DeskHeadingState>, &str) {
     for (keyword, state) in [
         ("TODO", DeskHeadingState::Todo),
-        ("STAFFED", DeskHeadingState::Staffed),
         ("DONE", DeskHeadingState::Done),
         ("DISCARDED", DeskHeadingState::Discarded),
     ] {
@@ -153,9 +188,19 @@ fn parse_state(content: &str) -> (Option<DeskHeadingState>, &str) {
     (None, content.trim_start())
 }
 
-fn parse_id_line(line: &str) -> Option<&str> {
-    let token = line.trim().strip_prefix(":id:")?.trim();
-    (!token.is_empty() && !token.contains(char::is_whitespace)).then_some(token)
+fn parse_property_line(line: &str) -> Option<(&str, &str, usize)> {
+    let leading = line.len() - line.trim_start().len();
+    let rest = &line[leading..];
+    let rest = rest.strip_prefix(':')?;
+    let colon = rest.find(':')?;
+    let key = &rest[..colon];
+    if key.is_empty() || key.contains(char::is_whitespace) {
+        return None;
+    }
+    let raw_value = &rest[colon + 1..];
+    let value = raw_value.trim();
+    let value_start = leading + 1 + colon + 1 + (raw_value.len() - raw_value.trim_start().len());
+    Some((key, value, value_start))
 }
 
 #[derive(
@@ -298,13 +343,6 @@ pub struct DeskReplica {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct DeskBinding {
-    pub token: DeskIdToken,
-    pub agent_id: AgentId,
-    pub orphaned: bool,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct DeskTextOpRecord {
     pub sequence: u64,
     pub timestamp_ms: u64,
@@ -320,8 +358,6 @@ pub struct DeskSnapshot {
     pub operations: Vec<DeskOperation>,
     pub transactions: Vec<DeskTransaction>,
     pub replicas: Vec<DeskReplica>,
-    pub bindings: Vec<DeskBinding>,
-    pub next_id: u64,
 }
 
 impl DeskSnapshot {
@@ -340,16 +376,6 @@ impl DeskSnapshot {
     }
     pub fn document_text(&self) -> Result<String, String> {
         Ok(self.buffer(ReplicaId::REMOTE_SERVER.as_u16())?.text())
-    }
-    pub fn refresh_orphans(&mut self, text: &str) {
-        let live: std::collections::BTreeSet<_> = parse(text)
-            .into_iter()
-            .filter(|h| !h.duplicate_token)
-            .filter_map(|h| h.token)
-            .collect();
-        for binding in &mut self.bindings {
-            binding.orphaned = !live.contains(&binding.token);
-        }
     }
 }
 
@@ -370,7 +396,7 @@ mod tests {
 
     #[test]
     fn parser_is_forgiving_and_derives_parents() {
-        let text = "orphan\n*bad\n* \n*** TODO deep\n:id: h-deep\nbody\n** DONE sibling\n  :id: bad token\n";
+        let text = "orphan\n*bad\n* \n*** TODO deep\n:owner: anyone\nbody\n** DONE sibling\n  :broken property\n";
         let headings = parse(text);
         assert_eq!(headings.len(), 3);
         assert_eq!(
@@ -385,32 +411,50 @@ mod tests {
             (headings[1].depth, headings[1].state, headings[1].parent),
             (3, Some(DeskHeadingState::Todo), Some(0))
         );
-        assert_eq!(headings[1].token.as_ref().unwrap().0, "h-deep");
         assert_eq!(headings[2].parent, Some(0));
-        assert_eq!(&text[headings[2].body_range.clone()], "  :id: bad token\n");
+        assert_eq!(&headings[1].properties[0].key, "owner");
+        assert_eq!(
+            &text[headings[2].body_range.clone()],
+            "  :broken property\n"
+        );
     }
 
     #[test]
-    fn first_duplicate_token_owns_binding_join() {
-        let headings = parse("* STAFFED first\n:id: h-7f3k\n* STAFFED copy\n:id: h-7f3k\n");
-        assert!(!headings[0].duplicate_token);
-        assert!(headings[1].duplicate_token);
+    fn parses_properties_bindings_duplicates_and_project_inheritance() {
+        let agent = AgentId::from_counter(1, &rho_core::AgentIdDomain(1)).unwrap();
+        let text = format!(
+            "* TODO root\n:project: /src/root\n:unknown: kept\n** first\n:agent: {}\n*** inherited\n** copy\n:agent: eng-{}\n:agent: ignored\n:project: child\n",
+            format!("eng-{}", agent.encoded()),
+            agent.encoded()
+        );
+        let headings = parse(&text);
+        assert_eq!(headings[0].project.as_deref(), Some("/src/root"));
+        assert_eq!(headings[0].properties[1].key, "unknown");
+        assert_eq!(
+            headings[1].agent_value.as_deref(),
+            Some(&format!("eng-{}", agent.encoded())[..])
+        );
+        assert!(!headings[1].duplicate_agent);
+        assert_eq!(headings[2].resolved_project.as_deref(), Some("/src/root"));
+        assert_eq!(
+            headings[3].agent_value.as_deref(),
+            Some(&format!("eng-{}", agent.encoded())[..])
+        );
+        assert!(headings[3].duplicate_agent);
+        assert_eq!(headings[3].resolved_project.as_deref(), Some("child"));
+        assert_eq!(
+            &text[headings[3].properties[0].line_range.clone()],
+            format!(":agent: eng-{}", agent.encoded())
+        );
     }
 
     #[test]
-    fn literal_removal_and_restore_orphans_and_revives() {
-        let agent_id = AgentId::from_counter(1, &rho_core::AgentIdDomain(1)).unwrap();
-        let mut snapshot = DeskSnapshot {
-            bindings: vec![DeskBinding {
-                token: DeskIdToken("h-a".into()),
-                agent_id,
-                orphaned: false,
-            }],
-            ..Default::default()
-        };
-        snapshot.refresh_orphans("* TODO task\n");
-        assert!(snapshot.bindings[0].orphaned);
-        snapshot.refresh_orphans("* STAFFED task\n:id: h-a\n");
-        assert!(!snapshot.bindings[0].orphaned);
+    fn first_agent_property_under_a_heading_wins_even_when_unknown() {
+        let agent = AgentId::from_counter(2, &rho_core::AgentIdDomain(1)).unwrap();
+        let headings = parse(&format!(
+            "* task\n:agent: not-an-agent\n:agent: {}\n",
+            agent.encoded()
+        ));
+        assert_eq!(headings[0].agent_value.as_deref(), Some("not-an-agent"));
     }
 }

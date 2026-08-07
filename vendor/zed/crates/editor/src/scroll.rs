@@ -19,13 +19,10 @@ use language::language_settings::{AllLanguageSettings, SoftWrap};
 use language::{Bias, Point};
 pub use scroll_amount::ScrollAmount;
 use settings::Settings;
-use std::{
-    cmp::Ordering,
-    time::Duration,
-};
-use web_time::Instant;
+use std::{cmp::Ordering, time::Duration};
 use ui::scrollbars::ScrollbarAutoHide;
 use util::ResultExt;
+use web_time::Instant;
 #[cfg(feature = "native")]
 use workspace::{ItemId, WorkspaceId};
 #[cfg(not(feature = "native"))]

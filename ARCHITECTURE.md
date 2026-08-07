@@ -99,10 +99,10 @@ than by running a supervisor, extension protocol, or daemon process graph.
   creation route through that identity explicitly; choosing a project never
   silently changes a draft's selected host.
   The Desk is one daemon-owned Zed CRDT text document per attached host. Its
-  org-like headings derive structure rather than receiving structural RPCs;
-  only headings with a directly following `:id:` property carry durable
-  identity. Bindings key that token to an agent outside the undoable document,
-  with the first duplicate token in document order owning the join. Clients
+  org-like headings derive structure rather than receiving structural RPCs.
+  Visible `:agent: <handle>` property lines are the binding source of truth;
+  `:project:` properties inherit down the heading tree. The first duplicate
+  agent handle in document order owns the binding. Clients
   project exactly one excerpt per host, so multibuffer seams coincide only
   with daemon ownership boundaries.
   `rho-gui` supplies its context strip, theme mapping, and focus/show policy,

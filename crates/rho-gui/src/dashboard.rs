@@ -12,8 +12,8 @@ use gpui::{App, Context, Entity, Focusable as _, Window};
 use language::{Buffer, BufferEvent, Capability, InlayId, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use rho_ui_proto::desk::{
-    DeskBinding, DeskClock, DeskHeading, DeskHeadingState, DeskOperation, DeskSnapshot,
-    DeskTextOpRecord, DeskTransaction, parse,
+    DeskClock, DeskHeading, DeskHeadingState, DeskOperation, DeskSnapshot, DeskTextOpRecord,
+    DeskTransaction, parse,
 };
 use rho_ui_proto::{AgentId, ClientMessage};
 use text::{BufferId, ReplicaId, ToOffset as _};
@@ -24,12 +24,15 @@ use crate::registry::{AgentRegistry, HostId};
 use crate::workspace::Workspace;
 
 const DECORATION_KEY: HighlightKey = HighlightKey::SyntaxTreeView(usize::MAX - 1);
-const ID_LINE_KEY: HighlightKey = HighlightKey::SyntaxTreeView(usize::MAX - 2);
+const PROPERTY_KEY: HighlightKey = HighlightKey::SyntaxTreeView(usize::MAX - 2);
+const HEADING_KEY: HighlightKey = HighlightKey::SyntaxTreeView(usize::MAX - 3);
+const TODO_KEY: HighlightKey = HighlightKey::SyntaxTreeView(usize::MAX - 4);
+const MUTED_STATE_KEY: HighlightKey = HighlightKey::SyntaxTreeView(usize::MAX - 5);
 const WELCOME_DESK: &str = "* TODO Run work from this Desk\n\
 o/O add a sibling · >>/<< change depth · Tab folds a subtree\n\
-s staffs this heading; its title and body become the brief\n\
+s staffs; edit the brief and press s again to reply\n\
 d marks done · x discards · gn cycles NOW · gh jumps headings\n\
-Staffing adds the :id: identity line; keep it with the heading\n\
+:agent: shows who owns a heading · :project: chooses its workdir\n\
 Edit freely in normal Vim modes; Desk text syncs across clients\n";
 
 pub type ParsedHeadingState = DeskHeadingState;
@@ -164,7 +167,6 @@ impl Dashboard {
                 Capability::ReadWrite,
                 "",
             );
-            crate::desk_language::configure(&mut buffer, cx);
             buffer.apply_ops(
                 operations
                     .iter()
@@ -231,16 +233,6 @@ impl Dashboard {
                 buffer.apply_ops([language::Operation::Buffer(operation)], cx)
             });
         }
-    }
-
-    pub fn apply_binding(&mut self, host: HostId, binding: DeskBinding) {
-        let Some(desk) = self.hosts.get_mut(&host) else {
-            return;
-        };
-        desk.snapshot.bindings.retain(|candidate| {
-            candidate.token != binding.token && candidate.agent_id != binding.agent_id
-        });
-        desk.snapshot.bindings.push(binding);
     }
 
     pub fn mark_local_text_op(&mut self, host: HostId, clock: DeskClock) {
@@ -348,15 +340,16 @@ impl Dashboard {
             .update(cx, |editor, cx| editor.insert_blocks(props, None, cx));
     }
 
-    fn binding_for<'a>(desk: &'a HostDesk, heading: &DeskHeading) -> Option<&'a DeskBinding> {
-        let token = heading.token.as_ref()?;
-        if heading.duplicate_token {
+    fn binding_for(
+        registry: &AgentRegistry,
+        host: HostId,
+        heading: &DeskHeading,
+    ) -> Option<AgentId> {
+        if heading.duplicate_agent {
             return None;
         }
-        desk.snapshot
-            .bindings
-            .iter()
-            .find(|binding| binding.token == *token && !binding.orphaned)
+        let agent_id = registry.agent_by_label(heading.agent_value.as_deref()?)?;
+        (registry.host_of_agent(agent_id) == Some(host)).then_some(agent_id)
     }
 
     fn sync_decorations(
@@ -368,26 +361,51 @@ impl Dashboard {
         let multi = self.multi_buffer.read(cx).snapshot(cx);
         let mut inlays = Vec::new();
         let mut highlights = Vec::new();
-        let mut id_ranges = Vec::new();
+        let mut property_ranges = Vec::new();
+        let mut heading_ranges = Vec::new();
+        let mut todo_ranges = Vec::new();
+        let mut muted_state_ranges = Vec::new();
         for host in order {
             let Some(text) = self.text(*host, cx) else {
                 continue;
             };
-            let desk = &self.hosts[host];
             let buffer = self.buffers[host].read(cx);
             for heading in parse(&text) {
-                if let Some(range) = &heading.id_line_range
+                for property in &heading.properties {
+                    let range = &property.line_range;
+                    if let (Some(start), Some(end)) = (
+                        multi.anchor_in_excerpt(buffer.anchor_before(range.start)),
+                        multi.anchor_in_excerpt(buffer.anchor_after(range.end)),
+                    ) {
+                        property_ranges.push(start..end);
+                    }
+                }
+                for range in [&heading.stars_range, &heading.title_range] {
+                    if let (Some(start), Some(end)) = (
+                        multi.anchor_in_excerpt(buffer.anchor_before(range.start)),
+                        multi.anchor_in_excerpt(buffer.anchor_after(range.end)),
+                    ) {
+                        heading_ranges.push(start..end);
+                    }
+                }
+                if let Some(range) = &heading.state_range
                     && let (Some(start), Some(end)) = (
                         multi.anchor_in_excerpt(buffer.anchor_before(range.start)),
                         multi.anchor_in_excerpt(buffer.anchor_after(range.end)),
                     )
                 {
-                    id_ranges.push(start..end);
+                    match heading.state {
+                        Some(DeskHeadingState::Todo) => todo_ranges.push(start..end),
+                        Some(DeskHeadingState::Done | DeskHeadingState::Discarded) => {
+                            muted_state_ranges.push(start..end)
+                        }
+                        None => {}
+                    }
                 }
-                let (position, label) = if heading.duplicate_token {
-                    (heading.heading_range.end, "  · duplicate id".to_owned())
-                } else if let Some(binding) = Self::binding_for(desk, &heading) {
-                    let attention = match registry.attention(binding.agent_id) {
+                let (position, label) = if heading.duplicate_agent {
+                    (heading.heading_range.end, "  · duplicate agent".to_owned())
+                } else if let Some(agent_id) = Self::binding_for(registry, *host, &heading) {
+                    let attention = match registry.attention(agent_id) {
                         rho_ui_proto::UiAttention::Quiet => "idle",
                         rho_ui_proto::UiAttention::Working => "working",
                         rho_ui_proto::UiAttention::Pending => "pending",
@@ -395,11 +413,10 @@ impl Dashboard {
                     };
                     (
                         heading.heading_range.end,
-                        format!(
-                            "  · {} · {attention}",
-                            registry.agent_human_name(binding.agent_id)
-                        ),
+                        format!("  · {} · {attention}", registry.agent_human_name(agent_id)),
                     )
+                } else if heading.agent_value.is_some() {
+                    (heading.heading_range.end, "  · unknown agent".to_owned())
                 } else {
                     continue;
                 };
@@ -430,8 +447,39 @@ impl Dashboard {
                 cx,
             );
             editor.highlight_text_key(
-                ID_LINE_KEY,
-                id_ranges,
+                PROPERTY_KEY,
+                property_ranges,
+                gpui::HighlightStyle {
+                    color: Some(cx.theme().colors().text_muted.into()),
+                    ..Default::default()
+                },
+                false,
+                cx,
+            );
+            editor.highlight_text_key(
+                HEADING_KEY,
+                heading_ranges,
+                gpui::HighlightStyle {
+                    font_weight: Some(gpui::FontWeight::BOLD),
+                    ..Default::default()
+                },
+                false,
+                cx,
+            );
+            editor.highlight_text_key(
+                TODO_KEY,
+                todo_ranges,
+                gpui::HighlightStyle {
+                    color: Some(cx.theme().colors().text_accent.into()),
+                    font_weight: Some(gpui::FontWeight::BOLD),
+                    ..Default::default()
+                },
+                false,
+                cx,
+            );
+            editor.highlight_text_key(
+                MUTED_STATE_KEY,
+                muted_state_ranges,
                 gpui::HighlightStyle {
                     color: Some(cx.theme().colors().text_muted.into()),
                     ..Default::default()
@@ -531,20 +579,20 @@ impl Dashboard {
                 continue;
             };
             for heading in parse(&text) {
-                let Some(binding) = Self::binding_for(&self.hosts[host], &heading) else {
+                let Some(agent_id) = Self::binding_for(registry, *host, &heading) else {
                     continue;
                 };
-                let attention = registry.attention(binding.agent_id);
+                let attention = registry.attention(agent_id);
                 if attention < rho_ui_proto::UiAttention::Pending {
                     continue;
                 }
-                let Some(last_active) = registry.agent_last_active(binding.agent_id) else {
+                let Some(last_active) = registry.agent_last_active(agent_id) else {
                     continue;
                 };
                 self.now_items.push(NowItem {
                     host: *host,
                     offset: heading.heading_range.start,
-                    agent_id: binding.agent_id,
+                    agent_id,
                     attention,
                     last_active,
                     title: heading.title,
@@ -683,17 +731,21 @@ impl Dashboard {
         true
     }
 
-    pub fn cursor_target(&self, cx: &mut Context<Workspace>) -> Option<RowTarget> {
+    pub fn cursor_target(
+        &self,
+        registry: &AgentRegistry,
+        cx: &mut Context<Workspace>,
+    ) -> Option<RowTarget> {
         let (host, _, headings, index) = self.cursor_heading(cx)?;
-        Self::binding_for(&self.hosts[&host], &headings[index])
-            .map(|binding| RowTarget::Agent(binding.agent_id))
+        Self::binding_for(registry, host, &headings[index])
+            .map(RowTarget::Agent)
             .or(Some(RowTarget::None))
     }
 
     pub fn staffing_target(
         &self,
         cx: &mut Context<Workspace>,
-    ) -> Result<(HostId, usize, String), &'static str> {
+    ) -> Result<(HostId, usize, String, Option<String>), &'static str> {
         let (host, text, headings, index) = self
             .cursor_heading(cx)
             .ok_or("staff: put the cursor on a heading")?;
@@ -720,7 +772,39 @@ impl Dashboard {
             })
             .collect::<Vec<_>>()
             .join("\n\n");
-        Ok((host, headings[index].heading_range.start, brief))
+        Ok((
+            host,
+            headings[index].heading_range.start,
+            brief,
+            headings[index].resolved_project.clone(),
+        ))
+    }
+
+    pub fn set_heading_project(
+        &mut self,
+        host: HostId,
+        offset: usize,
+        project: &str,
+        cx: &mut Context<Workspace>,
+    ) {
+        let Some(text) = self.text(host, cx) else {
+            return;
+        };
+        let Some(heading) = parse(&text)
+            .into_iter()
+            .find(|heading| heading.heading_range.start == offset)
+        else {
+            return;
+        };
+        let insertion = heading.heading_range.end
+            + usize::from(text.as_bytes().get(heading.heading_range.end) == Some(&b'\n'));
+        self.buffers[&host].update(cx, |buffer, cx| {
+            buffer.edit(
+                [(insertion..insertion, format!(":project: {project}\n"))],
+                None,
+                cx,
+            )
+        });
     }
 
     pub fn set_heading_state(
@@ -893,7 +977,6 @@ impl Dashboard {
         if has_child
             || !heading.title.is_empty()
             || !text[heading.body_range.clone()].trim().is_empty()
-            || heading.token.is_some()
         {
             return false;
         }
@@ -1038,7 +1121,7 @@ impl Dashboard {
     }
     pub fn hint(&self, cx: &mut Context<Workspace>) -> &'static str {
         if self.cursor_on_heading_line(cx) {
-            "o/O new heading · >>/<< demote/promote · Tab fold · s staff · d done · x discard · Alt-↑/↓ move · gn now · gh jump"
+            "o/O new heading · >>/<< demote/promote · Tab fold · s staff/reply · :project: workdir · d done · x discard · Alt-↑/↓ move · gn now · gh jump"
         } else {
             "vim editing · gn now · gb back · gh jump headings"
         }
