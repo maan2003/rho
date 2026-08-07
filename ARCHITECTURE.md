@@ -6,8 +6,8 @@ than by running a supervisor, extension protocol, or daemon process graph.
 ## Crate layering
 
 - `rho-core` owns the shared vocabulary: transcript items, inference requests,
-  inference events and responses, tool calls/results, usage, agent/workstream
-  identities, roles and dispositions, message delivery and phases, and opaque
+  inference events and responses, tool calls/results, usage, agent identities,
+  roles and dispositions, message delivery and phases, and opaque
   provider items. It should stay policy-light.
 - Inference crates, currently `rho-inference`, translate `rho-core` inference
   requests into provider-specific wire protocols and translate provider events
@@ -167,14 +167,14 @@ than by running a supervisor, extension protocol, or daemon process graph.
   role-bearing transcript snapshot, and routes delegation requests directly to
   Iris: a hidden persisted first-class `AgentRole::Iris` coordinator. Its prompt
   and typed tool schemas are built into `rho-agent`; the daemon hosts the
-  stateful fleet and workstream operations. Additional requests steer the
+  stateful fleet operations. Additional requests steer the
   active Iris turn. Commentary and final assistant items are appended directly
   on the provider sideband using commentary or speakable channels; output
   without an active delegation uses session-level context append. Sideband
   failure is terminal. The dedicated GUI-daemon stream carries only SDP and
   lifecycle messages. Session startup includes a bounded visible-fleet
   snapshot. Iris is projected as a synthetic dashboard row, not an ordinary
-  agent or workstream member. Media flows directly between the GUI and provider
+  agent. Media flows directly between the GUI and provider
   and never traverses the daemon or `rho-core` transcript vocabulary.
 - Store crates own concrete persistence formats. Tool crates own concrete tool
   execution.
@@ -387,7 +387,7 @@ unsubscribes agent state; activation does not imply observation by any GUI.
 Error and unfinished-turn states are live runtime detail rather than durable
 parked-agent attention, so an unloaded pending agent remains pending.
 The native GUI initially subscribes its retained selection and up to ten
-top-level representatives from recently active visible workstreams. It then
+recently active visible top-level agents. It then
 keeps a generous 128-entry transcript LRU; opening another agent beyond that
 bound releases the least recently viewed subscription. The daemon confirms a
 released or idle-evicted stream with `AgentUnloaded`, and only that server

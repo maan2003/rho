@@ -9,7 +9,7 @@ use camino::Utf8PathBuf;
 use rho_core::ContentPart;
 pub use rho_core::{
     AdvisorIntelligence, AgentDisposition, AgentId, AgentIdDomain, AgentRole, EngineerIntelligence,
-    MessageDelivery, WorkstreamId,
+    MessageDelivery,
 };
 pub use rho_workspaces_types::{
     WorkspaceDiffBaseContent, WorkspaceDiffContent, WorkspaceDiffFile, WorkspaceDiffSnapshot,
@@ -81,9 +81,6 @@ pub enum ClientMessage {
         agent_id: AgentId,
     },
     NewAgent {
-        /// The workstream to join; `None` founds a fresh one, named
-        /// provisionally until the agent's generated title lands.
-        workstream: Option<WorkstreamId>,
         role: AgentRole,
         /// Where the agent's working copy starts (including which repo, for
         /// the modes that need one).
@@ -112,11 +109,6 @@ pub enum ClientMessage {
         agent_id: AgentId,
         role: AgentRole,
     },
-    /// Renames a workstream; a colliding name gets a numeric suffix.
-    WorkstreamRename {
-        workstream_id: WorkstreamId,
-        name: String,
-    },
     CancelTurn {
         agent_id: AgentId,
     },
@@ -127,24 +119,11 @@ pub enum ClientMessage {
     ContinueTurn {
         agent_id: AgentId,
     },
-    /// Adds or removes one free-form label on a workstream; semantics
-    /// ("pin", …) live in the client's view layer.
-    WorkstreamLabel {
-        workstream_id: WorkstreamId,
-        label: String,
-        add: bool,
-    },
     /// Adds or removes one free-form label on an agent.
     AgentLabel {
         agent_id: AgentId,
         label: String,
         add: bool,
-    },
-    /// Moves an agent to another workstream; its spawn subtree moves with
-    /// it (an agent's workstream is always its root's).
-    AgentMove {
-        agent_id: AgentId,
-        target: WorkstreamTarget,
     },
     /// Replaces the stored client view configuration; the daemon keeps the
     /// bytes opaque and hands them back on [`ServerMessage::Ready`].
@@ -511,15 +490,6 @@ pub enum JoinTarget {
     User { repo: Utf8PathBuf },
 }
 
-/// Destination of [`ClientMessage::AgentMove`]. `Named` is resolved by the
-/// daemon against workstream names and creates the workstream when no match
-/// exists, so "spin off a workstream around this agent" is one message.
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum WorkstreamTarget {
-    Existing(WorkstreamId),
-    Named(String),
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum LandStatus {
     Queued,
@@ -557,7 +527,6 @@ pub enum ServerMessage {
         binding: desk::DeskBinding,
     },
     Ready {
-        workstreams: Vec<UiWorkstream>,
         agents: Vec<UiAgentSummary>,
         projects: Vec<UiProject>,
         auth: AuthState,
@@ -589,10 +558,6 @@ pub enum ServerMessage {
     },
     AgentCreated {
         agent_id: AgentId,
-        workstream: WorkstreamId,
-    },
-    WorkstreamCreated {
-        workstream: UiWorkstream,
     },
     AgentSubscribed {
         agent_id: AgentId,
@@ -824,15 +789,6 @@ pub struct AgentUsageSeries {
     pub buckets: Vec<AgentUsageBucket>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub struct UiWorkstream {
-    pub workstream_id: WorkstreamId,
-    pub name: String,
-    /// Free-form markers ("pin", …); semantics live in the
-    /// client's view layer.
-    pub labels: Vec<String>,
-}
-
 /// Enough about an agent to list and label it without loading it.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct UiAgentSummary {
@@ -873,8 +829,6 @@ pub struct UiAgentSummary {
     /// one-shot lands or after the user re-engages.
     #[senax(default)]
     pub turn_report: Option<UiTurnReport>,
-    /// The workstream this agent belongs to (exactly one).
-    pub workstream: WorkstreamId,
     /// Free-form markers ("pin", …); semantics live in the client's view
     /// layer.
     pub labels: Vec<String>,

@@ -161,7 +161,6 @@ impl Workspace {
             frame_flush_scheduled: false,
             draft_model,
             workdirs: Vec::new(),
-            draft_workstream: None,
             new_agent_draft: None,
             awaiting_draft_agent: None,
             ready_hosts: Default::default(),

@@ -16,7 +16,7 @@ use rho_ui_proto::client::Client;
 use rho_ui_proto::remote::AgentRemoteFrame;
 use rho_ui_proto::{
     AgentId, ClientMessage, GitService, GitTransportRequest, ServerMessage, UiAgentSummary,
-    UiProject, UiWorkstream, WorkspaceInfo, read_frame, write_frame,
+    UiProject, WorkspaceInfo, read_frame, write_frame,
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -66,7 +66,6 @@ pub enum ConnEvent {
     DeskTextApplied(rho_ui_proto::desk::DeskTextOpRecord),
     DeskBindingChanged(rho_ui_proto::desk::DeskBinding),
     Ready {
-        workstreams: Vec<UiWorkstream>,
         agents: Vec<UiAgentSummary>,
         projects: Vec<UiProject>,
         auth: rho_ui_proto::AuthState,
@@ -74,13 +73,8 @@ pub enum ConnEvent {
         agent_counter: u64,
     },
     AuthState(rho_ui_proto::AuthState),
-    WorkstreamCreated(UiWorkstream),
-    /// The daemon created an agent this connection asked for. The workstream
-    /// rides along so the agent's workstream context resolves before the
-    /// next `Ready` refresh lands.
     AgentCreated {
         agent_id: AgentId,
-        workstream: rho_ui_proto::WorkstreamId,
     },
     AgentSubscribed(AgentId),
     AgentUnloaded {
@@ -872,7 +866,6 @@ async fn run(
     write_frame(&mut stream, &ClientMessage::Subscribe).await?;
     let message: ServerMessage = read_frame(&mut stream).await?;
     let ServerMessage::Ready {
-        workstreams,
         agents,
         projects,
         auth,
@@ -885,7 +878,6 @@ async fn run(
     };
     if events
         .unbounded_send(ConnEvent::Ready {
-            workstreams,
             agents,
             projects,
             auth,
@@ -991,7 +983,6 @@ async fn run(
                 Some(ConnEvent::DeskBindingChanged(binding))
             }
             ServerMessage::Ready {
-                workstreams,
                 agents,
                 projects,
                 auth,
@@ -999,7 +990,6 @@ async fn run(
                 machine_seed,
                 agent_counter,
             } => Some(ConnEvent::Ready {
-                workstreams,
                 agents,
                 projects,
                 auth,
@@ -1007,16 +997,7 @@ async fn run(
                 agent_counter,
             }),
             ServerMessage::AuthState { auth } => Some(ConnEvent::AuthState(auth)),
-            ServerMessage::WorkstreamCreated { workstream } => {
-                Some(ConnEvent::WorkstreamCreated(workstream))
-            }
-            ServerMessage::AgentCreated {
-                agent_id,
-                workstream,
-            } => Some(ConnEvent::AgentCreated {
-                agent_id,
-                workstream,
-            }),
+            ServerMessage::AgentCreated { agent_id } => Some(ConnEvent::AgentCreated { agent_id }),
             ServerMessage::AgentSubscribed { agent_id } => {
                 Some(ConnEvent::AgentSubscribed(agent_id))
             }

@@ -3,7 +3,7 @@
 //! workspace handles one ordered sequence instead of polling per host.
 //!
 //! Hosts are addressed by [`HostId`], assigned here in attachment order.
-//! Agent and workstream ids are already unique across machines, so the id is
+//! Agent ids are already unique across machines, so the id is
 //! for routing — which socket a command goes down — not for disambiguation.
 
 use std::time::Duration;

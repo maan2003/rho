@@ -1,10 +1,5 @@
-//! Agent lifecycle, selection, and the rail policy — shared by every Rho
-//! client surface so ordering, folding, and naming behave identically.
-//!
-//! One explicit state machine instead of parallel sets: an agent is *known*
-//! (appears in summaries or was announced), and optionally *live* (this
-//! connection has received frames for it). Selection and next/previous
-//! cycling operate over live agents only.
+//! Agent lifecycle, selection, naming, and host ownership shared by Rho
+//! clients.
 
 pub mod session;
 pub mod store;
@@ -14,10 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use camino::Utf8PathBuf;
-use rho_ui_proto::{AgentId, UiAgentSummary, UiWorkstream, WorkstreamId};
+use rho_ui_proto::{AgentId, UiAgentSummary};
 
-/// Milliseconds since the unix epoch. `std::time` has no clock on
-/// wasm32-unknown-unknown; web-time is a drop-in that reads the browser's.
 pub fn now_ms() -> u64 {
     #[cfg(not(target_family = "wasm"))]
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -30,10 +23,6 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Client-local identity of one attached daemon. Assigned by the client in
-/// attachment order and never sent over the wire: daemons know nothing about
-/// each other, so this exists only to keep one client's view of several of
-/// them apart.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct HostId(pub u32);
 
@@ -43,118 +32,9 @@ impl fmt::Display for HostId {
     }
 }
 
-/// A workstream with its member agents resolved: the unit the rail rows
-/// and per-task pane contexts are built around.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Workstream {
-    /// The daemon this workstream lives on. Workstreams never span hosts.
-    pub host: HostId,
-    pub workstream_id: WorkstreamId,
-    pub name: String,
-    pub pinned: bool,
-    /// The stream's own `hide` label, or no visible members (empty, or
-    /// every agent hidden) — either folds it out of the rail.
-    pub hidden: bool,
-    /// The group this stream shelves under, from its `group:<name>` label.
-    pub group: Option<String>,
-    pub agents: Vec<UiAgentSummary>,
-}
-
-impl Workstream {
-    pub fn agent_ids(&self) -> impl Iterator<Item = AgentId> + '_ {
-        self.agents.iter().map(|agent| agent.agent_id)
-    }
-}
-
-/// Every agent's root in one pass: an agent whose parent is missing from the
-/// workstream (or absent) is its own root, and a parent cycle stops where it
-/// closes. Walking the chain per agent instead rescans the workstream at
-/// every hop.
-fn roots_by_agent(workstream: &Workstream) -> BTreeMap<AgentId, AgentId> {
-    let by_id = workstream
-        .agents
-        .iter()
-        .map(|agent| (agent.agent_id, agent))
-        .collect::<BTreeMap<_, _>>();
-    workstream
-        .agents
-        .iter()
-        .map(|agent| {
-            let mut root = agent.agent_id;
-            let mut seen = BTreeSet::new();
-            while seen.insert(root) {
-                let Some(parent) = by_id.get(&root).and_then(|agent| agent.parent_agent) else {
-                    break;
-                };
-                if !by_id.contains_key(&parent) {
-                    break;
-                }
-                root = parent;
-            }
-            (agent.agent_id, root)
-        })
-        .collect()
-}
-
-/// The well-known label that hides whatever carries it.
 pub const HIDE_LABEL: &str = "hide";
-
-/// The well-known label that pins whatever carries it.
-pub const PIN_LABEL: &str = "pin";
-
-/// The label prefix that shelves a workstream under a named group.
-pub const GROUP_LABEL_PREFIX: &str = "group:";
-
-/// How long a sent verdict outranks the summaries' attention. Long enough
-/// to cover a slow daemon answering over a remote link, short enough that a
-/// verdict whose answer was lost stops shadowing the truth.
 const VERDICT_GRACE_MS: u64 = 15_000;
-
-pub fn agent_pinned(agent: &UiAgentSummary) -> bool {
-    agent.labels.iter().any(|label| label == PIN_LABEL)
-}
-
-/// The rail's coarse active cohort: every item with non-quiet attention.
-/// Ordering inside the returned bucket is deliberately left to retained rail
-/// rank.
-fn active_bucket<K: Copy + Ord>(candidates: Vec<(K, rho_ui_proto::UiAttention)>) -> BTreeSet<K> {
-    candidates
-        .into_iter()
-        .filter(|(_, attention)| *attention != rho_ui_proto::UiAttention::Quiet)
-        .map(|(key, _)| key)
-        .collect()
-}
-
-fn derive_workstreams(
-    host: HostId,
-    workstreams: &[UiWorkstream],
-    agents: &[UiAgentSummary],
-) -> Vec<Workstream> {
-    workstreams
-        .iter()
-        .map(|workstream| {
-            let members = agents
-                .iter()
-                .filter(|agent| agent.workstream == workstream.workstream_id)
-                .cloned()
-                .collect::<Vec<_>>();
-            Workstream {
-                host,
-                workstream_id: workstream.workstream_id,
-                name: workstream.name.clone(),
-                pinned: workstream.labels.iter().any(|label| label == PIN_LABEL),
-                hidden: workstream.labels.iter().any(|label| label == HIDE_LABEL)
-                    || members.iter().all(|agent| agent.hidden),
-                group: workstream.labels.iter().find_map(|label| {
-                    label
-                        .strip_prefix(GROUP_LABEL_PREFIX)
-                        .map(|name| name.to_owned())
-                }),
-                agents: members,
-            }
-        })
-        .collect()
-}
+const LABEL_HEADROOM: u64 = 200;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentLife {
@@ -164,267 +44,65 @@ pub enum AgentLife {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ActivePane {
-    /// Initial bootstrapping state: the draft surface is visible, but the
-    /// first live agent may claim the view once daemon frames arrive.
     #[default]
     Startup,
-    /// The user intentionally opened the new-agent compose surface.
     Draft,
     Agent(AgentId),
 }
 
 #[derive(Default)]
-pub struct AgentRegistry {
-    agents: BTreeMap<AgentId, AgentLife>,
-    /// Live attention overlay: broadcasts land here between `Ready`
-    /// refreshes, which re-seed it from the summaries' snapshot.
-    attention: BTreeMap<AgentId, rho_ui_proto::UiAttention>,
-    /// Verdicts sent but not yet answered. A `Ready` is a snapshot of the
-    /// daemon at the moment it was built, which can be before a verdict the
-    /// user has already pressed; without this it would re-seed the lamp the
-    /// verdict just cleared, and the row would bounce back to active for no
-    /// reason the user can see. Cleared by the daemon's answer, or by
-    /// `VERDICT_GRACE_MS` if that answer never arrives.
-    pending_verdicts: BTreeMap<AgentId, (rho_ui_proto::UiAttention, rho_core::UnixMs)>,
-    /// Ephemeral activity text delivered separately from durable summaries.
-    activities: BTreeMap<AgentId, String>,
-    /// Turn-report overlay: broadcasts land here between `Ready` refreshes,
-    /// which re-seed it from the summaries' snapshot.
-    turn_reports: BTreeMap<AgentId, rho_ui_proto::UiTurnReport>,
-    /// Retained top-to-bottom rail order. Bucket changes are applied with a
-    /// stable sort, so agents only move when their coarse rail bucket changes
-    /// or when they are first seen.
-    rail_order: Vec<AgentId>,
-    /// Cached positions in `rail_order`, avoiding a linear scan for every row
-    /// while constructing the rail.
-    rail_ranks: BTreeMap<AgentId, usize>,
-    /// Derived row membership and ordering, rebuilt only when rail-relevant
-    /// state changes rather than on every window draw.
-    topic_rail_layouts: BTreeMap<WorkstreamId, TopicRailLayout>,
-    /// When the user last engaged each agent: seeded from summaries, bumped
-    /// locally on send. Seeds the retained order of newly seen agents.
-    last_active: BTreeMap<AgentId, rho_core::UnixMs>,
-    /// Every attached daemon's last `Ready` snapshot, in attachment order.
-    /// Each host is refreshed independently; everything below is derived
-    /// from all of them together.
-    hosts: BTreeMap<HostId, HostSnapshot>,
-    /// Every host's workstream snapshot, concatenated in host order.
-    raw_workstreams: Vec<UiWorkstream>,
-    /// Every host's agent summaries, concatenated in host order.
-    summaries: Vec<UiAgentSummary>,
-    /// Workstreams joined with their member agents, derived from the two
-    /// snapshots above.
-    workstreams: Vec<Workstream>,
-    /// Positions in `summaries`, used by all summary lookups.
-    agent_locations: BTreeMap<AgentId, usize>,
-    /// Which daemon each agent and workstream came from. Ids are unique
-    /// across machines (they are scrambled by a per-database seed), so these
-    /// are lookups rather than a disambiguating key.
-    agent_hosts: BTreeMap<AgentId, HostId>,
-    workstream_hosts: BTreeMap<WorkstreamId, HostId>,
-    /// Workstreams announced with `AgentCreated`, bridging the gap until the
-    /// next `Ready` refresh carries the agent's summary — so a fresh agent's
-    /// workstream context resolves immediately instead of falling back to
-    /// the draft context (and stranding pane splits there).
-    announced_workstreams: BTreeMap<AgentId, WorkstreamId>,
-    /// The host each announced agent was created on, so it can be addressed
-    /// before it appears in any snapshot.
-    announced_hosts: BTreeMap<AgentId, HostId>,
-    active: ActivePane,
-}
-
-/// One daemon's last `Ready` snapshot, with the id-domain constants that
-/// only mean anything against that daemon's own database.
-#[derive(Default)]
 struct HostSnapshot {
-    /// The short user-facing name this client attached the daemon under.
     name: String,
-    /// The daemon database's machine seed; kept for consumers that resolve
-    /// ids against this host.
     machine_seed: u64,
-    /// Last agent id counter, which keys this host's uniform agent label
-    /// prefix length.
     agent_counter: u64,
-    workstreams: Vec<UiWorkstream>,
     agents: Vec<UiAgentSummary>,
 }
 
 #[derive(Default)]
-struct TopicRailLayout {
-    /// Every visible root in retained rail order. Dashboard rows use this
-    /// directly; the listed/folded split below remains navigation policy.
-    roots: Vec<(AgentId, usize)>,
-    listed: Vec<(AgentId, usize)>,
-    /// Test support (for this crate and client crates' suites): the folded
-    /// complement of `listed`, newest first.
-    folded: Vec<(AgentId, usize)>,
-}
-
-struct TopicRailState<'a> {
-    by_id: BTreeMap<AgentId, &'a UiAgentSummary>,
-    root_by_id: BTreeMap<AgentId, AgentId>,
-    selected_root: Option<AgentId>,
-    top_roots: BTreeSet<AgentId>,
-    extra_roots: BTreeSet<AgentId>,
-}
-
-impl<'a> TopicRailState<'a> {
-    fn new(registry: &AgentRegistry, topic: &'a Workstream) -> Self {
-        let by_id = topic
-            .agents
-            .iter()
-            .map(|agent| (agent.agent_id, agent))
-            .collect::<BTreeMap<_, _>>();
-        let root_by_id = roots_by_agent(topic);
-        let selected_root = registry
-            .selected_agent()
-            .and_then(|selected| root_by_id.get(selected))
-            .copied();
-        let roots = topic
-            .agents
-            .iter()
-            .filter(|agent| {
-                agent
-                    .parent_agent
-                    .is_none_or(|parent| !by_id.contains_key(&parent))
-            })
-            .collect::<Vec<_>>();
-        // Descendant attention belongs to its visible root in the dashboard.
-        // Build the active cohort at root granularity so a large subtree
-        // cannot consume several slots.
-        let normal = roots
-            .iter()
-            .copied()
-            .filter(|agent| !agent_pinned(agent) && !agent.hidden)
-            .collect::<Vec<_>>();
-        let root_attention = |root_id| {
-            topic
-                .agents
-                .iter()
-                .filter(|agent| !agent.hidden && root_by_id.get(&agent.agent_id) == Some(&root_id))
-                .map(|agent| registry.attention(agent.agent_id))
-                .max()
-                .unwrap_or_default()
-        };
-        let top_roots = active_bucket(
-            normal
-                .into_iter()
-                .map(|root| (root.agent_id, root_attention(root.agent_id)))
-                .collect(),
-        );
-        let mut extra = roots
-            .into_iter()
-            .filter(|agent| {
-                !agent_pinned(agent) && !agent.hidden && !top_roots.contains(&agent.agent_id)
-            })
-            .collect::<Vec<_>>();
-        extra.sort_by_key(|agent| {
-            registry
-                .rail_ranks
-                .get(&agent.agent_id)
-                .copied()
-                .unwrap_or(usize::MAX)
-        });
-        let extra_roots = extra
-            .into_iter()
-            .take(5)
-            .map(|agent| agent.agent_id)
-            .collect();
-
-        Self {
-            by_id,
-            root_by_id,
-            selected_root,
-            top_roots,
-            extra_roots,
-        }
-    }
-
-    fn auto_collapsed(&self, agent_id: AgentId) -> bool {
-        let Some(root) = self.root_by_id.get(&agent_id).copied() else {
-            return false;
-        };
-        root != agent_id && self.selected_root != Some(root)
-    }
-
-    fn folded(&self, agent_id: AgentId) -> bool {
-        let Some(root_id) = self.root_by_id.get(&agent_id).copied() else {
-            return false;
-        };
-        if self.auto_collapsed(agent_id) {
-            return true;
-        }
-
-        let mut cursor = agent_id;
-        let mut seen = BTreeSet::new();
-        while seen.insert(cursor) {
-            let Some(agent) = self.by_id.get(&cursor) else {
-                break;
-            };
-            if agent.hidden {
-                return true;
-            }
-            let Some(parent) = agent
-                .parent_agent
-                .filter(|parent| self.by_id.contains_key(parent))
-            else {
-                break;
-            };
-            cursor = parent;
-        }
-
-        let root = self.by_id[&root_id];
-        if agent_pinned(root) || self.selected_root == Some(root_id) {
-            return false;
-        }
-        !self.top_roots.contains(&root_id) && !self.extra_roots.contains(&root_id)
-    }
+pub struct AgentRegistry {
+    agents: BTreeMap<AgentId, AgentLife>,
+    attention: BTreeMap<AgentId, rho_ui_proto::UiAttention>,
+    pending_verdicts: BTreeMap<AgentId, (rho_ui_proto::UiAttention, rho_core::UnixMs)>,
+    activities: BTreeMap<AgentId, String>,
+    turn_reports: BTreeMap<AgentId, rho_ui_proto::UiTurnReport>,
+    order: Vec<AgentId>,
+    last_active: BTreeMap<AgentId, rho_core::UnixMs>,
+    hosts: BTreeMap<HostId, HostSnapshot>,
+    summaries: Vec<UiAgentSummary>,
+    agent_locations: BTreeMap<AgentId, usize>,
+    agent_hosts: BTreeMap<AgentId, HostId>,
+    announced_hosts: BTreeMap<AgentId, HostId>,
+    active: ActivePane,
 }
 
 impl AgentRegistry {
-    /// Registers a daemon under its user-facing name, before its first
-    /// `Ready` lands. Attaching an already-known host renames it.
     pub fn attach_host(&mut self, host: HostId, name: String) {
         self.hosts.entry(host).or_default().name = name;
     }
 
-    /// Forgets a daemon and everything that came from it. Agents it owned
-    /// leave the rail, and a selection on one of them falls back to the
-    /// draft.
     pub fn detach_host(&mut self, host: HostId) {
         let Some(snapshot) = self.hosts.remove(&host) else {
             return;
         };
-        // Everything the host ever told us about: its last snapshot, plus
-        // any agent it announced whose summary never arrived.
         let departed = snapshot
             .agents
             .iter()
-            .map(|agent| agent.agent_id)
+            .map(|a| a.agent_id)
             .chain(
                 self.announced_hosts
                     .iter()
                     .filter(|(_, owner)| **owner == host)
-                    .map(|(agent_id, _)| *agent_id),
+                    .map(|(id, _)| *id),
             )
             .collect::<BTreeSet<_>>();
-        self.agents
-            .retain(|agent_id, _| !departed.contains(agent_id));
-        self.attention
-            .retain(|agent_id, _| !departed.contains(agent_id));
-        self.activities
-            .retain(|agent_id, _| !departed.contains(agent_id));
-        self.last_active
-            .retain(|agent_id, _| !departed.contains(agent_id));
-        self.announced_workstreams
-            .retain(|agent_id, _| !departed.contains(agent_id));
-        self.announced_hosts
-            .retain(|agent_id, _| !departed.contains(agent_id));
-        self.rail_order
-            .retain(|agent_id| !departed.contains(agent_id));
-        if let ActivePane::Agent(agent_id) = self.active
-            && departed.contains(&agent_id)
-        {
+        self.agents.retain(|id, _| !departed.contains(id));
+        self.attention.retain(|id, _| !departed.contains(id));
+        self.activities.retain(|id, _| !departed.contains(id));
+        self.turn_reports.retain(|id, _| !departed.contains(id));
+        self.last_active.retain(|id, _| !departed.contains(id));
+        self.announced_hosts.retain(|id, _| !departed.contains(id));
+        self.order.retain(|id| !departed.contains(id));
+        if matches!(self.active, ActivePane::Agent(id) if departed.contains(&id)) {
             self.active = ActivePane::Draft;
         }
         self.rebuild(None);
@@ -433,32 +111,27 @@ impl AgentRegistry {
     pub fn host_name(&self, host: HostId) -> &str {
         self.hosts
             .get(&host)
-            .map(|snapshot| snapshot.name.as_str())
+            .map(|h| h.name.as_str())
             .unwrap_or_default()
     }
 
-    /// Every attached host, in attachment order.
     pub fn hosts(&self) -> impl Iterator<Item = (HostId, &str)> {
         self.hosts
             .iter()
-            .map(|(host, snapshot)| (*host, snapshot.name.as_str()))
+            .map(|(id, host)| (*id, host.name.as_str()))
     }
 
     pub fn host_count(&self) -> usize {
         self.hosts.len()
     }
 
-    /// The machine seed of one host's database, for consumers that resolve
-    /// ids against it.
     pub fn host_machine_seed(&self, host: HostId) -> u64 {
         self.hosts
             .get(&host)
-            .map(|snapshot| snapshot.machine_seed)
+            .map(|h| h.machine_seed)
             .unwrap_or_default()
     }
 
-    /// The daemon an agent belongs to; falls back to the host announced at
-    /// creation until its summary lands.
     pub fn host_of_agent(&self, agent_id: AgentId) -> Option<HostId> {
         self.agent_hosts
             .get(&agent_id)
@@ -466,49 +139,38 @@ impl AgentRegistry {
             .copied()
     }
 
-    pub fn host_of_workstream(&self, workstream_id: WorkstreamId) -> Option<HostId> {
-        self.workstream_hosts.get(&workstream_id).copied()
+    pub fn note_agent_created(&mut self, host: HostId, agent_id: AgentId) {
+        self.announced_hosts.insert(agent_id, host);
+        self.mark_known(agent_id);
     }
 
-    /// Replaces one host's snapshot from its `Ready`. Other hosts keep the
-    /// state they last reported, including live attention that arrived
-    /// between their own refreshes.
     pub fn set_host_data(
         &mut self,
         host: HostId,
         machine_seed: u64,
         agent_counter: u64,
-        workstreams: Vec<UiWorkstream>,
         mut agents: Vec<UiAgentSummary>,
     ) {
-        // The "hide" label folds its carriers exactly like the filed-away
-        // disposition; merging here keeps every downstream check uniform.
         for agent in &mut agents {
             agent.hidden |= agent.labels.iter().any(|label| label == HIDE_LABEL);
         }
         let snapshot = self.hosts.entry(host).or_default();
         snapshot.machine_seed = machine_seed;
         snapshot.agent_counter = agent_counter;
-        snapshot.workstreams = workstreams;
         snapshot.agents = agents;
         self.rebuild(Some(host));
     }
 
-    /// Single-daemon convenience for clients that attach exactly one host,
-    /// and for tests.
-    pub fn set_data(&mut self, workstreams: Vec<UiWorkstream>, agents: Vec<UiAgentSummary>) {
+    pub fn set_data(&mut self, agents: Vec<UiAgentSummary>) {
         let host = HostId::default();
-        let (machine_seed, agent_counter) = self
+        let (seed, counter) = self
             .hosts
             .get(&host)
-            .map(|snapshot| (snapshot.machine_seed, snapshot.agent_counter))
+            .map(|h| (h.machine_seed, h.agent_counter))
             .unwrap_or_default();
-        self.set_host_data(host, machine_seed, agent_counter, workstreams, agents);
+        self.set_host_data(host, seed, counter, agents);
     }
 
-    /// Recomputes everything derived from the per-host snapshots. When one
-    /// host just refreshed, only its agents' live overlays (attention,
-    /// activity) are re-seeded from summaries; the other hosts keep theirs.
     fn rebuild(&mut self, refreshed: Option<HostId>) {
         self.agent_hosts = self
             .hosts
@@ -517,53 +179,27 @@ impl AgentRegistry {
                 snapshot.agents.iter().map(|agent| (agent.agent_id, *host))
             })
             .collect();
-        self.workstream_hosts = self
-            .hosts
-            .iter()
-            .flat_map(|(host, snapshot)| {
-                snapshot
-                    .workstreams
-                    .iter()
-                    .map(|workstream| (workstream.workstream_id, *host))
-            })
-            .collect();
-        let from_refreshed = |agent_id: &AgentId| {
-            refreshed.is_some() && self.agent_hosts.get(agent_id).copied() == refreshed
-        };
-        // Summaries carry an attention, activity, and turn-report snapshot,
-        // so for the host that just spoke they replace whatever its
-        // broadcasts left behind. Agents no longer in any snapshot drop out
-        // entirely. A verdict still awaiting its answer is the exception:
-        // this snapshot may predate it.
+        let from_refreshed =
+            |id: &AgentId| refreshed.is_some() && self.agent_hosts.get(id).copied() == refreshed;
         let now = rho_core::UnixMs(now_ms());
         self.pending_verdicts
-            .retain(|_, (_, sent_at)| now.0.saturating_sub(sent_at.0) < VERDICT_GRACE_MS);
-        let awaiting_answer = self
+            .retain(|_, (_, sent)| now.0.saturating_sub(sent.0) < VERDICT_GRACE_MS);
+        let awaiting = self
             .pending_verdicts
             .keys()
             .copied()
             .collect::<BTreeSet<_>>();
-        self.attention.retain(|agent_id, _| {
-            self.agent_hosts.contains_key(agent_id)
-                && (!from_refreshed(agent_id) || awaiting_answer.contains(agent_id))
+        self.attention.retain(|id, _| {
+            self.agent_hosts.contains_key(id) && (!from_refreshed(id) || awaiting.contains(id))
         });
-        self.activities.retain(|agent_id, _| {
-            self.agent_hosts.contains_key(agent_id) && !from_refreshed(agent_id)
-        });
-        self.turn_reports.retain(|agent_id, _| {
-            self.agent_hosts.contains_key(agent_id) && !from_refreshed(agent_id)
-        });
+        self.activities
+            .retain(|id, _| self.agent_hosts.contains_key(id) && !from_refreshed(id));
+        self.turn_reports
+            .retain(|id, _| self.agent_hosts.contains_key(id) && !from_refreshed(id));
 
+        let mut summaries = Vec::new();
         let mut unseen = Vec::new();
-        let mut workstreams = Vec::new();
-        let mut agents = Vec::new();
-        let mut derived = Vec::new();
-        for (host, snapshot) in &self.hosts {
-            derived.push(derive_workstreams(
-                *host,
-                &snapshot.workstreams,
-                &snapshot.agents,
-            ));
+        for snapshot in self.hosts.values() {
             for agent in &snapshot.agents {
                 self.agents
                     .entry(agent.agent_id)
@@ -571,86 +207,57 @@ impl AgentRegistry {
                 self.attention
                     .entry(agent.agent_id)
                     .or_insert(agent.attention);
-                if let Some(activity) = agent.activity.clone() {
-                    self.activities.entry(agent.agent_id).or_insert(activity);
+                if let Some(activity) = &agent.activity {
+                    self.activities
+                        .entry(agent.agent_id)
+                        .or_insert_with(|| activity.clone());
                 }
-                if let Some(report) = agent.turn_report.clone() {
-                    self.turn_reports.entry(agent.agent_id).or_insert(report);
+                if let Some(report) = &agent.turn_report {
+                    self.turn_reports
+                        .entry(agent.agent_id)
+                        .or_insert_with(|| report.clone());
                 }
-                // Keep the freshest engagement signal: a local send can be
-                // newer than the summary's persisted timestamp.
-                let last_active = self
+                let active = self
                     .last_active
                     .entry(agent.agent_id)
                     .or_insert(rho_core::UnixMs(0));
-                *last_active = (*last_active).max(agent.last_active);
-                if !self.rail_ranks.contains_key(&agent.agent_id) {
+                *active = (*active).max(agent.last_active);
+                if !self.order.contains(&agent.agent_id) {
                     unseen.push((agent.last_active, agent.agent_id));
                 }
             }
-            workstreams.extend(snapshot.workstreams.iter().cloned());
-            agents.extend(snapshot.agents.iter().cloned());
+            summaries.extend(snapshot.agents.iter().cloned());
         }
-        // First-seen agents enter above the retained order, seeded by
-        // engagement recency; already-placed agents keep their relative
-        // position across refreshes.
-        unseen.sort_by_key(|(last_active, agent_id)| (Reverse(*last_active), *agent_id));
-        self.rail_order
-            .splice(0..0, unseen.into_iter().map(|(_, agent_id)| agent_id));
-        self.rail_ranks = self
-            .rail_order
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(rank, agent_id)| (agent_id, rank))
-            .collect();
-        self.agent_locations = agents
+        unseen.sort_by_key(|(active, id)| (Reverse(*active), *id));
+        self.order
+            .splice(0..0, unseen.into_iter().map(|(_, id)| id));
+        self.order.retain(|id| self.agents.contains_key(id));
+        self.agent_locations = summaries
             .iter()
             .enumerate()
-            .map(|(index, agent)| (agent.agent_id, index))
+            .map(|(i, agent)| (agent.agent_id, i))
             .collect();
-        self.workstreams = derived.concat();
-        self.raw_workstreams = workstreams;
-        self.summaries = agents;
-        self.rebuild_topic_rail_layouts();
+        self.summaries = summaries;
     }
 
     pub fn set_attention(&mut self, agent_id: AgentId, attention: rho_ui_proto::UiAttention) {
-        // The daemon has spoken about this agent, so whatever verdict was
-        // outstanding is answered — by this level or by a newer event that
-        // overtook it. Either way the broadcast is the fresher word.
         self.pending_verdicts.remove(&agent_id);
-        if self.attention.insert(agent_id, attention) != Some(attention) {
-            self.rebuild_topic_rail_layouts();
-        }
+        self.attention.insert(agent_id, attention);
     }
-
-    /// Applies a verdict the client just sent, before its answer comes back:
-    /// the row settles under the hand that pressed it, and no `Ready` built
-    /// before the verdict can undo it (see `pending_verdicts`).
     pub fn expect_attention(&mut self, agent_id: AgentId, attention: rho_ui_proto::UiAttention) {
         self.pending_verdicts
             .insert(agent_id, (attention, rho_core::UnixMs(now_ms())));
-        if self.attention.insert(agent_id, attention) != Some(attention) {
-            self.rebuild_topic_rail_layouts();
-        }
+        self.attention.insert(agent_id, attention);
     }
-
     pub fn set_activity(&mut self, agent_id: AgentId, activity: String) {
         self.activities.insert(agent_id, activity);
     }
-
     pub fn agent_activity(&self, agent_id: AgentId) -> Option<&str> {
         self.activities.get(&agent_id).map(String::as_str)
     }
-
     pub fn set_turn_report(&mut self, agent_id: AgentId, report: rho_ui_proto::UiTurnReport) {
         self.turn_reports.insert(agent_id, report);
     }
-
-    /// The last finished turn's classification, shown while that turn still
-    /// awaits the user or was settled — a settled row keeps its summary. A
-    /// new turn (Working) retires it, no cleanup.
     pub fn agent_turn_report(&self, agent_id: AgentId) -> Option<&rho_ui_proto::UiTurnReport> {
         matches!(
             self.attention(agent_id),
@@ -659,1579 +266,200 @@ impl AgentRegistry {
         .then(|| self.turn_reports.get(&agent_id))
         .flatten()
     }
-
     pub fn attention(&self, agent_id: AgentId) -> rho_ui_proto::UiAttention {
         self.attention.get(&agent_id).copied().unwrap_or_default()
     }
-
-    /// The user engaged this agent right now (sent it a message).
     pub fn touch_agent(&mut self, agent_id: AgentId) {
         self.last_active
             .insert(agent_id, rho_core::UnixMs(now_ms()));
-        self.rebuild_topic_rail_layouts();
     }
-
-    /// Folded under the workstream's collapsed tail instead of listed.
-    /// Explicitly hidden agents always fold; otherwise the rail shows pinned
-    /// agents, the active bucket, five more agents from the quiet tail, and
-    /// the current selection.
     pub fn agent_folded(&self, agent_id: AgentId) -> bool {
-        let Some(workstream) = self
-            .workstreams
-            .iter()
-            .find(|workstream| workstream.agent_ids().any(|id| id == agent_id))
-        else {
-            return false;
-        };
-        // A folded row folds all its members with it.
-        let (_, folded_rows) = self.split_rows();
-        if folded_rows
-            .iter()
-            .any(|row| row.workstream_id == workstream.workstream_id)
-        {
-            return true;
-        }
-        self.topic_rail_layouts
-            .get(&workstream.workstream_id)
-            .is_some_and(|layout| layout.listed.iter().all(|(id, _)| *id != agent_id))
+        self.agent_summary(agent_id)
+            .is_some_and(|agent| agent.hidden)
     }
 
-    /// The rail-visible agent most in need of the user, excluding the one
-    /// already on screen: highest attention wins, rail order breaks ties.
-    /// Only Pending and above count — jumping to a quiet or merely working
-    /// agent would be noise.
     pub fn next_attention_agent(&self) -> Option<AgentId> {
         let selected = self.selected_agent().copied();
-        self.rail_order()
-            .into_iter()
-            .filter(|agent_id| Some(*agent_id) != selected && !self.agent_folded(*agent_id))
-            .map(|agent_id| (agent_id, self.attention(agent_id)))
-            .filter(|(_, attention)| *attention >= rho_ui_proto::UiAttention::Pending)
-            .min_by_key(|(_, attention)| Reverse(*attention))
-            .map(|(agent_id, _)| agent_id)
-    }
-
-    /// Where a new agent should work: the newest agent in the workstream sets
-    /// the precedent, since sibling agents usually share a project.
-    pub fn last_working_directory(&self, workstream_id: WorkstreamId) -> Option<Utf8PathBuf> {
-        self.workstreams
+        self.order
             .iter()
-            .find(|workstream| workstream.workstream_id == workstream_id)?
-            .agents
-            .last()
-            .map(|agent| agent.workspace.repo().to_owned())
+            .copied()
+            .filter(|id| Some(*id) != selected && !self.agent_folded(*id))
+            .map(|id| (id, self.attention(id)))
+            .filter(|(_, a)| *a >= rho_ui_proto::UiAttention::Pending)
+            .min_by_key(|(_, a)| Reverse(*a))
+            .map(|(id, _)| id)
     }
 
-    /// The workstream an agent currently belongs to; falls back to the one
-    /// announced at creation until the summary lands.
-    pub fn workstream_of(&self, agent_id: AgentId) -> Option<WorkstreamId> {
-        match self.agent_summary(agent_id) {
-            Some(agent) => Some(agent.workstream),
-            None => self.announced_workstreams.get(&agent_id).copied(),
-        }
-    }
-
-    /// Every agent a rail row for `agent_id` speaks for: the agent itself
-    /// and its descendants, whose attention the row aggregates. A verdict on
-    /// the row has to cover all of them, or the row keeps the lamp of a
-    /// child the user just acked through its parent. Hidden agents carry no
-    /// lamp and are left out — a verdict must never resurrect one.
     pub fn agent_subtree(&self, agent_id: AgentId) -> Vec<AgentId> {
-        let Some(workstream) = self
-            .workstream_of(agent_id)
-            .and_then(|workstream_id| self.workstream(workstream_id))
-        else {
-            return vec![agent_id];
-        };
-        let by_id = workstream
-            .agents
+        let by_id = self
+            .summaries
             .iter()
-            .map(|agent| (agent.agent_id, agent))
+            .map(|a| (a.agent_id, a))
             .collect::<BTreeMap<_, _>>();
-        let mut subtree = workstream
-            .agents
+        let mut result = vec![agent_id];
+        for candidate in self
+            .summaries
             .iter()
-            .filter(|agent| agent.agent_id != agent_id && !agent.hidden)
-            .map(|agent| agent.agent_id)
-            .filter(|candidate| {
-                let mut cursor = *candidate;
-                let mut seen = BTreeSet::new();
-                while seen.insert(cursor) {
-                    let Some(parent) = by_id.get(&cursor).and_then(|agent| agent.parent_agent)
-                    else {
-                        break;
-                    };
-                    if parent == agent_id {
-                        return true;
-                    }
-                    cursor = parent;
+            .filter(|a| !a.hidden && a.agent_id != agent_id)
+        {
+            let mut cursor = candidate.agent_id;
+            let mut seen = BTreeSet::new();
+            while seen.insert(cursor) {
+                let Some(parent) = by_id.get(&cursor).and_then(|a| a.parent_agent) else {
+                    break;
+                };
+                if parent == agent_id {
+                    result.push(candidate.agent_id);
+                    break;
                 }
-                false
-            })
-            .collect::<Vec<_>>();
-        // The row's own agent is always covered, hidden or not: a hide
-        // verdict on an open agent has to reach it.
-        subtree.insert(0, agent_id);
-        subtree
+                cursor = parent;
+            }
+        }
+        result
     }
 
-    /// Every listed agent in one workstream: what a verdict on the
-    /// workstream row covers, since the row aggregates all of them. Hidden
-    /// members are already put away and stay that way.
-    pub fn workstream_agents(&self, workstream_id: WorkstreamId) -> Vec<AgentId> {
-        self.workstream(workstream_id)
-            .map(|workstream| {
-                workstream
-                    .agents
-                    .iter()
-                    .filter(|agent| !agent.hidden)
-                    .map(|agent| agent.agent_id)
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    fn workstream(&self, workstream_id: WorkstreamId) -> Option<&Workstream> {
-        self.workstreams
-            .iter()
-            .find(|workstream| workstream.workstream_id == workstream_id)
-    }
-
-    /// Records the host and workstream announced with `AgentCreated`, so a
-    /// freshly created agent can be addressed — and routed to the right
-    /// daemon — before the next `Ready` carries its summary.
-    pub fn note_agent_workstream(
-        &mut self,
-        host: HostId,
-        agent_id: AgentId,
-        workstream: WorkstreamId,
-    ) {
-        self.announced_workstreams.insert(agent_id, workstream);
-        self.announced_hosts.insert(agent_id, host);
-    }
-
-    /// The role-prefixed short display label, unique among one daemon's
-    /// generated IDs. Two daemons allocate from independent id spaces, so
-    /// once several are attached the label carries its host: `fern/eng-h6u7`.
     pub fn agent_id_label(&self, agent_id: AgentId) -> String {
         let host = self.host_of_agent(agent_id);
-        // An id whose summary has not landed yet has no host to size its
-        // prefix; the longest attached host's counter is the safe guess.
-        let agent_counter = host
-            .and_then(|host| self.hosts.get(&host))
-            .map(|snapshot| snapshot.agent_counter)
+        let counter = host
+            .and_then(|h| self.hosts.get(&h))
+            .map(|h| h.agent_counter)
             .unwrap_or_else(|| {
                 self.hosts
                     .values()
-                    .map(|snapshot| snapshot.agent_counter)
+                    .map(|h| h.agent_counter)
                     .max()
                     .unwrap_or_default()
             });
-        let prefix_len = prefix_id::uniform_prefix_len(agent_counter, LABEL_HEADROOM).max(4);
+        let len = prefix_id::uniform_prefix_len(counter, LABEL_HEADROOM).max(4);
         let prefix = self
             .agent_summary(agent_id)
-            .map(|agent| agent.role.handle_prefix())
+            .map(|a| a.role.handle_prefix())
             .unwrap_or("eng");
-        let label = format!("{prefix}-{}", &agent_id.encoded()[..prefix_len]);
+        let label = format!("{prefix}-{}", &agent_id.encoded()[..len]);
         match host.filter(|_| self.hosts.len() > 1) {
-            Some(host) => format!("{}/{label}", self.host_name(host)),
+            Some(h) => format!("{}/{label}", self.host_name(h)),
             None => label,
         }
     }
-
     pub fn working_directory(&self, agent_id: AgentId) -> Option<Utf8PathBuf> {
         self.agent_summary(agent_id)
-            .map(|agent| agent.workspace.repo().to_owned())
+            .map(|a| a.workspace.repo().to_owned())
     }
-
     pub fn agent_workspace(&self, agent_id: AgentId) -> Option<&rho_ui_proto::WorkspaceInfo> {
-        self.agent_summary(agent_id).map(|agent| &agent.workspace)
+        self.agent_summary(agent_id).map(|a| &a.workspace)
     }
-
     pub fn workspace_id_label(&self, agent_id: AgentId) -> Option<String> {
-        let workspace_id = self
-            .agent_summary(agent_id)
-            .and_then(|agent| agent.workspace.workspace_id())?;
-        // Workspace ids are allocated in repository-local domains. Without
-        // that repository's seed and counter the GUI cannot know whether a
-        // short prefix selects this id or an earlier generated match, so keep
-        // the full typed handle here.
-        Some(format!("ws-{}", workspace_id.encoded()))
+        self.agent_summary(agent_id)
+            .and_then(|a| a.workspace.workspace_id())
+            .map(|id| format!("ws-{}", id.encoded()))
     }
-
     pub fn agent_role(&self, agent_id: AgentId) -> Option<rho_ui_proto::AgentRole> {
-        self.agent_summary(agent_id).map(|agent| agent.role)
+        self.agent_summary(agent_id).map(|a| a.role)
     }
-
     pub fn agent_last_active(&self, agent_id: AgentId) -> Option<rho_core::UnixMs> {
-        self.agent_summary(agent_id).map(|agent| agent.last_active)
+        self.last_active.get(&agent_id).copied()
     }
-
-    /// A workstream's raw labels, from the snapshot.
-    pub fn workstream_labels(&self, workstream_id: WorkstreamId) -> &[String] {
-        self.raw_workstreams
-            .iter()
-            .find(|workstream| workstream.workstream_id == workstream_id)
-            .map(|workstream| workstream.labels.as_slice())
-            .unwrap_or(&[])
-    }
-
-    /// Every distinct label carried by any workstream; label-prompt
-    /// completion.
-    pub fn workstream_label_names(&self) -> Vec<String> {
-        let mut labels = self
-            .raw_workstreams
-            .iter()
-            .flat_map(|workstream| workstream.labels.iter().cloned())
-            .collect::<Vec<_>>();
-        labels.sort();
-        labels.dedup();
-        labels
-    }
-
     fn agent_summary(&self, agent_id: AgentId) -> Option<&UiAgentSummary> {
-        let index = self.agent_locations.get(&agent_id)?;
-        self.summaries.get(*index)
+        self.agent_locations
+            .get(&agent_id)
+            .and_then(|i| self.summaries.get(*i))
     }
-
     pub fn agent_display_name(&self, agent_id: AgentId) -> Option<&str> {
         self.agent_summary(agent_id)
-            .and_then(|agent| agent.display_name.as_deref())
+            .and_then(|a| a.display_name.as_deref())
     }
-
     pub fn agent_display_label(&self, agent_id: AgentId) -> String {
-        let id_label = self.agent_id_label(agent_id);
-        match self.agent_display_name(agent_id) {
-            Some(name) if !name.trim().is_empty() => format!("{name} ({id_label})"),
-            _ => id_label,
-        }
+        let id = self.agent_id_label(agent_id);
+        self.agent_display_name(agent_id)
+            .filter(|n| !n.trim().is_empty())
+            .map_or_else(|| id.clone(), |n| format!("{n} ({id})"))
     }
-
-    /// Human-facing dashboard name. Generated ids remain available through
-    /// `agent_display_label` for addressing and disambiguation, not scanning.
     pub fn agent_human_name(&self, agent_id: AgentId) -> String {
         let Some(agent) = self.agent_summary(agent_id) else {
-            return "Untitled agent".to_owned();
+            return "Untitled agent".into();
         };
-        if let Some(name) = agent.display_name.as_deref().map(str::trim)
-            && !name.is_empty()
+        if let Some(name) = agent
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
         {
-            return name.to_owned();
+            return name.into();
         }
-        let message = agent.last_user_message_text.trim();
-        if !message.is_empty() {
-            return message.to_owned();
+        if !agent.last_user_message_text.trim().is_empty() {
+            return agent.last_user_message_text.trim().into();
         }
         if agent.role.is_pm() {
-            "Project manager".to_owned()
+            "Project manager".into()
         } else if agent.role.is_engineer() {
-            "Engineer".to_owned()
+            "Engineer".into()
         } else {
-            "Advisor".to_owned()
+            "Advisor".into()
         }
-    }
-
-    pub fn add_workstream(&mut self, host: HostId, workstream: UiWorkstream) {
-        let snapshot = self.hosts.entry(host).or_default();
-        // Workstreams stay in the daemon's creation order; a new one is the
-        // newest, so it belongs at the end.
-        snapshot
-            .workstreams
-            .retain(|existing| existing.workstream_id != workstream.workstream_id);
-        snapshot.workstreams.push(workstream);
-        self.rebuild(None);
-    }
-
-    pub fn workstreams(&self) -> &[Workstream] {
-        &self.workstreams
-    }
-
-    /// Rail row order applies the retained agent-rail policy at workstream
-    /// granularity: pinned containers, pinned roots, then the coarse active
-    /// cohort, with the best statefully ordered root as the stable tiebreak.
-    pub fn ordered_workstreams(&self) -> Vec<&Workstream> {
-        let bucket = self.row_bucket();
-        let mut rows = self.workstreams.iter().collect::<Vec<_>>();
-        rows.sort_by_key(|workstream| {
-            let roots = self.ordered_workstream_roots(workstream);
-            (
-                !workstream.pinned,
-                !roots.iter().any(|root| agent_pinned(root)),
-                !bucket.contains(&workstream.workstream_id),
-                roots
-                    .first()
-                    .and_then(|root| self.rail_ranks.get(&root.agent_id))
-                    .copied()
-                    .unwrap_or(usize::MAX),
-            )
-        });
-        rows
-    }
-
-    /// The attention/recency top bucket over workstream rows. Descendant
-    /// attention rolls up through roots, while quiet recency is represented
-    /// once per workstream, so member count cannot distort the five-row
-    /// cohort.
-    fn row_bucket(&self) -> BTreeSet<WorkstreamId> {
-        let normal = self
-            .workstreams
-            .iter()
-            .filter_map(|workstream| {
-                if workstream.hidden || workstream.pinned {
-                    return None;
-                }
-                let roots = self.ordered_workstream_roots(workstream);
-                if roots.is_empty() || roots.iter().any(|root| agent_pinned(root)) {
-                    return None;
-                }
-                // Every agent's attention belongs to its root, so one pass
-                // over the workstream answers for all of them at once. Asking
-                // root by root instead rescans the workstream per root, which
-                // makes a dashboard sync quadratic in agent count.
-                let roots_by_agent = roots_by_agent(workstream);
-                let root_ids = roots
-                    .iter()
-                    .map(|root| root.agent_id)
-                    .collect::<BTreeSet<_>>();
-                let attention = workstream
-                    .agents
-                    .iter()
-                    .filter(|agent| !agent.hidden)
-                    .filter(|agent| {
-                        roots_by_agent
-                            .get(&agent.agent_id)
-                            .is_some_and(|root| root_ids.contains(root))
-                    })
-                    .map(|agent| self.attention(agent.agent_id))
-                    .max()
-                    .unwrap_or_default();
-                Some((workstream.workstream_id, attention))
-            })
-            .collect::<Vec<_>>();
-        active_bucket(normal)
-    }
-
-    /// Rail rows split into the listed set and the folded tail, the same
-    /// policy the agent rail applied per topic: pinned rows, rows with a
-    /// pinned root or active-cohort membership, and the selected row stay,
-    /// plus [`EXTRA_ROWS`] more in retained order; quiet leftovers fold.
-    /// Hidden rows appear in neither list.
-    pub fn split_rows(&self) -> (Vec<&Workstream>, Vec<&Workstream>) {
-        let selected_row = self
-            .selected_agent()
-            .copied()
-            .and_then(|agent_id| self.workstream_of(agent_id));
-        let bucket = self.row_bucket();
-        let mut listed = Vec::new();
-        let mut folded = Vec::new();
-        let mut extra = 0;
-        for workstream in self.ordered_workstreams() {
-            if workstream.hidden {
-                continue;
-            }
-            let roots = self.ordered_workstream_roots(workstream);
-            let keep = workstream.pinned
-                || selected_row == Some(workstream.workstream_id)
-                || roots.iter().any(|root| agent_pinned(root))
-                || bucket.contains(&workstream.workstream_id);
-            if keep {
-                listed.push(workstream);
-            } else if extra < EXTRA_ROWS {
-                extra += 1;
-                listed.push(workstream);
-            } else {
-                folded.push(workstream);
-            }
-        }
-        (listed, folded)
     }
 
     pub fn mark_known(&mut self, agent_id: AgentId) {
         self.agents.entry(agent_id).or_insert(AgentLife::Known);
     }
-
     pub fn mark_live(&mut self, agent_id: AgentId) -> bool {
         self.agents.insert(agent_id, AgentLife::Live) != Some(AgentLife::Live)
     }
-
     pub fn mark_not_live(&mut self, agent_id: AgentId) {
         self.agents.insert(agent_id, AgentLife::Known);
     }
-
     pub fn active_pane(&self) -> ActivePane {
         self.active
     }
-
     pub fn selected_agent(&self) -> Option<&AgentId> {
-        match &self.active {
-            ActivePane::Agent(agent_id) => Some(agent_id),
-            ActivePane::Startup | ActivePane::Draft => None,
+        if let ActivePane::Agent(id) = &self.active {
+            Some(id)
+        } else {
+            None
         }
     }
-
     pub fn select_agent(&mut self, agent_id: AgentId) {
-        let active = ActivePane::Agent(agent_id);
-        if self.active != active {
-            self.active = active;
-            self.rebuild_topic_rail_layouts();
-        }
+        self.active = ActivePane::Agent(agent_id);
     }
-
     pub fn enter_draft(&mut self) {
-        if self.active != ActivePane::Draft {
-            self.active = ActivePane::Draft;
-            self.rebuild_topic_rail_layouts();
-        }
+        self.active = ActivePane::Draft;
     }
-
-    /// Cycles through live, rail-visible agents by `delta`, starting from
-    /// the current selection. Cycling follows rail order (workstreams, then
-    /// agents within each); agent id order is meaningless.
-    #[cfg(test)]
-    pub fn next_live_agent(&self, delta: isize) -> Option<AgentId> {
-        let live = self
-            .rail_order()
-            .into_iter()
-            .filter(|agent_id| {
-                self.agents.get(agent_id) == Some(&AgentLife::Live) && !self.agent_folded(*agent_id)
-            })
-            .collect::<Vec<_>>();
-        if live.is_empty() {
-            return None;
-        }
-        let len = live.len() as isize;
-        let index = self
-            .selected_agent()
-            .and_then(|selected| live.iter().position(|agent_id| agent_id == selected))
-            .map(|index| (index as isize + delta).rem_euclid(len) as usize)
-            .unwrap_or_else(|| if delta < 0 { live.len() - 1 } else { 0 });
-        live.get(index).copied()
-    }
-
-    /// Cycles through every known rail-visible agent. Selecting a parked
-    /// result lets the workspace establish its connection-local subscription.
     pub fn next_agent(&self, delta: isize) -> Option<AgentId> {
-        let agents = self
-            .rail_order()
-            .into_iter()
-            .filter(|agent_id| !self.agent_folded(*agent_id))
+        let visible = self
+            .order
+            .iter()
+            .copied()
+            .filter(|id| !self.agent_folded(*id))
             .collect::<Vec<_>>();
-        if agents.is_empty() {
+        if visible.is_empty() {
             return None;
         }
-        let len = agents.len() as isize;
         let index = self
             .selected_agent()
-            .and_then(|selected| agents.iter().position(|agent_id| agent_id == selected))
-            .map(|index| (index as isize + delta).rem_euclid(len) as usize)
-            .unwrap_or_else(|| if delta < 0 { agents.len() - 1 } else { 0 });
-        agents.get(index).copied()
+            .and_then(|selected| visible.iter().position(|id| id == selected))
+            .map(|i| (i as isize + delta).rem_euclid(visible.len() as isize) as usize)
+            .unwrap_or_else(|| if delta < 0 { visible.len() - 1 } else { 0 });
+        visible.get(index).copied()
     }
-
-    /// All agents in rail display order: pinned workstreams first, and within
-    /// one pinned agents first, then the active bucket, then the retained
-    /// order. Agents known outside any workstream trail at the end.
-    fn rail_order(&self) -> Vec<AgentId> {
-        let mut candidates = Vec::new();
-        let mut hidden = BTreeSet::new();
-        for workstream in self.ordered_workstreams() {
-            if workstream.hidden {
-                hidden.extend(workstream.agent_ids());
-                continue;
-            }
-            if let Some(layout) = self.topic_rail_layouts.get(&workstream.workstream_id) {
-                candidates.extend(layout.listed.iter().map(|(agent_id, _)| *agent_id));
-            }
-        }
-        for agent_id in self.agents.keys() {
-            if !hidden.contains(agent_id) && !candidates.contains(agent_id) {
-                candidates.push(*agent_id);
-            }
-        }
-        candidates
-    }
-
-    fn order_topic_agents_with_state<'a>(
-        &self,
-        state: &TopicRailState<'_>,
-        mut agents: Vec<&'a UiAgentSummary>,
-    ) -> Vec<&'a UiAgentSummary> {
-        agents.sort_by_key(|agent| {
-            (
-                !agent_pinned(agent),
-                !state.top_roots.contains(&agent.agent_id),
-                self.rail_ranks
-                    .get(&agent.agent_id)
-                    .copied()
-                    .unwrap_or(usize::MAX),
-            )
-        });
-
-        let visible_ids = agents
-            .iter()
-            .map(|agent| agent.agent_id)
-            .collect::<BTreeSet<_>>();
-        let mut children = BTreeMap::<Option<AgentId>, Vec<_>>::new();
-        for agent in agents {
-            let parent = agent
-                .parent_agent
-                .filter(|parent| state.by_id.contains_key(parent) && visible_ids.contains(parent));
-            children.entry(parent).or_default().push(agent);
-        }
-
-        fn append<'a>(
-            parent: Option<AgentId>,
-            children: &BTreeMap<Option<AgentId>, Vec<&'a UiAgentSummary>>,
-            seen: &mut BTreeSet<AgentId>,
-            ordered: &mut Vec<&'a UiAgentSummary>,
-        ) {
-            for agent in children.get(&parent).into_iter().flatten() {
-                if seen.insert(agent.agent_id) {
-                    ordered.push(agent);
-                    append(Some(agent.agent_id), children, seen, ordered);
-                }
-            }
-        }
-
-        let mut ordered = Vec::new();
-        let mut seen = BTreeSet::new();
-        append(None, &children, &mut seen, &mut ordered);
-        // Persisted data should be acyclic, but don't drop rows if it is not.
-        for agents in children.values() {
-            for agent in agents {
-                if seen.insert(agent.agent_id) {
-                    ordered.push(agent);
-                    append(Some(agent.agent_id), &children, &mut seen, &mut ordered);
-                }
-            }
-        }
-        ordered
-    }
-
-    fn rebuild_topic_rail_layouts(&mut self) {
-        let layouts = self
-            .workstreams
-            .iter()
-            .map(|topic| {
-                let state = TopicRailState::new(self, topic);
-                let roots = self.order_topic_agents_with_state(
-                    &state,
-                    topic
-                        .agents
-                        .iter()
-                        .filter(|agent| {
-                            !agent.hidden
-                                && state.root_by_id.get(&agent.agent_id) == Some(&agent.agent_id)
-                        })
-                        .collect(),
-                );
-                let (listed, folded): (Vec<_>, Vec<_>) = topic
-                    .agents
-                    .iter()
-                    .filter(|agent| !state.auto_collapsed(agent.agent_id))
-                    .partition(|agent| !state.folded(agent.agent_id));
-                let listed = self.order_topic_agents_with_state(&state, listed);
-                let mut folded = folded;
-                folded.sort_by_key(|agent| Reverse(agent.updated_at));
-                let indexes = topic
-                    .agents
-                    .iter()
-                    .enumerate()
-                    .map(|(index, agent)| (agent.agent_id, index))
-                    .collect::<BTreeMap<_, _>>();
-                let cache = |agents: Vec<&UiAgentSummary>| {
-                    agents
-                        .into_iter()
-                        .map(|agent| (agent.agent_id, indexes[&agent.agent_id]))
-                        .collect()
-                };
-                (
-                    topic.workstream_id,
-                    TopicRailLayout {
-                        roots: cache(roots),
-                        listed: cache(listed),
-                        folded: cache(folded),
-                    },
-                )
-            })
-            .collect();
-        self.topic_rail_layouts = layouts;
-    }
-
-    fn resolve_cached_agents<'a>(
-        topic: &'a Workstream,
-        cached: &[(AgentId, usize)],
-    ) -> Vec<&'a UiAgentSummary> {
-        cached
-            .iter()
-            .filter_map(|(agent_id, index)| {
-                topic
-                    .agents
-                    .get(*index)
-                    .filter(|agent| agent.agent_id == *agent_id)
-                    .or_else(|| {
-                        topic
-                            .agents
-                            .iter()
-                            .find(|agent| agent.agent_id == *agent_id)
-                    })
-            })
-            .collect()
-    }
-
-    /// Every visible root in the retained, coarse-bucket order used by the
-    /// old agent rail. Unlike navigation folding, this does not drop quiet
-    /// roots from a multi-root dashboard section.
-    pub fn ordered_workstream_roots<'a>(
-        &self,
-        workstream: &'a Workstream,
-    ) -> Vec<&'a UiAgentSummary> {
-        self.topic_rail_layouts
-            .get(&workstream.workstream_id)
-            .map(|layout| Self::resolve_cached_agents(workstream, &layout.roots))
-            .unwrap_or_default()
-    }
-
-    /// Every visible agent in one workstream, ordered as a parent-before-child
-    /// tree. The depth is relative to the root agent; roots have depth zero.
-    pub fn ordered_workstream_tree<'a>(
-        &self,
-        workstream: &'a Workstream,
-    ) -> Vec<(&'a UiAgentSummary, usize)> {
-        let state = TopicRailState::new(self, workstream);
-        let visible_through_ancestors = |agent: &&UiAgentSummary| {
-            let mut cursor = agent.agent_id;
-            let mut seen = BTreeSet::new();
-            while seen.insert(cursor) {
-                let Some(current) = state.by_id.get(&cursor) else {
-                    break;
-                };
-                if current.hidden {
-                    return false;
-                }
-                let Some(parent) = current.parent_agent else {
-                    break;
-                };
-                cursor = parent;
-            }
-            true
-        };
-        let ordered = self.order_topic_agents_with_state(
-            &state,
-            workstream
-                .agents
-                .iter()
-                .filter(visible_through_ancestors)
-                .collect(),
-        );
-        let visible = ordered
-            .iter()
-            .map(|agent| agent.agent_id)
-            .collect::<BTreeSet<_>>();
-        ordered
-            .into_iter()
-            .map(|agent| {
-                let mut depth = 0;
-                let mut cursor = agent.agent_id;
-                let mut seen = BTreeSet::new();
-                while seen.insert(cursor) {
-                    let Some(parent) = state
-                        .by_id
-                        .get(&cursor)
-                        .and_then(|agent| agent.parent_agent)
-                    else {
-                        break;
-                    };
-                    if !visible.contains(&parent) {
-                        break;
-                    }
-                    depth += 1;
-                    cursor = parent;
-                }
-                (agent, depth)
-            })
-            .collect()
-    }
-
-    /// Attention displayed for one dashboard root, including its visible
-    /// descendants. This is also the signal used to place the root and its
-    /// containing workstream in their coarse active cohorts.
-    ///
-    /// Test support for client crates' suites.
-    pub fn split_workstream_agents<'a>(
-        &self,
-        topic: &'a Workstream,
-    ) -> (Vec<&'a UiAgentSummary>, Vec<&'a UiAgentSummary>) {
-        let Some(layout) = self.topic_rail_layouts.get(&topic.workstream_id) else {
-            return (Vec::new(), Vec::new());
-        };
-        (
-            Self::resolve_cached_agents(topic, &layout.listed),
-            Self::resolve_cached_agents(topic, &layout.folded),
-        )
-    }
-
-    /// Resolves an agent label (as produced by [`Self::agent_id_label`],
-    /// with or without a leading `@`) or display name back to the agent id.
-    /// With several hosts attached, an unqualified label still resolves when
-    /// exactly one host answers to it — typing `fern/` is disambiguation,
-    /// not ceremony.
     pub fn agent_by_label(&self, label: &str) -> Option<AgentId> {
         let label = label.strip_prefix('@').unwrap_or(label);
-        let exact = self.agents.keys().copied().find(|agent_id| {
-            self.agent_id_label(*agent_id) == label
+        let exact = self.agents.keys().copied().find(|id| {
+            self.agent_id_label(*id) == label
                 || self
-                    .agent_display_name(*agent_id)
-                    .is_some_and(|name| name.eq_ignore_ascii_case(label))
+                    .agent_display_name(*id)
+                    .is_some_and(|n| n.eq_ignore_ascii_case(label))
         });
         if exact.is_some() || label.contains('/') {
             return exact;
         }
-        let mut unqualified = self.agents.keys().copied().filter(|agent_id| {
-            self.agent_id_label(*agent_id)
-                .rsplit('/')
-                .next()
-                .is_some_and(|bare| bare == label)
-        });
-        let first = unqualified.next()?;
-        unqualified.next().is_none().then_some(first)
+        let mut matches = self
+            .agents
+            .keys()
+            .copied()
+            .filter(|id| self.agent_id_label(*id).rsplit('/').next() == Some(label));
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first)
     }
-
     pub fn known_agents(&self) -> impl Iterator<Item = &AgentId> {
         self.agents.keys()
-    }
-}
-
-/// New agents guaranteed between two label-length changes.
-const LABEL_HEADROOM: u64 = 200;
-
-/// Quiet rows kept visible beyond pins and the top bucket before the rail
-/// tail folds.
-const EXTRA_ROWS: usize = 5;
-
-#[cfg(test)]
-mod tests {
-    use rho_ui_proto::{AgentIdDomain, UiAgentSummary, WorkspaceId, WorkspaceIdDomain};
-
-    use super::*;
-
-    /// Pin state fixture shorthand, in the shape the old tag `Status` had.
-    #[derive(Clone, Copy, PartialEq)]
-    enum Status {
-        Normal,
-        Pinned,
-    }
-
-    fn status_labels(status: Status) -> Vec<String> {
-        match status {
-            Status::Normal => Vec::new(),
-            Status::Pinned => vec![PIN_LABEL.to_owned()],
-        }
-    }
-
-    fn agent_id(id: u64) -> AgentId {
-        AgentId::from_counter(id, &AgentIdDomain(0)).unwrap()
-    }
-
-    /// Freshly-engaged fixture: `last_active` stays below now while `id`
-    /// provides deterministic seeding order.
-    fn agent(id: u64, status: Status) -> UiAgentSummary {
-        UiAgentSummary {
-            agent_id: agent_id(id),
-            parent_agent: None,
-            display_name: None,
-            created_at: rho_core::UnixMs(id),
-            updated_at: rho_core::UnixMs(id),
-            role: rho_ui_proto::AgentRole::default(),
-            workspace: rho_ui_proto::WorkspaceInfo::UserCheckout {
-                repo: "/tmp".into(),
-            },
-            attention: rho_ui_proto::UiAttention::Quiet,
-            last_active: rho_core::UnixMs(now_ms().saturating_sub(10_000).saturating_add(id)),
-            hidden: false,
-            last_user_message_text: String::new(),
-            activity: None,
-            turn_report: None,
-            workstream: WorkstreamId(0),
-            labels: status_labels(status),
-        }
-    }
-
-    fn named_agent(id: u64, name: &str) -> UiAgentSummary {
-        UiAgentSummary {
-            display_name: Some(name.to_owned()),
-            ..agent(id, Status::Normal)
-        }
-    }
-
-    fn workspace_agent(id: u64, workspace_id: WorkspaceId) -> UiAgentSummary {
-        UiAgentSummary {
-            workspace: rho_ui_proto::WorkspaceInfo::Workspace {
-                repo: "/tmp".into(),
-                id: workspace_id,
-            },
-            last_active: rho_core::UnixMs(0),
-            ..agent(id, Status::Normal)
-        }
-    }
-
-    /// A workstream with its members' `workstream` set to match.
-    fn topic(
-        id: u64,
-        status: Status,
-        mut agents: Vec<UiAgentSummary>,
-    ) -> (UiWorkstream, Vec<UiAgentSummary>) {
-        for agent in &mut agents {
-            agent.workstream = WorkstreamId(id);
-        }
-        (
-            UiWorkstream {
-                workstream_id: WorkstreamId(id),
-                name: id.to_string(),
-                labels: status_labels(status),
-            },
-            agents,
-        )
-    }
-
-    fn set_topics(registry: &mut AgentRegistry, topics: Vec<(UiWorkstream, Vec<UiAgentSummary>)>) {
-        let mut workstreams = Vec::new();
-        let mut agents = Vec::new();
-        for (workstream, members) in topics {
-            workstreams.push(workstream);
-            agents.extend(members);
-        }
-        registry.set_data(workstreams, agents);
-    }
-
-    #[test]
-    fn hide_label_on_the_workstream_folds_it_despite_visible_members() {
-        let mut registry = AgentRegistry::default();
-        let (mut hidden_stream, hidden_members) =
-            topic(1, Status::Normal, vec![agent(1, Status::Normal)]);
-        hidden_stream.labels.push(HIDE_LABEL.to_owned());
-        let visible = topic(2, Status::Normal, vec![agent(2, Status::Normal)]);
-        let mut agents = hidden_members;
-        agents.extend(visible.1.clone());
-        registry.set_data(vec![hidden_stream, visible.0], agents);
-
-        let (listed, folded) = registry.split_rows();
-        let listed = listed
-            .iter()
-            .map(|row| row.workstream_id)
-            .collect::<Vec<_>>();
-        // Hidden rows appear in neither list; only the unhidden stream rides.
-        assert_eq!(listed, [WorkstreamId(2)]);
-        assert!(folded.is_empty());
-    }
-
-    #[test]
-    fn cycling_follows_active_rail_order() {
-        let mut registry = AgentRegistry::default();
-        let mut recent = agent(3, Status::Normal);
-        recent.last_active = rho_core::UnixMs(now_ms() + 100);
-        set_topics(
-            &mut registry,
-            vec![topic(
-                1,
-                Status::Normal,
-                vec![agent(1, Status::Normal), agent(2, Status::Pinned), recent],
-            )],
-        );
-        for id in 1..=3 {
-            registry.mark_live(agent_id(id));
-        }
-
-        // Active rail order is pinned first, then most recently engaged
-        // (agent 3's newer last-user-message seeds it above the idle 1):
-        // 2, 3, 1. Forward cycling should move down that visible order.
-        registry.select_agent(agent_id(2));
-        assert_eq!(registry.next_live_agent(1), Some(agent_id(3)));
-        registry.select_agent(agent_id(3));
-        assert_eq!(registry.next_live_agent(1), Some(agent_id(1)));
-        assert_eq!(registry.next_live_agent(-1), Some(agent_id(2)));
-    }
-
-    #[test]
-    fn rows_sort_by_root_engagement_and_attention_not_creation() {
-        use rho_ui_proto::UiAttention;
-
-        let mut registry = AgentRegistry::default();
-        // Three workstreams in creation order 1, 2, 3; agent 3 pinned,
-        // agent 1 engaged most recently (fixture recency grows with id,
-        // bumped explicitly here).
-        let mut fresh = agent(1, Status::Normal);
-        fresh.last_active = rho_core::UnixMs(now_ms() + 100);
-        set_topics(
-            &mut registry,
-            vec![
-                topic(1, Status::Normal, vec![fresh]),
-                topic(2, Status::Normal, vec![agent(2, Status::Normal)]),
-                topic(3, Status::Normal, vec![agent(3, Status::Pinned)]),
-            ],
-        );
-
-        let order = |registry: &AgentRegistry| {
-            registry
-                .ordered_workstreams()
-                .into_iter()
-                .map(|workstream| workstream.workstream_id.0)
-                .collect::<Vec<_>>()
-        };
-        // Pinned membership leads; then retained engagement order (1 above 2),
-        // not creation order.
-        assert_eq!(order(&registry), [3, 1, 2]);
-
-        // Attention moves its row ahead of the quiet rows; a workstream-level
-        // pin still outranks everything.
-        registry.set_attention(agent_id(2), UiAttention::NeedsInput);
-        assert_eq!(order(&registry), [3, 2, 1]);
-        set_topics(
-            &mut registry,
-            vec![
-                topic(1, Status::Normal, vec![agent(1, Status::Normal)]),
-                topic(2, Status::Pinned, vec![agent(2, Status::Normal)]),
-                topic(3, Status::Normal, vec![agent(3, Status::Pinned)]),
-            ],
-        );
-        assert_eq!(order(&registry), [2, 3, 1]);
-    }
-
-    #[test]
-    fn workstream_attention_bucket_counts_roots_not_descendants() {
-        let mut registry = AgentRegistry::default();
-        let root = agent(1, Status::Normal);
-        let root_id = root.agent_id;
-        let descendants = (100..=104)
-            .map(|id| {
-                let mut descendant = agent(id, Status::Normal);
-                descendant.parent_agent = Some(root_id);
-                descendant
-            })
-            .collect::<Vec<_>>();
-        let mut crowded = vec![root];
-        crowded.extend(descendants);
-        let mut topics = vec![topic(1, Status::Normal, crowded)];
-        topics.extend((2..=6).map(|id| topic(id, Status::Normal, vec![agent(id, Status::Normal)])));
-        set_topics(&mut registry, topics);
-
-        let order = registry
-            .ordered_workstreams()
-            .into_iter()
-            .map(|workstream| workstream.workstream_id.0)
-            .collect::<Vec<_>>();
-
-        // Quiet descendants do not enter the attention bucket.
-        assert_eq!(order, [6, 5, 4, 3, 2, 1]);
-
-        for id in 100..=104 {
-            registry.set_attention(agent_id(id), rho_ui_proto::UiAttention::Working);
-        }
-        let order = registry
-            .ordered_workstreams()
-            .into_iter()
-            .map(|workstream| workstream.workstream_id.0)
-            .collect::<Vec<_>>();
-        // Five colored descendants still occupy one workstream slot.
-        assert_eq!(order, [1, 6, 5, 4, 3, 2]);
-    }
-
-    #[test]
-    fn descendant_attention_moves_its_root_into_the_coarse_bucket() {
-        use rho_ui_proto::UiAttention;
-
-        let root = agent(1, Status::Normal);
-        let root_id = root.agent_id;
-        let mut agents = vec![root];
-        agents.extend((2..=7).map(|id| agent(id, Status::Normal)));
-        let children = (8..=10)
-            .map(|id| {
-                let mut child = agent(id, Status::Normal);
-                child.parent_agent = Some(root_id);
-                child
-            })
-            .collect::<Vec<_>>();
-        let child_ids = children
-            .iter()
-            .map(|child| child.agent_id)
-            .collect::<Vec<_>>();
-        agents.extend(children);
-
-        let mut registry = AgentRegistry::default();
-        set_topics(&mut registry, vec![topic(1, Status::Normal, agents)]);
-        let roots = |registry: &AgentRegistry| {
-            registry
-                .ordered_workstream_roots(&registry.workstreams()[0])
-                .into_iter()
-                .map(|root| root.agent_id)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(roots(&registry), [7, 6, 5, 4, 3, 2, 1].map(agent_id));
-
-        for child_id in child_ids {
-            registry.set_attention(child_id, UiAttention::Pending);
-        }
-
-        // Root 1 becomes the sole active root and leads the quiet roots.
-        assert_eq!(roots(&registry), [1, 7, 6, 5, 4, 3, 2].map(agent_id));
-    }
-
-    #[test]
-    fn descendant_pin_does_not_pin_its_root_or_workstream() {
-        let root = agent(1, Status::Normal);
-        let mut child = agent(100, Status::Pinned);
-        child.parent_agent = Some(root.agent_id);
-
-        let mut registry = AgentRegistry::default();
-        set_topics(
-            &mut registry,
-            vec![
-                topic(1, Status::Normal, vec![root, child]),
-                topic(2, Status::Normal, vec![agent(2, Status::Normal)]),
-            ],
-        );
-
-        assert_eq!(
-            registry
-                .ordered_workstreams()
-                .into_iter()
-                .map(|workstream| workstream.workstream_id.0)
-                .collect::<Vec<_>>(),
-            [2, 1]
-        );
-    }
-
-    #[test]
-    fn announced_tags_resolve_workstream_before_summary_lands() {
-        let mut registry = AgentRegistry::default();
-        set_topics(&mut registry, vec![topic(1, Status::Normal, vec![])]);
-
-        // AgentCreated announces the workstream; the summary only arrives
-        // with the next Ready. The workstream must resolve in between, or
-        // the fresh agent's transcript lands in the draft context.
-        registry.note_agent_workstream(HostId::default(), agent_id(7), WorkstreamId(1));
-        assert_eq!(registry.workstream_of(agent_id(7)), Some(WorkstreamId(1)));
-
-        // Once the summary lands it wins over the announcement.
-        set_topics(
-            &mut registry,
-            vec![
-                topic(1, Status::Normal, vec![]),
-                topic(2, Status::Normal, vec![agent(7, Status::Normal)]),
-            ],
-        );
-        assert_eq!(registry.workstream_of(agent_id(7)), Some(WorkstreamId(2)));
-    }
-
-    #[test]
-    fn quiet_rows_beyond_tail_fold_until_attention_or_selection() {
-        use rho_ui_proto::UiAttention;
-
-        // Thirteen quiet single-agent workstreams: five ride the extra tail
-        // and the rest fold.
-        let mut registry = AgentRegistry::default();
-        set_topics(
-            &mut registry,
-            (1..=13)
-                .map(|id| topic(id, Status::Normal, vec![agent(id, Status::Normal)]))
-                .collect(),
-        );
-
-        let (listed, folded) = registry.split_rows();
-        assert_eq!(listed.len(), 5);
-        assert_eq!(
-            folded
-                .iter()
-                .map(|row| row.workstream_id.0)
-                .collect::<Vec<_>>(),
-            [8, 7, 6, 5, 4, 3, 2, 1]
-        );
-        // Members of folded rows fold with them (skipped by cycling).
-        assert!(registry.agent_folded(agent_id(1)));
-        assert!(!registry.agent_folded(agent_id(13)));
-
-        // Attention admits a folded row's member to the bucket, unfolding
-        // the row; selection keeps the open row visible regardless.
-        registry.set_attention(agent_id(1), UiAttention::Pending);
-        let (_, folded) = registry.split_rows();
-        assert!(folded.iter().all(|row| row.workstream_id.0 != 1));
-        assert!(!registry.agent_folded(agent_id(1)));
-
-        registry.set_attention(agent_id(1), UiAttention::Quiet);
-        registry.select_agent(agent_id(2));
-        let (_, folded) = registry.split_rows();
-        assert!(folded.iter().all(|row| row.workstream_id.0 != 2));
-    }
-
-    #[test]
-    fn hidden_topics_are_excluded_from_rail_navigation() {
-        // A workstream whose every member is hidden auto-hides.
-        let mut registry = AgentRegistry::default();
-        let mut filed = agent(1, Status::Normal);
-        filed.hidden = true;
-        set_topics(
-            &mut registry,
-            vec![
-                topic(1, Status::Normal, vec![filed]),
-                topic(2, Status::Normal, vec![agent(2, Status::Normal)]),
-            ],
-        );
-        registry.agents.insert(agent_id(1), AgentLife::Live);
-        registry.agents.insert(agent_id(2), AgentLife::Live);
-
-        assert_eq!(registry.next_live_agent(1), Some(agent_id(2)));
-    }
-
-    #[test]
-    fn attention_change_keeps_retained_order_inside_top_bucket() {
-        use rho_ui_proto::UiAttention;
-
-        let mut registry = AgentRegistry::default();
-        let agents = (1..=3)
-            .map(|id| agent(id, Status::Normal))
-            .collect::<Vec<_>>();
-        set_topics(&mut registry, vec![topic(1, Status::Normal, agents)]);
-        for id in 1..=3 {
-            registry.mark_live(agent_id(id));
-        }
-        // Seeded by engagement recency: 3, 2, 1.
-        registry.select_agent(agent_id(3));
-        assert_eq!(registry.next_live_agent(1), Some(agent_id(2)));
-
-        // Agent 1 works and settles back to Quiet. Since all three agents
-        // remain inside the top bucket, attention changes do not reshuffle
-        // their retained order.
-        registry.set_attention(agent_id(1), UiAttention::Working);
-        registry.set_attention(agent_id(1), UiAttention::Quiet);
-        registry.select_agent(agent_id(1));
-        assert_eq!(registry.next_live_agent(1), Some(agent_id(3)));
-        registry.select_agent(agent_id(3));
-        assert_eq!(registry.next_live_agent(1), Some(agent_id(2)));
-
-        // A repeat of the same level also leaves the retained order alone.
-        registry.set_attention(agent_id(2), UiAttention::Quiet);
-        registry.select_agent(agent_id(1));
-        assert_eq!(registry.next_live_agent(1), Some(agent_id(3)));
-    }
-
-    #[test]
-    fn refresh_does_not_reseed_retained_root_order() {
-        let mut first = agent(1, Status::Normal);
-        first.last_active = rho_core::UnixMs(20);
-        let mut second = agent(2, Status::Normal);
-        second.last_active = rho_core::UnixMs(10);
-        let mut registry = AgentRegistry::default();
-        set_topics(
-            &mut registry,
-            vec![topic(1, Status::Normal, vec![first, second])],
-        );
-
-        let roots = |registry: &AgentRegistry| {
-            registry
-                .ordered_workstream_roots(&registry.workstreams()[0])
-                .into_iter()
-                .map(|root| root.agent_id)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(roots(&registry), [1, 2].map(agent_id));
-
-        let mut first = agent(1, Status::Normal);
-        first.last_active = rho_core::UnixMs(20);
-        let mut second = agent(2, Status::Normal);
-        second.last_active = rho_core::UnixMs(30);
-        set_topics(
-            &mut registry,
-            vec![topic(1, Status::Normal, vec![second, first])],
-        );
-
-        // Changed snapshot order and timestamps do not rewrite retained rank.
-        assert_eq!(roots(&registry), [1, 2].map(agent_id));
-    }
-
-    #[test]
-    fn attention_moves_agent_to_the_active_bucket() {
-        use rho_ui_proto::UiAttention;
-
-        let mut registry = AgentRegistry::default();
-        let agents = (1..=7)
-            .map(|id| agent(id, Status::Normal))
-            .collect::<Vec<_>>();
-        set_topics(&mut registry, vec![topic(1, Status::Normal, agents)]);
-        for id in 1..=7 {
-            registry.mark_live(agent_id(id));
-        }
-
-        // The five quiet extra rows are visible in retained order.
-        registry.select_agent(agent_id(4));
-        assert_eq!(registry.next_live_agent(1), Some(agent_id(3)));
-        registry.select_agent(agent_id(3));
-        assert_eq!(registry.next_live_agent(1), Some(agent_id(7)));
-
-        // Coloring agent 1 makes it the sole active root, above every quiet
-        // root.
-        registry.set_attention(agent_id(1), UiAttention::Working);
-        registry.select_agent(agent_id(2));
-        assert_eq!(registry.next_live_agent(1), Some(agent_id(1)));
-        registry.select_agent(agent_id(1));
-        assert_eq!(registry.next_live_agent(1), Some(agent_id(7)));
-    }
-
-    #[test]
-    fn cycling_and_attention_jump_skip_folded_agents() {
-        use rho_ui_proto::UiAttention;
-
-        let mut registry = AgentRegistry::default();
-        let mut filed = agent(2, Status::Normal);
-        filed.hidden = true;
-        let mut agents = (1..=13)
-            .map(|id| agent(id, Status::Normal))
-            .collect::<Vec<_>>();
-        agents[1] = filed;
-        set_topics(&mut registry, vec![topic(1, Status::Normal, agents)]);
-        for id in 1..=13 {
-            registry.mark_live(agent_id(id));
-        }
-
-        // Explicitly filed agents fold, and quiet agents outside the
-        // five-agent tail fold automatically.
-        assert!(registry.agent_folded(agent_id(2)));
-        assert!(registry.agent_folded(agent_id(1)));
-
-        // Attention unfolds an otherwise folded agent: it needs the user, so it
-        // rejoins cycling and can win the jump.
-        registry.select_agent(agent_id(9));
-        registry.set_attention(agent_id(1), UiAttention::Pending);
-        assert!(!registry.agent_folded(agent_id(1)));
-        assert_eq!(registry.next_attention_agent(), Some(agent_id(1)));
-        assert_eq!(registry.next_live_agent(1), Some(agent_id(1)));
-    }
-
-    #[test]
-    fn attention_jump_picks_most_urgent_excluding_selected() {
-        use rho_ui_proto::UiAttention;
-
-        let mut registry = AgentRegistry::default();
-        set_topics(
-            &mut registry,
-            vec![topic(
-                1,
-                Status::Normal,
-                vec![
-                    agent(1, Status::Normal),
-                    agent(2, Status::Normal),
-                    agent(3, Status::Normal),
-                ],
-            )],
-        );
-        assert_eq!(registry.next_attention_agent(), None);
-
-        registry.set_attention(agent_id(1), UiAttention::Pending);
-        registry.set_attention(agent_id(2), UiAttention::NeedsInput);
-        registry.set_attention(agent_id(3), UiAttention::Working);
-        assert_eq!(registry.next_attention_agent(), Some(agent_id(2)));
-
-        // The agent already on screen never wins the jump; the next-most
-        // urgent one does. Working alone never qualifies.
-        registry.select_agent(agent_id(2));
-        assert_eq!(registry.next_attention_agent(), Some(agent_id(1)));
-        registry.set_attention(agent_id(1), UiAttention::Quiet);
-        assert_eq!(registry.next_attention_agent(), None);
-    }
-
-    #[test]
-    fn pins_stay_above_attention_bucket_in_rail_order() {
-        use rho_ui_proto::UiAttention;
-
-        let mut registry = AgentRegistry::default();
-        set_topics(
-            &mut registry,
-            vec![topic(
-                1,
-                Status::Normal,
-                vec![agent(1, Status::Normal), agent(2, Status::Pinned)],
-            )],
-        );
-        for id in 1..=2 {
-            registry.mark_live(agent_id(id));
-        }
-        registry.set_attention(agent_id(1), UiAttention::NeedsInput);
-
-        // Pinned agent 2 would lead by status, but agent 1's attention
-        // pushes it to the top of the rail (and thus of cycling).
-        registry.select_agent(agent_id(1));
-        assert_eq!(registry.next_live_agent(1), Some(agent_id(2)));
-        assert_eq!(registry.next_live_agent(-1), Some(agent_id(2)));
-    }
-
-    #[test]
-    fn quiet_agents_outside_the_extra_tail_stay_folded_after_engagement() {
-        let mut registry = AgentRegistry::default();
-        let mut idle = agent(1, Status::Normal);
-        idle.last_active = rho_core::UnixMs(0);
-        let mut idle_pinned = agent(2, Status::Pinned);
-        idle_pinned.last_active = rho_core::UnixMs(0);
-        let mut agents = vec![idle, idle_pinned];
-        agents.extend((3..=13).map(|id| agent(id, Status::Normal)));
-        set_topics(&mut registry, vec![topic(1, Status::Normal, agents)]);
-
-        // The quiet tail beyond the five extra rows folds away; fresh
-        // engagement alone does not revive it.
-        assert!(registry.agent_folded(agent_id(1)));
-        assert!(!registry.agent_folded(agent_id(2)));
-        assert!(!registry.agent_folded(agent_id(13)));
-        registry.touch_agent(agent_id(1));
-        assert!(registry.agent_folded(agent_id(1)));
-    }
-
-    #[test]
-    fn workspace_labels_use_full_repository_local_ids() {
-        let domain = WorkspaceIdDomain(0);
-        let short_workspace = WorkspaceId::from_counter(1, &domain).unwrap();
-        let long_workspace = WorkspaceId::from_counter(36 * 36, &domain).unwrap();
-
-        let mut registry = AgentRegistry::default();
-        set_topics(
-            &mut registry,
-            vec![topic(
-                1,
-                Status::Normal,
-                vec![
-                    workspace_agent(1, short_workspace),
-                    workspace_agent(2, long_workspace),
-                    agent(3, Status::Normal),
-                ],
-            )],
-        );
-
-        assert_eq!(
-            registry.workspace_id_label(agent_id(1)),
-            Some(format!("ws-{}", short_workspace.encoded()))
-        );
-        assert_eq!(
-            registry.workspace_id_label(agent_id(2)),
-            Some(format!("ws-{}", long_workspace.encoded()))
-        );
-        assert_eq!(registry.workspace_id_label(agent_id(3)), None);
-    }
-
-    #[test]
-    fn agent_labels_use_ready_counter() {
-        let id = agent_id(1);
-        let mut registry = AgentRegistry::default();
-        registry.set_host_data(HostId::default(), 0, 36 * 36, Vec::new(), Vec::new());
-
-        assert_eq!(
-            registry.agent_id_label(id),
-            format!("eng-{}", &id.encoded()[..4])
-        );
-    }
-
-    #[test]
-    fn agent_lookup_accepts_display_name() {
-        let mut registry = AgentRegistry::default();
-        set_topics(
-            &mut registry,
-            vec![topic(1, Status::Normal, vec![named_agent(1, "Fix Tests")])],
-        );
-
-        assert_eq!(registry.agent_by_label("fix tests"), Some(agent_id(1)));
-        assert_eq!(
-            registry.agent_by_label(&registry.agent_id_label(agent_id(1))),
-            Some(agent_id(1))
-        );
-    }
-
-    /// A second daemon's ids come from its own scrambling seed, so fixtures
-    /// for it must not reuse the default domain.
-    fn remote_agent_id(id: u64) -> AgentId {
-        AgentId::from_counter(id, &AgentIdDomain(7)).unwrap()
-    }
-
-    fn remote_agent(id: u64) -> UiAgentSummary {
-        UiAgentSummary {
-            agent_id: remote_agent_id(id),
-            ..agent(id, Status::Normal)
-        }
-    }
-
-    /// Two hosts, each with one workstream holding one agent.
-    fn two_hosts() -> (AgentRegistry, HostId, HostId) {
-        let mut registry = AgentRegistry::default();
-        let (local, remote) = (HostId(0), HostId(1));
-        registry.attach_host(local, "local".to_owned());
-        registry.attach_host(remote, "fern".to_owned());
-        let (stream, agents) = topic(1, Status::Normal, vec![agent(1, Status::Normal)]);
-        registry.set_host_data(local, 0, 1, vec![stream], agents);
-        let (stream, agents) = topic(2, Status::Normal, vec![remote_agent(2)]);
-        registry.set_host_data(remote, 7, 1, vec![stream], agents);
-        (registry, local, remote)
-    }
-
-    #[test]
-    fn one_hosts_refresh_leaves_the_others_live_state_alone() {
-        let (mut registry, local, _remote) = two_hosts();
-        registry.set_attention(remote_agent_id(2), rho_ui_proto::UiAttention::NeedsInput);
-        registry.set_attention(agent_id(1), rho_ui_proto::UiAttention::NeedsInput);
-
-        // The refreshed host's summaries are authoritative and replace what
-        // its broadcasts left behind; the other host is untouched.
-        let (stream, agents) = topic(1, Status::Normal, vec![agent(1, Status::Normal)]);
-        registry.set_host_data(local, 0, 1, vec![stream], agents);
-
-        assert_eq!(
-            registry.attention(agent_id(1)),
-            rho_ui_proto::UiAttention::Quiet
-        );
-        assert_eq!(
-            registry.attention(remote_agent_id(2)),
-            rho_ui_proto::UiAttention::NeedsInput
-        );
-    }
-
-    #[test]
-    fn both_hosts_workstreams_share_one_rail() {
-        let (registry, local, remote) = two_hosts();
-
-        let rail = registry
-            .workstreams()
-            .iter()
-            .map(|workstream| (workstream.host, workstream.workstream_id))
-            .collect::<Vec<_>>();
-        assert_eq!(rail, [(local, WorkstreamId(1)), (remote, WorkstreamId(2))]);
-        assert_eq!(registry.host_of_agent(remote_agent_id(2)), Some(remote));
-        assert_eq!(registry.host_count(), 2);
-    }
-
-    #[test]
-    fn labels_qualify_by_host_once_several_are_attached() {
-        let mut registry = AgentRegistry::default();
-        registry.attach_host(HostId(0), "local".to_owned());
-        let (stream, agents) = topic(1, Status::Normal, vec![agent(1, Status::Normal)]);
-        registry.set_host_data(HostId(0), 0, 1, vec![stream], agents);
-        let solo = registry.agent_id_label(agent_id(1));
-        assert!(!solo.contains('/'), "single host labels stay bare: {solo}");
-
-        let (registry, ..) = two_hosts();
-
-        let label = registry.agent_id_label(agent_id(1));
-        assert_eq!(label, format!("local/{solo}"));
-        assert_eq!(registry.agent_by_label(&label), Some(agent_id(1)));
-        // An unambiguous bare label still resolves, so muscle memory from
-        // the single-host case keeps working.
-        assert_eq!(registry.agent_by_label(&solo), Some(agent_id(1)));
-        assert!(
-            registry
-                .agent_id_label(remote_agent_id(2))
-                .starts_with("fern/")
-        );
-    }
-
-    #[test]
-    fn detaching_a_host_takes_its_agents_and_selection_with_it() {
-        let (mut registry, _local, remote) = two_hosts();
-        registry.select_agent(remote_agent_id(2));
-
-        registry.detach_host(remote);
-
-        assert_eq!(registry.host_count(), 1);
-        assert_eq!(registry.selected_agent(), None);
-        assert_eq!(registry.host_of_agent(remote_agent_id(2)), None);
-        assert_eq!(
-            registry
-                .workstreams()
-                .iter()
-                .map(|workstream| workstream.workstream_id)
-                .collect::<Vec<_>>(),
-            [WorkstreamId(1)]
-        );
-        // The surviving host is alone again, so its labels lose the prefix.
-        assert!(!registry.agent_id_label(agent_id(1)).contains('/'));
-    }
-
-    /// A `Ready` is a snapshot of the daemon at the moment it was built,
-    /// which can predate a verdict the user already pressed. Re-seeding
-    /// attention from it would put back the lamp the verdict cleared.
-    #[test]
-    fn a_snapshot_older_than_a_verdict_does_not_put_its_lamp_back() {
-        use rho_ui_proto::UiAttention;
-
-        let mut registry = AgentRegistry::default();
-        let pending = || {
-            let mut agent = agent(1, Status::Normal);
-            agent.attention = UiAttention::Pending;
-            vec![agent]
-        };
-        set_topics(&mut registry, vec![topic(1, Status::Normal, pending())]);
-        assert_eq!(registry.attention(agent_id(1)), UiAttention::Pending);
-
-        registry.expect_attention(agent_id(1), UiAttention::Quiet);
-        assert_eq!(registry.attention(agent_id(1)), UiAttention::Quiet);
-
-        // The snapshot in flight still describes the world before the press.
-        set_topics(&mut registry, vec![topic(1, Status::Normal, pending())]);
-        assert_eq!(
-            registry.attention(agent_id(1)),
-            UiAttention::Quiet,
-            "a snapshot older than the verdict undid it"
-        );
-
-        // The daemon's own word outranks the verdict: a new turn end
-        // resurfaces the row, and later snapshots agree again.
-        registry.set_attention(agent_id(1), UiAttention::Pending);
-        assert_eq!(registry.attention(agent_id(1)), UiAttention::Pending);
-        registry.expect_attention(agent_id(1), UiAttention::Quiet);
-        registry.set_attention(agent_id(1), UiAttention::Quiet);
-        set_topics(&mut registry, vec![topic(1, Status::Normal, pending())]);
-        assert_eq!(
-            registry.attention(agent_id(1)),
-            UiAttention::Pending,
-            "an answered verdict must stop shadowing the snapshots"
-        );
-    }
-
-    /// A verdict on a row covers the agents whose lamps that row shows:
-    /// descendants included, hidden members left alone.
-    #[test]
-    fn row_verdict_targets_cover_descendants_but_not_hidden_members() {
-        let mut registry = AgentRegistry::default();
-        let mut child = agent(2, Status::Normal);
-        child.parent_agent = Some(agent_id(1));
-        let mut grandchild = agent(3, Status::Normal);
-        grandchild.parent_agent = Some(agent_id(2));
-        let mut put_away = agent(4, Status::Normal);
-        put_away.parent_agent = Some(agent_id(1));
-        put_away.hidden = true;
-        let sibling_root = agent(5, Status::Normal);
-        set_topics(
-            &mut registry,
-            vec![topic(
-                1,
-                Status::Normal,
-                vec![
-                    agent(1, Status::Normal),
-                    child,
-                    grandchild,
-                    put_away,
-                    sibling_root,
-                ],
-            )],
-        );
-
-        let ids = |ids: &[u64]| ids.iter().map(|id| agent_id(*id)).collect::<BTreeSet<_>>();
-        assert_eq!(
-            registry
-                .agent_subtree(agent_id(1))
-                .into_iter()
-                .collect::<BTreeSet<_>>(),
-            ids(&[1, 2, 3])
-        );
-        assert_eq!(
-            registry
-                .workstream_agents(WorkstreamId(1))
-                .into_iter()
-                .collect::<BTreeSet<_>>(),
-            ids(&[1, 2, 3, 5]),
-            "a stream row speaks for every listed member, including other roots"
-        );
     }
 }

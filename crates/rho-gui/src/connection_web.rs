@@ -18,7 +18,7 @@ use rho_registry::session::AgentStreamGenerations;
 use rho_ui_proto::realtime::{RealtimeClientFrame, RealtimeServerFrame};
 use rho_ui_proto::remote::AgentRemoteFrame;
 use rho_ui_proto::{
-    AgentId, ClientMessage, ServerMessage, UiAgentSummary, UiProject, UiWorkstream, WorkspaceInfo,
+    AgentId, ClientMessage, ServerMessage, UiAgentSummary, UiProject, WorkspaceInfo,
 };
 use sha2::{Digest as _, Sha256};
 use tokio::io::AsyncWriteExt as _;
@@ -59,7 +59,6 @@ pub struct HostEvent {
 
 pub enum ConnEvent {
     Ready {
-        workstreams: Vec<UiWorkstream>,
         agents: Vec<UiAgentSummary>,
         projects: Vec<UiProject>,
         auth: rho_ui_proto::AuthState,
@@ -67,10 +66,8 @@ pub enum ConnEvent {
         agent_counter: u64,
     },
     AuthState(rho_ui_proto::AuthState),
-    WorkstreamCreated(UiWorkstream),
     AgentCreated {
         agent_id: AgentId,
-        workstream: rho_ui_proto::WorkstreamId,
     },
     AgentSubscribed(AgentId),
     AgentUnloaded {
@@ -363,7 +360,6 @@ fn handle_host_message(
     let Some(sink) = sink else { return };
     let event = match message {
         ServerMessage::Ready {
-            workstreams,
             agents,
             projects,
             auth,
@@ -371,7 +367,6 @@ fn handle_host_message(
             agent_counter,
             ..
         } => Some(ConnEvent::Ready {
-            workstreams: workstreams.clone(),
             agents: agents.clone(),
             projects: projects.clone(),
             auth: auth.clone(),
@@ -379,15 +374,8 @@ fn handle_host_message(
             agent_counter: *agent_counter,
         }),
         ServerMessage::AuthState { auth } => Some(ConnEvent::AuthState(auth.clone())),
-        ServerMessage::WorkstreamCreated { workstream } => {
-            Some(ConnEvent::WorkstreamCreated(workstream.clone()))
-        }
-        ServerMessage::AgentCreated {
-            agent_id,
-            workstream,
-        } => Some(ConnEvent::AgentCreated {
+        ServerMessage::AgentCreated { agent_id } => Some(ConnEvent::AgentCreated {
             agent_id: *agent_id,
-            workstream: *workstream,
         }),
         ServerMessage::AgentSubscribed { agent_id } => Some(ConnEvent::AgentSubscribed(*agent_id)),
         ServerMessage::AgentUnloaded { agent_id, reason } => Some(ConnEvent::AgentUnloaded {

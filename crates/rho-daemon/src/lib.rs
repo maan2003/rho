@@ -10,12 +10,11 @@ use camino::{Utf8Path, Utf8PathBuf};
 use futures::{FutureExt as _, StreamExt as _};
 use rho_agent::db::{
     AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole, AgentRuntime, AgentUsageModel,
-    AgentWriteTxnExt as _, PendingPresentationWorkstream, QuotaModel, QuotaObservationRecord,
-    QuotaProvider, WorkstreamId,
+    AgentWriteTxnExt as _, QuotaModel, QuotaObservationRecord, QuotaProvider,
 };
 use rho_agent::pool::{AgentPool, RunningAgent};
 use rho_agent::{AgentStateKind, MessageDelivery};
-use rho_core::{ContentPart, text_content};
+use rho_core::ContentPart;
 use rho_db::RhoDb;
 use rho_inference::{Inference, InferenceAuth};
 use rho_ui_proto::remote::AgentRemoteEncoder;
@@ -24,7 +23,7 @@ use rho_ui_proto::{
     AgentUsageBucket as UiAgentUsageBucket, AgentUsageSeries, AuthState, ClientMessage, JoinTarget,
     LandLeaseHolder, LandStatus, McpAgentToolRequest, McpAgentToolResponse, QuotaPoint,
     QuotaSeries, QuotaSummary, ServerMessage, StartMode, UiAgentSummary, UiAttention, UiProject,
-    UiTurnReport, UiWorkstream, WorkspaceInfo, WorkstreamTarget, read_frame, write_frame,
+    UiTurnReport, WorkspaceInfo, read_frame, write_frame,
 };
 use tokio::sync::{Mutex, Mutex as TokioMutex, OwnedMutexGuard, broadcast, mpsc, oneshot, watch};
 
@@ -1064,33 +1063,6 @@ impl AgentRegistry {
         });
     }
 
-    fn ui_workstreams(&self) -> Vec<UiWorkstream> {
-        let read = self.db.read();
-        let iris_workstreams = read
-            .list_agents()
-            .into_iter()
-            .filter(|(_, agent)| {
-                agent.role == AgentRole::Iris
-                    || agent
-                        .labels
-                        .iter()
-                        .any(|label| label == rho_agent::iris_tools::LABEL)
-            })
-            .map(|(_, agent)| agent.workstream)
-            .collect::<HashSet<_>>();
-        let mut records = read.list_workstreams();
-        records.sort_by_key(|(_, workstream)| workstream.created_at);
-        records
-            .into_iter()
-            .filter(|(workstream_id, _)| !iris_workstreams.contains(workstream_id))
-            .map(|(workstream_id, workstream)| UiWorkstream {
-                workstream_id,
-                name: workstream.name,
-                labels: workstream.labels,
-            })
-            .collect()
-    }
-
     fn ui_agents(&self, kinds: &HashMap<AgentId, AgentStateKind>) -> Vec<UiAgentSummary> {
         let mut records = self.db.read().list_agents();
         records.sort_by_key(|(_, agent)| agent.created_at);
@@ -1120,7 +1092,6 @@ impl AgentRegistry {
                     needs_you: report.needs_you,
                     summary: report.summary,
                 }),
-                workstream: agent.workstream,
                 labels: agent.labels,
             })
             .collect()
@@ -1187,7 +1158,6 @@ impl AgentRegistry {
 
     async fn ready_message(&self) -> ServerMessage {
         ServerMessage::Ready {
-            workstreams: self.ui_workstreams(),
             agents: self.ui_agents(&self.agent_state_kinds().await),
             projects: self.projects(),
             auth: self.auth_state(),
@@ -1238,22 +1208,8 @@ impl AgentRegistry {
             .insert(repo, (agent_id, status));
     }
 
-    async fn create_workstream(&self, name: String) -> UiWorkstream {
-        let mut write = self.db.write().await;
-        let workstream_id = write.create_workstream(rho_core::UnixMs::now(), name);
-        write.commit();
-        // Re-read: creation may have uniquified the name.
-        let workstream = self.db.read().get_workstream(workstream_id);
-        UiWorkstream {
-            workstream_id,
-            name: workstream.name,
-            labels: workstream.labels,
-        }
-    }
-
     async fn create(
         &self,
-        workstream: WorkstreamId,
         role: AgentRole,
         start: StartMode,
     ) -> anyhow::Result<(AgentId, RunningAgent)> {
@@ -1284,7 +1240,7 @@ impl AgentRegistry {
                 )]
             }
         };
-        let (agent_id, agent) = self.pool.create(workstream, role, None, start).await?;
+        let (agent_id, agent) = self.pool.create(role, None, start).await?;
         Ok((agent_id, agent))
     }
 
@@ -1496,65 +1452,6 @@ impl AgentRegistry {
         self.pool.agent_handle(agent_id)
     }
 
-    /// Moves an agent to another workstream. Its spawn subtree moves with
-    /// it, so a subtree never straddles workstreams; a `Named` target that
-    /// matches no workstream founds one under that name.
-    async fn move_agent(&self, agent_id: AgentId, target: WorkstreamTarget) -> anyhow::Result<()> {
-        let now = rho_core::UnixMs::now();
-        let mut write = self.db.write().await;
-        let read = self.db.read();
-        let workstreams = read.list_workstreams();
-        let workstream_id = match target {
-            WorkstreamTarget::Existing(workstream_id) => {
-                if !workstreams.iter().any(|(id, _)| *id == workstream_id) {
-                    anyhow::bail!("unknown workstream id: {}", workstream_id.0);
-                }
-                workstream_id
-            }
-            WorkstreamTarget::Named(name) => workstreams
-                .iter()
-                .find(|(_, workstream)| workstream.name == name)
-                .map(|(workstream_id, _)| *workstream_id)
-                .unwrap_or_else(|| write.create_workstream(now, name)),
-        };
-        let agents = read.list_agents();
-        let Some((_, moved)) = agents.iter().find(|(id, _)| *id == agent_id) else {
-            anyhow::bail!("agent is not known: {agent_id:?}");
-        };
-        let source = moved.workstream;
-        let members = spawn_subtree(&agents, agent_id);
-        for member in &members {
-            write.set_agent_workstream(now, *member, workstream_id);
-        }
-        // A workstream is only a statement about its agents; when the move
-        // empties the source, nothing is being said and the record goes,
-        // rather than lingering as a nameless husk (and letting merges be
-        // plain moves).
-        let source_emptied = source != workstream_id
-            && agents
-                .iter()
-                .filter(|(_, agent)| agent.workstream == source)
-                .all(|(id, _)| members.contains(id));
-        if source_emptied {
-            write.delete_workstream(source);
-        }
-        write.commit();
-        Ok(())
-    }
-
-    async fn workstream_label(
-        &self,
-        workstream_id: WorkstreamId,
-        label: String,
-        add: bool,
-    ) -> anyhow::Result<()> {
-        validate_label(&label)?;
-        let mut write = self.db.write().await;
-        write.workstream_label(rho_core::UnixMs::now(), workstream_id, &label, add);
-        write.commit();
-        Ok(())
-    }
-
     async fn agent_label(&self, agent_id: AgentId, label: String, add: bool) -> anyhow::Result<()> {
         validate_label(&label)?;
         let mut write = self.db.write().await;
@@ -1569,20 +1466,6 @@ impl AgentRegistry {
         }
         let mut write = self.db.write().await;
         write.set_agent_display_name(rho_core::UnixMs::now(), agent_id, name);
-        write.commit();
-        Ok(())
-    }
-
-    async fn rename_workstream(
-        &self,
-        workstream_id: WorkstreamId,
-        name: String,
-    ) -> anyhow::Result<()> {
-        if name.trim().is_empty() {
-            anyhow::bail!("workstream name cannot be empty");
-        }
-        let mut write = self.db.write().await;
-        write.set_workstream_name(rho_core::UnixMs::now(), workstream_id, name);
         write.commit();
         Ok(())
     }
@@ -1793,7 +1676,6 @@ where
                         if outgoing_tx
                             .send(ServerMessage::AgentCreated {
                                 agent_id: created.agent_id,
-                                workstream: created.workstream,
                             })
                             .is_err()
                             || outgoing_tx.send(agents.ready_message().await).is_err()
@@ -2392,7 +2274,7 @@ fn spawn_snooze_timer(
 }
 
 /// Whether a handled message changed registry state that clients see through
-/// `Ready` (workstreams, agents, workdirs); `Ready` refreshes every
+/// `Ready` (agents and workdirs); `Ready` refreshes every
 /// connection, so all clients converge on the change at once.
 enum Refresh {
     Ready,
@@ -2723,7 +2605,6 @@ async fn handle_message(
         }
         ClientMessage::Subscribe => Ok(Refresh::None),
         ClientMessage::NewAgent {
-            workstream,
             role,
             start,
             content,
@@ -2732,26 +2613,9 @@ async fn handle_message(
             if let Some(content) = content.as_deref() {
                 validate_image_content(content)?;
             }
-            // Without a workstream to join, the agent founds its own,
-            // provisionally named after its first message until the
-            // generated title lands.
-            let (workstream, founded) = match workstream {
-                Some(workstream_id) => (workstream_id, None),
-                None => {
-                    let name = provisional_workstream_name(content.as_deref());
-                    let workstream = agents.create_workstream(name).await;
-                    let _ = outgoing_tx.send(ServerMessage::WorkstreamCreated {
-                        workstream: workstream.clone(),
-                    });
-                    (
-                        workstream.workstream_id,
-                        Some((workstream.workstream_id, workstream.name)),
-                    )
-                }
-            };
             // Subscription and the AgentCreated announcement ride the pool's
             // creation broadcast (all connections, including this one).
-            let (agent_id, agent) = agents.create(workstream, role, start).await?;
+            let (agent_id, agent) = agents.create(role, start).await?;
             if let Some(node_id) = desk_node {
                 let binding = agents
                     .desk
@@ -2761,17 +2625,6 @@ async fn handle_message(
                 let _ = agents
                     .events
                     .send(ServerMessage::DeskBindingChanged { binding });
-            }
-            if let Some((workstream_id, provisional_name)) = &founded {
-                let mut write = agents.db.write().await;
-                write.set_pending_presentation_workstream(
-                    agent_id,
-                    Some(PendingPresentationWorkstream {
-                        workstream_id: *workstream_id,
-                        provisional_name: provisional_name.clone(),
-                    }),
-                );
-                write.commit();
             }
             if let Some(content) = content {
                 // The agent is fresh, so the lanes are equivalent here.
@@ -2913,10 +2766,6 @@ async fn handle_message(
             agent.compact(delivery)?;
             Ok(Refresh::None)
         }
-        ClientMessage::AgentMove { agent_id, target } => {
-            agents.move_agent(agent_id, target).await?;
-            Ok(Refresh::Ready)
-        }
         ClientMessage::AgentLabel {
             agent_id,
             label,
@@ -2944,21 +2793,6 @@ async fn handle_message(
                 .ok_or_else(|| anyhow::anyhow!("agent is not loaded: {agent_id:?}"))?;
             agent.change_prompt_cache_key()?;
             Ok(Refresh::None)
-        }
-        ClientMessage::WorkstreamRename {
-            workstream_id,
-            name,
-        } => {
-            agents.rename_workstream(workstream_id, name).await?;
-            Ok(Refresh::Ready)
-        }
-        ClientMessage::WorkstreamLabel {
-            workstream_id,
-            label,
-            add,
-        } => {
-            agents.workstream_label(workstream_id, label, add).await?;
-            Ok(Refresh::Ready)
         }
         ClientMessage::ViewConfigSet { data } => {
             let mut write = agents.db.write().await;
@@ -3834,21 +3668,6 @@ fn subscribe_agent(
 /// workdir registration and agent creation take repos. A leading `~` expands
 /// to the daemon's home: clients may run on another machine, so path
 /// interpretation belongs here.
-/// The name a self-founded workstream starts under: the first line of the
-/// agent's first message, truncated. The generated title replaces it
-/// (matching by this exact string) once it lands.
-fn provisional_workstream_name(content: Option<&[ContentPart]>) -> String {
-    let text = content.map(text_content).unwrap_or_default();
-    let line = text.lines().next().unwrap_or("").trim();
-    if line.is_empty() {
-        return "new task".to_owned();
-    }
-    match line.char_indices().nth(48) {
-        Some((index, _)) => format!("{}…", &line[..index]),
-        None => line.to_owned(),
-    }
-}
-
 const MAX_INPUT_IMAGES: usize = 20;
 const MAX_IMAGE_BASE64_BYTES: usize = 10 * 1024 * 1024;
 
@@ -3892,25 +3711,6 @@ fn validate_label(label: &str) -> anyhow::Result<()> {
         anyhow::bail!("label cannot be empty");
     }
     Ok(())
-}
-
-/// `agent_id` and every transitive spawn descendant, so workstream moves
-/// never leave a subtree straddling workstreams.
-fn spawn_subtree(
-    agents: &[(AgentId, rho_agent::db::AgentRecord)],
-    agent_id: AgentId,
-) -> Vec<AgentId> {
-    let mut members = vec![agent_id];
-    let mut frontier = vec![agent_id];
-    while let Some(parent) = frontier.pop() {
-        for (child, record) in agents {
-            if record.parent_agent == Some(parent) && !members.contains(child) {
-                members.push(*child);
-                frontier.push(*child);
-            }
-        }
-    }
-    members
 }
 
 fn validate_repo_root(path: Utf8PathBuf) -> anyhow::Result<Utf8PathBuf> {

@@ -5,7 +5,7 @@
 //! merged per agent, and views receive summarized changes rather than the
 //! protocol itself.
 //!
-//! Several daemons can be attached at once. Agent and workstream ids are
+//! Several daemons can be attached at once. Agent ids are
 //! already unique across machines, so the client-side state stays keyed by
 //! id alone; what the host is needed for is routing — which socket a command
 //! travels down — and for the few places where a daemon-side *name* (a
@@ -44,7 +44,7 @@ use crate::hosts::{HostStatus, Hosts};
 use crate::minibuffer::{ECHO_DURATION, Echo, Minibuffer, bottom_strip};
 use crate::pane::{PaneTree, SplitAxis, SurfaceKey};
 use crate::registry::session::{
-    AgentSubscriptions, INITIAL_AGENT_SUBSCRIPTIONS, recent_workstream_roots,
+    AgentSubscriptions, INITIAL_AGENT_SUBSCRIPTIONS, recent_agent_roots,
 };
 use crate::registry::{ActivePane, AgentRegistry, HostId};
 use crate::store::{AgentStore, FrameSummary};
@@ -120,7 +120,7 @@ impl PartialEq for Surface {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ContextId {
     Draft,
-    Task(rho_ui_proto::WorkstreamId),
+    Agent(AgentId),
     /// Zulip's own window arrangement: entering it from the dashboard
     /// leaves the agent panes exactly as they were, and leaving it comes
     /// back to them.
@@ -243,10 +243,6 @@ pub struct Workspace {
     /// Registered workdirs from every attached daemon; selection vocabulary
     /// for new agents, and what decides which host a new agent lands on.
     workdirs: Vec<HostProject>,
-    /// Workstream the draft inherits context from: whichever was focused
-    /// when the draft was entered. Only used to derive the default workdir —
-    /// a submitted draft always founds its own workstream.
-    draft_workstream: Option<rho_ui_proto::WorkstreamId>,
     /// Launch arguments for the dashboard's parked new-root draft. The
     /// transient edits these; the writable dashboard row owns the message.
     new_agent_draft: Option<NewAgentDraft>,
@@ -373,10 +369,6 @@ impl Workspace {
         cx.notify();
     }
 
-    fn apply_workstream_created(&mut self, host: HostId, workstream: rho_ui_proto::UiWorkstream) {
-        self.registry.add_workstream(host, workstream);
-    }
-
     fn apply_agent_subscribed(&mut self, agent_id: AgentId) {
         self.registry.mark_known(agent_id);
     }
@@ -402,32 +394,23 @@ impl Workspace {
         host: HostId,
         machine_seed: u64,
         agent_counter: u64,
-        workstreams: Vec<rho_ui_proto::UiWorkstream>,
         agents: Vec<rho_ui_proto::UiAgentSummary>,
     ) -> (bool, Option<Vec<AgentId>>) {
         let first_ready = self.ready_hosts.insert(host);
         let initial = first_ready.then(|| {
-            recent_workstream_roots(
-                &workstreams,
+            recent_agent_roots(
                 &agents,
                 self.registry.selected_agent().copied(),
                 INITIAL_AGENT_SUBSCRIPTIONS,
             )
         });
         self.registry
-            .set_host_data(host, machine_seed, agent_counter, workstreams, agents);
+            .set_host_data(host, machine_seed, agent_counter, agents);
         (first_ready, initial)
     }
 
-    fn note_agent_created(
-        &mut self,
-        host: HostId,
-        agent_id: AgentId,
-        workstream: rho_ui_proto::WorkstreamId,
-    ) {
-        self.registry
-            .note_agent_workstream(host, agent_id, workstream);
-        self.registry.mark_known(agent_id);
+    fn note_agent_created(&mut self, host: HostId, agent_id: AgentId) {
+        self.registry.note_agent_created(host, agent_id);
     }
 
     fn apply_frame_state(
@@ -556,7 +539,6 @@ pub struct Subject {
     /// — the one `enter` opens — so `space a` on a row acts on the agent
     /// the user would have opened anyway.
     pub agent: Option<AgentId>,
-    pub workstream: Option<rho_ui_proto::WorkstreamId>,
     /// Everything the subject's rail row aggregates. Verdicts need all of
     /// it: acking only the root leaves the row lit by a child's lamp, and
     /// the row never reaches settled.
@@ -566,13 +548,6 @@ pub struct Subject {
 impl Subject {
     pub fn has_agent(&self) -> bool {
         self.agent.is_some()
-    }
-
-    /// The unsubmitted draft belongs to a workstream that has no agents
-    /// yet, so workstream commands can still name it.
-    fn or_draft_workstream(mut self, draft: Option<rho_ui_proto::WorkstreamId>) -> Self {
-        self.workstream = self.workstream.or(draft);
-        self
     }
 }
 
@@ -685,7 +660,6 @@ impl Workspace {
             frame_flush_scheduled: false,
             draft_model,
             workdirs: Vec::new(),
-            draft_workstream: None,
             new_agent_draft: None,
             awaiting_draft_agent: None,
             ready_hosts: HashSet::new(),
@@ -755,12 +729,10 @@ impl Workspace {
             .copied()
             .filter(|agent_id| self.registry.host_of_agent(*agent_id) == Some(host))
             .collect::<Vec<_>>();
-        let contexts = self
-            .registry
-            .workstreams()
+        let contexts = departed
             .iter()
-            .filter(|workstream| workstream.host == host)
-            .map(|workstream| ContextId::Task(workstream.workstream_id))
+            .copied()
+            .map(ContextId::Agent)
             .collect::<HashSet<_>>();
         if self.iris_host == Some(host) {
             self.stop_iris();
@@ -868,13 +840,8 @@ impl Workspace {
             .expect("active context has a tree")
     }
 
-    /// The context an agent's transcript lives in: its workstream. An
-    /// agent the registry can't place yet shows in the draft context.
     fn context_for_agent(&self, agent_id: AgentId) -> ContextId {
-        self.registry
-            .workstream_of(agent_id)
-            .map(ContextId::Task)
-            .unwrap_or(ContextId::Draft)
+        ContextId::Agent(agent_id)
     }
 
     /// Drops trees for tasks that no longer exist; their views (and any
@@ -882,14 +849,12 @@ impl Workspace {
     fn prune_contexts(&mut self) {
         let live = self
             .registry
-            .workstreams()
-            .iter()
-            .map(|workstream| workstream.workstream_id)
+            .known_agents()
+            .copied()
             .collect::<HashSet<_>>();
         let keep = |context: &ContextId| match context {
             ContextId::Draft => true,
-            ContextId::Task(workstream_id) => live.contains(workstream_id),
-            // Zulip belongs to no daemon, so no workstream's death closes it.
+            ContextId::Agent(agent_id) => live.contains(agent_id),
             ContextId::Zulip => true,
         };
         self.contexts.retain(|context, _| keep(context));
@@ -1058,7 +1023,6 @@ impl Workspace {
                 | ConnEvent::DeskStructureApplied(_)
                 | ConnEvent::DeskTextApplied(_)
                 | ConnEvent::DeskBindingChanged(_)
-                | ConnEvent::WorkstreamCreated(_)
                 | ConnEvent::AgentCreated { .. }
                 | ConnEvent::AgentAttention { .. }
                 | ConnEvent::AgentTurnReport { .. }
@@ -1093,7 +1057,6 @@ impl Workspace {
                 self.dashboard.apply_binding(host, binding);
             }
             ConnEvent::Ready {
-                workstreams,
                 agents,
                 projects: workdirs,
                 auth,
@@ -1101,7 +1064,7 @@ impl Workspace {
                 agent_counter,
             } => {
                 let (first_ready, initial_subscriptions) =
-                    self.apply_ready(host, machine_seed, agent_counter, workstreams, agents);
+                    self.apply_ready(host, machine_seed, agent_counter, agents);
                 self.prune_contexts();
                 self.workdirs.retain(|workdir| workdir.host != host);
                 self.workdirs.extend(
@@ -1135,16 +1098,8 @@ impl Workspace {
                 }
                 cx.notify();
             }
-            ConnEvent::WorkstreamCreated(workstream) => {
-                self.apply_workstream_created(host, workstream);
-                self.refresh_draft_agent_targets(cx);
-                cx.notify();
-            }
-            ConnEvent::AgentCreated {
-                agent_id,
-                workstream,
-            } => {
-                self.note_agent_created(host, agent_id, workstream);
+            ConnEvent::AgentCreated { agent_id } => {
+                self.note_agent_created(host, agent_id);
                 if self.awaiting_draft_agent == Some(host) {
                     self.awaiting_draft_agent = None;
                     self.subscribe_agent(agent_id, cx);
@@ -1928,12 +1883,10 @@ impl Workspace {
             }
         };
         self.awaiting_draft_agent = Some(host);
-        // Every top-level agent founds its own workstream; the daemon names
-        // it from the agent's generated title.
+        // Start a top-level agent from the draft.
         self.hosts.send(
             host,
             ClientMessage::NewAgent {
-                workstream: None,
                 role,
                 start,
                 content: Some(content),
@@ -2789,11 +2742,6 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(selected) = self.registry.selected_agent().copied()
-            && let Some(workstream_id) = self.registry.workstream_of(selected)
-        {
-            self.draft_workstream = Some(workstream_id);
-        }
         match working_directory {
             Some(argument) => {
                 let workdir = match self.resolve_workdir(argument.as_str()) {
@@ -2923,7 +2871,6 @@ impl Workspace {
         let subject = match row {
             Some(RowTarget::Agent(agent_id)) => Some(Subject {
                 agent: Some(agent_id),
-                workstream: self.registry.workstream_of(agent_id),
                 agents: self.registry.agent_subtree(agent_id),
             }),
             _ => None,
@@ -2933,12 +2880,10 @@ impl Workspace {
                 let agent_id = self.registry.selected_agent().copied()?;
                 Some(Subject {
                     agent: Some(agent_id),
-                    workstream: self.registry.workstream_of(agent_id),
                     agents: self.registry.agent_subtree(agent_id),
                 })
             })
             .unwrap_or_default()
-            .or_draft_workstream(self.draft_workstream)
     }
 
     /// The subject's agent, or a `{verb}: no agent in focus` notice.
@@ -3068,18 +3013,13 @@ impl Workspace {
         });
     }
 
-    /// Where a new agent works when the draft doesn't say: the inherited
-    /// workstream's newest agent sets the precedent, else the first
-    /// registered workdir. All daemon-side data — the GUI may run on another
-    /// machine, so its own cwd is meaningless here.
+    /// Where a new agent works when the draft doesn't say: the selected
+    /// agent sets the precedent, else the first registered workdir.
     fn draft_default_workdir(&self) -> Option<HostPath> {
-        self.draft_workstream
-            .and_then(|workstream_id| {
-                Some(HostPath {
-                    host: self.registry.host_of_workstream(workstream_id)?,
-                    path: self.registry.last_working_directory(workstream_id)?,
-                })
-            })
+        self.registry
+            .selected_agent()
+            .copied()
+            .and_then(|agent_id| self.agent_workdir(agent_id))
             .or_else(|| {
                 self.workdirs.first().map(|workdir| HostPath {
                     host: workdir.host,
@@ -4664,20 +4604,11 @@ impl Workspace {
 
     pub(crate) fn open_new_agent_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.new_agent_draft.is_none() {
-            // A new agent starts where the subject works: its workdir, or —
-            // for a stream row whose agents are all gone — wherever that
-            // stream last ran.
+            // A new agent starts where the subject works.
             let subject = self.subject(window, cx);
             let contextual = subject
                 .agent
-                .and_then(|agent_id| self.agent_workdir(agent_id))
-                .or_else(|| {
-                    let workstream_id = subject.workstream?;
-                    self.registry
-                        .host_of_workstream(workstream_id)
-                        .zip(self.registry.last_working_directory(workstream_id))
-                        .map(|(host, path)| HostPath { host, path })
-                });
+                .and_then(|agent_id| self.agent_workdir(agent_id));
             let workdir = contextual.or_else(|| match self.workdirs.as_slice() {
                 [workdir] => Some(HostPath {
                     host: workdir.host,
@@ -5000,7 +4931,6 @@ impl Workspace {
         self.send_to_host(
             host,
             ClientMessage::NewAgent {
-                workstream: None,
                 role,
                 start,
                 content: (!text.trim().is_empty()).then_some(vec![ContentPart::Text { text }]),

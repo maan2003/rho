@@ -1,6 +1,5 @@
 //! Daemon-global Iris coordinator and its typed fleet-control tools.
 
-use std::collections::BTreeMap;
 use std::sync::{Arc, Weak};
 
 use futures::future::BoxFuture;
@@ -12,7 +11,7 @@ use rho_agent::iris_tools::IrisToolHost;
 use rho_agent::pool::{AgentAssistantItemCompleted, AgentTurnCompleted, RunningAgent};
 use rho_agent::{InputSourceId, MessageDelivery};
 use rho_core::{MessagePhase, ToolCall, ToolOutput, ToolOutputStatus};
-use rho_ui_proto::{StartMode, WorkstreamTarget};
+use rho_ui_proto::StartMode;
 use serde::Deserialize;
 use tokio::sync::broadcast;
 
@@ -103,11 +102,6 @@ impl AgentRegistry {
     }
 
     pub(crate) async fn iris_startup_context(&self) -> String {
-        let workstreams = self
-            .ui_workstreams()
-            .into_iter()
-            .map(|workstream| (workstream.workstream_id, workstream.name))
-            .collect::<BTreeMap<_, _>>();
         let kinds = self.agent_state_kinds().await;
         let mut lines = self
             .ui_agents(&kinds)
@@ -115,13 +109,9 @@ impl AgentRegistry {
             .filter(|agent| !agent.hidden && !agent.labels.iter().any(|label| label == IRIS_LABEL))
             .map(|agent| {
                 format!(
-                    "{} | {} | {} | {:?}",
+                    "{} | {} | {:?}",
                     self.display_agent_id(agent.agent_id),
                     agent.display_name.unwrap_or_else(|| "unnamed".to_owned()),
-                    workstreams
-                        .get(&agent.workstream)
-                        .map(String::as_str)
-                        .unwrap_or("unknown"),
                     agent.attention,
                 )
             })
@@ -129,10 +119,7 @@ impl AgentRegistry {
         if lines.is_empty() {
             return "No visible agents are currently registered.".to_owned();
         }
-        lines.insert(
-            0,
-            "Visible agents: handle | name | workstream | attention".to_owned(),
-        );
+        lines.insert(0, "Visible agents: handle | name | attention".to_owned());
         let mut context = lines.join("\n");
         let mut end = context.len().min(16 * 1024);
         while !context.is_char_boundary(end) {
@@ -191,7 +178,6 @@ impl AgentRegistry {
                     .map(|(_, record)| record.primary_workdir().clone())
             };
 
-            let workstream = self.create_workstream("iris".to_owned()).await;
             let workspace = match source {
                 Some(source) => self.pool.open_workspace(&source).await?,
                 None => {
@@ -206,7 +192,6 @@ impl AgentRegistry {
             let (agent_id, _) = self
                 .pool
                 .create(
-                    workstream.workstream_id,
                     AgentRole::Iris,
                     Some("Iris".to_owned()),
                     vec![rho_agent::StartWorkdir::Existing(workspace)],
@@ -246,11 +231,6 @@ async fn call_iris_tool(registry: &Arc<AgentRegistry>, call: ToolCall) -> anyhow
     match call.name.as_str() {
         "iris_list_agents" => {
             let kinds = registry.agent_state_kinds().await;
-            let workstreams = registry
-                .ui_workstreams()
-                .into_iter()
-                .map(|workstream| (workstream.workstream_id, workstream.name))
-                .collect::<std::collections::HashMap<_, _>>();
             let mut lines = Vec::new();
             for agent in registry
                 .ui_agents(&kinds)
@@ -258,45 +238,15 @@ async fn call_iris_tool(registry: &Arc<AgentRegistry>, call: ToolCall) -> anyhow
                 .filter(|agent| !agent.labels.iter().any(|label| label == IRIS_LABEL))
             {
                 lines.push(format!(
-                    "{} | {} | {} | {:?} | {}",
+                    "{} | {} | {:?} | {}",
                     registry.display_agent_id(agent.agent_id),
                     agent.display_name.unwrap_or_else(|| "unnamed".to_owned()),
-                    workstreams
-                        .get(&agent.workstream)
-                        .map(String::as_str)
-                        .unwrap_or("unknown"),
                     agent.attention,
                     agent.last_user_message_text
                 ));
             }
             Ok(if lines.is_empty() {
                 "No agents.".to_owned()
-            } else {
-                lines.join("\n")
-            })
-        }
-        "iris_list_workstreams" => {
-            let read = registry.db.read();
-            let agents = read.list_agents();
-            let lines = read
-                .list_workstreams()
-                .into_iter()
-                .filter(|(_, workstream)| workstream.name != "iris")
-                .map(|(id, workstream)| {
-                    let members = agents
-                        .iter()
-                        .filter(|(_, agent)| {
-                            agent.workstream == id
-                                && !agent.labels.iter().any(|label| label == IRIS_LABEL)
-                        })
-                        .map(|(agent_id, _)| registry.display_agent_id(*agent_id))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    format!("{} | {}", workstream.name, members)
-                })
-                .collect::<Vec<_>>();
-            Ok(if lines.is_empty() {
-                "No workstreams.".to_owned()
             } else {
                 lines.join("\n")
             })
@@ -316,29 +266,9 @@ async fn call_iris_tool(registry: &Arc<AgentRegistry>, call: ToolCall) -> anyhow
                     "project is required when zero or multiple projects are registered"
                 ),
             };
-            let workstream = match args.workstream {
-                Some(name) => match registry
-                    .ui_workstreams()
-                    .into_iter()
-                    .find(|workstream| workstream.name == name)
-                {
-                    Some(workstream) => workstream,
-                    None => registry.create_workstream(name).await,
-                },
-                None => {
-                    registry
-                        .create_workstream(
-                            args.task_name
-                                .clone()
-                                .unwrap_or_else(|| provisional_name(&args.prompt)),
-                        )
-                        .await
-                }
-            };
             let role = parse_role(args.role.as_deref().unwrap_or("eng"))?;
             let (agent_id, agent) = registry
                 .create(
-                    workstream.workstream_id,
                     role,
                     StartMode::NewOn {
                         repo: project.path,
@@ -367,11 +297,7 @@ async fn call_iris_tool(registry: &Arc<AgentRegistry>, call: ToolCall) -> anyhow
                 write.commit();
             }
             refresh_clients(registry).await;
-            Ok(format!(
-                "Started {} in workstream {}.",
-                registry.display_agent_id(agent_id),
-                workstream.name
-            ))
+            Ok(format!("Started {}.", registry.display_agent_id(agent_id)))
         }
         "iris_send_agent" => {
             let args: SendAgentArgs = parse(&call)?;
@@ -462,19 +388,6 @@ async fn call_iris_tool(registry: &Arc<AgentRegistry>, call: ToolCall) -> anyhow
             refresh_clients(registry).await;
             Ok(format!("Renamed agent to {}.", args.name))
         }
-        "iris_move_agent" => {
-            let args: MoveArgs = parse(&call)?;
-            let agent_id = registry.resolve_display_agent_id(&args.agent)?;
-            registry
-                .move_agent(agent_id, WorkstreamTarget::Named(args.workstream.clone()))
-                .await?;
-            refresh_clients(registry).await;
-            Ok(format!(
-                "Moved {} to {}.",
-                registry.display_agent_id(agent_id),
-                args.workstream
-            ))
-        }
         "iris_set_agent_visibility" => {
             let args: VisibilityArgs = parse(&call)?;
             let agent_id = registry.resolve_display_agent_id(&args.agent)?;
@@ -494,19 +407,6 @@ async fn call_iris_tool(registry: &Arc<AgentRegistry>, call: ToolCall) -> anyhow
                 registry.display_agent_id(agent_id),
                 if args.hidden { "hidden" } else { "shown" }
             ))
-        }
-        "iris_rename_workstream" => {
-            let args: RenameWorkstreamArgs = parse(&call)?;
-            let workstream = registry
-                .ui_workstreams()
-                .into_iter()
-                .find(|workstream| workstream.name == args.workstream)
-                .ok_or_else(|| anyhow::anyhow!("unknown workstream {}", args.workstream))?;
-            registry
-                .rename_workstream(workstream.workstream_id, args.name.clone())
-                .await?;
-            refresh_clients(registry).await;
-            Ok(format!("Renamed workstream to {}.", args.name))
         }
         other => anyhow::bail!("unsupported Iris tool {other}"),
     }
@@ -571,17 +471,6 @@ fn tool_error(error: impl Into<String>) -> ToolOutput {
     }
 }
 
-fn provisional_name(prompt: &str) -> String {
-    prompt
-        .lines()
-        .next()
-        .unwrap_or("voice task")
-        .split_whitespace()
-        .take(6)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn parse_role(role: &str) -> anyhow::Result<AgentRole> {
     Ok(match role {
         "eng-mini" => AgentRole::Engineer {
@@ -613,7 +502,6 @@ struct StartAgentArgs {
     prompt: String,
     task_name: Option<String>,
     project: Option<String>,
-    workstream: Option<String>,
     role: Option<String>,
 }
 
@@ -636,21 +524,9 @@ struct RenameArgs {
 }
 
 #[derive(Deserialize)]
-struct MoveArgs {
-    agent: String,
-    workstream: String,
-}
-
-#[derive(Deserialize)]
 struct VisibilityArgs {
     agent: String,
     hidden: bool,
-}
-
-#[derive(Deserialize)]
-struct RenameWorkstreamArgs {
-    workstream: String,
-    name: String,
 }
 
 #[cfg(test)]
@@ -667,7 +543,6 @@ mod tests {
             names,
             [
                 "iris_list_agents",
-                "iris_list_workstreams",
                 "iris_start_agent",
                 "iris_send_agent",
                 "iris_unsubscribe_agent",
@@ -675,9 +550,7 @@ mod tests {
                 "iris_cancel_agent",
                 "iris_continue_agent",
                 "iris_rename_agent",
-                "iris_move_agent",
                 "iris_set_agent_visibility",
-                "iris_rename_workstream",
             ]
         );
         assert!(rho_agent::iris_tools::PROMPT.contains("single global assistant"));

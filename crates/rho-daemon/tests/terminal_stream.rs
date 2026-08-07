@@ -53,7 +53,6 @@ async fn terminal_survives_detach_and_echoes() -> anyhow::Result<()> {
     write_frame(
         &mut control,
         &ClientMessage::NewAgent {
-            workstream: None,
             role: Default::default(),
             start: StartMode::Join(JoinTarget::User {
                 repo: camino::Utf8PathBuf::from_path_buf(repo_dir.path().to_owned()).unwrap(),

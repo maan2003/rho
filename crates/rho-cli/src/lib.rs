@@ -19,13 +19,12 @@ mod mcp_agent_tools;
 mod pr;
 mod visualization;
 mod wayland;
-mod workstream;
 
 #[cfg(test)]
 mod tests;
 
 pub fn main() -> Result<()> {
-    // Dying quietly on a closed pipe (`rho ws show | head`) is the correct
+    // Dying quietly on a closed pipe is the correct
     // CLI behavior; Rust's default ignore turns it into a print panic.
     // SAFETY: top of main, single-threaded, resetting to default handling.
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
@@ -70,7 +69,6 @@ async fn run(command: Command) -> Result<()> {
         Command::Pr(args) => pr::run(args).await,
         Command::RecordVisualization(args) => visualization::run(args).await,
         Command::Wayland(_) => unreachable!("wayland runs before the shared async runtime"),
-        Command::Workstream(args) => workstream::run(args).await,
         Command::ProtocolLog(args) => {
             let mut stdout = io::stdout().lock();
             rho_ui_proto::print_protocol_log(&args.path, &mut stdout)?;
@@ -158,7 +156,6 @@ enum Command {
     RecordVisualization(RecordVisualizationArgs),
     ProtocolLog(ProtocolLogArgs),
     Wayland(wayland::WaylandArgs),
-    Workstream(WorkstreamArgs),
 }
 
 #[derive(Parser)]
@@ -185,9 +182,6 @@ enum CliCommand {
     ProtocolLog(ProtocolLogArgs),
     /// Run and control applications in an isolated headless Wayland session.
     Wayland(wayland::WaylandArgs),
-    /// Inspect and edit workstreams: the persistent units of work.
-    #[command(alias = "ws")]
-    Workstream(WorkstreamArgs),
 }
 
 #[derive(Clone, clap::Args)]
@@ -293,39 +287,6 @@ pub(crate) struct LandArgs {
 }
 
 #[derive(Clone, clap::Args)]
-pub(crate) struct WorkstreamArgs {
-    #[arg(long = "socket-path")]
-    socket_path: Option<PathBuf>,
-    #[command(subcommand)]
-    command: WorkstreamCommand,
-}
-
-#[derive(Clone, Subcommand)]
-pub(crate) enum WorkstreamCommand {
-    /// List every workstream with its labels and member rollup.
-    List,
-    /// Show one workstream and its member agents.
-    Show { workstream: String },
-    /// Rename a workstream.
-    Rename { workstream: String, name: String },
-    /// Add a label to a workstream (`pin`, `hide`, `group:<name>`, or
-    /// anything else).
-    Label { workstream: String, label: String },
-    /// Remove a label from a workstream.
-    Unlabel { workstream: String, label: String },
-    /// Move an agent (and its spawned subtree) into a workstream, creating
-    /// the workstream when the name matches nothing.
-    Move { agent: String, workstream: String },
-    /// Move every agent of one workstream into another; the emptied source
-    /// is deleted.
-    Merge { from: String, into: String },
-    /// Write the stored view-config blob to stdout.
-    ViewGet,
-    /// Replace the stored view-config blob with stdin.
-    ViewSet,
-}
-
-#[derive(Clone, clap::Args)]
 struct ProtocolLogArgs {
     path: std::path::PathBuf,
 }
@@ -348,7 +309,6 @@ impl Args {
             CliCommand::RecordVisualization(args) => Command::RecordVisualization(args),
             CliCommand::ProtocolLog(args) => Command::ProtocolLog(args),
             CliCommand::Wayland(args) => Command::Wayland(args),
-            CliCommand::Workstream(args) => Command::Workstream(args),
         };
         Ok(Self { command })
     }
