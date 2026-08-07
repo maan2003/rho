@@ -18,7 +18,7 @@ use gpui::{
 use theme::ActiveTheme as _;
 
 use crate::minibuffer::bottom_strip;
-use crate::workspace::{Workspace, WorkstreamPrompt};
+use crate::workspace::{Subject, Workspace, WorkstreamPrompt};
 
 pub type TransientRun = Rc<dyn Fn(&mut Workspace, &mut Window, &mut Context<Workspace>)>;
 
@@ -34,7 +34,7 @@ pub struct TransientItem {
     stay: bool,
     /// Menu-time applicability: items whose context is missing (no agent
     /// selected, say) drop out at open instead of failing when pressed.
-    when: Option<fn(&Workspace) -> bool>,
+    when: Option<fn(&Subject) -> bool>,
 }
 
 pub struct Transient {
@@ -66,7 +66,7 @@ impl Transient {
         description: impl Into<String>,
         value: Option<String>,
         stay: bool,
-        when: Option<fn(&Workspace) -> bool>,
+        when: Option<fn(&Subject) -> bool>,
         run: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
     ) -> Self {
         self.items.push(TransientItem {
@@ -122,10 +122,10 @@ impl Transient {
         self.push(key, description, Some(value.into()), true, None, run)
     }
 
-    /// An item present only while `when` holds at menu open.
+    /// An item present only while `when` holds of the subject at menu open.
     fn item_when(
         self,
-        when: fn(&Workspace) -> bool,
+        when: fn(&Subject) -> bool,
         key: &'static str,
         label: impl Into<String>,
         run: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
@@ -133,10 +133,10 @@ impl Transient {
         self.push(key, label, None, false, Some(when), run)
     }
 
-    /// Drops items whose context predicate fails right now.
-    pub fn retain_applicable(&mut self, workspace: &Workspace) {
+    /// Drops items that have nothing to act on right now.
+    pub fn retain_applicable(&mut self, subject: &Subject) {
         self.items
-            .retain(|item| item.when.is_none_or(|when| when(workspace)));
+            .retain(|item| item.when.is_none_or(|when| when(subject)));
     }
 
     /// The action bound to `keystroke` and whether the menu stays open.
@@ -552,7 +552,7 @@ pub fn root_menu() -> Transient {
             workspace.cmd_iris_follow_selection(cx);
         })
         .item_when(
-            Workspace::has_selected_agent,
+            Subject::has_agent,
             "a",
             "agent…",
             |workspace, window, cx| {
@@ -560,7 +560,7 @@ pub fn root_menu() -> Transient {
             },
         )
         .item_when(
-            Workspace::has_focused_workstream,
+            Subject::has_workstream,
             "s",
             "workstream…",
             |workspace, window, cx| {
@@ -582,23 +582,23 @@ pub fn root_menu() -> Transient {
         .item("f", "open file…", |workspace, window, cx| {
             workspace.prompt_open_file(window, cx);
         })
-        .item("c", "start/attach shell", |workspace, _, cx| {
-            workspace.cmd_shell(cx);
+        .item("c", "start/attach shell", |workspace, window, cx| {
+            workspace.cmd_shell(window, cx);
         })
-        .item("shift-c", "close shell", |workspace, _, cx| {
-            workspace.cmd_shell_close(cx);
+        .item("shift-c", "close shell", |workspace, window, cx| {
+            workspace.cmd_shell_close(window, cx);
         })
         .item_when(
-            Workspace::has_selected_agent,
+            Subject::has_agent,
             "d",
             "changes",
-            |workspace, _, cx| workspace.cmd_diff(cx),
+            |workspace, window, cx| workspace.cmd_diff(window, cx),
         )
-        .item("t", "terminal", |workspace, _, cx| {
-            workspace.cmd_term(false, cx);
+        .item("t", "terminal", |workspace, window, cx| {
+            workspace.cmd_term(false, window, cx);
         })
-        .item("shift-t", "new terminal", |workspace, _, cx| {
-            workspace.cmd_term(true, cx);
+        .item("shift-t", "new terminal", |workspace, window, cx| {
+            workspace.cmd_term(true, window, cx);
         })
         .item("p", "projects…", |workspace, window, cx| {
             workspace.open_transient(projects_menu(), window, cx);
@@ -1317,26 +1317,26 @@ fn agent_menu() -> Transient {
         .item("s", "snooze…", |workspace, window, cx| {
             workspace.open_transient(snooze_menu(), window, cx);
         })
-        .item("c", "cancel turn", |workspace, _, cx| {
-            workspace.cmd_agent_cancel(cx);
+        .item("c", "cancel turn", |workspace, window, cx| {
+            workspace.cmd_agent_cancel(window, cx);
         })
         .item("r", "role…", |workspace, window, cx| {
             workspace.prompt_change_agent_role(window, cx);
         })
-        .item("k", "compact", |workspace, _, cx| {
-            workspace.cmd_compact(cx);
+        .item("k", "compact", |workspace, window, cx| {
+            workspace.cmd_compact(window, cx);
         })
-        .item("w", "rewind turn", |workspace, _, cx| {
-            workspace.cmd_rewind(1, cx);
+        .item("w", "rewind turn", |workspace, window, cx| {
+            workspace.cmd_rewind(1, window, cx);
         })
         .item("shift-w", "rewind turns…", |workspace, window, cx| {
             workspace.prompt_rewind(window, cx);
         })
-        .item("shift-c", "continue turn", |workspace, _, cx| {
-            workspace.cmd_continue_turn(cx);
+        .item("shift-c", "continue turn", |workspace, window, cx| {
+            workspace.cmd_continue_turn(window, cx);
         })
-        .item("shift-k", "new prompt cache key", |workspace, _, cx| {
-            workspace.cmd_change_prompt_cache_key(cx);
+        .item("shift-k", "new prompt cache key", |workspace, window, cx| {
+            workspace.cmd_change_prompt_cache_key(window, cx);
         })
 }
 
@@ -1364,11 +1364,11 @@ fn workstream_menu() -> Transient {
         .item("r", "rename…", |workspace, window, cx| {
             workspace.prompt_workstream(WorkstreamPrompt::Rename, window, cx);
         })
-        .toggle("p", "pin", |workspace, _, cx| {
-            workspace.cmd_workstream_pin(cx);
+        .toggle("p", "pin", |workspace, window, cx| {
+            workspace.cmd_workstream_pin(window, cx);
         })
-        .toggle("h", "hide", |workspace, _, cx| {
-            workspace.cmd_workstream_hide(cx);
+        .toggle("h", "hide", |workspace, window, cx| {
+            workspace.cmd_workstream_hide(window, cx);
         })
         .item("g", "group…", |workspace, window, cx| {
             workspace.prompt_workstream(WorkstreamPrompt::Group, window, cx);

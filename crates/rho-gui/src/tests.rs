@@ -441,7 +441,7 @@ fn triage_targets_the_whole_dashboard_row_under_the_cursor(cx: &mut TestAppConte
             workspace.sync_dashboard(window, cx);
             assert!(workspace.is_dashboard_mode(window, cx));
             // The cursor starts on the Iris row, which speaks for no agent.
-            assert_eq!(workspace.triage_targets(window, cx), Vec::new());
+            assert_eq!(workspace.subject(window, cx).agents, Vec::new());
         })
         .expect("start on dashboard");
     cx.run_until_parked();
@@ -459,22 +459,25 @@ fn triage_targets_the_whole_dashboard_row_under_the_cursor(cx: &mut TestAppConte
                     selections.select_anchor_ranges([anchor..anchor]);
                 });
             });
-            let mut targets = workspace.triage_targets(window, cx);
+            let subject = workspace.subject(window, cx);
+            let mut targets = subject.agents.clone();
             targets.sort();
             assert_eq!(
                 targets,
                 vec![agent(1), agent(2)],
                 "a stream row's verdict must cover the agents it aggregates"
             );
+            // With no tab open, a row still offers `space a` and `space s`.
+            assert!(subject.has_agent() && subject.has_workstream());
         })
         .expect("park the cursor on the stream row");
 }
 
 /// Triaging the rail while a conversation is open is the normal way to
-/// work: the verdict belongs to the row under the cursor, not to whatever
-/// tab happens to be open behind the dashboard.
+/// work: every command belongs to the row under the cursor, not to
+/// whatever tab happens to be open behind the dashboard.
 #[gpui::test]
-fn triage_from_the_dashboard_ignores_the_open_agent(cx: &mut TestAppContext) {
+fn the_subject_of_a_command_is_the_row_under_the_cursor(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
@@ -518,8 +521,11 @@ fn triage_from_the_dashboard_ignores_the_open_agent(cx: &mut TestAppContext) {
         .expect("dashboard editor");
     workspace
         .update(cx, |workspace, window, cx| {
-            // The open tab still owns the verdict while it holds focus.
-            assert_eq!(workspace.triage_targets(window, cx), vec![agent(3)]);
+            // The open tab is the subject while it holds focus.
+            let subject = workspace.subject(window, cx);
+            assert_eq!(subject.agent, Some(agent(3)));
+            assert_eq!(subject.workstream, Some(WorkstreamId(2)));
+            assert_eq!(subject.agents, vec![agent(3)]);
 
             workspace.focus_rail_for_test(window, cx);
             dashboard.update(cx, |editor, cx| {
@@ -530,13 +536,26 @@ fn triage_from_the_dashboard_ignores_the_open_agent(cx: &mut TestAppContext) {
                     selections.select_anchor_ranges([anchor..anchor]);
                 });
             });
+            let subject = workspace.subject(window, cx);
             assert_eq!(
-                workspace.triage_targets(window, cx),
+                subject.agents,
                 vec![agent(1)],
-                "a dashboard verdict speaks for the row under the cursor"
+                "a verdict speaks for the row under the cursor"
             );
+            assert_eq!(
+                subject.agent,
+                Some(agent(1)),
+                "single-agent commands take the row's root, the agent enter opens"
+            );
+            assert_eq!(
+                subject.workstream,
+                Some(WorkstreamId(1)),
+                "workstream commands follow the cursor, not the open tab"
+            );
+            // Both menu gates open on a row, with or without a tab behind it.
+            assert!(subject.has_agent() && subject.has_workstream());
         })
-        .expect("triage the rail row behind the open tab");
+        .expect("command the rail row behind the open tab");
 }
 
 /// The row settles only once every agent it aggregates is quiet — the

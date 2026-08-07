@@ -548,6 +548,39 @@ struct PendingAgentFrame {
     allocation: Option<AgentFrameAllocation>,
 }
 
+/// Who a command speaks about: the rail row under the cursor, or the open
+/// agent. Both answer the same three questions, which is what lets one
+/// resolver serve every command.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Subject {
+    /// The single agent the subject stands for. A stream row's is its root
+    /// — the one `enter` opens — so `space a` on a row acts on the agent
+    /// the user would have opened anyway.
+    pub agent: Option<AgentId>,
+    pub workstream: Option<rho_ui_proto::WorkstreamId>,
+    /// Everything the subject's rail row aggregates. Verdicts need all of
+    /// it: acking only the root leaves the row lit by a child's lamp, and
+    /// the row never reaches settled.
+    pub agents: Vec<AgentId>,
+}
+
+impl Subject {
+    pub fn has_agent(&self) -> bool {
+        self.agent.is_some()
+    }
+
+    pub fn has_workstream(&self) -> bool {
+        self.workstream.is_some()
+    }
+
+    /// The unsubmitted draft belongs to a workstream that has no agents
+    /// yet, so workstream commands can still name it.
+    fn or_draft_workstream(mut self, draft: Option<rho_ui_proto::WorkstreamId>) -> Self {
+        self.workstream = self.workstream.or(draft);
+        self
+    }
+}
+
 /// Which workstream operation a transient prompt collects a name for.
 #[derive(Clone, Copy)]
 pub enum WorkstreamPrompt {
@@ -2203,18 +2236,8 @@ impl Workspace {
         self.agent_online(agent_id)
     }
 
-    /// The selected agent, or a `{verb}: no agent selected` notice.
-    fn selected_or_notice(&mut self, verb: &str, cx: &mut Context<Self>) -> Option<AgentId> {
-        let selected = self.registry.selected_agent().copied();
-        if selected.is_none() {
-            let message = format!("{verb}: no agent selected");
-            self.notice_on(None, &message, StyleClass::SystemInfo, cx);
-        }
-        selected
-    }
-
-    pub(crate) fn cmd_agent_cancel(&mut self, cx: &mut Context<Self>) {
-        if let Some(agent_id) = self.selected_or_notice("cancel", cx) {
+    pub(crate) fn cmd_agent_cancel(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if let Some(agent_id) = self.subject_agent_or_notice("cancel", window, cx) {
             if !self.require_agent_online(agent_id, cx) {
                 return;
             }
@@ -2222,8 +2245,8 @@ impl Workspace {
         }
     }
 
-    pub(crate) fn cmd_rewind(&mut self, turns: u32, cx: &mut Context<Self>) {
-        if let Some(agent_id) = self.selected_or_notice("rewind", cx) {
+    pub(crate) fn cmd_rewind(&mut self, turns: u32, window: &Window, cx: &mut Context<Self>) {
+        if let Some(agent_id) = self.subject_agent_or_notice("rewind", window, cx) {
             if !self.require_agent_online(agent_id, cx) {
                 return;
             }
@@ -2231,8 +2254,8 @@ impl Workspace {
         }
     }
 
-    pub(crate) fn cmd_continue_turn(&mut self, cx: &mut Context<Self>) {
-        if let Some(agent_id) = self.selected_or_notice("continue", cx) {
+    pub(crate) fn cmd_continue_turn(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if let Some(agent_id) = self.subject_agent_or_notice("continue", window, cx) {
             if !self.require_agent_online(agent_id, cx) {
                 return;
             }
@@ -2240,8 +2263,8 @@ impl Workspace {
         }
     }
 
-    pub(crate) fn cmd_compact(&mut self, cx: &mut Context<Self>) {
-        if let Some(agent_id) = self.selected_or_notice("compact", cx) {
+    pub(crate) fn cmd_compact(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if let Some(agent_id) = self.subject_agent_or_notice("compact", window, cx) {
             if !self.require_agent_online(agent_id, cx) {
                 return;
             }
@@ -2261,8 +2284,8 @@ impl Workspace {
         }
     }
 
-    pub(crate) fn cmd_change_prompt_cache_key(&mut self, cx: &mut Context<Self>) {
-        if let Some(agent_id) = self.selected_or_notice("change-prompt-cache-key", cx) {
+    pub(crate) fn cmd_change_prompt_cache_key(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if let Some(agent_id) = self.subject_agent_or_notice("change-prompt-cache-key", window, cx) {
             if !self.require_agent_online(agent_id, cx) {
                 return;
             }
@@ -2279,9 +2302,10 @@ impl Workspace {
     pub(crate) fn cmd_change_agent_role(
         &mut self,
         intelligence: EngineerIntelligence,
+        window: &Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(agent_id) = self.selected_or_notice("change-role", cx) else {
+        let Some(agent_id) = self.subject_agent_or_notice("change-role", window, cx) else {
             return;
         };
         if !self.require_agent_online(agent_id, cx) {
@@ -2297,7 +2321,7 @@ impl Workspace {
     }
 
     pub(crate) fn prompt_change_agent_role(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(agent_id) = self.selected_or_notice("change-role", cx) else {
+        let Some(agent_id) = self.subject_agent_or_notice("change-role", window, cx) else {
             return;
         };
         let Some(role) = self.registry.agent_role(agent_id) else {
@@ -2350,7 +2374,7 @@ impl Workspace {
         let on_submit = std::rc::Rc::new(
             |workspace: &mut Workspace,
              input: String,
-             _window: &mut Window,
+             window: &mut Window,
              cx: &mut Context<Workspace>| {
                 let intelligence = match input.trim().to_ascii_lowercase().as_str() {
                     "eng-low" => Some(EngineerIntelligence::Low),
@@ -2362,7 +2386,7 @@ impl Workspace {
                     _ => None,
                 };
                 match intelligence {
-                    Some(intelligence) => workspace.cmd_change_agent_role(intelligence, cx),
+                    Some(intelligence) => workspace.cmd_change_agent_role(intelligence, window, cx),
                     None => workspace.notice_on(
                         None,
                         "change-role: choose a listed engineer role",
@@ -2375,8 +2399,8 @@ impl Workspace {
         self.open_prompt("role:", complete, on_submit, window, cx);
     }
 
-    pub(crate) fn cmd_workstream_rename(&mut self, name: String, cx: &mut Context<Self>) {
-        if let Some(workstream_id) = self.focused_workstream_or_notice(cx) {
+    pub(crate) fn cmd_workstream_rename(&mut self, name: String, window: &Window, cx: &mut Context<Self>) {
+        if let Some(workstream_id) = self.subject_workstream_or_notice(window, cx) {
             self.send_to_workstream(
                 workstream_id,
                 ClientMessage::WorkstreamRename {
@@ -2388,16 +2412,16 @@ impl Workspace {
     }
 
     /// The workstream the menus act on, or an echo-area notice saying why
-    /// there is none (not connected, or nothing selected).
-    fn focused_workstream_or_notice(
+    /// there is none (not connected, or nothing in focus).
+    fn subject_workstream_or_notice(
         &mut self,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<rho_ui_proto::WorkstreamId> {
         if !self.require_connected(cx) {
             return None;
         }
-        let selected = self.registry.selected_agent().copied();
-        let focused = self.focused_workstream(selected);
+        let focused = self.subject(window, cx).workstream;
         if focused.is_none() {
             self.notice_on(None, "no workstream in focus", StyleClass::SystemInfo, cx);
         }
@@ -2436,7 +2460,7 @@ impl Workspace {
         } else {
             rho_ui_proto::AgentDisposition::Done
         };
-        let targets = self.disposition_targets(window, cx);
+        let targets = self.subject(window, cx).agents;
         let hid_open_agent = self
             .registry
             .selected_agent()
@@ -2459,7 +2483,7 @@ impl Workspace {
             return;
         }
         let until = rho_core::UnixMs(now_ms().saturating_add(duration_ms));
-        let targets = self.disposition_targets(window, cx);
+        let targets = self.subject(window, cx).agents;
         self.set_agent_disposition(
             targets,
             "snooze",
@@ -2468,8 +2492,8 @@ impl Workspace {
         );
     }
 
-    pub(crate) fn cmd_workstream_pin(&mut self, cx: &mut Context<Self>) {
-        if let Some(workstream_id) = self.focused_workstream_or_notice(cx) {
+    pub(crate) fn cmd_workstream_pin(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if let Some(workstream_id) = self.subject_workstream_or_notice(window, cx) {
             let pinned = self
                 .registry
                 .workstream_labels(workstream_id)
@@ -2483,8 +2507,8 @@ impl Workspace {
         }
     }
 
-    pub(crate) fn cmd_workstream_hide(&mut self, cx: &mut Context<Self>) {
-        if let Some(workstream_id) = self.focused_workstream_or_notice(cx) {
+    pub(crate) fn cmd_workstream_hide(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if let Some(workstream_id) = self.subject_workstream_or_notice(window, cx) {
             let hidden = self
                 .registry
                 .workstream_labels(workstream_id)
@@ -2498,8 +2522,8 @@ impl Workspace {
         }
     }
 
-    pub(crate) fn cmd_workstream_group(&mut self, name: String, cx: &mut Context<Self>) {
-        if let Some(workstream_id) = self.focused_workstream_or_notice(cx) {
+    pub(crate) fn cmd_workstream_group(&mut self, name: String, window: &Window, cx: &mut Context<Self>) {
+        if let Some(workstream_id) = self.subject_workstream_or_notice(window, cx) {
             self.send_workstream_label(
                 workstream_id,
                 format!("{}{name}", crate::registry::GROUP_LABEL_PREFIX),
@@ -2508,14 +2532,14 @@ impl Workspace {
         }
     }
 
-    pub(crate) fn cmd_workstream_label(&mut self, name: String, cx: &mut Context<Self>) {
-        if let Some(workstream_id) = self.focused_workstream_or_notice(cx) {
+    pub(crate) fn cmd_workstream_label(&mut self, name: String, window: &Window, cx: &mut Context<Self>) {
+        if let Some(workstream_id) = self.subject_workstream_or_notice(window, cx) {
             self.send_workstream_label(workstream_id, name, true);
         }
     }
 
-    pub(crate) fn cmd_workstream_unlabel(&mut self, name: String, cx: &mut Context<Self>) {
-        if let Some(workstream_id) = self.focused_workstream_or_notice(cx) {
+    pub(crate) fn cmd_workstream_unlabel(&mut self, name: String, window: &Window, cx: &mut Context<Self>) {
+        if let Some(workstream_id) = self.subject_workstream_or_notice(window, cx) {
             if !self
                 .registry
                 .workstream_labels(workstream_id)
@@ -2532,8 +2556,8 @@ impl Workspace {
     /// Moves every agent of the focused workstream into the named one; the
     /// daemon deletes the emptied source. Merging targets existing streams
     /// only — a typo should not found a stream.
-    pub(crate) fn cmd_workstream_merge(&mut self, name: String, cx: &mut Context<Self>) {
-        let Some(source_id) = self.focused_workstream_or_notice(cx) else {
+    pub(crate) fn cmd_workstream_merge(&mut self, name: String, window: &Window, cx: &mut Context<Self>) {
+        let Some(source_id) = self.subject_workstream_or_notice(window, cx) else {
             return;
         };
         let Some(target) = self
@@ -2625,8 +2649,8 @@ impl Workspace {
         }
     }
 
-    pub(crate) fn cmd_open(&mut self, path: Utf8PathBuf, cx: &mut Context<Self>) {
-        let Some(agent_id) = self.selected_or_notice("open", cx) else {
+    pub(crate) fn cmd_open(&mut self, path: Utf8PathBuf, window: &Window, cx: &mut Context<Self>) {
+        let Some(agent_id) = self.subject_agent_or_notice("open", window, cx) else {
             return;
         };
         if !self.require_agent_online(agent_id, cx) {
@@ -2644,8 +2668,8 @@ impl Workspace {
         self.open_file_surface(agent_id, workspace, path, cx);
     }
 
-    pub(crate) fn cmd_shell(&mut self, cx: &mut Context<Self>) {
-        if let Some(agent_id) = self.selected_or_notice("shell", cx) {
+    pub(crate) fn cmd_shell(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if let Some(agent_id) = self.subject_agent_or_notice("shell", window, cx) {
             if !self.require_agent_online(agent_id, cx) {
                 return;
             }
@@ -2653,8 +2677,8 @@ impl Workspace {
         }
     }
 
-    pub(crate) fn cmd_shell_close(&mut self, cx: &mut Context<Self>) {
-        let Some(agent_id) = self.selected_or_notice("close shell", cx) else {
+    pub(crate) fn cmd_shell_close(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let Some(agent_id) = self.subject_agent_or_notice("close shell", window, cx) else {
             return;
         };
         if !self.require_agent_online(agent_id, cx) {
@@ -2681,8 +2705,8 @@ impl Workspace {
         .detach();
     }
 
-    pub(crate) fn cmd_term(&mut self, new: bool, cx: &mut Context<Self>) {
-        if let Some(agent_id) = self.selected_or_notice("term", cx) {
+    pub(crate) fn cmd_term(&mut self, new: bool, window: &Window, cx: &mut Context<Self>) {
+        if let Some(agent_id) = self.subject_agent_or_notice("term", window, cx) {
             if !self.require_agent_online(agent_id, cx) {
                 return;
             }
@@ -2690,8 +2714,8 @@ impl Workspace {
         }
     }
 
-    pub(crate) fn cmd_diff(&mut self, cx: &mut Context<Self>) {
-        let Some(agent_id) = self.selected_or_notice("diff", cx) else {
+    pub(crate) fn cmd_diff(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let Some(agent_id) = self.subject_agent_or_notice("diff", window, cx) else {
             return;
         };
         if !self.require_agent_online(agent_id, cx) {
@@ -3058,45 +3082,63 @@ impl Workspace {
         self.select_agent(Some(agent_id), window, cx);
     }
 
-    /// Clears (or snoozes, or files away) an agent's claim on the user's
-    /// attention; returns the agent it acted on. The daemon echoes the
-    /// resulting attention level back as a broadcast, so the rail updates
-    /// through the normal event path.
-    /// Whom a triage verdict speaks for: the row under the dashboard cursor
-    /// when the press came from the dashboard, otherwise the open agent.
-    /// Which one is asking has to be read from focus, not from whether a tab
-    /// happens to be open — triaging the rail with a conversation open is
-    /// the normal way to work, and taking the tab's agent there would ack
-    /// something the user is not even looking at.
+    /// What every command acts on. Which one is asking has to be read from
+    /// focus, not from whether a tab happens to be open: triaging the rail
+    /// with a conversation open is the normal way to work, and taking the
+    /// tab's agent there would act on something the user is not looking at.
     ///
-    /// Either way it covers everything the row's lamp aggregates: the whole
-    /// workstream for a stream row, the agent's subtree for an agent row.
-    /// Acking only the root would leave the row active on a child's lamp.
-    fn disposition_targets(&mut self, window: &Window, cx: &mut Context<Self>) -> Vec<AgentId> {
-        let selected = self
-            .registry
-            .selected_agent()
-            .copied()
-            .map(|agent_id| self.registry.agent_subtree(agent_id));
-        if !self.dashboard.focus_handle(cx).is_focused(window) {
-            return selected.unwrap_or_default();
-        }
-        self.dashboard_row_targets(cx)
-            .or(selected)
+    /// Rows that name nobody — Iris, the draft, the rail tail — fall through
+    /// to the open agent, so a chord from the dashboard still lands.
+    pub(crate) fn subject(&self, window: &Window, cx: &mut Context<Self>) -> Subject {
+        use crate::dashboard::RowTarget;
+
+        let row = if self.dashboard.focus_handle(cx).is_focused(window) {
+            self.dashboard.cursor_target(cx)
+        } else {
+            None
+        };
+        let subject = match row {
+            Some(RowTarget::Stream {
+                workstream_id,
+                root,
+            }) => Some(Subject {
+                agent: root,
+                workstream: Some(workstream_id),
+                agents: self.registry.workstream_agents(workstream_id),
+            }),
+            Some(RowTarget::Agent(agent_id)) | Some(RowTarget::Reply(agent_id)) => Some(Subject {
+                agent: Some(agent_id),
+                workstream: self.registry.workstream_of(agent_id),
+                agents: self.registry.agent_subtree(agent_id),
+            }),
+            _ => None,
+        };
+        subject
+            .or_else(|| {
+                let agent_id = self.registry.selected_agent().copied()?;
+                Some(Subject {
+                    agent: Some(agent_id),
+                    workstream: self.registry.workstream_of(agent_id),
+                    agents: self.registry.agent_subtree(agent_id),
+                })
+            })
             .unwrap_or_default()
+            .or_draft_workstream(self.draft_workstream)
     }
 
-    fn dashboard_row_targets(&mut self, cx: &mut Context<Self>) -> Option<Vec<AgentId>> {
-        use crate::dashboard::RowTarget;
-        match self.dashboard.cursor_target(cx) {
-            Some(RowTarget::Stream { workstream_id, .. }) => {
-                Some(self.registry.workstream_agents(workstream_id))
-            }
-            Some(RowTarget::Agent(agent_id)) | Some(RowTarget::Reply(agent_id)) => {
-                Some(self.registry.agent_subtree(agent_id))
-            }
-            _ => None,
+    /// The subject's agent, or a `{verb}: no agent in focus` notice.
+    fn subject_agent_or_notice(
+        &mut self,
+        verb: &str,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AgentId> {
+        let agent = self.subject(window, cx).agent;
+        if agent.is_none() {
+            let message = format!("{verb}: no agent in focus");
+            self.notice_on(None, &message, StyleClass::SystemInfo, cx);
         }
+        agent
     }
 
     /// Sends one verdict per agent of the row. All of them live on the same
@@ -3167,16 +3209,6 @@ impl Workspace {
             return;
         };
         self.open_agent(agent_id, window, cx);
-    }
-
-    fn focused_workstream(
-        &self,
-        source_agent: Option<AgentId>,
-    ) -> Option<rho_ui_proto::WorkstreamId> {
-        source_agent
-            .or_else(|| self.registry.selected_agent().copied())
-            .and_then(|agent_id| self.registry.workstream_of(agent_id))
-            .or(self.draft_workstream)
     }
 
     /// Tab in the draft cycles the `Workdir:` field, the start field, and
@@ -4251,15 +4283,6 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn triage_targets(
-        &mut self,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> Vec<AgentId> {
-        self.disposition_targets(window, cx)
-    }
-
-    #[cfg(test)]
     pub(crate) fn is_dashboard_mode(&self, window: &Window, cx: &App) -> bool {
         self.dashboard_mode(window, cx)
     }
@@ -4677,7 +4700,8 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.capture_overlay_focus(window, cx);
-        transient.retain_applicable(self);
+        let subject = self.subject(window, cx);
+        transient.retain_applicable(&subject);
         self.transient = Some(transient);
         self.minibuffer = None;
         self.echo = None;
@@ -4796,14 +4820,6 @@ impl Workspace {
         cx.stop_propagation();
     }
 
-    pub(crate) fn has_selected_agent(&self) -> bool {
-        self.registry.selected_agent().is_some()
-    }
-
-    pub(crate) fn has_focused_workstream(&self) -> bool {
-        let selected = self.registry.selected_agent().copied();
-        self.focused_workstream(selected).is_some()
-    }
 
     pub(crate) fn prompt_snooze(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let complete = std::rc::Rc::new(|_: &Workspace, _: &str, _: &gpui::App| Vec::new());
@@ -4859,18 +4875,18 @@ impl Workspace {
         let on_submit = std::rc::Rc::new(
             move |workspace: &mut Workspace,
                   input: String,
-                  _window: &mut Window,
+                  window: &mut Window,
                   cx: &mut Context<Workspace>| {
                 let name = input.trim().to_owned();
                 if name.is_empty() {
                     return;
                 }
                 match kind {
-                    WorkstreamPrompt::Merge => workspace.cmd_workstream_merge(name, cx),
-                    WorkstreamPrompt::Group => workspace.cmd_workstream_group(name, cx),
-                    WorkstreamPrompt::Label => workspace.cmd_workstream_label(name, cx),
-                    WorkstreamPrompt::Unlabel => workspace.cmd_workstream_unlabel(name, cx),
-                    WorkstreamPrompt::Rename => workspace.cmd_workstream_rename(name, cx),
+                    WorkstreamPrompt::Merge => workspace.cmd_workstream_merge(name, window, cx),
+                    WorkstreamPrompt::Group => workspace.cmd_workstream_group(name, window, cx),
+                    WorkstreamPrompt::Label => workspace.cmd_workstream_label(name, window, cx),
+                    WorkstreamPrompt::Unlabel => workspace.cmd_workstream_unlabel(name, window, cx),
+                    WorkstreamPrompt::Rename => workspace.cmd_workstream_rename(name, window, cx),
                 }
             },
         );
@@ -4883,11 +4899,11 @@ impl Workspace {
         let on_submit = std::rc::Rc::new(
             |workspace: &mut Workspace,
              input: String,
-             _window: &mut Window,
+             window: &mut Window,
              cx: &mut Context<Workspace>| {
                 let path = input.trim().to_owned();
                 if !path.is_empty() {
-                    workspace.cmd_open(camino::Utf8PathBuf::from(path), cx);
+                    workspace.cmd_open(camino::Utf8PathBuf::from(path), window, cx);
                 }
             },
         );
@@ -4900,7 +4916,7 @@ impl Workspace {
         let on_submit = std::rc::Rc::new(
             |workspace: &mut Workspace,
              input: String,
-             _window: &mut Window,
+             window: &mut Window,
              cx: &mut Context<Workspace>| {
                 let input = input.trim();
                 let turns = if input.is_empty() {
@@ -4909,7 +4925,7 @@ impl Workspace {
                     input.parse::<u32>().ok().filter(|turns| *turns > 0)
                 };
                 match turns {
-                    Some(turns) => workspace.cmd_rewind(turns, cx),
+                    Some(turns) => workspace.cmd_rewind(turns, window, cx),
                     None => workspace.notice_on(
                         None,
                         &format!("rewind: bad turn count `{input}`"),
@@ -4982,29 +4998,20 @@ impl Workspace {
 
     pub(crate) fn open_new_agent_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.new_agent_draft.is_none() {
-            use crate::dashboard::RowTarget;
-
-            let contextual = if self.dashboard.focus_handle(cx).is_focused(window) {
-                match self.dashboard.cursor_target(cx) {
-                    Some(RowTarget::Stream {
-                        root: Some(agent_id),
-                        ..
-                    })
-                    | Some(RowTarget::Agent(agent_id))
-                    | Some(RowTarget::Reply(agent_id)) => self.agent_workdir(agent_id),
-                    Some(RowTarget::Stream { workstream_id, .. }) => self
-                        .registry
+            // A new agent starts where the subject works: its workdir, or —
+            // for a stream row whose agents are all gone — wherever that
+            // stream last ran.
+            let subject = self.subject(window, cx);
+            let contextual = subject
+                .agent
+                .and_then(|agent_id| self.agent_workdir(agent_id))
+                .or_else(|| {
+                    let workstream_id = subject.workstream?;
+                    self.registry
                         .host_of_workstream(workstream_id)
                         .zip(self.registry.last_working_directory(workstream_id))
-                        .map(|(host, path)| HostPath { host, path }),
-                    _ => None,
-                }
-            } else {
-                self.registry
-                    .selected_agent()
-                    .copied()
-                    .and_then(|agent_id| self.agent_workdir(agent_id))
-            };
+                        .map(|(host, path)| HostPath { host, path })
+                });
             let workdir = contextual.or_else(|| match self.workdirs.as_slice() {
                 [workdir] => Some(HostPath {
                     host: workdir.host,
