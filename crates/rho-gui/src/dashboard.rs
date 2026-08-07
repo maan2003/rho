@@ -2,8 +2,10 @@
 //! single multibuffer in depth-first order.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
-use editor::{Editor, EditorMode, SizingBehavior};
+use editor::display_map::BlockStyle;
+use editor::{DisplayElisionId, DisplayElisionProperties, Editor, EditorMode, SizingBehavior};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, Focusable as _, Window};
 use language::{Buffer, BufferEvent, Capability, Point};
@@ -15,6 +17,7 @@ use rho_ui_proto::desk::{
 };
 use rho_ui_proto::{AgentId, ClientMessage, WorkstreamId};
 use text::{BufferId, ReplicaId};
+use ui::div;
 
 use crate::registry::{AgentRegistry, HostId};
 use crate::workspace::Workspace;
@@ -71,6 +74,7 @@ pub struct Dashboard {
     subscriptions: HashMap<(HostId, DeskNodeId), gpui::Subscription>,
     known_text_ops: HashSet<(HostId, DeskNodeId, DeskClock)>,
     collapsed: HashSet<(HostId, DeskNodeId)>,
+    collapse_elisions: HashMap<(HostId, DeskNodeId), DisplayElisionId>,
     buffer_nodes: HashMap<BufferId, (HostId, DeskNodeId)>,
     headers_disabled: HashSet<BufferId>,
     displayed_len: usize,
@@ -104,6 +108,7 @@ impl Dashboard {
             subscriptions: HashMap::new(),
             known_text_ops: HashSet::new(),
             collapsed: HashSet::new(),
+            collapse_elisions: HashMap::new(),
             buffer_nodes: HashMap::new(),
             headers_disabled: HashSet::new(),
             displayed_len: 0,
@@ -301,16 +306,18 @@ impl Dashboard {
         _window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        let mut order = Vec::new();
+        let mut projection = Projection::default();
         for (&host, desk) in &self.hosts {
-            depth_first(
+            project_depth_first(
                 &desk.snapshot.nodes,
                 None,
                 &self.collapsed,
                 host,
-                &mut order,
+                false,
+                &mut projection,
             );
         }
+        let order = projection.order;
         let live_buffers = order
             .iter()
             .filter_map(|key| self.buffers.get(key))
@@ -345,6 +352,90 @@ impl Dashboard {
             }
         });
         self.displayed_len = order.len();
+        self.sync_collapse_elisions(&order, projection.collapsed, cx);
+    }
+
+    fn sync_collapse_elisions(
+        &mut self,
+        order: &[(HostId, DeskNodeId)],
+        collapsed: Vec<((HostId, DeskNodeId), std::ops::Range<usize>)>,
+        cx: &mut Context<Workspace>,
+    ) {
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let mut properties = Vec::new();
+        for (key, range) in collapsed {
+            let Some(first) = self.buffers.get(&order[range.start]) else {
+                continue;
+            };
+            let Some(last) = self.buffers.get(&order[range.end - 1]) else {
+                continue;
+            };
+            let Some(start) = snapshot.anchor_in_excerpt(first.read(cx).anchor_before(0)) else {
+                continue;
+            };
+            let Some(end) =
+                snapshot.anchor_in_excerpt(last.read(cx).anchor_after(last.read(cx).len()))
+            else {
+                continue;
+            };
+            let count = range.len();
+            properties.push((
+                key,
+                DisplayElisionProperties {
+                    range: start..end,
+                    tail_rows: 0,
+                    height: Some(1),
+                    style: BlockStyle::Flex,
+                    render: Arc::new(move |_| {
+                        div()
+                            .pl_2()
+                            .child(format!("▸ {count} nested"))
+                            .into_any_element()
+                    }),
+                    priority: 0,
+                    type_tag: None,
+                },
+            ));
+        }
+
+        let live = properties
+            .iter()
+            .map(|(key, _)| *key)
+            .collect::<HashSet<_>>();
+        let removed = self
+            .collapse_elisions
+            .extract_if(|key, _| !live.contains(key))
+            .map(|(_, id)| id)
+            .collect::<Vec<_>>();
+        if !removed.is_empty() {
+            self.editor.update(cx, |editor, cx| {
+                editor.remove_display_elisions(removed.into_iter().collect(), None, cx)
+            });
+        }
+
+        let mut updates = Vec::new();
+        let mut inserts = Vec::new();
+        let mut insert_keys = Vec::new();
+        for (key, property) in properties {
+            if let Some(id) = self.collapse_elisions.get(&key).copied() {
+                updates.push((id, property));
+            } else {
+                insert_keys.push(key);
+                inserts.push(property);
+            }
+        }
+        if !updates.is_empty() {
+            self.editor.update(cx, |editor, cx| {
+                editor.update_display_elisions(updates, None, cx)
+            });
+        }
+        if !inserts.is_empty() {
+            let ids = self.editor.update(cx, |editor, cx| {
+                editor.insert_display_elisions(inserts, None, cx)
+            });
+            self.collapse_elisions
+                .extend(insert_keys.into_iter().zip(ids));
+        }
     }
 
     fn cursor_node(&self, cx: &mut Context<Workspace>) -> Option<(HostId, DeskNodeId)> {
@@ -398,6 +489,15 @@ impl Dashboard {
         let Some(node) = self.cursor_node(cx) else {
             return false;
         };
+        let has_children = self.hosts.get(&node.0).is_some_and(|desk| {
+            desk.snapshot
+                .nodes
+                .iter()
+                .any(|candidate| candidate.parent == Some(node.1))
+        });
+        if !has_children {
+            return false;
+        }
         if !self.collapsed.remove(&node) {
             self.collapsed.insert(node);
         }
@@ -462,12 +562,19 @@ impl Dashboard {
     }
 }
 
-fn depth_first(
+#[derive(Default)]
+struct Projection {
+    order: Vec<(HostId, DeskNodeId)>,
+    collapsed: Vec<((HostId, DeskNodeId), std::ops::Range<usize>)>,
+}
+
+fn project_depth_first(
     nodes: &[DeskNode],
     parent: Option<DeskNodeId>,
     collapsed: &HashSet<(HostId, DeskNodeId)>,
     host: HostId,
-    output: &mut Vec<(HostId, DeskNodeId)>,
+    ancestor_collapsed: bool,
+    projection: &mut Projection,
 ) {
     let mut children = nodes
         .iter()
@@ -475,9 +582,22 @@ fn depth_first(
         .collect::<Vec<_>>();
     children.sort_by(|left, right| left.order.cmp(&right.order));
     for node in children {
-        output.push((host, node.id));
-        if !collapsed.contains(&(host, node.id)) {
-            depth_first(nodes, Some(node.id), collapsed, host, output);
+        projection.order.push((host, node.id));
+        let descendants_start = projection.order.len();
+        let is_collapsed = collapsed.contains(&(host, node.id));
+        project_depth_first(
+            nodes,
+            Some(node.id),
+            collapsed,
+            host,
+            ancestor_collapsed || is_collapsed,
+            projection,
+        );
+        let descendants_end = projection.order.len();
+        if !ancestor_collapsed && is_collapsed && descendants_start != descendants_end {
+            projection
+                .collapsed
+                .push(((host, node.id), descendants_start..descendants_end));
         }
     }
 }
@@ -498,7 +618,7 @@ mod tests {
     }
 
     #[test]
-    fn tree_projects_in_depth_first_order_and_collapses_subtrees() {
+    fn tree_projects_in_depth_first_order_and_marks_collapsed_subtrees() {
         let root = DeskNodeId(1);
         let child = DeskNodeId(2);
         let sibling = DeskNodeId(3);
@@ -520,18 +640,19 @@ mod tests {
             },
         ];
         let host = HostId::default();
-        let mut order = Vec::new();
-        depth_first(&nodes, None, &HashSet::new(), host, &mut order);
-        assert_eq!(order, vec![(host, root), (host, child), (host, sibling)]);
-
-        order.clear();
-        depth_first(
+        let mut projection = Projection::default();
+        project_depth_first(
             &nodes,
             None,
             &HashSet::from([(host, root)]),
             host,
-            &mut order,
+            false,
+            &mut projection,
         );
-        assert_eq!(order, vec![(host, root), (host, sibling)]);
+        assert_eq!(
+            projection.order,
+            vec![(host, root), (host, child), (host, sibling)]
+        );
+        assert_eq!(projection.collapsed, vec![((host, root), 1..2)]);
     }
 }
