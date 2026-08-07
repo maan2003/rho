@@ -5,10 +5,13 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use editor::display_map::BlockStyle;
-use editor::{DisplayElisionId, DisplayElisionProperties, Editor, EditorMode, SizingBehavior};
+use editor::{
+    DisplayElisionId, DisplayElisionProperties, Editor, EditorMode, HighlightKey, Inlay,
+    InlayHighlight, SizingBehavior,
+};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, Focusable as _, Window};
-use language::{Buffer, BufferEvent, Capability, Point};
+use language::{Buffer, BufferEvent, Capability, InlayId, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use rho_core::ContentPart;
 use rho_ui_proto::desk::{
@@ -17,10 +20,13 @@ use rho_ui_proto::desk::{
 };
 use rho_ui_proto::{AgentId, ClientMessage, WorkstreamId};
 use text::{BufferId, ReplicaId};
+use theme::ActiveTheme as _;
 use ui::div;
 
 use crate::registry::{AgentRegistry, HostId};
 use crate::workspace::Workspace;
+
+const DEPTH_RAIL_KEY: HighlightKey = HighlightKey::SyntaxTreeView(usize::MAX - 1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParsedHeadingState {
@@ -75,6 +81,7 @@ pub struct Dashboard {
     known_text_ops: HashSet<(HostId, DeskNodeId, DeskClock)>,
     collapsed: HashSet<(HostId, DeskNodeId)>,
     collapse_elisions: HashMap<(HostId, DeskNodeId), DisplayElisionId>,
+    depth_inlays: Vec<InlayId>,
     buffer_nodes: HashMap<BufferId, (HostId, DeskNodeId)>,
     headers_disabled: HashSet<BufferId>,
     displayed_len: usize,
@@ -109,6 +116,7 @@ impl Dashboard {
             known_text_ops: HashSet::new(),
             collapsed: HashSet::new(),
             collapse_elisions: HashMap::new(),
+            depth_inlays: Vec::new(),
             buffer_nodes: HashMap::new(),
             headers_disabled: HashSet::new(),
             displayed_len: 0,
@@ -313,6 +321,7 @@ impl Dashboard {
                 None,
                 &self.collapsed,
                 host,
+                0,
                 false,
                 &mut projection,
             );
@@ -352,7 +361,60 @@ impl Dashboard {
             }
         });
         self.displayed_len = order.len();
+        self.sync_depth_rails(&order, &projection.depths, cx);
         self.sync_collapse_elisions(&order, projection.collapsed, cx);
+    }
+
+    fn sync_depth_rails(
+        &mut self,
+        order: &[(HostId, DeskNodeId)],
+        depths: &[usize],
+        cx: &mut Context<Workspace>,
+    ) {
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let mut inlays = Vec::new();
+        let mut highlights = Vec::new();
+        for (key, depth) in order.iter().zip(depths).filter(|(_, depth)| **depth > 0) {
+            let Some(buffer) = self.buffers.get(key) else {
+                continue;
+            };
+            let buffer_snapshot = buffer.read(cx).snapshot();
+            for row in 0..=buffer_snapshot.max_point().row {
+                let Some(position) =
+                    snapshot.anchor_in_excerpt(buffer_snapshot.anchor_before(Point::new(row, 0)))
+                else {
+                    continue;
+                };
+                let text = if row == 0 {
+                    format!("{}├─ ", "│  ".repeat(depth - 1))
+                } else {
+                    "│  ".repeat(*depth)
+                };
+                let inlay = Inlay::custom(inlays.len(), position, text.clone());
+                highlights.push(InlayHighlight {
+                    inlay: inlay.id,
+                    inlay_position: position,
+                    range: 0..text.len(),
+                });
+                inlays.push(inlay);
+            }
+        }
+
+        let removed = std::mem::take(&mut self.depth_inlays);
+        self.depth_inlays = inlays.iter().map(|inlay| inlay.id).collect();
+        self.editor.update(cx, |editor, cx| {
+            editor.splice_inlays(&removed, inlays, cx);
+            editor.clear_highlights(DEPTH_RAIL_KEY, cx);
+            editor.highlight_inlays(
+                DEPTH_RAIL_KEY,
+                highlights,
+                gpui::HighlightStyle {
+                    color: Some(cx.theme().colors().border_variant.into()),
+                    ..Default::default()
+                },
+                cx,
+            );
+        });
     }
 
     fn sync_collapse_elisions(
@@ -565,6 +627,7 @@ impl Dashboard {
 #[derive(Default)]
 struct Projection {
     order: Vec<(HostId, DeskNodeId)>,
+    depths: Vec<usize>,
     collapsed: Vec<((HostId, DeskNodeId), std::ops::Range<usize>)>,
 }
 
@@ -573,6 +636,7 @@ fn project_depth_first(
     parent: Option<DeskNodeId>,
     collapsed: &HashSet<(HostId, DeskNodeId)>,
     host: HostId,
+    depth: usize,
     ancestor_collapsed: bool,
     projection: &mut Projection,
 ) {
@@ -583,6 +647,7 @@ fn project_depth_first(
     children.sort_by(|left, right| left.order.cmp(&right.order));
     for node in children {
         projection.order.push((host, node.id));
+        projection.depths.push(depth);
         let descendants_start = projection.order.len();
         let is_collapsed = collapsed.contains(&(host, node.id));
         project_depth_first(
@@ -590,6 +655,7 @@ fn project_depth_first(
             Some(node.id),
             collapsed,
             host,
+            depth + 1,
             ancestor_collapsed || is_collapsed,
             projection,
         );
@@ -646,6 +712,7 @@ mod tests {
             None,
             &HashSet::from([(host, root)]),
             host,
+            0,
             false,
             &mut projection,
         );
@@ -654,5 +721,6 @@ mod tests {
             vec![(host, root), (host, child), (host, sibling)]
         );
         assert_eq!(projection.collapsed, vec![((host, root), 1..2)]);
+        assert_eq!(projection.depths, vec![0, 1, 0]);
     }
 }
