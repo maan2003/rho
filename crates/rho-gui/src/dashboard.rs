@@ -1774,6 +1774,42 @@ fn generate(
     segments
 }
 
+/// Bench-only access to the pure per-frame pass: `generate` plus the
+/// fingerprint comparison, the work `refresh_dashboard` does on every
+/// render before its early-out.
+#[cfg(feature = "bench-support")]
+pub mod bench_support {
+    use super::*;
+
+    pub struct Pass(Vec<Segment>);
+
+    pub fn generate_pass(
+        registry: &AgentRegistry,
+        documents: &[(HostId, String)],
+        filed: &HashMap<(HostId, usize), Vec<AgentId>>,
+    ) -> Pass {
+        Pass(generate(
+            registry,
+            documents,
+            filed,
+            &HashSet::new(),
+            &HashSet::new(),
+            &[],
+            None,
+        ))
+    }
+
+    impl Pass {
+        pub fn matches(&self, other: &Pass) -> bool {
+            self.0 == other.0
+        }
+
+        pub fn len(&self) -> usize {
+            self.0.len()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rho_core::UnixMs;

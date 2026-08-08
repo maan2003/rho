@@ -17,6 +17,8 @@ required-features = ["native"]
 
 [features]
 default = ["native"]
+# Exposes internal entry points for `benches/`.
+bench-support = []
 native = [
   "dep:clap",
   "dep:command_palette",
@@ -117,6 +119,7 @@ gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, featur
 
 [dev-dependencies]
 backtrace = "0.3"
+criterion = "0.5"
 editor = { path = "../../vendor/zed/crates/editor", features = ["wrap-test-support"] }
 gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["test-support"] }
 libc = "0.2"
@@ -138,3 +141,8 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = ["Crypto", "Location", "MediaQueryList", "Navigator", "Storage", "Window", "console"] }
 zeroize = "1"
+
+[[bench]]
+name = "desk_sync"
+harness = false
+required-features = ["bench-support"]

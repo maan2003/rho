@@ -70,6 +70,10 @@ pub struct AgentRegistry {
     hosts: BTreeMap<HostId, HostSnapshot>,
     summaries: Vec<UiAgentSummary>,
     agent_locations: BTreeMap<AgentId, usize>,
+    /// Parent → children (in summary order), rebuilt with `summaries`.
+    /// `agent_subtree` runs on every dashboard row every frame, so it
+    /// must not scan the whole registry per call.
+    children: BTreeMap<AgentId, Vec<AgentId>>,
     agent_hosts: BTreeMap<AgentId, HostId>,
     announced_hosts: BTreeMap<AgentId, HostId>,
     active: ActivePane,
@@ -237,6 +241,12 @@ impl AgentRegistry {
             .enumerate()
             .map(|(i, agent)| (agent.agent_id, i))
             .collect();
+        self.children = BTreeMap::new();
+        for agent in &summaries {
+            if let Some(parent) = agent.parent_agent {
+                self.children.entry(parent).or_default().push(agent.agent_id);
+            }
+        }
         self.summaries = summaries;
     }
 
@@ -291,30 +301,25 @@ impl AgentRegistry {
     }
 
     pub fn agent_subtree(&self, agent_id: AgentId) -> Vec<AgentId> {
-        let by_id = self
-            .summaries
-            .iter()
-            .map(|a| (a.agent_id, a))
-            .collect::<BTreeMap<_, _>>();
-        let mut result = vec![agent_id];
-        for candidate in self
-            .summaries
-            .iter()
-            .filter(|a| !a.hidden && a.agent_id != agent_id)
-        {
-            let mut cursor = candidate.agent_id;
-            let mut seen = BTreeSet::new();
-            while seen.insert(cursor) {
-                let Some(parent) = by_id.get(&cursor).and_then(|a| a.parent_agent) else {
-                    break;
-                };
-                if parent == agent_id {
-                    result.push(candidate.agent_id);
-                    break;
+        // Hidden agents are excluded from the result but still walked,
+        // so descendants behind a hidden intermediate are found.
+        let mut seen = BTreeSet::from([agent_id]);
+        let mut queue = vec![agent_id];
+        let mut descendants = Vec::new();
+        while let Some(cursor) = queue.pop() {
+            for child in self.children.get(&cursor).map_or(&[][..], Vec::as_slice) {
+                if seen.insert(*child) {
+                    queue.push(*child);
+                    if !self.agent_summary(*child).is_some_and(|a| a.hidden) {
+                        descendants.push(*child);
+                    }
                 }
-                cursor = parent;
             }
         }
+        // Callers see members in summary order, as before.
+        descendants.sort_by_key(|id| self.agent_locations.get(id).copied());
+        let mut result = vec![agent_id];
+        result.extend(descendants);
         result
     }
 
