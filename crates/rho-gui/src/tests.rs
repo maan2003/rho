@@ -3436,6 +3436,113 @@ fn heading_tags_file_agents_and_conceal_in_display(cx: &mut TestAppContext) {
     );
 }
 
+/// Collapse is a display fold over the subtree: TAB cycles folded →
+/// children → expanded, the buffer keeps the text throughout, and the
+/// fold is anchored — edits above it must not pop it open.
+#[gpui::test]
+fn collapsed_subtree_folds_in_the_display_and_survives_edits(cx: &mut TestAppContext) {
+    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
+
+    let desk_text = "* One\nbody\n** Kid\nkid stuff\n* Two\n";
+    let mut source = text::Buffer::new(
+        text::ReplicaId::new(8),
+        text::BufferId::new(1).unwrap(),
+        "",
+    );
+    let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text)]));
+    let desk_snapshot = DeskSnapshot {
+        text: source.snapshot().text(),
+        operations: vec![operation],
+        transactions: Vec::new(),
+        replicas: Vec::new(),
+    };
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskSnapshot {
+                    snapshot: desk_snapshot,
+                    replica_id: 42,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+        })
+        .expect("update workspace");
+    cx.run_until_parked();
+
+    let display = |cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |workspace, _, cx| {
+                workspace
+                    .dashboard_editor()
+                    .update(cx, |editor, cx| editor.display_text(cx))
+            })
+            .expect("read display text")
+    };
+    let cycle = |cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |workspace, window, cx| {
+                workspace.dashboard_cycle_fold_for_test(HostId::default(), 0, window, cx);
+            })
+            .expect("cycle fold");
+        cx.run_until_parked();
+    };
+
+    // Expanded → folded: the whole subtree hides behind the heading.
+    cycle(cx);
+    let folded = display(cx);
+    assert!(!folded.contains("body"), "folded: {folded:?}");
+    assert!(!folded.contains("** Kid"), "folded: {folded:?}");
+    assert!(folded.contains("* One"), "folded: {folded:?}");
+    assert!(folded.contains("* Two"), "folded: {folded:?}");
+    assert!(folded.contains('…'), "folded: {folded:?}");
+
+    // Folded → children: the body and child heading show, the child's
+    // own subtree stays folded.
+    cycle(cx);
+    let children = display(cx);
+    assert!(children.contains("body"), "children: {children:?}");
+    assert!(children.contains("** Kid"), "children: {children:?}");
+    assert!(!children.contains("kid stuff"), "children: {children:?}");
+
+    // The fold is anchored: an edit above it shifts every offset and
+    // the child must stay folded.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let buffer = workspace
+                .desk_buffer_for_test(HostId::default())
+                .expect("desk buffer");
+            buffer.update(cx, |buffer, cx| {
+                buffer.edit([(0..0, "* Zero\nzero body\n")], None, cx);
+            });
+            workspace.sync_dashboard(window, cx);
+        })
+        .expect("edit above fold");
+    cx.run_until_parked();
+    let shifted = display(cx);
+    assert!(shifted.contains("zero body"), "shifted: {shifted:?}");
+    assert!(shifted.contains("** Kid"), "shifted: {shifted:?}");
+    assert!(
+        !shifted.contains("kid stuff"),
+        "edit above the fold must not pop it open: {shifted:?}"
+    );
+
+    // Children → fully expanded, from the shifted offset.
+    let offset = "* Zero\nzero body\n".len();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.dashboard_cycle_fold_for_test(HostId::default(), offset, window, cx);
+        })
+        .expect("cycle fold");
+    cx.run_until_parked();
+    let expanded = display(cx);
+    assert!(expanded.contains("kid stuff"), "expanded: {expanded:?}");
+}
+
 /// The home view: the Desk document is the surface, agent rows render
 /// under their bound headings, unbound roots under a generated Unfiled
 /// tail, and daemon rebinds rearrange rows without touching the text.

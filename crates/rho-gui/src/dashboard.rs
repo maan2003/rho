@@ -22,7 +22,7 @@ use multi_buffer::composition::{Composition, CompositionSpec, CutSpec, RowSpec, 
 use project::InlayId;
 use rho_ui_proto::desk::{DeskHeading, DeskHeadingState, parse};
 use rho_ui_proto::{AgentId, UiAttention};
-use text::BufferId;
+use text::{BufferId, ToOffset as _};
 use theme::ActiveTheme as _;
 
 use crate::registry::{AgentRegistry, HostId};
@@ -166,7 +166,11 @@ pub struct Dashboard {
     /// The inline new-agent draft, when open: its buffer plus the edit
     /// subscription that keeps chrome fresh.
     new_draft: Option<(Option<(HostId, usize)>, Entity<Buffer>, gpui::Subscription)>,
-    collapsed: HashSet<(HostId, usize)>,
+    /// Collapsed headings, one anchor per heading line. Anchors ride
+    /// edits, so folds stay put while surrounding text changes; each
+    /// pass resolves them back to heading offsets (and drops any whose
+    /// heading is gone).
+    collapsed: HashMap<HostId, Vec<text::Anchor>>,
     /// Hosts whose Unfiled tail is folded behind its header.
     collapsed_unfiled: HashSet<HostId>,
     /// Move the cursor into this key's buffer on the next sync — how a
@@ -186,6 +190,7 @@ pub struct Dashboard {
         Vec<Segment>,
         Vec<(LineKey, String)>,
         Vec<(HostId, usize, String)>,
+        HashSet<(HostId, usize)>,
     )>,
     /// Buffers already registered as headerless with the editor. A
     /// boundary onto a headerless buffer draws nothing, so this is what
@@ -235,7 +240,7 @@ impl Dashboard {
             replies: Vec::new(),
             reply_subscriptions: HashMap::new(),
             new_draft: None,
-            collapsed: HashSet::new(),
+            collapsed: HashMap::new(),
             collapsed_unfiled: HashSet::new(),
             pending_cursor: None,
             pending_doc_cursor: None,
@@ -302,6 +307,16 @@ impl Dashboard {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        // A reply row splices under the agent's heading; a collapsed
+        // heading (or ancestor) would fold it away, so opening reveals.
+        let heading = self
+            .heading_agents
+            .iter()
+            .find(|(_, agents)| agents.contains(&agent_id))
+            .map(|(key, _)| *key);
+        if let Some((host, offset)) = heading {
+            self.reveal_heading(host, offset, cx);
+        }
         let key = LineKey::Reply(agent_id);
         if !self.replies.contains(&agent_id) {
             self.replies.push(agent_id);
@@ -331,6 +346,9 @@ impl Dashboard {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        if let Some((host, offset)) = topic {
+            self.reveal_heading(host, offset, cx);
+        }
         if self.new_draft.is_none() {
             let buffer = cx.new(|cx| Buffer::local("", cx));
             let subscription = cx.subscribe_in(&buffer, window, |this, _, event, window, cx| {
@@ -490,11 +508,12 @@ impl Dashboard {
         }
 
         let draft_topic = self.new_draft.as_ref().map(|(topic, _, _)| *topic);
+        let collapsed = self.collapsed_offsets(&documents, cx);
         let segments = generate(
             registry,
             &documents,
             &filed,
-            &self.collapsed,
+            &collapsed,
             &self.collapsed_unfiled,
             &self.replies,
             draft_topic,
@@ -502,7 +521,7 @@ impl Dashboard {
         // Staffed headings wear their agents as end-of-line inlays, not
         // rows, so the decoration strings join the fingerprint: attention
         // changes must not vanish into the early-out.
-        let decorations = heading_decorations(registry, &documents, &filed, &self.collapsed);
+        let decorations = heading_decorations(registry, &documents, &filed);
 
         // Render reconciles every frame, so most passes are registry
         // noise that changes nothing on screen. When the whole pass —
@@ -532,11 +551,12 @@ impl Dashboard {
             && self
                 .last_synced
                 .as_ref()
-                .is_some_and(|(docs, segs, drafts, decs)| {
+                .is_some_and(|(docs, segs, drafts, decs, folds)| {
                     *docs == documents
                         && *segs == segments
                         && *drafts == draft_texts
                         && *decs == decorations
+                        && *folds == collapsed
                 })
         {
             return;
@@ -736,7 +756,8 @@ impl Dashboard {
         self.apply_reply_chrome(registry, cx);
         self.apply_heading_chrome(&decorations, cx);
         self.apply_tag_conceals(&documents, cx);
-        self.last_synced = Some((documents, segments, draft_texts, decorations));
+        self.apply_subtree_folds(&documents, &collapsed, cx);
+        self.last_synced = Some((documents, segments, draft_texts, decorations, collapsed));
     }
 
     /// The stable composition id for a line key, allocated on first use.
@@ -1151,7 +1172,11 @@ impl Dashboard {
             return false;
         };
         buffer.update(cx, |buffer, cx| buffer.edit(edits, None, cx));
-        self.collapsed.insert((host, archive_offset));
+        if let Some(text) = self.source_text(host, cx) {
+            let mut offsets = self.collapsed_offsets(&[(host, text)], cx);
+            offsets.insert((host, archive_offset));
+            self.store_collapsed(host, &offsets, cx);
+        }
         self.cursor_to_doc(host, archive_offset, cx);
         true
     }
@@ -1241,6 +1266,77 @@ impl Dashboard {
         false
     }
 
+    /// The collapsed headings as current heading offsets: each stored
+    /// anchor resolves against today's text and snaps to the heading
+    /// line it lives on. Anchors whose heading vanished resolve to
+    /// nothing and drop out.
+    fn collapsed_offsets(
+        &self,
+        documents: &[(HostId, String)],
+        cx: &App,
+    ) -> HashSet<(HostId, usize)> {
+        let mut offsets = HashSet::new();
+        for (host, text) in documents {
+            let Some(anchors) = self.collapsed.get(host) else {
+                continue;
+            };
+            let Some(buffer) = self.hosts.get(host).and_then(|weak| weak.upgrade()) else {
+                continue;
+            };
+            let snapshot = buffer.read(cx).text_snapshot();
+            let headings = parse(text);
+            for anchor in anchors {
+                let offset = anchor.to_offset(&snapshot);
+                if let Some(start) = heading_line_at(&headings, offset) {
+                    offsets.insert((*host, start));
+                }
+            }
+        }
+        offsets
+    }
+
+    /// Replaces a host's collapse set, re-anchoring each heading offset
+    /// in the current text.
+    fn store_collapsed(&mut self, host: HostId, offsets: &HashSet<(HostId, usize)>, cx: &App) {
+        let Some(buffer) = self.hosts.get(&host).and_then(|weak| weak.upgrade()) else {
+            return;
+        };
+        let snapshot = buffer.read(cx).snapshot();
+        let anchors = offsets
+            .iter()
+            .filter(|(offset_host, _)| *offset_host == host)
+            .map(|(_, offset)| snapshot.anchor_after(*offset))
+            .collect();
+        self.collapsed.insert(host, anchors);
+    }
+
+    /// Un-collapses the heading and every ancestor, so the heading line
+    /// (and anything spliced under it, like a fresh reply draft) is
+    /// actually on screen.
+    fn reveal_heading(&mut self, host: HostId, offset: usize, cx: &App) {
+        let Some(text) = self.source_text(host, cx) else {
+            return;
+        };
+        let headings = parse(&text);
+        let Some(mut index) = headings
+            .iter()
+            .position(|heading| heading.heading_range.start == offset)
+        else {
+            return;
+        };
+        let mut chain = HashSet::new();
+        loop {
+            chain.insert(headings[index].heading_range.start);
+            match headings[index].parent {
+                Some(parent) => index = parent,
+                None => break,
+            }
+        }
+        let mut offsets = self.collapsed_offsets(&[(host, text)], cx);
+        offsets.retain(|(_, start)| !chain.contains(start));
+        self.store_collapsed(host, &offsets, cx);
+    }
+
     /// Org-style visibility cycling on the heading under the cursor:
     /// folded → children (child headings visible but folded) → fully
     /// expanded → folded. Headings without children just toggle.
@@ -1258,7 +1354,10 @@ impl Dashboard {
         let Some(text) = self.source_text(host, cx) else {
             return false;
         };
-        cycle_collapse(&mut self.collapsed, host, offset, &parse(&text));
+        let headings = parse(&text);
+        let mut offsets = self.collapsed_offsets(&[(host, text)], cx);
+        cycle_collapse(&mut offsets, host, offset, &headings);
+        self.store_collapsed(host, &offsets, cx);
         cx.notify();
         true
     }
@@ -1547,6 +1646,58 @@ impl Dashboard {
         });
     }
 
+    /// Collapsed subtrees hide behind display-level folds: the buffer
+    /// keeps the text (copy, search, and the daemon all still see it)
+    /// while the display shows the heading line plus a `…` placeholder.
+    fn apply_subtree_folds(
+        &self,
+        documents: &[(HostId, String)],
+        collapsed: &HashSet<(HostId, usize)>,
+        cx: &mut Context<Workspace>,
+    ) {
+        struct DeskSubtreeFold;
+        let type_id = std::any::TypeId::of::<DeskSubtreeFold>();
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let mut creases = Vec::new();
+        for (host, text) in documents {
+            let Some(buffer) = self.hosts.get(host).and_then(|weak| weak.upgrade()) else {
+                continue;
+            };
+            let buffer_snapshot = buffer.read(cx).snapshot();
+            for heading in parse(text) {
+                if !collapsed.contains(&(*host, heading.heading_range.start)) {
+                    continue;
+                }
+                let Some(range) = subtree_fold_range(text, &heading) else {
+                    continue;
+                };
+                let (Some(start), Some(end)) = (
+                    snapshot.anchor_in_excerpt(buffer_snapshot.anchor_after(range.start)),
+                    snapshot.anchor_in_excerpt(buffer_snapshot.anchor_before(range.end)),
+                ) else {
+                    continue;
+                };
+                creases.push(editor::display_map::Crease::simple(
+                    start..end,
+                    editor::FoldPlaceholder {
+                        render: std::sync::Arc::new(|_, _, _| {
+                            gpui::Empty.into_any_element()
+                        }),
+                        constrain_width: false,
+                        merge_adjacent: false,
+                        type_tag: Some(type_id),
+                        collapsed_text: Some(" …".into()),
+                    },
+                ));
+            }
+        }
+        self.editor.update(cx, |editor, cx| {
+            editor.display_map.update(cx, |display_map, cx| {
+                display_map.replace_folds_with_type(type_id, creases, cx);
+            });
+        });
+    }
+
     fn apply_heading_chrome(
         &mut self,
         decorations: &[(HostId, usize, String)],
@@ -1560,10 +1711,12 @@ impl Dashboard {
                 continue;
             };
             let buffer_snapshot = buffer.read(cx).snapshot();
-            // Right-biased so typing at the end of the title stays before
-            // the decoration.
+            // Left-biased: a fold starting at this same offset (the tag
+            // conceal or a collapsed subtree) begins *after* left-biased
+            // inlays, so the decoration stays visible ahead of the `…`.
+            // Edits re-anchor it on the same pass, so bias never shows.
             let Some(position) =
-                snapshot.anchor_in_excerpt(buffer_snapshot.anchor_after(*offset))
+                snapshot.anchor_in_excerpt(buffer_snapshot.anchor_before(*offset))
             else {
                 continue;
             };
@@ -1644,9 +1797,9 @@ impl DashClass {
         let color = match self {
             DashClass::Muted => colors.text_muted,
             DashClass::Heading => colors.terminal_ansi_magenta,
-            DashClass::Heading2 => colors.terminal_ansi_blue,
-            DashClass::Heading3 => colors.terminal_ansi_green,
-            DashClass::Heading4 => colors.terminal_ansi_bright_magenta,
+            DashClass::Heading2 => colors.terminal_ansi_green,
+            DashClass::Heading3 => colors.terminal_ansi_bright_magenta,
+            DashClass::Heading4 => colors.terminal_ansi_bright_green,
             DashClass::TodoHeading => colors.terminal_ansi_red,
             DashClass::StaffedHeading => colors.terminal_ansi_cyan,
             DashClass::Working => colors.terminal_ansi_cyan,
@@ -1831,7 +1984,6 @@ fn heading_decorations(
     registry: &AgentRegistry,
     documents: &[(HostId, String)],
     filed: &HashMap<(HostId, usize), Vec<AgentId>>,
-    collapsed: &HashSet<(HostId, usize)>,
 ) -> Vec<(HostId, usize, String)> {
     let empty = Vec::new();
     let mut decorations = Vec::new();
@@ -1846,13 +1998,6 @@ fn heading_decorations(
                 .iter()
                 .any(|zone| zone.contains(&heading.heading_range.start));
             let mut label = String::new();
-            if collapsed.contains(&(*host, heading.heading_range.start))
-                && !text[heading.heading_range.end..heading.subtree_range.end]
-                    .trim()
-                    .is_empty()
-            {
-                label.push_str("  …");
-            }
             for agent_id in agents {
                 // Archived agents read as quiet no matter what they want.
                 let attention = if archived {
@@ -1879,7 +2024,20 @@ fn heading_decorations(
                 }
             }
             if !label.is_empty() {
-                decorations.push((*host, heading.heading_range.end, label));
+                // Decorations anchor at the visible end of the line:
+                // before the concealed tag token, so neither the tag
+                // conceal (which ends at the line end) nor a subtree
+                // fold (which starts there) swallows the inlay.
+                let position = heading.tags_range.as_ref().map_or(
+                    heading.heading_range.end,
+                    |tags_range| {
+                        text[..tags_range.start]
+                            .trim_end_matches([' ', '\t'])
+                            .len()
+                            .max(heading.stars_range.end)
+                    },
+                );
+                decorations.push((*host, position, label));
             }
         }
     }
@@ -1938,6 +2096,31 @@ fn structure_edits(
             }
         })
         .collect()
+}
+
+/// The heading whose heading line contains `offset`, as its start
+/// offset. Anywhere else — body, blank line, out of range — is `None`.
+fn heading_line_at(headings: &[DeskHeading], offset: usize) -> Option<usize> {
+    headings
+        .iter()
+        .find(|heading| {
+            heading.heading_range.start <= offset && offset <= heading.heading_range.end
+        })
+        .map(|heading| heading.heading_range.start)
+}
+
+/// What a collapsed heading folds away: everything after its heading
+/// line to the end of its subtree, keeping the final newline so the
+/// next visible line stays a line of its own. `None` when there is
+/// nothing to hide. Trailing blank lines the boundary rule assigned to
+/// the enclosing context sit outside `subtree_range`, so they stay
+/// visible as the gap between a folded subtree and a shallower heading.
+fn subtree_fold_range(text: &str, heading: &DeskHeading) -> Option<Range<usize>> {
+    let mut end = heading.subtree_range.end;
+    if text[..end].ends_with('\n') {
+        end -= 1;
+    }
+    (end > heading.heading_range.end).then(|| heading.heading_range.end..end)
 }
 
 /// One step of org-style visibility cycling for the heading at `offset`:
@@ -2166,55 +2349,58 @@ fn generate(
             occurrence.hash(&mut hasher);
             hasher.finish()
         };
+        // Collapsed subtrees hide behind display-level folds, not cuts —
+        // the document slice stays contiguous. Rows cannot splice inside
+        // a fold, so drafts and replies there stay hidden with their
+        // heading instead of parking at the document tail.
+        let fold_zones: Vec<Range<usize>> = headings
+            .iter()
+            .filter(|heading| collapsed.contains(&(*host, heading.heading_range.start)))
+            .filter_map(|heading| subtree_fold_range(text, heading))
+            .collect();
         for heading in &headings {
             let start = heading.heading_range.start;
-            // Headings swallowed by a collapsed ancestor's cut emit
-            // nothing; their own collapse state survives for when the
-            // ancestor opens again.
             if start < slice_start {
                 continue;
             }
             let agents = filed.get(&(*host, start)).unwrap_or(&empty);
             let draft_here = draft_topic == Some(Some((*host, start)));
-            if collapsed.contains(&(*host, start)) {
-                // Collapsed: the heading line stays and wears an inline
-                // `…` decoration; its whole subtree — body and nested
-                // subheadings — hides behind a rowless cut.
-                segments.push(Segment::Doc {
-                    host: *host,
-                    range: slice_start..heading.heading_range.end,
-                    id: slice_id,
-                });
-                slice_id = next_slice_id(&heading.title, &mut title_counts);
-                if draft_here {
-                    segments.push(Segment::Line(Line::new(
-                        LineKey::NewDraft(Some((*host, start))),
-                        RowTarget::NewDraft(Some((*host, start))),
-                    )));
-                }
-                slice_start = heading.subtree_range.end;
-            } else if agents.iter().any(|agent_id| replies.contains(agent_id)) || draft_here {
-                // Drafts splice in after the heading's body, before the
-                // next heading (trailing newline trimmed so the excerpt
-                // boundary doesn't double it). A staffed heading with no
-                // open draft needs no cut at all: its agents are line
-                // decorations, not rows.
-                let (position, resume) = cut_points(text, heading);
-                segments.push(Segment::Doc {
-                    host: *host,
-                    range: slice_start..position,
-                    id: slice_id,
-                });
-                slice_id = next_slice_id(&heading.title, &mut title_counts);
-                push_reply_rows(&mut segments, &mut emitted_replies, agents);
-                if draft_here {
-                    segments.push(Segment::Line(Line::new(
-                        LineKey::NewDraft(Some((*host, start))),
-                        RowTarget::NewDraft(Some((*host, start))),
-                    )));
-                }
-                slice_start = resume;
+            if !draft_here && !agents.iter().any(|agent_id| replies.contains(agent_id)) {
+                continue;
             }
+            // Drafts splice in after the heading's body, before the
+            // next heading (trailing newline trimmed so the excerpt
+            // boundary doesn't double it). A staffed heading with no
+            // open draft needs no cut at all: its agents are line
+            // decorations, not rows.
+            let (position, resume) = cut_points(text, heading);
+            // Inclusive at the end: a body's trimmed cut point and the
+            // fold's trimmed end are the same offset.
+            if fold_zones
+                .iter()
+                .any(|zone| zone.start <= position && position <= zone.end)
+            {
+                for agent_id in agents {
+                    if replies.contains(agent_id) {
+                        emitted_replies.insert(*agent_id);
+                    }
+                }
+                continue;
+            }
+            segments.push(Segment::Doc {
+                host: *host,
+                range: slice_start..position,
+                id: slice_id,
+            });
+            slice_id = next_slice_id(&heading.title, &mut title_counts);
+            push_reply_rows(&mut segments, &mut emitted_replies, agents);
+            if draft_here {
+                segments.push(Segment::Line(Line::new(
+                    LineKey::NewDraft(Some((*host, start))),
+                    RowTarget::NewDraft(Some((*host, start))),
+                )));
+            }
+            slice_start = resume;
         }
         // The tail slice drops trailing blank lines: the listing's own
         // spacers separate it from what follows.
@@ -2462,8 +2648,7 @@ mod tests {
 
         // The heading's decoration triages the needs-input agent first
         // and names both agents by id.
-        let decorations =
-            heading_decorations(&registry, &[(host, text.clone())], &filed, &HashSet::new());
+        let decorations = heading_decorations(&registry, &[(host, text.clone())], &filed);
         assert_eq!(decorations.len(), 1);
         let (_, offset, label) = &decorations[0];
         assert_eq!(*offset, "* One".len());
@@ -2493,14 +2678,15 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_heading_hides_body_behind_the_cut_and_wears_an_ellipsis() {
+    fn collapsed_heading_folds_its_subtree_and_keeps_the_document_whole() {
         let a = agent(1, None, UiAttention::Quiet, 30);
         let (registry, host) = registry(vec![a.clone()]);
         let text = "* One\nbody\n* Two\n".to_string();
         let mut filed = HashMap::new();
         filed.insert((host, 0), vec![a.agent_id]);
-        let mut collapsed = HashSet::new();
-        collapsed.insert((host, 0));
+        let collapsed = HashSet::from([(host, 0)]);
+        // Collapse is a display fold, not a cut: the document stays one
+        // contiguous writable segment.
         let segments = generate(
             &registry,
             &[(host, text.clone())],
@@ -2510,55 +2696,39 @@ mod tests {
             &[],
             None,
         );
-        // Slice ends at the heading line; the body folds behind the cut
-        // with no indicator row of its own.
-        assert_eq!(
-            keys(&segments),
-            vec![
-                "doc 0..5".to_string(),
-                format!("doc 11..{}", text.len()),
-            ]
+        assert_eq!(keys(&segments), vec![format!("doc 0..{}", text.len())]);
+        // The fold hides everything after the heading line except the
+        // final newline, so the next heading keeps a line of its own.
+        let headings = parse(&text);
+        assert_eq!(subtree_fold_range(&text, &headings[0]), Some(5..10));
+        // A reply under the fold stays hidden with its heading instead
+        // of parking at the document tail.
+        let segments = generate(
+            &registry,
+            &[(host, text.clone())],
+            &filed,
+            &collapsed,
+            &HashSet::new(),
+            &[a.agent_id],
+            None,
         );
-        // The fold reads inline on the heading, ahead of the agents.
-        let decorations =
-            heading_decorations(&registry, &[(host, text.clone())], &filed, &collapsed);
-        assert_eq!(decorations.len(), 1);
-        let (_, offset, label) = &decorations[0];
-        assert_eq!(*offset, "* One".len());
-        assert!(label.starts_with("  …  · "), "label: {label:?}");
+        assert_eq!(keys(&segments), vec![format!("doc 0..{}", text.len())]);
     }
 
     #[test]
-    fn collapsing_a_parent_hides_its_whole_subtree() {
-        let (registry, host) = registry(vec![]);
-        let text = "* Parent\nbody\n** Child\nchild body\n* Other\n".to_string();
-        let generate_with = |collapsed: &HashSet<(HostId, usize)>| {
-            generate(
-                &registry,
-                &[(host, text.clone())],
-                &HashMap::new(),
-                collapsed,
-                &HashSet::new(),
-                &[],
-                None,
-            )
-        };
-        // Folding the parent hides body and the nested subheading alike.
-        let parent = HashSet::from([(host, 0)]);
-        assert_eq!(
-            keys(&generate_with(&parent)),
-            vec!["doc 0..8".to_string(), format!("doc 34..{}", text.len())]
-        );
-        // A collapsed child inside a collapsed parent changes nothing
-        // while hidden; its state waits for the parent to open.
-        let both = HashSet::from([(host, 0), (host, 14)]);
-        assert_eq!(keys(&generate_with(&both)), keys(&generate_with(&parent)));
-        // The child folds on its own once the parent is open.
-        let child = HashSet::from([(host, 14)]);
-        assert_eq!(
-            keys(&generate_with(&child)),
-            vec!["doc 0..22".to_string(), format!("doc 34..{}", text.len())]
-        );
+    fn collapsing_a_parent_folds_its_whole_subtree() {
+        let text = "* Parent\nbody\n** Child\nchild body\n* Other\n";
+        let headings = parse(text);
+        // The parent's fold spans body and nested subheading alike; the
+        // child's own fold nests inside it, waiting for the parent to
+        // open.
+        let parent = subtree_fold_range(text, &headings[0]).unwrap();
+        let child = subtree_fold_range(text, &headings[1]).unwrap();
+        assert_eq!(parent, 8..33);
+        assert_eq!(child, 22..33);
+        assert!(parent.start <= child.start && child.end <= parent.end);
+        // A childless heading with no body has nothing to fold.
+        assert_eq!(subtree_fold_range(text, &headings[2]), None);
     }
 
     fn apply_edits(text: &str, edits: &[(std::ops::Range<usize>, String)]) -> String {
@@ -2661,7 +2831,7 @@ mod tests {
         filed.insert((host, text.find("** Old").unwrap()), vec![loud.agent_id]);
         let documents = [(host, text.clone())];
         assert!(archived_roots(&documents, &filed).contains(&loud.agent_id));
-        let decorations = heading_decorations(&registry, &documents, &filed, &HashSet::new());
+        let decorations = heading_decorations(&registry, &documents, &filed);
         let (_, _, label) = &decorations[0];
         assert!(
             label.starts_with("  · ") && !label.contains('—'),

@@ -4108,6 +4108,22 @@ impl Workspace {
         self.desk_sync.buffer(host)
     }
 
+    /// One TAB-cycle step on the heading at `offset`, cursor included,
+    /// with the fold state applied to the display.
+    #[cfg(test)]
+    pub(crate) fn dashboard_cycle_fold_for_test(
+        &mut self,
+        host: HostId,
+        offset: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dashboard.cursor_to_doc(host, offset, cx);
+        self.dashboard.sync(&self.registry, window, cx);
+        self.dashboard.toggle_subagents(cx);
+        self.dashboard.sync(&self.registry, window, cx);
+    }
+
     /// The desk half of a quick spawn, without the daemon round-trip:
     /// appends the placeholder heading and writes the tag the daemon
     /// would, binding `agent_id` there. Returns the heading offset.
