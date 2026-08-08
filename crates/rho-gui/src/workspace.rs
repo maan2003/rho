@@ -4074,6 +4074,20 @@ impl Workspace {
         self.dashboard_preview
     }
 
+    /// The desk half of a quick spawn, without the daemon round-trip:
+    /// appends the placeholder heading and returns its offset and the
+    /// anchor the NewAgent message would carry.
+    #[cfg(test)]
+    pub(crate) fn quick_spawn_heading_for_test(
+        &mut self,
+        host: HostId,
+        cx: &mut Context<Self>,
+    ) -> Option<(usize, rho_ui_proto::desk::DeskAnchor)> {
+        let offset = self.dashboard.append_placeholder_heading(host, cx)?;
+        let anchor = self.desk_sync.anchor_at(host, offset, cx)?;
+        Some((offset, anchor))
+    }
+
     /// Reconciles the dashboard against the current world. Event-driven,
     /// with no flag to remember: the daemon funnel (`handle_event`),
     /// desk buffer edit subscriptions, draft edit subscriptions, the
@@ -4081,6 +4095,7 @@ impl Workspace {
     /// their source. The reconcile is idempotent and cheap, so calling
     /// it from several funnels is fine.
     pub(crate) fn refresh_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dashboard.autofill_titles(&self.registry, cx);
         self.dashboard.sync(&self.registry, window, cx);
     }
 
@@ -5086,19 +5101,20 @@ impl Workspace {
                 self.dashboard.open_reply(agent_id, window, cx);
                 self.dashboard_focus_draft(window, cx);
             }
-            // On a heading line, reply to the heading's top agent, so `r`
-            // works anywhere in a staffed topic, not only on its rows.
+            // On a heading line, `r` is the one talking verb: a reply to
+            // the heading's top agent when it's staffed, a first-message
+            // draft (which spawns an agent on send) when it isn't.
             Some(crate::dashboard::RowTarget::Topic {
                 host,
                 offset,
                 first_attention,
-            }) if first_attention.is_some()
-                || self.dashboard.first_agent_for_topic((host, offset)).is_some() =>
-            {
-                let agent_id = first_attention
+            }) => {
+                match first_attention
                     .or_else(|| self.dashboard.first_agent_for_topic((host, offset)))
-                    .expect("guard checked an agent exists");
-                self.dashboard.open_reply(agent_id, window, cx);
+                {
+                    Some(agent_id) => self.dashboard.open_reply(agent_id, window, cx),
+                    None => self.dashboard.open_new_draft(Some((host, offset)), window, cx),
+                }
                 self.dashboard_focus_draft(window, cx);
             }
             // Document text keeps vim's own `r`.
@@ -5120,7 +5136,7 @@ impl Workspace {
         self.dashboard_enter_insert(window, cx);
     }
 
-    /// An unfiled spawn has no heading to inherit `:project:` from, so the
+    /// A quick spawn has no heading to inherit `:project:` from, so the
     /// project comes from a picker (skipped when only one is registered).
     fn spawn_unfiled_dashboard_agent(
         &mut self,
@@ -5139,7 +5155,7 @@ impl Workspace {
         }
         if let [workdir] = self.workdirs.as_slice() {
             let workdir = workdir.clone();
-            self.spawn_unfiled_agent_on(workdir, body, cx);
+            self.quick_spawn_on(workdir, body, cx);
             return;
         }
         let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, _: &gpui::App| {
@@ -5199,10 +5215,23 @@ impl Workspace {
                     );
                     return;
                 };
-                workspace.spawn_unfiled_agent_on(workdir, body.clone(), cx);
+                workspace.quick_spawn_on(workdir, body.clone(), cx);
             },
         );
         self.open_prompt("project:", complete, on_submit, window, cx);
+    }
+
+    /// Quick spawn (`shift-r`): the desk gets a `* …` placeholder heading,
+    /// the agent spawns bound to it, and the title fills itself in from
+    /// the agent's generated summary once one exists. Hosts without a
+    /// desk fall back to an unfiled spawn.
+    fn quick_spawn_on(&mut self, workdir: HostProject, body: String, cx: &mut Context<Self>) {
+        let host = workdir.host;
+        let Some(offset) = self.dashboard.append_placeholder_heading(host, cx) else {
+            self.spawn_unfiled_agent_on(workdir, body, cx);
+            return;
+        };
+        self.spawn_dashboard_agent(host, offset, body, workdir, cx);
     }
 
     fn spawn_unfiled_agent_on(

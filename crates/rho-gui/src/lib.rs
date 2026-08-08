@@ -297,16 +297,20 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         KeyBinding::new("enter", GitApprovalDeny, Some("RhoGitApproval")),
         KeyBinding::new("escape", GitApprovalDeny, Some("RhoGitApproval")),
     ]);
-    // Desk verbs, vim-native: text editing stays pure vim everywhere. Verbs
-    // bind only in normal mode; handlers for single-letter verbs act on a
-    // node's heading line and propagate to vim's own binding anywhere else,
-    // so `o`, `s`, `d`, `x`, and Tab keep their vim meaning in body text.
+    // Desk verbs, vim-native: text editing stays pure vim everywhere.
+    // Talking to agents is one verb: `r` on a heading line opens a draft —
+    // a reply when the heading is staffed, a first message when it isn't —
+    // and propagates to vim (replace-char) anywhere else. `shift-r` opens
+    // a quick-spawn draft whose heading is written for you and titled by
+    // the agent's generated summary. Done/hide live on ctrl-shift-d and
+    // the space menu, so `o`, `d`, and `x` keep their vim meaning.
     // Navigation uses vim-idiomatic `g`-prefixed gotos and works anywhere.
     cx.bind_keys([
         KeyBinding::new("ctrl-z", DashboardUndo, Some("RhoDashboard > Editor")),
-        // Enter sends a reply or new-agent draft from insert mode too,
-        // matching the shell and transcript prompts; the handler
-        // propagates outside drafts so enter stays a newline in text.
+        // Enter sends from insert mode, but only inside draft rows —
+        // ephemeral message buffers, not document text (esc-o for the
+        // rare multi-line message). The handler propagates everywhere
+        // else so enter stays a newline in the desk itself.
         KeyBinding::new(
             "enter",
             DashboardSubmit,
@@ -320,10 +324,7 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         cx.bind_keys([
             KeyBinding::new("enter", DashboardGoto, Some(context)),
             KeyBinding::new("r", DashboardReply, Some(context)),
-            KeyBinding::new("o", DashboardStaff, Some(context)),
-            KeyBinding::new("shift-o", DashboardHeadingBelow, Some(context)),
-            KeyBinding::new("d", AgentDone, Some(context)),
-            KeyBinding::new("x", AgentHide, Some(context)),
+            KeyBinding::new("shift-r", DashboardNewAgent, Some(context)),
             KeyBinding::new("tab", DashboardToggleSubagents, Some(context)),
             KeyBinding::new("z a", DashboardToggleSubagents, Some(context)),
             KeyBinding::new("> >", DashboardDemote, Some(context)),

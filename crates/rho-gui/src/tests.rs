@@ -3444,3 +3444,142 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
         "* One\nbody\n* Two\n\nUnfiled · 2\n  · drifter\n  · planner"
     );
 }
+
+/// Quick spawn (`shift-r`) writes a `* …` placeholder heading and binds
+/// the agent there; once the agent's generated summary lands, the title
+/// fills itself in — but a heading the user has renamed is left alone.
+#[gpui::test]
+fn quick_spawn_placeholder_takes_the_generated_title(cx: &mut TestAppContext) {
+    use rho_ui_proto::desk::{DeskBinding, DeskOperation, DeskSnapshot};
+    use rho_ui_proto::{
+        AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
+    };
+
+    let summary = |name: Option<&str>| UiAgentSummary {
+        agent_id: agent(1),
+        parent_agent: None,
+        display_name: name.map(str::to_owned),
+        created_at: UnixMs(1),
+        updated_at: UnixMs(1),
+        role: AgentRole::default(),
+        workspace: WorkspaceInfo::UserCheckout { repo: "/tmp".into() },
+        attention: UiAttention::Quiet,
+        last_active: UnixMs(1),
+        hidden: false,
+        disposition: AgentDisposition::Pending,
+        last_user_message_text: String::new(),
+        activity: None,
+        turn_report: None,
+        labels: Vec::new(),
+    };
+    let ready = |agents: Vec<UiAgentSummary>| ConnEvent::Ready {
+        agents,
+        iris_agent: None,
+        projects: Vec::new(),
+        auth: AuthState {
+            active: String::new(),
+            default: String::new(),
+            namespaces: Vec::new(),
+        },
+        machine_seed: 0,
+        agent_counter: 100,
+    };
+
+    let mut source = text::Buffer::new(
+        text::ReplicaId::new(8),
+        text::BufferId::new(1).unwrap(),
+        "",
+    );
+    let operation = DeskOperation::from_text(&source.edit([(0..0, "* One\nbody\n")]));
+    let desk_snapshot = DeskSnapshot {
+        text: source.snapshot().text(),
+        operations: vec![operation],
+        transactions: Vec::new(),
+        replicas: Vec::new(),
+    };
+
+    let workspace = test_workspace(cx);
+    // The agent exists but has no generated summary yet when it spawns.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), ready(vec![summary(None)]), window, cx);
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskSnapshot {
+                    snapshot: desk_snapshot,
+                    replica_id: 42,
+                    bindings: Vec::new(),
+                },
+                window,
+                cx,
+            );
+            let (offset, anchor) = workspace
+                .quick_spawn_heading_for_test(HostId::default(), cx)
+                .expect("desk is present");
+            assert_eq!(offset, "* One\nbody\n".len());
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskBindingsChanged(vec![DeskBinding {
+                    agent_id: agent(1),
+                    anchor,
+                }]),
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+        })
+        .expect("update workspace");
+    cx.run_until_parked();
+
+    let desk_text = |workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |workspace, _, cx| {
+                let editor = workspace.dashboard_editor();
+                editor.read(cx).buffer().read(cx).snapshot(cx).text()
+            })
+            .expect("read dashboard")
+    };
+    assert!(
+        desk_text(&workspace, cx).contains("* …"),
+        "placeholder heading missing: {:?}",
+        desk_text(&workspace, cx)
+    );
+
+    // The generated summary arrives: the placeholder becomes the title.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ready(vec![summary(Some("fix the parser"))]),
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+        })
+        .expect("update workspace");
+    cx.run_until_parked();
+    let text = desk_text(&workspace, cx);
+    assert!(
+        text.contains("* fix the parser") && !text.contains('…'),
+        "title did not fill in: {text:?}"
+    );
+
+    // Another summary refresh must not clobber the now-real title.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ready(vec![summary(Some("a newer summary"))]),
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+        })
+        .expect("update workspace");
+    cx.run_until_parked();
+    assert!(
+        desk_text(&workspace, cx).contains("* fix the parser"),
+        "settled title was clobbered: {:?}",
+        desk_text(&workspace, cx)
+    );
+}

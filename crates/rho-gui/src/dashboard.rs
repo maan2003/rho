@@ -38,6 +38,10 @@ const DASHBOARD_KEY_BASE: usize = usize::MAX - 200;
 /// Inlay id space for reply-draft placeholders, clear of the lamp ids.
 const PLACEHOLDER_ID_BASE: usize = 1_000_000;
 
+/// Title a quick-spawned heading carries until the agent's generated
+/// summary replaces it.
+const PLACEHOLDER_TITLE: &str = "…";
+
 /// Highlight key for draft text (the user-message accent), past the
 /// class and lamp key ranges.
 const DRAFT_TEXT_KEY: HighlightKey =
@@ -877,6 +881,70 @@ impl Dashboard {
             .unwrap()
             .update(cx, |buffer, cx| buffer.edit([(len..len, topic)], None, cx));
         true
+    }
+
+    /// Appends a `* …` heading for a quick spawn and returns its offset.
+    /// The `…` title is a stateless promise: autofill_titles rewrites it
+    /// with the bound agent's generated summary, and only while the title
+    /// is still literally `…`, so a manual rename is never clobbered.
+    pub fn append_placeholder_heading(
+        &mut self,
+        host: HostId,
+        cx: &mut Context<Workspace>,
+    ) -> Option<usize> {
+        let buffer = self.hosts.get(&host)?.upgrade()?;
+        let text = self.source_text(host, cx)?;
+        let prefix = if text.is_empty() || text.ends_with('\n') {
+            ""
+        } else {
+            "\n"
+        };
+        let len = buffer.read(cx).len();
+        let offset = len + prefix.len();
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit(
+                [(len..len, format!("{prefix}* {PLACEHOLDER_TITLE}\n"))],
+                None,
+                cx,
+            )
+        });
+        Some(offset)
+    }
+
+    /// Gives every `…` heading its bound agent's generated title, once
+    /// one exists. Idempotent and cheap: hosts without a pending
+    /// placeholder are skipped on a substring check.
+    pub fn autofill_titles(&mut self, registry: &AgentRegistry, cx: &mut Context<Workspace>) {
+        let hosts = self.hosts.keys().copied().collect::<Vec<_>>();
+        for host in hosts {
+            let Some(text) = self.source_text(host, cx) else {
+                continue;
+            };
+            if !text.contains(PLACEHOLDER_TITLE) {
+                continue;
+            }
+            let documents = [(host, text.clone())];
+            let filed = self.resolve_bindings(registry, &documents, cx);
+            let edits = parse(&text)
+                .into_iter()
+                .filter(|heading| heading.title == PLACEHOLDER_TITLE)
+                .filter_map(|heading| {
+                    let agents = filed.get(&(host, heading.heading_range.start))?;
+                    let title = agents
+                        .iter()
+                        .find_map(|agent_id| registry.agent_display_name(*agent_id))
+                        .map(str::trim)
+                        .filter(|title| !title.is_empty())?;
+                    Some((heading.title_range.clone(), title.to_owned()))
+                })
+                .collect::<Vec<_>>();
+            if edits.is_empty() {
+                continue;
+            }
+            if let Some(buffer) = self.hosts.get(&host).and_then(|weak| weak.upgrade()) {
+                buffer.update(cx, |buffer, cx| buffer.edit(edits, None, cx));
+            }
+        }
     }
 
     /// Whether the cursor is somewhere dashboard verbs apply: a heading
