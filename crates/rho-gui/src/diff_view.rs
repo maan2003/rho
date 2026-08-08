@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use buffer_diff::{BufferDiff, BufferDiffEvent};
+use buffer_diff::{BufferDiff, BufferDiffEvent, DiffBaseKind};
 use camino::{Utf8Path, Utf8PathBuf};
 use gpui::{
     App, AppContext as _, AsyncApp, Context, Entity, InteractiveElement as _, IntoElement,
@@ -185,7 +185,13 @@ impl PreparedDiff {
                 let language = buffer_snapshot.language().cloned();
                 let language_registry = buffer.read(cx).language_registry();
                 let diff = cx.new(|cx| {
-                    BufferDiff::new(&buffer_snapshot.text, language, language_registry, cx)
+                    BufferDiff::new(
+                        &buffer_snapshot.text,
+                        language,
+                        language_registry,
+                        DiffBaseKind::Custom,
+                        cx,
+                    )
                 });
                 let update = diff.update(cx, |diff, cx| {
                     diff.set_base_text(base_text, buffer_snapshot.text.clone(), cx)

@@ -88,15 +88,15 @@ pub fn parse(text: &str) -> Vec<DeskHeading> {
         });
         start += part.len();
     }
-    if start < text.len() || (text.is_empty() || !text.ends_with('\n')) {
-        if lines.last().is_none_or(|line| line.full_end != text.len()) {
-            lines.push(Line {
-                start,
-                end: text.len(),
-                full_end: text.len(),
-                text: &text[start..],
-            });
-        }
+    if (start < text.len() || text.is_empty() || !text.ends_with('\n'))
+        && lines.last().is_none_or(|line| line.full_end != text.len())
+    {
+        lines.push(Line {
+            start,
+            end: text.len(),
+            full_end: text.len(),
+            text: &text[start..],
+        });
     }
 
     let mut headings = Vec::<DeskHeading>::new();
@@ -238,7 +238,9 @@ fn parse_state(content: &str) -> (Option<(DeskHeadingState, Range<usize>)>, &str
 /// An org-style tag token (`:a:b:`) at the end of the heading content, plus
 /// the content with the token stripped. The token must be its own word so
 /// mid-title colons (`Deploy at 12:30`) stay part of the title.
-fn parse_tags(content: &str) -> (Option<(Vec<String>, Range<usize>)>, &str) {
+type ParsedTags = Option<(Vec<String>, Range<usize>)>;
+
+fn parse_tags(content: &str) -> (ParsedTags, &str) {
     let Some(start) = content
         .rfind(char::is_whitespace)
         .and_then(|index| Some(index + content[index..].chars().next()?.len_utf8()))
@@ -602,8 +604,8 @@ mod tests {
     fn parses_properties_bindings_duplicates_and_project_inheritance() {
         let agent = AgentId::from_counter(1, &rho_core::AgentIdDomain(1)).unwrap();
         let text = format!(
-            "* TODO root\n:project: /src/root\n:unknown: kept\n** first\n:agent: {}\n*** inherited\n** copy\n:agent: eng-{}\n:agent: ignored\n:project: child\n",
-            format!("eng-{}", agent.encoded()),
+            "* TODO root\n:project: /src/root\n:unknown: kept\n** first\n:agent: eng-{}\n*** inherited\n** copy\n:agent: eng-{}\n:agent: ignored\n:project: child\n",
+            agent.encoded(),
             agent.encoded()
         );
         let headings = parse(&text);

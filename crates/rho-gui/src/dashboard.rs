@@ -56,6 +56,16 @@ const DRAFT_TEXT_KEY: HighlightKey =
     HighlightKey::SyntaxTreeView(DASHBOARD_KEY_BASE + 2 * DashClass::ALL.len());
 
 pub type ParsedHeadingState = DeskHeadingState;
+type DraftTopic = Option<(HostId, usize)>;
+type DraftState = (DraftTopic, Entity<Buffer>, gpui::Subscription);
+type SyncSnapshot = (
+    Vec<(HostId, String)>,
+    Vec<Segment>,
+    Vec<(LineKey, String)>,
+    Vec<(HostId, usize, String)>,
+    Vec<(HostId, Range<usize>)>,
+);
+type ArchiveEdits = (Vec<(Range<usize>, String)>, usize);
 
 #[derive(Clone, Copy)]
 pub enum StructureDirection {
@@ -70,7 +80,6 @@ pub enum StructureDirection {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum LineKey {
     Host(HostId),
-    Fold(HostId, usize),
     Agent(AgentId),
     Unfiled(HostId),
     Reply(AgentId),
@@ -165,7 +174,7 @@ pub struct Dashboard {
     reply_subscriptions: HashMap<AgentId, gpui::Subscription>,
     /// The inline new-agent draft, when open: its buffer plus the edit
     /// subscription that keeps chrome fresh.
-    new_draft: Option<(Option<(HostId, usize)>, Entity<Buffer>, gpui::Subscription)>,
+    new_draft: Option<DraftState>,
     /// Collapsed subtrees as anchored fold ranges, org-style: the fold
     /// is persistent state that rides edits, not something re-derived
     /// from the parse. The start anchor is right-biased (org's
@@ -190,13 +199,7 @@ pub struct Dashboard {
     heading_inlay_ids: Vec<InlayId>,
     /// The previous pass's inputs and output, so a sync whose world is
     /// unchanged returns without touching the editor.
-    last_synced: Option<(
-        Vec<(HostId, String)>,
-        Vec<Segment>,
-        Vec<(LineKey, String)>,
-        Vec<(HostId, usize, String)>,
-        Vec<(HostId, Range<usize>)>,
-    )>,
+    last_synced: Option<SyncSnapshot>,
     /// Buffers already registered as headerless with the editor. A
     /// boundary onto a headerless buffer draws nothing, so this is what
     /// keeps the interleaved excerpts seamless.
@@ -493,10 +496,9 @@ impl Dashboard {
             .is_some_and(|(_, buffer, _)| buffer.read(cx).is_empty())
             && !matches!(cursor_key, Some(LineKey::NewDraft(_)))
             && !matches!(pending, Some(LineKey::NewDraft(_)))
+            && let Some((topic, _, _)) = self.new_draft.take()
         {
-            if let Some((topic, _, _)) = self.new_draft.take() {
-                self.buffers.remove(&LineKey::NewDraft(topic));
-            }
+            self.buffers.remove(&LineKey::NewDraft(topic));
         }
 
         let draft_topic = self.new_draft.as_ref().map(|(topic, _, _)| *topic);
@@ -896,7 +898,6 @@ impl Dashboard {
                     .map(|heading| (host, heading.heading_range.start))
             }
             CursorPlace::Row(key) => match key {
-                LineKey::Fold(host, offset) => Some((host, offset)),
                 LineKey::NewDraft(topic) => topic,
                 LineKey::Agent(agent_id) | LineKey::Reply(agent_id) => self
                     .heading_agents
@@ -1090,12 +1091,15 @@ impl Dashboard {
         };
         // The keyword sits to the right of the title; the (concealed) tag
         // token stays at the very end, riding along unchanged.
+        let title = if heading.title.is_empty() {
+            String::new()
+        } else {
+            format!(" {}", heading.title)
+        };
         let replacement = format!(
             "{}{} {}{}",
             "*".repeat(heading.depth),
-            (!heading.title.is_empty())
-                .then(|| format!(" {}", heading.title))
-                .unwrap_or_default(),
+            title,
             state.keyword(),
             heading
                 .tags_range
@@ -2160,7 +2164,7 @@ fn subtree_fold_range(text: &str, heading: &DeskHeading) -> Option<Range<usize>>
     if text[..end].ends_with('\n') {
         end -= 1;
     }
-    (end > heading.heading_range.end).then(|| heading.heading_range.end..end)
+    (end > heading.heading_range.end).then_some(heading.heading_range.end..end)
 }
 
 /// A fold may never capture the cursor: whatever the parse says, the
@@ -2240,7 +2244,7 @@ fn archive_edits(
     text: &str,
     target_start: usize,
     archived_at: &str,
-) -> Option<(Vec<(Range<usize>, String)>, usize)> {
+) -> Option<ArchiveEdits> {
     let headings = parse(text);
     let target_index = headings
         .iter()
@@ -2274,8 +2278,7 @@ fn archive_edits(
             && heading.tags.iter().any(|tag| tag == ARCHIVE_TAG)
     });
     let mut edits = vec![(removal.clone(), String::new())];
-    let archive_offset;
-    match sibling_archive {
+    let archive_offset = match sibling_archive {
         Some(archive) => {
             let mut insertion = moved;
             let at = archive.subtree_range.end;
@@ -2284,11 +2287,11 @@ fn archive_edits(
             }
             edits.push((at..at, insertion));
             let start = archive.heading_range.start;
-            archive_offset = if removal.start < start {
+            if removal.start < start {
                 start - removal_len
             } else {
                 start
-            };
+            }
         }
         None => {
             let at = target
@@ -2307,9 +2310,9 @@ fn archive_edits(
             edits.push((at..at, insertion));
             // The insertion point always trails the removed subtree, which
             // lives inside the same parent subtree (or the document).
-            archive_offset = at - removal_len + fresh_line;
+            at - removal_len + fresh_line
         }
-    }
+    };
     edits.sort_by_key(|(range, _)| range.start);
     Some((edits, archive_offset))
 }
@@ -2328,8 +2331,6 @@ fn truncate_chars(value: &str, limit: usize) -> String {
 
 /// Ends a document slice before a cut point's newline, so the synthetic
 /// newline between excerpts doesn't double it.
-
-
 /// Generate the listing without mutating Desk text: the documents are
 /// emitted as writable slices, cut where a bound heading's rows (reply
 /// drafts, the staffing draft) splice in after its body. Bound agents

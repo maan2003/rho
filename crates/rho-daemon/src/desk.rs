@@ -264,7 +264,7 @@ fn retag_in_txn(
             if !snapshot.can_resolve(&anchor) {
                 return Err("Desk retag anchor does not resolve".to_owned());
             }
-            Some(text::ToOffset::to_offset(&anchor, &snapshot))
+            Some(text::ToOffset::to_offset(&anchor, snapshot))
         }
         None => None,
     };
@@ -831,7 +831,7 @@ mod tests {
         let two = DeskAnchor::from_text(snapshot.anchor_after(text.find("* two").unwrap()));
         let resolve = |handle: &str| (handle == "eng-aa").then(|| agent(2));
 
-        let mut retag = |anchor: Option<DeskAnchor>| {
+        let retag = |anchor: Option<DeskAnchor>| {
             let db = db.clone();
             async move {
                 let mut write = db.write().await;

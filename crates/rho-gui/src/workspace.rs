@@ -3321,23 +3321,6 @@ impl Workspace {
         self.iris_agents.get(&host).copied()
     }
 
-    fn preview_iris(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(agent_id) = self.current_iris_agent() else {
-            self.hosts.focus_agent(None);
-            cx.notify();
-            return;
-        };
-        if self.agent_online(agent_id) && !self.subscriptions.contains(agent_id) {
-            self.subscribe_agent(agent_id, cx);
-        }
-        let view = self.materialize_model(&agent_id, window, cx);
-        view.update(cx, |view, cx| view.tick_timers(now_ms(), cx));
-        self.hosts
-            .focus_agent(self.host_of(agent_id).map(|host| (host, agent_id)));
-        self.ensure_duration_timer(cx);
-        cx.notify();
-    }
-
     fn select_agent_inner(
         &mut self,
         agent_id: Option<AgentId>,
@@ -4077,28 +4060,8 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn iris_preview_editor_for_test(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Entity<editor::Editor> {
-        self.selected_preview_editor(true, window, cx)
-            .expect("Iris always has a preview")
-    }
-
-    #[cfg(test)]
     pub(crate) fn sync_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_dashboard(window, cx);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn preview_dashboard_agent(
-        &mut self,
-        agent_id: AgentId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.preview_agent(agent_id, window, cx);
     }
 
     #[cfg(test)]
