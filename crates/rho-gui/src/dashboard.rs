@@ -96,6 +96,10 @@ pub enum RowTarget {
         host: HostId,
         offset: usize,
         first_attention: Option<AgentId>,
+        /// Whether the cursor sits on the heading line itself, or merely
+        /// somewhere in its subtree. Verbs that share keys with vim text
+        /// editing (`r`, folding on bare enter) require the line.
+        on_heading_line: bool,
     },
     Agent(AgentId),
     /// An inline reply draft addressed to this agent.
@@ -839,39 +843,30 @@ impl Dashboard {
         match self.cursor_place(cx)? {
             CursorPlace::Row(key) => self.targets.get(&key).cloned(),
             CursorPlace::Doc(host, offset) => {
-                if let Some((host, start)) = self.cursor_heading_line_at(host, offset, cx) {
-                    let first_attention = self
-                        .heading_agents
-                        .get(&(host, start))
-                        .into_iter()
-                        .flatten()
-                        .copied()
-                        .find(|agent_id| registry.attention(*agent_id) >= UiAttention::Pending);
-                    Some(RowTarget::Topic {
-                        host,
-                        offset: start,
-                        first_attention,
-                    })
-                } else {
-                    Some(RowTarget::None)
-                }
+                let text = self.source_text(host, cx)?;
+                let Some(heading) = parse(&text)
+                    .into_iter()
+                    .rev()
+                    .find(|heading| heading.heading_range.start <= offset)
+                else {
+                    return Some(RowTarget::None);
+                };
+                let start = heading.heading_range.start;
+                let first_attention = self
+                    .heading_agents
+                    .get(&(host, start))
+                    .into_iter()
+                    .flatten()
+                    .copied()
+                    .find(|agent_id| registry.attention(*agent_id) >= UiAttention::Pending);
+                Some(RowTarget::Topic {
+                    host,
+                    offset: start,
+                    first_attention,
+                    on_heading_line: offset <= heading.heading_range.end,
+                })
             }
         }
-    }
-
-    fn cursor_heading_line_at(
-        &self,
-        host: HostId,
-        offset: usize,
-        cx: &App,
-    ) -> Option<(HostId, usize)> {
-        let text = self.source_text(host, cx)?;
-        parse(&text)
-            .into_iter()
-            .find(|heading| {
-                heading.heading_range.start <= offset && offset <= heading.heading_range.end
-            })
-            .map(|heading| (host, heading.heading_range.start))
     }
 
     /// The heading that owns the cursor position: the containing heading
@@ -1146,7 +1141,7 @@ impl Dashboard {
     /// sibling `:archive:` heading (created when missing), which folds.
     /// Unarchiving is plain vim editing — cut the lines back out.
     pub fn archive_cursor_heading(&mut self, cx: &mut Context<Workspace>) -> bool {
-        let Some((host, offset)) = self.cursor_heading_line(cx) else {
+        let Some((host, offset)) = self.cursor_topic(cx) else {
             return false;
         };
         let Some(text) = self.source_text(host, cx) else {
@@ -1172,7 +1167,7 @@ impl Dashboard {
     }
 
     pub fn rename_cursor_topic(&mut self, title: &str, cx: &mut Context<Workspace>) -> bool {
-        let Some((host, offset)) = self.cursor_heading_line(cx) else {
+        let Some((host, offset)) = self.cursor_topic(cx) else {
             return false;
         };
         let Some(text) = self.source_text(host, cx) else {
@@ -1223,8 +1218,15 @@ impl Dashboard {
         topic: &str,
         cx: &mut Context<Workspace>,
     ) -> Option<(HostId, AgentId, Option<usize>)> {
-        let RowTarget::Agent(agent_id) = self.cursor_target(registry, cx)? else {
-            return None;
+        let agent_id = match self.cursor_target(registry, cx)? {
+            RowTarget::Agent(agent_id) | RowTarget::Reply(agent_id) => agent_id,
+            RowTarget::Topic {
+                host,
+                offset,
+                first_attention,
+                ..
+            } => first_attention.or_else(|| self.first_agent_for_topic((host, offset)))?,
+            _ => return None,
         };
         let root = root_agent(registry, agent_id);
         let host = registry.host_of_agent(root)?;

@@ -2957,6 +2957,19 @@ impl Workspace {
                 agent: Some(agent_id),
                 agents: self.registry.agent_subtree(agent_id),
             }),
+            // Anywhere in a staffed heading's subtree, chords act on its
+            // top agent.
+            Some(RowTarget::Topic {
+                host,
+                offset,
+                first_attention,
+                ..
+            }) => first_attention
+                .or_else(|| self.dashboard.first_agent_for_topic((host, offset)))
+                .map(|agent_id| Subject {
+                    agent: Some(agent_id),
+                    agents: self.registry.agent_subtree(agent_id),
+                }),
             _ => None,
         };
         subject
@@ -3382,12 +3395,13 @@ impl Workspace {
                 self.preview_agent(agent_id, window, cx);
             }
             Some(RowTarget::Agent(_)) => {}
-            // A staffed heading line previews its top agent — bound
-            // agents have no rows of their own to land on.
+            // Anywhere in a staffed heading's subtree previews its top
+            // agent — bound agents have no rows of their own to land on.
             Some(RowTarget::Topic {
                 host,
                 offset,
                 first_attention,
+                ..
             }) => {
                 if let Some(agent_id) = first_attention
                     .or_else(|| self.dashboard.first_agent_for_topic((host, offset)))
@@ -5076,14 +5090,21 @@ impl Workspace {
             // A staffed heading opens its top agent full-frame — loudest
             // first, quiet agents still reachable. Unstaffed headings keep
             // enter as a fold toggle.
-            Some(RowTarget::Topic { host, offset, first_attention }) => {
+            Some(RowTarget::Topic {
+                host,
+                offset,
+                first_attention,
+                on_heading_line,
+            }) => {
                 if let Some(agent_id) = first_attention
                     .or_else(|| self.dashboard.first_agent_for_topic((host, offset)))
                 {
                     self.open_agent(agent_id, window, cx);
-                } else {
+                } else if on_heading_line {
                     self.dashboard.toggle_subagents(cx);
                     self.refresh_dashboard(window, cx);
+                } else {
+                    cx.propagate();
                 }
             }
             Some(RowTarget::Reply(agent_id)) => {
@@ -5150,6 +5171,7 @@ impl Workspace {
                 host,
                 offset,
                 first_attention,
+                on_heading_line: true,
             }) => {
                 match first_attention
                     .or_else(|| self.dashboard.first_agent_for_topic((host, offset)))
@@ -6507,7 +6529,7 @@ impl Render for Workspace {
                 }),
             )
             .on_action(cx.listener(|this, _: &DashboardArchive, window, cx| {
-                if !this.dashboard_verb_applies(window, cx) {
+                if !this.dashboard.is_focused(window, cx) {
                     cx.propagate();
                     return;
                 }
@@ -6753,6 +6775,7 @@ mod tests {
                 host: HostId::default(),
                 offset: 0,
                 first_attention: None,
+                on_heading_line: true,
             })
         ));
         assert!(!desk_heading_without_agent(
