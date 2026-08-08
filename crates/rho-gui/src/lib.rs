@@ -67,6 +67,8 @@ actions!(
         DashboardMoveDown,
         DashboardDeleteEmpty,
         DashboardUndo,
+        DashboardMoveAgent,
+        DashboardRenameTopic,
         RoleCycle,
         RoleCycleGroup,
         TaskBoard,
@@ -308,9 +310,9 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
     ] {
         cx.bind_keys([
             KeyBinding::new("enter", RailOpen, Some(context)),
-            KeyBinding::new("o", DashboardHeadingBelow, Some(context)),
-            KeyBinding::new("shift-o", DashboardHeadingAbove, Some(context)),
-            KeyBinding::new("s", DashboardStaff, Some(context)),
+            KeyBinding::new("r", DashboardReply, Some(context)),
+            KeyBinding::new("o", DashboardStaff, Some(context)),
+            KeyBinding::new("shift-o", DashboardHeadingBelow, Some(context)),
             KeyBinding::new("d", AgentDone, Some(context)),
             KeyBinding::new("x", AgentHide, Some(context)),
             KeyBinding::new("tab", DashboardToggleSubagents, Some(context)),
@@ -324,6 +326,8 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             KeyBinding::new("g n", DashboardNow, Some(context)),
             KeyBinding::new("g b", DashboardBack, Some(context)),
             KeyBinding::new("g h", DashboardJump, Some(context)),
+            KeyBinding::new("m", DashboardMoveAgent, Some(context)),
+            KeyBinding::new("c r", DashboardRenameTopic, Some(context)),
         ]);
     }
 }

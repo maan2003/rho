@@ -359,6 +359,28 @@ impl AgentRegistry {
     pub fn agent_disposition(&self, agent_id: AgentId) -> Option<rho_ui_proto::AgentDisposition> {
         self.agent_summary(agent_id).map(|agent| agent.disposition)
     }
+    pub fn agent_parent(&self, agent_id: AgentId) -> Option<AgentId> {
+        self.agent_summary(agent_id)
+            .and_then(|agent| agent.parent_agent)
+    }
+    pub fn agent_hidden(&self, agent_id: AgentId) -> bool {
+        self.agent_summary(agent_id)
+            .is_some_and(|agent| agent.hidden)
+    }
+    pub fn agent_pinned(&self, agent_id: AgentId) -> bool {
+        self.agent_summary(agent_id)
+            .is_some_and(|agent| agent.labels.iter().any(|label| label == "pin"))
+    }
+    pub fn agent_attention_reason(&self, agent_id: AgentId) -> Option<&str> {
+        self.turn_reports
+            .get(&agent_id)
+            .map(|report| report.summary.as_str())
+            .or_else(|| {
+                self.agent_summary(agent_id)
+                    .map(|agent| agent.last_user_message_text.as_str())
+            })
+            .filter(|reason| !reason.trim().is_empty())
+    }
     pub fn agent_last_active(&self, agent_id: AgentId) -> Option<rho_core::UnixMs> {
         self.last_active.get(&agent_id).copied()
     }

@@ -53,13 +53,13 @@ use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
     AgentDone, AgentHide, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, DashboardBack,
     DashboardDeleteEmpty, DashboardDemote, DashboardHeadingAbove, DashboardHeadingBelow,
-    DashboardJump, DashboardMoveDown, DashboardMoveUp, DashboardNow, DashboardPromote,
-    DashboardStaff, DashboardToggleSubagents, DashboardUndo, GitApprovalAllow, GitApprovalDeny,
-    MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious,
-    PaneBack, PaneClose, PaneFocusNext, PaneSplitDown, PaneSplitRight, PastePrompt, RailFocus,
-    RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore,
-    ShellPagerQuit, SubmitPrompt, TaskBoard, VoiceToggle, ZulipLoadOlder, ZulipNextUnread,
-    ZulipOpenRow, ZulipQuit,
+    DashboardJump, DashboardMoveAgent, DashboardMoveDown, DashboardMoveUp, DashboardNewAgent,
+    DashboardNow, DashboardPromote, DashboardRenameTopic, DashboardReply, DashboardStaff,
+    DashboardToggleSubagents, DashboardUndo, GitApprovalAllow, GitApprovalDeny, MinibufferCancel,
+    MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious, PaneBack, PaneClose,
+    PaneFocusNext, PaneSplitDown, PaneSplitRight, PastePrompt, RailFocus, RailOpen, RoleCycle,
+    RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit,
+    SubmitPrompt, TaskBoard, VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow, ZulipQuit,
 };
 
 /// What a pane shows: stable identity plus the live view. Surfaces live
@@ -2427,16 +2427,6 @@ impl Workspace {
             .selected_agent()
             .is_some_and(|agent_id| targets.contains(agent_id));
         let sent = self.set_agent_disposition(targets, "done", disposition, cx);
-        if sent && self.dashboard.is_focused(window, cx) {
-            self.dashboard.set_cursor_heading_state(
-                if hide {
-                    crate::dashboard::ParsedHeadingState::Discarded
-                } else {
-                    crate::dashboard::ParsedHeadingState::Done
-                },
-                cx,
-            );
-        }
         // Hiding the open agent closes its tab, or it would stay
         // rail-visible through the selection exemption.
         if hide && sent && hid_open_agent {
@@ -4058,6 +4048,11 @@ impl Workspace {
         self.dashboard_dirty
     }
 
+    pub(crate) fn dashboard_prose_edited(&mut self, key: (HostId, usize), cx: &mut Context<Self>) {
+        self.dashboard.flush_prose(key, cx);
+        self.dashboard_dirty = true;
+    }
+
     #[cfg(test)]
     pub(crate) fn preview_dashboard_agent(
         &mut self,
@@ -5021,11 +5016,92 @@ impl Workspace {
 
     /// `enter` on a bound Desk heading opens its agent.
     fn dashboard_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(crate::dashboard::RowTarget::Agent(agent_id)) =
-            self.dashboard.cursor_target(&self.registry, cx)
-        {
-            self.open_agent(agent_id, window, cx);
+        use crate::dashboard::RowTarget;
+        match self.dashboard.cursor_target(&self.registry, cx) {
+            Some(RowTarget::Agent(agent_id)) => self.open_agent(agent_id, window, cx),
+            Some(RowTarget::Topic {
+                first_attention: Some(agent_id),
+                ..
+            }) => self.open_agent(agent_id, window, cx),
+            Some(RowTarget::Topic { .. }) => {
+                self.dashboard.toggle_subagents(cx);
+                self.dashboard_dirty = true;
+            }
+            Some(RowTarget::NewAgent) => {
+                self.dashboard.open_new_draft(None, cx);
+                self.dashboard_enter_insert(window, cx);
+            }
+            Some(RowTarget::Reply(agent_id)) => {
+                if !self.require_connected(cx) {
+                    return;
+                }
+                if let Some(text) = self.dashboard.take_reply(agent_id, cx) {
+                    self.handle_submit(agent_id, vec![ContentPart::Text { text }], cx);
+                }
+                self.dashboard.cursor_to_agent(agent_id, cx);
+            }
+            Some(RowTarget::NewDraft(topic)) => {
+                if !self.require_connected(cx) {
+                    return;
+                }
+                if let Some(body) = self.dashboard.take_new_draft(cx) {
+                    if topic.is_some() {
+                        self.staff_dashboard_node_with_brief(topic, Some(body), window, cx);
+                    } else {
+                        self.spawn_unfiled_dashboard_agent(body, cx);
+                    }
+                }
+            }
+            _ => {}
         }
+    }
+
+    fn dashboard_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.dashboard.cursor_target(&self.registry, cx) {
+            Some(crate::dashboard::RowTarget::Agent(agent_id))
+            | Some(crate::dashboard::RowTarget::Reply(agent_id)) => {
+                self.dashboard.open_reply(agent_id, cx);
+                self.dashboard_enter_insert(window, cx);
+            }
+            _ => self.notice_on(
+                None,
+                "reply: no agent under the cursor",
+                StyleClass::SystemInfo,
+                cx,
+            ),
+        }
+    }
+
+    fn dashboard_enter_insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Ok(action) = cx.build_action("vim::InsertBefore", None) {
+            window.dispatch_action(action, cx);
+        }
+    }
+
+    fn spawn_unfiled_dashboard_agent(&mut self, body: String, cx: &mut Context<Self>) {
+        let workdir = self.draft_default_workdir();
+        let selected_host = workdir.as_ref().map(|workdir| workdir.host);
+        let (host, start) = match self.parse_start(
+            crate::draft_view::StartFieldMode::NewOn,
+            crate::draft_view::AUTO_BASE_REVSET,
+            workdir,
+            selected_host,
+        ) {
+            Ok(start) => start,
+            Err(message) => {
+                self.notice_on(None, &message, StyleClass::SystemInfo, cx);
+                return;
+            }
+        };
+        self.send_to_host(
+            host,
+            ClientMessage::NewAgent {
+                role: AgentRole::default(),
+                start,
+                content: Some(vec![ContentPart::Text { text: body }]),
+                desk_heading: None,
+            },
+        );
     }
 
     /// Vim-style `o`/`O` on a heading line: insert a sibling node below or
@@ -5037,15 +5113,26 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.dashboard_verb_applies(window, cx) {
-            cx.propagate();
-            return;
-        }
-        if self.dashboard.insert_sibling(above, window, cx)
-            && let Ok(action) = cx.build_action("vim::InsertBefore", None)
-        {
-            window.dispatch_action(action, cx);
-        }
+        let _ = above;
+        let on_submit = std::rc::Rc::new(
+            |workspace: &mut Workspace,
+             input: String,
+             _window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                let title = input.trim();
+                if !title.is_empty() {
+                    workspace.dashboard.append_topic(title, cx);
+                    workspace.dashboard_dirty = true;
+                }
+            },
+        );
+        self.open_prompt(
+            "new topic:",
+            std::rc::Rc::new(|_, _, _| Vec::new()),
+            on_submit,
+            window,
+            cx,
+        );
     }
 
     /// Single-letter Desk verbs only apply on a heading line of the focused
@@ -5060,13 +5147,36 @@ impl Workspace {
     }
 
     fn staff_dashboard_node(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (host, heading_offset, text, project) = match self.dashboard.staffing_target(cx) {
-            Ok(target) => target,
-            Err(message) => {
-                self.notice_on(None, message, StyleClass::SystemInfo, cx);
-                return;
-            }
+        let Some(topic) = self.dashboard.cursor_topic(cx) else {
+            self.notice_on(None, "staff: choose a topic", StyleClass::SystemInfo, cx);
+            return;
         };
+        self.dashboard.open_new_draft(Some(topic), cx);
+        self.dashboard_enter_insert(window, cx);
+    }
+
+    fn staff_dashboard_node_with_brief(
+        &mut self,
+        topic: Option<(HostId, usize)>,
+        brief: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(topic) = topic else {
+            self.notice_on(None, "staff: choose a topic", StyleClass::SystemInfo, cx);
+            return;
+        };
+        let (host, heading_offset, mut text, project) =
+            match self.dashboard.staffing_target_for(topic, cx) {
+                Ok(target) => target,
+                Err(message) => {
+                    self.notice_on(None, message, StyleClass::SystemInfo, cx);
+                    return;
+                }
+            };
+        if let Some(brief) = brief {
+            text = brief;
+        }
         if let Some(crate::dashboard::RowTarget::Agent(agent_id)) =
             self.dashboard.cursor_target(&self.registry, cx)
             && matches!(
@@ -5283,6 +5393,62 @@ impl Workspace {
             },
         );
         self.open_prompt("Desk heading:", complete, on_submit, window, cx);
+    }
+
+    fn prompt_dashboard_file_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let titles = self
+            .dashboard
+            .topic_titles_for_cursor_agent(&self.registry, cx);
+        let complete = std::rc::Rc::new(
+            move |_workspace: &Workspace, input: &str, _cx: &gpui::App| {
+                let needle = input.to_lowercase();
+                titles
+                    .clone()
+                    .into_iter()
+                    .filter(|title| title.to_lowercase().contains(&needle))
+                    .map(|value| crate::commands::Candidate {
+                        value,
+                        description: "Desk topic".to_owned(),
+                    })
+                    .collect()
+            },
+        );
+        let on_submit = std::rc::Rc::new(
+            |workspace: &mut Workspace,
+             input: String,
+             _window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                if workspace
+                    .dashboard
+                    .file_cursor_agent(&workspace.registry, input.trim(), cx)
+                {
+                    workspace.dashboard_dirty = true;
+                }
+            },
+        );
+        self.open_prompt("file agent:", complete, on_submit, window, cx);
+    }
+
+    fn prompt_dashboard_rename_topic(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let on_submit = std::rc::Rc::new(
+            |workspace: &mut Workspace,
+             input: String,
+             _window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                if !input.trim().is_empty()
+                    && workspace.dashboard.rename_cursor_topic(input.trim(), cx)
+                {
+                    workspace.dashboard_dirty = true;
+                }
+            },
+        );
+        self.open_prompt(
+            "rename topic:",
+            std::rc::Rc::new(|_, _, _| Vec::new()),
+            on_submit,
+            window,
+            cx,
+        );
     }
 
     /// The home-mode dashboard beside the active context's preview.
@@ -5850,7 +6016,7 @@ fn desk_heading_without_agent(
     dashboard_focused: bool,
     target: Option<crate::dashboard::RowTarget>,
 ) -> bool {
-    dashboard_focused && matches!(target, Some(crate::dashboard::RowTarget::None))
+    dashboard_focused && matches!(target, Some(crate::dashboard::RowTarget::Topic { .. }))
 }
 
 fn parse_agent_role(text: &str) -> Result<AgentRole, String> {
@@ -6086,6 +6252,13 @@ impl Render for Workspace {
                 }
                 this.staff_dashboard_node(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &DashboardReply, window, cx| {
+                this.dashboard_reply(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DashboardNewAgent, window, cx| {
+                this.dashboard.open_new_draft(None, cx);
+                this.dashboard_enter_insert(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &DashboardHeadingBelow, window, cx| {
                 this.dashboard_insert_heading(false, window, cx);
             }))
@@ -6100,6 +6273,12 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &DashboardJump, window, cx| {
                 this.prompt_dashboard_jump(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DashboardMoveAgent, window, cx| {
+                this.prompt_dashboard_file_agent(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DashboardRenameTopic, window, cx| {
+                this.prompt_dashboard_rename_topic(window, cx);
             }))
             .on_action(
                 cx.listener(|this, _: &DashboardToggleSubagents, window, cx| {
@@ -6339,7 +6518,14 @@ mod tests {
     fn unbound_desk_heading_is_a_local_disposition_target() {
         use crate::dashboard::RowTarget;
 
-        assert!(desk_heading_without_agent(true, Some(RowTarget::None)));
+        assert!(desk_heading_without_agent(
+            true,
+            Some(RowTarget::Topic {
+                host: HostId::default(),
+                offset: 0,
+                first_attention: None,
+            })
+        ));
         assert!(!desk_heading_without_agent(
             true,
             Some(RowTarget::Agent(

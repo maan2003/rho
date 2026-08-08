@@ -102,9 +102,11 @@ than by running a supervisor, extension protocol, or daemon process graph.
   org-like headings derive structure rather than receiving structural RPCs.
   Visible `:agent: <handle>` property lines are the binding source of truth;
   `:project:` properties inherit down the heading tree. The first duplicate
-  agent handle in document order owns the binding. Clients
-  project exactly one excerpt per host, so multibuffer seams coincide only
-  with daemon ownership boundaries.
+  agent handle in document order owns the binding. GUI clients retain one hidden
+  CRDT source buffer per host and project generated read-only topic/agent row
+  buffers interleaved with writable prose and draft buffers. Prose edits rebuild
+  the owning heading body through ordinary CRDT text ops while preserving
+  property lines.
   `rho-gui` supplies its context strip, theme mapping, and focus/show policy,
   while GPUI web owns only the immediate pointer-down routing region.
   The native GUI
