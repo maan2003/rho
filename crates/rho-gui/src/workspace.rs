@@ -53,7 +53,7 @@ use crate::style::{RoleFamily, StyleClass};
 use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
     AgentDone, AgentHide, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, DashboardBack,
-    DashboardDeleteEmpty, DashboardDemote, DashboardGoto, DashboardHeadingAbove,
+    DashboardArchive, DashboardDeleteEmpty, DashboardDemote, DashboardGoto, DashboardHeadingAbove,
     DashboardHeadingBelow, DashboardJump, DashboardMoveAgent,
     DashboardNewAgent, DashboardNow, DashboardPromote, DashboardRenameTopic, DashboardReply,
     DashboardStaff, DashboardSubmit, DashboardToggleSubagents, DashboardUndo, GitApprovalAllow, GitApprovalDeny,
@@ -1207,6 +1207,7 @@ impl Workspace {
                     && before < rho_ui_proto::UiAttention::Pending
                     && needs_you
                     && self.registry.selected_agent() != Some(&agent_id)
+                    && !self.dashboard.agent_archived(&self.registry, agent_id)
                 {
                     #[cfg(feature = "native")]
                     self.chime.play();
@@ -6505,6 +6506,22 @@ impl Render for Workspace {
                     this.refresh_dashboard(window, cx);
                 }),
             )
+            .on_action(cx.listener(|this, _: &DashboardArchive, window, cx| {
+                if !this.dashboard_verb_applies(window, cx) {
+                    cx.propagate();
+                    return;
+                }
+                if this.dashboard.archive_cursor_heading(cx) {
+                    this.refresh_dashboard(window, cx);
+                } else {
+                    this.notice_on(
+                        None,
+                        "archive: already archived",
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
+                }
+            }))
             .on_action(cx.listener(|this, _: &DashboardDemote, window, cx| {
                 if !this.dashboard_verb_applies(window, cx) {
                     cx.propagate();

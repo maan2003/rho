@@ -42,6 +42,11 @@ const PLACEHOLDER_ID_BASE: usize = 1_000_000;
 /// summary replaces it.
 const PLACEHOLDER_TITLE: &str = "…";
 
+/// The reserved heading tag that makes a subtree an archive zone: agents
+/// whose binding tag lives under it are muted, and the zone folds by
+/// default. Archiving and unarchiving are ordinary text moves.
+const ARCHIVE_TAG: &str = "archive";
+
 /// Inlay id space for heading decorations, clear of the placeholders.
 const HEADING_INLAY_ID_BASE: usize = 2_000_000;
 
@@ -146,6 +151,9 @@ pub struct Dashboard {
     /// Bound root agents per heading start, from the last sync — the
     /// source for `first_attention` and agent→heading lookups.
     heading_agents: HashMap<(HostId, usize), Vec<AgentId>>,
+    /// Roots whose binding tag lives inside an `:archive:` zone, as of the
+    /// last sync. Archived agents are muted: no chime, quiet decorations.
+    archived_agents: HashSet<AgentId>,
     /// Open reply drafts in creation order (position comes from `order`).
     replies: Vec<AgentId>,
     /// Keeps the workspace re-rendering on draft edits, so placeholder
@@ -219,6 +227,7 @@ impl Dashboard {
             order: Vec::new(),
             targets: HashMap::new(),
             heading_agents: HashMap::new(),
+            archived_agents: HashSet::new(),
             replies: Vec::new(),
             reply_subscriptions: HashMap::new(),
             new_draft: None,
@@ -436,6 +445,7 @@ impl Dashboard {
             .filter_map(|host| self.source_text(*host, cx).map(|text| (*host, text)))
             .collect::<Vec<_>>();
         let filed = self.resolve_bindings(registry, &documents);
+        self.archived_agents = archived_roots(&documents, &filed);
 
         // Empty reply drafts the cursor has left are dead weight; drop them.
         let cursor_place = self.cursor_place(cx);
@@ -1132,6 +1142,35 @@ impl Dashboard {
             .update(cx, |buffer, cx| buffer.edit([edit], None, cx));
     }
 
+    /// Archives the heading under the cursor: its subtree moves beneath a
+    /// sibling `:archive:` heading (created when missing), which folds.
+    /// Unarchiving is plain vim editing — cut the lines back out.
+    pub fn archive_cursor_heading(&mut self, cx: &mut Context<Workspace>) -> bool {
+        let Some((host, offset)) = self.cursor_heading_line(cx) else {
+            return false;
+        };
+        let Some(text) = self.source_text(host, cx) else {
+            return false;
+        };
+        let Some((edits, archive_offset)) = archive_edits(&text, offset) else {
+            return false;
+        };
+        let Some(buffer) = self.hosts.get(&host).and_then(|weak| weak.upgrade()) else {
+            return false;
+        };
+        buffer.update(cx, |buffer, cx| buffer.edit(edits, None, cx));
+        self.collapsed.insert((host, archive_offset));
+        self.cursor_to_doc(host, archive_offset, cx);
+        true
+    }
+
+    /// Whether the agent's root is filed inside an archive zone (muted:
+    /// no chime, quiet decorations).
+    pub fn agent_archived(&self, registry: &AgentRegistry, agent_id: AgentId) -> bool {
+        self.archived_agents
+            .contains(&root_agent(registry, agent_id))
+    }
+
     pub fn rename_cursor_topic(&mut self, title: &str, cx: &mut Context<Workspace>) -> bool {
         let Some((host, offset)) = self.cursor_heading_line(cx) else {
             return false;
@@ -1772,10 +1811,15 @@ fn heading_decorations(
     let empty = Vec::new();
     let mut decorations = Vec::new();
     for (host, text) in documents {
-        for heading in parse(text) {
+        let headings = parse(text);
+        let zones = archive_zones(&headings);
+        for heading in &headings {
             let agents = filed
                 .get(&(*host, heading.heading_range.start))
                 .unwrap_or(&empty);
+            let archived = zones
+                .iter()
+                .any(|zone| zone.contains(&heading.heading_range.start));
             let mut label = String::new();
             if collapsed.contains(&(*host, heading.heading_range.start))
                 && !text[heading.heading_range.end..heading.subtree_range.end]
@@ -1785,7 +1829,12 @@ fn heading_decorations(
                 label.push_str("  …");
             }
             for agent_id in agents {
-                let attention = registry.attention(*agent_id);
+                // Archived agents read as quiet no matter what they want.
+                let attention = if archived {
+                    UiAttention::Quiet
+                } else {
+                    registry.attention(*agent_id)
+                };
                 label.push_str("  ");
                 label.push_str(attention_glyph(attention));
                 label.push(' ');
@@ -1810,6 +1859,115 @@ fn heading_decorations(
         }
     }
     decorations
+}
+
+/// The filed roots whose heading sits inside an `:archive:` zone.
+fn archived_roots(
+    documents: &[(HostId, String)],
+    filed: &HashMap<(HostId, usize), Vec<AgentId>>,
+) -> HashSet<AgentId> {
+    let mut archived = HashSet::new();
+    for (host, text) in documents {
+        let zones = archive_zones(&parse(text));
+        if zones.is_empty() {
+            continue;
+        }
+        for ((filed_host, offset), agents) in filed {
+            if filed_host == host && zones.iter().any(|zone| zone.contains(offset)) {
+                archived.extend(agents.iter().copied());
+            }
+        }
+    }
+    archived
+}
+
+/// The `:archive:` subtree ranges of a document.
+fn archive_zones(headings: &[DeskHeading]) -> Vec<Range<usize>> {
+    headings
+        .iter()
+        .filter(|heading| heading.tags.iter().any(|tag| tag == ARCHIVE_TAG))
+        .map(|heading| heading.subtree_range.clone())
+        .collect()
+}
+
+/// The edits that archive the heading at `target_start`: its whole subtree
+/// moves under a sibling `:archive:` heading (created at the end of the
+/// parent's subtree when missing) and demotes one level so it nests
+/// inside. Returns the edits and the archive heading's offset once they
+/// apply. `None` when the target is already archived, is itself an
+/// archive, or does not exist.
+fn archive_edits(
+    text: &str,
+    target_start: usize,
+) -> Option<(Vec<(Range<usize>, String)>, usize)> {
+    let headings = parse(text);
+    let target_index = headings
+        .iter()
+        .position(|heading| heading.heading_range.start == target_start)?;
+    let target = &headings[target_index];
+    if archive_zones(&headings)
+        .iter()
+        .any(|zone| zone.contains(&target_start))
+    {
+        return None;
+    }
+    let removal = target.subtree_range.clone();
+    let removal_len = removal.len();
+    let mut moved = String::new();
+    for line in text[removal.clone()].split_inclusive('\n') {
+        let stars = line.bytes().take_while(|byte| *byte == b'*').count();
+        if stars > 0 && line.as_bytes().get(stars) == Some(&b' ') {
+            moved.push('*');
+        }
+        moved.push_str(line);
+    }
+    if !moved.ends_with('\n') {
+        moved.push('\n');
+    }
+    let sibling_archive = headings.iter().find(|heading| {
+        heading.parent == target.parent
+            && heading.heading_range.start != target_start
+            && heading.tags.iter().any(|tag| tag == ARCHIVE_TAG)
+    });
+    let mut edits = vec![(removal.clone(), String::new())];
+    let archive_offset;
+    match sibling_archive {
+        Some(archive) => {
+            let mut insertion = moved;
+            let at = archive.subtree_range.end;
+            if at == text.len() && !text.ends_with('\n') {
+                insertion.insert(0, '\n');
+            }
+            edits.push((at..at, insertion));
+            let start = archive.heading_range.start;
+            archive_offset = if removal.start < start {
+                start - removal_len
+            } else {
+                start
+            };
+        }
+        None => {
+            let at = target
+                .parent
+                .map_or(text.len(), |parent| headings[parent].subtree_range.end);
+            let fresh_line = usize::from(at == text.len() && !text.ends_with('\n'));
+            let mut insertion = String::new();
+            if fresh_line == 1 {
+                insertion.push('\n');
+            }
+            insertion.push_str(&format!(
+                "{} Archive :{ARCHIVE_TAG}:\n",
+                "*".repeat(target.depth)
+            ));
+            insertion.push_str(&moved);
+            edits.push((at..at, insertion));
+            // The insertion point always trails the removed subtree, which
+            // lives inside the same parent subtree (or the document).
+            archive_offset = at - removal_len + fresh_line;
+        }
+    }
+    edits.sort_by_key(|(range, _)| range.start);
+    Some((edits, archive_offset))
 }
 
 fn truncate_chars(value: &str, limit: usize) -> String {
@@ -2303,6 +2461,61 @@ mod tests {
         assert_eq!(
             keys(&generate_with(&child)),
             vec!["doc 0..22".to_string(), format!("doc 34..{}", text.len())]
+        );
+    }
+
+    fn apply_edits(text: &str, edits: &[(std::ops::Range<usize>, String)]) -> String {
+        let mut patched = text.to_owned();
+        for (range, replacement) in edits.iter().rev() {
+            patched.replace_range(range.clone(), replacement);
+        }
+        patched
+    }
+
+    #[test]
+    fn archiving_moves_the_subtree_under_a_sibling_archive() {
+        // No archive yet: one is created at the end of the document, the
+        // subtree demotes into it, and the tag rides along.
+        let text = "* Done task :eng-aa:\nnotes\n** Sub\n* Alive\n";
+        let (edits, archive_offset) = archive_edits(text, 0).expect("archivable");
+        let patched = apply_edits(text, &edits);
+        assert_eq!(
+            patched,
+            "* Alive\n* Archive :archive:\n** Done task :eng-aa:\nnotes\n*** Sub\n"
+        );
+        assert_eq!(&patched[archive_offset..archive_offset + 9], "* Archive");
+
+        // A nested heading archives under its own parent, next to its
+        // siblings, into the archive that already exists there.
+        let text = "* Project\n** Old :eng-bb:\n** Archive :archive:\n** Fresh\n* Other\n";
+        let (edits, archive_offset) = archive_edits(text, text.find("** Old").unwrap()).unwrap();
+        let patched = apply_edits(text, &edits);
+        assert_eq!(
+            patched,
+            "* Project\n** Archive :archive:\n*** Old :eng-bb:\n** Fresh\n* Other\n"
+        );
+        assert_eq!(&patched[archive_offset..archive_offset + 10], "** Archive");
+
+        // Inside an archive there is nothing further to archive, and the
+        // archive itself cannot be archived.
+        assert!(archive_edits(&patched, patched.find("*** Old").unwrap()).is_none());
+        assert!(archive_edits(&patched, patched.find("** Archive").unwrap()).is_none());
+    }
+
+    #[test]
+    fn archived_agents_are_quiet_no_matter_what_they_want() {
+        let loud = agent(1, None, UiAttention::NeedsInput, 10);
+        let (registry, host) = registry(vec![loud.clone()]);
+        let text = "* Archive :archive:\n** Old :eng-aa:\n".to_string();
+        let mut filed = HashMap::new();
+        filed.insert((host, text.find("** Old").unwrap()), vec![loud.agent_id]);
+        let documents = [(host, text.clone())];
+        assert!(archived_roots(&documents, &filed).contains(&loud.agent_id));
+        let decorations = heading_decorations(&registry, &documents, &filed, &HashSet::new());
+        let (_, _, label) = &decorations[0];
+        assert!(
+            label.starts_with("  · ") && !label.contains('—'),
+            "archived decoration should be quiet: {label:?}"
         );
     }
 
