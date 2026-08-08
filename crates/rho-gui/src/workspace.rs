@@ -56,7 +56,7 @@ use crate::{
     DashboardDeleteEmpty, DashboardDemote, DashboardGoto, DashboardHeadingAbove,
     DashboardHeadingBelow, DashboardJump, DashboardMoveAgent, DashboardMoveDown, DashboardMoveUp,
     DashboardNewAgent, DashboardNow, DashboardPromote, DashboardRenameTopic, DashboardReply,
-    DashboardStaff, DashboardToggleSubagents, DashboardUndo, GitApprovalAllow, GitApprovalDeny,
+    DashboardStaff, DashboardSubmit, DashboardToggleSubagents, DashboardUndo, GitApprovalAllow, GitApprovalDeny,
     MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious,
     PaneBack, PaneClose, PaneFocusNext, PaneSplitDown, PaneSplitRight, PastePrompt, RailFocus,
     RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore,
@@ -5035,10 +5035,6 @@ impl Workspace {
                 self.dashboard.toggle_subagents(cx);
                 self.refresh_dashboard(window, cx);
             }
-            Some(RowTarget::NewAgent) => {
-                self.dashboard.open_new_draft(None, window, cx);
-                self.dashboard_focus_draft(window, cx);
-            }
             Some(RowTarget::Reply(agent_id)) => {
                 if !self.require_connected(cx) {
                     return;
@@ -5063,6 +5059,22 @@ impl Workspace {
                 self.refresh_dashboard(window, cx);
             }
             // Document text keeps vim's own enter.
+            _ => cx.propagate(),
+        }
+    }
+
+    /// Insert-mode enter: send when the cursor is in a draft, and drop
+    /// back to normal mode on the row the send leaves behind; propagate
+    /// everywhere else so enter keeps inserting newlines.
+    fn dashboard_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        use crate::dashboard::RowTarget;
+        match self.dashboard.cursor_target(&self.registry, cx) {
+            Some(RowTarget::Reply(_)) | Some(RowTarget::NewDraft(_)) => {
+                self.dashboard_open(window, cx);
+                if let Ok(action) = cx.build_action("vim::NormalBefore", None) {
+                    window.dispatch_action(action, cx);
+                }
+            }
             _ => cx.propagate(),
         }
     }
@@ -6378,6 +6390,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &DashboardReply, window, cx| {
                 this.dashboard_reply(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DashboardSubmit, window, cx| {
+                this.dashboard_submit(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardNewAgent, window, cx| {
                 this.dashboard.open_new_draft(None, window, cx);

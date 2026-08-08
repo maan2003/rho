@@ -55,6 +55,7 @@ actions!(
         AgentHide,
         DashboardNewAgent,
         DashboardReply,
+        DashboardSubmit,
         DashboardNow,
         DashboardBack,
         DashboardJump,
@@ -301,11 +302,17 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
     // node's heading line and propagate to vim's own binding anywhere else,
     // so `o`, `s`, `d`, `x`, and Tab keep their vim meaning in body text.
     // Navigation uses vim-idiomatic `g`-prefixed gotos and works anywhere.
-    cx.bind_keys([KeyBinding::new(
-        "ctrl-z",
-        DashboardUndo,
-        Some("RhoDashboard > Editor"),
-    )]);
+    cx.bind_keys([
+        KeyBinding::new("ctrl-z", DashboardUndo, Some("RhoDashboard > Editor")),
+        // Enter sends a reply or new-agent draft from insert mode too,
+        // matching the shell and transcript prompts; the handler
+        // propagates outside drafts so enter stays a newline in text.
+        KeyBinding::new(
+            "enter",
+            DashboardSubmit,
+            Some("RhoDashboard > Editor && vim_mode == insert"),
+        ),
+    ]);
     for context in [
         "RhoDashboard > Editor && vim_mode == normal",
         "RhoDashboard > Editor && vim_mode == helix_normal",

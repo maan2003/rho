@@ -63,12 +63,10 @@ enum LineKey {
     Fold(HostId, usize),
     Agent(AgentId),
     Unfiled(HostId),
-    NewAgent,
     Reply(AgentId),
     NewDraft(Option<(HostId, usize)>),
-    /// An empty line separating listing regions (None = before the
-    /// new-agent action line).
-    Spacer(Option<HostId>),
+    /// An empty line separating listing regions.
+    Spacer(HostId),
 }
 
 impl LineKey {
@@ -90,7 +88,6 @@ pub enum RowTarget {
         first_attention: Option<AgentId>,
     },
     Agent(AgentId),
-    NewAgent,
     /// An inline reply draft addressed to this agent.
     Reply(AgentId),
     /// The inline new-agent draft.
@@ -968,12 +965,12 @@ impl Dashboard {
             return;
         };
         let replacement = format!(
-            "{} {}{}",
+            "{}{} {}",
             "*".repeat(heading.depth),
-            state.keyword(),
             (!heading.title.is_empty())
                 .then(|| format!(" {}", heading.title))
-                .unwrap_or_default()
+                .unwrap_or_default(),
+            state.keyword(),
         );
         self.hosts[&host]
             .upgrade()
@@ -1396,7 +1393,7 @@ impl DashClass {
         let colors = cx.theme().colors();
         let color = match self {
             DashClass::Muted => colors.text_muted,
-            DashClass::Heading => colors.terminal_ansi_blue,
+            DashClass::Heading => colors.terminal_ansi_magenta,
             DashClass::TodoHeading => colors.terminal_ansi_red,
             DashClass::StaffedHeading => colors.terminal_ansi_cyan,
             DashClass::Working => colors.terminal_ansi_cyan,
@@ -1764,7 +1761,7 @@ fn generate(
         }
         let folded = collapsed_unfiled.contains(host);
         segments.push(Segment::Line(Line::new(
-            LineKey::Spacer(Some(*host)),
+            LineKey::Spacer(*host),
             RowTarget::None,
         )));
         let mut header = Line::new(LineKey::Unfiled(*host), RowTarget::None);
@@ -1818,15 +1815,6 @@ fn generate(
         )));
     }
 
-    if !segments.is_empty() {
-        segments.push(Segment::Line(Line::new(
-            LineKey::Spacer(None),
-            RowTarget::None,
-        )));
-    }
-    let mut new_agent = Line::new(LineKey::NewAgent, RowTarget::NewAgent);
-    new_agent.span(Some(DashClass::Muted), |line| line.push_str("+ new agent"));
-    segments.push(Segment::Line(new_agent));
     segments
 }
 
@@ -1960,8 +1948,6 @@ mod tests {
                 format!("{:?}", LineKey::Agent(b.agent_id)),
                 format!("{:?}", LineKey::Agent(a.agent_id)),
                 format!("doc 11..{}", text.len() - 1),
-                format!("{:?}", LineKey::Spacer(None)),
-                format!("{:?}", LineKey::NewAgent),
             ]
         );
     }
@@ -1983,8 +1969,6 @@ mod tests {
             keys(&segments),
             vec![
                 format!("doc 0..{}", text.len() - 1),
-                format!("{:?}", LineKey::Spacer(None)),
-                format!("{:?}", LineKey::NewAgent),
             ]
         );
     }
@@ -2014,8 +1998,6 @@ mod tests {
                 "doc 0..5".to_string(),
                 format!("{:?}", LineKey::Fold(host, 0)),
                 format!("doc 11..{}", text.len() - 1),
-                format!("{:?}", LineKey::Spacer(None)),
-                format!("{:?}", LineKey::NewAgent),
             ]
         );
     }
@@ -2039,8 +2021,6 @@ mod tests {
                 "doc 0..10".to_string(),
                 format!("{:?}", LineKey::NewDraft(Some((host, 0)))),
                 format!("doc 11..{}", text.len() - 1),
-                format!("{:?}", LineKey::Spacer(None)),
-                format!("{:?}", LineKey::NewAgent),
             ]
         );
     }

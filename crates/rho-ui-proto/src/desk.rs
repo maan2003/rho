@@ -102,12 +102,13 @@ pub fn parse(text: &str) -> Vec<DeskHeading> {
         }
         let content_start = depth + 1;
         let content = line.text[content_start..].trim_end();
-        let (state, title) = parse_state(content);
+        let (parsed_state, title) = parse_state(content);
         let title_start = line.text.len() - line.text[content_start..].len()
             + (title.as_ptr() as usize - content.as_ptr() as usize);
-        let state_range = state.map(|state| {
-            let start = line.start + content_start;
-            start..start + state.keyword().len()
+        let state = parsed_state.as_ref().map(|(state, _)| *state);
+        let state_range = parsed_state.map(|(_, range)| {
+            let base = line.start + content_start;
+            base + range.start..base + range.end
         });
         while stack
             .last()
@@ -175,17 +176,32 @@ pub fn parse(text: &str) -> Vec<DeskHeading> {
     headings
 }
 
-fn parse_state(content: &str) -> (Option<DeskHeadingState>, &str) {
-    for (keyword, state) in [
+/// The state keyword and its byte range within `content`, plus the
+/// title. The keyword reads from the end of the line (`* Ship it DONE`);
+/// the leading position (`* DONE Ship it`) is still accepted so older
+/// documents and org-style habits keep parsing.
+fn parse_state(content: &str) -> (Option<(DeskHeadingState, Range<usize>)>, &str) {
+    const STATES: [(&str, DeskHeadingState); 4] = [
         ("TODO", DeskHeadingState::Todo),
         ("DONE", DeskHeadingState::Done),
         ("DISCARDED", DeskHeadingState::Discarded),
         ("STAFFED", DeskHeadingState::Staffed),
-    ] {
+    ];
+    for (keyword, state) in STATES {
         if let Some(rest) = content.strip_prefix(keyword)
             && (rest.is_empty() || rest.starts_with(char::is_whitespace))
         {
-            return (Some(state), rest.trim_start());
+            return (Some((state, 0..keyword.len())), rest.trim_start());
+        }
+    }
+    for (keyword, state) in STATES {
+        if let Some(rest) = content.strip_suffix(keyword)
+            && (rest.is_empty() || rest.ends_with(char::is_whitespace))
+        {
+            return (
+                Some((state, content.len() - keyword.len()..content.len())),
+                rest.trim_end(),
+            );
         }
     }
     (None, content.trim_start())
@@ -437,6 +453,22 @@ fn version_from_wire(version: &[DeskClock]) -> Global {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn state_keyword_reads_from_the_line_end() {
+        let text = "* Ship it DONE\n* STAFFED Crewed\n* mark TODO list\n";
+        let headings = super::parse(text);
+        assert_eq!(headings[0].state, Some(super::DeskHeadingState::Done));
+        assert_eq!(headings[0].title, "Ship it");
+        assert_eq!(&text[headings[0].state_range.clone().unwrap()], "DONE");
+        // Leading keywords keep parsing for older documents.
+        assert_eq!(headings[1].state, Some(super::DeskHeadingState::Staffed));
+        assert_eq!(headings[1].title, "Crewed");
+        // A keyword in the middle of a title is just a word.
+        assert_eq!(headings[2].state, None);
+        assert_eq!(headings[2].title, "mark TODO list");
+    }
+
+
     use super::*;
 
     #[test]
