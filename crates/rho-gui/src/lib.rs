@@ -314,7 +314,7 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         KeyBinding::new(
             "enter",
             DashboardSubmit,
-            Some("RhoDashboard > Editor && vim_mode == insert"),
+            Some("RhoDashboard > Editor && vim_mode == insert && !showing_completions"),
         ),
     ]);
     for context in [

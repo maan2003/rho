@@ -3388,6 +3388,20 @@ impl Workspace {
                 self.preview_agent(agent_id, window, cx);
             }
             Some(RowTarget::Agent(_)) => {}
+            // A staffed heading line previews its top agent — bound
+            // agents have no rows of their own to land on.
+            Some(RowTarget::Topic {
+                host,
+                offset,
+                first_attention,
+            }) => {
+                if let Some(agent_id) = first_attention
+                    .or_else(|| self.dashboard.first_agent_for_topic((host, offset)))
+                    && self.dashboard_preview != Some(agent_id)
+                {
+                    self.preview_agent(agent_id, window, cx);
+                }
+            }
             // Headers and the folded tail retain the last preview. Clearing
             // it here would remove the preview pane, resize the dashboard,
             // and visibly rewrap its rows on ordinary cursor motion.
@@ -5079,8 +5093,10 @@ impl Workspace {
     }
 
     /// Insert-mode enter: send when the cursor is in a draft, and drop
-    /// back to normal mode on the row the send leaves behind; propagate
-    /// everywhere else so enter keeps inserting newlines.
+    /// back to normal mode on the row the send leaves behind. In document
+    /// text it is a newline — dispatched explicitly, because propagating
+    /// would fall through to the transcript prompt's `RhoGui > Editor`
+    /// SubmitPrompt binding, which swallows the key.
     fn dashboard_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use crate::dashboard::RowTarget;
         match self.dashboard.cursor_target(&self.registry, cx) {
@@ -5090,7 +5106,11 @@ impl Workspace {
                     window.dispatch_action(action, cx);
                 }
             }
-            _ => cx.propagate(),
+            _ => {
+                if let Ok(action) = cx.build_action("editor::Newline", None) {
+                    window.dispatch_action(action, cx);
+                }
+            }
         }
     }
 

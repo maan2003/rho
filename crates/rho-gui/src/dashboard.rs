@@ -2017,6 +2017,16 @@ fn generate(
         )));
     }
 
+    // The tail trim above exists so the listing's spacers control the
+    // gap before generated rows. When nothing follows the document, show
+    // it whole — otherwise typing at its very end (a new heading, say)
+    // lands in the concealed trailing newline and appears to do nothing.
+    if let Some(Segment::Doc { host, range, .. }) = segments.last_mut()
+        && let Some((_, text)) = documents.iter().find(|(doc_host, _)| doc_host == host)
+    {
+        range.end = text.len();
+    }
+
     segments
 }
 
@@ -2143,7 +2153,7 @@ mod tests {
             &[],
             None,
         );
-        assert_eq!(keys(&segments), vec![format!("doc 0..{}", text.len() - 1)]);
+        assert_eq!(keys(&segments), vec![format!("doc 0..{}", text.len())]);
 
         // An open reply still splices in after the heading's body.
         let segments = generate(
@@ -2160,7 +2170,7 @@ mod tests {
             vec![
                 "doc 0..10".to_string(),
                 format!("{:?}", LineKey::Reply(b.agent_id)),
-                format!("doc 11..{}", text.len() - 1),
+                format!("doc 11..{}", text.len()),
             ]
         );
 
@@ -2191,7 +2201,7 @@ mod tests {
         assert_eq!(
             keys(&segments),
             vec![
-                format!("doc 0..{}", text.len() - 1),
+                format!("doc 0..{}", text.len()),
             ]
         );
     }
@@ -2220,7 +2230,7 @@ mod tests {
             vec![
                 "doc 0..5".to_string(),
                 format!("{:?}", LineKey::Fold(host, 0)),
-                format!("doc 11..{}", text.len() - 1),
+                format!("doc 11..{}", text.len()),
             ]
         );
     }
@@ -2243,7 +2253,7 @@ mod tests {
             vec![
                 "doc 0..10".to_string(),
                 format!("{:?}", LineKey::NewDraft(Some((host, 0)))),
-                format!("doc 11..{}", text.len() - 1),
+                format!("doc 11..{}", text.len()),
             ]
         );
     }

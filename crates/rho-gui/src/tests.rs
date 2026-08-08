@@ -3456,6 +3456,95 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
     );
 }
 
+/// Insert-mode enter in desk document text is a newline — the submit
+/// binding only means "send" inside draft rows.
+#[gpui::test]
+fn insert_mode_enter_stays_a_newline_in_desk_text(cx: &mut TestAppContext) {
+    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
+
+    let mut source = text::Buffer::new(
+        text::ReplicaId::new(8),
+        text::BufferId::new(1).unwrap(),
+        "",
+    );
+    let operation = DeskOperation::from_text(&source.edit([(0..0, "* One\nbody\n* Two\n")]));
+    let desk_snapshot = DeskSnapshot {
+        text: source.snapshot().text(),
+        operations: vec![operation],
+        transactions: Vec::new(),
+        replicas: Vec::new(),
+    };
+
+    let workspace = test_workspace(cx);
+    cx.update(bind_test_keymaps);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Ready {
+                    agents: Vec::new(),
+                    iris_agent: None,
+                    projects: Vec::new(),
+                    auth: rho_ui_proto::AuthState {
+                        active: String::new(),
+                        default: String::new(),
+                        namespaces: Vec::new(),
+                    },
+                    machine_seed: 0,
+                    agent_counter: 100,
+                },
+                window,
+                cx,
+            );
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskSnapshot {
+                    snapshot: desk_snapshot,
+                    replica_id: 42,
+                    bindings: Vec::new(),
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+        })
+        .expect("update workspace");
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let editor = workspace.dashboard_editor();
+            let focus_handle = editor.read(cx).focus_handle(cx);
+            window.focus(&focus_handle, cx);
+            editor.update(cx, |editor, cx| {
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    // End of "body" in "* One\nbody\n".
+                    let offset = editor::MultiBufferOffset(10);
+                    selections.select_ranges([offset..offset]);
+                });
+            });
+        })
+        .expect("focus dashboard");
+    cx.update(|cx| cx.refresh_windows());
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "escape");
+    cx.simulate_keystrokes(*workspace, "i");
+    cx.simulate_keystrokes(*workspace, "enter");
+    cx.simulate_keystrokes(*workspace, "x");
+    cx.run_until_parked();
+
+    let text = workspace
+        .update(cx, |workspace, _, cx| {
+            let editor = workspace.dashboard_editor();
+            editor.read(cx).buffer().read(cx).snapshot(cx).text()
+        })
+        .expect("read dashboard");
+    assert!(
+        text.contains("body\nx"),
+        "enter should insert a newline in document text: {text:?}"
+    );
+}
+
 /// Quick spawn (`shift-r`) writes a `* …` placeholder heading and binds
 /// the agent there; once the agent's generated summary lands, the title
 /// fills itself in — but a heading the user has renamed is left alone.
