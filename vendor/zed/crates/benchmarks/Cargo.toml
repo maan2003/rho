@@ -47,6 +47,10 @@ name = "editor_render"
 harness = false
 
 [[bench]]
+name = "desk_composition"
+harness = false
+
+[[bench]]
 name = "display_map"
 harness = false
 
