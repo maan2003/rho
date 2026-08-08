@@ -179,10 +179,21 @@ pub fn parse(text: &str) -> Vec<DeskHeading> {
             headings[index].properties.push(property);
         }
         headings[index].body_range = lines[line_index].full_end..end;
-        let subtree_end = headings[index + 1..]
-            .iter()
-            .find(|later| later.depth <= headings[index].depth)
-            .map_or(text.len(), |later| later.heading_range.start);
+        // Trailing blank lines separate this subtree from what follows.
+        // They fold (and move) with the subtree only when the next heading
+        // is a sibling at the same depth; before a shallower heading or the
+        // end of the document, the gap belongs to the enclosing context, so
+        // folding a subheading keeps the space above the outer heading.
+        let terminator = (index + 1..headings.len())
+            .find(|later| headings[*later].depth <= headings[index].depth);
+        let mut end_line = terminator.map_or(lines.len(), |later| heading_lines[later]);
+        let keeps_gap = terminator.is_none_or(|later| headings[later].depth < headings[index].depth);
+        if keeps_gap {
+            while end_line > line_index + 1 && lines[end_line - 1].text.trim().is_empty() {
+                end_line -= 1;
+            }
+        }
+        let subtree_end = lines.get(end_line).map_or(text.len(), |line| line.start);
         headings[index].subtree_range = headings[index].heading_range.start..subtree_end;
         headings[index].resolved_project = headings[index].project.clone().or_else(|| {
             headings[index]
@@ -544,6 +555,22 @@ mod tests {
         // Empty segments disqualify the whole token.
         assert!(headings[4].tags.is_empty());
         assert_eq!(headings[4].title, "Odd :a::b:");
+    }
+
+    #[test]
+    fn subtree_gaps_belong_to_the_boundary_that_needs_them() {
+        // Before a sibling, the blank run folds with the subtree; before a
+        // shallower heading, it stays outside so the visual gap survives
+        // folding. The same rule repeats at the parent's own boundary.
+        let text = "* One\n** A\nbody\n\n** B\nstuff\n\n\n* Two\n";
+        let headings = parse(text);
+        let (one, a, b, _two) = (&headings[0], &headings[1], &headings[2], &headings[3]);
+        assert_eq!(&text[a.subtree_range.clone()], "** A\nbody\n\n");
+        assert_eq!(&text[b.subtree_range.clone()], "** B\nstuff\n");
+        assert_eq!(&text[one.subtree_range.clone()], "* One\n** A\nbody\n\n** B\nstuff\n\n\n");
+        // At the end of the document the gap also stays out.
+        let headings = parse("* Last\nbody\n\n\n");
+        assert_eq!(headings[0].subtree_range, 0.."* Last\nbody\n".len());
     }
 
     #[test]
