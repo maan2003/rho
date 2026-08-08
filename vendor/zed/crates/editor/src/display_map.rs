@@ -88,7 +88,8 @@ pub use block_map::{
 };
 pub use crease_map::*;
 pub use fold_map::{
-    ChunkRenderer, ChunkRendererContext, ChunkRendererId, Fold, FoldId, FoldPlaceholder, FoldPoint,
+    CaretRest, ChunkRenderer, ChunkRendererContext, ChunkRendererId, Fold, FoldId,
+    FoldPlaceholder, FoldPoint,
 };
 pub use inlay_map::{InlayOffset, InlayPoint};
 pub use invisibles::{is_invisible, replacement};
@@ -1105,6 +1106,7 @@ impl DisplayMap {
                     merge_adjacent: base_placeholder.merge_adjacent,
                     type_tag: base_placeholder.type_tag,
                     collapsed_text: Some(collapsed_text),
+                    caret_rest: base_placeholder.caret_rest,
                 }
             } else {
                 base_placeholder.clone()
@@ -2407,6 +2409,40 @@ impl DisplaySnapshot {
         self.fold_snapshot().folds_in_range(range)
     }
 
+    /// Where an empty caret at `point` must move to honor one-sided
+    /// fold boundaries ([`CaretRest`]), if anywhere. Both sides of a
+    /// concealed fold occupy the same display position; this picks the
+    /// buffer side the fold declared restable.
+    pub fn caret_rest_adjustment(&self, point: MultiBufferPoint) -> Option<MultiBufferPoint> {
+        let buffer_snapshot = self.buffer_snapshot();
+        let offset = point.to_offset(buffer_snapshot);
+        let window = buffer_snapshot
+            .clip_offset(MultiBufferOffset(offset.0.saturating_sub(1)), Bias::Left)
+            ..buffer_snapshot.clip_offset(
+                MultiBufferOffset((offset.0 + 1).min(buffer_snapshot.len().0)),
+                Bias::Right,
+            );
+        let mut target = None;
+        for fold in self.folds_in_range(window) {
+            let range = fold.range.start.to_offset(buffer_snapshot)
+                ..fold.range.end.to_offset(buffer_snapshot);
+            match fold.placeholder.caret_rest {
+                CaretRest::Any => {}
+                CaretRest::Start => {
+                    if range.end == offset {
+                        target = Some(range.start);
+                    }
+                }
+                CaretRest::End => {
+                    if range.start == offset {
+                        target = Some(range.end);
+                    }
+                }
+            }
+        }
+        target.map(|offset| offset.to_point(buffer_snapshot))
+    }
+
     pub fn blocks_in_range(
         &self,
         rows: Range<DisplayRow>,
@@ -2780,7 +2816,16 @@ impl DisplaySnapshot {
         )
         .to_inlay_point(self.fold_snapshot());
 
-        self.inlay_snapshot().to_buffer_point(start)..self.inlay_snapshot().to_buffer_point(end)
+        // A zero-width concealed fold at a line edge pulls the fold-space
+        // boundary inside the buffer line; snap to whole buffer lines so
+        // line-wise operations still cover the concealed text.
+        let start = self.inlay_snapshot().to_buffer_point(start);
+        let end = self.inlay_snapshot().to_buffer_point(end);
+        Point::new(start.row, 0)
+            ..Point::new(
+                end.row,
+                self.buffer_snapshot().line_len(MultiBufferRow(end.row)),
+            )
     }
 }
 

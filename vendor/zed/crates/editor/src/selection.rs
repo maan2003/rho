@@ -65,7 +65,8 @@ impl Editor {
                 state.effects.nav_history = effects.nav_history.or(state.effects.nav_history);
             }
             let (changed, result) = self.selections.change_with(&snapshot, change);
-            let constrained = self.constrain_selections_to_editable_ranges(&snapshot);
+            let constrained = self.constrain_selections_to_editable_ranges(&snapshot)
+                | self.constrain_carets_to_fold_rest(&snapshot);
             if let Some(state) = &mut self.deferred_selection_effects_state {
                 state.changed |= changed || constrained;
             }
@@ -83,7 +84,8 @@ impl Editor {
             },
         };
         let (changed, result) = self.selections.change_with(&snapshot, change);
-        let constrained = self.constrain_selections_to_editable_ranges(&snapshot);
+        let constrained = self.constrain_selections_to_editable_ranges(&snapshot)
+            | self.constrain_carets_to_fold_rest(&snapshot);
         state.changed = state.changed || changed || constrained;
         if self.defer_selection_effects {
             self.deferred_selection_effects_state = Some(state);
@@ -138,6 +140,26 @@ impl Editor {
                 selection_collection.select(selections);
             });
     }
+
+    /// Moves empty carets off the forbidden side of one-sided fold
+    /// boundaries ([`crate::display_map::CaretRest`]). Ranged selections
+    /// are left alone so line-wise and visual operations still cover the
+    /// concealed text.
+    fn constrain_carets_to_fold_rest(&mut self, snapshot: &DisplaySnapshot) -> bool {
+        let (changed, ()) = self.selections.change_with(snapshot, |selections| {
+            selections.move_with(&mut |map, selection| {
+                if selection.start != selection.end {
+                    return;
+                }
+                let head = selection.head().to_point(map);
+                if let Some(target) = map.caret_rest_adjustment(head) {
+                    selection.collapse_to(target.to_display_point(map), SelectionGoal::None);
+                }
+            });
+        });
+        changed
+    }
+
     /// Defers the effects of selection change, so that the effects of multiple calls to
     /// `change_selections` are applied at the end. This way these intermediate states aren't added
     /// to selection history and the state of popovers based on selection position aren't

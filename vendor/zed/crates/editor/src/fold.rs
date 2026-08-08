@@ -1046,6 +1046,7 @@ impl Editor {
                 merge_adjacent: false,
                 type_tag: Some(type_id),
                 collapsed_text: None,
+                caret_rest: crate::display_map::CaretRest::Any,
             };
             let creases = new_newlines
                 .into_iter()

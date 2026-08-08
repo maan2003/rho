@@ -64,6 +64,7 @@ type SyncSnapshot = (
     Vec<(LineKey, String)>,
     Vec<(HostId, usize, String)>,
     Vec<(HostId, Range<usize>)>,
+    Vec<(HostId, Range<usize>, String, editor::display_map::CaretRest)>,
 );
 type ArchiveEdits = (Vec<(Range<usize>, String)>, usize);
 
@@ -185,6 +186,8 @@ pub struct Dashboard {
     /// operations — cycling, archiving — like org recomputes on cycle;
     /// a range whose start no longer sits on a heading line is dropped.
     collapsed: HashMap<HostId, Vec<(text::Anchor, text::Anchor)>>,
+    /// Next S-TAB target in org's OVERVIEW → CONTENTS → SHOW ALL cycle.
+    global_cycle: u8,
     /// Hosts whose Unfiled tail is folded behind its header.
     collapsed_unfiled: HashSet<HostId>,
     /// Move the cursor into this key's buffer on the next sync — how a
@@ -249,6 +252,7 @@ impl Dashboard {
             reply_subscriptions: HashMap::new(),
             new_draft: None,
             collapsed: HashMap::new(),
+            global_cycle: 0,
             collapsed_unfiled: HashSet::new(),
             pending_cursor: None,
             pending_doc_cursor: None,
@@ -517,6 +521,11 @@ impl Dashboard {
         // rows, so the decoration strings join the fingerprint: attention
         // changes must not vanish into the early-out.
         let decorations = heading_decorations(registry, &documents, &filed);
+        let cursor_doc = match &cursor_place {
+            Some(CursorPlace::Doc(host, offset)) => Some((*host, *offset)),
+            _ => None,
+        };
+        let conceals = heading_conceals(&documents, &fold_ranges, cursor_doc);
 
         // Render reconciles every frame, so most passes are registry
         // noise that changes nothing on screen. When the whole pass —
@@ -546,12 +555,13 @@ impl Dashboard {
             && self
                 .last_synced
                 .as_ref()
-                .is_some_and(|(docs, segs, drafts, decs, folds)| {
+                .is_some_and(|(docs, segs, drafts, decs, folds, hidden)| {
                     *docs == documents
                         && *segs == segments
                         && *drafts == draft_texts
                         && *decs == decorations
                         && *folds == fold_ranges
+                        && *hidden == conceals
                 })
         {
             return;
@@ -750,9 +760,10 @@ impl Dashboard {
         self.apply_highlights(&segments, &documents, cx);
         self.apply_reply_chrome(registry, cx);
         self.apply_heading_chrome(&decorations, cx);
-        self.apply_tag_conceals(&documents, cx);
+        self.apply_tag_conceals(&conceals, cx);
         self.apply_subtree_folds(&fold_ranges, cx);
-        self.last_synced = Some((documents, segments, draft_texts, decorations, fold_ranges));
+        self.last_synced =
+            Some((documents, segments, draft_texts, decorations, fold_ranges, conceals));
     }
 
     /// The stable composition id for a line key, allocated on first use.
@@ -1170,16 +1181,22 @@ impl Dashboard {
         };
         buffer.update(cx, |buffer, cx| buffer.edit(edits, None, cx));
         if let Some(text) = self.source_text(host, cx) {
-            let mut offsets: HashSet<(HostId, usize)> = self
-                .collapsed_ranges(&[(host, text)], cx)
-                .into_iter()
-                .map(|(range_host, start, _)| (range_host, start))
-                .collect();
-            offsets.insert((host, archive_offset));
             // The archive's fold recomputes so the subtree that just
             // moved in folds with it — an existing anchored range would
             // leave the new content visible (rear-nonsticky).
-            self.store_collapsed(host, &offsets, &[archive_offset], cx);
+            let mut ranges: Vec<Range<usize>> = self
+                .collapsed_ranges(&[(host, text.clone())], cx)
+                .into_iter()
+                .filter(|(_, owner, _)| *owner != archive_offset)
+                .map(|(_, _, range)| range)
+                .collect();
+            if let Some(archive) = parse(&text)
+                .iter()
+                .find(|heading| heading.heading_range.start == archive_offset)
+            {
+                ranges.extend(subtree_fold_range(&text, archive));
+            }
+            self.store_fold_ranges(host, &ranges, cx);
         }
         self.cursor_to_doc(host, archive_offset, cx);
         true
@@ -1339,48 +1356,40 @@ impl Dashboard {
         ranges
     }
 
-    /// Replaces a host's collapse set. Headings that stay collapsed
-    /// keep their anchored range untouched — the fold's drift from the
-    /// parsed structure is deliberate, org-style. Newly collapsed
-    /// headings get a fresh range from the current parse.
-    fn store_collapsed(
-        &mut self,
-        host: HostId,
-        offsets: &HashSet<(HostId, usize)>,
-        refresh: &[usize],
-        cx: &App,
-    ) {
+    /// Replaces a host's fold set. A range that resolves identically
+    /// today keeps its anchored pair — the fold's drift from the parsed
+    /// structure is deliberate, org-style — and every other range is
+    /// anchored fresh from the current text.
+    fn store_fold_ranges(&mut self, host: HostId, ranges: &[Range<usize>], cx: &App) {
         let Some(buffer) = self.hosts.get(&host).and_then(|weak| weak.upgrade()) else {
             return;
         };
-        let Some(text) = self.source_text(host, cx) else {
-            return;
-        };
         let snapshot = buffer.read(cx).text_snapshot();
-        let headings = parse(&text);
-        let mut kept: HashMap<usize, (text::Anchor, text::Anchor)> = HashMap::new();
-        for (start, end) in self.collapsed.get(&host).into_iter().flatten() {
-            if let Some(heading) = heading_line_at(&headings, start.to_offset(&snapshot))
-                && !refresh.contains(&heading)
-            {
-                kept.entry(heading).or_insert((*start, *end));
-            }
-        }
-        let pairs = offsets
+        let existing: Vec<(Range<usize>, (text::Anchor, text::Anchor))> = self
+            .collapsed
+            .get(&host)
+            .into_iter()
+            .flatten()
+            .map(|(start, end)| {
+                (
+                    start.to_offset(&snapshot)..end.to_offset(&snapshot),
+                    (*start, *end),
+                )
+            })
+            .collect();
+        let pairs = ranges
             .iter()
-            .filter(|(offset_host, _)| *offset_host == host)
-            .filter_map(|(_, offset)| {
-                if let Some(pair) = kept.get(offset) {
-                    return Some(*pair);
-                }
-                let heading = headings
+            .map(|range| {
+                existing
                     .iter()
-                    .find(|heading| heading.heading_range.start == *offset)?;
-                let range = subtree_fold_range(&text, heading)?;
-                Some((
-                    snapshot.anchor_after(range.start),
-                    snapshot.anchor_before(range.end),
-                ))
+                    .find(|(resolved, _)| resolved == range)
+                    .map(|(_, pair)| *pair)
+                    .unwrap_or_else(|| {
+                        (
+                            snapshot.anchor_after(range.start),
+                            snapshot.anchor_before(range.end),
+                        )
+                    })
             })
             .collect();
         self.collapsed.insert(host, pairs);
@@ -1404,13 +1413,46 @@ impl Dashboard {
             return false;
         };
         let headings = parse(&text);
-        let mut offsets: HashSet<(HostId, usize)> = self
-            .collapsed_ranges(&[(host, text)], cx)
+        let current: Vec<(usize, Range<usize>)> = self
+            .collapsed_ranges(&[(host, text.clone())], cx)
             .into_iter()
-            .map(|(range_host, start, _)| (range_host, start))
+            .map(|(_, owner, range)| (owner, range))
             .collect();
-        cycle_collapse(&mut offsets, host, offset, &headings);
-        self.store_collapsed(host, &offsets, &[], cx);
+        let next = cycle_folds(&text, &headings, offset, &current);
+        self.store_fold_ranges(host, &next, cx);
+        cx.notify();
+        true
+    }
+
+    /// Org's S-TAB: cycle the whole document through OVERVIEW (only
+    /// top-level headings), CONTENTS (every heading line, no bodies),
+    /// and SHOW ALL.
+    pub fn cycle_global_folds(&mut self, cx: &mut Context<Workspace>) -> bool {
+        let state = self.global_cycle;
+        self.global_cycle = (state + 1) % 3;
+        let hosts: Vec<HostId> = self.hosts.keys().copied().collect();
+        for host in hosts {
+            let Some(text) = self.source_text(host, cx) else {
+                continue;
+            };
+            let headings = parse(&text);
+            let top_depth = headings.iter().map(|heading| heading.depth).min();
+            let ranges: Vec<Range<usize>> = match state {
+                // OVERVIEW: fold every top-level subtree.
+                0 => headings
+                    .iter()
+                    .filter(|heading| Some(heading.depth) == top_depth)
+                    .filter_map(|heading| subtree_fold_range(&text, heading))
+                    .collect(),
+                // CONTENTS: every heading visible, every body hidden.
+                1 => (0..headings.len())
+                    .filter_map(|index| body_fold_range(&text, &headings, index))
+                    .collect(),
+                // SHOW ALL.
+                _ => Vec::new(),
+            };
+            self.store_fold_ranges(host, &ranges, cx);
+        }
         cx.notify();
         true
     }
@@ -1657,40 +1699,44 @@ impl Dashboard {
     /// Splices the staffed headings' end-of-line decorations in as
     /// inlays: display-only, so the document text never carries agent
     /// markers and typing on the heading line slides them along.
-    /// Hides `:eng-x7y2:` heading tags behind concealed folds. The tag stays
-    /// in the buffer, so line-wise copy and move carry the binding; only the
-    /// display drops it (the inlay decoration shows the pretty form).
-    fn apply_tag_conceals(&self, documents: &[(HostId, String)], cx: &mut Context<Workspace>) {
+    /// Replaces the star prefix with an org-modern fold indicator and
+    /// hides `:eng-x7y2:` heading tags. Both stay in the buffer — copy
+    /// and move carry structure and binding — but the display swaps
+    /// them for placeholders. The placeholders are never zero-width:
+    /// a widthless fold makes its two buffer sides display-identical,
+    /// and selection round-trips through display coordinates would
+    /// silently canonicalize one side to the other.
+    fn apply_tag_conceals(
+        &self,
+        conceals: &[(HostId, Range<usize>, String, editor::display_map::CaretRest)],
+        cx: &mut Context<Workspace>,
+    ) {
         struct DeskTagConceal;
         let type_id = std::any::TypeId::of::<DeskTagConceal>();
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
         let mut creases = Vec::new();
-        for (host, text) in documents {
+        for (host, range, placeholder_text, caret_rest) in conceals {
             let Some(buffer) = self.hosts.get(host).and_then(|weak| weak.upgrade()) else {
                 continue;
             };
             let buffer_snapshot = buffer.read(cx).snapshot();
-            for heading in parse(text) {
-                let Some(tags_range) = heading.tags_range else {
-                    continue;
-                };
-                // Swallow the separating whitespace too, so the visible
-                // line does not end in stray spaces.
-                let start = text[..tags_range.start]
-                    .trim_end_matches([' ', '\t'])
-                    .len()
-                    .max(heading.stars_range.end);
-                let (Some(start), Some(end)) = (
-                    snapshot.anchor_in_excerpt(buffer_snapshot.anchor_after(start)),
-                    snapshot.anchor_in_excerpt(buffer_snapshot.anchor_before(tags_range.end)),
-                ) else {
-                    continue;
-                };
-                creases.push(editor::display_map::Crease::simple(
-                    start..end,
-                    editor::FoldPlaceholder::concealed(type_id),
-                ));
-            }
+            let (Some(start), Some(end)) = (
+                snapshot.anchor_in_excerpt(buffer_snapshot.anchor_after(range.start)),
+                snapshot.anchor_in_excerpt(buffer_snapshot.anchor_before(range.end)),
+            ) else {
+                continue;
+            };
+            creases.push(editor::display_map::Crease::simple(
+                start..end,
+                editor::FoldPlaceholder {
+                    render: std::sync::Arc::new(|_, _, _| gpui::Empty.into_any_element()),
+                    constrain_width: false,
+                    merge_adjacent: false,
+                    type_tag: Some(type_id),
+                    collapsed_text: Some(placeholder_text.clone().into()),
+                    caret_rest: *caret_rest,
+                },
+            ));
         }
         self.editor.update(cx, |editor, cx| {
             editor.display_map.update(cx, |display_map, cx| {
@@ -1730,6 +1776,7 @@ impl Dashboard {
                     merge_adjacent: false,
                     type_tag: Some(type_id),
                     collapsed_text: Some(" …".into()),
+                    caret_rest: editor::display_map::CaretRest::Any,
                 },
             ));
         }
@@ -2024,6 +2071,79 @@ fn agent_line(agent_id: AgentId, registry: &AgentRegistry) -> Line {
 /// over a hidden body, then each bound agent as `glyph eng-id` (plus
 /// `+n` when it has subagents), and the attention reason inline when
 /// the agent is waiting on the human.
+/// Org-modern's fold-state stars, one closed/open pair per heading
+/// level, cycling like the level colors do.
+const FOLD_STARS: [(&str, &str); 4] = [("▶", "▼"), ("▷", "▽"), ("▸", "▾"), ("▹", "▿")];
+
+/// The heading-line conceals: the star token and its separating space
+/// render as an org-modern fold indicator (indented one column per
+/// level, closed when a fold hangs off the heading line, same width as
+/// the text it replaces), and the tag with its separating whitespace
+/// hides behind a single space (the inlay decoration shows the pretty
+/// form). Caret rest keeps the caret on the title side of both, so
+/// typing can never split the star token or fall behind the binding.
+///
+/// A conceal never captures the caret: typing with the caret inside a
+/// fold replaces the fold's contents, so a rebuilt conceal swallowing
+/// the position mid-edit would make the next keystroke eat the tag.
+/// The tag conceal starts no earlier than the caret, and a caret inside
+/// either token reveals it outright, org-appear style.
+fn heading_conceals(
+    documents: &[(HostId, String)],
+    fold_ranges: &[(HostId, Range<usize>)],
+    cursor: Option<(HostId, usize)>,
+) -> Vec<(HostId, Range<usize>, String, editor::display_map::CaretRest)> {
+    use editor::display_map::CaretRest;
+    let mut conceals = Vec::new();
+    for (host, text) in documents {
+        let caret = match cursor {
+            Some((cursor_host, offset)) if cursor_host == *host => Some(offset),
+            _ => None,
+        };
+        for heading in parse(text) {
+            let mut stars_end = heading.stars_range.end;
+            if text[stars_end..].starts_with(' ') {
+                stars_end += 1;
+            }
+            let stars = heading.stars_range.start..stars_end;
+            if !caret.is_some_and(|caret| stars.start < caret && caret < stars.end) {
+                let folded = fold_ranges.iter().any(|(fold_host, range)| {
+                    fold_host == host
+                        && heading.heading_range.start <= range.start
+                        && range.start <= heading.heading_range.end
+                });
+                let (closed, open) =
+                    FOLD_STARS[(heading.depth.saturating_sub(1)) % FOLD_STARS.len()];
+                let mut indicator = " ".repeat(heading.depth.saturating_sub(1));
+                indicator.push_str(if folded { closed } else { open });
+                indicator.push(' ');
+                conceals.push((*host, stars, indicator, CaretRest::End));
+            }
+            let Some(tags_range) = heading.tags_range else {
+                continue;
+            };
+            let mut start = text[..tags_range.start]
+                .trim_end_matches([' ', '\t'])
+                .len()
+                .max(heading.stars_range.end);
+            if let Some(caret) = caret {
+                if start < caret && caret <= tags_range.start {
+                    start = caret;
+                } else if tags_range.start < caret && caret < tags_range.end {
+                    continue;
+                }
+            }
+            conceals.push((
+                *host,
+                start..tags_range.end,
+                " ".to_owned(),
+                CaretRest::Start,
+            ));
+        }
+    }
+    conceals
+}
+
 fn heading_decorations(
     registry: &AgentRegistry,
     documents: &[(HostId, String)],
@@ -2191,46 +2311,107 @@ fn cursor_clamped_fold(
     }
 }
 
-/// One step of org-style visibility cycling for the heading at `offset`:
-/// folded → children (child headings visible but folded) → fully expanded
-/// → folded. Headings without children just toggle.
-fn cycle_collapse(
-    collapsed: &mut HashSet<(HostId, usize)>,
-    host: HostId,
-    offset: usize,
+/// Indices of the heading's direct children: the shallowest descendants.
+/// With sloppy nesting (`*` straight to `***`) that can be deeper than
+/// depth + 1.
+fn direct_children(headings: &[DeskHeading], index: usize) -> Vec<usize> {
+    let descendants: Vec<usize> = headings[index + 1..]
+        .iter()
+        .enumerate()
+        .take_while(|(_, heading)| heading.depth > headings[index].depth)
+        .map(|(at, _)| index + 1 + at)
+        .collect();
+    let child_depth = descendants
+        .iter()
+        .map(|&child| headings[child].depth)
+        .min();
+    descendants
+        .into_iter()
+        .filter(|&child| Some(headings[child].depth) == child_depth)
+        .collect()
+}
+
+/// What org's CHILDREN state hides of the heading's own text: the body
+/// between the heading line and its first child heading. For a heading
+/// without children this is the whole subtree fold. `None` when there
+/// is no body to hide.
+fn body_fold_range(text: &str, headings: &[DeskHeading], index: usize) -> Option<Range<usize>> {
+    let heading = &headings[index];
+    let children = direct_children(headings, index);
+    let Some(&first_child) = children.first() else {
+        return subtree_fold_range(text, heading);
+    };
+    let mut end = headings[first_child].heading_range.start;
+    if text[..end].ends_with('\n') {
+        end -= 1;
+    }
+    (end > heading.heading_range.end).then(|| heading.heading_range.end..end)
+}
+
+/// One step of org's TAB cycle for the heading at `offset`: FOLDED →
+/// CHILDREN (the body and every child's subtree hidden, so only the
+/// child heading lines show) → SUBTREE (everything visible) → FOLDED.
+/// Headings without children toggle. `current` is the host's resolved
+/// fold set as (owning heading start, range); the returned ranges
+/// replace it, leaving folds outside this subtree untouched.
+fn cycle_folds(
+    text: &str,
     headings: &[DeskHeading],
-) {
-    let descendants: Vec<(usize, usize)> = headings
+    offset: usize,
+    current: &[(usize, Range<usize>)],
+) -> Vec<Range<usize>> {
+    let Some(index) = headings
         .iter()
         .position(|heading| heading.heading_range.start == offset)
-        .map_or(Vec::new(), |index| {
-            headings[index + 1..]
-                .iter()
-                .take_while(|heading| heading.depth > headings[index].depth)
-                .map(|heading| (heading.depth, heading.heading_range.start))
-                .collect()
-        });
-    // Direct children are the shallowest descendants; with sloppy nesting
-    // (`*` straight to `***`) that can be deeper than depth + 1.
-    let child_depth = descendants.iter().map(|(depth, _)| *depth).min();
-    let children: Vec<(HostId, usize)> = descendants
+    else {
+        return current.iter().map(|(_, range)| range.clone()).collect();
+    };
+    let heading = &headings[index];
+    let subtree = heading.subtree_range.clone();
+    let children = direct_children(headings, index);
+    let first_child_start = children
+        .first()
+        .map(|&child| headings[child].heading_range.start);
+
+    let mut next: Vec<Range<usize>> = current
         .iter()
-        .filter(|(depth, _)| Some(*depth) == child_depth)
-        .map(|(_, start)| (host, *start))
+        .filter(|(owner, _)| !subtree.contains(owner))
+        .map(|(_, range)| range.clone())
         .collect();
-    let key = (host, offset);
-    if collapsed.contains(&key) {
-        collapsed.remove(&key);
-        for child in &children {
-            collapsed.insert(*child);
+    let owned: Vec<&Range<usize>> = current
+        .iter()
+        .filter(|(owner, _)| *owner == offset)
+        .map(|(_, range)| range)
+        .collect();
+
+    // Folded means the heading's own fold reaches past its first child
+    // (or exists at all, for a childless heading); a shorter fold is the
+    // CHILDREN state's body fold.
+    let folded = owned.iter().any(|range| match first_child_start {
+        Some(child_start) => range.end > child_start,
+        None => true,
+    });
+    let children_folded = !owned.is_empty()
+        || children.iter().any(|&child| {
+            current
+                .iter()
+                .any(|(owner, _)| *owner == headings[child].heading_range.start)
+        });
+
+    if folded {
+        // → CHILDREN; childless headings skip straight to expanded.
+        if first_child_start.is_some() {
+            next.extend(body_fold_range(text, headings, index));
+            for &child in &children {
+                next.extend(subtree_fold_range(text, &headings[child]));
+            }
         }
-    } else if !children.is_empty() && children.iter().all(|child| collapsed.contains(child)) {
-        for (_, start) in &descendants {
-            collapsed.remove(&(host, *start));
-        }
+    } else if children_folded {
+        // → SUBTREE: every fold inside is already dropped.
     } else {
-        collapsed.insert(key);
+        next.extend(subtree_fold_range(text, heading));
     }
+    next
 }
 
 /// The edits that archive the heading at `target_start`: its whole subtree
@@ -2844,32 +3025,57 @@ mod tests {
 
     #[test]
     fn tab_cycles_folded_then_children_then_expanded() {
-        let (_registry, host) = registry(vec![]);
-        let text = "* Top\nbody\n** A\n*** Deep\n** B\n* Next\n";
+        let text = "* Top\nbody\n** A\n*** Deep\n** B\n* Next\ntail\n";
         let headings = parse(text);
         let top = 0;
         let a = text.find("** A").unwrap();
-        let deep = text.find("*** Deep").unwrap();
-        let b = text.find("** B").unwrap();
         let next = text.find("* Next").unwrap();
 
-        let mut collapsed = HashSet::new();
-        // Expanded → folded.
-        cycle_collapse(&mut collapsed, host, top, &headings);
-        assert_eq!(collapsed, HashSet::from([(host, top)]));
-        // Folded → children: the heading opens, direct children fold.
-        cycle_collapse(&mut collapsed, host, top, &headings);
-        assert_eq!(collapsed, HashSet::from([(host, a), (host, b)]));
-        // Children → fully expanded, grandchildren included.
-        collapsed.insert((host, deep));
-        cycle_collapse(&mut collapsed, host, top, &headings);
-        assert_eq!(collapsed, HashSet::new());
+        // Expanded → folded: the whole subtree behind the heading line.
+        assert_eq!(cycle_folds(text, &headings, top, &[]), vec![5..29]);
+        // Folded → children (org's CHILDREN): the parent's own body and
+        // each child's subtree hide, so only the child heading lines
+        // show. B has nothing of its own to hide.
+        assert_eq!(
+            cycle_folds(text, &headings, top, &[(top, 5..29)]),
+            vec![5..10, 15..24]
+        );
+        // Children → SUBTREE: everything inside opens, grandchildren
+        // included.
+        assert_eq!(
+            cycle_folds(text, &headings, top, &[(top, 5..10), (a, 15..24)]),
+            Vec::<Range<usize>>::new()
+        );
 
-        // A heading without children just toggles.
-        cycle_collapse(&mut collapsed, host, next, &headings);
-        assert_eq!(collapsed, HashSet::from([(host, next)]));
-        cycle_collapse(&mut collapsed, host, next, &headings);
-        assert_eq!(collapsed, HashSet::new());
+        // A heading without children toggles.
+        assert_eq!(cycle_folds(text, &headings, next, &[]), vec![36..41]);
+        assert_eq!(
+            cycle_folds(text, &headings, next, &[(next, 36..41)]),
+            Vec::<Range<usize>>::new()
+        );
+
+        // Folds outside the cycled subtree survive the step.
+        assert_eq!(
+            cycle_folds(text, &headings, top, &[(next, 36..41)]),
+            vec![36..41, 5..29]
+        );
+    }
+
+    #[test]
+    fn tab_cycle_survives_bodiless_children() {
+        // With nothing to hide on any child, the CHILDREN state is
+        // carried entirely by the parent's body fold — without it the
+        // state would be indistinguishable from expanded and TAB would
+        // degrade to a two-way toggle.
+        let text = "* Top\nbody\n** A\n** B\n* Next\n";
+        let headings = parse(text);
+
+        let folded = cycle_folds(text, &headings, 0, &[]);
+        assert_eq!(folded, vec![5..20]);
+        let children = cycle_folds(text, &headings, 0, &[(0, 5..20)]);
+        assert_eq!(children, vec![5..10]);
+        let expanded = cycle_folds(text, &headings, 0, &[(0, 5..10)]);
+        assert_eq!(expanded, Vec::<Range<usize>>::new());
     }
 
     #[test]

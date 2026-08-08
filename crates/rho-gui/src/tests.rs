@@ -3431,7 +3431,7 @@ fn heading_tags_file_agents_and_conceal_in_display(cx: &mut TestAppContext) {
         "raw tag should be concealed: {display:?}"
     );
     assert!(
-        display.contains("* One  · eng-"),
+        display.contains("▼ One  · eng-"),
         "decoration should abut the title where the tag hid: {display:?}"
     );
 }
@@ -3553,6 +3553,231 @@ fn preview_clears_when_the_cursor_leaves_a_staffed_heading(cx: &mut TestAppConte
     );
 }
 
+/// TAB on a staffed heading cycles its fold like any other: the tag
+/// conceal (an adjacent zero-width fold ending exactly where the
+/// subtree fold starts) must not eat the cycle.
+#[gpui::test]
+fn tab_cycles_folds_on_a_staffed_heading(cx: &mut TestAppContext) {
+    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
+    use rho_ui_proto::{
+        AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
+    };
+
+    let summary = UiAgentSummary {
+        agent_id: agent(1),
+        parent_agent: None,
+        display_name: Some("planner".to_owned()),
+        created_at: UnixMs(1),
+        updated_at: UnixMs(1),
+        role: AgentRole::default(),
+        workspace: WorkspaceInfo::UserCheckout { repo: "/tmp".into() },
+        attention: UiAttention::Quiet,
+        last_active: UnixMs(1),
+        hidden: false,
+        disposition: AgentDisposition::Pending,
+        last_user_message_text: String::new(),
+        activity: None,
+        turn_report: None,
+        labels: Vec::new(),
+    };
+
+    let desk_text = format!(
+        "* One :eng-{}:\nbody\n** Kid\nkid stuff\n* Two\n",
+        agent(1).encoded()
+    );
+    let mut source = text::Buffer::new(
+        text::ReplicaId::new(8),
+        text::BufferId::new(1).unwrap(),
+        "",
+    );
+    let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text.as_str())]));
+    let desk_snapshot = DeskSnapshot {
+        text: source.snapshot().text(),
+        operations: vec![operation],
+        transactions: Vec::new(),
+        replicas: Vec::new(),
+    };
+
+    let workspace = test_workspace(cx);
+    cx.update(bind_test_keymaps);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Ready {
+                    agents: vec![summary],
+                    iris_agent: None,
+                    projects: Vec::new(),
+                    auth: AuthState {
+                        active: String::new(),
+                        default: String::new(),
+                        namespaces: Vec::new(),
+                    },
+                    machine_seed: 0,
+                    agent_counter: 100,
+                },
+                window,
+                cx,
+            );
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskSnapshot {
+                    snapshot: desk_snapshot,
+                    replica_id: 42,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+            let focus_handle = workspace.dashboard_editor().read(cx).focus_handle(cx);
+            window.focus(&focus_handle, cx);
+            workspace.dashboard_editor().update(cx, |editor, cx| {
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    let offset = editor::MultiBufferOffset(2);
+                    selections.select_ranges([offset..offset]);
+                });
+            });
+        })
+        .expect("update workspace");
+    cx.update(|cx| cx.refresh_windows());
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "escape");
+    cx.run_until_parked();
+
+    let display = |cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |workspace, _, cx| {
+                workspace
+                    .dashboard_editor()
+                    .update(cx, |editor, cx| editor.display_text(cx))
+            })
+            .expect("read display text")
+    };
+
+    cx.simulate_keystrokes(*workspace, "tab");
+    cx.run_until_parked();
+    let folded = display(cx);
+    assert!(!folded.contains("body"), "folded: {folded:?}");
+    assert!(!folded.contains("Kid"), "folded: {folded:?}");
+    assert!(folded.contains('…'), "folded: {folded:?}");
+
+    cx.simulate_keystrokes(*workspace, "tab");
+    cx.run_until_parked();
+    let children = display(cx);
+    assert!(!children.contains("body"), "children: {children:?}");
+    assert!(children.contains("Kid"), "children: {children:?}");
+    assert!(!children.contains("kid stuff"), "children: {children:?}");
+
+    cx.simulate_keystrokes(*workspace, "tab");
+    cx.run_until_parked();
+    let expanded = display(cx);
+    assert!(expanded.contains("kid stuff"), "expanded: {expanded:?}");
+
+    // `A` on the heading: the position past the concealed tag is not
+    // restable, so append lands at the visible title end and the typed
+    // text stays ahead of the binding.
+    cx.simulate_keystrokes(*workspace, "escape shift-a");
+    cx.simulate_keystrokes(*workspace, "space m o r e");
+    cx.run_until_parked();
+    let text = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .dashboard_editor()
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .text()
+        })
+        .expect("read dashboard");
+    assert!(
+        text.starts_with("* One more :eng-"),
+        "append must stay ahead of the tag: {text:?}"
+    );
+}
+
+/// Org's S-TAB: OVERVIEW folds every top-level subtree, CONTENTS shows
+/// every heading line and nothing else, SHOW ALL opens the document.
+#[gpui::test]
+fn shift_tab_cycles_overview_contents_show_all(cx: &mut TestAppContext) {
+    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
+
+    let desk_text = "* One\nbody\n** Kid\nkid stuff\n* Two\ntwo body\n";
+    let mut source = text::Buffer::new(
+        text::ReplicaId::new(8),
+        text::BufferId::new(1).unwrap(),
+        "",
+    );
+    let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text)]));
+    let workspace = test_workspace(cx);
+    cx.update(bind_test_keymaps);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskSnapshot {
+                    snapshot: DeskSnapshot {
+                        text: source.snapshot().text(),
+                        operations: vec![operation],
+                        transactions: Vec::new(),
+                        replicas: Vec::new(),
+                    },
+                    replica_id: 42,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+            let focus_handle = workspace.dashboard_editor().read(cx).focus_handle(cx);
+            window.focus(&focus_handle, cx);
+            workspace.dashboard_editor().update(cx, |editor, cx| {
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    let offset = editor::MultiBufferOffset(2);
+                    selections.select_ranges([offset..offset]);
+                });
+            });
+        })
+        .expect("set up dashboard");
+    cx.update(|cx| cx.refresh_windows());
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "escape");
+    cx.run_until_parked();
+
+    let display = |cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |workspace, _, cx| {
+                workspace
+                    .dashboard_editor()
+                    .update(cx, |editor, cx| editor.display_text(cx))
+            })
+            .expect("read display text")
+    };
+
+    cx.simulate_keystrokes(*workspace, "shift-tab");
+    cx.run_until_parked();
+    let overview = display(cx);
+    assert!(!overview.contains("body"), "overview: {overview:?}");
+    assert!(!overview.contains("Kid"), "overview: {overview:?}");
+    assert!(overview.contains("One"), "overview: {overview:?}");
+    assert!(overview.contains("Two"), "overview: {overview:?}");
+
+    cx.simulate_keystrokes(*workspace, "shift-tab");
+    cx.run_until_parked();
+    let contents = display(cx);
+    assert!(contents.contains("One"), "contents: {contents:?}");
+    assert!(contents.contains("Kid"), "contents: {contents:?}");
+    assert!(contents.contains("Two"), "contents: {contents:?}");
+    assert!(!contents.contains("body"), "contents: {contents:?}");
+    assert!(!contents.contains("kid stuff"), "contents: {contents:?}");
+
+    cx.simulate_keystrokes(*workspace, "shift-tab");
+    cx.run_until_parked();
+    let all = display(cx);
+    assert!(all.contains("body"), "show all: {all:?}");
+    assert!(all.contains("kid stuff"), "show all: {all:?}");
+    assert!(all.contains("two body"), "show all: {all:?}");
+}
+
 /// Collapse is a display fold over the subtree: TAB cycles folded →
 /// children → expanded, the buffer keeps the text throughout, and the
 /// fold is anchored — edits above it must not pop it open.
@@ -3613,17 +3838,22 @@ fn collapsed_subtree_folds_in_the_display_and_survives_edits(cx: &mut TestAppCon
     cycle(cx);
     let folded = display(cx);
     assert!(!folded.contains("body"), "folded: {folded:?}");
-    assert!(!folded.contains("** Kid"), "folded: {folded:?}");
-    assert!(folded.contains("* One"), "folded: {folded:?}");
-    assert!(folded.contains("* Two"), "folded: {folded:?}");
+    assert!(!folded.contains("Kid"), "folded: {folded:?}");
+    assert!(folded.contains("One"), "folded: {folded:?}");
+    assert!(folded.contains("Two"), "folded: {folded:?}");
     assert!(folded.contains('…'), "folded: {folded:?}");
+    // The star prefix conceals behind an org-modern fold indicator:
+    // closed on the folded heading, open on the expanded one.
+    assert!(folded.contains("▶ One"), "folded: {folded:?}");
+    assert!(folded.contains("▼ Two"), "folded: {folded:?}");
 
-    // Folded → children: the body and child heading show, the child's
-    // own subtree stays folded.
+    // Folded → children, org's CHILDREN state: only the child heading
+    // line joins the parent — the body and the child's subtree stay
+    // hidden.
     cycle(cx);
     let children = display(cx);
-    assert!(children.contains("body"), "children: {children:?}");
-    assert!(children.contains("** Kid"), "children: {children:?}");
+    assert!(!children.contains("body"), "children: {children:?}");
+    assert!(children.contains("Kid"), "children: {children:?}");
     assert!(!children.contains("kid stuff"), "children: {children:?}");
 
     // The fold is anchored: an edit above it shifts every offset and
@@ -3642,7 +3872,7 @@ fn collapsed_subtree_folds_in_the_display_and_survives_edits(cx: &mut TestAppCon
     cx.run_until_parked();
     let shifted = display(cx);
     assert!(shifted.contains("zero body"), "shifted: {shifted:?}");
-    assert!(shifted.contains("** Kid"), "shifted: {shifted:?}");
+    assert!(shifted.contains("Kid"), "shifted: {shifted:?}");
     assert!(
         !shifted.contains("kid stuff"),
         "edit above the fold must not pop it open: {shifted:?}"
@@ -3890,7 +4120,7 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
         })
         .expect("read display text");
     assert!(
-        display.contains("* One  · eng-"),
+        display.contains("▼ One  · eng-"),
         "heading decoration missing: {display:?}"
     );
 
@@ -4097,10 +4327,12 @@ fn quick_spawn_send_relocates_the_cursor(cx: &mut TestAppContext) {
         text.contains("* …"),
         "quick spawn should write the placeholder heading: {text:?}"
     );
+    // The star token is concealed chrome, so the caret rests past it on
+    // the title.
     assert_eq!(
         cursor.0,
-        text.find("* …").expect("placeholder present"),
-        "cursor should land on the new heading: {text:?}"
+        text.find("* …").expect("placeholder present") + 2,
+        "cursor should land on the new heading's title: {text:?}"
     );
 }
 

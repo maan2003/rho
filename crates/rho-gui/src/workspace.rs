@@ -56,7 +56,7 @@ use crate::{
     DashboardArchive, DashboardDeleteEmpty, DashboardDemote, DashboardGoto, DashboardHeadingAbove,
     DashboardHeadingBelow, DashboardJump, DashboardMoveAgent,
     DashboardNewAgent, DashboardNow, DashboardPromote, DashboardRenameTopic, DashboardReply,
-    DashboardStaff, DashboardSubmit, DashboardToggleSubagents, DashboardUndo, GitApprovalAllow, GitApprovalDeny,
+    DashboardCycleGlobal, DashboardStaff, DashboardSubmit, DashboardToggleSubagents, DashboardUndo, GitApprovalAllow, GitApprovalDeny,
     MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious,
     PaneBack, PaneClose, PaneFocusNext, PaneSplitDown, PaneSplitRight, PastePrompt, RailFocus,
     RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore,
@@ -6517,6 +6517,14 @@ impl Render for Workspace {
                     this.refresh_dashboard(window, cx);
                 }),
             )
+            .on_action(cx.listener(|this, _: &DashboardCycleGlobal, window, cx| {
+                if !this.dashboard.is_focused(window, cx) {
+                    cx.propagate();
+                    return;
+                }
+                this.dashboard.cycle_global_folds(cx);
+                this.refresh_dashboard(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &DashboardArchive, window, cx| {
                 if !this.dashboard.is_focused(window, cx) {
                     cx.propagate();

@@ -24,6 +24,22 @@ use sum_tree::{Bias, Cursor, Dimensions, FilterCursor, SumTree, Summary, TreeMap
 use ui::IntoElement as _;
 use util::post_inc;
 
+/// Where an empty caret may rest at this fold's boundaries. Both ends of
+/// a fold map to the same display position, so without a constraint the
+/// caret can sit on either buffer side of concealed text — invisible
+/// states that only differ once the user types. One-sided rest is
+/// emacs's point adjustment for invisible regions: the caret is moved
+/// to the allowed boundary whenever selections change.
+#[derive(Copy, Clone, Debug, Default, Eq, PartialEq)]
+pub enum CaretRest {
+    #[default]
+    Any,
+    /// A caret landing on this fold's end snaps to its start.
+    Start,
+    /// A caret landing on this fold's start snaps to its end.
+    End,
+}
+
 #[derive(Clone)]
 pub struct FoldPlaceholder {
     /// Creates an element to represent this fold's placeholder.
@@ -39,6 +55,8 @@ pub struct FoldPlaceholder {
     /// Empty text conceals: the folded range takes no display columns and
     /// produces no chunk at all. See [`FoldPlaceholder::concealed`].
     pub collapsed_text: Option<SharedString>,
+    /// Which boundary an empty caret may rest on.
+    pub caret_rest: CaretRest,
 }
 
 impl Default for FoldPlaceholder {
@@ -49,6 +67,7 @@ impl Default for FoldPlaceholder {
             merge_adjacent: true,
             type_tag: None,
             collapsed_text: None,
+            caret_rest: CaretRest::Any,
         }
     }
 }
@@ -59,6 +78,7 @@ impl FoldPlaceholder {
             && self.constrain_width == other.constrain_width
             && self.merge_adjacent == other.merge_adjacent
             && self.collapsed_text == other.collapsed_text
+            && self.caret_rest == other.caret_rest
             && (Arc::ptr_eq(&self.render, &other.render)
                 || self.is_concealed() && other.is_concealed())
     }
@@ -105,6 +125,7 @@ impl FoldPlaceholder {
             merge_adjacent: false,
             type_tag: Some(type_tag),
             collapsed_text: Some(SharedString::default()),
+            caret_rest: CaretRest::Any,
         }
     }
 
@@ -116,6 +137,7 @@ impl FoldPlaceholder {
             merge_adjacent: true,
             type_tag: None,
             collapsed_text: None,
+            caret_rest: CaretRest::Any,
         }
     }
 }
