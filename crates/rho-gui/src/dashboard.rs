@@ -307,16 +307,6 @@ impl Dashboard {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        // A reply row splices under the agent's heading; a collapsed
-        // heading (or ancestor) would fold it away, so opening reveals.
-        let heading = self
-            .heading_agents
-            .iter()
-            .find(|(_, agents)| agents.contains(&agent_id))
-            .map(|(key, _)| *key);
-        if let Some((host, offset)) = heading {
-            self.reveal_heading(host, offset, cx);
-        }
         let key = LineKey::Reply(agent_id);
         if !self.replies.contains(&agent_id) {
             self.replies.push(agent_id);
@@ -346,9 +336,6 @@ impl Dashboard {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        if let Some((host, offset)) = topic {
-            self.reveal_heading(host, offset, cx);
-        }
         if self.new_draft.is_none() {
             let buffer = cx.new(|cx| Buffer::local("", cx));
             let subscription = cx.subscribe_in(&buffer, window, |this, _, event, window, cx| {
@@ -1310,33 +1297,6 @@ impl Dashboard {
         self.collapsed.insert(host, anchors);
     }
 
-    /// Un-collapses the heading and every ancestor, so the heading line
-    /// (and anything spliced under it, like a fresh reply draft) is
-    /// actually on screen.
-    fn reveal_heading(&mut self, host: HostId, offset: usize, cx: &App) {
-        let Some(text) = self.source_text(host, cx) else {
-            return;
-        };
-        let headings = parse(&text);
-        let Some(mut index) = headings
-            .iter()
-            .position(|heading| heading.heading_range.start == offset)
-        else {
-            return;
-        };
-        let mut chain = HashSet::new();
-        loop {
-            chain.insert(headings[index].heading_range.start);
-            match headings[index].parent {
-                Some(parent) => index = parent,
-                None => break,
-            }
-        }
-        let mut offsets = self.collapsed_offsets(&[(host, text)], cx);
-        offsets.retain(|(_, start)| !chain.contains(start));
-        self.store_collapsed(host, &offsets, cx);
-    }
-
     /// Org-style visibility cycling on the heading under the cursor:
     /// folded → children (child headings visible but folded) → fully
     /// expanded → folded. Headings without children just toggle.
@@ -1796,10 +1756,12 @@ impl DashClass {
         let colors = cx.theme().colors();
         let color = match self {
             DashClass::Muted => colors.text_muted,
-            DashClass::Heading => colors.terminal_ansi_magenta,
-            DashClass::Heading2 => colors.terminal_ansi_green,
-            DashClass::Heading3 => colors.terminal_ansi_bright_magenta,
-            DashClass::Heading4 => colors.terminal_ansi_bright_green,
+            // Bright at the top: prominence tracks how shallow the
+            // heading sits, so top-level topics pop and deep ones recede.
+            DashClass::Heading => colors.terminal_ansi_bright_magenta,
+            DashClass::Heading2 => colors.terminal_ansi_bright_green,
+            DashClass::Heading3 => colors.terminal_ansi_magenta,
+            DashClass::Heading4 => colors.terminal_ansi_green,
             DashClass::TodoHeading => colors.terminal_ansi_red,
             DashClass::StaffedHeading => colors.terminal_ansi_cyan,
             DashClass::Working => colors.terminal_ansi_cyan,
@@ -2264,20 +2226,6 @@ fn truncate_chars(value: &str, limit: usize) -> String {
 
 /// Ends a document slice before a cut point's newline, so the synthetic
 /// newline between excerpts doesn't double it.
-/// Where a heading's rows splice in: the slice before them ends at the
-/// body's last non-blank character, and the slice after them resumes at
-/// the start of the following line. Trailing blank lines in the body
-/// then render *after* the rows, so the document's own spacing keeps
-/// separating this topic from the next heading.
-fn cut_points(text: &str, heading: &DeskHeading) -> (usize, usize) {
-    let body = &text[heading.heading_range.start..heading.body_range.end];
-    let position = heading.heading_range.start + body.trim_end().len();
-    let resume = text[position..heading.body_range.end]
-        .find('\n')
-        .map(|offset| position + offset + 1)
-        .unwrap_or(heading.body_range.end);
-    (position, resume)
-}
 
 
 /// Generate the listing without mutating Desk text: the documents are
@@ -2360,39 +2308,43 @@ fn generate(
             .collect();
         for heading in &headings {
             let start = heading.heading_range.start;
-            if start < slice_start {
-                continue;
-            }
             let agents = filed.get(&(*host, start)).unwrap_or(&empty);
             let draft_here = draft_topic == Some(Some((*host, start)));
             if !draft_here && !agents.iter().any(|agent_id| replies.contains(agent_id)) {
                 continue;
             }
-            // Drafts splice in after the heading's body, before the
-            // next heading (trailing newline trimmed so the excerpt
-            // boundary doesn't double it). A staffed heading with no
-            // open draft needs no cut at all: its agents are line
-            // decorations, not rows.
-            let (position, resume) = cut_points(text, heading);
-            // Inclusive at the end: a body's trimmed cut point and the
-            // fold's trimmed end are the same offset.
-            if fold_zones
+            // Rows splice right after the heading line, before its body
+            // (the cut swallows the newline, so the excerpt boundary's
+            // synthetic one doesn't double it). When that point is
+            // folded away, they land after the outermost enclosing fold
+            // instead — visible below the collapsed heading without
+            // popping it open. A staffed heading with no open draft
+            // needs no cut at all: its agents are line decorations, not
+            // rows.
+            let mut position = heading.heading_range.end;
+            let mut resume = heading.body_range.start;
+            if let Some(zone_end) = fold_zones
                 .iter()
-                .any(|zone| zone.start <= position && position <= zone.end)
+                .filter(|zone| zone.start <= position && position <= zone.end)
+                .map(|zone| zone.end)
+                .max()
             {
-                for agent_id in agents {
-                    if replies.contains(agent_id) {
-                        emitted_replies.insert(*agent_id);
-                    }
-                }
-                continue;
+                position = zone_end;
+                resume = if text[zone_end..].starts_with('\n') {
+                    zone_end + 1
+                } else {
+                    zone_end
+                };
             }
-            segments.push(Segment::Doc {
-                host: *host,
-                range: slice_start..position,
-                id: slice_id,
-            });
-            slice_id = next_slice_id(&heading.title, &mut title_counts);
+            if position > slice_start {
+                segments.push(Segment::Doc {
+                    host: *host,
+                    range: slice_start..position,
+                    id: slice_id,
+                });
+                slice_id = next_slice_id(&heading.title, &mut title_counts);
+                slice_start = resume;
+            }
             push_reply_rows(&mut segments, &mut emitted_replies, agents);
             if draft_here {
                 segments.push(Segment::Line(Line::new(
@@ -2400,7 +2352,6 @@ fn generate(
                     RowTarget::NewDraft(Some((*host, start))),
                 )));
             }
-            slice_start = resume;
         }
         // The tail slice drops trailing blank lines: the listing's own
         // spacers separate it from what follows.
@@ -2627,7 +2578,8 @@ mod tests {
         );
         assert_eq!(keys(&segments), vec![format!("doc 0..{}", text.len())]);
 
-        // An open reply still splices in after the heading's body.
+        // An open reply splices in right under the heading line, before
+        // the body.
         let segments = generate(
             &registry,
             &[(host, text.clone())],
@@ -2640,9 +2592,9 @@ mod tests {
         assert_eq!(
             keys(&segments),
             vec![
-                "doc 0..10".to_string(),
+                "doc 0..5".to_string(),
                 format!("{:?}", LineKey::Reply(b.agent_id)),
-                format!("doc 11..{}", text.len()),
+                format!("doc 6..{}", text.len()),
             ]
         );
 
@@ -2701,8 +2653,9 @@ mod tests {
         // final newline, so the next heading keeps a line of its own.
         let headings = parse(&text);
         assert_eq!(subtree_fold_range(&text, &headings[0]), Some(5..10));
-        // A reply under the fold stays hidden with its heading instead
-        // of parking at the document tail.
+        // A reply under the fold splices right after the fold's end, so
+        // it shows below the collapsed heading without popping it open
+        // (and without parking at the document tail).
         let segments = generate(
             &registry,
             &[(host, text.clone())],
@@ -2712,7 +2665,14 @@ mod tests {
             &[a.agent_id],
             None,
         );
-        assert_eq!(keys(&segments), vec![format!("doc 0..{}", text.len())]);
+        assert_eq!(
+            keys(&segments),
+            vec![
+                "doc 0..10".to_string(),
+                format!("{:?}", LineKey::Reply(a.agent_id)),
+                format!("doc 11..{}", text.len()),
+            ]
+        );
     }
 
     #[test]
@@ -2855,9 +2815,9 @@ mod tests {
         assert_eq!(
             keys(&segments),
             vec![
-                "doc 0..10".to_string(),
+                "doc 0..5".to_string(),
                 format!("{:?}", LineKey::NewDraft(Some((host, 0)))),
-                format!("doc 11..{}", text.len()),
+                format!("doc 6..{}", text.len()),
             ]
         );
     }

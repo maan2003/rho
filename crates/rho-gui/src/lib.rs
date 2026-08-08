@@ -335,7 +335,8 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             KeyBinding::new("g b", DashboardBack, Some(context)),
             KeyBinding::new("g h", DashboardJump, Some(context)),
             KeyBinding::new("m", DashboardMoveAgent, Some(context)),
-            KeyBinding::new("c r", DashboardRenameTopic, Some(context)),
+            // Not `c r`: a `c` prefix would shadow helix's change verb.
+            KeyBinding::new("g r", DashboardRenameTopic, Some(context)),
         ]);
     }
 }
