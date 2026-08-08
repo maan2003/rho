@@ -1077,14 +1077,11 @@ impl Workspace {
             ConnEvent::DeskSnapshot {
                 snapshot,
                 replica_id,
-                bindings,
             } => {
                 let buffer = self
                     .desk_sync
                     .apply_snapshot(host, snapshot, replica_id, cx);
-                self.desk_sync.set_bindings(host, bindings.clone());
                 self.dashboard.set_source(host, buffer.downgrade());
-                self.dashboard.set_bindings(host, bindings);
                 // Structure follows the text: any edit to the desk buffer
                 // (vim in the excerpts, or a CRDT op from another client)
                 // re-parses and reconciles.
@@ -1103,10 +1100,6 @@ impl Workspace {
             }
             ConnEvent::DeskTextApplied(record) => {
                 self.desk_sync.apply_text(host, record, cx);
-            }
-            ConnEvent::DeskBindingsChanged(bindings) => {
-                self.desk_sync.set_bindings(host, bindings.clone());
-                self.dashboard.set_bindings(host, bindings);
             }
             ConnEvent::Ready {
                 agents,
@@ -4095,18 +4088,34 @@ impl Workspace {
         self.hosts.set_status(host, crate::hosts::HostStatus::Online);
     }
 
+    #[cfg(test)]
+    pub(crate) fn desk_buffer_for_test(&self, host: HostId) -> Option<Entity<language::Buffer>> {
+        self.desk_sync.buffer(host)
+    }
+
     /// The desk half of a quick spawn, without the daemon round-trip:
-    /// appends the placeholder heading and returns its offset and the
-    /// anchor the NewAgent message would carry.
+    /// appends the placeholder heading and writes the tag the daemon
+    /// would, binding `agent_id` there. Returns the heading offset.
     #[cfg(test)]
     pub(crate) fn quick_spawn_heading_for_test(
         &mut self,
         host: HostId,
+        agent_id: rho_ui_proto::AgentId,
         cx: &mut Context<Self>,
-    ) -> Option<(usize, rho_ui_proto::desk::DeskAnchor)> {
+    ) -> Option<usize> {
         let offset = self.dashboard.append_placeholder_heading(host, cx)?;
-        let anchor = self.desk_sync.anchor_at(host, offset, cx)?;
-        Some((offset, anchor))
+        let buffer = self.desk_sync.buffer(host)?;
+        buffer.update(cx, |buffer, cx| {
+            let line_end = offset
+                + buffer
+                    .text_for_range(offset..buffer.len())
+                    .collect::<String>()
+                    .find('\n')
+                    .unwrap_or(buffer.len() - offset);
+            let tag = format!(" :eng-{}:", agent_id.encoded());
+            buffer.edit([(line_end..line_end, tag)], None, cx);
+        });
+        Some(offset)
     }
 
     /// Reconciles the dashboard against the current world. Event-driven,

@@ -1,10 +1,10 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use gpui::{AppContext as _, Context, Entity};
 use language::{Buffer, BufferEvent, Capability};
 use rho_ui_proto::ClientMessage;
 use rho_ui_proto::desk::{
-    DeskAnchor, DeskBinding, DeskClock, DeskOperation, DeskSnapshot, DeskTextOpRecord,
+    DeskAnchor, DeskClock, DeskOperation, DeskSnapshot, DeskTextOpRecord,
     DeskTransaction,
 };
 use text::{BufferId, ReplicaId};
@@ -23,8 +23,6 @@ pub struct DeskSync {
     hosts: BTreeMap<HostId, HostDesk>,
     known_ops: HashSet<(HostId, DeskClock)>,
     next_buffer_id: u64,
-    /// Daemon-owned agent bindings, replaced wholesale on every broadcast.
-    bindings: HashMap<HostId, Vec<DeskBinding>>,
 }
 
 impl Default for DeskSync {
@@ -33,7 +31,6 @@ impl Default for DeskSync {
             hosts: BTreeMap::new(),
             known_ops: HashSet::new(),
             next_buffer_id: 1,
-            bindings: HashMap::new(),
         }
     }
 }
@@ -131,14 +128,6 @@ impl DeskSync {
 
     pub fn buffer(&self, host: HostId) -> Option<Entity<Buffer>> {
         self.hosts.get(&host).map(|desk| desk.buffer.clone())
-    }
-
-    pub fn set_bindings(&mut self, host: HostId, bindings: Vec<DeskBinding>) {
-        self.bindings.insert(host, bindings);
-    }
-
-    pub fn bindings(&self, host: HostId) -> &[DeskBinding] {
-        self.bindings.get(&host).map_or(&[], Vec::as_slice)
     }
 
     /// The anchor a staffing request should carry for the heading at this

@@ -165,19 +165,6 @@ impl DeskStore {
         self.append_text(operation, transaction).await
     }
 
-    /// Legacy binding set for the wire's Ready shape. Always empty since
-    /// bindings became heading-line tags in the document text.
-    pub fn bindings(&self) -> Vec<DeskBinding> {
-        self.db
-            .read()
-            .open_table(STATE)
-            .get(&())
-            .expect("Desk state initialized")
-            .value()
-            .into_owned()
-            .bindings
-    }
-
     /// Moves `agent_id`'s heading-line tag: removed everywhere it appears,
     /// inserted on the heading containing `anchor` (`None` just unfiles).
     /// The rewrite is a server-replica CRDT edit, so clients converge
@@ -331,8 +318,8 @@ fn retag_edits(
         if mine.len() == heading.tags.len() {
             // The token empties out, so the separating whitespace goes too.
             let start = text[..tags_range.start]
-                .rfind(|c: char| !matches!(c, ' ' | '\t'))
-                .map_or(tags_range.start, |index| index + 1)
+                .trim_end_matches([' ', '\t'])
+                .len()
                 .max(heading.stars_range.end);
             edits.push((start..tags_range.end, String::new()));
         } else {
@@ -873,7 +860,6 @@ mod tests {
         // Unfiling strips the tag and its separating space.
         assert!(retag(None).await.is_some());
         assert_eq!(store.snapshot().document_text().unwrap(), text);
-        assert!(store.bindings().is_empty());
     }
 
     #[test]
@@ -946,7 +932,6 @@ mod tests {
         // The resolvable handle becomes a heading-line tag; the dead one
         // stays visible for the user to deal with.
         assert_eq!(text, "* one\nbody\n* two :eng-good:\n:agent: adv-gone\nnotes\n");
-        assert!(store.bindings().is_empty());
         assert_eq!(parse(&text)[1].tags, vec!["eng-good"]);
     }
 

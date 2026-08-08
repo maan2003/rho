@@ -2335,7 +2335,6 @@ async fn handle_message(
             let _ = outgoing_tx.send(ServerMessage::DeskSnapshot {
                 snapshot: agents.desk.snapshot(),
                 replica_id,
-                bindings: agents.desk.bindings(),
             });
             Ok(Refresh::None)
         }

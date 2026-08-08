@@ -3398,7 +3398,6 @@ fn heading_tags_file_agents_and_conceal_in_display(cx: &mut TestAppContext) {
                 ConnEvent::DeskSnapshot {
                     snapshot: desk_snapshot,
                     replica_id: 42,
-                    bindings: Vec::new(),
                 },
                 window,
                 cx,
@@ -3442,7 +3441,7 @@ fn heading_tags_file_agents_and_conceal_in_display(cx: &mut TestAppContext) {
 /// tail, and daemon rebinds rearrange rows without touching the text.
 #[gpui::test]
 fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
-    use rho_ui_proto::desk::{DeskAnchor, DeskBinding, DeskOperation, DeskSnapshot};
+    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
     use rho_ui_proto::{
         AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
     };
@@ -3470,8 +3469,8 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
         text::BufferId::new(1).unwrap(),
         "",
     );
-    let operation = DeskOperation::from_text(&source.edit([(0..0, "* One\nbody\n* Two\n")]));
-    let bound_anchor = DeskAnchor::from_text(source.snapshot().anchor_after(0));
+    let desk_text = format!("* One :eng-{}:\nbody\n* Two\n", agent(1).encoded());
+    let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text.as_str())]));
     let desk_snapshot = DeskSnapshot {
         text: source.snapshot().text(),
         operations: vec![operation],
@@ -3504,10 +3503,6 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
                 ConnEvent::DeskSnapshot {
                     snapshot: desk_snapshot,
                     replica_id: 42,
-                    bindings: vec![DeskBinding {
-                        agent_id: agent(1),
-                        anchor: bound_anchor,
-                    }],
                 },
                 window,
                 cx,
@@ -3525,11 +3520,11 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
             })
             .expect("read dashboard")
     };
-    // The bound agent decorates its heading line (as an inlay, never
-    // document text); only unbound agents get rows, under Unfiled.
+    // The tagged agent decorates its heading line (as an inlay, never
+    // extra rows); only untagged agents get rows, under Unfiled.
     assert_eq!(
         dashboard_text(&workspace, cx),
-        "* One\nbody\n* Two\n\nUnfiled · 1\n  · drifter"
+        format!("{desk_text}\nUnfiled · 1\n  · drifter")
     );
     let display = workspace
         .update(cx, |workspace, _, cx| {
@@ -3543,16 +3538,16 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
         "heading decoration missing: {display:?}"
     );
 
-    // A daemon rebind (to Unfiled) rearranges rows; the document merges
-    // back into one slice, untouched.
+    // Deleting the tag from the text is the unbind: rows rearrange and
+    // both agents fall back to Unfiled.
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskBindingsChanged(Vec::new()),
-                window,
-                cx,
-            );
+            let buffer = workspace.desk_buffer_for_test(HostId::default()).unwrap();
+            buffer.update(cx, |buffer, cx| {
+                let tag_start = "* One".len();
+                let tag_end = desk_text.find('\n').unwrap();
+                buffer.edit([(tag_start..tag_end, "")], None, cx);
+            });
             workspace.sync_dashboard(window, cx);
         })
         .expect("update workspace");
@@ -3608,7 +3603,6 @@ fn insert_mode_enter_stays_a_newline_in_desk_text(cx: &mut TestAppContext) {
                 ConnEvent::DeskSnapshot {
                     snapshot: desk_snapshot,
                     replica_id: 42,
-                    bindings: Vec::new(),
                 },
                 window,
                 cx,
@@ -3703,7 +3697,6 @@ fn quick_spawn_send_relocates_the_cursor(cx: &mut TestAppContext) {
                 ConnEvent::DeskSnapshot {
                     snapshot: desk_snapshot,
                     replica_id: 42,
-                    bindings: Vec::new(),
                 },
                 window,
                 cx,
@@ -3760,7 +3753,7 @@ fn quick_spawn_send_relocates_the_cursor(cx: &mut TestAppContext) {
 /// fills itself in — but a heading the user has renamed is left alone.
 #[gpui::test]
 fn quick_spawn_placeholder_takes_the_generated_title(cx: &mut TestAppContext) {
-    use rho_ui_proto::desk::{DeskBinding, DeskOperation, DeskSnapshot};
+    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
     use rho_ui_proto::{
         AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
     };
@@ -3818,24 +3811,14 @@ fn quick_spawn_placeholder_takes_the_generated_title(cx: &mut TestAppContext) {
                 ConnEvent::DeskSnapshot {
                     snapshot: desk_snapshot,
                     replica_id: 42,
-                    bindings: Vec::new(),
                 },
                 window,
                 cx,
             );
-            let (offset, anchor) = workspace
-                .quick_spawn_heading_for_test(HostId::default(), cx)
+            let offset = workspace
+                .quick_spawn_heading_for_test(HostId::default(), agent(1), cx)
                 .expect("desk is present");
             assert_eq!(offset, "* One\nbody\n".len());
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskBindingsChanged(vec![DeskBinding {
-                    agent_id: agent(1),
-                    anchor,
-                }]),
-                window,
-                cx,
-            );
             workspace.sync_dashboard(window, cx);
         })
         .expect("update workspace");

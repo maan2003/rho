@@ -20,7 +20,7 @@ use language::{Buffer, Capability, Point};
 use multi_buffer::MultiBuffer;
 use multi_buffer::composition::{Composition, CompositionSpec, CutSpec, RowSpec, SectionSpec};
 use project::InlayId;
-use rho_ui_proto::desk::{DeskBinding, DeskHeading, DeskHeadingState, parse};
+use rho_ui_proto::desk::{DeskHeading, DeskHeadingState, parse};
 use rho_ui_proto::{AgentId, UiAttention};
 use text::BufferId;
 use theme::ActiveTheme as _;
@@ -135,8 +135,6 @@ pub struct Dashboard {
     buffers: HashMap<LineKey, Entity<Buffer>>,
     /// Non-owning references to the workspace-owned Desk source buffers.
     hosts: BTreeMap<HostId, WeakEntity<Buffer>>,
-    /// Daemon-owned agent bindings per host, replaced wholesale.
-    bindings: HashMap<HostId, Vec<DeskBinding>>,
     /// Reconciles the multibuffer to the generated spec by element
     /// identity, so unchanged excerpts — and cursors in them — survive.
     composition: Composition,
@@ -217,7 +215,6 @@ impl Dashboard {
             editor,
             buffers: HashMap::new(),
             hosts: BTreeMap::new(),
-            bindings: HashMap::new(),
             composition: Composition::default(),
             element_keys: HashMap::new(),
             next_element_key: 0,
@@ -277,10 +274,6 @@ impl Dashboard {
 
     pub fn set_source(&mut self, host: HostId, source: WeakEntity<Buffer>) {
         self.hosts.insert(host, source);
-    }
-
-    pub fn set_bindings(&mut self, host: HostId, bindings: Vec<DeskBinding>) {
-        self.bindings.insert(host, bindings);
     }
 
     fn source_text(&self, host: HostId, cx: &App) -> Option<String> {
@@ -397,24 +390,18 @@ impl Dashboard {
         (!text.is_empty()).then_some(text)
     }
 
-    /// Resolves each host's bindings to the headings that contain them.
-    /// Unresolvable anchors and unknown agents fall through to Unfiled.
+    /// Resolves each host's heading-line tags to agents. Unresolvable tags
+    /// and unknown agents fall through to Unfiled; a duplicated tag counts
+    /// only at its first heading.
     fn resolve_bindings(
         &self,
         registry: &AgentRegistry,
         documents: &[(HostId, String)],
-        cx: &App,
     ) -> HashMap<(HostId, usize), Vec<AgentId>> {
         let mut filed_roots = HashSet::new();
         let mut by_heading: HashMap<(HostId, usize), Vec<AgentId>> = HashMap::new();
         for (host, text) in documents {
-            let Some(buffer) = self.hosts.get(host).and_then(|weak| weak.upgrade()) else {
-                continue;
-            };
-            let snapshot = buffer.read(cx).snapshot();
-            let buffer_id = snapshot.remote_id();
-            let headings = parse(text);
-            for heading in &headings {
+            for heading in parse(text) {
                 for tag in &heading.tags {
                     let Some(agent_id) = registry.agent_by_tag(*host, tag) else {
                         continue;
@@ -426,31 +413,6 @@ impl Dashboard {
                             .or_default()
                             .push(root);
                     }
-                }
-            }
-            // Legacy daemon anchor bindings; tags in the text win.
-            for binding in self.bindings.get(host).map_or(&[][..], Vec::as_slice) {
-                if registry.host_of_agent(binding.agent_id) != Some(*host) {
-                    continue;
-                }
-                let root = root_agent(registry, binding.agent_id);
-                let anchor = binding.anchor.to_text(buffer_id);
-                if !snapshot.can_resolve(&anchor) {
-                    continue;
-                }
-                let offset = snapshot.offset_for_anchor(&anchor);
-                let Some(heading) = headings
-                    .iter()
-                    .rev()
-                    .find(|heading| heading.heading_range.start <= offset)
-                else {
-                    continue;
-                };
-                if filed_roots.insert(root) {
-                    by_heading
-                        .entry((*host, heading.heading_range.start))
-                        .or_default()
-                        .push(root);
                 }
             }
         }
@@ -475,7 +437,7 @@ impl Dashboard {
             .keys()
             .filter_map(|host| self.source_text(*host, cx).map(|text| (*host, text)))
             .collect::<Vec<_>>();
-        let filed = self.resolve_bindings(registry, &documents, cx);
+        let filed = self.resolve_bindings(registry, &documents);
 
         // Empty reply drafts the cursor has left are dead weight; drop them.
         let cursor_place = self.cursor_place(cx);
@@ -1001,7 +963,7 @@ impl Dashboard {
                 continue;
             }
             let documents = [(host, text.clone())];
-            let filed = self.resolve_bindings(registry, &documents, cx);
+            let filed = self.resolve_bindings(registry, &documents);
             let edits = parse(&text)
                 .into_iter()
                 .filter(|heading| heading.title == PLACEHOLDER_TITLE)
@@ -1109,13 +1071,20 @@ impl Dashboard {
         else {
             return;
         };
+        // The keyword sits to the right of the title; the (concealed) tag
+        // token stays at the very end, riding along unchanged.
         let replacement = format!(
-            "{}{} {}",
+            "{}{} {}{}",
             "*".repeat(heading.depth),
             (!heading.title.is_empty())
                 .then(|| format!(" {}", heading.title))
                 .unwrap_or_default(),
             state.keyword(),
+            heading
+                .tags_range
+                .as_ref()
+                .map(|range| format!(" {}", &text[range.clone()]))
+                .unwrap_or_default(),
         );
         self.hosts[&host]
             .upgrade()
@@ -1526,8 +1495,8 @@ impl Dashboard {
                 // Swallow the separating whitespace too, so the visible
                 // line does not end in stray spaces.
                 let start = text[..tags_range.start]
-                    .rfind(|c: char| !matches!(c, ' ' | '\t'))
-                    .map_or(tags_range.start, |index| index + 1)
+                    .trim_end_matches([' ', '\t'])
+                    .len()
                     .max(heading.stars_range.end);
                 let (Some(start), Some(end)) = (
                     snapshot.anchor_in_excerpt(buffer_snapshot.anchor_after(start)),

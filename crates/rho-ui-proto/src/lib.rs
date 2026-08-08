@@ -501,15 +501,9 @@ pub enum ServerMessage {
         /// Zed replica id assigned to this user connection. Replica ids make
         /// body-operation attribution intrinsic to the CRDT history.
         replica_id: u16,
-        bindings: Vec<desk::DeskBinding>,
     },
     DeskTextApplied {
         record: desk::DeskTextOpRecord,
-    },
-    /// The full binding set for this host changed (staffing, rebind, or an
-    /// agent going away). Clients replace, never merge.
-    DeskBindingsChanged {
-        bindings: Vec<desk::DeskBinding>,
     },
     Ready {
         agents: Vec<UiAgentSummary>,
