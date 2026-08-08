@@ -1498,6 +1498,14 @@ impl BlockMap {
                         height,
                     }
                 } else if excerpt_boundary.prev.is_some() {
+                    // A buffer with its header disabled draws no boundary
+                    // chrome between its own excerpts either.
+                    if self
+                        .buffers_with_disabled_headers
+                        .contains(&excerpt_boundary.next.buffer_id())
+                    {
+                        continue;
+                    }
                     height += self.excerpt_header_height;
                     Block::ExcerptBoundary {
                         excerpt: excerpt_boundary.next,

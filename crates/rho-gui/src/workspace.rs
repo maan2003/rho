@@ -5072,13 +5072,18 @@ impl Workspace {
         use crate::dashboard::RowTarget;
         match self.dashboard.cursor_target(&self.registry, cx) {
             Some(RowTarget::Agent(agent_id)) => self.open_agent(agent_id, window, cx),
-            Some(RowTarget::Topic {
-                first_attention: Some(agent_id),
-                ..
-            }) => self.open_agent(agent_id, window, cx),
-            Some(RowTarget::Topic { .. }) => {
-                self.dashboard.toggle_subagents(cx);
-                self.refresh_dashboard(window, cx);
+            // A staffed heading opens its top agent full-frame — loudest
+            // first, quiet agents still reachable. Unstaffed headings keep
+            // enter as a fold toggle.
+            Some(RowTarget::Topic { host, offset, first_attention }) => {
+                if let Some(agent_id) = first_attention
+                    .or_else(|| self.dashboard.first_agent_for_topic((host, offset)))
+                {
+                    self.open_agent(agent_id, window, cx);
+                } else {
+                    self.dashboard.toggle_subagents(cx);
+                    self.refresh_dashboard(window, cx);
+                }
             }
             Some(RowTarget::Reply(agent_id)) => {
                 if !self.require_connected(cx) {
