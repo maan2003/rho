@@ -1,4 +1,5 @@
 mod anchor;
+pub mod composition;
 #[cfg(test)]
 mod multi_buffer_tests;
 mod path_key;
