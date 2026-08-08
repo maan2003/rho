@@ -3418,11 +3418,11 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
             })
             .expect("read dashboard")
     };
-    // The bound agent's row splices in after its heading's body; the
+    // The bound agent's row splices in under its heading line; the
     // document text itself carries no agent markers.
     assert_eq!(
         dashboard_text(&workspace, cx),
-        "* One\nbody\nplanner\n* Two\n\nUnfiled\ndrifter\n+ new agent"
+        "* One\n· planner\nbody\n* Two\n\nUnfiled · 1\n· drifter\n+ new agent"
     );
 
     // A daemon rebind (to Unfiled) rearranges rows; the document merges
@@ -3441,6 +3441,6 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(
         dashboard_text(&workspace, cx),
-        "* One\nbody\n* Two\n\nUnfiled\ndrifter\nplanner\n+ new agent"
+        "* One\nbody\n* Two\n\nUnfiled · 2\n· drifter\n· planner\n+ new agent"
     );
 }

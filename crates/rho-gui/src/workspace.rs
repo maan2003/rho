@@ -5060,7 +5060,7 @@ impl Workspace {
                     if topic.is_some() {
                         self.staff_dashboard_node_with_brief(topic, Some(body), window, cx);
                     } else {
-                        self.spawn_unfiled_dashboard_agent(body, cx);
+                        self.spawn_unfiled_dashboard_agent(body, window, cx);
                     }
                 }
             }
@@ -5076,6 +5076,21 @@ impl Workspace {
                 self.dashboard.open_reply(agent_id, cx);
                 self.dashboard_enter_insert(window, cx);
             }
+            // On a heading line, reply to the heading's top agent, so `r`
+            // works anywhere in a staffed topic, not only on its rows.
+            Some(crate::dashboard::RowTarget::Topic {
+                host,
+                offset,
+                first_attention,
+            }) if first_attention.is_some()
+                || self.dashboard.first_agent_for_topic((host, offset)).is_some() =>
+            {
+                let agent_id = first_attention
+                    .or_else(|| self.dashboard.first_agent_for_topic((host, offset)))
+                    .expect("guard checked an agent exists");
+                self.dashboard.open_reply(agent_id, cx);
+                self.dashboard_enter_insert(window, cx);
+            }
             // Document text keeps vim's own `r`.
             _ => cx.propagate(),
         }
@@ -5087,27 +5102,114 @@ impl Workspace {
         }
     }
 
-    fn spawn_unfiled_dashboard_agent(&mut self, body: String, cx: &mut Context<Self>) {
-        let workdir = self.draft_default_workdir();
-        let selected_host = workdir.as_ref().map(|workdir| workdir.host);
-        let (host, start) = match self.parse_start(
-            crate::draft_view::StartFieldMode::NewOn,
-            crate::draft_view::AUTO_BASE_REVSET,
-            workdir,
-            selected_host,
-        ) {
-            Ok(start) => start,
+    /// An unfiled spawn has no heading to inherit `:project:` from, so the
+    /// project comes from a picker (skipped when only one is registered).
+    fn spawn_unfiled_dashboard_agent(
+        &mut self,
+        body: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workdirs.is_empty() {
+            self.notice_on(
+                None,
+                "new agent: no registered projects",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        }
+        if let [workdir] = self.workdirs.as_slice() {
+            let workdir = workdir.clone();
+            self.spawn_unfiled_agent_on(workdir, body, cx);
+            return;
+        }
+        let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, _: &gpui::App| {
+            let needle = input.trim().to_lowercase();
+            let multiple_hosts = workspace
+                .workdirs
+                .iter()
+                .map(|workdir| workdir.host)
+                .collect::<std::collections::HashSet<_>>()
+                .len()
+                > 1;
+            workspace
+                .workdirs
+                .iter()
+                .filter(|candidate| {
+                    candidate.project.name.to_lowercase().contains(&needle)
+                        || candidate
+                            .project
+                            .path
+                            .as_str()
+                            .to_lowercase()
+                            .contains(&needle)
+                })
+                .map(|candidate| crate::commands::Candidate {
+                    value: candidate.project.name.clone(),
+                    description: if multiple_hosts {
+                        format!(
+                            "{} · {}",
+                            workspace.registry.host_name(candidate.host),
+                            candidate.project.path
+                        )
+                    } else {
+                        candidate.project.path.to_string()
+                    },
+                })
+                .collect()
+        });
+        let on_submit = std::rc::Rc::new(
+            move |workspace: &mut Workspace,
+                  input: String,
+                  _window: &mut Window,
+                  cx: &mut Context<Workspace>| {
+                let input = input.trim();
+                let Some(workdir) = workspace
+                    .workdirs
+                    .iter()
+                    .find(|candidate| {
+                        candidate.project.name == input || candidate.project.path == input
+                    })
+                    .cloned()
+                else {
+                    workspace.notice_on(
+                        None,
+                        "new agent: choose a listed project",
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
+                    return;
+                };
+                workspace.spawn_unfiled_agent_on(workdir, body.clone(), cx);
+            },
+        );
+        self.open_prompt("project:", complete, on_submit, window, cx);
+    }
+
+    fn spawn_unfiled_agent_on(
+        &mut self,
+        workdir: HostProject,
+        body: String,
+        cx: &mut Context<Self>,
+    ) {
+        let role_text = self.draft_model.read(cx).role_text(cx).trim().to_owned();
+        let role = match parse_agent_role(&role_text) {
+            Ok(role) => role,
             Err(message) => {
                 self.notice_on(None, &message, StyleClass::SystemInfo, cx);
                 return;
             }
         };
         self.send_to_host(
-            host,
+            workdir.host,
             ClientMessage::NewAgent {
-                role: AgentRole::default(),
-                start,
-                content: Some(vec![ContentPart::Text { text: body }]),
+                role,
+                start: rho_ui_proto::StartMode::NewOn {
+                    repo: workdir.project.path,
+                    revset: crate::draft_view::AUTO_BASE_REVSET.to_owned(),
+                },
+                content: (!body.trim().is_empty()).then_some(vec![ContentPart::Text { text: body }]),
                 desk_anchor: None,
             },
         );

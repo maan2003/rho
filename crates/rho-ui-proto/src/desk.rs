@@ -14,6 +14,7 @@ pub enum DeskHeadingState {
     Todo,
     Done,
     Discarded,
+    Staffed,
 }
 
 impl DeskHeadingState {
@@ -22,6 +23,7 @@ impl DeskHeadingState {
             Self::Todo => "TODO",
             Self::Done => "DONE",
             Self::Discarded => "DISCARDED",
+            Self::Staffed => "STAFFED",
         }
     }
 }
@@ -178,6 +180,7 @@ fn parse_state(content: &str) -> (Option<DeskHeadingState>, &str) {
         ("TODO", DeskHeadingState::Todo),
         ("DONE", DeskHeadingState::Done),
         ("DISCARDED", DeskHeadingState::Discarded),
+        ("STAFFED", DeskHeadingState::Staffed),
     ] {
         if let Some(rest) = content.strip_prefix(keyword)
             && (rest.is_empty() || rest.starts_with(char::is_whitespace))

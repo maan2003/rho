@@ -13,10 +13,9 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 
-use editor::hover_links::InlayHighlight;
 use editor::{Editor, EditorMode, HighlightKey, Inlay, SizingBehavior};
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, Focusable as _, FontWeight, HighlightStyle, WeakEntity, Window};
+use gpui::{App, Context, Entity, Focusable as _, HighlightStyle, WeakEntity, Window};
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use project::InlayId;
@@ -29,7 +28,7 @@ use crate::registry::{AgentRegistry, HostId};
 use crate::workspace::Workspace;
 
 /// How many member tags a workstream row shows before collapsing into `+n`.
-const VISIBLE_TAGS: usize = 4;
+const VISIBLE_TAGS: usize = 3;
 
 /// Highlight-key space for dashboard classes, clear of the transcript's
 /// semantic and syntax key ranges.
@@ -112,8 +111,9 @@ enum SegmentKey {
 }
 
 /// One generated segment: a slice of a host document, or a generated
-/// line (row or draft slot).
-#[derive(Debug)]
+/// line (row or draft slot). Equality against the previous pass lets a
+/// sync bail out before touching the editor at all.
+#[derive(Debug, PartialEq)]
 enum Segment {
     Doc { host: HostId, range: Range<usize> },
     Line(Line),
@@ -150,10 +150,11 @@ pub struct Dashboard {
     pending_cursor: Option<LineKey>,
     /// Move the cursor to this document offset on the next sync.
     pending_doc_cursor: Option<(HostId, usize)>,
-    /// Attention lamps currently spliced in, for replacement on sync.
-    lamp_ids: Vec<InlayId>,
     /// Reply placeholder inlays currently spliced in.
     placeholder_ids: Vec<InlayId>,
+    /// The previous pass's inputs and output, so a sync whose world is
+    /// unchanged returns without touching the editor.
+    last_synced: Option<(Vec<(HostId, String)>, Vec<Segment>)>,
     /// Buffers already registered as headerless with the editor. A
     /// boundary onto a headerless buffer draws nothing, so this is what
     /// keeps the interleaved excerpts seamless.
@@ -202,8 +203,8 @@ impl Dashboard {
             collapsed: HashSet::new(),
             pending_cursor: None,
             pending_doc_cursor: None,
-            lamp_ids: Vec::new(),
             placeholder_ids: Vec::new(),
+            last_synced: None,
             headers_disabled: std::collections::HashSet::new(),
         }
     }
@@ -454,6 +455,24 @@ impl Dashboard {
             draft_topic,
         );
 
+        // Most syncs are registry noise that changes nothing on screen
+        // (dirty is set on every broadcast). When the whole pass —
+        // documents, segments, and filing — matches the last one, skip
+        // before touching a single buffer or highlight. Open drafts opt
+        // out: their text lives outside the segments.
+        let draft_open = !self.replies.is_empty() || self.new_draft.is_some();
+        if !draft_open
+            && self.pending_cursor.is_none()
+            && self.pending_doc_cursor.is_none()
+            && self.heading_agents == filed
+            && self
+                .last_synced
+                .as_ref()
+                .is_some_and(|(docs, segs)| *docs == documents && *segs == segments)
+        {
+            return;
+        }
+
         // Create/refresh the generated line buffers (drafts keep their
         // user-typed text).
         let mut edited = std::collections::HashSet::new();
@@ -589,8 +608,8 @@ impl Dashboard {
         }
 
         self.apply_highlights(&segments, &documents, cx);
-        self.apply_lamps(&segments, cx);
         self.apply_reply_chrome(registry, cx);
+        self.last_synced = Some((documents, segments));
     }
 
     /// Places the cursor at the start of a key's buffer.
@@ -745,6 +764,14 @@ impl Dashboard {
                 _ => None,
             },
         }
+    }
+
+    /// The heading's top agent (rows are sorted loudest-first), for verbs
+    /// aimed at a heading line rather than a specific row.
+    pub fn first_agent_for_topic(&self, topic: (HostId, usize)) -> Option<AgentId> {
+        self.heading_agents
+            .get(&topic)
+            .and_then(|agents| agents.first().copied())
     }
 
     pub fn append_topic(&mut self, title: &str, cx: &mut Context<Workspace>) -> bool {
@@ -1157,56 +1184,6 @@ impl Dashboard {
         });
     }
 
-    /// Splices the attention lamps in as ` ●` inlays at each row's end —
-    /// state chrome the cursor never lands on — and colors them per level.
-    fn apply_lamps(&mut self, segments: &[Segment], cx: &mut Context<Workspace>) {
-        const LAMP_TEXT: &str = " ●";
-        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
-        let to_remove = std::mem::take(&mut self.lamp_ids);
-        let mut inlays = Vec::new();
-        let mut by_class: Vec<(DashClass, Vec<InlayHighlight>)> = [
-            DashClass::Working,
-            DashClass::Pending,
-            DashClass::NeedsInput,
-        ]
-        .into_iter()
-        .map(|class| (class, Vec::new()))
-        .collect();
-        for (index, segment) in segments.iter().enumerate() {
-            let Segment::Line(line) = segment else {
-                continue;
-            };
-            let Some(class) = line.lamp.and_then(DashClass::lamp) else {
-                continue;
-            };
-            let Some(buffer) = self.buffers.get(&line.key) else {
-                continue;
-            };
-            let buffer_snapshot = buffer.read(cx).snapshot();
-            let Some(position) =
-                snapshot.anchor_in_excerpt(buffer_snapshot.anchor_before(buffer_snapshot.len()))
-            else {
-                continue;
-            };
-            let inlay = Inlay::custom(index, position, LAMP_TEXT);
-            if let Some((_, highlights)) = by_class.iter_mut().find(|(entry, _)| *entry == class) {
-                highlights.push(InlayHighlight {
-                    inlay: inlay.id,
-                    inlay_position: position,
-                    range: 0..LAMP_TEXT.len(),
-                });
-            }
-            self.lamp_ids.push(inlay.id);
-            inlays.push(inlay);
-        }
-        self.editor.update(cx, |editor, cx| {
-            editor.splice_inlays(&to_remove, inlays, cx);
-            for (class, highlights) in by_class {
-                editor.highlight_inlays(class.lamp_key(), highlights, class.style(cx), cx);
-            }
-        });
-    }
-
     /// Reply-draft chrome: an accent gutter stripe plus a placeholder
     /// inlay naming the addressee while the draft is empty.
     fn apply_reply_chrome(&mut self, registry: &AgentRegistry, cx: &mut Context<Workspace>) {
@@ -1282,24 +1259,21 @@ enum DashClass {
     Muted,
     Heading,
     TodoHeading,
-    MutedHeading,
+    StaffedHeading,
     Working,
     Pending,
     NeedsInput,
-    /// Attention at pending or above: the title asks for the eye.
-    Urgent,
 }
 
 impl DashClass {
-    const ALL: [DashClass; 8] = [
+    const ALL: [DashClass; 7] = [
         DashClass::Muted,
         DashClass::Heading,
         DashClass::TodoHeading,
-        DashClass::MutedHeading,
+        DashClass::StaffedHeading,
         DashClass::Working,
         DashClass::Pending,
         DashClass::NeedsInput,
-        DashClass::Urgent,
     ];
 
     fn key(self) -> HighlightKey {
@@ -1307,56 +1281,25 @@ impl DashClass {
             DashClass::Muted => 0,
             DashClass::Heading => 1,
             DashClass::TodoHeading => 2,
-            DashClass::MutedHeading => 3,
+            DashClass::StaffedHeading => 3,
             DashClass::Working => 4,
             DashClass::Pending => 5,
             DashClass::NeedsInput => 6,
-            DashClass::Urgent => 7,
         };
         HighlightKey::SyntaxTreeView(DASHBOARD_KEY_BASE + slot)
     }
 
-    /// A parallel key space for lamp inlay highlights.
-    fn lamp_key(self) -> HighlightKey {
-        let HighlightKey::SyntaxTreeView(slot) = self.key() else {
-            unreachable!("dashboard keys are syntax-tree-view keys");
-        };
-        HighlightKey::SyntaxTreeView(slot + DashClass::ALL.len())
-    }
-
+    /// Color does all the talking: nothing on the dashboard is bold.
     fn style(self, cx: &App) -> HighlightStyle {
         let colors = cx.theme().colors();
         let color = match self {
             DashClass::Muted => colors.text_muted,
-            DashClass::Heading => {
-                return HighlightStyle {
-                    font_weight: Some(FontWeight::BOLD),
-                    ..Default::default()
-                };
-            }
-            DashClass::TodoHeading => {
-                return HighlightStyle {
-                    color: Some(colors.text_accent.into()),
-                    font_weight: Some(FontWeight::BOLD),
-                    ..Default::default()
-                };
-            }
-            DashClass::MutedHeading => {
-                return HighlightStyle {
-                    color: Some(colors.text_muted.into()),
-                    font_weight: Some(FontWeight::BOLD),
-                    ..Default::default()
-                };
-            }
+            DashClass::Heading => colors.text_accent,
+            DashClass::TodoHeading => colors.terminal_ansi_red,
+            DashClass::StaffedHeading => colors.terminal_ansi_cyan,
             DashClass::Working => colors.terminal_ansi_cyan,
             DashClass::Pending => colors.terminal_ansi_yellow,
             DashClass::NeedsInput => colors.terminal_ansi_red,
-            DashClass::Urgent => {
-                return HighlightStyle {
-                    font_weight: Some(FontWeight::BOLD),
-                    ..HighlightStyle::default()
-                };
-            }
         };
         HighlightStyle {
             color: Some(color.into()),
@@ -1374,14 +1317,13 @@ impl DashClass {
     }
 }
 
-/// One generated dashboard line: identity, text, semantic spans, lamp, and
+/// One generated dashboard line: identity, text, semantic spans, and
 /// the object addressed by dashboard verbs.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 struct Line {
     key: LineKey,
     text: String,
     spans: Vec<(DashClass, Range<usize>)>,
-    lamp: Option<UiAttention>,
     target: RowTarget,
 }
 
@@ -1391,7 +1333,6 @@ impl Line {
             key,
             text: String::new(),
             spans: Vec::new(),
-            lamp: None,
             target,
         }
     }
@@ -1411,13 +1352,16 @@ fn doc_spans(text: &str) -> Vec<(DashClass, Range<usize>)> {
     let mut spans = Vec::new();
     for heading in parse(text) {
         spans.push((DashClass::Muted, heading.stars_range.clone()));
-        let title_class = match heading.state {
-            Some(DeskHeadingState::Todo) => DashClass::TodoHeading,
-            Some(DeskHeadingState::Done | DeskHeadingState::Discarded) => DashClass::MutedHeading,
-            None => DashClass::Heading,
+        let (state_class, title_class) = match heading.state {
+            Some(DeskHeadingState::Todo) => (DashClass::TodoHeading, DashClass::Heading),
+            Some(DeskHeadingState::Staffed) => (DashClass::StaffedHeading, DashClass::Heading),
+            Some(DeskHeadingState::Done | DeskHeadingState::Discarded) => {
+                (DashClass::Muted, DashClass::Muted)
+            }
+            None => (DashClass::Heading, DashClass::Heading),
         };
         if let Some(state_range) = &heading.state_range {
-            spans.push((title_class, state_range.clone()));
+            spans.push((state_class, state_range.clone()));
         }
         spans.push((title_class, heading.title_range.clone()));
         for property in &heading.properties {
@@ -1481,11 +1425,23 @@ fn sorted_agents(
 fn agent_line(agent_id: AgentId, registry: &AgentRegistry) -> Line {
     let attention = registry.attention(agent_id);
     let mut line = Line::new(LineKey::Agent(agent_id), RowTarget::Agent(agent_id));
-    if registry.agent_pinned(agent_id) {
-        line.span(None, |text| text.push_str("◆ "));
-    }
+
+    // A fixed one-glyph lamp column: attention is the color, the cursor
+    // still lands on real text, and nothing floats at line ends.
+    let glyph = if registry.agent_pinned(agent_id) {
+        "◆"
+    } else if attention > UiAttention::Quiet {
+        "●"
+    } else {
+        "·"
+    };
     line.span(
-        (attention >= UiAttention::Pending).then_some(DashClass::Urgent),
+        Some(DashClass::lamp(attention).unwrap_or(DashClass::Muted)),
+        |text| text.push_str(glyph),
+    );
+    line.span(None, |text| text.push(' '));
+    line.span(
+        DashClass::lamp(attention).filter(|_| attention >= UiAttention::Pending),
         |text| text.push_str(&registry.agent_human_name(agent_id)),
     );
 
@@ -1510,13 +1466,12 @@ fn agent_line(agent_id: AgentId, registry: &AgentRegistry) -> Line {
     {
         let reason = reason.lines().next().unwrap_or_default().trim();
         if !reason.is_empty() {
-            let snippet = truncate_chars(reason, 80);
+            let snippet = truncate_chars(reason, 48);
             line.span(None, |text| text.push_str("  "));
-            line.span(Some(DashClass::Muted), |text| text.push_str(&snippet));
+            line.span(Some(DashClass::Muted), |text| {
+                text.push_str(&format!("— {snippet}"))
+            });
         }
-    }
-    if attention > UiAttention::Quiet {
-        line.lamp = Some(attention);
     }
     line
 }
@@ -1533,20 +1488,10 @@ fn truncate_chars(value: &str, limit: usize) -> String {
     result
 }
 
-/// Ends a document slice before a cut point's newline, so the synthetic
-/// newline between excerpts doesn't double it.
-fn trim_newline(text: &str, end: usize) -> usize {
-    if end > 0 && text.as_bytes().get(end - 1) == Some(&b'\n') {
-        end - 1
-    } else {
-        end
-    }
-}
-
 /// Generate the listing without mutating Desk text: the documents are
 /// emitted as writable slices, cut where a bound heading's rows (agent
-/// rows, replies, the staffing draft) splice in after its body. Root
-/// agents bound to no heading form the generated Unfiled tail.
+/// rows, replies, the staffing draft) splice in under its heading line.
+/// Root agents bound to no heading form the generated Unfiled tail.
 fn generate(
     registry: &AgentRegistry,
     documents: &[(HostId, String)],
@@ -1597,6 +1542,11 @@ fn generate(
                 let prose = prose_for(text, heading);
                 let folded_count = agents.len() + usize::from(!prose.is_empty());
                 if folded_count > 0 {
+                    let loudest = agents
+                        .iter()
+                        .map(|agent_id| registry.attention(*agent_id))
+                        .max()
+                        .unwrap_or(UiAttention::Quiet);
                     let mut fold = Line::new(
                         LineKey::Fold(*host, start),
                         RowTarget::Topic {
@@ -1607,8 +1557,12 @@ fn generate(
                             }),
                         },
                     );
+                    fold.span(
+                        Some(DashClass::lamp(loudest).unwrap_or(DashClass::Muted)),
+                        |line| line.push_str(if loudest > UiAttention::Quiet { "●" } else { "…" }),
+                    );
                     fold.span(Some(DashClass::Muted), |line| {
-                        line.push_str(&format!("{folded_count} more"))
+                        line.push_str(&format!(" {folded_count} more"))
                     });
                     segments.push(Segment::Line(fold));
                 }
@@ -1620,9 +1574,11 @@ fn generate(
                 }
                 slice_start = heading.body_range.end;
             } else if !agents.is_empty() || draft_here {
+                // Rows splice in directly under the heading line, before
+                // the body — content reads downward from its heading.
                 segments.push(Segment::Doc {
                     host: *host,
-                    range: slice_start..trim_newline(text, heading.body_range.end),
+                    range: slice_start..heading.heading_range.end,
                 });
                 push_agent_rows(&mut segments, &mut emitted_replies, agents);
                 if draft_here {
@@ -1631,7 +1587,7 @@ fn generate(
                         RowTarget::NewDraft(Some((*host, start))),
                     )));
                 }
-                slice_start = heading.body_range.end;
+                slice_start = heading.body_range.start;
             }
         }
         if slice_start < text.len() || slice_start == 0 {
@@ -1662,12 +1618,15 @@ fn generate(
             continue;
         }
         let mut header = Line::new(LineKey::Unfiled(*host), RowTarget::None);
-        header.span(Some(DashClass::Muted), |line| {
+        header.span(Some(DashClass::Heading), |line| {
             line.push_str("Unfiled");
             if multiple_hosts {
                 line.push_str(" · ");
                 line.push_str(registry.host_name(*host));
             }
+        });
+        header.span(Some(DashClass::Muted), |line| {
+            line.push_str(&format!(" · {}", unfiled.len()));
         });
         segments.push(Segment::Line(header));
         push_agent_rows(&mut segments, &mut emitted_replies, &unfiled);
@@ -1780,15 +1739,16 @@ mod tests {
             &[],
             None,
         );
-        // The document splits after "One"'s body (trailing newline
-        // trimmed); triage puts the needs-input agent first.
+        // The document splits right under "One"'s heading line, so rows
+        // read as the heading's content; triage puts the needs-input
+        // agent first, and the body resumes below the rows.
         assert_eq!(
             keys(&segments),
             vec![
-                "doc 0..10".to_string(),
+                "doc 0..5".to_string(),
                 format!("{:?}", LineKey::Agent(b.agent_id)),
                 format!("{:?}", LineKey::Agent(a.agent_id)),
-                format!("doc 11..{}", text.len()),
+                format!("doc 6..{}", text.len()),
                 format!("{:?}", LineKey::NewAgent),
             ]
         );
@@ -1859,9 +1819,9 @@ mod tests {
         assert_eq!(
             keys(&segments),
             vec![
-                "doc 0..10".to_string(),
+                "doc 0..5".to_string(),
                 format!("{:?}", LineKey::NewDraft(Some((host, 0)))),
-                format!("doc 11..{}", text.len()),
+                format!("doc 6..{}", text.len()),
                 format!("{:?}", LineKey::NewAgent),
             ]
         );
@@ -1898,17 +1858,26 @@ mod tests {
 
     #[test]
     fn heading_lines_style_by_state() {
-        let text = "* TODO Ship it\n:project: rho\n* DONE Old\n";
+        let text = "* TODO Ship it\n:project: rho\n* STAFFED Crewed\n* DONE Old\n";
         let spans = doc_spans(text);
         assert!(
             spans
                 .iter()
-                .any(|(class, _)| matches!(class, DashClass::TodoHeading))
+                .any(|(class, range)| matches!(class, DashClass::TodoHeading)
+                    && &text[range.clone()] == "TODO")
         );
         assert!(
             spans
                 .iter()
-                .any(|(class, _)| matches!(class, DashClass::MutedHeading))
+                .any(|(class, range)| matches!(class, DashClass::StaffedHeading)
+                    && &text[range.clone()] == "STAFFED")
+        );
+        // Done headings drop to the muted chrome color, keyword and title.
+        assert!(
+            spans
+                .iter()
+                .any(|(class, range)| matches!(class, DashClass::Muted)
+                    && &text[range.clone()] == "Old")
         );
         assert!(
             spans
