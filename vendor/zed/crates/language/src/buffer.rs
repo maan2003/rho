@@ -952,6 +952,16 @@ impl EditPreview {
     }
 }
 
+/// Which pre-existing line to exclude from auto-indentation when inserting
+/// text.
+#[derive(Clone, Copy, Debug)]
+pub enum AutoIndentExclusion {
+    /// Exclude the preceding line when the inserted text starts with a newline.
+    PrecedingLine,
+    /// Exclude the following line when the inserted text ends with a newline.
+    FollowingLine,
+}
+
 impl Buffer {
     /// Create a new buffer with the given base text.
     pub fn local<T: Into<String>>(base_text: T, cx: &Context<Self>) -> Self {
@@ -1928,7 +1938,12 @@ impl Buffer {
                 language.clone(),
                 sync_parse_timeout,
             ) {
-                self.did_finish_parsing(syntax_snapshot, Some(Duration::from_millis(300)), cx);
+                self.did_finish_parsing(
+                    syntax_snapshot,
+                    Some(Duration::from_millis(300)),
+                    false,
+                    cx,
+                );
                 self.reparse = None;
                 return;
             }
@@ -1960,7 +1975,7 @@ impl Buffer {
                 let parse_again = this.version.changed_since(&parsed_version)
                     || language_registry_changed()
                     || grammar_changed();
-                this.did_finish_parsing(new_syntax_map, None, cx);
+                this.did_finish_parsing(new_syntax_map, None, parse_again, cx);
                 this.reparse = None;
                 if parse_again {
                     this.reparse(cx, false);
@@ -1974,13 +1989,21 @@ impl Buffer {
         &mut self,
         syntax_snapshot: SyntaxSnapshot,
         block_budget: Option<Duration>,
+        parse_again: bool,
         cx: &mut Context<Self>,
     ) {
         self.non_text_state_update_count += 1;
         self.syntax_map.lock().did_parse(syntax_snapshot);
         self.was_changed();
-        self.request_autoindent(cx, block_budget);
-        self.parse_status.0.send(ParseStatus::Idle).unwrap();
+
+        let parsing_complete = !parse_again || self.language.is_none();
+        if self.language.is_none() {
+            self.syntax_map.lock().clear(&self.text);
+        }
+        if parsing_complete {
+            self.request_autoindent(cx, block_budget);
+            self.parse_status.0.send(ParseStatus::Idle).unwrap();
+        }
         Self::invalidate_tree_sitter_data(&mut self.tree_sitter_data, &self.text.snapshot());
         cx.emit(BufferEvent::Reparsed);
         cx.notify();
@@ -2797,7 +2820,35 @@ impl Buffer {
         S: ToOffset,
         T: Into<Arc<str>>,
     {
-        self.edit_internal(edits_iter, autoindent_mode, true, cx)
+        self.edit_internal(
+            edits_iter,
+            autoindent_mode,
+            true,
+            AutoIndentExclusion::PrecedingLine,
+            cx,
+        )
+    }
+
+    /// Like [`edit`](Self::edit), but preserves the following line's
+    /// indentation when the inserted text ends with a newline.
+    pub fn edit_before<I, S, T>(
+        &mut self,
+        edits_iter: I,
+        autoindent_mode: Option<AutoindentMode>,
+        cx: &mut Context<Self>,
+    ) -> Option<clock::Lamport>
+    where
+        I: IntoIterator<Item = (Range<S>, T)>,
+        S: ToOffset,
+        T: Into<Arc<str>>,
+    {
+        self.edit_internal(
+            edits_iter,
+            autoindent_mode,
+            true,
+            AutoIndentExclusion::FollowingLine,
+            cx,
+        )
     }
 
     /// Like [`edit`](Self::edit), but does not coalesce adjacent edits.
@@ -2812,7 +2863,13 @@ impl Buffer {
         S: ToOffset,
         T: Into<Arc<str>>,
     {
-        self.edit_internal(edits_iter, autoindent_mode, false, cx)
+        self.edit_internal(
+            edits_iter,
+            autoindent_mode,
+            false,
+            AutoIndentExclusion::PrecedingLine,
+            cx,
+        )
     }
 
     fn edit_internal<I, S, T>(
@@ -2820,6 +2877,7 @@ impl Buffer {
         edits_iter: I,
         autoindent_mode: Option<AutoindentMode>,
         coalesce_adjacent: bool,
+        autoindent_exclusion: AutoIndentExclusion,
         cx: &mut Context<Self>,
     ) -> Option<clock::Lamport>
     where
@@ -2959,11 +3017,21 @@ impl Buffer {
                         first_line_is_new = false;
                     }
 
-                    // When inserting text starting with a newline, avoid auto-indenting the
-                    // previous line.
-                    if new_text.starts_with('\n') {
-                        range_of_insertion_to_indent.start += 1;
-                        first_line_is_new = true;
+                    // When the insertion introduces a line boundary, exclude
+                    // the adjacent pre-existing line from auto-indentation.
+                    match autoindent_exclusion {
+                        AutoIndentExclusion::PrecedingLine => {
+                            if new_text.starts_with('\n') {
+                                range_of_insertion_to_indent.start += 1;
+                                first_line_is_new = true;
+                            }
+                        }
+                        AutoIndentExclusion::FollowingLine => {
+                            if new_text.ends_with('\n') {
+                                range_of_insertion_to_indent.end -= 1;
+                                first_line_is_new = true;
+                            }
+                        }
                     }
 
                     let mut original_indent_column = None;
@@ -3524,7 +3592,7 @@ impl Buffer {
         self.text.fast_forward(edited.text);
         if edited.snapshot.language == self.language {
             self.reparse = None;
-            self.did_finish_parsing(edited.snapshot.syntax, None, cx);
+            self.did_finish_parsing(edited.snapshot.syntax, None, false, cx);
             if did_edit {
                 cx.emit(BufferEvent::Edited {
                     source: BufferEditSource::User,

@@ -405,9 +405,31 @@ impl Render for HelloWeb {
 // Entry point
 // ---------------------------------------------------------------------------
 
+fn requested_backend() -> gpui_platform::WebBackendPreference {
+    let search = web_sys::window()
+        .and_then(|window| window.location().search().ok())
+        .unwrap_or_default();
+    if search
+        .trim_start_matches('?')
+        .split('&')
+        .any(|parameter| parameter == "backend=webgpu")
+    {
+        gpui_platform::WebBackendPreference::WebGpu
+    } else if search
+        .trim_start_matches('?')
+        .split('&')
+        .any(|parameter| parameter == "backend=webgl")
+    {
+        gpui_platform::WebBackendPreference::WebGl
+    } else {
+        gpui_platform::WebBackendPreference::Auto
+    }
+}
+
 fn main() {
     gpui_platform::web_init();
-    let app = gpui_platform::application().run_embedded(|cx: &mut App| {
+    let app = gpui_platform::application_with_web_backend(requested_backend())
+        .run_embedded(|cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(640.), px(560.)), cx);
         cx.open_window(
             WindowOptions {
@@ -418,6 +440,6 @@ fn main() {
         )
         .expect("failed to open window");
         cx.activate(true);
-    });
+        });
     std::mem::forget(app);
 }
