@@ -513,7 +513,7 @@ impl Dashboard {
         // Staffed headings wear their agents as end-of-line inlays, not
         // rows, so the decoration strings join the fingerprint: attention
         // changes must not vanish into the early-out.
-        let decorations = heading_decorations(registry, &documents, &filed);
+        let decorations = heading_decorations(registry, &documents, &filed, &self.collapsed);
 
         // Render reconciles every frame, so most passes are registry
         // noise that changes nothing on screen. When the whole pass —
@@ -1744,24 +1744,29 @@ fn agent_line(agent_id: AgentId, registry: &AgentRegistry) -> Line {
     line
 }
 
-/// What a staffed heading wears at the end of its line: each bound
-/// agent as `glyph eng-id` (plus `+n` when it has subagents), and the
-/// attention reason inline when the agent is waiting on the human.
+/// What a heading wears at the end of its line: `…` when collapsed
+/// over a hidden body, then each bound agent as `glyph eng-id` (plus
+/// `+n` when it has subagents), and the attention reason inline when
+/// the agent is waiting on the human.
 fn heading_decorations(
     registry: &AgentRegistry,
     documents: &[(HostId, String)],
     filed: &HashMap<(HostId, usize), Vec<AgentId>>,
+    collapsed: &HashSet<(HostId, usize)>,
 ) -> Vec<(HostId, usize, String)> {
+    let empty = Vec::new();
     let mut decorations = Vec::new();
     for (host, text) in documents {
         for heading in parse(text) {
-            let Some(agents) = filed.get(&(*host, heading.heading_range.start)) else {
-                continue;
-            };
-            if agents.is_empty() {
-                continue;
-            }
+            let agents = filed
+                .get(&(*host, heading.heading_range.start))
+                .unwrap_or(&empty);
             let mut label = String::new();
+            if collapsed.contains(&(*host, heading.heading_range.start))
+                && !prose_for(text, &heading).trim().is_empty()
+            {
+                label.push_str("  …");
+            }
             for agent_id in agents {
                 let attention = registry.attention(*agent_id);
                 label.push_str("  ");
@@ -1782,7 +1787,9 @@ fn heading_decorations(
                     }
                 }
             }
-            decorations.push((*host, heading.heading_range.end, label));
+            if !label.is_empty() {
+                decorations.push((*host, heading.heading_range.end, label));
+            }
         }
     }
     decorations
@@ -1892,45 +1899,14 @@ fn generate(
             let agents = filed.get(&(*host, start)).unwrap_or(&empty);
             let draft_here = draft_topic == Some(Some((*host, start)));
             if collapsed.contains(&(*host, start)) {
-                // Collapsed: the heading line stays, its body and rows
-                // fold behind an "n more" indicator.
+                // Collapsed: the heading line stays and wears an inline
+                // `…` decoration; its body hides behind a rowless cut.
                 segments.push(Segment::Doc {
                     host: *host,
                     range: slice_start..heading.heading_range.end,
                     id: slice_id,
                 });
                 slice_id = next_slice_id(&heading.title, &mut title_counts);
-                let prose = prose_for(text, heading);
-                let folded_count = usize::from(!prose.is_empty());
-                if folded_count > 0 {
-                    let loudest = agents
-                        .iter()
-                        .map(|agent_id| registry.attention(*agent_id))
-                        .max()
-                        .unwrap_or(UiAttention::Quiet);
-                    let mut fold = Line::new(
-                        LineKey::Fold(*host, start),
-                        RowTarget::Topic {
-                            host: *host,
-                            offset: start,
-                            first_attention: agents.iter().copied().find(|agent_id| {
-                                registry.attention(*agent_id) >= UiAttention::Pending
-                            }),
-                        },
-                    );
-                    fold.span(None, |line| line.push_str("  "));
-                    fold.span(Some(DashClass::Muted), |line| {
-                        line.push_str(if loudest > UiAttention::Quiet {
-                            attention_glyph(loudest)
-                        } else {
-                            "…"
-                        })
-                    });
-                    fold.span(Some(DashClass::Muted), |line| {
-                        line.push_str(&format!(" {folded_count} more"))
-                    });
-                    segments.push(Segment::Line(fold));
-                }
                 if draft_here {
                     segments.push(Segment::Line(Line::new(
                         LineKey::NewDraft(Some((*host, start))),
@@ -2208,7 +2184,7 @@ mod tests {
         // The heading's decoration triages the needs-input agent first
         // and names both agents by id.
         let decorations =
-            heading_decorations(&registry, &[(host, text.clone())], &filed);
+            heading_decorations(&registry, &[(host, text.clone())], &filed, &HashSet::new());
         assert_eq!(decorations.len(), 1);
         let (_, offset, label) = &decorations[0];
         assert_eq!(*offset, "* One".len());
@@ -2238,7 +2214,7 @@ mod tests {
     }
 
     #[test]
-    fn collapsed_heading_hides_body_behind_fold_row() {
+    fn collapsed_heading_hides_body_behind_the_cut_and_wears_an_ellipsis() {
         let a = agent(1, None, UiAttention::Quiet, 30);
         let (registry, host) = registry(vec![a.clone()]);
         let text = "* One\nbody\n* Two\n".to_string();
@@ -2255,15 +2231,22 @@ mod tests {
             &[],
             None,
         );
-        // Slice ends at the heading line; body and rows are folded.
+        // Slice ends at the heading line; the body folds behind the cut
+        // with no indicator row of its own.
         assert_eq!(
             keys(&segments),
             vec![
                 "doc 0..5".to_string(),
-                format!("{:?}", LineKey::Fold(host, 0)),
                 format!("doc 11..{}", text.len()),
             ]
         );
+        // The fold reads inline on the heading, ahead of the agents.
+        let decorations =
+            heading_decorations(&registry, &[(host, text.clone())], &filed, &collapsed);
+        assert_eq!(decorations.len(), 1);
+        let (_, offset, label) = &decorations[0];
+        assert_eq!(*offset, "* One".len());
+        assert!(label.starts_with("  …  · "), "label: {label:?}");
     }
 
     #[test]
