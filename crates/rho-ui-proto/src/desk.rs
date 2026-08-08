@@ -56,6 +56,10 @@ pub struct DeskHeading {
     pub state_range: Option<Range<usize>>,
     pub title_range: Range<usize>,
     pub body_range: Range<usize>,
+    /// Org-style tags from the end of the heading line (`* Title :eng-x7y2:`).
+    pub tags: Vec<String>,
+    /// Byte range of the whole `:a:b:` tag token, colons included.
+    pub tags_range: Option<Range<usize>>,
 }
 
 /// Parse an org-like Desk document. This deliberately has no error result:
@@ -102,14 +106,16 @@ pub fn parse(text: &str) -> Vec<DeskHeading> {
         }
         let content_start = depth + 1;
         let content = line.text[content_start..].trim_end();
+        let (parsed_tags, content) = parse_tags(content);
         let (parsed_state, title) = parse_state(content);
         let title_start = line.text.len() - line.text[content_start..].len()
             + (title.as_ptr() as usize - content.as_ptr() as usize);
         let state = parsed_state.as_ref().map(|(state, _)| *state);
-        let state_range = parsed_state.map(|(_, range)| {
-            let base = line.start + content_start;
-            base + range.start..base + range.end
-        });
+        let base = line.start + content_start;
+        let state_range = parsed_state.map(|(_, range)| base + range.start..base + range.end);
+        let (tags, tags_range) = parsed_tags
+            .map(|(tags, range)| (tags, Some(base + range.start..base + range.end)))
+            .unwrap_or_default();
         while stack
             .last()
             .is_some_and(|(ancestor_depth, _)| *ancestor_depth >= depth)
@@ -133,6 +139,8 @@ pub fn parse(text: &str) -> Vec<DeskHeading> {
             state_range,
             title_range: line.start + title_start..line.start + title_start + title.len(),
             body_range: line.full_end..text.len(),
+            tags,
+            tags_range,
         });
         heading_lines.push(line_index);
         stack.push((depth, index));
@@ -205,6 +213,38 @@ fn parse_state(content: &str) -> (Option<(DeskHeadingState, Range<usize>)>, &str
         }
     }
     (None, content.trim_start())
+}
+
+/// An org-style tag token (`:a:b:`) at the end of the heading content, plus
+/// the content with the token stripped. The token must be its own word so
+/// mid-title colons (`Deploy at 12:30`) stay part of the title.
+fn parse_tags(content: &str) -> (Option<(Vec<String>, Range<usize>)>, &str) {
+    let Some(start) = content
+        .rfind(char::is_whitespace)
+        .and_then(|index| Some(index + content[index..].chars().next()?.len_utf8()))
+    else {
+        return (None, content);
+    };
+    let Some(interior) = content[start..]
+        .strip_prefix(':')
+        .and_then(|rest| rest.strip_suffix(':'))
+        .filter(|interior| {
+            !interior.is_empty()
+                && interior.split(':').all(|segment| {
+                    !segment.is_empty()
+                        && segment
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '@' | '#'))
+                })
+        })
+    else {
+        return (None, content);
+    };
+    let tags = interior.split(':').map(str::to_owned).collect();
+    (
+        Some((tags, start..content.len())),
+        content[..start].trim_end(),
+    )
 }
 
 fn parse_property_line(line: &str) -> Option<(&str, &str, usize)> {
@@ -470,6 +510,32 @@ mod tests {
 
 
     use super::*;
+
+    #[test]
+    fn tags_conceal_at_the_line_end_and_mid_title_colons_stay_words() {
+        let text = "* Fix parser DONE :eng-x7y2:\n* Meet at 12:30\n* Crewed :eng-a1:eng-b2:\n* :lonely:\n* Odd :a::b:\n";
+        let headings = parse(text);
+        assert_eq!(headings[0].tags, vec!["eng-x7y2"]);
+        assert_eq!(headings[0].state, Some(DeskHeadingState::Done));
+        assert_eq!(headings[0].title, "Fix parser");
+        assert_eq!(
+            &text[headings[0].tags_range.clone().unwrap()],
+            ":eng-x7y2:"
+        );
+        assert_eq!(&text[headings[0].state_range.clone().unwrap()], "DONE");
+        // A colon inside the title is not a tag.
+        assert!(headings[1].tags.is_empty());
+        assert_eq!(headings[1].title, "Meet at 12:30");
+        // Several tags share one token.
+        assert_eq!(headings[2].tags, vec!["eng-a1", "eng-b2"]);
+        assert_eq!(headings[2].title, "Crewed");
+        // A heading that is nothing but a token keeps it as its title.
+        assert!(headings[3].tags.is_empty());
+        assert_eq!(headings[3].title, ":lonely:");
+        // Empty segments disqualify the whole token.
+        assert!(headings[4].tags.is_empty());
+        assert_eq!(headings[4].title, "Odd :a::b:");
+    }
 
     #[test]
     fn parser_is_forgiving_and_derives_parents() {
