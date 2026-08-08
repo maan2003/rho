@@ -2587,6 +2587,15 @@ async fn handle_message(
                 let _ = agents
                     .events
                     .send(ServerMessage::DeskTextApplied { record });
+                // Desk-staffed work is Iris's to curate: subscribe her to the
+                // agent's completions so summaries land under the heading.
+                // Best-effort — a fleet that never started Iris stays silent.
+                if let Ok(iris_id) = crate::iris::active_iris_id(&agents).await {
+                    let _ = agents
+                        .pool
+                        .set_response_subscription(iris_id, agent_id, true)
+                        .await;
+                }
             }
             if let Some(content) = content {
                 // The agent is fresh, so the lanes are equivalent here.

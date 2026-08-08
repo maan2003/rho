@@ -599,7 +599,7 @@ fn latest_transcript_reply(state: &rho_agent::AgentState) -> Option<String> {
     })
 }
 
-async fn active_iris_id(registry: &AgentRegistry) -> anyhow::Result<AgentId> {
+pub(crate) async fn active_iris_id(registry: &AgentRegistry) -> anyhow::Result<AgentId> {
     if let Some(agent_id) = *registry.iris_agent.lock().await {
         return Ok(agent_id);
     }

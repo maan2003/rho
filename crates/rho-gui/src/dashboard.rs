@@ -752,30 +752,10 @@ impl Dashboard {
         if headings[index].title.trim().is_empty() {
             return Err("staff: give this heading a title first");
         }
-        let mut path = Vec::new();
-        let mut current = Some(index);
-        while let Some(at) = current {
-            path.push(at);
-            current = headings[at].parent;
-        }
-        path.reverse();
-        let brief = path
-            .into_iter()
-            .map(|at| {
-                let heading = &headings[at];
-                let body = text[heading.body_range.clone()].trim_end();
-                if body.is_empty() {
-                    heading.title.clone()
-                } else {
-                    format!("{}\n{}", heading.title, body)
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n\n");
         Ok((
             host,
             headings[index].heading_range.start,
-            brief,
+            compose_brief(&text, &headings, index),
             headings[index].resolved_project.clone(),
         ))
     }
@@ -1169,9 +1149,56 @@ fn fuzzy_contains(haystack: &str, needle: &str) -> bool {
     false
 }
 
+/// The root→heading prose an agent receives: ancestor titles and bodies with
+/// property lines excluded — they are bookkeeping between the Desk and the
+/// daemon, not part of the contract.
+pub(crate) fn compose_brief(text: &str, headings: &[DeskHeading], index: usize) -> String {
+    let mut path = Vec::new();
+    let mut current = Some(index);
+    while let Some(at) = current {
+        path.push(at);
+        current = headings[at].parent;
+    }
+    path.reverse();
+    path.into_iter()
+        .map(|at| {
+            let heading = &headings[at];
+            let mut body = String::new();
+            let mut offset = heading.body_range.start;
+            for line in text[heading.body_range.clone()].split_inclusive('\n') {
+                let skip = heading
+                    .properties
+                    .iter()
+                    .any(|property| property.line_range.start == offset);
+                offset += line.len();
+                if !skip {
+                    body.push_str(line);
+                }
+            }
+            let body = body.trim_end();
+            if body.is_empty() {
+                heading.title.clone()
+            } else {
+                format!("{}\n{}", heading.title, body)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn briefs_carry_prose_but_never_property_lines() {
+        let text = "* Ship it\n:project: rho\ncontext prose\n** TODO child task\n:agent: eng-abcd\ndetails\nmore details\n";
+        let headings = parse(text);
+        assert_eq!(
+            compose_brief(text, &headings, 1),
+            "Ship it\ncontext prose\n\nchild task\ndetails\nmore details"
+        );
+    }
+
     #[test]
     fn fold_range_ends_at_next_peer() {
         let text = "* a\nbody\n** child\nchild body\n* b\n";
