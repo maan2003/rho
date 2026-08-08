@@ -3636,7 +3636,9 @@ fn vim_treats_a_collapsed_subtree_as_one_line(cx: &mut TestAppContext) {
         })
         .expect("move cursor to folded heading");
     cx.run_until_parked();
-    // Cursor gone, the line folds in with the rest of the subtree.
+    // The fold is persistent org-style state, rear-nonsticky at its
+    // end: the typed line stays outside it and visible even after the
+    // cursor leaves, until the heading is cycled again.
     let display = workspace
         .update(cx, |workspace, _, cx| {
             workspace
@@ -3645,8 +3647,12 @@ fn vim_treats_a_collapsed_subtree_as_one_line(cx: &mut TestAppContext) {
         })
         .expect("read display text");
     assert!(
-        !display.contains("\nx"),
-        "off the line, it folds back in: {display:?}"
+        display.contains("\nx"),
+        "the typed line stays visible off-cursor: {display:?}"
+    );
+    assert!(
+        !display.contains("body"),
+        "the original subtree stays folded: {display:?}"
     );
     cx.simulate_keystrokes(*workspace, "escape x d");
     cx.run_until_parked();
@@ -3661,9 +3667,11 @@ fn vim_treats_a_collapsed_subtree_as_one_line(cx: &mut TestAppContext) {
                 .text()
         })
         .expect("read dashboard");
+    // The typed line sits outside the fold, so the fold-merged line is
+    // heading plus original body — deletion takes exactly that.
     assert!(
-        text.starts_with("* Two\n"),
-        "helix line deletion should remove the collapsed subtree: {text:?}"
+        text.starts_with("x\n* Two\n"),
+        "helix line deletion should remove the folded subtree only: {text:?}"
     );
 }
 

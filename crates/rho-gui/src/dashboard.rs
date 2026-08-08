@@ -166,11 +166,16 @@ pub struct Dashboard {
     /// The inline new-agent draft, when open: its buffer plus the edit
     /// subscription that keeps chrome fresh.
     new_draft: Option<(Option<(HostId, usize)>, Entity<Buffer>, gpui::Subscription)>,
-    /// Collapsed headings, one anchor per heading line. Anchors ride
-    /// edits, so folds stay put while surrounding text changes; each
-    /// pass resolves them back to heading offsets (and drops any whose
-    /// heading is gone).
-    collapsed: HashMap<HostId, Vec<text::Anchor>>,
+    /// Collapsed subtrees as anchored fold ranges, org-style: the fold
+    /// is persistent state that rides edits, not something re-derived
+    /// from the parse. The start anchor is right-biased (org's
+    /// front-sticky through our newline-shifted boundary: typing at the
+    /// end of the title stays visible) and the end anchor left-biased
+    /// (rear-nonsticky: a line opened below a folded heading stays
+    /// outside and visible). Ranges are recomputed only by explicit
+    /// operations — cycling, archiving — like org recomputes on cycle;
+    /// a range whose start no longer sits on a heading line is dropped.
+    collapsed: HashMap<HostId, Vec<(text::Anchor, text::Anchor)>>,
     /// Hosts whose Unfiled tail is folded behind its header.
     collapsed_unfiled: HashSet<HostId>,
     /// Move the cursor into this key's buffer on the next sync — how a
@@ -495,13 +500,13 @@ impl Dashboard {
         }
 
         let draft_topic = self.new_draft.as_ref().map(|(topic, _, _)| *topic);
-        let collapsed = self.collapsed_offsets(&documents, cx);
+        let collapsed = self.collapsed_ranges(&documents, cx);
         let fold_ranges = self.effective_fold_ranges(&documents, &collapsed, cx);
         let segments = generate(
             registry,
             &documents,
             &filed,
-            &collapsed,
+            &fold_ranges,
             &self.collapsed_unfiled,
             &self.replies,
             draft_topic,
@@ -1161,9 +1166,16 @@ impl Dashboard {
         };
         buffer.update(cx, |buffer, cx| buffer.edit(edits, None, cx));
         if let Some(text) = self.source_text(host, cx) {
-            let mut offsets = self.collapsed_offsets(&[(host, text)], cx);
+            let mut offsets: HashSet<(HostId, usize)> = self
+                .collapsed_ranges(&[(host, text)], cx)
+                .into_iter()
+                .map(|(range_host, start, _)| (range_host, start))
+                .collect();
             offsets.insert((host, archive_offset));
-            self.store_collapsed(host, &offsets, cx);
+            // The archive's fold recomputes so the subtree that just
+            // moved in folds with it — an existing anchored range would
+            // leave the new content visible (rear-nonsticky).
+            self.store_collapsed(host, &offsets, &[archive_offset], cx);
         }
         self.cursor_to_doc(host, archive_offset, cx);
         true
@@ -1254,18 +1266,19 @@ impl Dashboard {
         false
     }
 
-    /// The collapsed headings as current heading offsets: each stored
-    /// anchor resolves against today's text and snaps to the heading
-    /// line it lives on. Anchors whose heading vanished resolve to
-    /// nothing and drop out.
-    fn collapsed_offsets(
+    /// The stored fold ranges resolved against today's text: each pair
+    /// of anchors becomes (heading start, fold range). Org's `:fragile`
+    /// rule, translated: a range whose start anchor no longer sits on a
+    /// heading line — the heading was deleted or broken — drops out, as
+    /// does one that collapsed to nothing.
+    fn collapsed_ranges(
         &self,
         documents: &[(HostId, String)],
         cx: &App,
-    ) -> HashSet<(HostId, usize)> {
-        let mut offsets = HashSet::new();
+    ) -> Vec<(HostId, usize, Range<usize>)> {
+        let mut resolved = Vec::new();
         for (host, text) in documents {
-            let Some(anchors) = self.collapsed.get(host) else {
+            let Some(pairs) = self.collapsed.get(host) else {
                 continue;
             };
             let Some(buffer) = self.hosts.get(host).and_then(|weak| weak.upgrade()) else {
@@ -1273,25 +1286,26 @@ impl Dashboard {
             };
             let snapshot = buffer.read(cx).text_snapshot();
             let headings = parse(text);
-            for anchor in anchors {
-                let offset = anchor.to_offset(&snapshot);
-                if let Some(start) = heading_line_at(&headings, offset) {
-                    offsets.insert((*host, start));
+            for (start, end) in pairs {
+                let range = start.to_offset(&snapshot)..end.to_offset(&snapshot);
+                let Some(heading) = heading_line_at(&headings, range.start) else {
+                    continue;
+                };
+                if range.end > range.start {
+                    resolved.push((*host, heading, range));
                 }
             }
         }
-        offsets
+        resolved
     }
 
-    /// The fold ranges to apply this pass: every collapsed heading's
-    /// subtree, clamped so no fold captures the cursor — the parse
-    /// happily assigns a freshly typed line below a folded heading to
-    /// that heading's subtree, and without the clamp the reapplied fold
-    /// would swallow the text mid-keystroke.
+    /// The fold ranges to apply this pass: the stored ranges, clamped
+    /// so no fold captures the cursor (org's catch-invisible-edits and
+    /// isearch-open, in one rule).
     fn effective_fold_ranges(
         &self,
         documents: &[(HostId, String)],
-        collapsed: &HashSet<(HostId, usize)>,
+        collapsed: &[(HostId, usize, Range<usize>)],
         cx: &mut Context<Workspace>,
     ) -> Vec<(HostId, Range<usize>)> {
         let cursor = match self.cursor_place(cx) {
@@ -1299,41 +1313,73 @@ impl Dashboard {
             _ => None,
         };
         let mut ranges = Vec::new();
-        for (host, text) in documents {
-            for heading in parse(text) {
-                if !collapsed.contains(&(*host, heading.heading_range.start)) {
-                    continue;
-                }
-                let Some(mut range) = subtree_fold_range(text, &heading) else {
+        for (host, _, range) in collapsed {
+            let mut range = range.clone();
+            if let Some((cursor_host, offset)) = cursor
+                && cursor_host == *host
+            {
+                let Some(text) = documents
+                    .iter()
+                    .find(|(document_host, _)| document_host == host)
+                    .map(|(_, text)| text.as_str())
+                else {
                     continue;
                 };
-                if let Some((cursor_host, offset)) = cursor
-                    && cursor_host == *host
-                {
-                    match cursor_clamped_fold(text, range, offset) {
-                        Some(clamped) => range = clamped,
-                        None => continue,
-                    }
+                match cursor_clamped_fold(text, range, offset) {
+                    Some(clamped) => range = clamped,
+                    None => continue,
                 }
-                ranges.push((*host, range));
             }
+            ranges.push((*host, range));
         }
         ranges
     }
 
-    /// Replaces a host's collapse set, re-anchoring each heading offset
-    /// in the current text.
-    fn store_collapsed(&mut self, host: HostId, offsets: &HashSet<(HostId, usize)>, cx: &App) {
+    /// Replaces a host's collapse set. Headings that stay collapsed
+    /// keep their anchored range untouched — the fold's drift from the
+    /// parsed structure is deliberate, org-style. Newly collapsed
+    /// headings get a fresh range from the current parse.
+    fn store_collapsed(
+        &mut self,
+        host: HostId,
+        offsets: &HashSet<(HostId, usize)>,
+        refresh: &[usize],
+        cx: &App,
+    ) {
         let Some(buffer) = self.hosts.get(&host).and_then(|weak| weak.upgrade()) else {
             return;
         };
-        let snapshot = buffer.read(cx).snapshot();
-        let anchors = offsets
+        let Some(text) = self.source_text(host, cx) else {
+            return;
+        };
+        let snapshot = buffer.read(cx).text_snapshot();
+        let headings = parse(&text);
+        let mut kept: HashMap<usize, (text::Anchor, text::Anchor)> = HashMap::new();
+        for (start, end) in self.collapsed.get(&host).into_iter().flatten() {
+            if let Some(heading) = heading_line_at(&headings, start.to_offset(&snapshot))
+                && !refresh.contains(&heading)
+            {
+                kept.entry(heading).or_insert((*start, *end));
+            }
+        }
+        let pairs = offsets
             .iter()
             .filter(|(offset_host, _)| *offset_host == host)
-            .map(|(_, offset)| snapshot.anchor_after(*offset))
+            .filter_map(|(_, offset)| {
+                if let Some(pair) = kept.get(offset) {
+                    return Some(*pair);
+                }
+                let heading = headings
+                    .iter()
+                    .find(|heading| heading.heading_range.start == *offset)?;
+                let range = subtree_fold_range(&text, heading)?;
+                Some((
+                    snapshot.anchor_after(range.start),
+                    snapshot.anchor_before(range.end),
+                ))
+            })
             .collect();
-        self.collapsed.insert(host, anchors);
+        self.collapsed.insert(host, pairs);
     }
 
     /// Org-style visibility cycling on the heading under the cursor:
@@ -1354,9 +1400,13 @@ impl Dashboard {
             return false;
         };
         let headings = parse(&text);
-        let mut offsets = self.collapsed_offsets(&[(host, text)], cx);
+        let mut offsets: HashSet<(HostId, usize)> = self
+            .collapsed_ranges(&[(host, text)], cx)
+            .into_iter()
+            .map(|(range_host, start, _)| (range_host, start))
+            .collect();
         cycle_collapse(&mut offsets, host, offset, &headings);
-        self.store_collapsed(host, &offsets, cx);
+        self.store_collapsed(host, &offsets, &[], cx);
         cx.notify();
         true
     }
@@ -2290,7 +2340,7 @@ fn generate(
     registry: &AgentRegistry,
     documents: &[(HostId, String)],
     filed: &HashMap<(HostId, usize), Vec<AgentId>>,
-    collapsed: &HashSet<(HostId, usize)>,
+    fold_ranges: &[(HostId, Range<usize>)],
     collapsed_unfiled: &HashSet<HostId>,
     replies: &[AgentId],
     draft_topic: Option<Option<(HostId, usize)>>,
@@ -2353,10 +2403,10 @@ fn generate(
         // the document slice stays contiguous. Rows cannot splice inside
         // a fold, so drafts and replies there stay hidden with their
         // heading instead of parking at the document tail.
-        let fold_zones: Vec<Range<usize>> = headings
+        let fold_zones: Vec<Range<usize>> = fold_ranges
             .iter()
-            .filter(|heading| collapsed.contains(&(*host, heading.heading_range.start)))
-            .filter_map(|heading| subtree_fold_range(text, heading))
+            .filter(|(zone_host, _)| zone_host == host)
+            .map(|(_, range)| range.clone())
             .collect();
         for heading in &headings {
             let start = heading.heading_range.start;
@@ -2623,7 +2673,7 @@ mod tests {
             &registry,
             &[(host, text.clone())],
             &filed,
-            &HashSet::new(),
+            &[],
             &HashSet::new(),
             &[],
             None,
@@ -2636,7 +2686,7 @@ mod tests {
             &registry,
             &[(host, text.clone())],
             &filed,
-            &HashSet::new(),
+            &[],
             &HashSet::new(),
             &[b.agent_id],
             None,
@@ -2668,7 +2718,7 @@ mod tests {
             &registry,
             &[(host, text.clone())],
             &HashMap::new(),
-            &HashSet::new(),
+            &[],
             &HashSet::new(),
             &[],
             None,
@@ -2688,7 +2738,7 @@ mod tests {
         let text = "* One\nbody\n* Two\n".to_string();
         let mut filed = HashMap::new();
         filed.insert((host, 0), vec![a.agent_id]);
-        let collapsed = HashSet::from([(host, 0)]);
+        let collapsed = vec![(host, 5..10)];
         // Collapse is a display fold, not a cut: the document stays one
         // contiguous writable segment.
         let segments = generate(
@@ -2878,7 +2928,7 @@ mod tests {
             &registry,
             &[(host, text.clone())],
             &HashMap::new(),
-            &HashSet::new(),
+            &[],
             &HashSet::new(),
             &[],
             Some(Some((host, 0))),
@@ -2902,7 +2952,7 @@ mod tests {
             &registry,
             &[(host, String::new())],
             &HashMap::new(),
-            &HashSet::new(),
+            &[],
             &HashSet::new(),
             &[],
             None,
@@ -2933,7 +2983,7 @@ mod tests {
             &registry,
             &[(host, String::new())],
             &HashMap::new(),
-            &HashSet::new(),
+            &[],
             &collapsed_unfiled,
             &[],
             None,
