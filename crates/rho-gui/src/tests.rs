@@ -3545,6 +3545,109 @@ fn insert_mode_enter_stays_a_newline_in_desk_text(cx: &mut TestAppContext) {
     );
 }
 
+/// Sending a quick-spawn draft removes its row out from under the
+/// cursor; the cursor must land somewhere resolvable (the new heading)
+/// before vim's NormalBefore touches the selection, or it panics on a
+/// dead excerpt anchor.
+#[gpui::test]
+fn quick_spawn_send_relocates_the_cursor(cx: &mut TestAppContext) {
+    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
+
+    let mut source = text::Buffer::new(
+        text::ReplicaId::new(8),
+        text::BufferId::new(1).unwrap(),
+        "",
+    );
+    let operation = DeskOperation::from_text(&source.edit([(0..0, "* One\nbody\n")]));
+    let desk_snapshot = DeskSnapshot {
+        text: source.snapshot().text(),
+        operations: vec![operation],
+        transactions: Vec::new(),
+        replicas: Vec::new(),
+    };
+
+    let workspace = test_workspace(cx);
+    cx.update(bind_test_keymaps);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Ready {
+                    agents: Vec::new(),
+                    iris_agent: None,
+                    projects: vec![rho_ui_proto::UiProject {
+                        path: "/tmp/repo".into(),
+                        name: "repo".to_owned(),
+                        description: String::new(),
+                    }],
+                    auth: rho_ui_proto::AuthState {
+                        active: String::new(),
+                        default: String::new(),
+                        namespaces: Vec::new(),
+                    },
+                    machine_seed: 0,
+                    agent_counter: 100,
+                },
+                window,
+                cx,
+            );
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskSnapshot {
+                    snapshot: desk_snapshot,
+                    replica_id: 42,
+                    bindings: Vec::new(),
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+            let editor = workspace.dashboard_editor();
+            let focus_handle = editor.read(cx).focus_handle(cx);
+            window.focus(&focus_handle, cx);
+        })
+        .expect("set up workspace");
+    cx.update(|cx| cx.refresh_windows());
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes(*workspace, "escape");
+    cx.simulate_keystrokes(*workspace, "shift-r");
+    cx.simulate_keystrokes(*workspace, "h i");
+    // Enter sends: spawns the agent, writes the placeholder heading, and
+    // must not leave the cursor on the removed draft row.
+    workspace
+        .update(cx, |workspace, _, _| {
+            workspace.force_host_online(HostId::default());
+        })
+        .expect("force online");
+    cx.simulate_keystrokes(*workspace, "enter");
+    cx.run_until_parked();
+
+    let (text, cursor) = workspace
+        .update(cx, |workspace, _, cx| {
+            let editor = workspace.dashboard_editor();
+            let text = editor.read(cx).buffer().read(cx).snapshot(cx).text();
+            let cursor = editor.update(cx, |editor, cx| {
+                let snapshot = editor.display_snapshot(cx);
+                editor
+                    .selections
+                    .newest::<editor::MultiBufferOffset>(&snapshot)
+                    .head()
+            });
+            (text, cursor)
+        })
+        .expect("read dashboard");
+    assert!(
+        text.contains("* …"),
+        "quick spawn should write the placeholder heading: {text:?}"
+    );
+    assert_eq!(
+        cursor.0,
+        text.find("* …").expect("placeholder present"),
+        "cursor should land on the new heading: {text:?}"
+    );
+}
+
 /// Quick spawn (`shift-r`) writes a `* …` placeholder heading and binds
 /// the agent there; once the agent's generated summary lands, the title
 /// fills itself in — but a heading the user has renamed is left alone.

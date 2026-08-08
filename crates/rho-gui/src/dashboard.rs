@@ -363,6 +363,12 @@ impl Dashboard {
         self.new_draft.as_ref().and_then(|draft| draft.0)
     }
 
+    /// Parks the cursor at a document offset on the next sync.
+    pub fn cursor_to_doc(&mut self, host: HostId, offset: usize, cx: &mut Context<Workspace>) {
+        self.pending_doc_cursor = Some((host, offset));
+        cx.notify();
+    }
+
     pub fn cursor_to_agent(&mut self, agent_id: AgentId, cx: &mut Context<Workspace>) {
         // Filed agents have no row of their own; the cursor lands on the
         // heading that carries them.
@@ -661,6 +667,15 @@ impl Dashboard {
             .as_ref()
             .and_then(|key| self.element_keys.get(key))
             .and_then(|id| self.composition.path_for_row(*id));
+        // The raw cursor offset, captured while its anchors still
+        // resolve — the fallback target if the reconcile orphans them.
+        let cursor_offset_before = self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            editor
+                .selections
+                .newest::<editor::MultiBufferOffset>(&snapshot)
+                .head()
+        });
 
         let structure_changed = self.composition.sync(&self.multi_buffer, &spec, cx);
 
@@ -711,6 +726,22 @@ impl Dashboard {
         {
             self.move_cursor_to_doc(host, offset, window, cx);
         }
+
+        // No dead anchors may survive the reconcile: a selection whose
+        // excerpt vanished (a sent draft's row, say) panics inside vim's
+        // next mode switch. Clamp any orphan to its old offset.
+        self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let orphaned = editor.selections.disjoint_anchors().iter().any(|selection| {
+                !snapshot.can_resolve(&selection.start) || !snapshot.can_resolve(&selection.end)
+            });
+            if orphaned {
+                let offset = cursor_offset_before.min(snapshot.len());
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_ranges([offset..offset]);
+                });
+            }
+        });
 
         self.apply_highlights(&segments, &documents, cx);
         self.apply_reply_chrome(registry, cx);

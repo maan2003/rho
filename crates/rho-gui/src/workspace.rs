@@ -4088,6 +4088,13 @@ impl Workspace {
         self.dashboard_preview
     }
 
+    /// The reconnect loop marks test hosts disconnected (their sockets
+    /// don't exist); verbs gated on connectivity need this to run.
+    #[cfg(test)]
+    pub(crate) fn force_host_online(&mut self, host: HostId) {
+        self.hosts.set_status(host, crate::hosts::HostStatus::Online);
+    }
+
     /// The desk half of a quick spawn, without the daemon round-trip:
     /// appends the placeholder heading and returns its offset and the
     /// anchor the NewAgent message would carry.
@@ -5251,6 +5258,9 @@ impl Workspace {
             self.spawn_unfiled_agent_on(workdir, body, cx);
             return;
         };
+        // The draft row the send came from is about to vanish; the new
+        // heading is where the cursor belongs.
+        self.dashboard.cursor_to_doc(host, offset, cx);
         self.spawn_dashboard_agent(host, offset, body, workdir, cx);
     }
 
