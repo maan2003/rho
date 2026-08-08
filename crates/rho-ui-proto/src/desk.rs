@@ -60,6 +60,9 @@ pub struct DeskHeading {
     pub tags: Vec<String>,
     /// Byte range of the whole `:a:b:` tag token, colons included.
     pub tags_range: Option<Range<usize>>,
+    /// The heading line plus everything nested beneath it: body and all
+    /// deeper subheadings, up to the next heading at this depth or above.
+    pub subtree_range: Range<usize>,
 }
 
 /// Parse an org-like Desk document. This deliberately has no error result:
@@ -141,6 +144,7 @@ pub fn parse(text: &str) -> Vec<DeskHeading> {
             body_range: line.full_end..text.len(),
             tags,
             tags_range,
+            subtree_range: line.start..text.len(),
         });
         heading_lines.push(line_index);
         stack.push((depth, index));
@@ -175,6 +179,11 @@ pub fn parse(text: &str) -> Vec<DeskHeading> {
             headings[index].properties.push(property);
         }
         headings[index].body_range = lines[line_index].full_end..end;
+        let subtree_end = headings[index + 1..]
+            .iter()
+            .find(|later| later.depth <= headings[index].depth)
+            .map_or(text.len(), |later| later.heading_range.start);
+        headings[index].subtree_range = headings[index].heading_range.start..subtree_end;
         headings[index].resolved_project = headings[index].project.clone().or_else(|| {
             headings[index]
                 .parent

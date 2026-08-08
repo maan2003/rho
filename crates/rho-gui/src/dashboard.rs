@@ -1790,7 +1790,9 @@ fn heading_decorations(
                 .unwrap_or(&empty);
             let mut label = String::new();
             if collapsed.contains(&(*host, heading.heading_range.start))
-                && !prose_for(text, &heading).trim().is_empty()
+                && !text[heading.heading_range.end..heading.subtree_range.end]
+                    .trim()
+                    .is_empty()
             {
                 label.push_str("  …");
             }
@@ -1923,11 +1925,18 @@ fn generate(
         };
         for heading in &headings {
             let start = heading.heading_range.start;
+            // Headings swallowed by a collapsed ancestor's cut emit
+            // nothing; their own collapse state survives for when the
+            // ancestor opens again.
+            if start < slice_start {
+                continue;
+            }
             let agents = filed.get(&(*host, start)).unwrap_or(&empty);
             let draft_here = draft_topic == Some(Some((*host, start)));
             if collapsed.contains(&(*host, start)) {
                 // Collapsed: the heading line stays and wears an inline
-                // `…` decoration; its body hides behind a rowless cut.
+                // `…` decoration; its whole subtree — body and nested
+                // subheadings — hides behind a rowless cut.
                 segments.push(Segment::Doc {
                     host: *host,
                     range: slice_start..heading.heading_range.end,
@@ -1940,7 +1949,7 @@ fn generate(
                         RowTarget::NewDraft(Some((*host, start))),
                     )));
                 }
-                slice_start = heading.body_range.end;
+                slice_start = heading.subtree_range.end;
             } else if agents.iter().any(|agent_id| replies.contains(agent_id)) || draft_here {
                 // Drafts splice in after the heading's body, before the
                 // next heading (trailing newline trimmed so the excerpt
@@ -2274,6 +2283,39 @@ mod tests {
         let (_, offset, label) = &decorations[0];
         assert_eq!(*offset, "* One".len());
         assert!(label.starts_with("  …  · "), "label: {label:?}");
+    }
+
+    #[test]
+    fn collapsing_a_parent_hides_its_whole_subtree() {
+        let (registry, host) = registry(vec![]);
+        let text = "* Parent\nbody\n** Child\nchild body\n* Other\n".to_string();
+        let generate_with = |collapsed: &HashSet<(HostId, usize)>| {
+            generate(
+                &registry,
+                &[(host, text.clone())],
+                &HashMap::new(),
+                collapsed,
+                &HashSet::new(),
+                &[],
+                None,
+            )
+        };
+        // Folding the parent hides body and the nested subheading alike.
+        let parent = HashSet::from([(host, 0)]);
+        assert_eq!(
+            keys(&generate_with(&parent)),
+            vec!["doc 0..8".to_string(), format!("doc 34..{}", text.len())]
+        );
+        // A collapsed child inside a collapsed parent changes nothing
+        // while hidden; its state waits for the parent to open.
+        let both = HashSet::from([(host, 0), (host, 14)]);
+        assert_eq!(keys(&generate_with(&both)), keys(&generate_with(&parent)));
+        // The child folds on its own once the parent is open.
+        let child = HashSet::from([(host, 14)]);
+        assert_eq!(
+            keys(&generate_with(&child)),
+            vec!["doc 0..22".to_string(), format!("doc 34..{}", text.len())]
+        );
     }
 
     #[test]
