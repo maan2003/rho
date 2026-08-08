@@ -61,8 +61,10 @@ pub enum ConnEvent {
     DeskSnapshot {
         snapshot: rho_ui_proto::desk::DeskSnapshot,
         replica_id: u16,
+        bindings: Vec<rho_ui_proto::desk::DeskBinding>,
     },
     DeskTextApplied(rho_ui_proto::desk::DeskTextOpRecord),
+    DeskBindingsChanged(Vec<rho_ui_proto::desk::DeskBinding>),
     Ready {
         agents: Vec<UiAgentSummary>,
         iris_agent: Option<AgentId>,
@@ -973,11 +975,16 @@ async fn run(
             ServerMessage::DeskSnapshot {
                 snapshot,
                 replica_id,
+                bindings,
             } => Some(ConnEvent::DeskSnapshot {
                 snapshot,
                 replica_id,
+                bindings,
             }),
             ServerMessage::DeskTextApplied { record } => Some(ConnEvent::DeskTextApplied(record)),
+            ServerMessage::DeskBindingsChanged { bindings } => {
+                Some(ConnEvent::DeskBindingsChanged(bindings))
+            }
             ServerMessage::Ready {
                 agents,
                 iris_agent,

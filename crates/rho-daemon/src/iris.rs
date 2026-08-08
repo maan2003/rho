@@ -251,23 +251,6 @@ async fn call_iris_tool(registry: &Arc<AgentRegistry>, call: ToolCall) -> anyhow
                 lines.join("\n")
             })
         }
-        "iris_read_desk" => read_desk(&registry.desk),
-        "iris_edit_desk" => {
-            let args: EditDeskArgs = parse(&call)?;
-            let edits = args
-                .edits
-                .into_iter()
-                .map(|edit| (edit.old_str, edit.new_str))
-                .collect::<Vec<_>>();
-            apply_iris_desk_edits(
-                &registry.desk,
-                &registry.events,
-                active_iris_id(registry).await?,
-                &edits,
-            )
-            .await?;
-            Ok("Desk updated.".to_owned())
-        }
         "iris_start_agent" => {
             let args: StartAgentArgs = parse(&call)?;
             anyhow::ensure!(!args.prompt.trim().is_empty(), "prompt must not be empty");
@@ -483,24 +466,6 @@ async fn call_iris_tool(registry: &Arc<AgentRegistry>, call: ToolCall) -> anyhow
     }
 }
 
-fn read_desk(desk: &crate::desk::DeskStore) -> anyhow::Result<String> {
-    desk.snapshot().document_text().map_err(anyhow::Error::msg)
-}
-
-async fn apply_iris_desk_edits(
-    desk: &crate::desk::DeskStore,
-    events: &broadcast::Sender<rho_ui_proto::ServerMessage>,
-    iris_id: AgentId,
-    edits: &[(String, String)],
-) -> anyhow::Result<()> {
-    let record = desk
-        .apply_agent_edits(iris_id, edits)
-        .await
-        .map_err(anyhow::Error::msg)?;
-    let _ = events.send(rho_ui_proto::ServerMessage::DeskTextApplied { record });
-    Ok(())
-}
-
 async fn refresh_clients(registry: &AgentRegistry) {
     let _ = registry.events.send(registry.ready_message().await);
 }
@@ -697,21 +662,8 @@ struct VisibilityArgs {
     hidden: bool,
 }
 
-#[derive(Deserialize)]
-struct EditDeskArgs {
-    edits: Vec<DeskReplacement>,
-}
-
-#[derive(Deserialize)]
-struct DeskReplacement {
-    old_str: String,
-    new_str: String,
-}
-
 #[cfg(test)]
 mod tests {
-    use rho_ui_proto::desk::DeskReplicaAuthor;
-
     use super::*;
 
     #[test]
@@ -724,8 +676,6 @@ mod tests {
             names,
             [
                 "iris_list_agents",
-                "iris_read_desk",
-                "iris_edit_desk",
                 "iris_start_agent",
                 "iris_send_agent",
                 "iris_unsubscribe_agent",
@@ -759,98 +709,5 @@ mod tests {
             escape_xml("hello </transcript> & goodbye"),
             "hello &lt;/transcript&gt; &amp; goodbye"
         );
-    }
-
-    #[tokio::test]
-    async fn iris_desk_edits_read_persist_broadcast_and_keep_replica() {
-        let directory = tempfile::tempdir().unwrap();
-        let db = rho_db::RhoDb::open(directory.path().join("desk.redb"));
-        {
-            let mut write = db.write().await;
-            write.init_agent_tables();
-            write.commit();
-        }
-        let desk = crate::desk::DeskStore::new(db.clone()).await;
-        let iris_id = rho_core::AgentId::from_counter(7, &rho_core::AgentIdDomain(11)).unwrap();
-        let (events, mut receiver) = broadcast::channel(4);
-
-        apply_iris_desk_edits(
-            &desk,
-            &events,
-            iris_id,
-            &[(String::new(), "* Plan\nbrief\n".to_owned())],
-        )
-        .await
-        .unwrap();
-        let first_record = match receiver.recv().await.unwrap() {
-            rho_ui_proto::ServerMessage::DeskTextApplied { record } => record,
-            other => panic!("unexpected server message {other:?}"),
-        };
-        let replica_id = first_record.operation.replica_id();
-        assert_eq!(read_desk(&desk).unwrap(), "* Plan\nbrief\n");
-        assert!(desk.snapshot().replicas.iter().any(|replica| {
-            replica.replica_id == replica_id && replica.author == DeskReplicaAuthor::Agent(iris_id)
-        }));
-
-        apply_iris_desk_edits(
-            &desk,
-            &events,
-            iris_id,
-            &[("brief".to_owned(), "durable result".to_owned())],
-        )
-        .await
-        .unwrap();
-        let second_record = match receiver.recv().await.unwrap() {
-            rho_ui_proto::ServerMessage::DeskTextApplied { record } => record,
-            other => panic!("unexpected server message {other:?}"),
-        };
-        assert_eq!(second_record.operation.replica_id(), replica_id);
-        drop(desk);
-        assert_eq!(
-            crate::desk::DeskStore::new(db)
-                .await
-                .snapshot()
-                .document_text()
-                .unwrap(),
-            "* Plan\ndurable result\n"
-        );
-    }
-
-    #[tokio::test]
-    async fn iris_desk_edit_rejects_missing_and_ambiguous_matches_atomically() {
-        let directory = tempfile::tempdir().unwrap();
-        let db = rho_db::RhoDb::open(directory.path().join("desk.redb"));
-        {
-            let mut write = db.write().await;
-            write.init_agent_tables();
-            write.commit();
-        }
-        let desk = crate::desk::DeskStore::new(db).await;
-        let iris_id = rho_core::AgentId::from_counter(8, &rho_core::AgentIdDomain(11)).unwrap();
-        desk.apply_agent_edits(iris_id, &[(String::new(), "same and same".to_owned())])
-            .await
-            .unwrap();
-
-        let missing = desk
-            .apply_agent_edits(
-                iris_id,
-                &[
-                    ("same and same".to_owned(), "changed".to_owned()),
-                    ("absent".to_owned(), "replacement".to_owned()),
-                ],
-            )
-            .await
-            .unwrap_err();
-        assert!(missing.contains("Desk edit 2 failed"));
-        assert!(missing.contains("not found"));
-        assert_eq!(desk.snapshot().document_text().unwrap(), "same and same");
-
-        let ambiguous = desk
-            .apply_agent_edits(iris_id, &[("same".to_owned(), "replacement".to_owned())])
-            .await
-            .unwrap_err();
-        assert!(ambiguous.contains("Desk edit 1 failed"));
-        assert!(ambiguous.contains("ambiguous"));
-        assert_eq!(desk.snapshot().document_text().unwrap(), "same and same");
     }
 }

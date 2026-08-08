@@ -65,9 +65,14 @@ pub enum ClientMessage {
         /// the modes that need one).
         start: StartMode,
         content: Option<Vec<ContentPart>>,
-        /// When present, staff the heading beginning at this UTF-8 byte offset.
-        /// The daemon inserts identity text after agent creation.
-        desk_heading: Option<u64>,
+        /// When present, bind the new agent to the Desk heading containing
+        /// this anchor. The text itself is never marked.
+        desk_anchor: Option<desk::DeskAnchor>,
+    },
+    /// Moves an agent's Desk binding to a new anchor, or unfiles it.
+    DeskRebind {
+        agent_id: AgentId,
+        anchor: Option<desk::DeskAnchor>,
     },
     SubscribeAgent {
         agent_id: AgentId,
@@ -496,9 +501,15 @@ pub enum ServerMessage {
         /// Zed replica id assigned to this user connection. Replica ids make
         /// body-operation attribution intrinsic to the CRDT history.
         replica_id: u16,
+        bindings: Vec<desk::DeskBinding>,
     },
     DeskTextApplied {
         record: desk::DeskTextOpRecord,
+    },
+    /// The full binding set for this host changed (staffing, rebind, or an
+    /// agent going away). Clients replace, never merge.
+    DeskBindingsChanged {
+        bindings: Vec<desk::DeskBinding>,
     },
     Ready {
         agents: Vec<UiAgentSummary>,

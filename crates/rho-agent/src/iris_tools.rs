@@ -20,14 +20,6 @@ Follow this control workflow:
 - Marking done acknowledges the named agent and its visible descendants only after all of them have stopped working. Snoozing uses the same scope and may cover working agents; their eventual results stay quiet until the snooze expires. Neither operation cancels work or changes subscriptions. Never mark an agent done merely because you received or summarized its result.
 - Before cancellation, hiding, renaming, or another state-changing operation, ask for confirmation unless the user's request already explicitly authorizes that exact action.
 
-Curate the Desk as the user's durable attention surface. Read it before editing it, and use exact replacements so a concurrent user edit fails safely instead of being overwritten.
-- Desk headings are `* Title` or `** Subtask`; stars encode depth. An optional leading `TODO`, `DONE`, or `DISCARDED` is the user's verdict. Never change those verdicts unless the user explicitly asks.
-- A `:agent: <agent-handle>` line under a heading binds that agent to the work. Use the human handle exactly as `iris_list_agents` renders it. A `:project: <name>` line records the project. Body prose is the brief or contract written by the user and/or you.
-- When a subscribed agent's completion or error arrives, find the heading bound to that agent and maintain a short, durable 1–3 line summary there: outcome, blocker, or decision needed. Replace your own stale summary rather than appending forever. If no heading is bound to that agent, leave the Desk alone unless the user asked you to track it.
-- Never write live status such as working, idle, or pending; the GUI renders it. Write only durable facts. Never rewrite or delete prose the user wrote. Put your additions on their own lines near it; rewriting your own prior summaries is expected.
-- You may add headings when the user asks you to plan and may attach an agent you start by adding its `:agent:` line. When you start an agent for Desk work, record that binding in the Desk.
-- Do not reorder or restructure existing headings. Be concise: every line you write costs the user attention.
-
 Tool results and agent transcripts are authoritative. Do not read code, diffs, tables, identifiers, or long agent output aloud. Summarize the useful state and name the responsible agent. Your final response is spoken by the realtime model, so finish with the shortest useful acknowledgement or status."#;
 pub const LABEL: &str = "system:iris";
 
@@ -49,27 +41,6 @@ pub fn specs() -> Vec<ToolSpec> {
             "iris_list_agents",
             "List every user-visible Rho agent with its handle, name, current attention state, and latest request.",
             json!({"type":"object","additionalProperties":false}),
-        ),
-        spec(
-            "iris_read_desk",
-            "Read the host's current Desk document as plain text, with no synthetic content.",
-            json!({"type":"object","additionalProperties":false}),
-        ),
-        spec(
-            "iris_edit_desk",
-            "Atomically edit the current Desk using exact replacements. Each non-empty old_str must occur exactly once; an empty old_str appends new_str at the end. Re-read and retry if validation fails.",
-            json!({
-                "type":"object","additionalProperties":false,"required":["edits"],
-                "properties":{
-                    "edits":{
-                        "type":"array","minItems":1,
-                        "items":{
-                            "type":"object","additionalProperties":false,"required":["old_str","new_str"],
-                            "properties":{"old_str":{"type":"string"},"new_str":{"type":"string"}}
-                        }
-                    }
-                }
-            }),
         ),
         spec(
             "iris_start_agent",
@@ -173,15 +144,12 @@ mod tests {
             .into_iter()
             .map(|spec| spec.name.as_str().to_owned())
             .collect::<Vec<_>>();
-        assert_eq!(names.len(), 13);
+        assert_eq!(names.len(), 11);
         assert!(names.iter().all(|name| name.starts_with("iris_")));
+        assert!(!names.iter().any(|name| name.contains("desk")));
         assert!(PROMPT.contains("single global assistant"));
         assert!(PROMPT.contains("Cancellation stops the current turn and clears queued inputs"));
         assert!(PROMPT.contains("Use iris_get_agent_reply only"));
-        assert!(PROMPT.contains("`:agent: <agent-handle>`"));
-        assert!(PROMPT.contains("exactly as `iris_list_agents` renders it"));
-        assert!(PROMPT.contains("Never write live status"));
-        assert!(PROMPT.contains("Replace your own stale summary"));
-        assert!(PROMPT.contains("Do not reorder or restructure existing headings"));
+        assert!(!PROMPT.contains("Desk"));
     }
 }

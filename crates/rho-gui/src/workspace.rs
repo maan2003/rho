@@ -1082,6 +1082,7 @@ impl Workspace {
             ConnEvent::Ready { .. }
                 | ConnEvent::DeskSnapshot { .. }
                 | ConnEvent::DeskTextApplied(_)
+                | ConnEvent::DeskBindingsChanged(_)
                 | ConnEvent::AgentCreated { .. }
                 | ConnEvent::AgentAttention { .. }
                 | ConnEvent::AgentTurnReport { .. }
@@ -1092,15 +1093,20 @@ impl Workspace {
             ConnEvent::DeskSnapshot {
                 snapshot,
                 replica_id,
+                bindings,
             } => {
                 let buffer = self
                     .desk_sync
                     .apply_snapshot(host, snapshot, replica_id, cx);
+                self.desk_sync.set_bindings(host, bindings);
                 self.dashboard.set_source(host, buffer.downgrade());
                 self.rebuild_desk_surfaces(host, buffer, window, cx);
             }
             ConnEvent::DeskTextApplied(record) => {
                 self.desk_sync.apply_text(host, record, cx);
+            }
+            ConnEvent::DeskBindingsChanged(bindings) => {
+                self.desk_sync.set_bindings(host, bindings);
             }
             ConnEvent::Ready {
                 agents,
@@ -1958,7 +1964,7 @@ impl Workspace {
                 role,
                 start,
                 content: Some(content),
-                desk_heading: None,
+                desk_anchor: None,
             },
         );
     }
@@ -5195,7 +5201,7 @@ impl Workspace {
                 role: AgentRole::default(),
                 start,
                 content: Some(vec![ContentPart::Text { text: body }]),
-                desk_heading: None,
+                desk_anchor: None,
             },
         );
     }
@@ -5419,7 +5425,7 @@ impl Workspace {
                     revset: crate::draft_view::AUTO_BASE_REVSET.to_owned(),
                 },
                 content: (!text.trim().is_empty()).then_some(vec![ContentPart::Text { text }]),
-                desk_heading: Some(heading_offset as u64),
+                desk_anchor: self.desk_sync.anchor_at(host, heading_offset, cx),
             },
         );
     }

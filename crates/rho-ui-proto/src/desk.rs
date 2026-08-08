@@ -329,6 +329,48 @@ pub struct DeskTransaction {
     pub edit_ids: Vec<DeskClock>,
 }
 
+/// A CRDT position in the Desk text. Buffer ids differ per replica, so the
+/// wire form carries only the insertion timestamp; each side reattaches its
+/// own buffer id on conversion.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Encode, Decode, Pack, Unpack)]
+pub struct DeskAnchor {
+    pub timestamp: DeskClock,
+    pub offset: u32,
+    pub right_bias: bool,
+}
+
+impl DeskAnchor {
+    pub fn from_text(anchor: text::Anchor) -> Self {
+        Self {
+            timestamp: anchor.timestamp().into(),
+            offset: anchor.offset,
+            right_bias: anchor.bias == text::Bias::Right,
+        }
+    }
+
+    pub fn to_text(&self, buffer_id: BufferId) -> text::Anchor {
+        text::Anchor::new(
+            self.timestamp.into(),
+            self.offset,
+            if self.right_bias {
+                text::Bias::Right
+            } else {
+                text::Bias::Left
+            },
+            buffer_id,
+        )
+    }
+}
+
+/// An agent attached to the Desk document at an anchored position. The
+/// heading containing the anchor is the agent's topic; the text itself
+/// carries no binding markers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct DeskBinding {
+    pub agent_id: AgentId,
+    pub anchor: DeskAnchor,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum DeskReplicaAuthor {
     User,

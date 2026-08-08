@@ -6,32 +6,36 @@ use redb::TableDefinition;
 use rho_agent::db::AgentReadTxnExt as _;
 use rho_db::{RhoDb, Sen, SenValue};
 use rho_ui_proto::desk::{
-    DeskOperation, DeskReplica, DeskReplicaAuthor, DeskSnapshot, DeskTextOpRecord, DeskTransaction,
-    parse,
+    DeskAnchor, DeskBinding, DeskOperation, DeskReplica, DeskReplicaAuthor, DeskSnapshot,
+    DeskTextOpRecord, DeskTransaction, parse,
 };
 use senax_encoder::{Decode, Encode};
 use text::ReplicaId;
 
-// Persisted TypeNames include the Rust type path: `PersistentStateV3` is now a
-// wire-stable name and must not be renamed while the v3 table exists.
-const STATE: TableDefinition<(), Sen<PersistentStateV3>> =
-    TableDefinition::new("rho_desk_state_v3");
+// Persisted TypeNames include the Rust type path: `PersistentStateV4` is now a
+// wire-stable name and must not be renamed while the v4 table exists.
+const STATE: TableDefinition<(), Sen<PersistentStateV4>> =
+    TableDefinition::new("rho_desk_state_v4");
 const TEXT_OPS: TableDefinition<u64, Sen<DeskTextOpRecord>> =
     TableDefinition::new("rho_desk_text_ops_v2");
 
 #[derive(Clone, Debug, Encode, Decode)]
-struct PersistentStateV3 {
+struct PersistentStateV4 {
     snapshot: DeskSnapshot,
     next_text_sequence: u64,
     next_replica_id: u16,
+    /// Agents attached to the document by CRDT anchor. The daemon stores and
+    /// broadcasts these; clients resolve anchors to headings themselves.
+    bindings: Vec<DeskBinding>,
 }
 
-impl Default for PersistentStateV3 {
+impl Default for PersistentStateV4 {
     fn default() -> Self {
         Self {
             snapshot: DeskSnapshot::default(),
             next_text_sequence: 1,
             next_replica_id: ReplicaId::FIRST_COLLAB_ID.as_u16(),
+            bindings: Vec::new(),
         }
     }
 }
@@ -63,13 +67,20 @@ impl DeskStore {
         let mut write = db.write().await;
         write.open_table(TEXT_OPS);
         if write.open_table(STATE).get(&()).is_none() {
-            let migrated = migrate_v2(&mut write, &agent_handles)
+            let migrated = migrate_v3(&mut write)
+                .or_else(|| migrate_v2(&mut write, &agent_handles))
                 .or_else(|| migrate_v1(&mut write, &agent_handles));
-            let state = migrated.unwrap_or_default();
+            let mut state = migrated.unwrap_or_default();
+            extract_bindings(
+                |handle| resolve_agent_handle(&db, handle),
+                &mut write,
+                &mut state,
+            );
             write.delete_table("rho_desk_structure_ops_v1");
             write.delete_table("rho_desk_text_ops_v1");
             write.delete_table("rho_desk_state_v1");
             write.delete_table("rho_desk_state_v2");
+            write.delete_table("rho_desk_state_v3");
             write.open_table(STATE).insert(&(), SenValue::owned(state));
         }
         write.commit();
@@ -132,136 +143,39 @@ impl DeskStore {
         self.append_text(operation, transaction).await
     }
 
-    /// Applies one atomic model-authored edit using a stable replica associated
-    /// with the agent. Every non-empty search string is resolved against the
-    /// same current document before anything is written.
-    pub async fn apply_agent_edits(
-        &self,
-        agent_id: rho_ui_proto::AgentId,
-        edits: &[(String, String)],
-    ) -> Result<DeskTextOpRecord, String> {
-        if edits.is_empty() {
-            return Err("Desk edit list must not be empty".to_owned());
-        }
-
-        let mut write = self.db.write().await;
-        let mut state = load_state(&mut write);
-        let replica_id = if let Some(replica) = state
-            .snapshot
-            .replicas
-            .iter()
-            .find(|replica| replica.author == DeskReplicaAuthor::Agent(agent_id))
-        {
-            replica.replica_id
-        } else {
-            let replica_id = state.next_replica_id;
-            state.next_replica_id = replica_id
-                .checked_add(1)
-                .ok_or_else(|| "Desk replica id space exhausted".to_owned())?;
-            state.snapshot.replicas.push(DeskReplica {
-                replica_id,
-                author: DeskReplicaAuthor::Agent(agent_id),
-            });
-            replica_id
-        };
-
-        let mut snapshot = state.snapshot.clone();
-        snapshot.operations = write
-            .open_table(TEXT_OPS)
-            .iter()
-            .map(|(_, value)| value.value().as_ref().operation.clone())
-            .collect();
-        let text = snapshot.document_text()?;
-        let mut replacements = Vec::with_capacity(edits.len());
-        for (index, (old_str, new_str)) in edits.iter().enumerate() {
-            if old_str.is_empty() {
-                replacements.push((text.len()..text.len(), new_str.clone()));
-                continue;
-            }
-            let mut matches = text.match_indices(old_str);
-            let Some((start, _)) = matches.next() else {
-                return Err(format!(
-                    "Desk edit {} failed: old_str was not found",
-                    index + 1
-                ));
-            };
-            if matches.next().is_some() {
-                return Err(format!(
-                    "Desk edit {} failed: old_str is ambiguous (more than one match)",
-                    index + 1
-                ));
-            }
-            replacements.push((start..start + old_str.len(), new_str.clone()));
-        }
-        for index in 0..replacements.len() {
-            for previous in 0..index {
-                let left = &replacements[previous].0;
-                let right = &replacements[index].0;
-                if left.start < right.end && right.start < left.end {
-                    return Err(format!(
-                        "Desk edit {} failed: replacement overlaps edit {}",
-                        index + 1,
-                        previous + 1
-                    ));
-                }
-            }
-        }
-
-        let mut buffer = snapshot.buffer(replica_id)?;
-        let operation = DeskOperation::from_text(&buffer.edit(replacements));
-        let record = append_text_in_txn(&mut write, &mut state, operation, None)?;
-        save_state(&mut write, &state);
-        write.commit();
-        Ok(record)
+    /// Current binding set: which agents are attached to the document, by
+    /// anchor. Order is insertion order; clients resolve and triage.
+    pub fn bindings(&self) -> Vec<DeskBinding> {
+        self.db
+            .read()
+            .open_table(STATE)
+            .get(&())
+            .expect("Desk state initialized")
+            .value()
+            .into_owned()
+            .bindings
     }
 
-    /// Atomically records the newly staffed agent in visible Desk text.
-    pub async fn staff_heading(
+    /// Attaches an agent at an anchor, moves it, or (with `None`) unfiles it.
+    /// Returns the full binding set after the change. The document text is
+    /// never touched.
+    pub async fn bind_agent(
         &self,
-        heading_offset: usize,
         agent_id: rho_ui_proto::AgentId,
-    ) -> Result<DeskTextOpRecord, String> {
-        let snapshot = self.snapshot();
-        let text = snapshot.document_text()?;
-        let heading = parse(&text)
-            .into_iter()
-            .find(|heading| heading.heading_range.start == heading_offset)
-            .ok_or_else(|| "Desk heading moved before staffing completed".to_owned())?;
-        let candidate = heading
-            .agent_value
-            .as_deref()
-            .and_then(|handle| resolve_agent_handle(&self.db, handle));
-        let candidate_disposition = candidate.and_then(|candidate| {
-            self.db
-                .read()
-                .list_agents()
-                .into_iter()
-                .find_map(|(agent_id, agent)| (agent_id == candidate).then_some(agent.disposition))
-        });
-        if candidate.is_some() && binding_is_live(candidate_disposition) {
-            return Err("Desk heading is already staffed by a live agent".to_owned());
-        }
-
+        anchor: Option<DeskAnchor>,
+    ) -> Vec<DeskBinding> {
         let mut write = self.db.write().await;
         let mut state = load_state(&mut write);
-        let mut buffer = snapshot.buffer(ReplicaId::REMOTE_SERVER.as_u16())?;
-        let agent_line = format!(":agent: {}", agent_handle(&self.db, agent_id));
-        let operation = if let Some(property) = heading
-            .properties
-            .iter()
-            .find(|property| property.key.eq_ignore_ascii_case("agent"))
-        {
-            buffer.edit([(property.line_range.clone(), agent_line)])
-        } else {
-            let insertion = heading.heading_range.end
-                + usize::from(text.as_bytes().get(heading.heading_range.end) == Some(&b'\n'));
-            buffer.edit([(insertion..insertion, format!("{agent_line}\n"))])
-        };
-        let operation = DeskOperation::from_text(&operation);
-        let record = append_text_in_txn(&mut write, &mut state, operation, None)?;
+        state
+            .bindings
+            .retain(|binding| binding.agent_id != agent_id);
+        if let Some(anchor) = anchor {
+            state.bindings.push(DeskBinding { agent_id, anchor });
+        }
         save_state(&mut write, &state);
+        let bindings = state.bindings.clone();
         write.commit();
-        Ok(record)
+        bindings
     }
 
     async fn append_text(
@@ -295,24 +209,6 @@ impl DeskStore {
     }
 }
 
-pub(crate) fn binding_is_live(disposition: Option<rho_core::AgentDisposition>) -> bool {
-    matches!(
-        disposition,
-        Some(rho_core::AgentDisposition::Pending | rho_core::AgentDisposition::Snoozed { .. })
-    )
-}
-
-fn agent_handle(db: &RhoDb, agent_id: rho_ui_proto::AgentId) -> String {
-    let read = db.read();
-    let prefix_len = prefix_id::uniform_prefix_len(read.last_agent_counter(), 200).max(4);
-    let role_prefix = read
-        .list_agents()
-        .into_iter()
-        .find(|(candidate, _)| *candidate == agent_id)
-        .map_or("eng", |(_, record)| record.role.handle_prefix());
-    format!("{}-{}", role_prefix, &agent_id.encoded()[..prefix_len])
-}
-
 fn resolve_agent_handle(db: &RhoDb, handle: &str) -> Option<rho_ui_proto::AgentId> {
     let (role_prefix, encoded) = handle.trim().split_once('-')?;
     let read = db.read();
@@ -335,7 +231,7 @@ fn resolve_agent_handle(db: &RhoDb, handle: &str) -> Option<rho_ui_proto::AgentI
 
 fn append_text_in_txn(
     write: &mut rho_db::WriteTxn,
-    state: &mut PersistentStateV3,
+    state: &mut PersistentStateV4,
     operation: DeskOperation,
     transaction: Option<DeskTransaction>,
 ) -> Result<DeskTextOpRecord, String> {
@@ -376,7 +272,7 @@ fn append_text_in_txn(
     Ok(record)
 }
 
-fn load_state(write: &mut rho_db::WriteTxn) -> PersistentStateV3 {
+fn load_state(write: &mut rho_db::WriteTxn) -> PersistentStateV4 {
     write
         .open_table(STATE)
         .get(&())
@@ -384,10 +280,93 @@ fn load_state(write: &mut rho_db::WriteTxn) -> PersistentStateV3 {
         .value()
         .into_owned()
 }
-fn save_state(write: &mut rho_db::WriteTxn, state: &PersistentStateV3) {
+fn save_state(write: &mut rho_db::WriteTxn, state: &PersistentStateV4) {
     write
         .open_table(STATE)
         .insert(&(), SenValue::borrowed(state));
+}
+
+/// Converts visible v3 `:agent:` property lines into anchor bindings and
+/// strips them from the text. Runs on every migration path (a fresh v4 state
+/// simply has no headings to convert). Lines whose handle does not resolve
+/// stay in the text for the user to deal with. The strip is appended as a
+/// server-replica CRDT operation, so racing clients converge through the
+/// ordinary text-op stream.
+fn extract_bindings(
+    resolve: impl Fn(&str) -> Option<rho_ui_proto::AgentId>,
+    write: &mut rho_db::WriteTxn,
+    state: &mut PersistentStateV4,
+) {
+    let mut materialized = state.snapshot.clone();
+    materialized.operations.extend(
+        write
+            .open_table(TEXT_OPS)
+            .iter()
+            .map(|(_, value)| value.value().as_ref().operation.clone()),
+    );
+    let Ok(text) = materialized.document_text() else {
+        return;
+    };
+    let Ok(buffer) = materialized.buffer(ReplicaId::REMOTE_SERVER.as_u16()) else {
+        return;
+    };
+    let snapshot = buffer.snapshot();
+    let mut removals = Vec::new();
+    for heading in parse(&text) {
+        for property in heading
+            .properties
+            .iter()
+            .filter(|property| property.key.eq_ignore_ascii_case("agent"))
+        {
+            let Some(agent_id) = resolve(&property.value) else {
+                continue;
+            };
+            if !state
+                .bindings
+                .iter()
+                .any(|binding| binding.agent_id == agent_id)
+            {
+                state.bindings.push(DeskBinding {
+                    agent_id,
+                    anchor: DeskAnchor::from_text(
+                        snapshot.anchor_after(heading.heading_range.start),
+                    ),
+                });
+            }
+            let end = property.line_range.end
+                + usize::from(text.as_bytes().get(property.line_range.end) == Some(&b'\n'));
+            removals.push(property.line_range.start..end);
+        }
+    }
+    if removals.is_empty() {
+        return;
+    }
+    let mut buffer = buffer;
+    let operation =
+        DeskOperation::from_text(&buffer.edit(removals.into_iter().map(|range| (range, ""))));
+    let _ = append_text_in_txn(write, state, operation, None);
+}
+
+// The redb value TypeName embeds this exact Rust path; the deployed v3 table
+// was created as `Sen<rho_daemon::desk::PersistentStateV3>`, so the compat
+// struct must keep that name and module.
+#[derive(Clone, Debug, Encode, Decode)]
+struct PersistentStateV3 {
+    snapshot: DeskSnapshot,
+    next_text_sequence: u64,
+    next_replica_id: u16,
+}
+const V3_STATE: TableDefinition<(), Sen<PersistentStateV3>> =
+    TableDefinition::new("rho_desk_state_v3");
+
+fn migrate_v3(write: &mut rho_db::WriteTxn) -> Option<PersistentStateV4> {
+    let old = write.open_table(V3_STATE).get(&())?.value().into_owned();
+    Some(PersistentStateV4 {
+        snapshot: old.snapshot,
+        next_text_sequence: old.next_text_sequence,
+        next_replica_id: old.next_replica_id,
+        bindings: Vec::new(),
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
@@ -425,7 +404,7 @@ const V2_STATE: TableDefinition<(), Sen<PersistentState>> =
 fn migrate_v2(
     write: &mut rho_db::WriteTxn,
     agent_handles: &BTreeMap<rho_ui_proto::AgentId, String>,
-) -> Option<PersistentStateV3> {
+) -> Option<PersistentStateV4> {
     let old = write.open_table(V2_STATE).get(&())?.value().into_owned();
     let mut materialized = DeskSnapshot {
         text: old.snapshot.text.clone(),
@@ -483,7 +462,7 @@ fn migrate_v2(
         migrated.push_str(newline);
     }
 
-    let mut state = PersistentStateV3 {
+    let mut state = PersistentStateV4 {
         snapshot: DeskSnapshot {
             text: old.snapshot.text,
             operations: old.snapshot.operations,
@@ -492,6 +471,7 @@ fn migrate_v2(
         },
         next_text_sequence: old.next_text_sequence,
         next_replica_id: old.next_replica_id,
+        bindings: Vec::new(),
     };
     if migrated != text {
         let mut buffer = materialized
@@ -561,7 +541,7 @@ const OLD_TEXT_OPS: TableDefinition<u64, Sen<OldTextRecord>> =
 fn migrate_v1(
     write: &mut rho_db::WriteTxn,
     agent_handles: &BTreeMap<rho_ui_proto::AgentId, String>,
-) -> Option<PersistentStateV3> {
+) -> Option<PersistentStateV4> {
     let old = write.open_table(OLD_STATE).get(&())?.value().into_owned();
     let mut histories: BTreeMap<OldNodeId, Vec<DeskOperation>> = BTreeMap::new();
     for (_, record) in write.open_table(OLD_TEXT_OPS).iter() {
@@ -660,7 +640,7 @@ fn migrate_v1(
     write
         .open_table(TEXT_OPS)
         .insert(&1, SenValue::borrowed(&record));
-    Some(PersistentStateV3 {
+    Some(PersistentStateV4 {
         snapshot: DeskSnapshot {
             text: String::new(),
             operations: Vec::new(),
@@ -669,6 +649,7 @@ fn migrate_v1(
         },
         next_text_sequence: 2,
         next_replica_id: old.next_replica_id,
+        bindings: Vec::new(),
     })
 }
 
@@ -688,15 +669,8 @@ mod tests {
         write.commit();
     }
 
-    #[test]
-    fn done_and_missing_agents_are_not_live() {
-        assert!(!binding_is_live(None));
-        assert!(!binding_is_live(Some(rho_core::AgentDisposition::Done)));
-        assert!(binding_is_live(Some(rho_core::AgentDisposition::Pending)));
-    }
-
     #[tokio::test]
-    async fn staffing_replaces_the_first_agent_property_without_rewriting_state() {
+    async fn bindings_persist_move_and_unfile_without_touching_text() {
         let directory = tempfile::tempdir().unwrap();
         let db = RhoDb::open(directory.path().join("desk.redb"));
         init_agent_tables(&db).await;
@@ -704,16 +678,87 @@ mod tests {
         let replica = store.allocate_user_replica().await.unwrap();
         let mut buffer =
             text::Buffer::new(ReplicaId::new(replica), text::BufferId::new(1).unwrap(), "");
-        let edit = buffer.edit([(0..0, "* TODO plan\n:agent: eng-dead\nnotes\n")]);
+        let edit = buffer.edit([(0..0, "* one\n* two\n")]);
         store
             .apply_text(DeskOperation::from_text(&edit), None)
             .await
             .unwrap();
-        store.staff_heading(0, agent(2)).await.unwrap();
         let text = store.snapshot().document_text().unwrap();
-        assert_eq!(text.matches(":agent:").count(), 1);
-        assert!(text.contains(&format!(":agent: eng-{}", &agent(2).encoded()[..4])));
-        assert!(text.starts_with("* TODO plan\n"));
+        let snapshot = buffer.snapshot();
+        let one = DeskAnchor::from_text(snapshot.anchor_after(0));
+        let two = DeskAnchor::from_text(snapshot.anchor_after(text.find("* two").unwrap()));
+
+        let bindings = store.bind_agent(agent(2), Some(one)).await;
+        assert_eq!(bindings.len(), 1);
+        let bindings = store.bind_agent(agent(2), Some(two)).await;
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].anchor, two);
+        assert_eq!(store.snapshot().document_text().unwrap(), text);
+
+        drop(store);
+        let reopened = DeskStore::new(db).await;
+        assert_eq!(
+            reopened.bindings(),
+            vec![DeskBinding {
+                agent_id: agent(2),
+                anchor: two,
+            }]
+        );
+        assert!(reopened.bind_agent(agent(2), None).await.is_empty());
+        assert!(reopened.bindings().is_empty());
+    }
+
+    #[tokio::test]
+    async fn v3_migration_extracts_agent_lines_into_anchor_bindings() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = RhoDb::open(directory.path().join("desk.redb"));
+        init_agent_tables(&db).await;
+        let mut buffer = text::Buffer::new(ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
+        let operation = DeskOperation::from_text(&buffer.edit([(
+            0..0,
+            "* one\nbody\n* two\n:agent: eng-good\n:agent: adv-gone\nnotes\n",
+        )]));
+        let mut write = db.write().await;
+        write.open_table(V3_STATE).insert(
+            &(),
+            SenValue::owned(PersistentStateV3 {
+                snapshot: DeskSnapshot::default(),
+                next_text_sequence: 2,
+                next_replica_id: 9,
+            }),
+        );
+        write.open_table(TEXT_OPS).insert(
+            &1,
+            SenValue::owned(DeskTextOpRecord {
+                sequence: 1,
+                timestamp_ms: 1,
+                operation,
+                transaction: None,
+            }),
+        );
+        let mut state = migrate_v3(&mut write).unwrap();
+        extract_bindings(
+            |handle| (handle == "eng-good").then(|| agent(5)),
+            &mut write,
+            &mut state,
+        );
+        write.open_table(STATE).insert(&(), SenValue::owned(state));
+        write.commit();
+
+        let store = DeskStore::new(db).await;
+        let text = store.snapshot().document_text().unwrap();
+        assert_eq!(text, "* one\nbody\n* two\n:agent: adv-gone\nnotes\n");
+        let bindings = store.bindings();
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].agent_id, agent(5));
+        // A client materializing the migrated history resolves the anchor to
+        // the heading the binding was extracted from.
+        let client = store.snapshot().buffer(42).unwrap();
+        let anchor = bindings[0].anchor.to_text(text::BufferId::new(1).unwrap());
+        assert_eq!(
+            client.snapshot().offset_for_anchor(&anchor),
+            text.find("* two").unwrap()
+        );
     }
 
     #[tokio::test]

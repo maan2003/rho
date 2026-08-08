@@ -29,7 +29,7 @@ use tokio::sync::{Mutex, Mutex as TokioMutex, OwnedMutexGuard, broadcast, mpsc, 
 
 mod agent_ui;
 pub mod debug;
-mod desk;
+pub mod desk;
 mod iris;
 mod realtime;
 mod secret_store;
@@ -2335,6 +2335,7 @@ async fn handle_message(
             let _ = outgoing_tx.send(ServerMessage::DeskSnapshot {
                 snapshot: agents.desk.snapshot(),
                 replica_id,
+                bindings: agents.desk.bindings(),
             });
             Ok(Refresh::None)
         }
@@ -2350,6 +2351,22 @@ async fn handle_message(
             let _ = agents
                 .events
                 .send(ServerMessage::DeskTextApplied { record });
+            Ok(Refresh::None)
+        }
+        ClientMessage::DeskRebind { agent_id, anchor } => {
+            if !agents
+                .db
+                .read()
+                .list_agents()
+                .into_iter()
+                .any(|(id, _)| id == agent_id)
+            {
+                anyhow::bail!("Desk rebind references an unknown agent");
+            }
+            let bindings = agents.desk.bind_agent(agent_id, anchor).await;
+            let _ = agents
+                .events
+                .send(ServerMessage::DeskBindingsChanged { bindings });
             Ok(Refresh::None)
         }
         ClientMessage::RecordVisualization { mime_type, content } => {
@@ -2566,7 +2583,7 @@ async fn handle_message(
             role,
             start,
             content,
-            desk_heading,
+            desk_anchor,
         } => {
             if let Some(content) = content.as_deref() {
                 validate_image_content(content)?;
@@ -2574,28 +2591,11 @@ async fn handle_message(
             // Subscription and the AgentCreated announcement ride the pool's
             // creation broadcast (all connections, including this one).
             let (agent_id, agent) = agents.create(role, start).await?;
-            if let Some(heading_offset) = desk_heading {
-                let record = agents
-                    .desk
-                    .staff_heading(
-                        usize::try_from(heading_offset)
-                            .map_err(|_| anyhow::anyhow!("Desk heading offset overflow"))?,
-                        agent_id,
-                    )
-                    .await
-                    .map_err(anyhow::Error::msg)?;
+            if let Some(anchor) = desk_anchor {
+                let bindings = agents.desk.bind_agent(agent_id, Some(anchor)).await;
                 let _ = agents
                     .events
-                    .send(ServerMessage::DeskTextApplied { record });
-                // Desk-staffed work is Iris's to curate: subscribe her to the
-                // agent's completions so summaries land under the heading.
-                // Best-effort — a fleet that never started Iris stays silent.
-                if let Ok(iris_id) = crate::iris::active_iris_id(&agents).await {
-                    let _ = agents
-                        .pool
-                        .set_response_subscription(iris_id, agent_id, true)
-                        .await;
-                }
+                    .send(ServerMessage::DeskBindingsChanged { bindings });
             }
             if let Some(content) = content {
                 // The agent is fresh, so the lanes are equivalent here.
