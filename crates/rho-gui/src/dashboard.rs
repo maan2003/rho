@@ -1463,7 +1463,7 @@ fn generate(
             lines.push(header);
         }
         let headings = parse(text);
-        for heading in headings {
+        for heading in &headings {
             let mut topic_agents = Vec::new();
             for property in heading
                 .properties
@@ -1502,10 +1502,27 @@ fn generate(
                 }
                 None => Some(DashClass::Heading),
             };
+            // Rows triage flat (like org-agenda), so nested headings carry
+            // their ancestry as a breadcrumb instead of indentation.
+            let mut crumbs = Vec::new();
+            let mut cursor = heading.parent;
+            while let Some(parent) = cursor {
+                crumbs.push(headings[parent].title.as_str());
+                cursor = headings[parent].parent;
+            }
+            if !crumbs.is_empty() {
+                crumbs.reverse();
+                topic.span(Some(DashClass::Muted), |line| {
+                    for crumb in &crumbs {
+                        line.push_str(crumb);
+                        line.push_str(" ▸ ");
+                    }
+                });
+            }
             topic.span(class, |line| line.push_str(&heading.title));
             lines.push(topic);
 
-            let prose = prose_for(text, &heading);
+            let prose = prose_for(text, heading);
             let folded_count = topic_agents.len() + usize::from(!prose.is_empty());
             if collapsed.contains(&(*host, heading.heading_range.start)) {
                 if folded_count > 0 {
@@ -1665,6 +1682,21 @@ mod tests {
         assert!(keys.iter().any(
             |key| matches!(key, LineKey::Topic(owner, offset) if *owner == host && *offset > 0)
         ));
+    }
+
+    #[test]
+    fn nested_topics_carry_breadcrumbs_not_indentation() {
+        let (registry, host) = registry(vec![]);
+        let text = "* Parent\n** Child\n* Other\n".to_string();
+        let rows = generate(&registry, &[(host, text)], &HashSet::new());
+        let topics = rows
+            .iter()
+            .filter(|line| matches!(line.key, LineKey::Topic(..)))
+            .collect::<Vec<_>>();
+        assert_eq!(topics.len(), 3);
+        assert_eq!(topics[0].text, "Parent");
+        assert_eq!(topics[1].text, "Parent ▸ Child");
+        assert_eq!(topics[2].text, "Other");
     }
 
     #[test]
