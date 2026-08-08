@@ -56,8 +56,6 @@ pub type ParsedHeadingState = DeskHeadingState;
 pub enum StructureDirection {
     Demote,
     Promote,
-    Up,
-    Down,
 }
 
 /// Identity of one generated line; each key owns one buffer in the
@@ -1103,45 +1101,35 @@ impl Dashboard {
         false
     }
 
+    /// `>>`/`<<`: one star in or out on the heading under the cursor.
+    /// Reordering is plain vim editing — cut and paste the lines.
     pub fn structure_move(&mut self, direction: StructureDirection, cx: &mut Context<Workspace>) {
-        let (StructureDirection::Up | StructureDirection::Down) = direction else {
-            return;
-        };
         let Some((host, offset)) = self.cursor_heading_line(cx) else {
             return;
         };
         let Some(text) = self.source_text(host, cx) else {
             return;
         };
-        let headings = parse(&text);
-        let Some(index) = headings
-            .iter()
-            .position(|heading| heading.heading_range.start == offset)
+        let Some(heading) = parse(&text)
+            .into_iter()
+            .find(|heading| heading.heading_range.start == offset)
         else {
             return;
         };
-        let target = match direction {
-            StructureDirection::Up => index.checked_sub(1),
-            StructureDirection::Down => (index + 1 < headings.len()).then_some(index + 1),
-            _ => None,
-        };
-        let Some(target) = target else { return };
-        let block =
-            |index: usize| headings[index].heading_range.start..headings[index].body_range.end;
-        let a = block(index);
-        let b = block(target);
-        let range = a.start.min(b.start)..a.end.max(b.end);
-        let replacement = if index < target {
-            format!("{}{}", &text[b.clone()], &text[a.clone()])
-        } else {
-            format!("{}{}", &text[a.clone()], &text[b.clone()])
+        let stars = heading.stars_range.start;
+        let edit = match direction {
+            StructureDirection::Demote => (stars..stars, "*".to_owned()),
+            StructureDirection::Promote => {
+                if heading.depth <= 1 {
+                    return;
+                }
+                (stars..stars + 1, String::new())
+            }
         };
         self.hosts[&host]
             .upgrade()
             .unwrap()
-            .update(cx, |buffer, cx| {
-                buffer.edit([(range, replacement)], None, cx)
-            });
+            .update(cx, |buffer, cx| buffer.edit([edit], None, cx));
     }
 
     pub fn rename_cursor_topic(&mut self, title: &str, cx: &mut Context<Workspace>) -> bool {

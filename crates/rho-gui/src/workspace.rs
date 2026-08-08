@@ -54,7 +54,7 @@ use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
     AgentDone, AgentHide, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, DashboardBack,
     DashboardDeleteEmpty, DashboardDemote, DashboardGoto, DashboardHeadingAbove,
-    DashboardHeadingBelow, DashboardJump, DashboardMoveAgent, DashboardMoveDown, DashboardMoveUp,
+    DashboardHeadingBelow, DashboardJump, DashboardMoveAgent,
     DashboardNewAgent, DashboardNow, DashboardPromote, DashboardRenameTopic, DashboardReply,
     DashboardStaff, DashboardSubmit, DashboardToggleSubagents, DashboardUndo, GitApprovalAllow, GitApprovalDeny,
     MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious,
@@ -6518,12 +6518,6 @@ impl Render for Workspace {
                     return;
                 }
                 this.dashboard_structure_move(crate::dashboard::StructureDirection::Promote, cx);
-            }))
-            .on_action(cx.listener(|this, _: &DashboardMoveUp, _, cx| {
-                this.dashboard_structure_move(crate::dashboard::StructureDirection::Up, cx);
-            }))
-            .on_action(cx.listener(|this, _: &DashboardMoveDown, _, cx| {
-                this.dashboard_structure_move(crate::dashboard::StructureDirection::Down, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardDeleteEmpty, window, cx| {
                 if !this.dashboard_verb_applies(window, cx) {
