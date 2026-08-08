@@ -3605,6 +3605,24 @@ fn vim_treats_a_collapsed_subtree_as_one_line(cx: &mut TestAppContext) {
         text.starts_with("* One\nbody\nx\n* Two\n"),
         "o should insert after the collapsed subtree: {text:?}"
     );
+    // The reparsed subtree claims the new line, but a fold never
+    // captures the cursor: with the cursor still on it, the typed line
+    // stays visible below the fold.
+    let display = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .dashboard_editor()
+                .update(cx, |editor, cx| editor.display_text(cx))
+        })
+        .expect("read display text");
+    assert!(
+        display.contains("\nx"),
+        "the line under the cursor must stay visible: {display:?}"
+    );
+    assert!(
+        !display.contains("body"),
+        "the rest of the subtree stays folded: {display:?}"
+    );
 
     workspace
         .update(cx, |workspace, window, cx| {
@@ -3614,8 +3632,22 @@ fn vim_treats_a_collapsed_subtree_as_one_line(cx: &mut TestAppContext) {
                     selections.select_ranges([offset..offset]);
                 });
             });
+            workspace.sync_dashboard(window, cx);
         })
         .expect("move cursor to folded heading");
+    cx.run_until_parked();
+    // Cursor gone, the line folds in with the rest of the subtree.
+    let display = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .dashboard_editor()
+                .update(cx, |editor, cx| editor.display_text(cx))
+        })
+        .expect("read display text");
+    assert!(
+        !display.contains("\nx"),
+        "off the line, it folds back in: {display:?}"
+    );
     cx.simulate_keystrokes(*workspace, "escape x d");
     cx.run_until_parked();
     let text = workspace

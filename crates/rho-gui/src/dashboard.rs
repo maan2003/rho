@@ -190,7 +190,7 @@ pub struct Dashboard {
         Vec<Segment>,
         Vec<(LineKey, String)>,
         Vec<(HostId, usize, String)>,
-        HashSet<(HostId, usize)>,
+        Vec<(HostId, Range<usize>)>,
     )>,
     /// Buffers already registered as headerless with the editor. A
     /// boundary onto a headerless buffer draws nothing, so this is what
@@ -496,6 +496,7 @@ impl Dashboard {
 
         let draft_topic = self.new_draft.as_ref().map(|(topic, _, _)| *topic);
         let collapsed = self.collapsed_offsets(&documents, cx);
+        let fold_ranges = self.effective_fold_ranges(&documents, &collapsed, cx);
         let segments = generate(
             registry,
             &documents,
@@ -543,7 +544,7 @@ impl Dashboard {
                         && *segs == segments
                         && *drafts == draft_texts
                         && *decs == decorations
-                        && *folds == collapsed
+                        && *folds == fold_ranges
                 })
         {
             return;
@@ -743,8 +744,8 @@ impl Dashboard {
         self.apply_reply_chrome(registry, cx);
         self.apply_heading_chrome(&decorations, cx);
         self.apply_tag_conceals(&documents, cx);
-        self.apply_subtree_folds(&documents, &collapsed, cx);
-        self.last_synced = Some((documents, segments, draft_texts, decorations, collapsed));
+        self.apply_subtree_folds(&fold_ranges, cx);
+        self.last_synced = Some((documents, segments, draft_texts, decorations, fold_ranges));
     }
 
     /// The stable composition id for a line key, allocated on first use.
@@ -1282,6 +1283,44 @@ impl Dashboard {
         offsets
     }
 
+    /// The fold ranges to apply this pass: every collapsed heading's
+    /// subtree, clamped so no fold captures the cursor — the parse
+    /// happily assigns a freshly typed line below a folded heading to
+    /// that heading's subtree, and without the clamp the reapplied fold
+    /// would swallow the text mid-keystroke.
+    fn effective_fold_ranges(
+        &self,
+        documents: &[(HostId, String)],
+        collapsed: &HashSet<(HostId, usize)>,
+        cx: &mut Context<Workspace>,
+    ) -> Vec<(HostId, Range<usize>)> {
+        let cursor = match self.cursor_place(cx) {
+            Some(CursorPlace::Doc(host, offset)) => Some((host, offset)),
+            _ => None,
+        };
+        let mut ranges = Vec::new();
+        for (host, text) in documents {
+            for heading in parse(text) {
+                if !collapsed.contains(&(*host, heading.heading_range.start)) {
+                    continue;
+                }
+                let Some(mut range) = subtree_fold_range(text, &heading) else {
+                    continue;
+                };
+                if let Some((cursor_host, offset)) = cursor
+                    && cursor_host == *host
+                {
+                    match cursor_clamped_fold(text, range, offset) {
+                        Some(clamped) => range = clamped,
+                        None => continue,
+                    }
+                }
+                ranges.push((*host, range));
+            }
+        }
+        ranges
+    }
+
     /// Replaces a host's collapse set, re-anchoring each heading offset
     /// in the current text.
     fn store_collapsed(&mut self, host: HostId, offsets: &HashSet<(HostId, usize)>, cx: &App) {
@@ -1611,45 +1650,34 @@ impl Dashboard {
     /// while the display shows the heading line plus a `…` placeholder.
     fn apply_subtree_folds(
         &self,
-        documents: &[(HostId, String)],
-        collapsed: &HashSet<(HostId, usize)>,
+        fold_ranges: &[(HostId, Range<usize>)],
         cx: &mut Context<Workspace>,
     ) {
         struct DeskSubtreeFold;
         let type_id = std::any::TypeId::of::<DeskSubtreeFold>();
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
         let mut creases = Vec::new();
-        for (host, text) in documents {
+        for (host, range) in fold_ranges {
             let Some(buffer) = self.hosts.get(host).and_then(|weak| weak.upgrade()) else {
                 continue;
             };
             let buffer_snapshot = buffer.read(cx).snapshot();
-            for heading in parse(text) {
-                if !collapsed.contains(&(*host, heading.heading_range.start)) {
-                    continue;
-                }
-                let Some(range) = subtree_fold_range(text, &heading) else {
-                    continue;
-                };
-                let (Some(start), Some(end)) = (
-                    snapshot.anchor_in_excerpt(buffer_snapshot.anchor_after(range.start)),
-                    snapshot.anchor_in_excerpt(buffer_snapshot.anchor_before(range.end)),
-                ) else {
-                    continue;
-                };
-                creases.push(editor::display_map::Crease::simple(
-                    start..end,
-                    editor::FoldPlaceholder {
-                        render: std::sync::Arc::new(|_, _, _| {
-                            gpui::Empty.into_any_element()
-                        }),
-                        constrain_width: false,
-                        merge_adjacent: false,
-                        type_tag: Some(type_id),
-                        collapsed_text: Some(" …".into()),
-                    },
-                ));
-            }
+            let (Some(start), Some(end)) = (
+                snapshot.anchor_in_excerpt(buffer_snapshot.anchor_after(range.start)),
+                snapshot.anchor_in_excerpt(buffer_snapshot.anchor_before(range.end)),
+            ) else {
+                continue;
+            };
+            creases.push(editor::display_map::Crease::simple(
+                start..end,
+                editor::FoldPlaceholder {
+                    render: std::sync::Arc::new(|_, _, _| gpui::Empty.into_any_element()),
+                    constrain_width: false,
+                    merge_adjacent: false,
+                    type_tag: Some(type_id),
+                    collapsed_text: Some(" …".into()),
+                },
+            ));
         }
         self.editor.update(cx, |editor, cx| {
             editor.display_map.update(cx, |display_map, cx| {
@@ -2083,6 +2111,30 @@ fn subtree_fold_range(text: &str, heading: &DeskHeading) -> Option<Range<usize>>
         end -= 1;
     }
     (end > heading.heading_range.end).then(|| heading.heading_range.end..end)
+}
+
+/// A fold may never capture the cursor: whatever the parse says, the
+/// line the user is on stays visible. Outside the range the fold is
+/// untouched. On the fold's last line — where `o` below a folded
+/// heading puts you, and where the recomputed subtree would otherwise
+/// swallow what you type — the fold shortens to end above that line.
+/// Deeper inside, the fold lifts entirely (vim opens folds on jumps
+/// into them); it reapplies once the cursor leaves.
+fn cursor_clamped_fold(
+    text: &str,
+    range: Range<usize>,
+    cursor: usize,
+) -> Option<Range<usize>> {
+    if cursor <= range.start || cursor > range.end {
+        return Some(range);
+    }
+    let line_start = text[..cursor].rfind('\n').map_or(0, |at| at + 1);
+    let line_end = text[cursor..].find('\n').map_or(text.len(), |at| cursor + at);
+    if line_end >= range.end && line_start > range.start + 1 {
+        Some(range.start..line_start - 1)
+    } else {
+        None
+    }
 }
 
 /// One step of org-style visibility cycling for the heading at `offset`:
@@ -2673,6 +2725,25 @@ mod tests {
                 format!("doc 11..{}", text.len()),
             ]
         );
+    }
+
+    #[test]
+    fn folds_never_capture_the_cursor() {
+        let text = "* One\nbody\nx\n* Two\n";
+        let fold = 5..12;
+        // Outside the range — before, at the start boundary, after —
+        // the fold applies untouched.
+        assert_eq!(cursor_clamped_fold(text, fold.clone(), 0), Some(5..12));
+        assert_eq!(cursor_clamped_fold(text, fold.clone(), 5), Some(5..12));
+        assert_eq!(cursor_clamped_fold(text, fold.clone(), 14), Some(5..12));
+        // On the fold's last line (`o` below a folded heading, then
+        // typing) the fold shortens to end above that line.
+        assert_eq!(cursor_clamped_fold(text, fold.clone(), 11), Some(5..10));
+        assert_eq!(cursor_clamped_fold(text, fold.clone(), 12), Some(5..10));
+        // Deeper inside — or on the subtree's only line — it lifts.
+        assert_eq!(cursor_clamped_fold(text, fold.clone(), 8), None);
+        let short = "* One\nbody\n* Two\n";
+        assert_eq!(cursor_clamped_fold(short, 5..10, 8), None);
     }
 
     #[test]
