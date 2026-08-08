@@ -3329,3 +3329,118 @@ fn streaming_markdown_parses_the_edited_turn_without_revisiting_history(cx: &mut
         "emphasis flashed raw: {text:?}"
     );
 }
+
+/// The home view: the Desk document is the surface, agent rows render
+/// under their bound headings, unbound roots under a generated Unfiled
+/// tail, and daemon rebinds rearrange rows without touching the text.
+#[gpui::test]
+fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
+    use rho_ui_proto::desk::{DeskAnchor, DeskBinding, DeskOperation, DeskSnapshot};
+    use rho_ui_proto::{
+        AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
+    };
+
+    let summary = |id: u64, name: &str| UiAgentSummary {
+        agent_id: agent(id),
+        parent_agent: None,
+        display_name: Some(name.to_owned()),
+        created_at: UnixMs(id),
+        updated_at: UnixMs(id),
+        role: AgentRole::default(),
+        workspace: WorkspaceInfo::UserCheckout { repo: "/tmp".into() },
+        attention: UiAttention::Quiet,
+        last_active: UnixMs(id),
+        hidden: false,
+        disposition: AgentDisposition::Pending,
+        last_user_message_text: String::new(),
+        activity: None,
+        turn_report: None,
+        labels: Vec::new(),
+    };
+
+    let mut source = text::Buffer::new(
+        text::ReplicaId::new(8),
+        text::BufferId::new(1).unwrap(),
+        "",
+    );
+    let operation = DeskOperation::from_text(&source.edit([(0..0, "* One\nbody\n* Two\n")]));
+    let bound_anchor = DeskAnchor::from_text(source.snapshot().anchor_after(0));
+    let desk_snapshot = DeskSnapshot {
+        text: source.snapshot().text(),
+        operations: vec![operation],
+        transactions: Vec::new(),
+        replicas: Vec::new(),
+    };
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Ready {
+                    agents: vec![summary(1, "planner"), summary(2, "drifter")],
+                    iris_agent: None,
+                    projects: Vec::new(),
+                    auth: AuthState {
+                        active: String::new(),
+                        default: String::new(),
+                        namespaces: Vec::new(),
+                    },
+                    machine_seed: 0,
+                    agent_counter: 100,
+                },
+                window,
+                cx,
+            );
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskSnapshot {
+                    snapshot: desk_snapshot,
+                    replica_id: 42,
+                    bindings: vec![DeskBinding {
+                        agent_id: agent(1),
+                        anchor: bound_anchor,
+                    }],
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+        })
+        .expect("update workspace");
+    cx.run_until_parked();
+
+    let dashboard_text = |workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |workspace, _, cx| {
+                let editor = workspace.dashboard_editor();
+                editor.read(cx).buffer().read(cx).snapshot(cx).text()
+            })
+            .expect("read dashboard")
+    };
+    // The bound agent's row splices in after its heading's body; the
+    // document text itself carries no agent markers.
+    assert_eq!(
+        dashboard_text(&workspace, cx),
+        "* One\nbody\nplanner\n* Two\n\nUnfiled\ndrifter\n+ new agent"
+    );
+
+    // A daemon rebind (to Unfiled) rearranges rows; the document merges
+    // back into one slice, untouched.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskBindingsChanged(Vec::new()),
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+        })
+        .expect("update workspace");
+    cx.run_until_parked();
+    assert_eq!(
+        dashboard_text(&workspace, cx),
+        "* One\nbody\n* Two\n\nUnfiled\ndrifter\nplanner\n+ new agent"
+    );
+}

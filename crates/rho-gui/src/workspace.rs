@@ -39,7 +39,7 @@ use crate::chime::Chime;
 #[cfg(feature = "native")]
 use crate::connection::GitApprovalDecision;
 use crate::connection::{AgentFrameAllocation, ConnEvent, Connection, HostEvent};
-use crate::desk_view::{DeskSync, DeskView};
+use crate::desk_view::DeskSync;
 use crate::draft_view::DraftModel;
 use crate::hosts::{HostStatus, Hosts};
 use crate::minibuffer::{ECHO_DURATION, Echo, Minibuffer, bottom_strip};
@@ -101,7 +101,6 @@ enum SurfaceView {
         editor: Entity<editor::Editor>,
     },
     File(Entity<FileView>),
-    Desk(Entity<DeskView>),
     Shell {
         model: Entity<crate::shell_view::ShellModel>,
         editor: Entity<editor::Editor>,
@@ -1098,15 +1097,16 @@ impl Workspace {
                 let buffer = self
                     .desk_sync
                     .apply_snapshot(host, snapshot, replica_id, cx);
-                self.desk_sync.set_bindings(host, bindings);
+                self.desk_sync.set_bindings(host, bindings.clone());
                 self.dashboard.set_source(host, buffer.downgrade());
-                self.rebuild_desk_surfaces(host, buffer, window, cx);
+                self.dashboard.set_bindings(host, bindings);
             }
             ConnEvent::DeskTextApplied(record) => {
                 self.desk_sync.apply_text(host, record, cx);
             }
             ConnEvent::DeskBindingsChanged(bindings) => {
-                self.desk_sync.set_bindings(host, bindings);
+                self.desk_sync.set_bindings(host, bindings.clone());
+                self.dashboard.set_bindings(host, bindings);
             }
             ConnEvent::Ready {
                 agents,
@@ -3410,7 +3410,6 @@ impl Workspace {
             SurfaceKey::Draft => "draft".to_owned(),
             SurfaceKey::Transcript(agent_id) => self.registry.agent_display_label(*agent_id),
             SurfaceKey::File { path, .. } => path.to_string(),
-            SurfaceKey::Desk(host) => format!("desk {}", self.registry.host_name(*host)),
             SurfaceKey::Shell(agent_id) => {
                 format!("shell {}", self.registry.agent_id_label(*agent_id))
             }
@@ -3434,7 +3433,6 @@ impl Workspace {
             SurfaceKey::Draft => "compose",
             SurfaceKey::Transcript(_) => "transcript",
             SurfaceKey::File { .. } => "file",
-            SurfaceKey::Desk(_) => "desk",
             SurfaceKey::Shell(_) => "shell",
             SurfaceKey::Diff { .. } => "diff",
             SurfaceKey::Terminal { .. } => "terminal",
@@ -4067,11 +4065,6 @@ impl Workspace {
         self.dashboard_dirty
     }
 
-    pub(crate) fn dashboard_prose_edited(&mut self, key: (HostId, usize), cx: &mut Context<Self>) {
-        self.dashboard.flush_prose(key, cx);
-        self.dashboard_dirty = true;
-    }
-
     #[cfg(test)]
     pub(crate) fn preview_dashboard_agent(
         &mut self,
@@ -4119,7 +4112,6 @@ impl Workspace {
             SurfaceView::Draft { editor, .. } => editor.clone(),
             SurfaceView::Transcript { editor, .. } => editor.clone(),
             SurfaceView::File(view) => view.read(cx).editor().clone(),
-            SurfaceView::Desk(view) => view.read(cx).editor().clone(),
             SurfaceView::Shell { editor, .. } => editor.clone(),
             SurfaceView::Diff(view) => view.read(cx).editor().clone(),
             SurfaceView::Terminal(_) => self
@@ -4159,7 +4151,6 @@ impl Workspace {
             SurfaceView::Draft { editor, .. } => editor.focus_handle(cx),
             SurfaceView::Transcript { editor, .. } => editor.focus_handle(cx),
             SurfaceView::File(view) => view.read(cx).editor().focus_handle(cx),
-            SurfaceView::Desk(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::Shell { editor, .. } => editor.focus_handle(cx),
             SurfaceView::Diff(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::Terminal(view) => view.read(cx).focus_handle(cx),
@@ -4210,13 +4201,6 @@ impl Workspace {
             SurfaceKey::File { .. } => {
                 unreachable!("file surfaces are created by open_file_surface")
             }
-            SurfaceKey::Desk(host) => {
-                let buffer = self
-                    .desk_sync
-                    .buffer(*host)
-                    .expect("Desk surface requires a received snapshot");
-                SurfaceView::Desk(cx.new(|cx| DeskView::new(buffer, window, cx)))
-            }
             SurfaceKey::Shell(_) => {
                 unreachable!("shell surfaces are created by open_shell_surface")
             }
@@ -4257,11 +4241,6 @@ impl Workspace {
                 let (project, buffer) = view.read(cx).shared_content();
                 let view = cx.new(|cx| FileView::new(project, buffer, window, cx));
                 Self::wrap_surface(surface.key.clone(), SurfaceView::File(view), window, cx)
-            }
-            SurfaceView::Desk(view) => {
-                let buffer = view.read(cx).shared_buffer();
-                let view = cx.new(|cx| DeskView::new(buffer, window, cx));
-                Self::wrap_surface(surface.key.clone(), SurfaceView::Desk(view), window, cx)
             }
             SurfaceView::Diff(view) => {
                 let model = view.read(cx).model();
@@ -4314,52 +4293,6 @@ impl Workspace {
         }
     }
 
-    /// Reconnect snapshots replace the CRDT buffer entity. Rebuild every
-    /// view over the old entity, including independent split views and pane
-    /// history, so no editor can keep accepting edits on an orphaned buffer.
-    fn rebuild_desk_surfaces(
-        &mut self,
-        host: HostId,
-        buffer: Entity<language::Buffer>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let key = SurfaceKey::Desk(host);
-        let refocus = self
-            .contexts
-            .get(&self.active_context)
-            .is_some_and(|tree| tree.focused().surface.key == key);
-        let mut replacements = HashMap::<gpui::EntityId, Surface>::new();
-        let mut replace = |surface: &mut Surface| {
-            if surface.key != key {
-                return;
-            }
-            let SurfaceView::Desk(old_view) = &surface.view else {
-                return;
-            };
-            let replacement = replacements
-                .entry(old_view.entity_id())
-                .or_insert_with(|| {
-                    let view = cx.new(|cx| DeskView::new(buffer.clone(), window, cx));
-                    Self::wrap_surface(key.clone(), SurfaceView::Desk(view), window, cx)
-                })
-                .clone();
-            *surface = replacement;
-        };
-        for surfaces in self.surfaces.values_mut() {
-            for surface in surfaces {
-                replace(surface);
-            }
-        }
-        for tree in self.contexts.values_mut() {
-            tree.for_each_surface_mut(&mut replace);
-        }
-        drop(replace);
-        if refocus {
-            self.focus_active_surface(window, cx);
-        }
-    }
-
     /// Wraps a view as a surface with a focus-follow observer: gpui focus
     /// arriving inside its editor (mouse click, vim motion) moves pane
     /// focus and the agent context along.
@@ -4373,10 +4306,6 @@ impl Workspace {
             SurfaceView::Draft { editor, .. } => (editor.focus_handle(cx), editor.entity_id()),
             SurfaceView::Transcript { editor, .. } => (editor.focus_handle(cx), editor.entity_id()),
             SurfaceView::File(view) => {
-                let editor = view.read(cx).editor();
-                (editor.focus_handle(cx), editor.entity_id())
-            }
-            SurfaceView::Desk(view) => {
                 let editor = view.read(cx).editor();
                 (editor.focus_handle(cx), editor.entity_id())
             }
@@ -4442,7 +4371,6 @@ impl Workspace {
             }
             // Files and chat keep whatever agent context was current.
             SurfaceKey::File { .. }
-            | SurfaceKey::Desk(_)
             | SurfaceKey::ZulipInbox
             | SurfaceKey::ZulipNarrow { .. } => None,
         };
@@ -5136,25 +5064,8 @@ impl Workspace {
                     }
                 }
             }
-            _ => {}
-        }
-    }
-
-    /// Org agenda goto: topic rows jump to their shared editable Desk source.
-    fn dashboard_goto(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some((host, offset)) = self.dashboard.cursor_topic(cx) {
-            if self.desk_sync.buffer(host).is_none() {
-                return;
-            }
-            let surface = self.make_surface(SurfaceKey::Desk(host), window, cx);
-            if let SurfaceView::Desk(view) = &surface.view {
-                view.update(cx, |view, cx| view.jump_to_heading(offset, window, cx));
-            }
-            self.display_surface(surface);
-            self.focus_active_surface(window, cx);
-            cx.notify();
-        } else {
-            self.dashboard_open(window, cx);
+            // Document text keeps vim's own enter.
+            _ => cx.propagate(),
         }
     }
 
@@ -5165,12 +5076,8 @@ impl Workspace {
                 self.dashboard.open_reply(agent_id, cx);
                 self.dashboard_enter_insert(window, cx);
             }
-            _ => self.notice_on(
-                None,
-                "reply: no agent under the cursor",
-                StyleClass::SystemInfo,
-                cx,
-            ),
+            // Document text keeps vim's own `r`.
+            _ => cx.propagate(),
         }
     }
 
@@ -5520,12 +5427,20 @@ impl Workspace {
              input: String,
              _window: &mut Window,
              cx: &mut Context<Workspace>| {
-                if workspace
+                let Some((host, agent_id, heading_offset)) = workspace
                     .dashboard
-                    .file_cursor_agent(&workspace.registry, input.trim(), cx)
-                {
-                    workspace.dashboard_dirty = true;
+                    .rebind_target_for_cursor_agent(&workspace.registry, input.trim(), cx)
+                else {
+                    return;
+                };
+                // Binding is a daemon operation; the confirmed set comes
+                // back as a DeskBindingsChanged broadcast.
+                let anchor = heading_offset
+                    .and_then(|offset| workspace.desk_sync.anchor_at(host, offset, cx));
+                if anchor.is_none() && heading_offset.is_some() {
+                    return;
                 }
+                workspace.send_to_host(host, ClientMessage::DeskRebind { agent_id, anchor });
             },
         );
         self.open_prompt("file agent:", complete, on_submit, window, cx);
@@ -5933,12 +5848,6 @@ impl Workspace {
                 .into_any_element(),
             SurfaceView::File(view) => div()
                 .id("rho-surface-file")
-                .size_full()
-                .overflow_hidden()
-                .child(view.clone())
-                .into_any_element(),
-            SurfaceView::Desk(view) => div()
-                .id("rho-surface-desk")
                 .size_full()
                 .overflow_hidden()
                 .child(view.clone())
@@ -6464,7 +6373,7 @@ impl Render for Workspace {
                 this.dashboard_open(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardGoto, window, cx| {
-                this.dashboard_goto(window, cx);
+                this.dashboard_open(window, cx);
             }))
             .on_action(cx.listener(|this, _: &crate::RootTransient, window, cx| {
                 this.open_transient(crate::transient::root_menu(), window, cx);

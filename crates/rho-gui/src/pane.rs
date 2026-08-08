@@ -10,7 +10,6 @@
 //! is per-viewport, like emacs window history.
 
 use camino::Utf8PathBuf;
-use rho_registry::HostId;
 use rho_ui_proto::AgentId;
 
 /// Stable identity of a surface, independent of any view entity.
@@ -26,8 +25,6 @@ pub enum SurfaceKey {
         agent_id: AgentId,
         path: Utf8PathBuf,
     },
-    /// A host's editable daemon-owned Desk source document.
-    Desk(HostId),
     /// An editor-native shell process and transcript owned by the daemon.
     Shell(AgentId),
     /// The jj working-copy diff for an agent's workspace.

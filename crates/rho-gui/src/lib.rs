@@ -60,7 +60,6 @@ actions!(
         DashboardJump,
         DashboardStaff,
         DashboardGoto,
-        DeskCycle,
         DashboardToggleSubagents,
         DashboardHeadingBelow,
         DashboardHeadingAbove,
@@ -333,11 +332,6 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             KeyBinding::new("c r", DashboardRenameTopic, Some(context)),
         ]);
     }
-    cx.bind_keys([KeyBinding::new(
-        "tab",
-        DeskCycle,
-        Some("RhoDeskView > Editor"),
-    )]);
 }
 
 #[cfg(all(test, feature = "native"))]
