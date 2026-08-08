@@ -138,7 +138,9 @@ use std::{
 };
 
 use crate::{
-    EditorStyle, RowExt, inlays::{Inlay, InlayHighlight}, movement::TextLayoutDetails,
+    EditorStyle, RowExt,
+    inlays::{Inlay, InlayHighlight},
+    movement::TextLayoutDetails,
 };
 use block_map::{BlockPointCursor, BlockRow, BlockSnapshot};
 use fold_map::{FoldPointCursor, FoldSnapshot};
@@ -2754,6 +2756,24 @@ impl DisplaySnapshot {
             ),
             Bias::Right,
         )
+    }
+
+    /// Returns the buffer range occupied by the FoldMap line containing `point`.
+    ///
+    /// This excludes soft wrapping, so a closed multi-line fold is represented
+    /// as one line while a fold contained within one buffer row does not change
+    /// the returned range.
+    pub fn fold_merged_line_range(&self, point: Point) -> Range<Point> {
+        let inlay_point = self.inlay_snapshot().to_inlay_point(point);
+        let fold_point = self.fold_snapshot().to_fold_point(inlay_point, Bias::Left);
+        let start = FoldPoint::new(fold_point.row(), 0).to_inlay_point(self.fold_snapshot());
+        let end = FoldPoint::new(
+            fold_point.row(),
+            self.fold_snapshot().line_len(fold_point.row()),
+        )
+        .to_inlay_point(self.fold_snapshot());
+
+        self.inlay_snapshot().to_buffer_point(start)..self.inlay_snapshot().to_buffer_point(end)
     }
 }
 

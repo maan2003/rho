@@ -1350,7 +1350,12 @@ impl Vim {
                         }
                         selection.collapse_to(point, selection.goal)
                     } else if !last_mode.is_visual() && mode.is_visual() {
-                        if selection.is_empty() {
+                        let folded_line = map.fold_merged_line_range(selection.start.to_point(map));
+                        if mode == Mode::VisualLine && folded_line.start.row != folded_line.end.row
+                        {
+                            selection.start = folded_line.start.to_display_point(map);
+                            selection.end = folded_line.end.to_display_point(map);
+                        } else if selection.is_empty() {
                             selection.end = movement::right(map, selection.start);
                         }
                     }

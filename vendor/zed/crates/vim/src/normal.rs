@@ -752,12 +752,16 @@ impl Vim {
         self.switch_mode(Mode::Insert, false, window, cx);
         self.update_editor(cx, |_, editor, cx| {
             editor.transact(window, cx, |editor, window, cx| {
-                let selections = editor.selections.all::<Point>(&editor.display_snapshot(cx));
+                let display_snapshot = editor.display_snapshot(cx);
+                let selections = editor.selections.all::<Point>(&display_snapshot);
                 let snapshot = editor.buffer().read(cx).snapshot(cx);
 
                 let selection_start_rows: BTreeSet<u32> = selections
                     .into_iter()
-                    .map(|selection| selection.start.row)
+                    .map(|selection| {
+                        let range = display_snapshot.fold_merged_line_range(selection.start);
+                        range.start.row
+                    })
                     .collect();
 
                 let mut auto_indent_edits = Vec::new();
@@ -819,17 +823,19 @@ impl Vim {
         self.switch_mode(Mode::Insert, false, window, cx);
         self.update_editor(cx, |_, editor, cx| {
             editor.transact(window, cx, |editor, window, cx| {
-                let selections = editor.selections.all::<Point>(&editor.display_snapshot(cx));
+                let display_snapshot = editor.display_snapshot(cx);
+                let selections = editor.selections.all::<Point>(&display_snapshot);
                 let snapshot = editor.buffer().read(cx).snapshot(cx);
 
                 let selection_end_rows: BTreeSet<u32> = selections
                     .into_iter()
                     .map(|selection| {
-                        if !selection.is_empty() && selection.end.column == 0 {
-                            selection.end.row.saturating_sub(1)
+                        let point = if !selection.is_empty() && selection.end.column == 0 {
+                            Point::new(selection.end.row.saturating_sub(1), 0)
                         } else {
-                            selection.end.row
-                        }
+                            selection.end
+                        };
+                        display_snapshot.fold_merged_line_range(point).end.row
                     })
                     .collect();
 

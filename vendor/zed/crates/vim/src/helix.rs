@@ -879,6 +879,27 @@ impl Vim {
                 let start_row = selection.start.row;
                 let current_end_row = selection.end.row;
 
+                let folded_line = display_map.fold_merged_line_range(selection.start);
+                if folded_line.start.row != folded_line.end.row {
+                    let mut end = folded_line.end;
+                    for _ in 1..count {
+                        if end.row >= max_point.row {
+                            break;
+                        }
+                        end = display_map
+                            .fold_merged_line_range(Point::new(end.row + 1, 0))
+                            .end;
+                    }
+                    selection.start = folded_line.start;
+                    selection.end = if end.row < max_point.row {
+                        Point::new(end.row + 1, 0)
+                    } else {
+                        max_point
+                    };
+                    selection.reversed = false;
+                    continue;
+                }
+
                 // Check if cursor is on empty line by checking first character
                 let line_start_offset = buffer_snapshot.point_to_offset(Point::new(start_row, 0));
                 let first_char = buffer_snapshot.chars_at(line_start_offset).next();

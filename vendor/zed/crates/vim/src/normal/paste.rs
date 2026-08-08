@@ -165,7 +165,15 @@ impl Vim {
 
                         selection.start..end_point
                     } else if line_mode {
-                        let point = if before {
+                        let buffer_point = selection.start.to_point(&display_map);
+                        let folded_line = display_map.fold_merged_line_range(buffer_point);
+                        let point = if folded_line.start.row != folded_line.end.row {
+                            if before {
+                                folded_line.start.to_display_point(&display_map)
+                            } else {
+                                folded_line.end.to_display_point(&display_map)
+                            }
+                        } else if before {
                             movement::line_beginning(&display_map, selection.start, false)
                         } else {
                             movement::line_end(&display_map, selection.start, false)

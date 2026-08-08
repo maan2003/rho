@@ -3543,6 +3543,98 @@ fn collapsed_subtree_folds_in_the_display_and_survives_edits(cx: &mut TestAppCon
     assert!(expanded.contains("kid stuff"), "expanded: {expanded:?}");
 }
 
+#[gpui::test]
+fn vim_treats_a_collapsed_subtree_as_one_line(cx: &mut TestAppContext) {
+    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
+
+    let desk_text = "* One\nbody\n* Two\n";
+    let mut source = text::Buffer::new(
+        text::ReplicaId::new(8),
+        text::BufferId::new(1).unwrap(),
+        "",
+    );
+    let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text)]));
+    let workspace = test_workspace(cx);
+    cx.update(bind_test_keymaps);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskSnapshot {
+                    snapshot: DeskSnapshot {
+                        text: source.snapshot().text(),
+                        operations: vec![operation],
+                        transactions: Vec::new(),
+                        replicas: Vec::new(),
+                    },
+                    replica_id: 42,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+            workspace.dashboard_cycle_fold_for_test(HostId::default(), 0, window, cx);
+
+            let editor = workspace.dashboard_editor();
+            window.focus(&editor.read(cx).focus_handle(cx), cx);
+            editor.update(cx, |editor, cx| {
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    let offset = editor::MultiBufferOffset(0);
+                    selections.select_ranges([offset..offset]);
+                });
+            });
+        })
+        .expect("set up folded dashboard");
+    cx.update(|cx| cx.refresh_windows());
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes(*workspace, "escape o x escape");
+    cx.run_until_parked();
+    let text = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .dashboard_editor()
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .text()
+        })
+        .expect("read dashboard");
+    assert!(
+        text.starts_with("* One\nbody\nx\n* Two\n"),
+        "o should insert after the collapsed subtree: {text:?}"
+    );
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.dashboard_editor().update(cx, |editor, cx| {
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    let offset = editor::MultiBufferOffset(0);
+                    selections.select_ranges([offset..offset]);
+                });
+            });
+        })
+        .expect("move cursor to folded heading");
+    cx.simulate_keystrokes(*workspace, "escape x d");
+    cx.run_until_parked();
+    let text = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .dashboard_editor()
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .text()
+        })
+        .expect("read dashboard");
+    assert!(
+        text.starts_with("* Two\n"),
+        "helix line deletion should remove the collapsed subtree: {text:?}"
+    );
+}
+
 /// The home view: the Desk document is the surface, agent rows render
 /// under their bound headings, unbound roots under a generated Unfiled
 /// tail, and daemon rebinds rearrange rows without touching the text.

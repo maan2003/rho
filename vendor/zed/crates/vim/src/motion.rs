@@ -1462,8 +1462,20 @@ impl Motion {
         }
 
         if kind == MotionKind::Linewise {
-            selection.start = map.prev_line_boundary(selection.start.to_point(map)).1;
-            selection.end = map.next_line_boundary(selection.end.to_point(map)).1;
+            let start = selection.start.to_point(map);
+            let end = selection.end.to_point(map);
+            let start_line = map.fold_merged_line_range(start);
+            let end_line = map.fold_merged_line_range(end);
+            selection.start = if start_line.start.row != start_line.end.row {
+                start_line.start.to_display_point(map)
+            } else {
+                map.prev_line_boundary(start).1
+            };
+            selection.end = if end_line.start.row != end_line.end.row {
+                end_line.end.to_display_point(map)
+            } else {
+                map.next_line_boundary(end).1
+            };
         }
         Some((selection.start..selection.end, kind))
     }
