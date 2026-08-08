@@ -3382,7 +3382,8 @@ impl Workspace {
         cx.notify();
     }
 
-    /// The dashboard cursor moved: preview the row it landed on. Only
+    /// The dashboard cursor moved: preview the row it landed on, and hide
+    /// the preview when the cursor leaves every staffed region. Only
     /// while the dashboard owns the keyboard — programmatic cursor
     /// restoration and unfocused syncs never drive the panes.
     fn dashboard_cursor_moved(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3390,11 +3391,10 @@ impl Workspace {
         if !self.dashboard.focus_handle(cx).is_focused(window) {
             return;
         }
-        match self.dashboard.cursor_target(&self.registry, cx) {
-            Some(RowTarget::Agent(agent_id)) if self.dashboard_preview != Some(agent_id) => {
-                self.preview_agent(agent_id, window, cx);
-            }
-            Some(RowTarget::Agent(_)) => {}
+        // A reply draft sits inside its agent's heading region, so it keeps
+        // that agent on screen while the reply is typed.
+        let agent = match self.dashboard.cursor_target(&self.registry, cx) {
+            Some(RowTarget::Agent(agent_id)) | Some(RowTarget::Reply(agent_id)) => Some(agent_id),
             // Anywhere in a staffed heading's subtree previews its top
             // agent — bound agents have no rows of their own to land on.
             Some(RowTarget::Topic {
@@ -3402,19 +3402,29 @@ impl Workspace {
                 offset,
                 first_attention,
                 ..
-            }) => {
-                if let Some(agent_id) = first_attention
-                    .or_else(|| self.dashboard.first_agent_for_topic((host, offset)))
-                    && self.dashboard_preview != Some(agent_id)
-                {
-                    self.preview_agent(agent_id, window, cx);
-                }
+            }) => first_attention
+                .or_else(|| self.dashboard.first_agent_for_topic((host, offset))),
+            Some(RowTarget::NewDraft(Some(topic))) => self.dashboard.first_agent_for_topic(topic),
+            _ => None,
+        };
+        match agent {
+            Some(agent_id) if self.dashboard_preview != Some(agent_id) => {
+                self.preview_agent(agent_id, window, cx);
             }
-            // Headers and the folded tail retain the last preview. Clearing
-            // it here would remove the preview pane, resize the dashboard,
-            // and visibly rewrap its rows on ordinary cursor motion.
-            _ => {}
+            Some(_) => {}
+            None => self.clear_dashboard_preview(cx),
         }
+    }
+
+    /// Hides the preview pane: the cursor is on a header, prose, or an
+    /// unstaffed heading, so no agent claims the frame.
+    fn clear_dashboard_preview(&mut self, cx: &mut Context<Self>) {
+        if self.dashboard_preview.is_none() {
+            return;
+        }
+        self.dashboard_preview = None;
+        self.hosts.focus_agent(None);
+        cx.notify();
     }
 
     /// The active context's surface with the given key, whether or not

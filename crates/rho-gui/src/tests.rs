@@ -3436,6 +3436,123 @@ fn heading_tags_file_agents_and_conceal_in_display(cx: &mut TestAppContext) {
     );
 }
 
+/// The preview pane follows the cursor: a staffed heading (or its body)
+/// shows its agent, and moving onto an unstaffed heading hides the
+/// preview instead of retaining the last agent.
+#[gpui::test]
+fn preview_clears_when_the_cursor_leaves_a_staffed_heading(cx: &mut TestAppContext) {
+    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
+    use rho_ui_proto::{
+        AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
+    };
+
+    let summary = |id: u64, name: &str| UiAgentSummary {
+        agent_id: agent(id),
+        parent_agent: None,
+        display_name: Some(name.to_owned()),
+        created_at: UnixMs(id),
+        updated_at: UnixMs(id),
+        role: AgentRole::default(),
+        workspace: WorkspaceInfo::UserCheckout { repo: "/tmp".into() },
+        attention: UiAttention::Quiet,
+        last_active: UnixMs(id),
+        hidden: false,
+        disposition: AgentDisposition::Pending,
+        last_user_message_text: String::new(),
+        activity: None,
+        turn_report: None,
+        labels: Vec::new(),
+    };
+
+    let desk_text = format!("* One :eng-{}:\nbody\n* Two\n", agent(1).encoded());
+    let mut source = text::Buffer::new(
+        text::ReplicaId::new(8),
+        text::BufferId::new(1).unwrap(),
+        "",
+    );
+    let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text.as_str())]));
+    let desk_snapshot = DeskSnapshot {
+        text: source.snapshot().text(),
+        operations: vec![operation],
+        transactions: Vec::new(),
+        replicas: Vec::new(),
+    };
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Ready {
+                    agents: vec![summary(1, "planner")],
+                    iris_agent: None,
+                    projects: Vec::new(),
+                    auth: AuthState {
+                        active: String::new(),
+                        default: String::new(),
+                        namespaces: Vec::new(),
+                    },
+                    machine_seed: 0,
+                    agent_counter: 100,
+                },
+                window,
+                cx,
+            );
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskSnapshot {
+                    snapshot: desk_snapshot,
+                    replica_id: 42,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+            let focus_handle = workspace.dashboard_editor().read(cx).focus_handle(cx);
+            window.focus(&focus_handle, cx);
+        })
+        .expect("update workspace");
+    cx.update(|cx| cx.refresh_windows());
+    cx.run_until_parked();
+
+    let select = |workspace: &gpui::WindowHandle<Workspace>,
+                  cx: &mut TestAppContext,
+                  offset: usize| {
+        workspace
+            .update(cx, |workspace, window, cx| {
+                workspace.dashboard_editor().update(cx, |editor, cx| {
+                    editor.change_selections(Default::default(), window, cx, |selections| {
+                        let offset = editor::MultiBufferOffset(offset);
+                        selections.select_ranges([offset..offset]);
+                    });
+                });
+            })
+            .expect("move dashboard cursor");
+        cx.run_until_parked();
+    };
+    let preview = |workspace: &gpui::WindowHandle<Workspace>, cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |workspace, _, _| workspace.dashboard_preview_agent())
+            .expect("read preview")
+    };
+
+    // Inside the staffed heading's body.
+    select(&workspace, cx, desk_text.find("body").expect("body") + 2);
+    assert_eq!(
+        preview(&workspace, cx),
+        Some(agent(1)),
+        "staffed heading's body should preview its agent"
+    );
+
+    // On the unstaffed heading below.
+    select(&workspace, cx, desk_text.find("* Two").expect("Two") + 2);
+    assert_eq!(
+        preview(&workspace, cx),
+        None,
+        "unstaffed heading should hide the preview"
+    );
+}
+
 /// Collapse is a display fold over the subtree: TAB cycles folded →
 /// children → expanded, the buffer keeps the text throughout, and the
 /// fold is anchored — edits above it must not pop it open.
