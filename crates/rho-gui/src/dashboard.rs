@@ -42,6 +42,9 @@ const PLACEHOLDER_ID_BASE: usize = 1_000_000;
 /// summary replaces it.
 const PLACEHOLDER_TITLE: &str = "…";
 
+/// Inlay id space for heading decorations, clear of the placeholders.
+const HEADING_INLAY_ID_BASE: usize = 2_000_000;
+
 /// Highlight key for draft text (the user-message accent), past the
 /// class and lamp key ranges.
 const DRAFT_TEXT_KEY: HighlightKey =
@@ -165,9 +168,17 @@ pub struct Dashboard {
     pending_doc_cursor: Option<(HostId, usize)>,
     /// Reply placeholder inlays currently spliced in.
     placeholder_ids: Vec<InlayId>,
+    /// Heading decoration inlays (glyph, eng-id, attention reason)
+    /// currently spliced in.
+    heading_inlay_ids: Vec<InlayId>,
     /// The previous pass's inputs and output, so a sync whose world is
     /// unchanged returns without touching the editor.
-    last_synced: Option<(Vec<(HostId, String)>, Vec<Segment>, Vec<(LineKey, String)>)>,
+    last_synced: Option<(
+        Vec<(HostId, String)>,
+        Vec<Segment>,
+        Vec<(LineKey, String)>,
+        Vec<(HostId, usize, String)>,
+    )>,
     /// Buffers already registered as headerless with the editor. A
     /// boundary onto a headerless buffer draws nothing, so this is what
     /// keeps the interleaved excerpts seamless.
@@ -221,6 +232,7 @@ impl Dashboard {
             pending_cursor: None,
             pending_doc_cursor: None,
             placeholder_ids: Vec::new(),
+            heading_inlay_ids: Vec::new(),
             last_synced: None,
             headers_disabled: std::collections::HashSet::new(),
         }
@@ -352,7 +364,17 @@ impl Dashboard {
     }
 
     pub fn cursor_to_agent(&mut self, agent_id: AgentId, cx: &mut Context<Workspace>) {
-        self.pending_cursor = Some(LineKey::Agent(agent_id));
+        // Filed agents have no row of their own; the cursor lands on the
+        // heading that carries them.
+        let heading = self
+            .heading_agents
+            .iter()
+            .find(|(_, agents)| agents.contains(&agent_id))
+            .map(|(topic, _)| *topic);
+        match heading {
+            Some((host, offset)) => self.pending_doc_cursor = Some((host, offset)),
+            None => self.pending_cursor = Some(LineKey::Agent(agent_id)),
+        }
         cx.notify();
     }
 
@@ -482,6 +504,10 @@ impl Dashboard {
             &self.replies,
             draft_topic,
         );
+        // Staffed headings wear their agents as end-of-line inlays, not
+        // rows, so the decoration strings join the fingerprint: attention
+        // changes must not vanish into the early-out.
+        let decorations = heading_decorations(registry, &documents, &filed);
 
         // Render reconciles every frame, so most passes are registry
         // noise that changes nothing on screen. When the whole pass —
@@ -511,8 +537,11 @@ impl Dashboard {
             && self
                 .last_synced
                 .as_ref()
-                .is_some_and(|(docs, segs, drafts)| {
-                    *docs == documents && *segs == segments && *drafts == draft_texts
+                .is_some_and(|(docs, segs, drafts, decs)| {
+                    *docs == documents
+                        && *segs == segments
+                        && *drafts == draft_texts
+                        && *decs == decorations
                 })
         {
             return;
@@ -685,7 +714,8 @@ impl Dashboard {
 
         self.apply_highlights(&segments, &documents, cx);
         self.apply_reply_chrome(registry, cx);
-        self.last_synced = Some((documents, segments, draft_texts));
+        self.apply_heading_chrome(&decorations, cx);
+        self.last_synced = Some((documents, segments, draft_texts, decorations));
     }
 
     /// The stable composition id for a line key, allocated on first use.
@@ -1357,6 +1387,23 @@ impl Dashboard {
         let mut inlays = Vec::new();
         let mut gutter_ranges = Vec::new();
         let mut draft_text_ranges = Vec::new();
+        // The new-draft placeholder says where the spawn will land, so
+        // the project is visible (and fixable, via `:project:` on the
+        // heading) before anything is sent.
+        let new_draft_hint = self.new_draft.as_ref().map(|(topic, _, _)| {
+            let mut label = "first message for the new agent".to_owned();
+            if let Some((host, offset)) = topic
+                && let Some(text) = self.source_text(*host, cx)
+                && let Some(project) = parse(&text)
+                    .into_iter()
+                    .find(|heading| heading.heading_range.start == *offset)
+                    .and_then(|heading| heading.resolved_project)
+            {
+                label.push_str(&format!(" · {project}"));
+            }
+            label.push('…');
+            (LineKey::NewDraft(*topic), label)
+        });
         let drafts = self
             .replies
             .iter()
@@ -1366,11 +1413,7 @@ impl Dashboard {
                     format!("reply to {}…", registry.agent_id_label(*agent_id)),
                 )
             })
-            .chain(
-                self.new_draft
-                    .as_ref()
-                    .map(|(topic, _, _)| (LineKey::NewDraft(*topic), "new agent…".to_owned())),
-            );
+            .chain(new_draft_hint);
         for (index, (key, placeholder)) in drafts.enumerate() {
             let Some(buffer) = self.buffers.get(&key) else {
                 continue;
@@ -1410,6 +1453,38 @@ impl Dashboard {
                 cx,
             );
             editor.highlight_text(DRAFT_TEXT_KEY, draft_text_ranges, draft_style, cx);
+        });
+    }
+
+    /// Splices the staffed headings' end-of-line decorations in as
+    /// inlays: display-only, so the document text never carries agent
+    /// markers and typing on the heading line slides them along.
+    fn apply_heading_chrome(
+        &mut self,
+        decorations: &[(HostId, usize, String)],
+        cx: &mut Context<Workspace>,
+    ) {
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let to_remove = std::mem::take(&mut self.heading_inlay_ids);
+        let mut inlays = Vec::new();
+        for (index, (host, offset, text)) in decorations.iter().enumerate() {
+            let Some(buffer) = self.hosts.get(host).and_then(|weak| weak.upgrade()) else {
+                continue;
+            };
+            let buffer_snapshot = buffer.read(cx).snapshot();
+            // Right-biased so typing at the end of the title stays before
+            // the decoration.
+            let Some(position) =
+                snapshot.anchor_in_excerpt(buffer_snapshot.anchor_after(*offset))
+            else {
+                continue;
+            };
+            let inlay = Inlay::custom(HEADING_INLAY_ID_BASE + index, position, text.clone());
+            self.heading_inlay_ids.push(inlay.id);
+            inlays.push(inlay);
+        }
+        self.editor.update(cx, |editor, cx| {
+            editor.splice_inlays(&to_remove, inlays, cx);
         });
     }
 }
@@ -1638,6 +1713,50 @@ fn agent_line(agent_id: AgentId, registry: &AgentRegistry) -> Line {
     line
 }
 
+/// What a staffed heading wears at the end of its line: each bound
+/// agent as `glyph eng-id` (plus `+n` when it has subagents), and the
+/// attention reason inline when the agent is waiting on the human.
+fn heading_decorations(
+    registry: &AgentRegistry,
+    documents: &[(HostId, String)],
+    filed: &HashMap<(HostId, usize), Vec<AgentId>>,
+) -> Vec<(HostId, usize, String)> {
+    let mut decorations = Vec::new();
+    for (host, text) in documents {
+        for heading in parse(text) {
+            let Some(agents) = filed.get(&(*host, heading.heading_range.start)) else {
+                continue;
+            };
+            if agents.is_empty() {
+                continue;
+            }
+            let mut label = String::new();
+            for agent_id in agents {
+                let attention = registry.attention(*agent_id);
+                label.push_str("  ");
+                label.push_str(attention_glyph(attention));
+                label.push(' ');
+                label.push_str(&registry.agent_id_label(*agent_id));
+                let members = registry.agent_subtree(*agent_id).len().saturating_sub(1);
+                if members > 0 {
+                    label.push_str(&format!(" +{members}"));
+                }
+                if attention >= UiAttention::Pending
+                    && let Some(reason) = registry.agent_attention_reason(*agent_id)
+                {
+                    let reason = reason.lines().next().unwrap_or_default().trim();
+                    if !reason.is_empty() {
+                        label.push_str(" — ");
+                        label.push_str(&truncate_chars(reason, 48));
+                    }
+                }
+            }
+            decorations.push((*host, heading.heading_range.end, label));
+        }
+    }
+    decorations
+}
+
 fn truncate_chars(value: &str, limit: usize) -> String {
     if value.chars().count() <= limit {
         return value.to_owned();
@@ -1669,9 +1788,11 @@ fn cut_points(text: &str, heading: &DeskHeading) -> (usize, usize) {
 
 
 /// Generate the listing without mutating Desk text: the documents are
-/// emitted as writable slices, cut where a bound heading's rows (agent
-/// rows, replies, the staffing draft) splice in after its body. Root
-/// agents bound to no heading form the generated Unfiled tail.
+/// emitted as writable slices, cut where a bound heading's rows (reply
+/// drafts, the staffing draft) splice in after its body. Bound agents
+/// themselves are not rows — they ride their heading line as inlay
+/// decorations. Root agents bound to no heading form the generated
+/// Unfiled tail, where they keep full rows.
 fn generate(
     registry: &AgentRegistry,
     documents: &[(HostId, String)],
@@ -1690,6 +1811,17 @@ fn generate(
         |segments: &mut Vec<Segment>, emitted_replies: &mut HashSet<AgentId>, agents: &[AgentId]| {
             for agent_id in agents {
                 segments.push(Segment::Line(agent_line(*agent_id, registry)));
+                if replies.contains(agent_id) && emitted_replies.insert(*agent_id) {
+                    segments.push(Segment::Line(Line::new(
+                        LineKey::Reply(*agent_id),
+                        RowTarget::Reply(*agent_id),
+                    )));
+                }
+            }
+        };
+    let push_reply_rows =
+        |segments: &mut Vec<Segment>, emitted_replies: &mut HashSet<AgentId>, agents: &[AgentId]| {
+            for agent_id in agents {
                 if replies.contains(agent_id) && emitted_replies.insert(*agent_id) {
                     segments.push(Segment::Line(Line::new(
                         LineKey::Reply(*agent_id),
@@ -1738,7 +1870,7 @@ fn generate(
                 });
                 slice_id = next_slice_id(&heading.title, &mut title_counts);
                 let prose = prose_for(text, heading);
-                let folded_count = agents.len() + usize::from(!prose.is_empty());
+                let folded_count = usize::from(!prose.is_empty());
                 if folded_count > 0 {
                     let loudest = agents
                         .iter()
@@ -1775,10 +1907,12 @@ fn generate(
                     )));
                 }
                 slice_start = heading.body_range.end;
-            } else if !agents.is_empty() || draft_here {
-                // Rows splice in after the heading's body, before the
+            } else if agents.iter().any(|agent_id| replies.contains(agent_id)) || draft_here {
+                // Drafts splice in after the heading's body, before the
                 // next heading (trailing newline trimmed so the excerpt
-                // boundary doesn't double it).
+                // boundary doesn't double it). A staffed heading with no
+                // open draft needs no cut at all: its agents are line
+                // decorations, not rows.
                 let (position, resume) = cut_points(text, heading);
                 segments.push(Segment::Doc {
                     host: *host,
@@ -1786,7 +1920,7 @@ fn generate(
                     id: slice_id,
                 });
                 slice_id = next_slice_id(&heading.title, &mut title_counts);
-                push_agent_rows(&mut segments, &mut emitted_replies, agents);
+                push_reply_rows(&mut segments, &mut emitted_replies, agents);
                 if draft_here {
                     segments.push(Segment::Line(Line::new(
                         LineKey::NewDraft(Some((*host, start))),
@@ -1988,7 +2122,7 @@ mod tests {
     }
 
     #[test]
-    fn documents_slice_at_bound_headings_and_agents_triage_locally() {
+    fn bound_agents_decorate_their_heading_and_replies_still_cut() {
         let a = agent(1, None, UiAttention::Quiet, 30);
         let b = agent(2, None, UiAttention::NeedsInput, 10);
         let (registry, host) = registry(vec![a.clone(), b.clone()]);
@@ -1998,6 +2132,8 @@ mod tests {
             (host, 0),
             sorted_agents(&registry, [a.agent_id, b.agent_id]),
         );
+        // Bound agents are decorations, not rows: with no draft open the
+        // document stays one writable slice.
         let segments = generate(
             &registry,
             &[(host, text.clone())],
@@ -2007,17 +2143,36 @@ mod tests {
             &[],
             None,
         );
-        // The document splits after "One"'s body (trailing newline
-        // trimmed); triage puts the needs-input agent first.
+        assert_eq!(keys(&segments), vec![format!("doc 0..{}", text.len() - 1)]);
+
+        // An open reply still splices in after the heading's body.
+        let segments = generate(
+            &registry,
+            &[(host, text.clone())],
+            &filed,
+            &HashSet::new(),
+            &HashSet::new(),
+            &[b.agent_id],
+            None,
+        );
         assert_eq!(
             keys(&segments),
             vec![
                 "doc 0..10".to_string(),
-                format!("{:?}", LineKey::Agent(b.agent_id)),
-                format!("{:?}", LineKey::Agent(a.agent_id)),
+                format!("{:?}", LineKey::Reply(b.agent_id)),
                 format!("doc 11..{}", text.len() - 1),
             ]
         );
+
+        // The heading's decoration triages the needs-input agent first
+        // and names both agents by id.
+        let decorations =
+            heading_decorations(&registry, &[(host, text.clone())], &filed);
+        assert_eq!(decorations.len(), 1);
+        let (_, offset, label) = &decorations[0];
+        assert_eq!(*offset, "* One".len());
+        assert!(label.starts_with("  ? "), "label: {label:?}");
+        assert_eq!(label.matches(" eng-").count(), 2, "label: {label:?}");
     }
 
     #[test]

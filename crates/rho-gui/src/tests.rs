@@ -3418,11 +3418,22 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
             })
             .expect("read dashboard")
     };
-    // The bound agent's row splices in after its heading's body; the
-    // document text itself carries no agent markers.
+    // The bound agent decorates its heading line (as an inlay, never
+    // document text); only unbound agents get rows, under Unfiled.
     assert_eq!(
         dashboard_text(&workspace, cx),
-        "* One\nbody\n  · planner\n* Two\n\nUnfiled · 1\n  · drifter"
+        "* One\nbody\n* Two\n\nUnfiled · 1\n  · drifter"
+    );
+    let display = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .dashboard_editor()
+                .update(cx, |editor, cx| editor.display_text(cx))
+        })
+        .expect("read display text");
+    assert!(
+        display.contains("* One  · eng-"),
+        "heading decoration missing: {display:?}"
     );
 
     // A daemon rebind (to Unfiled) rearranges rows; the document merges
