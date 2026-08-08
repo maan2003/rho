@@ -89,6 +89,11 @@ pub struct MultiBuffer {
     /// The writing capability of the multi-buffer.
     capability: Capability,
     buffer_changed_since_sync: Rc<Cell<bool>>,
+    /// When true, one buffer's excerpts may live under multiple path keys
+    /// simultaneously. Setting excerpts for a path no longer evicts the
+    /// buffer's excerpts from other paths; callers manage path removal
+    /// explicitly via [`MultiBuffer::remove_excerpts`].
+    multiple_paths_per_buffer: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -682,15 +687,43 @@ impl DiffState {
 
 #[derive(Clone)]
 struct BufferStateSnapshot {
-    pub(crate) path_key: PathKey,
-    path_key_index: PathKeyIndex,
+    /// The path keys this buffer's excerpts live under, sorted by path key.
+    /// Always non-empty. Contains more than one entry only when the
+    /// multibuffer has enabled [`MultiBuffer::set_multiple_paths_per_buffer`].
+    paths: SmallVec<[(PathKey, PathKeyIndex); 1]>,
     buffer_snapshot: BufferSnapshot,
+}
+
+impl BufferStateSnapshot {
+    fn primary_path(&self) -> &PathKey {
+        &self.paths[0].0
+    }
+
+    fn primary_path_key_index(&self) -> PathKeyIndex {
+        self.paths[0].1
+    }
+
+    fn has_path(&self, path: &PathKey) -> bool {
+        self.paths.iter().any(|(key, _)| key == path)
+    }
+
+    fn add_path(&mut self, path: PathKey, index: PathKeyIndex) {
+        if let Err(ix) = self.paths.binary_search_by(|(key, _)| key.cmp(&path)) {
+            self.paths.insert(ix, (path, index));
+        }
+    }
+
+    /// Removes a path from this buffer's path set. Returns true if no paths remain.
+    fn remove_path(&mut self, path: &PathKey) -> bool {
+        self.paths.retain(|(key, _)| key != path);
+        self.paths.is_empty()
+    }
 }
 
 impl fmt::Debug for BufferStateSnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BufferStateSnapshot")
-            .field("path_key", &self.path_key)
+            .field("paths", &self.paths)
             .field("buffer_id", &self.buffer_snapshot.remote_id())
             .finish()
     }
@@ -1265,7 +1298,20 @@ impl MultiBuffer {
             title: None,
             buffer_changed_since_sync: Default::default(),
             history: History::default(),
+            multiple_paths_per_buffer: false,
         }
+    }
+
+    /// Allows one buffer's excerpts to live under multiple path keys at once.
+    /// With this enabled, setting excerpts for a path never evicts the
+    /// buffer's excerpts from other paths; callers remove stale paths
+    /// explicitly via [`MultiBuffer::remove_excerpts`].
+    pub fn set_multiple_paths_per_buffer(&mut self, enabled: bool) {
+        self.multiple_paths_per_buffer = enabled;
+    }
+
+    pub(crate) fn multiple_paths_per_buffer(&self) -> bool {
+        self.multiple_paths_per_buffer
     }
 
     pub fn clone(&self, new_cx: &mut Context<Self>) -> Self {
@@ -1300,6 +1346,7 @@ impl MultiBuffer {
             history: self.history.clone(),
             title: self.title.clone(),
             buffer_changed_since_sync,
+            multiple_paths_per_buffer: self.multiple_paths_per_buffer,
         }
     }
 
@@ -1876,8 +1923,9 @@ impl MultiBuffer {
         let buffer_snapshot = buffer.read(cx).snapshot();
         let text_anchor = buffer_snapshot.anchor_after(&point);
         let snapshot = self.snapshot(cx);
-        let path_key_index = snapshot.path_key_index_for_buffer(buffer_snapshot.remote_id())?;
-        for excerpt in snapshot.excerpts_for_buffer(buffer_snapshot.remote_id()) {
+        for excerpt in snapshot.full_excerpts_for_buffer(buffer_snapshot.remote_id()) {
+            let path_key_index = excerpt.path_key_index;
+            let excerpt = &excerpt.range;
             if excerpt
                 .context
                 .start
@@ -2584,16 +2632,19 @@ impl MultiBuffer {
             let buffer_non_text_state_updated = non_text_state_update_count
                 > last_snapshot.buffer_snapshot.non_text_state_update_count();
             if buffer_edited || buffer_non_text_state_updated {
-                paths_to_edit.push((
-                    last_snapshot.path_key.clone(),
-                    last_snapshot.path_key_index,
-                    buffer_state.buffer.clone(),
-                    if buffer_edited {
-                        Some(last_snapshot.buffer_snapshot.version().clone())
-                    } else {
-                        None
-                    },
-                ));
+                let prev_version = if buffer_edited {
+                    Some(last_snapshot.buffer_snapshot.version().clone())
+                } else {
+                    None
+                };
+                for (path_key, path_key_index) in &last_snapshot.paths {
+                    paths_to_edit.push((
+                        path_key.clone(),
+                        *path_key_index,
+                        buffer_state.buffer.clone(),
+                        prev_version.clone(),
+                    ));
+                }
             }
 
             edited |= buffer_edited;
@@ -2617,16 +2668,20 @@ impl MultiBuffer {
         let mut new_excerpts = SumTree::default();
         let mut cursor = excerpts.cursor::<ExcerptSummary>(());
 
-        for (path, path_key_index, buffer, prev_version) in paths_to_edit {
+        for (path, _path_key_index, buffer, prev_version) in paths_to_edit {
             new_excerpts.append(cursor.slice(&path, Bias::Left), ());
             let buffer = buffer.read(cx);
             let buffer_id = buffer.remote_id();
 
+            let paths = buffer_snapshots
+                .get(&buffer_id)
+                .expect("each buffer should have a snapshot")
+                .paths
+                .clone();
             buffer_snapshots.insert(
                 buffer_id,
                 BufferStateSnapshot {
-                    path_key: path.clone(),
-                    path_key_index,
+                    paths,
                     buffer_snapshot: buffer.snapshot(),
                 },
             );
@@ -3321,7 +3376,7 @@ impl MultiBuffer {
                     .buffers
                     .get(&buffer_ids.choose(rng).unwrap())
                     .unwrap()
-                    .path_key
+                    .primary_path()
                     .clone();
                 log::info!("Removing excerpts {:?}", path_key);
                 self.remove_excerpts(path_key, cx);
@@ -3596,21 +3651,16 @@ impl MultiBufferSnapshot {
         let anchors = anchors.into_iter();
         let mut result = Vec::with_capacity(anchors.size_hint().0);
         let mut anchors = anchors.peekable();
-        let mut cursor = self.excerpts.cursor::<ExcerptSummary>(());
         'anchors: while let Some(anchor) = anchors.peek() {
             let buffer_id = anchor.buffer_id;
             let mut same_buffer_anchors = anchors.peeking_take_while(|a| a.buffer_id == buffer_id);
 
-            if let Some(buffer) = self.buffers.get(&buffer_id) {
-                let path = &buffer.path_key;
+            if self.buffers.get(&buffer_id).is_some() {
                 let Some(mut next) = same_buffer_anchors.next() else {
                     continue 'anchors;
                 };
-                cursor.seek_forward(path, Bias::Left);
-                'excerpts: while let Some(excerpt) = cursor.item() {
-                    if excerpt.path_key != *path {
-                        break;
-                    }
+                let mut excerpts = self.full_excerpts_for_buffer(buffer_id);
+                'excerpts: while let Some(excerpt) = excerpts.next() {
                     let buffer_snapshot = excerpt.buffer_snapshot(self);
 
                     loop {
@@ -3651,7 +3701,6 @@ impl MultiBufferSnapshot {
                             }
                         // anchor is after the excerpt, try the next one
                         } else {
-                            cursor.next();
                             continue 'excerpts;
                         }
                     }
@@ -5188,17 +5237,33 @@ impl MultiBufferSnapshot {
         &self,
         buffer_id: BufferId,
     ) -> impl Iterator<Item = ExcerptRange<text::Anchor>> {
+        self.full_excerpts_for_buffer(buffer_id)
+            .map(|excerpt| excerpt.range.clone())
+    }
+
+    /// Iterates the buffer's excerpts across all of its path keys, in path
+    /// key order.
+    fn full_excerpts_for_buffer(&self, buffer_id: BufferId) -> impl Iterator<Item = &Excerpt> {
         if let Some(buffer_state) = self.buffers.get(&buffer_id) {
-            let path_key = buffer_state.path_key.clone();
+            let paths = buffer_state.paths.clone();
             let mut cursor = self.excerpts.cursor::<PathKey>(());
-            cursor.seek_forward(&path_key, Bias::Left);
+            let mut paths = paths.into_iter();
+            let mut current_path: Option<PathKey> = None;
             Some(iter::from_fn(move || {
-                let excerpt = cursor.item()?;
-                if excerpt.path_key != path_key {
-                    return None;
+                loop {
+                    if let Some(path_key) = &current_path {
+                        if let Some(excerpt) = cursor.item()
+                            && &excerpt.path_key == path_key
+                        {
+                            cursor.next();
+                            return Some(excerpt);
+                        }
+                        current_path = None;
+                    }
+                    let (next_path, _) = paths.next()?;
+                    cursor.seek_forward(&next_path, Bias::Left);
+                    current_path = Some(next_path);
                 }
-                cursor.next();
-                Some(excerpt.range.clone())
             }))
         } else {
             None
@@ -5293,6 +5358,12 @@ impl MultiBufferSnapshot {
 
     /// Lifts a buffer anchor to a multibuffer anchor without checking against excerpt boundaries. Returns `None` if there are no excerpts for the buffer
     pub fn anchor_in_buffer(&self, anchor: text::Anchor) -> Option<Anchor> {
+        if let Some(state) = self.buffers.get(&anchor.buffer_id)
+            && state.paths.len() > 1
+            && let Some(found) = self.anchor_in_excerpt(anchor)
+        {
+            return Some(found);
+        }
         let path_key_index = self.path_key_index_for_buffer(anchor.buffer_id)?;
         Some(Anchor::in_buffer(path_key_index, anchor))
     }
@@ -5303,33 +5374,12 @@ impl MultiBufferSnapshot {
             return None;
         }
 
-        let path_key_index = self.path_key_index_for_buffer(range.start.buffer_id)?;
-        Some(Anchor::range_in_buffer(path_key_index, range))
+        Some(self.anchor_in_buffer(range.start)?..self.anchor_in_buffer(range.end)?)
     }
 
     /// Creates a multibuffer anchor for the given buffer anchor, if it is contained in any excerpt.
     pub fn anchor_in_excerpt(&self, text_anchor: text::Anchor) -> Option<Anchor> {
-        let excerpts = {
-            let buffer_id = text_anchor.buffer_id;
-            if let Some(buffer_state) = self.buffers.get(&buffer_id) {
-                let path_key = buffer_state.path_key.clone();
-                let mut cursor = self.excerpts.cursor::<PathKey>(());
-                cursor.seek_forward(&path_key, Bias::Left);
-                Some(iter::from_fn(move || {
-                    let excerpt = cursor.item()?;
-                    if excerpt.path_key != path_key {
-                        return None;
-                    }
-                    cursor.next();
-                    Some(excerpt)
-                }))
-            } else {
-                None
-            }
-            .into_iter()
-            .flatten()
-        };
-        for excerpt in excerpts {
+        for excerpt in self.full_excerpts_for_buffer(text_anchor.buffer_id) {
             let buffer_snapshot = excerpt.buffer_snapshot(self);
             if excerpt.range.contains(&text_anchor, &buffer_snapshot) {
                 return Some(Anchor::in_buffer(excerpt.path_key_index, text_anchor));
@@ -5357,27 +5407,7 @@ impl MultiBufferSnapshot {
         // for each search match
 
         let mut buffer_snapshot = None;
-        for excerpt in {
-            let this = &self;
-            let buffer_id = text_anchor.start.buffer_id;
-            if let Some(buffer_state) = this.buffers.get(&buffer_id) {
-                let path_key = buffer_state.path_key.clone();
-                let mut cursor = this.excerpts.cursor::<PathKey>(());
-                cursor.seek_forward(&path_key, Bias::Left);
-                Some(iter::from_fn(move || {
-                    let excerpt = cursor.item()?;
-                    if excerpt.path_key != path_key {
-                        return None;
-                    }
-                    cursor.next();
-                    Some(excerpt)
-                }))
-            } else {
-                None
-            }
-            .into_iter()
-            .flatten()
-        } {
+        for excerpt in self.full_excerpts_for_buffer(text_anchor.start.buffer_id) {
             let buffer_snapshot =
                 buffer_snapshot.get_or_insert_with(|| excerpt.buffer_snapshot(self));
             if excerpt.range.contains(&text_anchor.start, &buffer_snapshot)
@@ -6434,17 +6464,30 @@ impl MultiBufferSnapshot {
         ))
     }
 
+    /// Returns the buffer's first path key. A buffer has multiple paths only
+    /// when [`MultiBuffer::set_multiple_paths_per_buffer`] is enabled; use
+    /// [`MultiBufferSnapshot::paths_for_buffer`] to see all of them.
     pub fn path_for_buffer(&self, buffer_id: BufferId) -> Option<&PathKey> {
-        Some(&self.buffers.get(&buffer_id)?.path_key)
+        Some(self.buffers.get(&buffer_id)?.primary_path())
+    }
+
+    pub fn paths_for_buffer(
+        &self,
+        buffer_id: BufferId,
+    ) -> impl Iterator<Item = &PathKey> {
+        self.buffers
+            .get(&buffer_id)
+            .into_iter()
+            .flat_map(|state| state.paths.iter().map(|(path, _)| path))
     }
 
     pub(crate) fn path_key_index_for_buffer(&self, buffer_id: BufferId) -> Option<PathKeyIndex> {
         let snapshot = self.buffers.get(&buffer_id)?;
-        Some(snapshot.path_key_index)
+        Some(snapshot.primary_path_key_index())
     }
 
     fn first_excerpt_for_buffer(&self, buffer_id: BufferId) -> Option<&Excerpt> {
-        let path_key = &self.buffers.get(&buffer_id)?.path_key;
+        let path_key = self.buffers.get(&buffer_id)?.primary_path();
         self.first_excerpt_for_path(path_key)
     }
 
@@ -6748,7 +6791,7 @@ impl MultiBufferSnapshot {
         self.buffers
             .get(&buffer_id)
             .map(|buffer_state_snapshot| {
-                let path_key_index = buffer_state_snapshot.path_key_index;
+                let path_key_index = buffer_state_snapshot.primary_path_key_index();
                 let buffer_snapshot = &buffer_state_snapshot.buffer_snapshot;
                 let buffer_range = range.to_offset(buffer_snapshot);
 
@@ -6801,9 +6844,12 @@ impl MultiBufferSnapshot {
     pub fn buffers_with_paths<'a>(
         &'a self,
     ) -> impl 'a + Iterator<Item = (&'a BufferSnapshot, &'a PathKey)> {
-        self.buffers
-            .values()
-            .map(|buffer| (&buffer.buffer_snapshot, &buffer.path_key))
+        self.buffers.values().flat_map(|buffer| {
+            buffer
+                .paths
+                .iter()
+                .map(move |(path, _)| (&buffer.buffer_snapshot, path))
+        })
     }
 
     /// Returns the number of graphemes in `range`.
@@ -6842,12 +6888,25 @@ impl MultiBufferSnapshot {
 
         let mut all_buffer_path_keys = HashSet::default();
         for buffer in self.buffers.values() {
-            let path_key = buffer.path_key.clone();
+            assert!(!buffer.paths.is_empty(), "buffer with no paths: {:#?}", self.buffers);
             assert!(
-                all_buffer_path_keys.insert(path_key),
-                "path key reused for multiple buffers: {:#?}",
+                buffer.paths.is_sorted_by(|a, b| a.0 < b.0),
+                "buffer paths not sorted and deduplicated: {:#?}",
                 self.buffers
             );
+            for (path_key, path_key_index) in &buffer.paths {
+                assert_eq!(
+                    self.path_keys.get_index(path_key_index.0 as usize),
+                    Some(path_key),
+                    "buffer path key index does not match path key: {:#?}",
+                    self.buffers
+                );
+                assert!(
+                    all_buffer_path_keys.insert(path_key.clone()),
+                    "path key reused for multiple buffers: {:#?}",
+                    self.buffers
+                );
+            }
         }
 
         let all_excerpt_path_keys = HashSet::from_iter(excerpts.iter().map(|e| e.path_key.clone()));

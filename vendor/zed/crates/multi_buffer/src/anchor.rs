@@ -126,7 +126,7 @@ impl ExcerptAnchor {
         let Some(buffer) = snapshot
             .buffers
             .get(&self.text_anchor.buffer_id)
-            .filter(|buffer_state| buffer_state.path_key == *self_path_key)
+            .filter(|buffer_state| buffer_state.has_path(self_path_key))
         else {
             // buffer no longer exists at the original path (which may have been reused for a different buffer),
             // so no way to compare the anchors
@@ -270,7 +270,7 @@ impl ExcerptAnchor {
         let Some(state) = snapshot
             .buffers
             .get(&self.buffer_id())
-            .filter(|state| &state.path_key == path_key)
+            .filter(|state| state.has_path(path_key))
         else {
             return Some(AnchorSeekTarget::Missing { path_key });
         };

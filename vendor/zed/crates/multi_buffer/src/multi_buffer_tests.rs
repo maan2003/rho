@@ -6357,3 +6357,149 @@ fn test_is_valid_anchor_past_last_excerpt_for_buffer(cx: &mut TestAppContext) {
         );
     });
 }
+
+#[gpui::test]
+fn test_multiple_paths_per_buffer(cx: &mut App) {
+    let doc = cx.new(|cx| Buffer::local("aaa\nbbb\nccc\nddd\neee\nfff", cx));
+    let row_1 = cx.new(|cx| Buffer::local("row one", cx));
+    let row_2 = cx.new(|cx| Buffer::local("row two", cx));
+    let multibuffer = cx.new(|_| {
+        let mut multibuffer = MultiBuffer::without_headers(Capability::ReadWrite);
+        multibuffer.set_multiple_paths_per_buffer(true);
+        multibuffer
+    });
+
+    // Interleave three slices of `doc` with the two row buffers.
+    multibuffer.update(cx, |multibuffer, cx| {
+        multibuffer.set_excerpts_for_path(
+            PathKey::sorted(0),
+            doc.clone(),
+            [Point::new(0, 0)..Point::new(1, 3)],
+            0,
+            cx,
+        );
+        multibuffer.set_excerpts_for_path(
+            PathKey::sorted(1),
+            row_1.clone(),
+            [Point::new(0, 0)..Point::new(0, 7)],
+            0,
+            cx,
+        );
+        multibuffer.set_excerpts_for_path(
+            PathKey::sorted(2),
+            doc.clone(),
+            [Point::new(2, 0)..Point::new(3, 3)],
+            0,
+            cx,
+        );
+        multibuffer.set_excerpts_for_path(
+            PathKey::sorted(3),
+            row_2.clone(),
+            [Point::new(0, 0)..Point::new(0, 7)],
+            0,
+            cx,
+        );
+        multibuffer.set_excerpts_for_path(
+            PathKey::sorted(4),
+            doc.clone(),
+            [Point::new(4, 0)..Point::new(5, 3)],
+            0,
+            cx,
+        );
+    });
+    let snapshot = multibuffer.update(cx, |multibuffer, cx| multibuffer.snapshot(cx));
+    assert_eq!(
+        snapshot.text(),
+        "aaa\nbbb\nrow one\nccc\nddd\nrow two\neee\nfff"
+    );
+
+    // Edits to the shared buffer propagate to every slice.
+    doc.update(cx, |doc, cx| {
+        doc.edit(
+            [
+                (Point::new(0, 0)..Point::new(0, 0), "X"),
+                (Point::new(2, 0)..Point::new(2, 0), "Y"),
+                (Point::new(4, 0)..Point::new(4, 0), "Z"),
+            ],
+            None,
+            cx,
+        )
+    });
+    let snapshot = multibuffer.update(cx, |multibuffer, cx| multibuffer.snapshot(cx));
+    assert_eq!(
+        snapshot.text(),
+        "Xaaa\nbbb\nrow one\nYccc\nddd\nrow two\nZeee\nfff"
+    );
+
+    // Buffer anchors resolve into the slice that contains them.
+    let doc_snapshot = doc.read(cx).snapshot();
+    let anchor_in_middle_slice = snapshot
+        .anchor_in_excerpt(doc_snapshot.anchor_before(Point::new(2, 1)))
+        .unwrap();
+    assert_eq!(anchor_in_middle_slice.to_point(&snapshot), Point::new(3, 1));
+    let anchor_in_last_slice = snapshot
+        .anchor_in_excerpt(doc_snapshot.anchor_before(Point::new(4, 2)))
+        .unwrap();
+    assert_eq!(anchor_in_last_slice.to_point(&snapshot), Point::new(6, 2));
+
+    // Ordered text anchors resolve across all slices in one pass.
+    let visible = snapshot.text_anchors_to_visible_anchors([
+        doc_snapshot.anchor_before(Point::new(0, 1)),
+        doc_snapshot.anchor_before(Point::new(2, 1)),
+        doc_snapshot.anchor_before(Point::new(4, 2)),
+    ]);
+    assert_eq!(
+        visible
+            .into_iter()
+            .map(|anchor| anchor.map(|anchor| anchor.to_point(&snapshot)))
+            .collect::<Vec<_>>(),
+        vec![
+            Some(Point::new(0, 1)),
+            Some(Point::new(3, 1)),
+            Some(Point::new(6, 2)),
+        ]
+    );
+
+    // Editing through the multibuffer writes through to the shared buffer.
+    multibuffer.update(cx, |multibuffer, cx| {
+        multibuffer.edit([(Point::new(3, 0)..Point::new(3, 1), "")], None, cx)
+    });
+    assert_eq!(
+        doc.read(cx).text(),
+        "Xaaa\nbbb\nccc\nddd\nZeee\nfff"
+    );
+    let snapshot = multibuffer.update(cx, |multibuffer, cx| multibuffer.snapshot(cx));
+    assert_eq!(
+        snapshot.text(),
+        "Xaaa\nbbb\nrow one\nccc\nddd\nrow two\nZeee\nfff"
+    );
+
+    // Removing one path leaves the buffer's other slices intact.
+    multibuffer.update(cx, |multibuffer, cx| {
+        multibuffer.remove_excerpts(PathKey::sorted(2), cx)
+    });
+    let snapshot = multibuffer.update(cx, |multibuffer, cx| multibuffer.snapshot(cx));
+    assert_eq!(snapshot.text(), "Xaaa\nbbb\nrow one\nrow two\nZeee\nfff");
+    assert!(snapshot.path_for_buffer(doc_snapshot.remote_id()).is_some());
+
+    // Updating ranges under one path does not disturb the buffer's other paths.
+    multibuffer.update(cx, |multibuffer, cx| {
+        multibuffer.set_excerpts_for_path(
+            PathKey::sorted(0),
+            doc.clone(),
+            [Point::new(0, 0)..Point::new(0, 4)],
+            0,
+            cx,
+        );
+    });
+    let snapshot = multibuffer.update(cx, |multibuffer, cx| multibuffer.snapshot(cx));
+    assert_eq!(snapshot.text(), "Xaaa\nrow one\nrow two\nZeee\nfff");
+
+    // Removing every path for the buffer removes the buffer entirely.
+    multibuffer.update(cx, |multibuffer, cx| {
+        multibuffer.remove_excerpts_for_buffer(doc_snapshot.remote_id(), cx)
+    });
+    let snapshot = multibuffer.update(cx, |multibuffer, cx| multibuffer.snapshot(cx));
+    assert_eq!(snapshot.text(), "row one\nrow two");
+    assert!(snapshot.path_for_buffer(doc_snapshot.remote_id()).is_none());
+}

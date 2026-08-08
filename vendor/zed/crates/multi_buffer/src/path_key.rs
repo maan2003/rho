@@ -1,6 +1,6 @@
 use std::{ops::Range, rc::Rc, sync::Arc};
 
-use collections::{BTreeMap, HashSet};
+use collections::{BTreeMap, HashMap, HashSet};
 use gpui::{App, AppContext, Context, Entity};
 use itertools::Itertools;
 use language::{Buffer, BufferEditSource, BufferSnapshot};
@@ -197,18 +197,34 @@ impl MultiBuffer {
             new_excerpts.append(suffix, ());
             snapshot.excerpts = new_excerpts;
 
+            let mut updated_buffers: HashMap<BufferId, BufferStateSnapshot> = HashMap::default();
             for (path, path_key_index, _, buffer_snapshot, ranges) in &prepared {
                 if ranges.is_empty() {
                     continue;
                 }
-                snapshot.buffers.insert(
-                    buffer_snapshot.remote_id(),
-                    BufferStateSnapshot {
-                        path_key: path.clone(),
-                        path_key_index: *path_key_index,
-                        buffer_snapshot: buffer_snapshot.clone(),
-                    },
-                );
+                let buffer_id = buffer_snapshot.remote_id();
+                let state = updated_buffers.entry(buffer_id).or_insert_with(|| {
+                    match snapshot.buffers.get(&buffer_id) {
+                        Some(existing) => {
+                            let mut state = existing.clone();
+                            // Paths within the replaced range are superseded by
+                            // this call; paths outside it are preserved.
+                            state
+                                .paths
+                                .retain(|(key, _)| &*key < first_path || &*key > last_path);
+                            state.buffer_snapshot = buffer_snapshot.clone();
+                            state
+                        }
+                        None => BufferStateSnapshot {
+                            paths: Default::default(),
+                            buffer_snapshot: buffer_snapshot.clone(),
+                        },
+                    }
+                });
+                state.add_path(path.clone(), *path_key_index);
+            }
+            for (buffer_id, state) in updated_buffers {
+                snapshot.buffers.insert(buffer_id, state);
             }
 
             let patch = vec![Edit {
@@ -224,18 +240,29 @@ impl MultiBuffer {
             .filter(|(_, _, _, _, ranges)| !ranges.is_empty())
             .map(|(_, _, _, snapshot, _)| snapshot.remote_id())
             .collect::<HashSet<_>>();
-        let removed_buffer_ids = old_buffer_ids
-            .difference(&new_buffer_ids)
-            .copied()
-            .collect::<Vec<_>>();
-        if !removed_buffer_ids.is_empty() {
+        let mut removed_buffer_ids = Vec::new();
+        {
             let snapshot = self.snapshot.get_mut();
-            for buffer_id in &removed_buffer_ids {
-                self.buffers.remove(buffer_id);
-                snapshot.buffers.remove(buffer_id);
-                remove_diff_state(&mut snapshot.diffs, *buffer_id);
-                self.diffs.remove(buffer_id);
+            for buffer_id in old_buffer_ids.difference(&new_buffer_ids).copied() {
+                // Buffers that keep paths outside the replaced range stay alive.
+                if let Some(existing) = snapshot.buffers.get(&buffer_id) {
+                    let mut state = existing.clone();
+                    state
+                        .paths
+                        .retain(|(key, _)| &*key < first_path || &*key > last_path);
+                    if !state.paths.is_empty() {
+                        snapshot.buffers.insert(buffer_id, state);
+                        continue;
+                    }
+                }
+                self.buffers.remove(&buffer_id);
+                snapshot.buffers.remove(&buffer_id);
+                remove_diff_state(&mut snapshot.diffs, buffer_id);
+                self.diffs.remove(&buffer_id);
+                removed_buffer_ids.push(buffer_id);
             }
+        }
+        if !removed_buffer_ids.is_empty() {
             cx.emit(Event::BuffersRemoved { removed_buffer_ids });
         }
 
@@ -556,9 +583,10 @@ impl MultiBuffer {
         cx: &mut Context<Self>,
     ) -> bool {
         let path_key_index = self.get_or_create_path_key_index(&path_key);
-        if let Some(old_path_key) = self
-            .snapshot(cx)
-            .path_for_buffer(buffer_snapshot.remote_id())
+        if !self.multiple_paths_per_buffer()
+            && let Some(old_path_key) = self
+                .snapshot(cx)
+                .path_for_buffer(buffer_snapshot.remote_id())
             && old_path_key != &path_key
         {
             self.remove_excerpts(old_path_key.clone(), cx);
@@ -594,10 +622,26 @@ impl MultiBuffer {
             && excerpt.buffer_id != buffer_id
         {
             let old_buffer_id = excerpt.buffer_id;
-            self.buffers.remove(&old_buffer_id);
-            snapshot.buffers.remove(&old_buffer_id);
-            remove_diff_state(&mut snapshot.diffs, old_buffer_id);
-            self.diffs.remove(&old_buffer_id);
+            // The old buffer only loses this path; it is removed entirely
+            // when no other paths hold its excerpts.
+            let fully_removed = match snapshot.buffers.get(&old_buffer_id) {
+                Some(existing) => {
+                    let mut state = existing.clone();
+                    if state.remove_path(&path_key) {
+                        snapshot.buffers.remove(&old_buffer_id);
+                        true
+                    } else {
+                        snapshot.buffers.insert(old_buffer_id, state);
+                        false
+                    }
+                }
+                None => true,
+            };
+            if fully_removed {
+                self.buffers.remove(&old_buffer_id);
+                remove_diff_state(&mut snapshot.diffs, old_buffer_id);
+                self.diffs.remove(&old_buffer_id);
+            }
             let before = cursor.position.1;
             cursor.seek_forward(&path_key, Bias::Right);
             let after = cursor.position.1;
@@ -605,9 +649,11 @@ impl MultiBuffer {
                 old: before..after,
                 new: new_excerpts.summary().len()..new_excerpts.summary().len(),
             });
-            cx.emit(Event::BuffersRemoved {
-                removed_buffer_ids: vec![old_buffer_id],
-            });
+            if fully_removed {
+                cx.emit(Event::BuffersRemoved {
+                    removed_buffer_ids: vec![old_buffer_id],
+                });
+            }
         }
 
         while let Some(excerpt) = cursor.item()
@@ -754,14 +800,19 @@ impl MultiBuffer {
         drop(cursor);
 
         snapshot.excerpts = new_excerpts;
-        snapshot.buffers.insert(
-            buffer_id,
-            BufferStateSnapshot {
-                path_key: path_key.clone(),
-                path_key_index,
+        let mut state = match snapshot.buffers.get(&buffer_id) {
+            Some(existing) => {
+                let mut state = existing.clone();
+                state.buffer_snapshot = buffer_snapshot.clone();
+                state
+            }
+            None => BufferStateSnapshot {
+                paths: Default::default(),
                 buffer_snapshot: buffer_snapshot.clone(),
             },
-        );
+        };
+        state.add_path(path_key.clone(), path_key_index);
+        snapshot.buffers.insert(buffer_id, state);
 
         self.buffers.entry(buffer_id).or_insert_with(|| {
             self.buffer_changed_since_sync.replace(true);
@@ -805,10 +856,10 @@ impl MultiBuffer {
 
     pub fn remove_excerpts_for_buffer(&mut self, buffer: BufferId, cx: &mut Context<Self>) {
         let snapshot = self.sync_mut(cx);
-        let Some(path) = snapshot.path_for_buffer(buffer).cloned() else {
-            return;
-        };
-        self.remove_excerpts(path, cx);
+        let paths = snapshot.paths_for_buffer(buffer).cloned().collect::<Vec<_>>();
+        for path in paths {
+            self.remove_excerpts(path, cx);
+        }
     }
 
     pub fn remove_excerpts(&mut self, path: PathKey, cx: &mut Context<Self>) {
@@ -835,13 +886,29 @@ impl MultiBuffer {
         new_excerpts.append(suffix, ());
 
         if let Some(buffer_id) = buffer_id {
-            snapshot.buffers.remove(&buffer_id);
-            remove_diff_state(&mut snapshot.diffs, buffer_id);
-            self.buffers.remove(&buffer_id);
-            self.diffs.remove(&buffer_id);
-            cx.emit(Event::BuffersRemoved {
-                removed_buffer_ids: vec![buffer_id],
-            })
+            // The buffer only loses this path; it is removed entirely when no
+            // other paths hold its excerpts.
+            let fully_removed = match snapshot.buffers.get(&buffer_id) {
+                Some(existing) => {
+                    let mut state = existing.clone();
+                    if state.remove_path(&path) {
+                        snapshot.buffers.remove(&buffer_id);
+                        true
+                    } else {
+                        snapshot.buffers.insert(buffer_id, state);
+                        false
+                    }
+                }
+                None => true,
+            };
+            if fully_removed {
+                remove_diff_state(&mut snapshot.diffs, buffer_id);
+                self.buffers.remove(&buffer_id);
+                self.diffs.remove(&buffer_id);
+                cx.emit(Event::BuffersRemoved {
+                    removed_buffer_ids: vec![buffer_id],
+                })
+            }
         }
         drop(cursor);
         if changed_trailing_excerpt {
