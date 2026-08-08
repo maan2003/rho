@@ -3422,7 +3422,7 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
     // document text itself carries no agent markers.
     assert_eq!(
         dashboard_text(&workspace, cx),
-        "* One\nbody\n· planner\n* Two\n\nUnfiled · 1\n· drifter\n+ new agent"
+        "* One\nbody\n  · planner\n* Two\n\nUnfiled · 1\n  · drifter\n\n+ new agent"
     );
 
     // A daemon rebind (to Unfiled) rearranges rows; the document merges
@@ -3441,6 +3441,6 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(
         dashboard_text(&workspace, cx),
-        "* One\nbody\n* Two\n\nUnfiled · 2\n· drifter\n· planner\n+ new agent"
+        "* One\nbody\n* Two\n\nUnfiled · 2\n  · drifter\n  · planner\n\n+ new agent"
     );
 }

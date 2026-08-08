@@ -316,6 +316,8 @@ pub struct Workspace {
     /// Canonical per-host CRDT Desk buffers shared by dashboard and source
     /// views.
     desk_sync: DeskSync,
+    /// Reconciles the dashboard when a desk buffer changes, per host.
+    desk_edit_subscriptions: HashMap<HostId, gpui::Subscription>,
     /// Agent shown beside the dashboard cursor. Kept separate from the
     /// focused task so cursor previews do not rebuild or reorder the rail.
     dashboard_preview: Option<AgentId>,
@@ -688,6 +690,7 @@ impl Workspace {
                     event,
                     editor::EditorEvent::SelectionsChanged { local: true }
                 ) {
+                    this.refresh_dashboard(window, cx);
                     this.dashboard_cursor_moved(window, cx);
                 }
             },
@@ -720,6 +723,7 @@ impl Workspace {
             active_context: ContextId::Draft,
             dashboard,
             desk_sync: DeskSync::default(),
+            desk_edit_subscriptions: HashMap::new(),
             dashboard_preview: None,
             iris_preview,
             iris_agents: HashMap::new(),
@@ -750,6 +754,8 @@ impl Workspace {
         // Startup lands in home mode: the dashboard is the front door.
         let dashboard_focus = this.dashboard.focus_handle(cx);
         window.focus(&dashboard_focus, cx);
+        // Seed the listing before any event arrives ("+ new agent").
+        this.refresh_dashboard(window, cx);
         this
     }
 
@@ -796,6 +802,8 @@ impl Workspace {
         self.workdirs.retain(|workdir| workdir.host != host);
         self.remote_projects.retain(|(owner, _), _| *owner != host);
         self.registry.detach_host(host);
+        self.desk_edit_subscriptions.remove(&host);
+        self.refresh_dashboard(window, cx);
         for agent_id in departed {
             self.subscriptions.forget(agent_id);
             self.store.forget(agent_id);
@@ -1077,6 +1085,21 @@ impl Workspace {
                 self.desk_sync.set_bindings(host, bindings.clone());
                 self.dashboard.set_source(host, buffer.downgrade());
                 self.dashboard.set_bindings(host, bindings);
+                // Structure follows the text: any edit to the desk buffer
+                // (vim in the excerpts, or a CRDT op from another client)
+                // re-parses and reconciles.
+                self.desk_edit_subscriptions.insert(
+                    host,
+                    cx.subscribe_in(
+                        &buffer,
+                        window,
+                        |this, _, event: &language::BufferEvent, window, cx| {
+                            if matches!(event, language::BufferEvent::Edited { .. }) {
+                                this.refresh_dashboard(window, cx);
+                            }
+                        },
+                    ),
+                );
             }
             ConnEvent::DeskTextApplied(record) => {
                 self.desk_sync.apply_text(host, record, cx);
@@ -1392,6 +1415,9 @@ impl Workspace {
                 cx.notify();
             }
         }
+        // Every daemon event funnels through here, so this one call is
+        // the event-driven replacement for reconciling on render.
+        self.refresh_dashboard(window, cx);
     }
 
     /// How a daemon names itself in error text: bare when it is the only
@@ -4048,11 +4074,12 @@ impl Workspace {
         self.dashboard_preview
     }
 
-    /// Reconciles the dashboard against the current world. There is no
-    /// dirty flag to remember: render reconciles every frame (a pass
-    /// whose inputs match the last one returns before touching the
-    /// editor), and verbs that move the cursor into a fresh row call
-    /// this directly so the row exists within the same action.
+    /// Reconciles the dashboard against the current world. Event-driven,
+    /// with no flag to remember: the daemon funnel (`handle_event`),
+    /// desk buffer edit subscriptions, draft edit subscriptions, the
+    /// editor selection subscription, and the verbs each call this at
+    /// their source. The reconcile is idempotent and cheap, so calling
+    /// it from several funnels is fine.
     pub(crate) fn refresh_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dashboard.sync(&self.registry, window, cx);
     }
@@ -5009,7 +5036,7 @@ impl Workspace {
                 self.refresh_dashboard(window, cx);
             }
             Some(RowTarget::NewAgent) => {
-                self.dashboard.open_new_draft(None, cx);
+                self.dashboard.open_new_draft(None, window, cx);
                 self.dashboard_focus_draft(window, cx);
             }
             Some(RowTarget::Reply(agent_id)) => {
@@ -5044,7 +5071,7 @@ impl Workspace {
         match self.dashboard.cursor_target(&self.registry, cx) {
             Some(crate::dashboard::RowTarget::Agent(agent_id))
             | Some(crate::dashboard::RowTarget::Reply(agent_id)) => {
-                self.dashboard.open_reply(agent_id, cx);
+                self.dashboard.open_reply(agent_id, window, cx);
                 self.dashboard_focus_draft(window, cx);
             }
             // On a heading line, reply to the heading's top agent, so `r`
@@ -5059,7 +5086,7 @@ impl Workspace {
                 let agent_id = first_attention
                     .or_else(|| self.dashboard.first_agent_for_topic((host, offset)))
                     .expect("guard checked an agent exists");
-                self.dashboard.open_reply(agent_id, cx);
+                self.dashboard.open_reply(agent_id, window, cx);
                 self.dashboard_focus_draft(window, cx);
             }
             // Document text keeps vim's own `r`.
@@ -5241,7 +5268,7 @@ impl Workspace {
             self.notice_on(None, "staff: choose a topic", StyleClass::SystemInfo, cx);
             return;
         };
-        self.dashboard.open_new_draft(Some(topic), cx);
+        self.dashboard.open_new_draft(Some(topic), window, cx);
         self.dashboard_focus_draft(window, cx);
     }
 
@@ -6268,7 +6295,6 @@ impl Render for Workspace {
         let editor = self.active_editor(cx);
         let text_style = editor.update(cx, |editor, cx| editor.style(cx).text.clone());
         let connection_status = self.render_connection_status(&text_style, cx);
-        self.refresh_dashboard(window, cx);
         div()
             .id("rho-gui")
             .size_full()
@@ -6354,7 +6380,7 @@ impl Render for Workspace {
                 this.dashboard_reply(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardNewAgent, window, cx| {
-                this.dashboard.open_new_draft(None, cx);
+                this.dashboard.open_new_draft(None, window, cx);
                 this.dashboard_focus_draft(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardHeadingBelow, window, cx| {

@@ -66,6 +66,9 @@ enum LineKey {
     NewAgent,
     Reply(AgentId),
     NewDraft(Option<(HostId, usize)>),
+    /// An empty line separating listing regions (None = before the
+    /// new-agent action line).
+    Spacer(Option<HostId>),
 }
 
 impl LineKey {
@@ -276,7 +279,12 @@ impl Dashboard {
     /// Opens (or returns to) an inline reply draft under the agent's row.
     /// The draft is a writable buffer of its own: it parks where it is
     /// when the user wanders off and survives every refresh.
-    pub fn open_reply(&mut self, agent_id: AgentId, cx: &mut Context<Workspace>) {
+    pub fn open_reply(
+        &mut self,
+        agent_id: AgentId,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
         let key = LineKey::Reply(agent_id);
         if !self.replies.contains(&agent_id) {
             self.replies.push(agent_id);
@@ -287,9 +295,9 @@ impl Dashboard {
                 .clone();
             self.reply_subscriptions.insert(
                 agent_id,
-                cx.subscribe(&buffer, |_, _, event, cx| {
+                cx.subscribe_in(&buffer, window, |this, _, event, window, cx| {
                     if matches!(event, language::BufferEvent::Edited { .. }) {
-                        cx.notify();
+                        this.refresh_dashboard(window, cx);
                     }
                 }),
             );
@@ -300,12 +308,17 @@ impl Dashboard {
 
     /// Opens (or returns to) the inline new-agent draft. Like a reply
     /// draft it parks when left and survives refreshes.
-    pub fn open_new_draft(&mut self, topic: Option<(HostId, usize)>, cx: &mut Context<Workspace>) {
+    pub fn open_new_draft(
+        &mut self,
+        topic: Option<(HostId, usize)>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
         if self.new_draft.is_none() {
             let buffer = cx.new(|cx| Buffer::local("", cx));
-            let subscription = cx.subscribe(&buffer, |_, _, event, cx| {
+            let subscription = cx.subscribe_in(&buffer, window, |this, _, event, window, cx| {
                 if matches!(event, language::BufferEvent::Edited { .. }) {
-                    cx.notify();
+                    this.refresh_dashboard(window, cx);
                 }
             });
             self.buffers
@@ -542,6 +555,9 @@ impl Dashboard {
         let mut order = Vec::new();
         let mut pending_rows: Vec<RowSpec> = Vec::new();
         let mut current: Option<(HostId, usize)> = None;
+        // Last doc-slice end and host length per section, so trailing
+        // blank lines can be hidden behind a rowless cut below.
+        let mut section_ends: Vec<(usize, usize)> = Vec::new();
         for segment in &segments {
             match segment {
                 Segment::Doc { host, range, id } => {
@@ -563,14 +579,19 @@ impl Dashboard {
                                 current = None;
                                 continue;
                             };
+                            let host_len = buffer.read(cx).len();
                             spec.sections.push(SectionSpec {
                                 host: buffer,
                                 lead: std::mem::take(&mut pending_rows),
                                 cuts: Vec::new(),
                             });
+                            section_ends.push((0, host_len));
                         }
                     }
                     current = Some((*host, range.end));
+                    if let Some(end) = section_ends.last_mut() {
+                        end.0 = range.end;
+                    }
                 }
                 Segment::Line(line) => {
                     let Some(buffer) = self.buffers.get(&line.key).cloned() else {
@@ -585,6 +606,18 @@ impl Dashboard {
             }
         }
         spec.tail = pending_rows;
+        // A section's trailing blank lines hide behind a final rowless
+        // cut, so the listing's spacers control the spacing after it.
+        for (section, (last_end, host_len)) in spec.sections.iter_mut().zip(&section_ends) {
+            if last_end < host_len {
+                section.cuts.push(CutSpec {
+                    id: u64::MAX,
+                    position: *last_end,
+                    resume: *host_len,
+                    rows: Vec::new(),
+                });
+            }
+        }
 
         // Capture where the cursor is before reconciling: a document
         // cursor as a buffer offset, a row cursor as its current path
@@ -1376,14 +1409,6 @@ impl DashClass {
         }
     }
 
-    fn lamp(attention: UiAttention) -> Option<DashClass> {
-        match attention {
-            UiAttention::Quiet => None,
-            UiAttention::Working => Some(DashClass::Working),
-            UiAttention::Pending => Some(DashClass::Pending),
-            UiAttention::NeedsInput => Some(DashClass::NeedsInput),
-        }
-    }
 }
 
 /// One generated dashboard line: identity, text, semantic spans, and
@@ -1493,25 +1518,34 @@ fn sorted_agents(
     agents
 }
 
+fn attention_glyph(attention: UiAttention) -> &'static str {
+    match attention {
+        UiAttention::NeedsInput => "?",
+        UiAttention::Pending => "✓",
+        UiAttention::Working => "~",
+        UiAttention::Quiet => "·",
+    }
+}
+
+fn attention_class(attention: UiAttention) -> DashClass {
+    match attention {
+        UiAttention::NeedsInput => DashClass::NeedsInput,
+        UiAttention::Pending => DashClass::Pending,
+        UiAttention::Working | UiAttention::Quiet => DashClass::Muted,
+    }
+}
+
 fn agent_line(agent_id: AgentId, registry: &AgentRegistry) -> Line {
     let attention = registry.attention(agent_id);
     let mut line = Line::new(LineKey::Agent(agent_id), RowTarget::Agent(agent_id));
 
-    // A fixed one-glyph lamp column: attention is the color, the cursor
-    // still lands on real text, and nothing floats at line ends.
-    let glyph = if registry.agent_pinned(agent_id) {
-        "◆"
-    } else if attention > UiAttention::Quiet {
-        "●"
-    } else {
-        "·"
-    };
-    // The glyph is the row's only splash of color; the rest stays plain
-    // so the document's headings carry the page.
-    line.span(
-        Some(DashClass::lamp(attention).unwrap_or(DashClass::Muted)),
-        |text| text.push_str(glyph),
-    );
+    // A fixed one-character status column, indented under the heading:
+    // `?` needs you, `✓` finished and waiting, `~` working, `·` quiet.
+    // Only `?` and `✓` carry color; the rest of the row stays plain.
+    line.span(None, |text| text.push_str("  "));
+    line.span(Some(attention_class(attention)), |text| {
+        text.push_str(attention_glyph(attention))
+    });
     line.span(None, |text| text.push(' '));
     line.span(None, |text| {
         text.push_str(&registry.agent_human_name(agent_id))
@@ -1561,13 +1595,21 @@ fn truncate_chars(value: &str, limit: usize) -> String {
 
 /// Ends a document slice before a cut point's newline, so the synthetic
 /// newline between excerpts doesn't double it.
-fn trim_newline(text: &str, end: usize) -> usize {
-    if end > 0 && text.as_bytes().get(end - 1) == Some(&b'\n') {
-        end - 1
-    } else {
-        end
-    }
+/// Where a heading's rows splice in: the slice before them ends at the
+/// body's last non-blank character, and the slice after them resumes at
+/// the start of the following line. Trailing blank lines in the body
+/// then render *after* the rows, so the document's own spacing keeps
+/// separating this topic from the next heading.
+fn cut_points(text: &str, heading: &DeskHeading) -> (usize, usize) {
+    let body = &text[heading.heading_range.start..heading.body_range.end];
+    let position = heading.heading_range.start + body.trim_end().len();
+    let resume = text[position..heading.body_range.end]
+        .find('\n')
+        .map(|offset| position + offset + 1)
+        .unwrap_or(heading.body_range.end);
+    (position, resume)
 }
+
 
 /// Generate the listing without mutating Desk text: the documents are
 /// emitted as writable slices, cut where a bound heading's rows (agent
@@ -1656,10 +1698,14 @@ fn generate(
                             }),
                         },
                     );
-                    fold.span(
-                        Some(DashClass::lamp(loudest).unwrap_or(DashClass::Muted)),
-                        |line| line.push_str(if loudest > UiAttention::Quiet { "●" } else { "…" }),
-                    );
+                    fold.span(None, |line| line.push_str("  "));
+                    fold.span(Some(attention_class(loudest)), |line| {
+                        line.push_str(if loudest > UiAttention::Quiet {
+                            attention_glyph(loudest)
+                        } else {
+                            "…"
+                        })
+                    });
                     fold.span(Some(DashClass::Muted), |line| {
                         line.push_str(&format!(" {folded_count} more"))
                     });
@@ -1676,9 +1722,10 @@ fn generate(
                 // Rows splice in after the heading's body, before the
                 // next heading (trailing newline trimmed so the excerpt
                 // boundary doesn't double it).
+                let (position, resume) = cut_points(text, heading);
                 segments.push(Segment::Doc {
                     host: *host,
-                    range: slice_start..trim_newline(text, heading.body_range.end),
+                    range: slice_start..position,
                     id: slice_id,
                 });
                 slice_id = next_slice_id(&heading.title, &mut title_counts);
@@ -1689,13 +1736,16 @@ fn generate(
                         RowTarget::NewDraft(Some((*host, start))),
                     )));
                 }
-                slice_start = heading.body_range.end;
+                slice_start = resume;
             }
         }
-        if slice_start < text.len() || slice_start == 0 {
+        // The tail slice drops trailing blank lines: the listing's own
+        // spacers separate it from what follows.
+        let tail_end = text.trim_end().len().max(slice_start);
+        if tail_end > slice_start || slice_start == 0 {
             segments.push(Segment::Doc {
                 host: *host,
-                range: slice_start..text.len(),
+                range: slice_start..tail_end,
                 id: slice_id,
             });
         }
@@ -1721,6 +1771,10 @@ fn generate(
             continue;
         }
         let folded = collapsed_unfiled.contains(host);
+        segments.push(Segment::Line(Line::new(
+            LineKey::Spacer(Some(*host)),
+            RowTarget::None,
+        )));
         let mut header = Line::new(LineKey::Unfiled(*host), RowTarget::None);
         header.span(Some(DashClass::Heading), |line| {
             line.push_str("Unfiled");
@@ -1740,10 +1794,14 @@ fn generate(
                 .map(|agent_id| registry.attention(*agent_id))
                 .max()
                 .unwrap_or(UiAttention::Quiet);
-            header.span(
-                Some(DashClass::lamp(loudest).unwrap_or(DashClass::Muted)),
-                |line| line.push_str(if loudest > UiAttention::Quiet { " ●" } else { " …" }),
-            );
+            header.span(Some(attention_class(loudest)), |line| {
+                if loudest > UiAttention::Quiet {
+                    line.push(' ');
+                    line.push_str(attention_glyph(loudest));
+                } else {
+                    line.push_str(" …");
+                }
+            });
         }
         segments.push(Segment::Line(header));
         if !folded {
@@ -1768,6 +1826,12 @@ fn generate(
         )));
     }
 
+    if !segments.is_empty() {
+        segments.push(Segment::Line(Line::new(
+            LineKey::Spacer(None),
+            RowTarget::None,
+        )));
+    }
     let mut new_agent = Line::new(LineKey::NewAgent, RowTarget::NewAgent);
     new_agent.span(Some(DashClass::Muted), |line| line.push_str("+ new agent"));
     segments.push(Segment::Line(new_agent));
@@ -1903,7 +1967,8 @@ mod tests {
                 "doc 0..10".to_string(),
                 format!("{:?}", LineKey::Agent(b.agent_id)),
                 format!("{:?}", LineKey::Agent(a.agent_id)),
-                format!("doc 11..{}", text.len()),
+                format!("doc 11..{}", text.len() - 1),
+                format!("{:?}", LineKey::Spacer(None)),
                 format!("{:?}", LineKey::NewAgent),
             ]
         );
@@ -1925,7 +1990,8 @@ mod tests {
         assert_eq!(
             keys(&segments),
             vec![
-                format!("doc 0..{}", text.len()),
+                format!("doc 0..{}", text.len() - 1),
+                format!("{:?}", LineKey::Spacer(None)),
                 format!("{:?}", LineKey::NewAgent),
             ]
         );
@@ -1955,7 +2021,8 @@ mod tests {
             vec![
                 "doc 0..5".to_string(),
                 format!("{:?}", LineKey::Fold(host, 0)),
-                format!("doc 11..{}", text.len()),
+                format!("doc 11..{}", text.len() - 1),
+                format!("{:?}", LineKey::Spacer(None)),
                 format!("{:?}", LineKey::NewAgent),
             ]
         );
@@ -1979,7 +2046,8 @@ mod tests {
             vec![
                 "doc 0..10".to_string(),
                 format!("{:?}", LineKey::NewDraft(Some((host, 0)))),
-                format!("doc 11..{}", text.len()),
+                format!("doc 11..{}", text.len() - 1),
+                format!("{:?}", LineKey::Spacer(None)),
                 format!("{:?}", LineKey::NewAgent),
             ]
         );
