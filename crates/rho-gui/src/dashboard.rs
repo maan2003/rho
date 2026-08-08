@@ -17,7 +17,8 @@ use editor::{Editor, EditorMode, HighlightKey, Inlay, SizingBehavior};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, Focusable as _, HighlightStyle, WeakEntity, Window};
 use language::{Buffer, Capability, Point};
-use multi_buffer::{MultiBuffer, PathKey};
+use multi_buffer::MultiBuffer;
+use multi_buffer::composition::{Composition, CompositionSpec, CutSpec, RowSpec, SectionSpec};
 use project::InlayId;
 use rho_ui_proto::desk::{DeskBinding, DeskHeading, DeskHeadingState, parse};
 use rho_ui_proto::{AgentId, UiAttention};
@@ -101,21 +102,21 @@ enum CursorPlace {
     Doc(HostId, usize),
 }
 
-/// One slot of the arranged listing, in display order. Document slices
-/// carry their identity by (host, slice index); their ranges live in
-/// the segment list of the sync that produced them.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum SegmentKey {
-    Doc(HostId, u32),
-    Line(LineKey),
-}
-
 /// One generated segment: a slice of a host document, or a generated
 /// line (row or draft slot). Equality against the previous pass lets a
 /// sync bail out before touching the editor at all.
+///
+/// A document slice's `id` is its stable identity across passes: a hash
+/// of the title of the heading whose cut opens the slice (0 for the
+/// slice that starts the document). The composition keys the excerpt on
+/// it, so typing that shifts every offset still reconciles to a no-op.
 #[derive(Debug, PartialEq)]
 enum Segment {
-    Doc { host: HostId, range: Range<usize> },
+    Doc {
+        host: HostId,
+        range: Range<usize>,
+        id: u64,
+    },
     Line(Line),
 }
 
@@ -129,8 +130,14 @@ pub struct Dashboard {
     hosts: BTreeMap<HostId, WeakEntity<Buffer>>,
     /// Daemon-owned agent bindings per host, replaced wholesale.
     bindings: HashMap<HostId, Vec<DeskBinding>>,
-    /// Current display order; index n is the multibuffer's path key n.
-    order: Vec<SegmentKey>,
+    /// Reconciles the multibuffer to the generated spec by element
+    /// identity, so unchanged excerpts — and cursors in them — survive.
+    composition: Composition,
+    /// Stable composition keys per line, allocated once and never reused.
+    element_keys: HashMap<LineKey, u64>,
+    next_element_key: u64,
+    /// Generated rows in display order, from the last sync.
+    order: Vec<LineKey>,
     /// What each generated key means, for cursor lookup.
     targets: HashMap<LineKey, RowTarget>,
     /// Bound root agents per heading start, from the last sync — the
@@ -145,6 +152,8 @@ pub struct Dashboard {
     /// subscription that keeps chrome fresh.
     new_draft: Option<(Option<(HostId, usize)>, Entity<Buffer>, gpui::Subscription)>,
     collapsed: HashSet<(HostId, usize)>,
+    /// Hosts whose Unfiled tail is folded behind its header.
+    collapsed_unfiled: HashSet<HostId>,
     /// Move the cursor into this key's buffer on the next sync — how a
     /// freshly opened reply draft receives the cursor.
     pending_cursor: Option<LineKey>,
@@ -154,7 +163,7 @@ pub struct Dashboard {
     placeholder_ids: Vec<InlayId>,
     /// The previous pass's inputs and output, so a sync whose world is
     /// unchanged returns without touching the editor.
-    last_synced: Option<(Vec<(HostId, String)>, Vec<Segment>)>,
+    last_synced: Option<(Vec<(HostId, String)>, Vec<Segment>, Vec<(LineKey, String)>)>,
     /// Buffers already registered as headerless with the editor. A
     /// boundary onto a headerless buffer draws nothing, so this is what
     /// keeps the interleaved excerpts seamless.
@@ -194,6 +203,9 @@ impl Dashboard {
             buffers: HashMap::new(),
             hosts: BTreeMap::new(),
             bindings: HashMap::new(),
+            composition: Composition::default(),
+            element_keys: HashMap::new(),
+            next_element_key: 0,
             order: Vec::new(),
             targets: HashMap::new(),
             heading_agents: HashMap::new(),
@@ -201,6 +213,7 @@ impl Dashboard {
             reply_subscriptions: HashMap::new(),
             new_draft: None,
             collapsed: HashSet::new(),
+            collapsed_unfiled: HashSet::new(),
             pending_cursor: None,
             pending_doc_cursor: None,
             placeholder_ids: Vec::new(),
@@ -451,24 +464,42 @@ impl Dashboard {
             &documents,
             &filed,
             &self.collapsed,
+            &self.collapsed_unfiled,
             &self.replies,
             draft_topic,
         );
 
-        // Most syncs are registry noise that changes nothing on screen
-        // (dirty is set on every broadcast). When the whole pass —
-        // documents, segments, and filing — matches the last one, skip
-        // before touching a single buffer or highlight. Open drafts opt
-        // out: their text lives outside the segments.
-        let draft_open = !self.replies.is_empty() || self.new_draft.is_some();
-        if !draft_open
-            && self.pending_cursor.is_none()
+        // Render reconciles every frame, so most passes are registry
+        // noise that changes nothing on screen. When the whole pass —
+        // documents, segments, filing, and draft texts (which live in
+        // their buffers, outside the segments) — matches the last one,
+        // return before touching a single buffer or highlight.
+        let draft_texts = self
+            .replies
+            .iter()
+            .map(|agent_id| LineKey::Reply(*agent_id))
+            .chain(
+                self.new_draft
+                    .as_ref()
+                    .map(|(topic, _, _)| LineKey::NewDraft(*topic)),
+            )
+            .map(|key| {
+                let text = self
+                    .buffers
+                    .get(&key)
+                    .map_or_else(String::new, |buffer| buffer.read(cx).text());
+                (key, text)
+            })
+            .collect::<Vec<_>>();
+        if self.pending_cursor.is_none()
             && self.pending_doc_cursor.is_none()
             && self.heading_agents == filed
             && self
                 .last_synced
                 .as_ref()
-                .is_some_and(|(docs, segs)| *docs == documents && *segs == segments)
+                .is_some_and(|(docs, segs, drafts)| {
+                    *docs == documents && *segs == segments && *drafts == draft_texts
+                })
         {
             return;
         }
@@ -501,73 +532,79 @@ impl Dashboard {
 
         self.ensure_headerless(cx);
 
-        // Arrange: every segment takes a display-index path key. With
-        // multiple paths per buffer enabled, document slices coexist;
-        // every index is reassigned each pass and the stale tail removed,
-        // so no buffer keeps a path it no longer owns.
+        // Build the composition spec: one section per host document,
+        // cut wherever generated rows splice in (or a folded body hides).
+        // Cut and slice identities are the heading-title hashes generate
+        // stamped on the doc segments; row identities are the per-key
+        // element ids. The composition reconciles by identity, so a pass
+        // where only offsets shifted (typing) touches nothing.
+        let mut spec = CompositionSpec::default();
         let mut order = Vec::new();
-        let mut doc_counters: HashMap<HostId, u32> = HashMap::new();
+        let mut pending_rows: Vec<RowSpec> = Vec::new();
+        let mut current: Option<(HostId, usize)> = None;
         for segment in &segments {
             match segment {
-                Segment::Doc { host, .. } => {
-                    let counter = doc_counters.entry(*host).or_default();
-                    order.push(SegmentKey::Doc(*host, *counter));
-                    *counter += 1;
+                Segment::Doc { host, range, id } => {
+                    match current {
+                        Some((section_host, position)) if section_host == *host => {
+                            if let Some(section) = spec.sections.last_mut() {
+                                section.cuts.push(CutSpec {
+                                    id: *id,
+                                    position,
+                                    resume: range.start,
+                                    rows: std::mem::take(&mut pending_rows),
+                                });
+                            }
+                        }
+                        _ => {
+                            let Some(buffer) =
+                                self.hosts.get(host).and_then(|weak| weak.upgrade())
+                            else {
+                                current = None;
+                                continue;
+                            };
+                            spec.sections.push(SectionSpec {
+                                host: buffer,
+                                lead: std::mem::take(&mut pending_rows),
+                                cuts: Vec::new(),
+                            });
+                        }
+                    }
+                    current = Some((*host, range.end));
                 }
-                Segment::Line(line) => order.push(SegmentKey::Line(line.key.clone())),
+                Segment::Line(line) => {
+                    let Some(buffer) = self.buffers.get(&line.key).cloned() else {
+                        continue;
+                    };
+                    order.push(line.key.clone());
+                    pending_rows.push(RowSpec {
+                        id: self.element_key(&line.key),
+                        buffer,
+                    });
+                }
             }
         }
-        let order_changed = order != self.order;
-        let old_len = self.order.len();
-        // Capture the document cursor before rearranging; excerpt paths
-        // shift when slices split or merge, so it is restored from a
-        // buffer-level offset afterwards.
-        let doc_cursor = match (&self.pending_doc_cursor, &cursor_place) {
-            (Some(pending), _) => Some(*pending),
-            (None, Some(CursorPlace::Doc(host, offset))) if order_changed => {
-                Some((*host, *offset))
-            }
+        spec.tail = pending_rows;
+
+        // Capture where the cursor is before reconciling: a document
+        // cursor as a buffer offset, a row cursor as its current path
+        // (if the path survives, so did the excerpt and the anchor).
+        let pending_doc = self.pending_doc_cursor.take();
+        let doc_cursor_before = match &cursor_place {
+            Some(CursorPlace::Doc(host, offset)) => Some((*host, *offset)),
             _ => None,
         };
-        self.multi_buffer.update(cx, |multi_buffer, cx| {
-            let mut index = 0u64;
-            for segment in &segments {
-                let (buffer, range) = match segment {
-                    Segment::Doc { host, range } => {
-                        let Some(buffer) = self.hosts.get(host).and_then(|weak| weak.upgrade())
-                        else {
-                            continue;
-                        };
-                        let snapshot = buffer.read(cx).snapshot();
-                        let range =
-                            snapshot.offset_to_point(range.start)..snapshot.offset_to_point(range.end);
-                        (buffer, range)
-                    }
-                    Segment::Line(line) => {
-                        let Some(buffer) = self.buffers.get(&line.key) else {
-                            continue;
-                        };
-                        (buffer.clone(), Point::zero()..buffer.read(cx).max_point())
-                    }
-                };
-                multi_buffer.set_excerpts_for_path(
-                    PathKey::sorted(index),
-                    buffer,
-                    [range],
-                    0,
-                    cx,
-                );
-                index += 1;
-            }
-            for stale in (index as usize)..old_len {
-                multi_buffer.remove_excerpts(PathKey::sorted(stale as u64), cx);
-            }
-        });
+        let cursor_row_path = cursor_key
+            .as_ref()
+            .and_then(|key| self.element_keys.get(key))
+            .and_then(|id| self.composition.path_for_row(*id));
+
+        let structure_changed = self.composition.sync(&self.multi_buffer, &spec, cx);
+
         // Prune buffers for lines that fell out of the listing (their
         // excerpts are gone); open drafts always stay.
-        self.buffers.retain(|key, _| {
-            order.contains(&SegmentKey::Line(key.clone())) || key.is_draft()
-        });
+        self.buffers
+            .retain(|key, _| order.contains(key) || key.is_draft());
 
         self.targets = segments
             .iter()
@@ -578,20 +615,24 @@ impl Dashboard {
             .collect();
         self.heading_agents = filed;
 
-        // The cursor follows its buffer: a row cursor repositions when the
-        // row moved or was rewritten under it (or a fresh draft claims
-        // it); a document cursor is restored by offset when slices moved.
-        let moved = |key: &LineKey| {
-            let key = SegmentKey::Line(key.clone());
-            self.order.iter().position(|entry| *entry == key)
-                != order.iter().position(|entry| *entry == key)
+        // The cursor follows its buffer: anchors survive any reconcile
+        // that kept their excerpt, so a row cursor is re-placed only when
+        // its excerpt was rebuilt (path changed) or its text rewritten,
+        // and a document cursor is restored by offset only when the
+        // structure moved at all.
+        let rebuilt = |dashboard: &Self, key: &LineKey| {
+            dashboard
+                .element_keys
+                .get(key)
+                .and_then(|id| dashboard.composition.path_for_row(*id))
+                != cursor_row_path
         };
         let restore = match &self.pending_cursor {
-            Some(key) if order.contains(&SegmentKey::Line(key.clone())) => Some(key.clone()),
+            Some(key) if order.contains(key) => Some(key.clone()),
             _ => match &cursor_key {
                 Some(key)
-                    if order.contains(&SegmentKey::Line(key.clone()))
-                        && (moved(key) || edited.contains(key)) =>
+                    if order.contains(key)
+                        && (edited.contains(key) || rebuilt(self, key)) =>
                 {
                     Some(key.clone())
                 }
@@ -599,17 +640,28 @@ impl Dashboard {
             },
         };
         self.pending_cursor = None;
-        self.pending_doc_cursor = None;
         self.order = order;
         if let Some(key) = restore {
             self.move_cursor_to(&key, window, cx);
-        } else if let Some((host, offset)) = doc_cursor {
+        } else if let Some((host, offset)) =
+            pending_doc.or(if structure_changed { doc_cursor_before } else { None })
+        {
             self.move_cursor_to_doc(host, offset, window, cx);
         }
 
         self.apply_highlights(&segments, &documents, cx);
         self.apply_reply_chrome(registry, cx);
-        self.last_synced = Some((documents, segments));
+        self.last_synced = Some((documents, segments, draft_texts));
+    }
+
+    /// The stable composition id for a line key, allocated on first use.
+    fn element_key(&mut self, key: &LineKey) -> u64 {
+        if let Some(id) = self.element_keys.get(key) {
+            return *id;
+        }
+        self.next_element_key += 1;
+        self.element_keys.insert(key.clone(), self.next_element_key);
+        self.next_element_key
     }
 
     /// Places the cursor at the start of a key's buffer.
@@ -1020,6 +1072,13 @@ impl Dashboard {
     }
 
     pub fn toggle_subagents(&mut self, cx: &mut Context<Workspace>) -> bool {
+        if let Some(CursorPlace::Row(LineKey::Unfiled(host))) = self.cursor_place(cx) {
+            if !self.collapsed_unfiled.remove(&host) {
+                self.collapsed_unfiled.insert(host);
+            }
+            cx.notify();
+            return true;
+        }
         let Some(topic) = self.cursor_topic(cx) else {
             return false;
         };
@@ -1028,6 +1087,14 @@ impl Dashboard {
         }
         cx.notify();
         true
+    }
+
+    /// Whether the cursor sits on a host's Unfiled header row.
+    pub fn cursor_on_unfiled_header(&self, cx: &mut Context<Workspace>) -> bool {
+        matches!(
+            self.cursor_place(cx),
+            Some(CursorPlace::Row(LineKey::Unfiled(_)))
+        )
     }
 
     pub fn heading_candidates(
@@ -1087,7 +1154,7 @@ impl Dashboard {
             .order
             .iter()
             .filter_map(|key| match key {
-                SegmentKey::Line(LineKey::Agent(agent_id))
+                LineKey::Agent(agent_id)
                     if registry.attention(*agent_id) >= UiAttention::Pending =>
                 {
                     Some(*agent_id)
@@ -1290,11 +1357,13 @@ impl DashClass {
     }
 
     /// Color does all the talking: nothing on the dashboard is bold.
+    /// Headings deliberately avoid `text_accent`, which is the typed
+    /// user-message color everywhere else in rho.
     fn style(self, cx: &App) -> HighlightStyle {
         let colors = cx.theme().colors();
         let color = match self {
             DashClass::Muted => colors.text_muted,
-            DashClass::Heading => colors.text_accent,
+            DashClass::Heading => colors.terminal_ansi_blue,
             DashClass::TodoHeading => colors.terminal_ansi_red,
             DashClass::StaffedHeading => colors.terminal_ansi_cyan,
             DashClass::Working => colors.terminal_ansi_cyan,
@@ -1352,14 +1421,16 @@ fn doc_spans(text: &str) -> Vec<(DashClass, Range<usize>)> {
     let mut spans = Vec::new();
     for heading in parse(text) {
         spans.push((DashClass::Muted, heading.stars_range.clone()));
-        let (state_class, title_class) = match heading.state {
-            Some(DeskHeadingState::Todo) => (DashClass::TodoHeading, DashClass::Heading),
-            Some(DeskHeadingState::Staffed) => (DashClass::StaffedHeading, DashClass::Heading),
-            Some(DeskHeadingState::Done | DeskHeadingState::Discarded) => {
-                (DashClass::Muted, DashClass::Muted)
-            }
-            None => (DashClass::Heading, DashClass::Heading),
+        // The title keeps the heading color in every state — a DONE
+        // heading is still a heading, not a comment; only the keyword
+        // fades.
+        let state_class = match heading.state {
+            Some(DeskHeadingState::Todo) => DashClass::TodoHeading,
+            Some(DeskHeadingState::Staffed) => DashClass::StaffedHeading,
+            Some(DeskHeadingState::Done | DeskHeadingState::Discarded) => DashClass::Muted,
+            None => DashClass::Heading,
         };
+        let title_class = DashClass::Heading;
         if let Some(state_range) = &heading.state_range {
             spans.push((state_class, state_range.clone()));
         }
@@ -1435,23 +1506,23 @@ fn agent_line(agent_id: AgentId, registry: &AgentRegistry) -> Line {
     } else {
         "·"
     };
+    // The glyph is the row's only splash of color; the rest stays plain
+    // so the document's headings carry the page.
     line.span(
         Some(DashClass::lamp(attention).unwrap_or(DashClass::Muted)),
         |text| text.push_str(glyph),
     );
     line.span(None, |text| text.push(' '));
-    line.span(
-        DashClass::lamp(attention).filter(|_| attention >= UiAttention::Pending),
-        |text| text.push_str(&registry.agent_human_name(agent_id)),
-    );
+    line.span(None, |text| {
+        text.push_str(&registry.agent_human_name(agent_id))
+    });
 
     let members = registry.agent_subtree(agent_id);
     let members = members.into_iter().skip(1).collect::<Vec<_>>();
     let overflow = members.len().saturating_sub(VISIBLE_TAGS);
     for member in members.into_iter().take(VISIBLE_TAGS) {
         line.span(None, |text| text.push_str("  "));
-        let class = DashClass::lamp(registry.attention(member)).unwrap_or(DashClass::Muted);
-        line.span(Some(class), |text| {
+        line.span(Some(DashClass::Muted), |text| {
             text.push_str(&registry.agent_id_label(member))
         });
     }
@@ -1488,15 +1559,26 @@ fn truncate_chars(value: &str, limit: usize) -> String {
     result
 }
 
+/// Ends a document slice before a cut point's newline, so the synthetic
+/// newline between excerpts doesn't double it.
+fn trim_newline(text: &str, end: usize) -> usize {
+    if end > 0 && text.as_bytes().get(end - 1) == Some(&b'\n') {
+        end - 1
+    } else {
+        end
+    }
+}
+
 /// Generate the listing without mutating Desk text: the documents are
 /// emitted as writable slices, cut where a bound heading's rows (agent
-/// rows, replies, the staffing draft) splice in under its heading line.
-/// Root agents bound to no heading form the generated Unfiled tail.
+/// rows, replies, the staffing draft) splice in after its body. Root
+/// agents bound to no heading form the generated Unfiled tail.
 fn generate(
     registry: &AgentRegistry,
     documents: &[(HostId, String)],
     filed: &HashMap<(HostId, usize), Vec<AgentId>>,
     collapsed: &HashSet<(HostId, usize)>,
+    collapsed_unfiled: &HashSet<HostId>,
     replies: &[AgentId],
     draft_topic: Option<Option<(HostId, usize)>>,
 ) -> Vec<Segment> {
@@ -1505,7 +1587,7 @@ fn generate(
     let mut emitted_replies = HashSet::new();
     let empty = Vec::new();
 
-    let mut push_agent_rows =
+    let push_agent_rows =
         |segments: &mut Vec<Segment>, emitted_replies: &mut HashSet<AgentId>, agents: &[AgentId]| {
             for agent_id in agents {
                 segments.push(Segment::Line(agent_line(*agent_id, registry)));
@@ -1528,6 +1610,21 @@ fn generate(
         }
         let headings = parse(text);
         let mut slice_start = 0usize;
+        let mut slice_id = 0u64;
+        let mut title_counts: HashMap<String, u32> = HashMap::new();
+        // The next slice's identity comes from the heading whose cut
+        // opens it: a hash of the title (plus an occurrence index for
+        // duplicates), so it survives every offset shift above it.
+        let next_slice_id = |title: &str, title_counts: &mut HashMap<String, u32>| {
+            use std::hash::{Hash as _, Hasher as _};
+            let count = title_counts.entry(title.to_owned()).or_insert(0);
+            let occurrence = *count;
+            *count += 1;
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            title.hash(&mut hasher);
+            occurrence.hash(&mut hasher);
+            hasher.finish()
+        };
         for heading in &headings {
             let start = heading.heading_range.start;
             let agents = filed.get(&(*host, start)).unwrap_or(&empty);
@@ -1538,7 +1635,9 @@ fn generate(
                 segments.push(Segment::Doc {
                     host: *host,
                     range: slice_start..heading.heading_range.end,
+                    id: slice_id,
                 });
+                slice_id = next_slice_id(&heading.title, &mut title_counts);
                 let prose = prose_for(text, heading);
                 let folded_count = agents.len() + usize::from(!prose.is_empty());
                 if folded_count > 0 {
@@ -1574,12 +1673,15 @@ fn generate(
                 }
                 slice_start = heading.body_range.end;
             } else if !agents.is_empty() || draft_here {
-                // Rows splice in directly under the heading line, before
-                // the body — content reads downward from its heading.
+                // Rows splice in after the heading's body, before the
+                // next heading (trailing newline trimmed so the excerpt
+                // boundary doesn't double it).
                 segments.push(Segment::Doc {
                     host: *host,
-                    range: slice_start..heading.heading_range.end,
+                    range: slice_start..trim_newline(text, heading.body_range.end),
+                    id: slice_id,
                 });
+                slice_id = next_slice_id(&heading.title, &mut title_counts);
                 push_agent_rows(&mut segments, &mut emitted_replies, agents);
                 if draft_here {
                     segments.push(Segment::Line(Line::new(
@@ -1587,13 +1689,14 @@ fn generate(
                         RowTarget::NewDraft(Some((*host, start))),
                     )));
                 }
-                slice_start = heading.body_range.start;
+                slice_start = heading.body_range.end;
             }
         }
         if slice_start < text.len() || slice_start == 0 {
             segments.push(Segment::Doc {
                 host: *host,
                 range: slice_start..text.len(),
+                id: slice_id,
             });
         }
     }
@@ -1617,6 +1720,7 @@ fn generate(
         if unfiled.is_empty() {
             continue;
         }
+        let folded = collapsed_unfiled.contains(host);
         let mut header = Line::new(LineKey::Unfiled(*host), RowTarget::None);
         header.span(Some(DashClass::Heading), |line| {
             line.push_str("Unfiled");
@@ -1628,8 +1732,23 @@ fn generate(
         header.span(Some(DashClass::Muted), |line| {
             line.push_str(&format!(" · {}", unfiled.len()));
         });
+        if folded {
+            // The fold indicator turns into a lamp when something
+            // folded away wants attention.
+            let loudest = unfiled
+                .iter()
+                .map(|agent_id| registry.attention(*agent_id))
+                .max()
+                .unwrap_or(UiAttention::Quiet);
+            header.span(
+                Some(DashClass::lamp(loudest).unwrap_or(DashClass::Muted)),
+                |line| line.push_str(if loudest > UiAttention::Quiet { " ●" } else { " …" }),
+            );
+        }
         segments.push(Segment::Line(header));
-        push_agent_rows(&mut segments, &mut emitted_replies, &unfiled);
+        if !folded {
+            push_agent_rows(&mut segments, &mut emitted_replies, &unfiled);
+        }
     }
 
     // Replies whose rows are folded away, and the unanchored new-agent
@@ -1736,19 +1855,19 @@ mod tests {
             &[(host, text.clone())],
             &filed,
             &HashSet::new(),
+            &HashSet::new(),
             &[],
             None,
         );
-        // The document splits right under "One"'s heading line, so rows
-        // read as the heading's content; triage puts the needs-input
-        // agent first, and the body resumes below the rows.
+        // The document splits after "One"'s body (trailing newline
+        // trimmed); triage puts the needs-input agent first.
         assert_eq!(
             keys(&segments),
             vec![
-                "doc 0..5".to_string(),
+                "doc 0..10".to_string(),
                 format!("{:?}", LineKey::Agent(b.agent_id)),
                 format!("{:?}", LineKey::Agent(a.agent_id)),
-                format!("doc 6..{}", text.len()),
+                format!("doc 11..{}", text.len()),
                 format!("{:?}", LineKey::NewAgent),
             ]
         );
@@ -1762,6 +1881,7 @@ mod tests {
             &registry,
             &[(host, text.clone())],
             &HashMap::new(),
+            &HashSet::new(),
             &HashSet::new(),
             &[],
             None,
@@ -1789,6 +1909,7 @@ mod tests {
             &[(host, text.clone())],
             &filed,
             &collapsed,
+            &HashSet::new(),
             &[],
             None,
         );
@@ -1813,15 +1934,16 @@ mod tests {
             &[(host, text.clone())],
             &HashMap::new(),
             &HashSet::new(),
+            &HashSet::new(),
             &[],
             Some(Some((host, 0))),
         );
         assert_eq!(
             keys(&segments),
             vec![
-                "doc 0..5".to_string(),
+                "doc 0..10".to_string(),
                 format!("{:?}", LineKey::NewDraft(Some((host, 0)))),
-                format!("doc 6..{}", text.len()),
+                format!("doc 11..{}", text.len()),
                 format!("{:?}", LineKey::NewAgent),
             ]
         );
@@ -1836,6 +1958,7 @@ mod tests {
             &registry,
             &[(host, String::new())],
             &HashMap::new(),
+            &HashSet::new(),
             &HashSet::new(),
             &[],
             None,
@@ -1857,6 +1980,38 @@ mod tests {
     }
 
     #[test]
+    fn unfiled_tail_folds_behind_its_header() {
+        let root = agent(1, None, UiAttention::Quiet, 1);
+        let (registry, host) = registry(vec![root.clone()]);
+        let mut collapsed_unfiled = HashSet::new();
+        collapsed_unfiled.insert(host);
+        let segments = generate(
+            &registry,
+            &[(host, String::new())],
+            &HashMap::new(),
+            &HashSet::new(),
+            &collapsed_unfiled,
+            &[],
+            None,
+        );
+        assert!(
+            !segments.iter().any(|segment| matches!(
+                segment,
+                Segment::Line(line) if matches!(line.key, LineKey::Agent(_))
+            )),
+            "folded Unfiled hides its rows"
+        );
+        let header = segments
+            .iter()
+            .find_map(|segment| match segment {
+                Segment::Line(line) if line.key == LineKey::Unfiled(host) => Some(line),
+                _ => None,
+            })
+            .expect("header row remains");
+        assert!(header.text.contains("· 1"));
+    }
+
+    #[test]
     fn heading_lines_style_by_state() {
         let text = "* TODO Ship it\n:project: rho\n* STAFFED Crewed\n* DONE Old\n";
         let spans = doc_spans(text);
@@ -1872,11 +2027,18 @@ mod tests {
                 .any(|(class, range)| matches!(class, DashClass::StaffedHeading)
                     && &text[range.clone()] == "STAFFED")
         );
-        // Done headings drop to the muted chrome color, keyword and title.
+        // A DONE heading's keyword fades but the title keeps the heading
+        // color — it should not read as a comment next to its body.
         assert!(
             spans
                 .iter()
                 .any(|(class, range)| matches!(class, DashClass::Muted)
+                    && &text[range.clone()] == "DONE")
+        );
+        assert!(
+            spans
+                .iter()
+                .any(|(class, range)| matches!(class, DashClass::Heading)
                     && &text[range.clone()] == "Old")
         );
         assert!(

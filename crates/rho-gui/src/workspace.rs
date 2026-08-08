@@ -319,10 +319,6 @@ pub struct Workspace {
     /// Agent shown beside the dashboard cursor. Kept separate from the
     /// focused task so cursor previews do not rebuild or reorder the rail.
     dashboard_preview: Option<AgentId>,
-    /// The dashboard projection is regenerated only after its registry or
-    /// local composition state changes, never merely because another view
-    /// dirtied the window.
-    dashboard_dirty: bool,
     /// Read-only document shown when the synthetic Iris row is targeted.
     iris_preview: Entity<editor::Editor>,
     /// Each daemon's hidden persisted Iris coordinator. These identities stay
@@ -725,7 +721,6 @@ impl Workspace {
             dashboard,
             desk_sync: DeskSync::default(),
             dashboard_preview: None,
-            dashboard_dirty: true,
             iris_preview,
             iris_agents: HashMap::new(),
             zulip: None,
@@ -819,7 +814,6 @@ impl Workspace {
             self.focus_active_surface(window, cx);
         }
         self.refresh_draft_agent_targets(cx);
-        self.dashboard_dirty = true;
         cx.notify();
     }
 
@@ -858,7 +852,6 @@ impl Workspace {
         clock: rho_ui_proto::desk::DeskClock,
     ) {
         self.desk_sync.mark_local(host, clock);
-        self.dashboard_dirty = true;
     }
 
     /// Whether the daemon behind an agent is answering. Acting on an agent
@@ -1072,22 +1065,6 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Transcript frames are delivered independently of rail state and
-        // can arrive for every streamed token. Rebuilding the dashboard's
-        // editor excerpts and inlays for them makes the rail visibly flicker.
-        // Only events that can change its projection invalidate it.
-        if matches!(
-            &event,
-            ConnEvent::Ready { .. }
-                | ConnEvent::DeskSnapshot { .. }
-                | ConnEvent::DeskTextApplied(_)
-                | ConnEvent::DeskBindingsChanged(_)
-                | ConnEvent::AgentCreated { .. }
-                | ConnEvent::AgentAttention { .. }
-                | ConnEvent::AgentTurnReport { .. }
-        ) {
-            self.dashboard_dirty = true;
-        }
         match event {
             ConnEvent::DeskSnapshot {
                 snapshot,
@@ -1899,7 +1876,7 @@ impl Workspace {
         // Engagement bump: keeps display-time staleness correct between
         // topic refreshes (the daemon persists the same timestamp).
         self.registry.touch_agent(agent_id);
-        self.dashboard_dirty = true;
+        cx.notify();
     }
 
     /// Submitting the compose surface creates the agent: the workdir field
@@ -2853,7 +2830,6 @@ impl Workspace {
     pub(crate) fn mark_draft_active_from_edit(&mut self, cx: &mut Context<Self>) {
         if matches!(self.registry.active_pane(), ActivePane::Startup) {
             self.registry.enter_draft();
-            self.dashboard_dirty = true;
             cx.notify();
         }
     }
@@ -3037,7 +3013,6 @@ impl Workspace {
                     .expect_attention(agent_id, rho_ui_proto::UiAttention::Quiet);
             }
         }
-        self.dashboard_dirty = true;
         cx.notify();
         true
     }
@@ -3362,7 +3337,6 @@ impl Workspace {
                 (ContextId::Draft, SurfaceKey::Draft)
             }
         };
-        self.dashboard_dirty = true;
         self.active_context = context;
         let surface = self.make_surface(key, window, cx);
         self.display_surface(surface);
@@ -4056,13 +4030,7 @@ impl Workspace {
 
     #[cfg(test)]
     pub(crate) fn sync_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.dashboard.sync(&self.registry, window, cx);
-        self.dashboard_dirty = false;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn dashboard_is_dirty(&self) -> bool {
-        self.dashboard_dirty
+        self.refresh_dashboard(window, cx);
     }
 
     #[cfg(test)]
@@ -4080,11 +4048,13 @@ impl Workspace {
         self.dashboard_preview
     }
 
-    fn sync_dashboard_if_dirty(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dashboard_dirty {
-            self.dashboard.sync(&self.registry, window, cx);
-            self.dashboard_dirty = false;
-        }
+    /// Reconciles the dashboard against the current world. There is no
+    /// dirty flag to remember: render reconciles every frame (a pass
+    /// whose inputs match the last one returns before touching the
+    /// editor), and verbs that move the cursor into a fresh row call
+    /// this directly so the row exists within the same action.
+    pub(crate) fn refresh_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dashboard.sync(&self.registry, window, cx);
     }
 
     #[cfg(test)]
@@ -4379,7 +4349,6 @@ impl Workspace {
         {
             self.subscribe_agent(agent_id, cx);
         }
-        self.dashboard_dirty = true;
         cx.notify();
     }
 
@@ -5037,11 +5006,11 @@ impl Workspace {
             }) => self.open_agent(agent_id, window, cx),
             Some(RowTarget::Topic { .. }) => {
                 self.dashboard.toggle_subagents(cx);
-                self.dashboard_dirty = true;
+                self.refresh_dashboard(window, cx);
             }
             Some(RowTarget::NewAgent) => {
                 self.dashboard.open_new_draft(None, cx);
-                self.dashboard_enter_insert(window, cx);
+                self.dashboard_focus_draft(window, cx);
             }
             Some(RowTarget::Reply(agent_id)) => {
                 if !self.require_connected(cx) {
@@ -5051,6 +5020,7 @@ impl Workspace {
                     self.handle_submit(agent_id, vec![ContentPart::Text { text }], cx);
                 }
                 self.dashboard.cursor_to_agent(agent_id, cx);
+                self.refresh_dashboard(window, cx);
             }
             Some(RowTarget::NewDraft(topic)) => {
                 if !self.require_connected(cx) {
@@ -5063,6 +5033,7 @@ impl Workspace {
                         self.spawn_unfiled_dashboard_agent(body, window, cx);
                     }
                 }
+                self.refresh_dashboard(window, cx);
             }
             // Document text keeps vim's own enter.
             _ => cx.propagate(),
@@ -5074,7 +5045,7 @@ impl Workspace {
             Some(crate::dashboard::RowTarget::Agent(agent_id))
             | Some(crate::dashboard::RowTarget::Reply(agent_id)) => {
                 self.dashboard.open_reply(agent_id, cx);
-                self.dashboard_enter_insert(window, cx);
+                self.dashboard_focus_draft(window, cx);
             }
             // On a heading line, reply to the heading's top agent, so `r`
             // works anywhere in a staffed topic, not only on its rows.
@@ -5089,7 +5060,7 @@ impl Workspace {
                     .or_else(|| self.dashboard.first_agent_for_topic((host, offset)))
                     .expect("guard checked an agent exists");
                 self.dashboard.open_reply(agent_id, cx);
-                self.dashboard_enter_insert(window, cx);
+                self.dashboard_focus_draft(window, cx);
             }
             // Document text keeps vim's own `r`.
             _ => cx.propagate(),
@@ -5100,6 +5071,14 @@ impl Workspace {
         if let Ok(action) = cx.build_action("vim::InsertBefore", None) {
             window.dispatch_action(action, cx);
         }
+    }
+
+    /// A freshly opened draft row only exists on screen after a sync:
+    /// splice it in now so the pending cursor lands on it, then enter
+    /// insert there — never on the read-only row the cursor came from.
+    fn dashboard_focus_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.refresh_dashboard(window, cx);
+        self.dashboard_enter_insert(window, cx);
     }
 
     /// An unfiled spawn has no heading to inherit `:project:` from, so the
@@ -5233,7 +5212,7 @@ impl Workspace {
                 let title = input.trim();
                 if !title.is_empty() {
                     workspace.dashboard.append_topic(title, cx);
-                    workspace.dashboard_dirty = true;
+                    workspace.refresh_dashboard(_window, cx);
                 }
             },
         );
@@ -5263,7 +5242,7 @@ impl Workspace {
             return;
         };
         self.dashboard.open_new_draft(Some(topic), cx);
-        self.dashboard_enter_insert(window, cx);
+        self.dashboard_focus_draft(window, cx);
     }
 
     fn staff_dashboard_node_with_brief(
@@ -5557,7 +5536,7 @@ impl Workspace {
                 if !input.trim().is_empty()
                     && workspace.dashboard.rename_cursor_topic(input.trim(), cx)
                 {
-                    workspace.dashboard_dirty = true;
+                    workspace.refresh_dashboard(_window, cx);
                 }
             },
         );
@@ -6289,7 +6268,7 @@ impl Render for Workspace {
         let editor = self.active_editor(cx);
         let text_style = editor.update(cx, |editor, cx| editor.style(cx).text.clone());
         let connection_status = self.render_connection_status(&text_style, cx);
-        self.sync_dashboard_if_dirty(window, cx);
+        self.refresh_dashboard(window, cx);
         div()
             .id("rho-gui")
             .size_full()
@@ -6376,7 +6355,7 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &DashboardNewAgent, window, cx| {
                 this.dashboard.open_new_draft(None, cx);
-                this.dashboard_enter_insert(window, cx);
+                this.dashboard_focus_draft(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardHeadingBelow, window, cx| {
                 this.dashboard_insert_heading(false, window, cx);
@@ -6401,12 +6380,15 @@ impl Render for Workspace {
             }))
             .on_action(
                 cx.listener(|this, _: &DashboardToggleSubagents, window, cx| {
-                    if !this.dashboard_verb_applies(window, cx) {
+                    if !this.dashboard_verb_applies(window, cx)
+                        && !(this.dashboard.is_focused(window, cx)
+                            && this.dashboard.cursor_on_unfiled_header(cx))
+                    {
                         cx.propagate();
                         return;
                     }
                     this.dashboard.toggle_subagents(cx);
-                    this.dashboard_dirty = true;
+                    this.refresh_dashboard(window, cx);
                 }),
             )
             .on_action(cx.listener(|this, _: &DashboardDemote, window, cx| {
