@@ -39,6 +39,7 @@ use crate::chime::Chime;
 #[cfg(feature = "native")]
 use crate::connection::GitApprovalDecision;
 use crate::connection::{AgentFrameAllocation, ConnEvent, Connection, HostEvent};
+use crate::desk_view::{DeskSync, DeskView};
 use crate::draft_view::DraftModel;
 use crate::hosts::{HostStatus, Hosts};
 use crate::minibuffer::{ECHO_DURATION, Echo, Minibuffer, bottom_strip};
@@ -52,14 +53,15 @@ use crate::style::{RoleFamily, StyleClass};
 use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
     AgentDone, AgentHide, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, DashboardBack,
-    DashboardDeleteEmpty, DashboardDemote, DashboardHeadingAbove, DashboardHeadingBelow,
-    DashboardJump, DashboardMoveAgent, DashboardMoveDown, DashboardMoveUp, DashboardNewAgent,
-    DashboardNow, DashboardPromote, DashboardRenameTopic, DashboardReply, DashboardStaff,
-    DashboardToggleSubagents, DashboardUndo, GitApprovalAllow, GitApprovalDeny, MinibufferCancel,
-    MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious, PaneBack, PaneClose,
-    PaneFocusNext, PaneSplitDown, PaneSplitRight, PastePrompt, RailFocus, RailOpen, RoleCycle,
-    RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit,
-    SubmitPrompt, TaskBoard, VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow, ZulipQuit,
+    DashboardDeleteEmpty, DashboardDemote, DashboardGoto, DashboardHeadingAbove,
+    DashboardHeadingBelow, DashboardJump, DashboardMoveAgent, DashboardMoveDown, DashboardMoveUp,
+    DashboardNewAgent, DashboardNow, DashboardPromote, DashboardRenameTopic, DashboardReply,
+    DashboardStaff, DashboardToggleSubagents, DashboardUndo, GitApprovalAllow, GitApprovalDeny,
+    MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious,
+    PaneBack, PaneClose, PaneFocusNext, PaneSplitDown, PaneSplitRight, PastePrompt, RailFocus,
+    RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore,
+    ShellPagerQuit, SubmitPrompt, TaskBoard, VoiceToggle, ZulipLoadOlder, ZulipNextUnread,
+    ZulipOpenRow, ZulipQuit,
 };
 
 /// What a pane shows: stable identity plus the live view. Surfaces live
@@ -99,6 +101,7 @@ enum SurfaceView {
         editor: Entity<editor::Editor>,
     },
     File(Entity<FileView>),
+    Desk(Entity<DeskView>),
     Shell {
         model: Entity<crate::shell_view::ShellModel>,
         editor: Entity<editor::Editor>,
@@ -311,6 +314,9 @@ pub struct Workspace {
     /// The dashboard: the rail as a real editor buffer, ambient chrome
     /// beside the active tree.
     dashboard: crate::dashboard::Dashboard,
+    /// Canonical per-host CRDT Desk buffers shared by dashboard and source
+    /// views.
+    desk_sync: DeskSync,
     /// Agent shown beside the dashboard cursor. Kept separate from the
     /// focused task so cursor previews do not rebuild or reorder the rail.
     dashboard_preview: Option<AgentId>,
@@ -718,6 +724,7 @@ impl Workspace {
             surfaces: HashMap::new(),
             active_context: ContextId::Draft,
             dashboard,
+            desk_sync: DeskSync::default(),
             dashboard_preview: None,
             dashboard_dirty: true,
             iris_preview,
@@ -851,7 +858,8 @@ impl Workspace {
         host: HostId,
         clock: rho_ui_proto::desk::DeskClock,
     ) {
-        self.dashboard.mark_local_text_op(host, clock);
+        self.desk_sync.mark_local(host, clock);
+        self.dashboard_dirty = true;
     }
 
     /// Whether the daemon behind an agent is answering. Acting on an agent
@@ -1085,11 +1093,14 @@ impl Workspace {
                 snapshot,
                 replica_id,
             } => {
-                self.dashboard
+                let buffer = self
+                    .desk_sync
                     .apply_snapshot(host, snapshot, replica_id, cx);
+                self.dashboard.set_source(host, buffer.downgrade());
+                self.rebuild_desk_surfaces(host, buffer, window, cx);
             }
             ConnEvent::DeskTextApplied(record) => {
-                self.dashboard.apply_text(host, record, cx);
+                self.desk_sync.apply_text(host, record, cx);
             }
             ConnEvent::Ready {
                 agents,
@@ -3393,6 +3404,7 @@ impl Workspace {
             SurfaceKey::Draft => "draft".to_owned(),
             SurfaceKey::Transcript(agent_id) => self.registry.agent_display_label(*agent_id),
             SurfaceKey::File { path, .. } => path.to_string(),
+            SurfaceKey::Desk(host) => format!("desk {}", self.registry.host_name(*host)),
             SurfaceKey::Shell(agent_id) => {
                 format!("shell {}", self.registry.agent_id_label(*agent_id))
             }
@@ -3416,6 +3428,7 @@ impl Workspace {
             SurfaceKey::Draft => "compose",
             SurfaceKey::Transcript(_) => "transcript",
             SurfaceKey::File { .. } => "file",
+            SurfaceKey::Desk(_) => "desk",
             SurfaceKey::Shell(_) => "shell",
             SurfaceKey::Diff { .. } => "diff",
             SurfaceKey::Terminal { .. } => "terminal",
@@ -4100,6 +4113,7 @@ impl Workspace {
             SurfaceView::Draft { editor, .. } => editor.clone(),
             SurfaceView::Transcript { editor, .. } => editor.clone(),
             SurfaceView::File(view) => view.read(cx).editor().clone(),
+            SurfaceView::Desk(view) => view.read(cx).editor().clone(),
             SurfaceView::Shell { editor, .. } => editor.clone(),
             SurfaceView::Diff(view) => view.read(cx).editor().clone(),
             SurfaceView::Terminal(_) => self
@@ -4139,6 +4153,7 @@ impl Workspace {
             SurfaceView::Draft { editor, .. } => editor.focus_handle(cx),
             SurfaceView::Transcript { editor, .. } => editor.focus_handle(cx),
             SurfaceView::File(view) => view.read(cx).editor().focus_handle(cx),
+            SurfaceView::Desk(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::Shell { editor, .. } => editor.focus_handle(cx),
             SurfaceView::Diff(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::Terminal(view) => view.read(cx).focus_handle(cx),
@@ -4189,6 +4204,13 @@ impl Workspace {
             SurfaceKey::File { .. } => {
                 unreachable!("file surfaces are created by open_file_surface")
             }
+            SurfaceKey::Desk(host) => {
+                let buffer = self
+                    .desk_sync
+                    .buffer(*host)
+                    .expect("Desk surface requires a received snapshot");
+                SurfaceView::Desk(cx.new(|cx| DeskView::new(buffer, window, cx)))
+            }
             SurfaceKey::Shell(_) => {
                 unreachable!("shell surfaces are created by open_shell_surface")
             }
@@ -4229,6 +4251,11 @@ impl Workspace {
                 let (project, buffer) = view.read(cx).shared_content();
                 let view = cx.new(|cx| FileView::new(project, buffer, window, cx));
                 Self::wrap_surface(surface.key.clone(), SurfaceView::File(view), window, cx)
+            }
+            SurfaceView::Desk(view) => {
+                let buffer = view.read(cx).shared_buffer();
+                let view = cx.new(|cx| DeskView::new(buffer, window, cx));
+                Self::wrap_surface(surface.key.clone(), SurfaceView::Desk(view), window, cx)
             }
             SurfaceView::Diff(view) => {
                 let model = view.read(cx).model();
@@ -4281,6 +4308,52 @@ impl Workspace {
         }
     }
 
+    /// Reconnect snapshots replace the CRDT buffer entity. Rebuild every
+    /// view over the old entity, including independent split views and pane
+    /// history, so no editor can keep accepting edits on an orphaned buffer.
+    fn rebuild_desk_surfaces(
+        &mut self,
+        host: HostId,
+        buffer: Entity<language::Buffer>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = SurfaceKey::Desk(host);
+        let refocus = self
+            .contexts
+            .get(&self.active_context)
+            .is_some_and(|tree| tree.focused().surface.key == key);
+        let mut replacements = HashMap::<gpui::EntityId, Surface>::new();
+        let mut replace = |surface: &mut Surface| {
+            if surface.key != key {
+                return;
+            }
+            let SurfaceView::Desk(old_view) = &surface.view else {
+                return;
+            };
+            let replacement = replacements
+                .entry(old_view.entity_id())
+                .or_insert_with(|| {
+                    let view = cx.new(|cx| DeskView::new(buffer.clone(), window, cx));
+                    Self::wrap_surface(key.clone(), SurfaceView::Desk(view), window, cx)
+                })
+                .clone();
+            *surface = replacement;
+        };
+        for surfaces in self.surfaces.values_mut() {
+            for surface in surfaces {
+                replace(surface);
+            }
+        }
+        for tree in self.contexts.values_mut() {
+            tree.for_each_surface_mut(&mut replace);
+        }
+        drop(replace);
+        if refocus {
+            self.focus_active_surface(window, cx);
+        }
+    }
+
     /// Wraps a view as a surface with a focus-follow observer: gpui focus
     /// arriving inside its editor (mouse click, vim motion) moves pane
     /// focus and the agent context along.
@@ -4294,6 +4367,10 @@ impl Workspace {
             SurfaceView::Draft { editor, .. } => (editor.focus_handle(cx), editor.entity_id()),
             SurfaceView::Transcript { editor, .. } => (editor.focus_handle(cx), editor.entity_id()),
             SurfaceView::File(view) => {
+                let editor = view.read(cx).editor();
+                (editor.focus_handle(cx), editor.entity_id())
+            }
+            SurfaceView::Desk(view) => {
                 let editor = view.read(cx).editor();
                 (editor.focus_handle(cx), editor.entity_id())
             }
@@ -4358,9 +4435,10 @@ impl Workspace {
                 None
             }
             // Files and chat keep whatever agent context was current.
-            SurfaceKey::File { .. } | SurfaceKey::ZulipInbox | SurfaceKey::ZulipNarrow { .. } => {
-                None
-            }
+            SurfaceKey::File { .. }
+            | SurfaceKey::Desk(_)
+            | SurfaceKey::ZulipInbox
+            | SurfaceKey::ZulipNarrow { .. } => None,
         };
         if self.connected()
             && let Some(agent_id) = selected
@@ -5053,6 +5131,24 @@ impl Workspace {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Org agenda goto: topic rows jump to their shared editable Desk source.
+    fn dashboard_goto(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((host, offset)) = self.dashboard.cursor_topic(cx) {
+            if self.desk_sync.buffer(host).is_none() {
+                return;
+            }
+            let surface = self.make_surface(SurfaceKey::Desk(host), window, cx);
+            if let SurfaceView::Desk(view) = &surface.view {
+                view.update(cx, |view, cx| view.jump_to_heading(offset, window, cx));
+            }
+            self.display_surface(surface);
+            self.focus_active_surface(window, cx);
+            cx.notify();
+        } else {
+            self.dashboard_open(window, cx);
         }
     }
 
@@ -5835,6 +5931,12 @@ impl Workspace {
                 .overflow_hidden()
                 .child(view.clone())
                 .into_any_element(),
+            SurfaceView::Desk(view) => div()
+                .id("rho-surface-desk")
+                .size_full()
+                .overflow_hidden()
+                .child(view.clone())
+                .into_any_element(),
             #[cfg(feature = "native")]
             SurfaceView::ZulipInbox(view) => div()
                 .id("rho-surface-zulip-inbox")
@@ -6354,6 +6456,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &RailOpen, window, cx| {
                 this.dashboard_open(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DashboardGoto, window, cx| {
+                this.dashboard_goto(window, cx);
             }))
             .on_action(cx.listener(|this, _: &crate::RootTransient, window, cx| {
                 this.open_transient(crate::transient::root_menu(), window, cx);

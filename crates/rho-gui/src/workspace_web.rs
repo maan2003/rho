@@ -174,6 +174,7 @@ impl Workspace {
             surfaces: HashMap::new(),
             active_context: ContextId::Draft,
             dashboard,
+            desk_sync: crate::desk_view::DeskSync::default(),
             dashboard_preview: None,
             dashboard_dirty: true,
             iris_preview,

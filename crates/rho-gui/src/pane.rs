@@ -10,6 +10,7 @@
 //! is per-viewport, like emacs window history.
 
 use camino::Utf8PathBuf;
+use rho_registry::HostId;
 use rho_ui_proto::AgentId;
 
 /// Stable identity of a surface, independent of any view entity.
@@ -25,6 +26,8 @@ pub enum SurfaceKey {
         agent_id: AgentId,
         path: Utf8PathBuf,
     },
+    /// A host's editable daemon-owned Desk source document.
+    Desk(HostId),
     /// An editor-native shell process and transcript owned by the daemon.
     Shell(AgentId),
     /// The jj working-copy diff for an agent's workspace.
@@ -187,6 +190,17 @@ impl<S: PartialEq> PaneTree<S> {
             }
         }
         walk(&mut self.root, f);
+    }
+
+    /// Visits every surface retained by the tree, including pane history.
+    /// This is used when live content behind a stable surface key is replaced.
+    pub fn for_each_surface_mut(&mut self, f: &mut dyn FnMut(&mut S)) {
+        self.for_each_pane_mut(&mut |pane| {
+            f(&mut pane.surface);
+            for surface in &mut pane.history {
+                f(surface);
+            }
+        });
     }
 
     /// The first pane whose current surface matches, if any.
@@ -372,5 +386,19 @@ mod tests {
         assert!(tree.focused_mut().back());
         assert_eq!(tree.focused().surface, SurfaceKey::Draft);
         assert!(!tree.focused_mut().back());
+    }
+
+    #[test]
+    fn replacing_surfaces_also_replaces_history() {
+        let mut tree = PaneTree::new(SurfaceKey::Draft);
+        tree.focused_mut().show(transcript(1));
+        tree.focused_mut().show(transcript(2));
+        tree.for_each_surface_mut(&mut |surface| {
+            if *surface == transcript(1) {
+                *surface = transcript(3);
+            }
+        });
+        assert!(tree.focused_mut().back());
+        assert_eq!(tree.focused().surface, transcript(3));
     }
 }

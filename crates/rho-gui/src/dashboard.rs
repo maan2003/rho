@@ -16,16 +16,13 @@ use std::ops::Range;
 use editor::hover_links::InlayHighlight;
 use editor::{Editor, EditorMode, HighlightKey, Inlay, SizingBehavior};
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, Focusable as _, FontWeight, HighlightStyle, Window};
+use gpui::{App, Context, Entity, Focusable as _, FontWeight, HighlightStyle, WeakEntity, Window};
 use language::{Buffer, BufferEvent, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use project::InlayId;
-use rho_ui_proto::desk::{
-    DeskClock, DeskHeading, DeskHeadingState, DeskOperation, DeskSnapshot, DeskTextOpRecord,
-    DeskTransaction, parse,
-};
-use rho_ui_proto::{AgentId, ClientMessage, UiAttention};
-use text::{BufferId, ReplicaId};
+use rho_ui_proto::desk::{DeskHeading, DeskHeadingState, parse};
+use rho_ui_proto::{AgentId, UiAttention};
+use text::BufferId;
 use theme::ActiveTheme as _;
 
 use crate::registry::{AgentRegistry, HostId};
@@ -91,21 +88,14 @@ pub enum RowTarget {
     NewDraft(Option<(HostId, usize)>),
 }
 
-struct HostDesk {
-    snapshot: DeskSnapshot,
-    source: Entity<Buffer>,
-    _subscription: gpui::Subscription,
-}
-
 pub struct Dashboard {
     multi_buffer: Entity<MultiBuffer>,
     editor: Entity<Editor>,
     /// One buffer per line key: read-only listing lines and writable
     /// reply drafts alike.
     buffers: HashMap<LineKey, Entity<Buffer>>,
-    hosts: BTreeMap<HostId, HostDesk>,
-    known_ops: HashSet<(HostId, DeskClock)>,
-    next_buffer_id: u64,
+    /// Non-owning references to the workspace-owned Desk source buffers.
+    hosts: BTreeMap<HostId, WeakEntity<Buffer>>,
     /// Current display order; index n is the multibuffer's path key n.
     order: Vec<LineKey>,
     /// What each present key means, for cursor lookup.
@@ -159,8 +149,6 @@ impl Dashboard {
             editor,
             buffers: HashMap::new(),
             hosts: BTreeMap::new(),
-            known_ops: HashSet::new(),
-            next_buffer_id: 1,
             order: Vec::new(),
             targets: HashMap::new(),
             replies: Vec::new(),
@@ -207,99 +195,13 @@ impl Dashboard {
         self.focus_handle(cx).is_focused(window)
     }
 
-    pub fn apply_snapshot(
-        &mut self,
-        host: HostId,
-        snapshot: DeskSnapshot,
-        replica_id: u16,
-        cx: &mut Context<Workspace>,
-    ) {
-        self.known_ops.retain(|(owner, _)| *owner != host);
-        self.known_ops
-            .extend(snapshot.operations.iter().map(|op| (host, op.timestamp())));
-        let operations = snapshot.operations.clone();
-        let buffer_id = BufferId::new(self.next_buffer_id).expect("nonzero GUI buffer id");
-        self.next_buffer_id += 1;
-        let source = cx.new(|cx| {
-            let mut buffer = Buffer::remote(
-                buffer_id,
-                ReplicaId::new(replica_id),
-                Capability::ReadWrite,
-                "",
-            );
-            buffer.apply_ops(
-                operations
-                    .iter()
-                    .filter_map(|operation| operation.to_text().ok())
-                    .map(language::Operation::Buffer)
-                    .collect::<Vec<_>>(),
-                cx,
-            );
-            buffer
-        });
-        let subscription = cx.subscribe(&source, move |workspace, _, event, _| {
-            let BufferEvent::Operation {
-                operation: language::Operation::Buffer(operation),
-                is_local: true,
-            } = event
-            else {
-                return;
-            };
-            let operation = DeskOperation::from_text(operation);
-            let timestamp = operation.timestamp();
-            workspace.mark_desk_text_local(host, timestamp);
-            workspace.send_to_host(
-                host,
-                ClientMessage::DeskTextApply {
-                    operation,
-                    transaction: Some(DeskTransaction {
-                        id: timestamp,
-                        edit_ids: vec![timestamp],
-                    }),
-                },
-            );
-        });
-        self.hosts.insert(
-            host,
-            HostDesk {
-                snapshot,
-                source,
-                _subscription: subscription,
-            },
-        );
-        cx.notify();
-    }
-
-    pub fn apply_text(
-        &mut self,
-        host: HostId,
-        record: DeskTextOpRecord,
-        cx: &mut Context<Workspace>,
-    ) {
-        if !self.known_ops.insert((host, record.operation.timestamp())) {
-            return;
-        }
-        let Some(desk) = self.hosts.get_mut(&host) else {
-            return;
-        };
-        desk.snapshot.operations.push(record.operation.clone());
-        if let Some(transaction) = record.transaction {
-            desk.snapshot.transactions.push(transaction);
-        }
-        if let Ok(operation) = record.operation.to_text() {
-            desk.source.update(cx, |buffer, cx| {
-                buffer.apply_ops([language::Operation::Buffer(operation)], cx)
-            });
-        }
-        cx.notify();
-    }
-
-    pub fn mark_local_text_op(&mut self, host: HostId, clock: DeskClock) {
-        self.known_ops.insert((host, clock));
+    pub fn set_source(&mut self, host: HostId, source: WeakEntity<Buffer>) {
+        self.hosts.insert(host, source);
     }
 
     fn source_text(&self, host: HostId, cx: &App) -> Option<String> {
-        let buffer = self.hosts.get(&host)?.source.read(cx);
+        let source = self.hosts.get(&host)?.upgrade()?;
+        let buffer = source.read(cx);
         Some(buffer.text_for_range(0..buffer.len()).collect())
     }
 
@@ -610,9 +512,12 @@ impl Dashboard {
         if text[heading.body_range.clone()] == replacement {
             return;
         }
-        self.hosts[&key.0].source.update(cx, |buffer, cx| {
-            buffer.edit([(heading.body_range, replacement)], None, cx)
-        });
+        self.hosts[&key.0]
+            .upgrade()
+            .unwrap()
+            .update(cx, |buffer, cx| {
+                buffer.edit([(heading.body_range, replacement)], None, cx)
+            });
     }
 
     /// Places the cursor at the start of a key's buffer.
@@ -700,9 +605,10 @@ impl Dashboard {
             "\n"
         };
         let topic = format!("{insertion}* {}\n", title.trim());
-        let len = self.hosts[&host].source.read(cx).len();
+        let len = self.hosts[&host].upgrade().unwrap().read(cx).len();
         self.hosts[&host]
-            .source
+            .upgrade()
+            .unwrap()
             .update(cx, |buffer, cx| buffer.edit([(len..len, topic)], None, cx));
         true
     }
@@ -761,13 +667,16 @@ impl Dashboard {
         };
         let insertion = heading.heading_range.end
             + usize::from(text.as_bytes().get(heading.heading_range.end) == Some(&b'\n'));
-        self.hosts[&host].source.update(cx, |buffer, cx| {
-            buffer.edit(
-                [(insertion..insertion, format!(":project: {project}\n"))],
-                None,
-                cx,
-            )
-        });
+        self.hosts[&host]
+            .upgrade()
+            .unwrap()
+            .update(cx, |buffer, cx| {
+                buffer.edit(
+                    [(insertion..insertion, format!(":project: {project}\n"))],
+                    None,
+                    cx,
+                )
+            });
     }
 
     pub fn set_cursor_heading_state(
@@ -795,9 +704,12 @@ impl Dashboard {
                 .then(|| format!(" {}", heading.title))
                 .unwrap_or_default()
         );
-        self.hosts[&host].source.update(cx, |buffer, cx| {
-            buffer.edit([(heading.heading_range, replacement)], None, cx)
-        });
+        self.hosts[&host]
+            .upgrade()
+            .unwrap()
+            .update(cx, |buffer, cx| {
+                buffer.edit([(heading.heading_range, replacement)], None, cx)
+            });
     }
 
     pub fn insert_sibling(
@@ -842,9 +754,12 @@ impl Dashboard {
         } else {
             format!("{}{}", &text[a.clone()], &text[b.clone()])
         };
-        self.hosts[&host].source.update(cx, |buffer, cx| {
-            buffer.edit([(range, replacement)], None, cx)
-        });
+        self.hosts[&host]
+            .upgrade()
+            .unwrap()
+            .update(cx, |buffer, cx| {
+                buffer.edit([(range, replacement)], None, cx)
+            });
     }
 
     pub fn rename_cursor_topic(&mut self, title: &str, cx: &mut Context<Workspace>) -> bool {
@@ -860,9 +775,12 @@ impl Dashboard {
         else {
             return false;
         };
-        self.hosts[&host].source.update(cx, |buffer, cx| {
-            buffer.edit([(heading.title_range, title.trim())], None, cx)
-        });
+        self.hosts[&host]
+            .upgrade()
+            .unwrap()
+            .update(cx, |buffer, cx| {
+                buffer.edit([(heading.title_range, title.trim())], None, cx)
+            });
         true
     }
 
@@ -921,9 +839,12 @@ impl Dashboard {
             }
         }
         if !removals.is_empty() {
-            self.hosts[&host].source.update(cx, |buffer, cx| {
-                buffer.edit(removals.into_iter().map(|range| (range, "")), None, cx)
-            });
+            self.hosts[&host]
+                .upgrade()
+                .unwrap()
+                .update(cx, |buffer, cx| {
+                    buffer.edit(removals.into_iter().map(|range| (range, "")), None, cx)
+                });
         }
         if topic == "Unfiled" {
             return true;
@@ -947,9 +868,12 @@ impl Dashboard {
                 .next()
                 .unwrap_or_default()
         );
-        self.hosts[&host].source.update(cx, |buffer, cx| {
-            buffer.edit([(insertion..insertion, property)], None, cx)
-        });
+        self.hosts[&host]
+            .upgrade()
+            .unwrap()
+            .update(cx, |buffer, cx| {
+                buffer.edit([(insertion..insertion, property)], None, cx)
+            });
         true
     }
 

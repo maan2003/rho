@@ -12,6 +12,7 @@ pub(crate) mod connection;
 #[cfg(all(target_family = "wasm", not(feature = "native")))]
 pub(crate) use connection as connection_web;
 pub mod dashboard;
+pub mod desk_view;
 pub(crate) mod diff_view;
 pub mod draft_view;
 pub mod editor_config;
@@ -58,6 +59,8 @@ actions!(
         DashboardBack,
         DashboardJump,
         DashboardStaff,
+        DashboardGoto,
+        DeskCycle,
         DashboardToggleSubagents,
         DashboardHeadingBelow,
         DashboardHeadingAbove,
@@ -309,7 +312,7 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         "RhoDashboard > Editor && vim_mode == helix_normal",
     ] {
         cx.bind_keys([
-            KeyBinding::new("enter", RailOpen, Some(context)),
+            KeyBinding::new("enter", DashboardGoto, Some(context)),
             KeyBinding::new("r", DashboardReply, Some(context)),
             KeyBinding::new("o", DashboardStaff, Some(context)),
             KeyBinding::new("shift-o", DashboardHeadingBelow, Some(context)),
@@ -330,6 +333,11 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             KeyBinding::new("c r", DashboardRenameTopic, Some(context)),
         ]);
     }
+    cx.bind_keys([KeyBinding::new(
+        "tab",
+        DeskCycle,
+        Some("RhoDeskView > Editor"),
+    )]);
 }
 
 #[cfg(all(test, feature = "native"))]
