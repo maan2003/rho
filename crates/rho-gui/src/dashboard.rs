@@ -1106,8 +1106,9 @@ impl Dashboard {
         false
     }
 
-    /// `>>`/`<<`: one star in or out on the heading under the cursor.
-    /// Reordering is plain vim editing — cut and paste the lines.
+    /// `>>`/`<<`: one star in or out on the heading under the cursor and
+    /// every heading in its subtree, so children keep their relative
+    /// depth. Reordering is plain vim editing — cut and paste the lines.
     pub fn structure_move(&mut self, direction: StructureDirection, cx: &mut Context<Workspace>) {
         let Some((host, offset)) = self.cursor_heading_line(cx) else {
             return;
@@ -1115,26 +1116,21 @@ impl Dashboard {
         let Some(text) = self.source_text(host, cx) else {
             return;
         };
-        let Some(heading) = parse(&text)
-            .into_iter()
-            .find(|heading| heading.heading_range.start == offset)
+        let headings = parse(&text);
+        let Some(index) = headings
+            .iter()
+            .position(|heading| heading.heading_range.start == offset)
         else {
             return;
         };
-        let stars = heading.stars_range.start;
-        let edit = match direction {
-            StructureDirection::Demote => (stars..stars, "*".to_owned()),
-            StructureDirection::Promote => {
-                if heading.depth <= 1 {
-                    return;
-                }
-                (stars..stars + 1, String::new())
-            }
-        };
+        let edits = structure_edits(&headings, index, direction);
+        if edits.is_empty() {
+            return;
+        }
         self.hosts[&host]
             .upgrade()
             .unwrap()
-            .update(cx, |buffer, cx| buffer.edit([edit], None, cx));
+            .update(cx, |buffer, cx| buffer.edit(edits, None, cx));
     }
 
     /// Archives the heading under the cursor: its subtree moves beneath a
@@ -1147,7 +1143,8 @@ impl Dashboard {
         let Some(text) = self.source_text(host, cx) else {
             return false;
         };
-        let Some((edits, archive_offset)) = archive_edits(&text, offset) else {
+        let archived_at = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
+        let Some((edits, archive_offset)) = archive_edits(&text, offset, &archived_at) else {
             return false;
         };
         let Some(buffer) = self.hosts.get(&host).and_then(|weak| weak.upgrade()) else {
@@ -1244,6 +1241,9 @@ impl Dashboard {
         false
     }
 
+    /// Org-style visibility cycling on the heading under the cursor:
+    /// folded → children (child headings visible but folded) → fully
+    /// expanded → folded. Headings without children just toggle.
     pub fn toggle_subagents(&mut self, cx: &mut Context<Workspace>) -> bool {
         if let Some(CursorPlace::Row(LineKey::Unfiled(host))) = self.cursor_place(cx) {
             if !self.collapsed_unfiled.remove(&host) {
@@ -1252,12 +1252,13 @@ impl Dashboard {
             cx.notify();
             return true;
         }
-        let Some(topic) = self.cursor_topic(cx) else {
+        let Some((host, offset)) = self.cursor_topic(cx) else {
             return false;
         };
-        if !self.collapsed.remove(&topic) {
-            self.collapsed.insert(topic);
-        }
+        let Some(text) = self.source_text(host, cx) else {
+            return false;
+        };
+        cycle_collapse(&mut self.collapsed, host, offset, &parse(&text));
         cx.notify();
         true
     }
@@ -1585,6 +1586,9 @@ pub struct ReplyGutter;
 enum DashClass {
     Muted,
     Heading,
+    Heading2,
+    Heading3,
+    Heading4,
     TodoHeading,
     StaffedHeading,
     Working,
@@ -1593,9 +1597,12 @@ enum DashClass {
 }
 
 impl DashClass {
-    const ALL: [DashClass; 7] = [
+    const ALL: [DashClass; 10] = [
         DashClass::Muted,
         DashClass::Heading,
+        DashClass::Heading2,
+        DashClass::Heading3,
+        DashClass::Heading4,
         DashClass::TodoHeading,
         DashClass::StaffedHeading,
         DashClass::Working,
@@ -1603,15 +1610,28 @@ impl DashClass {
         DashClass::NeedsInput,
     ];
 
+    /// Org-style per-level heading colors, cycling every four levels.
+    fn for_depth(depth: usize) -> DashClass {
+        match depth.saturating_sub(1) % 4 {
+            0 => DashClass::Heading,
+            1 => DashClass::Heading2,
+            2 => DashClass::Heading3,
+            _ => DashClass::Heading4,
+        }
+    }
+
     fn key(self) -> HighlightKey {
         let slot = match self {
             DashClass::Muted => 0,
             DashClass::Heading => 1,
-            DashClass::TodoHeading => 2,
-            DashClass::StaffedHeading => 3,
-            DashClass::Working => 4,
-            DashClass::Pending => 5,
-            DashClass::NeedsInput => 6,
+            DashClass::Heading2 => 2,
+            DashClass::Heading3 => 3,
+            DashClass::Heading4 => 4,
+            DashClass::TodoHeading => 5,
+            DashClass::StaffedHeading => 6,
+            DashClass::Working => 7,
+            DashClass::Pending => 8,
+            DashClass::NeedsInput => 9,
         };
         HighlightKey::SyntaxTreeView(DASHBOARD_KEY_BASE + slot)
     }
@@ -1624,6 +1644,9 @@ impl DashClass {
         let color = match self {
             DashClass::Muted => colors.text_muted,
             DashClass::Heading => colors.terminal_ansi_magenta,
+            DashClass::Heading2 => colors.terminal_ansi_blue,
+            DashClass::Heading3 => colors.terminal_ansi_green,
+            DashClass::Heading4 => colors.terminal_ansi_bright_magenta,
             DashClass::TodoHeading => colors.terminal_ansi_red,
             DashClass::StaffedHeading => colors.terminal_ansi_cyan,
             DashClass::Working => colors.terminal_ansi_cyan,
@@ -1680,9 +1703,9 @@ fn doc_spans(text: &str) -> Vec<(DashClass, Range<usize>)> {
             Some(DeskHeadingState::Todo) => DashClass::TodoHeading,
             Some(DeskHeadingState::Staffed) => DashClass::StaffedHeading,
             Some(DeskHeadingState::Done | DeskHeadingState::Discarded) => DashClass::Muted,
-            None => DashClass::Heading,
+            None => DashClass::for_depth(heading.depth),
         };
-        let title_class = DashClass::Heading;
+        let title_class = DashClass::for_depth(heading.depth);
         if let Some(state_range) = &heading.state_range {
             spans.push((state_class, state_range.clone()));
         }
@@ -1892,15 +1915,84 @@ fn archive_zones(headings: &[DeskHeading]) -> Vec<Range<usize>> {
         .collect()
 }
 
+/// The edits demoting or promoting the heading at `index` together with
+/// every heading in its subtree, one star each. Empty when promoting a
+/// top-level heading.
+fn structure_edits(
+    headings: &[DeskHeading],
+    index: usize,
+    direction: StructureDirection,
+) -> Vec<(Range<usize>, String)> {
+    if matches!(direction, StructureDirection::Promote) && headings[index].depth <= 1 {
+        return Vec::new();
+    }
+    let subtree_end = headings[index].subtree_range.end;
+    headings[index..]
+        .iter()
+        .take_while(|heading| heading.heading_range.start < subtree_end)
+        .map(|heading| {
+            let stars = heading.stars_range.start;
+            match direction {
+                StructureDirection::Demote => (stars..stars, "*".to_owned()),
+                StructureDirection::Promote => (stars..stars + 1, String::new()),
+            }
+        })
+        .collect()
+}
+
+/// One step of org-style visibility cycling for the heading at `offset`:
+/// folded → children (child headings visible but folded) → fully expanded
+/// → folded. Headings without children just toggle.
+fn cycle_collapse(
+    collapsed: &mut HashSet<(HostId, usize)>,
+    host: HostId,
+    offset: usize,
+    headings: &[DeskHeading],
+) {
+    let descendants: Vec<(usize, usize)> = headings
+        .iter()
+        .position(|heading| heading.heading_range.start == offset)
+        .map_or(Vec::new(), |index| {
+            headings[index + 1..]
+                .iter()
+                .take_while(|heading| heading.depth > headings[index].depth)
+                .map(|heading| (heading.depth, heading.heading_range.start))
+                .collect()
+        });
+    // Direct children are the shallowest descendants; with sloppy nesting
+    // (`*` straight to `***`) that can be deeper than depth + 1.
+    let child_depth = descendants.iter().map(|(depth, _)| *depth).min();
+    let children: Vec<(HostId, usize)> = descendants
+        .iter()
+        .filter(|(depth, _)| Some(*depth) == child_depth)
+        .map(|(_, start)| (host, *start))
+        .collect();
+    let key = (host, offset);
+    if collapsed.contains(&key) {
+        collapsed.remove(&key);
+        for child in &children {
+            collapsed.insert(*child);
+        }
+    } else if !children.is_empty() && children.iter().all(|child| collapsed.contains(child)) {
+        for (_, start) in &descendants {
+            collapsed.remove(&(host, *start));
+        }
+    } else {
+        collapsed.insert(key);
+    }
+}
+
 /// The edits that archive the heading at `target_start`: its whole subtree
 /// moves under a sibling `:archive:` heading (created at the end of the
 /// parent's subtree when missing) and demotes one level so it nests
-/// inside. Returns the edits and the archive heading's offset once they
-/// apply. `None` when the target is already archived, is itself an
-/// archive, or does not exist.
+/// inside. The moved heading gains an `:archived: <when>` property line
+/// recording the archive time. Returns the edits and the archive
+/// heading's offset once they apply. `None` when the target is already
+/// archived, is itself an archive, or does not exist.
 fn archive_edits(
     text: &str,
     target_start: usize,
+    archived_at: &str,
 ) -> Option<(Vec<(Range<usize>, String)>, usize)> {
     let headings = parse(text);
     let target_index = headings
@@ -1925,6 +2017,9 @@ fn archive_edits(
     }
     if !moved.ends_with('\n') {
         moved.push('\n');
+    }
+    if let Some(line_end) = moved.find('\n') {
+        moved.insert_str(line_end + 1, &format!(":archived: {archived_at}\n"));
     }
     let sibling_archive = headings.iter().find(|heading| {
         heading.parent == target.parent
@@ -2475,33 +2570,86 @@ mod tests {
     }
 
     #[test]
+    fn demote_and_promote_move_the_whole_subtree() {
+        let text = "* Top\n** Child\nbody\n*** Grand\n* Next\n";
+        let headings = parse(text);
+        let edits = structure_edits(&headings, 0, StructureDirection::Demote);
+        assert_eq!(
+            apply_edits(text, &edits),
+            "** Top\n*** Child\nbody\n**** Grand\n* Next\n"
+        );
+        let child = headings
+            .iter()
+            .position(|heading| heading.title == "Child")
+            .unwrap();
+        let edits = structure_edits(&headings, child, StructureDirection::Promote);
+        assert_eq!(
+            apply_edits(text, &edits),
+            "* Top\n* Child\nbody\n** Grand\n* Next\n"
+        );
+        assert!(structure_edits(&headings, 0, StructureDirection::Promote).is_empty());
+    }
+
+    #[test]
+    fn tab_cycles_folded_then_children_then_expanded() {
+        let (_registry, host) = registry(vec![]);
+        let text = "* Top\nbody\n** A\n*** Deep\n** B\n* Next\n";
+        let headings = parse(text);
+        let top = 0;
+        let a = text.find("** A").unwrap();
+        let deep = text.find("*** Deep").unwrap();
+        let b = text.find("** B").unwrap();
+        let next = text.find("* Next").unwrap();
+
+        let mut collapsed = HashSet::new();
+        // Expanded → folded.
+        cycle_collapse(&mut collapsed, host, top, &headings);
+        assert_eq!(collapsed, HashSet::from([(host, top)]));
+        // Folded → children: the heading opens, direct children fold.
+        cycle_collapse(&mut collapsed, host, top, &headings);
+        assert_eq!(collapsed, HashSet::from([(host, a), (host, b)]));
+        // Children → fully expanded, grandchildren included.
+        collapsed.insert((host, deep));
+        cycle_collapse(&mut collapsed, host, top, &headings);
+        assert_eq!(collapsed, HashSet::new());
+
+        // A heading without children just toggles.
+        cycle_collapse(&mut collapsed, host, next, &headings);
+        assert_eq!(collapsed, HashSet::from([(host, next)]));
+        cycle_collapse(&mut collapsed, host, next, &headings);
+        assert_eq!(collapsed, HashSet::new());
+    }
+
+    #[test]
     fn archiving_moves_the_subtree_under_a_sibling_archive() {
         // No archive yet: one is created at the end of the document, the
-        // subtree demotes into it, and the tag rides along.
+        // subtree demotes into it, the tag rides along, and the archive
+        // time lands as a property on the moved heading.
         let text = "* Done task :eng-aa:\nnotes\n** Sub\n* Alive\n";
-        let (edits, archive_offset) = archive_edits(text, 0).expect("archivable");
+        let (edits, archive_offset) = archive_edits(text, 0, "2026-08-08 12:00").expect("archivable");
         let patched = apply_edits(text, &edits);
         assert_eq!(
             patched,
-            "* Alive\n* Archive :archive:\n** Done task :eng-aa:\nnotes\n*** Sub\n"
+            "* Alive\n* Archive :archive:\n** Done task :eng-aa:\n:archived: 2026-08-08 12:00\nnotes\n*** Sub\n"
         );
         assert_eq!(&patched[archive_offset..archive_offset + 9], "* Archive");
 
         // A nested heading archives under its own parent, next to its
         // siblings, into the archive that already exists there.
         let text = "* Project\n** Old :eng-bb:\n** Archive :archive:\n** Fresh\n* Other\n";
-        let (edits, archive_offset) = archive_edits(text, text.find("** Old").unwrap()).unwrap();
+        let (edits, archive_offset) =
+            archive_edits(text, text.find("** Old").unwrap(), "2026-08-08 12:00").unwrap();
         let patched = apply_edits(text, &edits);
         assert_eq!(
             patched,
-            "* Project\n** Archive :archive:\n*** Old :eng-bb:\n** Fresh\n* Other\n"
+            "* Project\n** Archive :archive:\n*** Old :eng-bb:\n:archived: 2026-08-08 12:00\n** Fresh\n* Other\n"
         );
         assert_eq!(&patched[archive_offset..archive_offset + 10], "** Archive");
 
         // Inside an archive there is nothing further to archive, and the
         // archive itself cannot be archived.
-        assert!(archive_edits(&patched, patched.find("*** Old").unwrap()).is_none());
-        assert!(archive_edits(&patched, patched.find("** Archive").unwrap()).is_none());
+        assert!(archive_edits(&patched, patched.find("*** Old").unwrap(), "now").is_none());
+        assert!(archive_edits(&patched, patched.find("** Archive").unwrap(), "now").is_none());
     }
 
     #[test]
@@ -2642,5 +2790,24 @@ mod tests {
                 .any(|(class, range)| matches!(class, DashClass::Muted)
                     && &text[range.clone()] == ":project: rho")
         );
+    }
+
+    #[test]
+    fn heading_titles_color_by_depth() {
+        let text = "* One\n** Two\n*** Three\n**** Four\n***** Five\n";
+        let spans = doc_spans(text);
+        let class_of = |title: &str| {
+            spans
+                .iter()
+                .find(|(_, range)| &text[range.clone()] == title)
+                .map(|(class, _)| *class)
+                .unwrap()
+        };
+        assert_eq!(class_of("One"), DashClass::Heading);
+        assert_eq!(class_of("Two"), DashClass::Heading2);
+        assert_eq!(class_of("Three"), DashClass::Heading3);
+        assert_eq!(class_of("Four"), DashClass::Heading4);
+        // Level five wraps back around to the level-one color.
+        assert_eq!(class_of("Five"), DashClass::Heading);
     }
 }
