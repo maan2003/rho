@@ -37,9 +37,6 @@ const PROJECTS: TableDefinition<String, Sen<ProjectRecord>> = TableDefinition::n
 /// Opaque client-owned view configuration (see
 /// [`AgentReadTxnExt::view_config`]).
 const VIEW_CONFIG: TableDefinition<(), Vec<u8>> = TableDefinition::new("view_config");
-/// The daemon-wide auth namespace selected at startup.
-const DEFAULT_AUTH_NAMESPACE: TableDefinition<(), String> =
-    TableDefinition::new("default_auth_namespace");
 const QUOTA_OBSERVATIONS: TableDefinition<QuotaObservationKey, Sen<QuotaObservationRecord>> =
     TableDefinition::new("quota_observations_by_model_time");
 const AGENT_USAGE_BUCKETS: TableDefinition<AgentUsageKey, Sen<AgentUsageBucket>> =
@@ -689,7 +686,6 @@ pub trait AgentReadTxnExt {
     /// Opaque client-owned view configuration; the daemon stores and
     /// forwards it without interpreting a byte.
     fn view_config(&self) -> Vec<u8>;
-    fn default_auth_namespace(&self) -> Option<String>;
     fn get_agent(&self, agent_id: AgentId) -> AgentRecord;
     fn list_agents(&self) -> Vec<(AgentId, AgentRecord)>;
     fn list_projects(&self) -> Vec<(Utf8PathBuf, ProjectRecord)>;
@@ -731,7 +727,6 @@ pub trait AgentWriteTxnExt {
     fn agent_label(&mut self, now: UnixMillis, agent_id: AgentId, label: &str, add: bool);
 
     fn set_view_config(&mut self, data: Vec<u8>);
-    fn set_default_auth_namespace(&mut self, name: String);
 
     fn set_agent_display_name(&mut self, now: UnixMillis, agent_id: AgentId, name: String);
     fn set_agent_role(&mut self, agent_id: AgentId, role: AgentRole);
@@ -916,15 +911,6 @@ impl AgentReadTxnExt for ReadTxn {
             .get(&())
             .map(|value| value.value())
             .unwrap_or_default()
-    }
-
-    fn default_auth_namespace(&self) -> Option<String> {
-        if !self.has_table("default_auth_namespace") {
-            return None;
-        }
-        self.open_table(DEFAULT_AUTH_NAMESPACE)
-            .get(&())
-            .map(|value| value.value())
     }
 
     fn get_agent(&self, agent_id: AgentId) -> AgentRecord {
@@ -1152,7 +1138,6 @@ impl AgentWriteTxnExt for WriteTxn {
         self.open_table(AGENT_RESPONSE_SUBSCRIPTIONS);
         self.open_table(PROJECTS);
         self.open_table(VIEW_CONFIG);
-        self.open_table(DEFAULT_AUTH_NAMESPACE);
         self.open_table(QUOTA_OBSERVATIONS);
         self.open_table(AGENT_USAGE_BUCKETS);
         self.open_table(AGENT_USAGE_TOTALS);
@@ -1177,10 +1162,6 @@ impl AgentWriteTxnExt for WriteTxn {
 
     fn set_view_config(&mut self, data: Vec<u8>) {
         self.open_table(VIEW_CONFIG).insert(&(), &data);
-    }
-
-    fn set_default_auth_namespace(&mut self, name: String) {
-        self.open_table(DEFAULT_AUTH_NAMESPACE).insert(&(), &name);
     }
 
     fn set_agent_display_name(&mut self, now: UnixMillis, agent_id: AgentId, name: String) {

@@ -2779,10 +2779,23 @@ impl Workspace {
                     .into_iter()
                     .flat_map(|auth| &auth.namespaces)
                     .filter(|name| name.to_lowercase().contains(&needle))
-                    .map(|name| crate::commands::Candidate {
-                        value: name.clone(),
-                        description: "auth namespace".to_owned(),
+                    .map(|name| {
+                        let disabled = workspace
+                            .hosts
+                            .get(host)
+                            .and_then(|host| host.auth.as_ref())
+                            .is_some_and(|auth| auth.disabled_namespaces.contains(name));
+                        crate::commands::Candidate {
+                            value: name.clone(),
+                            description: if disabled {
+                                "disabled account"
+                            } else {
+                                "enabled account"
+                            }
+                            .to_owned(),
+                        }
                     })
+                    .filter(|candidate| candidate.value.to_lowercase().contains(&needle))
                     .collect()
             });
         let on_submit = std::rc::Rc::new(
@@ -2794,15 +2807,25 @@ impl Workspace {
                 if name.is_empty() {
                     return;
                 }
+                let enabled = workspace
+                    .hosts
+                    .get(host)
+                    .and_then(|host| host.auth.as_ref())
+                    .is_some_and(|auth| auth.disabled_namespaces.iter().any(|item| item == name));
                 workspace.hosts.send(
                     host,
-                    ClientMessage::SetAuthNamespace {
+                    ClientMessage::SetAuthAccountEnabled {
                         name: name.to_owned(),
+                        enabled,
                     },
                 );
                 workspace.notice_on(
                     None,
-                    &format!("setting auth on {} to {name}", workspace.host_label(host)),
+                    &format!(
+                        "{} account {name} on {}",
+                        if enabled { "enabling" } else { "disabling" },
+                        workspace.host_label(host)
+                    ),
                     StyleClass::SystemInfo,
                     cx,
                 );

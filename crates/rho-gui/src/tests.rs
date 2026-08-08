@@ -3383,8 +3383,7 @@ fn heading_tags_file_agents_and_conceal_in_display(cx: &mut TestAppContext) {
                     iris_agent: None,
                     projects: Vec::new(),
                     auth: AuthState {
-                        active: String::new(),
-                        default: String::new(),
+                        disabled_namespaces: Vec::new(),
                         namespaces: Vec::new(),
                     },
                     machine_seed: 0,
@@ -4083,8 +4082,7 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
                     iris_agent: None,
                     projects: Vec::new(),
                     auth: AuthState {
-                        active: String::new(),
-                        default: String::new(),
+                        disabled_namespaces: Vec::new(),
                         namespaces: Vec::new(),
                     },
                     machine_seed: 0,
@@ -4179,8 +4177,7 @@ fn insert_mode_enter_stays_a_newline_in_desk_text(cx: &mut TestAppContext) {
                     iris_agent: None,
                     projects: Vec::new(),
                     auth: rho_ui_proto::AuthState {
-                        active: String::new(),
-                        default: String::new(),
+                        disabled_namespaces: Vec::new(),
                         namespaces: Vec::new(),
                     },
                     machine_seed: 0,
@@ -4273,8 +4270,7 @@ fn quick_spawn_send_relocates_the_cursor(cx: &mut TestAppContext) {
                         description: String::new(),
                     }],
                     auth: rho_ui_proto::AuthState {
-                        active: String::new(),
-                        default: String::new(),
+                        disabled_namespaces: Vec::new(),
                         namespaces: Vec::new(),
                     },
                     machine_seed: 0,
@@ -4373,8 +4369,7 @@ fn quick_spawn_placeholder_takes_the_generated_title(cx: &mut TestAppContext) {
         iris_agent: None,
         projects: Vec::new(),
         auth: AuthState {
-            active: String::new(),
-            default: String::new(),
+            disabled_namespaces: Vec::new(),
             namespaces: Vec::new(),
         },
         machine_seed: 0,

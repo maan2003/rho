@@ -115,10 +115,10 @@ pub enum ClientMessage {
     ViewConfigSet {
         data: Vec<u8>,
     },
-    /// Switches subsequent provider requests on this host to `name` and
-    /// persists it as the default for future daemon starts.
-    SetAuthNamespace {
+    /// Enables or disables one provider account namespace on this host.
+    SetAuthAccountEnabled {
         name: String,
+        enabled: bool,
     },
     /// The user's verdict on an agent's last finished turn. Attention is
     /// action-cleared: viewing an agent never clears it; `Done`, snoozing,
@@ -862,9 +862,8 @@ pub struct UiProject {
 /// Daemon-wide authentication settings presented by a GUI host.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct AuthState {
-    pub active: String,
-    pub default: String,
     pub namespaces: Vec<String>,
+    pub disabled_namespaces: Vec<String>,
 }
 
 /// Encode and write one length-prefixed senax frame.
@@ -1149,8 +1148,9 @@ mod tests {
 
     #[test]
     fn auth_settings_round_trip() {
-        let message = ClientMessage::SetAuthNamespace {
+        let message = ClientMessage::SetAuthAccountEnabled {
             name: "work".to_owned(),
+            enabled: false,
         };
         let bytes = senax_encoder::pack(&message).unwrap();
         let mut slice: &[u8] = &bytes;
@@ -1159,9 +1159,8 @@ mod tests {
 
         let message = ServerMessage::AuthState {
             auth: AuthState {
-                active: "work".to_owned(),
-                default: "default".to_owned(),
                 namespaces: vec!["default".to_owned(), "work".to_owned()],
+                disabled_namespaces: vec!["work".to_owned()],
             },
         };
         let bytes = senax_encoder::pack(&message).unwrap();

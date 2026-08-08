@@ -385,8 +385,7 @@ impl Session {
                 }
                 InferenceEvent::TemporaryFailure { .. }
                 | InferenceEvent::RequestSent
-                | InferenceEvent::StreamingStarted
-                | InferenceEvent::Quota { .. } => {}
+                | InferenceEvent::StreamingStarted => {}
             }
         };
         let results = tool_results(&items);

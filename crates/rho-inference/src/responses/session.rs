@@ -8,10 +8,22 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 use super::DEFAULT_CHATGPT_BASE_URL;
-use super::wire::{ResponseState, ResponsesRequest};
+use super::wire::{ProviderError, ResponseState, ResponsesRequest};
 use super::ws::{self, WebSocketConnection};
+use crate::accounts::SelectedAuth;
 use crate::config::{InferenceModel, InferenceProfile, ReasoningEffort};
 use crate::inference::Inference;
+
+#[derive(Debug)]
+struct AuthFailure(anyhow::Error);
+
+impl std::fmt::Display for AuthFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl std::error::Error for AuthFailure {}
 
 #[derive(
     Clone, Copy, Debug, Decode, Encode, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize,
@@ -167,6 +179,8 @@ struct SessionTask {
     /// (single owner, no lock). Reopened lazily when missing, stale, or dropped
     /// after a failure.
     connection: Option<WebSocketConnection>,
+    /// The account chosen for the current request and warm connection.
+    selected_auth: Option<SelectedAuth>,
     /// The active turn, if one has been requested.
     turn: Option<Turn>,
     config: SessionConfig,
@@ -446,6 +460,7 @@ impl InferenceSession {
             tokio::spawn(
                 SessionTask {
                     connection: None,
+                    selected_auth: None,
                     turn: None,
                     config: config.clone(),
                     debug_counter: 0,
@@ -527,9 +542,29 @@ impl SessionTask {
                         if self.turn.is_some() {
                             self.abort();
                         }
+                        if self.config.prompt_cache_key != config.prompt_cache_key {
+                            self.connection = None;
+                            self.selected_auth = None;
+                        }
                         self.config = config;
                         self.epoch = epoch;
-                        self.request(request);
+                        match self.config.inference.select().await {
+                            Ok(selected) => {
+                                if self.selected_auth.as_ref().is_none_or(|previous| {
+                                    previous.namespace != selected.namespace
+                                        || previous.auth != selected.auth
+                                }) {
+                                    self.connection = None;
+                                }
+                                self.selected_auth = Some(selected);
+                                self.request(request);
+                            }
+                            Err(error) => {
+                                self.connection = None;
+                                self.selected_auth = None;
+                                self.emit(InferenceEvent::Failed { error: error.into() });
+                            }
+                        }
                     }
                 },
                 () = self.pump() => unreachable!("the socket is never finished with"),
@@ -585,7 +620,7 @@ impl SessionTask {
                 }
                 if let Err(error) = self.ensure_connection().await {
                     self.connection = None;
-                    self.fail_turn(error);
+                    self.fail_turn(error).await;
                     continue;
                 }
                 let debug_sequence = self.next_debug_sequence();
@@ -614,7 +649,7 @@ impl SessionTask {
                 };
                 self.maybe_debug_write_provider_request(debug_sequence, &body);
                 if let Err(error) = self.connection.as_mut().unwrap().send_envelope(body).await {
-                    self.on_socket_failure(error);
+                    self.on_socket_failure(error).await;
                     continue;
                 }
                 self.emit(InferenceEvent::RequestSent);
@@ -643,24 +678,27 @@ impl SessionTask {
                 });
 
             match read {
-                Ok(WsMessage::Text(text)) => self.apply_text(text.as_ref()),
+                Ok(WsMessage::Text(text)) => self.apply_text(text.as_ref()).await,
                 Ok(WsMessage::Ping(payload)) => {
                     if let Err(error) = self.connection.as_mut().unwrap().pong(payload).await {
-                        self.on_socket_failure(error);
+                        self.on_socket_failure(error).await;
                     }
                 }
-                Ok(WsMessage::Close(_)) => self.on_socket_failure(anyhow::anyhow!(
-                    "stream error: websocket closed mid-stream"
-                )),
+                Ok(WsMessage::Close(_)) => {
+                    self.on_socket_failure(anyhow::anyhow!(
+                        "stream error: websocket closed mid-stream"
+                    ))
+                    .await
+                }
                 Ok(WsMessage::Binary(_) | WsMessage::Pong(_) | WsMessage::Frame(_)) => {}
-                Err(error) => self.on_socket_failure(error),
+                Err(error) => self.on_socket_failure(error).await,
             }
         }
     }
 
     /// Apply one text frame to the active turn's accumulator and emit whatever
     /// it produces — which may be nothing, or several updates at once.
-    fn apply_text(&mut self, text: &str) {
+    async fn apply_text(&mut self, text: &str) {
         let Ok(event) = serde_json::from_str::<serde_json::Value>(text) else {
             return;
         };
@@ -668,13 +706,17 @@ impl SessionTask {
         if self.turn.is_none() {
             return;
         }
+        let quota = ResponseState::quota_update(&event);
         let outcome = {
             let turn = self.turn.as_mut().unwrap();
             turn.raw_events.push(event.clone());
             turn.response.apply_event(&event)
         };
+        if let (Some(selected), Some(quota)) = (self.selected_auth.clone(), quota) {
+            self.config.inference.observe_quota(&selected, quota).await;
+        }
         match outcome {
-            Err(error) => self.fail_turn(error),
+            Err(error) => self.fail_turn(error).await,
             Ok((done, updates)) => {
                 // Announce the first streamed content of the turn once.
                 let turn = self.turn.as_mut().unwrap();
@@ -697,33 +739,6 @@ impl SessionTask {
                         .map(|id| id.as_str().to_owned()),
                     _ => None,
                 });
-                // Quota is account-wide rather than a fact about this stream,
-                // so hand it to the account on the way past.
-                //
-                // TODO: and then stop forwarding it. `InferenceEvent::Quota`
-                // only exists because the wire parser has no handle on the
-                // account, so it smuggles the observation through the update
-                // stream to be picked up here. Once it has been, nothing
-                // downstream needs it: `Inference::quota` is a watch that
-                // yields immediately and on every change, and `latest_quota`
-                // covers callers with nothing to await. Every consumer today
-                // either ignores the event (rho-agent2, rho-agent's title
-                // session) or copies it into a second place that then has to be
-                // diffed against itself (rho-agent's `AgentState`, read by
-                // rho-daemon). Dropping the variant means moving those to
-                // `inference.quota()` and handing the parser a way to report it
-                // that is not a public enum.
-                for update in &updates {
-                    if let InferenceEvent::Quota {
-                        used_percent,
-                        reset_at_unix,
-                    } = update
-                    {
-                        self.config
-                            .inference
-                            .observe_quota(*used_percent, *reset_at_unix);
-                    }
-                }
                 for update in updates {
                     self.emit(update);
                 }
@@ -749,9 +764,9 @@ impl SessionTask {
 
     /// A read/write failure: replay or fail the active turn, or just drop the
     /// dead socket when idle.
-    fn on_socket_failure(&mut self, error: anyhow::Error) {
+    async fn on_socket_failure(&mut self, error: anyhow::Error) {
         match self.turn.is_some() {
-            true => self.fail_turn(error),
+            true => self.fail_turn(error).await,
             // Nothing to fail, so the dead socket is the whole of it.
             false => self.connection = None,
         }
@@ -759,8 +774,8 @@ impl SessionTask {
 
     /// Say what a failed turn sounds like: a recoverable failure if it is being
     /// retried internally, and a final one if it is not.
-    fn fail_turn(&mut self, error: anyhow::Error) {
-        match self.on_turn_error(error) {
+    async fn fail_turn(&mut self, error: anyhow::Error) {
+        match self.on_turn_error(error).await {
             ErrorAction::Retry { error, retrying_at } => {
                 self.emit(temporary_failure(error, retrying_at))
             }
@@ -774,7 +789,7 @@ impl SessionTask {
     /// caller. Stale `previous_response_id` failures are retried once as a full
     /// replay; transient provider/transport failures are retried with bounded
     /// exponential backoff.
-    fn on_turn_error(&mut self, error: anyhow::Error) -> ErrorAction {
+    async fn on_turn_error(&mut self, error: anyhow::Error) -> ErrorAction {
         if let Some(turn) = &self.turn
             && let Some(sequence) = turn.debug_sequence
         {
@@ -784,6 +799,44 @@ impl SessionTask {
                 &turn.raw_events,
                 Some(error_message.as_str()),
             );
+        }
+        if error.downcast_ref::<AuthFailure>().is_some() {
+            self.turn = None;
+            self.connection = None;
+            return ErrorAction::Fail(error);
+        }
+        let quota_exhaustion = is_quota_exhaustion_error(&error);
+        let quota_failover = quota_exhaustion && self.selected_auth.is_some();
+        if quota_failover {
+            let selected = self.selected_auth.as_ref().unwrap().clone();
+            if self.config.inference.mark_rate_limited(&selected).await {
+                let Ok(replacement) = self.config.inference.select().await else {
+                    self.turn = None;
+                    self.connection = None;
+                    self.selected_auth = None;
+                    return ErrorAction::Fail(error);
+                };
+                self.selected_auth = Some(replacement);
+                let turn = self.turn.as_mut().unwrap();
+                turn.phase = TurnPhase::Queued {
+                    replay: true,
+                    not_before: None,
+                };
+                turn.streaming_started = false;
+                turn.debug_sequence = None;
+                turn.raw_events.clear();
+                turn.response = ResponseState::new();
+                self.connection = None;
+                return ErrorAction::Retry {
+                    error,
+                    retrying_at: Instant::now(),
+                };
+            }
+        }
+        if quota_exhaustion {
+            self.turn = None;
+            self.connection = None;
+            return ErrorAction::Fail(error);
         }
         let stale_previous_response = matches!(
             &self.turn,
@@ -932,28 +985,62 @@ impl SessionTask {
     /// Ensure a usable connection, reopening when missing, when OAuth rotated
     /// the bearer, or when nearing the server's age cap.
     async fn ensure_connection(&mut self) -> Result<()> {
-        let auth = self.config.inference.auth().clone();
-        let resolved = tokio::task::spawn_blocking(move || auth.resolve()).await??;
+        let Some(mut selected) = self.selected_auth.clone() else {
+            anyhow::bail!("inference request has no selected account")
+        };
+
+        let auth = selected.auth.clone();
+        let resolved = tokio::task::spawn_blocking(move || auth.resolve())
+            .await?
+            .map_err(|error| AuthFailure(error.into()))?;
+        selected.account_id = resolved.account_id.clone();
+        self.selected_auth = Some(selected.clone());
+
         let reusable = self.connection.as_ref().is_some_and(|connection| {
             connection.bearer_token == resolved.bearer_token
+                && connection.client_secret == resolved.client_secret
                 && connection.opened_at.elapsed() < ws::MAX_CONNECTION_AGE
         });
-        if !reusable {
-            let thread_id = self
-                .turn
-                .as_ref()
-                .filter(|turn| matches!(turn.phase, TurnPhase::Queued { .. }))
-                .map(|_| {
-                    self.config
-                        .prompt_cache_key
-                        .to_wire_uuid(&self.config.base_url, resolved.client_secret)
-                        .to_string()
-                });
-            let request = ws::build_ws_request(&self.config, thread_id.as_deref(), &resolved)?;
-            let (socket, _response) = connect_async(request).await?;
-            self.connection = Some(WebSocketConnection::new(socket, &resolved));
+        if reusable {
+            return Ok(());
         }
-        Ok(())
+
+        let thread_id = self
+            .turn
+            .as_ref()
+            .filter(|turn| matches!(turn.phase, TurnPhase::Queued { .. }))
+            .map(|_| {
+                self.config
+                    .prompt_cache_key
+                    .to_wire_uuid(&self.config.base_url, resolved.client_secret)
+                    .to_string()
+            });
+        let request = ws::build_ws_request(&self.config, thread_id.as_deref(), &resolved)?;
+        match connect_async(request).await {
+            Ok((socket, _response)) => {
+                self.connection = Some(WebSocketConnection::new(socket, &resolved));
+                Ok(())
+            }
+            Err(error) => {
+                let status = match &error {
+                    tokio_tungstenite::tungstenite::Error::Http(response) => {
+                        Some(response.status().as_u16())
+                    }
+                    _ => None,
+                };
+                if status == Some(429) {
+                    return Err(ProviderError::rate_limit(
+                        "websocket handshake failed",
+                        error.to_string(),
+                    )
+                    .into());
+                }
+                if matches!(status, Some(401 | 403)) {
+                    return Err(AuthFailure(error.into()).into());
+                }
+                Err(error.into())
+            }
+        }
     }
 }
 
@@ -1020,12 +1107,14 @@ pub(crate) fn transient_backoff(attempt: u32) -> Duration {
 }
 
 pub(crate) fn is_transient_turn_error(error: &anyhow::Error) -> bool {
+    if let Some(error) = error.downcast_ref::<ProviderError>() {
+        return error.is_transient();
+    }
     let message = error.to_string().to_ascii_lowercase();
     [
         "server_is_overloaded",
         "slow_down",
         "overloaded",
-        "rate_limit_exceeded",
         "service_unavailable",
         "server_error",
         "internal_server_error",
@@ -1037,6 +1126,12 @@ pub(crate) fn is_transient_turn_error(error: &anyhow::Error) -> bool {
     ]
     .iter()
     .any(|needle| message.contains(needle))
+}
+
+pub(crate) fn is_quota_exhaustion_error(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<ProviderError>()
+        .is_some_and(ProviderError::is_rate_limit)
 }
 
 fn temporary_failure(error: anyhow::Error, retrying_at: Instant) -> InferenceEvent {
@@ -1055,5 +1150,69 @@ impl std::fmt::Debug for InferenceSession {
             .field("responses_config", &self.config.responses_config)
             .field("prompt_cache_key", &self.config.prompt_cache_key)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod account_selection_tests {
+    use super::*;
+    use crate::InferenceAuth;
+
+    #[tokio::test]
+    async fn ordinary_retries_keep_request_account_snapshot_after_output() {
+        let auth = InferenceAuth::named("first").unwrap();
+        let selected = SelectedAuth {
+            auth: auth.clone(),
+            namespace: Some("first".to_owned()),
+            account_id: None,
+        };
+        let (events, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut task = SessionTask {
+            connection: None,
+            selected_auth: Some(selected.clone()),
+            turn: Some(Turn {
+                request: InferenceRequest {
+                    instructions: std::sync::Arc::from(""),
+                    input: Vec::new().into(),
+                    agent_id_labels: std::collections::BTreeMap::new(),
+                    tools: Vec::new().into(),
+                },
+                phase: TurnPhase::Queued {
+                    replay: false,
+                    not_before: None,
+                },
+                response: ResponseState::new(),
+                streaming_started: false,
+                debug_sequence: None,
+                raw_events: Vec::new(),
+                retry_attempts: 0,
+                retry_deadline: None,
+            }),
+            config: SessionConfig {
+                base_url: DEFAULT_CHATGPT_BASE_URL.to_owned(),
+                inference: Inference::for_test(auth),
+                mode: InferenceSessionMode::Title,
+                responses_config: ResponsesConfig::title(),
+                prompt_cache_key: PromptCacheKey::from_bytes(*b"testkey0"),
+            },
+            debug_counter: 0,
+            events,
+            epoch: 1,
+        };
+
+        assert!(matches!(
+            task.on_turn_error(anyhow::anyhow!("server_is_overloaded"))
+                .await,
+            ErrorAction::Retry { .. }
+        ));
+        assert_eq!(task.selected_auth, Some(selected.clone()));
+
+        task.turn.as_mut().unwrap().streaming_started = true;
+        assert!(matches!(
+            task.on_turn_error(anyhow::anyhow!("server_is_overloaded"))
+                .await,
+            ErrorAction::Retry { .. }
+        ));
+        assert_eq!(task.selected_auth, Some(selected));
     }
 }

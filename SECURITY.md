@@ -9,18 +9,18 @@ AI APIs.
 
 - Local users control prompts, session names/paths, inference auth setup/import,
   and tool inputs.
-- Authenticated GUI clients may select a daemon's OAuth namespace, which also
-  becomes its persisted restart default. The daemon exposes namespace names but never
-  credential contents, validates and resolves a selected namespace before
-  applying it, and broadcasts only the resulting names. An in-flight provider
-  request may finish under the previous namespace; subsequent inference, web
-  search, realtime, and quota requests use the replacement. The restart
-  default is stored in the local rho database; bearer and refresh tokens remain
-  only in the existing credential files.
-- ChatGPT quota polling resolves every configured OAuth namespace roughly every
-  ten minutes so the GUI can compare their independent rate-limit histories.
+- Authenticated GUI clients may enable or disable OAuth namespaces.
+  `rho-inference` exposes only those safe settings and namespace names; bearer
+  and refresh tokens remain in credential files. Its persisted current
+  selection is internal. An in-flight request may finish under the previous
+  selection; subsequent inference, web search, and realtime requests observe
+  the replacement. Authentication failures fail the request and never trigger
+  automatic account failover.
+- `rho-inference` owns the sole ChatGPT quota poller and provider-prefixed quota
+  tables. It resolves every enabled configured namespace roughly every ten
+  minutes.
   Only namespace names, percentages, and reset times are persisted or sent to
-  GUI clients; credentials and provider account identifiers are not exposed.
+  clients; provider account identifiers remain memory-only.
 - Inference APIs and streamed inference events are remote, semi-trusted inputs and
   must be parsed defensively.
 - A watched agent presentation sidecar sends a bounded (10 KiB total, 1 KiB

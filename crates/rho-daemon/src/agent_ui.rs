@@ -407,7 +407,6 @@ mod tests {
             context_used: None,
             total_usage: rho_agent::db::AgentUsageBucket::default(),
             usage_provider: rho_agent::db::AgentUsageModel::GPT,
-            quota_observation: None,
         }
     }
 
@@ -447,7 +446,6 @@ mod tests {
             context_used: None,
             total_usage: rho_agent::db::AgentUsageBucket::default(),
             usage_provider: rho_agent::db::AgentUsageModel::GPT,
-            quota_observation: None,
         }
     }
 
@@ -468,7 +466,6 @@ mod tests {
             context_used: None,
             total_usage: rho_agent::db::AgentUsageBucket::default(),
             usage_provider: rho_agent::db::AgentUsageModel::GPT,
-            quota_observation: None,
         }
     }
 
@@ -505,7 +502,6 @@ mod tests {
             context_used: None,
             total_usage: rho_agent::db::AgentUsageBucket::default(),
             usage_provider: rho_agent::db::AgentUsageModel::GPT,
-            quota_observation: None,
         }
     }
 
@@ -541,7 +537,6 @@ mod tests {
             context_used: None,
             total_usage: rho_agent::db::AgentUsageBucket::default(),
             usage_provider: rho_agent::db::AgentUsageModel::GPT,
-            quota_observation: None,
         }
     }
 

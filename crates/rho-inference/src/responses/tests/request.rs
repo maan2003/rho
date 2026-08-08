@@ -19,7 +19,8 @@ fn inference_response(
 #[test]
 fn title_session_uses_luna_fast_profile() {
     let (_temp, auth) = test_oauth_file("token", None);
-    let session = InferenceSession::new_title(Inference::new(auth), PromptCacheKey::generate());
+    let session =
+        InferenceSession::new_title(Inference::for_test(auth), PromptCacheKey::generate());
 
     assert_eq!(
         session.config.responses_config.model,
@@ -46,7 +47,8 @@ fn title_session_uses_luna_fast_profile() {
 #[test]
 fn status_session_uses_luna_fast_profile() {
     let (_temp, auth) = test_oauth_file("token", None);
-    let session = InferenceSession::new_status(Inference::new(auth), PromptCacheKey::generate());
+    let session =
+        InferenceSession::new_status(Inference::for_test(auth), PromptCacheKey::generate());
 
     assert_eq!(
         session.config.responses_config.model,
@@ -247,7 +249,7 @@ fn serializes_configured_reasoning_effort() {
 fn serializes_configured_reasoning_context() {
     let (_temp, auth) = test_oauth_file("token", None);
     let mut session = InferenceSession::new_deep(
-        Inference::new(auth),
+        Inference::for_test(auth),
         InferenceProfile {
             effort: ReasoningEffort::High,
             fast_mode: false,
@@ -674,7 +676,7 @@ fn serializes_custom_tool_calls_and_results() {
 fn responses_lite_moves_tools_and_instructions_into_input() {
     let (_temp, auth) = test_oauth_file("token", None);
     let mut session = InferenceSession::new_deep(
-        Inference::new(auth),
+        Inference::for_test(auth),
         InferenceProfile {
             effort: ReasoningEffort::Medium,
             fast_mode: false,
@@ -722,7 +724,7 @@ fn responses_lite_moves_tools_and_instructions_into_input() {
 fn responses_lite_previous_response_skips_developer_prefix() {
     let (_temp, auth) = test_oauth_file("token", None);
     let session = InferenceSession::new_deep(
-        Inference::new(auth),
+        Inference::for_test(auth),
         InferenceProfile {
             effort: ReasoningEffort::Medium,
             fast_mode: false,

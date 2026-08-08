@@ -107,7 +107,6 @@ impl ClaudeAgent {
                     crate::db::AgentUsageModel::FABLE
                 }
             },
-            quota_observation: None,
         };
         Ok((
             agent_id,
@@ -252,7 +251,6 @@ impl ClaudeAgent {
                     crate::db::AgentUsageModel::FABLE
                 }
             },
-            quota_observation: None,
         };
         let pool_events = pool.clone();
         Ok(Self::new(
@@ -2303,7 +2301,6 @@ mod tests {
             context_used: None,
             total_usage: crate::db::AgentUsageBucket::default(),
             usage_provider: crate::db::AgentUsageModel::FABLE,
-            quota_observation: None,
         };
         state.queued_inputs.push(QueuedItem {
             kind: QueuedItemKind::UserMessage {

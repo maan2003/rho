@@ -18,6 +18,68 @@ use super::session::{
     AutoCompaction, ReasoningContext, ResponsesEffort, ServiceTier, SessionConfig, TextVerbosity,
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct QuotaUpdate {
+    pub(crate) weekly_used_percent: u8,
+    pub(crate) weekly_reset_at_unix: Option<i64>,
+    pub(crate) routing_used_percent: u8,
+    pub(crate) routing_reset_at_unix: Option<i64>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ProviderError {
+    context: &'static str,
+    detail: String,
+    code: Option<String>,
+}
+
+impl ProviderError {
+    fn new(context: &'static str, detail: &str, code: Option<&str>) -> Self {
+        Self {
+            context,
+            detail: detail.to_owned(),
+            code: code.map(str::to_owned),
+        }
+    }
+
+    pub(crate) fn rate_limit(context: &'static str, detail: impl Into<String>) -> Self {
+        Self {
+            context,
+            detail: detail.into(),
+            code: Some("rate_limit_exceeded".to_owned()),
+        }
+    }
+
+    pub(crate) fn is_rate_limit(&self) -> bool {
+        self.code.as_deref() == Some("rate_limit_exceeded")
+    }
+
+    pub(crate) fn is_transient(&self) -> bool {
+        matches!(
+            self.code.as_deref(),
+            Some(
+                "server_is_overloaded"
+                    | "slow_down"
+                    | "service_unavailable"
+                    | "server_error"
+                    | "internal_server_error"
+            )
+        )
+    }
+}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}: {}", self.context, self.detail)?;
+        if let Some(code) = &self.code {
+            write!(formatter, " (type={code})")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ProviderError {}
+
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 pub enum OpenAiResponsesProviderData {
     Message {
@@ -777,27 +839,6 @@ impl ResponseState {
         let mut updates = Vec::new();
         let index = output_index(event);
         match event["type"].as_str().unwrap_or_default() {
-            "codex.rate_limits" => {
-                if let Some(window) = event
-                    .get("rate_limits")
-                    .into_iter()
-                    .flat_map(|limits| [limits.get("primary"), limits.get("secondary")])
-                    .flatten()
-                    .find(|window| {
-                        window
-                            .get("window_minutes")
-                            .and_then(Value::as_u64)
-                            .is_some_and(|minutes| minutes.abs_diff(7 * 24 * 60) <= 7 * 24 * 3)
-                    })
-                    && let Some(used_percent) = window.get("used_percent").and_then(Value::as_f64)
-                    && used_percent.is_finite()
-                {
-                    updates.push(InferenceEvent::Quota {
-                        used_percent: used_percent.clamp(0.0, 100.0).round() as u8,
-                        reset_at_unix: window.get("reset_at").and_then(Value::as_i64),
-                    });
-                }
-            }
             "response.output_item.added" => {
                 if let Some(item) = event.get("item")
                     && let Some(builder) = builder_from_added(item)?
@@ -868,15 +909,16 @@ impl ResponseState {
                 bail!("response incomplete: {reason}");
             }
             "response.failed" => {
-                let detail = event
-                    .get("response")
-                    .and_then(|response| {
-                        response["error"]["message"]
-                            .as_str()
-                            .or_else(|| response["error"]["code"].as_str())
-                    })
+                let error = event.get("response").map(|response| &response["error"]);
+                let detail = error
+                    .and_then(|error| error["message"].as_str())
                     .unwrap_or("unknown error");
-                bail!("response failed: {detail}");
+                return Err(ProviderError::new(
+                    "response failed",
+                    detail,
+                    error.and_then(|error| error["code"].as_str()),
+                )
+                .into());
             }
             "error" => {
                 let detail = event["error"]["message"]
@@ -887,15 +929,44 @@ impl ResponseState {
                     .as_str()
                     .or_else(|| event["code"].as_str())
                     .or_else(|| event["error"]["type"].as_str());
-                match error_code {
-                    Some(code) => bail!("stream error: {detail} (type={code})"),
-                    None => bail!("stream error: {detail}"),
-                }
+                return Err(ProviderError::new("stream error", detail, error_code).into());
             }
             _ => {}
         }
 
         Ok((false, updates))
+    }
+
+    pub(crate) fn quota_update(event: &Value) -> Option<QuotaUpdate> {
+        if event["type"].as_str()? != "codex.rate_limits" {
+            return None;
+        }
+        let limits = event.get("rate_limits")?;
+        let windows = [limits.get("primary"), limits.get("secondary")]
+            .into_iter()
+            .flatten()
+            .filter_map(|window| {
+                let used = window.get("used_percent")?.as_f64()?;
+                used.is_finite().then_some((window, used))
+            })
+            .collect::<Vec<_>>();
+        let (weekly, weekly_used) = windows.iter().copied().find(|(window, _)| {
+            window
+                .get("window_minutes")
+                .and_then(Value::as_u64)
+                .is_some_and(|minutes| minutes.abs_diff(7 * 24 * 60) <= 7 * 24 * 3)
+        })?;
+        let (routing, routing_used) = windows
+            .iter()
+            .copied()
+            .max_by(|(_, left), (_, right)| left.total_cmp(right))
+            .unwrap_or((weekly, weekly_used));
+        Some(QuotaUpdate {
+            weekly_used_percent: weekly_used.clamp(0.0, 100.0).round() as u8,
+            weekly_reset_at_unix: weekly.get("reset_at").and_then(Value::as_i64),
+            routing_used_percent: routing_used.clamp(0.0, 100.0).round() as u8,
+            routing_reset_at_unix: routing.get("reset_at").and_then(Value::as_i64),
+        })
     }
 }
 
@@ -1146,47 +1217,5 @@ fn usage_from_event(event: &Value) -> Option<TokenUsage> {
             cache_write_input_tokens,
             output_tokens,
         })
-    }
-}
-
-#[cfg(test)]
-mod quota_tests {
-    use super::*;
-
-    #[test]
-    fn emits_weekly_quota_from_codex_rate_limit_event() {
-        let event = serde_json::json!({
-            "type": "codex.rate_limits",
-            "rate_limits": {
-                "primary": {
-                    "used_percent": 28.2,
-                    "window_minutes": 10080,
-                    "reset_at": 1_783_173_000
-                }
-            }
-        });
-        let (_, updates) = ResponseState::new().apply_event(&event).unwrap();
-        assert!(matches!(
-            updates.as_slice(),
-            [InferenceEvent::Quota {
-                used_percent: 28,
-                reset_at_unix: Some(1_783_173_000)
-            }]
-        ));
-    }
-
-    #[test]
-    fn ignores_non_weekly_quota_window() {
-        let event = serde_json::json!({
-            "type": "codex.rate_limits",
-            "rate_limits": {
-                "secondary": {
-                    "used_percent": 28,
-                    "window_minutes": 300
-                }
-            }
-        });
-        let (_, updates) = ResponseState::new().apply_event(&event).unwrap();
-        assert!(updates.is_empty());
     }
 }

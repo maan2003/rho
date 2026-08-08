@@ -94,7 +94,7 @@ pub(crate) struct MailItem {
 /// Everything a UI needs, rebuilt whenever state changes.
 ///
 /// Quota is deliberately absent: it is an account-wide fact the agent neither
-/// uses nor owns, so a UI reads it from [`rho_inference::quota`] directly.
+/// uses nor owns, so a UI reads it from the daemon-wide inference state.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct AgentSnapshot {
     pub history: Vec<Arc<ContextBlock>>,
@@ -752,11 +752,7 @@ impl Agent {
                     return;
                 };
                 match event {
-                    // Quota is account-wide and published by rho-inference
-                    // itself, so there is nothing here to carry.
-                    InferenceEvent::RequestSent
-                    | InferenceEvent::StreamingStarted
-                    | InferenceEvent::Quota { .. } => {}
+                    InferenceEvent::RequestSent | InferenceEvent::StreamingStarted => {}
                     InferenceEvent::ContextItem { index, event } => {
                         in_flight.pending.apply(index, event)
                     }

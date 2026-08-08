@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::num::NonZeroU16;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
 
 use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
@@ -16,7 +16,7 @@ use rho_agent::pool::{AgentPool, RunningAgent};
 use rho_agent::{AgentStateKind, MessageDelivery};
 use rho_core::ContentPart;
 use rho_db::RhoDb;
-use rho_inference::{Inference, InferenceAuth};
+use rho_inference::Inference;
 use rho_ui_proto::remote::AgentRemoteEncoder;
 use rho_ui_proto::server::{Server, ServerConnection};
 use rho_ui_proto::{
@@ -326,19 +326,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     let user_environment = rho_workspaces::UserEnvironment::new(user_environment);
 
     let db = RhoDb::open(default_db_path()?);
-    let stored_auth_name = db.read().default_auth_namespace();
-    let default_auth_name = match stored_auth_name {
-        Some(name) => name,
-        None => {
-            let name = "default".to_owned();
-            let mut write = db.write().await;
-            write.set_default_auth_namespace(name.clone());
-            write.commit();
-            name
-        }
-    };
-    let active_auth_name = default_auth_name;
-    let inference = Inference::new(InferenceAuth::named(&active_auth_name)?);
+    let inference = Inference::new(db.clone()).await?;
     let path_overrides = PathOverrides {
         before: args
             .extra_before_path
@@ -367,14 +355,13 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             path_overrides,
             user_environment,
             platform_secrets,
-            active_auth_name,
         )
         .await?,
     );
     agents.install_iris_tool_host();
     spawn_presentation_projection(Arc::clone(&agents));
     spawn_turn_report_projection(Arc::clone(&agents));
-    spawn_chatgpt_quota_poller(Arc::clone(&agents));
+    spawn_inference_projection(Arc::clone(&agents));
     let quota_environment = agents.user_environment.clone();
     spawn_claude_quota_recorder(
         rho_claude_usage::spawn_poller(
@@ -390,6 +377,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             default_db_path()?.with_file_name("claude-quota-probe"),
         ),
         agents.db.clone(),
+        agents.inference.clone(),
         agents.events.clone(),
     );
 
@@ -954,8 +942,6 @@ struct AgentRegistry {
     desk: desk::DeskStore,
     visualizations: rho_visualizations::VisualizationStore,
     inference: Inference,
-    active_auth_name: RwLock<String>,
-    quota_refresh: tokio::sync::Notify,
     /// The database's machine seed, announced in `Ready` so clients can
     /// encode agent IDs.
     machine_seed: u64,
@@ -991,7 +977,6 @@ impl AgentRegistry {
         path_overrides: PathOverrides,
         user_environment: rho_workspaces::UserEnvironment,
         platform_secrets: PlatformSecrets,
-        active_auth_name: String,
     ) -> anyhow::Result<Self> {
         let pool = AgentPool::new(
             db.clone(),
@@ -1010,8 +995,6 @@ impl AgentRegistry {
             desk,
             visualizations,
             inference,
-            active_auth_name: RwLock::new(active_auth_name),
-            quota_refresh: tokio::sync::Notify::new(),
             machine_seed,
             land_locks: Mutex::new(HashMap::new()),
             land_holders: Mutex::new(HashMap::new()),
@@ -1139,46 +1122,15 @@ impl AgentRegistry {
     }
 
     fn auth_state(&self) -> AuthState {
-        let active = self.active_auth_name.read().unwrap().clone();
-        let default = self
-            .db
-            .read()
-            .default_auth_namespace()
-            .unwrap_or_else(|| "default".to_owned());
-        let mut namespaces = rho_inference::auth_namespaces().unwrap_or_default();
-        namespaces.extend([active.clone(), default.clone()]);
-        namespaces.sort();
-        namespaces.dedup();
+        let state = self.inference.state();
         AuthState {
-            active,
-            default,
-            namespaces,
+            namespaces: state.namespaces,
+            disabled_namespaces: state.disabled_namespaces,
         }
     }
 
-    async fn validated_auth(name: &str) -> anyhow::Result<InferenceAuth> {
-        let name = name.trim();
-        let auth = InferenceAuth::named(name)?;
-        let candidate = auth.clone();
-        tokio::task::spawn_blocking(move || candidate.resolve_oauth())
-            .await
-            .context("join auth credential validation")??;
-        Ok(auth)
-    }
-
-    async fn set_auth_namespace(&self, name: &str) -> anyhow::Result<()> {
-        let auth = Self::validated_auth(name).await?;
-        let name = name.trim().to_owned();
-        let mut write = self.db.write().await;
-        write.set_default_auth_namespace(name.clone());
-        write.commit();
-        self.inference.set_auth(auth);
-        *self.active_auth_name.write().unwrap() = name;
-        let _ = self.events.send(ServerMessage::AuthState {
-            auth: self.auth_state(),
-        });
-        self.quota_refresh.notify_one();
-        Ok(())
+    async fn set_auth_account_enabled(&self, name: &str, enabled: bool) {
+        self.inference.set_account_enabled(name, enabled).await;
     }
 
     async fn ready_message(&self) -> ServerMessage {
@@ -1887,6 +1839,25 @@ fn attention_level(kind: Option<&AgentStateKind>, disposition: AgentDisposition)
 /// Durable presentation changes refresh the normal snapshot for every
 /// connection. Broadcast loss is harmless because `Ready` is reconstructed
 /// from the agent cache, including after daemon restart.
+fn spawn_inference_projection(agents: Arc<AgentRegistry>) {
+    let mut state = agents.inference.subscribe();
+    let agents = Arc::downgrade(&agents);
+    tokio::spawn(async move {
+        while state.changed().await.is_ok() {
+            let Some(agents) = agents.upgrade() else {
+                break;
+            };
+            let _ = state.borrow_and_update();
+            let _ = agents.events.send(ServerMessage::AuthState {
+                auth: agents.auth_state(),
+            });
+            let _ = agents.events.send(ServerMessage::QuotaUsage {
+                summaries: combined_quota_summaries(&agents.db, &agents.inference),
+            });
+        }
+    });
+}
+
 fn spawn_presentation_projection(agents: Arc<AgentRegistry>) {
     let mut changes = agents.pool.subscribe_presentation_changes();
     let agents = Arc::downgrade(&agents);
@@ -1967,44 +1938,9 @@ async fn spawn_attention_watcher(
         let _ = ready_tx.send(());
         let mut was_working = initial_state.kind.is_working();
         let mut last_sent = None;
-        let mut last_quota = None;
         let states = futures::stream::once(async move { initial_state }).chain(changes);
         futures::pin_mut!(states);
         while let Some(state) = states.next().await {
-            if state.quota_observation != last_quota {
-                last_quota = state.quota_observation.clone();
-                if let Some(observation) = &state.quota_observation {
-                    let model = match observation.model.as_str() {
-                        "gpt" => QuotaModel::GPT,
-                        "fable" => QuotaModel::FABLE,
-                        "opus" => QuotaModel::OPUS,
-                        _ => continue,
-                    };
-                    // ChatGPT quota is persisted by the namespace-aware
-                    // poller. A streamed observation does not carry the auth
-                    // used by its in-flight request and cannot be attributed
-                    // safely after an auth switch.
-                    let provider = match observation.provider {
-                        rho_agent::QuotaProvider::ChatGpt => continue,
-                        rho_agent::QuotaProvider::Claude => QuotaProvider::Claude,
-                    };
-                    let mut write = db.write().await;
-                    let changed = write.record_quota_observation(QuotaObservationRecord {
-                        provider,
-                        model,
-                        auth_namespace: None,
-                        observed_at: observation.observed_at,
-                        used_percent: observation.used_percent,
-                        reset_at_unix: observation.reset_at_unix,
-                    });
-                    write.commit();
-                    if changed {
-                        let _ = events.send(ServerMessage::QuotaUsage {
-                            summaries: quota_summaries(&db),
-                        });
-                    }
-                }
-            }
             let working = state.kind.is_working();
             if !working && was_working {
                 pool.flush_agent_usage(Some(agent_id)).await;
@@ -2022,6 +1958,27 @@ async fn spawn_attention_watcher(
         }
     });
     let _ = ready_rx.await;
+}
+
+fn combined_quota_summaries(db: &RhoDb, inference: &Inference) -> Vec<QuotaSummary> {
+    let mut summaries = quota_summaries(db);
+    summaries.extend(
+        inference
+            .state()
+            .quotas
+            .into_iter()
+            .map(|summary| QuotaSummary {
+                model: "gpt".to_owned(),
+                auth_namespace: Some(summary.auth_namespace),
+                remaining_percent: summary.remaining_percent,
+                burn_10m: summary.burn_10m,
+                burn_2h: summary.burn_2h,
+                burn_1d: summary.burn_1d,
+                burn_3d: summary.burn_3d,
+                reset_at_unix: summary.reset_at_unix,
+            }),
+    );
+    summaries
 }
 
 fn quota_summaries(db: &RhoDb) -> Vec<QuotaSummary> {
@@ -2117,7 +2074,32 @@ fn hourly_global_usage_series(
     .collect()
 }
 
-fn quota_history(db: &RhoDb) -> Vec<QuotaSeries> {
+fn quota_history(db: &RhoDb, inference: &Inference) -> Vec<QuotaSeries> {
+    let mut series = claude_quota_history(db);
+    let since = rho_core::UnixMs(
+        rho_core::UnixMs::now()
+            .0
+            .saturating_sub(30 * 24 * 60 * 60 * 1_000),
+    );
+    for history in inference.quota_history(since) {
+        series.push(QuotaSeries {
+            model: "gpt".to_owned(),
+            auth_namespace: Some(history.auth_namespace),
+            points: history
+                .points
+                .into_iter()
+                .map(|point| rho_ui_proto::QuotaPoint {
+                    observed_at_ms: point.observed_at.0,
+                    remaining_percent: point.remaining_percent,
+                    reset_at_unix: point.reset_at_unix,
+                })
+                .collect(),
+        });
+    }
+    series
+}
+
+fn claude_quota_history(db: &RhoDb) -> Vec<QuotaSeries> {
     let now = rho_core::UnixMs::now().0;
     let since = rho_core::UnixMs(now.saturating_sub(30 * 24 * 60 * 60 * 1_000));
     quota_observation_groups(db, since)
@@ -2146,12 +2128,8 @@ fn quota_observation_groups(
 ) -> BTreeMap<(QuotaModel, Option<String>), Vec<QuotaObservationRecord>> {
     let read = db.read();
     let mut groups = BTreeMap::new();
-    for model in [QuotaModel::GPT, QuotaModel::OPUS, QuotaModel::FABLE] {
+    for model in [QuotaModel::OPUS, QuotaModel::FABLE] {
         for observation in read.quota_observations(model, since) {
-            // Pre-namespace GPT history cannot be attributed safely.
-            if model == QuotaModel::GPT && observation.auth_namespace.is_none() {
-                continue;
-            }
             groups
                 .entry((model, observation.auth_namespace.clone()))
                 .or_insert_with(Vec::new)
@@ -2197,47 +2175,10 @@ fn quota_burn(samples: &[&QuotaObservationRecord], now: u64, duration_ms: u64) -
         .saturating_sub(epoch_start.used_percent) as u16
 }
 
-fn spawn_chatgpt_quota_poller(agents: Arc<AgentRegistry>) {
-    tokio::spawn(async move {
-        loop {
-            let auth = agents.auth_state();
-            let mut namespaces = auth.namespaces;
-            namespaces.sort_by_key(|name| (name != &auth.active, name.clone()));
-            let mut changed = false;
-            for namespace in namespaces {
-                let name = namespace.clone();
-                let usage =
-                    tokio::task::spawn_blocking(move || rho_inference::chatgpt_weekly_usage(name))
-                        .await;
-                if let Ok(Ok(Some(usage))) = usage {
-                    let mut write = agents.db.write().await;
-                    changed |= write.record_quota_observation(QuotaObservationRecord {
-                        provider: QuotaProvider::ChatGpt,
-                        model: QuotaModel::GPT,
-                        auth_namespace: Some(namespace),
-                        observed_at: rho_core::UnixMs::now(),
-                        used_percent: usage.used_percent.clamp(0.0, 100.0).round() as u8,
-                        reset_at_unix: Some(usage.reset_at_unix),
-                    });
-                    write.commit();
-                }
-            }
-            if changed {
-                let _ = agents.events.send(ServerMessage::QuotaUsage {
-                    summaries: quota_summaries(&agents.db),
-                });
-            }
-            tokio::select! {
-                () = tokio::time::sleep(std::time::Duration::from_secs(10 * 60)) => {}
-                () = agents.quota_refresh.notified() => {}
-            }
-        }
-    });
-}
-
 fn spawn_claude_quota_recorder(
     mut updates: tokio::sync::mpsc::Receiver<anyhow::Result<rho_claude_usage::ClaudeUsage>>,
     db: RhoDb,
+    inference: Inference,
     events: broadcast::Sender<ServerMessage>,
 ) {
     tokio::spawn(async move {
@@ -2270,7 +2211,7 @@ fn spawn_claude_quota_recorder(
             write.commit();
             if changed {
                 let _ = events.send(ServerMessage::QuotaUsage {
-                    summaries: quota_summaries(&db),
+                    summaries: combined_quota_summaries(&db, &inference),
                 });
             }
         }
@@ -2383,13 +2324,13 @@ async fn handle_message(
         }
         ClientMessage::ChatGptUsage => {
             let _ = outgoing_tx.send(ServerMessage::QuotaUsage {
-                summaries: quota_summaries(&agents.db),
+                summaries: combined_quota_summaries(&agents.db, &agents.inference),
             });
             Ok(Refresh::None)
         }
         ClientMessage::QuotaHistory => {
             let _ = outgoing_tx.send(ServerMessage::QuotaHistory {
-                series: quota_history(&agents.db),
+                series: quota_history(&agents.db, &agents.inference),
             });
             Ok(Refresh::None)
         }
@@ -2603,7 +2544,9 @@ async fn handle_message(
                 // the fresh agent unfiled rather than failing the spawn.
                 match agents.desk.retag_agent(agent_id, Some(anchor)).await {
                     Ok(Some(record)) => {
-                        let _ = agents.events.send(ServerMessage::DeskTextApplied { record });
+                        let _ = agents
+                            .events
+                            .send(ServerMessage::DeskTextApplied { record });
                     }
                     Ok(None) => {}
                     Err(error) => {
@@ -2785,8 +2728,8 @@ async fn handle_message(
             write.commit();
             Ok(Refresh::None)
         }
-        ClientMessage::SetAuthNamespace { name } => {
-            agents.set_auth_namespace(&name).await?;
+        ClientMessage::SetAuthAccountEnabled { name, enabled } => {
+            agents.set_auth_account_enabled(&name, enabled).await;
             Ok(Refresh::None)
         }
         ClientMessage::SetAgentDisposition {
@@ -3721,8 +3664,8 @@ mod tests {
 
     use super::{
         AgentUsageModel, GitProviderClaim, GitTransportBroker, MAX_IMAGE_BASE64_BYTES,
-        MAX_INPUT_IMAGES, configure_octo_git_transport, hourly_global_usage_series, quota_burn,
-        quota_history, quota_summaries, validate_image_content,
+        MAX_INPUT_IMAGES, claude_quota_history, configure_octo_git_transport,
+        hourly_global_usage_series, quota_burn, quota_summaries, validate_image_content,
     };
 
     #[test]
@@ -3826,32 +3769,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quota_history_includes_every_stored_point() {
+    async fn claude_quota_history_includes_every_stored_point() {
         let temp = tempfile::tempdir().unwrap();
         let db = RhoDb::open(temp.path().join("rho.redb"));
         let now = rho_core::UnixMs::now().0;
         let mut write = db.write().await;
         for index in 0..5 {
             assert!(write.record_quota_observation(QuotaObservationRecord {
-                provider: QuotaProvider::ChatGpt,
-                model: QuotaModel::GPT,
-                auth_namespace: Some("work".to_owned()),
+                provider: QuotaProvider::Claude,
+                model: QuotaModel::OPUS,
+                auth_namespace: None,
                 observed_at: rho_core::UnixMs(now - (4 - index) * 1_000),
                 used_percent: index as u8,
                 reset_at_unix: Some(123),
             }));
         }
         assert!(write.record_quota_observation(QuotaObservationRecord {
-            provider: QuotaProvider::ChatGpt,
-            model: QuotaModel::GPT,
-            auth_namespace: Some("personal".to_owned()),
-            observed_at: rho_core::UnixMs(now),
-            used_percent: 50,
-            reset_at_unix: Some(789),
-        }));
-        assert!(write.record_quota_observation(QuotaObservationRecord {
             provider: QuotaProvider::Claude,
-            model: QuotaModel::OPUS,
+            model: QuotaModel::FABLE,
             auth_namespace: None,
             observed_at: rho_core::UnixMs(now),
             used_percent: 25,
@@ -3859,33 +3794,48 @@ mod tests {
         }));
         write.commit();
 
-        let history = quota_history(&db);
-        let gpt = history
+        let history = claude_quota_history(&db);
+        let opus = history
             .iter()
-            .find(|series| {
-                series.model == "gpt" && series.auth_namespace.as_deref() == Some("work")
-            })
+            .find(|series| series.model == "opus")
             .unwrap();
-        assert_eq!(gpt.points.len(), 5);
+        assert_eq!(opus.points.len(), 5);
         assert_eq!(
-            gpt.points
+            opus.points
                 .iter()
                 .map(|point| point.remaining_percent)
                 .collect::<Vec<_>>(),
             [100, 99, 98, 97, 96]
         );
-        let personal = history
+        let fable = history
             .iter()
-            .find(|series| {
-                series.model == "gpt" && series.auth_namespace.as_deref() == Some("personal")
-            })
+            .find(|series| series.model == "fable")
             .unwrap();
-        assert_eq!(personal.points[0].remaining_percent, 50);
-        let opus = history
-            .iter()
-            .find(|series| series.model == "opus")
-            .unwrap();
-        assert_eq!(opus.points[0].remaining_percent, 75);
+        assert_eq!(fable.points[0].remaining_percent, 75);
+    }
+
+    #[tokio::test]
+    async fn inference_migrates_legacy_scoped_gpt_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = RhoDb::open(temp.path().join("rho.redb"));
+        let mut write = db.write().await;
+        write.init_agent_tables();
+        assert!(write.record_quota_observation(QuotaObservationRecord {
+            provider: QuotaProvider::ChatGpt,
+            model: QuotaModel::GPT,
+            auth_namespace: Some("work".to_owned()),
+            observed_at: rho_core::UnixMs(123),
+            used_percent: 42,
+            reset_at_unix: Some(456),
+        }));
+        write.commit();
+
+        let inference = rho_inference::Inference::new(db).await.unwrap();
+        let history = inference.quota_history(rho_core::UnixMs(0));
+
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].auth_namespace, "work");
+        assert_eq!(history[0].points[0].remaining_percent, 58);
     }
 
     #[tokio::test]

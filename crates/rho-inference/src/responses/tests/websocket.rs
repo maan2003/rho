@@ -27,8 +27,8 @@ async fn websocket_wait_sends_keepalive_ping_before_event_timeout() {
     );
 }
 
-#[test]
-fn websocket_request_uses_responses_url_and_prompt_cache_headers() {
+#[tokio::test]
+async fn websocket_request_uses_responses_url_and_prompt_cache_headers() {
     let (_temp, auth) = test_oauth_file("token", Some("acct_1"));
     let mut session = test_inference_service_with(
         auth,
@@ -38,7 +38,14 @@ fn websocket_request_uses_responses_url_and_prompt_cache_headers() {
     );
     session.config.base_url = "https://chatgpt.com/backend-api".to_owned();
 
-    let auth = session.config.inference.auth().resolve().unwrap();
+    let auth = session
+        .config
+        .inference
+        .auth()
+        .await
+        .unwrap()
+        .resolve()
+        .unwrap();
     let request = build_ws_request(&session.config, Some("thread-1"), &auth).unwrap();
 
     assert_eq!(
@@ -52,8 +59,8 @@ fn websocket_request_uses_responses_url_and_prompt_cache_headers() {
     assert_eq!(request.headers()["chatgpt-account-id"], "acct_1");
 }
 
-#[test]
-fn websocket_request_uses_oauth_bearer_without_account_header() {
+#[tokio::test]
+async fn websocket_request_uses_oauth_bearer_without_account_header() {
     let (_temp, auth) = test_oauth_file("sk-test", None);
     let session = test_inference_service_with(
         auth,
@@ -62,15 +69,22 @@ fn websocket_request_uses_oauth_bearer_without_account_header() {
         None,
     );
 
-    let auth = session.config.inference.auth().resolve().unwrap();
+    let auth = session
+        .config
+        .inference
+        .auth()
+        .await
+        .unwrap()
+        .resolve()
+        .unwrap();
     let request = build_ws_request(&session.config, None, &auth).unwrap();
 
     assert_eq!(request.headers()["Authorization"], "Bearer sk-test");
     assert!(!request.headers().contains_key("chatgpt-account-id"));
 }
 
-#[test]
-fn websocket_request_uses_oauth_file_credentials() {
+#[tokio::test]
+async fn websocket_request_uses_oauth_file_credentials() {
     let temp = tempfile::tempdir().unwrap();
     let file = test_oauth_file_in(temp.path(), "chatgpt").unwrap();
     file.save(&ResponsesOAuthCredentials {
@@ -89,7 +103,14 @@ fn websocket_request_uses_oauth_file_credentials() {
     );
     session.config.base_url = "https://chatgpt.com/backend-api".to_owned();
 
-    let auth = session.config.inference.auth().resolve().unwrap();
+    let auth = session
+        .config
+        .inference
+        .auth()
+        .await
+        .unwrap()
+        .resolve()
+        .unwrap();
     let request = build_ws_request(&session.config, Some("thread-1"), &auth).unwrap();
 
     assert_eq!(request.headers()["Authorization"], "Bearer oauth-access");

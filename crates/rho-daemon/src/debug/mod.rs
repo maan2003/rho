@@ -8,6 +8,7 @@ use rho_agent::db::{
     EngineerIntelligence,
 };
 use rho_db::RhoDb;
+use rho_inference::Inference;
 use rho_workspaces::WorkspaceInfo;
 
 use crate::default_db_path;
@@ -336,6 +337,7 @@ async fn test_migration(db_path: Option<PathBuf>) -> anyhow::Result<()> {
 }
 
 async fn migrate_snapshot(db: &RhoDb) -> anyhow::Result<()> {
+    Inference::migrate(db).await?;
     let mut write = db.write().await;
     write.init_agent_tables();
     write.commit();

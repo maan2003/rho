@@ -9,16 +9,17 @@ than by running a supervisor, extension protocol, or daemon process graph.
   inference events and responses, tool calls/results, usage, agent identities,
   roles and dispositions, message delivery and phases, and opaque
   provider items. It should stay policy-light.
-- Inference crates, currently `rho-inference`, translate `rho-core` inference
-  requests into provider-specific wire protocols and translate provider events
-  back into `rho-core` items and updates. One daemon-wide `Inference` account
-  is shared by loaded and future sessions. Its auth namespace is replaceable:
-  an in-flight request finishes with the credentials it resolved, while later
-  requests (including web search and realtime) resolve the replacement and
-  reconnect when needed. Selecting a namespace also persists it as the restart
-  default; daemon startup reads that database setting without a CLI override.
+- `rho-inference` translates `rho-core` requests and provider events, and its
+  daemon-wide `Inference` handle owns the complete ChatGPT runtime: persisted
+  enabled-account settings and current selection, quota polling/history,
+  automatic account routing, and session creation. `Inference::new` opens that
+  state from `RhoDb`. The private account manager makes selection decisions only
+  when settings, quota, or rate-limit facts change; each new request snapshots
+  the existing choice. Ordinary retries retain that choice and only explicit
+  rate-limit failover replaces it. The
+  daemon only projects safe settings/quota DTOs and merges Claude presentation.
   ChatGPT quota observations are attributed to that daemon-local namespace;
-  the daemon polls every configured namespace and the GUI keeps each
+  `Inference` polls every enabled configured namespace and the GUI keeps each
   host/namespace history as an independent graph series.
 - `rho-agent` owns the opinionated harness policy: queueing, retries/tool
   scheduling, streamed transcript handling, inference response block recording,

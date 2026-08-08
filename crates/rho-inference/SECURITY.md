@@ -27,6 +27,15 @@ manages file-backed OAuth credentials.
 - WebSocket turns have an event-idle timeout and keepalive pings.
 - OAuth credential refresh is synchronous and is run from async inference paths
   with `spawn_blocking`; auth-management commands are owned by `run_auth_cli`.
+- `Inference` owns the sole periodic ChatGPT quota poller and provider-prefixed
+  database tables. Persistence and public state contain only auth settings,
+  namespace names, percentages, and reset times—never OAuth tokens or provider
+  account identifiers. Account identifiers remain memory-only for alias
+  deduplication. Session creation and account selection never request quota.
+- The current automatic account selection is persisted privately and read at
+  request setup by sessions, web search, and realtime. Safe public state
+  deliberately omits it. Authentication failures fail their request without
+  changing selection; only rate limits and user disablement trigger failover.
 - WebSocket pool entries are keyed by base URL, account id, and
   prompt-cache/thread id.
 
@@ -43,6 +52,11 @@ manages file-backed OAuth credentials.
   limit, and mid-turn WebSocket loss) are retried in the active turn for up to
   eight hours with jittered Fibonacci backoff capped at 30 minutes before
   surfacing a terminal failure.
+- A structured `rate_limit_exceeded` failure switches the process-wide
+  selection and may replay the active request through another enabled OAuth
+  account. `TemporaryFailure` lets the agent retain the failed attempt's
+  partial response while starting a clean pending response. Cross-account
+  replay always drops the old socket and provider response chain.
 - Responses protocol drift or malformed events: event parsing should ignore
   unknown/malformed non-terminal events, surface terminal error/incomplete
   events, and preserve provider items needed for replay.

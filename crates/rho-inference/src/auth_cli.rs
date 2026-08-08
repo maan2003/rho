@@ -198,7 +198,7 @@ fn list_credentials() -> io::Result<Vec<(String, &'static str)>> {
 }
 
 /// Names of the OAuth credential namespaces available on this machine.
-pub fn auth_namespaces() -> io::Result<Vec<String>> {
+pub(crate) fn auth_namespaces() -> io::Result<Vec<String>> {
     let auth_dir = OAuthFile::default_auth_dir()?;
     let entries = match std::fs::read_dir(&auth_dir) {
         Ok(entries) => entries,
@@ -323,39 +323,65 @@ fn print_rate_limits(name: impl AsRef<str>) -> Result<()> {
 }
 
 /// The account-wide weekly Codex allowance reported by ChatGPT.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct ChatGptUsage {
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ChatGptUsage {
+    pub account_id: Option<String>,
+    /// Weekly usage retained for quota history and UI summaries.
     pub used_percent: f64,
     pub reset_at_unix: i64,
+    /// Usage of the currently most constrained reported window. The account
+    /// router consumes this from the inference runtime's poll.
+    pub routing_used_percent: f64,
+    pub routing_reset_at_unix: i64,
 }
 
 /// Fetches the weekly window for an OAuth namespace. Accounts which do not
 /// report a weekly window return `None`.
-pub fn chatgpt_weekly_usage(name: impl AsRef<str>) -> Result<Option<ChatGptUsage>> {
+pub(crate) fn chatgpt_weekly_usage(name: impl AsRef<str>) -> Result<Option<ChatGptUsage>> {
     let auth = InferenceAuth::named(name)?;
     chatgpt_weekly_usage_for_auth(auth)
 }
 
 /// Fetches the weekly window for an already selected OAuth namespace.
-pub fn chatgpt_weekly_usage_for_auth(auth: InferenceAuth) -> Result<Option<ChatGptUsage>> {
+fn chatgpt_weekly_usage_for_auth(auth: InferenceAuth) -> Result<Option<ChatGptUsage>> {
     let resolved = auth.resolve().context("resolving OAuth credentials")?;
     let status = fetch_rate_limit_status(&resolved.bearer_token, resolved.account_id.as_deref())
         .context("fetching ChatGPT rate limits")?;
-    let Some(window) = status.rate_limit.as_ref().and_then(weekly_window) else {
+    let Some(rate_limit) = status.rate_limit.as_ref() else {
         return Ok(None);
     };
-    if !window.used_percent.is_finite() {
+    let Some(weekly) = weekly_window(rate_limit) else {
         return Ok(None);
-    }
-    let reset_at_unix = window.reset_at.or_else(|| {
+    };
+    let Some(reset_at_unix) = window_reset_at(weekly) else {
+        return Ok(None);
+    };
+    let routing = routing_window(rate_limit).unwrap_or(weekly);
+    let routing_reset_at_unix = window_reset_at(routing).unwrap();
+    Ok(weekly.used_percent.is_finite().then_some(ChatGptUsage {
+        account_id: resolved.account_id,
+        used_percent: weekly.used_percent,
+        reset_at_unix,
+        routing_used_percent: routing.used_percent,
+        routing_reset_at_unix,
+    }))
+}
+
+fn window_reset_at(window: &RateLimitWindow) -> Option<i64> {
+    window.reset_at.or_else(|| {
         window
             .reset_after_seconds
             .map(|seconds| now_secs().saturating_add(seconds))
-    });
-    Ok(reset_at_unix.map(|reset_at_unix| ChatGptUsage {
-        used_percent: window.used_percent,
-        reset_at_unix,
-    }))
+    })
+}
+
+fn routing_window(rate_limit: &RateLimitDetails) -> Option<&RateLimitWindow> {
+    rate_limit
+        .primary_window
+        .iter()
+        .chain(rate_limit.secondary_window.iter())
+        .filter(|window| window.used_percent.is_finite() && window_reset_at(window).is_some())
+        .max_by(|left, right| left.used_percent.total_cmp(&right.used_percent))
 }
 
 fn weekly_window(rate_limit: &RateLimitDetails) -> Option<&RateLimitWindow> {
@@ -487,6 +513,22 @@ mod usage_tests {
     fn auth_cli_installs_the_tls_provider() {
         assert!(run_auth_cli(AuthArgs::Status { name: "/".into() }).is_err());
         reqwest::blocking::Client::builder().build().unwrap();
+    }
+
+    #[test]
+    fn routing_uses_the_most_constrained_cached_window() {
+        let window = |used_percent| RateLimitWindow {
+            used_percent,
+            limit_window_seconds: None,
+            reset_after_seconds: None,
+            reset_at: Some(123),
+        };
+        let limits = RateLimitDetails {
+            primary_window: Some(window(35.0)),
+            secondary_window: Some(window(90.0)),
+        };
+
+        assert_eq!(routing_window(&limits).unwrap().used_percent, 90.0);
     }
 
     #[test]

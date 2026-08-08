@@ -50,7 +50,7 @@ where
         }
     };
     let opened = async {
-        let auth = agents.inference.auth().clone();
+        let auth = agents.inference.auth().await?;
         let credential = tokio::task::spawn_blocking(move || auth.resolve_oauth())
             .await
             .context("join realtime OAuth resolver")??;

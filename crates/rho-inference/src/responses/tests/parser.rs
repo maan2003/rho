@@ -1,6 +1,44 @@
 use super::*;
 
 #[test]
+fn parses_streamed_weekly_and_routing_quota() {
+    let event = serde_json::json!({
+        "type": "codex.rate_limits",
+        "rate_limits": {
+            "primary": {
+                "used_percent": 60.2,
+                "window_minutes": 300,
+                "reset_at": 123
+            },
+            "secondary": {
+                "used_percent": 28.2,
+                "window_minutes": 10080,
+                "reset_at": 456
+            }
+        }
+    });
+
+    let quota = ResponseState::quota_update(&event).unwrap();
+
+    assert_eq!(quota.weekly_used_percent, 28);
+    assert_eq!(quota.weekly_reset_at_unix, Some(456));
+    assert_eq!(quota.routing_used_percent, 60);
+    assert_eq!(quota.routing_reset_at_unix, Some(123));
+}
+
+#[test]
+fn ignores_streamed_quota_without_a_weekly_window() {
+    let event = serde_json::json!({
+        "type": "codex.rate_limits",
+        "rate_limits": {
+            "primary": { "used_percent": 60, "window_minutes": 300 }
+        }
+    });
+
+    assert_eq!(ResponseState::quota_update(&event), None);
+}
+
+#[test]
 fn parses_text_delta_stream() {
     let parsed = parse_response_events([
         r#"{"type":"response.output_item.added","output_index":0,"item":{"type":"message","id":"msg_1"}}"#,
@@ -251,6 +289,37 @@ fn surfaces_stream_error() {
 
     assert!(error.to_string().contains("rate limit"));
     assert!(error.to_string().contains("type=rate_limit_exceeded"));
+}
+
+#[test]
+fn response_failed_preserves_rate_limit_code_for_failover() {
+    let error = parse_response_events([
+        r#"{"type":"response.failed","response":{"error":{"message":"rate limit","code":"rate_limit_exceeded"}}}"#,
+    ])
+    .unwrap_err();
+
+    assert!(error.to_string().contains("type=rate_limit_exceeded"));
+    assert!(super::is_quota_exhaustion_error(&error));
+}
+
+#[test]
+fn rate_limit_words_without_rate_limit_code_do_not_trigger_failover() {
+    let error = parse_response_events([
+        r#"{"type":"error","error":{"message":"mentions rate_limit_exceeded","code":"server_error"}}"#,
+    ])
+    .unwrap_err();
+
+    assert!(!super::is_quota_exhaustion_error(&error));
+}
+
+#[test]
+fn transient_words_do_not_override_non_transient_provider_code() {
+    let error = parse_response_events([
+        r#"{"type":"error","error":{"message":"request timeout is invalid","code":"invalid_request_error"}}"#,
+    ])
+    .unwrap_err();
+
+    assert!(!super::is_transient_turn_error(&error));
 }
 
 #[test]

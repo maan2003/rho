@@ -1,48 +1,56 @@
-//! The account an agent talks to, and the sessions that talk to it.
-//!
-//! A session is one conversation; some facts belong to the account behind all
-//! of them. Quota is the first: the provider mentions it in passing while
-//! streaming something else, it is true of every session at once, and nothing
-//! downstream should have to carry it from where it is noticed to where it is
-//! shown. Holding it here means it can be watched at the source instead.
+//! The daemon-wide inference runtime and the sessions created from it.
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use rho_core::UnixMs;
+use rho_db::RhoDb;
 use tokio::sync::watch;
 
 use crate::config::{InferenceModel, InferenceProfile};
-use crate::responses::{InferenceAuth, InferenceSession, PromptCacheKey};
+use crate::accounts::{self, AccountManager, InferenceQuotaSeries, InferenceState, SelectedAuth};
+use crate::responses::{InferenceAuth, InferenceSession, PromptCacheKey, QuotaUpdate};
 
-/// The most recent quota the provider mentioned.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct QuotaObservation {
-    pub observed_at: UnixMs,
-    pub used_percent: u8,
-    /// When the window rolls over, if the provider said.
-    pub reset_at_unix: Option<i64>,
-}
-
-/// One account's inference. Cheap to clone; every clone shares the account's
-/// state, so an observation on any session is visible from all of them.
+/// Provider account policy, quota, persistence, and session creation. Cheap to
+/// clone.
 #[derive(Clone, Debug)]
-pub struct Inference(Arc<Account>);
+pub struct Inference(Arc<Inner>);
 
 #[derive(Debug)]
-struct Account {
-    auth: RwLock<InferenceAuth>,
-    quota: watch::Sender<Option<QuotaObservation>>,
+struct Inner {
+    accounts: Option<Arc<AccountManager>>,
+    #[cfg(test)]
+    fixed_auth: Option<InferenceAuth>,
 }
 
 impl Inference {
-    pub fn new(auth: InferenceAuth) -> Self {
-        Self(Arc::new(Account {
-            auth: RwLock::new(auth),
-            quota: watch::Sender::new(None),
+    /// Applies provider-owned database migrations without starting runtime
+    /// work or accessing credentials.
+    pub async fn migrate(db: &RhoDb) -> anyhow::Result<()> {
+        accounts::init(db).await
+    }
+
+    /// Opens the daemon-owned inference runtime and starts its fallback quota
+    /// poller.
+    pub async fn new(db: RhoDb) -> anyhow::Result<Self> {
+        Self::migrate(&db).await?;
+        let accounts = Arc::new(AccountManager::open(db).await);
+        accounts.spawn_poller();
+        let inference = Self(Arc::new(Inner {
+            accounts: Some(accounts),
+            #[cfg(test)]
+            fixed_auth: None,
+        }));
+        Ok(inference)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(auth: InferenceAuth) -> Self {
+        Self(Arc::new(Inner {
+            accounts: None,
+            fixed_auth: Some(auth),
         }))
     }
 
-    /// A session for the main conversation.
     pub fn deep_session(
         &self,
         profile: InferenceProfile,
@@ -52,93 +60,68 @@ impl Inference {
         InferenceSession::new_deep(self.clone(), profile, model, prompt_cache_key)
     }
 
-    /// A session for naming a conversation, which uses a smaller model and no
-    /// profile.
     pub fn title_session(&self, prompt_cache_key: PromptCacheKey) -> InferenceSession {
         InferenceSession::new_title(self.clone(), prompt_cache_key)
     }
 
-    /// A small, runtime-local session for deriving display activity from an
-    /// agent transcript. It deliberately has no relationship to the agent's
-    /// persisted conversation.
     pub fn status_session(&self, prompt_cache_key: PromptCacheKey) -> InferenceSession {
         InferenceSession::new_status(self.clone(), prompt_cache_key)
     }
 
-    /// Watch the account's quota. Yields immediately with whatever is known,
-    /// which is `None` until the provider first mentions it.
-    pub fn quota(&self) -> watch::Receiver<Option<QuotaObservation>> {
-        self.0.quota.subscribe()
+    /// Returns the account decision already made by the account manager.
+    pub async fn auth(&self) -> anyhow::Result<InferenceAuth> {
+        Ok(self.select().await?.auth)
     }
 
-    /// The latest observation, for callers with nothing to await on.
-    pub fn latest_quota(&self) -> Option<QuotaObservation> {
-        *self.0.quota.borrow()
+    pub(crate) async fn select(&self) -> anyhow::Result<SelectedAuth> {
+        if let Some(accounts) = &self.0.accounts {
+            accounts.select().await
+        } else {
+            #[cfg(test)]
+            if let Some(auth) = &self.0.fixed_auth {
+                return Ok(SelectedAuth {
+                    auth: auth.clone(),
+                    namespace: None,
+                    account_id: None,
+                });
+            }
+            anyhow::bail!("inference account manager is unavailable")
+        }
     }
 
-    pub fn auth(&self) -> InferenceAuth {
-        self.0.auth.read().unwrap().clone()
+    pub(crate) async fn mark_rate_limited(&self, selected: &SelectedAuth) -> bool {
+        let Some(accounts) = &self.0.accounts else {
+            return false;
+        };
+        accounts.mark_rate_limited(selected).await
     }
 
-    /// Changes the account used by existing and future sessions. An active
-    /// request finishes with the credentials it started with; the next
-    /// request observes the replacement and reconnects if necessary.
-    pub fn set_auth(&self, auth: InferenceAuth) {
-        *self.0.auth.write().unwrap() = auth;
-        self.0.quota.send_replace(None);
+    pub(crate) async fn observe_quota(&self, selected: &SelectedAuth, quota: QuotaUpdate) {
+        if let Some(accounts) = &self.0.accounts {
+            accounts.observe_quota(selected, quota).await;
+        }
     }
 
-    pub(crate) fn observe_quota(&self, used_percent: u8, reset_at_unix: Option<i64>) {
-        self.0.quota.send_replace(Some(QuotaObservation {
-            observed_at: UnixMs::now(),
-            used_percent,
-            reset_at_unix,
-        }));
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn account() -> Inference {
-        Inference::new(InferenceAuth::oauth_file("/nonexistent"))
+    pub async fn set_account_enabled(&self, namespace: &str, enabled: bool) {
+        self.accounts().set_enabled(namespace, enabled).await;
     }
 
-    #[tokio::test]
-    async fn an_observation_reaches_anything_already_watching() {
-        let inference = account();
-        let mut watcher = inference.quota();
-        inference.observe_quota(42, Some(1_783_173_000));
-
-        watcher.changed().await.unwrap();
-        let observed = watcher.borrow().expect("an observation");
-        assert_eq!(observed.used_percent, 42);
-        assert_eq!(observed.reset_at_unix, Some(1_783_173_000));
-        assert_eq!(
-            inference.latest_quota(),
-            Some(observed),
-            "and is there for latecomers"
-        );
+    pub fn state(&self) -> InferenceState {
+        self.accounts().state()
     }
 
-    #[test]
-    fn clones_share_one_account_but_separate_accounts_do_not() {
-        let inference = account();
-        inference.clone().observe_quota(7, None);
-        assert!(inference.latest_quota().is_some(), "same account");
-        assert!(
-            account().latest_quota().is_none(),
-            "a second account starts blank"
-        );
+    pub fn subscribe(&self) -> watch::Receiver<InferenceState> {
+        self.accounts().subscribe()
     }
 
-    #[test]
-    fn auth_changes_reach_existing_clones() {
-        let inference = account();
-        let clone = inference.clone();
-        let replacement = InferenceAuth::oauth_file("/replacement");
-        inference.set_auth(replacement.clone());
-        assert_eq!(clone.auth(), replacement);
+    pub fn quota_history(&self, since: UnixMs) -> Vec<InferenceQuotaSeries> {
+        self.accounts().history(since)
+    }
+
+    fn accounts(&self) -> &AccountManager {
+        self.0
+            .accounts
+            .as_ref()
+            .expect("inference account manager")
     }
 }

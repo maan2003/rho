@@ -32,20 +32,6 @@ fn quota_observation_decodes_before_auth_namespaces() {
 }
 
 #[tokio::test]
-async fn default_auth_namespace_is_optional_and_persistent() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-    assert_eq!(db.read().default_auth_namespace(), None);
-
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    write.set_default_auth_namespace("work".to_owned());
-    write.commit();
-
-    assert_eq!(db.read().default_auth_namespace().as_deref(), Some("work"));
-}
-
-#[tokio::test]
 async fn agent_usage_accumulates_in_five_minute_buckets() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));

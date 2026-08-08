@@ -600,11 +600,6 @@ pub enum InferenceEvent {
     RequestSent,
     /// server has started sending tokens
     StreamingStarted,
-    /// An account quota update delivered alongside the provider stream.
-    Quota {
-        used_percent: u8,
-        reset_at_unix: Option<i64>,
-    },
     /// turn has failed due to some reason
     /// you shouldn't retry, that is already done internally
     Failed {

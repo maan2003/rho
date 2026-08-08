@@ -82,7 +82,11 @@ impl WebSearchTools {
                 .map_err(|error| format!("invalid web search arguments: {error}"))?
         };
 
-        let auth = self.inference.auth();
+        let auth = self
+            .inference
+            .auth()
+            .await
+            .map_err(|error| format!("selecting ChatGPT OAuth credentials: {error}"))?;
         let auth = tokio::task::spawn_blocking(move || auth.resolve_oauth())
             .await
             .map_err(|_| "OAuth credential resolution task failed".to_owned())?

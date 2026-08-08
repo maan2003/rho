@@ -8,9 +8,17 @@ module uses the OpenAI Responses WebSocket protocol.
 
 The public surface is intentionally small:
 
-- `InferenceAuth` selects the named auth credentials required for inference.
-- `InferenceSession` configures inference access, prompt-cache/thread behavior,
-  and owns the session's warm WebSocket connection.
+- `Inference::new(RhoDb)` opens the complete daemon-wide ChatGPT runtime:
+  persisted disabled accounts and current selection, quota polling/history,
+  automatic routing, and session creation.
+- `InferenceSession` configures prompt-cache/thread behavior and owns one warm
+  WebSocket. The session task snapshots the account manager's existing
+  selection when it accepts each new request and reconnects when it differs
+  from the socket account. Ordinary retries retain that snapshot; only an
+  explicit rate-limit failover replaces it.
+- `InferenceState` exposes disabled namespaces, namespace names, and quota
+  summaries. The current account selected internally is not part of the public
+  settings contract. Request setup never queries quota.
 - `InferenceSession::request` queues a `rho_core::InferenceRequest`;
   `InferenceSession::run` drives the concrete session and yields
   `rho_core::InferenceEvent` values ending in `InferenceEvent::Finished`.
@@ -39,7 +47,13 @@ configuration.
   WebSocket defaults, and event-loop timeouts/pings.
 - `responses/oauth.rs` owns private credential files, OAuth token exchange/refresh,
   account id extraction, and file locking.
-- `auth_cli.rs` owns the auth-management CLI workflow exposed by `run_auth_cli`.
+- `accounts.rs` is the deep account module: it owns the persisted current
+  selection and disabled set, in-memory quota/rate-limit state, selection
+  transitions, ChatGPT quota persistence, and safe presentation DTOs. Selection
+  is sticky and changes only when the current account is disabled/rate-limited,
+  or another enabled account's weekly reset is more than one hour earlier.
+- `auth_cli.rs` owns credential management and the single usage request made by
+  the runtime's ten-minute poller.
 
 ## Request and replay model
 

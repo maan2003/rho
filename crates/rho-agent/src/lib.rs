@@ -202,23 +202,6 @@ pub struct AgentState {
     /// Cumulative provider-reported usage across this agent's requests.
     pub total_usage: db::AgentUsageBucket,
     pub usage_provider: db::AgentUsageModel,
-    /// Latest weekly provider quota observation seen by this runtime.
-    pub quota_observation: Option<QuotaObservation>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct QuotaObservation {
-    pub provider: QuotaProvider,
-    pub model: String,
-    pub observed_at: rho_core::UnixMs,
-    pub used_percent: u8,
-    pub reset_at_unix: Option<i64>,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum QuotaProvider {
-    ChatGpt,
-    Claude,
 }
 
 /// One input waiting in the agent's queue. Persisted verbatim inside
@@ -794,7 +777,6 @@ impl Agent {
                 db::InferenceModel::Gpt56Luna => db::AgentUsageModel::LUNA,
                 _ => db::AgentUsageModel::GPT,
             },
-            quota_observation: None,
         }));
         let notify = Arc::new(Notify::new());
         let presentation_session = Arc::new(tokio::sync::Mutex::new(presentation::Session::new(
@@ -1723,19 +1705,6 @@ impl AgentLoop {
 
                     match update {
                         InferenceEvent::RequestSent | InferenceEvent::StreamingStarted => {
-                            state.kind = AgentStateKind::ApiStreaming {
-                                pending_response,
-                                previous_attempt,
-                            };
-                        }
-                        InferenceEvent::Quota { used_percent, reset_at_unix } => {
-                            state.quota_observation = Some(QuotaObservation {
-                                provider: QuotaProvider::ChatGpt,
-                                model: "gpt".to_owned(),
-                                observed_at: rho_core::UnixMs::now(),
-                                used_percent,
-                                reset_at_unix,
-                            });
                             state.kind = AgentStateKind::ApiStreaming {
                                 pending_response,
                                 previous_attempt,
@@ -3035,7 +3004,6 @@ mod tests {
             context_used: None,
             total_usage: db::AgentUsageBucket::default(),
             usage_provider: db::AgentUsageModel::GPT,
-            quota_observation: None,
         }
     }
 
@@ -3127,7 +3095,6 @@ mod tests {
             context_used: Some(232_560),
             total_usage: db::AgentUsageBucket::default(),
             usage_provider: db::AgentUsageModel::GPT,
-            quota_observation: None,
         };
         assert!(should_auto_compact(&state, Some(232_560)));
         assert!(!should_auto_compact(&state, Some(232_561)));

@@ -18,7 +18,7 @@ use tokio_tungstenite::tungstenite::Message as WsMessage;
 use super::oauth::{InferenceAuth, OAuthFile, ResponsesOAuthCredentials};
 use super::session::{
     AutoCompaction, ReasoningContext, ResponsesEffort, ResponsesModel, ServiceTier, TextVerbosity,
-    is_transient_turn_error, transient_backoff,
+    is_quota_exhaustion_error, is_transient_turn_error, transient_backoff,
 };
 use super::wire::{
     OpenAiResponsesProviderData, ResponseState, ResponsesRequest, openai_provider_specific_data,
@@ -275,7 +275,7 @@ fn test_inference_service_with(
     auto_compaction: Option<AutoCompaction>,
 ) -> InferenceSession {
     let mut session = InferenceSession::new_deep(
-        Inference::new(auth),
+        Inference::for_test(auth),
         InferenceProfile {
             effort: ReasoningEffort::Medium,
             fast_mode: false,
