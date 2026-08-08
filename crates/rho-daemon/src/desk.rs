@@ -24,8 +24,8 @@ struct PersistentStateV4 {
     snapshot: DeskSnapshot,
     next_text_sequence: u64,
     next_replica_id: u16,
-    /// Agents attached to the document by CRDT anchor. The daemon stores and
-    /// broadcasts these; clients resolve anchors to headings themselves.
+    /// Pre-tag anchor bindings. Drained into heading-line tags at startup;
+    /// kept in the wire-stable struct shape, but always empty now.
     bindings: Vec<DeskBinding>,
 }
 
@@ -82,6 +82,28 @@ impl DeskStore {
             write.delete_table("rho_desk_state_v2");
             write.delete_table("rho_desk_state_v3");
             write.open_table(STATE).insert(&(), SenValue::owned(state));
+        }
+        // Anchor bindings ride into the text as heading-line tags: the
+        // document is now the binding source of truth, so the stored
+        // table drains once and stays empty.
+        let mut state = load_state(&mut write);
+        if !state.bindings.is_empty() {
+            for binding in std::mem::take(&mut state.bindings) {
+                let Some(label) = agent_handles.get(&binding.agent_id) else {
+                    continue;
+                };
+                if let Err(error) = retag_in_txn(
+                    |handle| resolve_agent_handle(&db, handle),
+                    &mut write,
+                    &mut state,
+                    binding.agent_id,
+                    label,
+                    Some(binding.anchor),
+                ) {
+                    tracing::warn!(%error, "converting a Desk anchor binding to a tag failed");
+                }
+            }
+            save_state(&mut write, &state);
         }
         write.commit();
         Self { db }
@@ -143,8 +165,8 @@ impl DeskStore {
         self.append_text(operation, transaction).await
     }
 
-    /// Current binding set: which agents are attached to the document, by
-    /// anchor. Order is insertion order; clients resolve and triage.
+    /// Legacy binding set for the wire's Ready shape. Always empty since
+    /// bindings became heading-line tags in the document text.
     pub fn bindings(&self) -> Vec<DeskBinding> {
         self.db
             .read()
@@ -156,26 +178,33 @@ impl DeskStore {
             .bindings
     }
 
-    /// Attaches an agent at an anchor, moves it, or (with `None`) unfiles it.
-    /// Returns the full binding set after the change. The document text is
-    /// never touched.
-    pub async fn bind_agent(
+    /// Moves `agent_id`'s heading-line tag: removed everywhere it appears,
+    /// inserted on the heading containing `anchor` (`None` just unfiles).
+    /// The rewrite is a server-replica CRDT edit, so clients converge
+    /// through the ordinary text-op stream. Returns the record to
+    /// broadcast when the text changed at all.
+    pub async fn retag_agent(
         &self,
         agent_id: rho_ui_proto::AgentId,
         anchor: Option<DeskAnchor>,
-    ) -> Vec<DeskBinding> {
+    ) -> Result<Option<DeskTextOpRecord>, String> {
+        let label = agent_label(&self.db, agent_id)
+            .ok_or_else(|| "Desk retag references an unknown agent".to_owned())?;
         let mut write = self.db.write().await;
         let mut state = load_state(&mut write);
-        state
-            .bindings
-            .retain(|binding| binding.agent_id != agent_id);
-        if let Some(anchor) = anchor {
-            state.bindings.push(DeskBinding { agent_id, anchor });
+        let record = retag_in_txn(
+            |handle| resolve_agent_handle(&self.db, handle),
+            &mut write,
+            &mut state,
+            agent_id,
+            &label,
+            anchor,
+        )?;
+        if record.is_some() {
+            save_state(&mut write, &state);
+            write.commit();
         }
-        save_state(&mut write, &state);
-        let bindings = state.bindings.clone();
-        write.commit();
-        bindings
+        Ok(record)
     }
 
     async fn append_text(
@@ -207,6 +236,132 @@ impl DeskStore {
                     && matches!(replica.author, DeskReplicaAuthor::User)
             })
     }
+}
+
+fn agent_label(db: &RhoDb, agent_id: rho_ui_proto::AgentId) -> Option<String> {
+    let read = db.read();
+    let prefix_len = prefix_id::uniform_prefix_len(read.last_agent_counter(), 200).max(4);
+    read.list_agents()
+        .into_iter()
+        .find(|(id, _)| *id == agent_id)
+        .map(|(id, record)| {
+            format!(
+                "{}-{}",
+                record.role.handle_prefix(),
+                &id.encoded()[..prefix_len]
+            )
+        })
+}
+
+fn retag_in_txn(
+    resolve: impl Fn(&str) -> Option<rho_ui_proto::AgentId>,
+    write: &mut rho_db::WriteTxn,
+    state: &mut PersistentStateV4,
+    agent_id: rho_ui_proto::AgentId,
+    label: &str,
+    anchor: Option<DeskAnchor>,
+) -> Result<Option<DeskTextOpRecord>, String> {
+    let mut materialized = state.snapshot.clone();
+    materialized.operations.extend(
+        write
+            .open_table(TEXT_OPS)
+            .iter()
+            .map(|(_, value)| value.value().as_ref().operation.clone()),
+    );
+    let text = materialized.document_text()?;
+    let mut buffer = materialized.buffer(ReplicaId::REMOTE_SERVER.as_u16())?;
+    let snapshot = buffer.snapshot();
+    let target_offset = match anchor {
+        Some(anchor) => {
+            let anchor = anchor.to_text(snapshot.remote_id());
+            if !snapshot.can_resolve(&anchor) {
+                return Err("Desk retag anchor does not resolve".to_owned());
+            }
+            Some(text::ToOffset::to_offset(&anchor, &snapshot))
+        }
+        None => None,
+    };
+    let edits = retag_edits(&resolve, &text, agent_id, label, target_offset);
+    if edits.is_empty() {
+        return Ok(None);
+    }
+    let operation = DeskOperation::from_text(&buffer.edit(edits));
+    append_text_in_txn(write, state, operation, None).map(Some)
+}
+
+/// The text edits that move `agent_id`'s tag to the heading containing
+/// `target_offset`: every stale occurrence is stripped (the whole token
+/// when it holds nothing else), and one tag is written onto the target
+/// unless it already carries the agent.
+fn retag_edits(
+    resolve: &impl Fn(&str) -> Option<rho_ui_proto::AgentId>,
+    text: &str,
+    agent_id: rho_ui_proto::AgentId,
+    label: &str,
+    target_offset: Option<usize>,
+) -> Vec<(std::ops::Range<usize>, String)> {
+    let headings = parse(text);
+    let target = target_offset.and_then(|offset| {
+        headings
+            .iter()
+            .rev()
+            .find(|heading| heading.heading_range.start <= offset)
+            .map(|heading| heading.heading_range.start)
+    });
+    let mut edits = Vec::new();
+    let mut already_tagged = false;
+    for heading in &headings {
+        let Some(tags_range) = heading.tags_range.clone() else {
+            continue;
+        };
+        let mine = heading
+            .tags
+            .iter()
+            .enumerate()
+            .filter(|(_, tag)| resolve(tag) == Some(agent_id))
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        if mine.is_empty() {
+            continue;
+        }
+        if Some(heading.heading_range.start) == target {
+            already_tagged = true;
+            continue;
+        }
+        if mine.len() == heading.tags.len() {
+            // The token empties out, so the separating whitespace goes too.
+            let start = text[..tags_range.start]
+                .rfind(|c: char| !matches!(c, ' ' | '\t'))
+                .map_or(tags_range.start, |index| index + 1)
+                .max(heading.stars_range.end);
+            edits.push((start..tags_range.end, String::new()));
+        } else {
+            let mut segment_start = tags_range.start + 1;
+            for (index, tag) in heading.tags.iter().enumerate() {
+                let segment_end = segment_start + tag.len() + 1;
+                if mine.contains(&index) {
+                    edits.push((segment_start..segment_end, String::new()));
+                }
+                segment_start = segment_end;
+            }
+        }
+    }
+    if let Some(target_start) = target
+        && !already_tagged
+        && let Some(heading) = headings
+            .iter()
+            .find(|heading| heading.heading_range.start == target_start)
+    {
+        match &heading.tags_range {
+            Some(range) => edits.push((range.end..range.end, format!("{label}:"))),
+            None => edits.push((
+                heading.heading_range.end..heading.heading_range.end,
+                format!(" :{label}:"),
+            )),
+        }
+    }
+    edits.sort_by_key(|(range, _)| range.start);
+    edits
 }
 
 fn resolve_agent_handle(db: &RhoDb, handle: &str) -> Option<rho_ui_proto::AgentId> {
@@ -286,12 +441,12 @@ fn save_state(write: &mut rho_db::WriteTxn, state: &PersistentStateV4) {
         .insert(&(), SenValue::borrowed(state));
 }
 
-/// Converts visible v3 `:agent:` property lines into anchor bindings and
-/// strips them from the text. Runs on every migration path (a fresh v4 state
-/// simply has no headings to convert). Lines whose handle does not resolve
-/// stay in the text for the user to deal with. The strip is appended as a
-/// server-replica CRDT operation, so racing clients converge through the
-/// ordinary text-op stream.
+/// Converts visible v3 `:agent:` property lines into heading-line tags and
+/// strips the property lines from the text. Runs on every migration path (a
+/// fresh v4 state simply has no headings to convert). Lines whose handle
+/// does not resolve stay in the text for the user to deal with. The rewrite
+/// is appended as a server-replica CRDT operation, so racing clients
+/// converge through the ordinary text-op stream.
 fn extract_bindings(
     resolve: impl Fn(&str) -> Option<rho_ui_proto::AgentId>,
     write: &mut rho_db::WriteTxn,
@@ -307,43 +462,43 @@ fn extract_bindings(
     let Ok(text) = materialized.document_text() else {
         return;
     };
-    let Ok(buffer) = materialized.buffer(ReplicaId::REMOTE_SERVER.as_u16()) else {
+    let Ok(mut buffer) = materialized.buffer(ReplicaId::REMOTE_SERVER.as_u16()) else {
         return;
     };
-    let snapshot = buffer.snapshot();
-    let mut removals = Vec::new();
+    let mut edits = Vec::new();
     for heading in parse(&text) {
+        let mut labels = Vec::new();
         for property in heading
             .properties
             .iter()
             .filter(|property| property.key.eq_ignore_ascii_case("agent"))
         {
-            let Some(agent_id) = resolve(&property.value) else {
+            if resolve(&property.value).is_none() {
                 continue;
-            };
-            if !state
-                .bindings
-                .iter()
-                .any(|binding| binding.agent_id == agent_id)
-            {
-                state.bindings.push(DeskBinding {
-                    agent_id,
-                    anchor: DeskAnchor::from_text(
-                        snapshot.anchor_after(heading.heading_range.start),
-                    ),
-                });
             }
             let end = property.line_range.end
                 + usize::from(text.as_bytes().get(property.line_range.end) == Some(&b'\n'));
-            removals.push(property.line_range.start..end);
+            edits.push((property.line_range.start..end, String::new()));
+            labels.push(property.value.trim().to_owned());
         }
+        if labels.is_empty() {
+            continue;
+        }
+        // All of a heading's labels merge into one token; separate tokens
+        // would not parse (only the line's last word can be tags).
+        edits.push(match &heading.tags_range {
+            Some(range) => (range.end..range.end, format!("{}:", labels.join(":"))),
+            None => (
+                heading.heading_range.end..heading.heading_range.end,
+                format!(" :{}:", labels.join(":")),
+            ),
+        });
     }
-    if removals.is_empty() {
+    if edits.is_empty() {
         return;
     }
-    let mut buffer = buffer;
-    let operation =
-        DeskOperation::from_text(&buffer.edit(removals.into_iter().map(|range| (range, ""))));
+    edits.sort_by_key(|(range, _)| range.start);
+    let operation = DeskOperation::from_text(&buffer.edit(edits));
     let _ = append_text_in_txn(write, state, operation, None);
 }
 
@@ -670,7 +825,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bindings_persist_move_and_unfile_without_touching_text() {
+    async fn retagging_moves_the_heading_tag_and_unfiles_by_edit() {
         let directory = tempfile::tempdir().unwrap();
         let db = RhoDb::open(directory.path().join("desk.redb"));
         init_agent_tables(&db).await;
@@ -687,29 +842,70 @@ mod tests {
         let snapshot = buffer.snapshot();
         let one = DeskAnchor::from_text(snapshot.anchor_after(0));
         let two = DeskAnchor::from_text(snapshot.anchor_after(text.find("* two").unwrap()));
+        let resolve = |handle: &str| (handle == "eng-aa").then(|| agent(2));
 
-        let bindings = store.bind_agent(agent(2), Some(one)).await;
-        assert_eq!(bindings.len(), 1);
-        let bindings = store.bind_agent(agent(2), Some(two)).await;
-        assert_eq!(bindings.len(), 1);
-        assert_eq!(bindings[0].anchor, two);
-        assert_eq!(store.snapshot().document_text().unwrap(), text);
-
-        drop(store);
-        let reopened = DeskStore::new(db).await;
+        let mut retag = |anchor: Option<DeskAnchor>| {
+            let db = db.clone();
+            async move {
+                let mut write = db.write().await;
+                let mut state = load_state(&mut write);
+                let record =
+                    retag_in_txn(resolve, &mut write, &mut state, agent(2), "eng-aa", anchor)
+                        .unwrap();
+                save_state(&mut write, &state);
+                write.commit();
+                record
+            }
+        };
+        assert!(retag(Some(one)).await.is_some());
         assert_eq!(
-            reopened.bindings(),
-            vec![DeskBinding {
-                agent_id: agent(2),
-                anchor: two,
-            }]
+            store.snapshot().document_text().unwrap(),
+            "* one :eng-aa:\n* two\n"
         );
-        assert!(reopened.bind_agent(agent(2), None).await.is_empty());
-        assert!(reopened.bindings().is_empty());
+        // Moving edits the tag between lines; the binding travels as text.
+        assert!(retag(Some(two)).await.is_some());
+        assert_eq!(
+            store.snapshot().document_text().unwrap(),
+            "* one\n* two :eng-aa:\n"
+        );
+        // Retagging in place changes nothing.
+        assert!(retag(Some(two)).await.is_none());
+        // Unfiling strips the tag and its separating space.
+        assert!(retag(None).await.is_some());
+        assert_eq!(store.snapshot().document_text().unwrap(), text);
+        assert!(store.bindings().is_empty());
+    }
+
+    #[test]
+    fn retag_edits_do_token_surgery_on_shared_tags() {
+        let a = agent(1);
+        let b = agent(2);
+        let resolve = |handle: &str| match handle {
+            "eng-a" => Some(a),
+            "eng-b" => Some(b),
+            _ => None,
+        };
+        // Removing one agent from a shared token keeps the others.
+        let text = "* one :eng-a:eng-b:\n* two\n";
+        let edits = retag_edits(&resolve, text, a, "eng-a", Some(text.find("* two").unwrap()));
+        let mut patched = text.to_owned();
+        for (range, replacement) in edits.iter().rev() {
+            patched.replace_range(range.clone(), replacement);
+        }
+        assert_eq!(patched, "* one :eng-b:\n* two :eng-a:\n");
+        // Joining an existing token extends it instead of adding a second
+        // token (which would not parse).
+        let text = "* one :eng-a:\n";
+        let edits = retag_edits(&resolve, text, b, "eng-b", Some(0));
+        let mut patched = text.to_owned();
+        for (range, replacement) in edits.iter().rev() {
+            patched.replace_range(range.clone(), replacement);
+        }
+        assert_eq!(patched, "* one :eng-a:eng-b:\n");
     }
 
     #[tokio::test]
-    async fn v3_migration_extracts_agent_lines_into_anchor_bindings() {
+    async fn v3_migration_extracts_agent_lines_into_heading_tags() {
         let directory = tempfile::tempdir().unwrap();
         let db = RhoDb::open(directory.path().join("desk.redb"));
         init_agent_tables(&db).await;
@@ -747,18 +943,11 @@ mod tests {
 
         let store = DeskStore::new(db).await;
         let text = store.snapshot().document_text().unwrap();
-        assert_eq!(text, "* one\nbody\n* two\n:agent: adv-gone\nnotes\n");
-        let bindings = store.bindings();
-        assert_eq!(bindings.len(), 1);
-        assert_eq!(bindings[0].agent_id, agent(5));
-        // A client materializing the migrated history resolves the anchor to
-        // the heading the binding was extracted from.
-        let client = store.snapshot().buffer(42).unwrap();
-        let anchor = bindings[0].anchor.to_text(text::BufferId::new(1).unwrap());
-        assert_eq!(
-            client.snapshot().offset_for_anchor(&anchor),
-            text.find("* two").unwrap()
-        );
+        // The resolvable handle becomes a heading-line tag; the dead one
+        // stays visible for the user to deal with.
+        assert_eq!(text, "* one\nbody\n* two :eng-good:\n:agent: adv-gone\nnotes\n");
+        assert!(store.bindings().is_empty());
+        assert_eq!(parse(&text)[1].tags, vec!["eng-good"]);
     }
 
     #[tokio::test]

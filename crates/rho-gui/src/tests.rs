@@ -3330,6 +3330,113 @@ fn streaming_markdown_parses_the_edited_turn_without_revisiting_history(cx: &mut
     );
 }
 
+/// A `:eng-…:` tag written in the heading line itself is a binding: the
+/// agent files under that heading with no daemon anchor at all, the raw
+/// tag stays in the buffer (so line-wise copy carries it), and the
+/// display conceals it behind the pretty decoration.
+#[gpui::test]
+fn heading_tags_file_agents_and_conceal_in_display(cx: &mut TestAppContext) {
+    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
+    use rho_ui_proto::{
+        AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
+    };
+
+    let summary = |id: u64, name: &str| UiAgentSummary {
+        agent_id: agent(id),
+        parent_agent: None,
+        display_name: Some(name.to_owned()),
+        created_at: UnixMs(id),
+        updated_at: UnixMs(id),
+        role: AgentRole::default(),
+        workspace: WorkspaceInfo::UserCheckout { repo: "/tmp".into() },
+        attention: UiAttention::Quiet,
+        last_active: UnixMs(id),
+        hidden: false,
+        disposition: AgentDisposition::Pending,
+        last_user_message_text: String::new(),
+        activity: None,
+        turn_report: None,
+        labels: Vec::new(),
+    };
+
+    let desk_text = format!("* One :eng-{}:\nbody\n* Two\n", agent(1).encoded());
+    let mut source = text::Buffer::new(
+        text::ReplicaId::new(8),
+        text::BufferId::new(1).unwrap(),
+        "",
+    );
+    let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text.as_str())]));
+    let desk_snapshot = DeskSnapshot {
+        text: source.snapshot().text(),
+        operations: vec![operation],
+        transactions: Vec::new(),
+        replicas: Vec::new(),
+    };
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Ready {
+                    agents: vec![summary(1, "planner"), summary(2, "drifter")],
+                    iris_agent: None,
+                    projects: Vec::new(),
+                    auth: AuthState {
+                        active: String::new(),
+                        default: String::new(),
+                        namespaces: Vec::new(),
+                    },
+                    machine_seed: 0,
+                    agent_counter: 100,
+                },
+                window,
+                cx,
+            );
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskSnapshot {
+                    snapshot: desk_snapshot,
+                    replica_id: 42,
+                    bindings: Vec::new(),
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+        })
+        .expect("update workspace");
+    cx.run_until_parked();
+
+    let buffer_text = workspace
+        .update(cx, |workspace, _, cx| {
+            let editor = workspace.dashboard_editor();
+            editor.read(cx).buffer().read(cx).snapshot(cx).text()
+        })
+        .expect("read dashboard");
+    assert_eq!(
+        buffer_text,
+        format!("{desk_text}\nUnfiled · 1\n  · drifter"),
+        "tagged agent should file under its heading, tag intact in the buffer"
+    );
+
+    let display = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .dashboard_editor()
+                .update(cx, |editor, cx| editor.display_text(cx))
+        })
+        .expect("read display text");
+    assert!(
+        !display.contains(":eng-"),
+        "raw tag should be concealed: {display:?}"
+    );
+    assert!(
+        display.contains("* One  · eng-"),
+        "decoration should abut the title where the tag hid: {display:?}"
+    );
+}
+
 /// The home view: the Desk document is the surface, agent rows render
 /// under their bound headings, unbound roots under a generated Unfiled
 /// tail, and daemon rebinds rearrange rows without touching the text.

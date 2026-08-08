@@ -5612,8 +5612,8 @@ impl Workspace {
                 else {
                     return;
                 };
-                // Binding is a daemon operation; the confirmed set comes
-                // back as a DeskBindingsChanged broadcast.
+                // The daemon rewrites the heading-line tag; the edit comes
+                // back through the ordinary text-op stream.
                 let anchor = heading_offset
                     .and_then(|offset| workspace.desk_sync.anchor_at(host, offset, cx));
                 if anchor.is_none() && heading_offset.is_some() {

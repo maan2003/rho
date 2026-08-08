@@ -414,6 +414,21 @@ impl Dashboard {
             let snapshot = buffer.read(cx).snapshot();
             let buffer_id = snapshot.remote_id();
             let headings = parse(text);
+            for heading in &headings {
+                for tag in &heading.tags {
+                    let Some(agent_id) = registry.agent_by_tag(*host, tag) else {
+                        continue;
+                    };
+                    let root = root_agent(registry, agent_id);
+                    if filed_roots.insert(root) {
+                        by_heading
+                            .entry((*host, heading.heading_range.start))
+                            .or_default()
+                            .push(root);
+                    }
+                }
+            }
+            // Legacy daemon anchor bindings; tags in the text win.
             for binding in self.bindings.get(host).map_or(&[][..], Vec::as_slice) {
                 if registry.host_of_agent(binding.agent_id) != Some(*host) {
                     continue;
@@ -746,6 +761,7 @@ impl Dashboard {
         self.apply_highlights(&segments, &documents, cx);
         self.apply_reply_chrome(registry, cx);
         self.apply_heading_chrome(&decorations, cx);
+        self.apply_tag_conceals(&documents, cx);
         self.last_synced = Some((documents, segments, draft_texts, decorations));
     }
 
@@ -1490,6 +1506,48 @@ impl Dashboard {
     /// Splices the staffed headings' end-of-line decorations in as
     /// inlays: display-only, so the document text never carries agent
     /// markers and typing on the heading line slides them along.
+    /// Hides `:eng-x7y2:` heading tags behind concealed folds. The tag stays
+    /// in the buffer, so line-wise copy and move carry the binding; only the
+    /// display drops it (the inlay decoration shows the pretty form).
+    fn apply_tag_conceals(&self, documents: &[(HostId, String)], cx: &mut Context<Workspace>) {
+        struct DeskTagConceal;
+        let type_id = std::any::TypeId::of::<DeskTagConceal>();
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let mut creases = Vec::new();
+        for (host, text) in documents {
+            let Some(buffer) = self.hosts.get(host).and_then(|weak| weak.upgrade()) else {
+                continue;
+            };
+            let buffer_snapshot = buffer.read(cx).snapshot();
+            for heading in parse(text) {
+                let Some(tags_range) = heading.tags_range else {
+                    continue;
+                };
+                // Swallow the separating whitespace too, so the visible
+                // line does not end in stray spaces.
+                let start = text[..tags_range.start]
+                    .rfind(|c: char| !matches!(c, ' ' | '\t'))
+                    .map_or(tags_range.start, |index| index + 1)
+                    .max(heading.stars_range.end);
+                let (Some(start), Some(end)) = (
+                    snapshot.anchor_in_excerpt(buffer_snapshot.anchor_after(start)),
+                    snapshot.anchor_in_excerpt(buffer_snapshot.anchor_before(tags_range.end)),
+                ) else {
+                    continue;
+                };
+                creases.push(editor::display_map::Crease::simple(
+                    start..end,
+                    editor::FoldPlaceholder::concealed(type_id),
+                ));
+            }
+        }
+        self.editor.update(cx, |editor, cx| {
+            editor.display_map.update(cx, |display_map, cx| {
+                display_map.replace_folds_with_type(type_id, creases, cx);
+            });
+        });
+    }
+
     fn apply_heading_chrome(
         &mut self,
         decorations: &[(HostId, usize, String)],

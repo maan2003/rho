@@ -346,6 +346,22 @@ impl AgentRegistry {
             None => label,
         }
     }
+    /// Resolves a bare desk tag (`eng-x7y2`) to the unique matching agent on
+    /// `host`. Prefixes written when the id space was smaller keep resolving
+    /// for as long as they stay unambiguous.
+    pub fn agent_by_tag(&self, host: HostId, label: &str) -> Option<AgentId> {
+        let (role_prefix, encoded_prefix) = label.split_once('-')?;
+        let mut matches = self.agents.keys().copied().filter(|agent_id| {
+            self.host_of_agent(*agent_id) == Some(host)
+                && self
+                    .agent_role(*agent_id)
+                    .is_some_and(|role| role.handle_prefix() == role_prefix)
+                && agent_id.encoded().starts_with(encoded_prefix)
+        });
+        let found = matches.next()?;
+        matches.next().is_none().then_some(found)
+    }
+
     pub fn working_directory(&self, agent_id: AgentId) -> Option<Utf8PathBuf> {
         self.agent_summary(agent_id)
             .map(|a| a.workspace.repo().to_owned())
