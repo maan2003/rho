@@ -1527,23 +1527,15 @@ fn attention_glyph(attention: UiAttention) -> &'static str {
     }
 }
 
-fn attention_class(attention: UiAttention) -> DashClass {
-    match attention {
-        UiAttention::NeedsInput => DashClass::NeedsInput,
-        UiAttention::Pending => DashClass::Pending,
-        UiAttention::Working | UiAttention::Quiet => DashClass::Muted,
-    }
-}
-
 fn agent_line(agent_id: AgentId, registry: &AgentRegistry) -> Line {
     let attention = registry.attention(agent_id);
     let mut line = Line::new(LineKey::Agent(agent_id), RowTarget::Agent(agent_id));
 
     // A fixed one-character status column, indented under the heading:
     // `?` needs you, `✓` finished and waiting, `~` working, `·` quiet.
-    // Only `?` and `✓` carry color; the rest of the row stays plain.
+    // The glyph alone carries the state; no color.
     line.span(None, |text| text.push_str("  "));
-    line.span(Some(attention_class(attention)), |text| {
+    line.span(Some(DashClass::Muted), |text| {
         text.push_str(attention_glyph(attention))
     });
     line.span(None, |text| text.push(' '));
@@ -1699,7 +1691,7 @@ fn generate(
                         },
                     );
                     fold.span(None, |line| line.push_str("  "));
-                    fold.span(Some(attention_class(loudest)), |line| {
+                    fold.span(Some(DashClass::Muted), |line| {
                         line.push_str(if loudest > UiAttention::Quiet {
                             attention_glyph(loudest)
                         } else {
@@ -1794,7 +1786,7 @@ fn generate(
                 .map(|agent_id| registry.attention(*agent_id))
                 .max()
                 .unwrap_or(UiAttention::Quiet);
-            header.span(Some(attention_class(loudest)), |line| {
+            header.span(Some(DashClass::Muted), |line| {
                 if loudest > UiAttention::Quiet {
                     line.push(' ');
                     line.push_str(attention_glyph(loudest));
