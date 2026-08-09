@@ -1893,6 +1893,9 @@ impl Dashboard {
                     .gap(gpui::px(6.))
                     .font(font)
                     .text_size(size)
+                    // Match the editor's line height so the hint's
+                    // baseline lands on the line's baseline.
+                    .line_height(gpui::relative(settings.line_height()))
                     .text_color(color);
                 if !text.is_empty() {
                     row = row.child(text.clone());

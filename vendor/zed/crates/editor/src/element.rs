@@ -2140,8 +2140,12 @@ impl EditorElement {
             let start_y =
                 content_origin.y + line_height * ((row.as_f64() - scroll_position.y) as f32);
             let mut element = renderer(window, cx);
+            // The renderer's element is laid out at its intrinsic
+            // height, which is typically shorter than the editor line;
+            // center it so the hint sits on the line, not above it.
+            let size = element.layout_as_root(AvailableSpace::min_size(), window, cx);
             element.prepaint_as_root(
-                point(start_x, start_y),
+                point(start_x, start_y + (line_height - size.height) / 2.),
                 AvailableSpace::min_size(),
                 window,
                 cx,
