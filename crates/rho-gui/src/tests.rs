@@ -65,6 +65,7 @@ fn test_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace> {
 
 #[gpui::test]
 fn modal_overlays_preserve_dashboard_and_surface_modes(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
     let workspace = test_workspace(cx);
 
     workspace
@@ -3373,6 +3374,7 @@ fn heading_tags_file_agents_and_conceal_in_display(cx: &mut TestAppContext) {
         replicas: Vec::new(),
     };
 
+    cx.update(bind_test_keymaps);
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
@@ -3403,6 +3405,14 @@ fn heading_tags_file_agents_and_conceal_in_display(cx: &mut TestAppContext) {
                 cx,
             );
             workspace.sync_dashboard(window, cx);
+            let focus_handle = workspace.dashboard_editor().read(cx).focus_handle(cx);
+            window.focus(&focus_handle, cx);
+            workspace.dashboard_editor().update(cx, |editor, cx| {
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    let offset = editor::MultiBufferOffset(2);
+                    selections.select_ranges([offset..offset]);
+                });
+            });
         })
         .expect("update workspace");
     cx.run_until_parked();
@@ -3446,6 +3456,60 @@ fn heading_tags_file_agents_and_conceal_in_display(cx: &mut TestAppContext) {
         })
         .expect("read hints");
     assert_eq!(hints, 1, "the staffed heading wears its chip as a hint");
+
+    cx.simulate_keystrokes(*workspace, "escape space e");
+    cx.run_until_parked();
+    let raw_buffer = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .dashboard_editor()
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .text()
+        })
+        .expect("read raw dashboard");
+    assert_eq!(raw_buffer, desk_text, "raw mode contains only Desk source");
+    let raw_display = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .dashboard_editor()
+                .update(cx, |editor, cx| editor.display_text(cx))
+        })
+        .expect("read raw display");
+    assert!(raw_display.contains("* One :eng-"), "raw display: {raw_display:?}");
+    let hints = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace.dashboard_editor().read(cx).eol_hints().len()
+        })
+        .expect("read raw hints");
+    assert_eq!(hints, 0, "raw mode has no generated hints");
+
+    cx.simulate_keystrokes(*workspace, "i x escape");
+    cx.run_until_parked();
+    let edited_source = workspace
+        .update(cx, |workspace, _, cx| {
+            let buffer = workspace.desk_buffer_for_test(HostId::default()).unwrap();
+            buffer.read(cx).text()
+        })
+        .expect("read edited Desk source");
+    assert!(
+        edited_source.starts_with("* xOne :eng-"),
+        "raw Desk should be directly editable: {edited_source:?}"
+    );
+
+    cx.simulate_keystrokes(*workspace, "space e");
+    cx.run_until_parked();
+    let composed_display = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .dashboard_editor()
+                .update(cx, |editor, cx| editor.display_text(cx))
+        })
+        .expect("read restored composed display");
+    assert!(composed_display.contains("xOne"));
+    assert!(!composed_display.contains(":eng-"));
 }
 
 /// The preview pane follows the cursor: a staffed heading (or its body)

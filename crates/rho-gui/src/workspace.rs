@@ -4851,6 +4851,15 @@ impl Workspace {
         cx.notify();
     }
 
+    pub(crate) fn cmd_toggle_raw_desk(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dashboard.toggle_raw_mode(cx);
+        self.refresh_dashboard(window, cx);
+    }
+
     pub(crate) fn open_new_agent_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.new_agent_draft.is_none() {
             // A new agent starts where the subject works.

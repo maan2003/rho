@@ -109,6 +109,9 @@ than by running a supervisor, extension protocol, or daemon process graph.
   transient, per-occurrence display state. GUI clients retain one hidden CRDT source buffer per host
   and project shared read-only agent runtime buffers through occurrence-specific
   multibuffer rows, interleaved with writable prose and draft buffers.
+  `space e` switches the Desk to a raw-source projection containing only those
+  editable CRDT buffers, with all generated rows, hints, folds, and conceals
+  removed until the user toggles the composed view back on.
   `rho-gui` supplies its context strip, theme mapping, and focus/show policy,
   while GPUI web owns only the immediate pointer-down routing region.
   The native GUI

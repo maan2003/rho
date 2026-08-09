@@ -66,6 +66,7 @@ type ArchiveEdits = (Vec<(Range<usize>, String)>, usize);
 struct ListingVisibility<'a> {
     collapsed_unfiled: &'a HashSet<HostId>,
     expanded_portals: &'a HashSet<AgentOccurrence>,
+    raw: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -214,6 +215,8 @@ pub struct Dashboard {
     global_cycle: u8,
     /// Hosts whose Unfiled tail is folded behind its header.
     collapsed_unfiled: HashSet<HostId>,
+    /// Shows only literal editable Desk source, with no generated UI.
+    raw_mode: bool,
     /// Portal occurrences whose complete runtime subtree is visible.
     /// This is transient display state and is never written to Desk.
     expanded_portals: HashSet<AgentOccurrence>,
@@ -279,6 +282,7 @@ impl Dashboard {
             collapsed: HashMap::new(),
             global_cycle: 0,
             collapsed_unfiled: HashSet::new(),
+            raw_mode: false,
             expanded_portals: HashSet::new(),
             pending_cursor: None,
             pending_doc_cursor: None,
@@ -537,7 +541,11 @@ impl Dashboard {
 
         let draft_topic = self.new_draft.as_ref().map(|(topic, _, _)| *topic);
         let collapsed = self.collapsed_ranges(&documents, cx);
-        let fold_ranges = self.effective_fold_ranges(&documents, &collapsed, cx);
+        let fold_ranges = if self.raw_mode {
+            Vec::new()
+        } else {
+            self.effective_fold_ranges(&documents, &collapsed, cx)
+        };
         let segments = generate(
             registry,
             &documents,
@@ -546,6 +554,7 @@ impl Dashboard {
             ListingVisibility {
                 collapsed_unfiled: &self.collapsed_unfiled,
                 expanded_portals: &self.expanded_portals,
+                raw: self.raw_mode,
             },
             &self.replies,
             draft_topic,
@@ -553,18 +562,26 @@ impl Dashboard {
         // Staffed headings wear their agents as end-of-line inlays, not
         // rows, so the decoration strings join the fingerprint: attention
         // changes must not vanish into the early-out.
-        let decorations = heading_decorations(
-            registry,
-            &documents,
-            &filed,
-            &self.expanded_portals,
-            &fold_ranges,
-        );
+        let decorations = if self.raw_mode {
+            Vec::new()
+        } else {
+            heading_decorations(
+                registry,
+                &documents,
+                &filed,
+                &self.expanded_portals,
+                &fold_ranges,
+            )
+        };
         let cursor_doc = match &cursor_place {
             Some(CursorPlace::Doc(host, offset)) => Some((*host, *offset)),
             _ => None,
         };
-        let conceals = heading_conceals(&documents, cursor_doc);
+        let conceals = if self.raw_mode {
+            Vec::new()
+        } else {
+            heading_conceals(&documents, cursor_doc)
+        };
 
         // Render reconciles every frame, so most passes are registry
         // noise that changes nothing on screen. When the whole pass —
@@ -1511,6 +1528,13 @@ impl Dashboard {
         }
         cx.notify();
         true
+    }
+
+    /// Switches between the composed Desk and its literal editable
+    /// source. The mode is display-only; no source or fold state is changed.
+    pub fn toggle_raw_mode(&mut self, cx: &mut Context<Workspace>) {
+        self.raw_mode = !self.raw_mode;
+        cx.notify();
     }
 
     /// Org's S-TAB: cycle the whole document through OVERVIEW (only
@@ -2794,7 +2818,18 @@ fn generate(
     let ListingVisibility {
         collapsed_unfiled,
         expanded_portals,
+        raw,
     } = visibility;
+    if raw {
+        return documents
+            .iter()
+            .map(|(host, text)| Segment::Doc {
+                host: *host,
+                range: 0..text.len(),
+                id: 0,
+            })
+            .collect();
+    }
 
     let push_agent_portals =
         |segments: &mut Vec<Segment>,
@@ -3075,6 +3110,7 @@ pub mod bench_support {
             ListingVisibility {
                 collapsed_unfiled: &HashSet::new(),
                 expanded_portals: &HashSet::new(),
+                raw: false,
             },
             &[],
             None,
@@ -3177,6 +3213,7 @@ mod tests {
             ListingVisibility {
                 collapsed_unfiled: &HashSet::new(),
                 expanded_portals: &HashSet::new(),
+                raw: false,
             },
             &[],
             None,
@@ -3201,6 +3238,7 @@ mod tests {
             ListingVisibility {
                 collapsed_unfiled: &HashSet::new(),
                 expanded_portals: &expanded,
+                raw: false,
             },
             &[],
             None,
@@ -3219,6 +3257,7 @@ mod tests {
             ListingVisibility {
                 collapsed_unfiled: &HashSet::new(),
                 expanded_portals: &HashSet::new(),
+                raw: false,
             },
             &[b.agent_id],
             None,
@@ -3264,6 +3303,7 @@ mod tests {
             ListingVisibility {
                 collapsed_unfiled: &HashSet::new(),
                 expanded_portals: &HashSet::new(),
+                raw: false,
             },
             &[],
             None,
@@ -3300,6 +3340,7 @@ mod tests {
             ListingVisibility {
                 collapsed_unfiled: &HashSet::new(),
                 expanded_portals: &expanded,
+                raw: false,
             },
             &[],
             None,
@@ -3326,6 +3367,7 @@ mod tests {
             ListingVisibility {
                 collapsed_unfiled: &HashSet::new(),
                 expanded_portals: &expanded,
+                raw: false,
             },
             &[],
             None,
@@ -3367,6 +3409,7 @@ mod tests {
             ListingVisibility {
                 collapsed_unfiled: &HashSet::new(),
                 expanded_portals: &HashSet::new(),
+                raw: false,
             },
             &[],
             None,
@@ -3402,6 +3445,7 @@ mod tests {
             ListingVisibility {
                 collapsed_unfiled: &HashSet::new(),
                 expanded_portals: &expanded,
+                raw: false,
             },
             &[],
             None,
@@ -3423,6 +3467,7 @@ mod tests {
             ListingVisibility {
                 collapsed_unfiled: &HashSet::new(),
                 expanded_portals: &HashSet::new(),
+                raw: false,
             },
             &[a.agent_id],
             None,
@@ -3617,6 +3662,7 @@ mod tests {
             ListingVisibility {
                 collapsed_unfiled: &HashSet::new(),
                 expanded_portals: &HashSet::new(),
+                raw: false,
             },
             &[],
             Some(Some((host, 0))),
@@ -3644,6 +3690,7 @@ mod tests {
             ListingVisibility {
                 collapsed_unfiled: &HashSet::new(),
                 expanded_portals: &HashSet::new(),
+                raw: false,
             },
             &[],
             None,
@@ -3674,6 +3721,7 @@ mod tests {
             ListingVisibility {
                 collapsed_unfiled: &HashSet::new(),
                 expanded_portals: &expanded,
+                raw: false,
             },
             &[],
             None,
@@ -3708,6 +3756,7 @@ mod tests {
             ListingVisibility {
                 collapsed_unfiled: &collapsed_unfiled,
                 expanded_portals: &HashSet::new(),
+                raw: false,
             },
             &[],
             None,
