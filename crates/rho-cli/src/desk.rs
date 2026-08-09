@@ -83,8 +83,11 @@ async fn checkout(socket_path: &Path, file: &Path, agent: Option<String>) -> Res
     let mut client = connect_or_start_daemon(socket_path).await?;
     let subscribe = match &agent {
         Some(handle) => {
-            // The greeting Ready carries the id domain needed to resolve
-            // the handle into a full agent id.
+            // The daemon classifies a stream by its first client frame and
+            // greets with Ready only after it arrives, so the client must
+            // speak before waiting. Ready then carries the id domain needed
+            // to resolve the handle into a full agent id.
+            client.send(&ClientMessage::Ping).await?;
             let (machine_seed, agent_counter) = loop {
                 match client.recv().await? {
                     ServerMessage::Ready {
