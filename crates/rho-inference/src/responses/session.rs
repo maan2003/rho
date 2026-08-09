@@ -1173,7 +1173,7 @@ mod account_selection_tests {
             turn: Some(Turn {
                 request: InferenceRequest {
                     instructions: std::sync::Arc::from(""),
-                    input: Vec::new().into(),
+                    input: Vec::new(),
                     agent_id_labels: std::collections::BTreeMap::new(),
                     tools: Vec::new().into(),
                 },
