@@ -62,8 +62,11 @@ impl MultiBuffer {
     pub fn location_for_path(&self, path: &PathKey, cx: &App) -> Option<Anchor> {
         let snapshot = self.snapshot(cx);
         let excerpt = snapshot.excerpts_for_path(path).next()?;
-        let path_key_index = snapshot.path_key_index_for_buffer(excerpt.context.start.buffer_id)?;
-        Some(Anchor::in_buffer(path_key_index, excerpt.context.start))
+        let path_key_index = PathKeyIndex(snapshot.path_keys.get_index_of(path)? as u64);
+        Some(Anchor::in_buffer(
+            path_key_index,
+            excerpt.context.start,
+        ))
     }
 
     pub fn set_excerpts_for_buffer(

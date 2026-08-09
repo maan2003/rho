@@ -101,13 +101,14 @@ than by running a supervisor, extension protocol, or daemon process graph.
   silently changes a draft's selected host.
   The Desk is one daemon-owned Zed CRDT text document per attached host. Its
   org-like headings derive structure rather than receiving structural RPCs.
-  Visible `:agent: <handle>` property lines are the binding source of truth;
-  `:project:` properties inherit down the heading tree. The first duplicate
-  agent handle in document order owns the binding. GUI clients retain one hidden
-  CRDT source buffer per host and project generated read-only topic/agent row
-  buffers interleaved with writable prose and draft buffers. Prose edits rebuild
-  the owning heading body through ordinary CRDT text ops while preserving
-  property lines.
+  Visible agent-handle tags at the end of heading lines are the filing source
+  of truth; `:project:` properties inherit down the heading tree. Every
+  resolvable tag occurrence is an independent portal onto the exact named
+  agent, so one agent may appear in several places. Portals show only that
+  agent by default; their complete runtime subtree is transient, per-occurrence
+  expansion state. GUI clients retain one hidden CRDT source buffer per host
+  and project shared read-only agent runtime buffers through occurrence-specific
+  multibuffer rows, interleaved with writable prose and draft buffers.
   `rho-gui` supplies its context strip, theme mapping, and focus/show policy,
   while GPUI web owns only the immediate pointer-down routing region.
   The native GUI

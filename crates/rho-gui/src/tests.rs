@@ -3415,7 +3415,12 @@ fn heading_tags_file_agents_and_conceal_in_display(cx: &mut TestAppContext) {
         .expect("read dashboard");
     assert_eq!(
         buffer_text,
-        format!("{desk_text}\nUnfiled · 1\n  · drifter"),
+        format!(
+            "* One :eng-{}:\n  · planner  eng-{}\nbody\n* Two\n\nUnfiled · 1\n  · drifter  eng-{}",
+            agent(1).encoded(),
+            &agent(1).encoded()[..4],
+            &agent(2).encoded()[..4],
+        ),
         "tagged agent should file under its heading, tag intact in the buffer"
     );
 
@@ -3528,10 +3533,17 @@ fn preview_clears_when_the_cursor_leaves_a_staffed_heading(cx: &mut TestAppConte
                   offset: usize| {
         workspace
             .update(cx, |workspace, window, cx| {
+                let source = workspace.desk_buffer_for_test(HostId::default()).unwrap();
+                let source_anchor = source.read(cx).anchor_after(offset);
                 workspace.dashboard_editor().update(cx, |editor, cx| {
+                    let anchor = editor
+                        .buffer()
+                        .read(cx)
+                        .snapshot(cx)
+                        .anchor_in_excerpt(source_anchor)
+                        .expect("Desk offset is visible");
                     editor.change_selections(Default::default(), window, cx, |selections| {
-                        let offset = editor::MultiBufferOffset(offset);
-                        selections.select_ranges([offset..offset]);
+                        selections.select_anchor_ranges([anchor..anchor]);
                     });
                 });
             })
@@ -4115,12 +4127,16 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
             })
             .expect("read dashboard")
     };
-    // The tagged agent decorates its heading line (as an end-of-line
-    // hint, never extra rows); only untagged agents get rows, under
-    // Unfiled.
+    // The tagged agent keeps its compact heading hint and projects its
+    // addressable runtime row below the heading line.
     assert_eq!(
         dashboard_text(&workspace, cx),
-        format!("{desk_text}\nUnfiled · 1\n  · drifter")
+        format!(
+            "* One :eng-{}:\n  · planner  eng-{}\nbody\n* Two\n\nUnfiled · 1\n  · drifter  eng-{}",
+            agent(1).encoded(),
+            &agent(1).encoded()[..4],
+            &agent(2).encoded()[..4],
+        )
     );
     let hints = workspace
         .update(cx, |workspace, _, cx| {
@@ -4145,7 +4161,11 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(
         dashboard_text(&workspace, cx),
-        "* One\nbody\n* Two\n\nUnfiled · 2\n  · drifter\n  · planner"
+        format!(
+            "* One\nbody\n* Two\n\nUnfiled · 2\n  · drifter  eng-{}\n  · planner  eng-{}",
+            &agent(2).encoded()[..4],
+            &agent(1).encoded()[..4],
+        )
     );
 }
 

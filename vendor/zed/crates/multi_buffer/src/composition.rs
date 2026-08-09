@@ -563,6 +563,52 @@ mod tests {
     }
 
     #[gpui::test]
+    fn test_one_row_buffer_can_be_projected_at_multiple_paths(cx: &mut TestAppContext) {
+        let multibuffer = build(cx);
+        let host = buffer("## A\n## B\n", cx);
+        let row = buffer("runtime", cx);
+        let mut composition = Composition::default();
+        let spec = CompositionSpec {
+            sections: vec![SectionSpec {
+                host,
+                lead: Vec::new(),
+                cuts: vec![CutSpec {
+                    id: 1,
+                    position: 4,
+                    resume: 5,
+                    rows: vec![RowSpec {
+                        id: 100,
+                        buffer: row.clone(),
+                    }],
+                }],
+            }],
+            tail: vec![RowSpec {
+                id: 101,
+                buffer: row,
+            }],
+        };
+        cx.update(|cx| composition.sync(&multibuffer, &spec, cx));
+        assert_eq!(text(&multibuffer, cx).matches("runtime").count(), 2);
+
+        let first_path = composition.path_for_row(100).unwrap();
+        let second_path = composition.path_for_row(101).unwrap();
+        multibuffer.read_with(cx, |multibuffer, cx| {
+            let snapshot = multibuffer.snapshot(cx);
+            let first = multibuffer.location_for_path(&first_path, cx).unwrap();
+            let second = multibuffer.location_for_path(&second_path, cx).unwrap();
+            assert_ne!(first.to_offset(&snapshot), second.to_offset(&snapshot));
+            let crate::Anchor::Excerpt(first) = first else {
+                panic!("row location should be an excerpt anchor")
+            };
+            let crate::Anchor::Excerpt(second) = second else {
+                panic!("row location should be an excerpt anchor")
+            };
+            assert_eq!(snapshot.path_for_anchor(first), &first_path);
+            assert_eq!(snapshot.path_for_anchor(second), &second_path);
+        });
+    }
+
+    #[gpui::test]
     fn test_folded_cut_hides_a_body(cx: &mut TestAppContext) {
         let multibuffer = build(cx);
         let host = buffer("## A\nalpha\n## B\nbeta\n", cx);

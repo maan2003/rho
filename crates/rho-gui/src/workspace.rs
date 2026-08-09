@@ -3003,7 +3003,7 @@ impl Workspace {
             None
         };
         let subject = match row {
-            Some(RowTarget::Agent(agent_id)) => Some(Subject {
+            Some(RowTarget::Agent { agent_id, .. }) => Some(Subject {
                 agent: Some(agent_id),
                 agents: self.registry.agent_subtree(agent_id),
             }),
@@ -3427,9 +3427,11 @@ impl Workspace {
         // A reply draft sits inside its agent's heading region, so it keeps
         // that agent on screen while the reply is typed.
         let agent = match self.dashboard.cursor_target(&self.registry, cx) {
-            Some(RowTarget::Agent(agent_id)) | Some(RowTarget::Reply(agent_id)) => Some(agent_id),
-            // Anywhere in a staffed heading's subtree previews its top
-            // agent — bound agents have no rows of their own to land on.
+            Some(RowTarget::Agent { agent_id, .. }) | Some(RowTarget::Reply(agent_id)) => {
+                Some(agent_id)
+            }
+            // Anywhere else in a staffed heading's subtree previews its top
+            // agent. Portal rows are handled by the arm above.
             Some(RowTarget::Topic {
                 host,
                 offset,
@@ -5129,7 +5131,7 @@ impl Workspace {
     fn dashboard_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use crate::dashboard::RowTarget;
         match self.dashboard.cursor_target(&self.registry, cx) {
-            Some(RowTarget::Agent(agent_id)) => self.open_agent(agent_id, window, cx),
+            Some(RowTarget::Agent { agent_id, .. }) => self.open_agent(agent_id, window, cx),
             // A staffed heading opens its top agent full-frame — loudest
             // first, quiet agents still reachable. Unstaffed headings keep
             // enter as a fold toggle.
@@ -5202,7 +5204,7 @@ impl Workspace {
 
     fn dashboard_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.dashboard.cursor_target(&self.registry, cx) {
-            Some(crate::dashboard::RowTarget::Agent(agent_id))
+            Some(crate::dashboard::RowTarget::Agent { agent_id, .. })
             | Some(crate::dashboard::RowTarget::Reply(agent_id)) => {
                 self.dashboard.open_reply(agent_id, window, cx);
                 self.dashboard_focus_draft(window, cx);
@@ -5445,7 +5447,7 @@ impl Workspace {
         if let Some(brief) = brief {
             text = brief;
         }
-        if let Some(crate::dashboard::RowTarget::Agent(agent_id)) =
+        if let Some(crate::dashboard::RowTarget::Agent { agent_id, .. }) =
             self.dashboard.cursor_target(&self.registry, cx)
             && matches!(
                 self.registry.agent_disposition(agent_id),
@@ -6517,7 +6519,8 @@ impl Render for Workspace {
                 cx.listener(|this, _: &DashboardToggleSubagents, window, cx| {
                     if !this.dashboard_verb_applies(window, cx)
                         && !(this.dashboard.is_focused(window, cx)
-                            && this.dashboard.cursor_on_unfiled_header(cx))
+                            && (this.dashboard.cursor_on_unfiled_header(cx)
+                                || this.dashboard.cursor_on_agent_row(cx)))
                     {
                         cx.propagate();
                         return;
@@ -6786,9 +6789,10 @@ mod tests {
         ));
         assert!(!desk_heading_without_agent(
             true,
-            Some(RowTarget::Agent(
-                AgentId::from_counter(1, &rho_ui_proto::AgentIdDomain(0)).unwrap()
-            ))
+            Some(RowTarget::Agent {
+                agent_id: AgentId::from_counter(1, &rho_ui_proto::AgentIdDomain(0)).unwrap(),
+                topic: None,
+            })
         ));
         assert!(!desk_heading_without_agent(false, Some(RowTarget::None)));
         assert!(!desk_heading_without_agent(true, None));

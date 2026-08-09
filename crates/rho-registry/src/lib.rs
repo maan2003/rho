@@ -323,6 +323,15 @@ impl AgentRegistry {
         result
     }
 
+    /// Direct children in stable summary order. Unlike `agent_subtree`, this
+    /// preserves the runtime hierarchy and includes hidden agents so a full
+    /// tree never silently rewrites its ancestry.
+    pub fn agent_children(&self, agent_id: AgentId) -> &[AgentId] {
+        self.children
+            .get(&agent_id)
+            .map_or(&[][..], Vec::as_slice)
+    }
+
     pub fn agent_id_label(&self, agent_id: AgentId) -> String {
         let host = self.host_of_agent(agent_id);
         let counter = host
