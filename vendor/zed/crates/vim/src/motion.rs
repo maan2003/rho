@@ -2156,7 +2156,11 @@ pub(crate) fn end_of_line(
             Bias::Left,
         )
     } else {
-        map.clip_point(map.next_line_boundary(point.to_point(map)).1, Bias::Left)
+        // Line chrome (concealed tags, collapsed subtrees hanging off
+        // the line) is not line content: end-of-line stops in front of
+        // it, emacs-field style.
+        let target = map.logical_line_end(point.to_point(map));
+        map.clip_point(target.to_display_point(map), Bias::Left)
     }
 }
 

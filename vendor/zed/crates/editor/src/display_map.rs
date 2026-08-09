@@ -2394,9 +2394,15 @@ impl DisplaySnapshot {
     pub fn clip_at_line_end(&self, display_point: DisplayPoint) -> DisplayPoint {
         let mut point = self.display_point_to_point(display_point, Bias::Left);
 
-        if point.column != self.buffer_snapshot().line_len(MultiBufferRow(point.row)) {
+        // The block cursor stops before the logical line end, so line
+        // chrome (concealed tags, collapsed subtrees) never wears it:
+        // a block over invisible columns reads as a cursor on empty
+        // space.
+        let logical_end = self.logical_line_end(point);
+        if point < logical_end {
             return display_point;
         }
+        point = logical_end;
         point.column = point.column.saturating_sub(1);
         point = self.buffer_snapshot().clip_point(point, Bias::Left);
         self.point_to_display_point(point, Bias::Left)
@@ -2432,6 +2438,88 @@ impl DisplaySnapshot {
             moved = true;
         }
         moved.then(|| offset.to_point(buffer_snapshot))
+    }
+
+    /// The position end-of-line commands target: the end of the caret's
+    /// (fold-merged) line, stepped back over trailing chrome. A fold
+    /// ending exactly at the line end whose caret rest forbids resting
+    /// inside ([`CaretRest::Start`]) or only transits its end
+    /// ([`CaretRest::Boundary`]) is chrome hanging off the line — a
+    /// concealed tag, a collapsed subtree — not line content, so "end
+    /// of line" means the position in front of it. Emacs calls this a
+    /// field boundary: `end-of-line` stops at the field edge, not the
+    /// physical newline.
+    pub fn logical_line_end(&self, point: MultiBufferPoint) -> MultiBufferPoint {
+        let buffer_snapshot = self.buffer_snapshot();
+        let (boundary, _) = self.next_line_boundary(point);
+        let mut offset = boundary.to_offset(buffer_snapshot);
+        for _ in 0..8 {
+            let mut stepped = None;
+            for fold in self.folds_in_range(
+                buffer_snapshot.clip_offset(
+                    MultiBufferOffset(offset.0.saturating_sub(1)),
+                    Bias::Left,
+                )..offset,
+            ) {
+                let range = fold.range.start.to_offset(buffer_snapshot)
+                    ..fold.range.end.to_offset(buffer_snapshot);
+                if range.end == offset
+                    && matches!(
+                        fold.placeholder.caret_rest,
+                        CaretRest::Start | CaretRest::Boundary
+                    )
+                {
+                    stepped = Some(range.start);
+                }
+            }
+            let Some(next) = stepped else {
+                break;
+            };
+            offset = next;
+        }
+        offset.to_point(buffer_snapshot)
+    }
+
+    /// Where a block cursor that exactly covers a one-sided concealed
+    /// fold must move: onto the character on the fold's restable side.
+    /// Helix's cursor is a one-column selection rather than a caret, so
+    /// it can occupy a concealed fold that a caret never could.
+    pub fn cursor_selection_rest(
+        &self,
+        range: Range<MultiBufferPoint>,
+    ) -> Option<Range<MultiBufferPoint>> {
+        let buffer_snapshot = self.buffer_snapshot();
+        let range = range.start.to_offset(buffer_snapshot)..range.end.to_offset(buffer_snapshot);
+        for fold in self.folds_in_range(range.clone()) {
+            let fold_range = fold.range.start.to_offset(buffer_snapshot)
+                ..fold.range.end.to_offset(buffer_snapshot);
+            if fold_range != range {
+                continue;
+            }
+            let target = match fold.placeholder.caret_rest {
+                CaretRest::Any | CaretRest::Boundary => continue,
+                CaretRest::Start => {
+                    let before = buffer_snapshot.clip_offset(
+                        MultiBufferOffset(fold_range.start.0.saturating_sub(1)),
+                        Bias::Left,
+                    );
+                    before..fold_range.start
+                }
+                CaretRest::End => {
+                    let after = buffer_snapshot.clip_offset(
+                        MultiBufferOffset((fold_range.end.0 + 1).min(buffer_snapshot.len().0)),
+                        Bias::Right,
+                    );
+                    fold_range.end..after
+                }
+            };
+            if target.start < target.end {
+                return Some(
+                    target.start.to_point(buffer_snapshot)..target.end.to_point(buffer_snapshot),
+                );
+            }
+        }
+        None
     }
 
     fn caret_rest_step(&self, offset: MultiBufferOffset) -> Option<MultiBufferOffset> {

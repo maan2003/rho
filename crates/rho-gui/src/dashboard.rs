@@ -1755,7 +1755,11 @@ impl Dashboard {
             // The placeholder is layout text (collapsed_text) but pixels
             // come from the render element, so the glyphs must be drawn
             // here too. Depth is recoverable from the indicator's indent.
-            let glyph: gpui::SharedString = placeholder_text.clone().into();
+            // An all-space placeholder (the tag conceal) keeps its layout
+            // column — zero-width folds corrupt selection roundtrips —
+            // but draws nothing, so no visible gap invites the eye in.
+            let glyph: Option<gpui::SharedString> = (!placeholder_text.trim().is_empty())
+                .then(|| placeholder_text.clone().into());
             let class = DashClass::for_depth(
                 placeholder_text
                     .chars()
@@ -1769,6 +1773,9 @@ impl Dashboard {
                     render: std::sync::Arc::new(move |_, _, cx| {
                         use gpui::Styled as _;
                         use settings::Settings as _;
+                        let Some(glyph) = glyph.clone() else {
+                            return gpui::Empty.into_any_element();
+                        };
                         let buffer_font = theme_settings::ThemeSettings::get_global(cx)
                             .buffer_font
                             .clone();
@@ -1776,7 +1783,7 @@ impl Dashboard {
                         gpui::div()
                             .font(buffer_font)
                             .text_color(color)
-                            .child(glyph.clone())
+                            .child(glyph)
                             .into_any_element()
                     }),
                     constrain_width: false,
@@ -1833,6 +1840,7 @@ impl Dashboard {
                             .h_full()
                             .flex()
                             .items_center()
+                            .ml(gpui::px(4.))
                             .child(
                                 gpui::svg()
                                     .path("icons/chevron_right.svg")

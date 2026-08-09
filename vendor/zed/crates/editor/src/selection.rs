@@ -149,6 +149,21 @@ impl Editor {
         let (changed, ()) = self.selections.change_with(snapshot, |selections| {
             selections.move_with(&mut |map, selection| {
                 if selection.start != selection.end {
+                    // Helix's cursor is a one-column selection, so it can
+                    // sit *on* a concealed fold — covering it exactly.
+                    // Move it to the fold's restable side. Wider
+                    // selections stay untouched: line-wise and visual
+                    // operations must cover concealed text.
+                    let range = selection.start.to_point(map)..selection.end.to_point(map);
+                    if let Some(target) = map.cursor_selection_rest(range) {
+                        let start = target.start.to_display_point(map);
+                        let end = target.end.to_display_point(map);
+                        if selection.reversed {
+                            selection.set_head_tail(start, end, SelectionGoal::None);
+                        } else {
+                            selection.set_head_tail(end, start, SelectionGoal::None);
+                        }
+                    }
                     return;
                 }
                 let head = selection.head().to_point(map);

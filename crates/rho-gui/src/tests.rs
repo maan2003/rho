@@ -4740,3 +4740,154 @@ fn hjkl_travel_never_opens_a_fold(cx: &mut TestAppContext) {
         );
     }
 }
+
+/// End-of-line commands stop at the logical line end — in front of the
+/// concealed tag and the collapsed subtree — and helix's one-column
+/// cursor can never sit on that chrome either.
+#[gpui::test]
+fn helix_append_on_a_folded_heading_lands_at_the_title(cx: &mut TestAppContext) {
+    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
+    use rho_ui_proto::{
+        AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
+    };
+
+    let summary = UiAgentSummary {
+        agent_id: agent(1),
+        parent_agent: None,
+        display_name: Some("planner".to_owned()),
+        created_at: UnixMs(1),
+        updated_at: UnixMs(1),
+        role: AgentRole::default(),
+        workspace: WorkspaceInfo::UserCheckout { repo: "/tmp".into() },
+        attention: UiAttention::Quiet,
+        last_active: UnixMs(1),
+        hidden: false,
+        disposition: AgentDisposition::Pending,
+        last_user_message_text: String::new(),
+        activity: None,
+        turn_report: None,
+        labels: Vec::new(),
+    };
+
+    let desk_text = format!(
+        "* One :eng-{}:\none body\n** Kid\nkid stuff\n* Two\n",
+        agent(1).encoded()
+    );
+    let mut source = text::Buffer::new(
+        text::ReplicaId::new(8),
+        text::BufferId::new(1).unwrap(),
+        "",
+    );
+    let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text.as_str())]));
+    let desk_snapshot = DeskSnapshot {
+        text: source.snapshot().text(),
+        operations: vec![operation],
+        transactions: Vec::new(),
+        replicas: Vec::new(),
+    };
+
+    let workspace = test_workspace(cx);
+    cx.update(bind_test_keymaps);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Ready {
+                    agents: vec![summary],
+                    iris_agent: None,
+                    projects: Vec::new(),
+                    auth: AuthState {
+                        active: String::new(),
+                        default: String::new(),
+                        namespaces: Vec::new(),
+                    },
+                    machine_seed: 0,
+                    agent_counter: 100,
+                },
+                window,
+                cx,
+            );
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskSnapshot {
+                    snapshot: desk_snapshot,
+                    replica_id: 42,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+            let focus_handle = workspace.dashboard_editor().read(cx).focus_handle(cx);
+            window.focus(&focus_handle, cx);
+            workspace.dashboard_editor().update(cx, |editor, cx| {
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    let offset = editor::MultiBufferOffset(2);
+                    selections.select_ranges([offset..offset]);
+                });
+            });
+        })
+        .expect("update workspace");
+    cx.update(|cx| cx.refresh_windows());
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "escape tab");
+    cx.run_until_parked();
+
+    let cursor = |cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |workspace, _, cx| {
+                workspace.dashboard_editor().update(cx, |editor, cx| {
+                    let snapshot = editor.display_snapshot(cx);
+                    let selection = editor
+                        .selections
+                        .newest::<editor::MultiBufferOffset>(&snapshot);
+                    (selection.start.0, selection.end.0)
+                })
+            })
+            .expect("read cursor")
+    };
+
+    // `$` rests the cursor on the title's last character. `l` steps to
+    // the logical line end — the append position, rendered as a
+    // line-end block — and no further: the concealed tag, the chip,
+    // and the chevron are not cursor positions.
+    cx.simulate_keystrokes(*workspace, "$");
+    cx.run_until_parked();
+    assert_eq!(cursor(cx), (4, 4), "$ rests on the title's last character");
+    cx.simulate_keystrokes(*workspace, "l");
+    cx.run_until_parked();
+    assert_eq!(cursor(cx), (5, 5), "l stops at the logical line end");
+    cx.simulate_keystrokes(*workspace, "l");
+    cx.run_until_parked();
+    assert_eq!(cursor(cx), (5, 5), "the cursor never enters line chrome");
+
+    // Append lands ahead of the tag, and the subtree stays folded.
+    cx.simulate_keystrokes(*workspace, "shift-a");
+    cx.simulate_keystrokes(*workspace, "space m o r e");
+    cx.run_until_parked();
+    let text = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .dashboard_editor()
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .text()
+        })
+        .expect("read dashboard");
+    assert!(
+        text.starts_with("* One more :eng-"),
+        "append must stay ahead of the tag: {text:?}"
+    );
+    let display = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .dashboard_editor()
+                .update(cx, |editor, cx| editor.display_text(cx))
+        })
+        .expect("read display text");
+    assert!(
+        !display.contains("one body") && !display.contains("kid stuff"),
+        "the subtree stays folded through the append: {display:?}"
+    );
+}

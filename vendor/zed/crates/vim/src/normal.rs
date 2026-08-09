@@ -860,7 +860,14 @@ impl Vim {
                         } else {
                             selection.end
                         };
-                        let insert_point = motion::end_of_line(map, false, current_line, 1);
+                        // The physical end, not the logical one: the
+                        // caret must sit exactly where the newline is
+                        // inserted (past any line chrome) so the edit
+                        // carries it onto the new line.
+                        let insert_point = map.clip_point(
+                            map.next_line_boundary(current_line.to_point(map)).1,
+                            Bias::Left,
+                        );
                         selection.collapse_to(insert_point, SelectionGoal::None)
                     });
                 });
