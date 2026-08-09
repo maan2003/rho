@@ -3,12 +3,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::Context as _;
 use rho_agent::multi_agent_tools;
 use rho_ui_proto::{
-    AgentId, AgentIdDomain, ClientMessage, McpAgentToolRequest, McpSpawnWorkdir, ServerMessage,
+    AgentId, ClientMessage, McpAgentToolRequest, McpSpawnWorkdir, ServerMessage,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::{McpAgentToolsArgs, connect_or_start_daemon};
+use crate::{McpAgentToolsArgs, connect_or_start_daemon, resolve_agent_id};
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -119,21 +119,6 @@ async fn handle_request(
             }
         }
         _ => anyhow::bail!("unsupported MCP method: {}", message.method),
-    }
-}
-
-fn resolve_agent_id(text: &str, machine_seed: u64, agent_counter: u64) -> anyhow::Result<AgentId> {
-    let (_, raw) = text
-        .trim()
-        .split_once('-')
-        .ok_or_else(|| anyhow::anyhow!("invalid role-prefixed agent id"))?;
-    let domain = AgentIdDomain(machine_seed);
-    match AgentId::from_prefix(raw, agent_counter + 1, &domain)? {
-        prefix_id::PrefixResolution::Unique(agent_id)
-        | prefix_id::PrefixResolution::Ambiguous {
-            first: agent_id, ..
-        } => Ok(agent_id),
-        prefix_id::PrefixResolution::NotFound => anyhow::bail!("no agent with id {text}"),
     }
 }
 

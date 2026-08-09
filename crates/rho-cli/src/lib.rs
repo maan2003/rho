@@ -14,6 +14,7 @@ use rho_daemon::{DaemonArgs, default_socket_path};
 use rho_inference::{AuthArgs, run_auth_cli};
 use rho_ui_proto::client::Client as UiClient;
 
+mod desk;
 mod land;
 mod mcp_agent_tools;
 mod pr;
@@ -63,6 +64,7 @@ async fn run(command: Command) -> Result<()> {
             rho_daemon::debug::run(args).await?;
             Ok(())
         }
+        Command::Desk(args) => desk::run(args).await,
         Command::Iroh(args) => run_iroh(args).await,
         Command::Land(args) => land::run(args).await,
         Command::McpAgentTools(args) => mcp_agent_tools::run(args).await,
@@ -113,6 +115,25 @@ async fn run_iroh(args: IrohArgs) -> Result<()> {
     }
 }
 
+/// Resolves an agent handle — role-prefixed (`eng-j2qk`) or a raw encoded id
+/// as found in `$RHO_AGENT_ID` — against the daemon's id domain.
+pub(crate) fn resolve_agent_id(
+    text: &str,
+    machine_seed: u64,
+    agent_counter: u64,
+) -> Result<rho_ui_proto::AgentId> {
+    let text = text.trim();
+    let raw = text.split_once('-').map_or(text, |(_, raw)| raw);
+    let domain = rho_ui_proto::AgentIdDomain(machine_seed);
+    match rho_ui_proto::AgentId::from_prefix(raw, agent_counter + 1, &domain)? {
+        prefix_id::PrefixResolution::Unique(agent_id)
+        | prefix_id::PrefixResolution::Ambiguous {
+            first: agent_id, ..
+        } => Ok(agent_id),
+        prefix_id::PrefixResolution::NotFound => anyhow::bail!("no agent with id {text}"),
+    }
+}
+
 pub(crate) async fn connect_or_start_daemon(socket_path: &std::path::Path) -> Result<UiClient> {
     if let Ok(client) = UiClient::connect(socket_path).await {
         return Ok(client);
@@ -149,6 +170,7 @@ enum Command {
     Auth(AuthArgs),
     Daemon(DaemonArgs),
     Debug(DebugArgs),
+    Desk(desk::DeskArgs),
     Iroh(IrohArgs),
     Land(LandArgs),
     McpAgentTools(McpAgentToolsArgs),
@@ -173,6 +195,8 @@ enum CliCommand {
     },
     Daemon(DaemonArgs),
     Debug(DebugArgs),
+    /// Read and edit the Desk document through checkout/apply files.
+    Desk(desk::DeskArgs),
     Iroh(IrohArgs),
     Land(LandArgs),
     McpAgentTools(McpAgentToolsArgs),
@@ -302,6 +326,7 @@ impl Args {
             CliCommand::Auth { command } => Command::Auth(command),
             CliCommand::Daemon(args) => Command::Daemon(args),
             CliCommand::Debug(args) => Command::Debug(args),
+            CliCommand::Desk(args) => Command::Desk(args),
             CliCommand::Iroh(args) => Command::Iroh(args),
             CliCommand::Land(args) => Command::Land(args),
             CliCommand::McpAgentTools(args) => Command::McpAgentTools(args),

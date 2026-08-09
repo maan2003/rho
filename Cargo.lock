@@ -13625,9 +13625,11 @@ name = "rho-cli"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "camino",
  "clap",
  "dirs",
+ "imara-diff",
  "jj-cli",
  "libc",
  "prefix-id",
@@ -13638,8 +13640,10 @@ dependencies = [
  "rho-ui-proto",
  "rho-visualizations",
  "rho-workspaces",
+ "senax-encoder",
  "serde",
  "serde_json",
+ "text",
  "tokio",
  "tracing",
  "zip 2.4.2",

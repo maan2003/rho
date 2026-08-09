@@ -2270,7 +2270,37 @@ async fn handle_message(
         ClientMessage::DeskSubscribe => {
             let replica_id = agents
                 .desk
-                .allocate_user_replica()
+                .allocate_replica(rho_ui_proto::desk::DeskReplicaAuthor::User)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            let _ = outgoing_tx.send(ServerMessage::DeskSnapshot {
+                snapshot: agents.desk.snapshot(),
+                replica_id,
+            });
+            Ok(Refresh::None)
+        }
+        ClientMessage::DeskGet => {
+            let text = agents
+                .desk
+                .snapshot()
+                .document_text()
+                .map_err(anyhow::Error::msg)?;
+            let _ = outgoing_tx.send(ServerMessage::DeskDocument { text });
+            Ok(Refresh::None)
+        }
+        ClientMessage::DeskSubscribeAgent { agent_id } => {
+            if !agents
+                .db
+                .read()
+                .list_agents()
+                .into_iter()
+                .any(|(id, _)| id == agent_id)
+            {
+                anyhow::bail!("Desk subscribe references an unknown agent");
+            }
+            let replica_id = agents
+                .desk
+                .allocate_replica(rho_ui_proto::desk::DeskReplicaAuthor::Agent(agent_id))
                 .await
                 .map_err(anyhow::Error::msg)?;
             let _ = outgoing_tx.send(ServerMessage::DeskSnapshot {

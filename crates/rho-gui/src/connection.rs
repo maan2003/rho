@@ -978,6 +978,8 @@ async fn run(
                 replica_id,
             }),
             ServerMessage::DeskTextApplied { record } => Some(ConnEvent::DeskTextApplied(record)),
+            // A `DeskGet` reply; the GUI subscribes and never sends one.
+            ServerMessage::DeskDocument { .. } => None,
             ServerMessage::Ready {
                 agents,
                 iris_agent,

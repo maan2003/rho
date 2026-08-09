@@ -131,17 +131,14 @@ impl DeskStore {
         snapshot
     }
 
-    pub async fn allocate_user_replica(&self) -> Result<u16, String> {
+    pub async fn allocate_replica(&self, author: DeskReplicaAuthor) -> Result<u16, String> {
         let mut write = self.db.write().await;
         let mut state = load_state(&mut write);
         let replica_id = state.next_replica_id;
         state.next_replica_id = replica_id
             .checked_add(1)
             .ok_or_else(|| "Desk replica id space exhausted".to_owned())?;
-        state.snapshot.replicas.push(DeskReplica {
-            replica_id,
-            author: DeskReplicaAuthor::User,
-        });
+        state.snapshot.replicas.push(DeskReplica { replica_id, author });
         save_state(&mut write, &state);
         write.commit();
         Ok(replica_id)
@@ -152,8 +149,8 @@ impl DeskStore {
         operation: DeskOperation,
         transaction: Option<DeskTransaction>,
     ) -> Result<DeskTextOpRecord, String> {
-        if !self.is_user_replica(operation.replica_id()) {
-            return Err("Desk text operation has an unassigned user replica id".to_owned());
+        if !self.is_client_replica(operation.replica_id()) {
+            return Err("Desk text operation has an unassigned replica id".to_owned());
         }
         if let Some(transaction) = &transaction
             && (transaction.id.replica_id != operation.replica_id()
@@ -207,7 +204,7 @@ impl DeskStore {
         Ok(record)
     }
 
-    fn is_user_replica(&self, replica_id: u16) -> bool {
+    fn is_client_replica(&self, replica_id: u16) -> bool {
         self.db
             .read()
             .open_table(STATE)
@@ -220,7 +217,10 @@ impl DeskStore {
             .iter()
             .any(|replica| {
                 replica.replica_id == replica_id
-                    && matches!(replica.author, DeskReplicaAuthor::User)
+                    && matches!(
+                        replica.author,
+                        DeskReplicaAuthor::User | DeskReplicaAuthor::Agent(_)
+                    )
             })
     }
 }
@@ -812,12 +812,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn agent_replicas_write_and_unassigned_replicas_are_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = RhoDb::open(directory.path().join("desk.redb"));
+        init_agent_tables(&db).await;
+        let store = DeskStore::new(db.clone()).await;
+        let replica = store
+            .allocate_replica(DeskReplicaAuthor::Agent(agent(3)))
+            .await
+            .unwrap();
+        let mut buffer =
+            text::Buffer::new(ReplicaId::new(replica), text::BufferId::new(1).unwrap(), "");
+        let edit = buffer.edit([(0..0, "* migrated :eng-old:\n")]);
+        store
+            .apply_text(DeskOperation::from_text(&edit), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            store.snapshot().document_text().unwrap(),
+            "* migrated :eng-old:\n"
+        );
+
+        let mut stranger = text::Buffer::new(
+            ReplicaId::new(replica + 1),
+            text::BufferId::new(1).unwrap(),
+            "",
+        );
+        let edit = stranger.edit([(0..0, "intruder\n")]);
+        let error = store
+            .apply_text(DeskOperation::from_text(&edit), None)
+            .await
+            .unwrap_err();
+        assert!(error.contains("unassigned"), "{error}");
+    }
+
+    #[tokio::test]
     async fn retagging_moves_the_heading_tag_and_unfiles_by_edit() {
         let directory = tempfile::tempdir().unwrap();
         let db = RhoDb::open(directory.path().join("desk.redb"));
         init_agent_tables(&db).await;
         let store = DeskStore::new(db.clone()).await;
-        let replica = store.allocate_user_replica().await.unwrap();
+        let replica = store.allocate_replica(DeskReplicaAuthor::User).await.unwrap();
         let mut buffer =
             text::Buffer::new(ReplicaId::new(replica), text::BufferId::new(1).unwrap(), "");
         let edit = buffer.edit([(0..0, "* one\n* two\n")]);
@@ -941,7 +976,7 @@ mod tests {
         let db = RhoDb::open(directory.path().join("desk.redb"));
         init_agent_tables(&db).await;
         let store = DeskStore::new(db.clone()).await;
-        let replica = store.allocate_user_replica().await.unwrap();
+        let replica = store.allocate_replica(DeskReplicaAuthor::User).await.unwrap();
         let mut buffer =
             text::Buffer::new(ReplicaId::new(replica), text::BufferId::new(1).unwrap(), "");
         let edit = buffer.edit([(0..0, "* TODO plan\n:agent: eng-test\nnotes\n")]);

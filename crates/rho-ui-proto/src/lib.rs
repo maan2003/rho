@@ -53,6 +53,13 @@ pub enum ClientMessage {
     Subscribe,
     /// Subscribes to the daemon-owned Desk snapshot and live operation stream.
     DeskSubscribe,
+    /// Fetches the current Desk document text without allocating a replica.
+    DeskGet,
+    /// Subscribes like `DeskSubscribe`, but attributes the allocated replica
+    /// to an agent, so its edits are distinguishable in the CRDT history.
+    DeskSubscribeAgent {
+        agent_id: AgentId,
+    },
     /// Appends an ordinary Zed text-buffer operation. The operation's
     /// replica id must match the id assigned by `DeskSnapshot`.
     DeskTextApply {
@@ -504,6 +511,10 @@ pub enum ServerMessage {
     },
     DeskTextApplied {
         record: desk::DeskTextOpRecord,
+    },
+    /// Reply to `DeskGet`: the materialized document, without a subscription.
+    DeskDocument {
+        text: String,
     },
     Ready {
         agents: Vec<UiAgentSummary>,

@@ -8,9 +8,11 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+bytes.workspace = true
 camino.workspace = true
 clap.workspace = true
 dirs.workspace = true
+imara-diff.workspace = true
 jj-cli.workspace = true
 libc.workspace = true
 prefix-id.workspace = true
@@ -21,8 +23,10 @@ rho-inference.workspace = true
 rho-ui-proto.workspace = true
 rho-visualizations.workspace = true
 rho-workspaces.workspace = true
+senax-encoder.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+text.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 zip.workspace = true
