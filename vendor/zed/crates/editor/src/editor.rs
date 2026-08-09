@@ -1015,6 +1015,9 @@ struct ActionFetchReady {
     actions: Rc<[AvailableCodeAction]>,
 }
 
+/// Renders one end-of-line hint. See [`Editor::set_eol_hints`].
+pub type EolHintRenderer = Arc<dyn Fn(&mut Window, &mut App) -> AnyElement + Send + Sync>;
+
 /// Zed's primary implementation of text input, allowing users to edit a [`MultiBuffer`].
 ///
 /// See the [module level documentation](self) for more information.
@@ -1210,6 +1213,11 @@ pub struct Editor {
     git_blame_inline_enabled: bool,
     buffer_serialization: Option<BufferSerialization>,
     show_selection_menu: Option<bool>,
+    /// Line-end annotations painted after each anchored line's content,
+    /// outside text flow: they occupy no display columns, so carets,
+    /// motions, and goal columns never interact with them (neovim's
+    /// eol virtual text).
+    eol_hints: Vec<(Anchor, EolHintRenderer)>,
     #[cfg(feature = "native")]
     blame: Option<Entity<GitBlame>>,
     blame_subscription: Option<Subscription>,
@@ -2642,6 +2650,7 @@ impl Editor {
             blame: None,
             blame_subscription: None,
             pending_blame_hover_observation: None,
+            eol_hints: Vec::new(),
 
             #[cfg(feature = "native")]
             bookmark_store,

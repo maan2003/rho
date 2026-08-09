@@ -3431,9 +3431,17 @@ fn heading_tags_file_agents_and_conceal_in_display(cx: &mut TestAppContext) {
         "raw tag should be concealed: {display:?}"
     );
     assert!(
-        display.contains("◉ One  · eng-"),
-        "decoration should abut the title where the tag hid: {display:?}"
+        display.contains("◉ One"),
+        "the bullet and title stay visible: {display:?}"
     );
+    // The chip is an end-of-line hint: painted after the line, outside
+    // text flow, so it never appears in display text.
+    let hints = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace.dashboard_editor().read(cx).eol_hints().len()
+        })
+        .expect("read hints");
+    assert_eq!(hints, 1, "the staffed heading wears its chip as a hint");
 }
 
 /// The preview pane follows the cursor: a staffed heading (or its body)
@@ -4107,23 +4115,19 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
             })
             .expect("read dashboard")
     };
-    // The tagged agent decorates its heading line (as an inlay, never
-    // extra rows); only untagged agents get rows, under Unfiled.
+    // The tagged agent decorates its heading line (as an end-of-line
+    // hint, never extra rows); only untagged agents get rows, under
+    // Unfiled.
     assert_eq!(
         dashboard_text(&workspace, cx),
         format!("{desk_text}\nUnfiled · 1\n  · drifter")
     );
-    let display = workspace
+    let hints = workspace
         .update(cx, |workspace, _, cx| {
-            workspace
-                .dashboard_editor()
-                .update(cx, |editor, cx| editor.display_text(cx))
+            workspace.dashboard_editor().read(cx).eol_hints().len()
         })
-        .expect("read display text");
-    assert!(
-        display.contains("◉ One  · eng-"),
-        "heading decoration missing: {display:?}"
-    );
+        .expect("read hints");
+    assert_eq!(hints, 1, "the staffed heading wears its chip as a hint");
 
     // Deleting the tag from the text is the unbind: rows rearrange and
     // both agents fall back to Unfiled.

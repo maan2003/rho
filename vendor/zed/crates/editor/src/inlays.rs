@@ -168,6 +168,19 @@ impl InlineValueCache {
 }
 
 impl Editor {
+    /// Replaces the editor's end-of-line hints: annotations painted
+    /// after each anchored line's content, outside text flow. Unlike
+    /// inlays they occupy no display columns, so carets, motions, and
+    /// goal columns never interact with them.
+    pub fn set_eol_hints(&mut self, hints: Vec<(Anchor, crate::EolHintRenderer)>, cx: &mut Context<Self>) {
+        self.eol_hints = hints;
+        cx.notify();
+    }
+
+    pub fn eol_hints(&self) -> &[(Anchor, crate::EolHintRenderer)] {
+        &self.eol_hints
+    }
+
     /// Modify which hints are displayed in the editor.
     pub fn splice_inlays(
         &mut self,

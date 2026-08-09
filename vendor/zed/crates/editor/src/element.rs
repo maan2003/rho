@@ -2094,6 +2094,52 @@ impl EditorElement {
 
     #[cfg(feature = "native")]
 
+    /// Lays out end-of-line hints for every visible row that carries
+    /// one: pure paint after the line's content, no display-space
+    /// footprint (see [`Editor::set_eol_hints`]).
+    fn layout_eol_hints(
+        &self,
+        snapshot: &EditorSnapshot,
+        line_layouts: &[LineWithInvisibles],
+        start_row: DisplayRow,
+        end_row: DisplayRow,
+        em_width: Pixels,
+        content_origin: gpui::Point<Pixels>,
+        scroll_position: gpui::Point<ScrollOffset>,
+        scroll_pixel_position: gpui::Point<ScrollPixelOffset>,
+        line_height: Pixels,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Vec<AnyElement> {
+        let hints = self.editor.read(cx).eol_hints().to_vec();
+        let mut elements = Vec::new();
+        for (anchor, renderer) in hints {
+            let display_point = anchor.to_display_point(&snapshot.display_snapshot);
+            let row = display_point.row();
+            if row < start_row || row >= end_row {
+                continue;
+            }
+            let Some(line_layout) = line_layouts.get(row.minus(start_row) as usize) else {
+                continue;
+            };
+            let start_x = Pixels::from(
+                ScrollPixelOffset::from(content_origin.x + line_layout.width)
+                    - scroll_pixel_position.x,
+            ) + em_width;
+            let start_y =
+                content_origin.y + line_height * ((row.as_f64() - scroll_position.y) as f32);
+            let mut element = renderer(window, cx);
+            element.prepaint_as_root(
+                point(start_x, start_y),
+                AvailableSpace::min_size(),
+                window,
+                cx,
+            );
+            elements.push(element);
+        }
+        elements
+    }
+
     fn layout_inline_blame(
         &self,
         display_row: DisplayRow,
@@ -5841,6 +5887,7 @@ impl EditorElement {
                 self.paint_redactions(layout, window);
                 self.paint_navigation_overlays(layout, window, cx);
                 self.paint_cursors(layout, window, cx);
+                self.paint_eol_hints(layout, window, cx);
                 #[cfg(feature = "native")]
                 self.paint_inline_diagnostics(layout, window, cx);
                 #[cfg(feature = "native")]
@@ -6574,6 +6621,18 @@ impl EditorElement {
     }
 
     #[cfg(feature = "native")]
+
+    fn paint_eol_hints(&mut self, layout: &mut EditorLayout, window: &mut Window, cx: &mut App) {
+        let elements = std::mem::take(&mut layout.eol_hint_layouts);
+        if elements.is_empty() {
+            return;
+        }
+        window.paint_layer(layout.position_map.text_hitbox.bounds, |window| {
+            for mut element in elements {
+                element.paint(window, cx);
+            }
+        })
+    }
 
     fn paint_inline_blame(&mut self, layout: &mut EditorLayout, window: &mut Window, cx: &mut App) {
         if let Some(mut blame_layout) = layout.inline_blame_layout.take() {
@@ -9309,6 +9368,20 @@ impl Element for EditorElement {
                         cx,
                     );
 
+                    let eol_hint_layouts = self.layout_eol_hints(
+                        &snapshot,
+                        &line_layouts,
+                        start_row,
+                        end_row,
+                        em_width,
+                        content_origin,
+                        scroll_position,
+                        scroll_pixel_position,
+                        line_height,
+                        window,
+                        cx,
+                    );
+
                     #[cfg(feature = "native")]
                     let mut inline_blame_layout = None;
                     #[cfg(feature = "native")]
@@ -9871,6 +9944,7 @@ impl Element for EditorElement {
                         inline_diagnostics,
                         #[cfg(feature = "native")]
                         inline_blame_layout,
+                        eol_hint_layouts,
                         #[cfg(feature = "native")]
                         inline_code_actions,
                         #[cfg(feature = "native")]
@@ -10110,6 +10184,7 @@ pub struct EditorLayout {
     inline_diagnostics: HashMap<DisplayRow, AnyElement>,
     #[cfg(feature = "native")]
     inline_blame_layout: Option<InlineBlameLayout>,
+    eol_hint_layouts: Vec<AnyElement>,
     #[cfg(feature = "native")]
     inline_code_actions: Option<AnyElement>,
     #[cfg(feature = "native")]

@@ -48,7 +48,6 @@ const PLACEHOLDER_TITLE: &str = "…";
 const ARCHIVE_TAG: &str = "archive";
 
 /// Inlay id space for heading decorations, clear of the placeholders.
-const HEADING_INLAY_ID_BASE: usize = 2_000_000;
 
 /// Highlight key for draft text (the user-message accent), past the
 /// class and lamp key ranges.
@@ -197,9 +196,6 @@ pub struct Dashboard {
     pending_doc_cursor: Option<(HostId, usize)>,
     /// Reply placeholder inlays currently spliced in.
     placeholder_ids: Vec<InlayId>,
-    /// Heading decoration inlays (glyph, eng-id, attention reason)
-    /// currently spliced in.
-    heading_inlay_ids: Vec<InlayId>,
     /// The previous pass's inputs and output, so a sync whose world is
     /// unchanged returns without touching the editor.
     last_synced: Option<SyncSnapshot>,
@@ -257,7 +253,6 @@ impl Dashboard {
             pending_cursor: None,
             pending_doc_cursor: None,
             placeholder_ids: Vec::new(),
-            heading_inlay_ids: Vec::new(),
             last_synced: None,
             headers_disabled: std::collections::HashSet::new(),
         }
@@ -763,7 +758,7 @@ impl Dashboard {
 
         self.apply_highlights(&segments, &documents, cx);
         self.apply_reply_chrome(registry, cx);
-        self.apply_heading_chrome(&decorations, cx);
+        self.apply_heading_chrome(&decorations, &fold_ranges, cx);
         self.apply_tag_conceals(&conceals, cx);
         self.apply_subtree_folds(&fold_ranges, cx);
         self.nudge_caret_off_folds(window, cx);
@@ -1824,32 +1819,14 @@ impl Dashboard {
             ) else {
                 continue;
             };
-            // The fold sits at the end of the heading line, so its
-            // placeholder is the folded indicator: a right chevron.
+            // The folded indicator is an end-of-line hint, not the
+            // placeholder: the placeholder keeps its layout columns
+            // (zero-width folds corrupt selection roundtrips) but
+            // draws nothing the cursor could appear to sit on.
             creases.push(editor::display_map::Crease::simple(
                 start..end,
                 editor::FoldPlaceholder {
-                    render: std::sync::Arc::new(|_, _, cx| {
-                        use gpui::Styled as _;
-                        use settings::Settings as _;
-                        use theme::ActiveTheme as _;
-                        let size = theme_settings::ThemeSettings::get_global(cx)
-                            .buffer_font_size(cx);
-                        let color = cx.theme().colors().text_muted;
-                        gpui::div()
-                            .h_full()
-                            .flex()
-                            .items_center()
-                            .ml(gpui::px(4.))
-                            .child(
-                                gpui::svg()
-                                    .path("icons/chevron_right.svg")
-                                    .w(size)
-                                    .h(size)
-                                    .text_color(color),
-                            )
-                            .into_any_element()
-                    }),
+                    render: std::sync::Arc::new(|_, _, _| gpui::Empty.into_any_element()),
                     constrain_width: false,
                     merge_adjacent: false,
                     type_tag: Some(type_id),
@@ -1868,34 +1845,73 @@ impl Dashboard {
         });
     }
 
+    /// Heading chrome — the agent chip and the folded chevron — paints
+    /// as end-of-line hints: annotations outside text flow, with no
+    /// display columns for carets, motions, or goal columns to land on.
     fn apply_heading_chrome(
         &mut self,
         decorations: &[(HostId, usize, String)],
+        fold_ranges: &[(HostId, Range<usize>)],
         cx: &mut Context<Workspace>,
     ) {
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
-        let to_remove = std::mem::take(&mut self.heading_inlay_ids);
-        let mut inlays = Vec::new();
-        for (index, (host, offset, text)) in decorations.iter().enumerate() {
-            let Some(buffer) = self.hosts.get(host).and_then(|weak| weak.upgrade()) else {
+        // One hint per line: the chip text (if any agents are bound)
+        // and the chevron (if a fold hangs off the line).
+        let mut lines: Vec<((HostId, usize), (String, bool))> = Vec::new();
+        for (host, offset, text) in decorations {
+            lines.push(((*host, *offset), (text.trim_start().to_owned(), false)));
+        }
+        for (host, range) in fold_ranges {
+            match lines.iter_mut().find(|(key, _)| *key == (*host, range.start)) {
+                Some((_, (_, folded))) => *folded = true,
+                None => lines.push(((*host, range.start), (String::new(), true))),
+            }
+        }
+        let mut hints: Vec<(editor::Anchor, editor::EolHintRenderer)> = Vec::new();
+        for ((host, offset), (text, folded)) in lines {
+            let Some(buffer) = self.hosts.get(&host).and_then(|weak| weak.upgrade()) else {
                 continue;
             };
             let buffer_snapshot = buffer.read(cx).snapshot();
-            // Left-biased: a fold starting at this same offset (the tag
-            // conceal or a collapsed subtree) begins *after* left-biased
-            // inlays, so the decoration stays visible ahead of the `…`.
-            // Edits re-anchor it on the same pass, so bias never shows.
             let Some(position) =
-                snapshot.anchor_in_excerpt(buffer_snapshot.anchor_before(*offset))
+                snapshot.anchor_in_excerpt(buffer_snapshot.anchor_before(offset))
             else {
                 continue;
             };
-            let inlay = Inlay::custom(HEADING_INLAY_ID_BASE + index, position, text.clone());
-            self.heading_inlay_ids.push(inlay.id);
-            inlays.push(inlay);
+            let text: gpui::SharedString = text.into();
+            let renderer: editor::EolHintRenderer = std::sync::Arc::new(move |_, cx| {
+                use gpui::Styled as _;
+                use settings::Settings as _;
+                use theme::ActiveTheme as _;
+                let settings = theme_settings::ThemeSettings::get_global(cx);
+                let font = settings.buffer_font.clone();
+                let size = settings.buffer_font_size(cx);
+                let color = cx.theme().colors().text_muted;
+                let mut row = gpui::div()
+                    .flex()
+                    .items_center()
+                    .gap(gpui::px(6.))
+                    .font(font)
+                    .text_size(size)
+                    .text_color(color);
+                if !text.is_empty() {
+                    row = row.child(text.clone());
+                }
+                if folded {
+                    row = row.child(
+                        gpui::svg()
+                            .path("icons/chevron_right.svg")
+                            .w(size)
+                            .h(size)
+                            .text_color(color),
+                    );
+                }
+                row.into_any_element()
+            });
+            hints.push((position, renderer));
         }
         self.editor.update(cx, |editor, cx| {
-            editor.splice_inlays(&to_remove, inlays, cx);
+            editor.set_eol_hints(hints, cx);
         });
     }
 }
