@@ -1726,10 +1726,33 @@ impl Dashboard {
             ) else {
                 continue;
             };
+            // The placeholder is layout text (collapsed_text) but pixels
+            // come from the render element, so the glyphs must be drawn
+            // here too. Depth is recoverable from the indicator's indent.
+            let glyph: gpui::SharedString = placeholder_text.clone().into();
+            let class = DashClass::for_depth(
+                placeholder_text
+                    .chars()
+                    .take_while(|character| *character == ' ')
+                    .count()
+                    + 1,
+            );
             creases.push(editor::display_map::Crease::simple(
                 start..end,
                 editor::FoldPlaceholder {
-                    render: std::sync::Arc::new(|_, _, _| gpui::Empty.into_any_element()),
+                    render: std::sync::Arc::new(move |_, _, cx| {
+                        use gpui::Styled as _;
+                        use settings::Settings as _;
+                        let buffer_font = theme_settings::ThemeSettings::get_global(cx)
+                            .buffer_font
+                            .clone();
+                        let color = class.style(cx).color.unwrap_or_default();
+                        gpui::div()
+                            .font(buffer_font)
+                            .text_color(color)
+                            .child(glyph.clone())
+                            .into_any_element()
+                    }),
                     constrain_width: false,
                     merge_adjacent: false,
                     type_tag: Some(type_id),
