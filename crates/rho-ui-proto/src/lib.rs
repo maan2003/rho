@@ -875,6 +875,7 @@ pub struct UiProject {
 pub struct AuthState {
     pub namespaces: Vec<String>,
     pub disabled_namespaces: Vec<String>,
+    pub active_namespace: Option<String>,
 }
 
 /// Encode and write one length-prefixed senax frame.
@@ -1172,6 +1173,7 @@ mod tests {
             auth: AuthState {
                 namespaces: vec!["default".to_owned(), "work".to_owned()],
                 disabled_namespaces: vec!["work".to_owned()],
+                active_namespace: Some("default".to_owned()),
             },
         };
         let bytes = senax_encoder::pack(&message).unwrap();

@@ -1126,6 +1126,7 @@ impl AgentRegistry {
         AuthState {
             namespaces: state.namespaces,
             disabled_namespaces: state.disabled_namespaces,
+            active_namespace: state.active_namespace,
         }
     }
 

@@ -1143,6 +1143,17 @@ impl Workspace {
                 if let Some(entry) = self.hosts.get_mut(host) {
                     entry.auth = Some(auth);
                 }
+                if self
+                    .transient
+                    .as_ref()
+                    .is_some_and(|transient| transient.title() == "rate limit")
+                {
+                    self.transient = Some(crate::transient::usage_menu(
+                        self.merged_quota_history(),
+                        self.active_quota_namespaces(),
+                        self.quota_history_days,
+                    ));
+                }
                 cx.notify();
             }
             ConnEvent::AgentCreated { agent_id } => {
@@ -1261,6 +1272,7 @@ impl Workspace {
                 {
                     self.transient = Some(crate::transient::usage_menu(
                         self.merged_quota_history(),
+                        self.active_quota_namespaces(),
                         self.quota_history_days,
                     ));
                 }
@@ -1502,6 +1514,21 @@ impl Workspace {
         }
         merged.sort_by(|a, b| (&a.model, &a.auth_namespace).cmp(&(&b.model, &b.auth_namespace)));
         merged
+    }
+
+    fn active_quota_namespaces(&self) -> Vec<String> {
+        let qualify = self.hosts.len() > 1;
+        self.hosts
+            .iter()
+            .filter_map(|host| {
+                let namespace = host.auth.as_ref()?.active_namespace.as_ref()?;
+                Some(if qualify {
+                    format!("{}/{}", host.name, namespace)
+                } else {
+                    namespace.clone()
+                })
+            })
+            .collect()
     }
 
     /// Spend and token usage sum across hosts: unlike quota headroom, cost
@@ -4876,7 +4903,11 @@ impl Workspace {
         self.quota_history_days = days;
         self.hosts.broadcast(|| ClientMessage::QuotaHistory);
         let history = self.merged_quota_history();
-        self.open_transient(crate::transient::usage_menu(history, days), window, cx);
+        self.open_transient(
+            crate::transient::usage_menu(history, self.active_quota_namespaces(), days),
+            window,
+            cx,
+        );
     }
 
     pub(crate) fn open_global_usage_transient(

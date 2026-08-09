@@ -41,6 +41,7 @@ pub struct Transient {
     title: &'static str,
     items: Vec<TransientItem>,
     quota_usage: Option<Vec<rho_ui_proto::QuotaSeries>>,
+    active_auth_namespaces: Vec<String>,
     global_usage: Option<Vec<rho_ui_proto::AgentUsageSeries>>,
     usage_days: u64,
 }
@@ -51,6 +52,7 @@ impl Transient {
             title,
             items: Vec::new(),
             quota_usage: None,
+            active_auth_namespaces: Vec::new(),
             global_usage: None,
             usage_days: 7,
         }
@@ -167,7 +169,11 @@ impl Transient {
                             && series.auth_namespace.as_deref() == Some(name.as_str())
                     })
                     .and_then(|series| series.points.last());
-                let mut label = format!("gpt/{name}");
+                let mut label = if self.active_auth_namespaces.contains(name) {
+                    format!("★ gpt/{name}")
+                } else {
+                    format!("gpt/{name}")
+                };
                 if let Some(latest) = latest {
                     label.push_str(&format!(" {}%", latest.remaining_percent));
                     if let Some(seconds) = latest
@@ -644,9 +650,14 @@ pub fn usage_root_menu() -> Transient {
         )
 }
 
-pub fn usage_menu(series: Vec<rho_ui_proto::QuotaSeries>, days: u64) -> Transient {
+pub fn usage_menu(
+    series: Vec<rho_ui_proto::QuotaSeries>,
+    active_auth_namespaces: Vec<String>,
+    days: u64,
+) -> Transient {
     let mut menu = Transient::new("rate limit");
     menu.quota_usage = Some(series);
+    menu.active_auth_namespaces = active_auth_namespaces;
     menu.usage_days = days;
     menu
 }

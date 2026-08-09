@@ -10,12 +10,12 @@ AI APIs.
 - Local users control prompts, session names/paths, inference auth setup/import,
   and tool inputs.
 - Authenticated GUI clients may enable or disable OAuth namespaces.
-  `rho-inference` exposes only those safe settings and namespace names; bearer
-  and refresh tokens remain in credential files. Its persisted current
-  selection is internal. An in-flight request may finish under the previous
-  selection; subsequent inference, web search, and realtime requests observe
-  the replacement. Authentication failures fail the request and never trigger
-  automatic account failover.
+  `rho-inference` exposes only those safe settings, namespace names, and the
+  active namespace name; bearer and refresh tokens remain in credential files.
+  Its persisted selection record is internal. An in-flight request may finish
+  under the previous selection; subsequent inference, web search, and realtime
+  requests observe the replacement. Authentication failures fail the request
+  and never trigger automatic account failover.
 - `rho-inference` owns the sole ChatGPT quota poller and provider-prefixed quota
   tables. It resolves every enabled configured namespace roughly every ten
   minutes.

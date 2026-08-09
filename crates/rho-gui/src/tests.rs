@@ -3384,6 +3384,7 @@ fn heading_tags_file_agents_and_conceal_in_display(cx: &mut TestAppContext) {
                     projects: Vec::new(),
                     auth: AuthState {
                         disabled_namespaces: Vec::new(),
+                        active_namespace: None,
                         namespaces: Vec::new(),
                     },
                     machine_seed: 0,
@@ -3497,6 +3498,7 @@ fn preview_clears_when_the_cursor_leaves_a_staffed_heading(cx: &mut TestAppConte
                     auth: AuthState {
                         namespaces: Vec::new(),
                         disabled_namespaces: Vec::new(),
+                        active_namespace: None,
                     },
                     machine_seed: 0,
                     agent_counter: 100,
@@ -3617,6 +3619,7 @@ fn tab_cycles_folds_on_a_staffed_heading(cx: &mut TestAppContext) {
                     auth: AuthState {
                         namespaces: Vec::new(),
                         disabled_namespaces: Vec::new(),
+                        active_namespace: None,
                     },
                     machine_seed: 0,
                     agent_counter: 100,
@@ -4081,6 +4084,7 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
                     projects: Vec::new(),
                     auth: AuthState {
                         disabled_namespaces: Vec::new(),
+                        active_namespace: None,
                         namespaces: Vec::new(),
                     },
                     machine_seed: 0,
@@ -4176,6 +4180,7 @@ fn insert_mode_enter_stays_a_newline_in_desk_text(cx: &mut TestAppContext) {
                     projects: Vec::new(),
                     auth: rho_ui_proto::AuthState {
                         disabled_namespaces: Vec::new(),
+                        active_namespace: None,
                         namespaces: Vec::new(),
                     },
                     machine_seed: 0,
@@ -4269,6 +4274,7 @@ fn quick_spawn_send_relocates_the_cursor(cx: &mut TestAppContext) {
                     }],
                     auth: rho_ui_proto::AuthState {
                         disabled_namespaces: Vec::new(),
+                        active_namespace: None,
                         namespaces: Vec::new(),
                     },
                     machine_seed: 0,
@@ -4368,6 +4374,7 @@ fn quick_spawn_placeholder_takes_the_generated_title(cx: &mut TestAppContext) {
         projects: Vec::new(),
         auth: AuthState {
             disabled_namespaces: Vec::new(),
+            active_namespace: None,
             namespaces: Vec::new(),
         },
         machine_seed: 0,
@@ -4519,6 +4526,7 @@ fn daemon_retag_keeps_the_caret_at_the_title_end(cx: &mut TestAppContext) {
                     auth: AuthState {
                         namespaces: Vec::new(),
                         disabled_namespaces: Vec::new(),
+                        active_namespace: None,
                     },
                     machine_seed: 0,
                     agent_counter: 100,
@@ -4679,6 +4687,7 @@ fn hjkl_travel_never_opens_a_fold(cx: &mut TestAppContext) {
                     auth: AuthState {
                         namespaces: Vec::new(),
                         disabled_namespaces: Vec::new(),
+                        active_namespace: None,
                     },
                     machine_seed: 0,
                     agent_counter: 100,
@@ -4794,6 +4803,7 @@ fn helix_append_on_a_folded_heading_lands_at_the_title(cx: &mut TestAppContext) 
                     auth: AuthState {
                         namespaces: Vec::new(),
                         disabled_namespaces: Vec::new(),
+                        active_namespace: None,
                     },
                     machine_seed: 0,
                     agent_counter: 100,
