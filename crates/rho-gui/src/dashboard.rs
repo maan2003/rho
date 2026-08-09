@@ -47,8 +47,6 @@ const PLACEHOLDER_TITLE: &str = "…";
 /// default. Archiving and unarchiving are ordinary text moves.
 const ARCHIVE_TAG: &str = "archive";
 
-/// Inlay id space for heading decorations, clear of the placeholders.
-
 /// Highlight key for draft text (the user-message accent), past the
 /// class and lamp key ranges.
 const DRAFT_TEXT_KEY: HighlightKey =
@@ -2434,7 +2432,7 @@ fn body_fold_range(text: &str, headings: &[DeskHeading], index: usize) -> Option
     if text[..end].ends_with('\n') {
         end -= 1;
     }
-    (end > heading.heading_range.end).then(|| heading.heading_range.end..end)
+    (end > heading.heading_range.end).then_some(heading.heading_range.end..end)
 }
 
 /// One step of org's TAB cycle for the heading at `offset`: FOLDED →
