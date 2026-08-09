@@ -1229,58 +1229,6 @@ impl Dashboard {
         true
     }
 
-    pub fn topic_titles_for_cursor_agent(
-        &self,
-        registry: &AgentRegistry,
-        cx: &mut Context<Workspace>,
-    ) -> Vec<String> {
-        let Some(RowTarget::Agent(agent_id)) = self.cursor_target(registry, cx) else {
-            return Vec::new();
-        };
-        let Some(host) = registry.host_of_agent(agent_id) else {
-            return Vec::new();
-        };
-        let Some(text) = self.source_text(host, cx) else {
-            return Vec::new();
-        };
-        parse(&text)
-            .into_iter()
-            .map(|heading| heading.title)
-            .chain(["Unfiled".to_owned()])
-            .collect()
-    }
-
-    /// Resolves the move-agent verb: which root agent to rebind, and the
-    /// heading offset it should bind to (`None` unfiles it). The rebind
-    /// itself is a daemon operation — the document text never changes.
-    pub fn rebind_target_for_cursor_agent(
-        &self,
-        registry: &AgentRegistry,
-        topic: &str,
-        cx: &mut Context<Workspace>,
-    ) -> Option<(HostId, AgentId, Option<usize>)> {
-        let agent_id = match self.cursor_target(registry, cx)? {
-            RowTarget::Agent(agent_id) | RowTarget::Reply(agent_id) => agent_id,
-            RowTarget::Topic {
-                host,
-                offset,
-                first_attention,
-                ..
-            } => first_attention.or_else(|| self.first_agent_for_topic((host, offset)))?,
-            _ => return None,
-        };
-        let root = root_agent(registry, agent_id);
-        let host = registry.host_of_agent(root)?;
-        if topic == "Unfiled" {
-            return Some((host, root, None));
-        }
-        let text = self.source_text(host, cx)?;
-        let heading = parse(&text)
-            .into_iter()
-            .find(|heading| heading.title == topic)?;
-        Some((host, root, Some(heading.heading_range.start)))
-    }
-
     pub fn delete_empty(&mut self, _cx: &mut Context<Workspace>) -> bool {
         false
     }

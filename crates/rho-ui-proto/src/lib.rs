@@ -72,14 +72,9 @@ pub enum ClientMessage {
         /// the modes that need one).
         start: StartMode,
         content: Option<Vec<ContentPart>>,
-        /// When present, bind the new agent to the Desk heading containing
-        /// this anchor. The text itself is never marked.
+        /// When present, tag the Desk heading containing this anchor with
+        /// the newly allocated agent's handle.
         desk_anchor: Option<desk::DeskAnchor>,
-    },
-    /// Moves an agent's Desk binding to a new anchor, or unfiles it.
-    DeskRebind {
-        agent_id: AgentId,
-        anchor: Option<desk::DeskAnchor>,
     },
     SubscribeAgent {
         agent_id: AgentId,

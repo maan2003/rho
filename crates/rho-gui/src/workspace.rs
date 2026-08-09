@@ -54,7 +54,7 @@ use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
     AgentDone, AgentHide, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, DashboardBack,
     DashboardArchive, DashboardDeleteEmpty, DashboardDemote, DashboardGoto, DashboardHeadingAbove,
-    DashboardHeadingBelow, DashboardJump, DashboardMoveAgent,
+    DashboardHeadingBelow, DashboardJump,
     DashboardNewAgent, DashboardNow, DashboardPromote, DashboardRenameTopic, DashboardReply,
     DashboardCycleGlobal, DashboardStaff, DashboardSubmit, DashboardToggleSubagents, DashboardUndo, GitApprovalAllow, GitApprovalDeny,
     MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious,
@@ -5663,48 +5663,6 @@ impl Workspace {
         self.open_prompt("Desk heading:", complete, on_submit, window, cx);
     }
 
-    fn prompt_dashboard_file_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let titles = self
-            .dashboard
-            .topic_titles_for_cursor_agent(&self.registry, cx);
-        let complete = std::rc::Rc::new(
-            move |_workspace: &Workspace, input: &str, _cx: &gpui::App| {
-                let needle = input.to_lowercase();
-                titles
-                    .clone()
-                    .into_iter()
-                    .filter(|title| title.to_lowercase().contains(&needle))
-                    .map(|value| crate::commands::Candidate {
-                        value,
-                        description: "Desk topic".to_owned(),
-                    })
-                    .collect()
-            },
-        );
-        let on_submit = std::rc::Rc::new(
-            |workspace: &mut Workspace,
-             input: String,
-             _window: &mut Window,
-             cx: &mut Context<Workspace>| {
-                let Some((host, agent_id, heading_offset)) = workspace
-                    .dashboard
-                    .rebind_target_for_cursor_agent(&workspace.registry, input.trim(), cx)
-                else {
-                    return;
-                };
-                // The daemon rewrites the heading-line tag; the edit comes
-                // back through the ordinary text-op stream.
-                let anchor = heading_offset
-                    .and_then(|offset| workspace.desk_sync.anchor_at(host, offset, cx));
-                if anchor.is_none() && heading_offset.is_some() {
-                    return;
-                }
-                workspace.send_to_host(host, ClientMessage::DeskRebind { agent_id, anchor });
-            },
-        );
-        self.open_prompt("file agent:", complete, on_submit, window, cx);
-    }
-
     fn prompt_dashboard_rename_topic(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let on_submit = std::rc::Rc::new(
             |workspace: &mut Workspace,
@@ -6551,9 +6509,6 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &DashboardJump, window, cx| {
                 this.prompt_dashboard_jump(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &DashboardMoveAgent, window, cx| {
-                this.prompt_dashboard_file_agent(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardRenameTopic, window, cx| {
                 this.prompt_dashboard_rename_topic(window, cx);

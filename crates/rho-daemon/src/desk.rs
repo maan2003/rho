@@ -162,28 +162,19 @@ impl DeskStore {
         self.append_text(operation, transaction).await
     }
 
-    /// Moves `agent_id`'s heading-line tag: removed everywhere it appears,
-    /// inserted on the heading containing `anchor` (`None` just unfiles).
-    /// The rewrite is a server-replica CRDT edit, so clients converge
-    /// through the ordinary text-op stream. Returns the record to
-    /// broadcast when the text changed at all.
-    pub async fn retag_agent(
+    /// Tags the heading containing `anchor` with a newly allocated agent.
+    /// The server authors this one edit because the client does not know the
+    /// agent id before creation. Existing tags are never removed.
+    pub async fn tag_new_agent(
         &self,
         agent_id: rho_ui_proto::AgentId,
-        anchor: Option<DeskAnchor>,
+        anchor: DeskAnchor,
     ) -> Result<Option<DeskTextOpRecord>, String> {
         let label = agent_label(&self.db, agent_id)
-            .ok_or_else(|| "Desk retag references an unknown agent".to_owned())?;
+            .ok_or_else(|| "Desk tag references an unknown agent".to_owned())?;
         let mut write = self.db.write().await;
         let mut state = load_state(&mut write);
-        let record = retag_in_txn(
-            |handle| resolve_agent_handle(&self.db, handle),
-            &mut write,
-            &mut state,
-            agent_id,
-            &label,
-            anchor,
-        )?;
+        let record = tag_new_agent_in_txn(&mut write, &mut state, &label, anchor)?;
         if record.is_some() {
             save_state(&mut write, &state);
             write.commit();
@@ -223,6 +214,48 @@ impl DeskStore {
                     )
             })
     }
+}
+
+fn tag_new_agent_in_txn(
+    write: &mut rho_db::WriteTxn,
+    state: &mut PersistentStateV4,
+    label: &str,
+    anchor: DeskAnchor,
+) -> Result<Option<DeskTextOpRecord>, String> {
+    let mut materialized = state.snapshot.clone();
+    materialized.operations.extend(
+        write
+            .open_table(TEXT_OPS)
+            .iter()
+            .map(|(_, value)| value.value().as_ref().operation.clone()),
+    );
+    let text = materialized.document_text()?;
+    let mut buffer = materialized.buffer(ReplicaId::REMOTE_SERVER.as_u16())?;
+    let snapshot = buffer.snapshot();
+    let anchor = anchor.to_text(snapshot.remote_id());
+    if !snapshot.can_resolve(&anchor) {
+        return Err("Desk tag anchor does not resolve".to_owned());
+    }
+    let offset = text::ToOffset::to_offset(&anchor, snapshot);
+    let Some(heading) = parse(&text)
+        .into_iter()
+        .rev()
+        .find(|heading| heading.heading_range.start <= offset)
+    else {
+        return Ok(None);
+    };
+    if heading.tags.iter().any(|tag| tag == label) {
+        return Ok(None);
+    }
+    let edit = match heading.tags_range {
+        Some(range) => (range.end..range.end, format!("{label}:")),
+        None => (
+            heading.heading_range.end..heading.heading_range.end,
+            format!(" :{label}:"),
+        ),
+    };
+    let operation = DeskOperation::from_text(&buffer.edit([edit]));
+    append_text_in_txn(write, state, operation, None).map(Some)
 }
 
 fn agent_label(db: &RhoDb, agent_id: rho_ui_proto::AgentId) -> Option<String> {
@@ -847,7 +880,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retagging_moves_the_heading_tag_and_unfiles_by_edit() {
+    async fn new_agent_tagging_inserts_without_moving_existing_tags() {
         let directory = tempfile::tempdir().unwrap();
         let db = RhoDb::open(directory.path().join("desk.redb"));
         init_agent_tables(&db).await;
@@ -860,41 +893,33 @@ mod tests {
             .apply_text(DeskOperation::from_text(&edit), None)
             .await
             .unwrap();
-        let text = store.snapshot().document_text().unwrap();
         let snapshot = buffer.snapshot();
         let one = DeskAnchor::from_text(snapshot.anchor_after(0));
-        let two = DeskAnchor::from_text(snapshot.anchor_after(text.find("* two").unwrap()));
-        let resolve = |handle: &str| (handle == "eng-aa").then(|| agent(2));
+        let two = DeskAnchor::from_text(snapshot.anchor_after("* one\n".len()));
 
-        let retag = |anchor: Option<DeskAnchor>| {
+        let tag = |label: &'static str, anchor: DeskAnchor| {
             let db = db.clone();
             async move {
                 let mut write = db.write().await;
                 let mut state = load_state(&mut write);
-                let record =
-                    retag_in_txn(resolve, &mut write, &mut state, agent(2), "eng-aa", anchor)
-                        .unwrap();
+                let record = tag_new_agent_in_txn(&mut write, &mut state, label, anchor).unwrap();
                 save_state(&mut write, &state);
                 write.commit();
                 record
             }
         };
-        assert!(retag(Some(one)).await.is_some());
+        assert!(tag("eng-aa", one).await.is_some());
         assert_eq!(
             store.snapshot().document_text().unwrap(),
             "* one :eng-aa:\n* two\n"
         );
-        // Moving edits the tag between lines; the binding travels as text.
-        assert!(retag(Some(two)).await.is_some());
+        assert!(tag("eng-bb", two).await.is_some());
         assert_eq!(
             store.snapshot().document_text().unwrap(),
-            "* one\n* two :eng-aa:\n"
+            "* one :eng-aa:\n* two :eng-bb:\n"
         );
-        // Retagging in place changes nothing.
-        assert!(retag(Some(two)).await.is_none());
-        // Unfiling strips the tag and its separating space.
-        assert!(retag(None).await.is_some());
-        assert_eq!(store.snapshot().document_text().unwrap(), text);
+        // An idempotent retry does not duplicate the tag.
+        assert!(tag("eng-bb", two).await.is_none());
     }
 
     #[test]
