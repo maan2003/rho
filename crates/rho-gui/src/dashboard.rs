@@ -2279,20 +2279,11 @@ fn heading_decorations(
                 }
             }
             if !label.is_empty() {
-                // Decorations anchor at the visible end of the line:
-                // before the concealed tag token, so neither the tag
-                // conceal (which ends at the line end) nor a subtree
-                // fold (which starts there) swallows the inlay.
-                let position = heading.tags_range.as_ref().map_or(
-                    heading.heading_range.end,
-                    |tags_range| {
-                        text[..tags_range.start]
-                            .trim_end_matches([' ', '\t'])
-                            .len()
-                            .max(heading.stars_range.end)
-                    },
-                );
-                decorations.push((*host, position, label));
+                // Decorations anchor at the line end — the same offset
+                // where body and subtree folds start, so the chip and
+                // the folded chevron merge into a single hint. Hints
+                // paint outside text flow, so no fold can swallow them.
+                decorations.push((*host, heading.heading_range.end, label));
             }
         }
     }

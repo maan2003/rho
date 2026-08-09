@@ -2114,9 +2114,20 @@ impl EditorElement {
         let hints = self.editor.read(cx).eol_hints().to_vec();
         let mut elements = Vec::new();
         for (anchor, renderer) in hints {
-            let display_point = anchor.to_display_point(&snapshot.display_snapshot);
+            let anchor_point = anchor.to_point(&snapshot.buffer_snapshot());
+            let display_point = anchor_point.to_display_point(&snapshot.display_snapshot);
             let row = display_point.row();
             if row < start_row || row >= end_row {
+                continue;
+            }
+            // A hint whose line is hidden inside a fold resolves to the
+            // fold line's display row; rendering it there would pile
+            // every hidden line's hint onto the fold line. Only the
+            // line that starts the display row shows its hint.
+            let row_start = snapshot
+                .display_snapshot
+                .display_point_to_point(DisplayPoint::new(row, 0), Bias::Left);
+            if row_start.row != anchor_point.row {
                 continue;
             }
             let Some(line_layout) = line_layouts.get(row.minus(start_row) as usize) else {
