@@ -2,9 +2,9 @@
 //! magit-status. The real per-host CRDT document is spliced into the
 //! editor as writable excerpts, so headings and prose are edited
 //! directly with plain vim, while generated read-only agent rows are
-//! interleaved under the headings whose visible tags name them. Each tag
-//! occurrence projects the named agent's shared runtime row. Its spawn
-//! tree is collapsed by default and toggled with `tab` on the agent row.
+//! interleaved under the headings whose visible tags name them. Headings
+//! normally summarize bindings in an end-of-line hint; `g t` temporarily
+//! projects the named agents' shared runtime rows and complete spawn trees.
 //! Acting keys address the row under the cursor: `enter` opens, `r`
 //! splices an inline reply draft under the row. Generated rows
 //! and drafts sit between document slices — a refresh rearranges excerpts
@@ -62,6 +62,11 @@ type SyncSnapshot = (
     Vec<(HostId, Range<usize>, String, editor::display_map::CaretRest)>,
 );
 type ArchiveEdits = (Vec<(Range<usize>, String)>, usize);
+
+struct ListingVisibility<'a> {
+    collapsed_unfiled: &'a HashSet<HostId>,
+    expanded_portals: &'a HashSet<AgentOccurrence>,
+}
 
 #[derive(Clone, Copy)]
 pub enum StructureDirection {
@@ -538,15 +543,23 @@ impl Dashboard {
             &documents,
             &filed,
             &fold_ranges,
-            &self.collapsed_unfiled,
-            &self.expanded_portals,
+            ListingVisibility {
+                collapsed_unfiled: &self.collapsed_unfiled,
+                expanded_portals: &self.expanded_portals,
+            },
             &self.replies,
             draft_topic,
         );
         // Staffed headings wear their agents as end-of-line inlays, not
         // rows, so the decoration strings join the fingerprint: attention
         // changes must not vanish into the early-out.
-        let decorations = heading_decorations(registry, &documents, &filed);
+        let decorations = heading_decorations(
+            registry,
+            &documents,
+            &filed,
+            &self.expanded_portals,
+            &fold_ranges,
+        );
         let cursor_doc = match &cursor_place {
             Some(CursorPlace::Doc(host, offset)) => Some((*host, *offset)),
             _ => None,
@@ -1428,16 +1441,8 @@ impl Dashboard {
         self.collapsed.insert(host, pairs);
     }
 
-    /// Toggles the runtime tree when the cursor is on an agent portal;
-    /// otherwise performs Org-style visibility cycling on the heading.
+    /// Org-style visibility cycling on the heading under the cursor.
     pub fn toggle_subagents(&mut self, cx: &mut Context<Workspace>) -> bool {
-        if let Some(CursorPlace::Row(LineKey::Agent { occurrence, .. })) = self.cursor_place(cx) {
-            if !self.expanded_portals.remove(&occurrence) {
-                self.expanded_portals.insert(occurrence);
-            }
-            cx.notify();
-            return true;
-        }
         if let Some(CursorPlace::Row(LineKey::Unfiled(host))) = self.cursor_place(cx) {
             if !self.collapsed_unfiled.remove(&host) {
                 self.collapsed_unfiled.insert(host);
@@ -1463,8 +1468,49 @@ impl Dashboard {
         true
     }
 
-    pub fn cursor_on_agent_row(&self, cx: &mut Context<Workspace>) -> bool {
-        matches!(self.cursor_place(cx), Some(CursorPlace::Row(LineKey::Agent { .. })))
+    /// `g t`: toggles the transient runtime tree for the staffed heading
+    /// under the cursor, or closes the occurrence containing a portal row.
+    pub fn toggle_agent_tree(&mut self, cx: &mut Context<Workspace>) -> bool {
+        let occurrences = match self.cursor_place(cx) {
+            Some(CursorPlace::Row(LineKey::Agent { occurrence, .. })) => vec![occurrence],
+            Some(CursorPlace::Doc(host, offset)) => {
+                let Some(text) = self.source_text(host, cx) else {
+                    return false;
+                };
+                let headings = parse(&text);
+                let Some((index, heading)) = headings.iter().enumerate().find(|(_, heading)| {
+                    heading.heading_range.start <= offset && offset <= heading.heading_range.end
+                }) else {
+                    return false;
+                };
+                let Some(agents) = self.heading_agents.get(&(host, heading.heading_range.start))
+                else {
+                    return false;
+                };
+                let heading = heading_portal_ids(&headings)[index];
+                agents
+                    .iter()
+                    .map(|portal| AgentOccurrence::Filed {
+                        host,
+                        heading,
+                        portal: *portal,
+                    })
+                    .collect()
+            }
+            _ => return false,
+        };
+        if occurrences
+            .iter()
+            .all(|occurrence| self.expanded_portals.contains(occurrence))
+        {
+            for occurrence in &occurrences {
+                self.expanded_portals.remove(occurrence);
+            }
+        } else {
+            self.expanded_portals.extend(occurrences);
+        }
+        cx.notify();
+        true
     }
 
     /// Org's S-TAB: cycle the whole document through OVERVIEW (only
@@ -2327,16 +2373,39 @@ fn heading_decorations(
     registry: &AgentRegistry,
     documents: &[(HostId, String)],
     filed: &HashMap<(HostId, usize), Vec<AgentId>>,
+    expanded_portals: &HashSet<AgentOccurrence>,
+    fold_ranges: &[(HostId, Range<usize>)],
 ) -> Vec<(HostId, usize, String)> {
     let empty = Vec::new();
     let mut decorations = Vec::new();
     for (host, text) in documents {
         let headings = parse(text);
+        let portal_ids = heading_portal_ids(&headings);
         let zones = archive_zones(&headings);
-        for heading in &headings {
+        let folds = fold_ranges
+            .iter()
+            .filter(|(fold_host, _)| fold_host == host)
+            .map(|(_, range)| range)
+            .collect::<Vec<_>>();
+        for (index, heading) in headings.iter().enumerate() {
             let agents = filed
                 .get(&(*host, heading.heading_range.start))
                 .unwrap_or(&empty);
+            let folded = folds.iter().any(|range| {
+                range.start <= heading.heading_range.end
+                    && heading.heading_range.end <= range.end
+            });
+            if !folded
+                && agents.iter().any(|portal| {
+                    expanded_portals.contains(&AgentOccurrence::Filed {
+                        host: *host,
+                        heading: portal_ids[index],
+                        portal: *portal,
+                    })
+                })
+            {
+                continue;
+            }
             let archived = zones
                 .iter()
                 .any(|zone| zone.contains(&heading.heading_range.start));
@@ -2684,6 +2753,24 @@ fn truncate_chars(value: &str, limit: usize) -> String {
     result
 }
 
+fn heading_portal_ids(headings: &[DeskHeading]) -> Vec<u64> {
+    use std::hash::{Hash as _, Hasher as _};
+
+    let mut title_counts: HashMap<&str, u32> = HashMap::new();
+    headings
+        .iter()
+        .map(|heading| {
+            let count = title_counts.entry(&heading.title).or_insert(0);
+            let occurrence = *count;
+            *count += 1;
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            heading.title.hash(&mut hasher);
+            occurrence.hash(&mut hasher);
+            hasher.finish()
+        })
+        .collect()
+}
+
 /// Ends a document slice before a cut point's newline, so the synthetic
 /// newline between excerpts doesn't double it.
 /// Generate the listing without mutating Desk text: the documents are
@@ -2696,8 +2783,7 @@ fn generate(
     documents: &[(HostId, String)],
     filed: &HashMap<(HostId, usize), Vec<AgentId>>,
     fold_ranges: &[(HostId, Range<usize>)],
-    collapsed_unfiled: &HashSet<HostId>,
-    expanded_portals: &HashSet<AgentOccurrence>,
+    visibility: ListingVisibility<'_>,
     replies: &[AgentId],
     draft_topic: Option<Option<(HostId, usize)>>,
 ) -> Vec<Segment> {
@@ -2705,25 +2791,37 @@ fn generate(
     let multiple_hosts = documents.len() > 1;
     let mut emitted_replies = HashSet::new();
     let empty = Vec::new();
+    let ListingVisibility {
+        collapsed_unfiled,
+        expanded_portals,
+    } = visibility;
 
     let push_agent_portals =
         |segments: &mut Vec<Segment>,
          emitted_replies: &mut HashSet<AgentId>,
          roots: &[AgentId],
          occurrence_for: &dyn Fn(AgentId) -> AgentOccurrence,
-         topic: Option<(HostId, usize)>| {
+         topic: Option<(HostId, usize)>,
+         show_collapsed_roots: bool,
+         allow_expanded: bool| {
             for root in roots {
                 let occurrence = occurrence_for(*root);
-                let agents = if expanded_portals.contains(&occurrence) {
-                    agent_tree_lines(registry, &[*root], occurrence, topic)
-                } else {
-                    vec![agent_line(*root, occurrence, topic, registry)]
-                };
-                for line in agents {
+                let expanded = allow_expanded && expanded_portals.contains(&occurrence);
+                for (index, line) in agent_tree_lines(
+                    registry,
+                    &[*root],
+                    occurrence,
+                    topic,
+                )
+                .into_iter()
+                .enumerate()
+                {
                     let RowTarget::Agent { agent_id, .. } = line.target else {
                         unreachable!()
                     };
-                    segments.push(Segment::Line(line));
+                    if expanded || (show_collapsed_roots && index == 0) {
+                        segments.push(Segment::Line(line));
+                    }
                     if replies.contains(&agent_id) && emitted_replies.insert(agent_id) {
                         segments.push(Segment::Line(Line::new(
                             LineKey::Reply(agent_id),
@@ -2743,22 +2841,7 @@ fn generate(
             segments.push(Segment::Line(header));
         }
         let headings = parse(text);
-        let mut portal_title_counts: HashMap<String, u32> = HashMap::new();
-        let portal_ids = headings
-            .iter()
-            .map(|heading| {
-                use std::hash::{Hash as _, Hasher as _};
-                let count = portal_title_counts
-                    .entry(heading.title.clone())
-                    .or_insert(0);
-                let occurrence = *count;
-                *count += 1;
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                heading.title.hash(&mut hasher);
-                occurrence.hash(&mut hasher);
-                hasher.finish()
-            })
-            .collect::<Vec<_>>();
+        let portal_ids = heading_portal_ids(&headings);
         let mut slice_start = 0usize;
         let mut slice_id = 0u64;
         let mut title_counts: HashMap<String, u32> = HashMap::new();
@@ -2788,7 +2871,25 @@ fn generate(
             let start = heading.heading_range.start;
             let agents = filed.get(&(*host, start)).unwrap_or(&empty);
             let draft_here = draft_topic == Some(Some((*host, start)));
-            if agents.is_empty() && !draft_here {
+            let folded_here = fold_zones.iter().any(|zone| {
+                zone.start <= heading.heading_range.end
+                    && heading.heading_range.end <= zone.end
+            });
+            let portal_here = !folded_here
+                && agents.iter().any(|portal| {
+                    expanded_portals.contains(&AgentOccurrence::Filed {
+                        host: *host,
+                        heading: portal_ids[heading_index],
+                        portal: *portal,
+                    })
+                });
+            let reply_here = agents.iter().any(|root| {
+                registry
+                    .agent_subtree(*root)
+                    .iter()
+                    .any(|agent_id| replies.contains(agent_id))
+            });
+            if !portal_here && !reply_here && !draft_here {
                 continue;
             }
             // Rows splice right after the heading line, before its body
@@ -2831,6 +2932,8 @@ fn generate(
                     portal,
                 },
                 Some((*host, start)),
+                false,
+                portal_here,
             );
             if draft_here {
                 segments.push(Segment::Line(Line::new(
@@ -2914,6 +3017,8 @@ fn generate(
                     portal,
                 },
                 None,
+                true,
+                true,
             );
         }
     }
@@ -2967,8 +3072,10 @@ pub mod bench_support {
             documents,
             filed,
             &[],
-            &HashSet::new(),
-            &HashSet::new(),
+            ListingVisibility {
+                collapsed_unfiled: &HashSet::new(),
+                expanded_portals: &HashSet::new(),
+            },
             &[],
             None,
         ))
@@ -3061,30 +3168,46 @@ mod tests {
             (host, 0),
             sorted_agents(&registry, [a.agent_id, b.agent_id]),
         );
-        // The heading tag opens a runtime portal immediately under its line.
+        // The binding stays in the heading's end-of-line hint until `g t`.
         let segments = generate(
             &registry,
             &[(host, text.clone())],
             &filed,
             &[],
-            &HashSet::new(),
-            &HashSet::new(),
+            ListingVisibility {
+                collapsed_unfiled: &HashSet::new(),
+                expanded_portals: &HashSet::new(),
+            },
+            &[],
+            None,
+        );
+        assert_eq!(segments.len(), 1);
+        assert!(matches!(segments[0], Segment::Doc { ref range, .. } if *range == (0..text.len())));
+
+        let heading = heading_portal_ids(&parse(&text))[0];
+        let expanded = [a.agent_id, b.agent_id]
+            .map(|portal| AgentOccurrence::Filed {
+                host,
+                heading,
+                portal,
+            })
+            .into_iter()
+            .collect();
+        let segments = generate(
+            &registry,
+            &[(host, text.clone())],
+            &filed,
+            &[],
+            ListingVisibility {
+                collapsed_unfiled: &HashSet::new(),
+                expanded_portals: &expanded,
+            },
             &[],
             None,
         );
         assert_eq!(segments.len(), 4);
-        assert!(matches!(segments[0], Segment::Doc { ref range, .. } if *range == (0..5)));
-        assert!(matches!(
-            segments[1],
-            Segment::Line(ref line)
-                if matches!(line.target, RowTarget::Agent { agent_id, .. } if agent_id == b.agent_id)
-        ));
-        assert!(matches!(
-            segments[2],
-            Segment::Line(ref line)
-                if matches!(line.target, RowTarget::Agent { agent_id, .. } if agent_id == a.agent_id)
-        ));
-        assert!(matches!(segments[3], Segment::Doc { ref range, .. } if *range == (6..text.len())));
+        assert!(matches!(segments[1], Segment::Line(ref line) if matches!(line.target, RowTarget::Agent { agent_id, .. } if agent_id == b.agent_id)));
+        assert!(matches!(segments[2], Segment::Line(ref line) if matches!(line.target, RowTarget::Agent { agent_id, .. } if agent_id == a.agent_id)));
 
         // An open reply splices in right under the heading line, before
         // the body.
@@ -3093,20 +3216,28 @@ mod tests {
             &[(host, text.clone())],
             &filed,
             &[],
-            &HashSet::new(),
-            &HashSet::new(),
+            ListingVisibility {
+                collapsed_unfiled: &HashSet::new(),
+                expanded_portals: &HashSet::new(),
+            },
             &[b.agent_id],
             None,
         );
-        assert_eq!(segments.len(), 5);
+        assert_eq!(segments.len(), 3);
         assert!(matches!(
-            segments[2],
+            segments[1],
             Segment::Line(ref line) if line.key == LineKey::Reply(b.agent_id)
         ));
 
         // The heading's decoration triages the needs-input agent first
         // and names both agents by id.
-        let decorations = heading_decorations(&registry, &[(host, text.clone())], &filed);
+        let decorations = heading_decorations(
+            &registry,
+            &[(host, text.clone())],
+            &filed,
+            &HashSet::new(),
+            &[],
+        );
         assert_eq!(decorations.len(), 1);
         let (_, offset, label) = &decorations[0];
         assert_eq!(*offset, "* One".len());
@@ -3130,8 +3261,10 @@ mod tests {
             &[(host, text.clone())],
             &filed,
             &[],
-            &HashSet::new(),
-            &HashSet::new(),
+            ListingVisibility {
+                collapsed_unfiled: &HashSet::new(),
+                expanded_portals: &HashSet::new(),
+            },
             &[],
             None,
         );
@@ -3145,22 +3278,55 @@ mod tests {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        assert!(collapsed_rows.is_empty());
+
+        let portal_ids = heading_portal_ids(&parse(&text));
+        let first = AgentOccurrence::Filed {
+            host,
+            heading: portal_ids[0],
+            portal: root.agent_id,
+        };
+        let second = AgentOccurrence::Filed {
+            host,
+            heading: portal_ids[1],
+            portal: root.agent_id,
+        };
+        let expanded = HashSet::from([first.clone()]);
+        let first_only = generate(
+            &registry,
+            &[(host, text.clone())],
+            &filed,
+            &[],
+            ListingVisibility {
+                collapsed_unfiled: &HashSet::new(),
+                expanded_portals: &expanded,
+            },
+            &[],
+            None,
+        );
         assert_eq!(
-            collapsed_rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
-            vec![root.agent_id, root.agent_id]
+            first_only
+                .iter()
+                .filter_map(|segment| match segment {
+                    Segment::Line(Line { target: RowTarget::Agent { agent_id, .. }, .. }) => {
+                        Some(*agent_id)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec![root.agent_id, child.agent_id, grandchild.agent_id]
         );
 
-        let expanded = collapsed_rows
-            .iter()
-            .map(|(_, occurrence)| occurrence.clone())
-            .collect::<HashSet<_>>();
+        let expanded = HashSet::from([first, second]);
         let segments = generate(
             &registry,
             &[(host, text)],
             &filed,
             &[],
-            &HashSet::new(),
-            &expanded,
+            ListingVisibility {
+                collapsed_unfiled: &HashSet::new(),
+                expanded_portals: &expanded,
+            },
             &[],
             None,
         );
@@ -3198,8 +3364,10 @@ mod tests {
             &[(host, text.clone())],
             &HashMap::new(),
             &[],
-            &HashSet::new(),
-            &HashSet::new(),
+            ListingVisibility {
+                collapsed_unfiled: &HashSet::new(),
+                expanded_portals: &HashSet::new(),
+            },
             &[],
             None,
         );
@@ -3219,22 +3387,27 @@ mod tests {
         let mut filed = HashMap::new();
         filed.insert((host, 0), vec![a.agent_id]);
         let collapsed = vec![(host, 5..10)];
-        // Collapse keeps the runtime portal visible directly below the
-        // folded task while the document body remains folded.
+        let heading = heading_portal_ids(&parse(&text))[0];
+        let expanded = HashSet::from([AgentOccurrence::Filed {
+            host,
+            heading,
+            portal: a.agent_id,
+        }]);
+        // A folded heading hides even an explicitly opened runtime tree.
         let segments = generate(
             &registry,
             &[(host, text.clone())],
             &filed,
             &collapsed,
-            &HashSet::new(),
-            &HashSet::new(),
+            ListingVisibility {
+                collapsed_unfiled: &HashSet::new(),
+                expanded_portals: &expanded,
+            },
             &[],
             None,
         );
-        assert_eq!(segments.len(), 3);
-        assert!(matches!(segments[0], Segment::Doc { ref range, .. } if *range == (0..10)));
-        assert!(matches!(segments[1], Segment::Line(ref line) if matches!(line.target, RowTarget::Agent { agent_id, .. } if agent_id == a.agent_id)));
-        assert!(matches!(segments[2], Segment::Doc { ref range, .. } if *range == (11..text.len())));
+        assert_eq!(segments.len(), 1);
+        assert!(!segments.iter().any(|segment| matches!(segment, Segment::Line(Line { target: RowTarget::Agent { .. }, .. }))));
         // The fold hides everything after the heading line except the
         // final newline, so the next heading keeps a line of its own.
         let headings = parse(&text);
@@ -3247,14 +3420,16 @@ mod tests {
             &[(host, text.clone())],
             &filed,
             &collapsed,
-            &HashSet::new(),
-            &HashSet::new(),
+            ListingVisibility {
+                collapsed_unfiled: &HashSet::new(),
+                expanded_portals: &HashSet::new(),
+            },
             &[a.agent_id],
             None,
         );
-        assert_eq!(segments.len(), 4);
+        assert_eq!(segments.len(), 3);
         assert!(matches!(
-            segments[2],
+            segments[1],
             Segment::Line(ref line) if line.key == LineKey::Reply(a.agent_id)
         ));
     }
@@ -3421,7 +3596,8 @@ mod tests {
         filed.insert((host, text.find("** Old").unwrap()), vec![loud.agent_id]);
         let documents = [(host, text.clone())];
         assert!(archived_roots(&documents, &filed).contains(&loud.agent_id));
-        let decorations = heading_decorations(&registry, &documents, &filed);
+        let decorations =
+            heading_decorations(&registry, &documents, &filed, &HashSet::new(), &[]);
         let (_, _, label) = &decorations[0];
         assert!(
             label.starts_with("  · ") && !label.contains('—'),
@@ -3438,8 +3614,10 @@ mod tests {
             &[(host, text.clone())],
             &HashMap::new(),
             &[],
-            &HashSet::new(),
-            &HashSet::new(),
+            ListingVisibility {
+                collapsed_unfiled: &HashSet::new(),
+                expanded_portals: &HashSet::new(),
+            },
             &[],
             Some(Some((host, 0))),
         );
@@ -3463,8 +3641,10 @@ mod tests {
             &[(host, String::new())],
             &HashMap::new(),
             &[],
-            &HashSet::new(),
-            &HashSet::new(),
+            ListingVisibility {
+                collapsed_unfiled: &HashSet::new(),
+                expanded_portals: &HashSet::new(),
+            },
             &[],
             None,
         );
@@ -3491,8 +3671,10 @@ mod tests {
             &[(host, String::new())],
             &HashMap::new(),
             &[],
-            &HashSet::new(),
-            &expanded,
+            ListingVisibility {
+                collapsed_unfiled: &HashSet::new(),
+                expanded_portals: &expanded,
+            },
             &[],
             None,
         );
@@ -3523,8 +3705,10 @@ mod tests {
             &[(host, String::new())],
             &HashMap::new(),
             &[],
-            &collapsed_unfiled,
-            &HashSet::new(),
+            ListingVisibility {
+                collapsed_unfiled: &collapsed_unfiled,
+                expanded_portals: &HashSet::new(),
+            },
             &[],
             None,
         );

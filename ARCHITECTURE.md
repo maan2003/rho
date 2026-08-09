@@ -104,9 +104,9 @@ than by running a supervisor, extension protocol, or daemon process graph.
   Visible agent-handle tags at the end of heading lines are the filing source
   of truth; `:project:` properties inherit down the heading tree. Every
   resolvable tag occurrence is an independent portal onto the exact named
-  agent, so one agent may appear in several places. Portals show only that
-  agent by default; their complete runtime subtree is transient, per-occurrence
-  expansion state. GUI clients retain one hidden CRDT source buffer per host
+  agent, so one agent may appear in several places. The normal presentation is
+  a compact end-of-line hint; `g t` opens the complete runtime subtree as
+  transient, per-occurrence display state. GUI clients retain one hidden CRDT source buffer per host
   and project shared read-only agent runtime buffers through occurrence-specific
   multibuffer rows, interleaved with writable prose and draft buffers.
   `rho-gui` supplies its context strip, theme mapping, and focus/show policy,

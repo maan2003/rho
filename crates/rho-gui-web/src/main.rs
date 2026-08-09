@@ -1,8 +1,8 @@
 use editor::{Backspace, MoveLeft, MoveRight, MoveToBeginningOfLine, MoveToEndOfLine, Newline, Redo, Undo};
 use gpui::{App, AppContext as _, Bounds, KeyBinding, WindowBounds, WindowOptions, px, size};
 use rho_gui::{
-    AgentDone, AgentHide, DashboardNewAgent, DashboardReply, DashboardToggleSubagents, RailOpen,
-    SubmitPrompt,
+    AgentDone, AgentHide, DashboardNewAgent, DashboardReply, DashboardToggleAgentTree,
+    DashboardToggleSubagents, RailOpen, SubmitPrompt,
 };
 use rho_gui::rho_assets::RhoAssets;
 use rho_gui::workspace::Workspace;
@@ -55,6 +55,7 @@ fn main() {
             KeyBinding::new("d", AgentDone, Some("RhoDashboard > Editor")),
             KeyBinding::new("shift-d", AgentHide, Some("RhoDashboard > Editor")),
             KeyBinding::new("n", DashboardNewAgent, Some("RhoDashboard > Editor")),
+            KeyBinding::new("g t", DashboardToggleAgentTree, Some("RhoDashboard > Editor")),
             KeyBinding::new(
                 "tab",
                 DashboardToggleSubagents,

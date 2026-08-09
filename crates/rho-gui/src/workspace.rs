@@ -56,7 +56,8 @@ use crate::{
     DashboardArchive, DashboardDeleteEmpty, DashboardDemote, DashboardGoto, DashboardHeadingAbove,
     DashboardHeadingBelow, DashboardJump,
     DashboardNewAgent, DashboardNow, DashboardPromote, DashboardRenameTopic, DashboardReply,
-    DashboardCycleGlobal, DashboardStaff, DashboardSubmit, DashboardToggleSubagents, DashboardUndo, GitApprovalAllow, GitApprovalDeny,
+    DashboardCycleGlobal, DashboardStaff, DashboardSubmit, DashboardToggleAgentTree,
+    DashboardToggleSubagents, DashboardUndo, GitApprovalAllow, GitApprovalDeny,
     MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious,
     PaneBack, PaneClose, PaneFocusNext, PaneSplitDown, PaneSplitRight, PastePrompt, RailFocus,
     RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore,
@@ -6516,11 +6517,21 @@ impl Render for Workspace {
                 this.prompt_dashboard_rename_topic(window, cx);
             }))
             .on_action(
+                cx.listener(|this, _: &DashboardToggleAgentTree, window, cx| {
+                    if !this.dashboard.is_focused(window, cx)
+                        || !this.dashboard.toggle_agent_tree(cx)
+                    {
+                        cx.propagate();
+                        return;
+                    }
+                    this.refresh_dashboard(window, cx);
+                }),
+            )
+            .on_action(
                 cx.listener(|this, _: &DashboardToggleSubagents, window, cx| {
                     if !this.dashboard_verb_applies(window, cx)
                         && !(this.dashboard.is_focused(window, cx)
-                            && (this.dashboard.cursor_on_unfiled_header(cx)
-                                || this.dashboard.cursor_on_agent_row(cx)))
+                            && this.dashboard.cursor_on_unfiled_header(cx))
                     {
                         cx.propagate();
                         return;

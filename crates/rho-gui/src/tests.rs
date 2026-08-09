@@ -3416,9 +3416,8 @@ fn heading_tags_file_agents_and_conceal_in_display(cx: &mut TestAppContext) {
     assert_eq!(
         buffer_text,
         format!(
-            "* One :eng-{}:\n  · planner  eng-{}\nbody\n* Two\n\nUnfiled · 1\n  · drifter  eng-{}",
+            "* One :eng-{}:\nbody\n* Two\n\nUnfiled · 1\n  · drifter  eng-{}",
             agent(1).encoded(),
-            &agent(1).encoded()[..4],
             &agent(2).encoded()[..4],
         ),
         "tagged agent should file under its heading, tag intact in the buffer"
@@ -4043,9 +4042,8 @@ fn vim_treats_a_collapsed_subtree_as_one_line(cx: &mut TestAppContext) {
     );
 }
 
-/// The home view: the Desk document is the surface, agent rows render
-/// under their bound headings, unbound roots under a generated Unfiled
-/// tail, and daemon rebinds rearrange rows without touching the text.
+/// The home view: bound agents stay in compact heading hints until `g t`
+/// projects their runtime tree; unbound roots live in the Unfiled tail.
 #[gpui::test]
 fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
     use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
@@ -4085,6 +4083,7 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
         replicas: Vec::new(),
     };
 
+    cx.update(bind_test_keymaps);
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
@@ -4115,6 +4114,14 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
                 cx,
             );
             workspace.sync_dashboard(window, cx);
+            let focus_handle = workspace.dashboard_editor().read(cx).focus_handle(cx);
+            window.focus(&focus_handle, cx);
+            workspace.dashboard_editor().update(cx, |editor, cx| {
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    let offset = editor::MultiBufferOffset(2);
+                    selections.select_ranges([offset..offset]);
+                });
+            });
         })
         .expect("update workspace");
     cx.run_until_parked();
@@ -4127,14 +4134,12 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
             })
             .expect("read dashboard")
     };
-    // The tagged agent keeps its compact heading hint and projects its
-    // addressable runtime row below the heading line.
+    // The tagged agent starts as only a compact heading hint.
     assert_eq!(
         dashboard_text(&workspace, cx),
         format!(
-            "* One :eng-{}:\n  · planner  eng-{}\nbody\n* Two\n\nUnfiled · 1\n  · drifter  eng-{}",
+            "* One :eng-{}:\nbody\n* Two\n\nUnfiled · 1\n  · drifter  eng-{}",
             agent(1).encoded(),
-            &agent(1).encoded()[..4],
             &agent(2).encoded()[..4],
         )
     );
@@ -4144,6 +4149,43 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
         })
         .expect("read hints");
     assert_eq!(hints, 1, "the staffed heading wears its chip as a hint");
+
+    cx.simulate_keystrokes(*workspace, "escape g t");
+    cx.run_until_parked();
+    assert_eq!(
+        dashboard_text(&workspace, cx),
+        format!(
+            "* One :eng-{}:\n  · planner  eng-{}\nbody\n* Two\n\nUnfiled · 1\n  · drifter  eng-{}",
+            agent(1).encoded(),
+            &agent(1).encoded()[..4],
+            &agent(2).encoded()[..4],
+        ),
+        "g t should explicitly project the runtime tree"
+    );
+    let hints = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace.dashboard_editor().read(cx).eol_hints().len()
+        })
+        .expect("read expanded hints");
+    assert_eq!(hints, 0, "the open portal replaces its compact hint");
+
+    cx.simulate_keystrokes(*workspace, "g t");
+    cx.run_until_parked();
+    assert_eq!(
+        dashboard_text(&workspace, cx),
+        format!(
+            "* One :eng-{}:\nbody\n* Two\n\nUnfiled · 1\n  · drifter  eng-{}",
+            agent(1).encoded(),
+            &agent(2).encoded()[..4],
+        ),
+        "a second g t should return to the compact hint-only view"
+    );
+    let hints = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace.dashboard_editor().read(cx).eol_hints().len()
+        })
+        .expect("read collapsed hints");
+    assert_eq!(hints, 1, "closing the portal restores its compact hint");
 
     // Deleting the tag from the text is the unbind: rows rearrange and
     // both agents fall back to Unfiled.
