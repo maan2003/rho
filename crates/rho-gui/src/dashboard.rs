@@ -564,6 +564,10 @@ impl Dashboard {
                         && *hidden == conceals
                 })
         {
+            // The world is unchanged, but the caret may have moved onto
+            // a conceal through a path that skips the editor's motion
+            // constraint (anchor resolution over a daemon edit).
+            self.nudge_caret_off_folds(window, cx);
             return;
         }
 
@@ -762,6 +766,7 @@ impl Dashboard {
         self.apply_heading_chrome(&decorations, cx);
         self.apply_tag_conceals(&conceals, cx);
         self.apply_subtree_folds(&fold_ranges, cx);
+        self.nudge_caret_off_folds(window, cx);
         self.last_synced =
             Some((documents, segments, draft_texts, decorations, fold_ranges, conceals));
     }
@@ -1706,6 +1711,27 @@ impl Dashboard {
     /// a widthless fold makes its two buffer sides display-identical,
     /// and selection round-trips through display coordinates would
     /// silently canonicalize one side to the other.
+    /// Motions constrain the caret to fold rest positions; applied
+    /// folds and anchor resolution do not. A conceal materializing
+    /// under a caret that was legally resting there — the daemon retag
+    /// inserts the tag at the very spot the caret occupies after typing
+    /// a title — strands it on a forbidden edge, where it renders past
+    /// the heading's decoration inlay. Nudge it through the editor's
+    /// own constraint.
+    fn nudge_caret_off_folds(&self, window: &mut Window, cx: &mut Context<Workspace>) {
+        self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.display_snapshot(cx);
+            let selection = editor
+                .selections
+                .newest::<multi_buffer::MultiBufferPoint>(&snapshot);
+            if selection.start == selection.end
+                && snapshot.caret_rest_adjustment(selection.head()).is_some()
+            {
+                editor.change_selections(Default::default(), window, cx, |_| {});
+            }
+        });
+    }
+
     fn apply_tag_conceals(
         &self,
         conceals: &[(HostId, Range<usize>, String, editor::display_map::CaretRest)],
@@ -1820,7 +1846,10 @@ impl Dashboard {
                     merge_adjacent: false,
                     type_tag: Some(type_id),
                     collapsed_text: Some(" …".into()),
-                    caret_rest: editor::display_map::CaretRest::Any,
+                    // Buffer-space motions (`e`, `w`, searches) can land
+                    // inside the hidden subtree; vim keeps the fold
+                    // closed and shows the cursor on the fold line.
+                    caret_rest: editor::display_map::CaretRest::Boundary,
                 },
             ));
         }
@@ -2111,10 +2140,10 @@ fn agent_line(agent_id: AgentId, registry: &AgentRegistry) -> Line {
     line
 }
 
-/// Org-modern's replacement stars, one per heading level, cycling like
+/// The classic org-bullets stars, one per heading level, cycling like
 /// the level colors do. Fold state lives in the chevron the collapsed
 /// body's placeholder draws at the end of the heading line.
-const HEADING_STARS: [&str; 4] = ["◉", "○", "◈", "◇"];
+const HEADING_STARS: [&str; 4] = ["◉", "○", "✸", "✿"];
 
 /// The heading-line conceals: the star token and its separating space
 /// render as an org-modern bullet (indented one column per level, same
@@ -2337,7 +2366,11 @@ fn cursor_clamped_fold(
     range: Range<usize>,
     cursor: usize,
 ) -> Option<Range<usize>> {
-    if cursor <= range.start || cursor > range.end {
+    // Both boundaries stay foldable: the end anchor is left-biased, so
+    // typing at the end boundary lands outside the fold, and motions
+    // resting there (word motions stop on the fold's last character)
+    // must not open it.
+    if cursor <= range.start || cursor >= range.end {
         return Some(range);
     }
     let line_start = text[..cursor].rfind('\n').map_or(0, |at| at + 1);
@@ -3001,15 +3034,17 @@ mod tests {
     fn folds_never_capture_the_cursor() {
         let text = "* One\nbody\nx\n* Two\n";
         let fold = 5..12;
-        // Outside the range — before, at the start boundary, after —
-        // the fold applies untouched.
+        // Outside the range — before, at either boundary, after — the
+        // fold applies untouched. The end boundary is where word
+        // motions rest, and its left-biased anchor keeps typed text
+        // outside the fold.
         assert_eq!(cursor_clamped_fold(text, fold.clone(), 0), Some(5..12));
         assert_eq!(cursor_clamped_fold(text, fold.clone(), 5), Some(5..12));
+        assert_eq!(cursor_clamped_fold(text, fold.clone(), 12), Some(5..12));
         assert_eq!(cursor_clamped_fold(text, fold.clone(), 14), Some(5..12));
         // On the fold's last line (`o` below a folded heading, then
         // typing) the fold shortens to end above that line.
         assert_eq!(cursor_clamped_fold(text, fold.clone(), 11), Some(5..10));
-        assert_eq!(cursor_clamped_fold(text, fold.clone(), 12), Some(5..10));
         // Deeper inside — or on the subtree's only line — it lifts.
         assert_eq!(cursor_clamped_fold(text, fold.clone(), 8), None);
         let short = "* One\nbody\n* Two\n";

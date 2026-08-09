@@ -4465,3 +4465,278 @@ fn quick_spawn_placeholder_takes_the_generated_title(cx: &mut TestAppContext) {
         desk_text(&workspace, cx)
     );
 }
+
+/// The daemon retags a heading by inserting the tag at the very spot
+/// the caret occupies after typing the title. That edit arrives as a
+/// CRDT operation and moves the caret by anchor resolution, outside
+/// `change_selections` and its caret-rest constraint — so the sync that
+/// conceals the new tag must also nudge the caret off the conceal.
+#[gpui::test]
+fn daemon_retag_keeps_the_caret_at_the_title_end(cx: &mut TestAppContext) {
+    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot, DeskTextOpRecord};
+    use rho_ui_proto::{
+        AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
+    };
+
+    let summary = UiAgentSummary {
+        agent_id: agent(1),
+        parent_agent: None,
+        display_name: Some("planner".to_owned()),
+        created_at: UnixMs(1),
+        updated_at: UnixMs(1),
+        role: AgentRole::default(),
+        workspace: WorkspaceInfo::UserCheckout { repo: "/tmp".into() },
+        attention: UiAttention::Quiet,
+        last_active: UnixMs(1),
+        hidden: false,
+        disposition: AgentDisposition::Pending,
+        last_user_message_text: String::new(),
+        activity: None,
+        turn_report: None,
+        labels: Vec::new(),
+    };
+
+    let mut source = text::Buffer::new(
+        text::ReplicaId::new(8),
+        text::BufferId::new(1).unwrap(),
+        "",
+    );
+    let operation = DeskOperation::from_text(&source.edit([(0..0, "* One\nbody\n* Two\n")]));
+    let desk_snapshot = DeskSnapshot {
+        text: source.snapshot().text(),
+        operations: vec![operation],
+        transactions: Vec::new(),
+        replicas: Vec::new(),
+    };
+
+    let workspace = test_workspace(cx);
+    cx.update(bind_test_keymaps);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Ready {
+                    agents: vec![summary],
+                    iris_agent: None,
+                    projects: Vec::new(),
+                    auth: AuthState {
+                        active: String::new(),
+                        default: String::new(),
+                        namespaces: Vec::new(),
+                    },
+                    machine_seed: 0,
+                    agent_counter: 100,
+                },
+                window,
+                cx,
+            );
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskSnapshot {
+                    snapshot: desk_snapshot,
+                    replica_id: 42,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+            let focus_handle = workspace.dashboard_editor().read(cx).focus_handle(cx);
+            window.focus(&focus_handle, cx);
+            workspace.dashboard_editor().update(cx, |editor, cx| {
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    let offset = editor::MultiBufferOffset(5);
+                    selections.select_ranges([offset..offset]);
+                });
+            });
+        })
+        .expect("update workspace");
+    cx.update(|cx| cx.refresh_windows());
+    cx.run_until_parked();
+
+    let caret = |cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |workspace, _, cx| {
+                workspace.dashboard_editor().update(cx, |editor, cx| {
+                    let snapshot = editor.display_snapshot(cx);
+                    editor
+                        .selections
+                        .newest::<editor::MultiBufferOffset>(&snapshot)
+                        .head()
+                        .0
+                })
+            })
+            .expect("read caret")
+    };
+    assert_eq!(caret(cx), 5, "caret starts at the title end");
+
+    let tag_edit = format!(" :eng-{}:", agent(1).encoded());
+    let operation = DeskOperation::from_text(&source.edit([(5..5, tag_edit.as_str())]));
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskTextApplied(DeskTextOpRecord {
+                    sequence: 2,
+                    timestamp_ms: 2,
+                    operation,
+                    transaction: None,
+                }),
+                window,
+                cx,
+            );
+        })
+        .expect("apply retag");
+    cx.update(|cx| cx.refresh_windows());
+    cx.run_until_parked();
+
+    let display = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .dashboard_editor()
+                .update(cx, |editor, cx| editor.display_text(cx))
+        })
+        .expect("read display text");
+    assert!(
+        !display.contains(":eng-"),
+        "tag should be concealed: {display:?}"
+    );
+    assert_eq!(
+        caret(cx),
+        5,
+        "the caret must not strand past the concealed tag"
+    );
+
+    // Any anchor-resolution path can strand the caret inside the
+    // conceal; the next sync heals it.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.dashboard_editor().update(cx, |editor, cx| {
+                let snapshot = editor.display_snapshot(cx);
+                editor.selections.change_with(&snapshot, |selections| {
+                    let line_end = editor::MultiBufferOffset(5 + tag_edit.len());
+                    selections.select_ranges([line_end..line_end]);
+                });
+            });
+            workspace.sync_dashboard(window, cx);
+        })
+        .expect("strand caret");
+    cx.update(|cx| cx.refresh_windows());
+    cx.run_until_parked();
+    assert_eq!(caret(cx), 5, "sync must nudge a stranded caret off the conceal");
+}
+
+/// Cursor motion must never open a fold: the clamp that lifts a fold
+/// when the caret lands inside it exists for genuine jumps (`o`,
+/// searches), and hjkl travel around a folded heading must not trip it.
+#[gpui::test]
+fn hjkl_travel_never_opens_a_fold(cx: &mut TestAppContext) {
+    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
+    use rho_ui_proto::{
+        AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
+    };
+
+    let summary = UiAgentSummary {
+        agent_id: agent(1),
+        parent_agent: None,
+        display_name: Some("planner".to_owned()),
+        created_at: UnixMs(1),
+        updated_at: UnixMs(1),
+        role: AgentRole::default(),
+        workspace: WorkspaceInfo::UserCheckout { repo: "/tmp".into() },
+        attention: UiAttention::Quiet,
+        last_active: UnixMs(1),
+        hidden: false,
+        disposition: AgentDisposition::Pending,
+        last_user_message_text: String::new(),
+        activity: None,
+        turn_report: None,
+        labels: Vec::new(),
+    };
+
+    let desk_text = format!(
+        "* One :eng-{}:\none body\n** Kid\nkid stuff\n* Two\ntwo tail\n",
+        agent(1).encoded()
+    );
+    let mut source = text::Buffer::new(
+        text::ReplicaId::new(8),
+        text::BufferId::new(1).unwrap(),
+        "",
+    );
+    let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text.as_str())]));
+    let desk_snapshot = DeskSnapshot {
+        text: source.snapshot().text(),
+        operations: vec![operation],
+        transactions: Vec::new(),
+        replicas: Vec::new(),
+    };
+
+    let workspace = test_workspace(cx);
+    cx.update(bind_test_keymaps);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Ready {
+                    agents: vec![summary],
+                    iris_agent: None,
+                    projects: Vec::new(),
+                    auth: AuthState {
+                        active: String::new(),
+                        default: String::new(),
+                        namespaces: Vec::new(),
+                    },
+                    machine_seed: 0,
+                    agent_counter: 100,
+                },
+                window,
+                cx,
+            );
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskSnapshot {
+                    snapshot: desk_snapshot,
+                    replica_id: 42,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+            let focus_handle = workspace.dashboard_editor().read(cx).focus_handle(cx);
+            window.focus(&focus_handle, cx);
+            workspace.dashboard_editor().update(cx, |editor, cx| {
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    let offset = editor::MultiBufferOffset(2);
+                    selections.select_ranges([offset..offset]);
+                });
+            });
+        })
+        .expect("update workspace");
+    cx.update(|cx| cx.refresh_windows());
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "escape tab");
+    cx.run_until_parked();
+
+    let folded_body_hidden = |cx: &mut TestAppContext| {
+        let display = workspace
+            .update(cx, |workspace, _, cx| {
+                workspace
+                    .dashboard_editor()
+                    .update(cx, |editor, cx| editor.display_text(cx))
+            })
+            .expect("read display text");
+        !display.contains("one body") && !display.contains("kid stuff")
+    };
+    assert!(folded_body_hidden(cx), "tab folds the subtree");
+
+    for step in [
+        "j", "k", "$", "l", "l", "h", "j", "j", "k", "k", "0", "$", "j", "$", "k", "e", "e", "b",
+        "w", "g g", "shift-g", "k",
+    ] {
+        cx.simulate_keystrokes(*workspace, step);
+        cx.run_until_parked();
+        assert!(
+            folded_body_hidden(cx),
+            "motion {step:?} must not open the fold"
+        );
+    }
+}

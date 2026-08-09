@@ -34,10 +34,15 @@ use util::post_inc;
 pub enum CaretRest {
     #[default]
     Any,
-    /// A caret landing on this fold's end snaps to its start.
+    /// A caret landing on this fold's end or interior snaps to its start.
     Start,
-    /// A caret landing on this fold's start snaps to its end.
+    /// A caret landing on this fold's start or interior snaps to its end.
     End,
+    /// A caret landing strictly inside snaps to the start; both
+    /// boundaries stay restable. This is vim's closed-fold convention:
+    /// motions into the fold show the cursor on the fold line, while
+    /// line-wise edits still address either edge.
+    Boundary,
 }
 
 #[derive(Clone)]

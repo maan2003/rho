@@ -2412,10 +2412,30 @@ impl DisplaySnapshot {
     /// Where an empty caret at `point` must move to honor one-sided
     /// fold boundaries ([`CaretRest`]), if anywhere. Both sides of a
     /// concealed fold occupy the same display position; this picks the
-    /// buffer side the fold declared restable.
+    /// buffer side the fold declared restable. A caret strictly inside
+    /// the fold snaps to the restable side too: motions that resolve
+    /// through display coordinates (goal columns over trailing inlays,
+    /// end-of-line clips) can otherwise land the caret in the hidden
+    /// text.
     pub fn caret_rest_adjustment(&self, point: MultiBufferPoint) -> Option<MultiBufferPoint> {
         let buffer_snapshot = self.buffer_snapshot();
-        let offset = point.to_offset(buffer_snapshot);
+        let mut offset = point.to_offset(buffer_snapshot);
+        let mut moved = false;
+        // A snap can land on another fold's forbidden side (one fold's
+        // start is another's end), so chase the adjustment to a
+        // fixpoint. The bound guards against adversarial fold cycles.
+        for _ in 0..8 {
+            let Some(next) = self.caret_rest_step(offset) else {
+                break;
+            };
+            offset = next;
+            moved = true;
+        }
+        moved.then(|| offset.to_point(buffer_snapshot))
+    }
+
+    fn caret_rest_step(&self, offset: MultiBufferOffset) -> Option<MultiBufferOffset> {
+        let buffer_snapshot = self.buffer_snapshot();
         let window = buffer_snapshot
             .clip_offset(MultiBufferOffset(offset.0.saturating_sub(1)), Bias::Left)
             ..buffer_snapshot.clip_offset(
@@ -2429,18 +2449,23 @@ impl DisplaySnapshot {
             match fold.placeholder.caret_rest {
                 CaretRest::Any => {}
                 CaretRest::Start => {
-                    if range.end == offset {
+                    if range.start < offset && offset <= range.end {
                         target = Some(range.start);
                     }
                 }
                 CaretRest::End => {
-                    if range.start == offset {
+                    if range.start <= offset && offset < range.end {
                         target = Some(range.end);
+                    }
+                }
+                CaretRest::Boundary => {
+                    if range.start < offset && offset < range.end {
+                        target = Some(range.start);
                     }
                 }
             }
         }
-        target.map(|offset| offset.to_point(buffer_snapshot))
+        target
     }
 
     pub fn blocks_in_range(
