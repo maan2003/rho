@@ -525,7 +525,7 @@ impl Dashboard {
             Some(CursorPlace::Doc(host, offset)) => Some((*host, *offset)),
             _ => None,
         };
-        let conceals = heading_conceals(&documents, &fold_ranges, cursor_doc);
+        let conceals = heading_conceals(&documents, cursor_doc);
 
         // Render reconciles every frame, so most passes are registry
         // noise that changes nothing on screen. When the whole pass —
@@ -1791,10 +1791,31 @@ impl Dashboard {
             ) else {
                 continue;
             };
+            // The fold sits at the end of the heading line, so its
+            // placeholder is the folded indicator: a right chevron.
             creases.push(editor::display_map::Crease::simple(
                 start..end,
                 editor::FoldPlaceholder {
-                    render: std::sync::Arc::new(|_, _, _| gpui::Empty.into_any_element()),
+                    render: std::sync::Arc::new(|_, _, cx| {
+                        use gpui::Styled as _;
+                        use settings::Settings as _;
+                        use theme::ActiveTheme as _;
+                        let size = theme_settings::ThemeSettings::get_global(cx)
+                            .buffer_font_size(cx);
+                        let color = cx.theme().colors().text_muted;
+                        gpui::div()
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .child(
+                                gpui::svg()
+                                    .path("icons/chevron_right.svg")
+                                    .w(size)
+                                    .h(size)
+                                    .text_color(color),
+                            )
+                            .into_any_element()
+                    }),
                     constrain_width: false,
                     merge_adjacent: false,
                     type_tag: Some(type_id),
@@ -2090,21 +2111,18 @@ fn agent_line(agent_id: AgentId, registry: &AgentRegistry) -> Line {
     line
 }
 
-/// What a heading wears at the end of its line: `…` when collapsed
-/// over a hidden body, then each bound agent as `glyph eng-id` (plus
-/// `+n` when it has subagents), and the attention reason inline when
-/// the agent is waiting on the human.
-/// Org-modern's fold-state stars, one closed/open pair per heading
-/// level, cycling like the level colors do.
-const FOLD_STARS: [(&str, &str); 4] = [("▶", "▼"), ("▷", "▽"), ("▸", "▾"), ("▹", "▿")];
+/// Org-modern's replacement stars, one per heading level, cycling like
+/// the level colors do. Fold state lives in the chevron the collapsed
+/// body's placeholder draws at the end of the heading line.
+const HEADING_STARS: [&str; 4] = ["◉", "○", "◈", "◇"];
 
 /// The heading-line conceals: the star token and its separating space
-/// render as an org-modern fold indicator (indented one column per
-/// level, closed when a fold hangs off the heading line, same width as
-/// the text it replaces), and the tag with its separating whitespace
-/// hides behind a single space (the inlay decoration shows the pretty
-/// form). Caret rest keeps the caret on the title side of both, so
-/// typing can never split the star token or fall behind the binding.
+/// render as an org-modern bullet (indented one column per level, same
+/// width as the text it replaces), and the tag with its separating
+/// whitespace hides behind a single space (the inlay decoration shows
+/// the pretty form). Caret rest keeps the caret on the title side of
+/// both, so typing can never split the star token or fall behind the
+/// binding.
 ///
 /// A conceal never captures the caret: typing with the caret inside a
 /// fold replaces the fold's contents, so a rebuilt conceal swallowing
@@ -2113,7 +2131,6 @@ const FOLD_STARS: [(&str, &str); 4] = [("▶", "▼"), ("▷", "▽"), ("▸", "
 /// either token reveals it outright, org-appear style.
 fn heading_conceals(
     documents: &[(HostId, String)],
-    fold_ranges: &[(HostId, Range<usize>)],
     cursor: Option<(HostId, usize)>,
 ) -> Vec<(HostId, Range<usize>, String, editor::display_map::CaretRest)> {
     use editor::display_map::CaretRest;
@@ -2130,17 +2147,11 @@ fn heading_conceals(
             }
             let stars = heading.stars_range.start..stars_end;
             if !caret.is_some_and(|caret| stars.start < caret && caret < stars.end) {
-                let folded = fold_ranges.iter().any(|(fold_host, range)| {
-                    fold_host == host
-                        && heading.heading_range.start <= range.start
-                        && range.start <= heading.heading_range.end
-                });
-                let (closed, open) =
-                    FOLD_STARS[(heading.depth.saturating_sub(1)) % FOLD_STARS.len()];
-                let mut indicator = " ".repeat(heading.depth.saturating_sub(1));
-                indicator.push_str(if folded { closed } else { open });
-                indicator.push(' ');
-                conceals.push((*host, stars, indicator, CaretRest::End));
+                let star = HEADING_STARS[(heading.depth.saturating_sub(1)) % HEADING_STARS.len()];
+                let mut bullet = " ".repeat(heading.depth.saturating_sub(1));
+                bullet.push_str(star);
+                bullet.push(' ');
+                conceals.push((*host, stars, bullet, CaretRest::End));
             }
             let Some(tags_range) = heading.tags_range else {
                 continue;
@@ -2167,6 +2178,10 @@ fn heading_conceals(
     conceals
 }
 
+/// What a heading wears at the end of its line: a chevron when
+/// collapsed over a hidden body, then each bound agent as `glyph
+/// eng-id` (plus `+n` when it has subagents), and the attention reason
+/// inline when the agent is waiting on the human.
 fn heading_decorations(
     registry: &AgentRegistry,
     documents: &[(HostId, String)],

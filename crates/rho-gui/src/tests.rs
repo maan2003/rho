@@ -3431,7 +3431,7 @@ fn heading_tags_file_agents_and_conceal_in_display(cx: &mut TestAppContext) {
         "raw tag should be concealed: {display:?}"
     );
     assert!(
-        display.contains("▼ One  · eng-"),
+        display.contains("◉ One  · eng-"),
         "decoration should abut the title where the tag hid: {display:?}"
     );
 }
@@ -3842,10 +3842,11 @@ fn collapsed_subtree_folds_in_the_display_and_survives_edits(cx: &mut TestAppCon
     assert!(folded.contains("One"), "folded: {folded:?}");
     assert!(folded.contains("Two"), "folded: {folded:?}");
     assert!(folded.contains('…'), "folded: {folded:?}");
-    // The star prefix conceals behind an org-modern fold indicator:
-    // closed on the folded heading, open on the expanded one.
-    assert!(folded.contains("▶ One"), "folded: {folded:?}");
-    assert!(folded.contains("▼ Two"), "folded: {folded:?}");
+    // The star prefix conceals behind an org-modern bullet on folded
+    // and expanded headings alike; the chevron placeholder carries the
+    // fold state.
+    assert!(folded.contains("◉ One"), "folded: {folded:?}");
+    assert!(folded.contains("◉ Two"), "folded: {folded:?}");
 
     // Folded → children, org's CHILDREN state: only the child heading
     // line joins the parent — the body and the child's subtree stay
@@ -4120,7 +4121,7 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
         })
         .expect("read display text");
     assert!(
-        display.contains("▼ One  · eng-"),
+        display.contains("◉ One  · eng-"),
         "heading decoration missing: {display:?}"
     );
 
