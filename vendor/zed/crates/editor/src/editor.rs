@@ -4261,6 +4261,34 @@ impl Editor {
     }
 
     #[ztracing::instrument(skip_all)]
+    fn refresh_selected_text_highlights_after_buffer_event(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Editor>,
+    ) {
+        let selection = self.selections.newest_anchor();
+        if matches!(self.mode, EditorMode::SingleLine)
+            || !self.use_selection_highlight
+            || !EditorSettings::get_global(cx).selection_highlight
+            || self.selections.count() != 1
+            || self.selections.line_mode()
+            || selection.start == selection.end
+        {
+            self.clear_selected_text_highlights(cx);
+            return;
+        }
+        let snapshot = self.display_snapshot(cx);
+        self.refresh_selected_text_highlights(&snapshot, true, window, cx);
+    }
+
+    fn clear_selected_text_highlights(&mut self, cx: &mut Context<Editor>) {
+        self.clear_background_highlights(HighlightKey::SelectedTextHighlight, cx);
+        self.quick_selection_highlight_task.take();
+        self.debounced_selection_highlight_task.take();
+        self.debounced_selection_highlight_complete = false;
+    }
+
+    #[ztracing::instrument(skip_all)]
     fn refresh_selected_text_highlights(
         &mut self,
         snapshot: &DisplaySnapshot,
@@ -4271,10 +4299,7 @@ impl Editor {
         let Some((query_text, query_range)) =
             self.prepare_highlight_query_from_selection(snapshot, cx)
         else {
-            self.clear_background_highlights(HighlightKey::SelectedTextHighlight, cx);
-            self.quick_selection_highlight_task.take();
-            self.debounced_selection_highlight_task.take();
-            self.debounced_selection_highlight_complete = false;
+            self.clear_selected_text_highlights(cx);
             return;
         };
         let display_snapshot = self.display_map.update(cx, |map, cx| map.snapshot(cx));
@@ -10327,12 +10352,29 @@ impl Editor {
                 #[cfg(feature = "native")]
                 self.refresh_code_actions_for_selection(window, cx);
                 self.refresh_single_line_folds(window, cx);
-                let snapshot = self.snapshot(window, cx);
-                self.refresh_matching_bracket_highlights(&snapshot, cx);
+                let refresh_matching_bracket_highlights = edited_buffer.as_ref().is_none_or(
+                    |edited_buffer| {
+                        let head = self.selections.newest_anchor().head();
+                        self.buffer
+                            .read(cx)
+                            .text_anchor_for_position(head, cx)
+                            .is_none_or(|(cursor_buffer, _)| cursor_buffer == *edited_buffer)
+                    },
+                );
+                #[cfg(feature = "native")]
+                let refresh_display_snapshot = true;
+                #[cfg(not(feature = "native"))]
+                let refresh_display_snapshot = refresh_matching_bracket_highlights;
+                if refresh_display_snapshot {
+                    let snapshot = self.snapshot(window, cx);
+                    if refresh_matching_bracket_highlights {
+                        self.refresh_matching_bracket_highlights(&snapshot, cx);
+                    }
+                    #[cfg(feature = "native")]
+                    self.refresh_sticky_headers(&snapshot, cx);
+                }
                 #[cfg(feature = "native")]
                 self.refresh_outline_symbols_at_cursor(cx);
-                #[cfg(feature = "native")]
-                self.refresh_sticky_headers(&snapshot, cx);
                 #[cfg(feature = "native")]
                 if source.is_local() && self.has_active_edit_prediction() {
                     self.update_visible_edit_prediction(window, cx);
@@ -10408,7 +10450,7 @@ impl Editor {
                 self.bracket_fetched_tree_sitter_chunks
                     .retain(|range, _| range.start.buffer_id != buffer_id);
                 self.colorize_brackets(false, cx);
-                self.refresh_selected_text_highlights(&self.display_snapshot(cx), true, window, cx);
+                self.refresh_selected_text_highlights_after_buffer_event(window, cx);
                 #[cfg(feature = "native")]
                 self.semantic_token_state.invalidate_buffer(&buffer_id);
                 cx.emit(EditorEvent::BufferRangesUpdated {
@@ -10468,7 +10510,7 @@ impl Editor {
                 }
                 #[cfg(feature = "native")]
                 self.refresh_runnables(Some(*buffer_id), window, cx);
-                self.refresh_selected_text_highlights(&self.display_snapshot(cx), true, window, cx);
+                self.refresh_selected_text_highlights_after_buffer_event(window, cx);
                 self.colorize_brackets(true, cx);
                 jsx_tag_auto_close::refresh_enabled_for_buffer(
                     self,
@@ -10566,7 +10608,7 @@ impl Editor {
         self.bracket_fetched_tree_sitter_chunks
             .retain(|range, _| !buffer_ids.contains(&range.start.buffer_id));
         self.colorize_brackets(false, cx);
-        self.refresh_selected_text_highlights(&self.display_snapshot(cx), true, window, cx);
+        self.refresh_selected_text_highlights_after_buffer_event(window, cx);
     }
 
     fn on_display_map_changed(

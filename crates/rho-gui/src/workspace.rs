@@ -18,6 +18,7 @@ mod web;
 use std::collections::{HashMap, HashSet};
 #[cfg(feature = "native")]
 use std::path::PathBuf;
+use std::time::Duration;
 #[cfg(feature = "native")]
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -758,7 +759,7 @@ impl Workspace {
             global_usage: HashMap::new(),
             global_usage_days: 7,
             duration_timer: None,
-            chime: Chime::default(),
+            chime: Chime,
             contexts: HashMap::new(),
             surfaces: HashMap::new(),
             active_context: ContextId::Draft,
@@ -1011,13 +1012,28 @@ impl Workspace {
             return;
         }
         self.frame_flush_scheduled = true;
-        cx.on_next_frame(window, |this, window, cx| {
-            this.frame_flush_scheduled = false;
-            this.flush_pending_frames(window, cx);
-        });
-        // `on_next_frame` attaches to a draw; make sure an otherwise idle
-        // window gets one to consume the queued transport state.
-        cx.notify();
+        // GPUI's test platform reports every window as inactive, so tests use
+        // the foreground path unless they explicitly exercise this policy.
+        if window.is_window_active() || cfg!(test) {
+            cx.on_next_frame(window, |this, window, cx| {
+                this.frame_flush_scheduled = false;
+                this.flush_pending_frames(window, cx);
+            });
+            // `on_next_frame` attaches to a draw; make sure an otherwise idle
+            // window gets one to consume the queued transport state.
+            cx.notify();
+        } else {
+            cx.spawn_in(window, async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(200))
+                    .await;
+                let _ = this.update_in(cx, |this, window, cx| {
+                    this.frame_flush_scheduled = false;
+                    this.flush_pending_frames(window, cx);
+                });
+            })
+            .detach();
+        }
     }
 
     fn flush_pending_frames(&mut self, window: &mut Window, cx: &mut Context<Self>) {
