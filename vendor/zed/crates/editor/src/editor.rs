@@ -10470,7 +10470,12 @@ impl Editor {
                 self.refresh_runnables(Some(*buffer_id), window, cx);
                 self.refresh_selected_text_highlights(&self.display_snapshot(cx), true, window, cx);
                 self.colorize_brackets(true, cx);
-                jsx_tag_auto_close::refresh_enabled_in_any_buffer(self, multibuffer, cx);
+                jsx_tag_auto_close::refresh_enabled_for_buffer(
+                    self,
+                    multibuffer,
+                    *buffer_id,
+                    cx,
+                );
 
                 cx.emit(EditorEvent::Reparsed(*buffer_id));
             }
@@ -10484,7 +10489,12 @@ impl Editor {
                 if !is_fresh_language {
                     self.registered_buffers.remove(&buffer_id);
                 }
-                jsx_tag_auto_close::refresh_enabled_in_any_buffer(self, multibuffer, cx);
+                jsx_tag_auto_close::refresh_enabled_for_buffer(
+                    self,
+                    multibuffer,
+                    *buffer_id,
+                    cx,
+                );
                 cx.emit(EditorEvent::Reparsed(*buffer_id));
                 #[cfg(feature = "native")]
                 self.update_edit_prediction_settings(cx);

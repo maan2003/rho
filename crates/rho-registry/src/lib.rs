@@ -58,6 +58,8 @@ struct HostSnapshot {
     agents: Vec<UiAgentSummary>,
 }
 
+type TagAgents = BTreeMap<HostId, BTreeMap<&'static str, Vec<(String, AgentId)>>>;
+
 #[derive(Default)]
 pub struct AgentRegistry {
     agents: BTreeMap<AgentId, AgentLife>,
@@ -75,6 +77,7 @@ pub struct AgentRegistry {
     /// must not scan the whole registry per call.
     children: BTreeMap<AgentId, Vec<AgentId>>,
     agent_hosts: BTreeMap<AgentId, HostId>,
+    tag_agents: TagAgents,
     announced_hosts: BTreeMap<AgentId, HostId>,
     active: ActivePane,
 }
@@ -247,6 +250,24 @@ impl AgentRegistry {
                 self.children.entry(parent).or_default().push(agent.agent_id);
             }
         }
+        self.tag_agents = BTreeMap::new();
+        for (agent_id, location) in &self.agent_locations {
+            let agent = &summaries[*location];
+            let Some(host) = self.agent_hosts.get(agent_id) else {
+                continue;
+            };
+            self.tag_agents
+                .entry(*host)
+                .or_default()
+                .entry(agent.role.handle_prefix())
+                .or_default()
+                .push((agent_id.encoded(), *agent_id));
+        }
+        for roles in self.tag_agents.values_mut() {
+            for agents in roles.values_mut() {
+                agents.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+            }
+        }
         self.summaries = summaries;
     }
 
@@ -360,15 +381,16 @@ impl AgentRegistry {
     /// for as long as they stay unambiguous.
     pub fn agent_by_tag(&self, host: HostId, label: &str) -> Option<AgentId> {
         let (role_prefix, encoded_prefix) = label.split_once('-')?;
-        let mut matches = self.agents.keys().copied().filter(|agent_id| {
-            self.host_of_agent(*agent_id) == Some(host)
-                && self
-                    .agent_role(*agent_id)
-                    .is_some_and(|role| role.handle_prefix() == role_prefix)
-                && agent_id.encoded().starts_with(encoded_prefix)
-        });
-        let found = matches.next()?;
-        matches.next().is_none().then_some(found)
+        let agents = self.tag_agents.get(&host)?.get(role_prefix)?;
+        let start = agents.partition_point(|(encoded, _)| encoded.as_str() < encoded_prefix);
+        let found = agents.get(start)?.1;
+        agents[start].0.starts_with(encoded_prefix)
+            .then_some(found)
+            .filter(|_| {
+                !agents
+                    .get(start + 1)
+                    .is_some_and(|(encoded, _)| encoded.starts_with(encoded_prefix))
+            })
     }
 
     pub fn working_directory(&self, agent_id: AgentId) -> Option<Utf8PathBuf> {

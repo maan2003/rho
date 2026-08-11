@@ -5,7 +5,9 @@ use multi_buffer::{BufferOffset, MultiBuffer, ToOffset};
 use std::ops::Range;
 use util::ResultExt as _;
 
-use language::{BufferSnapshot, JsxTagAutoCloseConfig, Node, language_settings::LanguageSettings};
+use language::{
+    Buffer, BufferSnapshot, JsxTagAutoCloseConfig, Node, language_settings::LanguageSettings,
+};
 use text::{Anchor, OffsetRangeExt as _};
 
 use crate::{Editor, SelectionEffects};
@@ -312,27 +314,42 @@ pub(crate) fn refresh_enabled_in_any_buffer(
         let multi_buffer = multi_buffer.read(cx);
         let mut found_enabled = false;
         multi_buffer.for_each_buffer(&mut |buffer| {
-            if found_enabled {
-                return;
-            }
-
-            let buffer = buffer.read(cx);
-            let snapshot = buffer.snapshot();
-            for language in snapshot.syntax_layers_languages() {
-                if language.config().jsx_tag_auto_close.is_none() {
-                    continue;
-                }
-                let should_auto_close =
-                    LanguageSettings::resolve(Some(buffer), Some(&language.name()), cx)
-                        .jsx_tag_auto_close;
-                if should_auto_close {
-                    found_enabled = true;
-                }
+            if !found_enabled {
+                found_enabled = jsx_tag_auto_close_enabled(buffer, cx);
             }
         });
 
         found_enabled
     };
+}
+
+pub(crate) fn refresh_enabled_for_buffer(
+    editor: &mut Editor,
+    multi_buffer: &Entity<MultiBuffer>,
+    buffer_id: language::BufferId,
+    cx: &Context<Editor>,
+) {
+    let enabled = multi_buffer
+        .read(cx)
+        .buffer(buffer_id)
+        .is_some_and(|buffer| jsx_tag_auto_close_enabled(&buffer, cx));
+    if enabled {
+        editor.jsx_tag_auto_close_enabled_in_any_buffer = true;
+    } else if editor.jsx_tag_auto_close_enabled_in_any_buffer {
+        // The changed buffer may have been the one that made the aggregate
+        // true. Only that transition requires checking every other buffer.
+        refresh_enabled_in_any_buffer(editor, multi_buffer, cx);
+    }
+}
+
+fn jsx_tag_auto_close_enabled(buffer: &Entity<Buffer>, cx: &Context<Editor>) -> bool {
+    let buffer = buffer.read(cx);
+    let snapshot = buffer.snapshot();
+    snapshot.syntax_layers_languages().any(|language| {
+        language.config().jsx_tag_auto_close.is_some()
+            && LanguageSettings::resolve(Some(buffer), Some(&language.name()), cx)
+                .jsx_tag_auto_close
+    })
 }
 
 pub(crate) type InitialBufferVersionsMap = HashMap<language::BufferId, clock::Global>;
