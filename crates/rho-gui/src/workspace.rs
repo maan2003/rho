@@ -341,6 +341,9 @@ pub struct Workspace {
     /// quit-one) before a final escape closes the strip.
     transient_stack: Vec<crate::transient::Transient>,
     transient_focus: gpui::FocusHandle,
+    /// Evil's one-shot `SPC u` prefix. The next supported Desk command
+    /// consumes it; every other non-modifier key clears it.
+    universal_argument: bool,
     #[cfg(feature = "native")]
     git_approval_focus: gpui::FocusHandle,
     /// Focus beneath the single modal overlay. Transients, minibuffers, and
@@ -364,6 +367,7 @@ pub struct Workspace {
     iris_host: Option<HostId>,
     _event_task: Task<()>,
     _dashboard_subscription: gpui::Subscription,
+    _universal_argument_subscription: gpui::Subscription,
     #[cfg(all(target_family = "wasm", not(feature = "native")))]
     web: web::WebUi,
 }
@@ -719,6 +723,19 @@ impl Workspace {
                 }
             },
         );
+        let universal_argument_subscription = cx.observe_keystrokes(|this, event, _, cx| {
+            if this.universal_argument
+                && !matches!(
+                    event.keystroke.key.as_str(),
+                    "shift" | "control" | "alt" | "platform" | "function"
+                )
+            {
+                // Supported actions consume the prefix before observers run;
+                // anything still armed here was an unrelated command.
+                this.universal_argument = false;
+                cx.notify();
+            }
+        });
         let mut this = Self {
             hosts,
             subscriptions: AgentSubscriptions::default(),
@@ -756,6 +773,7 @@ impl Workspace {
             transient: None,
             transient_stack: Vec::new(),
             transient_focus: cx.focus_handle(),
+            universal_argument: false,
             git_approval_focus: cx.focus_handle(),
             overlay_return_focus: None,
             echo: None,
@@ -768,6 +786,7 @@ impl Workspace {
             iris_host: None,
             _event_task: event_task,
             _dashboard_subscription: dashboard_subscription,
+            _universal_argument_subscription: universal_argument_subscription,
         };
         for spec in specs {
             this.attach_host(spec, cx);
@@ -4155,6 +4174,16 @@ impl Workspace {
         self.new_agent_draft.is_some()
     }
 
+    #[cfg(test)]
+    pub(crate) fn has_universal_argument_for_test(&self) -> bool {
+        self.universal_argument
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_transient_for_test(&self) -> bool {
+        self.transient.is_some()
+    }
+
     /// The reconnect loop marks test hosts disconnected (their sockets
     /// don't exist); verbs gated on connectivity need this to run.
     #[cfg(test)]
@@ -5423,6 +5452,15 @@ impl Workspace {
             // Document text keeps vim's own enter.
             _ => cx.propagate(),
         }
+    }
+
+    pub(crate) fn set_universal_argument(&mut self, cx: &mut Context<Self>) {
+        self.universal_argument = true;
+        cx.notify();
+    }
+
+    fn take_universal_argument(&mut self) -> bool {
+        std::mem::take(&mut self.universal_argument)
     }
 
     /// Insert-mode enter: send when the cursor is in a draft, and drop
@@ -6735,15 +6773,23 @@ impl Render for Workspace {
                 this.staff_dashboard_node(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardReply, window, cx| {
-                this.dashboard_reply(window, cx);
+                if this.take_universal_argument() {
+                    this.configure_dashboard_staff(window, cx);
+                } else {
+                    this.dashboard_reply(window, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &DashboardSubmit, window, cx| {
                 this.dashboard_submit(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardNewAgent, window, cx| {
-                this.new_agent_draft = None;
-                this.dashboard.open_new_draft(None, window, cx);
-                this.dashboard_focus_draft(window, cx);
+                if this.take_universal_argument() {
+                    this.configure_dashboard_quick_spawn(window, cx);
+                } else {
+                    this.new_agent_draft = None;
+                    this.dashboard.open_new_draft(None, window, cx);
+                    this.dashboard_focus_draft(window, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &DashboardHeadingBelow, window, cx| {
                 this.dashboard_insert_heading(false, window, cx);
@@ -6912,10 +6958,11 @@ impl Render for Workspace {
                     &self.pending_git_approval,
                     &self.minibuffer,
                     &self.transient,
+                    self.universal_argument,
                     connection_status,
                     &self.echo,
                 ) {
-                    (Some(pending), _, _, _, _) => {
+                    (Some(pending), _, _, _, _, _) => {
                         let colors = cx.theme().colors();
                         let focused = self.git_approval_focus.is_focused(window);
                         let mut deny = div().flex().flex_row().px_1().child("n deny");
@@ -6963,17 +7010,32 @@ impl Render for Workspace {
                                 .into_any_element(),
                         )
                     }
-                    (None, Some(minibuffer), _, _, _) => Some(minibuffer.render(&text_style, cx)),
-                    (None, None, Some(transient), _, _) => Some(
+                    (None, Some(minibuffer), _, _, _, _) => {
+                        Some(minibuffer.render(&text_style, cx))
+                    }
+                    (None, None, Some(transient), _, _, _) => Some(
                         div()
                             .track_focus(&self.transient_focus)
                             .on_key_down(cx.listener(Self::transient_key))
                             .child(transient.render(&text_style, cx))
                             .into_any_element(),
                     ),
-                    (None, None, None, Some(status), _) => Some(status),
-                    (None, None, None, None, Some(echo)) => Some(echo.render(&text_style, cx)),
-                    (None, None, None, None, None) => None,
+                    (None, None, None, true, _, _) => Some(
+                        bottom_strip(&text_style, cx)
+                            .child(
+                                div()
+                                    .px_2()
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .child("SPC u"),
+                            )
+                            .child(div().px_2().child("universal argument"))
+                            .into_any_element(),
+                    ),
+                    (None, None, None, false, Some(status), _) => Some(status),
+                    (None, None, None, false, None, Some(echo)) => {
+                        Some(echo.render(&text_style, cx))
+                    }
+                    (None, None, None, false, None, None) => None,
                 },
             )
     }

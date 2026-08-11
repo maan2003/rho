@@ -147,6 +147,17 @@ impl Workspace {
             editor.set_read_only(true);
             editor
         });
+        let universal_argument_subscription = cx.observe_keystrokes(|this, event, _, cx| {
+            if this.universal_argument
+                && !matches!(
+                    event.keystroke.key.as_str(),
+                    "shift" | "control" | "alt" | "platform" | "function"
+                )
+            {
+                this.universal_argument = false;
+                cx.notify();
+            }
+        });
 
         let mut this = Self {
             hosts,
@@ -183,6 +194,7 @@ impl Workspace {
             transient: None,
             transient_stack: Vec::new(),
             transient_focus: cx.focus_handle(),
+            universal_argument: false,
             overlay_return_focus: None,
             echo: None,
             realtime_task: None,
@@ -193,6 +205,7 @@ impl Workspace {
             iris_host: None,
             _event_task: event_task,
             _dashboard_subscription: dashboard_subscription,
+            _universal_argument_subscription: universal_argument_subscription,
             web: WebUi {
                 authorizations,
                 target_error,
@@ -300,20 +313,27 @@ impl Render for Workspace {
         let bottom = match (
             &self.minibuffer,
             &self.transient,
+            self.universal_argument,
             connection_status,
             &self.echo,
         ) {
-            (Some(minibuffer), _, _, _) => Some(minibuffer.render(&text_style, cx)),
-            (None, Some(transient), _, _) => Some(
+            (Some(minibuffer), _, _, _, _) => Some(minibuffer.render(&text_style, cx)),
+            (None, Some(transient), _, _, _) => Some(
                 div()
                     .track_focus(&self.transient_focus)
                     .on_key_down(cx.listener(Self::transient_key))
                     .child(transient.render(&text_style, cx))
                     .into_any_element(),
             ),
-            (None, None, Some(status), _) => Some(status),
-            (None, None, None, Some(echo)) => Some(echo.render(&text_style, cx)),
-            (None, None, None, None) => None,
+            (None, None, true, _, _) => Some(
+                crate::minibuffer::bottom_strip(&text_style, cx)
+                    .child(div().px_2().font_weight(gpui::FontWeight::BOLD).child("SPC u"))
+                    .child(div().px_2().child("universal argument"))
+                    .into_any_element(),
+            ),
+            (None, None, false, Some(status), _) => Some(status),
+            (None, None, false, None, Some(echo)) => Some(echo.render(&text_style, cx)),
+            (None, None, false, None, None) => None,
         };
 
         let mut root = div()
@@ -333,6 +353,22 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::toggle_voice))
             .on_action(cx.listener(|this, _: &crate::RootTransient, window, cx| {
                 this.open_transient(crate::transient::root_menu(), window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::DashboardReply, window, cx| {
+                if this.take_universal_argument() {
+                    this.configure_dashboard_staff(window, cx);
+                } else {
+                    this.dashboard_reply(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &crate::DashboardNewAgent, window, cx| {
+                if this.take_universal_argument() {
+                    this.configure_dashboard_quick_spawn(window, cx);
+                } else {
+                    this.new_agent_draft = None;
+                    this.dashboard.open_new_draft(None, window, cx);
+                    this.dashboard_focus_draft(window, cx);
+                }
             }))
             .on_action(
                 cx.listener(|this, _: &crate::MinibufferConfirm, window, cx| {

@@ -4466,10 +4466,26 @@ fn quick_spawn_send_relocates_the_cursor(cx: &mut TestAppContext) {
         "cursor should land on the new heading's title: {text:?}"
     );
 
-    // `space u R` takes the Magit-style configured path. Change the role,
-    // compose, and submit; it should finish through the same quick-spawn
-    // placement behavior as bare `R`.
-    cx.simulate_keystrokes(*workspace, "escape space u shift-r r c");
+    // `space u` closes the leader transient and arms a one-shot prefix.
+    cx.simulate_keystrokes(*workspace, "escape space u");
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(workspace.has_universal_argument_for_test());
+            assert!(!workspace.has_transient_for_test());
+        })
+        .expect("inspect universal argument");
+
+    // Its `R` variant takes the configured path. Change the role, compose,
+    // and submit; it should finish through the same quick-spawn placement
+    // behavior as bare `R`.
+    cx.simulate_keystrokes(*workspace, "shift-r");
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(!workspace.has_universal_argument_for_test());
+            assert!(workspace.has_new_agent_configuration_for_test());
+        })
+        .expect("inspect configured quick spawn");
+    cx.simulate_keystrokes(*workspace, "r c");
     cx.simulate_keystrokes(*workspace, "configured");
     cx.simulate_keystrokes(*workspace, "enter");
     cx.run_until_parked();
@@ -4519,6 +4535,15 @@ fn quick_spawn_send_relocates_the_cursor(cx: &mut TestAppContext) {
             );
         })
         .expect("inspect configured staffing send");
+
+    // Unsupported keys clear the prefix instead of leaving it sticky.
+    cx.simulate_keystrokes(*workspace, "escape space u j");
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(!workspace.has_universal_argument_for_test());
+            assert!(!workspace.has_transient_for_test());
+        })
+        .expect("inspect cleared universal argument");
 }
 
 /// Quick spawn (`shift-r`) writes a `* …` placeholder heading and binds

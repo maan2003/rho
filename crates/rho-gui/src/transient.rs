@@ -601,26 +601,10 @@ pub fn root_menu() -> Transient {
         .item("s", "status…", |workspace, window, cx| {
             workspace.open_transient(status_menu(), window, cx);
         })
-        .item("u", "universal argument…", |workspace, window, cx| {
-            workspace.open_transient(modified_command_menu(), window, cx);
+        .item("u", "universal argument", |workspace, _, cx| {
+            workspace.set_universal_argument(cx);
         })
         .item("q", "quit", |_, _, cx| cx.quit())
-}
-
-/// Evil's `SPC u`: keep Vim's `C-u` scrolling while exposing configured
-/// variants of terse Desk commands through Magit-style transients.
-fn modified_command_menu() -> Transient {
-    Transient::new("universal argument")
-        .item("r", "staff heading with options…", |workspace, window, cx| {
-            workspace.configure_dashboard_staff(window, cx);
-        })
-        .item(
-            "shift-r",
-            "quick-spawn with options…",
-            |workspace, window, cx| {
-                workspace.configure_dashboard_quick_spawn(window, cx);
-            },
-        )
 }
 
 fn status_menu() -> Transient {
@@ -1405,13 +1389,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn leader_keeps_usage_under_status_and_u_modifies_desk_commands() {
+    fn leader_keeps_usage_under_status_and_u_is_a_prefix() {
         let root = root_menu();
         assert!(root.items.iter().any(|item| {
             item.key == "s" && item.description == "status…"
         }));
         assert!(root.items.iter().any(|item| {
-            item.key == "u" && item.description == "universal argument…"
+            item.key == "u" && item.description == "universal argument"
         }));
         assert!(!root.items.iter().any(|item| item.description == "usage…"));
 
@@ -1419,9 +1403,6 @@ mod tests {
         assert!(status.items.iter().any(|item| {
             item.key == "u" && item.description == "usage…"
         }));
-        let modified = modified_command_menu();
-        assert!(modified.items.iter().any(|item| item.key == "r"));
-        assert!(modified.items.iter().any(|item| item.key == "shift-r"));
     }
 
     #[test]
