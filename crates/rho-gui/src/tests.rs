@@ -4465,6 +4465,60 @@ fn quick_spawn_send_relocates_the_cursor(cx: &mut TestAppContext) {
         text.find("* …").expect("placeholder present") + 2,
         "cursor should land on the new heading's title: {text:?}"
     );
+
+    // `space u R` takes the Magit-style configured path. Change the role,
+    // compose, and submit; it should finish through the same quick-spawn
+    // placement behavior as bare `R`.
+    cx.simulate_keystrokes(*workspace, "escape space u shift-r r c");
+    cx.simulate_keystrokes(*workspace, "configured");
+    cx.simulate_keystrokes(*workspace, "enter");
+    cx.run_until_parked();
+    let text = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .dashboard_editor()
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .text()
+        })
+        .expect("read configured quick spawn");
+    assert_eq!(
+        text.matches("* …").count(),
+        2,
+        "configured quick spawn should add its own placeholder heading: {text:?}"
+    );
+
+    // The lowercase modified command scopes the same options transient to
+    // the heading under point instead of creating another heading.
+    cx.simulate_keystrokes(*workspace, "escape space u r r c");
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(workspace.configured_draft_topic_for_test().is_some());
+            assert!(workspace.has_new_agent_configuration_for_test());
+        })
+        .expect("inspect configured staffing draft");
+    cx.simulate_keystrokes(*workspace, "staff here");
+    cx.simulate_keystrokes(*workspace, "enter");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert!(!workspace.has_new_agent_configuration_for_test());
+            let text = workspace
+                .dashboard_editor()
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .text();
+            assert_eq!(
+                text.matches("* …").count(),
+                2,
+                "configured staffing should bind to the existing heading: {text:?}"
+            );
+        })
+        .expect("inspect configured staffing send");
 }
 
 /// Quick spawn (`shift-r`) writes a `* …` placeholder heading and binds

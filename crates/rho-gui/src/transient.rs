@@ -598,13 +598,39 @@ pub fn root_menu() -> Transient {
         .item("h", "hosts…", |workspace, window, cx| {
             workspace.open_transient(hosts_menu(), window, cx);
         })
-        .item("v", "version", |workspace, _, cx| {
-            workspace.cmd_version(cx);
+        .item("s", "status…", |workspace, window, cx| {
+            workspace.open_transient(status_menu(), window, cx);
         })
+        .item("u", "universal argument…", |workspace, window, cx| {
+            workspace.open_transient(modified_command_menu(), window, cx);
+        })
+        .item("q", "quit", |_, _, cx| cx.quit())
+}
+
+/// Evil's `SPC u`: keep Vim's `C-u` scrolling while exposing configured
+/// variants of terse Desk commands through Magit-style transients.
+fn modified_command_menu() -> Transient {
+    Transient::new("universal argument")
+        .item("r", "staff heading with options…", |workspace, window, cx| {
+            workspace.configure_dashboard_staff(window, cx);
+        })
+        .item(
+            "shift-r",
+            "quick-spawn with options…",
+            |workspace, window, cx| {
+                workspace.configure_dashboard_quick_spawn(window, cx);
+            },
+        )
+}
+
+fn status_menu() -> Transient {
+    Transient::new("status")
         .item("u", "usage…", |workspace, window, cx| {
             workspace.open_transient(usage_root_menu(), window, cx);
         })
-        .item("q", "quit", |_, _, cx| cx.quit())
+        .item("v", "version", |workspace, _, cx| {
+            workspace.cmd_version(cx);
+        })
 }
 
 fn input_menu() -> Transient {
@@ -1219,7 +1245,13 @@ pub(crate) fn bucket_cost_usd(bucket: &rho_ui_proto::AgentUsageBucket, model: &s
         / 1_000_000.0
 }
 
-pub fn new_agent_menu(host: String, project: String, workspace: String, role: String) -> Transient {
+pub fn new_agent_menu(
+    host: String,
+    project: String,
+    workspace: String,
+    role: String,
+    compose_label: &'static str,
+) -> Transient {
     Transient::new("new agent")
         .infix("h", "host", host, |workspace, window, cx| {
             workspace.prompt_new_agent_host(window, cx);
@@ -1232,6 +1264,9 @@ pub fn new_agent_menu(host: String, project: String, workspace: String, role: St
         })
         .infix_toggle("r", "role", role, |workspace, window, cx| {
             workspace.cycle_new_agent_role(window, cx);
+        })
+        .item("c", compose_label, |workspace, window, cx| {
+            workspace.compose_configured_agent(window, cx);
         })
 }
 
@@ -1368,6 +1403,26 @@ fn snooze_menu() -> Transient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn leader_keeps_usage_under_status_and_u_modifies_desk_commands() {
+        let root = root_menu();
+        assert!(root.items.iter().any(|item| {
+            item.key == "s" && item.description == "status…"
+        }));
+        assert!(root.items.iter().any(|item| {
+            item.key == "u" && item.description == "universal argument…"
+        }));
+        assert!(!root.items.iter().any(|item| item.description == "usage…"));
+
+        let status = status_menu();
+        assert!(status.items.iter().any(|item| {
+            item.key == "u" && item.description == "usage…"
+        }));
+        let modified = modified_command_menu();
+        assert!(modified.items.iter().any(|item| item.key == "r"));
+        assert!(modified.items.iter().any(|item| item.key == "shift-r"));
+    }
 
     #[test]
     fn model_cost_uses_provider_cache_rates() {
