@@ -1,0 +1,15 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "rho-browser-wayland"
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+libc.workspace = true
+smithay = { git = "https://github.com/Smithay/smithay", rev = "0d49747f72b281eb5ecf7e61e221d55dcb8732c7", default-features = false, features = ["backend_drm", "wayland_frontend"] }
+tempfile.workspace = true
+tracing.workspace = true

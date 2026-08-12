@@ -35,6 +35,7 @@ native = [
   "dep:release_channel",
   "dep:rho-iroh-auth",
   "dep:rho-profiling",
+  "dep:rho-browser-wayland",
   "dep:rho-rpc",
   "dep:rho-zulip",
   "dep:rodio",
@@ -82,6 +83,7 @@ prefix-id = { workspace = true, optional = true }
 project = { path = "../../vendor/zed/crates/project", optional = true }
 release_channel = { path = "../../vendor/zed/crates/release_channel", optional = true }
 rho-core.workspace = true
+rho-browser-wayland = { workspace = true, optional = true }
 rho-iroh-auth = { workspace = true, optional = true }
 rho-profiling = { workspace = true, optional = true }
 rho-rtc.workspace = true
@@ -93,6 +95,8 @@ rho-ui-proto.workspace = true
 rho-zulip = { workspace = true, features = ["ui"], optional = true }
 rodio = { git = "https://github.com/RustAudio/rodio", rev = "e50e726ddd0292f6ef9de0dda6b90af4ed1fb66a", default-features = false, features = ["playback", "wav"], optional = true }
 rust-embed = { version = "8.11", features = ["include-exclude"] }
+image = { version = "0.25", default-features = false }
+smallvec = "1"
 rustc-hash = "2.1.0"
 rustls = { workspace = true, optional = true }
 search = { path = "../../vendor/zed/crates/search", optional = true }

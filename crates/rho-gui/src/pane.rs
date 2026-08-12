@@ -31,6 +31,8 @@ pub enum SurfaceKey {
     Diff { agent_id: AgentId },
     /// A daemon-owned terminal attached over a dedicated stream.
     Terminal { agent_id: AgentId, terminal_id: u64 },
+    /// A client-local stock browser instance, keyed by browser family.
+    Browser(String),
     /// The Zulip inbox: streams and their unread topics.
     ZulipInbox,
     /// One Zulip conversation, identified by its narrow's label so the key

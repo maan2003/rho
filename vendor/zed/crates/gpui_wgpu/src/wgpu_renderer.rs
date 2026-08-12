@@ -1,5 +1,7 @@
 use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
+#[cfg(target_os = "linux")]
+use ash::vk;
 use bytemuck::{Pod, Zeroable};
 use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
@@ -9,14 +11,80 @@ use log::{info, warn};
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::cell::RefCell;
+#[cfg(target_os = "linux")]
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
 use std::ops::Range;
+#[cfg(target_os = "linux")]
+use std::os::fd::{FromRawFd as _, IntoRawFd as _};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+
+#[cfg(target_os = "linux")]
+struct ImportedDmaBuf {
+    surface: gpui::LinuxDmaBufSurface,
+    _texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    raw_image: vk::Image,
+    acquire_semaphore: Option<vk::Semaphore>,
+    raw_device: ash::Device,
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for ImportedDmaBuf {
+    fn drop(&mut self) {
+        if let Some(semaphore) = self.acquire_semaphore.take() {
+            unsafe { self.raw_device.destroy_semaphore(semaphore, None) };
+        }
+        self.surface.released();
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct ImportRejectionGuard(Option<gpui::LinuxDmaBufSurface>);
+
+#[cfg(target_os = "linux")]
+impl Drop for ImportRejectionGuard {
+    fn drop(&mut self) {
+        if let Some(surface) = self.0.take() {
+            surface.released();
+        }
+    }
+}
 
 const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
 const INSTANCE_TEXTURE_TEXEL_SIZE: u64 = 16;
+
+#[cfg(target_os = "linux")]
+fn raw_image(texture: &wgpu::Texture) -> Result<vk::Image> {
+    let texture = unsafe { texture.as_hal::<wgpu_hal::vulkan::Api>() }
+        .context("Vulkan DMA-BUF texture unavailable")?;
+    Ok(unsafe { texture.raw_handle() })
+}
+
+#[cfg(target_os = "linux")]
+fn drive_completion(device: Arc<wgpu::Device>, submission: wgpu::SubmissionIndex) {
+    use std::sync::{OnceLock, mpsc};
+    static POLLER: OnceLock<mpsc::Sender<(Arc<wgpu::Device>, wgpu::SubmissionIndex)>> =
+        OnceLock::new();
+    let poller = POLLER.get_or_init(|| {
+        let (sender, receiver) = mpsc::channel::<(Arc<wgpu::Device>, wgpu::SubmissionIndex)>();
+        std::thread::Builder::new()
+            .name("gpui-wgpu-completion".into())
+            .spawn(move || {
+                while let Ok((device, submission)) = receiver.recv() {
+                    let _ = device.poll(wgpu::PollType::Wait {
+                        submission_index: Some(submission),
+                        timeout: None,
+                    });
+                }
+            })
+            .expect("spawn WGPU completion poller");
+        sender
+    });
+    let _ = poller.send((device, submission));
+}
 
 /// Shader variant for backends with storage buffer support: the shared shader
 /// logic plus the storage-buffer instance transport.
@@ -84,6 +152,9 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 struct SurfaceParams {
     bounds: PodBounds,
     content_mask: PodBounds,
+    opaque: u32,
+    y_inverted: u32,
+    _pad: [u32; 2],
 }
 
 #[repr(C)]
@@ -241,6 +312,8 @@ pub struct WgpuRenderer {
     device_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     surface_configured: bool,
     needs_redraw: bool,
+    #[cfg(target_os = "linux")]
+    imported_dma_bufs: HashMap<u64, ImportedDmaBuf>,
 }
 
 impl WgpuRenderer {
@@ -629,6 +702,8 @@ impl WgpuRenderer {
             device_lost: context.device_lost_flag(),
             surface_configured: true,
             needs_redraw: false,
+            #[cfg(target_os = "linux")]
+            imported_dma_bufs: HashMap::new(),
         })
     }
 
@@ -784,16 +859,6 @@ impl WgpuRenderer {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 3,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
@@ -1118,7 +1183,10 @@ impl WgpuRenderer {
             &layouts.surfaces,
             None,
             wgpu::PrimitiveTopology::TriangleStrip,
-            &[Some(color_target)],
+            &[Some(wgpu::ColorTargetState {
+                blend: Some(wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING),
+                ..color_target
+            })],
             1,
             &shader_module,
         );
@@ -1498,6 +1566,10 @@ impl WgpuRenderer {
                 )
             })?;
 
+        #[cfg(target_os = "linux")]
+        let (acquire_commands, mut new_imports, stale_ids, release_commands) =
+            self.prepare_dma_bufs(scene)?;
+
         let mut encoder =
             self.resources()
                 .device
@@ -1605,17 +1677,365 @@ impl WgpuRenderer {
                         instance_range(range),
                         &mut pass,
                     ),
-                    // Surfaces are macOS-only for video playback and are not
-                    // implemented by the WGPU renderer.
-                    PrimitiveBatch::Surfaces(_surfaces) => {}
+                    PrimitiveBatch::Surfaces(surfaces) =>
+                    {
+                        #[cfg(target_os = "linux")]
+                        for surface in &scene.surfaces[surfaces] {
+                            let imported = self
+                                .imported_dma_bufs
+                                .get(&surface.dma_buf.lease_id())
+                                .or_else(|| new_imports.get(&surface.dma_buf.lease_id()))
+                                .context("DMA-BUF surface was not imported")?;
+                            let params = SurfaceParams {
+                                bounds: surface.bounds.into(),
+                                content_mask: surface.content_mask.bounds.into(),
+                                opaque: (surface.dma_buf.fourcc() == u32::from_le_bytes(*b"XR24"))
+                                    as u32,
+                                y_inverted: surface.dma_buf.y_inverted() as u32,
+                                _pad: [0; 2],
+                            };
+                            let buffer =
+                                self.resources()
+                                    .device
+                                    .create_buffer(&wgpu::BufferDescriptor {
+                                        label: Some("dma_buf_surface_params"),
+                                        size: std::mem::size_of::<SurfaceParams>() as u64,
+                                        usage: wgpu::BufferUsages::UNIFORM
+                                            | wgpu::BufferUsages::COPY_DST,
+                                        mapped_at_creation: false,
+                                    });
+                            self.resources().queue.write_buffer(
+                                &buffer,
+                                0,
+                                bytemuck::bytes_of(&params),
+                            );
+                            let bind_group = self.resources().device.create_bind_group(
+                                &wgpu::BindGroupDescriptor {
+                                    label: Some("dma_buf_surface_bind_group"),
+                                    layout: &self.resources().bind_group_layouts.surfaces,
+                                    entries: &[
+                                        wgpu::BindGroupEntry {
+                                            binding: 0,
+                                            resource: buffer.as_entire_binding(),
+                                        },
+                                        wgpu::BindGroupEntry {
+                                            binding: 1,
+                                            resource: wgpu::BindingResource::TextureView(
+                                                &imported.view,
+                                            ),
+                                        },
+                                        wgpu::BindGroupEntry {
+                                            binding: 2,
+                                            resource: wgpu::BindingResource::Sampler(
+                                                &self.resources().atlas_sampler,
+                                            ),
+                                        },
+                                    ],
+                                },
+                            );
+                            pass.set_pipeline(&self.resources().pipelines.surfaces);
+                            pass.set_bind_group(1, &bind_group, &[]);
+                            pass.draw(0..4, 0..1);
+                        }
+                    }
                 }
             }
         }
 
+        #[cfg(target_os = "linux")]
+        {
+            let newly_imported = new_imports.keys().copied().collect::<Vec<_>>();
+            let semaphores = new_imports
+                .values_mut()
+                .filter_map(|imported| imported.acquire_semaphore.take())
+                .collect::<Vec<_>>();
+            if !semaphores.is_empty() {
+                let queue = unsafe { self.resources().queue.as_hal::<wgpu_hal::vulkan::Api>() }
+                    .expect("Vulkan queue for DMA-BUF");
+                for semaphore in &semaphores {
+                    queue.add_wait_semaphore(*semaphore, None, vk::PipelineStageFlags::TOP_OF_PIPE);
+                }
+            }
+            let stale = stale_ids
+                .into_iter()
+                .filter_map(|id| self.imported_dma_bufs.remove(&id))
+                .collect::<Vec<_>>();
+            self.imported_dma_bufs.extend(new_imports);
+            let mut commands = Vec::with_capacity(3);
+            if let Some(acquire) = acquire_commands {
+                commands.push(acquire);
+            }
+            commands.push(encoder.finish());
+            if let Some(release) = release_commands {
+                commands.push(release);
+            }
+            let needs_completion = !semaphores.is_empty() || !stale.is_empty();
+            let submission = self.resources().queue.submit(commands);
+            if !semaphores.is_empty() {
+                let raw_device =
+                    unsafe { self.resources().queue.as_hal::<wgpu_hal::vulkan::Api>() }
+                        .expect("Vulkan queue for DMA-BUF")
+                        .raw_device()
+                        .clone();
+                self.resources()
+                    .queue
+                    .on_submitted_work_done(move || unsafe {
+                        for semaphore in semaphores {
+                            raw_device.destroy_semaphore(semaphore, None);
+                        }
+                    });
+            }
+            for id in newly_imported {
+                if let Some(imported) = self.imported_dma_bufs.get(&id) {
+                    imported.surface.submitted();
+                }
+            }
+            if !stale.is_empty() {
+                self.resources().queue.on_submitted_work_done(move || {
+                    for imported in stale {
+                        imported.surface.released();
+                    }
+                });
+            }
+            if needs_completion {
+                drive_completion(Arc::clone(&self.resources().device), submission);
+            }
+            self.resources().device.poll(wgpu::PollType::Poll).ok();
+        }
+        #[cfg(not(target_os = "linux"))]
         self.resources()
             .queue
             .submit(std::iter::once(encoder.finish()));
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn prepare_dma_bufs(
+        &self,
+        scene: &Scene,
+    ) -> Result<(
+        Option<wgpu::CommandBuffer>,
+        HashMap<u64, ImportedDmaBuf>,
+        Vec<u64>,
+        Option<wgpu::CommandBuffer>,
+    )> {
+        let active: HashSet<_> = scene
+            .surfaces
+            .iter()
+            .map(|surface| surface.dma_buf.lease_id())
+            .collect();
+        let stale_ids: Vec<_> = self
+            .imported_dma_bufs
+            .keys()
+            .filter(|id| !active.contains(id))
+            .copied()
+            .collect();
+        let mut new_imports = HashMap::new();
+        for surface in &scene.surfaces {
+            let id = surface.dma_buf.lease_id();
+            if !self.imported_dma_bufs.contains_key(&id) && !new_imports.contains_key(&id) {
+                new_imports.insert(id, self.import_dma_buf(surface.dma_buf.clone())?);
+            }
+        }
+
+        let acquire_images = new_imports
+            .values()
+            .map(|imported| imported.raw_image)
+            .collect::<Vec<_>>();
+        let release_images = stale_ids
+            .iter()
+            .filter_map(|id| self.imported_dma_bufs.get(id))
+            .map(|imported| imported.raw_image)
+            .collect::<Vec<_>>();
+        let acquire = self.barrier_commands(&acquire_images, true)?;
+        let release = self.barrier_commands(&release_images, false)?;
+        Ok((acquire, new_imports, stale_ids, release))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn import_dma_buf(&self, surface: gpui::LinuxDmaBufSurface) -> Result<ImportedDmaBuf> {
+        let fd = surface
+            .take_fd()
+            .context("DMA-BUF plane was already imported")?;
+        let mut rejection = ImportRejectionGuard(Some(surface.clone()));
+        let fence = surface
+            .take_acquire_fence()
+            .context("DMA-BUF acquire fence was already imported")?;
+        let usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC;
+        let descriptor = wgpu::TextureDescriptor {
+            label: Some("chrome_dma_buf"),
+            size: wgpu::Extent3d {
+                width: surface.width(),
+                height: surface.height(),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            usage,
+            view_formats: &[],
+        };
+        let hal_descriptor = wgpu_hal::TextureDescriptor {
+            label: Some("chrome_dma_buf"),
+            size: descriptor.size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: descriptor.dimension,
+            format: descriptor.format,
+            usage: wgpu::TextureUses::RESOURCE | wgpu::TextureUses::COPY_SRC,
+            memory_flags: wgpu_hal::MemoryFlags::empty(),
+            view_formats: Vec::new(),
+        };
+        let hal_device = unsafe { self.resources().device.as_hal::<wgpu_hal::vulkan::Api>() }
+            .context("Vulkan device unavailable")?;
+        let hal_texture = unsafe {
+            hal_device.texture_from_dmabuf_fd(
+                fd,
+                &hal_descriptor,
+                surface.modifier(),
+                surface.stride().into(),
+                surface.offset().into(),
+            )
+        }
+        .context("import Chrome DMA-BUF into Vulkan")?;
+        let texture = unsafe {
+            self.resources()
+                .device
+                .create_texture_from_hal::<wgpu_hal::vulkan::Api>(
+                    hal_texture,
+                    &descriptor,
+                    wgpu::TextureUses::RESOURCE | wgpu::TextureUses::COPY_SRC,
+                )
+        };
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let raw_image = raw_image(&texture)?;
+
+        let semaphore = unsafe {
+            hal_device
+                .raw_device()
+                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)
+        }
+        .context("create DMA-BUF acquire semaphore")?;
+        let loader = ash::khr::external_semaphore_fd::Device::new(
+            hal_device.shared_instance().raw_instance(),
+            hal_device.raw_device(),
+        );
+        let raw_fd = fence.into_raw_fd();
+        let import = vk::ImportSemaphoreFdInfoKHR::default()
+            .semaphore(semaphore)
+            .flags(vk::SemaphoreImportFlags::TEMPORARY)
+            .handle_type(vk::ExternalSemaphoreHandleTypeFlags::SYNC_FD)
+            .fd(raw_fd);
+        if let Err(error) = unsafe { loader.import_semaphore_fd(&import) } {
+            unsafe {
+                drop(std::os::fd::OwnedFd::from_raw_fd(raw_fd));
+                hal_device.raw_device().destroy_semaphore(semaphore, None);
+            }
+            return Err(anyhow::anyhow!("import Chrome acquire sync_file: {error}"));
+        }
+        rejection.0.take();
+        Ok(ImportedDmaBuf {
+            surface,
+            _texture: texture,
+            view,
+            raw_image,
+            acquire_semaphore: Some(semaphore),
+            raw_device: hal_device.raw_device().clone(),
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn barrier_commands(
+        &self,
+        images: &[vk::Image],
+        acquire: bool,
+    ) -> Result<Option<wgpu::CommandBuffer>> {
+        if images.is_empty() {
+            return Ok(None);
+        }
+        let hal_device = unsafe { self.resources().device.as_hal::<wgpu_hal::vulkan::Api>() }
+            .context("Vulkan device unavailable")?;
+        let family = hal_device.queue_family_index();
+        let barriers: Vec<_> = images
+            .iter()
+            .map(|image| {
+                vk::ImageMemoryBarrier::default()
+                    .src_access_mask(if acquire {
+                        vk::AccessFlags::MEMORY_WRITE
+                    } else {
+                        vk::AccessFlags::SHADER_READ
+                    })
+                    .dst_access_mask(if acquire {
+                        vk::AccessFlags::SHADER_READ
+                    } else {
+                        vk::AccessFlags::MEMORY_READ
+                    })
+                    .old_layout(if acquire {
+                        vk::ImageLayout::GENERAL
+                    } else {
+                        vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+                    })
+                    .new_layout(if acquire {
+                        vk::ImageLayout::GENERAL
+                    } else {
+                        vk::ImageLayout::GENERAL
+                    })
+                    .src_queue_family_index(if acquire {
+                        vk::QUEUE_FAMILY_FOREIGN_EXT
+                    } else {
+                        family
+                    })
+                    .dst_queue_family_index(if acquire {
+                        family
+                    } else {
+                        vk::QUEUE_FAMILY_FOREIGN_EXT
+                    })
+                    .image(*image)
+                    .subresource_range(vk::ImageSubresourceRange {
+                        aspect_mask: vk::ImageAspectFlags::COLOR,
+                        base_mip_level: 0,
+                        level_count: 1,
+                        base_array_layer: 0,
+                        layer_count: 1,
+                    })
+            })
+            .collect();
+        let raw_device = hal_device.raw_device().clone();
+        drop(hal_device);
+        let mut encoder =
+            self.resources()
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some(if acquire {
+                        "dma_buf_acquire"
+                    } else {
+                        "dma_buf_release"
+                    }),
+                });
+        unsafe {
+            encoder.as_hal_mut::<wgpu_hal::vulkan::Api, _, _>(|hal| {
+                let hal = hal.expect("Vulkan command encoder");
+                raw_device.cmd_pipeline_barrier(
+                    hal.raw_handle(),
+                    if acquire {
+                        vk::PipelineStageFlags::ALL_COMMANDS
+                    } else {
+                        vk::PipelineStageFlags::FRAGMENT_SHADER
+                    },
+                    if acquire {
+                        vk::PipelineStageFlags::FRAGMENT_SHADER
+                    } else {
+                        vk::PipelineStageFlags::ALL_COMMANDS
+                    },
+                    vk::DependencyFlags::empty(),
+                    &[],
+                    &[],
+                    &barriers,
+                );
+            });
+        }
+        Ok(Some(encoder.finish()))
     }
 
     fn write_instances(
@@ -2120,7 +2540,39 @@ impl WgpuRenderer {
     pub fn destroy(&mut self) {
         // Release surface-bound GPU resources eagerly so the underlying native
         // window can be destroyed before the renderer itself is dropped.
+        #[cfg(target_os = "linux")]
+        self.retire_all_dma_bufs();
         self.resources.take();
+    }
+
+    #[cfg(target_os = "linux")]
+    fn retire_all_dma_bufs(&mut self) {
+        if self.imported_dma_bufs.is_empty() {
+            return;
+        }
+        if self.resources.is_none() || self.device_lost() {
+            self.imported_dma_bufs.clear();
+            return;
+        }
+        let images = self
+            .imported_dma_bufs
+            .values()
+            .map(|imported| imported.raw_image)
+            .collect::<Vec<_>>();
+        let commands = self
+            .barrier_commands(&images, false)
+            .expect("active DMA-BUF imports require the Vulkan device")
+            .expect("nonempty DMA-BUF retirement has a release barrier");
+        let submission = self.resources().queue.submit([commands]);
+        let imported = self
+            .imported_dma_bufs
+            .drain()
+            .map(|(_, imported)| imported)
+            .collect::<Vec<_>>();
+        self.resources().queue.on_submitted_work_done(move || {
+            drop(imported);
+        });
+        drive_completion(Arc::clone(&self.resources().device), submission);
     }
 
     /// Returns true if the GPU device was lost and recovery is needed.
@@ -2162,6 +2614,8 @@ impl WgpuRenderer {
             log::warn!("GPU device lost, recreating context...");
 
             // Drop old resources to release Arc<Device>/Arc<Queue> and GPU resources
+            #[cfg(target_os = "linux")]
+            self.imported_dma_bufs.clear();
             self.resources = None;
             *gpu_context.borrow_mut() = None;
 
@@ -2210,6 +2664,13 @@ impl WgpuRenderer {
 
         log::info!("GPU recovery complete");
         Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for WgpuRenderer {
+    fn drop(&mut self) {
+        self.retire_all_dma_bufs();
     }
 }
 

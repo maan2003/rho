@@ -110,6 +110,8 @@ enum SurfaceView {
     Diff(Entity<crate::diff_view::DiffView>),
     Terminal(Entity<crate::terminal_view::TerminalView>),
     #[cfg(feature = "native")]
+    Browser(Entity<crate::browser_view::BrowserView>),
+    #[cfg(feature = "native")]
     ZulipInbox(Entity<rho_zulip::ui::InboxView>),
     #[cfg(feature = "native")]
     ZulipNarrow(Entity<rho_zulip::ui::NarrowView>),
@@ -2661,6 +2663,36 @@ impl Workspace {
         }
     }
 
+    #[cfg(feature = "native")]
+    pub fn cmd_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(surface) = self
+            .find_surface(|surface| surface.key == SurfaceKey::Browser("chromium".into()))
+            .cloned()
+        {
+            self.display_surface(surface);
+            self.focus_active_surface(window, cx);
+            cx.notify();
+            return;
+        }
+        let url = std::env::var("RHO_BROWSER_URL")
+            .unwrap_or_else(|_| "https://www.google.com/".to_owned());
+        let model = cx.new(|cx| crate::browser_view::BrowserModel::new(url.clone(), cx));
+        let view = cx.new(|cx| crate::browser_view::BrowserView::new(model, cx));
+        let surface =
+            Self::wrap_surface(SurfaceKey::Browser("chromium".into()), SurfaceView::Browser(view), window, cx);
+        self.display_surface(surface);
+        if std::env::var_os("RHO_BROWSER_DEMO").is_some() {
+            let model = cx.new(|cx| crate::browser_view::BrowserModel::new_program(
+                rho_browser_wayland::BrowserProgram::Firefox, url, cx));
+            let view = cx.new(|cx| crate::browser_view::BrowserView::new(model, cx));
+            let firefox = Self::wrap_surface(SurfaceKey::Browser("firefox".into()), SurfaceView::Browser(view), window, cx);
+            self.surfaces.entry(self.active_context).or_default().push(firefox.clone());
+            self.active_tree_mut().split(SplitAxis::Row, firefox);
+        }
+        self.focus_active_surface(window, cx);
+        cx.notify();
+    }
+
     pub(crate) fn cmd_diff(&mut self, window: &Window, cx: &mut Context<Self>) {
         let Some(agent_id) = self.subject_agent_or_notice("diff", window, cx) else {
             return;
@@ -3549,6 +3581,7 @@ impl Workspace {
                 "term {}/{terminal_id}",
                 self.registry.agent_id_label(*agent_id)
             ),
+            SurfaceKey::Browser(browser) => browser.clone(),
             SurfaceKey::ZulipInbox => "zulip".to_owned(),
             SurfaceKey::ZulipNarrow { label } => label.clone(),
         }
@@ -3562,6 +3595,7 @@ impl Workspace {
             SurfaceKey::Shell(_) => "shell",
             SurfaceKey::Diff { .. } => "diff",
             SurfaceKey::Terminal { .. } => "terminal",
+            SurfaceKey::Browser(_) => "browser",
             SurfaceKey::ZulipInbox => "zulip inbox",
             SurfaceKey::ZulipNarrow { .. } => "zulip",
         }
@@ -4295,6 +4329,10 @@ impl Workspace {
                 .any_draft_editor()
                 .expect("the draft context always holds a draft surface"),
             #[cfg(feature = "native")]
+            SurfaceView::Browser(_) => self
+                .any_draft_editor()
+                .expect("the draft context always holds a draft surface"),
+            #[cfg(feature = "native")]
             SurfaceView::ZulipInbox(view) => view.read(cx).editor().clone(),
             #[cfg(feature = "native")]
             SurfaceView::ZulipNarrow(view) => view.read(cx).editor().clone(),
@@ -4331,6 +4369,8 @@ impl Workspace {
             SurfaceView::Shell { editor, .. } => editor.focus_handle(cx),
             SurfaceView::Diff(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::Terminal(view) => view.read(cx).focus_handle(cx),
+            #[cfg(feature = "native")]
+            SurfaceView::Browser(view) => view.read(cx).focus_handle(cx),
             #[cfg(feature = "native")]
             SurfaceView::ZulipInbox(view) => view.read(cx).editor().focus_handle(cx),
             #[cfg(feature = "native")]
@@ -4386,6 +4426,9 @@ impl Workspace {
             }
             SurfaceKey::Terminal { .. } => {
                 unreachable!("terminal surfaces are created by open_terminal_surface")
+            }
+            SurfaceKey::Browser(_) => {
+                unreachable!("browser surfaces are created by cmd_browser")
             }
             #[cfg(feature = "native")]
             SurfaceKey::ZulipInbox => {
@@ -4462,6 +4505,12 @@ impl Workspace {
                 let view = cx.new(|cx| crate::terminal_view::TerminalView::new(model, cx));
                 Self::wrap_surface(surface.key.clone(), SurfaceView::Terminal(view), window, cx)
             }
+            #[cfg(feature = "native")]
+            SurfaceView::Browser(view) => {
+                let model = view.read(cx).model().clone();
+                let view = cx.new(|cx| crate::browser_view::BrowserView::new(model, cx));
+                Self::wrap_surface(surface.key.clone(), SurfaceView::Browser(view), window, cx)
+            }
             // Chat surfaces hold one editor over one conversation: a split
             // shows the same view rather than a second cursor over the
             // same messages, which no one has ever wanted.
@@ -4493,6 +4542,8 @@ impl Workspace {
             }
             // Terminals have no editor; the view itself carries focus.
             SurfaceView::Terminal(view) => (view.read(cx).focus_handle(cx), view.entity_id()),
+            #[cfg(feature = "native")]
+            SurfaceView::Browser(view) => (view.read(cx).focus_handle(cx), view.entity_id()),
             #[cfg(feature = "native")]
             SurfaceView::ZulipInbox(view) => {
                 let editor = view.read(cx).editor().clone();
@@ -4538,6 +4589,7 @@ impl Workspace {
                 self.registry.select_agent(agent_id);
                 Some(agent_id)
             }
+            SurfaceKey::Browser(_) => None,
             SurfaceKey::Diff { agent_id } => {
                 self.registry.select_agent(agent_id);
                 Some(agent_id)
@@ -6401,6 +6453,13 @@ impl Workspace {
                 .into_any_element(),
             SurfaceView::Terminal(view) => div()
                 .id("rho-surface-terminal")
+                .size_full()
+                .overflow_hidden()
+                .child(view.clone())
+                .into_any_element(),
+            #[cfg(feature = "native")]
+            SurfaceView::Browser(view) => div()
+                .id("rho-surface-browser")
                 .size_full()
                 .overflow_hidden()
                 .child(view.clone())

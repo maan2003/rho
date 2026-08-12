@@ -592,6 +592,9 @@ pub fn root_menu() -> Transient {
         .item("shift-t", "new terminal", |workspace, window, cx| {
             workspace.cmd_term(true, window, cx);
         })
+        .item("g", "browser", |workspace, window, cx| {
+            workspace.cmd_browser(window, cx);
+        })
         .item("p", "projects…", |workspace, window, cx| {
             workspace.open_transient(projects_menu(), window, cx);
         })

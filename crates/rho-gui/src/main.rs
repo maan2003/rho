@@ -205,7 +205,13 @@ fn run() -> Result<()> {
             cx.activate(true);
 
             if let Err(error) = cx.open_window(WindowOptions::default(), move |window, cx| {
-                cx.new(|cx| Workspace::new(specs.clone(), window, cx))
+                cx.new(|cx| {
+                    let mut workspace = Workspace::new(specs.clone(), window, cx);
+                    if std::env::var_os("RHO_BROWSER_DEMO").is_some() {
+                        workspace.cmd_browser(window, cx);
+                    }
+                    workspace
+                })
             }) {
                 eprintln!("rho-gui: failed to open window: {error:#}");
                 cx.quit();

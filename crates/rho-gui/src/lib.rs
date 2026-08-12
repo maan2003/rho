@@ -2,6 +2,8 @@
 
 pub mod agent_view;
 #[cfg(feature = "native")]
+pub(crate) mod browser_view;
+#[cfg(feature = "native")]
 pub(crate) mod chime;
 pub(crate) mod commands;
 #[cfg(feature = "native")]
