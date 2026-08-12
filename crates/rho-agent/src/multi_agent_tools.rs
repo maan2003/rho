@@ -251,7 +251,7 @@ fn advisor_spec() -> ToolSpec {
     ToolSpec {
         name: ToolName::try_from(ASK_ADVISOR_TOOL_NAME).expect("valid tool name"),
         tool_type: ToolType::Function,
-        description: r#"Start a fresh independent Advisor consultation - a read-only expert reviewer for hard judgment calls, tricky reviews, alternative analysis, and complex plans.
+        description: r#"Start a fresh independent Advisor consultation - an expert engineering advisor for hard judgment calls, tricky reviews, alternative analysis, and complex plans.
 
 You should consult the Advisor for:
 - Tricky code reviews where subtle bugs, regressions, or architectural risks may be missed
