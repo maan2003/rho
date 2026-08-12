@@ -242,16 +242,72 @@ fn interrupt_engineer_spec() -> ToolSpec {
 fn advisor_spec() -> ToolSpec {
     let properties = serde_json::Map::from_iter([(
         "message".to_owned(),
-        json!({"type": "string", "description": "Question or follow-up for the Advisor."}),
+        json!({
+            "type": "string",
+            "description": "The focused review, planning, alternative-analysis, or debugging task. Include all context here, name relevant files inline, constrain the scope, and say what output shape you need."
+        }),
     )]);
     let required = vec!["message"];
     ToolSpec {
         name: ToolName::try_from(ASK_ADVISOR_TOOL_NAME).expect("valid tool name"),
         tool_type: ToolType::Function,
-        description: "Start a fresh independent Advisor consultation. The answer arrives later \
-                      as mail. Wait patiently for up to five minutes for its response; do not \
-                      keep messaging it while it is working. Use message_agent with its handle \
-                      only when genuine follow-up or additional context is needed."
+        description: r#"Start a fresh independent Advisor consultation - a read-only expert reviewer for hard judgment calls, tricky reviews, alternative analysis, and complex plans.
+
+You should consult the Advisor for:
+- Tricky code reviews where subtle bugs, regressions, or architectural risks may be missed
+- Choosing between plausible alternatives and weighing tradeoffs
+- Stress-testing complex implementation plans, migrations, or refactors
+- Finding difficult bugs in codepaths that flow across many files
+- Getting a second opinion when you are stuck or uncertain about a high-impact decision
+
+You should NOT consult the Advisor for:
+- Routine code review, simple implementation plans, or obvious bugs
+- Basic codebase searches (use direct inspection tools)
+- Basic code modifications and tasks that require executing changes (do them yourself or delegate to an Engineer when authorized)
+
+Write the task well:
+- Keep it focused and constrained to one review, decision, plan, or debugging question
+- Include the necessary context directly in the task
+- Name the most relevant file paths inline, for example src/auth/index.ts
+- If asking about current changes, say so explicitly; the Advisor should inspect them with git diff
+- State what decision you need help making, what alternatives to compare, or what risks to look for
+- Tell the oracle what to ignore when scope creep would make the answer less useful
+- Ask for the output shape you need, such as ranked risks, tradeoff table, or recommended plan changes
+- For code review, tell it the intended behavior so it can review intent first and implementation second
+
+# Examples
+
+Review current changes against a stated intent
+```json
+{"message":"Intent: the current uncommitted changes should only change when idle notification sounds are suppressed; they must not change when requires-user-input sounds play. Start with git diff, not whole-file reads. Relevant files: @thread-actors/src/thread-notifications.ts, @thread-actors/src/thread-notifications.test.ts, @thread-actors/src/db/notification-subscriptions.ts, @cli/src/tui/neo/notification-service.ts. Review for subtle behavior regressions, especially inverted conditions, changed defaults, and client/server semantic drift. Ignore naming and formatting unless they affect behavior. Output: Recommendation, Findings with evidence, and Unverified assumptions."}
+```
+
+Review implementation intent before code details
+```json
+{"message":"Intent: this PR moves sandbox executor recovery from best-effort startup logic into a durable state machine so actor restarts can resume without duplicating sandboxes. Review whether the implementation actually preserves that intent. Start with git diff for these files, not whole-file reads: @thread-actors/src/sandbox/manager.ts, @thread-actors/src/thread-coordinator.ts, @thread-actors/src/db/sandboxes.ts, @thread-actors/src/db/sandboxes.test.ts. Then read only surrounding code needed to understand lifecycle invariants. Focus on restart/drain behavior, durable-vs-ephemeral state boundaries, duplicate launch races, and stale alarm handling. Output only high-confidence blockers plus the smallest fix for each."}
+```
+
+Produce alternative implementation options
+```json
+{"message":"We need automatic file-mention handling for Oracle tasks. Produce 3 implementation options, not code: (1) parse file mentions in @thread-actors/src/server-tools/oracle.ts and append a Relevant files list, (2) resolve file mentions into attached content using @core/src/mentions/data.ts and inference backend handling in @thread-actors/src/inference/backends/openai-responses.ts, or (3) leave mentions in the task and rely on Oracle tool use. Relevant files: @thread-actors/src/server-tools/oracle.ts, @core/src/mentions/data.ts, @core/src/threads/thread.ts, @thread-actors/src/thread-coordinator.ts, @thread-actors/src/inference/backends/openai-responses.ts. Compare correctness, speed, prompt size, permissions, and implementation risk. Recommend one default, one fallback, and the failure mode that would make you switch."}
+```
+
+Produce an implementation plan
+```json
+{"message":"Produce a concrete implementation plan for resumable thread version-sync repair. Goal: when AmpServer repeatedly rejects a version-sync patch, back off, then re-diff against a fresh server skeleton and resume incremental flushes only after a patch is acknowledged. Relevant files: @thread-actors/src/thread-version-syncer.ts, @thread-actors/src/thread-version-sync-track.ts, @thread-actors/src/db/thread-version-sync-state.ts, @server/src/lib/db/thread-actor-version-sync.ts, @api/types/src/internal-api.ts. Stay read-only: inspect the current contracts and propose the smallest safe plan. Include: data model changes, API shape, algorithm steps, migration/backfill concerns, tests to add, rollout risks, and open questions. Call out any part that should not be implemented until verified."}
+```
+
+Review a proposed plan for gaps
+```json
+{"message":"Review this proposed plan before implementation: make Oracle parse file mentions from its task string, remove separate context/files args, and add speed-focused review instructions. Relevant files: @thread-actors/src/server-tools/oracle.ts, @thread-actors/src/inference/system-prompts/oracle.md.njk, @thread-actors/src/server-tools.test.ts, @core/src/mentions/data.ts, @core/src/mentions/data.test.ts. Look for gaps in schema compatibility, prompt size bounds, file mention parsing edge cases, prompt-injection risk, and test coverage. Return only plan changes needed before coding plus a brief \"safe to implement?\" recommendation."}
+```
+
+Review a TypeScript type-boundary change
+```json
+{"message":"Review this TypeScript API boundary change: we are replacing optional fields with a discriminated union so callers cannot represent impossible executor states. Relevant files: @thread-actors/src/sandbox/manager.ts, @thread-actors/src/db/environment.ts, @thread-actors/src/thread-coordinator.ts, @lib/thread-protocol/src/protocol.ts. Check whether the new type actually makes illegal states unrepresentable or just moves casts/undefined checks elsewhere. Focus on public protocol compatibility, inference quality at call sites, and any hidden runtime migration risk. Return concrete type-model improvements, not style nits."}
+```
+
+The answer arrives later as mail. Wait patiently for up to five minutes for its response; do not keep messaging the Advisor while it is working. Use `message_agent` with its handle only when genuine follow-up or additional context is needed."#
             .to_owned(),
         input_schema: json!({
             "type": "object", "additionalProperties": false,
@@ -545,7 +601,23 @@ mod tests {
     fn advisor_description_encourages_patient_waiting() {
         let description = advisor_spec().description;
         assert!(description.contains("Wait patiently for up to five minutes"));
-        assert!(description.contains("do not keep messaging it while it is working"));
+        assert!(description.contains("do not keep messaging the Advisor while it is working"));
+        assert!(description.contains("You should consult the Advisor for:"));
+        assert!(description.contains("You should NOT consult the Advisor for:"));
+        for example in [
+            "Review current changes against a stated intent",
+            "Review implementation intent before code details",
+            "Produce alternative implementation options",
+            "Produce an implementation plan",
+            "Review a proposed plan for gaps",
+            "Review a TypeScript type-boundary change",
+        ] {
+            assert!(description.contains(example), "missing example: {example}");
+        }
+        assert!(description.contains(r#"{"message":"#));
+        assert!(!description.contains(r#"{"task":"#));
+        assert!(!description.contains("zero-shot"));
+        assert!(!description.contains("one-shot"));
     }
 
     #[test]
