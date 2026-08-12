@@ -2120,7 +2120,7 @@ mod tests {
         // Prompt construction is bounded independently of command execution.
         first
             .submit
-            .send("PS1=$(printf '%20000s' '')".to_owned())
+            .send("printf -v PS1 '%20000s' ''".to_owned())
             .await
             .unwrap();
         let bounded_prompt_token = "bounded-prompt-survived";
