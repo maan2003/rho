@@ -4,8 +4,7 @@ use gpui::{AppContext as _, Context, Entity};
 use language::{Buffer, BufferEvent, Capability};
 use rho_ui_proto::ClientMessage;
 use rho_ui_proto::desk::{
-    DeskAnchor, DeskClock, DeskOperation, DeskSnapshot, DeskTextOpRecord,
-    DeskTransaction,
+    DeskAnchor, DeskClock, DeskOperation, DeskSnapshot, DeskTextOpRecord, DeskTransaction,
 };
 use text::{BufferId, ReplicaId};
 

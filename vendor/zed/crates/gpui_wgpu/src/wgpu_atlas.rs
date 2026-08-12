@@ -387,7 +387,7 @@ impl WgpuAtlasTexture {
 
 fn swizzle_upload_data(bytes: &[u8], format: wgpu::TextureFormat) -> Vec<u8> {
     match format {
-        wgpu::TextureFormat::Rgba8Unorm => {
+        wgpu::TextureFormat::Bgra8Unorm => {
             let mut data = bytes.to_vec();
             for pixel in data.chunks_exact_mut(4) {
                 pixel.swap(0, 2);
@@ -419,6 +419,7 @@ mod tests {
                     power_preference: wgpu::PowerPreference::LowPower,
                     compatible_surface: None,
                     force_fallback_adapter: false,
+                    apply_limit_buckets: false,
                 })
                 .await
                 .map_err(|error| anyhow::anyhow!("failed to request adapter: {error}"))?;
@@ -508,20 +509,20 @@ mod tests {
     }
 
     #[test]
-    fn swizzle_upload_data_preserves_bgra_uploads() {
+    fn swizzle_upload_data_converts_rgba_to_bgra() {
         let input = vec![0x10, 0x20, 0x30, 0x40];
         assert_eq!(
             swizzle_upload_data(&input, wgpu::TextureFormat::Bgra8Unorm),
-            input
+            vec![0x30, 0x20, 0x10, 0x40]
         );
     }
 
     #[test]
-    fn swizzle_upload_data_converts_bgra_to_rgba() {
+    fn swizzle_upload_data_preserves_rgba_uploads() {
         let input = vec![0x10, 0x20, 0x30, 0x40, 0xAA, 0xBB, 0xCC, 0xDD];
         assert_eq!(
             swizzle_upload_data(&input, wgpu::TextureFormat::Rgba8Unorm),
-            vec![0x30, 0x20, 0x10, 0x40, 0xCC, 0xBB, 0xAA, 0xDD]
+            input
         );
     }
 }

@@ -70,6 +70,17 @@ AI APIs.
   single path component, and records process start identities before sending
   signals during cleanup. Applications launched in a driver session are not
   sandboxed and retain the invoking user's authority.
+- Native embedded pages run an ordinary stock Chromium process with the invoking
+  user's full authority and a persistent cookie/storage identity under the Rho
+  client state directory; this is not a sandbox. `rho-browser` accepts only
+  bounded HTTP(S) launch URLs, holds an exclusive advisory lock on that identity,
+  and exposes Chromium only to one private shared Wayland socket. Page-to-surface
+  routing uses compositor-issued, one-shot `xdg-activation-v1` tokens passed in
+  `XDG_ACTIVATION_TOKEN`; it does not enable CDP/remote debugging, load an
+  extension, inject website script, or expose a loopback bootstrap service.
+  Chromium must propagate activation tokens through its existing-profile process
+  handoff; otherwise the page fails closed after ten seconds instead of guessing
+  which unbound toplevel belongs to it.
 - Long-running `exec_command` processes are retained only in their owning
   agent's in-memory command-session table. `write_stdin` requires that local
   numeric session id; waits are capped at five minutes and dropping the agent

@@ -128,6 +128,9 @@ impl WgpuContext {
             adapter.get_info().backend
         );
 
+        #[cfg(target_os = "linux")]
+        crate::linux_dmabuf::install_capabilities(&adapter, &device);
+
         let backend = WgpuBackend::Native(adapter.get_info().backend);
         Ok(Self {
             instance,
@@ -250,6 +253,14 @@ impl WgpuContext {
                 Subpixel text antialiasing will be disabled."
             );
         }
+        #[cfg(target_os = "linux")]
+        if adapter.get_info().backend == wgpu::Backend::Vulkan
+            && adapter
+                .features()
+                .contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF)
+        {
+            required_features |= wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF;
+        }
 
         let color_atlas_texture_format = Self::select_color_texture_format(adapter)?;
         #[cfg(target_family = "wasm")]
@@ -267,17 +278,45 @@ impl WgpuContext {
             .using_resolution(adapter.limits())
             .using_alignment(adapter.limits());
 
-        let (device, queue) = adapter
-            .request_device(&wgpu::DeviceDescriptor {
-                label: Some("gpui_device"),
-                required_features,
-                required_limits,
-                memory_hints: wgpu::MemoryHints::MemoryUsage,
-                trace: wgpu::Trace::Off,
-                experimental_features: wgpu::ExperimentalFeatures::disabled(),
-            })
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to create wgpu device: {e}"))?;
+        let mut descriptor = wgpu::DeviceDescriptor {
+            label: Some("gpui_device"),
+            required_features,
+            required_limits,
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
+            trace: wgpu::Trace::Off,
+            experimental_features: wgpu::ExperimentalFeatures::disabled(),
+        };
+        #[cfg(target_os = "linux")]
+        let external = if adapter.get_info().backend == wgpu::Backend::Vulkan
+            && required_features.contains(wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF)
+        {
+            unsafe {
+                crate::linux_dmabuf::open(
+                    adapter,
+                    required_features,
+                    &descriptor.required_limits,
+                    &descriptor.memory_hints,
+                    &descriptor,
+                )
+            }
+            .ok()
+        } else {
+            None
+        };
+        #[cfg(not(target_os = "linux"))]
+        let external: Option<(wgpu::Device, wgpu::Queue)> = None;
+        if external.is_none() {
+            descriptor
+                .required_features
+                .remove(wgpu::Features::VULKAN_EXTERNAL_MEMORY_DMA_BUF);
+        }
+        let (device, queue) = match external {
+            Some(device) => device,
+            None => adapter
+                .request_device(&descriptor)
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to create wgpu device: {e}"))?,
+        };
 
         Ok((
             device,

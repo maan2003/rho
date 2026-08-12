@@ -327,7 +327,12 @@ impl Render for Workspace {
             ),
             (None, None, true, _, _) => Some(
                 crate::minibuffer::bottom_strip(&text_style, cx)
-                    .child(div().px_2().font_weight(gpui::FontWeight::BOLD).child("SPC u"))
+                    .child(
+                        div()
+                            .px_2()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("SPC u"),
+                    )
                     .child(div().px_2().child("universal argument"))
                     .into_any_element(),
             ),
@@ -361,15 +366,17 @@ impl Render for Workspace {
                     this.dashboard_reply(window, cx);
                 }
             }))
-            .on_action(cx.listener(|this, _: &crate::DashboardNewAgent, window, cx| {
-                if this.take_universal_argument() {
-                    this.configure_dashboard_quick_spawn(window, cx);
-                } else {
-                    this.new_agent_draft = None;
-                    this.dashboard.open_new_draft(None, window, cx);
-                    this.dashboard_focus_draft(window, cx);
-                }
-            }))
+            .on_action(
+                cx.listener(|this, _: &crate::DashboardNewAgent, window, cx| {
+                    if this.take_universal_argument() {
+                        this.configure_dashboard_quick_spawn(window, cx);
+                    } else {
+                        this.new_agent_draft = None;
+                        this.dashboard.open_new_draft(None, window, cx);
+                        this.dashboard_focus_draft(window, cx);
+                    }
+                }),
+            )
             .on_action(
                 cx.listener(|this, _: &crate::MinibufferConfirm, window, cx| {
                     this.minibuffer_confirm(window, cx);

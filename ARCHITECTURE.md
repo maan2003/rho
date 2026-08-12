@@ -114,6 +114,18 @@ than by running a supervisor, extension protocol, or daemon process graph.
   removed until the user toggles the composed view back on.
   `rho-gui` supplies its context strip, theme mapping, and focus/show policy,
   while GPUI web owns only the immediate pointer-down routing region.
+  Native web pages are client-local first-class resources owned by `rho-browser`.
+  They use typed compact prefix IDs (`web-<prefix>`, written as Desk tags like
+  `:web-xxxx:`) whose encoded IDs,
+  machine seed, and allocation counters are persisted in a separate client
+  `RhoDb`, one implicit persistent Chromium user-data directory, and one private shared
+  Smithay compositor. The compositor issues one-shot XDG activation tokens and
+  binds each new XDG toplevel only when Chromium applies its token; no debugging
+  protocol, extension, injected page script, or title convention participates.
+  `rho-gui` only hosts the resulting GPUI page model/view. A `:web-xxxx:` tag
+  on an ordinary Desk heading is a portal to the client-local page, just as an
+  agent tag is a portal to an agent; selecting the heading uses the same
+  right-hand preview card. Daemons do not own browser state.
   The native GUI
   exposes two deliberately separate daemon-owned process surfaces: an
   editor-native, Comint-style shell for ordinary commands and a raw terminal

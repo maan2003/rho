@@ -138,7 +138,10 @@ impl DeskStore {
         state.next_replica_id = replica_id
             .checked_add(1)
             .ok_or_else(|| "Desk replica id space exhausted".to_owned())?;
-        state.snapshot.replicas.push(DeskReplica { replica_id, author });
+        state
+            .snapshot
+            .replicas
+            .push(DeskReplica { replica_id, author });
         save_state(&mut write, &state);
         write.commit();
         Ok(replica_id)
@@ -885,7 +888,10 @@ mod tests {
         let db = RhoDb::open(directory.path().join("desk.redb"));
         init_agent_tables(&db).await;
         let store = DeskStore::new(db.clone()).await;
-        let replica = store.allocate_replica(DeskReplicaAuthor::User).await.unwrap();
+        let replica = store
+            .allocate_replica(DeskReplicaAuthor::User)
+            .await
+            .unwrap();
         let mut buffer =
             text::Buffer::new(ReplicaId::new(replica), text::BufferId::new(1).unwrap(), "");
         let edit = buffer.edit([(0..0, "* one\n* two\n")]);
@@ -933,7 +939,13 @@ mod tests {
         };
         // Removing one agent from a shared token keeps the others.
         let text = "* one :eng-a:eng-b:\n* two\n";
-        let edits = retag_edits(&resolve, text, a, "eng-a", Some(text.find("* two").unwrap()));
+        let edits = retag_edits(
+            &resolve,
+            text,
+            a,
+            "eng-a",
+            Some(text.find("* two").unwrap()),
+        );
         let mut patched = text.to_owned();
         for (range, replacement) in edits.iter().rev() {
             patched.replace_range(range.clone(), replacement);
@@ -991,7 +1003,10 @@ mod tests {
         let text = store.snapshot().document_text().unwrap();
         // The resolvable handle becomes a heading-line tag; the dead one
         // stays visible for the user to deal with.
-        assert_eq!(text, "* one\nbody\n* two :eng-good:\n:agent: adv-gone\nnotes\n");
+        assert_eq!(
+            text,
+            "* one\nbody\n* two :eng-good:\n:agent: adv-gone\nnotes\n"
+        );
         assert_eq!(parse(&text)[1].tags, vec!["eng-good"]);
     }
 
@@ -1001,7 +1016,10 @@ mod tests {
         let db = RhoDb::open(directory.path().join("desk.redb"));
         init_agent_tables(&db).await;
         let store = DeskStore::new(db.clone()).await;
-        let replica = store.allocate_replica(DeskReplicaAuthor::User).await.unwrap();
+        let replica = store
+            .allocate_replica(DeskReplicaAuthor::User)
+            .await
+            .unwrap();
         let mut buffer =
             text::Buffer::new(ReplicaId::new(replica), text::BufferId::new(1).unwrap(), "");
         let edit = buffer.edit([(0..0, "* TODO plan\n:agent: eng-test\nnotes\n")]);

@@ -2,9 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context as _;
 use rho_agent::multi_agent_tools;
-use rho_ui_proto::{
-    AgentId, ClientMessage, McpAgentToolRequest, McpSpawnWorkdir, ServerMessage,
-};
+use rho_ui_proto::{AgentId, ClientMessage, McpAgentToolRequest, McpSpawnWorkdir, ServerMessage};
 use serde::Deserialize;
 use serde_json::{Value, json};
 

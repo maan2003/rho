@@ -212,7 +212,8 @@ fn diff_edits(old: &str, new: &str) -> Vec<(Range<usize>, String)> {
     for hunk in diff.hunks() {
         let old_range =
             old_offsets[hunk.before.start as usize]..old_offsets[hunk.before.end as usize];
-        let new_range = new_offsets[hunk.after.start as usize]..new_offsets[hunk.after.end as usize];
+        let new_range =
+            new_offsets[hunk.after.start as usize]..new_offsets[hunk.after.end as usize];
         let (old_range, replacement) = tighten(old, new, old_range, new_range);
         if old_range.is_empty() && replacement.is_empty() {
             continue;
@@ -308,11 +309,8 @@ mod tests {
 
     #[test]
     fn apply_merges_with_edits_made_after_the_checkout() {
-        let mut server = text::Buffer::new(
-            text::ReplicaId::new(1),
-            text::BufferId::new(1).unwrap(),
-            "",
-        );
+        let mut server =
+            text::Buffer::new(text::ReplicaId::new(1), text::BufferId::new(1).unwrap(), "");
         let history = vec![DeskOperation::from_text(
             &server.edit([(0..0, "* One\nbody\n")]),
         )];

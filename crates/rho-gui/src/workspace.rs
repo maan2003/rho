@@ -53,17 +53,16 @@ use crate::store::{AgentStore, FrameSummary};
 use crate::style::{RoleFamily, StyleClass};
 use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
-    AgentDone, AgentHide, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, DashboardBack,
-    DashboardArchive, DashboardDeleteEmpty, DashboardDemote, DashboardGoto, DashboardHeadingAbove,
-    DashboardHeadingBelow, DashboardJump,
-    DashboardNewAgent, DashboardNow, DashboardPromote, DashboardRenameTopic, DashboardReply,
-    DashboardCycleGlobal, DashboardStaff, DashboardSubmit, DashboardToggleAgentTree,
-    DashboardToggleSubagents, DashboardUndo, GitApprovalAllow, GitApprovalDeny,
-    MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious,
-    PaneBack, PaneClose, PaneFocusNext, PaneSplitDown, PaneSplitRight, PastePrompt, RailFocus,
-    RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore,
-    ShellPagerQuit, SubmitPrompt, TaskBoard, VoiceToggle, ZulipLoadOlder, ZulipNextUnread,
-    ZulipOpenRow, ZulipQuit,
+    AgentDone, AgentHide, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, DashboardArchive,
+    DashboardBack, DashboardCycleGlobal, DashboardDeleteEmpty, DashboardDemote, DashboardGoto,
+    DashboardHeadingAbove, DashboardHeadingBelow, DashboardJump, DashboardNewAgent, DashboardNow,
+    DashboardPromote, DashboardRenameTopic, DashboardReply, DashboardStaff, DashboardSubmit,
+    DashboardToggleAgentTree, DashboardToggleSubagents, DashboardUndo, GitApprovalAllow,
+    GitApprovalDeny, MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext,
+    MinibufferPrevious, PaneBack, PaneClose, PaneFocusNext, PaneSplitDown, PaneSplitRight,
+    PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt,
+    ShellPagerAll, ShellPagerMore, ShellPagerQuit, SubmitPrompt, TaskBoard, VoiceToggle,
+    ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow, ZulipQuit,
 };
 
 /// What a pane shows: stable identity plus the live view. Surfaces live
@@ -109,6 +108,8 @@ enum SurfaceView {
     },
     Diff(Entity<crate::diff_view::DiffView>),
     Terminal(Entity<crate::terminal_view::TerminalView>),
+    #[cfg(feature = "native")]
+    Browser(Entity<rho_browser::PageView>),
     #[cfg(feature = "native")]
     ZulipInbox(Entity<rho_zulip::ui::InboxView>),
     #[cfg(feature = "native")]
@@ -323,6 +324,9 @@ pub struct Workspace {
     /// Agent shown beside the dashboard cursor. Kept separate from the
     /// focused task so cursor previews do not rebuild or reorder the rail.
     dashboard_preview: Option<AgentId>,
+    /// Client-local web page shown in the same right-hand preview card.
+    #[cfg(feature = "native")]
+    dashboard_web_preview: Option<(rho_browser::PageId, Entity<rho_browser::PageView>)>,
     /// Read-only document shown when the synthetic Iris row is targeted.
     iris_preview: Entity<editor::Editor>,
     /// Each daemon's hidden persisted Iris coordinator. These identities stay
@@ -767,6 +771,7 @@ impl Workspace {
             desk_sync: DeskSync::default(),
             desk_edit_subscriptions: HashMap::new(),
             dashboard_preview: None,
+            dashboard_web_preview: None,
             iris_preview,
             iris_agents: HashMap::new(),
             zulip: None,
@@ -2661,6 +2666,109 @@ impl Workspace {
         }
     }
 
+    #[cfg(feature = "native")]
+    pub fn open_browser_page(
+        &mut self,
+        id: rho_browser::PageId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(model) = rho_browser::open_page(id, cx) else {
+            let message = format!("browser page not found: {id}");
+            self.notice_on(None, &message, StyleClass::SystemInfo, cx);
+            return;
+        };
+        let view = cx.new(|cx| rho_browser::PageView::new(model, cx));
+        let surface = Self::wrap_surface(
+            SurfaceKey::Browser(id),
+            SurfaceView::Browser(view),
+            window,
+            cx,
+        );
+        self.display_surface(surface);
+        self.focus_active_surface(window, cx);
+        cx.notify();
+    }
+
+    #[cfg(feature = "native")]
+    pub fn cmd_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dashboard.cursor_topic(cx).is_none() {
+            self.notice_on(
+                None,
+                "new web: choose a Desk heading",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        }
+        let on_submit = std::rc::Rc::new(
+            |workspace: &mut Workspace,
+             input: String,
+             _window: &mut Window,
+             cx: &mut Context<Workspace>| {
+                let input = input.trim();
+                if input.is_empty() {
+                    return;
+                }
+                let url = if input.contains("://") {
+                    input.to_owned()
+                } else {
+                    format!("https://{input}")
+                };
+                workspace.create_browser_page(url, cx);
+            },
+        );
+        self.open_prompt(
+            "new web:",
+            std::rc::Rc::new(|_, _, _| Vec::new()),
+            on_submit,
+            window,
+            cx,
+        );
+    }
+
+    #[cfg(feature = "native")]
+    fn create_browser_page(&mut self, url: String, cx: &mut Context<Self>) {
+        let create = rho_browser::create_page(url, cx);
+        cx.spawn(async move |this, cx| {
+            let record = create.await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                let record = match record {
+                    Ok(record) => record,
+                    Err(error) => {
+                        let message = format!("browser: {error:#}");
+                        this.notice_on(None, &message, StyleClass::SystemInfo, cx);
+                        return;
+                    }
+                };
+                let id = record.id;
+                let tag = id.to_string();
+                if !this.dashboard.tag_cursor_heading_with_page(&tag, cx) {
+                    this.notice_on(
+                        None,
+                        "new web: heading disappeared",
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
+                    return;
+                }
+                this.refresh_dashboard(window, cx);
+                let model = rho_browser::open_page_record(record, cx);
+                let view = cx.new(|cx| rho_browser::PageView::new(model, cx));
+                let surface = Self::wrap_surface(
+                    SurfaceKey::Browser(id),
+                    SurfaceView::Browser(view),
+                    window,
+                    cx,
+                );
+                this.display_surface(surface);
+                this.focus_active_surface(window, cx);
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
     pub(crate) fn cmd_diff(&mut self, window: &Window, cx: &mut Context<Self>) {
         let Some(agent_id) = self.subject_agent_or_notice("diff", window, cx) else {
             return;
@@ -3419,9 +3527,41 @@ impl Workspace {
         let view = self.materialize_model(&agent_id, window, cx);
         view.update(cx, |view, cx| view.tick_timers(now_ms(), cx));
         self.dashboard_preview = Some(agent_id);
+        self.dashboard_web_preview = None;
         self.hosts
             .focus_agent(self.host_of(agent_id).map(|host| (host, agent_id)));
         self.ensure_duration_timer(cx);
+        cx.notify();
+    }
+
+    #[cfg(feature = "native")]
+    pub fn preview_recent_browser_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(page) = rho_browser::pages(cx).into_iter().next() {
+            self.preview_browser_page(page.id, window, cx);
+        }
+    }
+
+    #[cfg(feature = "native")]
+    fn preview_browser_page(
+        &mut self,
+        id: rho_browser::PageId,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .dashboard_web_preview
+            .as_ref()
+            .is_some_and(|(current, _)| *current == id)
+        {
+            return;
+        }
+        let Some(model) = rho_browser::open_page(id, cx) else {
+            return;
+        };
+        let view = cx.new(|cx| rho_browser::PageView::new(model, cx));
+        self.dashboard_preview = None;
+        self.hosts.focus_agent(None);
+        self.dashboard_web_preview = Some((id, view));
         cx.notify();
     }
 
@@ -3483,9 +3623,15 @@ impl Workspace {
         if !self.dashboard.focus_handle(cx).is_focused(window) {
             return;
         }
+        let target = self.dashboard.cursor_target(&self.registry, cx);
+        #[cfg(feature = "native")]
+        if let Some(RowTarget::Page(id)) = &target {
+            self.preview_browser_page(*id, window, cx);
+            return;
+        }
         // A reply draft sits inside its agent's heading region, so it keeps
         // that agent on screen while the reply is typed.
-        let agent = match self.dashboard.cursor_target(&self.registry, cx) {
+        let agent = match target {
             Some(RowTarget::Agent { agent_id, .. }) | Some(RowTarget::Reply(agent_id)) => {
                 Some(agent_id)
             }
@@ -3496,8 +3642,7 @@ impl Workspace {
                 offset,
                 first_attention,
                 ..
-            }) => first_attention
-                .or_else(|| self.dashboard.first_agent_for_topic((host, offset))),
+            }) => first_attention.or_else(|| self.dashboard.first_agent_for_topic((host, offset))),
             Some(RowTarget::NewDraft(Some(topic))) => self.dashboard.first_agent_for_topic(topic),
             _ => None,
         };
@@ -3513,10 +3658,11 @@ impl Workspace {
     /// Hides the preview pane: the cursor is on a header, prose, or an
     /// unstaffed heading, so no agent claims the frame.
     fn clear_dashboard_preview(&mut self, cx: &mut Context<Self>) {
-        if self.dashboard_preview.is_none() {
+        if self.dashboard_preview.is_none() && self.dashboard_web_preview.is_none() {
             return;
         }
         self.dashboard_preview = None;
+        self.dashboard_web_preview = None;
         self.hosts.focus_agent(None);
         cx.notify();
     }
@@ -3549,6 +3695,7 @@ impl Workspace {
                 "term {}/{terminal_id}",
                 self.registry.agent_id_label(*agent_id)
             ),
+            SurfaceKey::Browser(browser) => browser.to_string(),
             SurfaceKey::ZulipInbox => "zulip".to_owned(),
             SurfaceKey::ZulipNarrow { label } => label.clone(),
         }
@@ -3562,6 +3709,7 @@ impl Workspace {
             SurfaceKey::Shell(_) => "shell",
             SurfaceKey::Diff { .. } => "diff",
             SurfaceKey::Terminal { .. } => "terminal",
+            SurfaceKey::Browser(_) => "browser",
             SurfaceKey::ZulipInbox => "zulip inbox",
             SurfaceKey::ZulipNarrow { .. } => "zulip",
         }
@@ -4204,7 +4352,8 @@ impl Workspace {
     /// don't exist); verbs gated on connectivity need this to run.
     #[cfg(test)]
     pub(crate) fn force_host_online(&mut self, host: HostId) {
-        self.hosts.set_status(host, crate::hosts::HostStatus::Online);
+        self.hosts
+            .set_status(host, crate::hosts::HostStatus::Online);
     }
 
     #[cfg(test)]
@@ -4260,6 +4409,8 @@ impl Workspace {
     /// their source. The reconcile is idempotent and cheap, so calling
     /// it from several funnels is fine.
     pub(crate) fn refresh_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        #[cfg(feature = "native")]
+        self.dashboard.set_browser_pages(rho_browser::pages(cx));
         self.dashboard.autofill_titles(&self.registry, cx);
         self.dashboard.sync(&self.registry, window, cx);
     }
@@ -4292,6 +4443,10 @@ impl Workspace {
             SurfaceView::Shell { editor, .. } => editor.clone(),
             SurfaceView::Diff(view) => view.read(cx).editor().clone(),
             SurfaceView::Terminal(_) => self
+                .any_draft_editor()
+                .expect("the draft context always holds a draft surface"),
+            #[cfg(feature = "native")]
+            SurfaceView::Browser(_) => self
                 .any_draft_editor()
                 .expect("the draft context always holds a draft surface"),
             #[cfg(feature = "native")]
@@ -4331,6 +4486,8 @@ impl Workspace {
             SurfaceView::Shell { editor, .. } => editor.focus_handle(cx),
             SurfaceView::Diff(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::Terminal(view) => view.read(cx).focus_handle(cx),
+            #[cfg(feature = "native")]
+            SurfaceView::Browser(view) => view.read(cx).focus_handle(cx),
             #[cfg(feature = "native")]
             SurfaceView::ZulipInbox(view) => view.read(cx).editor().focus_handle(cx),
             #[cfg(feature = "native")]
@@ -4386,6 +4543,9 @@ impl Workspace {
             }
             SurfaceKey::Terminal { .. } => {
                 unreachable!("terminal surfaces are created by open_terminal_surface")
+            }
+            SurfaceKey::Browser(_) => {
+                unreachable!("browser surfaces are created by cmd_browser")
             }
             #[cfg(feature = "native")]
             SurfaceKey::ZulipInbox => {
@@ -4462,6 +4622,12 @@ impl Workspace {
                 let view = cx.new(|cx| crate::terminal_view::TerminalView::new(model, cx));
                 Self::wrap_surface(surface.key.clone(), SurfaceView::Terminal(view), window, cx)
             }
+            #[cfg(feature = "native")]
+            SurfaceView::Browser(view) => {
+                let model = view.read(cx).model().clone();
+                let view = cx.new(|cx| rho_browser::PageView::new(model, cx));
+                Self::wrap_surface(surface.key.clone(), SurfaceView::Browser(view), window, cx)
+            }
             // Chat surfaces hold one editor over one conversation: a split
             // shows the same view rather than a second cursor over the
             // same messages, which no one has ever wanted.
@@ -4493,6 +4659,8 @@ impl Workspace {
             }
             // Terminals have no editor; the view itself carries focus.
             SurfaceView::Terminal(view) => (view.read(cx).focus_handle(cx), view.entity_id()),
+            #[cfg(feature = "native")]
+            SurfaceView::Browser(view) => (view.read(cx).focus_handle(cx), view.entity_id()),
             #[cfg(feature = "native")]
             SurfaceView::ZulipInbox(view) => {
                 let editor = view.read(cx).editor().clone();
@@ -4538,6 +4706,7 @@ impl Workspace {
                 self.registry.select_agent(agent_id);
                 Some(agent_id)
             }
+            SurfaceKey::Browser(_) => None,
             SurfaceKey::Diff { agent_id } => {
                 self.registry.select_agent(agent_id);
                 Some(agent_id)
@@ -4547,9 +4716,9 @@ impl Workspace {
                 None
             }
             // Files and chat keep whatever agent context was current.
-            SurfaceKey::File { .. }
-            | SurfaceKey::ZulipInbox
-            | SurfaceKey::ZulipNarrow { .. } => None,
+            SurfaceKey::File { .. } | SurfaceKey::ZulipInbox | SurfaceKey::ZulipNarrow { .. } => {
+                None
+            }
         };
         if self.connected()
             && let Some(agent_id) = selected
@@ -4929,11 +5098,7 @@ impl Workspace {
         cx.notify();
     }
 
-    pub(crate) fn cmd_toggle_raw_desk(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn cmd_toggle_raw_desk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dashboard.toggle_raw_mode(cx);
         self.refresh_dashboard(window, cx);
     }
@@ -4944,7 +5109,12 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(topic) = self.dashboard.cursor_topic(cx) else {
-            self.notice_on(None, "staff: choose a Desk heading", StyleClass::SystemInfo, cx);
+            self.notice_on(
+                None,
+                "staff: choose a Desk heading",
+                StyleClass::SystemInfo,
+                cx,
+            );
             return;
         };
         self.begin_new_agent_configuration(NewAgentIntent::Staff(topic), window, cx);
@@ -5311,11 +5481,7 @@ impl Workspace {
         self.open_new_agent_transient(window, cx);
     }
 
-    pub(crate) fn compose_configured_agent(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn compose_configured_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(intent) = self.new_agent_draft.as_ref().map(|draft| draft.intent) else {
             return;
         };
@@ -5370,8 +5536,7 @@ impl Workspace {
                 };
                 if let Some(project) = self.workdirs.iter().find(|candidate| {
                     candidate.host == host && candidate.project.path.as_path() == repo
-                })
-                {
+                }) {
                     self.dashboard.set_heading_project(
                         topic_host,
                         offset,
@@ -5382,10 +5547,13 @@ impl Workspace {
                 self.dashboard.cursor_to_doc(topic_host, offset, cx);
                 self.desk_sync.anchor_at(topic_host, offset, cx)
             }
-            None => self.dashboard.append_placeholder_heading(host, cx).and_then(|offset| {
-                self.dashboard.cursor_to_doc(host, offset, cx);
-                self.desk_sync.anchor_at(host, offset, cx)
-            }),
+            None => self
+                .dashboard
+                .append_placeholder_heading(host, cx)
+                .and_then(|offset| {
+                    self.dashboard.cursor_to_doc(host, offset, cx);
+                    self.desk_sync.anchor_at(host, offset, cx)
+                }),
         };
         self.send_to_host(
             host,
@@ -5404,6 +5572,8 @@ impl Workspace {
         use crate::dashboard::RowTarget;
         match self.dashboard.cursor_target(&self.registry, cx) {
             Some(RowTarget::Agent { agent_id, .. }) => self.open_agent(agent_id, window, cx),
+            #[cfg(feature = "native")]
+            Some(RowTarget::Page(id)) => self.open_browser_page(id, window, cx),
             // A staffed heading opens its top agent full-frame — loudest
             // first, quiet agents still reachable. Unstaffed headings keep
             // enter as a fold toggle.
@@ -5413,8 +5583,8 @@ impl Workspace {
                 first_attention,
                 on_heading_line,
             }) => {
-                if let Some(agent_id) = first_attention
-                    .or_else(|| self.dashboard.first_agent_for_topic((host, offset)))
+                if let Some(agent_id) =
+                    first_attention.or_else(|| self.dashboard.first_agent_for_topic((host, offset)))
                 {
                     self.open_agent(agent_id, window, cx);
                 } else if on_heading_line {
@@ -5522,7 +5692,9 @@ impl Workspace {
                     .or_else(|| self.dashboard.first_agent_for_topic((host, offset)))
                 {
                     Some(agent_id) => self.dashboard.open_reply(agent_id, window, cx),
-                    None => self.dashboard.open_new_draft(Some((host, offset)), window, cx),
+                    None => self
+                        .dashboard
+                        .open_new_draft(Some((host, offset)), window, cx),
                 }
                 self.dashboard_focus_draft(window, cx);
             }
@@ -5668,7 +5840,8 @@ impl Workspace {
                     repo: workdir.project.path,
                     revset: crate::draft_view::AUTO_BASE_REVSET.to_owned(),
                 },
-                content: (!body.trim().is_empty()).then_some(vec![ContentPart::Text { text: body }]),
+                content: (!body.trim().is_empty())
+                    .then_some(vec![ContentPart::Text { text: body }]),
                 desk_anchor: None,
             },
         );
@@ -6022,6 +6195,7 @@ impl Workspace {
             .id("dashboard-rail")
             .flex_grow(1.0)
             .min_h_0()
+            .overflow_hidden()
             .child(self.dashboard.editor().clone());
         let hint = div()
             .flex_none()
@@ -6036,7 +6210,8 @@ impl Workspace {
             // press/release around it, then open after its cursor has moved.
             .capture_any_mouse_down(cx.listener(Self::dashboard_pointer_down))
             .capture_any_mouse_up(cx.listener(Self::dashboard_pointer_up));
-        container.child(dashboard).child(hint).into_any_element()
+        let container = container.child(dashboard);
+        container.child(hint).into_any_element()
     }
 
     /// The dashboard-only two-line masthead.
@@ -6191,6 +6366,32 @@ impl Workspace {
         Some(model.update(cx, |model, cx| model.preview_editor(window, cx)))
     }
 
+    fn selected_preview(
+        &mut self,
+        iris: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        #[cfg(feature = "native")]
+        if let Some((_, view)) = &self.dashboard_web_preview {
+            return Some(
+                div()
+                    .size_full()
+                    .overflow_hidden()
+                    .child(view.clone())
+                    .into_any_element(),
+            );
+        }
+        self.selected_preview_editor(iris, window, cx)
+            .map(|editor| {
+                div()
+                    .size_full()
+                    .overflow_hidden()
+                    .child(editor)
+                    .into_any_element()
+            })
+    }
+
     fn render_panes(
         &mut self,
         window: &mut Window,
@@ -6205,7 +6406,10 @@ impl Workspace {
         let home = self.dashboard_mode(window, cx);
         let iris = false;
         self.sync_diff_visibility(!home, cx);
-        let show_panes = !home || iris || self.dashboard_preview.is_some();
+        let show_panes = !home
+            || iris
+            || self.dashboard_preview.is_some()
+            || self.dashboard_web_preview.is_some();
         let rail = home.then(|| self.render_rail(show_panes, text_style, cx));
         // Same hairline the rail uses against the panes.
         let separator_color = cx.theme().colors().border_variant.opacity(0.6);
@@ -6218,7 +6422,7 @@ impl Workspace {
             .then(|| self.render_preview_bar(&preview_text_style, cx))
             .flatten();
         let preview = home
-            .then(|| self.selected_preview_editor(iris, window, cx))
+            .then(|| self.selected_preview(iris, window, cx))
             .flatten();
         let mut leaf = |pane: &crate::pane::Pane<Surface>| -> gpui::AnyElement {
             let id = pane.id;
@@ -6401,6 +6605,13 @@ impl Workspace {
                 .into_any_element(),
             SurfaceView::Terminal(view) => div()
                 .id("rho-surface-terminal")
+                .size_full()
+                .overflow_hidden()
+                .child(view.clone())
+                .into_any_element(),
+            #[cfg(feature = "native")]
+            SurfaceView::Browser(view) => div()
+                .id("rho-surface-browser")
                 .size_full()
                 .overflow_hidden()
                 .child(view.clone())

@@ -18,8 +18,8 @@ use editor::{Editor, EditorMode, HighlightKey, Inlay, SizingBehavior};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, Focusable as _, HighlightStyle, WeakEntity, Window};
 use language::{Buffer, Capability, Point};
-use multi_buffer::{MultiBuffer, ToOffset as _};
 use multi_buffer::composition::{Composition, CompositionSpec, CutSpec, RowSpec, SectionSpec};
+use multi_buffer::{MultiBuffer, ToOffset as _};
 use project::InlayId;
 use rho_ui_proto::desk::{DeskHeading, DeskHeadingState, parse};
 use rho_ui_proto::{AgentId, UiAttention};
@@ -49,6 +49,7 @@ const ARCHIVE_TAG: &str = "archive";
 /// class and lamp key ranges.
 const DRAFT_TEXT_KEY: HighlightKey =
     HighlightKey::SyntaxTreeView(DASHBOARD_KEY_BASE + 2 * DashClass::ALL.len());
+const WEB_HEADING_DECORATION: &str = "\0web";
 
 pub type ParsedHeadingState = DeskHeadingState;
 type DraftTopic = Option<(HostId, usize)>;
@@ -138,6 +139,8 @@ pub enum RowTarget {
     Reply(AgentId),
     /// The inline new-agent draft.
     NewDraft(Option<(HostId, usize)>),
+    #[cfg(feature = "native")]
+    Page(rho_browser::PageId),
 }
 
 /// Where the cursor is: on a generated row, or at an offset inside a
@@ -190,6 +193,8 @@ pub struct Dashboard {
     /// Bound root agents per heading start, from the last sync — the
     /// source for `first_attention` and agent→heading lookups.
     heading_agents: HashMap<(HostId, usize), Vec<AgentId>>,
+    #[cfg(feature = "native")]
+    heading_pages: HashMap<(HostId, usize), rho_browser::PageId>,
     /// Roots whose binding tag lives inside an `:archive:` zone, as of the
     /// last sync. Archived agents are muted: no chime, quiet decorations.
     archived_agents: HashSet<AgentId>,
@@ -234,6 +239,8 @@ pub struct Dashboard {
     /// boundary onto a headerless buffer draws nothing, so this is what
     /// keeps the interleaved excerpts seamless.
     headers_disabled: std::collections::HashSet<BufferId>,
+    #[cfg(feature = "native")]
+    browser_pages: Vec<rho_browser::PageRecord>,
 }
 
 impl Dashboard {
@@ -275,6 +282,8 @@ impl Dashboard {
             order: Vec::new(),
             targets: HashMap::new(),
             heading_agents: HashMap::new(),
+            #[cfg(feature = "native")]
+            heading_pages: HashMap::new(),
             archived_agents: HashSet::new(),
             replies: Vec::new(),
             reply_subscriptions: HashMap::new(),
@@ -289,7 +298,14 @@ impl Dashboard {
             placeholder_ids: Vec::new(),
             last_synced: None,
             headers_disabled: std::collections::HashSet::new(),
+            #[cfg(feature = "native")]
+            browser_pages: Vec::new(),
         }
+    }
+
+    #[cfg(feature = "native")]
+    pub fn set_browser_pages(&mut self, pages: Vec<rho_browser::PageRecord>) {
+        self.browser_pages = pages;
     }
 
     /// Registers every current buffer (rows and Desk documents) as
@@ -484,6 +500,33 @@ impl Dashboard {
         by_heading
     }
 
+    #[cfg(feature = "native")]
+    fn resolve_page_bindings(
+        &self,
+        documents: &[(HostId, String)],
+    ) -> HashMap<(HostId, usize), rho_browser::PageId> {
+        let mut by_heading = HashMap::new();
+        for (host, text) in documents {
+            for heading in parse(text) {
+                for tag in &heading.tags {
+                    let Some(prefix) = tag.strip_prefix("web-") else {
+                        continue;
+                    };
+                    let mut matches = self
+                        .browser_pages
+                        .iter()
+                        .filter(|page| page.id.0.encoded().starts_with(prefix));
+                    if let Some(page) = matches.next()
+                        && matches.next().is_none()
+                    {
+                        by_heading.insert((*host, heading.heading_range.start), page.id);
+                    }
+                }
+            }
+        }
+        by_heading
+    }
+
     /// Regenerates the listing: the host documents are sliced at bound
     /// headings, generated rows and drafts are interleaved between the
     /// slices, and highlights and lamps reapplied. The cursor follows
@@ -500,6 +543,8 @@ impl Dashboard {
             .filter_map(|host| self.source_text(*host, cx).map(|text| (*host, text)))
             .collect::<Vec<_>>();
         let filed = self.resolve_bindings(registry, &documents);
+        #[cfg(feature = "native")]
+        let filed_pages = self.resolve_page_bindings(&documents);
         self.archived_agents = archived_roots(&documents, &filed);
 
         // Empty reply drafts the cursor has left are dead weight; drop them.
@@ -562,7 +607,7 @@ impl Dashboard {
         // Staffed headings wear their agents as end-of-line inlays, not
         // rows, so the decoration strings join the fingerprint: attention
         // changes must not vanish into the early-out.
-        let decorations = if self.raw_mode {
+        let mut decorations = if self.raw_mode {
             Vec::new()
         } else {
             heading_decorations(
@@ -573,6 +618,10 @@ impl Dashboard {
                 &fold_ranges,
             )
         };
+        #[cfg(feature = "native")]
+        if !self.raw_mode {
+            decorations.extend(page_heading_decorations(&documents, &filed_pages));
+        }
         let cursor_doc = match &cursor_place {
             Some(CursorPlace::Doc(host, offset)) => Some((*host, *offset)),
             _ => None,
@@ -608,6 +657,16 @@ impl Dashboard {
         if self.pending_cursor.is_none()
             && self.pending_doc_cursor.is_none()
             && self.heading_agents == filed
+            && {
+                #[cfg(feature = "native")]
+                {
+                    self.heading_pages == filed_pages
+                }
+                #[cfg(not(feature = "native"))]
+                {
+                    true
+                }
+            }
             && self
                 .last_synced
                 .as_ref()
@@ -693,8 +752,7 @@ impl Dashboard {
                             }
                         }
                         _ => {
-                            let Some(buffer) =
-                                self.hosts.get(host).and_then(|weak| weak.upgrade())
+                            let Some(buffer) = self.hosts.get(host).and_then(|weak| weak.upgrade())
                             else {
                                 current = None;
                                 continue;
@@ -776,6 +834,10 @@ impl Dashboard {
             })
             .collect();
         self.heading_agents = filed;
+        #[cfg(feature = "native")]
+        {
+            self.heading_pages = filed_pages;
+        }
 
         // The cursor follows its buffer: anchors survive any reconcile
         // that kept their excerpt, so a row cursor is re-placed only when
@@ -793,8 +855,7 @@ impl Dashboard {
             Some(key) if order.contains(key) => Some(key.clone()),
             _ => match &cursor_key {
                 Some(key)
-                    if order.contains(key)
-                        && (edited.contains(key) || rebuilt(self, key)) =>
+                    if order.contains(key) && (edited.contains(key) || rebuilt(self, key)) =>
                 {
                     Some(key.clone())
                 }
@@ -805,9 +866,11 @@ impl Dashboard {
         self.order = order;
         if let Some(key) = restore {
             self.move_cursor_to(&key, window, cx);
-        } else if let Some((host, offset)) =
-            pending_doc.or(if structure_changed { doc_cursor_before } else { None })
-        {
+        } else if let Some((host, offset)) = pending_doc.or(if structure_changed {
+            doc_cursor_before
+        } else {
+            None
+        }) {
             self.move_cursor_to_doc(host, offset, window, cx);
         }
 
@@ -816,9 +879,13 @@ impl Dashboard {
         // next mode switch. Clamp any orphan to its old offset.
         self.editor.update(cx, |editor, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
-            let orphaned = editor.selections.disjoint_anchors().iter().any(|selection| {
-                !snapshot.can_resolve(&selection.start) || !snapshot.can_resolve(&selection.end)
-            });
+            let orphaned = editor
+                .selections
+                .disjoint_anchors()
+                .iter()
+                .any(|selection| {
+                    !snapshot.can_resolve(&selection.start) || !snapshot.can_resolve(&selection.end)
+                });
             if orphaned {
                 let offset = cursor_offset_before.min(snapshot.len());
                 editor.change_selections(Default::default(), window, cx, |selections| {
@@ -833,8 +900,14 @@ impl Dashboard {
         self.apply_tag_conceals(&conceals, cx);
         self.apply_subtree_folds(&fold_ranges, cx);
         self.nudge_caret_off_folds(window, cx);
-        self.last_synced =
-            Some((documents, segments, draft_texts, decorations, fold_ranges, conceals));
+        self.last_synced = Some((
+            documents,
+            segments,
+            draft_texts,
+            decorations,
+            fold_ranges,
+            conceals,
+        ));
     }
 
     /// The stable composition id for a line key, allocated on first use.
@@ -863,11 +936,7 @@ impl Dashboard {
         let Some(path) = self.composition.path_for_row(*id) else {
             return;
         };
-        let Some(anchor) = self
-            .multi_buffer
-            .read(cx)
-            .location_for_path(&path, cx)
-        else {
+        let Some(anchor) = self.multi_buffer.read(cx).location_for_path(&path, cx) else {
             return;
         };
         self.editor.update(cx, |editor, cx| {
@@ -983,6 +1052,10 @@ impl Dashboard {
                     return Some(RowTarget::None);
                 };
                 let start = heading.heading_range.start;
+                #[cfg(feature = "native")]
+                if let Some(page) = self.heading_pages.get(&(host, start)) {
+                    return Some(RowTarget::Page(*page));
+                }
                 let first_attention = self
                     .heading_agents
                     .get(&(host, start))
@@ -1058,6 +1131,40 @@ impl Dashboard {
             .upgrade()
             .unwrap()
             .update(cx, |buffer, cx| buffer.edit([(len..len, topic)], None, cx));
+        true
+    }
+
+    #[cfg(feature = "native")]
+    pub fn tag_cursor_heading_with_page(&mut self, tag: &str, cx: &mut Context<Workspace>) -> bool {
+        let Some((host, offset)) = self.cursor_topic(cx) else {
+            return false;
+        };
+        let Some(buffer) = self.hosts.get(&host).and_then(WeakEntity::upgrade) else {
+            return false;
+        };
+        let Some(text) = self.source_text(host, cx) else {
+            return false;
+        };
+        let Some(heading) = parse(&text)
+            .into_iter()
+            .find(|heading| heading.heading_range.start == offset)
+        else {
+            return false;
+        };
+        if heading.tags.iter().any(|candidate| candidate == tag) {
+            return true;
+        }
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit(
+                [(
+                    heading.heading_range.end..heading.heading_range.end,
+                    format!(" :{tag}:"),
+                )],
+                None,
+                cx,
+            )
+        });
+        self.pending_doc_cursor = Some((host, offset));
         true
     }
 
@@ -1500,7 +1607,9 @@ impl Dashboard {
                 }) else {
                     return false;
                 };
-                let Some(agents) = self.heading_agents.get(&(host, heading.heading_range.start))
+                let Some(agents) = self
+                    .heading_agents
+                    .get(&(host, heading.heading_range.start))
                 else {
                     return false;
                 };
@@ -1637,7 +1746,9 @@ impl Dashboard {
             .filter_map(|key| match self.targets.get(key) {
                 Some(RowTarget::Agent { agent_id, .. })
                     if registry.attention(*agent_id) >= UiAttention::Pending =>
-                    Some((key.clone(), *agent_id)),
+                {
+                    Some((key.clone(), *agent_id))
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1866,8 +1977,8 @@ impl Dashboard {
             // An all-space placeholder (the tag conceal) keeps its layout
             // column — zero-width folds corrupt selection roundtrips —
             // but draws nothing, so no visible gap invites the eye in.
-            let glyph: Option<gpui::SharedString> = (!placeholder_text.trim().is_empty())
-                .then(|| placeholder_text.clone().into());
+            let glyph: Option<gpui::SharedString> =
+                (!placeholder_text.trim().is_empty()).then(|| placeholder_text.clone().into());
             let class = DashClass::for_depth(
                 placeholder_text
                     .chars()
@@ -1970,24 +2081,43 @@ impl Dashboard {
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
         // One hint per line: the chip text (if any agents are bound)
         // and the chevron (if a fold hangs off the line).
-        let mut lines: Vec<((HostId, usize), (String, bool))> = Vec::new();
+        let mut lines: Vec<((HostId, usize), (String, bool, bool))> = Vec::new();
         for (host, offset, text) in decorations {
-            lines.push(((*host, *offset), (text.trim_start().to_owned(), false)));
+            let key = (*host, *offset);
+            let web = text == WEB_HEADING_DECORATION;
+            match lines.iter_mut().find(|(candidate, _)| *candidate == key) {
+                Some((_, (label, has_web, _))) => {
+                    *has_web |= web;
+                    if !web {
+                        label.push_str(text);
+                    }
+                }
+                None => lines.push((
+                    key,
+                    (
+                        (if web { "" } else { text.trim_start() }).to_owned(),
+                        web,
+                        false,
+                    ),
+                )),
+            }
         }
         for (host, range) in fold_ranges {
-            match lines.iter_mut().find(|(key, _)| *key == (*host, range.start)) {
-                Some((_, (_, folded))) => *folded = true,
-                None => lines.push(((*host, range.start), (String::new(), true))),
+            match lines
+                .iter_mut()
+                .find(|(key, _)| *key == (*host, range.start))
+            {
+                Some((_, (_, _, folded))) => *folded = true,
+                None => lines.push(((*host, range.start), (String::new(), false, true))),
             }
         }
         let mut hints: Vec<(editor::Anchor, editor::EolHintRenderer)> = Vec::new();
-        for ((host, offset), (text, folded)) in lines {
+        for ((host, offset), (text, web, folded)) in lines {
             let Some(buffer) = self.hosts.get(&host).and_then(|weak| weak.upgrade()) else {
                 continue;
             };
             let buffer_snapshot = buffer.read(cx).snapshot();
-            let Some(position) =
-                snapshot.anchor_in_excerpt(buffer_snapshot.anchor_before(offset))
+            let Some(position) = snapshot.anchor_in_excerpt(buffer_snapshot.anchor_before(offset))
             else {
                 continue;
             };
@@ -2012,6 +2142,15 @@ impl Dashboard {
                     .text_color(color);
                 if !text.is_empty() {
                     row = row.child(text.clone());
+                }
+                if web {
+                    row = row.child(
+                        gpui::svg()
+                            .path("icons/public.svg")
+                            .w(size)
+                            .h(size)
+                            .text_color(color),
+                    );
                 }
                 if folded {
                     row = row.child(
@@ -2115,7 +2254,6 @@ impl DashClass {
             ..HighlightStyle::default()
         }
     }
-
 }
 
 /// One generated dashboard line: identity, text, semantic spans, and
@@ -2279,9 +2417,7 @@ fn agent_line(
     let label = registry.agent_id_label(agent_id);
     if !line.text.contains(&label) {
         line.span(None, |text| text.push_str("  "));
-        line.span(Some(DashClass::Muted), |text| {
-            text.push_str(&label)
-        });
+        line.span(Some(DashClass::Muted), |text| text.push_str(&label));
     }
     if attention >= UiAttention::Pending
         && let Some(reason) = registry.agent_attention_reason(agent_id)
@@ -2311,12 +2447,7 @@ fn agent_tree_lines(
         if !seen.insert(agent_id) {
             continue;
         }
-        lines.push(agent_line(
-            agent_id,
-            occurrence.clone(),
-            topic,
-            registry,
-        ));
+        lines.push(agent_line(agent_id, occurrence.clone(), topic, registry));
         stack.extend(registry.agent_children(agent_id).iter().rev().copied());
     }
     lines
@@ -2416,8 +2547,7 @@ fn heading_decorations(
                 .get(&(*host, heading.heading_range.start))
                 .unwrap_or(&empty);
             let folded = folds.iter().any(|range| {
-                range.start <= heading.heading_range.end
-                    && heading.heading_range.end <= range.end
+                range.start <= heading.heading_range.end && heading.heading_range.end <= range.end
             });
             if !folded
                 && agents.iter().any(|portal| {
@@ -2465,6 +2595,26 @@ fn heading_decorations(
                 // the folded chevron merge into a single hint. Hints
                 // paint outside text flow, so no fold can swallow them.
                 decorations.push((*host, heading.heading_range.end, label));
+            }
+        }
+    }
+    decorations
+}
+
+#[cfg(feature = "native")]
+fn page_heading_decorations(
+    documents: &[(HostId, String)],
+    filed: &HashMap<(HostId, usize), rho_browser::PageId>,
+) -> Vec<(HostId, usize, String)> {
+    let mut decorations = Vec::new();
+    for (host, text) in documents {
+        for heading in parse(text) {
+            if filed.contains_key(&(*host, heading.heading_range.start)) {
+                decorations.push((
+                    *host,
+                    heading.heading_range.end,
+                    WEB_HEADING_DECORATION.to_owned(),
+                ));
             }
         }
     }
@@ -2557,11 +2707,7 @@ fn subtree_fold_range(text: &str, heading: &DeskHeading) -> Option<Range<usize>>
 /// swallow what you type — the fold shortens to end above that line.
 /// Deeper inside, the fold lifts entirely (vim opens folds on jumps
 /// into them); it reapplies once the cursor leaves.
-fn cursor_clamped_fold(
-    text: &str,
-    range: Range<usize>,
-    cursor: usize,
-) -> Option<Range<usize>> {
+fn cursor_clamped_fold(text: &str, range: Range<usize>, cursor: usize) -> Option<Range<usize>> {
     // Both boundaries stay foldable: the end anchor is left-biased, so
     // typing at the end boundary lands outside the fold, and motions
     // resting there (word motions stop on the fold's last character)
@@ -2570,7 +2716,9 @@ fn cursor_clamped_fold(
         return Some(range);
     }
     let line_start = text[..cursor].rfind('\n').map_or(0, |at| at + 1);
-    let line_end = text[cursor..].find('\n').map_or(text.len(), |at| cursor + at);
+    let line_end = text[cursor..]
+        .find('\n')
+        .map_or(text.len(), |at| cursor + at);
     if line_end >= range.end && line_start > range.start + 1 {
         Some(range.start..line_start - 1)
     } else {
@@ -2588,10 +2736,7 @@ fn direct_children(headings: &[DeskHeading], index: usize) -> Vec<usize> {
         .take_while(|(_, heading)| heading.depth > headings[index].depth)
         .map(|(at, _)| index + 1 + at)
         .collect();
-    let child_depth = descendants
-        .iter()
-        .map(|&child| headings[child].depth)
-        .min();
+    let child_depth = descendants.iter().map(|&child| headings[child].depth).min();
     descendants
         .into_iter()
         .filter(|&child| Some(headings[child].depth) == child_depth)
@@ -2688,11 +2833,7 @@ fn cycle_folds(
 /// recording the archive time. Returns the edits and the archive
 /// heading's offset once they apply. `None` when the target is already
 /// archived, is itself an archive, or does not exist.
-fn archive_edits(
-    text: &str,
-    target_start: usize,
-    archived_at: &str,
-) -> Option<ArchiveEdits> {
+fn archive_edits(text: &str, target_start: usize, archived_at: &str) -> Option<ArchiveEdits> {
     let headings = parse(text);
     let target_index = headings
         .iter()
@@ -2831,41 +2972,35 @@ fn generate(
             .collect();
     }
 
-    let push_agent_portals =
-        |segments: &mut Vec<Segment>,
-         emitted_replies: &mut HashSet<AgentId>,
-         roots: &[AgentId],
-         occurrence_for: &dyn Fn(AgentId) -> AgentOccurrence,
-         topic: Option<(HostId, usize)>,
-         show_collapsed_roots: bool,
-         allow_expanded: bool| {
-            for root in roots {
-                let occurrence = occurrence_for(*root);
-                let expanded = allow_expanded && expanded_portals.contains(&occurrence);
-                for (index, line) in agent_tree_lines(
-                    registry,
-                    &[*root],
-                    occurrence,
-                    topic,
-                )
+    let push_agent_portals = |segments: &mut Vec<Segment>,
+                              emitted_replies: &mut HashSet<AgentId>,
+                              roots: &[AgentId],
+                              occurrence_for: &dyn Fn(AgentId) -> AgentOccurrence,
+                              topic: Option<(HostId, usize)>,
+                              show_collapsed_roots: bool,
+                              allow_expanded: bool| {
+        for root in roots {
+            let occurrence = occurrence_for(*root);
+            let expanded = allow_expanded && expanded_portals.contains(&occurrence);
+            for (index, line) in agent_tree_lines(registry, &[*root], occurrence, topic)
                 .into_iter()
                 .enumerate()
-                {
-                    let RowTarget::Agent { agent_id, .. } = line.target else {
-                        unreachable!()
-                    };
-                    if expanded || (show_collapsed_roots && index == 0) {
-                        segments.push(Segment::Line(line));
-                    }
-                    if replies.contains(&agent_id) && emitted_replies.insert(agent_id) {
-                        segments.push(Segment::Line(Line::new(
-                            LineKey::Reply(agent_id),
-                            RowTarget::Reply(agent_id),
-                        )));
-                    }
+            {
+                let RowTarget::Agent { agent_id, .. } = line.target else {
+                    unreachable!()
+                };
+                if expanded || (show_collapsed_roots && index == 0) {
+                    segments.push(Segment::Line(line));
+                }
+                if replies.contains(&agent_id) && emitted_replies.insert(agent_id) {
+                    segments.push(Segment::Line(Line::new(
+                        LineKey::Reply(agent_id),
+                        RowTarget::Reply(agent_id),
+                    )));
                 }
             }
-        };
+        }
+    };
 
     for (host, text) in documents {
         if multiple_hosts {
@@ -2907,8 +3042,7 @@ fn generate(
             let agents = filed.get(&(*host, start)).unwrap_or(&empty);
             let draft_here = draft_topic == Some(Some((*host, start)));
             let folded_here = fold_zones.iter().any(|zone| {
-                zone.start <= heading.heading_range.end
-                    && heading.heading_range.end <= zone.end
+                zone.start <= heading.heading_range.end && heading.heading_range.end <= zone.end
             });
             let portal_here = !folded_here
                 && agents.iter().any(|portal| {
@@ -3244,8 +3378,12 @@ mod tests {
             None,
         );
         assert_eq!(segments.len(), 4);
-        assert!(matches!(segments[1], Segment::Line(ref line) if matches!(line.target, RowTarget::Agent { agent_id, .. } if agent_id == b.agent_id)));
-        assert!(matches!(segments[2], Segment::Line(ref line) if matches!(line.target, RowTarget::Agent { agent_id, .. } if agent_id == a.agent_id)));
+        assert!(
+            matches!(segments[1], Segment::Line(ref line) if matches!(line.target, RowTarget::Agent { agent_id, .. } if agent_id == b.agent_id))
+        );
+        assert!(
+            matches!(segments[2], Segment::Line(ref line) if matches!(line.target, RowTarget::Agent { agent_id, .. } if agent_id == a.agent_id))
+        );
 
         // An open reply splices in right under the heading line, before
         // the body.
@@ -3312,7 +3450,11 @@ mod tests {
             .iter()
             .filter_map(|segment| match segment {
                 Segment::Line(Line {
-                    key: LineKey::Agent { agent_id, occurrence },
+                    key:
+                        LineKey::Agent {
+                            agent_id,
+                            occurrence,
+                        },
                     ..
                 }) => Some((*agent_id, occurrence.clone())),
                 _ => None,
@@ -3349,7 +3491,10 @@ mod tests {
             first_only
                 .iter()
                 .filter_map(|segment| match segment {
-                    Segment::Line(Line { target: RowTarget::Agent { agent_id, .. }, .. }) => {
+                    Segment::Line(Line {
+                        target: RowTarget::Agent { agent_id, .. },
+                        ..
+                    }) => {
                         Some(*agent_id)
                     }
                     _ => None,
@@ -3393,8 +3538,13 @@ mod tests {
                 grandchild.agent_id,
             ]
         );
-        assert_ne!(rows[0].0, rows[3].0, "each portal has distinct row identity");
-        assert!(matches!(rows[1].0, LineKey::Agent { agent_id, .. } if *agent_id == child.agent_id));
+        assert_ne!(
+            rows[0].0, rows[3].0,
+            "each portal has distinct row identity"
+        );
+        assert!(
+            matches!(rows[1].0, LineKey::Agent { agent_id, .. } if *agent_id == child.agent_id)
+        );
     }
 
     #[test]
@@ -3414,12 +3564,7 @@ mod tests {
             &[],
             None,
         );
-        assert_eq!(
-            keys(&segments),
-            vec![
-                format!("doc 0..{}", text.len()),
-            ]
-        );
+        assert_eq!(keys(&segments), vec![format!("doc 0..{}", text.len()),]);
     }
 
     #[test]
@@ -3451,7 +3596,13 @@ mod tests {
             None,
         );
         assert_eq!(segments.len(), 1);
-        assert!(!segments.iter().any(|segment| matches!(segment, Segment::Line(Line { target: RowTarget::Agent { .. }, .. }))));
+        assert!(!segments.iter().any(|segment| matches!(
+            segment,
+            Segment::Line(Line {
+                target: RowTarget::Agent { .. },
+                ..
+            })
+        )));
         // The fold hides everything after the heading line except the
         // final newline, so the next heading keeps a line of its own.
         let headings = parse(&text);
@@ -3606,7 +3757,8 @@ mod tests {
         // subtree demotes into it, the tag rides along, and the archive
         // time lands as a property on the moved heading.
         let text = "* Done task :eng-aa:\nnotes\n** Sub\n* Alive\n";
-        let (edits, archive_offset) = archive_edits(text, 0, "2026-08-08 12:00").expect("archivable");
+        let (edits, archive_offset) =
+            archive_edits(text, 0, "2026-08-08 12:00").expect("archivable");
         let patched = apply_edits(text, &edits);
         assert_eq!(
             patched,
@@ -3641,8 +3793,7 @@ mod tests {
         filed.insert((host, text.find("** Old").unwrap()), vec![loud.agent_id]);
         let documents = [(host, text.clone())];
         assert!(archived_roots(&documents, &filed).contains(&loud.agent_id));
-        let decorations =
-            heading_decorations(&registry, &documents, &filed, &HashSet::new(), &[]);
+        let decorations = heading_decorations(&registry, &documents, &filed, &HashSet::new(), &[]);
         let (_, _, label) = &decorations[0];
         assert!(
             label.starts_with("  · ") && !label.contains('—'),

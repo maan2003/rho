@@ -12,6 +12,16 @@ pub enum SurfaceSource {
     /// A macOS image buffer from CoreVideo
     #[cfg(target_os = "macos")]
     Surface(CVPixelBuffer),
+    /// A Linux DMA-BUF whose ownership is synchronized explicitly.
+    #[cfg(target_os = "linux")]
+    DmaBuf(crate::LinuxDmaBufSurface),
+}
+
+#[cfg(target_os = "linux")]
+impl From<crate::LinuxDmaBufSurface> for SurfaceSource {
+    fn from(value: crate::LinuxDmaBufSurface) -> Self {
+        Self::DmaBuf(value)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -29,7 +39,7 @@ pub struct Surface {
 }
 
 /// Create a new surface element.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 pub fn surface(source: impl Into<SurfaceSource>) -> Surface {
     Surface {
         source: source.into(),
@@ -98,6 +108,12 @@ impl Element for Surface {
                 let size = crate::size(surface.get_width().into(), surface.get_height().into());
                 let new_bounds = self.object_fit.get_bounds(bounds, size);
                 // TODO: Add support for corner_radii
+                window.paint_surface(new_bounds, surface.clone());
+            }
+            #[cfg(target_os = "linux")]
+            SurfaceSource::DmaBuf(surface) => {
+                let size = crate::size(surface.width().into(), surface.height().into());
+                let new_bounds = self.object_fit.get_bounds(bounds, size);
                 window.paint_surface(new_bounds, surface.clone());
             }
             #[allow(unreachable_patterns)]

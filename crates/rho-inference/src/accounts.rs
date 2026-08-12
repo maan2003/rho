@@ -854,7 +854,10 @@ mod tests {
         let record = quota("work", 25, i64::MAX);
         append_quota(&db, &record).await;
         state.history.push(record);
-        assert_eq!(state.public_state().active_namespace.as_deref(), Some("work"));
+        assert_eq!(
+            state.public_state().active_namespace.as_deref(),
+            Some("work")
+        );
         assert_eq!(state.public_state().quotas[0].remaining_percent, 75);
         assert_eq!(records(&db)[0].routing_used_percent, 25);
         assert_eq!(history(&db, UnixMs(0))[0].points[0].remaining_percent, 75);

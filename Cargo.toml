@@ -19,6 +19,7 @@ members = [
   "crates/rho-shell",
   "crates/rho-shell-proto",
   "crates/rho-gui",
+  "crates/rho-browser-wayland",
   "crates/rho-touch-keyboard",
   "crates/rho-inference",
   "crates/rho-iroh-auth",
@@ -31,6 +32,7 @@ members = [
   "crates/rho-tool-shell",
   "crates/rho-ui-proto",
   "crates/rho-visualizations",
+  "crates/rho-browser",
   "crates/rho-web-search",
   "crates/rho-workspaces",
   "crates/rho-workspaces-types",
@@ -101,6 +103,7 @@ reqwest = { version = "0.12", default-features = false, features = [
   "rustls-tls-native-roots-no-provider",
 ] }
 rho-agent = { path = "crates/rho-agent", default-features = false }
+rho-browser-wayland = { path = "crates/rho-browser-wayland" }
 rho-ci = { path = "crates/rho-ci" }
 rho-claude = { path = "crates/rho-claude" }
 rho-claude-usage = { path = "crates/rho-claude-usage" }
@@ -123,6 +126,7 @@ rho-shell = { path = "crates/rho-shell" }
 rho-tool-shell = { path = "crates/rho-tool-shell" }
 rho-ui-proto = { path = "crates/rho-ui-proto" }
 rho-visualizations = { path = "crates/rho-visualizations" }
+rho-browser = { path = "crates/rho-browser" }
 rho-web-search = { path = "crates/rho-web-search" }
 rho-workspaces = { path = "crates/rho-workspaces" }
 rho-workspaces-types = { path = "crates/rho-workspaces-types" }

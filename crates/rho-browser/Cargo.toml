@@ -1,0 +1,27 @@
+[package]
+edition.workspace = true
+license.workspace = true
+name = "rho-browser"
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+bytes.workspace = true
+anyhow.workspace = true
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"] }
+image = { version = "0.25", default-features = false }
+redb.workspace = true
+libc.workspace = true
+prefix-id = { workspace = true, default-features = false }
+rand.workspace = true
+url.workspace = true
+rho-browser-wayland.workspace = true
+rho-db.workspace = true
+senax-encoder.workspace = true
+smallvec = "1"
+
+[dev-dependencies]
+futures-lite = "2"
+tempfile.workspace = true

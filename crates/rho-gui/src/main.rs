@@ -125,6 +125,11 @@ fn init_tracing() {
     tracing::info!("rho-gui tracing initialized");
 }
 
+fn default_client_db_path() -> Result<PathBuf> {
+    let base = dirs::state_dir().ok_or_else(|| anyhow::anyhow!("state directory not available"))?;
+    Ok(base.join("rho").join("rho-client.redb"))
+}
+
 fn run() -> Result<()> {
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         rustls::crypto::aws_lc_rs::default_provider()
@@ -154,6 +159,14 @@ fn run() -> Result<()> {
         })
         .transpose()?;
     let specs = host_specs(&args)?;
+    let client_db_path = default_client_db_path()?;
+    let client_state_dir = client_db_path
+        .parent()
+        .expect("client DB has parent")
+        .to_owned();
+    let web_store = futures::executor::block_on(rho_browser::WebStore::open(rho_db::RhoDb::open(
+        client_db_path,
+    )));
 
     gpui_platform::application()
         .with_assets(RhoAssets)
@@ -202,6 +215,7 @@ fn run() -> Result<()> {
                 return;
             }
 
+            rho_browser::init(web_store.clone(), &client_state_dir, cx);
             cx.activate(true);
 
             if let Err(error) = cx.open_window(WindowOptions::default(), move |window, cx| {
