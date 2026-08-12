@@ -313,6 +313,7 @@ impl EditorElement {
         cx: &mut App,
     ) -> Option<AnyElement> {
         let position = self.editor.update(cx, |editor, cx| {
+            editor.mouse_context_menu.as_ref()?;
             let visible_start_point = editor.display_to_pixel_point(
                 DisplayPoint::new(visible_range.start, 0),
                 editor_snapshot,
