@@ -32,6 +32,8 @@ pub mod absorb;
 pub mod annotate;
 pub mod backend;
 pub mod bisect;
+#[cfg(feature = "git")]
+pub mod clone_store;
 pub mod commit;
 pub mod commit_builder;
 pub mod config;
