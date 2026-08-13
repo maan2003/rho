@@ -28,6 +28,13 @@ Each command prints a JSON record of the paths it created. Inside a
 workspace, plain `jj` and `git` just work — there is nothing else to
 learn.
 
+Agent-facing workflow and machine conventions (store and workspace
+locations, per-agent clone naming, handing a workspace to a sub-agent)
+live in the `clone-store` skill (`.agents/skills/clone-store/SKILL.md`).
+On devboxes, `/ws` is provisioned by systemd-tmpfiles as the eventual
+workspace mount root — host-side read-only, so entries appear only via
+rho's mount layer; until that lands, workspaces go in `~/src/ws/`.
+
 ## Constraints, then design
 
 Two constraints drive everything:
