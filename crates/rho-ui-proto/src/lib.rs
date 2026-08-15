@@ -11,7 +11,7 @@ pub use rho_core::{
     AdvisorIntelligence, AgentDisposition, AgentId, AgentIdDomain, AgentRole, EngineerIntelligence,
     MessageDelivery,
 };
-pub use rho_workspaces_types::{
+pub use rho_workset_types::{
     WorkspaceDiffBaseContent, WorkspaceDiffContent, WorkspaceDiffFile, WorkspaceDiffSnapshot,
     WorkspaceDiffStatus, WorkspaceDiffTarget, WorkspaceInfo,
 };

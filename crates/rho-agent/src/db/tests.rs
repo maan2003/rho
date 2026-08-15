@@ -3,7 +3,7 @@ use std::sync::Arc;
 use rho_core::{ContentPart, UnixMs};
 use rho_db::{RhoDb, SenValue};
 use rho_inference::PromptCacheKey;
-use rho_workspaces::WorkspaceInfo;
+use rho_workset::WorkspaceInfo;
 
 use super::*;
 

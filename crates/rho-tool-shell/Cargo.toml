@@ -10,7 +10,7 @@ rust-version.workspace = true
 anyhow.workspace = true
 camino.workspace = true
 rho-core.workspace = true
-rho-workspaces.workspace = true
+rho-workset.workspace = true
 rustix = { version = "1", features = ["process", "thread"] }
 serde.workspace = true
 serde_json.workspace = true
@@ -19,5 +19,4 @@ tokio.workspace = true
 [dev-dependencies]
 anyhow.workspace = true
 rho-db.workspace = true
-rho-fs-view.workspace = true
 tempfile.workspace = true

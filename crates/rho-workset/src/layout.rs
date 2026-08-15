@@ -156,7 +156,7 @@ impl FsViewBuilder {
     {
         let (program, argv) = prepare_command(program, args)?;
         let root = tempfile::Builder::new()
-            .prefix("rho-fs-view-")
+            .prefix("rho-workset-layout-")
             .tempdir()
             .context("create view mount point")?;
         // SAFETY: required by this method's single-threaded contract.
@@ -238,7 +238,7 @@ unsafe fn spawn_setup(setup: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Res
     if pid == 0 {
         let result = arm_parent_death_signal(parent_pid).and_then(|()| setup());
         if let Err(ref error) = result {
-            eprintln!("rho-fs-view setup: {error:#}");
+            eprintln!("rho-workset setup: {error:#}");
         }
         unsafe { libc::_exit(125) }
     }

@@ -167,7 +167,7 @@ mod tests {
     use std::time::Duration;
 
     use rho_tool_shell::ShellTools;
-    use rho_workspaces::PathOverrides;
+    use rho_workset::PathOverrides;
 
     fn shell_tools() -> ShellTools {
         ShellTools::in_directory(

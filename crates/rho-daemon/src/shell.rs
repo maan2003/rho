@@ -40,18 +40,18 @@ const OMITTED: &str = "[... older shell output omitted ...]\n";
 const SHELL_COLS: u16 = 80;
 const SHELL_ROWS: u16 = 24;
 
-pub fn ensure_supported_workdirs(workdirs: &[rho_workspaces::WorkspaceInfo]) -> anyhow::Result<()> {
+pub fn ensure_supported_workdirs(workdirs: &[rho_workset::WorkspaceInfo]) -> anyhow::Result<()> {
     anyhow::ensure!(
         !workdirs
             .iter()
-            .any(|workdir| matches!(workdir, rho_workspaces::WorkspaceInfo::Sandbox { .. })),
+            .any(|workdir| matches!(workdir, rho_workset::WorkspaceInfo::Sandbox { .. })),
         "sandboxed agents have no editor shells yet"
     );
     Ok(())
 }
 
 pub struct ShellSpawn {
-    pub view: Arc<rho_workspaces::Namespace>,
+    pub view: Arc<rho_workset::Namespace>,
     /// Shell sidecar launched through the agent View.
     pub program: OsString,
     pub args: Vec<OsString>,
@@ -1696,13 +1696,13 @@ mod tests {
 
     #[test]
     fn sandboxed_workdirs_are_refused() {
-        let sandbox = rho_workspaces::WorkspaceInfo::Sandbox {
+        let sandbox = rho_workset::WorkspaceInfo::Sandbox {
             workset: "test-workset".into(),
             repo: "repo".into(),
             name: "repo".into(),
         };
         assert!(ensure_supported_workdirs(&[sandbox]).is_err());
-        let checkout = rho_workspaces::WorkspaceInfo::Checkout {
+        let checkout = rho_workset::WorkspaceInfo::Checkout {
             workset: "test-workset".into(),
             repo: "repo".into(),
             name: "repo".into(),
@@ -2003,7 +2003,7 @@ mod tests {
              trap 'printf fired >\"$HOME/brush-exit-hook\"' EXIT\n",
         )
         .unwrap();
-        let environment = rho_workspaces::UserEnvironment::new(vec![
+        let environment = rho_workset::UserEnvironment::new(vec![
             ("PATH".into(), std::env::var_os("PATH").unwrap()),
             ("HOME".into(), home.clone().into_os_string()),
             ("USER".into(), "rho-test".into()),
@@ -2052,11 +2052,11 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        let worksets = rho_workspaces::Worksets::open(
+        let worksets = rho_workset::Worksets::open(
             temp.path().join("storage"),
             rho_db::RhoDb::open(temp.path().join("rho.redb")),
             environment,
-            rho_workspaces::PathOverrides::default(),
+            rho_workset::PathOverrides::default(),
         )
         .unwrap();
         let workset = worksets.create().await.unwrap();
@@ -2064,7 +2064,7 @@ mod tests {
             .clone("source", source.to_str().unwrap(), Some("source"), None)
             .await
             .unwrap();
-        let view = workset.enter(rho_workspaces::Mode::Exposed).await.unwrap();
+        let view = workset.enter(rho_workset::Mode::Exposed).await.unwrap();
         let registry = Arc::new(ShellRegistry::default());
         let agent_id =
             AgentId::from_counter(1, &rho_agent::db::AgentIdDomain(42)).expect("counter encodes");

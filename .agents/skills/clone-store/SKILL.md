@@ -7,8 +7,9 @@ description: Create instant private jj clones and workspaces from a shared clone
 
 A clone store gives every agent a full private clone—own refs, op log, config,
 and fetch/push/gc freedom—without O(repo) disk or network per clone. Design:
-`CLONES.md`; implementation: `jj_lib::clone_store` and the rho fork's
-`jj store` CLI.
+`CLONES.md`; the Rho Workset/runtime contract is in `WORKSET.md` and implemented
+by `rho-workset`; the storage primitive is `jj_lib::clone_store` plus the rho
+fork's `jj store` CLI.
 
 Requires a jj build with `jj store`. If `jj store --help` fails, use rho's
 bundled jj or ask for a redeploy.

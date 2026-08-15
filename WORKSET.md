@@ -1,4 +1,15 @@
-# The agent filesystem view
+# Worksets and filesystem views
+
+A Workset is the unit Rho gives an agent: an ordered collection of named
+Checkouts backed by daemon-managed clone stores. `rho-workset` owns the full
+lifecycle—rho-db records, clone/fork orchestration, mount mapping, tmpfs layout,
+and the live namespace. Shared stores live under `~/src/.rho/stores`; each
+Workset's host-frame files live under `~/src/.rho/worksets/<id>/src`, while its
+explicit primary Checkout and append-only Checkout order live in rho-db.
+
+`Workset::enter(Mode)` turns that durable host-frame collection into one of the
+runtime views below. The lower-level layout builders remain public for direct
+inspection and development tooling (`rho-workset-dev`).
 
 How a Rho agent's filesystem is laid out: a private mount namespace
 whose root is built fresh for each agent. The clone store that
@@ -6,10 +17,11 @@ provides the repositories in it is described in `CLONES.md`.
 
 **This is a layout, not a sandbox.** Everything runs as the invoking
 user in an unprivileged user namespace; no security boundary is
-claimed or implied. What the view buys is hygiene: agents get an
-identical, minimal, disposable environment, they don't see each
-other's working trees, and nothing they do can drift or clutter the
-host filesystem — the whole root evaporates with the namespace.
+claimed or implied. What the view buys is hygiene: agents get an identical, minimal,
+disposable environment; they see only the Checkouts their Workset grants, not
+the rest of the host or other Worksets; and everything outside those
+host-backed Checkouts—the root, `$HOME`, and `/tmp`—is tmpfs that evaporates
+with the namespace.
 
 ## What's in the view
 

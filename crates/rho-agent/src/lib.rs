@@ -20,7 +20,7 @@ use rho_db::RhoDb;
 use rho_inference::{Inference, InferenceSession, PromptCacheKey};
 use rho_tool_shell::{DEFAULT_TIMEOUT_SECS, ShellTools};
 use rho_web_search::WebSearchTools;
-use rho_workspaces::{Checkout, Mode, Namespace, Worksets};
+use rho_workset::{Checkout, Mode, Namespace, Worksets};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use tokio::sync::{Notify, mpsc, oneshot};
 
@@ -33,6 +33,8 @@ use crate::lazy::Lazy;
 use crate::multi_agent_tools::MultiAgentTools;
 use crate::pool::{AgentAssistantItemCompleted, AgentInputAccepted, AgentTurnCompleted};
 
+mod diff;
+pub use diff::{diff_base_contents, diff_snapshot};
 mod claude;
 #[cfg(feature = "code-mode")]
 mod code_mode;
@@ -568,7 +570,7 @@ pub enum StartWorkdir {
 pub(crate) async fn materialize_workdirs(
     start: Vec<StartWorkdir>,
     worksets: &Arc<Worksets>,
-) -> anyhow::Result<(rho_workspaces::Workset, Vec<Arc<Checkout>>)> {
+) -> anyhow::Result<(rho_workset::Workset, Vec<Arc<Checkout>>)> {
     anyhow::ensure!(!start.is_empty(), "an agent needs at least one workdir");
     if let StartWorkdir::Existing(first) = &start[0] {
         anyhow::ensure!(

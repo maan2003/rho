@@ -14,7 +14,7 @@ use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use rho_db::RhoDb;
 use rho_inference::Inference;
-use rho_workspaces::{Mode, Namespace, PathOverrides, UserEnvironment, Worksets, WorkspaceInfo};
+use rho_workset::{Mode, Namespace, PathOverrides, UserEnvironment, Worksets, WorkspaceInfo};
 use tokio::sync::{Mutex, broadcast};
 
 use crate::claude::ClaudeAgent;
@@ -702,7 +702,7 @@ impl AgentPool {
     pub async fn open_checkout(
         &self,
         info: &WorkspaceInfo,
-    ) -> anyhow::Result<Arc<rho_workspaces::Checkout>> {
+    ) -> anyhow::Result<Arc<rho_workset::Checkout>> {
         self.worksets
             .open_workset(info.workset())
             .await?

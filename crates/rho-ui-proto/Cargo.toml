@@ -17,7 +17,7 @@ futures.workspace = true
 rho-core.workspace = true
 rho-rpc.workspace = true
 rho-shell-proto.workspace = true
-rho-workspaces-types.workspace = true
+rho-workset-types.workspace = true
 senax-encoder.workspace = true
 tokio = { version = "1", features = ["io-util"] }
 text.workspace = true

@@ -48,7 +48,7 @@ than by running a supervisor, extension protocol, or daemon process graph.
   workspace/context discovery, collaboration, Claude runtime, or CLI/daemon/UI
   integration. Its architecture and governing decisions are recorded under
   `crates/rho-agent2/specs/`.
-- `rho-workspaces` owns daemon-managed clone stores, Worksets, Checkouts, and
+- `rho-workset` owns daemon-managed clone stores, Worksets, Checkouts, and
   filesystem namespaces. `Worksets::open_default` uses `~/src/.rho`: shared
   append-only clone stores live under `stores/<repo>`, while each generated
   Workset owns `worksets/<id>/src/`, private clone state, and one or more named
@@ -67,16 +67,16 @@ than by running a supervisor, extension protocol, or daemon process graph.
   that exit after returning namespace/root fds—runtime pool threads must never
   retain `unshare` or `setns` state. Entry zero is the primary Checkout and
   supplies the default cwd. Agents joining a Checkout share its underlying
-  worktree but receive separate Namespace handles. Snapshot and live-diff
-  operations stay owned by `Checkout` and return immutable jj epochs for
-  derived manifests. Sandbox start remains explicitly refused until synthetic
-  Git/VCS masking is rebuilt on Worksets; the Landlock policy implementation is
-  retained and tested, but is never presented as a complete sandbox by itself.
+  worktree but receive separate Namespace handles. The public `layout` module
+  owns the lower-level builders and mount primitives used by `Workset::enter`.
+  `rho-agent` owns turn-diff capture and loading over Checkouts. Sandbox start
+  remains explicitly refused until TODO(clone-store-sandbox) restores synthetic
+  Git/VCS masking on Worksets; the old unwired sandbox implementation was removed.
 - `rho-context-config` owns bounded `AGENTS.md` loading plus local Markdown
   skill discovery/frontmatter parsing. Rho packages platform-owned skills under
   `$out/share/rho/skills`; the final package build embeds that immutable root in
   the binaries, below project and user skills in precedence. Results are cached per
-  `rho-workspaces::Checkout` and merged across a namespace's Checkouts;
+  `rho-workset::Checkout` and merged across a namespace's Checkouts;
   `rho-agent` owns system prompt rendering. Clients have no special skill or
   AGENTS.md command path. The native Rho inference loop and Claude Code use
   separate prompt compositions: Claude performs its own project and skill
@@ -147,7 +147,7 @@ than by running a supervisor, extension protocol, or daemon process graph.
   paths and Mesa's software Vulkan driver rather than relying on the caller's
   environment.
 - The daemon snapshots the user's login-shell environment and passes it
-  explicitly to `rho-workspaces` for daemon-owned commands. Workspace-control
+  explicitly to `rho-workset` for daemon-owned commands. Workspace-control
   subprocesses use that environment directly; agent execution shells and
   Claude processes add the primary project's environment through `direnv exec`.
   The GUI's Comint-style surface instead starts `rho-shell` through the agent

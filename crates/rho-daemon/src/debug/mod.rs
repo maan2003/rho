@@ -9,7 +9,7 @@ use rho_agent::db::{
 };
 use rho_db::RhoDb;
 use rho_inference::Inference;
-use rho_workspaces::WorkspaceInfo;
+use rho_workset::WorkspaceInfo;
 
 use crate::default_db_path;
 
@@ -64,12 +64,12 @@ async fn render_prompt(role: &str) -> anyhow::Result<()> {
             .map(|root| PathBuf::from(root.trim()))
             .unwrap_or(cwd);
     let storage = tempfile::tempdir().context("create prompt workset storage")?;
-    let environment = rho_workspaces::UserEnvironment::new(std::env::vars_os().collect());
-    let worksets = rho_workspaces::Worksets::open(
+    let environment = rho_workset::UserEnvironment::new(std::env::vars_os().collect());
+    let worksets = rho_workset::Worksets::open(
         storage.path(),
         rho_db::RhoDb::open(storage.path().join("rho.redb")),
         environment,
-        rho_workspaces::PathOverrides::default(),
+        rho_workset::PathOverrides::default(),
     )?;
     let workset = worksets.create().await?;
     let name = root
@@ -80,7 +80,7 @@ async fn render_prompt(role: &str) -> anyhow::Result<()> {
         .clone(name, root.to_string_lossy().as_ref(), Some(name), None)
         .await?;
     let view = workset
-        .enter(rho_workspaces::Mode::View {
+        .enter(rho_workset::Mode::View {
             home_skeleton: None,
         })
         .await?;

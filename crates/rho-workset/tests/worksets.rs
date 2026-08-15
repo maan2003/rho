@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use rho_workspaces::{PathOverrides, UserEnvironment, Worksets};
+use rho_workset::{PathOverrides, UserEnvironment, Worksets};
 
 fn git(dir: &Path, args: &[&str]) -> String {
     let output = Command::new("git")
@@ -69,7 +69,7 @@ fn jj_binary() -> PathBuf {
 }
 
 #[tokio::test]
-async fn worksets_grant_workspace_fork_diff_and_order() {
+async fn worksets_grant_workspace_fork_and_order() {
     let jj_bin = jj_binary();
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source");
@@ -150,8 +150,6 @@ async fn worksets_grant_workspace_fork_diff_and_order() {
         raw_commit.contains("change-id "),
         "commit lacks change-id header: {raw_commit}"
     );
-    let diff = parent.diff_snapshot(None, &[]).await.unwrap().unwrap();
-    assert!(diff.files.iter().any(|file| file.path == "file.txt"));
     let child_workset = root.create().await.unwrap();
     let child = child_workset
         .fork_from(&parent, Some("project"))

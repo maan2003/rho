@@ -224,7 +224,7 @@ fn spawn_octo_server(
     Ok(())
 }
 
-pub use rho_workspaces::{PathOverrides, init_daemon_namespace};
+pub use rho_workset::{PathOverrides, init_daemon_namespace};
 
 const EMBEDDED_DIRENV_PATH_BEFORE: Option<&str> = option_env!("RHO_DIRENV_PATH_BEFORE");
 const FIND_DENY_ROOTS_ENV: &str = "FIND_DENY_ROOTS";
@@ -320,7 +320,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     }
     user_environment.push((FIND_DENY_ROOTS_ENV.into(), find_deny_roots()));
     configure_octo_git_transport(&mut user_environment)?;
-    let user_environment = rho_workspaces::UserEnvironment::new(user_environment);
+    let user_environment = rho_workset::UserEnvironment::new(user_environment);
 
     let db = RhoDb::open(default_db_path()?);
     let inference = Inference::new(db.clone()).await?;
@@ -958,7 +958,7 @@ struct AgentRegistry {
     /// Daemon-owned terminal sessions, keyed per agent.
     terminals: Arc<terminal::TerminalRegistry>,
     /// The snapshotted login environment, for terminal shells.
-    user_environment: rho_workspaces::UserEnvironment,
+    user_environment: rho_workset::UserEnvironment,
     git_transport: GitTransportBroker,
     /// The hidden persisted coordinator backing the single global Iris
     /// surface. It is loaded lazily on the first delegated voice request.
@@ -972,7 +972,7 @@ impl AgentRegistry {
         db: RhoDb,
         inference: Inference,
         path_overrides: PathOverrides,
-        user_environment: rho_workspaces::UserEnvironment,
+        user_environment: rho_workset::UserEnvironment,
         platform_secrets: PlatformSecrets,
     ) -> anyhow::Result<Self> {
         let pool = AgentPool::new(
@@ -3127,9 +3127,7 @@ where
     let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let _permit = DIFF_LOADS.acquire().await.context("diff loader closed")?;
         let workspace = agents.pool.open_checkout(&workspace).await?;
-        workspace
-            .diff_base_contents(&operation_id, &commit_id, &paths)
-            .await
+        rho_agent::diff_base_contents(&workspace, &operation_id, &commit_id, &paths).await
     })
     .await
     .context("deferred diff content timed out after 30 seconds")
@@ -3167,9 +3165,7 @@ where
     let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let _permit = DIFF_LOADS.acquire().await.context("diff loader closed")?;
         let workspace = agents.pool.open_checkout(&workspace).await?;
-        workspace
-            .diff_snapshot(known_commit_id.as_deref(), &include_paths)
-            .await
+        rho_agent::diff_snapshot(&workspace, known_commit_id.as_deref(), &include_paths).await
     })
     .await
     .context("diff snapshot timed out after 30 seconds")

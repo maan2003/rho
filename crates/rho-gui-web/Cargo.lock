@@ -8022,19 +8022,18 @@ dependencies = [
  "rho-core",
  "rho-rpc",
  "rho-shell-proto",
- "rho-workspaces-types",
+ "rho-workset-types",
  "senax-encoder",
  "text",
  "tokio",
 ]
 
 [[package]]
-name = "rho-workspaces-types"
+name = "rho-workset-types"
 version = "0.1.0"
 dependencies = [
  "bytes",
  "camino",
- "prefix-id",
  "senax-encoder",
 ]
 

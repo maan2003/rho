@@ -2,7 +2,7 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 
 use anyhow::{Context as _, bail};
-use rho_fs_view::{
+use rho_workset::{
     ExposedBuilder, FsViewBuilder, FsViewConfig, Mounts, StoreMount, WorkspaceMount,
 };
 
@@ -94,7 +94,7 @@ fn pair(value: &OsString, kind: &str) -> anyhow::Result<(String, String)> {
 
 fn usage() {
     eprintln!(
-        "usage: rho-fs-view-dev [--exposed] [--workspace NAME=PATH] [--store REPO=PATH=CLONE_ID] [--skeleton PATH] [-- COMMAND ...]"
+        "usage: rho-workset-dev [--exposed] [--workspace NAME=PATH] [--store REPO=PATH=CLONE_ID] [--skeleton PATH] [-- COMMAND ...]"
     );
 }
 

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use rho_core::{ToolCall, ToolCallId, ToolName, ToolType};
 use rho_tool_shell::{EXEC_COMMAND_TOOL_NAME, ShellTools};
-use rho_workspaces::{Mode, PathOverrides, UserEnvironment, Worksets};
+use rho_workset::{Mode, PathOverrides, UserEnvironment, Worksets};
 
 fn shell_call(command: &str) -> ToolCall {
     ToolCall {
@@ -37,7 +37,7 @@ fn view_roots() -> anyhow::Result<std::collections::BTreeSet<std::path::PathBuf>
 
 fn main() -> anyhow::Result<()> {
     // SAFETY: called before the runtime starts any worker threads.
-    unsafe { rho_workspaces::init_daemon_namespace()? };
+    unsafe { rho_workset::init_daemon_namespace()? };
     tokio::runtime::Runtime::new()?.block_on(async {
         let temp = tempfile::tempdir()?;
         let source = temp.path().join("source");
@@ -61,7 +61,15 @@ fn main() -> anyhow::Result<()> {
             ])
             .current_dir(&source))?;
 
-        let environment = UserEnvironment::new(std::env::vars_os().collect());
+        let mut environment_vars: Vec<_> = std::env::vars_os().collect();
+        if let Some((_, jj)) = environment_vars
+            .iter_mut()
+            .find(|(name, _)| name == "RHO_JJ")
+            && std::path::Path::new(jj).is_relative()
+        {
+            *jj = std::fs::canonicalize(&*jj)?.into_os_string();
+        }
+        let environment = UserEnvironment::new(environment_vars);
         let direnv = std::process::Command::new("which").arg("direnv").output()?;
         let direnv = String::from_utf8(direnv.stdout)?;
         let direnv = std::fs::canonicalize(direnv.trim())?;
@@ -99,9 +107,9 @@ fn main() -> anyhow::Result<()> {
             .clone("source", source.to_str().unwrap(), Some("second"), None)
             .await?;
         namespace
-            .refresh(rho_fs_view::Mounts {
+            .refresh(rho_workset::Mounts {
                 stores: Vec::new(),
-                workspaces: vec![rho_fs_view::WorkspaceMount {
+                workspaces: vec![rho_workset::WorkspaceMount {
                     name: "second".to_owned(),
                     source: second.checkout().as_std_path().to_owned(),
                 }],

@@ -25,7 +25,6 @@ members = [
   "crates/rho-pr-monitor",
   "crates/rho-profiling",
   "crates/rho-rpc",
-  "crates/rho-fs-view",
   "crates/rho-openai-realtime",
   "crates/rho-rtc",
   "crates/rho-registry",
@@ -33,8 +32,8 @@ members = [
   "crates/rho-ui-proto",
   "crates/rho-visualizations",
   "crates/rho-web-search",
-  "crates/rho-workspaces",
-  "crates/rho-workspaces-types",
+  "crates/rho-workset",
+  "crates/rho-workset-types",
   "crates/rho-zulip",
   "crates/senax-encoder",
   "crates/senax-encoder/derive",
@@ -120,15 +119,13 @@ rho-iroh-auth = { path = "crates/rho-iroh-auth", default-features = false }
 rho-pr-monitor = { path = "crates/rho-pr-monitor" }
 rho-profiling = { path = "crates/rho-profiling" }
 rho-rpc = { path = "crates/rho-rpc", default-features = false }
-rho-sandbox = { path = "crates/rho-fs-view" }
-rho-fs-view = { path = "crates/rho-fs-view" }
 rho-shell = { path = "crates/rho-shell" }
 rho-tool-shell = { path = "crates/rho-tool-shell" }
 rho-ui-proto = { path = "crates/rho-ui-proto" }
 rho-visualizations = { path = "crates/rho-visualizations" }
 rho-web-search = { path = "crates/rho-web-search" }
-rho-workspaces = { path = "crates/rho-workspaces" }
-rho-workspaces-types = { path = "crates/rho-workspaces-types" }
+rho-workset = { path = "crates/rho-workset" }
+rho-workset-types = { path = "crates/rho-workset-types" }
 rho-zulip = { path = "crates/rho-zulip", default-features = false }
 rustix-openpty = "0.2"
 rustls = { version = "0.23", default-features = false, features = [

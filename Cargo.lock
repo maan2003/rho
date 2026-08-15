@@ -13537,6 +13537,8 @@ dependencies = [
  "chrono",
  "dirs",
  "futures 0.3.33",
+ "jj-cli",
+ "jj-lib",
  "prefix-id",
  "rand 0.8.7",
  "redb",
@@ -13549,7 +13551,7 @@ dependencies = [
  "rho-inference",
  "rho-tool-shell",
  "rho-web-search",
- "rho-workspaces",
+ "rho-workset",
  "senax-encoder",
  "serde",
  "serde_json",
@@ -13599,7 +13601,7 @@ dependencies = [
  "bytes",
  "camino",
  "rho-core",
- "rho-workspaces",
+ "rho-workset",
  "senax-encoder",
  "serde",
  "serde_json",
@@ -13639,7 +13641,6 @@ dependencies = [
  "rho-inference",
  "rho-ui-proto",
  "rho-visualizations",
- "rho-workspaces",
  "senax-encoder",
  "serde",
  "serde_json",
@@ -13722,7 +13723,7 @@ dependencies = [
  "rho-shell-proto",
  "rho-ui-proto",
  "rho-visualizations",
- "rho-workspaces",
+ "rho-workset",
  "rustix-openpty",
  "senax-encoder",
  "serde",
@@ -13746,16 +13747,6 @@ dependencies = [
  "senax-encoder",
  "tempfile",
  "tokio",
-]
-
-[[package]]
-name = "rho-fs-view"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "libc",
- "serde_json",
- "tempfile",
 ]
 
 [[package]]
@@ -14007,8 +13998,7 @@ dependencies = [
  "camino",
  "rho-core",
  "rho-db",
- "rho-fs-view",
- "rho-workspaces",
+ "rho-workset",
  "rustix 1.1.4",
  "serde",
  "serde_json",
@@ -14042,7 +14032,7 @@ dependencies = [
  "rho-core",
  "rho-rpc",
  "rho-shell-proto",
- "rho-workspaces-types",
+ "rho-workset-types",
  "senax-encoder",
  "text",
  "tokio",
@@ -14078,22 +14068,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "rho-workspaces"
+name = "rho-workset"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "bytes",
  "camino",
  "dirs",
- "futures 0.3.33",
- "jj-cli",
- "jj-lib",
  "libc",
  "redb",
  "rho-context-config",
  "rho-db",
- "rho-fs-view",
- "rho-workspaces-types",
+ "rho-workset-types",
  "senax-encoder",
  "serde_json",
  "tempfile",
@@ -14101,7 +14087,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "rho-workspaces-types"
+name = "rho-workset-types"
 version = "0.1.0"
 dependencies = [
  "bytes",

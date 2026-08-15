@@ -7,7 +7,7 @@ use crate::multi_agent_tools::MultiAgentTools;
 /// the section explaining them. `code_mode` is set when the agent's tool
 /// surface is the code-mode `exec`/`wait` pair.
 pub fn prompt(
-    view: &rho_workspaces::Namespace,
+    view: &rho_workset::Namespace,
     multi_agent: Option<&MultiAgentTools>,
     code_mode: bool,
     role: AgentRole,
@@ -155,7 +155,7 @@ fn render_projects_prompt(projects: &[(camino::Utf8PathBuf, String)]) -> String 
 /// prompt and project discovery, so this contains only Rho team identity,
 /// workspace context, and the one Claude-backed specialized role.
 pub fn claude_prompt(
-    view: Option<&rho_workspaces::Namespace>,
+    view: Option<&rho_workset::Namespace>,
     multi_agent: Option<&MultiAgentTools>,
     role: AgentRole,
 ) -> Arc<str> {
@@ -221,7 +221,7 @@ enum WorkdirKind {
 }
 
 impl WorkdirKind {
-    fn of(workspace: &rho_workspaces::Checkout) -> Self {
+    fn of(workspace: &rho_workset::Checkout) -> Self {
         if workspace.is_sandbox() {
             Self::Sandbox
         } else if workspace.is_user_checkout() {
@@ -236,7 +236,7 @@ impl WorkdirKind {
 /// path (the user-level file appears in each entry's discovery), skills
 /// deduped by name with earlier (primary-first) workdirs winning.
 fn merged_context(
-    entries: &[Arc<rho_workspaces::Checkout>],
+    entries: &[Arc<rho_workset::Checkout>],
 ) -> (
     Vec<rho_context_config::AgentsFile>,
     Vec<rho_context_config::Skill>,

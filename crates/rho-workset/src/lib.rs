@@ -1,6 +1,6 @@
 //! Daemon-owned clone-store storage root and per-workset workspace collections.
 //!
-//! Every workspace has the same relative layout in the host frame and in an
+//! Every workspace has the same relative layout in the host frame and in a
 //! workset's `/src` view, so jj and Git pointers need no namespace-specific
 //! rewriting.
 
@@ -17,12 +17,13 @@ use rho_db::{RhoDb, Sen, SenValue};
 use senax_encoder::{Decode, Encode};
 use tokio::sync::Mutex;
 
-mod diff;
 mod ns;
-pub mod sandbox;
 
+pub mod layout;
+
+pub use layout::*;
 pub use ns::{Mode, Namespace};
-pub use rho_workspaces_types::{
+pub use rho_workset_types::{
     WorkspaceDiffBaseContent, WorkspaceDiffContent, WorkspaceDiffFile, WorkspaceDiffSnapshot,
     WorkspaceDiffStatus, WorkspaceDiffTarget, WorkspaceInfo,
 };
@@ -54,7 +55,7 @@ impl Default for WorksetRecord {
 /// # Safety
 /// The caller must invoke this before starting any threads.
 pub unsafe fn init_daemon_namespace() -> anyhow::Result<()> {
-    rho_fs_view::unshare_identity_user_namespace()
+    layout::unshare_identity_user_namespace()
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -480,7 +481,7 @@ impl Workset {
         self.0.record.lock().await.checkouts.clone()
     }
 
-    pub(crate) async fn mounts(&self) -> rho_fs_view::Mounts {
+    pub(crate) async fn mounts(&self) -> layout::Mounts {
         self.0.mounts().await
     }
 }
@@ -766,13 +767,13 @@ impl WorksetInner {
             .collect()
     }
 
-    pub async fn mounts(&self) -> rho_fs_view::Mounts {
+    pub async fn mounts(&self) -> layout::Mounts {
         let stores = self.stores.lock().await;
         let workspaces = self.ordered_checkouts().await;
-        rho_fs_view::Mounts {
+        layout::Mounts {
             stores: stores
                 .values()
-                .map(|store| rho_fs_view::StoreMount {
+                .map(|store| layout::StoreMount {
                     name: store.name.clone(),
                     source: store.root.as_std_path().to_owned(),
                     writable_clone: self.id.clone(),
@@ -780,7 +781,7 @@ impl WorksetInner {
                 .collect(),
             workspaces: workspaces
                 .iter()
-                .map(|workspace| rho_fs_view::WorkspaceMount {
+                .map(|workspace| layout::WorkspaceMount {
                     name: workspace.name.clone(),
                     source: workspace.checkout.as_std_path().to_owned(),
                 })
@@ -908,82 +909,14 @@ impl Checkout {
         run(command, "jj snapshot").await
     }
 
-    pub async fn diff_snapshot(
-        &self,
-        known_commit_id: Option<&str>,
-        include_paths: &[Utf8PathBuf],
-    ) -> anyhow::Result<Option<WorkspaceDiffSnapshot>> {
-        anyhow::ensure!(include_paths.len() <= 2_048, "too many live diff paths");
-        static DIFF_READERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
-        let permit = DIFF_READERS
-            .acquire()
-            .await
-            .context("diff readers closed")?;
-        let checkout = self.checkout.clone();
-        let lock = Arc::clone(&self.command_lock);
-        let known_commit_id = known_commit_id.map(str::to_owned);
-        let include_paths = include_paths.to_vec();
-        let environment = self.environment.values();
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let _guard = lock.blocking_lock();
-            futures::executor::block_on(async {
-                let epoch = jj_cli::cli_util::snapshot_workspace_descendants_at_with_environment(
-                    checkout.as_std_path(),
-                    environment,
-                )
-                .await
-                .map_err(|error| anyhow::anyhow!(error.error.to_string()))?;
-                let captured = diff::capture(epoch).await?;
-                if known_commit_id.as_deref() == Some(captured.commit_id_hex().as_str()) {
-                    return Ok(None);
-                }
-                diff::load(captured, &include_paths).await.map(Some)
-            })
-        })
-        .await
-        .context("jj diff reader panicked")?
-    }
-
-    pub async fn diff_base_contents(
-        &self,
-        operation_id: &str,
-        commit_id: &str,
-        paths: &[Utf8PathBuf],
-    ) -> anyhow::Result<Vec<WorkspaceDiffBaseContent>> {
-        anyhow::ensure!(paths.len() <= 64, "too many deferred diff paths");
-        static DIFF_READERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
-        let permit = DIFF_READERS
-            .acquire()
-            .await
-            .context("diff readers closed")?;
-        let checkout = self.checkout.clone();
-        let lock = Arc::clone(&self.command_lock);
-        let operation_id = operation_id.to_owned();
-        let commit_id = commit_id.to_owned();
-        let paths = paths.to_vec();
-        let environment = self.environment.values();
-        tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            let _guard = lock.blocking_lock();
-            futures::executor::block_on(async {
-                let epoch = jj_cli::cli_util::workspace_snapshot_at_operation_with_environment(
-                    checkout.as_std_path(),
-                    &operation_id,
-                    environment,
-                )
-                .await
-                .map_err(|error| anyhow::anyhow!(error.error.to_string()))?;
-                let captured = diff::capture(epoch).await?;
-                anyhow::ensure!(
-                    captured.commit_id_hex() == commit_id,
-                    "diff snapshot revision is no longer available"
-                );
-                diff::load_base_contents(captured, &paths).await
-            })
-        })
-        .await
-        .context("jj deferred diff reader panicked")?
+    /// Internal snapshot inputs used by rho-agent's turn-diff tracker.
+    #[doc(hidden)]
+    pub fn diff_inputs(&self) -> (Utf8PathBuf, Arc<Mutex<()>>, Vec<(OsString, OsString)>) {
+        (
+            self.checkout.clone(),
+            Arc::clone(&self.command_lock),
+            self.environment.values(),
+        )
     }
 }
 

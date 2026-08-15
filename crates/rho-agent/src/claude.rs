@@ -76,7 +76,7 @@ impl ClaudeAgent {
         let pool_handle = pool.upgrade().context("agent pool dropped")?;
         let (workset, entries) = crate::materialize_workdirs(start, pool_handle.worksets()).await?;
         let view = workset
-            .enter(rho_workspaces::Mode::View {
+            .enter(rho_workset::Mode::View {
                 home_skeleton: None,
             })
             .await?;
@@ -141,7 +141,7 @@ impl ClaudeAgent {
         db: RhoDb,
         inference: Inference,
         agent_id: AgentId,
-        view: Arc<Lazy<Arc<rho_workspaces::Namespace>>>,
+        view: Arc<Lazy<Arc<rho_workset::Namespace>>>,
         pool: std::sync::Weak<crate::pool::AgentPool>,
     ) -> anyhow::Result<Self> {
         let record = db.read().get_agent(agent_id);
@@ -285,7 +285,7 @@ impl ClaudeAgent {
         db: RhoDb,
         inference: Inference,
         agent_id: AgentId,
-        view: Arc<Lazy<Arc<rho_workspaces::Namespace>>>,
+        view: Arc<Lazy<Arc<rho_workset::Namespace>>>,
         model: Model,
         effort: Effort,
         session_id: Uuid,
@@ -549,7 +549,7 @@ struct ClaudeLoop {
     /// and turn reports so both keep one prompt prefix warm.
     presentation_session: Arc<tokio::sync::Mutex<crate::presentation::Session>>,
     agent_id: AgentId,
-    view: Arc<Lazy<Arc<rho_workspaces::Namespace>>>,
+    view: Arc<Lazy<Arc<rho_workset::Namespace>>>,
     model: Model,
     effort: Effort,
     session_id: Uuid,
@@ -1532,7 +1532,7 @@ impl ClaudeLoop {
 
     fn write_claude_prompt_mount(
         &mut self,
-        view: &rho_workspaces::Namespace,
+        view: &rho_workset::Namespace,
     ) -> anyhow::Result<Option<(Utf8PathBuf, Utf8PathBuf)>> {
         // A view whose entries are all live checkouts has no private mount
         // namespace to bind the generated prompt into.
@@ -2102,7 +2102,7 @@ fn write_claude_prompt_source(
 mod tests {
     use rho_db::RhoDb;
     use rho_inference::PromptCacheKey;
-    use rho_workspaces::WorkspaceInfo;
+    use rho_workset::WorkspaceInfo;
     use serde_json::json;
 
     use super::*;

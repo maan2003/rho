@@ -45,8 +45,8 @@ impl Namespace {
             "workset primary checkout is not materialized: {primary}"
         );
         let visible_root = match &mode {
-            Mode::View { .. } => rho_fs_view::VIEW_MOUNT_ROOT,
-            Mode::Exposed => rho_fs_view::EXPOSED_MOUNT_ROOT,
+            Mode::View { .. } => crate::layout::VIEW_MOUNT_ROOT,
+            Mode::Exposed => crate::layout::EXPOSED_MOUNT_ROOT,
         };
         let host_paths = mounts
             .workspaces
@@ -78,18 +78,18 @@ impl Namespace {
         let view_root_path = view_root.as_ref().map(|root| root.path().to_owned());
         let mode_for_thread = mode.clone();
         let (user_ns, mount_ns, root) = namespace_thread("rho-workset-namespace", move || {
-            rho_fs_view::unshare_mount_namespace()?;
+            crate::layout::unshare_mount_namespace()?;
             match mode_for_thread {
                 Mode::View { home_skeleton } => {
                     let root = view_root_path.context("view mode has no namespace root")?;
-                    let mut config = rho_fs_view::FsViewConfig::new(mounts)?;
+                    let mut config = crate::layout::FsViewConfig::new(mounts)?;
                     config.home_skeleton = home_skeleton;
-                    let builder = rho_fs_view::FsViewBuilder::new(config)?;
+                    let builder = crate::layout::FsViewBuilder::new(config)?;
                     builder.build_in_place(&root)?;
                     builder.pivot_into(&root)?;
                 }
                 Mode::Exposed => {
-                    rho_fs_view::ExposedBuilder::new(mounts)?.build_in_place(Path::new("/"))?;
+                    crate::layout::ExposedBuilder::new(mounts)?.build_in_place(Path::new("/"))?;
                 }
             }
             Ok::<_, anyhow::Error>((
@@ -134,18 +134,18 @@ impl Namespace {
         Ok(())
     }
 
-    pub async fn refresh(&self, mounts: rho_fs_view::Mounts) -> anyhow::Result<()> {
+    pub async fn refresh(&self, mounts: crate::layout::Mounts) -> anyhow::Result<()> {
         let mount_ns = self.mount_ns.try_clone()?;
         let root = self.root.try_clone()?;
         let visible_root = match &self.mode {
-            Mode::View { .. } => rho_fs_view::VIEW_MOUNT_ROOT,
-            Mode::Exposed => rho_fs_view::EXPOSED_MOUNT_ROOT,
+            Mode::View { .. } => crate::layout::VIEW_MOUNT_ROOT,
+            Mode::Exposed => crate::layout::EXPOSED_MOUNT_ROOT,
         };
         namespace_thread("rho-workset-refresh", move || {
-            rho_fs_view::unshare_mount_namespace()?;
-            let mounts = rho_fs_view::prepare_mounts(&mounts)?;
+            crate::layout::unshare_mount_namespace()?;
+            let mounts = crate::layout::prepare_mounts(&mounts)?;
             enter(&mount_ns, &root)?;
-            rho_fs_view::mount_prepared_in_place(&mounts, Path::new("/"), visible_root)
+            crate::layout::mount_prepared_in_place(&mounts, Path::new("/"), visible_root)
         })
         .await
     }
@@ -186,8 +186,8 @@ impl Namespace {
             }
         }
         let visible_root = match &self.mode {
-            Mode::View { .. } => rho_fs_view::VIEW_MOUNT_ROOT,
-            Mode::Exposed => rho_fs_view::EXPOSED_MOUNT_ROOT,
+            Mode::View { .. } => crate::layout::VIEW_MOUNT_ROOT,
+            Mode::Exposed => crate::layout::EXPOSED_MOUNT_ROOT,
         };
         let cwd = namespace_cwd(visible_root, &self.primary, cwd)?;
         let cwd = CString::new(cwd).context("namespace cwd contains NUL")?;

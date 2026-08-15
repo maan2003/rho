@@ -65,7 +65,7 @@ const MAX_DIM: u16 = 1000;
 /// Everything needed to spawn a terminal's child process; built by the
 /// caller (which knows agents and views), used when no session is running.
 pub struct TerminalSpawn {
-    pub view: Arc<rho_workspaces::Namespace>,
+    pub view: Arc<rho_workset::Namespace>,
     /// Program run through `direnv exec .` in the view's primary workdir.
     pub shell: String,
 }
@@ -1139,12 +1139,12 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        let environment = rho_workspaces::UserEnvironment::new(std::env::vars_os().collect());
-        let worksets = rho_workspaces::Worksets::open(
+        let environment = rho_workset::UserEnvironment::new(std::env::vars_os().collect());
+        let worksets = rho_workset::Worksets::open(
             temp.path().join("storage"),
             rho_db::RhoDb::open(temp.path().join("rho.redb")),
             environment,
-            rho_workspaces::PathOverrides::default(),
+            rho_workset::PathOverrides::default(),
         )
         .unwrap();
         let workset = worksets.create().await.unwrap();
@@ -1152,7 +1152,7 @@ mod tests {
             .clone("source", source.to_str().unwrap(), Some("source"), None)
             .await
             .unwrap();
-        let view = workset.enter(rho_workspaces::Mode::Exposed).await.unwrap();
+        let view = workset.enter(rho_workset::Mode::Exposed).await.unwrap();
 
         let registry = Arc::new(TerminalRegistry::default());
         let agent_id =

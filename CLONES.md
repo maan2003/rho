@@ -34,7 +34,7 @@ repositories under `~/src/.rho/stores/` and each generated Workset under
 `~/src/.rho/worksets/<id>/src/`; rho-db’s `worksets` table persists each
 workset’s explicit primary Checkout and creation order. A private namespace presents a Workset at
 `/src` in view mode; exposed mode temporarily uses the deployed `/ws` stub.
-`FS-VIEW.md` describes that mode split and mount layout.
+`WORKSET.md` describes that mode split and mount layout.
 
 ## Constraints, then design
 
@@ -172,7 +172,7 @@ view-mode checkouts at `/src/<name>` beside stores at `/src/.stores/<repo>`,
 or the temporary exposed-mode equivalents below `/ws` — and everything
 resolves, as long as mounts preserve each workspace's
 position relative to its store. Nothing else needs to be mounted for
-git and jj to fully work; `FS-VIEW.md` builds on exactly this. jj
+git and jj to fully work; `WORKSET.md` builds on exactly this. jj
 materializes the files and keeps HEAD and the git index
 in sync, because that's what stock jj does in a colocated repo. Every
 git tool works — `status`, `describe --tags`, `log`, editors' git

@@ -18,6 +18,8 @@ camino.workspace = true
 chrono = "0.4"
 dirs.workspace = true
 futures.workspace = true
+jj-cli.workspace = true
+jj-lib.workspace = true
 prefix-id = { workspace = true, features = ["redb"] }
 rand.workspace = true
 redb.workspace = true
@@ -29,7 +31,7 @@ rho-core.workspace = true
 rho-db.workspace = true
 rho-inference.workspace = true
 rho-tool-shell.workspace = true
-rho-workspaces.workspace = true
+rho-workset.workspace = true
 rho-web-search.workspace = true
 senax-encoder = { workspace = true, features = ["uuid"] }
 serde.workspace = true

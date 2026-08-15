@@ -63,7 +63,7 @@ fn jj_binary() -> PathBuf {
 fn namespace_setup_available() -> bool {
     let status = Command::new("unshare").args(["-U", "true"]).status();
     if !status.is_ok_and(|status| status.success()) {
-        eprintln!("skipping fs-view namespace test: kernel forbids unshare(CLONE_NEWUSER)");
+        eprintln!("skipping workset namespace test: kernel forbids unshare(CLONE_NEWUSER)");
         return false;
     }
     true
@@ -162,7 +162,7 @@ touch /src/.stores/repo/clones/agent/writable
         jj = "/home/agent/jj",
         unshare = unshare.display(),
     );
-    let mut view = Command::new(env!("CARGO_BIN_EXE_rho-fs-view-dev"));
+    let mut view = Command::new(env!("CARGO_BIN_EXE_rho-workset-dev"));
     let inherited = std::fs::File::open(&remote).unwrap();
     // SAFETY: dup2 is async-signal-safe and the captured fd remains open.
     unsafe {
@@ -216,7 +216,7 @@ touch /ws/.stores/repo/clones/agent/writable
         temp = temp.path().display(),
         jj = jj.display(),
     );
-    let mut view = Command::new(env!("CARGO_BIN_EXE_rho-fs-view-dev"));
+    let mut view = Command::new(env!("CARGO_BIN_EXE_rho-workset-dev"));
     view.env("RHO_FS_VIEW_TEST_ENV", "kept")
         .args(["--exposed"])
         .args(["--workspace", &format!("project={}", workspace.display())])

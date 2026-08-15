@@ -12,7 +12,7 @@ use jj_lib::merged_tree::MergedTree;
 use jj_lib::object_id::ObjectId as _;
 use jj_lib::repo::Repo as _;
 use jj_lib::repo_path::RepoPath;
-use rho_workspaces_types::{
+use rho_workset::{
     WorkspaceDiffBaseContent, WorkspaceDiffContent, WorkspaceDiffFile, WorkspaceDiffSnapshot,
     WorkspaceDiffStatus, WorkspaceDiffTarget,
 };
@@ -500,4 +500,78 @@ mod tests {
         assert!(!charge_io_budget(&mut budget, probe));
         assert_eq!(budget, 0);
     }
+}
+
+pub async fn diff_snapshot(
+    workspace: &rho_workset::Checkout,
+    known_commit_id: Option<&str>,
+    include_paths: &[Utf8PathBuf],
+) -> anyhow::Result<Option<WorkspaceDiffSnapshot>> {
+    anyhow::ensure!(include_paths.len() <= 2_048, "too many live diff paths");
+    static DIFF_READERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+    let permit = DIFF_READERS
+        .acquire()
+        .await
+        .context("diff readers closed")?;
+    let (checkout, lock, environment) = workspace.diff_inputs();
+    let known_commit_id = known_commit_id.map(str::to_owned);
+    let include_paths = include_paths.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let _guard = lock.blocking_lock();
+        futures::executor::block_on(async {
+            let epoch = jj_cli::cli_util::snapshot_workspace_descendants_at_with_environment(
+                checkout.as_std_path(),
+                environment,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error.error.to_string()))?;
+            let captured = capture(epoch).await?;
+            if known_commit_id.as_deref() == Some(captured.commit_id_hex().as_str()) {
+                return Ok(None);
+            }
+            load(captured, &include_paths).await.map(Some)
+        })
+    })
+    .await
+    .context("jj diff reader panicked")?
+}
+
+pub async fn diff_base_contents(
+    workspace: &rho_workset::Checkout,
+    operation_id: &str,
+    commit_id: &str,
+    paths: &[Utf8PathBuf],
+) -> anyhow::Result<Vec<WorkspaceDiffBaseContent>> {
+    anyhow::ensure!(paths.len() <= 64, "too many deferred diff paths");
+    static DIFF_READERS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+    let permit = DIFF_READERS
+        .acquire()
+        .await
+        .context("diff readers closed")?;
+    let (checkout, lock, environment) = workspace.diff_inputs();
+    let operation_id = operation_id.to_owned();
+    let commit_id = commit_id.to_owned();
+    let paths = paths.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let _guard = lock.blocking_lock();
+        futures::executor::block_on(async {
+            let epoch = jj_cli::cli_util::workspace_snapshot_at_operation_with_environment(
+                checkout.as_std_path(),
+                &operation_id,
+                environment,
+            )
+            .await
+            .map_err(|error| anyhow::anyhow!(error.error.to_string()))?;
+            let captured = capture(epoch).await?;
+            anyhow::ensure!(
+                captured.commit_id_hex() == commit_id,
+                "diff snapshot revision is no longer available"
+            );
+            load_base_contents(captured, &paths).await
+        })
+    })
+    .await
+    .context("jj deferred diff reader panicked")?
 }
