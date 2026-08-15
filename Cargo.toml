@@ -25,6 +25,7 @@ members = [
   "crates/rho-pr-monitor",
   "crates/rho-profiling",
   "crates/rho-rpc",
+  "crates/rho-fs-view",
   "crates/rho-openai-realtime",
   "crates/rho-rtc",
   "crates/rho-registry",
@@ -119,6 +120,7 @@ rho-iroh-auth = { path = "crates/rho-iroh-auth", default-features = false }
 rho-pr-monitor = { path = "crates/rho-pr-monitor" }
 rho-profiling = { path = "crates/rho-profiling" }
 rho-rpc = { path = "crates/rho-rpc", default-features = false }
+rho-sandbox = { path = "crates/rho-fs-view" }
 rho-shell = { path = "crates/rho-shell" }
 rho-tool-shell = { path = "crates/rho-tool-shell" }
 rho-ui-proto = { path = "crates/rho-ui-proto" }

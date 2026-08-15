@@ -13749,6 +13749,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rho-fs-view"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "libc",
+ "serde_json",
+ "tempfile",
+]
+
+[[package]]
 name = "rho-gui"
 version = "0.1.0"
 dependencies = [

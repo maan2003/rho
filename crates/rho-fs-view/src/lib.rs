@@ -1,0 +1,603 @@
+//! The agent filesystem view: a private mount namespace whose root is a
+//! fresh tmpfs holding only what an agent works with — `/nix/store`, a
+//! generated `/etc`, an empty `$HOME`, and the `/ws` workspace tree.
+//!
+//! This is a layout, not a sandbox: everything runs as the invoking user,
+//! and no security boundary is claimed.
+
+use std::ffi::{CString, OsStr, OsString};
+use std::os::unix::ffi::OsStrExt as _;
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+use std::path::{Component, Path, PathBuf};
+use std::process::ExitStatus;
+use std::{fs, io};
+
+use anyhow::{Context as _, bail, ensure};
+
+#[derive(Clone, Debug)]
+pub struct WorkspaceMount {
+    pub name: String,
+    pub source: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct StoreMount {
+    pub name: String,
+    pub source: PathBuf,
+    /// The id below `source/clones` owned by this agent. That subtree is
+    /// mounted read-write over the otherwise read-only store.
+    pub writable_clone: String,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct WorkingSet {
+    pub workspaces: Vec<WorkspaceMount>,
+    pub stores: Vec<StoreMount>,
+}
+
+/// Host-derived files captured before the namespace is constructed.
+#[derive(Clone, Debug)]
+pub struct HostEtc {
+    pub resolv_conf: Vec<u8>,
+    pub ssl_cert_file: Option<PathBuf>,
+    pub localtime: Option<PathBuf>,
+}
+
+impl HostEtc {
+    pub fn discover() -> anyhow::Result<Self> {
+        let resolv_conf = fs::read("/etc/resolv.conf").context("read host /etc/resolv.conf")?;
+        let ssl_cert_file = resolve_store_path("/etc/ssl/certs/ca-certificates.crt")?;
+        let localtime = resolve_store_path("/etc/localtime")?;
+        Ok(Self {
+            resolv_conf,
+            ssl_cert_file,
+            localtime,
+        })
+    }
+}
+
+fn resolve_store_path(path: impl AsRef<Path>) -> anyhow::Result<Option<PathBuf>> {
+    let path = path.as_ref();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let resolved = path
+        .canonicalize()
+        .with_context(|| format!("resolve {}", path.display()))?;
+    ensure!(
+        resolved.starts_with("/nix/store"),
+        "{} resolves outside /nix/store: {}",
+        path.display(),
+        resolved.display()
+    );
+    Ok(Some(resolved))
+}
+
+#[derive(Clone, Debug)]
+pub struct FsViewConfig {
+    pub home_skeleton: Option<PathBuf>,
+    pub working_set: WorkingSet,
+    pub host_etc: HostEtc,
+    /// Explicit non-secret environment passed through to the command. HOME,
+    /// USER, and LOGNAME are always set by the builder.
+    pub environment: Vec<(OsString, OsString)>,
+}
+
+impl FsViewConfig {
+    pub fn new(working_set: WorkingSet) -> anyhow::Result<Self> {
+        Ok(Self {
+            home_skeleton: None,
+            working_set,
+            host_etc: HostEtc::discover()?,
+            environment: ["PATH", "TERM"]
+                .into_iter()
+                .filter_map(|name| std::env::var_os(name).map(|value| (name.into(), value)))
+                .collect(),
+        })
+    }
+}
+
+pub struct FsViewBuilder {
+    config: FsViewConfig,
+}
+
+impl FsViewBuilder {
+    pub fn new(config: FsViewConfig) -> anyhow::Result<Self> {
+        validate_working_set(&config.working_set)?;
+        if let Some(skeleton) = &config.home_skeleton {
+            ensure!(
+                skeleton.is_dir(),
+                "HOME skeleton is not a directory: {}",
+                skeleton.display()
+            );
+        }
+        Ok(Self { config })
+    }
+
+    /// Runs a command inside the view (a new user and mount namespace).
+    ///
+    /// # Safety
+    ///
+    /// The calling process must be single-threaded. This implementation forks
+    /// and performs filesystem construction before exec. The dev launcher is
+    /// deliberately a tiny single-threaded process; a later daemon integration
+    /// must launch such a helper rather than call this from the Tokio process.
+    pub unsafe fn run<I, S>(&self, program: &OsStr, args: I) -> anyhow::Result<ExitStatus>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let (program, argv) = prepare_command(program, args)?;
+        let root = tempfile::Builder::new()
+            .prefix("rho-fs-view-")
+            .tempdir()
+            .context("create view mount point")?;
+        // SAFETY: required by this method's single-threaded contract.
+        unsafe { spawn_setup(|| setup_child(&self.config, root.path(), &program, &argv)) }
+    }
+}
+
+/// Exposed mode: the full host view as the invoking user, plus the same
+/// `/ws` working-set tree the filesystem view presents, mounted over the
+/// host's permanently empty `/ws` stub. Environment, `$HOME`, and every
+/// host path stay exactly as they are.
+pub struct ExposedBuilder {
+    working_set: WorkingSet,
+}
+
+impl ExposedBuilder {
+    pub fn new(working_set: WorkingSet) -> anyhow::Result<Self> {
+        validate_working_set(&working_set)?;
+        Ok(Self { working_set })
+    }
+
+    /// Runs a command with `/ws` mounted (a new user and mount namespace).
+    ///
+    /// # Safety
+    ///
+    /// The calling process must be single-threaded; see [`FsViewBuilder::run`].
+    pub unsafe fn run<I, S>(&self, program: &OsStr, args: I) -> anyhow::Result<ExitStatus>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let (program, argv) = prepare_command(program, args)?;
+        // SAFETY: required by this method's single-threaded contract.
+        unsafe { spawn_setup(|| setup_exposed(&self.working_set, &program, &argv)) }
+    }
+}
+
+fn prepare_command<I, S>(program: &OsStr, args: I) -> anyhow::Result<(CString, Vec<CString>)>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let program = CString::new(program.as_bytes()).context("program contains NUL")?;
+    let mut argv = vec![program.clone()];
+    for arg in args {
+        argv.push(CString::new(arg.as_ref().as_bytes()).context("argument contains NUL")?);
+    }
+    Ok((program, argv))
+}
+
+/// Forks; the child runs `setup`, which only returns on error (on success
+/// exec replaces it). The parent waits for the command's exit status.
+unsafe fn spawn_setup(setup: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Result<ExitStatus> {
+    let parent_pid = unsafe { libc::getpid() };
+    let pid = unsafe { libc::fork() };
+    if pid < 0 {
+        return Err(io::Error::last_os_error()).context("fork setup process");
+    }
+    if pid == 0 {
+        let result = arm_parent_death_signal(parent_pid).and_then(|()| setup());
+        if let Err(ref error) = result {
+            eprintln!("rho-fs-view setup: {error:#}");
+        }
+        unsafe { libc::_exit(125) }
+    }
+    wait_pid(pid)
+}
+
+fn validate_working_set(set: &WorkingSet) -> anyhow::Result<()> {
+    let mut targets = std::collections::HashSet::new();
+    for workspace in &set.workspaces {
+        validate_name(&workspace.name)?;
+        ensure!(
+            workspace.source.is_dir(),
+            "workspace is not a directory: {}",
+            workspace.source.display()
+        );
+        ensure!(
+            targets.insert(format!("w/{}", workspace.name)),
+            "duplicate workspace name: {}",
+            workspace.name
+        );
+    }
+    for store in &set.stores {
+        validate_name(&store.name)?;
+        validate_name(&store.writable_clone)?;
+        ensure!(
+            store.source.is_dir(),
+            "store is not a directory: {}",
+            store.source.display()
+        );
+        ensure!(
+            store
+                .source
+                .join("clones")
+                .join(&store.writable_clone)
+                .is_dir(),
+            "writable clone is not a directory: {}/clones/{}",
+            store.source.display(),
+            store.writable_clone
+        );
+        ensure!(
+            targets.insert(format!("s/{}", store.name)),
+            "duplicate store name: {}",
+            store.name
+        );
+    }
+    Ok(())
+}
+
+fn validate_name(name: &str) -> anyhow::Result<()> {
+    ensure!(!name.is_empty(), "mount name is empty");
+    ensure!(
+        Path::new(name)
+            .components()
+            .all(|c| matches!(c, Component::Normal(_)))
+            && !name.contains('/'),
+        "mount name is not one path component: {name}"
+    );
+    Ok(())
+}
+
+fn setup_child(
+    config: &FsViewConfig,
+    root: &Path,
+    program: &CString,
+    argv: &[CString],
+) -> anyhow::Result<()> {
+    mark_inherited_fds_close_on_exec()?;
+    enter_identity_namespace()?;
+    unsafe { libc::umask(0o022) };
+    build_filesystem(config, root)?;
+    enter_and_exec(config, root, program, argv)
+}
+
+fn setup_exposed(set: &WorkingSet, program: &CString, argv: &[CString]) -> anyhow::Result<()> {
+    ensure!(
+        Path::new("/ws").is_dir(),
+        "host /ws mount stub is missing (deployed via systemd-tmpfiles: d /ws 0500 root root -)"
+    );
+    mark_inherited_fds_close_on_exec()?;
+    enter_identity_namespace()?;
+    mount_fs(
+        Some(OsStr::new("tmpfs")),
+        Path::new("/ws"),
+        Some("tmpfs"),
+        libc::MS_NOSUID | libc::MS_NODEV,
+        Some("mode=0755"),
+    )
+    .context("mount tmpfs over /ws")?;
+    fs::create_dir("/ws/.stores").context("create /ws/.stores")?;
+    build_ws(set, Path::new("/"))?;
+    cvt(unsafe { libc::chdir(c"/ws".as_ptr()) }).context("chdir /ws")?;
+    exec_command(program, argv)
+}
+
+/// Unshares user and mount namespaces, maps the caller's uid/gid onto
+/// themselves, and makes all mounts private to the namespace.
+fn enter_identity_namespace() -> anyhow::Result<()> {
+    let identity_uid = unsafe { libc::getuid() };
+    let identity_gid = unsafe { libc::getgid() };
+    cvt(unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) })
+        .context("unshare user and mount namespaces")?;
+    fs::write(
+        "/proc/self/uid_map",
+        format!("{identity_uid} {identity_uid} 1\n"),
+    )
+    .context("write identity uid_map")?;
+    fs::write("/proc/self/setgroups", "deny").context("deny setgroups")?;
+    fs::write(
+        "/proc/self/gid_map",
+        format!("{identity_gid} {identity_gid} 1\n"),
+    )
+    .context("write identity gid_map")?;
+    mount_fs(
+        None,
+        Path::new("/"),
+        None,
+        libc::MS_REC | libc::MS_PRIVATE,
+        None,
+    )
+    .context("make mounts recursively private")?;
+    Ok(())
+}
+
+fn arm_parent_death_signal(expected_parent: libc::pid_t) -> anyhow::Result<()> {
+    cvt(unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) })
+        .context("arm parent-death signal")?;
+    ensure!(
+        unsafe { libc::getppid() } == expected_parent,
+        "view launcher exited during setup"
+    );
+    Ok(())
+}
+
+fn mark_inherited_fds_close_on_exec() -> anyhow::Result<()> {
+    // stdin/stdout/stderr are the dev launcher's deliberate command channel.
+    // Everything else, including descriptors the eventual daemon happens to
+    // hold, must disappear at exec. CLOEXEC rather than immediate close keeps
+    // this setup process's synchronization pipes usable until then.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_close_range,
+            3_u32,
+            u32::MAX,
+            libc::CLOSE_RANGE_CLOEXEC,
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error()).context("mark inherited fds close-on-exec");
+    }
+    Ok(())
+}
+
+fn build_filesystem(config: &FsViewConfig, root: &Path) -> anyhow::Result<()> {
+    // The root is one fresh tmpfs; /home/agent, /tmp, /ws, and /dev are plain
+    // directories on it rather than mounts of their own.
+    mount_fs(
+        Some(OsStr::new("tmpfs")),
+        root,
+        Some("tmpfs"),
+        libc::MS_NOSUID | libc::MS_NODEV,
+        Some("mode=0755"),
+    )?;
+    for dir in [
+        "nix/store",
+        "etc",
+        "home/agent",
+        "tmp",
+        "proc",
+        "dev",
+        "ws/.stores",
+        "old-root",
+    ] {
+        fs::create_dir_all(root.join(dir)).with_context(|| format!("create /{dir}"))?;
+    }
+    bind(Path::new("/nix/store"), &root.join("nix/store"), true)?;
+    // The pid namespace is the host's, so a fresh procfs mount is not
+    // permitted here; the host's proc view is the correct one anyway.
+    bind(Path::new("/proc"), &root.join("proc"), false)?;
+    write_etc(config, root)?;
+
+    fs::set_permissions(root.join("home/agent"), fs::Permissions::from_mode(0o700))?;
+    if let Some(skeleton) = &config.home_skeleton {
+        copy_tree(skeleton, &root.join("home/agent"))?;
+    }
+    fs::set_permissions(root.join("tmp"), fs::Permissions::from_mode(0o1777))?;
+    build_dev(root)?;
+    build_ws(&config.working_set, root)?;
+    Ok(())
+}
+
+fn write_etc(config: &FsViewConfig, root: &Path) -> anyhow::Result<()> {
+    let etc = root.join("etc");
+    let (agent_uid, agent_gid) = (unsafe { libc::getuid() }, unsafe { libc::getgid() });
+    fs::write(
+        etc.join("passwd"),
+        format!(
+            "root:x:0:0:root:/root:/bin/sh\nagent:x:{agent_uid}:{agent_gid}:rho agent:/home/agent:/bin/sh\n"
+        ),
+    )?;
+    fs::write(
+        etc.join("group"),
+        format!("root:x:0:\nagent:x:{agent_gid}:\n"),
+    )?;
+    fs::write(etc.join("resolv.conf"), &config.host_etc.resolv_conf)?;
+    fs::write(etc.join("hosts"), "127.0.0.1 localhost\n::1 localhost\n")?;
+    fs::write(
+        etc.join("nsswitch.conf"),
+        "passwd: files\ngroup: files\nhosts: files dns\n",
+    )?;
+    if let Some(cert) = &config.host_etc.ssl_cert_file {
+        fs::create_dir_all(etc.join("ssl/certs"))?;
+        symlink(cert, etc.join("ssl/certs/ca-certificates.crt"))?;
+    }
+    if let Some(localtime) = &config.host_etc.localtime {
+        symlink(localtime, etc.join("localtime"))?;
+    }
+    Ok(())
+}
+
+fn build_dev(root: &Path) -> anyhow::Result<()> {
+    let dev = root.join("dev");
+    for name in ["null", "zero", "full", "random", "urandom", "tty"] {
+        let target = dev.join(name);
+        fs::File::create(&target)?;
+        bind(&Path::new("/dev").join(name), &target, false)?;
+    }
+    fs::create_dir(dev.join("pts"))?;
+    mount_fs(
+        Some(OsStr::new("devpts")),
+        &dev.join("pts"),
+        Some("devpts"),
+        libc::MS_NOSUID | libc::MS_NOEXEC,
+        Some("newinstance,ptmxmode=0666,mode=0620"),
+    )?;
+    symlink("pts/ptmx", dev.join("ptmx"))?;
+    fs::create_dir(dev.join("shm"))?;
+    fs::set_permissions(dev.join("shm"), fs::Permissions::from_mode(0o1777))?;
+    Ok(())
+}
+
+fn build_ws(set: &WorkingSet, root: &Path) -> anyhow::Result<()> {
+    let ws = root.join("ws");
+    for store in &set.stores {
+        let target = ws.join(".stores").join(&store.name);
+        fs::create_dir(&target)?;
+        bind(&store.source, &target, true)?;
+        let clone_target = target.join("clones").join(&store.writable_clone);
+        bind(
+            &store.source.join("clones").join(&store.writable_clone),
+            &clone_target,
+            false,
+        )?;
+    }
+    for workspace in &set.workspaces {
+        let target = ws.join(&workspace.name);
+        fs::create_dir(&target)?;
+        bind(&workspace.source, &target, false)?;
+    }
+    Ok(())
+}
+
+fn enter_and_exec(
+    config: &FsViewConfig,
+    root: &Path,
+    program: &CString,
+    argv: &[CString],
+) -> anyhow::Result<()> {
+    let root_c = cstring(root)?;
+    let old = cstring(&root.join("old-root"))?;
+    cvt(unsafe { libc::syscall(libc::SYS_pivot_root, root_c.as_ptr(), old.as_ptr()) as i32 })
+        .context("pivot_root")?;
+    cvt(unsafe { libc::chdir(c"/".as_ptr()) }).context("chdir /")?;
+    cvt(unsafe { libc::umount2(c"/old-root".as_ptr(), libc::MNT_DETACH) })
+        .context("detach host root")?;
+    fs::remove_dir("/old-root").context("remove old root mount point")?;
+    cvt(unsafe { libc::chdir(c"/ws".as_ptr()) }).context("chdir /ws")?;
+    cvt(unsafe { libc::clearenv() }).context("clear inherited environment")?;
+    for (name, value) in &config.environment {
+        let name = CString::new(name.as_bytes()).context("environment name contains NUL")?;
+        let value = CString::new(value.as_bytes()).context("environment value contains NUL")?;
+        cvt(unsafe { libc::setenv(name.as_ptr(), value.as_ptr(), 1) })
+            .context("set configured environment")?;
+    }
+    unsafe {
+        libc::setenv(c"HOME".as_ptr(), c"/home/agent".as_ptr(), 1);
+        libc::setenv(c"USER".as_ptr(), c"agent".as_ptr(), 1);
+        libc::setenv(c"LOGNAME".as_ptr(), c"agent".as_ptr(), 1);
+    }
+    exec_command(program, argv)
+}
+
+fn exec_command(program: &CString, argv: &[CString]) -> anyhow::Result<()> {
+    let mut pointers = argv.iter().map(|arg| arg.as_ptr()).collect::<Vec<_>>();
+    pointers.push(std::ptr::null());
+    unsafe { libc::execvp(program.as_ptr(), pointers.as_ptr()) };
+    Err(io::Error::last_os_error()).with_context(|| format!("exec {}", program.to_string_lossy()))
+}
+
+fn copy_tree(source: &Path, target: &Path) -> anyhow::Result<()> {
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let from = entry.path();
+        let to = target.join(entry.file_name());
+        let metadata = fs::symlink_metadata(&from)?;
+        if metadata.is_dir() {
+            fs::create_dir(&to)?;
+            fs::set_permissions(&to, fs::Permissions::from_mode(metadata.mode()))?;
+            copy_tree(&from, &to)?;
+        } else if metadata.file_type().is_symlink() {
+            symlink(fs::read_link(&from)?, &to)?;
+        } else if metadata.is_file() {
+            fs::copy(&from, &to)?;
+            fs::set_permissions(&to, fs::Permissions::from_mode(metadata.mode()))?;
+        } else {
+            bail!("unsupported skeleton entry: {}", from.display());
+        }
+    }
+    Ok(())
+}
+
+fn bind(source: &Path, target: &Path, readonly: bool) -> anyhow::Result<()> {
+    mount_fs(
+        Some(source.as_os_str()),
+        target,
+        None,
+        libc::MS_BIND | libc::MS_REC,
+        None,
+    )
+    .with_context(|| format!("bind {} at {}", source.display(), target.display()))?;
+    // Setting flags via mount_setattr (bind root and MS_REC-cloned submounts
+    // alike) never clears anything, so it cannot collide with flags the user
+    // namespace holds locked — unlike MS_REMOUNT|MS_BIND, which must repeat
+    // every locked flag or fail.
+    let attr = libc::mount_attr {
+        attr_set: libc::MOUNT_ATTR_NOSUID | if readonly { libc::MOUNT_ATTR_RDONLY } else { 0 },
+        // A writable bind root must not relax read-only nested mounts.
+        attr_clr: 0,
+        propagation: 0,
+        userns_fd: 0,
+    };
+    let target_c = cstring(target)?;
+    const AT_RECURSIVE: libc::c_uint = 0x8000;
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_mount_setattr,
+            libc::AT_FDCWD,
+            target_c.as_ptr(),
+            AT_RECURSIVE,
+            &attr,
+            std::mem::size_of::<libc::mount_attr>(),
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error())
+            .with_context(|| format!("set recursive mount attributes on {}", target.display()));
+    }
+    Ok(())
+}
+
+fn mount_fs(
+    source: Option<&OsStr>,
+    target: &Path,
+    fstype: Option<&str>,
+    flags: libc::c_ulong,
+    data: Option<&str>,
+) -> anyhow::Result<()> {
+    let source = source
+        .map(|s| CString::new(s.as_bytes()))
+        .transpose()
+        .context("mount source contains NUL")?;
+    let target = cstring(target)?;
+    let fstype = fstype.map(CString::new).transpose()?;
+    let data = data.map(CString::new).transpose()?;
+    cvt(unsafe {
+        libc::mount(
+            source.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+            target.as_ptr(),
+            fstype.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+            flags,
+            data.as_ref()
+                .map_or(std::ptr::null(), |s| s.as_ptr().cast()),
+        )
+    })?;
+    Ok(())
+}
+
+fn cstring(path: &Path) -> anyhow::Result<CString> {
+    CString::new(path.as_os_str().as_bytes()).context("path contains NUL")
+}
+fn cvt(value: i32) -> io::Result<i32> {
+    if value < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(value)
+    }
+}
+fn wait_pid(pid: libc::pid_t) -> anyhow::Result<ExitStatus> {
+    let mut status = 0;
+    loop {
+        let result = unsafe { libc::waitpid(pid, &mut status, 0) };
+        if result == pid {
+            return Ok(std::os::unix::process::ExitStatusExt::from_raw(status));
+        }
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error).context("waitpid");
+        }
+    }
+}

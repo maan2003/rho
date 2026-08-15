@@ -31,9 +31,9 @@ learn.
 Agent-facing workflow and machine conventions (store and workspace
 locations, per-agent clone naming, handing a workspace to a sub-agent)
 live in the `clone-store` skill (`.agents/skills/clone-store/SKILL.md`).
-On devboxes, `/ws` is provisioned by systemd-tmpfiles as the eventual
-workspace mount root — host-side read-only, so entries appear only via
-rho's mount layer; until that lands, workspaces go in `~/src/ws/`.
+The target model — a per-agent `/ws` tree inside a private mount
+namespace — is described in `FS-VIEW.md`; until that lands, workspaces
+go in `~/src/ws/`.
 
 ## Constraints, then design
 
@@ -170,7 +170,8 @@ it. A mount namespace can therefore expose the tree at any root —
 workspaces at `/ws/<name>` beside stores at `/ws/.stores/<repo>` —
 and everything resolves, as long as mounts preserve each workspace's
 position relative to its store. Nothing else needs to be mounted for
-git and jj to fully work; `SANDBOX.md` builds on exactly this. jj materializes the files and keeps HEAD and the git index
+git and jj to fully work; `FS-VIEW.md` builds on exactly this. jj
+materializes the files and keeps HEAD and the git index
 in sync, because that's what stock jj does in a colocated repo. Every
 git tool works — `status`, `describe --tags`, `log`, editors' git
 integrations — because this *is* a git repository checkout. Multiple
