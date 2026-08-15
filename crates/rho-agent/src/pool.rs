@@ -8,13 +8,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use camino::{Utf8Path, Utf8PathBuf};
+use camino::Utf8PathBuf;
 use futures::StreamExt as _;
 use futures::future::BoxFuture;
 use futures::stream::BoxStream;
 use rho_db::RhoDb;
 use rho_inference::Inference;
-use rho_workspaces::{PathOverrides, Repo, UserEnvironment, View, WorkspaceInfo};
+use rho_workspaces::{Mode, Namespace, PathOverrides, UserEnvironment, Worksets, WorkspaceInfo};
 use tokio::sync::{Mutex, broadcast};
 
 use crate::claude::ClaudeAgent;
@@ -34,8 +34,6 @@ const ID_LABEL_HEADROOM: u64 = 200;
 pub struct AgentPool {
     db: RhoDb,
     inference: Inference,
-    path_overrides: PathOverrides,
-    user_environment: UserEnvironment,
     agents: Mutex<HashMap<AgentId, RunningAgent>>,
     /// Per-id activation serialization; unrelated cold loads remain
     /// concurrent, while one persisted agent can never restore two loops.
@@ -43,7 +41,7 @@ pub struct AgentPool {
     /// One shared handle per repo root: live-workspace sharing (joined
     /// agents get one checkout but retain separate View namespaces) only
     /// holds within one instance.
-    repos: Mutex<HashMap<Utf8PathBuf, Arc<Repo>>>,
+    worksets: Arc<Worksets>,
     /// Fires for every agent created in this pool — including agents spawned
     /// by other agents — so every UI connection can pick them up.
     created: broadcast::Sender<AgentCreated>,
@@ -147,6 +145,7 @@ pub struct SpawnWorkdir {
 }
 
 /// Which checkout a child workdir works in.
+#[derive(Clone)]
 pub enum SpawnCheckout {
     /// The checkout the parent uses for this repo (its workspace or a live
     /// checkout), or the user's live checkout when the repo is outside the
@@ -170,14 +169,15 @@ impl AgentPool {
         let mut write = db.write().await;
         write.init_agent_tables();
         write.commit();
+        let worksets =
+            Worksets::open_default(db.clone(), user_environment.clone(), path_overrides.clone())
+                .expect("open workset storage");
         let pool = Arc::new(Self {
             db,
             inference: inference.clone(),
-            path_overrides,
-            user_environment,
             agents: Mutex::new(HashMap::new()),
             load_locks: Mutex::new(HashMap::new()),
-            repos: Mutex::new(HashMap::new()),
+            worksets,
             created: broadcast::channel(64).0,
             activation_observer: std::sync::RwLock::new(None),
             completed_turns: broadcast::channel(64).0,
@@ -202,6 +202,10 @@ impl AgentPool {
             }
         });
         pool
+    }
+
+    pub fn worksets(&self) -> &Arc<Worksets> {
+        &self.worksets
     }
 
     pub fn set_iris_tool_host(&self, host: crate::iris_tools::SharedIrisToolHost) {
@@ -521,68 +525,60 @@ impl AgentPool {
             let record = read.get_agent(parent);
             (record.workdirs, record.role)
         };
-        let workdirs = if workdirs.is_empty() {
+        let selected = if workdirs.is_empty() {
             parent_workdirs
                 .iter()
-                .map(|info| SpawnWorkdir {
-                    repo: info.repo().to_owned(),
-                    checkout: SpawnCheckout::Own { revset: None },
-                })
-                .collect()
+                .map(|info| (info, SpawnCheckout::Own { revset: None }))
+                .collect::<Vec<_>>()
         } else {
             workdirs
-        };
-        let parent_is_sandboxed = parent_workdirs[0].is_sandbox();
-        let mut start = Vec::with_capacity(workdirs.len());
-        for entry in workdirs {
-            let repo = self.repo(&entry.repo).await?;
-            let parent_entry = parent_workdirs
                 .iter()
-                .find(|info| info.repo() == repo.root());
-            start.push(match entry.checkout {
-                SpawnCheckout::Own { revset } if repo.is_jj() => {
-                    // The child's change forks off whatever the parent's
-                    // checkout currently points at; repos outside the
-                    // parent's working set start from trunk.
-                    let parent_revset = revset
-                        .unwrap_or_else(|| parent_entry.map_or("trunk()", |_| "@").to_owned());
-                    let source = match parent_entry {
-                        Some(info) => self.open_workspace(info).await?,
-                        None => repo.user_checkout().await?,
-                    };
-                    let workspace = if parent_is_sandboxed {
-                        repo.create_sandbox_from(&source, &parent_revset).await?
-                    } else {
-                        repo.create_workspace_from(&source, &parent_revset).await?
-                    };
-                    StartWorkdir::Existing(workspace)
-                }
+                .map(|request| {
+                    let repo = request
+                        .repo
+                        .file_name()
+                        .context("spawn repository has no name")?;
+                    let info = parent_workdirs
+                        .iter()
+                        .find(|info| info.repo() == repo)
+                        .with_context(|| format!("parent has no checkout for {repo}"))?;
+                    Ok((info, request.checkout.clone()))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?
+        };
+        let owns = selected
+            .iter()
+            .any(|(_, checkout)| matches!(checkout, SpawnCheckout::Own { .. }));
+        anyhow::ensure!(
+            selected
+                .iter()
+                .all(|(_, checkout)| matches!(checkout, SpawnCheckout::Own { .. }))
+                || !owns,
+            "cannot mix shared and owned child checkouts"
+        );
+        let child_workset = owns.then(|| self.worksets.create());
+        let child_workset = match child_workset {
+            Some(workset) => Some(workset.await?),
+            None => None,
+        };
+        let mut start = Vec::with_capacity(selected.len());
+        for (info, checkout) in selected {
+            let source = self.open_checkout(info).await?;
+            let checkout = match checkout {
                 SpawnCheckout::Own { revset } => {
                     anyhow::ensure!(
                         revset.is_none(),
-                        "revset is only supported inside a jj repository: {}",
-                        repo.root()
+                        "custom spawn revsets are no longer supported"
                     );
-                    anyhow::ensure!(
-                        !parent_is_sandboxed,
-                        "sandboxed Engineers cannot spawn into plain directories: {}",
-                        repo.root()
-                    );
-                    // Plain directories have no workspaces to create.
-                    StartWorkdir::Existing(repo.user_checkout().await?)
+                    child_workset
+                        .as_ref()
+                        .expect("owned checkout has child workset")
+                        .fork_from(&source, Some(info.name()))
+                        .await?
                 }
-                SpawnCheckout::Shared => {
-                    anyhow::ensure!(
-                        !parent_is_sandboxed || parent_entry.is_some_and(WorkspaceInfo::is_sandbox),
-                        "sandboxed Engineers cannot share an ordinary checkout: {}",
-                        repo.root()
-                    );
-                    match parent_entry {
-                        Some(info) => StartWorkdir::Existing(self.open_workspace(info).await?),
-                        None => StartWorkdir::Existing(repo.user_checkout().await?),
-                    }
-                }
-            });
+                SpawnCheckout::Shared => source,
+            };
+            start.push(StartWorkdir::Existing(checkout));
         }
         let config = child_role(parent_role, config);
         let (child_id, child) = self
@@ -703,68 +699,50 @@ impl AgentPool {
         )
     }
 
-    /// The shared handle for the workdir containing `path`: the enclosing jj
-    /// repo when there is one, otherwise the plain directory itself
-    /// (live-only, no separate workspaces). Cache-keyed by the resolved root
-    /// so agents in the same repo share one instance.
-    pub async fn repo(&self, path: &Utf8Path) -> anyhow::Result<Arc<Repo>> {
-        let (root, is_jj) = rho_workspaces::resolve_workdir_root(path.as_std_path())?;
-        let repo = if is_jj {
-            Repo::open_with_environment(
-                root.as_std_path(),
-                self.path_overrides.clone(),
-                self.user_environment.clone(),
-            )?
-        } else {
-            Repo::open_plain_with_environment(
-                root.as_std_path(),
-                self.path_overrides.clone(),
-                self.user_environment.clone(),
-            )?
-        };
-        let mut repos = self.repos.lock().await;
-        Ok(match repos.entry(repo.root().to_owned()) {
-            std::collections::hash_map::Entry::Occupied(entry) => Arc::clone(entry.get()),
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                Arc::clone(entry.insert(Arc::new(repo)))
-            }
-        })
-    }
-
-    pub async fn open_workspace(
+    pub async fn open_checkout(
         &self,
         info: &WorkspaceInfo,
-    ) -> anyhow::Result<Arc<rho_workspaces::Workspace>> {
-        match info {
-            WorkspaceInfo::UserCheckout { repo } => self.repo(repo).await?.user_checkout().await,
-            WorkspaceInfo::Workspace { repo, id } => {
-                self.repo(repo).await?.open_workspace(*id).await
-            }
-            WorkspaceInfo::Sandbox { repo, id } => self.repo(repo).await?.open_sandbox(*id).await,
-        }
+    ) -> anyhow::Result<Arc<rho_workspaces::Checkout>> {
+        self.worksets
+            .open_workset(info.workset())
+            .await?
+            .checkout(info.name())
+            .await
+            .with_context(|| format!("checkout {} is missing", info.name()))
     }
 
-    /// Materializes an agent's persisted working set into a live view.
-    pub async fn materialize_view(&self, workdirs: &[WorkspaceInfo]) -> anyhow::Result<Arc<View>> {
-        let mut entries = Vec::with_capacity(workdirs.len());
-        for info in workdirs {
-            entries.push(self.open_workspace(info).await?);
-        }
-        View::new(entries)
+    pub async fn materialize_namespace(
+        &self,
+        workdirs: &[WorkspaceInfo],
+    ) -> anyhow::Result<Arc<Namespace>> {
+        let first = workdirs.first().context("agent has no checkouts")?;
+        anyhow::ensure!(
+            workdirs
+                .iter()
+                .all(|info| info.workset() == first.workset()),
+            "agent checkouts span worksets"
+        );
+        self.worksets
+            .open_workset(first.workset())
+            .await?
+            .enter(Mode::View {
+                home_skeleton: None,
+            })
+            .await
     }
 
     fn lazy_view(
         self: &Arc<Self>,
         _agent_id: AgentId,
         workdirs: Vec<WorkspaceInfo>,
-    ) -> Arc<Lazy<Arc<View>>> {
+    ) -> Arc<Lazy<Arc<Namespace>>> {
         let pool = Arc::downgrade(self);
         Arc::new(Lazy::new(move || {
             let pool = pool.clone();
             let workdirs = workdirs.clone();
             async move {
                 let pool = pool.upgrade().context("agent pool dropped")?;
-                pool.materialize_view(&workdirs).await
+                pool.materialize_namespace(&workdirs).await
             }
         }))
     }

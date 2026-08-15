@@ -18,8 +18,8 @@ use editor::{Editor, EditorMode, HighlightKey, Inlay, SizingBehavior};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, Focusable as _, HighlightStyle, WeakEntity, Window};
 use language::{Buffer, Capability, Point};
-use multi_buffer::{MultiBuffer, ToOffset as _};
 use multi_buffer::composition::{Composition, CompositionSpec, CutSpec, RowSpec, SectionSpec};
+use multi_buffer::{MultiBuffer, ToOffset as _};
 use project::InlayId;
 use rho_ui_proto::desk::{DeskHeading, DeskHeadingState, parse};
 use rho_ui_proto::{AgentId, UiAttention};
@@ -693,8 +693,7 @@ impl Dashboard {
                             }
                         }
                         _ => {
-                            let Some(buffer) =
-                                self.hosts.get(host).and_then(|weak| weak.upgrade())
+                            let Some(buffer) = self.hosts.get(host).and_then(|weak| weak.upgrade())
                             else {
                                 current = None;
                                 continue;
@@ -793,8 +792,7 @@ impl Dashboard {
             Some(key) if order.contains(key) => Some(key.clone()),
             _ => match &cursor_key {
                 Some(key)
-                    if order.contains(key)
-                        && (edited.contains(key) || rebuilt(self, key)) =>
+                    if order.contains(key) && (edited.contains(key) || rebuilt(self, key)) =>
                 {
                     Some(key.clone())
                 }
@@ -805,9 +803,11 @@ impl Dashboard {
         self.order = order;
         if let Some(key) = restore {
             self.move_cursor_to(&key, window, cx);
-        } else if let Some((host, offset)) =
-            pending_doc.or(if structure_changed { doc_cursor_before } else { None })
-        {
+        } else if let Some((host, offset)) = pending_doc.or(if structure_changed {
+            doc_cursor_before
+        } else {
+            None
+        }) {
             self.move_cursor_to_doc(host, offset, window, cx);
         }
 
@@ -816,9 +816,13 @@ impl Dashboard {
         // next mode switch. Clamp any orphan to its old offset.
         self.editor.update(cx, |editor, cx| {
             let snapshot = editor.buffer().read(cx).snapshot(cx);
-            let orphaned = editor.selections.disjoint_anchors().iter().any(|selection| {
-                !snapshot.can_resolve(&selection.start) || !snapshot.can_resolve(&selection.end)
-            });
+            let orphaned = editor
+                .selections
+                .disjoint_anchors()
+                .iter()
+                .any(|selection| {
+                    !snapshot.can_resolve(&selection.start) || !snapshot.can_resolve(&selection.end)
+                });
             if orphaned {
                 let offset = cursor_offset_before.min(snapshot.len());
                 editor.change_selections(Default::default(), window, cx, |selections| {
@@ -833,8 +837,14 @@ impl Dashboard {
         self.apply_tag_conceals(&conceals, cx);
         self.apply_subtree_folds(&fold_ranges, cx);
         self.nudge_caret_off_folds(window, cx);
-        self.last_synced =
-            Some((documents, segments, draft_texts, decorations, fold_ranges, conceals));
+        self.last_synced = Some((
+            documents,
+            segments,
+            draft_texts,
+            decorations,
+            fold_ranges,
+            conceals,
+        ));
     }
 
     /// The stable composition id for a line key, allocated on first use.
@@ -863,11 +873,7 @@ impl Dashboard {
         let Some(path) = self.composition.path_for_row(*id) else {
             return;
         };
-        let Some(anchor) = self
-            .multi_buffer
-            .read(cx)
-            .location_for_path(&path, cx)
-        else {
+        let Some(anchor) = self.multi_buffer.read(cx).location_for_path(&path, cx) else {
             return;
         };
         self.editor.update(cx, |editor, cx| {
@@ -1500,7 +1506,9 @@ impl Dashboard {
                 }) else {
                     return false;
                 };
-                let Some(agents) = self.heading_agents.get(&(host, heading.heading_range.start))
+                let Some(agents) = self
+                    .heading_agents
+                    .get(&(host, heading.heading_range.start))
                 else {
                     return false;
                 };
@@ -1637,7 +1645,9 @@ impl Dashboard {
             .filter_map(|key| match self.targets.get(key) {
                 Some(RowTarget::Agent { agent_id, .. })
                     if registry.attention(*agent_id) >= UiAttention::Pending =>
-                    Some((key.clone(), *agent_id)),
+                {
+                    Some((key.clone(), *agent_id))
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -1866,8 +1876,8 @@ impl Dashboard {
             // An all-space placeholder (the tag conceal) keeps its layout
             // column — zero-width folds corrupt selection roundtrips —
             // but draws nothing, so no visible gap invites the eye in.
-            let glyph: Option<gpui::SharedString> = (!placeholder_text.trim().is_empty())
-                .then(|| placeholder_text.clone().into());
+            let glyph: Option<gpui::SharedString> =
+                (!placeholder_text.trim().is_empty()).then(|| placeholder_text.clone().into());
             let class = DashClass::for_depth(
                 placeholder_text
                     .chars()
@@ -1975,7 +1985,10 @@ impl Dashboard {
             lines.push(((*host, *offset), (text.trim_start().to_owned(), false)));
         }
         for (host, range) in fold_ranges {
-            match lines.iter_mut().find(|(key, _)| *key == (*host, range.start)) {
+            match lines
+                .iter_mut()
+                .find(|(key, _)| *key == (*host, range.start))
+            {
                 Some((_, (_, folded))) => *folded = true,
                 None => lines.push(((*host, range.start), (String::new(), true))),
             }
@@ -1986,8 +1999,7 @@ impl Dashboard {
                 continue;
             };
             let buffer_snapshot = buffer.read(cx).snapshot();
-            let Some(position) =
-                snapshot.anchor_in_excerpt(buffer_snapshot.anchor_before(offset))
+            let Some(position) = snapshot.anchor_in_excerpt(buffer_snapshot.anchor_before(offset))
             else {
                 continue;
             };
@@ -2115,7 +2127,6 @@ impl DashClass {
             ..HighlightStyle::default()
         }
     }
-
 }
 
 /// One generated dashboard line: identity, text, semantic spans, and
@@ -2279,9 +2290,7 @@ fn agent_line(
     let label = registry.agent_id_label(agent_id);
     if !line.text.contains(&label) {
         line.span(None, |text| text.push_str("  "));
-        line.span(Some(DashClass::Muted), |text| {
-            text.push_str(&label)
-        });
+        line.span(Some(DashClass::Muted), |text| text.push_str(&label));
     }
     if attention >= UiAttention::Pending
         && let Some(reason) = registry.agent_attention_reason(agent_id)
@@ -2311,12 +2320,7 @@ fn agent_tree_lines(
         if !seen.insert(agent_id) {
             continue;
         }
-        lines.push(agent_line(
-            agent_id,
-            occurrence.clone(),
-            topic,
-            registry,
-        ));
+        lines.push(agent_line(agent_id, occurrence.clone(), topic, registry));
         stack.extend(registry.agent_children(agent_id).iter().rev().copied());
     }
     lines
@@ -2416,8 +2420,7 @@ fn heading_decorations(
                 .get(&(*host, heading.heading_range.start))
                 .unwrap_or(&empty);
             let folded = folds.iter().any(|range| {
-                range.start <= heading.heading_range.end
-                    && heading.heading_range.end <= range.end
+                range.start <= heading.heading_range.end && heading.heading_range.end <= range.end
             });
             if !folded
                 && agents.iter().any(|portal| {
@@ -2557,11 +2560,7 @@ fn subtree_fold_range(text: &str, heading: &DeskHeading) -> Option<Range<usize>>
 /// swallow what you type — the fold shortens to end above that line.
 /// Deeper inside, the fold lifts entirely (vim opens folds on jumps
 /// into them); it reapplies once the cursor leaves.
-fn cursor_clamped_fold(
-    text: &str,
-    range: Range<usize>,
-    cursor: usize,
-) -> Option<Range<usize>> {
+fn cursor_clamped_fold(text: &str, range: Range<usize>, cursor: usize) -> Option<Range<usize>> {
     // Both boundaries stay foldable: the end anchor is left-biased, so
     // typing at the end boundary lands outside the fold, and motions
     // resting there (word motions stop on the fold's last character)
@@ -2570,7 +2569,9 @@ fn cursor_clamped_fold(
         return Some(range);
     }
     let line_start = text[..cursor].rfind('\n').map_or(0, |at| at + 1);
-    let line_end = text[cursor..].find('\n').map_or(text.len(), |at| cursor + at);
+    let line_end = text[cursor..]
+        .find('\n')
+        .map_or(text.len(), |at| cursor + at);
     if line_end >= range.end && line_start > range.start + 1 {
         Some(range.start..line_start - 1)
     } else {
@@ -2588,10 +2589,7 @@ fn direct_children(headings: &[DeskHeading], index: usize) -> Vec<usize> {
         .take_while(|(_, heading)| heading.depth > headings[index].depth)
         .map(|(at, _)| index + 1 + at)
         .collect();
-    let child_depth = descendants
-        .iter()
-        .map(|&child| headings[child].depth)
-        .min();
+    let child_depth = descendants.iter().map(|&child| headings[child].depth).min();
     descendants
         .into_iter()
         .filter(|&child| Some(headings[child].depth) == child_depth)
@@ -2688,11 +2686,7 @@ fn cycle_folds(
 /// recording the archive time. Returns the edits and the archive
 /// heading's offset once they apply. `None` when the target is already
 /// archived, is itself an archive, or does not exist.
-fn archive_edits(
-    text: &str,
-    target_start: usize,
-    archived_at: &str,
-) -> Option<ArchiveEdits> {
+fn archive_edits(text: &str, target_start: usize, archived_at: &str) -> Option<ArchiveEdits> {
     let headings = parse(text);
     let target_index = headings
         .iter()
@@ -2831,41 +2825,35 @@ fn generate(
             .collect();
     }
 
-    let push_agent_portals =
-        |segments: &mut Vec<Segment>,
-         emitted_replies: &mut HashSet<AgentId>,
-         roots: &[AgentId],
-         occurrence_for: &dyn Fn(AgentId) -> AgentOccurrence,
-         topic: Option<(HostId, usize)>,
-         show_collapsed_roots: bool,
-         allow_expanded: bool| {
-            for root in roots {
-                let occurrence = occurrence_for(*root);
-                let expanded = allow_expanded && expanded_portals.contains(&occurrence);
-                for (index, line) in agent_tree_lines(
-                    registry,
-                    &[*root],
-                    occurrence,
-                    topic,
-                )
+    let push_agent_portals = |segments: &mut Vec<Segment>,
+                              emitted_replies: &mut HashSet<AgentId>,
+                              roots: &[AgentId],
+                              occurrence_for: &dyn Fn(AgentId) -> AgentOccurrence,
+                              topic: Option<(HostId, usize)>,
+                              show_collapsed_roots: bool,
+                              allow_expanded: bool| {
+        for root in roots {
+            let occurrence = occurrence_for(*root);
+            let expanded = allow_expanded && expanded_portals.contains(&occurrence);
+            for (index, line) in agent_tree_lines(registry, &[*root], occurrence, topic)
                 .into_iter()
                 .enumerate()
-                {
-                    let RowTarget::Agent { agent_id, .. } = line.target else {
-                        unreachable!()
-                    };
-                    if expanded || (show_collapsed_roots && index == 0) {
-                        segments.push(Segment::Line(line));
-                    }
-                    if replies.contains(&agent_id) && emitted_replies.insert(agent_id) {
-                        segments.push(Segment::Line(Line::new(
-                            LineKey::Reply(agent_id),
-                            RowTarget::Reply(agent_id),
-                        )));
-                    }
+            {
+                let RowTarget::Agent { agent_id, .. } = line.target else {
+                    unreachable!()
+                };
+                if expanded || (show_collapsed_roots && index == 0) {
+                    segments.push(Segment::Line(line));
+                }
+                if replies.contains(&agent_id) && emitted_replies.insert(agent_id) {
+                    segments.push(Segment::Line(Line::new(
+                        LineKey::Reply(agent_id),
+                        RowTarget::Reply(agent_id),
+                    )));
                 }
             }
-        };
+        }
+    };
 
     for (host, text) in documents {
         if multiple_hosts {
@@ -2907,8 +2895,7 @@ fn generate(
             let agents = filed.get(&(*host, start)).unwrap_or(&empty);
             let draft_here = draft_topic == Some(Some((*host, start)));
             let folded_here = fold_zones.iter().any(|zone| {
-                zone.start <= heading.heading_range.end
-                    && heading.heading_range.end <= zone.end
+                zone.start <= heading.heading_range.end && heading.heading_range.end <= zone.end
             });
             let portal_here = !folded_here
                 && agents.iter().any(|portal| {
@@ -3148,8 +3135,10 @@ mod tests {
             created_at: UnixMs(id),
             updated_at: UnixMs(active),
             role: AgentRole::default(),
-            workspace: WorkspaceInfo::UserCheckout {
+            workspace: WorkspaceInfo::Checkout {
+                workset: "test-workset".into(),
                 repo: "/tmp".into(),
+                name: "repo".into(),
             },
             attention,
             last_active: UnixMs(active),
@@ -3244,8 +3233,12 @@ mod tests {
             None,
         );
         assert_eq!(segments.len(), 4);
-        assert!(matches!(segments[1], Segment::Line(ref line) if matches!(line.target, RowTarget::Agent { agent_id, .. } if agent_id == b.agent_id)));
-        assert!(matches!(segments[2], Segment::Line(ref line) if matches!(line.target, RowTarget::Agent { agent_id, .. } if agent_id == a.agent_id)));
+        assert!(
+            matches!(segments[1], Segment::Line(ref line) if matches!(line.target, RowTarget::Agent { agent_id, .. } if agent_id == b.agent_id))
+        );
+        assert!(
+            matches!(segments[2], Segment::Line(ref line) if matches!(line.target, RowTarget::Agent { agent_id, .. } if agent_id == a.agent_id))
+        );
 
         // An open reply splices in right under the heading line, before
         // the body.
@@ -3312,7 +3305,11 @@ mod tests {
             .iter()
             .filter_map(|segment| match segment {
                 Segment::Line(Line {
-                    key: LineKey::Agent { agent_id, occurrence },
+                    key:
+                        LineKey::Agent {
+                            agent_id,
+                            occurrence,
+                        },
                     ..
                 }) => Some((*agent_id, occurrence.clone())),
                 _ => None,
@@ -3349,7 +3346,10 @@ mod tests {
             first_only
                 .iter()
                 .filter_map(|segment| match segment {
-                    Segment::Line(Line { target: RowTarget::Agent { agent_id, .. }, .. }) => {
+                    Segment::Line(Line {
+                        target: RowTarget::Agent { agent_id, .. },
+                        ..
+                    }) => {
                         Some(*agent_id)
                     }
                     _ => None,
@@ -3393,8 +3393,13 @@ mod tests {
                 grandchild.agent_id,
             ]
         );
-        assert_ne!(rows[0].0, rows[3].0, "each portal has distinct row identity");
-        assert!(matches!(rows[1].0, LineKey::Agent { agent_id, .. } if *agent_id == child.agent_id));
+        assert_ne!(
+            rows[0].0, rows[3].0,
+            "each portal has distinct row identity"
+        );
+        assert!(
+            matches!(rows[1].0, LineKey::Agent { agent_id, .. } if *agent_id == child.agent_id)
+        );
     }
 
     #[test]
@@ -3414,12 +3419,7 @@ mod tests {
             &[],
             None,
         );
-        assert_eq!(
-            keys(&segments),
-            vec![
-                format!("doc 0..{}", text.len()),
-            ]
-        );
+        assert_eq!(keys(&segments), vec![format!("doc 0..{}", text.len()),]);
     }
 
     #[test]
@@ -3451,7 +3451,13 @@ mod tests {
             None,
         );
         assert_eq!(segments.len(), 1);
-        assert!(!segments.iter().any(|segment| matches!(segment, Segment::Line(Line { target: RowTarget::Agent { .. }, .. }))));
+        assert!(!segments.iter().any(|segment| matches!(
+            segment,
+            Segment::Line(Line {
+                target: RowTarget::Agent { .. },
+                ..
+            })
+        )));
         // The fold hides everything after the heading line except the
         // final newline, so the next heading keeps a line of its own.
         let headings = parse(&text);
@@ -3606,7 +3612,8 @@ mod tests {
         // subtree demotes into it, the tag rides along, and the archive
         // time lands as a property on the moved heading.
         let text = "* Done task :eng-aa:\nnotes\n** Sub\n* Alive\n";
-        let (edits, archive_offset) = archive_edits(text, 0, "2026-08-08 12:00").expect("archivable");
+        let (edits, archive_offset) =
+            archive_edits(text, 0, "2026-08-08 12:00").expect("archivable");
         let patched = apply_edits(text, &edits);
         assert_eq!(
             patched,
@@ -3641,8 +3648,7 @@ mod tests {
         filed.insert((host, text.find("** Old").unwrap()), vec![loud.agent_id]);
         let documents = [(host, text.clone())];
         assert!(archived_roots(&documents, &filed).contains(&loud.agent_id));
-        let decorations =
-            heading_decorations(&registry, &documents, &filed, &HashSet::new(), &[]);
+        let decorations = heading_decorations(&registry, &documents, &filed, &HashSet::new(), &[]);
         let (_, _, label) = &decorations[0];
         assert!(
             label.starts_with("  · ") && !label.contains('—'),

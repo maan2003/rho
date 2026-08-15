@@ -19,4 +19,5 @@ tokio.workspace = true
 [dev-dependencies]
 anyhow.workspace = true
 rho-db.workspace = true
+rho-fs-view.workspace = true
 tempfile.workspace = true

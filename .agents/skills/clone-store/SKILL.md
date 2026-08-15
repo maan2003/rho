@@ -5,80 +5,64 @@ description: Create instant private jj clones and workspaces from a shared clone
 
 # Clone-store workspaces
 
-A clone store gives every agent what a human contributor has: a full private
-clone — own refs, op log, config, free to fetch/push/gc — without O(repo)
-disk or network per clone. Design and internals: `CLONES.md` in the rho
-repo; implementation: `jj_lib::clone_store` and the `jj store` CLI in the
-jj fork.
+A clone store gives every agent a full private clone—own refs, op log, config,
+and fetch/push/gc freedom—without O(repo) disk or network per clone. Design:
+`CLONES.md`; implementation: `jj_lib::clone_store` and the rho fork's
+`jj store` CLI.
 
-Requires a jj build that has `jj store` (the rho package's bundled jj; if
-`jj store --help` fails, the deployed jj predates it — use
-`vendor/jj/target/release/jj` from a rho checkout or ask for a redeploy).
+Requires a jj build with `jj store`. If `jj store --help` fails, use rho's
+bundled jj or ask for a redeploy.
 
-## Conventions on this machine
+## Daemon-managed workflow (normal)
 
-- Stores: `~/src/.jj-stores/<repo-name>` (one per repository, shared by all
-  agents; `~/src` is the big bcachefs volume).
-- Workspaces: `~/src/ws/<name>` until rho's mount layer lands, then `/ws/<name>`.
-  Name after the task or the agent that will use it.
-- Clone ids: one clone per agent or workstream, named after it
-  (e.g. `eng-h6u7` or `fix-index-race`). Clones are cheap (~60ms) —
-  prefer a fresh clone over sharing one.
+Do not manually allocate paths for Rho agents. The daemon's `Worksets` manager
+owns `~/src/.rho`:
 
-## Commands
+- shared stores: `~/src/.rho/stores/<repo>`;
+- generated Worksets: `~/src/.rho/worksets/<id>/src/`;
+- durable primary/order record: the `worksets` table in rho-db;
+- host-frame Checkouts: `.../src/<name>` with `.stores/<repo>` plumbing;
+- view-mode agent paths: `/src/<name>` and `/src/.stores/<repo>`;
+- exposed-mode paths: temporarily `/ws/<name>` and `/ws/.stores/<repo>`.
 
-```sh
-# Once per repository (slow: full fetch of the remote):
-jj store init ~/src/.jj-stores/rho octo://github.com/maan2003/rho.git
+Use the normal spawn/agent tools. A child needing its own checkout is forked by
+Worksets from the parent's snapshotted commit and starts on a fresh jj change.
+A shared checkout request joins the existing Workset. Never pass or derive
+`~/src/.rho` bookkeeping paths as model-facing workdirs.
 
-# Optional prefetch; clones also fetch on their own:
-jj store fetch ~/src/.jj-stores/rho
+## Manual CLI workflow (out of daemon only)
 
-# Per agent/task — instant, born at the store's last-fetched state:
-jj store clone ~/src/.jj-stores/rho <id>
-
-# Materialize a checkout (a real colocated git worktree + jj workspace):
-jj store workspace ~/src/.jj-stores/rho <id> ~/src/ws/<name> \
-    [--name NAME] [--at COMMIT_HEX]
-```
-
-Each command prints a JSON record of what it created. `--at` defaults to the
-clone's trunk (`main@origin`). All commands are safe to interrupt and retry:
-final paths only ever hold complete artifacts.
-
-## Giving a workspace to a sub-agent
-
-Create the clone and workspace yourself, then pass the workspace path as the
-sub-agent's workdir:
-
-```ts
-tools.spawn_engineer({
-  task_name: "fix-index-race",
-  prompt: "...",
-  workdirs: [{ repo: "/home/maan2003/src/ws/fix-index-race" }],
-});
-```
-
-Inside the workspace, plain `jj` and `git` just work — it is a stock
-colocated checkout. The clone is private to that agent: its commits, op log,
-and refs are invisible to everyone else until pushed.
-
-## Integrating results
-
-Clones collaborate through the remote, like coworkers on different machines:
-the sub-agent pushes a bookmark, you fetch it in your own checkout. For local
-handoff without a push, add the clone's git dir as a remote and fetch:
+The commands below remain useful for experiments, debugging the jj primitive,
+or other workflows that do not run through the daemon. Choose an isolated root;
+these paths are examples, not daemon conventions:
 
 ```sh
-git fetch ~/src/.jj-stores/rho/clones/<id>/git <ref>
+root=~/src/.jj-stores/rho
+checkout=~/src/ws/fix-index-race
+
+jj store init "$root" octo://github.com/maan2003/rho.git
+jj store fetch "$root"                    # optional prefetch
+jj store clone "$root" fix-index-race
+jj store workspace "$root" fix-index-race "$checkout" \
+    --name fix-index-race                  # optional: --at COMMIT_HEX
+```
+
+Each command prints a JSON record. `--at` defaults to the clone's trunk. Final
+paths only hold complete artifacts, so interrupted commands are safe to retry.
+Inside the checkout, plain `jj` and `git` work normally.
+
+Manual clones collaborate through the remote. For a local handoff without a
+push, fetch from the clone's private Git directory:
+
+```sh
+git fetch "$root/clones/fix-index-race/git" <ref>
 ```
 
 ## Rules
 
-- Never delete or prune inside `~/src/.jj-stores/*/git` — clones borrow the
-  store's objects. (The store's own config already disables auto-gc; just
-  don't fight it.)
-- Everything *inside a clone* is fair game: `jj op undo`, `git gc`,
-  reindexing — blast radius is that clone only.
-- Deleting a clone or workspace directory you created is safe cleanup once
-  its work is pushed or abandoned.
+- Never delete or prune a store's shared `git` object database; clones borrow
+  those objects. Store configuration disables auto-gc—do not override it.
+- Everything inside a private clone is fair game (`jj op undo`, `git gc`,
+  reindexing); its blast radius is that clone.
+- Delete manual clone/checkouts only after their work is pushed or abandoned.
+- Do not manually mutate daemon-owned `~/src/.rho`; use Worksets/agent APIs.

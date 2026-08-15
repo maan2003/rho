@@ -28,12 +28,13 @@ Each command prints a JSON record of the paths it created. Inside a
 workspace, plain `jj` and `git` just work — there is nothing else to
 learn.
 
-Agent-facing workflow and machine conventions (store and workspace
-locations, per-agent clone naming, handing a workspace to a sub-agent)
-live in the `clone-store` skill (`.agents/skills/clone-store/SKILL.md`).
-The target model — a per-agent `/ws` tree inside a private mount
-namespace — is described in `FS-VIEW.md`; until that lands, workspaces
-go in `~/src/ws/`.
+Daemon-managed workflow and the separate manual CLI conventions live in the
+`clone-store` skill (`.agents/skills/clone-store/SKILL.md`). Rho stores shared
+repositories under `~/src/.rho/stores/` and each generated Workset under
+`~/src/.rho/worksets/<id>/src/`; rho-db’s `worksets` table persists each
+workset’s explicit primary Checkout and creation order. A private namespace presents a Workset at
+`/src` in view mode; exposed mode temporarily uses the deployed `/ws` stub.
+`FS-VIEW.md` describes that mode split and mount layout.
 
 ## Constraints, then design
 
@@ -62,7 +63,7 @@ git's first-class borrowing mechanism:
   `-l` even dedups a clone's private objects against the store.
 - Push, log, diff, everything else just works: objects are objects.
 
-### Shared artifact 2: the jj commit index (hardlinked segments)
+### Shared artifact 2: the jj commit index (reflinked segments, with hardlink fallback)
 
 jj's default index is a set of immutable, content-addressed segment
 files. Two facts make them shareable:
@@ -72,7 +73,7 @@ files. Two facts make them shareable:
 - Reindexing replaces a repo's *links* to segments, never the segment
   bytes, so one clone reindexing cannot disturb another.
 
-Clone creation hardlinks the template's segment files and associates the
+Clone creation reflinks the template's segment files (with hardlink fallback) and associates the
 clone's initial operation with the template's index via one copied
 op-link file.
 
@@ -139,7 +140,7 @@ on a repo with 1,700 tags:
    listing — the same `refs/remotes/origin/*` and `refs/tags/*` a real
    `git clone` leaves.
 3. Stock jj repo over that git repo; the template's index segments are
-   hardlinked in and its op link copied.
+   reflinked in (with hardlink fallback) and its op link copied.
 4. The template's **view** — heads, remote bookmarks, remote tags, local
    tags, git_refs — is copied wholesale as plain data in one
    transaction. Working-copy and git-HEAD state is cleared: that is
@@ -166,9 +167,10 @@ against the clone's private git repo (created `--no-checkout`), plus a
 jj workspace attached to the clone's repo. Its pointers (`.git`,
 `.jj/repo`, git's worktree back-pointer) are **relative**: a store and
 its workspaces form one relocatable tree, and no pointer ever leaves
-it. A mount namespace can therefore expose the tree at any root —
-workspaces at `/ws/<name>` beside stores at `/ws/.stores/<repo>` —
-and everything resolves, as long as mounts preserve each workspace's
+it. A mount namespace can therefore expose the tree at any root — for example,
+view-mode checkouts at `/src/<name>` beside stores at `/src/.stores/<repo>`,
+or the temporary exposed-mode equivalents below `/ws` — and everything
+resolves, as long as mounts preserve each workspace's
 position relative to its store. Nothing else needs to be mounted for
 git and jj to fully work; `FS-VIEW.md` builds on exactly this. jj
 materializes the files and keeps HEAD and the git index
@@ -199,7 +201,7 @@ Earlier iterations shared the git repo itself between clones, which
 required vendored guard patches in jj (banned commands, marker files),
 a shared "furniture" git directory, store-level gc that unioned every
 clone's keep refs, and careful reasoning about which git config was
-shared. Sharing only bytes — via alternates and hardlinks, both built
+shared. Sharing only bytes — via alternates and reflinks (with hardlink fallback), both built
 for exactly this — deletes all of it:
 
 - No jj patches, no banned commands, no marker semantics. Stock jj.

@@ -6,8 +6,8 @@ use rho_core::UnixMs;
 use rho_db::RhoDb;
 use tokio::sync::watch;
 
-use crate::config::{InferenceModel, InferenceProfile};
 use crate::accounts::{self, AccountManager, InferenceQuotaSeries, InferenceState, SelectedAuth};
+use crate::config::{InferenceModel, InferenceProfile};
 use crate::responses::{InferenceAuth, InferenceSession, PromptCacheKey, QuotaUpdate};
 
 /// Provider account policy, quota, persistence, and session creation. Cheap to
@@ -119,9 +119,6 @@ impl Inference {
     }
 
     fn accounts(&self) -> &AccountManager {
-        self.0
-            .accounts
-            .as_ref()
-            .expect("inference account manager")
+        self.0.accounts.as_ref().expect("inference account manager")
     }
 }

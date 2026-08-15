@@ -395,7 +395,7 @@ async fn ask_advisor(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result
         .workdirs
         .into_iter()
         .map(|info| SpawnWorkdir {
-            repo: info.repo().to_owned(),
+            repo: info.repo().to_owned().into(),
             checkout: SpawnCheckout::Shared,
         })
         .collect();

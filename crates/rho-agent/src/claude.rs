@@ -71,10 +71,17 @@ impl ClaudeAgent {
         let effort = mode
             .claude_effort()
             .ok_or_else(|| anyhow::anyhow!("cannot create Claude runtime for Rho agent mode"))?;
+        // Workset materialization writes through rho-db and must precede the
+        // non-reentrant agent write transaction.
+        let pool_handle = pool.upgrade().context("agent pool dropped")?;
+        let (workset, entries) = crate::materialize_workdirs(start, pool_handle.worksets()).await?;
+        let view = workset
+            .enter(rho_workspaces::Mode::View {
+                home_skeleton: None,
+            })
+            .await?;
         let mut write = db.write().await;
         let agent_id = write.alloc_agent_id();
-        let entries = crate::materialize_workdirs(start).await?;
-        let view = rho_workspaces::View::new(entries.clone())?;
         let session_id = Uuid::new_v4();
         let next_event = write.create_agent(
             UnixMillis::now(),
@@ -134,7 +141,7 @@ impl ClaudeAgent {
         db: RhoDb,
         inference: Inference,
         agent_id: AgentId,
-        view: Arc<Lazy<Arc<rho_workspaces::View>>>,
+        view: Arc<Lazy<Arc<rho_workspaces::Namespace>>>,
         pool: std::sync::Weak<crate::pool::AgentPool>,
     ) -> anyhow::Result<Self> {
         let record = db.read().get_agent(agent_id);
@@ -149,7 +156,7 @@ impl ClaudeAgent {
             .binding
             .claude_effort()
             .ok_or_else(|| anyhow::anyhow!("Claude runtime stored with non-Claude agent mode"))?;
-        let primary_repo = record.primary_workdir().repo().to_owned();
+        let primary_repo = Utf8PathBuf::from("/src").join(record.primary_workdir().name());
         let (session_id, messages, start_mode, pending_rewind, context_used) = if let Some(rewind) =
             record.claude_rewind
         {
@@ -278,7 +285,7 @@ impl ClaudeAgent {
         db: RhoDb,
         inference: Inference,
         agent_id: AgentId,
-        view: Arc<Lazy<Arc<rho_workspaces::View>>>,
+        view: Arc<Lazy<Arc<rho_workspaces::Namespace>>>,
         model: Model,
         effort: Effort,
         session_id: Uuid,
@@ -542,7 +549,7 @@ struct ClaudeLoop {
     /// and turn reports so both keep one prompt prefix warm.
     presentation_session: Arc<tokio::sync::Mutex<crate::presentation::Session>>,
     agent_id: AgentId,
-    view: Arc<Lazy<Arc<rho_workspaces::View>>>,
+    view: Arc<Lazy<Arc<rho_workspaces::Namespace>>>,
     model: Model,
     effort: Effort,
     session_id: Uuid,
@@ -1366,7 +1373,7 @@ impl ClaudeLoop {
                 } => {
                     let source = rho_claude::read_session_messages_by_id(
                         source_session_id,
-                        view.primary().repo(),
+                        &view.primary().visible_path(),
                         rho_claude::SessionMessagesOptions::default(),
                     )
                     .await?;
@@ -1381,7 +1388,7 @@ impl ClaudeLoop {
         } else {
             let messages = rho_claude::read_session_messages_by_id(
                 self.session_id,
-                view.primary().repo(),
+                &view.primary().visible_path(),
                 rho_claude::SessionMessagesOptions::default(),
             )
             .await?;
@@ -1503,7 +1510,7 @@ impl ClaudeLoop {
             },
         };
         let mut options = ClaudeCodeOptions::new(
-            view.primary().repo().to_owned(),
+            view.primary().visible_path(),
             self.model,
             self.effort,
             self.session_id,
@@ -1515,8 +1522,7 @@ impl ClaudeLoop {
         }
         let file_mounts = self.write_claude_prompt_mount(&view)?.into_iter().collect();
         let mut command = options.command().await?;
-        view.prepare_command(&mut command, None, file_mounts)
-            .await?;
+        view.prepare_command_with_mounts(&mut command, None, file_mounts)?;
         self.process = Some(ClaudeCode::spawn_command(command).await?);
         if !self.pending_rewind {
             self.start_mode = ClaudeStartMode::Resume;
@@ -1526,7 +1532,7 @@ impl ClaudeLoop {
 
     fn write_claude_prompt_mount(
         &mut self,
-        view: &rho_workspaces::View,
+        view: &rho_workspaces::Namespace,
     ) -> anyhow::Result<Option<(Utf8PathBuf, Utf8PathBuf)>> {
         // A view whose entries are all live checkouts has no private mount
         // namespace to bind the generated prompt into.
@@ -1790,7 +1796,7 @@ impl ClaudeLoop {
         let view = Arc::clone(self.view.get().await?);
         let messages = rho_claude::read_session_messages_by_id(
             self.session_id,
-            view.primary().repo(),
+            &view.primary().visible_path(),
             rho_claude::SessionMessagesOptions::default(),
         )
         .await?;
@@ -2096,7 +2102,7 @@ fn write_claude_prompt_source(
 mod tests {
     use rho_db::RhoDb;
     use rho_inference::PromptCacheKey;
-    use rho_workspaces::{WorkspaceId, WorkspaceIdDomain, WorkspaceInfo};
+    use rho_workspaces::WorkspaceInfo;
     use serde_json::json;
 
     use super::*;
@@ -2111,9 +2117,10 @@ mod tests {
             rho_core::UnixMs(1),
             agent_id,
             None,
-            vec![WorkspaceInfo::Workspace {
-                repo: "/home/user/src/rho".into(),
-                id: WorkspaceId::from_counter(1, &WorkspaceIdDomain(0)).unwrap(),
+            vec![WorkspaceInfo::Checkout {
+                workset: "test-workset".into(),
+                repo: "rho".into(),
+                name: "rho".into(),
             }],
             SessionBinding::ResponsesSol(crate::db::InferenceProfile::default()),
             AgentRuntime::Rho {

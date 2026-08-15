@@ -187,7 +187,8 @@ pub fn parse(text: &str) -> Vec<DeskHeading> {
         let terminator = (index + 1..headings.len())
             .find(|later| headings[*later].depth <= headings[index].depth);
         let mut end_line = terminator.map_or(lines.len(), |later| heading_lines[later]);
-        let keeps_gap = terminator.is_none_or(|later| headings[later].depth < headings[index].depth);
+        let keeps_gap =
+            terminator.is_none_or(|later| headings[later].depth < headings[index].depth);
         if keeps_gap {
             while end_line > line_index + 1 && lines[end_line - 1].text.trim().is_empty() {
                 end_line -= 1;
@@ -254,9 +255,9 @@ fn parse_tags(content: &str) -> (ParsedTags, &str) {
             !interior.is_empty()
                 && interior.split(':').all(|segment| {
                     !segment.is_empty()
-                        && segment
-                            .chars()
-                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '@' | '#'))
+                        && segment.chars().all(|c| {
+                            c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '@' | '#')
+                        })
                 })
         })
     else {
@@ -530,7 +531,6 @@ mod tests {
         assert_eq!(headings[2].title, "mark TODO list");
     }
 
-
     use super::*;
 
     #[test]
@@ -540,10 +540,7 @@ mod tests {
         assert_eq!(headings[0].tags, vec!["eng-x7y2"]);
         assert_eq!(headings[0].state, Some(DeskHeadingState::Done));
         assert_eq!(headings[0].title, "Fix parser");
-        assert_eq!(
-            &text[headings[0].tags_range.clone().unwrap()],
-            ":eng-x7y2:"
-        );
+        assert_eq!(&text[headings[0].tags_range.clone().unwrap()], ":eng-x7y2:");
         assert_eq!(&text[headings[0].state_range.clone().unwrap()], "DONE");
         // A colon inside the title is not a tag.
         assert!(headings[1].tags.is_empty());
@@ -569,7 +566,10 @@ mod tests {
         let (one, a, b, _two) = (&headings[0], &headings[1], &headings[2], &headings[3]);
         assert_eq!(&text[a.subtree_range.clone()], "** A\nbody\n\n");
         assert_eq!(&text[b.subtree_range.clone()], "** B\nstuff\n");
-        assert_eq!(&text[one.subtree_range.clone()], "* One\n** A\nbody\n\n** B\nstuff\n\n\n");
+        assert_eq!(
+            &text[one.subtree_range.clone()],
+            "* One\n** A\nbody\n\n** B\nstuff\n\n\n"
+        );
         // At the end of the document the gap also stays out.
         let headings = parse("* Last\nbody\n\n\n");
         assert_eq!(headings[0].subtree_range, 0.."* Last\nbody\n".len());

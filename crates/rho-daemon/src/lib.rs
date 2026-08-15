@@ -224,9 +224,6 @@ fn spawn_octo_server(
     Ok(())
 }
 
-/// Re-exported so daemon entry points can set up the user+mount namespace
-/// before the async runtime starts (see
-/// [`rho_workspaces::init_daemon_namespace`]).
 pub use rho_workspaces::{PathOverrides, init_daemon_namespace};
 
 const EMBEDDED_DIRENV_PATH_BEFORE: Option<&str> = option_env!("RHO_DIRENV_PATH_BEFORE");
@@ -1196,28 +1193,28 @@ impl AgentRegistry {
             StartMode::NewOn { repo, revset } => {
                 let repo = validate_repo_root(repo)?;
                 vec![rho_agent::StartWorkdir::Create {
-                    repo: self.pool.repo(&repo).await?,
+                    repo,
                     parent_revset: revset,
                 }]
             }
             StartMode::Sandbox { repo, revset } => {
                 let repo = validate_repo_root(repo)?;
                 vec![rho_agent::StartWorkdir::Sandbox {
-                    repo: self.pool.repo(&repo).await?,
+                    repo,
                     parent_revset: revset,
                 }]
             }
             StartMode::Join(JoinTarget::Workspace(info)) => {
                 vec![rho_agent::StartWorkdir::Existing(
-                    self.pool.open_workspace(&info).await?,
+                    self.pool.open_checkout(&info).await?,
                 )]
             }
-            StartMode::Join(JoinTarget::User { repo }) => {
-                let repo = validate_repo_root(repo)?;
-                vec![rho_agent::StartWorkdir::Existing(
-                    self.pool.repo(&repo).await?.user_checkout().await?,
-                )]
-            }
+            // TODO(workset-host-fork): replace this with a fetch-and-attach
+            // primitive that forks the host repo's current change into a new
+            // Workset without sharing the user's live files.
+            StartMode::Join(JoinTarget::User { .. }) => anyhow::bail!(
+                "joining the user's live checkout is not supported in the workset model yet"
+            ),
         };
         let (agent_id, agent) = self.pool.create(role, None, start).await?;
         Ok((agent_id, agent))
@@ -1351,7 +1348,7 @@ impl AgentRegistry {
                     .workdirs
                     .into_iter()
                     .map(|info| rho_agent::pool::SpawnWorkdir {
-                        repo: info.repo().to_owned(),
+                        repo: info.repo().to_owned().into(),
                         checkout: rho_agent::pool::SpawnCheckout::Shared,
                     })
                     .collect();
@@ -3033,7 +3030,7 @@ async fn shell_start(agents: &Arc<AgentRegistry>, agent: &str) -> anyhow::Result
     shell::ensure_supported_workdirs(&record.workdirs)?;
     let view = agents
         .pool
-        .materialize_view(&record.workdirs)
+        .materialize_namespace(&record.workdirs)
         .await
         .context("materialize agent view")?;
     agents
@@ -3129,7 +3126,7 @@ where
     static DIFF_LOADS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
     let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let _permit = DIFF_LOADS.acquire().await.context("diff loader closed")?;
-        let workspace = agents.pool.open_workspace(&workspace).await?;
+        let workspace = agents.pool.open_checkout(&workspace).await?;
         workspace
             .diff_base_contents(&operation_id, &commit_id, &paths)
             .await
@@ -3169,7 +3166,7 @@ where
     static DIFF_LOADS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
     let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
         let _permit = DIFF_LOADS.acquire().await.context("diff loader closed")?;
-        let workspace = agents.pool.open_workspace(&workspace).await?;
+        let workspace = agents.pool.open_checkout(&workspace).await?;
         workspace
             .diff_snapshot(known_commit_id.as_deref(), &include_paths)
             .await
@@ -3322,7 +3319,7 @@ async fn terminal_attach(
     );
     let view = agents
         .pool
-        .materialize_view(&record.workdirs)
+        .materialize_namespace(&record.workdirs)
         .await
         .context("materialize agent view")?;
     let shell = agents
@@ -3397,7 +3394,7 @@ where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let workspace = match agents.pool.open_workspace(&workspace).await {
+    let workspace = match agents.pool.open_checkout(&workspace).await {
         Ok(workspace) => workspace,
         Err(error) => {
             let _ = write_frame(
@@ -3653,7 +3650,7 @@ fn validate_label(label: &str) -> anyhow::Result<()> {
 
 fn validate_repo_root(path: Utf8PathBuf) -> anyhow::Result<Utf8PathBuf> {
     let path = expand_home(&path).unwrap_or(path);
-    rho_workspaces::resolve_repo_root(path.as_std_path())
+    Ok(path)
 }
 
 fn expand_home(path: &Utf8Path) -> Option<Utf8PathBuf> {

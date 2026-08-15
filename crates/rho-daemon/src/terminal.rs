@@ -65,7 +65,7 @@ const MAX_DIM: u16 = 1000;
 /// Everything needed to spawn a terminal's child process; built by the
 /// caller (which knows agents and views), used when no session is running.
 pub struct TerminalSpawn {
-    pub view: Arc<rho_workspaces::View>,
+    pub view: Arc<rho_workspaces::Namespace>,
     /// Program run through `direnv exec .` in the view's primary workdir.
     pub shell: String,
 }
@@ -316,10 +316,7 @@ impl Session {
         }
         command.env("TERM", "xterm-256color");
         command.env("COLORTERM", "truecolor");
-        spawn
-            .view
-            .prepare_command(&mut command, None, Vec::new())
-            .await?;
+        spawn.view.prepare_command(&mut command, None)?;
         command.stdin(std::process::Stdio::from(slave.try_clone()?));
         command.stdout(std::process::Stdio::from(slave.try_clone()?));
         command.stderr(std::process::Stdio::from(slave));
@@ -1076,6 +1073,21 @@ mod tests {
 
     #[tokio::test]
     async fn shell_end_to_end_over_registry() {
+        if !std::fs::read_to_string("/proc/self/uid_map")
+            .is_ok_and(|map| map.split_whitespace().nth(2) == Some("1"))
+        {
+            eprintln!("skipping: test process is not in an identity user namespace");
+            return;
+        }
+        let jj = std::env::var_os("RHO_JJ").unwrap_or_else(|| "jj".into());
+        if !std::process::Command::new(jj)
+            .args(["store", "--help"])
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            eprintln!("skipping: clone-store jj is unavailable");
+            return;
+        }
         if !std::process::Command::new("direnv")
             .arg("version")
             .output()
@@ -1085,15 +1097,62 @@ mod tests {
             return;
         }
         let temp = tempfile::tempdir().unwrap();
-        let repo = Arc::new(
-            rho_workspaces::Repo::open_plain_with_path_overrides(
-                temp.path(),
-                rho_workspaces::PathOverrides::default(),
-            )
-            .unwrap(),
+        let source = temp.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&source)
+                .status()
+                .unwrap()
+                .success()
         );
-        let workspace = repo.user_checkout().await.unwrap();
-        let view = rho_workspaces::View::new(vec![workspace]).unwrap();
+        std::fs::write(source.join("README"), "test\n").unwrap();
+        assert!(
+            std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Rho Test",
+                    "-c",
+                    "user.email=rho@example.invalid",
+                    "add",
+                    "."
+                ])
+                .current_dir(&source)
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Rho Test",
+                    "-c",
+                    "user.email=rho@example.invalid",
+                    "commit",
+                    "-qm",
+                    "initial"
+                ])
+                .current_dir(&source)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let environment = rho_workspaces::UserEnvironment::new(std::env::vars_os().collect());
+        let worksets = rho_workspaces::Worksets::open(
+            temp.path().join("storage"),
+            rho_db::RhoDb::open(temp.path().join("rho.redb")),
+            environment,
+            rho_workspaces::PathOverrides::default(),
+        )
+        .unwrap();
+        let workset = worksets.create().await.unwrap();
+        workset
+            .clone("source", source.to_str().unwrap(), Some("source"), None)
+            .await
+            .unwrap();
+        let view = workset.enter(rho_workspaces::Mode::Exposed).await.unwrap();
 
         let registry = Arc::new(TerminalRegistry::default());
         let agent_id =

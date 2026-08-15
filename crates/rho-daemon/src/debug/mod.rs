@@ -53,17 +53,37 @@ pub async fn run(args: DebugArgs) -> anyhow::Result<()> {
 async fn render_prompt(role: &str) -> anyhow::Result<()> {
     let role = parse_role(role)?;
     let cwd = std::env::current_dir().context("read current directory")?;
-    let (root, is_jj) = rho_workspaces::resolve_workdir_root(&cwd)?;
-    let repo = if is_jj {
-        rho_workspaces::Repo::open(root.as_std_path())?
-    } else {
-        rho_workspaces::Repo::open_plain_with_path_overrides(
-            root.as_std_path(),
-            rho_workspaces::PathOverrides::default(),
-        )?
-    };
-    let workspace = std::sync::Arc::new(repo).user_checkout().await?;
-    let view = rho_workspaces::View::new(vec![workspace])?;
+    let root =
+        std::process::Command::new(std::env::var_os("RHO_JJ").unwrap_or_else(|| "jj".into()))
+            .args(["root"])
+            .current_dir(&cwd)
+            .output()
+            .ok()
+            .filter(|output| output.status.success())
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .map(|root| PathBuf::from(root.trim()))
+            .unwrap_or(cwd);
+    let storage = tempfile::tempdir().context("create prompt workset storage")?;
+    let environment = rho_workspaces::UserEnvironment::new(std::env::vars_os().collect());
+    let worksets = rho_workspaces::Worksets::open(
+        storage.path(),
+        rho_db::RhoDb::open(storage.path().join("rho.redb")),
+        environment,
+        rho_workspaces::PathOverrides::default(),
+    )?;
+    let workset = worksets.create().await?;
+    let name = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("project");
+    workset
+        .clone(name, root.to_string_lossy().as_ref(), Some(name), None)
+        .await?;
+    let view = workset
+        .enter(rho_workspaces::Mode::View {
+            home_skeleton: None,
+        })
+        .await?;
     let surface = rho_agent::render_agent_surface(view, role)?;
 
     println!("# System prompt\n");
@@ -206,7 +226,7 @@ async fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
                 writeln!(output, "  session_id: {session_id}")?;
                 match rho_claude::find_session_transcript(
                     session_id,
-                    agent.primary_workdir().repo(),
+                    &workspace_visible_path(agent.primary_workdir()),
                 )
                 .await?
                 {
@@ -266,9 +286,11 @@ async fn print_context(db_path: Option<PathBuf>) -> anyhow::Result<()> {
             AgentRuntime::Claude { session_id } => {
                 writeln!(output, "  runtime: claude")?;
                 writeln!(output, "  session_id: {session_id}")?;
-                let transcript =
-                    rho_claude::find_session_transcript(session_id, agent.primary_workdir().repo())
-                        .await?;
+                let transcript = rho_claude::find_session_transcript(
+                    session_id,
+                    &workspace_visible_path(agent.primary_workdir()),
+                )
+                .await?;
                 let Some(transcript) = transcript else {
                     writeln!(output, "  transcript: <missing>")?;
                     continue;
@@ -276,7 +298,7 @@ async fn print_context(db_path: Option<PathBuf>) -> anyhow::Result<()> {
                 writeln!(output, "  transcript: {transcript}")?;
                 let messages = rho_claude::read_session_messages_by_id(
                     session_id,
-                    agent.primary_workdir().repo(),
+                    &workspace_visible_path(agent.primary_workdir()),
                     rho_claude::SessionMessagesOptions::default(),
                 )
                 .await?;
@@ -384,14 +406,13 @@ fn config_name(config: rho_agent::db::AgentRole) -> String {
 
 fn workspace_name(workspace: &WorkspaceInfo) -> String {
     match workspace {
-        WorkspaceInfo::UserCheckout { repo } => format!("user-checkout {repo}"),
-        WorkspaceInfo::Workspace { repo, id } => {
-            format!("workspace ws-{} in {repo}", id.encoded())
-        }
-        WorkspaceInfo::Sandbox { repo, id } => {
-            format!("sandbox ws-{} from {repo}", id.encoded())
-        }
+        WorkspaceInfo::Checkout { repo, name, .. } => format!("checkout {name} in {repo}"),
+        WorkspaceInfo::Sandbox { repo, name, .. } => format!("sandbox {name} from {repo}"),
     }
+}
+
+fn workspace_visible_path(workspace: &WorkspaceInfo) -> camino::Utf8PathBuf {
+    camino::Utf8PathBuf::from("/src").join(workspace.name())
 }
 
 #[cfg(test)]

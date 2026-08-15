@@ -247,7 +247,10 @@ impl AgentRegistry {
         self.children = BTreeMap::new();
         for agent in &summaries {
             if let Some(parent) = agent.parent_agent {
-                self.children.entry(parent).or_default().push(agent.agent_id);
+                self.children
+                    .entry(parent)
+                    .or_default()
+                    .push(agent.agent_id);
             }
         }
         self.tag_agents = BTreeMap::new();
@@ -348,9 +351,7 @@ impl AgentRegistry {
     /// preserves the runtime hierarchy and includes hidden agents so a full
     /// tree never silently rewrites its ancestry.
     pub fn agent_children(&self, agent_id: AgentId) -> &[AgentId] {
-        self.children
-            .get(&agent_id)
-            .map_or(&[][..], Vec::as_slice)
+        self.children.get(&agent_id).map_or(&[][..], Vec::as_slice)
     }
 
     pub fn agent_id_label(&self, agent_id: AgentId) -> String {
@@ -384,7 +385,9 @@ impl AgentRegistry {
         let agents = self.tag_agents.get(&host)?.get(role_prefix)?;
         let start = agents.partition_point(|(encoded, _)| encoded.as_str() < encoded_prefix);
         let found = agents.get(start)?.1;
-        agents[start].0.starts_with(encoded_prefix)
+        agents[start]
+            .0
+            .starts_with(encoded_prefix)
             .then_some(found)
             .filter(|_| {
                 !agents
@@ -395,15 +398,14 @@ impl AgentRegistry {
 
     pub fn working_directory(&self, agent_id: AgentId) -> Option<Utf8PathBuf> {
         self.agent_summary(agent_id)
-            .map(|a| a.workspace.repo().to_owned())
+            .map(|a| Utf8PathBuf::from("/src").join(a.workspace.name()))
     }
     pub fn agent_workspace(&self, agent_id: AgentId) -> Option<&rho_ui_proto::WorkspaceInfo> {
         self.agent_summary(agent_id).map(|a| &a.workspace)
     }
     pub fn workspace_id_label(&self, agent_id: AgentId) -> Option<String> {
         self.agent_summary(agent_id)
-            .and_then(|a| a.workspace.workspace_id())
-            .map(|id| format!("ws-{}", id.encoded()))
+            .map(|a| a.workspace.name().to_owned())
     }
     pub fn agent_role(&self, agent_id: AgentId) -> Option<rho_ui_proto::AgentRole> {
         self.agent_summary(agent_id).map(|a| a.role)

@@ -6,6 +6,7 @@
 //! and no security boundary is claimed.
 
 use std::ffi::{CString, OsStr, OsString};
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
 use std::path::{Component, Path, PathBuf};
@@ -14,7 +15,8 @@ use std::{fs, io};
 
 use anyhow::{Context as _, bail, ensure};
 
-pub const MOUNT_ROOT: &str = "/src";
+pub const VIEW_MOUNT_ROOT: &str = "/src";
+pub const EXPOSED_MOUNT_ROOT: &str = "/ws";
 
 #[derive(Clone, Debug)]
 pub struct WorkspaceMount {
@@ -163,9 +165,8 @@ impl FsViewBuilder {
 }
 
 /// Exposed mode: the full host view as the invoking user, plus the same
-/// `/src` mount-list tree the filesystem view presents, mounted over the
-/// host's permanently empty `/src` stub. Environment, `$HOME`, and every
-/// host path stay exactly as they are.
+/// `/ws` mount-list tree, mounted over the host's permanently empty `/ws` stub.
+/// Environment, `$HOME`, and every host path stay exactly as they are.
 pub struct ExposedBuilder {
     mounts: Mounts,
 }
@@ -176,10 +177,10 @@ impl ExposedBuilder {
         Ok(Self { mounts })
     }
 
-    /// Mounts the mount-list tmpfs at `root/src` in the current mount
+    /// Mounts the mount-list tmpfs at `root/ws` in the current mount
     /// namespace without forking, unsharing, or changing cwd/environment.
     pub fn build_in_place(&self, root: &Path) -> anyhow::Result<()> {
-        let ws = mount_root(root);
+        let ws = mount_root(root, EXPOSED_MOUNT_ROOT);
         ensure!(
             ws.is_dir(),
             "mount-list mount stub is missing: {}",
@@ -194,10 +195,10 @@ impl ExposedBuilder {
         )
         .with_context(|| format!("mount tmpfs over {}", ws.display()))?;
         fs::create_dir(ws.join(".stores")).context("create mount-list .stores")?;
-        mount_in_place(&self.mounts, root)
+        mount_in_place(&self.mounts, root, EXPOSED_MOUNT_ROOT)
     }
 
-    /// Runs a command with `/src` mounted (a new user and mount namespace).
+    /// Runs a command with `/ws` mounted (a new user and mount namespace).
     ///
     /// # Safety
     ///
@@ -318,8 +319,8 @@ fn setup_child(
 
 fn setup_exposed(set: &Mounts, program: &CString, argv: &[CString]) -> anyhow::Result<()> {
     ensure!(
-        Path::new(MOUNT_ROOT).is_dir(),
-        "host /src mount stub is missing (deployed via systemd-tmpfiles: d /src 0500 root root -)"
+        Path::new(EXPOSED_MOUNT_ROOT).is_dir(),
+        "host /ws mount stub is missing (deployed via systemd-tmpfiles: d /ws 0500 root root -)"
     );
     mark_inherited_fds_close_on_exec()?;
     unshare_identity_namespaces()?;
@@ -327,7 +328,7 @@ fn setup_exposed(set: &Mounts, program: &CString, argv: &[CString]) -> anyhow::R
         mounts: set.clone(),
     }
     .build_in_place(Path::new("/"))?;
-    let mount_root = CString::new(MOUNT_ROOT)?;
+    let mount_root = CString::new(EXPOSED_MOUNT_ROOT)?;
     cvt(unsafe { libc::chdir(mount_root.as_ptr()) }).context("chdir mount root")?;
     exec_command(program, argv)
 }
@@ -335,10 +336,17 @@ fn setup_exposed(set: &Mounts, program: &CString, argv: &[CString]) -> anyhow::R
 /// Unshares user and mount namespaces, maps the caller's uid/gid onto
 /// themselves, and makes all mounts private to the namespace.
 pub fn unshare_identity_namespaces() -> anyhow::Result<()> {
+    unshare_identity_user_namespace()?;
+    unshare_mount_namespace()
+}
+
+/// Establishes the process-wide identity user namespace. Call before starting
+/// any threads; individual worker threads can then create private mount
+/// namespaces with [`unshare_mount_namespace`].
+pub fn unshare_identity_user_namespace() -> anyhow::Result<()> {
     let identity_uid = unsafe { libc::getuid() };
     let identity_gid = unsafe { libc::getgid() };
-    cvt(unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) })
-        .context("unshare user and mount namespaces")?;
+    cvt(unsafe { libc::unshare(libc::CLONE_NEWUSER) }).context("unshare user namespace")?;
     fs::write(
         "/proc/self/uid_map",
         format!("{identity_uid} {identity_uid} 1\n"),
@@ -350,6 +358,12 @@ pub fn unshare_identity_namespaces() -> anyhow::Result<()> {
         format!("{identity_gid} {identity_gid} 1\n"),
     )
     .context("write identity gid_map")?;
+    Ok(())
+}
+
+pub fn unshare_mount_namespace() -> anyhow::Result<()> {
+    unshare_fs_attributes()?;
+    cvt(unsafe { libc::unshare(libc::CLONE_NEWNS) }).context("unshare mount namespace")?;
     mount_fs(
         None,
         Path::new("/"),
@@ -359,6 +373,15 @@ pub fn unshare_identity_namespaces() -> anyhow::Result<()> {
     )
     .context("make mounts recursively private")?;
     Ok(())
+}
+
+/// Detaches the calling thread's cwd/root state before it changes or enters a
+/// mount namespace. Required for both `unshare(CLONE_NEWNS)` and `setns` from
+/// a pthread, whose fs_struct is shared by default.
+pub fn unshare_fs_attributes() -> anyhow::Result<()> {
+    cvt(unsafe { libc::unshare(libc::CLONE_FS) })
+        .context("unshare filesystem attributes")
+        .map(|_| ())
 }
 
 fn arm_parent_death_signal(expected_parent: libc::pid_t) -> anyhow::Result<()> {
@@ -424,7 +447,7 @@ fn build_filesystem(config: &FsViewConfig, root: &Path) -> anyhow::Result<()> {
     }
     fs::set_permissions(root.join("tmp"), fs::Permissions::from_mode(0o1777))?;
     build_dev(root)?;
-    mount_in_place(&config.mounts, root)?;
+    mount_in_place(&config.mounts, root, VIEW_MOUNT_ROOT)?;
     Ok(())
 }
 
@@ -478,14 +501,130 @@ fn build_dev(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Adds a validated working set below `root/src` in the current mount
-/// namespace. This is also the primitive used to refresh a live namespace
+struct PreparedEntry {
+    name: String,
+    source: OwnedFd,
+}
+struct PreparedStore {
+    name: String,
+    source: OwnedFd,
+    writable_clone: String,
+    clone_source: OwnedFd,
+}
+/// Detached mount trees captured before entering a target mount namespace.
+pub struct PreparedMounts {
+    workspaces: Vec<PreparedEntry>,
+    stores: Vec<PreparedStore>,
+}
+
+/// Captures mount sources in detached trees that survive a namespace switch.
+pub fn prepare_mounts(set: &Mounts) -> anyhow::Result<PreparedMounts> {
+    validate_mounts(set)?;
+    let workspaces = set
+        .workspaces
+        .iter()
+        .map(|entry| {
+            Ok(PreparedEntry {
+                name: entry.name.clone(),
+                source: clone_mount(&entry.source)?,
+            })
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let stores = set
+        .stores
+        .iter()
+        .map(|entry| {
+            Ok(PreparedStore {
+                name: entry.name.clone(),
+                source: clone_mount(&entry.source)?,
+                writable_clone: entry.writable_clone.clone(),
+                clone_source: clone_mount(
+                    &entry.source.join("clones").join(&entry.writable_clone),
+                )?,
+            })
+        })
+        .collect::<anyhow::Result<_>>()?;
+    Ok(PreparedMounts { workspaces, stores })
+}
+
+fn clone_mount(source: &Path) -> anyhow::Result<OwnedFd> {
+    let staging = tempfile::tempdir().context("create mount staging directory")?;
+    bind(source, staging.path(), false)?;
+    let path = cstring(staging.path())?;
+    const OPEN_TREE_CLONE: libc::c_uint = 1;
+    const AT_RECURSIVE: libc::c_uint = 0x8000;
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_open_tree,
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            OPEN_TREE_CLONE | libc::O_CLOEXEC as libc::c_uint | AT_RECURSIVE,
+        ) as i32
+    };
+    let open_result = if fd < 0 {
+        Err(io::Error::last_os_error()).context("clone staged mount")
+    } else {
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    };
+    let unmounted = unsafe { libc::umount2(path.as_ptr(), libc::MNT_DETACH) };
+    if unmounted < 0 {
+        return Err(io::Error::last_os_error()).context("unmount staged source");
+    }
+    open_result
+}
+
+fn install_mount(source: &OwnedFd, target: &Path, readonly: bool) -> anyhow::Result<()> {
+    let target = cstring(target)?;
+    const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 4;
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_move_mount,
+            source.as_raw_fd(),
+            c"".as_ptr(),
+            libc::AT_FDCWD,
+            target.as_ptr(),
+            MOVE_MOUNT_F_EMPTY_PATH,
+        )
+    };
+    if result < 0 {
+        return Err(io::Error::last_os_error()).context("install prepared mount");
+    }
+    set_mount_attributes(Path::new(OsStr::from_bytes(target.as_bytes())), readonly)
+}
+
+/// Installs previously captured mount trees below a visible root.
+pub fn mount_prepared_in_place(
+    set: &PreparedMounts,
+    root: &Path,
+    visible_root: &str,
+) -> anyhow::Result<()> {
+    let ws = mount_root(root, visible_root);
+    for store in &set.stores {
+        let target = ws.join(".stores").join(&store.name);
+        fs::create_dir(&target)?;
+        install_mount(&store.source, &target, true)?;
+        install_mount(
+            &store.clone_source,
+            &target.join("clones").join(&store.writable_clone),
+            false,
+        )?;
+    }
+    for entry in &set.workspaces {
+        let target = ws.join(&entry.name);
+        fs::create_dir(&target)?;
+        install_mount(&entry.source, &target, false)?;
+    }
+    Ok(())
+}
+
+/// Adds a validated working set below the selected visible root in the current
+/// mount namespace. This is also the primitive used to refresh a live namespace
 /// after a daemon grants another store or creates another workspace. For
 /// refresh, pass a `Mounts` containing only the newly added entries; collisions
 /// with already-mounted names fail when their target directory is created.
-pub fn mount_in_place(set: &Mounts, root: &Path) -> anyhow::Result<()> {
+pub fn mount_in_place(set: &Mounts, root: &Path, visible_root: &str) -> anyhow::Result<()> {
     validate_mounts(set)?;
-    let ws = mount_root(root);
+    let ws = mount_root(root, visible_root);
     for store in &set.stores {
         let target = ws.join(".stores").join(&store.name);
         fs::create_dir(&target)?;
@@ -514,7 +653,7 @@ fn pivot_into(root: &Path) -> anyhow::Result<()> {
     cvt(unsafe { libc::umount2(c"/old-root".as_ptr(), libc::MNT_DETACH) })
         .context("detach host root")?;
     fs::remove_dir("/old-root").context("remove old root mount point")?;
-    let mount_root = CString::new(MOUNT_ROOT)?;
+    let mount_root = CString::new(VIEW_MOUNT_ROOT)?;
     cvt(unsafe { libc::chdir(mount_root.as_ptr()) }).context("chdir mount root")?;
     Ok(())
 }
@@ -573,6 +712,10 @@ fn bind(source: &Path, target: &Path, readonly: bool) -> anyhow::Result<()> {
         None,
     )
     .with_context(|| format!("bind {} at {}", source.display(), target.display()))?;
+    set_mount_attributes(target, readonly)
+}
+
+fn set_mount_attributes(target: &Path, readonly: bool) -> anyhow::Result<()> {
     // Setting flags via mount_setattr (bind root and MS_REC-cloned submounts
     // alike) never clears anything, so it cannot collide with flags the user
     // namespace holds locked — unlike MS_REMOUNT|MS_BIND, which must repeat
@@ -634,8 +777,8 @@ fn cstring(path: &Path) -> anyhow::Result<CString> {
     CString::new(path.as_os_str().as_bytes()).context("path contains NUL")
 }
 
-fn mount_root(root: &Path) -> PathBuf {
-    root.join(MOUNT_ROOT.trim_start_matches('/'))
+fn mount_root(root: &Path, visible_root: &str) -> PathBuf {
+    root.join(visible_root.trim_start_matches('/'))
 }
 fn cvt(value: i32) -> io::Result<i32> {
     if value < 0 {

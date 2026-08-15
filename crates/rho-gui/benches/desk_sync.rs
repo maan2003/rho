@@ -11,8 +11,7 @@ use rho_gui::dashboard::bench_support::{Pass, generate_pass};
 use rho_gui::registry::{AgentRegistry, HostId};
 use rho_ui_proto::desk::parse;
 use rho_ui_proto::{
-    AgentDisposition, AgentId, AgentIdDomain, AgentRole, UiAgentSummary, UiAttention,
-    WorkspaceInfo,
+    AgentDisposition, AgentId, AgentIdDomain, AgentRole, UiAgentSummary, UiAttention, WorkspaceInfo,
 };
 
 struct Fixture {
@@ -29,8 +28,10 @@ fn agent_summary(id: u64) -> UiAgentSummary {
         created_at: UnixMs(id),
         updated_at: UnixMs(id),
         role: AgentRole::default(),
-        workspace: WorkspaceInfo::UserCheckout {
+        workspace: WorkspaceInfo::Checkout {
+            workset: "test-workset".into(),
             repo: "/tmp".into(),
+            name: "repo".into(),
         },
         attention: UiAttention::Quiet,
         last_active: UnixMs(id),
@@ -66,10 +67,7 @@ fn build_fixture(heading_count: usize) -> Fixture {
     for (index, heading) in parse(&text).iter().enumerate() {
         filed.insert(
             (host, heading.heading_range.start),
-            vec![
-                agents[index * 2].agent_id,
-                agents[index * 2 + 1].agent_id,
-            ],
+            vec![agents[index * 2].agent_id, agents[index * 2 + 1].agent_id],
         );
     }
     Fixture {

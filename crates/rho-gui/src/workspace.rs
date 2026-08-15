@@ -53,17 +53,16 @@ use crate::store::{AgentStore, FrameSummary};
 use crate::style::{RoleFamily, StyleClass};
 use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
-    AgentDone, AgentHide, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, DashboardBack,
-    DashboardArchive, DashboardDeleteEmpty, DashboardDemote, DashboardGoto, DashboardHeadingAbove,
-    DashboardHeadingBelow, DashboardJump,
-    DashboardNewAgent, DashboardNow, DashboardPromote, DashboardRenameTopic, DashboardReply,
-    DashboardCycleGlobal, DashboardStaff, DashboardSubmit, DashboardToggleAgentTree,
-    DashboardToggleSubagents, DashboardUndo, GitApprovalAllow, GitApprovalDeny,
-    MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious,
-    PaneBack, PaneClose, PaneFocusNext, PaneSplitDown, PaneSplitRight, PastePrompt, RailFocus,
-    RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore,
-    ShellPagerQuit, SubmitPrompt, TaskBoard, VoiceToggle, ZulipLoadOlder, ZulipNextUnread,
-    ZulipOpenRow, ZulipQuit,
+    AgentDone, AgentHide, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, DashboardArchive,
+    DashboardBack, DashboardCycleGlobal, DashboardDeleteEmpty, DashboardDemote, DashboardGoto,
+    DashboardHeadingAbove, DashboardHeadingBelow, DashboardJump, DashboardNewAgent, DashboardNow,
+    DashboardPromote, DashboardRenameTopic, DashboardReply, DashboardStaff, DashboardSubmit,
+    DashboardToggleAgentTree, DashboardToggleSubagents, DashboardUndo, GitApprovalAllow,
+    GitApprovalDeny, MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext,
+    MinibufferPrevious, PaneBack, PaneClose, PaneFocusNext, PaneSplitDown, PaneSplitRight,
+    PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt,
+    ShellPagerAll, ShellPagerMore, ShellPagerQuit, SubmitPrompt, TaskBoard, VoiceToggle,
+    ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow, ZulipQuit,
 };
 
 /// What a pane shows: stable identity plus the live view. Surfaces live
@@ -2153,10 +2152,10 @@ impl Workspace {
     /// Interprets the draft's start field (`auto` selects the first available
     /// local `main`, local `master`, or `trunk()`). An agent label resolves to
     /// the agent's workspace — `<ws-id>@` as a stacking base, or the workspace
-    /// itself for Join; anything else is a revset (stacking only). `user` is
-    /// only meaningful for Join — your own checkout. Agent targets carry their
-    /// own repo; `workdir` is only needed (and only checked) for the other
-    /// arms.
+    /// itself for Join; anything else is a revset (stacking only). Joining the
+    /// user's live checkout is deliberately unavailable in the Workset model.
+    /// Agent targets carry their own repo; `workdir` is only needed (and only
+    /// checked) for the other arms.
     fn parse_start(
         &self,
         mode: crate::draft_view::StartFieldMode,
@@ -2164,7 +2163,7 @@ impl Workspace {
         workdir: Option<HostPath>,
         selected_host: Option<HostId>,
     ) -> Result<(HostId, rho_ui_proto::StartMode), String> {
-        use rho_ui_proto::{JoinTarget, StartMode, WorkspaceInfo};
+        use rho_ui_proto::{JoinTarget, StartMode};
 
         use crate::draft_view::StartFieldMode;
         let require_workdir = || {
@@ -2219,19 +2218,8 @@ impl Workspace {
             (StartFieldMode::Sandbox, "", _) => {
                 return Err("pick a sandbox base: a revset like `@-` or an agent label".to_owned());
             }
-            (
-                StartFieldMode::Sandbox,
-                _,
-                Some(WorkspaceInfo::Workspace { repo, id } | WorkspaceInfo::Sandbox { repo, id }),
-            ) => StartMode::Sandbox {
-                repo,
-                revset: format!("{}@", id.encoded()),
-            },
-            (StartFieldMode::Sandbox, _, Some(WorkspaceInfo::UserCheckout { repo })) => {
-                StartMode::Sandbox {
-                    repo,
-                    revset: "@".to_owned(),
-                }
+            (StartFieldMode::Sandbox, _, Some(_)) => {
+                return Err("starting a sandbox from an agent checkout is not supported; select a registered project and revset".to_owned());
             }
             (StartFieldMode::Sandbox, _, None) => StartMode::Sandbox {
                 repo: require_workdir()?.path,
@@ -2245,26 +2233,15 @@ impl Workspace {
             (StartFieldMode::NewOn, "", _) => {
                 return Err("pick a base: a revset like `@-` or an agent label".to_owned());
             }
-            (
-                StartFieldMode::NewOn,
-                _,
-                Some(WorkspaceInfo::Workspace { repo, id } | WorkspaceInfo::Sandbox { repo, id }),
-            ) => StartMode::NewOn {
-                repo,
-                revset: format!("{}@", id.encoded()),
-            },
-            // An agent in the user's checkout works on the user's own change.
-            (StartFieldMode::NewOn, _, Some(WorkspaceInfo::UserCheckout { repo })) => {
-                StartMode::NewOn {
-                    repo,
-                    revset: "@".to_owned(),
-                }
+            (StartFieldMode::NewOn, _, Some(_)) => {
+                return Err("starting from an agent checkout is not supported; select a registered project and revset".to_owned());
             }
             (StartFieldMode::NewOn, _, None) => {
                 if target.eq_ignore_ascii_case("user") {
-                    return Err("`user` is a join target; base on a revset like `@-`, \
-                         or Shift-Tab to Join mode"
-                        .to_owned());
+                    return Err(
+                        "joining the user's live checkout is not supported in the workset model yet"
+                            .to_owned(),
+                    );
                 }
                 if target
                     .strip_prefix('@')
@@ -2287,12 +2264,13 @@ impl Workspace {
             }
             (StartFieldMode::Join, target, None) => {
                 if target.is_empty() || target.eq_ignore_ascii_case("user") {
-                    StartMode::Join(JoinTarget::User {
-                        repo: require_workdir()?.path,
-                    })
+                    return Err(
+                        "joining the user's live checkout is not supported in the workset model yet"
+                            .to_owned(),
+                    );
                 } else {
                     return Err(format!(
-                        "join target must be `user` or an agent label, not `{target}`"
+                        "join target must be an agent label, not `{target}`"
                     ));
                 }
             }
@@ -3496,8 +3474,7 @@ impl Workspace {
                 offset,
                 first_attention,
                 ..
-            }) => first_attention
-                .or_else(|| self.dashboard.first_agent_for_topic((host, offset))),
+            }) => first_attention.or_else(|| self.dashboard.first_agent_for_topic((host, offset))),
             Some(RowTarget::NewDraft(Some(topic))) => self.dashboard.first_agent_for_topic(topic),
             _ => None,
         };
@@ -4204,7 +4181,8 @@ impl Workspace {
     /// don't exist); verbs gated on connectivity need this to run.
     #[cfg(test)]
     pub(crate) fn force_host_online(&mut self, host: HostId) {
-        self.hosts.set_status(host, crate::hosts::HostStatus::Online);
+        self.hosts
+            .set_status(host, crate::hosts::HostStatus::Online);
     }
 
     #[cfg(test)]
@@ -4547,9 +4525,9 @@ impl Workspace {
                 None
             }
             // Files and chat keep whatever agent context was current.
-            SurfaceKey::File { .. }
-            | SurfaceKey::ZulipInbox
-            | SurfaceKey::ZulipNarrow { .. } => None,
+            SurfaceKey::File { .. } | SurfaceKey::ZulipInbox | SurfaceKey::ZulipNarrow { .. } => {
+                None
+            }
         };
         if self.connected()
             && let Some(agent_id) = selected
@@ -4929,11 +4907,7 @@ impl Workspace {
         cx.notify();
     }
 
-    pub(crate) fn cmd_toggle_raw_desk(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn cmd_toggle_raw_desk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dashboard.toggle_raw_mode(cx);
         self.refresh_dashboard(window, cx);
     }
@@ -4944,7 +4918,12 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let Some(topic) = self.dashboard.cursor_topic(cx) else {
-            self.notice_on(None, "staff: choose a Desk heading", StyleClass::SystemInfo, cx);
+            self.notice_on(
+                None,
+                "staff: choose a Desk heading",
+                StyleClass::SystemInfo,
+                cx,
+            );
             return;
         };
         self.begin_new_agent_configuration(NewAgentIntent::Staff(topic), window, cx);
@@ -5252,20 +5231,15 @@ impl Workspace {
             std::rc::Rc::new(move |workspace: &Workspace, input: &str, _: &gpui::App| {
                 let needle = input.trim().to_lowercase();
                 let mut candidates = workspace.live_agent_targets();
-                candidates.insert(
-                    0,
-                    if mode == StartFieldMode::Join {
-                        crate::commands::Candidate {
-                            value: "user".to_owned(),
-                            description: "your checkout".to_owned(),
-                        }
-                    } else {
+                if mode != StartFieldMode::Join {
+                    candidates.insert(
+                        0,
                         crate::commands::Candidate {
                             value: crate::draft_view::DEFAULT_START.to_owned(),
                             description: "local main → local master → trunk".to_owned(),
-                        }
-                    },
-                );
+                        },
+                    );
+                }
                 candidates
                     .into_iter()
                     .filter(|candidate| {
@@ -5311,11 +5285,7 @@ impl Workspace {
         self.open_new_agent_transient(window, cx);
     }
 
-    pub(crate) fn compose_configured_agent(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn compose_configured_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(intent) = self.new_agent_draft.as_ref().map(|draft| draft.intent) else {
             return;
         };
@@ -5362,16 +5332,13 @@ impl Workspace {
                     rho_ui_proto::StartMode::NewOn { repo, .. }
                     | rho_ui_proto::StartMode::Sandbox { repo, .. }
                     | rho_ui_proto::StartMode::Join(rho_ui_proto::JoinTarget::User { repo }) => {
-                        repo.as_path()
+                        Some(repo.as_path())
                     }
-                    rho_ui_proto::StartMode::Join(rho_ui_proto::JoinTarget::Workspace(info)) => {
-                        info.repo()
-                    }
+                    rho_ui_proto::StartMode::Join(rho_ui_proto::JoinTarget::Workspace(_)) => None,
                 };
                 if let Some(project) = self.workdirs.iter().find(|candidate| {
-                    candidate.host == host && candidate.project.path.as_path() == repo
-                })
-                {
+                    candidate.host == host && Some(candidate.project.path.as_path()) == repo
+                }) {
                     self.dashboard.set_heading_project(
                         topic_host,
                         offset,
@@ -5382,10 +5349,13 @@ impl Workspace {
                 self.dashboard.cursor_to_doc(topic_host, offset, cx);
                 self.desk_sync.anchor_at(topic_host, offset, cx)
             }
-            None => self.dashboard.append_placeholder_heading(host, cx).and_then(|offset| {
-                self.dashboard.cursor_to_doc(host, offset, cx);
-                self.desk_sync.anchor_at(host, offset, cx)
-            }),
+            None => self
+                .dashboard
+                .append_placeholder_heading(host, cx)
+                .and_then(|offset| {
+                    self.dashboard.cursor_to_doc(host, offset, cx);
+                    self.desk_sync.anchor_at(host, offset, cx)
+                }),
         };
         self.send_to_host(
             host,
@@ -5413,8 +5383,8 @@ impl Workspace {
                 first_attention,
                 on_heading_line,
             }) => {
-                if let Some(agent_id) = first_attention
-                    .or_else(|| self.dashboard.first_agent_for_topic((host, offset)))
+                if let Some(agent_id) =
+                    first_attention.or_else(|| self.dashboard.first_agent_for_topic((host, offset)))
                 {
                     self.open_agent(agent_id, window, cx);
                 } else if on_heading_line {
@@ -5522,7 +5492,9 @@ impl Workspace {
                     .or_else(|| self.dashboard.first_agent_for_topic((host, offset)))
                 {
                     Some(agent_id) => self.dashboard.open_reply(agent_id, window, cx),
-                    None => self.dashboard.open_new_draft(Some((host, offset)), window, cx),
+                    None => self
+                        .dashboard
+                        .open_new_draft(Some((host, offset)), window, cx),
                 }
                 self.dashboard_focus_draft(window, cx);
             }
@@ -5668,7 +5640,8 @@ impl Workspace {
                     repo: workdir.project.path,
                     revset: crate::draft_view::AUTO_BASE_REVSET.to_owned(),
                 },
-                content: (!body.trim().is_empty()).then_some(vec![ContentPart::Text { text: body }]),
+                content: (!body.trim().is_empty())
+                    .then_some(vec![ContentPart::Text { text: body }]),
                 desk_anchor: None,
             },
         );

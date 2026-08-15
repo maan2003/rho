@@ -8,6 +8,7 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+bytes.workspace = true
 camino.workspace = true
 dirs.workspace = true
 futures.workspace = true
@@ -16,9 +17,10 @@ jj-cli.workspace = true
 libc.workspace = true
 rho-context-config.workspace = true
 rho-fs-view.workspace = true
+rho-db.workspace = true
+redb.workspace = true
+senax-encoder.workspace = true
+serde_json.workspace = true
 rho-workspaces-types.workspace = true
 tokio.workspace = true
 tempfile.workspace = true
-
-[dev-dependencies]
-serde_json.workspace = true

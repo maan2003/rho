@@ -3349,7 +3349,11 @@ fn heading_tags_file_agents_and_conceal_in_display(cx: &mut TestAppContext) {
         created_at: UnixMs(id),
         updated_at: UnixMs(id),
         role: AgentRole::default(),
-        workspace: WorkspaceInfo::UserCheckout { repo: "/tmp".into() },
+        workspace: WorkspaceInfo::Checkout {
+            workset: "test-workset".into(),
+            repo: "/tmp".into(),
+            name: "repo".into(),
+        },
         attention: UiAttention::Quiet,
         last_active: UnixMs(id),
         hidden: false,
@@ -3361,11 +3365,8 @@ fn heading_tags_file_agents_and_conceal_in_display(cx: &mut TestAppContext) {
     };
 
     let desk_text = format!("* One :eng-{}:\nbody\n* Two\n", agent(1).encoded());
-    let mut source = text::Buffer::new(
-        text::ReplicaId::new(8),
-        text::BufferId::new(1).unwrap(),
-        "",
-    );
+    let mut source =
+        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
     let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text.as_str())]));
     let desk_snapshot = DeskSnapshot {
         text: source.snapshot().text(),
@@ -3478,7 +3479,10 @@ fn heading_tags_file_agents_and_conceal_in_display(cx: &mut TestAppContext) {
                 .update(cx, |editor, cx| editor.display_text(cx))
         })
         .expect("read raw display");
-    assert!(raw_display.contains("* One :eng-"), "raw display: {raw_display:?}");
+    assert!(
+        raw_display.contains("* One :eng-"),
+        "raw display: {raw_display:?}"
+    );
     let hints = workspace
         .update(cx, |workspace, _, cx| {
             workspace.dashboard_editor().read(cx).eol_hints().len()
@@ -3529,7 +3533,11 @@ fn preview_clears_when_the_cursor_leaves_a_staffed_heading(cx: &mut TestAppConte
         created_at: UnixMs(id),
         updated_at: UnixMs(id),
         role: AgentRole::default(),
-        workspace: WorkspaceInfo::UserCheckout { repo: "/tmp".into() },
+        workspace: WorkspaceInfo::Checkout {
+            workset: "test-workset".into(),
+            repo: "/tmp".into(),
+            name: "repo".into(),
+        },
         attention: UiAttention::Quiet,
         last_active: UnixMs(id),
         hidden: false,
@@ -3541,11 +3549,8 @@ fn preview_clears_when_the_cursor_leaves_a_staffed_heading(cx: &mut TestAppConte
     };
 
     let desk_text = format!("* One :eng-{}:\nbody\n* Two\n", agent(1).encoded());
-    let mut source = text::Buffer::new(
-        text::ReplicaId::new(8),
-        text::BufferId::new(1).unwrap(),
-        "",
-    );
+    let mut source =
+        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
     let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text.as_str())]));
     let desk_snapshot = DeskSnapshot {
         text: source.snapshot().text(),
@@ -3591,28 +3596,27 @@ fn preview_clears_when_the_cursor_leaves_a_staffed_heading(cx: &mut TestAppConte
     cx.update(|cx| cx.refresh_windows());
     cx.run_until_parked();
 
-    let select = |workspace: &gpui::WindowHandle<Workspace>,
-                  cx: &mut TestAppContext,
-                  offset: usize| {
-        workspace
-            .update(cx, |workspace, window, cx| {
-                let source = workspace.desk_buffer_for_test(HostId::default()).unwrap();
-                let source_anchor = source.read(cx).anchor_after(offset);
-                workspace.dashboard_editor().update(cx, |editor, cx| {
-                    let anchor = editor
-                        .buffer()
-                        .read(cx)
-                        .snapshot(cx)
-                        .anchor_in_excerpt(source_anchor)
-                        .expect("Desk offset is visible");
-                    editor.change_selections(Default::default(), window, cx, |selections| {
-                        selections.select_anchor_ranges([anchor..anchor]);
+    let select =
+        |workspace: &gpui::WindowHandle<Workspace>, cx: &mut TestAppContext, offset: usize| {
+            workspace
+                .update(cx, |workspace, window, cx| {
+                    let source = workspace.desk_buffer_for_test(HostId::default()).unwrap();
+                    let source_anchor = source.read(cx).anchor_after(offset);
+                    workspace.dashboard_editor().update(cx, |editor, cx| {
+                        let anchor = editor
+                            .buffer()
+                            .read(cx)
+                            .snapshot(cx)
+                            .anchor_in_excerpt(source_anchor)
+                            .expect("Desk offset is visible");
+                        editor.change_selections(Default::default(), window, cx, |selections| {
+                            selections.select_anchor_ranges([anchor..anchor]);
+                        });
                     });
-                });
-            })
-            .expect("move dashboard cursor");
-        cx.run_until_parked();
-    };
+                })
+                .expect("move dashboard cursor");
+            cx.run_until_parked();
+        };
     let preview = |workspace: &gpui::WindowHandle<Workspace>, cx: &mut TestAppContext| {
         workspace
             .update(cx, |workspace, _, _| workspace.dashboard_preview_agent())
@@ -3653,7 +3657,11 @@ fn tab_cycles_folds_on_a_staffed_heading(cx: &mut TestAppContext) {
         created_at: UnixMs(1),
         updated_at: UnixMs(1),
         role: AgentRole::default(),
-        workspace: WorkspaceInfo::UserCheckout { repo: "/tmp".into() },
+        workspace: WorkspaceInfo::Checkout {
+            workset: "test-workset".into(),
+            repo: "/tmp".into(),
+            name: "repo".into(),
+        },
         attention: UiAttention::Quiet,
         last_active: UnixMs(1),
         hidden: false,
@@ -3668,11 +3676,8 @@ fn tab_cycles_folds_on_a_staffed_heading(cx: &mut TestAppContext) {
         "* One :eng-{}:\nbody\n** Kid\nkid stuff\n* Two\n",
         agent(1).encoded()
     );
-    let mut source = text::Buffer::new(
-        text::ReplicaId::new(8),
-        text::BufferId::new(1).unwrap(),
-        "",
-    );
+    let mut source =
+        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
     let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text.as_str())]));
     let desk_snapshot = DeskSnapshot {
         text: source.snapshot().text(),
@@ -3786,11 +3791,8 @@ fn shift_tab_cycles_overview_contents_show_all(cx: &mut TestAppContext) {
     use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
 
     let desk_text = "* One\nbody\n** Kid\nkid stuff\n* Two\ntwo body\n";
-    let mut source = text::Buffer::new(
-        text::ReplicaId::new(8),
-        text::BufferId::new(1).unwrap(),
-        "",
-    );
+    let mut source =
+        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
     let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text)]));
     let workspace = test_workspace(cx);
     cx.update(bind_test_keymaps);
@@ -3869,11 +3871,8 @@ fn collapsed_subtree_folds_in_the_display_and_survives_edits(cx: &mut TestAppCon
     use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
 
     let desk_text = "* One\nbody\n** Kid\nkid stuff\n* Two\n";
-    let mut source = text::Buffer::new(
-        text::ReplicaId::new(8),
-        text::BufferId::new(1).unwrap(),
-        "",
-    );
+    let mut source =
+        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
     let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text)]));
     let desk_snapshot = DeskSnapshot {
         text: source.snapshot().text(),
@@ -3979,11 +3978,8 @@ fn vim_treats_a_collapsed_subtree_as_one_line(cx: &mut TestAppContext) {
     use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
 
     let desk_text = "* One\nbody\n* Two\n";
-    let mut source = text::Buffer::new(
-        text::ReplicaId::new(8),
-        text::BufferId::new(1).unwrap(),
-        "",
-    );
+    let mut source =
+        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
     let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text)]));
     let workspace = test_workspace(cx);
     cx.update(bind_test_keymaps);
@@ -4122,7 +4118,11 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
         created_at: UnixMs(id),
         updated_at: UnixMs(id),
         role: AgentRole::default(),
-        workspace: WorkspaceInfo::UserCheckout { repo: "/tmp".into() },
+        workspace: WorkspaceInfo::Checkout {
+            workset: "test-workset".into(),
+            repo: "/tmp".into(),
+            name: "repo".into(),
+        },
         attention: UiAttention::Quiet,
         last_active: UnixMs(id),
         hidden: false,
@@ -4133,11 +4133,8 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
         labels: Vec::new(),
     };
 
-    let mut source = text::Buffer::new(
-        text::ReplicaId::new(8),
-        text::BufferId::new(1).unwrap(),
-        "",
-    );
+    let mut source =
+        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
     let desk_text = format!("* One :eng-{}:\nbody\n* Two\n", agent(1).encoded());
     let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text.as_str())]));
     let desk_snapshot = DeskSnapshot {
@@ -4281,11 +4278,8 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
 fn insert_mode_enter_stays_a_newline_in_desk_text(cx: &mut TestAppContext) {
     use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
 
-    let mut source = text::Buffer::new(
-        text::ReplicaId::new(8),
-        text::BufferId::new(1).unwrap(),
-        "",
-    );
+    let mut source =
+        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
     let operation = DeskOperation::from_text(&source.edit([(0..0, "* One\nbody\n* Two\n")]));
     let desk_snapshot = DeskSnapshot {
         text: source.snapshot().text(),
@@ -4371,11 +4365,8 @@ fn insert_mode_enter_stays_a_newline_in_desk_text(cx: &mut TestAppContext) {
 fn quick_spawn_send_relocates_the_cursor(cx: &mut TestAppContext) {
     use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
 
-    let mut source = text::Buffer::new(
-        text::ReplicaId::new(8),
-        text::BufferId::new(1).unwrap(),
-        "",
-    );
+    let mut source =
+        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
     let operation = DeskOperation::from_text(&source.edit([(0..0, "* One\nbody\n")]));
     let desk_snapshot = DeskSnapshot {
         text: source.snapshot().text(),
@@ -4563,7 +4554,11 @@ fn quick_spawn_placeholder_takes_the_generated_title(cx: &mut TestAppContext) {
         created_at: UnixMs(1),
         updated_at: UnixMs(1),
         role: AgentRole::default(),
-        workspace: WorkspaceInfo::UserCheckout { repo: "/tmp".into() },
+        workspace: WorkspaceInfo::Checkout {
+            workset: "test-workset".into(),
+            repo: "/tmp".into(),
+            name: "repo".into(),
+        },
         attention: UiAttention::Quiet,
         last_active: UnixMs(1),
         hidden: false,
@@ -4586,11 +4581,8 @@ fn quick_spawn_placeholder_takes_the_generated_title(cx: &mut TestAppContext) {
         agent_counter: 100,
     };
 
-    let mut source = text::Buffer::new(
-        text::ReplicaId::new(8),
-        text::BufferId::new(1).unwrap(),
-        "",
-    );
+    let mut source =
+        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
     let operation = DeskOperation::from_text(&source.edit([(0..0, "* One\nbody\n")]));
     let desk_snapshot = DeskSnapshot {
         text: source.snapshot().text(),
@@ -4694,7 +4686,11 @@ fn daemon_retag_keeps_the_caret_at_the_title_end(cx: &mut TestAppContext) {
         created_at: UnixMs(1),
         updated_at: UnixMs(1),
         role: AgentRole::default(),
-        workspace: WorkspaceInfo::UserCheckout { repo: "/tmp".into() },
+        workspace: WorkspaceInfo::Checkout {
+            workset: "test-workset".into(),
+            repo: "/tmp".into(),
+            name: "repo".into(),
+        },
         attention: UiAttention::Quiet,
         last_active: UnixMs(1),
         hidden: false,
@@ -4705,11 +4701,8 @@ fn daemon_retag_keeps_the_caret_at_the_title_end(cx: &mut TestAppContext) {
         labels: Vec::new(),
     };
 
-    let mut source = text::Buffer::new(
-        text::ReplicaId::new(8),
-        text::BufferId::new(1).unwrap(),
-        "",
-    );
+    let mut source =
+        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
     let operation = DeskOperation::from_text(&source.edit([(0..0, "* One\nbody\n* Two\n")]));
     let desk_snapshot = DeskSnapshot {
         text: source.snapshot().text(),
@@ -4831,7 +4824,11 @@ fn daemon_retag_keeps_the_caret_at_the_title_end(cx: &mut TestAppContext) {
         .expect("strand caret");
     cx.update(|cx| cx.refresh_windows());
     cx.run_until_parked();
-    assert_eq!(caret(cx), 5, "sync must nudge a stranded caret off the conceal");
+    assert_eq!(
+        caret(cx),
+        5,
+        "sync must nudge a stranded caret off the conceal"
+    );
 }
 
 /// Cursor motion must never open a fold: the clamp that lifts a fold
@@ -4851,7 +4848,11 @@ fn hjkl_travel_never_opens_a_fold(cx: &mut TestAppContext) {
         created_at: UnixMs(1),
         updated_at: UnixMs(1),
         role: AgentRole::default(),
-        workspace: WorkspaceInfo::UserCheckout { repo: "/tmp".into() },
+        workspace: WorkspaceInfo::Checkout {
+            workset: "test-workset".into(),
+            repo: "/tmp".into(),
+            name: "repo".into(),
+        },
         attention: UiAttention::Quiet,
         last_active: UnixMs(1),
         hidden: false,
@@ -4866,11 +4867,8 @@ fn hjkl_travel_never_opens_a_fold(cx: &mut TestAppContext) {
         "* One :eng-{}:\none body\n** Kid\nkid stuff\n* Two\ntwo tail\n",
         agent(1).encoded()
     );
-    let mut source = text::Buffer::new(
-        text::ReplicaId::new(8),
-        text::BufferId::new(1).unwrap(),
-        "",
-    );
+    let mut source =
+        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
     let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text.as_str())]));
     let desk_snapshot = DeskSnapshot {
         text: source.snapshot().text(),
@@ -4967,7 +4965,11 @@ fn helix_append_on_a_folded_heading_lands_at_the_title(cx: &mut TestAppContext) 
         created_at: UnixMs(1),
         updated_at: UnixMs(1),
         role: AgentRole::default(),
-        workspace: WorkspaceInfo::UserCheckout { repo: "/tmp".into() },
+        workspace: WorkspaceInfo::Checkout {
+            workset: "test-workset".into(),
+            repo: "/tmp".into(),
+            name: "repo".into(),
+        },
         attention: UiAttention::Quiet,
         last_active: UnixMs(1),
         hidden: false,
@@ -4982,11 +4984,8 @@ fn helix_append_on_a_folded_heading_lands_at_the_title(cx: &mut TestAppContext) 
         "* One :eng-{}:\none body\n** Kid\nkid stuff\n* Two\n",
         agent(1).encoded()
     );
-    let mut source = text::Buffer::new(
-        text::ReplicaId::new(8),
-        text::BufferId::new(1).unwrap(),
-        "",
-    );
+    let mut source =
+        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
     let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text.as_str())]));
     let desk_snapshot = DeskSnapshot {
         text: source.snapshot().text(),

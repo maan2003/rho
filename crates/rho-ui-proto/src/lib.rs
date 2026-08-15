@@ -13,7 +13,7 @@ pub use rho_core::{
 };
 pub use rho_workspaces_types::{
     WorkspaceDiffBaseContent, WorkspaceDiffContent, WorkspaceDiffFile, WorkspaceDiffSnapshot,
-    WorkspaceDiffStatus, WorkspaceDiffTarget, WorkspaceId, WorkspaceIdDomain, WorkspaceInfo,
+    WorkspaceDiffStatus, WorkspaceDiffTarget, WorkspaceInfo,
 };
 use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 
@@ -464,7 +464,8 @@ pub enum StartMode {
     Sandbox { repo: Utf8PathBuf, revset: String },
     /// The SAME workspace as the target: no new checkout — agents share the
     /// directory (and namespace), seeing each other's edits instantly.
-    /// Joining the user means working directly in the user's checkout.
+    /// `JoinTarget::User` remains wire-compatible but is rejected until the
+    /// Workset model can fork the host checkout's current change.
     Join(JoinTarget),
 }
 
@@ -473,6 +474,7 @@ pub enum StartMode {
 pub enum JoinTarget {
     /// A known workspace, sent back verbatim from [`UiAgentSummary`].
     Workspace(WorkspaceInfo),
+    /// Reserved for a future host-checkout-to-Workset fork primitive.
     /// The user's own checkout of `repo`.
     User { repo: Utf8PathBuf },
 }
@@ -1357,8 +1359,10 @@ mod tests {
 
     #[test]
     fn diff_manifest_messages_round_trip() {
-        let workspace = WorkspaceInfo::UserCheckout {
-            repo: Utf8PathBuf::from("/repo"),
+        let workspace = WorkspaceInfo::Checkout {
+            workset: "test-workset".into(),
+            repo: "repo".into(),
+            name: "repo".into(),
         };
         let request = ClientMessage::DiffSnapshot {
             workspace,
@@ -1371,8 +1375,10 @@ mod tests {
         assert_eq!(request, decoded);
 
         let request = ClientMessage::DiffBaseContents {
-            workspace: WorkspaceInfo::UserCheckout {
-                repo: Utf8PathBuf::from("/repo"),
+            workspace: WorkspaceInfo::Checkout {
+                workset: "test-workset".into(),
+                repo: "repo".into(),
+                name: "repo".into(),
             },
             operation_id: "operation".to_owned(),
             commit_id: "commit".to_owned(),

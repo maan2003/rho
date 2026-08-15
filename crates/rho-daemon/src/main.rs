@@ -9,9 +9,8 @@ struct Args {
 
 fn main() {
     let args = Args::parse();
-    // SAFETY: top of main — no threads exist yet and nothing has captured
-    // pre-namespace state.
-    unsafe { rho_daemon::init_daemon_namespace() }.expect("set up daemon namespace");
+    // SAFETY: top of main, before the async runtime starts any threads.
+    unsafe { rho_daemon::init_daemon_namespace() }.expect("set up daemon user namespace");
     rho_daemon::configure_embedded_environment();
     let mut daemon_args = args.daemon;
     let result = (|| {

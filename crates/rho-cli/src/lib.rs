@@ -31,9 +31,8 @@ pub fn main() -> Result<()> {
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let args = Args::parse_or_exit(std::env::args().skip(1));
     if let Command::Daemon(mut daemon_args) = args.command {
-        // SAFETY: top of main, before the runtime — no threads exist yet and
-        // nothing has captured pre-namespace state.
-        unsafe { rho_daemon::init_daemon_namespace() }.expect("set up daemon namespace");
+        // SAFETY: top of main, before the async runtime starts any threads.
+        unsafe { rho_daemon::init_daemon_namespace() }.expect("set up daemon user namespace");
         let profiler = rho_daemon::DaemonProfiler::start(&mut daemon_args)?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)

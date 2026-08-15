@@ -178,24 +178,25 @@ impl AgentRegistry {
                     .map(|(_, record)| record.primary_workdir().clone())
             };
 
-            let workspace = match source {
-                Some(source) => self.pool.open_workspace(&source).await?,
+            let start = match source {
+                Some(source) => {
+                    rho_agent::StartWorkdir::Existing(self.pool.open_checkout(&source).await?)
+                }
                 None => {
                     let project = self
                         .projects()
                         .into_iter()
                         .next()
                         .ok_or_else(|| anyhow::anyhow!("Iris needs a registered project or existing agent to establish its coordinator view"))?;
-                    self.pool.repo(&project.path).await?.user_checkout().await?
+                    rho_agent::StartWorkdir::Create {
+                        repo: project.path,
+                        parent_revset: "@".to_owned(),
+                    }
                 }
             };
             let (agent_id, _) = self
                 .pool
-                .create(
-                    AgentRole::Iris,
-                    Some("Iris".to_owned()),
-                    vec![rho_agent::StartWorkdir::Existing(workspace)],
-                )
+                .create(AgentRole::Iris, Some("Iris".to_owned()), vec![start])
                 .await?;
             let mut write = self.db.write().await;
             write.agent_label(rho_core::UnixMs::now(), agent_id, IRIS_LABEL, true);

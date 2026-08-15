@@ -8,16 +8,36 @@ use senax_encoder::{Decode, Encode, Pack, Unpack};
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Encode, Decode, Pack, Unpack)]
 pub enum WorkspaceInfo {
     /// A workspace in an agent-owned clone-store family.
-    Checkout { repo: String, name: String },
+    Checkout {
+        workset: String,
+        repo: String,
+        name: String,
+    },
     /// A workspace whose original VCS metadata is masked from
     /// child commands and replaced by a synthetic Git baseline.
-    Sandbox { repo: String, name: String },
+    Sandbox {
+        workset: String,
+        repo: String,
+        name: String,
+    },
 }
 
 impl WorkspaceInfo {
     pub fn repo(&self) -> &str {
         match self {
             Self::Checkout { repo, .. } | Self::Sandbox { repo, .. } => repo,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Checkout { name, .. } | Self::Sandbox { name, .. } => name,
+        }
+    }
+
+    pub fn workset(&self) -> &str {
+        match self {
+            Self::Checkout { workset, .. } | Self::Sandbox { workset, .. } => workset,
         }
     }
 

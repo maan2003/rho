@@ -3,7 +3,7 @@ use std::sync::Arc;
 use rho_core::{ContentPart, UnixMs};
 use rho_db::{RhoDb, SenValue};
 use rho_inference::PromptCacheKey;
-use rho_workspaces::{WorkspaceId, WorkspaceIdDomain, WorkspaceInfo};
+use rho_workspaces::WorkspaceInfo;
 
 use super::*;
 
@@ -407,9 +407,10 @@ fn event_text(event: &AgentEvent<'_>) -> String {
 
 /// Tests exercise agent records only; any workspace info will do.
 fn test_workspace() -> WorkspaceInfo {
-    WorkspaceInfo::Workspace {
-        repo: "/home/user/src/rho".into(),
-        id: WorkspaceId::from_counter(1, &WorkspaceIdDomain(0)).unwrap(),
+    WorkspaceInfo::Checkout {
+        workset: "test-workset".into(),
+        repo: "rho".into(),
+        name: "rho".into(),
     }
 }
 

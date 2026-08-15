@@ -12,6 +12,9 @@ use std::sync::{Arc, OnceLock, Weak};
 
 use anyhow::Context as _;
 use camino::{Utf8Path, Utf8PathBuf};
+use redb::TableDefinition;
+use rho_db::{RhoDb, Sen, SenValue};
+use senax_encoder::{Decode, Encode};
 use tokio::sync::Mutex;
 
 mod diff;
@@ -23,6 +26,36 @@ pub use rho_workspaces_types::{
     WorkspaceDiffBaseContent, WorkspaceDiffContent, WorkspaceDiffFile, WorkspaceDiffSnapshot,
     WorkspaceDiffStatus, WorkspaceDiffTarget, WorkspaceInfo,
 };
+
+const WORKSET_RECORDS: TableDefinition<Sen<String>, Sen<WorksetRecord>> =
+    TableDefinition::new("worksets");
+
+/// Durable Workset ordering. `primary` is stored explicitly rather than
+/// inferred from map or directory iteration; `checkouts` records creation
+/// order and is append-only.
+#[derive(Clone, Debug, Encode, Decode)]
+struct WorksetRecord {
+    primary: Option<String>,
+    checkouts: Vec<String>,
+}
+
+impl Default for WorksetRecord {
+    fn default() -> Self {
+        Self {
+            primary: None,
+            checkouts: Vec::new(),
+        }
+    }
+}
+
+/// Establishes the identity user namespace required before workset mount
+/// namespaces are created from runtime worker threads.
+///
+/// # Safety
+/// The caller must invoke this before starting any threads.
+pub unsafe fn init_daemon_namespace() -> anyhow::Result<()> {
+    rho_fs_view::unshare_identity_user_namespace()
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PathOverrides {
@@ -93,15 +126,17 @@ impl UserEnvironment {
 #[derive(Debug)]
 pub struct Worksets {
     root: Utf8PathBuf,
+    db: RhoDb,
     environment: UserEnvironment,
     path_overrides: PathOverrides,
     stores: Mutex<BTreeMap<String, Weak<Store>>>,
-    worksets: Mutex<BTreeMap<String, Weak<Workset>>>,
+    worksets: Mutex<BTreeMap<String, Weak<WorksetInner>>>,
 }
 
 impl Worksets {
     pub fn open(
         root: impl AsRef<Path>,
+        db: RhoDb,
         environment: UserEnvironment,
         path_overrides: PathOverrides,
     ) -> anyhow::Result<Arc<Self>> {
@@ -112,6 +147,7 @@ impl Worksets {
             .with_context(|| format!("create workset storage root at {root}"))?;
         Ok(Arc::new(Self {
             root,
+            db,
             environment,
             path_overrides,
             stores: Mutex::new(BTreeMap::new()),
@@ -120,11 +156,32 @@ impl Worksets {
     }
 
     pub fn open_default(
+        db: RhoDb,
         environment: UserEnvironment,
         path_overrides: PathOverrides,
     ) -> anyhow::Result<Arc<Self>> {
         let home = dirs::home_dir().context("HOME directory is unavailable")?;
-        Self::open(home.join("src/.rho"), environment, path_overrides)
+        Self::open(home.join("src/.rho"), db, environment, path_overrides)
+    }
+
+    fn load_record(&self, id: &str) -> anyhow::Result<WorksetRecord> {
+        let read = self.db.read();
+        anyhow::ensure!(read.has_table("worksets"), "workset does not exist: {id}");
+        let table = read.open_table(WORKSET_RECORDS);
+        let key = id.to_owned();
+        table
+            .get(SenValue::borrowed(&key))
+            .map(|record| record.value().into_owned())
+            .with_context(|| format!("workset does not exist: {id}"))
+    }
+
+    async fn save_record(&self, id: &str, record: &WorksetRecord) {
+        let mut write = self.db.write().await;
+        let key = id.to_owned();
+        write
+            .open_table(WORKSET_RECORDS)
+            .insert(SenValue::borrowed(&key), SenValue::borrowed(record));
+        write.commit();
     }
 
     pub fn root(&self) -> &Utf8Path {
@@ -132,11 +189,7 @@ impl Worksets {
     }
 
     /// Gets or crash-safely initializes a named clone store.
-    pub async fn store(
-        self: &Arc<Self>,
-        name: &str,
-        remote_url: &str,
-    ) -> anyhow::Result<Arc<Store>> {
+    async fn store(self: &Arc<Self>, name: &str, remote_url: &str) -> anyhow::Result<Arc<Store>> {
         validate_name(name)?;
         let mut stores = self.stores.lock().await;
         if let Some(store) = stores.get(name).and_then(Weak::upgrade) {
@@ -160,14 +213,13 @@ impl Worksets {
             name: name.to_owned(),
             root,
             remote_url: remote_url.to_owned(),
-            owner: Arc::downgrade(self),
             operation_lock: Mutex::new(()),
         });
         stores.insert(name.to_owned(), Arc::downgrade(&store));
         Ok(store)
     }
 
-    pub async fn create(self: &Arc<Self>) -> anyhow::Result<Arc<Workset>> {
+    pub async fn create(self: &Arc<Self>) -> anyhow::Result<Workset> {
         for _ in 0..64 {
             let workset_id = random_workset_id()?;
             let base = self.root.join("worksets").join(&workset_id);
@@ -175,6 +227,8 @@ impl Worksets {
                 Ok(()) => {
                     std::fs::create_dir_all(base.join("src/.stores"))
                         .with_context(|| format!("create workset {workset_id}"))?;
+                    self.save_record(&workset_id, &WorksetRecord::default())
+                        .await;
                     return self.load_workset(&workset_id, true).await;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -184,7 +238,7 @@ impl Worksets {
         anyhow::bail!("could not allocate a unique workset id")
     }
 
-    pub async fn open_workset(self: &Arc<Self>, workset_id: &str) -> anyhow::Result<Arc<Workset>> {
+    pub async fn open_workset(self: &Arc<Self>, workset_id: &str) -> anyhow::Result<Workset> {
         self.load_workset(workset_id, false).await
     }
 
@@ -192,7 +246,7 @@ impl Worksets {
         self: &Arc<Self>,
         workset_id: &str,
         newly_created: bool,
-    ) -> anyhow::Result<Arc<Workset>> {
+    ) -> anyhow::Result<Workset> {
         validate_name(workset_id)?;
         if let Some(workset) = self
             .worksets
@@ -201,7 +255,7 @@ impl Worksets {
             .get(workset_id)
             .and_then(Weak::upgrade)
         {
-            return Ok(workset);
+            return Ok(Workset(workset));
         }
         let root = self.root.join("worksets").join(workset_id).join("src");
         anyhow::ensure!(
@@ -209,12 +263,14 @@ impl Worksets {
             "workset does not exist: {workset_id}"
         );
         let operation_lock = Arc::new(Mutex::new(()));
-        let workset = Arc::new(Workset {
+        let record = self.load_record(workset_id)?;
+        let workset = Arc::new(WorksetInner {
             id: workset_id.to_owned(),
             root: root.clone(),
             owner: Arc::downgrade(self),
             stores: Mutex::new(BTreeMap::new()),
             workspaces: Mutex::new(BTreeMap::new()),
+            record: Mutex::new(record),
             operation_lock: Arc::clone(&operation_lock),
         });
         if !newly_created {
@@ -228,16 +284,13 @@ impl Worksets {
                 granted.insert(name.clone(), self.existing_store(&name).await?);
             }
             let mut workspaces = BTreeMap::new();
-            for entry in std::fs::read_dir(&root)? {
-                let entry = entry?;
-                let name = entry
-                    .file_name()
-                    .into_string()
-                    .map_err(|_| anyhow::anyhow!("workspace name is not UTF-8"))?;
-                if name.starts_with('.') || !entry.file_type()?.is_dir() {
+            let checkout_names = workset.record.lock().await.checkouts.clone();
+            for name in checkout_names {
+                let checkout_path = root.join(&name);
+                if !checkout_path.is_dir() {
                     continue;
                 }
-                let pointer = std::fs::read_to_string(entry.path().join(".jj/repo"))
+                let pointer = std::fs::read_to_string(checkout_path.join(".jj/repo"))
                     .with_context(|| format!("read workspace pointer for {name}"))?;
                 let store = granted
                     .values()
@@ -245,15 +298,13 @@ impl Worksets {
                     .with_context(|| format!("workspace {name} references an ungranted store"))?;
                 workspaces.insert(
                     name.clone(),
-                    Arc::new(
-                        self.checkout(
-                            Arc::clone(store),
-                            name,
-                            Utf8PathBuf::try_from(entry.path())
-                                .context("workspace path is not UTF-8")?,
-                            Arc::clone(&operation_lock),
-                        ),
-                    ),
+                    Arc::new(self.checkout(
+                        workset_id,
+                        Arc::clone(store),
+                        name,
+                        checkout_path,
+                        Arc::clone(&operation_lock),
+                    )),
                 );
             }
             *workset.stores.lock().await = granted;
@@ -263,7 +314,7 @@ impl Worksets {
             .lock()
             .await
             .insert(workset_id.to_owned(), Arc::downgrade(&workset));
-        Ok(workset)
+        Ok(Workset(workset))
     }
 
     async fn existing_store(self: &Arc<Self>, name: &str) -> anyhow::Result<Arc<Store>> {
@@ -289,7 +340,6 @@ impl Worksets {
             name: name.to_owned(),
             root,
             remote_url,
-            owner: Arc::downgrade(self),
             operation_lock: Mutex::new(()),
         });
         self.stores
@@ -301,6 +351,7 @@ impl Worksets {
 
     fn checkout(
         &self,
+        workset_id: &str,
         store: Arc<Store>,
         name: String,
         checkout: Utf8PathBuf,
@@ -308,6 +359,7 @@ impl Worksets {
     ) -> Checkout {
         Checkout {
             info: WorkspaceInfo::Checkout {
+                workset: workset_id.to_owned(),
                 repo: store.name.clone(),
                 name: name.clone(),
             },
@@ -351,11 +403,10 @@ impl Worksets {
 }
 
 #[derive(Debug)]
-pub struct Store {
+struct Store {
     name: String,
     root: Utf8PathBuf,
     remote_url: String,
-    owner: Weak<Worksets>,
     operation_lock: Mutex<()>,
 }
 
@@ -363,45 +414,95 @@ impl Store {
     pub fn name(&self) -> &str {
         &self.name
     }
+}
 
-    pub fn root(&self) -> &Utf8Path {
-        &self.root
+/// A handle to one workset's host-frame `src` directory.
+#[derive(Debug)]
+pub struct Workset(Arc<WorksetInner>);
+
+impl Workset {
+    pub fn id(&self) -> &str {
+        self.0.id()
     }
 
-    pub async fn fetch(&self) -> anyhow::Result<()> {
-        let _guard = self.operation_lock.lock().await;
-        let owner = self
+    pub fn root(&self) -> &Utf8Path {
+        self.0.root()
+    }
+
+    pub async fn enter(&self, mode: Mode) -> anyhow::Result<Arc<Namespace>> {
+        Namespace::create(Self(Arc::clone(&self.0)), mode).await
+    }
+
+    pub async fn clone(
+        &self,
+        repo: &str,
+        remote_url: &str,
+        name: Option<&str>,
+        at: Option<&str>,
+    ) -> anyhow::Result<Arc<Checkout>> {
+        self.0.as_ref().clone(repo, remote_url, name, at).await
+    }
+
+    pub async fn fork_from(
+        &self,
+        parent: &Checkout,
+        name: Option<&str>,
+    ) -> anyhow::Result<Arc<Checkout>> {
+        self.0.fork_from(parent, name).await
+    }
+
+    pub async fn checkout(&self, name: &str) -> Option<Arc<Checkout>> {
+        self.0.checkout(name).await
+    }
+
+    pub(crate) fn owner(&self) -> anyhow::Result<Arc<Worksets>> {
+        self.0
             .owner
             .upgrade()
-            .context("worksets manager was dropped")?;
-        let mut command = owner.command("jj");
-        command.args(["store", "fetch"]).arg(&self.root);
-        run(command, "fetch clone store").await
+            .context("worksets manager was dropped")
+    }
+
+    pub(crate) async fn checkouts(&self) -> Vec<Arc<Checkout>> {
+        self.0.ordered_checkouts().await
+    }
+
+    pub async fn primary_name(&self) -> anyhow::Result<String> {
+        self.0
+            .record
+            .lock()
+            .await
+            .primary
+            .clone()
+            .context("workset has no primary checkout")
+    }
+
+    pub async fn checkout_names(&self) -> Vec<String> {
+        self.0.record.lock().await.checkouts.clone()
+    }
+
+    pub(crate) async fn mounts(&self) -> rho_fs_view::Mounts {
+        self.0.mounts().await
     }
 }
 
-/// One workset's host-frame `src` directory.
 #[derive(Debug)]
-pub struct Workset {
+struct WorksetInner {
     id: String,
     root: Utf8PathBuf,
     pub(crate) owner: Weak<Worksets>,
     stores: Mutex<BTreeMap<String, Arc<Store>>>,
     pub(crate) workspaces: Mutex<BTreeMap<String, Arc<Checkout>>>,
+    record: Mutex<WorksetRecord>,
     operation_lock: Arc<Mutex<()>>,
 }
 
-impl Workset {
+impl WorksetInner {
     pub fn id(&self) -> &str {
         &self.id
     }
 
     pub fn root(&self) -> &Utf8Path {
         &self.root
-    }
-
-    pub async fn enter(self: &Arc<Self>, mode: Mode) -> anyhow::Result<Arc<Namespace>> {
-        Namespace::create(Arc::clone(self), mode).await
     }
 
     async fn grant(&self, store: Arc<Store>) -> anyhow::Result<()> {
@@ -481,11 +582,48 @@ impl Workset {
             .arg(&self.id)
             .arg(&checkout)
             .args(["--name", name]);
-        if let Some(at) = at {
-            command.args(["--at", at]);
+        if let Err(error) = run(command, "create workset workspace").await {
+            if !checkout.exists() {
+                return Err(error);
+            }
+            self.discard_workspace(&owner, &store, &checkout)
+                .await
+                .with_context(|| format!("{error:#}; clean unrecorded workspace before retry"))?;
+            let mut retry = owner.command("jj");
+            retry
+                .args(["store", "workspace"])
+                .arg(self.root.join(".stores").join(&store.name))
+                .arg(&self.id)
+                .arg(&checkout)
+                .args(["--name", name]);
+            run(retry, "retry creation of cleaned unrecorded workspace").await?;
         }
-        run(command, "create workset workspace").await?;
+        if let Some(at) = at {
+            let mut new = owner.command("jj");
+            new.current_dir(&checkout).args(["new", at]);
+            if let Err(error) = run(new, "start checkout at requested revset").await {
+                return match self.discard_workspace(&owner, &store, &checkout).await {
+                    Ok(()) => Err(error),
+                    Err(cleanup) => Err(anyhow::anyhow!(
+                        "{error:#}; cleanup after failed checkout initialization also failed: {cleanup:#}"
+                    )),
+                };
+            }
+        }
+        {
+            let mut record = self.record.lock().await;
+            let mut updated = record.clone();
+            if !updated.checkouts.iter().any(|checkout| checkout == name) {
+                updated.checkouts.push(name.to_owned());
+                if updated.primary.is_none() {
+                    updated.primary = Some(name.to_owned());
+                }
+                owner.save_record(&self.id, &updated).await;
+                *record = updated;
+            }
+        }
         let workspace = Arc::new(owner.checkout(
+            &self.id,
             store,
             name.to_owned(),
             checkout,
@@ -498,21 +636,53 @@ impl Workset {
         Ok(workspace)
     }
 
+    async fn discard_workspace(
+        &self,
+        owner: &Worksets,
+        store: &Store,
+        checkout: &Utf8Path,
+    ) -> anyhow::Result<()> {
+        let mut forget = owner.command("jj");
+        forget.current_dir(checkout).args(["workspace", "forget"]);
+        let forget_result = run(forget, "forget failed workset workspace").await;
+
+        let mut remove = owner.command("git");
+        remove
+            .arg("--git-dir")
+            .arg(store.root.join("clones").join(&self.id).join("git"))
+            .args(["worktree", "remove", "--force"])
+            .arg(checkout);
+        let remove_result = run(remove, "remove failed workset Git worktree").await;
+        let directory_result = if checkout.exists() {
+            std::fs::remove_dir_all(checkout)
+                .with_context(|| format!("remove failed workset checkout directory {checkout}"))
+        } else {
+            Ok(())
+        };
+        if forget_result.is_ok() {
+            directory_result
+        } else {
+            forget_result.and(remove_result).and(directory_result)
+        }
+    }
+
     /// Ensures the shared store and this workset's private clone, then
     /// materializes one checkout. The checkout name defaults to the repo name.
+    /// When `at` is supplied, the checkout starts a fresh change whose parent
+    /// is that revset; resolution failure is returned without a trunk fallback.
     pub async fn clone(
         &self,
         repo: &str,
         remote_url: &str,
         name: Option<&str>,
+        at: Option<&str>,
     ) -> anyhow::Result<Arc<Checkout>> {
         let owner = self
             .owner
             .upgrade()
             .context("worksets manager was dropped")?;
         let store = owner.store(repo, remote_url).await?;
-        self.create_workspace(store, name.unwrap_or(repo), None)
-            .await
+        self.create_workspace(store, name.unwrap_or(repo), at).await
     }
 
     /// Forks the parent's exact current working-copy commit into this workset's
@@ -587,9 +757,18 @@ impl Workset {
         self.workspaces.lock().await.get(name).cloned()
     }
 
+    async fn ordered_checkouts(&self) -> Vec<Arc<Checkout>> {
+        let order = self.record.lock().await.checkouts.clone();
+        let workspaces = self.workspaces.lock().await;
+        order
+            .iter()
+            .filter_map(|name| workspaces.get(name).cloned())
+            .collect()
+    }
+
     pub async fn mounts(&self) -> rho_fs_view::Mounts {
         let stores = self.stores.lock().await;
-        let workspaces = self.workspaces.lock().await;
+        let workspaces = self.ordered_checkouts().await;
         rho_fs_view::Mounts {
             stores: stores
                 .values()
@@ -600,7 +779,7 @@ impl Workset {
                 })
                 .collect(),
             workspaces: workspaces
-                .values()
+                .iter()
                 .map(|workspace| rho_fs_view::WorkspaceMount {
                     name: workspace.name.clone(),
                     source: workspace.checkout.as_std_path().to_owned(),

@@ -7,7 +7,7 @@ use crate::multi_agent_tools::MultiAgentTools;
 /// the section explaining them. `code_mode` is set when the agent's tool
 /// surface is the code-mode `exec`/`wait` pair.
 pub fn prompt(
-    view: &rho_workspaces::View,
+    view: &rho_workspaces::Namespace,
     multi_agent: Option<&MultiAgentTools>,
     code_mode: bool,
     role: AgentRole,
@@ -20,7 +20,7 @@ pub fn prompt(
     let workdirs = entries
         .iter()
         .map(|workspace| WorkdirPrompt {
-            path: workspace.repo().to_string(),
+            path: workspace.visible_path().to_string(),
             kind: WorkdirKind::of(workspace),
         })
         .collect::<Vec<_>>();
@@ -155,7 +155,7 @@ fn render_projects_prompt(projects: &[(camino::Utf8PathBuf, String)]) -> String 
 /// prompt and project discovery, so this contains only Rho team identity,
 /// workspace context, and the one Claude-backed specialized role.
 pub fn claude_prompt(
-    view: Option<&rho_workspaces::View>,
+    view: Option<&rho_workspaces::Namespace>,
     multi_agent: Option<&MultiAgentTools>,
     role: AgentRole,
 ) -> Arc<str> {
@@ -197,7 +197,7 @@ pub fn claude_prompt(
                 .entries()
                 .iter()
                 .map(|workspace| WorkdirPrompt {
-                    path: workspace.repo().to_string(),
+                    path: workspace.visible_path().to_string(),
                     kind: WorkdirKind::of(workspace),
                 })
                 .collect::<Vec<_>>();
@@ -221,7 +221,7 @@ enum WorkdirKind {
 }
 
 impl WorkdirKind {
-    fn of(workspace: &rho_workspaces::Workspace) -> Self {
+    fn of(workspace: &rho_workspaces::Checkout) -> Self {
         if workspace.is_sandbox() {
             Self::Sandbox
         } else if workspace.is_user_checkout() {
@@ -236,7 +236,7 @@ impl WorkdirKind {
 /// path (the user-level file appears in each entry's discovery), skills
 /// deduped by name with earlier (primary-first) workdirs winning.
 fn merged_context(
-    entries: &[Arc<rho_workspaces::Workspace>],
+    entries: &[Arc<rho_workspaces::Checkout>],
 ) -> (
     Vec<rho_context_config::AgentsFile>,
     Vec<rho_context_config::Skill>,

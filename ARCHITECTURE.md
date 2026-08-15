@@ -48,45 +48,35 @@ than by running a supervisor, extension protocol, or daemon process graph.
   workspace/context discovery, collaboration, Claude runtime, or CLI/daemon/UI
   integration. Its architecture and governing decisions are recorded under
   `crates/rho-agent2/specs/`.
-- `rho-workspaces` owns checkout materialization and filesystem views. A
-  `Workspace` is one materialized checkout (a stable jj-managed bcachefs
-  subvolume, the user's live checkout, a VCS-masked sandbox workspace, or a
-  plain directory). Managed workspace ids are repository-local prefix ids
-  rendered as `ws-<id>` and allocated by jj from a compact repository-local
-  `(seed, next-counter)` registry; generated IDs are derived rather than
-  stored individually. jj also dictates their stable per-repository paths,
-  rematerializes missing checkouts, and garbage-collects stale materialized
-  paths enumerated by jj's workspace store after snapshotting them. GC never
-  scans the prefix-id counter range. Snapshotting is commit-cone scoped: jj
-  snapshots the command workspace, workspaces sharing its working-copy commit,
-  and materialized descendant workspaces, but not ancestors or siblings.
-  Turn-boundary snapshots run `jj util snapshot` from the specific workspace
-  checkout so the correct cone is selected. Every live `Workspace`
-  holds a shared lock on its persistent sibling lease file; GC alone requests
-  the nonblocking exclusive lock, so any number of Rho processes can inhibit
-  collection without using the lease as a workspace-ownership mutex.
-  Repository caches retain only weak references, while agents and views own
-  live workspaces. Sandbox workspaces use the same managed checkout
-  lifecycle while masking their `.jj` and colocated `.git` metadata from child
-  commands, expose a separate synthetic Git baseline, and install a Landlock
-  filesystem/network policy on every prepared child command. A `View` is one agent's world: a working
-  set of workdir entries, fixed at spawn, realized as a private mount
-  namespace with each entry's checkout mounted over its origin path. Entry 0 is
-  the primary workdir (default cwd, prompt header).
-  Agents joining a workspace share the `Workspace`; each agent has its own
-  `View`. Each repository allocates its own managed workspace id, so a
-  multi-repository agent's prompt lists a separate `ws-<id>` handle for every
-  workdir.
-  Sandbox and ordinary workspaces cannot be mixed in one view.
-  Live-diff semantic barriers use the same vendored descendant-snapshot
-  implementation through an embedded `jj-cli` API under the repo lock. The
-  API returns the exact immutable repository epoch it wrote, so derived
-  manifests never reload a racing operation head.
+- `rho-workspaces` owns daemon-managed clone stores, Worksets, Checkouts, and
+  filesystem namespaces. `Worksets::open_default` uses `~/src/.rho`: shared
+  append-only clone stores live under `stores/<repo>`, while each generated
+  Workset owns `worksets/<id>/src/`, private clone state, and one or more named
+  Checkouts. rho-db’s `worksets` table stores an explicit primary Checkout plus
+  append-only creation order, so cwd and context precedence survive daemon
+  restarts rather than depending on map or directory iteration. A Workset
+  grants a store through a relative `.stores/<repo>`
+  symlink, so checkout and Git/jj administrative pointers remain valid in both
+  the host frame and a mounted frame. `Workset::clone` creates a fresh checkout;
+  `fork_from` snapshots and imports a parent's exact commit, preserves that
+  source change as `@-`, and starts the child on a fresh change.
+  `Workset::enter` creates a per-agent `Namespace`. View mode builds a minimal
+  generated root and exposes Checkouts below `/src`; exposed mode retains the
+  host filesystem and temporarily mounts the same tree below the deployed
+  `/ws` stub. Namespace construction and refresh run only on dedicated threads
+  that exit after returning namespace/root fds—runtime pool threads must never
+  retain `unshare` or `setns` state. Entry zero is the primary Checkout and
+  supplies the default cwd. Agents joining a Checkout share its underlying
+  worktree but receive separate Namespace handles. Snapshot and live-diff
+  operations stay owned by `Checkout` and return immutable jj epochs for
+  derived manifests. Sandbox start remains explicitly refused until synthetic
+  Git/VCS masking is rebuilt on Worksets; the Landlock policy implementation is
+  retained and tested, but is never presented as a complete sandbox by itself.
 - `rho-context-config` owns bounded `AGENTS.md` loading plus local Markdown
   skill discovery/frontmatter parsing. Rho packages platform-owned skills under
   `$out/share/rho/skills`; the final package build embeds that immutable root in
   the binaries, below project and user skills in precedence. Results are cached per
-  `rho-workspaces::Workspace` and merged across a view's workdirs;
+  `rho-workspaces::Checkout` and merged across a namespace's Checkouts;
   `rho-agent` owns system prompt rendering. Clients have no special skill or
   AGENTS.md command path. The native Rho inference loop and Claude Code use
   separate prompt compositions: Claude performs its own project and skill
@@ -118,10 +108,10 @@ than by running a supervisor, extension protocol, or daemon process graph.
   exposes two deliberately separate daemon-owned process surfaces: an
   editor-native, Comint-style shell for ordinary commands and a raw terminal
   for programs that require a terminal screen. The editor shell starts a
-  `rho-shell` sidecar inside the agent View. That sidecar embeds one persistent,
+  `rho-shell` sidecar inside the agent Namespace. That sidecar embeds one persistent,
   serialized Brush evaluator retaining cwd, variables, functions, aliases,
   Bash-compatible configuration, history, and jobs. The process boundary keeps
-  shell-global effects out of the daemon and preserves the View's namespace;
+  shell-global effects out of the daemon and preserves the agent Namespace;
   the neutral bounded `rho-shell-proto` sideband supplies execution and lifecycle
   boundaries.
   Each execution receives a fresh PTY whose slave is Brush's stdin, stdout, and
@@ -161,7 +151,7 @@ than by running a supervisor, extension protocol, or daemon process graph.
   subprocesses use that environment directly; agent execution shells and
   Claude processes add the primary project's environment through `direnv exec`.
   The GUI's Comint-style surface instead starts `rho-shell` through the agent
-  View and lets Brush load normal Bash-compatible interactive configuration
+  Namespace and lets Brush load normal Bash-compatible interactive configuration
   (`~/.bashrc`, `PS1`, and `PROMPT_COMMAND`), including a configured direnv Bash
   hook. Brush's `brush-v0.4.0` tag (commit `96a26d0c`) is imported under
   `vendor/brush` as a squashed Git subtree and linked only into the sidecar.
@@ -250,11 +240,11 @@ pending descriptor reconstructs that view on load and rotates away from any
 partial destination transcript before retrying.
 
 Collaboration creation is role-specific while communication is shared.
-`spawn_engineer` always gives jj-backed workdirs isolated child workspaces.
-Explicit child revsets resolve in the parent's corresponding workspace context
-(or the user checkout for a repository outside the parent's working set), so
-workspace-relative symbols and snapshot scope follow the spawning agent.
-Sandboxed parents create only sandboxed child workdirs;
+`spawn_engineer` gives owned jj-backed workdirs an isolated child Workset.
+Each child Checkout is forked from the parent's snapshotted commit and starts a
+fresh change above it; shared requests join the parent's existing Workset.
+Custom child revsets, host live-checkout joins, and sandboxed children are
+explicitly refused until their Workset-native semantics are implemented;
 detailed delegation and integration guidance lives in the
 `delegate-engineering` skill rather than every Engineer prompt. Engineers can
 use `ask_advisor` to create an advisory session; PMs cannot. `message_agent` is

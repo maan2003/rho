@@ -1391,18 +1391,25 @@ mod tests {
     #[test]
     fn leader_keeps_usage_under_status_and_u_is_a_prefix() {
         let root = root_menu();
-        assert!(root.items.iter().any(|item| {
-            item.key == "s" && item.description == "status…"
-        }));
-        assert!(root.items.iter().any(|item| {
-            item.key == "u" && item.description == "universal argument"
-        }));
+        assert!(
+            root.items
+                .iter()
+                .any(|item| { item.key == "s" && item.description == "status…" })
+        );
+        assert!(
+            root.items
+                .iter()
+                .any(|item| { item.key == "u" && item.description == "universal argument" })
+        );
         assert!(!root.items.iter().any(|item| item.description == "usage…"));
 
         let status = status_menu();
-        assert!(status.items.iter().any(|item| {
-            item.key == "u" && item.description == "usage…"
-        }));
+        assert!(
+            status
+                .items
+                .iter()
+                .any(|item| { item.key == "u" && item.description == "usage…" })
+        );
     }
 
     #[test]

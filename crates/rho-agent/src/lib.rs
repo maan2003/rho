@@ -3,7 +3,9 @@ use std::collections::{BTreeMap, HashSet};
 use std::num::NonZeroU64;
 use std::sync::{Arc, RwLock};
 
+use anyhow::Context as _;
 use async_stream::stream;
+use camino::Utf8PathBuf;
 use futures::future::BoxFuture;
 use futures::stream::FuturesUnordered;
 use futures::{Stream, StreamExt};
@@ -18,7 +20,7 @@ use rho_db::RhoDb;
 use rho_inference::{Inference, InferenceSession, PromptCacheKey};
 use rho_tool_shell::{DEFAULT_TIMEOUT_SECS, ShellTools};
 use rho_web_search::WebSearchTools;
-use rho_workspaces::{Repo, View, Workspace};
+use rho_workspaces::{Checkout, Mode, Namespace, Worksets};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use tokio::sync::{Notify, mpsc, oneshot};
 
@@ -57,7 +59,7 @@ pub struct RenderedAgentSurface {
 }
 
 pub fn render_agent_surface(
-    view: Arc<View>,
+    view: Arc<Namespace>,
     role: db::AgentRole,
 ) -> anyhow::Result<RenderedAgentSurface> {
     let binding = role.session_profile()?;
@@ -543,41 +545,66 @@ pub struct Agent {
 pub enum StartWorkdir {
     /// Create a jj workspace on a new change on top of the revset.
     Create {
-        repo: Arc<Repo>,
+        repo: Utf8PathBuf,
         parent_revset: String,
     },
     /// Create a jj workspace whose original VCS metadata is masked and whose
     /// child commands are Landlock-restricted.
+    ///
+    /// TODO(clone-store-sandbox): restore synthetic Git/VCS masking on top of
+    /// Worksets before accepting this start mode; materialization currently
+    /// returns an explicit error rather than silently weakening the sandbox.
     Sandbox {
-        repo: Arc<Repo>,
+        repo: Utf8PathBuf,
         parent_revset: String,
     },
     /// Work in an existing workspace (joining another agent, the user's
     /// checkout, or a plain live directory).
-    Existing(Arc<Workspace>),
+    Existing(Arc<Checkout>),
 }
 
 /// Materializes a new agent's workdirs. Each jj repository allocates its own
 /// managed workspace id.
 pub(crate) async fn materialize_workdirs(
     start: Vec<StartWorkdir>,
-) -> anyhow::Result<Vec<Arc<Workspace>>> {
+    worksets: &Arc<Worksets>,
+) -> anyhow::Result<(rho_workspaces::Workset, Vec<Arc<Checkout>>)> {
     anyhow::ensure!(!start.is_empty(), "an agent needs at least one workdir");
+    if let StartWorkdir::Existing(first) = &start[0] {
+        anyhow::ensure!(
+            start.iter().all(|entry| matches!(entry, StartWorkdir::Existing(checkout) if checkout.info().workset() == first.info().workset())),
+            "all existing checkouts must belong to one workset"
+        );
+        let workset = worksets.open_workset(first.info().workset()).await?;
+        let entries = start
+            .into_iter()
+            .map(|entry| match entry {
+                StartWorkdir::Existing(checkout) => checkout,
+                _ => unreachable!(),
+            })
+            .collect();
+        return Ok((workset, entries));
+    }
+    let workset = worksets.create().await?;
     let mut entries = Vec::with_capacity(start.len());
     for entry in start {
         entries.push(match entry {
             StartWorkdir::Create {
                 repo,
                 parent_revset,
-            } => repo.create_workspace(&parent_revset).await?,
-            StartWorkdir::Sandbox {
-                repo,
-                parent_revset,
-            } => repo.create_sandbox(&parent_revset).await?,
-            StartWorkdir::Existing(workspace) => workspace,
+            } => {
+                let name = repo.file_name().context("workdir has no name")?;
+                workset
+                    .clone(name, repo.as_str(), Some(name), Some(&parent_revset))
+                    .await?
+            }
+            StartWorkdir::Sandbox { .. } => anyhow::bail!(
+                "sandbox workdirs are unavailable with clone-store worksets until VCS masking is implemented"
+            ),
+            StartWorkdir::Existing(_) => anyhow::bail!("cannot mix new and existing checkouts"),
         });
     }
-    Ok(entries)
+    Ok((workset, entries))
 }
 
 impl Agent {
@@ -599,13 +626,18 @@ impl Agent {
             .deep_config()
             .ok_or_else(|| anyhow::anyhow!("cannot create Rho runtime for Claude agent mode"))?;
         let model = mode.deep_model().expect("deep config implies a deep model");
+        // Materialization writes the workset record through rho-db, so it must
+        // finish before the non-reentrant agent write transaction is opened.
+        let pool_handle = pool.upgrade().context("agent pool dropped")?;
+        let (workset, entries) = materialize_workdirs(start, pool_handle.worksets()).await?;
+        let view = workset
+            .enter(Mode::View {
+                home_skeleton: None,
+            })
+            .await?;
         // One transaction spans agent id allocation and the record write.
-        // jj owns repository-local managed workspace id allocation; a failed
-        // multi-repo creation may leave an unreachable checkout for jj GC.
         let mut write = db.write().await;
         let agent_id = write.alloc_agent_id();
-        let entries = materialize_workdirs(start).await?;
-        let view = View::new(entries.clone())?;
         let now = UnixMillis::now();
         let next_event = write.create_agent(
             now,
@@ -642,7 +674,7 @@ impl Agent {
         db: RhoDb,
         inference: Inference,
         agent_id: AgentId,
-        view: Arc<View>,
+        view: Arc<Namespace>,
         pool: std::sync::Weak<pool::AgentPool>,
     ) -> Self {
         Self::load_lazy(db, inference, agent_id, Arc::new(Lazy::ready(view)), pool)
@@ -652,7 +684,7 @@ impl Agent {
         db: RhoDb,
         inference: Inference,
         agent_id: AgentId,
-        view: Arc<Lazy<Arc<View>>>,
+        view: Arc<Lazy<Arc<Namespace>>>,
         // A dead Weak (e.g. `Weak::default()`) means no pool: the
         // multi-agent tools are not offered.
         pool: std::sync::Weak<pool::AgentPool>,
@@ -701,7 +733,7 @@ impl Agent {
         prompt_cache_key: PromptCacheKey,
         agent_id: AgentId,
         next_event: AgentEventPos,
-        view: Arc<Lazy<Arc<View>>>,
+        view: Arc<Lazy<Arc<Namespace>>>,
         parent: Option<AgentId>,
         pool: std::sync::Weak<pool::AgentPool>,
         restored: RestoredAgent,
@@ -1221,7 +1253,7 @@ impl Drop for AgentLoop {
 }
 
 struct ExecutionContext {
-    view: Arc<View>,
+    view: Arc<Namespace>,
     system_prompt: Arc<str>,
     shell_tools: ShellTools,
     web_search: WebSearchTools,
@@ -1233,7 +1265,7 @@ struct ExecutionContext {
 impl ExecutionContext {
     #[expect(clippy::too_many_arguments)]
     fn new(
-        view: Arc<View>,
+        view: Arc<Namespace>,
         role: db::AgentRole,
         agent_id: AgentId,
         web_search: WebSearchTools,

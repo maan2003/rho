@@ -69,9 +69,9 @@ fn jj_binary() -> PathBuf {
 }
 
 #[tokio::test]
-async fn worksets_grant_workspace_fork_and_diff() {
-    let temp = tempfile::tempdir().unwrap();
+async fn worksets_grant_workspace_fork_diff_and_order() {
     let jj_bin = jj_binary();
+    let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("source");
     let remote = temp.path().join("remote.git");
     std::fs::create_dir(&source).unwrap();
@@ -94,16 +94,33 @@ async fn worksets_grant_workspace_fork_and_diff() {
     let environment = UserEnvironment::new(environment);
     let root = Worksets::open(
         temp.path().join("root"),
-        environment,
+        rho_db::RhoDb::open(temp.path().join("rho.redb")),
+        environment.clone(),
         PathOverrides::default(),
     )
     .unwrap();
     let parent_workset = root.create().await.unwrap();
     let parent = parent_workset
-        .as_ref()
-        .clone("repo", remote.to_str().unwrap(), Some("project"))
+        .clone(
+            "repo",
+            remote.to_str().unwrap(),
+            Some("project"),
+            Some("main@origin"),
+        )
         .await
         .unwrap();
+    assert_eq!(
+        jj(
+            &jj_bin,
+            parent.checkout().as_std_path(),
+            &["log", "-r", "@-", "--no-graph", "-T", "commit_id"]
+        ),
+        jj(
+            &jj_bin,
+            parent.checkout().as_std_path(),
+            &["log", "-r", "main@origin", "--no-graph", "-T", "commit_id"]
+        )
+    );
     assert_eq!(
         std::fs::read_to_string(parent.checkout().join("file.txt")).unwrap(),
         "one\n"
@@ -172,4 +189,108 @@ async fn worksets_grant_workspace_fork_and_diff() {
     drop(child_workset);
     let reopened = root.open_workset(&child_id).await.unwrap();
     assert!(reopened.checkout("project").await.is_some());
+
+    let invalid = root.create().await.unwrap();
+    let invalid_id = invalid.id().to_owned();
+    assert!(
+        invalid
+            .clone(
+                "repo",
+                remote.to_str().unwrap(),
+                Some("invalid"),
+                Some("definitely-not-a-revset"),
+            )
+            .await
+            .is_err()
+    );
+    assert!(invalid.checkout("invalid").await.is_none());
+    assert!(invalid.checkout_names().await.is_empty());
+    assert!(invalid.primary_name().await.is_err());
+    assert!(!invalid.root().join("invalid").exists());
+    drop(invalid);
+    let invalid = root.open_workset(&invalid_id).await.unwrap();
+    assert!(invalid.checkout_names().await.is_empty());
+    assert!(invalid.primary_name().await.is_err());
+    let recovered = invalid
+        .clone(
+            "repo",
+            remote.to_str().unwrap(),
+            Some("invalid"),
+            Some("main@origin"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(invalid.primary_name().await.unwrap(), "invalid");
+    drop(recovered);
+
+    let orphaned = root.create().await.unwrap();
+    orphaned
+        .clone(
+            "repo",
+            remote.to_str().unwrap(),
+            Some("grant-seed"),
+            Some("definitely-not-a-revset"),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        std::process::Command::new(&jj_bin)
+            .args([
+                "--config",
+                "git.write-change-id-header=true",
+                "store",
+                "workspace"
+            ])
+            .arg(orphaned.root().join(".stores/repo"))
+            .arg(orphaned.id())
+            .arg(orphaned.root().join("orphan"))
+            .args(["--name", "orphan"])
+            .stdout(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let _recovered_orphan = orphaned
+        .clone(
+            "repo",
+            remote.to_str().unwrap(),
+            Some("orphan"),
+            Some("main@origin"),
+        )
+        .await
+        .unwrap();
+    assert_eq!(orphaned.primary_name().await.unwrap(), "orphan");
+
+    let ordered = root.create().await.unwrap();
+    let zeta = ordered
+        .clone("repo", remote.to_str().unwrap(), Some("zeta"), None)
+        .await
+        .unwrap();
+    let alpha = ordered
+        .clone("repo", remote.to_str().unwrap(), Some("alpha"), None)
+        .await
+        .unwrap();
+    let ordered_id = ordered.id().to_owned();
+    assert!(
+        !ordered
+            .root()
+            .parent()
+            .unwrap()
+            .join("workset.json")
+            .exists()
+    );
+    drop(zeta);
+    drop(alpha);
+    drop(ordered);
+    drop(root);
+    let reopened_root = Worksets::open(
+        temp.path().join("root"),
+        rho_db::RhoDb::open(temp.path().join("rho.redb")),
+        environment,
+        PathOverrides::default(),
+    )
+    .unwrap();
+    let reopened = reopened_root.open_workset(&ordered_id).await.unwrap();
+    assert_eq!(reopened.checkout_names().await, vec!["zeta", "alpha"]);
+    assert_eq!(reopened.primary_name().await.unwrap(), "zeta");
 }

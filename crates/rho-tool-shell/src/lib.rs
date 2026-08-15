@@ -21,7 +21,7 @@ use rho_core::{
     ApplyPatchMetadata, ToolCall, ToolFormat, ToolGrammarSyntax, ToolName, ToolOutput,
     ToolOutputStatus, ToolResultMetadata, ToolSpec, ToolType,
 };
-use rho_workspaces::{PathOverrides, View};
+use rho_workspaces::{Namespace, PathOverrides};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -151,7 +151,7 @@ enum ExecContext {
         working_directory: Utf8PathBuf,
         path_overrides: PathOverrides,
     },
-    View(Arc<View>),
+    Namespace(Arc<Namespace>),
 }
 
 #[derive(Clone, Debug)]
@@ -223,9 +223,9 @@ impl ShellTools {
     /// Tools for an agent's workspace view. Namespace setup and cache warming
     /// run lazily on the first shell command, hiding their latency behind the
     /// model's first response.
-    pub fn new(_timeout: Duration, view: Arc<View>) -> Self {
+    pub fn new(_timeout: Duration, view: Arc<Namespace>) -> Self {
         Self {
-            exec: ExecContext::View(view),
+            exec: ExecContext::Namespace(view),
             env: Vec::new(),
             processes: Arc::new(ProcessManager::default()),
         }
@@ -265,7 +265,7 @@ impl ShellTools {
             } else {
                 working_directory.as_std_path().join(path)
             }),
-            ExecContext::View(view) => view
+            ExecContext::Namespace(view) => view
                 .resolve_host_path_checked(path)
                 .map_err(|error| error.to_string()),
         }
@@ -458,8 +458,8 @@ impl ShellTools {
                 );
                 command.current_dir(cwd.as_std_path());
             }
-            ExecContext::View(view) => {
-                view.prepare_command(&mut command, cwd, Vec::new()).await?;
+            ExecContext::Namespace(view) => {
+                view.prepare_command(&mut command, cwd)?;
             }
         }
 
