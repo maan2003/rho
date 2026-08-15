@@ -114,6 +114,29 @@ impl FsViewBuilder {
         Ok(Self { config })
     }
 
+    /// Builds the generated filesystem at `root` in the current mount
+    /// namespace. This does not fork, unshare, pivot the caller's root, or
+    /// change its environment.
+    ///
+    /// The caller must already have mount capability in the current user
+    /// namespace. Keeping this operation separate lets a daemon construct a
+    /// long-lived agent namespace while the development runner continues to
+    /// use the fork-and-exec convenience path.
+    pub fn build_in_place(&self, root: &Path) -> anyhow::Result<()> {
+        build_filesystem(&self.config, root)
+    }
+
+    /// Pivots the current process into a root produced by
+    /// [`Self::build_in_place`] and starts it in `/ws`.
+    pub fn pivot_into(&self, root: &Path) -> anyhow::Result<()> {
+        pivot_into(root)
+    }
+
+    /// Replaces the current process environment with the view's allowlist.
+    pub fn apply_environment(&self) -> anyhow::Result<()> {
+        apply_view_environment(&self.config)
+    }
+
     /// Runs a command inside the view (a new user and mount namespace).
     ///
     /// # Safety
@@ -149,6 +172,27 @@ impl ExposedBuilder {
     pub fn new(working_set: WorkingSet) -> anyhow::Result<Self> {
         validate_working_set(&working_set)?;
         Ok(Self { working_set })
+    }
+
+    /// Mounts the working-set tmpfs at `root/ws` in the current mount
+    /// namespace without forking, unsharing, or changing cwd/environment.
+    pub fn build_in_place(&self, root: &Path) -> anyhow::Result<()> {
+        let ws = root.join("ws");
+        ensure!(
+            ws.is_dir(),
+            "working-set mount stub is missing: {}",
+            ws.display()
+        );
+        mount_fs(
+            Some(OsStr::new("tmpfs")),
+            &ws,
+            Some("tmpfs"),
+            libc::MS_NOSUID | libc::MS_NODEV,
+            Some("mode=0755"),
+        )
+        .with_context(|| format!("mount tmpfs over {}", ws.display()))?;
+        fs::create_dir(ws.join(".stores")).context("create working-set .stores")?;
+        mount_working_set_in_place(&self.working_set, root)
     }
 
     /// Runs a command with `/ws` mounted (a new user and mount namespace).
@@ -259,10 +303,15 @@ fn setup_child(
     argv: &[CString],
 ) -> anyhow::Result<()> {
     mark_inherited_fds_close_on_exec()?;
-    enter_identity_namespace()?;
+    unshare_identity_mount_namespace()?;
     unsafe { libc::umask(0o022) };
-    build_filesystem(config, root)?;
-    enter_and_exec(config, root, program, argv)
+    let builder = FsViewBuilder {
+        config: config.clone(),
+    };
+    builder.build_in_place(root)?;
+    builder.pivot_into(root)?;
+    builder.apply_environment()?;
+    exec_command(program, argv)
 }
 
 fn setup_exposed(set: &WorkingSet, program: &CString, argv: &[CString]) -> anyhow::Result<()> {
@@ -271,24 +320,18 @@ fn setup_exposed(set: &WorkingSet, program: &CString, argv: &[CString]) -> anyho
         "host /ws mount stub is missing (deployed via systemd-tmpfiles: d /ws 0500 root root -)"
     );
     mark_inherited_fds_close_on_exec()?;
-    enter_identity_namespace()?;
-    mount_fs(
-        Some(OsStr::new("tmpfs")),
-        Path::new("/ws"),
-        Some("tmpfs"),
-        libc::MS_NOSUID | libc::MS_NODEV,
-        Some("mode=0755"),
-    )
-    .context("mount tmpfs over /ws")?;
-    fs::create_dir("/ws/.stores").context("create /ws/.stores")?;
-    build_ws(set, Path::new("/"))?;
+    unshare_identity_mount_namespace()?;
+    ExposedBuilder {
+        working_set: set.clone(),
+    }
+    .build_in_place(Path::new("/"))?;
     cvt(unsafe { libc::chdir(c"/ws".as_ptr()) }).context("chdir /ws")?;
     exec_command(program, argv)
 }
 
 /// Unshares user and mount namespaces, maps the caller's uid/gid onto
 /// themselves, and makes all mounts private to the namespace.
-fn enter_identity_namespace() -> anyhow::Result<()> {
+pub fn unshare_identity_mount_namespace() -> anyhow::Result<()> {
     let identity_uid = unsafe { libc::getuid() };
     let identity_gid = unsafe { libc::getgid() };
     cvt(unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) })
@@ -378,7 +421,7 @@ fn build_filesystem(config: &FsViewConfig, root: &Path) -> anyhow::Result<()> {
     }
     fs::set_permissions(root.join("tmp"), fs::Permissions::from_mode(0o1777))?;
     build_dev(root)?;
-    build_ws(&config.working_set, root)?;
+    mount_working_set_in_place(&config.working_set, root)?;
     Ok(())
 }
 
@@ -432,7 +475,11 @@ fn build_dev(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_ws(set: &WorkingSet, root: &Path) -> anyhow::Result<()> {
+/// Adds a validated working set below `root/ws` in the current mount
+/// namespace. This is also the primitive used to refresh a live namespace
+/// after a daemon grants another store or creates another workspace.
+pub fn mount_working_set_in_place(set: &WorkingSet, root: &Path) -> anyhow::Result<()> {
+    validate_working_set(set)?;
     let ws = root.join("ws");
     for store in &set.stores {
         let target = ws.join(".stores").join(&store.name);
@@ -453,12 +500,7 @@ fn build_ws(set: &WorkingSet, root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn enter_and_exec(
-    config: &FsViewConfig,
-    root: &Path,
-    program: &CString,
-    argv: &[CString],
-) -> anyhow::Result<()> {
+fn pivot_into(root: &Path) -> anyhow::Result<()> {
     let root_c = cstring(root)?;
     let old = cstring(&root.join("old-root"))?;
     cvt(unsafe { libc::syscall(libc::SYS_pivot_root, root_c.as_ptr(), old.as_ptr()) as i32 })
@@ -468,6 +510,10 @@ fn enter_and_exec(
         .context("detach host root")?;
     fs::remove_dir("/old-root").context("remove old root mount point")?;
     cvt(unsafe { libc::chdir(c"/ws".as_ptr()) }).context("chdir /ws")?;
+    Ok(())
+}
+
+fn apply_view_environment(config: &FsViewConfig) -> anyhow::Result<()> {
     cvt(unsafe { libc::clearenv() }).context("clear inherited environment")?;
     for (name, value) in &config.environment {
         let name = CString::new(name.as_bytes()).context("environment name contains NUL")?;
@@ -480,7 +526,7 @@ fn enter_and_exec(
         libc::setenv(c"USER".as_ptr(), c"agent".as_ptr(), 1);
         libc::setenv(c"LOGNAME".as_ptr(), c"agent".as_ptr(), 1);
     }
-    exec_command(program, argv)
+    Ok(())
 }
 
 fn exec_command(program: &CString, argv: &[CString]) -> anyhow::Result<()> {
