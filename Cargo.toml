@@ -121,6 +121,7 @@ rho-pr-monitor = { path = "crates/rho-pr-monitor" }
 rho-profiling = { path = "crates/rho-profiling" }
 rho-rpc = { path = "crates/rho-rpc", default-features = false }
 rho-sandbox = { path = "crates/rho-fs-view" }
+rho-fs-view = { path = "crates/rho-fs-view" }
 rho-shell = { path = "crates/rho-shell" }
 rho-tool-shell = { path = "crates/rho-tool-shell" }
 rho-ui-proto = { path = "crates/rho-ui-proto" }

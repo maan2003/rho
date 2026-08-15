@@ -1,142 +1,205 @@
-//! Mount-namespace plumbing: the daemon-wide user namespace, per-workspace
-//! mount namespaces held in fds, and the per-repo alias mounts that keep jj's
-//! `.jj/repo` pointers resolvable from every namespace.
-
+use std::ffi::CString;
 use std::fs::File;
-use std::os::fd::{AsFd as _, OwnedFd};
+use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Context as _;
-use rustix::fs::CWD;
-use rustix::mount::{
-    MountPropagationFlags, MoveMountFlags, OpenTreeFlags, mount_change, move_mount, open_tree,
-};
-use rustix::thread::{UnshareFlags, unshare_unsafe};
+use camino::Utf8Path;
 
-/// Moves the daemon into its own user + mount namespace, mapped to the
-/// current user and holding `CAP_SYS_ADMIN` over all mounts made after this
-/// point. Workspaces require it: agents whose real cwd contradicts the paths
-/// baked into their context are worse than a dead daemon, so callers should
-/// treat failure as fatal rather than degrade.
-///
-/// # Safety
-///
-/// The process must be single-threaded: `unshare(CLONE_NEWUSER)` fails on a
-/// threaded process, but the deeper contract is that this rewires
-/// process-wide state — every subsequent thread inherits the new namespaces,
-/// and code that already captured pre-namespace state (open directory fds,
-/// resolved paths, cached credentials) would silently disagree with code
-/// running after. Call it once, at the top of `main`, before the tokio
-/// runtime or any other thread exists.
-pub unsafe fn init_daemon_namespace() -> anyhow::Result<()> {
-    let uid = rustix::process::getuid().as_raw();
-    let gid = rustix::process::getgid().as_raw();
-    // SAFETY: single-threaded per this function's contract.
-    unsafe { unshare_unsafe(UnshareFlags::NEWUSER | UnshareFlags::NEWNS) }
-        .context("unshare user+mount namespace")?;
-    std::fs::write("/proc/self/setgroups", "deny").context("deny setgroups")?;
-    std::fs::write("/proc/self/uid_map", format!("{uid} {uid} 1")).context("write uid_map")?;
-    std::fs::write("/proc/self/gid_map", format!("{gid} {gid} 1")).context("write gid_map")?;
-    // Host mounts keep flowing in; nothing the daemon mounts leaks back out.
-    mount_change(
-        "/",
-        MountPropagationFlags::DOWNSTREAM | MountPropagationFlags::REC,
-    )
-    .context("make mount tree a recursive slave")?;
-    Ok(())
+use crate::{Checkout, PathOverrides, UserEnvironment, Workset};
+
+#[derive(Clone, Debug)]
+pub enum Mode {
+    View { home_skeleton: Option<PathBuf> },
+    Exposed,
 }
 
-/// The escape hatch back to the origin repo: checkout pointers reference
-/// `<origin>/.jj/ws-parent/…`, which must resolve to the origin from *three*
-/// namespaces. On the host and in the daemon's namespace it does via a
-/// symlink in the origin's `.jj` pointing back at the repo itself (so no
-/// mounts, and nothing to re-establish after a daemon restart). In an
-/// agent's namespace the origin path is covered by the checkout, so the same
-/// path lands on the checkout's plain `.jj/ws-parent` directory — where
-/// [`create_view_ns`] binds the real origin.
-pub const WS_PARENT: &str = "ws-parent";
-
-pub struct ViewMount {
-    pub repo: PathBuf,
-    pub checkout: PathBuf,
-    pub metadata_masks: Option<(PathBuf, PathBuf)>,
+/// A live user+mount namespace presenting one workset at `/src`.
+#[derive(Debug)]
+pub struct Namespace {
+    workset: Arc<Workset>,
+    mode: Mode,
+    user_ns: OwnedFd,
+    mount_ns: OwnedFd,
+    root: OwnedFd,
+    primary: String,
+    environment: UserEnvironment,
+    path_overrides: PathOverrides,
 }
 
-/// Creates the mount namespace for one agent view: a copy of the daemon's
-/// namespace with each entry's managed checkout mounted over its origin repo
-/// path, and each origin bound back in at `.jj/ws-parent` for the checkout's
-/// repo pointers. Runs on a dedicated thread because the thread ends up
-/// permanently inside the new namespace — the returned
-/// `/proc/thread-self/ns/mnt` fd is what keeps it alive after the thread
-/// exits.
-pub fn create_view_ns(mounts: Vec<ViewMount>) -> anyhow::Result<OwnedFd> {
-    std::thread::spawn(move || -> anyhow::Result<OwnedFd> {
-        // SAFETY: NEWNS implies unsharing fs state for this thread only; the
-        // thread exits immediately after and shares nothing else.
-        unsafe { unshare_unsafe(UnshareFlags::NEWNS) }.context("unshare mount namespace")?;
-        for mount in &mounts {
-            cover_origin_with_checkout(
-                &mount.repo,
-                &mount.checkout,
-                mount.metadata_masks.is_none(),
-            )?;
-            if let Some((jj_mask, git_mask)) = &mount.metadata_masks {
-                rustix::mount::mount_bind(jj_mask, mount.repo.join(".jj"))
-                    .context("mask sandbox .jj metadata")?;
-                // Pure jj repositories have no colocated `.git` entry.
-                if mount.repo.join(".git").exists() {
-                    rustix::mount::mount_bind(git_mask, mount.repo.join(".git"))
-                        .context("mask sandbox .git metadata")?;
+impl Namespace {
+    pub(crate) async fn create(workset: Arc<Workset>, mode: Mode) -> anyhow::Result<Arc<Self>> {
+        let owner = workset
+            .owner
+            .upgrade()
+            .context("worksets manager was dropped")?;
+        let mounts = workset.mounts().await;
+        let primary = mounts
+            .workspaces
+            .first()
+            .map(|workspace| workspace.name.clone())
+            .context("workset has no workspace")?;
+        let environment = owner.environment.clone();
+        let path_overrides = owner.path_overrides.clone();
+        let mode_for_thread = mode.clone();
+        let (user_ns, mount_ns, root) = tokio::task::spawn_blocking(move || {
+            rho_fs_view::unshare_identity_namespaces()?;
+            match mode_for_thread {
+                Mode::View { home_skeleton } => {
+                    let root = tempfile::Builder::new()
+                        .prefix("rho-workset-view-")
+                        .tempdir()
+                        .context("create namespace root")?;
+                    let mut config = rho_fs_view::FsViewConfig::new(mounts)?;
+                    config.home_skeleton = home_skeleton;
+                    let builder = rho_fs_view::FsViewBuilder::new(config)?;
+                    builder.build_in_place(root.path())?;
+                    builder.pivot_into(root.path())?;
+                }
+                Mode::Exposed => {
+                    rho_fs_view::ExposedBuilder::new(mounts)?.build_in_place(Path::new("/"))?;
                 }
             }
+            Ok::<_, anyhow::Error>((
+                File::open("/proc/thread-self/ns/user")?.into(),
+                File::open("/proc/thread-self/ns/mnt")?.into(),
+                open_root()?,
+            ))
+        })
+        .await
+        .context("namespace builder thread panicked")??;
+        Ok(Arc::new(Self {
+            workset,
+            mode,
+            user_ns,
+            mount_ns,
+            root,
+            primary,
+            environment,
+            path_overrides,
+        }))
+    }
+
+    pub fn workset(&self) -> &Arc<Workset> {
+        &self.workset
+    }
+
+    pub async fn primary(&self) -> anyhow::Result<Arc<Checkout>> {
+        self.workset
+            .workspaces
+            .lock()
+            .await
+            .values()
+            .next()
+            .cloned()
+            .context("workset has no workspace")
+    }
+
+    pub async fn refresh(&self, mounts: rho_fs_view::Mounts) -> anyhow::Result<()> {
+        let user_ns = self.user_ns.try_clone()?;
+        let mount_ns = self.mount_ns.try_clone()?;
+        let root = self.root.try_clone()?;
+        tokio::task::spawn_blocking(move || {
+            enter(&user_ns, &mount_ns, &root)?;
+            rho_fs_view::mount_in_place(&mounts, Path::new("/"))
+        })
+        .await
+        .context("namespace refresh thread panicked")?
+    }
+
+    pub fn prepare_command(
+        &self,
+        command: &mut tokio::process::Command,
+        cwd: Option<&Utf8Path>,
+    ) -> anyhow::Result<()> {
+        match &self.mode {
+            Mode::View { .. } => {
+                command.env_clear();
+                for name in ["PATH", "TERM"] {
+                    if let Some(value) = self.environment.get(name) {
+                        command.env(name, value);
+                    }
+                }
+                command
+                    .env("HOME", "/home/agent")
+                    .env("USER", "agent")
+                    .env("LOGNAME", "agent");
+            }
+            Mode::Exposed => self.environment.apply(command),
         }
-        let fd = File::open("/proc/thread-self/ns/mnt").context("open mount namespace fd")?;
-        Ok(fd.into())
-    })
-    .join()
-    .expect("view namespace thread panicked")
+        if let Some(path) = self.environment.get("PATH") {
+            command.env("PATH", self.path_overrides.add_to(path));
+        }
+        let cwd = cwd.map_or_else(
+            || format!("{}/{}", rho_fs_view::MOUNT_ROOT, self.primary),
+            |path| {
+                if path.is_absolute() {
+                    path.as_str().to_owned()
+                } else {
+                    format!("{}/{}/{}", rho_fs_view::MOUNT_ROOT, self.primary, path)
+                }
+            },
+        );
+        anyhow::ensure!(
+            cwd.starts_with(rho_fs_view::MOUNT_ROOT),
+            "namespace cwd must be below /src: {cwd}"
+        );
+        let cwd = CString::new(cwd).context("namespace cwd contains NUL")?;
+        let user_ns = self.user_ns.as_raw_fd();
+        let mount_ns = self.mount_ns.as_raw_fd();
+        let root = self.root.as_raw_fd();
+        unsafe {
+            command.pre_exec(move || {
+                setns(user_ns)?;
+                setns(mount_ns)?;
+                if libc::fchdir(root) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::chroot(c".".as_ptr()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::chdir(cwd.as_ptr()) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        Ok(())
+    }
 }
 
-/// The per-entry mount dance, in whatever namespace this thread is in:
-/// mount the checkout over the origin repo path and bind the origin
-/// back in at the checkout's `.jj/ws-parent`.
-fn cover_origin_with_checkout(
-    repo: &Path,
-    checkout: &Path,
-    bind_origin_back: bool,
-) -> anyhow::Result<()> {
-    // Clone both trees before the cover mount hides the origin.
-    let clone = |path: &Path| {
-        open_tree(
-            CWD,
-            path,
-            OpenTreeFlags::OPEN_TREE_CLONE
-                | OpenTreeFlags::AT_RECURSIVE
-                | OpenTreeFlags::OPEN_TREE_CLOEXEC,
+fn open_root() -> anyhow::Result<OwnedFd> {
+    let fd = unsafe {
+        libc::open(
+            c"/".as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
         )
     };
-    let origin_tree = bind_origin_back
-        .then(|| clone(repo).context("open repo tree"))
-        .transpose()?;
-    let checkout_tree = clone(checkout).context("open checkout tree")?;
-    move_mount(
-        checkout_tree.as_fd(),
-        "",
-        CWD,
-        repo,
-        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
-    )
-    .context("mount checkout over repo path")?;
-    // The path now resolves inside the checkout: its empty ws-parent dir.
-    if let Some(origin_tree) = origin_tree {
-        move_mount(
-            origin_tree.as_fd(),
-            "",
-            CWD,
-            repo.join(".jj").join(WS_PARENT),
-            MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
-        )
-        .context("bind origin at ws-parent")?;
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error()).context("open namespace root");
+    }
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+fn enter(user_ns: &OwnedFd, mount_ns: &OwnedFd, root: &OwnedFd) -> anyhow::Result<()> {
+    setns(user_ns.as_raw_fd()).context("enter workset user namespace")?;
+    setns(mount_ns.as_raw_fd()).context("enter workset mount namespace")?;
+    let result = unsafe { libc::fchdir(root.as_raw_fd()) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).context("enter namespace root");
+    }
+    let result = unsafe { libc::chroot(c".".as_ptr()) };
+    if result != 0 {
+        return Err(std::io::Error::last_os_error()).context("chroot namespace root");
     }
     Ok(())
+}
+
+fn setns(fd: i32) -> std::io::Result<()> {
+    if unsafe { libc::setns(fd, 0) } != 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }

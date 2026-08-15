@@ -1,6 +1,6 @@
 //! The agent filesystem view: a private mount namespace whose root is a
 //! fresh tmpfs holding only what an agent works with — `/nix/store`, a
-//! generated `/etc`, an empty `$HOME`, and the `/ws` workspace tree.
+//! generated `/etc`, an empty `$HOME`, and the `/src` workspace tree.
 //!
 //! This is a layout, not a sandbox: everything runs as the invoking user,
 //! and no security boundary is claimed.
@@ -14,6 +14,8 @@ use std::{fs, io};
 
 use anyhow::{Context as _, bail, ensure};
 
+pub const MOUNT_ROOT: &str = "/src";
+
 #[derive(Clone, Debug)]
 pub struct WorkspaceMount {
     pub name: String,
@@ -24,13 +26,13 @@ pub struct WorkspaceMount {
 pub struct StoreMount {
     pub name: String,
     pub source: PathBuf,
-    /// The id below `source/clones` owned by this agent. That subtree is
+    /// The id below `source/clones` owned by this workset. That subtree is
     /// mounted read-write over the otherwise read-only store.
     pub writable_clone: String,
 }
 
 #[derive(Clone, Debug, Default)]
-pub struct WorkingSet {
+pub struct Mounts {
     pub workspaces: Vec<WorkspaceMount>,
     pub stores: Vec<StoreMount>,
 }
@@ -76,7 +78,7 @@ fn resolve_store_path(path: impl AsRef<Path>) -> anyhow::Result<Option<PathBuf>>
 #[derive(Clone, Debug)]
 pub struct FsViewConfig {
     pub home_skeleton: Option<PathBuf>,
-    pub working_set: WorkingSet,
+    pub mounts: Mounts,
     pub host_etc: HostEtc,
     /// Explicit non-secret environment passed through to the command. HOME,
     /// USER, and LOGNAME are always set by the builder.
@@ -84,10 +86,10 @@ pub struct FsViewConfig {
 }
 
 impl FsViewConfig {
-    pub fn new(working_set: WorkingSet) -> anyhow::Result<Self> {
+    pub fn new(mounts: Mounts) -> anyhow::Result<Self> {
         Ok(Self {
             home_skeleton: None,
-            working_set,
+            mounts,
             host_etc: HostEtc::discover()?,
             environment: ["PATH", "TERM"]
                 .into_iter()
@@ -103,7 +105,7 @@ pub struct FsViewBuilder {
 
 impl FsViewBuilder {
     pub fn new(config: FsViewConfig) -> anyhow::Result<Self> {
-        validate_working_set(&config.working_set)?;
+        validate_mounts(&config.mounts)?;
         if let Some(skeleton) = &config.home_skeleton {
             ensure!(
                 skeleton.is_dir(),
@@ -127,7 +129,7 @@ impl FsViewBuilder {
     }
 
     /// Pivots the current process into a root produced by
-    /// [`Self::build_in_place`] and starts it in `/ws`.
+    /// [`Self::build_in_place`] and starts it in `/src`.
     pub fn pivot_into(&self, root: &Path) -> anyhow::Result<()> {
         pivot_into(root)
     }
@@ -161,26 +163,26 @@ impl FsViewBuilder {
 }
 
 /// Exposed mode: the full host view as the invoking user, plus the same
-/// `/ws` working-set tree the filesystem view presents, mounted over the
-/// host's permanently empty `/ws` stub. Environment, `$HOME`, and every
+/// `/src` mount-list tree the filesystem view presents, mounted over the
+/// host's permanently empty `/src` stub. Environment, `$HOME`, and every
 /// host path stay exactly as they are.
 pub struct ExposedBuilder {
-    working_set: WorkingSet,
+    mounts: Mounts,
 }
 
 impl ExposedBuilder {
-    pub fn new(working_set: WorkingSet) -> anyhow::Result<Self> {
-        validate_working_set(&working_set)?;
-        Ok(Self { working_set })
+    pub fn new(mounts: Mounts) -> anyhow::Result<Self> {
+        validate_mounts(&mounts)?;
+        Ok(Self { mounts })
     }
 
-    /// Mounts the working-set tmpfs at `root/ws` in the current mount
+    /// Mounts the mount-list tmpfs at `root/src` in the current mount
     /// namespace without forking, unsharing, or changing cwd/environment.
     pub fn build_in_place(&self, root: &Path) -> anyhow::Result<()> {
-        let ws = root.join("ws");
+        let ws = mount_root(root);
         ensure!(
             ws.is_dir(),
-            "working-set mount stub is missing: {}",
+            "mount-list mount stub is missing: {}",
             ws.display()
         );
         mount_fs(
@@ -191,11 +193,11 @@ impl ExposedBuilder {
             Some("mode=0755"),
         )
         .with_context(|| format!("mount tmpfs over {}", ws.display()))?;
-        fs::create_dir(ws.join(".stores")).context("create working-set .stores")?;
-        mount_working_set_in_place(&self.working_set, root)
+        fs::create_dir(ws.join(".stores")).context("create mount-list .stores")?;
+        mount_in_place(&self.mounts, root)
     }
 
-    /// Runs a command with `/ws` mounted (a new user and mount namespace).
+    /// Runs a command with `/src` mounted (a new user and mount namespace).
     ///
     /// # Safety
     ///
@@ -207,7 +209,7 @@ impl ExposedBuilder {
     {
         let (program, argv) = prepare_command(program, args)?;
         // SAFETY: required by this method's single-threaded contract.
-        unsafe { spawn_setup(|| setup_exposed(&self.working_set, &program, &argv)) }
+        unsafe { spawn_setup(|| setup_exposed(&self.mounts, &program, &argv)) }
     }
 }
 
@@ -242,7 +244,7 @@ unsafe fn spawn_setup(setup: impl FnOnce() -> anyhow::Result<()>) -> anyhow::Res
     wait_pid(pid)
 }
 
-fn validate_working_set(set: &WorkingSet) -> anyhow::Result<()> {
+fn validate_mounts(set: &Mounts) -> anyhow::Result<()> {
     let mut targets = std::collections::HashSet::new();
     for workspace in &set.workspaces {
         validate_name(&workspace.name)?;
@@ -303,7 +305,7 @@ fn setup_child(
     argv: &[CString],
 ) -> anyhow::Result<()> {
     mark_inherited_fds_close_on_exec()?;
-    unshare_identity_mount_namespace()?;
+    unshare_identity_namespaces()?;
     unsafe { libc::umask(0o022) };
     let builder = FsViewBuilder {
         config: config.clone(),
@@ -314,24 +316,25 @@ fn setup_child(
     exec_command(program, argv)
 }
 
-fn setup_exposed(set: &WorkingSet, program: &CString, argv: &[CString]) -> anyhow::Result<()> {
+fn setup_exposed(set: &Mounts, program: &CString, argv: &[CString]) -> anyhow::Result<()> {
     ensure!(
-        Path::new("/ws").is_dir(),
-        "host /ws mount stub is missing (deployed via systemd-tmpfiles: d /ws 0500 root root -)"
+        Path::new(MOUNT_ROOT).is_dir(),
+        "host /src mount stub is missing (deployed via systemd-tmpfiles: d /src 0500 root root -)"
     );
     mark_inherited_fds_close_on_exec()?;
-    unshare_identity_mount_namespace()?;
+    unshare_identity_namespaces()?;
     ExposedBuilder {
-        working_set: set.clone(),
+        mounts: set.clone(),
     }
     .build_in_place(Path::new("/"))?;
-    cvt(unsafe { libc::chdir(c"/ws".as_ptr()) }).context("chdir /ws")?;
+    let mount_root = CString::new(MOUNT_ROOT)?;
+    cvt(unsafe { libc::chdir(mount_root.as_ptr()) }).context("chdir mount root")?;
     exec_command(program, argv)
 }
 
 /// Unshares user and mount namespaces, maps the caller's uid/gid onto
 /// themselves, and makes all mounts private to the namespace.
-pub fn unshare_identity_mount_namespace() -> anyhow::Result<()> {
+pub fn unshare_identity_namespaces() -> anyhow::Result<()> {
     let identity_uid = unsafe { libc::getuid() };
     let identity_gid = unsafe { libc::getgid() };
     cvt(unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) })
@@ -388,7 +391,7 @@ fn mark_inherited_fds_close_on_exec() -> anyhow::Result<()> {
 }
 
 fn build_filesystem(config: &FsViewConfig, root: &Path) -> anyhow::Result<()> {
-    // The root is one fresh tmpfs; /home/agent, /tmp, /ws, and /dev are plain
+    // The root is one fresh tmpfs; /home/agent, /tmp, /src, and /dev are plain
     // directories on it rather than mounts of their own.
     mount_fs(
         Some(OsStr::new("tmpfs")),
@@ -404,7 +407,7 @@ fn build_filesystem(config: &FsViewConfig, root: &Path) -> anyhow::Result<()> {
         "tmp",
         "proc",
         "dev",
-        "ws/.stores",
+        "src/.stores",
         "old-root",
     ] {
         fs::create_dir_all(root.join(dir)).with_context(|| format!("create /{dir}"))?;
@@ -421,7 +424,7 @@ fn build_filesystem(config: &FsViewConfig, root: &Path) -> anyhow::Result<()> {
     }
     fs::set_permissions(root.join("tmp"), fs::Permissions::from_mode(0o1777))?;
     build_dev(root)?;
-    mount_working_set_in_place(&config.working_set, root)?;
+    mount_in_place(&config.mounts, root)?;
     Ok(())
 }
 
@@ -475,12 +478,14 @@ fn build_dev(root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Adds a validated working set below `root/ws` in the current mount
+/// Adds a validated working set below `root/src` in the current mount
 /// namespace. This is also the primitive used to refresh a live namespace
-/// after a daemon grants another store or creates another workspace.
-pub fn mount_working_set_in_place(set: &WorkingSet, root: &Path) -> anyhow::Result<()> {
-    validate_working_set(set)?;
-    let ws = root.join("ws");
+/// after a daemon grants another store or creates another workspace. For
+/// refresh, pass a `Mounts` containing only the newly added entries; collisions
+/// with already-mounted names fail when their target directory is created.
+pub fn mount_in_place(set: &Mounts, root: &Path) -> anyhow::Result<()> {
+    validate_mounts(set)?;
+    let ws = mount_root(root);
     for store in &set.stores {
         let target = ws.join(".stores").join(&store.name);
         fs::create_dir(&target)?;
@@ -509,7 +514,8 @@ fn pivot_into(root: &Path) -> anyhow::Result<()> {
     cvt(unsafe { libc::umount2(c"/old-root".as_ptr(), libc::MNT_DETACH) })
         .context("detach host root")?;
     fs::remove_dir("/old-root").context("remove old root mount point")?;
-    cvt(unsafe { libc::chdir(c"/ws".as_ptr()) }).context("chdir /ws")?;
+    let mount_root = CString::new(MOUNT_ROOT)?;
+    cvt(unsafe { libc::chdir(mount_root.as_ptr()) }).context("chdir mount root")?;
     Ok(())
 }
 
@@ -626,6 +632,10 @@ fn mount_fs(
 
 fn cstring(path: &Path) -> anyhow::Result<CString> {
     CString::new(path.as_os_str().as_bytes()).context("path contains NUL")
+}
+
+fn mount_root(root: &Path) -> PathBuf {
+    root.join(MOUNT_ROOT.trim_start_matches('/'))
 }
 fn cvt(value: i32) -> io::Result<i32> {
     if value < 0 {

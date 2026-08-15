@@ -23,15 +23,15 @@ a plain directory or file except a handful of real mounts:
   optional skeleton. The host home is not mounted at all.
 - `/dev`: the standard character devices bound in, plus a private
   devpts.
-- `/ws`: the working set, below. The command starts here.
+- `/src`: the working set, below. The command starts here.
 
 The environment is an explicit allowlist (plus HOME/USER/LOGNAME);
 inherited fds are closed on exec.
 
-## /ws: the working set
+## /src: the working set
 
-Workspaces appear at `/ws/<name>`, read-write. Clone stores appear at
-`/ws/.stores/<repo>`, read-only, with the agent's own clone
+Workspaces appear at `/src/<name>`, read-write. Clone stores appear at
+`/src/.stores/<repo>`, read-only, with the agent's own clone
 (`clones/<id>`) bind-mounted read-write over it — so the store's
 never-prune invariant is at least mount-enforced against accidents,
 while the agent's own refs, op log, and fetches work normally.
@@ -46,15 +46,15 @@ backing directories are bookkeeping the launcher owns.
 
 Some work genuinely needs the real system. Exposed mode is the full
 host view as the user — environment, `$HOME`, every path unchanged —
-plus the same `/ws` working-set tree, mounted in a namespace of its
-own over the host's `/ws` stub. Both modes therefore present
-identical `/ws` paths, so nothing about an agent's repositories or
+plus the same `/src` working-set tree, mounted in a namespace of its
+own over the host's `/src` stub. Both modes therefore present
+identical `/src` paths, so nothing about an agent's repositories or
 instructions differs between them. Granted per agent by the user.
 
 The stub is the one host prerequisite this implies: an unprivileged
 mount namespace can only mount over a directory that already exists,
-and `/` belongs to root. So the host keeps a permanently empty `/ws`
-(`d /ws 0500 root root` via systemd-tmpfiles) purely as mountpoint
+and `/` belongs to root. So the host keeps a permanently empty `/src`
+(`d /src 0500 root root` via systemd-tmpfiles) purely as mountpoint
 real estate — deliberately opaque, so nothing can use or pollute it
 unmounted.
 
@@ -68,4 +68,4 @@ unmounted.
   tools (sandboxed browsers, containers, agents' own tools) keep
   working without pid-1 signal plumbing.
 - No other host prerequisites: unprivileged user namespaces and the
-  `/ws` stub are the whole list.
+  `/src` stub are the whole list.

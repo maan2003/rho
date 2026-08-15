@@ -3,12 +3,12 @@ use std::path::PathBuf;
 
 use anyhow::{Context as _, bail};
 use rho_fs_view::{
-    ExposedBuilder, FsViewBuilder, FsViewConfig, StoreMount, WorkingSet, WorkspaceMount,
+    ExposedBuilder, FsViewBuilder, FsViewConfig, Mounts, StoreMount, WorkspaceMount,
 };
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args_os().skip(1).peekable();
-    let mut set = WorkingSet::default();
+    let mut set = Mounts::default();
     let mut skeleton = None;
     let mut exposed = false;
     let mut command = Vec::new();

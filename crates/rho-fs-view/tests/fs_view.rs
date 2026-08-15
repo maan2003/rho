@@ -134,9 +134,9 @@ fn clone_store_workspace_and_generated_root_work_in_the_view() {
     let script = format!(
         r#"
 set -eu
-test "$PWD" = /ws
-test -d /ws/project
-test -d /ws/.stores/repo
+test "$PWD" = /src
+test -d /src/project
+test -d /src/.stores/repo
 test -f "$HOME/seeded"
 test -L "$HOME/store-link"
 touch "$HOME/writable"
@@ -152,11 +152,11 @@ test -L /etc/localtime
 test -L /etc/ssl/certs/ca-certificates.crt
 grep -q ' / / .* - tmpfs ' /proc/self/mountinfo
 grep ' /nix/store ' /proc/self/mountinfo | grep -q ' ro[, ]'
-{git} -C /ws/project status --short
-{jj} -R /ws/project st >/dev/null
+{git} -C /src/project status --short
+{jj} -R /src/project st >/dev/null
 {unshare} -Ur true
-test ! -w /ws/.stores/repo/clone-store
-touch /ws/.stores/repo/clones/agent/writable
+test ! -w /src/.stores/repo/clone-store
+touch /src/.stores/repo/clones/agent/writable
 "#,
         git = git.display(),
         jj = "/home/agent/jj",
@@ -189,8 +189,8 @@ fn exposed_mode_mounts_the_working_set_over_the_host_ws_stub() {
     if !namespace_setup_available() {
         return;
     }
-    if !Path::new("/ws").is_dir() {
-        eprintln!("skipping exposed-mode test: host has no /ws mount stub");
+    if !Path::new("/src").is_dir() {
+        eprintln!("skipping exposed-mode test: host has no /src mount stub");
         return;
     }
 
@@ -201,16 +201,16 @@ fn exposed_mode_mounts_the_working_set_over_the_host_ws_stub() {
     let script = format!(
         r#"
 set -eu
-test "$PWD" = /ws
-test -d /ws/project
-test -d /ws/.stores/repo
+test "$PWD" = /src
+test -d /src/project
+test -d /src/.stores/repo
 test "$HOME" = {home}
 test -d {temp}
 test "$RHO_FS_VIEW_TEST_ENV" = kept
-git -C /ws/project status --short
-{jj} -R /ws/project st >/dev/null
-test ! -w /ws/.stores/repo/clone-store
-touch /ws/.stores/repo/clones/agent/writable
+git -C /src/project status --short
+{jj} -R /src/project st >/dev/null
+test ! -w /src/.stores/repo/clone-store
+touch /src/.stores/repo/clones/agent/writable
 "#,
         home = std::env::var("HOME").unwrap(),
         temp = temp.path().display(),
