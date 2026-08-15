@@ -742,10 +742,22 @@ impl CloneStore {
             .strip_prefix("gitdir:")
             .map(str::trim)
             .ok_or_else(|| CloneStoreError::msg("unexpected .git pointer format"))?;
-        let staging_abs =
-            fs::canonicalize(staging).ctx(|| "canonicalize workspace staging".to_string())?;
-        let admin_abs =
-            fs::canonicalize(gitdir).ctx(|| "canonicalize worktree admin dir".to_string())?;
+        // Preserve symlinks in the caller's frame. In particular, Rho exposes
+        // stores through a sibling `.stores/<name>` symlink; resolving that
+        // symlink here would bake the host store location into these relative
+        // pointers and make the workspace unusable when the same frame is
+        // assembled under `/ws`.
+        let staging_abs = std::path::absolute(staging)
+            .ctx(|| "make workspace staging path absolute".to_string())?;
+        // Git resolves the `--git-dir` symlink before writing `gitdir`, so
+        // recover the admin directory under the path by which the caller
+        // reached the clone instead of absolutizing Git's already-resolved
+        // spelling.
+        let admin_name = Path::new(gitdir)
+            .file_name()
+            .ok_or_else(|| CloneStoreError::msg("worktree admin path has no directory name"))?;
+        let admin_abs = std::path::absolute(clone_git.join("worktrees").join(admin_name))
+            .ctx(|| "make worktree admin path absolute".to_string())?;
         let final_abs = staging_abs.parent().unwrap().join(file_name);
         let to_admin = relative_path(&staging_abs, &admin_abs);
         fs::write(&pointer_path, format!("gitdir: {}\n", to_admin.display()))
@@ -787,6 +799,16 @@ impl CloneStore {
             .await
             .ctx(|| "init workspace".to_string())?
         };
+        // Workspace initialization canonicalizes the repository path before
+        // writing `.jj/repo`. Rewrite that pointer in the caller's symlink
+        // frame for the same reason as the Git pointers above.
+        let clone_repo_abs = std::path::absolute(&clone_repo_path)
+            .ctx(|| "make clone repository path absolute".to_string())?;
+        let to_repo = relative_path(&staging_abs.join(".jj"), &clone_repo_abs);
+        let repo_pointer = crate::file_util::path_to_bytes(&to_repo)
+            .ctx(|| "encode jj repository pointer".to_string())?;
+        fs::write(staging.join(".jj/repo"), repo_pointer)
+            .ctx(|| "rewrite jj repository pointer".to_string())?;
 
         let mut tx = repo.start_transaction();
         let wc_commit = tx

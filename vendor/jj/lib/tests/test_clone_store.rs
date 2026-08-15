@@ -672,6 +672,98 @@ fn store_and_contents_survive_moving_wholesale() {
 }
 
 #[test]
+fn workspace_pointers_preserve_symlinked_store_frame() {
+    async {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let (_source, remote) = setup_remote(root);
+        let stores = root.join("stores");
+        std::fs::create_dir(&stores).unwrap();
+        let store_path = stores.join("repo");
+        CloneStore::init_from_remote(
+            &store_path,
+            remote.to_str().unwrap(),
+            &testutils::user_settings(),
+        )
+        .await
+        .unwrap();
+
+        let frame = root.join("frame");
+        std::fs::create_dir_all(frame.join(".stores")).unwrap();
+        std::os::unix::fs::symlink("../../stores/repo", frame.join(".stores/repo")).unwrap();
+        let store =
+            CloneStore::open(&frame.join(".stores/repo"), &testutils::user_settings()).unwrap();
+        store.create_clone("agent").await.unwrap();
+        let workspace = frame.join("work");
+        store
+            .create_workspace("agent", &workspace, "default", None)
+            .await
+            .unwrap();
+
+        let git_pointer = std::fs::read_to_string(workspace.join(".git")).unwrap();
+        assert!(
+            git_pointer.contains("../.stores/repo/"),
+            "pointer escaped the symlink frame: {git_pointer}"
+        );
+        let jj_pointer = std::fs::read_to_string(workspace.join(".jj/repo")).unwrap();
+        assert!(
+            jj_pointer.contains("../../.stores/repo/"),
+            "pointer escaped the symlink frame: {jj_pointer}"
+        );
+        assert!(
+            workspace.join(".jj").join(jj_pointer.trim()).exists(),
+            "jj pointer does not resolve: {jj_pointer}"
+        );
+        assert_eq!(git_stdout(&workspace, &["status", "--porcelain"]), "");
+        let output = Command::new("jj")
+            .arg("log")
+            .arg("-r")
+            .arg("@")
+            .arg("--no-graph")
+            .current_dir(&workspace)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "jj failed through original frame: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        // Model the namespace's reassembled `/ws` tree without requiring
+        // mount privileges: copy the workspace to a second same-shaped frame
+        // and expose the same store at its sibling `.stores/repo` path.
+        let reassembled = root.join("reassembled");
+        std::fs::create_dir_all(reassembled.join(".stores")).unwrap();
+        std::os::unix::fs::symlink("../../stores/repo", reassembled.join(".stores/repo")).unwrap();
+        let status = Command::new("cp")
+            .args([
+                "-a",
+                workspace.to_str().unwrap(),
+                reassembled.to_str().unwrap(),
+            ])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let workspace = reassembled.join("work");
+        assert_eq!(git_stdout(&workspace, &["status", "--porcelain"]), "");
+        let output = Command::new("jj")
+            .arg("log")
+            .arg("-r")
+            .arg("@")
+            .arg("--no-graph")
+            .current_dir(&workspace)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "jj failed through reassembled frame: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    .block_on();
+}
+
+#[test]
 fn fetch_prunes_and_advances_the_mirror() {
     async {
         let temp = tempfile::tempdir().unwrap();
