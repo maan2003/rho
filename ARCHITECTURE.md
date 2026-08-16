@@ -124,10 +124,12 @@ than by running a supervisor, extension protocol, or daemon process graph.
   receive an eager registry.
   All pages share one normal Chromium window and one private Smithay compositor
   surface, so exactly one page is visible. Switching a Rho page activates its
-  tab. Presentation waits for a DMA-BUF commit that acknowledges a deliberately
-  changed post-activation XDG configure, so an outgoing or prematurely
-  committed frame cannot be attributed to the new page. The extension explicitly
-  discards the previous tab, bounding loaded
+  tab. A generation-scoped handoff serializes extension focus requests and gates
+  input until a DMA-BUF commit acknowledges a deliberately changed
+  post-activation XDG configure. The previous atomic scene may remain visible
+  but non-interactive during that handoff; Wayland ordering establishes frame
+  readiness, not semantic pixel ownership by a Chrome tab. The extension
+  explicitly discards the previous tab, bounding loaded
   renderer and surface memory while Chrome retains per-page history metadata.
   The compositor issues one XDG activation token for the singleton toplevel and
   retains the unambiguous first-window fallback for stock Chromium builds that
@@ -139,12 +141,14 @@ than by running a supervisor, extension protocol, or daemon process graph.
   synchronization, and GPUI retains each imported Vulkan image while its page
   model owns the lease; Smithay does not render or flatten the tree. Synchronized
   subsurface commits are reconciled only at their transaction anchor and the
-  resulting bottom-to-top scene carries per-node position, viewport crop, and
-  destination size. Chromium SHM chrome and `xdg_popup` widgets use the bounded
-  exception: the compositor validates and snapshots ARGB/XRGB rows into owned
-  memory for GPUI/WGPU upload. Pointer hit-testing uses the same versioned scene,
-  stacking order, geometry, and input regions. Wayland overlay delegation remains
-  disabled so every visible client surface follows this single composition path.
+  compositor copies lock-bound Smithay state into an immutable tree snapshot;
+  the resulting bottom-to-top scene carries per-node position, viewport crop,
+  destination size, and input region. Chromium SHM chrome and `xdg_popup`
+  widgets use the bounded exception: the compositor validates and snapshots
+  ARGB/XRGB rows into owned memory for GPUI/WGPU upload. Pointer hit-testing uses
+  the same versioned scene, stacking order, geometry, and input regions. Wayland
+  overlay delegation remains disabled so every visible client surface follows
+  this single composition path.
   The compositor is wake-driven, advertises per-surface fractional scale and a
   viewporter while keeping its shared synthetic output stable, and forwards
   raw physical keys, pointer axes, and pinch phases to Chromium. `wl_shm`

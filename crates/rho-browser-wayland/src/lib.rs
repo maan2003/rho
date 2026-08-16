@@ -555,6 +555,17 @@ struct SurfaceMapping {
     logical_size: (u32, u32),
 }
 
+struct MappedSurface {
+    offset: (i32, i32),
+    mapping: SurfaceMapping,
+    input_region: Option<smithay::wayland::compositor::RegionAttributes>,
+}
+
+struct SurfaceTreeSnapshot {
+    nodes: Vec<SceneNode>,
+    hits: Vec<HitNode>,
+}
+
 fn normalize_shm_pixels(format: wl_shm::Format, pixels: &mut [u8]) {
     if format == wl_shm::Format::Xrgb8888 {
         for pixel in pixels.as_chunks_mut::<4>().0 {
@@ -601,17 +612,19 @@ fn surface_mapping(
     }
 }
 
-fn surface_node_mapping(states: &SurfaceData, slot: SurfaceSlot) -> Result<SurfaceMapping> {
+fn map_surface_state(states: &SurfaceData, slot: SurfaceSlot) -> Result<MappedSurface> {
     // Copy everything needed from the cache guards before validation. Smithay's
     // validator locks ViewportCachedState itself, so retaining that guard here
     // would deadlock the compositor thread.
-    let (viewport, buffer_scale, buffer_transform) = {
+    let (viewport, buffer_scale, buffer_transform, input_region) = {
         let mut viewport = states.cached_state.get::<ViewportCachedState>();
         let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+        let attributes = attributes.current();
         (
             *viewport.current(),
-            attributes.current().buffer_scale,
-            attributes.current().buffer_transform,
+            attributes.buffer_scale,
+            attributes.buffer_transform,
+            attributes.input_region.clone(),
         )
     };
     if buffer_transform != wl_output::Transform::Normal {
@@ -660,25 +673,27 @@ fn surface_node_mapping(states: &SurfaceData, slot: SurfaceSlot) -> Result<Surfa
     {
         bail!("viewport source is outside its buffer")
     }
-    Ok(mapping)
+    let offset = if states.role == Some(SUBSURFACE_ROLE) {
+        let mut subsurface = states.cached_state.get::<SubsurfaceCachedState>();
+        let location = subsurface.current().location;
+        (location.x, location.y)
+    } else {
+        (0, 0)
+    };
+    Ok(MappedSurface {
+        offset,
+        mapping,
+        input_region,
+    })
 }
 
-fn subsurface_offset(states: &SurfaceData) -> (i32, i32) {
-    if states.role != Some(SUBSURFACE_ROLE) {
-        return (0, 0);
-    }
-    let mut subsurface = states.cached_state.get::<SubsurfaceCachedState>();
-    let location = subsurface.current().location;
-    (location.x, location.y)
-}
-
-fn append_surface_tree(
+fn snapshot_surface_tree(
     root: &WlSurface,
     root_origin: (i32, i32),
     slots: &HashMap<ObjectId, SurfaceSlot>,
-    nodes: &mut Vec<SceneNode>,
-    hits: &mut Vec<HitNode>,
-) -> Result<()> {
+) -> Result<SurfaceTreeSnapshot> {
+    let mut nodes = Vec::new();
+    let mut hits = Vec::new();
     let error = RefCell::new(None);
     with_surface_tree_upward(
         root,
@@ -687,9 +702,13 @@ fn append_surface_tree(
             if !slots.contains_key(&surface.id()) {
                 return TraversalAction::SkipChildren;
             }
-            // Smithay holds this surface's tree mutex during traversal. Use the
-            // supplied state rather than re-entering `with_states`/`get_role`.
-            let offset = subsurface_offset(states);
+            let offset = if states.role == Some(SUBSURFACE_ROLE) {
+                let mut subsurface = states.cached_state.get::<SubsurfaceCachedState>();
+                let location = subsurface.current().location;
+                (location.x, location.y)
+            } else {
+                (0, 0)
+            };
             TraversalAction::DoChildren((parent_origin.0 + offset.0, parent_origin.1 + offset.1))
         },
         |surface, states, parent_origin| {
@@ -699,14 +718,16 @@ fn append_surface_tree(
             let Some(slot) = slots.get(&surface.id()).copied() else {
                 return;
             };
-            let offset = subsurface_offset(states);
-            let origin = (parent_origin.0 + offset.0, parent_origin.1 + offset.1);
-            match surface_node_mapping(states, slot) {
-                Ok(mapping) => {
+            match map_surface_state(states, slot) {
+                Ok(mapped) => {
+                    let origin = (
+                        parent_origin.0 + mapped.offset.0,
+                        parent_origin.1 + mapped.offset.1,
+                    );
                     let origin = (f64::from(origin.0), f64::from(origin.1));
                     let destination = (
-                        f64::from(mapping.logical_size.0),
-                        f64::from(mapping.logical_size.1),
+                        f64::from(mapped.mapping.logical_size.0),
+                        f64::from(mapped.mapping.logical_size.1),
                     );
                     nodes.push(SceneNode {
                         surface_id: slot.buffer_id,
@@ -714,24 +735,18 @@ fn append_surface_tree(
                         origin,
                         destination,
                         source: (
-                            mapping.offset,
+                            mapped.mapping.offset,
                             (
-                                mapping.scale.0 * f64::from(mapping.logical_size.0),
-                                mapping.scale.1 * f64::from(mapping.logical_size.1),
+                                mapped.mapping.scale.0 * f64::from(mapped.mapping.logical_size.0),
+                                mapped.mapping.scale.1 * f64::from(mapped.mapping.logical_size.1),
                             ),
                         ),
                     });
-                    let input_region = states
-                        .cached_state
-                        .get::<SurfaceAttributes>()
-                        .current()
-                        .input_region
-                        .clone();
                     hits.push(HitNode {
                         surface: surface.clone(),
                         origin,
                         destination,
-                        input_region,
+                        input_region: mapped.input_region,
                     });
                 }
                 Err(mapping_error) => *error.borrow_mut() = Some(mapping_error),
@@ -739,7 +754,9 @@ fn append_surface_tree(
         },
         |_, _, _| error.borrow().is_none(),
     );
-    error.into_inner().map_or(Ok(()), Err)
+    error
+        .into_inner()
+        .map_or(Ok(SurfaceTreeSnapshot { nodes, hits }), Err)
 }
 
 impl<K: BrowserPageKey> State<K> {
@@ -1088,9 +1105,10 @@ impl<K: BrowserPageKey> State<K> {
             .map(|geometry| (-geometry.loc.x, -geometry.loc.y))
             .unwrap_or((0, 0));
         let slots = &self.windows[&id].surface_slots;
-        let mut nodes = Vec::new();
-        let mut hits = Vec::new();
-        append_surface_tree(&root, root_origin, slots, &mut nodes, &mut hits)?;
+        let SurfaceTreeSnapshot {
+            mut nodes,
+            mut hits,
+        } = snapshot_surface_tree(&root, root_origin, slots)?;
         let new_visible_toplevel_dma = nodes
             .iter()
             .any(|node| new_toplevel_dma.contains(&node.buffer_id));
@@ -1101,13 +1119,9 @@ impl<K: BrowserPageKey> State<K> {
         for (popup, offset) in popups {
             let geometry = popup.geometry();
             let origin = offset - geometry.loc;
-            append_surface_tree(
-                popup.wl_surface(),
-                (origin.x, origin.y),
-                slots,
-                &mut nodes,
-                &mut hits,
-            )?;
+            let popup = snapshot_surface_tree(popup.wl_surface(), (origin.x, origin.y), slots)?;
+            nodes.extend(popup.nodes);
+            hits.extend(popup.hits);
         }
 
         let attached = slots

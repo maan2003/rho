@@ -40,14 +40,28 @@ enum BrowserBuffer {
     Shm(Arc<RenderImage>),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HandoffPhase {
+    Requested,
+    Focusing,
+    AwaitingFrame { barrier: u64 },
+    Ready,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PageHandoff {
+    generation: u64,
+    target: PageId,
+    phase: HandoffPhase,
+}
+
 /// The singleton live Chrome surface shared by every logical page view.
 pub struct BrowserModel {
     browser: Arc<BrowserRuntime>,
-    focused_page: Option<PageId>,
-    desired_page: Option<PageId>,
-    focus_in_flight: bool,
+    handoff: Option<PageHandoff>,
+    active_focus: Option<PageId>,
+    next_handoff_generation: u64,
     next_frame_barrier: u64,
-    awaiting_frame: Option<(u64, PageId)>,
     presentation_owner: Option<EntityId>,
     runtime: RuntimePageState,
     _events_task: Task<()>,
@@ -75,8 +89,7 @@ impl BrowserModel {
                                     );
                                     return;
                                 }
-                                let awaiting_barrier =
-                                    model.awaiting_frame.map(|(barrier, _)| barrier);
+                                let awaiting_barrier = model.awaiting_barrier();
                                 if awaiting_barrier.is_some() {
                                     tracing::info!(
                                         scene_id = scene.id,
@@ -159,9 +172,7 @@ impl BrowserModel {
                                     !model.runtime.buffers.contains_key(buffer_id)
                                 });
                                 let eligible = frame_is_eligible(
-                                    model.desired_page,
-                                    model.focused_page,
-                                    model.awaiting_frame,
+                                    model.handoff,
                                     scene.barrier,
                                 );
                                 if import_failed || missing_buffer || !eligible {
@@ -203,12 +214,7 @@ impl BrowserModel {
                                     }
                                     keep
                                 });
-                                complete_frame_handoff(
-                                    model.desired_page,
-                                    &mut model.focused_page,
-                                    &mut model.awaiting_frame,
-                                    scene.barrier,
-                                );
+                                complete_frame_handoff(&mut model.handoff, scene.barrier);
                                 if awaiting_barrier.is_some() {
                                     tracing::info!(
                                         scene_id = scene.id,
@@ -270,11 +276,10 @@ impl BrowserModel {
         });
         Self {
             browser,
-            focused_page: None,
-            desired_page: None,
-            focus_in_flight: false,
+            handoff: None,
+            active_focus: None,
+            next_handoff_generation: 1,
             next_frame_barrier: 1,
-            awaiting_frame: None,
             presentation_owner: None,
             runtime: RuntimePageState {
                 session: Some(session),
@@ -292,24 +297,45 @@ impl BrowserModel {
     }
 
     pub(crate) fn focus(&mut self, id: PageId, cx: &mut Context<Self>) {
-        self.desired_page = Some(id);
+        if self.handoff.is_none_or(|handoff| handoff.target != id) {
+            self.request_handoff(id);
+        }
         self.start_focus(cx);
     }
 
+    fn request_handoff(&mut self, target: PageId) {
+        let generation = self.next_handoff_generation;
+        self.next_handoff_generation = self.next_handoff_generation.wrapping_add(1).max(1);
+        self.handoff = Some(PageHandoff {
+            generation,
+            target,
+            phase: HandoffPhase::Requested,
+        });
+    }
+
+    fn awaiting_barrier(&self) -> Option<u64> {
+        match self.handoff?.phase {
+            HandoffPhase::AwaitingFrame { barrier } => Some(barrier),
+            _ => None,
+        }
+    }
+
     fn start_focus(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.desired_page else {
-            return;
-        };
-        if self.focus_in_flight
-            || self.focused_page == Some(id)
-            || self.awaiting_frame.is_some_and(|(_, page)| page == id)
-        {
+        if self.active_focus.is_some() {
             return;
         }
-        self.focus_in_flight = true;
+        let Some(mut handoff) = self.handoff else {
+            return;
+        };
+        if handoff.phase != HandoffPhase::Requested {
+            return;
+        }
+        let id = handoff.target;
+        handoff.phase = HandoffPhase::Focusing;
+        self.handoff = Some(handoff);
+        self.active_focus = Some(id);
         tracing::info!(
-            had_focused_page = self.focused_page.is_some(),
-            awaiting_frame = self.awaiting_frame.is_some(),
+            generation = handoff.generation,
             "browser handoff requested extension tab focus"
         );
         let browser = self.browser.clone();
@@ -317,25 +343,27 @@ impl BrowserModel {
         cx.spawn(async move |this, cx| {
             let result = request.await;
             let _ = this.update(cx, |model, cx| {
-                model.focus_in_flight = false;
+                model.active_focus = None;
+                let current = model.handoff;
                 tracing::info!(
                     succeeded = result.is_ok(),
-                    still_desired = model.desired_page == Some(id),
+                    still_desired = current.is_some_and(|handoff| handoff.target == id),
                     "browser handoff extension tab focus completed"
                 );
                 match result {
-                    Ok(()) if model.desired_page == Some(id) => model.begin_frame_barrier(id),
-                    Ok(()) => {}
+                    Ok(()) => {
+                        if let Some(handoff) = current.filter(|handoff| handoff.target == id) {
+                            model.begin_frame_barrier(handoff);
+                        }
+                    }
                     Err(error) => {
-                        model.runtime.status = Some(format!("browser: {error:#}"));
-                        if model.desired_page == Some(id) {
-                            model.desired_page = None;
+                        if current.is_some_and(|handoff| handoff.target == id) {
+                            model.runtime.status = Some(format!("browser: {error:#}"));
+                            model.handoff = None;
                         }
                     }
                 }
-                if model.desired_page != model.focused_page && model.awaiting_frame.is_none() {
-                    model.start_focus(cx);
-                }
+                model.start_focus(cx);
                 cx.notify();
             });
         })
@@ -345,22 +373,21 @@ impl BrowserModel {
     fn claim_presentation(&mut self, owner: EntityId, page: PageId, cx: &mut Context<Self>) {
         // A fresh portal claim must refocus Chrome even if our last confirmed
         // request named this page: the user can switch tabs in Chrome itself.
-        self.focused_page = None;
-        self.awaiting_frame = None;
+        self.request_handoff(page);
         self.runtime.painted_scene_id = None;
         self.runtime.status = Some("switching browser page".into());
         self.presentation_owner = Some(owner);
         tracing::info!(
             previous_scene = ?self.runtime.scene_id,
             previous_barrier = self.runtime.presented_barrier,
-            had_focus_request = self.focus_in_flight,
+            had_focus_request = self.active_focus.is_some(),
             "browser portal claimed presentation"
         );
-        self.focus(page, cx);
+        self.start_focus(cx);
         cx.notify();
     }
 
-    fn begin_frame_barrier(&mut self, page: PageId) {
+    fn begin_frame_barrier(&mut self, handoff: PageHandoff) {
         let barrier = self.next_frame_barrier;
         self.next_frame_barrier = self.next_frame_barrier.wrapping_add(1).max(1);
         let (width, height, scale) = self.runtime.sent_size.get();
@@ -379,7 +406,15 @@ impl BrowserModel {
                 "browser handoff sent a compositor frame barrier"
             );
             session.frame_barrier(barrier, probe_width, height, f32::from_bits(scale));
-            self.awaiting_frame = Some((barrier, page));
+            if self
+                .handoff
+                .is_some_and(|current| current.generation == handoff.generation)
+            {
+                self.handoff = Some(PageHandoff {
+                    phase: HandoffPhase::AwaitingFrame { barrier },
+                    ..handoff
+                });
+            }
         } else {
             tracing::info!(
                 barrier,
@@ -390,8 +425,9 @@ impl BrowserModel {
 
     fn presents(&self, owner: EntityId, page: PageId) -> bool {
         self.presentation_owner == Some(owner)
-            && self.desired_page == Some(page)
-            && self.focused_page == Some(page)
+            && self.handoff.is_some_and(|handoff| {
+                handoff.target == page && handoff.phase == HandoffPhase::Ready
+            })
     }
 
     fn resize(&self, width: u32, height: u32, scale: f32) {
@@ -483,16 +519,12 @@ impl BrowserModel {
     }
 }
 
-fn frame_is_eligible(
-    desired: Option<PageId>,
-    focused: Option<PageId>,
-    awaiting: Option<(u64, PageId)>,
-    frame_barrier: u64,
-) -> bool {
-    if let Some((barrier, page)) = awaiting {
-        return desired == Some(page) && frame_barrier >= barrier;
+fn frame_is_eligible(handoff: Option<PageHandoff>, frame_barrier: u64) -> bool {
+    match handoff.map(|handoff| handoff.phase) {
+        Some(HandoffPhase::AwaitingFrame { barrier }) => frame_barrier >= barrier,
+        Some(HandoffPhase::Ready) => true,
+        _ => false,
     }
-    desired == focused
 }
 
 fn bgra_to_rgba(pixels: &mut [u8]) {
@@ -501,18 +533,12 @@ fn bgra_to_rgba(pixels: &mut [u8]) {
     }
 }
 
-fn complete_frame_handoff(
-    desired: Option<PageId>,
-    focused: &mut Option<PageId>,
-    awaiting: &mut Option<(u64, PageId)>,
-    frame_barrier: u64,
-) {
-    if let Some((barrier, page)) = *awaiting
-        && desired == Some(page)
+fn complete_frame_handoff(handoff: &mut Option<PageHandoff>, frame_barrier: u64) {
+    if let Some(current) = handoff
+        && let HandoffPhase::AwaitingFrame { barrier } = current.phase
         && frame_barrier >= barrier
     {
-        *focused = Some(page);
-        *awaiting = None;
+        current.phase = HandoffPhase::Ready;
     }
 }
 
@@ -903,21 +929,23 @@ mod tests {
     #[test]
     fn pre_response_frame_cannot_complete_focus_without_configure_barrier() {
         let page = PageId(uuid::Uuid::new_v4());
-        let mut focused = None;
-        let mut awaiting = None;
+        let mut handoff = Some(PageHandoff {
+            generation: 1,
+            target: page,
+            phase: HandoffPhase::Focusing,
+        });
 
         // A target-looking frame may arrive before the activation RPC reply.
-        assert!(!frame_is_eligible(Some(page), focused, awaiting, 0));
-        assert_eq!(focused, None);
+        assert!(!frame_is_eligible(handoff, 0));
 
         // RPC completion installs a configure barrier. No ordinary later frame
         // can unblock presentation; only the post-ACK barrier commit can.
-        awaiting = Some((7, page));
-        assert!(!frame_is_eligible(Some(page), focused, awaiting, 0));
-        assert!(frame_is_eligible(Some(page), focused, awaiting, 7));
-        assert_eq!(focused, None, "eligibility alone must not enable input");
-        complete_frame_handoff(Some(page), &mut focused, &mut awaiting, 7);
-        assert_eq!(focused, Some(page));
+        handoff.as_mut().unwrap().phase = HandoffPhase::AwaitingFrame { barrier: 7 };
+        assert!(!frame_is_eligible(handoff, 0));
+        assert!(frame_is_eligible(handoff, 7));
+        assert_ne!(handoff.unwrap().phase, HandoffPhase::Ready);
+        complete_frame_handoff(&mut handoff, 7);
+        assert_eq!(handoff.unwrap().phase, HandoffPhase::Ready);
     }
 
     #[test]
