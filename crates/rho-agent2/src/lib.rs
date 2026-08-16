@@ -139,6 +139,10 @@ impl AgentHandle {
         tools: Vec<Arc<dyn Tool>>,
         instructions: impl Into<String>,
     ) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            model != InferenceModel::Gemini35FlashLow,
+            "rho-agent2 does not support the reduced Antigravity transcript protocol"
+        );
         let (id, next_event, record) = store
             .create_agent(profile, model.into(), PromptCacheKey::generate())
             .await;
@@ -198,6 +202,10 @@ impl AgentHandle {
         let (record, next_event, events) = store
             .load(id)
             .ok_or_else(|| anyhow::anyhow!("rho-agent2 agent not found"))?;
+        anyhow::ensure!(
+            !matches!(record.model, db::PersistedModel::Gemini35FlashLow),
+            "rho-agent2 does not support the reduced Antigravity transcript protocol"
+        );
 
         let mut history: Vec<Arc<ContextBlock>> = Vec::new();
         let mut user: Vec<QueuedInput> = Vec::new();

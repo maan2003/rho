@@ -2062,6 +2062,7 @@ fn hourly_global_usage_series(
         AgentUsageModel::OPUS,
         AgentUsageModel::TERRA,
         AgentUsageModel::LUNA,
+        AgentUsageModel::GEMINI,
     ]
     .into_iter()
     .map(|model| AgentUsageSeries {
@@ -3791,7 +3792,7 @@ mod tests {
             ),
         ]);
 
-        assert_eq!(series.len(), 5);
+        assert_eq!(series.len(), 6);
         assert_eq!(series[0].model, "fable");
         assert_eq!(series[0].buckets.len(), 1);
         assert_eq!(series[0].buckets[0].bucket_start_ms, 0);
@@ -3799,6 +3800,8 @@ mod tests {
         assert_eq!(series[0].buckets[0].requests, 2);
         assert_eq!(series[1].model, "gpt");
         assert_eq!(series[1].buckets[0].bucket_start_ms, 60 * 60 * 1_000);
+        assert_eq!(series[5].model, "gemini");
+        assert!(series[5].buckets.is_empty());
     }
 
     #[test]

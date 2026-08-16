@@ -36,7 +36,7 @@ enum DebugCommand {
     /// Render the system prompt and top-level model-facing tools for a role.
     RenderPrompt {
         /// Role text: eng, eng-mini, eng-low, eng-cheap, eng-high, eng-ultra,
-        /// eng-alt, pm, advisor, advisor-cheap, or advisor-high.
+        /// eng-alt, eng-gemini, pm, advisor, advisor-cheap, or advisor-high.
         role: String,
     },
 }
@@ -116,6 +116,9 @@ fn parse_role(text: &str) -> anyhow::Result<AgentRole> {
         "eng-alt" => AgentRole::Engineer {
             intelligence: EngineerIntelligence::Alt,
         },
+        "eng-gemini" => AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Gemini,
+        },
         "pm" => AgentRole::pm(),
         "advisor" => AgentRole::Advisor {
             intelligence: AdvisorIntelligence::Medium,
@@ -127,7 +130,7 @@ fn parse_role(text: &str) -> anyhow::Result<AgentRole> {
             intelligence: AdvisorIntelligence::High,
         },
         _ => anyhow::bail!(
-            "unknown role `{text}`; use eng, eng-mini, eng-low, eng-cheap, eng-high, eng-ultra, eng-alt, pm, advisor, advisor-cheap, or advisor-high"
+            "unknown role `{text}`; use eng, eng-mini, eng-low, eng-cheap, eng-high, eng-ultra, eng-alt, eng-gemini, pm, advisor, advisor-cheap, or advisor-high"
         ),
     })
 }
@@ -376,6 +379,7 @@ fn config_name(config: rho_agent::db::AgentRole) -> String {
                 EngineerIntelligence::High => "high",
                 EngineerIntelligence::Ultra => "ultra",
                 EngineerIntelligence::Alt => "alt",
+                EngineerIntelligence::Gemini => "gemini",
             };
             format!("engineer {intelligence}")
         }
@@ -401,6 +405,12 @@ mod render_prompt_tests {
     #[test]
     fn parses_render_prompt_roles() {
         assert_eq!(parse_role("eng").unwrap(), AgentRole::default());
+        assert_eq!(
+            parse_role("eng-gemini").unwrap(),
+            AgentRole::Engineer {
+                intelligence: EngineerIntelligence::Gemini,
+            }
+        );
         assert_eq!(
             parse_role("advisor-high").unwrap(),
             AgentRole::Advisor {

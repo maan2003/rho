@@ -51,7 +51,7 @@ pub fn specs() -> Vec<ToolSpec> {
                     "prompt":{"type":"string"},
                     "task_name":{"type":"string","description":"Short display name."},
                     "project":{"type":"string","description":"Registered project name or absolute repository path."},
-                    "role":{"type":"string","enum":["eng-mini","eng-low","eng-cheap","eng","eng-high","eng-ultra","eng-alt","pm"]}
+                    "role":{"type":"string","enum":["eng-mini","eng-low","eng-cheap","eng","eng-high","eng-ultra","eng-alt","eng-gemini","pm"]}
                 }
             }),
         ),

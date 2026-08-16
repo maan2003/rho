@@ -6,6 +6,7 @@ use anyhow::{Context, Result};
 use clap::Subcommand;
 use serde::Deserialize;
 
+use crate::antigravity::{AntigravityAuthFile, create_credentials};
 use crate::responses::DEFAULT_CHATGPT_BASE_URL;
 use crate::responses::oauth::{
     InferenceAuth, OAuthFile, ResponsesOAuthCredentials, oauth_token_should_refresh,
@@ -43,6 +44,19 @@ pub enum AuthArgs {
         #[arg(long = "file")]
         path: Option<PathBuf>,
     },
+    /// Manage the single Antigravity/Gemini credential profile.
+    Antigravity {
+        #[command(subcommand)]
+        command: AntigravityAuthArgs,
+    },
+}
+
+#[derive(Clone, Subcommand)]
+pub enum AntigravityAuthArgs {
+    Add,
+    Remove,
+    Path,
+    Status,
 }
 
 pub fn run_auth_cli(command: AuthArgs) -> Result<()> {
@@ -76,6 +90,64 @@ pub fn run_auth_cli(command: AuthArgs) -> Result<()> {
         AuthArgs::Import { name, path } => {
             let credentials_json = read_credentials_json(path)?;
             println!("{}", save_json(name, &credentials_json)?);
+            Ok(())
+        }
+        AuthArgs::Antigravity { command } => run_antigravity_auth(command),
+    }
+}
+
+fn run_antigravity_auth(command: AntigravityAuthArgs) -> Result<()> {
+    let file = AntigravityAuthFile::open_default()?;
+    match command {
+        AntigravityAuthArgs::Add => {
+            let refresh_token = rpassword::prompt_password("Antigravity refresh token: ")?;
+            eprint!("Google project id: ");
+            io::stderr().flush()?;
+            let mut project_id = String::new();
+            io::stdin().read_line(&mut project_id)?;
+            eprintln!("Refreshing Antigravity access token...");
+            let credentials = create_credentials(
+                refresh_token.trim().to_owned(),
+                project_id.trim().to_owned(),
+            )?;
+            file.save(&credentials)?;
+            println!("saved {}", file.path().display());
+            Ok(())
+        }
+        AntigravityAuthArgs::Remove => {
+            let path = file.path();
+            if file.delete()? {
+                println!("removed {}", path.display());
+            } else {
+                println!("missing {}", path.display());
+            }
+            Ok(())
+        }
+        AntigravityAuthArgs::Path => {
+            println!("{}", file.path().display());
+            Ok(())
+        }
+        AntigravityAuthArgs::Status => {
+            let path = file.path();
+            match file.load()? {
+                Some(credentials) => println!(
+                    "present path={} project={} status={}",
+                    path.display(),
+                    credentials.project_id,
+                    if credentials.access_token.trim().is_empty() {
+                        "missing-access-token"
+                    } else if credentials.expires_at_ms
+                        <= u64::try_from(now_secs())
+                            .unwrap_or_default()
+                            .saturating_mul(1000)
+                    {
+                        "expired"
+                    } else {
+                        "ready"
+                    }
+                ),
+                None => println!("missing path={}", path.display()),
+            }
             Ok(())
         }
     }

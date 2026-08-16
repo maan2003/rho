@@ -16,6 +16,7 @@ fnv.workspace = true
 futures.workspace = true
 futures-util.workspace = true
 rand.workspace = true
+rpassword.workspace = true
 rho-core.workspace = true
 rho-db.workspace = true
 redb.workspace = true

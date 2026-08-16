@@ -21,6 +21,12 @@ AI APIs.
   minutes.
   Only namespace names, percentages, and reset times are persisted or sent to
   clients; provider account identifiers remain memory-only.
+- The explicit `eng-gemini` mode reads one separate Antigravity credential file
+  under `auth.d/antigravity/`; it is never scanned as a ChatGPT namespace or
+  considered by ChatGPT routing. Its refresh token, access token, and Google
+  project id remain daemon-side. GenerateContent responses are capped at 8 MiB,
+  HTTP/error text is bounded, and dropping or aborting the session cancels its
+  request/retry task.
 - Inference APIs and streamed inference events are remote, semi-trusted inputs and
   must be parsed defensively.
 - A watched agent presentation sidecar sends a bounded (10 KiB total, 1 KiB

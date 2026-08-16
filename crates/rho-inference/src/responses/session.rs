@@ -268,6 +268,9 @@ impl From<InferenceModel> for ResponsesModel {
             InferenceModel::Gpt56Sol => Self::Gpt56Sol,
             InferenceModel::Gpt56Luna => Self::Gpt56Luna,
             InferenceModel::Gpt56Terra => Self::Gpt56Terra,
+            InferenceModel::Gemini35FlashLow => {
+                unreachable!("Antigravity models do not use ResponsesConfig")
+            }
         }
     }
 }

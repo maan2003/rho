@@ -619,6 +619,9 @@ fn parse_role(role: &str) -> anyhow::Result<AgentRole> {
         "eng-alt" => AgentRole::Engineer {
             intelligence: EngineerIntelligence::Alt,
         },
+        "eng-gemini" => AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Gemini,
+        },
         "pm" => AgentRole::pm(),
         other => anyhow::bail!("unknown role {other}"),
     })
@@ -700,6 +703,12 @@ mod tests {
             }
         ));
         assert!(matches!(parse_role("pm").unwrap(), AgentRole::PM));
+        assert!(matches!(
+            parse_role("eng-gemini").unwrap(),
+            AgentRole::Engineer {
+                intelligence: EngineerIntelligence::Gemini
+            }
+        ));
         assert!(parse_role("iris").is_err());
     }
 

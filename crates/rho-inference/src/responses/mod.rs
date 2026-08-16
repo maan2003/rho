@@ -13,6 +13,7 @@ mod wire;
 mod ws;
 
 pub use oauth::{InferenceAuth, ResolvedOAuth};
+pub(crate) use session::transient_backoff;
 pub use session::{InferenceSession, PromptCacheKey};
 pub use wire::OpenAiResponsesProviderData;
 pub(crate) use wire::QuotaUpdate;

@@ -8,7 +8,8 @@ use tokio::sync::watch;
 
 use crate::accounts::{self, AccountManager, InferenceQuotaSeries, InferenceState, SelectedAuth};
 use crate::config::{InferenceModel, InferenceProfile};
-use crate::responses::{InferenceAuth, InferenceSession, PromptCacheKey, QuotaUpdate};
+use crate::responses::{InferenceAuth, PromptCacheKey, QuotaUpdate};
+use crate::session::InferenceSession;
 
 /// Provider account policy, quota, persistence, and session creation. Cheap to
 /// clone.
@@ -57,7 +58,12 @@ impl Inference {
         model: InferenceModel,
         prompt_cache_key: PromptCacheKey,
     ) -> InferenceSession {
-        InferenceSession::new_deep(self.clone(), profile, model, prompt_cache_key)
+        match model {
+            InferenceModel::Gemini35FlashLow => {
+                InferenceSession::new_antigravity(profile, prompt_cache_key)
+            }
+            _ => InferenceSession::new_responses(self.clone(), profile, model, prompt_cache_key),
+        }
     }
 
     pub fn title_session(&self, prompt_cache_key: PromptCacheKey) -> InferenceSession {

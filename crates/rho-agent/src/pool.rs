@@ -461,7 +461,8 @@ impl AgentPool {
             | SessionBinding::CoordinatorTerra(_)
             | SessionBinding::CoordinatorSol(_)
             | SessionBinding::AdvisorSol(_)
-            | SessionBinding::AdvisorTerra(_) => {
+            | SessionBinding::AdvisorTerra(_)
+            | SessionBinding::AntigravityFlashLow(_) => {
                 let (agent_id, agent) = Agent::create(
                     self.db.clone(),
                     self.inference.clone(),

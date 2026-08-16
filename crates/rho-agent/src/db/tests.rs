@@ -323,6 +323,18 @@ fn agent_role_resolves_opinionated_bindings() {
             effort: ClaudeEffort::Medium
         }
     );
+    assert!(matches!(
+        profile(EngineerIntelligence::Gemini),
+        SessionBinding::AntigravityFlashLow(InferenceProfile {
+            effort: ReasoningEffort::Medium,
+            fast_mode: false,
+            code_mode: false,
+        })
+    ));
+    assert_eq!(
+        profile(EngineerIntelligence::Gemini).deep_model(),
+        Some(InferenceModel::Gemini35FlashLow)
+    );
     assert_eq!(
         AgentRole::Advisor {
             intelligence: AdvisorIntelligence::High,

@@ -106,6 +106,8 @@ pub enum EngineerIntelligence {
     Mini,
     Alt,
     Cheap,
+    /// Reduced function-tool agent backed by Gemini through Antigravity.
+    Gemini,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]

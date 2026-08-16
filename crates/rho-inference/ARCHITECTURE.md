@@ -1,8 +1,10 @@
 # rho-inference architecture
 
 `rho-inference` provides concrete inference provider integrations for rho. Its
-public API is intentionally provider-neutral; the current private implementation
-module uses the OpenAI Responses WebSocket protocol.
+public API is intentionally provider-neutral. Normal deep, title, and status
+sessions use the OpenAI Responses WebSocket protocol. The explicit
+`gemini-3.5-flash-low` deep model instead dispatches to the reduced Antigravity
+GenerateContent backend.
 
 ## Public API boundary
 
@@ -16,6 +18,10 @@ The public surface is intentionally small:
   selection when it accepts each new request and reconnects when it differs
   from the socket account. Ordinary retries retain that snapshot; only an
   explicit rate-limit failover replaces it.
+- Antigravity sessions are deliberately outside that account runtime. They
+  resolve one manually configured credential profile, perform full transcript
+  replay with preserved thought signatures, and support text plus function
+  tools only.
 - `InferenceState` exposes disabled namespaces, namespace names, and quota
   summaries. The current account selected internally is not part of the public
   settings contract. Request setup never queries quota.
@@ -54,6 +60,8 @@ configuration.
   or another enabled account's weekly reset is more than one hour earlier.
 - `auth_cli.rs` owns credential management and the single usage request made by
   the runtime's ten-minute poller.
+- `antigravity/` owns its distinct credential schema, bounded async HTTP
+  session, GenerateContent translation, and opaque thought-signature payload.
 
 ## Request and replay model
 
@@ -109,3 +117,9 @@ credentials. It stores access-token, refresh-token, expiry, and optional account
 id JSON under the rho auth directory or an explicit auth directory, protects
 refresh/save with a sibling lock file, and writes credentials with private
 filesystem permissions where supported.
+
+Antigravity credentials are isolated at
+`auth.d/antigravity/default.json`, outside the root JSON files scanned as
+ChatGPT namespaces. The file stores access token, refresh token, expiry, and
+Google project id. It uses private atomic writes and a cross-process refresh
+lock, but never participates in ChatGPT account selection or failover.

@@ -132,6 +132,7 @@ impl AgentUsageModel {
     pub const OPUS: Self = Self(3);
     pub const TERRA: Self = Self(4);
     pub const LUNA: Self = Self(5);
+    pub const GEMINI: Self = Self(6);
 
     pub fn name(self) -> &'static str {
         match self {
@@ -140,6 +141,7 @@ impl AgentUsageModel {
             Self::OPUS => "opus",
             Self::TERRA => "terra",
             Self::LUNA => "luna",
+            Self::GEMINI => "gemini",
             _ => "unknown",
         }
     }
@@ -201,6 +203,7 @@ fn usage_model(record: &AgentRecord) -> AgentUsageModel {
         AgentRuntime::Rho { .. } => match record.binding.deep_model() {
             Some(InferenceModel::Gpt56Terra) => AgentUsageModel::TERRA,
             Some(InferenceModel::Gpt56Luna) => AgentUsageModel::LUNA,
+            Some(InferenceModel::Gemini35FlashLow) => AgentUsageModel::GEMINI,
             _ => AgentUsageModel::GPT,
         },
         AgentRuntime::Claude { .. } => match record.binding.claude_model() {
@@ -441,6 +444,9 @@ pub(crate) enum SessionBinding {
     /// Terra-backed cheap advisory agent. Appended so persisted modes keep
     /// decoding.
     AdvisorTerra(InferenceProfile),
+    /// Reduced function-tool Gemini agent. Appended for persisted
+    /// compatibility.
+    AntigravityFlashLow(InferenceProfile),
 }
 
 pub(crate) trait AgentRoleSessionProfile {
@@ -527,6 +533,17 @@ impl AgentRoleSessionProfile for AgentRole {
             } => SessionBinding::ClaudeOpus {
                 effort: ClaudeEffort::Medium,
             },
+            AgentRole::Engineer {
+                intelligence: EngineerIntelligence::Gemini,
+            }
+            | AgentRole::WorkflowEngineer {
+                intelligence: EngineerIntelligence::Gemini,
+                ..
+            } => SessionBinding::AntigravityFlashLow(InferenceProfile {
+                effort: ReasoningEffort::Medium,
+                fast_mode: false,
+                code_mode: false,
+            }),
             AgentRole::Advisor {
                 intelligence: AdvisorIntelligence::Medium,
             } => SessionBinding::AdvisorSol(deep(ReasoningEffort::Xhigh)),
@@ -568,6 +585,7 @@ impl SessionBinding {
         }
         let intelligence = match self {
             Self::ResponsesLuna(_) => EngineerIntelligence::Mini,
+            Self::AntigravityFlashLow(_) => EngineerIntelligence::Gemini,
             Self::ClaudeFable {
                 effort: ClaudeEffort::High,
             }
@@ -614,6 +632,7 @@ impl SessionBinding {
             | Self::CoordinatorSol(config)
             | Self::AdvisorSol(config)
             | Self::AdvisorTerra(config) => Some(config),
+            Self::AntigravityFlashLow(config) => Some(config),
             Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeAdvisor { .. } => None,
         }
     }
@@ -627,6 +646,7 @@ impl SessionBinding {
                 Some(InferenceModel::Gpt56Terra)
             }
             Self::CoordinatorSol(_) => Some(InferenceModel::Gpt56Sol),
+            Self::AntigravityFlashLow(_) => Some(InferenceModel::Gemini35FlashLow),
             Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeAdvisor { .. } => None,
         }
     }
@@ -643,6 +663,7 @@ impl SessionBinding {
             | Self::CoordinatorSol(_)
             | Self::AdvisorSol(_)
             | Self::AdvisorTerra(_) => None,
+            Self::AntigravityFlashLow(_) => None,
         }
     }
 
@@ -660,6 +681,7 @@ impl SessionBinding {
             | Self::CoordinatorSol(_)
             | Self::AdvisorSol(_)
             | Self::AdvisorTerra(_) => None,
+            Self::AntigravityFlashLow(_) => None,
         }
     }
 

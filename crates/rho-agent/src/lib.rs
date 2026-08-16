@@ -70,6 +70,7 @@ pub fn render_agent_surface(
     let profile = binding
         .deep_config()
         .ok_or_else(|| anyhow::anyhow!("role has no inference profile"))?;
+    let function_tools_only = binding.deep_model() == Some(InferenceModel::Gemini35FlashLow);
     let code_mode = cfg!(feature = "code-mode") && profile.code_mode;
     let shell_tools = ShellTools::new(
         std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
@@ -78,7 +79,13 @@ pub fn render_agent_surface(
     let agent_tools_enabled = true;
     Ok(RenderedAgentSurface {
         system_prompt: system_prompt::prompt(view.as_ref(), None, code_mode, role, &[]),
-        tools: agent_tool_specs(&shell_tools, agent_tools_enabled, code_mode, role),
+        tools: agent_tool_specs(
+            &shell_tools,
+            agent_tools_enabled,
+            code_mode,
+            function_tools_only,
+            role,
+        ),
     })
 }
 
@@ -709,6 +716,7 @@ impl Agent {
         // Role policy wins over persisted profiles created before PM code mode
         // was disabled.
         let code_mode_enabled = cfg!(feature = "code-mode") && config.code_mode && !role.is_pm();
+        let function_tools_only = model == InferenceModel::Gemini35FlashLow;
         let web_search = WebSearchTools::new(inference.clone(), agent_id.encoded().to_owned());
         let inference_session = inference.deep_session(config, model, prompt_cache_key);
         let iris_tools = (role == db::AgentRole::Iris).then(|| {
@@ -749,6 +757,7 @@ impl Agent {
                         agent_id,
                         web_search,
                         code_mode_enabled,
+                        function_tools_only,
                         agent_tools_enabled,
                         multi_agent.as_ref(),
                         &projects,
@@ -775,6 +784,7 @@ impl Agent {
             usage_provider: match model {
                 db::InferenceModel::Gpt56Terra => db::AgentUsageModel::TERRA,
                 db::InferenceModel::Gpt56Luna => db::AgentUsageModel::LUNA,
+                db::InferenceModel::Gemini35FlashLow => db::AgentUsageModel::GEMINI,
                 _ => db::AgentUsageModel::GPT,
             },
         }));
@@ -1061,6 +1071,7 @@ fn agent_tool_specs(
     shell_tools: &ShellTools,
     multi_agent: bool,
     code_mode: bool,
+    function_tools_only: bool,
     role: db::AgentRole,
 ) -> Arc<[ToolSpec]> {
     if role == db::AgentRole::Iris {
@@ -1077,10 +1088,16 @@ fn agent_tool_specs(
     } else {
         shell_tools.specs()
     };
+    if function_tools_only {
+        specs
+            .retain(|tool| tool.tool_type == rho_core::ToolType::Function && tool.format.is_none());
+    }
     if multi_agent {
         specs.extend(multi_agent_tools::agent_tool_specs(role));
     }
-    specs.push(rho_web_search::web_search_spec());
+    if !function_tools_only {
+        specs.push(rho_web_search::web_search_spec());
+    }
     specs.into()
 }
 
@@ -1225,6 +1242,7 @@ struct ExecutionContext {
     system_prompt: Arc<str>,
     shell_tools: ShellTools,
     web_search: WebSearchTools,
+    web_search_enabled: bool,
     tool_specs: Arc<[ToolSpec]>,
     #[cfg(feature = "code-mode")]
     code_mode: Option<Arc<CodeModeSession>>,
@@ -1238,6 +1256,7 @@ impl ExecutionContext {
         agent_id: AgentId,
         web_search: WebSearchTools,
         code_mode_enabled: bool,
+        function_tools_only: bool,
         agent_tools_enabled: bool,
         multi_agent: Option<&MultiAgentTools>,
         projects: &[(camino::Utf8PathBuf, String)],
@@ -1259,6 +1278,7 @@ impl ExecutionContext {
             &shell_tools,
             multi_agent.is_some() && agent_tools_enabled,
             code_mode.is_some(),
+            function_tools_only,
             role,
         );
         let system_prompt = system_prompt::prompt(
@@ -1273,6 +1293,7 @@ impl ExecutionContext {
             system_prompt,
             shell_tools,
             web_search,
+            web_search_enabled: !function_tools_only,
             tool_specs,
             #[cfg(feature = "code-mode")]
             code_mode,
@@ -1989,8 +2010,9 @@ impl AgentLoop {
                                             continue;
                                         }
                                         let shell_tools = execution.shell_tools.clone();
-                                        let web_search = (call.name.as_str()
-                                            == rho_web_search::WEB_SEARCH_TOOL_NAME)
+                                        let web_search = (execution.web_search_enabled
+                                            && call.name.as_str()
+                                                == rho_web_search::WEB_SEARCH_TOOL_NAME)
                                             .then(|| execution.web_search.clone());
                                         let context = tool_context.clone();
                                         let agent_tools = (self.agent_tools_enabled

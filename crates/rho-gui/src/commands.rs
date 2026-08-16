@@ -103,6 +103,7 @@ pub fn role_field_candidates(text_before_cursor: &str) -> Vec<Candidate> {
             "eng-high",
             "eng-ultra",
             "eng-alt",
+            "eng-gemini",
             "pm",
         ]
         .into_iter()

@@ -94,6 +94,7 @@ octo-types = { path = "crates/octo-types" }
 pprof = { path = "crates/pprof", default-features = false }
 prefix-id = { path = "crates/prefix-id", default-features = false }
 rand = "0.8"
+rpassword = "7"
 redb = "4.1.0"
 redb-derive = "0.1.0"
 regex = "1"
@@ -101,6 +102,7 @@ reqwest = { version = "0.12", default-features = false, features = [
   "blocking",
   "json",
   "rustls-tls-native-roots-no-provider",
+  "stream",
 ] }
 rho-agent = { path = "crates/rho-agent", default-features = false }
 rho-browser-wayland = { path = "crates/rho-browser-wayland" }

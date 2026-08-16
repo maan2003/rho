@@ -2505,6 +2505,7 @@ impl Workspace {
                     "eng-high" => Some(EngineerIntelligence::High),
                     "eng-ultra" => Some(EngineerIntelligence::Ultra),
                     "eng-alt" => Some(EngineerIntelligence::Alt),
+                    "eng-gemini" => Some(EngineerIntelligence::Gemini),
                     _ => None,
                 };
                 match intelligence {
@@ -6826,9 +6827,12 @@ fn parse_agent_role(text: &str) -> Result<AgentRole, String> {
         "eng-alt" => Ok(AgentRole::Engineer {
             intelligence: EngineerIntelligence::Alt,
         }),
+        "eng-gemini" => Ok(AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Gemini,
+        }),
         "pm" => Ok(AgentRole::pm()),
         other => Err(format!(
-            "unknown role `{other}`; use eng, eng-mini, eng-low, eng-cheap, eng-high, eng-ultra, eng-alt, or pm"
+            "unknown role `{other}`; use eng, eng-mini, eng-low, eng-cheap, eng-high, eng-ultra, eng-alt, eng-gemini, or pm"
         )),
     }
 }
@@ -6890,6 +6894,14 @@ fn cycle_agent_role_text(current: &str) -> &'static str {
         | AgentRole::WorkflowEngineer {
             intelligence: EngineerIntelligence::Alt,
             ..
+        } => "eng-gemini",
+        AgentRole::Engineer {
+            intelligence: EngineerIntelligence::Gemini,
+            ..
+        }
+        | AgentRole::WorkflowEngineer {
+            intelligence: EngineerIntelligence::Gemini,
+            ..
         } => "pm",
         AgentRole::Advisor { .. } => "eng",
         AgentRole::PM | AgentRole::WorkflowPM { .. } => "eng-mini",
@@ -6935,6 +6947,7 @@ fn agent_role_label(config: AgentRole) -> RoleLabel {
                     EngineerIntelligence::High => "eng-high",
                     EngineerIntelligence::Ultra => "eng-ultra",
                     EngineerIntelligence::Alt => "eng-alt",
+                    EngineerIntelligence::Gemini => "eng-gemini",
                 }
                 .to_owned(),
                 family: if matches!(
@@ -7351,6 +7364,12 @@ mod tests {
             }
         );
         assert_eq!(parse_agent_role("pm").unwrap(), AgentRole::pm());
+        assert_eq!(
+            parse_agent_role("eng-gemini").unwrap(),
+            AgentRole::Engineer {
+                intelligence: EngineerIntelligence::Gemini,
+            }
+        );
         assert!(parse_agent_role("pm ultra").is_err());
         assert!(parse_agent_role("eng-ultra-fast").is_err());
         assert!(parse_agent_role("advisor high").is_err());

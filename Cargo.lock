@@ -13938,6 +13938,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rho-core",
  "rho-db",
+ "rpassword",
  "rustls",
  "senax-encoder",
  "serde",
