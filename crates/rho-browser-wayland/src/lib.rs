@@ -24,6 +24,7 @@ use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::{Buffer as _, Format, Fourcc, Modifier};
 use smithay::backend::drm::DrmDeviceFd;
 use smithay::backend::input::{Axis, AxisSource, ButtonState, KeyState, Keycode};
+use smithay::backend::renderer::{BufferType, buffer_type};
 use smithay::input::keyboard::{FilterResult, KeyboardHandle};
 use smithay::input::pointer::{
     AxisFrame, ButtonEvent, GesturePinchBeginEvent, GesturePinchEndEvent,
@@ -43,7 +44,8 @@ use smithay::utils::{Serial, Transform};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
-    SurfaceAttributes, TraversalAction, with_states, with_surface_tree_downward,
+    SUBSURFACE_ROLE, SurfaceAttributes, TraversalAction, get_role, with_states,
+    with_surface_tree_downward,
 };
 use smithay::wayland::dmabuf::{
     DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf,
@@ -430,6 +432,14 @@ struct SurfaceMapping {
     logical_size: (u32, u32),
 }
 
+fn permits_uncomposited_shm_subsurface(
+    is_root: bool,
+    role: Option<&str>,
+    buffer_type: Option<&BufferType>,
+) -> bool {
+    !is_root && role == Some(SUBSURFACE_ROLE) && matches!(buffer_type, Some(BufferType::Shm))
+}
+
 fn surface_mapping(
     buffer_size: (i32, i32),
     buffer_scale: i32,
@@ -576,6 +586,8 @@ impl<K: BrowserPageKey> CompositorHandler for State<K> {
                 .and_then(|w| w.toplevel.as_ref())
                 .is_some_and(|t| t.wl_surface() == surface)
         });
+        let role = get_role(surface);
+        let is_subsurface = role == Some(SUBSURFACE_ROLE);
         let (buffer, (acquire, mut release)) = with_states(surface, |states| {
             let mut c = states.cached_state.get::<SurfaceAttributes>();
             let b = c.current().buffer.take();
@@ -611,6 +623,15 @@ impl<K: BrowserPageKey> CompositorHandler for State<K> {
                 return;
             }
         };
+        let buffer_type = buffer_type(&buffer);
+        if permits_uncomposited_shm_subsurface(is_root, role, buffer_type.as_ref()) {
+            if let Some(r) = release {
+                let _ = r.signal();
+            }
+            buffer.release();
+            complete_surface_callbacks(surface, self.time());
+            return;
+        }
         if let Ok(dmabuf) = get_dmabuf(&buffer) {
             if is_root {
                 let (Some(a), Some(r)) = (acquire, release.take()) else {
@@ -665,8 +686,12 @@ impl<K: BrowserPageKey> CompositorHandler for State<K> {
                 let _ = r.signal();
             }
             self.windows[&wid].events.send(BrowserEvent::Failed(
-                "Chromium committed a content-bearing DMA-BUF subsurface; zero-copy tree composition is not supported"
-                    .into(),
+                if is_subsurface {
+                    "Chromium committed a content-bearing DMA-BUF subsurface; zero-copy tree composition is not supported"
+                } else {
+                    "Chromium committed a DMA-BUF auxiliary surface; zero-copy tree composition is not supported"
+                }
+                .into(),
             ));
             buffer.release();
             complete_surface_callbacks(surface, self.time());
@@ -677,7 +702,14 @@ impl<K: BrowserPageKey> CompositorHandler for State<K> {
         }
         complete_surface_callbacks(surface, self.time());
         self.windows[&wid].events.send(BrowserEvent::Failed(
-            "Chromium did not provide the required zero-copy DMA-BUF with explicit sync".into(),
+            if is_root {
+                "Chromium did not provide the required zero-copy DMA-BUF with explicit sync"
+            } else if is_subsurface {
+                "Chromium committed an unsupported non-SHM subsurface buffer"
+            } else {
+                "Chromium committed an unsupported non-DMA-BUF auxiliary surface buffer"
+            }
+            .into(),
         ));
         buffer.release();
     }
@@ -1629,6 +1661,29 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
+
+    #[test]
+    fn only_shm_subsurfaces_may_be_discarded_without_composition() {
+        use smithay::wayland::shell::xdg::{XDG_POPUP_ROLE, XDG_TOPLEVEL_ROLE};
+
+        let shm = BufferType::Shm;
+        let dma = BufferType::Dma;
+        let cases = [
+            (true, Some(XDG_TOPLEVEL_ROLE), Some(&shm), false),
+            (true, Some(XDG_TOPLEVEL_ROLE), Some(&dma), false),
+            (false, Some(SUBSURFACE_ROLE), Some(&shm), true),
+            (false, Some(SUBSURFACE_ROLE), Some(&dma), false),
+            (false, Some(SUBSURFACE_ROLE), None, false),
+            (false, Some(XDG_POPUP_ROLE), Some(&shm), false),
+        ];
+        for (is_root, role, buffer_type, expected) in cases {
+            assert_eq!(
+                permits_uncomposited_shm_subsurface(is_root, role, buffer_type),
+                expected,
+                "is_root={is_root}, role={role:?}, buffer_type={buffer_type:?}"
+            );
+        }
+    }
 
     #[test]
     fn chrome_wrapper_has_safe_default() {

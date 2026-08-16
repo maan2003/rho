@@ -85,8 +85,10 @@ AI APIs.
   Browser content also fails closed unless GPUI and Chromium share an
   importable DMA-BUF format on the selected DRM render node and explicit-sync
   eventfd support. Root SHM content, missing acquire/release points,
-  unsupported buffer transforms, and content-bearing subsurfaces are rejected
-  rather than copied through CPU memory or displayed under a guessed mapping.
+  unsupported buffer transforms, DMA-BUF subsurfaces, and non-SHM ancillary
+  buffers are rejected rather than copied through CPU memory or displayed
+  under a guessed mapping. Chromium's SHM browser-chrome subsurfaces are
+  acknowledged and released without being composited into page content.
 - Long-running `exec_command` processes are retained only in their owning
   agent's in-memory command-session table. `write_stdin` requires that local
   numeric session id; waits are capped at five minutes and dropping the agent

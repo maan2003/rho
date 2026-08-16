@@ -136,7 +136,8 @@ than by running a supervisor, extension protocol, or daemon process graph.
   viewporter while keeping its shared synthetic output stable, and forwards
   raw physical keys, pointer axes, and pinch phases to Chromium. `wl_shm`
   remains available only for ancillary Chromium surfaces such as cursors and
-  is never copied into browser content.
+  browser-chrome input subsurfaces; those buffers are acknowledged but never
+  copied into browser content.
   `rho-gui` only hosts the resulting GPUI page model/view. A `:web-xxxx:` tag
   on an ordinary Desk heading is a portal to the client-local page, just as an
   agent tag is a portal to an agent; selecting the heading uses the same
