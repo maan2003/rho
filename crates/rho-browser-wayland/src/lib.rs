@@ -836,6 +836,15 @@ impl<K: BrowserPageKey> State<K> {
     }
 
     fn update_surface_buffer(&mut self, id: K, surface: &WlSurface) -> Result<Option<u64>> {
+        let diagnosing_handoff = {
+            let window = &self.windows[&id];
+            !window.pending_barriers.is_empty()
+                || window.unbound_barrier.is_some()
+                || window.acked_barrier > window.committed_barrier
+        };
+        if diagnosing_handoff {
+            tracing::info!(surface = ?surface.id(), "browser handoff reading committed surface state");
+        }
         let (assignment, buffer_delta, (acquire, mut release)) = with_states(surface, |states| {
             let mut attributes = states.cached_state.get::<SurfaceAttributes>();
             let current = attributes.current();
@@ -849,6 +858,19 @@ impl<K: BrowserPageKey> State<K> {
                 (sync.acquire_point.take(), sync.release_point.take()),
             )
         });
+        if diagnosing_handoff {
+            tracing::info!(
+                surface = ?surface.id(),
+                assignment = match &assignment {
+                    Some(BufferAssignment::NewBuffer(_)) => "new-buffer",
+                    Some(BufferAssignment::Removed) => "removed",
+                    None => "unchanged",
+                },
+                has_acquire = acquire.is_some(),
+                has_release = release.is_some(),
+                "browser handoff read committed surface state"
+            );
+        }
         if buffer_delta.is_some_and(|delta| delta.x != 0 || delta.y != 0) {
             if let Some(release) = release.take() {
                 let _ = release.signal();
@@ -887,6 +909,15 @@ impl<K: BrowserPageKey> State<K> {
 
         let result = (|| -> Result<_> {
             if let Ok(dmabuf) = get_dmabuf(&buffer) {
+                if diagnosing_handoff {
+                    tracing::info!(
+                        surface = ?surface.id(),
+                        buffer_id,
+                        planes = dmabuf.num_planes(),
+                        size = ?dmabuf.size(),
+                        "browser handoff identified a DMA-BUF surface"
+                    );
+                }
                 let acquire = acquire
                     .context("DMA-BUF commit omitted required explicit-sync acquire point")?;
                 let release_point = release
@@ -901,9 +932,18 @@ impl<K: BrowserPageKey> State<K> {
                     buffer.clone(),
                     acquire,
                     release_point,
-                    id,
-                    self.commands.clone(),
+                    (id, self.commands.clone()),
+                    diagnosing_handoff,
                 )?;
+                if diagnosing_handoff {
+                    tracing::info!(
+                        surface = ?surface.id(),
+                        buffer_id,
+                        width,
+                        height,
+                        "browser handoff prepared a DMA-BUF import"
+                    );
+                }
                 Ok((
                     SurfaceSlot {
                         buffer_id,
@@ -915,6 +955,13 @@ impl<K: BrowserPageKey> State<K> {
                     true,
                 ))
             } else if matches!(buffer_type(&buffer), Some(BufferType::Shm)) {
+                if diagnosing_handoff {
+                    tracing::info!(
+                        surface = ?surface.id(),
+                        buffer_id,
+                        "browser handoff identified an SHM surface"
+                    );
+                }
                 if acquire.is_some() {
                     bail!("Chromium SHM surface unexpectedly used explicit synchronization")
                 }
@@ -946,6 +993,12 @@ impl<K: BrowserPageKey> State<K> {
                 Ok(is_dma.then_some(buffer_id))
             }
             Err(error) => {
+                tracing::error!(
+                    surface = ?surface.id(),
+                    buffer_id,
+                    ?error,
+                    "browser handoff failed to import a committed surface buffer"
+                );
                 if let Some(release) = release {
                     let _ = release.signal();
                 }
@@ -962,6 +1015,18 @@ impl<K: BrowserPageKey> State<K> {
             .context("surface tree has no toplevel")?
             .wl_surface()
             .clone();
+        let diagnosing_handoff = {
+            let window = &self.windows[&id];
+            !window.pending_barriers.is_empty()
+                || window.unbound_barrier.is_some()
+                || window.acked_barrier > window.committed_barrier
+        };
+        if diagnosing_handoff {
+            tracing::info!(
+                barrier_anchor,
+                "browser handoff began surface-tree reconciliation"
+            );
+        }
 
         // Smithay applies synchronized child state at its effectively-unsynchronized
         // ancestor. Reconcile every current slot only at that transaction anchor.
@@ -983,9 +1048,32 @@ impl<K: BrowserPageKey> State<K> {
                 |_, _, &()| true,
             );
         }
+        if diagnosing_handoff {
+            tracing::info!(
+                surfaces = surfaces.len(),
+                toplevel_surfaces = toplevel_surface_count,
+                "browser handoff collected the surface tree"
+            );
+        }
         let mut new_toplevel_dma = std::collections::HashSet::new();
         for (index, surface) in surfaces.iter().enumerate() {
+            if diagnosing_handoff {
+                tracing::info!(
+                    surface = ?surface.id(),
+                    index,
+                    is_toplevel_tree = index < toplevel_surface_count,
+                    "browser handoff reconciling a surface"
+                );
+            }
             let dma_buffer = self.update_surface_buffer(id, surface)?;
+            if diagnosing_handoff {
+                tracing::info!(
+                    surface = ?surface.id(),
+                    index,
+                    ?dma_buffer,
+                    "browser handoff reconciled a surface"
+                );
+            }
             if index < toplevel_surface_count
                 && let Some(buffer_id) = dma_buffer
             {
@@ -1036,9 +1124,6 @@ impl<K: BrowserPageKey> State<K> {
         }
         let window = self.windows.get_mut(&id).expect("known window");
         let previous_barrier = window.committed_barrier;
-        let diagnosing_handoff = !window.pending_barriers.is_empty()
-            || window.unbound_barrier.is_some()
-            || window.acked_barrier > window.committed_barrier;
         if diagnosing_handoff {
             tracing::info!(
                 scene_id = window.next_scene_id,
@@ -1268,6 +1353,10 @@ impl<K: BrowserPageKey> CompositorHandler for State<K> {
             );
         }
         if let Err(error) = self.publish_scene(id, barrier_anchor) {
+            tracing::error!(
+                ?error,
+                "browser handoff failed to publish a surface-tree commit"
+            );
             self.windows[&id].events.send(BrowserEvent::Failed(
                 format!("invalid Chromium surface tree: {error:#}").into(),
             ));
@@ -1663,28 +1752,60 @@ fn dma_buf_frame<K: BrowserPageKey>(
     buffer: wl_buffer::WlBuffer,
     acquire: DrmSyncPoint,
     release: DrmSyncPoint,
-    window_id: K,
-    commands: channel::Sender<RuntimeCommand<K>>,
+    retirement: (K, channel::Sender<RuntimeCommand<K>>),
+    diagnosing_handoff: bool,
 ) -> Result<DmaBufFrame> {
     let mut release = ReleasePointGuard(Some(release));
+    if diagnosing_handoff {
+        tracing::info!(
+            buffer_id = id,
+            "browser handoff began DMA-BUF frame preparation"
+        );
+    }
     if dmabuf.num_planes() != 1 {
         bail!("only single-plane DMA-BUFs are supported");
     }
     let size = dmabuf.size();
     let format = dmabuf.format();
+    if diagnosing_handoff {
+        tracing::info!(
+            buffer_id = id,
+            size = ?size,
+            fourcc = format.code as u32,
+            modifier = u64::from(format.modifier),
+            "browser handoff read DMA-BUF metadata"
+        );
+    }
     let fd = dmabuf
         .handles()
         .next()
         .context("DMA-BUF has no plane")?
         .try_clone_to_owned()
         .context("duplicate DMA-BUF plane")?;
+    if diagnosing_handoff {
+        tracing::info!(
+            buffer_id = id,
+            "browser handoff duplicated the DMA-BUF plane"
+        );
+        tracing::info!(
+            buffer_id = id,
+            "browser handoff exporting the acquire sync file"
+        );
+    }
     let acquire_fence = acquire
         .export_sync_file()
         .context("export DMA-BUF acquire fence")?;
+    if diagnosing_handoff {
+        tracing::info!(
+            buffer_id = id,
+            "browser handoff exported the acquire sync file"
+        );
+    }
     let stride = dmabuf.strides().next().context("DMA-BUF has no stride")?;
     let offset = dmabuf.offsets().next().context("DMA-BUF has no offset")?;
     let keep_alive = dmabuf.clone();
     let release = release.0.take().expect("release point available");
+    let (window_id, commands) = retirement;
     Ok(DmaBufFrame {
         id,
         width: u32::try_from(size.w).context("invalid DMA-BUF width")?,

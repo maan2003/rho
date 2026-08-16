@@ -252,6 +252,7 @@ impl BrowserModel {
                                 model.runtime.session = None;
                             }
                             BrowserEvent::Failed(error) => {
+                                tracing::error!(%error, "browser compositor reported a terminal failure");
                                 model.runtime.status = Some(format!("browser failed: {error}"));
                                 model.runtime.session = None;
                             }
