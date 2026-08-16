@@ -95,7 +95,9 @@ pub fn open_page(id: PageId, cx: &mut App) -> Option<Entity<PageModel>> {
 }
 
 pub fn pages(cx: &App) -> Vec<PageRecord> {
-    cx.global::<WebState>().store.list_pages()
+    cx.try_global::<WebState>()
+        .map(|web| web.store.list_pages())
+        .unwrap_or_default()
 }
 
 pub fn page_handle(id: PageId, cx: &App) -> String {

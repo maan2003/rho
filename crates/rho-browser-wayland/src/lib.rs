@@ -665,7 +665,10 @@ fn copy_shm_frame(buffer: &wl_buffer::WlBuffer) -> Result<ShmFrame> {
         for y in 0..height {
             let src = &bytes[offset + y * stride..offset + y * stride + width * 4];
             let dst = &mut rgba[y * width * 4..(y + 1) * width * 4];
-            for (source, target) in src.chunks_exact(4).zip(dst.chunks_exact_mut(4)) {
+            let (source_pixels, source_remainder) = src.as_chunks::<4>();
+            let (target_pixels, target_remainder) = dst.as_chunks_mut::<4>();
+            debug_assert!(source_remainder.is_empty() && target_remainder.is_empty());
+            for (source, target) in source_pixels.iter().zip(target_pixels) {
                 let alpha = if data.format == wl_shm::Format::Argb8888 {
                     source[3]
                 } else {
@@ -1233,13 +1236,12 @@ fn drain_frame_callbacks(toplevel: &ToplevelSurface) -> Vec<wl_callback::WlCallb
         (),
         |_, _, &()| TraversalAction::DoChildren(()),
         |_surface, states, &()| {
-            callbacks.extend(
-                states
+            callbacks.append(
+                &mut states
                     .cached_state
                     .get::<SurfaceAttributes>()
                     .current()
-                    .frame_callbacks
-                    .drain(..),
+                    .frame_callbacks,
             );
         },
         |_, _, &()| true,
@@ -1305,7 +1307,13 @@ mod tests {
         let (width, height, cropped, origin) = trim_translucent_margins(4, 3, rgba);
         assert_eq!((width, height), (3, 2));
         assert_eq!(origin, (1, 1));
-        assert!(cropped.chunks_exact(4).all(|pixel| pixel[3] == 255));
+        assert!(
+            cropped
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| pixel[3] == 255)
+        );
     }
 
     #[test]

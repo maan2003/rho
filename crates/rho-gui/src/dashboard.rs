@@ -2081,24 +2081,29 @@ impl Dashboard {
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
         // One hint per line: the chip text (if any agents are bound)
         // and the chevron (if a fold hangs off the line).
-        let mut lines: Vec<((HostId, usize), (String, bool, bool))> = Vec::new();
+        struct HeadingChrome {
+            label: String,
+            web: bool,
+            folded: bool,
+        }
+        let mut lines: Vec<((HostId, usize), HeadingChrome)> = Vec::new();
         for (host, offset, text) in decorations {
             let key = (*host, *offset);
             let web = text == WEB_HEADING_DECORATION;
             match lines.iter_mut().find(|(candidate, _)| *candidate == key) {
-                Some((_, (label, has_web, _))) => {
-                    *has_web |= web;
+                Some((_, chrome)) => {
+                    chrome.web |= web;
                     if !web {
-                        label.push_str(text);
+                        chrome.label.push_str(text);
                     }
                 }
                 None => lines.push((
                     key,
-                    (
-                        (if web { "" } else { text.trim_start() }).to_owned(),
+                    HeadingChrome {
+                        label: (if web { "" } else { text.trim_start() }).to_owned(),
                         web,
-                        false,
-                    ),
+                        folded: false,
+                    },
                 )),
             }
         }
@@ -2107,12 +2112,19 @@ impl Dashboard {
                 .iter_mut()
                 .find(|(key, _)| *key == (*host, range.start))
             {
-                Some((_, (_, _, folded))) => *folded = true,
-                None => lines.push(((*host, range.start), (String::new(), false, true))),
+                Some((_, chrome)) => chrome.folded = true,
+                None => lines.push((
+                    (*host, range.start),
+                    HeadingChrome {
+                        label: String::new(),
+                        web: false,
+                        folded: true,
+                    },
+                )),
             }
         }
         let mut hints: Vec<(editor::Anchor, editor::EolHintRenderer)> = Vec::new();
-        for ((host, offset), (text, web, folded)) in lines {
+        for ((host, offset), chrome) in lines {
             let Some(buffer) = self.hosts.get(&host).and_then(|weak| weak.upgrade()) else {
                 continue;
             };
@@ -2121,7 +2133,9 @@ impl Dashboard {
             else {
                 continue;
             };
-            let text: gpui::SharedString = text.into();
+            let text: gpui::SharedString = chrome.label.into();
+            let web = chrome.web;
+            let folded = chrome.folded;
             let renderer: editor::EolHintRenderer = std::sync::Arc::new(move |_, cx| {
                 use gpui::Styled as _;
                 use settings::Settings as _;

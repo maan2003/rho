@@ -139,10 +139,10 @@ impl BrowserModel {
     }
 
     fn resize(&self, width: u32, height: u32) {
-        if self.sent_size.replace((width, height)) != (width, height) {
-            if let Some(session) = &self.session {
-                session.resize(width, height);
-            }
+        if self.sent_size.replace((width, height)) != (width, height)
+            && let Some(session) = &self.session
+        {
+            session.resize(width, height);
         }
     }
 

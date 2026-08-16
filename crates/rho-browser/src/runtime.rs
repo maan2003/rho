@@ -27,6 +27,7 @@ impl BrowserRuntime {
         std::fs::create_dir_all(&profile)?;
         let profile_lock = OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(state_dir.join("chromium.lock"))?;
