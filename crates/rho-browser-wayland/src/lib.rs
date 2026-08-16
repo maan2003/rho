@@ -602,11 +602,18 @@ fn surface_mapping(
 }
 
 fn surface_node_mapping(states: &SurfaceData, slot: SurfaceSlot) -> Result<SurfaceMapping> {
-    let mut viewport = states.cached_state.get::<ViewportCachedState>();
-    let mut attributes = states.cached_state.get::<SurfaceAttributes>();
-    let viewport = *viewport.current();
-    let buffer_scale = attributes.current().buffer_scale;
-    let buffer_transform = attributes.current().buffer_transform;
+    // Copy everything needed from the cache guards before validation. Smithay's
+    // validator locks ViewportCachedState itself, so retaining that guard here
+    // would deadlock the compositor thread.
+    let (viewport, buffer_scale, buffer_transform) = {
+        let mut viewport = states.cached_state.get::<ViewportCachedState>();
+        let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+        (
+            *viewport.current(),
+            attributes.current().buffer_scale,
+            attributes.current().buffer_transform,
+        )
+    };
     if buffer_transform != wl_output::Transform::Normal {
         bail!("unsupported buffer transform {buffer_transform:?}")
     }
