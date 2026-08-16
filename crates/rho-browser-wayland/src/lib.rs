@@ -539,9 +539,9 @@ fn committed_barrier_after_scene(
     committed: u64,
     acknowledged: u64,
     barrier_anchor: bool,
-    new_visible_toplevel_dma: bool,
+    visible_toplevel_dma: bool,
 ) -> u64 {
-    if barrier_anchor && new_visible_toplevel_dma {
+    if barrier_anchor && visible_toplevel_dma {
         acknowledged
     } else {
         committed
@@ -1112,6 +1112,16 @@ impl<K: BrowserPageKey> State<K> {
         let new_visible_toplevel_dma = nodes
             .iter()
             .any(|node| new_toplevel_dma.contains(&node.buffer_id));
+        // Chromium may acknowledge a configure with a damage/state commit that
+        // keeps the current wl_buffer attached. That effective post-ACK commit
+        // is sufficient for handoff readiness as long as the atomic scene still
+        // contains a validated DMA-BUF; requiring a fresh attachment wedges on
+        // ordinary swapchain reuse.
+        let visible_toplevel_dma = nodes.iter().any(|node| {
+            slots
+                .values()
+                .any(|slot| slot.buffer_id == node.buffer_id && slot.shm_bytes == 0)
+        });
 
         // PopupManager yields topmost first; GPUI paints bottom-to-top.
         let mut popups = PopupManager::popups_for_surface(&root).collect::<Vec<_>>();
@@ -1146,6 +1156,7 @@ impl<K: BrowserPageKey> State<K> {
                 barrier_anchor,
                 new_toplevel_dma = new_toplevel_dma.len(),
                 new_visible_toplevel_dma,
+                visible_toplevel_dma,
                 surfaces = surfaces.len(),
                 toplevel_surfaces = toplevel_surface_count,
                 nodes = nodes.len(),
@@ -1157,7 +1168,7 @@ impl<K: BrowserPageKey> State<K> {
             window.committed_barrier,
             window.acked_barrier,
             barrier_anchor,
-            new_visible_toplevel_dma,
+            visible_toplevel_dma,
         );
         if window.committed_barrier != previous_barrier {
             tracing::info!(
@@ -2641,7 +2652,7 @@ mod tests {
     }
 
     #[test]
-    fn synchronized_child_dma_advances_barrier_at_root_transaction() {
+    fn visible_dma_scene_advances_barrier_at_transaction_anchor() {
         assert_eq!(committed_barrier_after_scene(3, 7, true, true), 7);
         assert_eq!(committed_barrier_after_scene(3, 7, true, false), 3);
         assert_eq!(committed_barrier_after_scene(3, 7, false, true), 3);
