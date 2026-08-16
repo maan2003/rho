@@ -300,17 +300,7 @@ impl BrowserModel {
         // request named this page: the user can switch tabs in Chrome itself.
         self.focused_page = None;
         self.awaiting_frame = None;
-        if let Some(scene_id) = self.runtime.scene_id {
-            self.runtime.invalidated_through = self.runtime.invalidated_through.max(scene_id);
-        }
-        self.runtime.scene.clear();
-        self.runtime.scene_id = None;
         self.runtime.painted_scene_id = None;
-        for (_, buffer) in self.runtime.buffers.drain() {
-            if let BrowserBuffer::Shm(image) = buffer {
-                cx.drop_image(image, None);
-            }
-        }
         self.runtime.status = Some("switching browser page".into());
         self.presentation_owner = Some(owner);
         self.focus(page, cx);
@@ -723,7 +713,7 @@ impl Render for BrowserView {
                 }
             });
         }
-        let scene = if presents {
+        let scene = if owns_presentation {
             model
                 .runtime
                 .scene
@@ -750,7 +740,6 @@ impl Render for BrowserView {
         };
         let scale = window.scale_factor();
         let owner_id = self.owner_id;
-        let page_id = self.page_id;
         let browser = self.model.clone();
         let origin = self.origin.clone();
         let measure = canvas(
@@ -759,7 +748,7 @@ impl Render for BrowserView {
                 let width = f32::from(bounds.size.width).round().max(1.0) as u32;
                 let height = f32::from(bounds.size.height).round().max(1.0) as u32;
                 let browser = browser.read(cx);
-                if browser.presents(owner_id, page_id) {
+                if browser.presentation_owner == Some(owner_id) {
                     browser.resize(width, height, scale);
                 }
             },

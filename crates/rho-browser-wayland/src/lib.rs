@@ -535,6 +535,19 @@ struct State<K: BrowserPageKey> {
 #[derive(Clone, Copy)]
 struct PointerFrame;
 
+fn committed_barrier_after_scene(
+    committed: u64,
+    acknowledged: u64,
+    barrier_anchor: bool,
+    new_toplevel_dma: bool,
+) -> u64 {
+    if barrier_anchor && new_toplevel_dma {
+        acknowledged
+    } else {
+        committed
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SurfaceMapping {
     offset: (f64, f64),
@@ -822,7 +835,7 @@ impl<K: BrowserPageKey> State<K> {
         })?
     }
 
-    fn update_surface_buffer(&mut self, id: K, surface: &WlSurface) -> Result<()> {
+    fn update_surface_buffer(&mut self, id: K, surface: &WlSurface) -> Result<bool> {
         let (assignment, buffer_delta, (acquire, mut release)) = with_states(surface, |states| {
             let mut attributes = states.cached_state.get::<SurfaceAttributes>();
             let current = attributes.current();
@@ -849,7 +862,7 @@ impl<K: BrowserPageKey> State<K> {
             if let Some(release) = release {
                 let _ = release.signal();
             }
-            return Ok(());
+            return Ok(false);
         };
         if matches!(assignment, BufferAssignment::Removed) {
             self.windows
@@ -860,7 +873,7 @@ impl<K: BrowserPageKey> State<K> {
             if let Some(release) = release {
                 let _ = release.signal();
             }
-            return Ok(());
+            return Ok(false);
         }
         let BufferAssignment::NewBuffer(buffer) = assignment else {
             unreachable!()
@@ -899,6 +912,7 @@ impl<K: BrowserPageKey> State<K> {
                         shm_bytes: 0,
                     },
                     BufferImport::DmaBuf(frame),
+                    true,
                 ))
             } else if matches!(buffer_type(&buffer), Some(BufferType::Shm)) {
                 if acquire.is_some() {
@@ -918,21 +932,18 @@ impl<K: BrowserPageKey> State<K> {
                     let _ = release.signal();
                 }
                 buffer.release();
-                Ok((slot, BufferImport::Shm(frame)))
+                Ok((slot, BufferImport::Shm(frame), false))
             } else {
                 bail!("Chromium committed an unsupported surface buffer")
             }
         })();
 
         match result {
-            Ok((slot, import)) => {
+            Ok((slot, import, is_dma)) => {
                 let window = self.windows.get_mut(&id).expect("known window");
                 window.surface_slots.insert(surface.id(), slot);
                 window.pending_imports.insert(buffer_id, import);
-                if is_root {
-                    window.committed_barrier = window.acked_barrier;
-                }
-                Ok(())
+                Ok(is_dma)
             }
             Err(error) => {
                 if let Some(release) = release {
@@ -944,7 +955,7 @@ impl<K: BrowserPageKey> State<K> {
         }
     }
 
-    fn publish_scene(&mut self, id: K) -> Result<()> {
+    fn publish_scene(&mut self, id: K, barrier_anchor: bool) -> Result<()> {
         let root = self.windows[&id]
             .toplevel
             .as_ref()
@@ -962,6 +973,7 @@ impl<K: BrowserPageKey> State<K> {
             |surface, _, &()| surfaces.push(surface.clone()),
             |_, _, &()| true,
         );
+        let toplevel_surface_count = surfaces.len();
         for (popup, _) in PopupManager::popups_for_surface(&root) {
             with_surface_tree_upward(
                 popup.wl_surface(),
@@ -971,8 +983,10 @@ impl<K: BrowserPageKey> State<K> {
                 |_, _, &()| true,
             );
         }
-        for surface in &surfaces {
-            self.update_surface_buffer(id, surface)?;
+        let mut new_toplevel_dma = false;
+        for (index, surface) in surfaces.iter().enumerate() {
+            let is_dma = self.update_surface_buffer(id, surface)?;
+            new_toplevel_dma |= index < toplevel_surface_count && is_dma;
         }
 
         let geometry = with_states(&root, |states| {
@@ -1014,6 +1028,12 @@ impl<K: BrowserPageKey> State<K> {
             bail!("Chromium SHM scene exceeds {MAX_SCENE_SHM_BYTES} bytes")
         }
         let window = self.windows.get_mut(&id).expect("known window");
+        window.committed_barrier = committed_barrier_after_scene(
+            window.committed_barrier,
+            window.acked_barrier,
+            barrier_anchor,
+            new_toplevel_dma,
+        );
         window
             .pending_imports
             .retain(|buffer_id, _| attached.contains(buffer_id));
@@ -1144,7 +1164,7 @@ impl<K: BrowserPageKey> CompositorHandler for State<K> {
         let Some(id) = self.window_id_for_surface(parent) else {
             return;
         };
-        if let Err(error) = self.publish_scene(id) {
+        if let Err(error) = self.publish_scene(id, false) {
             self.windows[&id].events.send(BrowserEvent::Failed(
                 format!("invalid Chromium surface tree after subsurface creation: {error:#}")
                     .into(),
@@ -1179,7 +1199,11 @@ impl<K: BrowserPageKey> CompositorHandler for State<K> {
             return;
         };
 
-        if let Err(error) = self.publish_scene(id) {
+        let barrier_anchor = self.windows[&id]
+            .toplevel
+            .as_ref()
+            .is_some_and(|toplevel| toplevel.wl_surface() == surface);
+        if let Err(error) = self.publish_scene(id, barrier_anchor) {
             self.windows[&id].events.send(BrowserEvent::Failed(
                 format!("invalid Chromium surface tree: {error:#}").into(),
             ));
@@ -1204,7 +1228,7 @@ impl<K: BrowserPageKey> CompositorHandler for State<K> {
                 .surface_slots
                 .remove(&surface.id());
             if get_role(surface) == Some(SUBSURFACE_ROLE)
-                && let Err(error) = self.publish_scene(id)
+                && let Err(error) = self.publish_scene(id, false)
             {
                 self.windows[&id].events.send(BrowserEvent::Failed(
                     format!("invalid Chromium surface tree after removal: {error:#}").into(),
@@ -1293,7 +1317,7 @@ impl<K: BrowserPageKey> XdgShellHandler for State<K> {
         }
         self.popup_manager.cleanup();
         if let Some(window_id) = window_id
-            && let Err(error) = self.publish_scene(window_id)
+            && let Err(error) = self.publish_scene(window_id, false)
         {
             self.windows[&window_id].events.send(BrowserEvent::Failed(
                 format!("invalid Chromium popup tree after removal: {error:#}").into(),
@@ -1514,7 +1538,7 @@ impl<K: BrowserPageKey> Dispatch<WlSubsurface, SubsurfaceUserData> for State<K> 
         // The wl_surface and its attached buffer outlive the role. Keep the
         // lease as hidden attached state so recreating the role can remap it,
         // but republish after Smithay removes it from the surface tree.
-        if let Err(error) = state.publish_scene(window_id) {
+        if let Err(error) = state.publish_scene(window_id, false) {
             state.windows[&window_id].events.send(BrowserEvent::Failed(
                 format!("invalid Chromium surface tree after subsurface removal: {error:#}").into(),
             ));
@@ -1910,7 +1934,7 @@ fn handle_page_command<K: BrowserPageKey>(state: &mut State<K>, id: K, c: PageCo
                     .retain(|_, slot| slot.buffer_id != commit);
                 before != window.surface_slots.len()
             });
-            if removed_attached && let Err(error) = state.publish_scene(id) {
+            if removed_attached && let Err(error) = state.publish_scene(id, false) {
                 state.windows[&id].events.send(BrowserEvent::Failed(
                     format!("invalid Chromium surface tree after buffer retirement: {error:#}")
                         .into(),
@@ -2377,6 +2401,13 @@ mod tests {
 
         assert_eq!(window.unbound_barrier, None);
         assert_eq!(window.pending_barriers, vec![(42_u32.into(), 9)]);
+    }
+
+    #[test]
+    fn synchronized_child_dma_advances_barrier_at_root_transaction() {
+        assert_eq!(committed_barrier_after_scene(3, 7, true, true), 7);
+        assert_eq!(committed_barrier_after_scene(3, 7, true, false), 3);
+        assert_eq!(committed_barrier_after_scene(3, 7, false, true), 3);
     }
 
     #[test]
