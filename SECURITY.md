@@ -91,15 +91,16 @@ AI APIs.
   omit the token. Additional or ambiguous toplevels fail closed.
   Browser content also fails closed unless GPUI and Chromium share an
   importable DMA-BUF format on the selected DRM render node and explicit-sync
-  eventfd support. Root SHM content, missing acquire/release points,
-  unsupported buffer transforms, DMA-BUF ancillary surfaces, and non-SHM
+  eventfd support. Root SHM content, missing acquire/release points on any
+  DMA-BUF surface, unsupported buffer transforms, and non-SHM/non-DMA-BUF
   ancillary buffers are rejected rather than displayed under a guessed mapping.
-  Tracked `xdg_popup` SHM buffers are the bounded exception: only ARGB8888 and
-  XRGB8888 rows with checked dimensions, stride, scale, pool range, per-popup
-  size, and aggregate size are copied into owned memory, released immediately,
-  and uploaded as separate GPUI overlays. Popup nesting, removal, grabs, and
-  pointer focus remain compositor-owned. Other SHM browser-chrome subsurfaces
-  are acknowledged and released without being composited into page content.
+  Synchronized commits are published as one versioned surface tree, preventing
+  buffers or hit-test geometry from different Wayland transactions from mixing.
+  Ancillary SHM buffers are the bounded exception: only ARGB8888 and XRGB8888
+  rows with checked dimensions, stride, pool range, per-surface size, and total
+  scene size are copied into owned memory and released immediately. GPUI/WGPU
+  performs the only rendering; Smithay retains protocol, popup/grab, and input
+  state but does not render browser pixels.
 - Long-running `exec_command` processes are retained only in their owning
   agent's in-memory command-session table. `write_stdin` requires that local
   numeric session id; waits are capped at five minutes and dropping the agent

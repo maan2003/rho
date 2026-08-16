@@ -7,6 +7,7 @@
 #![cfg(target_os = "linux")]
 
 use std::collections::{HashMap, VecDeque};
+use std::cell::RefCell;
 use std::ffi::OsString;
 use std::hash::Hash;
 use std::os::fd::{AsFd as _, OwnedFd};
@@ -40,18 +41,20 @@ use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_to
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason, ObjectId};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::reexports::wayland_server::protocol::wl_subsurface::{self, WlSubsurface};
 use smithay::reexports::wayland_server::protocol::{
     wl_buffer, wl_callback, wl_output, wl_seat, wl_shm,
 };
 use smithay::reexports::wayland_server::{
-    Client, Display, DisplayHandle, ListeningSocket, Resource,
+    Client, DataInit, Dispatch, Display, DisplayHandle, ListeningSocket, Resource,
 };
 use smithay::utils::{Logical, Rectangle, Serial, Transform};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
-    SUBSURFACE_ROLE, SurfaceAttributes, TraversalAction, get_role, with_states,
-    with_surface_tree_downward,
+    SUBSURFACE_ROLE, SubsurfaceCachedState, SubsurfaceUserData, SurfaceAttributes,
+    TraversalAction, get_role, is_sync_subsurface, with_states, with_surface_tree_downward,
+    with_surface_tree_upward,
 };
 use smithay::wayland::dmabuf::{
     DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf,
@@ -71,17 +74,17 @@ use smithay::wayland::xdg_activation::{XdgActivationHandler, XdgActivationState,
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::wayland::shell::xdg::{
     Configure, PopupSurface, PositionerState, SurfaceCachedState as XdgSurfaceCachedState,
-    ToplevelSurface, XDG_POPUP_ROLE, XdgShellHandler, XdgShellState,
+    ToplevelSurface, XdgShellHandler, XdgShellState,
 };
 use smithay::wayland::shm::{ShmHandler, ShmState, with_buffer_contents};
 use smithay::{
-    delegate_compositor, delegate_dmabuf, delegate_drm_syncobj, delegate_fractional_scale,
+    delegate_dmabuf, delegate_drm_syncobj, delegate_fractional_scale,
     delegate_output, delegate_pointer_gestures, delegate_seat, delegate_shm,
     delegate_viewporter, delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
 };
 
 const MAX_POPUP_BYTES: usize = 16 * 1024 * 1024;
-const MAX_AUXILIARY_BYTES: usize = 32 * 1024 * 1024;
+const MAX_SCENE_SHM_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct DmaBufConfig {
@@ -93,7 +96,6 @@ pub struct DmaBufConfig {
 pub struct DmaBufFrame {
     pub id: u64,
     /// The newest host-requested frame barrier acknowledged before this commit.
-    pub barrier: u64,
     pub width: u32,
     pub height: u32,
     pub fourcc: u32,
@@ -101,8 +103,6 @@ pub struct DmaBufFrame {
     pub stride: u32,
     pub offset: u32,
     pub y_inverted: bool,
-    pub source_origin: (u32, u32),
-    pub source_size: (u32, u32),
     pub fd: OwnedFd,
     pub acquire_fence: OwnedFd,
     release: Option<Box<dyn FnOnce() + Send>>,
@@ -111,21 +111,49 @@ pub struct DmaBufFrame {
 #[derive(Clone, Debug)]
 pub struct ShmFrame {
     pub id: u64,
-    pub x: i32,
-    pub y: i32,
     pub width: u32,
     pub height: u32,
-    pub logical_width: u32,
-    pub logical_height: u32,
     /// Straight-alpha BGRA pixels in Wayland SHM's native little-endian layout.
     /// The GPUI view converts them to RGBA at the `RgbaImage` boundary.
     pub pixels: Vec<u8>,
 }
 
 #[derive(Debug)]
-pub struct AuxiliarySnapshot {
+pub enum BufferImport {
+    DmaBuf(DmaBufFrame),
+    Shm(ShmFrame),
+}
+
+impl BufferImport {
+    fn id(&self) -> u64 {
+        match self {
+            Self::DmaBuf(frame) => frame.id,
+            Self::Shm(frame) => frame.id,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct SceneNode {
+    pub surface_id: u64,
+    pub buffer_id: u64,
+    pub origin: (f64, f64),
+    pub destination: (f64, f64),
+    /// Source rectangle in buffer pixels.
+    pub source: ((f64, f64), (f64, f64)),
+}
+
+#[derive(Debug)]
+pub struct SceneUpdate {
+    pub id: u64,
     pub barrier: u64,
-    pub frames: Vec<ShmFrame>,
+    pub logical_size: (u32, u32),
+    pub imports: Vec<BufferImport>,
+    /// Every currently attached buffer, including buffers hidden by an unmapped
+    /// ancestor.
+    pub attached: Vec<u64>,
+    /// Surface nodes in bottom-to-top paint order.
+    pub nodes: Vec<SceneNode>,
 }
 
 impl DmaBufFrame {
@@ -163,8 +191,7 @@ impl Drop for DmaBufFrame {
 
 #[derive(Debug)]
 pub enum BrowserEvent {
-    DmaBuf(DmaBufFrame),
-    Auxiliary(AuxiliarySnapshot),
+    Scene(SceneUpdate),
     FrameRetired(u64),
     ToplevelReady,
     Closed,
@@ -180,19 +207,35 @@ struct BrowserEventSender {
 impl BrowserEventSender {
     fn send(&self, event: BrowserEvent) {
         let mut queue = self.queue.lock().unwrap();
-        if matches!(event, BrowserEvent::DmaBuf(_))
+        if let BrowserEvent::Scene(incoming) = &event
             && let Some(position) = queue
                 .iter()
-                .position(|queued| matches!(queued, BrowserEvent::DmaBuf(_)))
+                .position(|queued| matches!(queued, BrowserEvent::Scene(_)))
+            && let BrowserEvent::Scene(mut previous) = queue.remove(position).unwrap()
         {
-            queue.remove(position);
-        }
-        if matches!(event, BrowserEvent::Auxiliary(_))
-            && let Some(position) = queue
+            let referenced = incoming
+                .attached
                 .iter()
-                .position(|queued| matches!(queued, BrowserEvent::Auxiliary(_)))
-        {
-            queue.remove(position);
+                .copied()
+                .collect::<std::collections::HashSet<_>>();
+            let already_incoming = incoming
+                .imports
+                .iter()
+                .map(BufferImport::id)
+                .collect::<std::collections::HashSet<_>>();
+            previous.imports.retain(|import| {
+                referenced.contains(&import.id()) && !already_incoming.contains(&import.id())
+            });
+            if let BrowserEvent::Scene(incoming) = event {
+                previous.imports.extend(incoming.imports);
+                queue.push_back(BrowserEvent::Scene(SceneUpdate {
+                    imports: previous.imports,
+                    ..incoming
+                }));
+                drop(queue);
+                let _ = self.wake.try_send(());
+                return;
+            }
         }
         queue.push_back(event);
         drop(queue);
@@ -428,13 +471,32 @@ struct WindowState {
     events: BrowserEventSender,
     dma_frame_callbacks: HashMap<u64, Vec<wl_callback::WlCallback>>,
     pointer_frames: HashMap<u64, PointerFrame>,
+    hit_scenes: HashMap<u64, Vec<HitNode>>,
     pointer_location: (f64, f64),
-    auxiliary_ids: HashMap<ObjectId, u64>,
-    auxiliary_frames: HashMap<u64, ShmFrame>,
+    surface_slots: HashMap<ObjectId, SurfaceSlot>,
+    pending_imports: HashMap<u64, BufferImport>,
+    next_scene_id: u64,
     unbound_barrier: Option<u64>,
     pending_barriers: Vec<(Serial, u64)>,
     acked_barrier: u64,
+    committed_barrier: u64,
     opened_at: Instant,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SurfaceSlot {
+    buffer_id: u64,
+    width: u32,
+    height: u32,
+    shm_bytes: usize,
+}
+
+#[derive(Clone)]
+struct HitNode {
+    surface: WlSurface,
+    origin: (f64, f64),
+    destination: (f64, f64),
+    input_region: Option<smithay::wayland::compositor::RegionAttributes>,
 }
 
 struct State<K: BrowserPageKey> {
@@ -466,32 +528,18 @@ struct State<K: BrowserPageKey> {
     allow_initial_unambiguous_toplevel: bool,
     surface_windows: HashMap<ObjectId, K>,
     next_buffer_id: u64,
-    next_auxiliary_id: u64,
     commands: channel::Sender<RuntimeCommand<K>>,
     popup_manager: PopupManager,
 }
 
 #[derive(Clone, Copy)]
-struct PointerFrame {
-    origin: (i32, i32),
-    size: (u32, u32),
-}
-
-type BufferRect = ((u32, u32), (u32, u32));
+struct PointerFrame;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SurfaceMapping {
     offset: (f64, f64),
     scale: (f64, f64),
     logical_size: (u32, u32),
-}
-
-fn permits_uncomposited_shm_subsurface(
-    is_root: bool,
-    role: Option<&str>,
-    buffer_type: Option<&BufferType>,
-) -> bool {
-    !is_root && role == Some(SUBSURFACE_ROLE) && matches!(buffer_type, Some(BufferType::Shm))
 }
 
 fn normalize_shm_pixels(format: wl_shm::Format, pixels: &mut [u8]) {
@@ -511,32 +559,6 @@ fn normalize_shm_pixels(format: wl_shm::Format, pixels: &mut [u8]) {
             }
         }
     }
-}
-
-fn popup_logical_size(surface: &WlSurface, width: u32, height: u32) -> Result<(u32, u32)> {
-    let (viewport, buffer_scale, buffer_transform) = with_states(surface, |states| {
-        let mut viewport = states.cached_state.get::<ViewportCachedState>();
-        let mut attributes = states.cached_state.get::<SurfaceAttributes>();
-        (
-            *viewport.current(),
-            attributes.current().buffer_scale,
-            attributes.current().buffer_transform,
-        )
-    });
-    if buffer_transform != wl_output::Transform::Normal {
-        bail!("unsupported buffer transform {buffer_transform:?}")
-    }
-    if viewport.src.is_some() || viewport.dst.is_some() {
-        bail!("popup viewport cropping or destination scaling is unsupported")
-    }
-    if buffer_scale <= 0 {
-        bail!("non-positive popup buffer scale {buffer_scale}")
-    }
-    let scale = u32::try_from(buffer_scale)?;
-    if !width.is_multiple_of(scale) || !height.is_multiple_of(scale) {
-        bail!("popup dimensions {width}x{height} are not divisible by scale {scale}")
-    }
-    Ok((width / scale, height / scale))
 }
 
 fn surface_mapping(
@@ -566,6 +588,148 @@ fn surface_mapping(
     }
 }
 
+fn surface_node_mapping(surface: &WlSurface, slot: SurfaceSlot) -> Result<SurfaceMapping> {
+    let (viewport, buffer_scale, buffer_transform) = with_states(surface, |states| {
+        let mut viewport = states.cached_state.get::<ViewportCachedState>();
+        let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+        (
+            *viewport.current(),
+            attributes.current().buffer_scale,
+            attributes.current().buffer_transform,
+        )
+    });
+    if buffer_transform != wl_output::Transform::Normal {
+        bail!("unsupported buffer transform {buffer_transform:?}")
+    }
+    if buffer_scale <= 0 {
+        bail!("non-positive buffer scale {buffer_scale}")
+    }
+    let buffer_scale_u32 = u32::try_from(buffer_scale)?;
+    if !slot.width.is_multiple_of(buffer_scale_u32) || !slot.height.is_multiple_of(buffer_scale_u32)
+    {
+        bail!(
+            "buffer dimensions {}x{} are not divisible by scale {buffer_scale}",
+            slot.width,
+            slot.height
+        )
+    }
+    let logical_buffer_size = (
+        i32::try_from(slot.width / buffer_scale_u32)?,
+        i32::try_from(slot.height / buffer_scale_u32)?,
+    );
+    if !with_states(surface, |states| {
+        smithay::wayland::viewporter::ensure_viewport_valid(states, logical_buffer_size.into())
+    }) {
+        bail!("invalid viewport state")
+    }
+    if slot.shm_bytes != 0 && viewport.src.is_some() {
+        bail!("SHM viewport cropping is unsupported")
+    }
+    let mapping = surface_mapping(
+        (slot.width as i32, slot.height as i32),
+        buffer_scale,
+        viewport
+            .src
+            .map(|source| ((source.loc.x, source.loc.y), (source.size.w, source.size.h))),
+        viewport
+            .dst
+            .map(|destination| (destination.w, destination.h)),
+    );
+    let source_size = (
+        mapping.scale.0 * f64::from(mapping.logical_size.0),
+        mapping.scale.1 * f64::from(mapping.logical_size.1),
+    );
+    if mapping.offset.0 < 0.0
+        || mapping.offset.1 < 0.0
+        || mapping.offset.0 + source_size.0 > f64::from(slot.width)
+        || mapping.offset.1 + source_size.1 > f64::from(slot.height)
+    {
+        bail!("viewport source is outside its buffer")
+    }
+    Ok(mapping)
+}
+
+fn subsurface_offset(surface: &WlSurface) -> (i32, i32) {
+    if get_role(surface) != Some(SUBSURFACE_ROLE) {
+        return (0, 0);
+    }
+    with_states(surface, |states| {
+        let mut subsurface = states.cached_state.get::<SubsurfaceCachedState>();
+        let location = subsurface.current().location;
+        (location.x, location.y)
+    })
+}
+
+fn append_surface_tree(
+    root: &WlSurface,
+    root_origin: (i32, i32),
+    slots: &HashMap<ObjectId, SurfaceSlot>,
+    nodes: &mut Vec<SceneNode>,
+    hits: &mut Vec<HitNode>,
+) -> Result<()> {
+    let error = RefCell::new(None);
+    with_surface_tree_upward(
+        root,
+        root_origin,
+        |surface, _, parent_origin| {
+            if !slots.contains_key(&surface.id()) {
+                return TraversalAction::SkipChildren;
+            }
+            let offset = subsurface_offset(surface);
+            TraversalAction::DoChildren((parent_origin.0 + offset.0, parent_origin.1 + offset.1))
+        },
+        |surface, _, parent_origin| {
+            if error.borrow().is_some() {
+                return;
+            }
+            let Some(slot) = slots.get(&surface.id()).copied() else {
+                return;
+            };
+            let offset = subsurface_offset(surface);
+            let origin = (parent_origin.0 + offset.0, parent_origin.1 + offset.1);
+            match surface_node_mapping(surface, slot) {
+                Ok(mapping) => {
+                    let origin = (f64::from(origin.0), f64::from(origin.1));
+                    let destination = (
+                        f64::from(mapping.logical_size.0),
+                        f64::from(mapping.logical_size.1),
+                    );
+                    nodes.push(SceneNode {
+                        surface_id: slot.buffer_id,
+                        buffer_id: slot.buffer_id,
+                        origin,
+                        destination,
+                        source: (
+                            mapping.offset,
+                            (
+                                mapping.scale.0 * f64::from(mapping.logical_size.0),
+                                mapping.scale.1 * f64::from(mapping.logical_size.1),
+                            ),
+                        ),
+                    });
+                    let input_region = with_states(surface, |states| {
+                        states
+                            .cached_state
+                            .get::<SurfaceAttributes>()
+                            .current()
+                            .input_region
+                            .clone()
+                    });
+                    hits.push(HitNode {
+                        surface: surface.clone(),
+                        origin,
+                        destination,
+                        input_region,
+                    });
+                }
+                Err(mapping_error) => *error.borrow_mut() = Some(mapping_error),
+            }
+        },
+        |_, _, _| error.borrow().is_none(),
+    );
+    error.into_inner().map_or(Ok(()), Err)
+}
+
 impl<K: BrowserPageKey> State<K> {
     fn next_serial(&mut self) -> Serial {
         let serial = self.serial;
@@ -584,17 +748,6 @@ impl<K: BrowserPageKey> State<K> {
         self.surface_windows.get(&root.id()).copied()
     }
 
-    fn popup_origin(&self, id: K, surface: &WlSurface) -> Option<(i32, i32)> {
-        let root = self.windows[&id].toplevel.as_ref()?.wl_surface();
-        PopupManager::popups_for_surface(root).find_map(|(popup, offset)| {
-            (popup.wl_surface() == surface).then(|| {
-                let geometry = popup.geometry();
-                let origin = offset - geometry.loc;
-                (origin.x, origin.y)
-            })
-        })
-    }
-
     fn constrain_popup(&self, id: K, surface: &PopupSurface, positioner: PositionerState) {
         let size = self.windows[&id].size;
         let mut target =
@@ -606,77 +759,46 @@ impl<K: BrowserPageKey> State<K> {
         });
     }
 
-    fn send_auxiliary_snapshot(&self, id: K) {
-        let window = &self.windows[&id];
-        if window.toplevel.is_none() {
-            return;
-        }
-        let mut frames = window
-            .auxiliary_frames
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        frames.sort_unstable_by_key(|frame| frame.id);
-        window
-            .events
-            .send(BrowserEvent::Auxiliary(AuxiliarySnapshot {
-                barrier: window.acked_barrier,
-                frames,
-            }));
-    }
+    fn snapshot_shm(&self, buffer_id: u64, buffer: &wl_buffer::WlBuffer) -> Result<ShmFrame> {
+        const MAX_SURFACE_DIMENSION: u32 = 8192;
 
-    fn snapshot_shm_popup(
-        &self,
-        id: K,
-        surface: &WlSurface,
-        buffer: &wl_buffer::WlBuffer,
-    ) -> Result<ShmFrame> {
-        const MAX_POPUP_DIMENSION: u32 = 4096;
-
-        let auxiliary_id = *self.windows[&id]
-            .auxiliary_ids
-            .get(&surface.id())
-            .context("untracked Chromium popup")?;
-        let (x, y) = self
-            .popup_origin(id, surface)
-            .context("Chromium popup is outside the tracked popup tree")?;
         with_buffer_contents(buffer, |pointer, pool_len, data| -> Result<ShmFrame> {
-            let width = u32::try_from(data.width).context("negative popup width")?;
-            let height = u32::try_from(data.height).context("negative popup height")?;
-            let stride = usize::try_from(data.stride).context("negative popup stride")?;
-            let offset = usize::try_from(data.offset).context("negative popup offset")?;
+            let width = u32::try_from(data.width).context("negative SHM width")?;
+            let height = u32::try_from(data.height).context("negative SHM height")?;
+            let stride = usize::try_from(data.stride).context("negative SHM stride")?;
+            let offset = usize::try_from(data.offset).context("negative SHM offset")?;
             if width == 0
                 || height == 0
-                || width > MAX_POPUP_DIMENSION
-                || height > MAX_POPUP_DIMENSION
+                || width > MAX_SURFACE_DIMENSION
+                || height > MAX_SURFACE_DIMENSION
             {
-                bail!("popup dimensions are outside the supported bounds: {width}x{height}")
+                bail!("SHM dimensions are outside the supported bounds: {width}x{height}")
             }
             if !matches!(
                 data.format,
                 wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888
             ) {
-                bail!("unsupported popup SHM format {:?}", data.format)
+                bail!("unsupported SHM format {:?}", data.format)
             }
             let row_bytes = usize::try_from(width)?
                 .checked_mul(4)
-                .context("popup row overflow")?;
+                .context("SHM row overflow")?;
             if stride < row_bytes {
-                bail!("popup stride {stride} is shorter than row {row_bytes}")
+                bail!("SHM stride {stride} is shorter than row {row_bytes}")
             }
             let pixel_bytes = row_bytes
                 .checked_mul(usize::try_from(height)?)
-                .context("popup size overflow")?;
+                .context("SHM size overflow")?;
             if pixel_bytes > MAX_POPUP_BYTES {
-                bail!("popup exceeds {MAX_POPUP_BYTES} bytes")
+                bail!("SHM surface exceeds {MAX_POPUP_BYTES} bytes")
             }
             let last_row = stride
                 .checked_mul(usize::try_from(height - 1)?)
                 .and_then(|bytes| offset.checked_add(bytes))
                 .and_then(|start| start.checked_add(row_bytes))
-                .context("popup pool range overflow")?;
+                .context("SHM pool range overflow")?;
             if last_row > pool_len {
-                bail!("popup buffer exceeds its SHM pool")
+                bail!("SHM buffer exceeds its pool")
             }
             let mut pixels = vec![0_u8; pixel_bytes];
             for row in 0..usize::try_from(height)? {
@@ -691,78 +813,234 @@ impl<K: BrowserPageKey> State<K> {
                 }
             }
             normalize_shm_pixels(data.format, &mut pixels);
-            let (logical_width, logical_height) = popup_logical_size(surface, width, height)?;
             Ok(ShmFrame {
-                id: auxiliary_id,
-                x,
-                y,
+                id: buffer_id,
                 width,
                 height,
-                logical_width,
-                logical_height,
                 pixels,
             })
         })?
     }
 
-    fn clear_popup_frame(&mut self, id: K, surface: &WlSurface) {
-        let Some(auxiliary_id) = self.windows[&id].auxiliary_ids.get(&surface.id()).copied() else {
-            return;
+    fn update_surface_buffer(&mut self, id: K, surface: &WlSurface) -> Result<()> {
+        let (assignment, buffer_delta, (acquire, mut release)) = with_states(surface, |states| {
+            let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+            let current = attributes.current();
+            let assignment = current.buffer.take();
+            let buffer_delta = current.buffer_delta.take();
+            let mut sync = states.cached_state.get::<DrmSyncobjCachedState>();
+            let sync = sync.current();
+            (
+                assignment,
+                buffer_delta,
+                (sync.acquire_point.take(), sync.release_point.take()),
+            )
+        });
+        if buffer_delta.is_some_and(|delta| delta.x != 0 || delta.y != 0) {
+            if let Some(release) = release.take() {
+                let _ = release.signal();
+            }
+            if let Some(BufferAssignment::NewBuffer(buffer)) = assignment {
+                buffer.release();
+            }
+            bail!("nonzero Wayland buffer offset is unsupported")
+        }
+        let Some(assignment) = assignment else {
+            if let Some(release) = release {
+                let _ = release.signal();
+            }
+            return Ok(());
         };
-        if self
-            .windows
-            .get_mut(&id)
-            .expect("popup window exists")
-            .auxiliary_frames
-            .remove(&auxiliary_id)
-            .is_some()
-        {
-            self.send_auxiliary_snapshot(id);
+        if matches!(assignment, BufferAssignment::Removed) {
+            self.windows
+                .get_mut(&id)
+                .unwrap()
+                .surface_slots
+                .remove(&surface.id());
+            if let Some(release) = release {
+                let _ = release.signal();
+            }
+            return Ok(());
+        }
+        let BufferAssignment::NewBuffer(buffer) = assignment else {
+            unreachable!()
+        };
+        let is_root = self.windows[&id]
+            .toplevel
+            .as_ref()
+            .is_some_and(|toplevel| toplevel.wl_surface() == surface);
+        let buffer_id = self.next_buffer_id;
+        self.next_buffer_id = self.next_buffer_id.wrapping_add(1).max(1);
+
+        let result = (|| -> Result<_> {
+            if let Ok(dmabuf) = get_dmabuf(&buffer) {
+                let acquire = acquire
+                    .context("DMA-BUF commit omitted required explicit-sync acquire point")?;
+                let release_point = release
+                    .take()
+                    .context("DMA-BUF commit omitted required explicit-sync release point")?;
+                let size = dmabuf.size();
+                let width = u32::try_from(size.w).context("invalid DMA-BUF width")?;
+                let height = u32::try_from(size.h).context("invalid DMA-BUF height")?;
+                let frame = dma_buf_frame(
+                    buffer_id,
+                    dmabuf,
+                    buffer.clone(),
+                    acquire,
+                    release_point,
+                    id,
+                    self.commands.clone(),
+                )?;
+                Ok((
+                    SurfaceSlot {
+                        buffer_id,
+                        width,
+                        height,
+                        shm_bytes: 0,
+                    },
+                    BufferImport::DmaBuf(frame),
+                ))
+            } else if matches!(buffer_type(&buffer), Some(BufferType::Shm)) {
+                if acquire.is_some() {
+                    bail!("Chromium SHM surface unexpectedly used explicit synchronization")
+                }
+                if is_root {
+                    bail!("Chromium root surface did not provide the required zero-copy DMA-BUF")
+                }
+                let frame = self.snapshot_shm(buffer_id, &buffer)?;
+                let slot = SurfaceSlot {
+                    buffer_id,
+                    width: frame.width,
+                    height: frame.height,
+                    shm_bytes: frame.pixels.len(),
+                };
+                if let Some(release) = release.take() {
+                    let _ = release.signal();
+                }
+                buffer.release();
+                Ok((slot, BufferImport::Shm(frame)))
+            } else {
+                bail!("Chromium committed an unsupported surface buffer")
+            }
+        })();
+
+        match result {
+            Ok((slot, import)) => {
+                let window = self.windows.get_mut(&id).expect("known window");
+                window.surface_slots.insert(surface.id(), slot);
+                window.pending_imports.insert(buffer_id, import);
+                if is_root {
+                    window.committed_barrier = window.acked_barrier;
+                }
+                Ok(())
+            }
+            Err(error) => {
+                if let Some(release) = release {
+                    let _ = release.signal();
+                }
+                buffer.release();
+                Err(error)
+            }
         }
     }
 
-    fn refresh_popup_tree(&mut self, id: K) {
-        let result = (|| -> Result<()> {
-            let root = self.windows[&id]
-                .toplevel
-                .as_ref()
-                .context("popup tree has no root")?
-                .wl_surface();
-            let updates = PopupManager::popups_for_surface(root)
-                .filter_map(|(popup, offset)| {
-                    let auxiliary_id = *self.windows[&id]
-                        .auxiliary_ids
-                        .get(&popup.wl_surface().id())?;
-                    let frame = self.windows[&id].auxiliary_frames.get(&auxiliary_id)?;
-                    Some((popup, offset, auxiliary_id, frame.width, frame.height))
-                })
-                .map(|(popup, offset, auxiliary_id, width, height)| {
-                    let origin = offset - popup.geometry().loc;
-                    let logical_size = popup_logical_size(popup.wl_surface(), width, height)?;
-                    Ok((auxiliary_id, origin, logical_size))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            let window = self
-                .windows
-                .get_mut(&id)
-                .context("popup window disappeared")?;
-            for (auxiliary_id, origin, logical_size) in updates {
-                let frame = window
-                    .auxiliary_frames
-                    .get_mut(&auxiliary_id)
-                    .context("popup frame disappeared")?;
-                (frame.x, frame.y) = (origin.x, origin.y);
-                (frame.logical_width, frame.logical_height) = logical_size;
-            }
-            Ok(())
-        })();
-        if let Err(error) = result {
-            self.windows[&id].events.send(BrowserEvent::Failed(
-                format!("invalid Chromium SHM popup state: {error:#}").into(),
-            ));
-        } else {
-            self.send_auxiliary_snapshot(id);
+    fn publish_scene(&mut self, id: K) -> Result<()> {
+        let root = self.windows[&id]
+            .toplevel
+            .as_ref()
+            .context("surface tree has no toplevel")?
+            .wl_surface()
+            .clone();
+
+        // Smithay applies synchronized child state at its effectively-unsynchronized
+        // ancestor. Reconcile every current slot only at that transaction anchor.
+        let mut surfaces = Vec::new();
+        with_surface_tree_upward(
+            &root,
+            (),
+            |_, _, &()| TraversalAction::DoChildren(()),
+            |surface, _, &()| surfaces.push(surface.clone()),
+            |_, _, &()| true,
+        );
+        for (popup, _) in PopupManager::popups_for_surface(&root) {
+            with_surface_tree_upward(
+                popup.wl_surface(),
+                (),
+                |_, _, &()| TraversalAction::DoChildren(()),
+                |surface, _, &()| surfaces.push(surface.clone()),
+                |_, _, &()| true,
+            );
         }
+        for surface in &surfaces {
+            self.update_surface_buffer(id, surface)?;
+        }
+
+        let geometry = with_states(&root, |states| {
+            *states.cached_state.get::<XdgSurfaceCachedState>().current()
+        })
+        .geometry;
+        let root_origin = geometry
+            .map(|geometry| (-geometry.loc.x, -geometry.loc.y))
+            .unwrap_or((0, 0));
+        let slots = &self.windows[&id].surface_slots;
+        let mut nodes = Vec::new();
+        let mut hits = Vec::new();
+        append_surface_tree(&root, root_origin, slots, &mut nodes, &mut hits)?;
+
+        // PopupManager yields topmost first; GPUI paints bottom-to-top.
+        let mut popups = PopupManager::popups_for_surface(&root).collect::<Vec<_>>();
+        popups.reverse();
+        for (popup, offset) in popups {
+            let geometry = popup.geometry();
+            let origin = offset - geometry.loc;
+            append_surface_tree(
+                popup.wl_surface(),
+                (origin.x, origin.y),
+                slots,
+                &mut nodes,
+                &mut hits,
+            )?;
+        }
+
+        let attached = slots
+            .values()
+            .map(|slot| slot.buffer_id)
+            .collect::<std::collections::HashSet<_>>();
+        let shm_bytes = slots
+            .values()
+            .try_fold(0_usize, |total, slot| total.checked_add(slot.shm_bytes))
+            .context("Chromium SHM scene size overflow")?;
+        if shm_bytes > MAX_SCENE_SHM_BYTES {
+            bail!("Chromium SHM scene exceeds {MAX_SCENE_SHM_BYTES} bytes")
+        }
+        let window = self.windows.get_mut(&id).expect("known window");
+        window
+            .pending_imports
+            .retain(|buffer_id, _| attached.contains(buffer_id));
+        let imports = window
+            .pending_imports
+            .drain()
+            .map(|(_, import)| import)
+            .collect();
+        let scene_id = window.next_scene_id;
+        window.next_scene_id = window.next_scene_id.wrapping_add(1).max(1);
+        // Hit nodes and GPUI use the same window-local coordinate space. The
+        // root's XDG geometry offset is already represented by its node origin.
+        let pointer_frame = PointerFrame;
+        window.pointer_frames.insert(scene_id, pointer_frame);
+        window.hit_scenes.insert(scene_id, hits);
+        window
+            .dma_frame_callbacks
+            .insert(scene_id, drain_frame_callbacks(&surfaces));
+        window.events.send(BrowserEvent::Scene(SceneUpdate {
+            id: scene_id,
+            barrier: window.committed_barrier,
+            logical_size: window.size,
+            imports,
+            attached: attached.into_iter().collect(),
+            nodes,
+        }));
+        Ok(())
     }
 
     fn bind_toplevel(&mut self, id: K, root: ObjectId) {
@@ -862,200 +1140,50 @@ impl<K: BrowserPageKey> CompositorHandler for State<K> {
             .expect("known browser client")
             .compositor
     }
+    fn new_subsurface(&mut self, _surface: &WlSurface, parent: &WlSurface) {
+        let Some(id) = self.window_id_for_surface(parent) else {
+            return;
+        };
+        if let Err(error) = self.publish_scene(id) {
+            self.windows[&id].events.send(BrowserEvent::Failed(
+                format!("invalid Chromium surface tree after subsurface creation: {error:#}")
+                    .into(),
+            ));
+        }
+    }
     fn commit(&mut self, surface: &WlSurface) {
         self.popup_manager.commit(surface);
-        let wid = self.window_id_for_surface(surface);
-        let is_root = wid.is_some_and(|id| {
-            self.windows
-                .get(&id)
-                .and_then(|w| w.toplevel.as_ref())
-                .is_some_and(|t| t.wl_surface() == surface)
-        });
-        let role = get_role(surface);
-        let is_subsurface = role == Some(SUBSURFACE_ROLE);
-        let (buffer, (acquire, mut release)) = with_states(surface, |states| {
-            let mut c = states.cached_state.get::<SurfaceAttributes>();
-            let b = c.current().buffer.take();
-            let mut y = states.cached_state.get::<DrmSyncobjCachedState>();
-            let y = y.current();
-            (b, (y.acquire_point.take(), y.release_point.take()))
-        });
-        let Some(wid) = wid else {
-            if let Some(r) = release {
-                let _ = r.signal();
-            }
-            if let Some(BufferAssignment::NewBuffer(b)) = buffer {
-                b.release();
-            }
-            complete_surface_callbacks(surface, self.time());
-            return;
-        };
-        let buffer = match buffer {
-            Some(BufferAssignment::NewBuffer(b)) => b,
-            Some(BufferAssignment::Removed) => {
-                if role == Some(XDG_POPUP_ROLE) {
-                    self.clear_popup_frame(wid, surface);
-                    self.refresh_popup_tree(wid);
-                }
-                if let Some(r) = release {
-                    let _ = r.signal();
-                }
-                let time = self.time();
-                complete_surface_callbacks(surface, time);
-                return;
-            }
-            None => {
-                if role == Some(XDG_POPUP_ROLE) {
-                    self.refresh_popup_tree(wid);
-                }
-                if let Some(r) = release {
-                    let _ = r.signal();
-                }
-                complete_surface_callbacks(surface, self.time());
-                return;
-            }
-        };
-        let buffer_type = buffer_type(&buffer);
-        if permits_uncomposited_shm_subsurface(is_root, role, buffer_type.as_ref()) {
-            if let Some(r) = release {
-                let _ = r.signal();
-            }
-            buffer.release();
-            complete_surface_callbacks(surface, self.time());
+
+        // A synchronized child's current state is applied by Smithay when its
+        // effectively-unsynchronized ancestor commits. Taking it here would
+        // split one Wayland transaction into unrelated GPUI frames.
+        if is_sync_subsurface(surface) {
             return;
         }
-        if role == Some(XDG_POPUP_ROLE) && matches!(buffer_type, Some(BufferType::Shm)) {
-            match self.snapshot_shm_popup(wid, surface, &buffer) {
-                Ok(frame) => {
-                    let window = self.windows.get_mut(&wid).expect("popup window exists");
-                    let retained_bytes = window
-                        .auxiliary_frames
-                        .iter()
-                        .filter(|(id, _)| **id != frame.id)
-                        .try_fold(0_usize, |bytes, (_, retained)| {
-                            bytes.checked_add(retained.pixels.len())
-                        });
-                    let Some(total_bytes) =
-                        retained_bytes.and_then(|bytes| bytes.checked_add(frame.pixels.len()))
-                    else {
-                        window.events.send(BrowserEvent::Failed(
-                            "Chromium SHM popup snapshot size overflow".into(),
-                        ));
-                        if let Some(r) = release.take() {
-                            let _ = r.signal();
-                        }
-                        buffer.release();
-                        complete_surface_callbacks(surface, self.time());
-                        return;
-                    };
-                    if total_bytes > MAX_AUXILIARY_BYTES {
-                        window.events.send(BrowserEvent::Failed(
-                            format!("Chromium SHM popup tree exceeds {MAX_AUXILIARY_BYTES} bytes")
-                                .into(),
-                        ));
-                        if let Some(r) = release.take() {
-                            let _ = r.signal();
-                        }
-                        buffer.release();
-                        complete_surface_callbacks(surface, self.time());
-                        return;
-                    }
-                    window.auxiliary_frames.insert(frame.id, frame);
-                    self.refresh_popup_tree(wid);
-                }
-                Err(error) => self.windows[&wid].events.send(BrowserEvent::Failed(
-                    format!("invalid Chromium SHM popup: {error:#}").into(),
-                )),
+
+        let Some(id) = self.window_id_for_surface(surface) else {
+            let (assignment, release) = with_states(surface, |states| {
+                let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+                let assignment = attributes.current().buffer.take();
+                let mut sync = states.cached_state.get::<DrmSyncobjCachedState>();
+                let release = sync.current().release_point.take();
+                (assignment, release)
+            });
+            if let Some(release) = release {
+                let _ = release.signal();
             }
-            if let Some(r) = release {
-                let _ = r.signal();
-            }
-            buffer.release();
-            complete_surface_callbacks(surface, self.time());
-            return;
-        }
-        if let Ok(dmabuf) = get_dmabuf(&buffer) {
-            if is_root {
-                let (Some(a), Some(r)) = (acquire, release.take()) else {
-                    self.windows[&wid].events.send(BrowserEvent::Failed(
-                        "Chromium DMA-BUF commit omitted required explicit-sync points".into(),
-                    ));
-                    buffer.release();
-                    complete_surface_callbacks(surface, self.time());
-                    return;
-                };
-                let bid = self.next_buffer_id;
-                self.next_buffer_id = self.next_buffer_id.wrapping_add(1).max(1);
-                let (source, pointer_frame) =
-                    match dma_source_rect(surface, dmabuf.size().w, dmabuf.size().h) {
-                        Ok(frame) => frame,
-                        Err(error) => {
-                            let message: Arc<str> =
-                                format!("unsupported Chromium surface mapping: {error:#}").into();
-                            self.windows[&wid]
-                                .events
-                                .send(BrowserEvent::Failed(message));
-                            buffer.release();
-                            complete_surface_callbacks(surface, self.time());
-                            return;
-                        }
-                    };
-                let barrier = self.windows[&wid].acked_barrier;
-                match dma_buf_frame(bid, dmabuf, source, a, r, wid, self.commands.clone()) {
-                    Ok(mut frame) => {
-                        frame.barrier = barrier;
-                        let window = self.windows.get_mut(&wid).expect("known window");
-                        window.pointer_frames.insert(bid, pointer_frame);
-                        if let Some(toplevel) = &window.toplevel {
-                            window
-                                .dma_frame_callbacks
-                                .insert(bid, drain_frame_callbacks(toplevel));
-                        }
-                        window.events.send(BrowserEvent::DmaBuf(frame));
-                        return;
-                    }
-                    Err(error) => {
-                        let message: Arc<str> =
-                            format!("invalid Chromium DMA-BUF: {error:#}").into();
-                        self.windows[&wid]
-                            .events
-                            .send(BrowserEvent::Failed(message));
-                    }
-                }
+            if let Some(BufferAssignment::NewBuffer(buffer)) = assignment {
                 buffer.release();
-                complete_surface_callbacks(surface, self.time());
-                return;
             }
-            if let Some(r) = release {
-                let _ = r.signal();
-            }
-            self.windows[&wid].events.send(BrowserEvent::Failed(
-                if is_subsurface {
-                    "Chromium committed a content-bearing DMA-BUF subsurface; zero-copy tree composition is not supported"
-                } else {
-                    "Chromium committed a DMA-BUF auxiliary surface; zero-copy tree composition is not supported"
-                }
-                .into(),
-            ));
-            buffer.release();
             complete_surface_callbacks(surface, self.time());
             return;
+        };
+
+        if let Err(error) = self.publish_scene(id) {
+            self.windows[&id].events.send(BrowserEvent::Failed(
+                format!("invalid Chromium surface tree: {error:#}").into(),
+            ));
         }
-        if let Some(r) = release {
-            let _ = r.signal();
-        }
-        complete_surface_callbacks(surface, self.time());
-        self.windows[&wid].events.send(BrowserEvent::Failed(
-            if is_root {
-                "Chromium did not provide the required zero-copy DMA-BUF with explicit sync"
-            } else if is_subsurface {
-                "Chromium committed an unsupported non-SHM subsurface buffer"
-            } else {
-                "Chromium committed an unsupported non-DMA-BUF auxiliary surface buffer"
-            }
-            .into(),
-        ));
-        buffer.release();
     }
     fn destroyed(&mut self, surface: &WlSurface) {
         let Some(id) = self.window_id_for_surface(surface) else {
@@ -1070,6 +1198,18 @@ impl<K: BrowserPageKey> CompositorHandler for State<K> {
             .is_some_and(|toplevel| toplevel.wl_surface() == surface);
         if !is_root {
             self.surface_windows.remove(&surface.id());
+            self.windows
+                .get_mut(&id)
+                .expect("surface window exists")
+                .surface_slots
+                .remove(&surface.id());
+            if get_role(surface) == Some(SUBSURFACE_ROLE)
+                && let Err(error) = self.publish_scene(id)
+            {
+                self.windows[&id].events.send(BrowserEvent::Failed(
+                    format!("invalid Chromium surface tree after removal: {error:#}").into(),
+                ));
+            }
         }
         // XdgShellHandler::toplevel_destroyed owns root teardown. Keeping the
         // route until then ensures either Smithay destruction callback order
@@ -1127,20 +1267,7 @@ impl<K: BrowserPageKey> XdgShellHandler for State<K> {
             && let Some(id) = self.window_id_for_surface(&parent)
         {
             let object_id = surface.wl_surface().id();
-            self.surface_windows.insert(object_id.clone(), id);
-            let auxiliary_id = self.next_auxiliary_id;
-            let Some(next_auxiliary_id) = self.next_auxiliary_id.checked_add(1) else {
-                self.windows[&id].events.send(BrowserEvent::Failed(
-                    "Chromium popup identifier space exhausted".into(),
-                ));
-                return;
-            };
-            self.next_auxiliary_id = next_auxiliary_id;
-            self.windows
-                .get_mut(&id)
-                .expect("popup window exists")
-                .auxiliary_ids
-                .insert(object_id, auxiliary_id);
+            self.surface_windows.insert(object_id, id);
             Some(id)
         } else {
             None
@@ -1156,22 +1283,22 @@ impl<K: BrowserPageKey> XdgShellHandler for State<K> {
 
     fn popup_destroyed(&mut self, surface: PopupSurface) {
         let object_id = surface.wl_surface().id();
-        if let Some(window_id) = self.surface_windows.remove(&object_id)
-            && let Some(auxiliary_id) = self
-                .windows
+        let window_id = self.surface_windows.remove(&object_id);
+        if let Some(window_id) = window_id {
+            self.windows
                 .get_mut(&window_id)
                 .expect("popup window exists")
-                .auxiliary_ids
-                .remove(&object_id)
-        {
-            let window = self
-                .windows
-                .get_mut(&window_id)
-                .expect("popup window exists");
-            window.auxiliary_frames.remove(&auxiliary_id);
-            self.send_auxiliary_snapshot(window_id);
+                .surface_slots
+                .remove(&object_id);
         }
         self.popup_manager.cleanup();
+        if let Some(window_id) = window_id
+            && let Err(error) = self.publish_scene(window_id)
+        {
+            self.windows[&window_id].events.send(BrowserEvent::Failed(
+                format!("invalid Chromium popup tree after removal: {error:#}").into(),
+            ));
+        }
     }
     fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {
         let Some(window_id) = self.window_id_for_surface(surface.wl_surface()) else {
@@ -1355,7 +1482,69 @@ impl ClientData for ClientState {
     fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
 }
 
-delegate_compositor!(@<K: BrowserPageKey> State<K>);
+impl<K: BrowserPageKey> Dispatch<WlSubsurface, SubsurfaceUserData> for State<K> {
+    fn request(
+        state: &mut Self,
+        client: &Client,
+        subsurface: &WlSubsurface,
+        request: wl_subsurface::Request,
+        data: &SubsurfaceUserData,
+        display: &DisplayHandle,
+        data_init: &mut DataInit<'_, Self>,
+    ) {
+        <CompositorState as Dispatch<WlSubsurface, SubsurfaceUserData, Self>>::request(
+            state, client, subsurface, request, data, display, data_init,
+        );
+    }
+
+    fn destroyed(
+        state: &mut Self,
+        client_id: ClientId,
+        subsurface: &WlSubsurface,
+        data: &SubsurfaceUserData,
+    ) {
+        let surface = data.surface().clone();
+        let window_id = state.window_id_for_surface(&surface);
+        <CompositorState as Dispatch<WlSubsurface, SubsurfaceUserData, Self>>::destroyed(
+            state, client_id, subsurface, data,
+        );
+        let Some(window_id) = window_id else {
+            return;
+        };
+        // The wl_surface and its attached buffer outlive the role. Keep the
+        // lease as hidden attached state so recreating the role can remap it,
+        // but republish after Smithay removes it from the surface tree.
+        if let Err(error) = state.publish_scene(window_id) {
+            state.windows[&window_id].events.send(BrowserEvent::Failed(
+                format!("invalid Chromium surface tree after subsurface removal: {error:#}").into(),
+            ));
+        }
+    }
+}
+
+smithay::reexports::wayland_server::delegate_global_dispatch!(@<K: BrowserPageKey> State<K>: [
+    smithay::reexports::wayland_server::protocol::wl_compositor::WlCompositor: ()
+] => CompositorState);
+smithay::reexports::wayland_server::delegate_global_dispatch!(@<K: BrowserPageKey> State<K>: [
+    smithay::reexports::wayland_server::protocol::wl_subcompositor::WlSubcompositor: ()
+] => CompositorState);
+smithay::reexports::wayland_server::delegate_dispatch!(@<K: BrowserPageKey> State<K>: [
+    smithay::reexports::wayland_server::protocol::wl_compositor::WlCompositor: ()
+] => CompositorState);
+smithay::reexports::wayland_server::delegate_dispatch!(@<K: BrowserPageKey> State<K>: [
+    smithay::reexports::wayland_server::protocol::wl_surface::WlSurface:
+        smithay::wayland::compositor::SurfaceUserData
+] => CompositorState);
+smithay::reexports::wayland_server::delegate_dispatch!(@<K: BrowserPageKey> State<K>: [
+    smithay::reexports::wayland_server::protocol::wl_region::WlRegion:
+        smithay::wayland::compositor::RegionUserData
+] => CompositorState);
+smithay::reexports::wayland_server::delegate_dispatch!(@<K: BrowserPageKey> State<K>: [
+    smithay::reexports::wayland_server::protocol::wl_callback::WlCallback: ()
+] => CompositorState);
+smithay::reexports::wayland_server::delegate_dispatch!(@<K: BrowserPageKey> State<K>: [
+    smithay::reexports::wayland_server::protocol::wl_subcompositor::WlSubcompositor: ()
+] => CompositorState);
 delegate_xdg_shell!(@<K: BrowserPageKey> State<K>);
 delegate_xdg_activation!(@<K: BrowserPageKey> State<K>);
 delegate_xdg_decoration!(@<K: BrowserPageKey> State<K>);
@@ -1371,7 +1560,7 @@ delegate_pointer_gestures!(@<K: BrowserPageKey> State<K>);
 fn dma_buf_frame<K: BrowserPageKey>(
     id: u64,
     dmabuf: &Dmabuf,
-    source: BufferRect,
+    buffer: wl_buffer::WlBuffer,
     acquire: DrmSyncPoint,
     release: DrmSyncPoint,
     window_id: K,
@@ -1398,7 +1587,6 @@ fn dma_buf_frame<K: BrowserPageKey>(
     let release = release.0.take().expect("release point available");
     Ok(DmaBufFrame {
         id,
-        barrier: 0,
         width: u32::try_from(size.w).context("invalid DMA-BUF width")?,
         height: u32::try_from(size.h).context("invalid DMA-BUF height")?,
         fourcc: format.code as u32,
@@ -1406,8 +1594,6 @@ fn dma_buf_frame<K: BrowserPageKey>(
         stride,
         offset,
         y_inverted: dmabuf.y_inverted(),
-        source_origin: source.0,
-        source_size: source.1,
         fd,
         acquire_fence,
         release: Some(Box::new(move || {
@@ -1415,100 +1601,10 @@ fn dma_buf_frame<K: BrowserPageKey>(
             if let Err(error) = release.signal() {
                 tracing::error!(?error, "signal Chrome DMA-BUF release point");
             }
+            buffer.release();
             let _ = commands.send(RuntimeCommand::Page(window_id, PageCommand::Retired(id)));
         })),
     })
-}
-
-fn dma_source_rect(
-    surface: &WlSurface,
-    buffer_width: i32,
-    buffer_height: i32,
-) -> Result<(BufferRect, PointerFrame)> {
-    let (geometry, viewport, buffer_scale, buffer_transform) = with_states(surface, |states| {
-        let mut cached = states.cached_state.get::<XdgSurfaceCachedState>();
-        let geometry = cached.current().geometry;
-        let mut viewport = states.cached_state.get::<ViewportCachedState>();
-        let mut surface = states.cached_state.get::<SurfaceAttributes>();
-        (
-            geometry,
-            *viewport.current(),
-            surface.current().buffer_scale,
-            surface.current().buffer_transform,
-        )
-    });
-    if buffer_transform != wl_output::Transform::Normal {
-        bail!("buffer transform {buffer_transform:?}");
-    }
-    let mapping = surface_mapping(
-        (buffer_width, buffer_height),
-        buffer_scale,
-        viewport
-            .src
-            .map(|source| ((source.loc.x, source.loc.y), (source.size.w, source.size.h))),
-        viewport
-            .dst
-            .map(|destination| (destination.w, destination.h)),
-    );
-    let (scale_x, scale_y) = mapping.scale;
-    let (offset_x, offset_y) = mapping.offset;
-    let pointer_frame = geometry
-        .map(|geometry| PointerFrame {
-            origin: (geometry.loc.x, geometry.loc.y),
-            size: (geometry.size.w.max(1) as u32, geometry.size.h.max(1) as u32),
-        })
-        .unwrap_or(PointerFrame {
-            origin: (0, 0),
-            size: mapping.logical_size,
-        });
-    let source = clamped_source_rect(
-        geometry.map(|geometry| {
-            let left = offset_x + f64::from(geometry.loc.x) * scale_x;
-            let top = offset_y + f64::from(geometry.loc.y) * scale_y;
-            let right =
-                offset_x + f64::from(geometry.loc.x.saturating_add(geometry.size.w)) * scale_x;
-            let bottom =
-                offset_y + f64::from(geometry.loc.y.saturating_add(geometry.size.h)) * scale_y;
-            (
-                (left.floor() as i32, top.floor() as i32),
-                (
-                    (right.ceil() - left.floor()) as i32,
-                    (bottom.ceil() - top.floor()) as i32,
-                ),
-            )
-        }),
-        buffer_width,
-        buffer_height,
-    );
-    Ok((source, pointer_frame))
-}
-
-fn clamped_source_rect(
-    geometry: Option<((i32, i32), (i32, i32))>,
-    buffer_width: i32,
-    buffer_height: i32,
-) -> BufferRect {
-    let Some(((x, y), (width, height))) = geometry else {
-        return (
-            (0, 0),
-            (buffer_width.max(1) as u32, buffer_height.max(1) as u32),
-        );
-    };
-    let left = x.clamp(0, buffer_width);
-    let top = y.clamp(0, buffer_height);
-    let right = x.saturating_add(width).clamp(left, buffer_width);
-    let bottom = y.saturating_add(height).clamp(top, buffer_height);
-    if right == left || bottom == top {
-        (
-            (0, 0),
-            (buffer_width.max(1) as u32, buffer_height.max(1) as u32),
-        )
-    } else {
-        (
-            (left as u32, top as u32),
-            ((right - left) as u32, (bottom - top) as u32),
-        )
-    }
 }
 
 struct ReleasePointGuard(Option<DrmSyncPoint>);
@@ -1614,7 +1710,6 @@ fn run<K: BrowserPageKey>(
         allow_initial_unambiguous_toplevel: true,
         surface_windows: HashMap::new(),
         next_buffer_id: 1,
-        next_auxiliary_id: 1,
         commands: sender,
         popup_manager: PopupManager::default(),
     };
@@ -1705,12 +1800,15 @@ fn handle_runtime_command<K: BrowserPageKey>(
                     events,
                     dma_frame_callbacks: HashMap::new(),
                     pointer_frames: HashMap::new(),
+                    hit_scenes: HashMap::new(),
                     pointer_location: (0.0, 0.0),
-                    auxiliary_ids: HashMap::new(),
-                    auxiliary_frames: HashMap::new(),
+                    surface_slots: HashMap::new(),
+                    pending_imports: HashMap::new(),
+                    next_scene_id: 1,
                     unbound_barrier: None,
                     pending_barriers: Vec::new(),
                     acked_barrier: 0,
+                    committed_barrier: 0,
                     opened_at: Instant::now(),
                 },
             );
@@ -1799,15 +1897,27 @@ fn handle_page_command<K: BrowserPageKey>(state: &mut State<K>, id: K, c: PageCo
         PageCommand::Presented(commit) => {
             let time = state.time();
             if let Some(w) = state.windows.get_mut(&id) {
-                send_frame_callbacks(w, time, commit)
+                send_frame_callbacks(w, time, commit);
+                w.pointer_frames.retain(|scene, _| *scene >= commit);
+                w.hit_scenes.retain(|scene, _| *scene >= commit);
             }
         }
         PageCommand::Retired(commit) => {
-            let time = state.time();
-            if let Some(w) = state.windows.get_mut(&id) {
-                w.pointer_frames.remove(&commit);
-                send_frame_callbacks(w, time, commit);
-                w.events.send(BrowserEvent::FrameRetired(commit));
+            let removed_attached = state.windows.get_mut(&id).is_some_and(|window| {
+                let before = window.surface_slots.len();
+                window
+                    .surface_slots
+                    .retain(|_, slot| slot.buffer_id != commit);
+                before != window.surface_slots.len()
+            });
+            if removed_attached && let Err(error) = state.publish_scene(id) {
+                state.windows[&id].events.send(BrowserEvent::Failed(
+                    format!("invalid Chromium surface tree after buffer retirement: {error:#}")
+                        .into(),
+                ));
+            }
+            if let Some(window) = state.windows.get(&id) {
+                window.events.send(BrowserEvent::FrameRetired(commit));
             }
         }
         PageCommand::PointerMotion { commit_id, x, y } => {
@@ -1906,27 +2016,28 @@ fn track_unbound_barrier(window: &mut WindowState, serial: Serial) {
     }
 }
 
-fn pointer_target(window: &WindowState, location: (f64, f64)) -> Option<(WlSurface, (f64, f64))> {
-    let root = window.toplevel.as_ref()?.wl_surface().clone();
-    let mut target = (root.clone(), (0.0, 0.0));
-    let mut popups = PopupManager::popups_for_surface(&root)
-        .filter_map(|(popup, _)| {
-            let auxiliary_id = *window.auxiliary_ids.get(&popup.wl_surface().id())?;
-            let frame = window.auxiliary_frames.get(&auxiliary_id)?;
-            Some((auxiliary_id, popup, frame))
-        })
-        .collect::<Vec<_>>();
-    popups.sort_unstable_by_key(|(auxiliary_id, _, _)| *auxiliary_id);
-    for (_, popup, frame) in popups {
-        let left = f64::from(frame.x);
-        let top = f64::from(frame.y);
-        let right = left + f64::from(frame.logical_width);
-        let bottom = top + f64::from(frame.logical_height);
-        if location.0 >= left && location.0 < right && location.1 >= top && location.1 < bottom {
-            target = (popup.wl_surface().clone(), (left, top));
+fn pointer_target(
+    window: &WindowState,
+    scene_id: u64,
+    location: (f64, f64),
+) -> Option<(WlSurface, (f64, f64))> {
+    for hit in window.hit_scenes.get(&scene_id)?.iter().rev() {
+        let local = (location.0 - hit.origin.0, location.1 - hit.origin.1);
+        if local.0 < 0.0
+            || local.1 < 0.0
+            || local.0 >= hit.destination.0
+            || local.1 >= hit.destination.1
+        {
+            continue;
         }
+        if hit.input_region.as_ref().is_some_and(|region| {
+            !region.contains((local.0.floor() as i32, local.1.floor() as i32))
+        }) {
+            continue;
+        }
+        return Some((hit.surface.clone(), hit.origin));
     }
-    Some(target)
+    None
 }
 
 fn pointer_motion<K: BrowserPageKey>(state: &mut State<K>, id: K, commit_id: u64, x: f64, y: f64) {
@@ -1936,11 +2047,8 @@ fn pointer_motion<K: BrowserPageKey>(state: &mut State<K>, id: K, commit_id: u64
     let Some(frame) = w.pointer_frames.get(&commit_id).copied() else {
         return;
     };
-    let size = w.size;
-    let (x, y) = mapped_pointer(frame, size, x, y);
-    let Some((surface, origin)) = pointer_target(w, (x, y)) else {
-        return;
-    };
+    let (x, y) = mapped_pointer(frame, x, y);
+    let target = pointer_target(w, commit_id, (x, y));
     if let Some(window) = state.windows.get_mut(&id) {
         window.pointer_location = (x, y);
     }
@@ -1950,36 +2058,24 @@ fn pointer_motion<K: BrowserPageKey>(state: &mut State<K>, id: K, commit_id: u64
         time: state.time(),
     };
     let pointer = state.pointer.clone();
-    pointer.motion(state, Some((surface, origin.into())), &event);
+    pointer.motion(
+        state,
+        target.map(|(surface, origin)| (surface, origin.into())),
+        &event,
+    );
     pointer.frame(state);
 }
 
-fn mapped_pointer(frame: PointerFrame, window_size: (u32, u32), x: f64, y: f64) -> (f64, f64) {
-    (
-        f64::from(frame.origin.0) + x.max(0.0) * f64::from(frame.size.0) / f64::from(window_size.0),
-        f64::from(frame.origin.1) + y.max(0.0) * f64::from(frame.size.1) / f64::from(window_size.1),
-    )
+fn mapped_pointer(_frame: PointerFrame, x: f64, y: f64) -> (f64, f64) {
+    (x.max(0.0), y.max(0.0))
 }
 fn pointer_button<K: BrowserPageKey>(state: &mut State<K>, id: K, button: u32, pressed: bool) {
-    let Some((surface, origin, location)) = state.windows.get(&id).and_then(|window| {
-        let location = window.pointer_location;
-        let (surface, origin) = pointer_target(window, location)?;
-        Some((surface, origin, location))
-    }) else {
+    if !state.windows.contains_key(&id) {
         return;
-    };
+    }
     let pointer = state.pointer.clone();
     let serial = state.next_serial();
     let time = state.time();
-    pointer.motion(
-        state,
-        Some((surface, origin.into())),
-        &MotionEvent {
-            location: location.into(),
-            serial,
-            time,
-        },
-    );
     pointer.button(
         state,
         &ButtonEvent {
@@ -1997,25 +2093,11 @@ fn pointer_button<K: BrowserPageKey>(state: &mut State<K>, id: K, button: u32, p
 }
 
 fn pointer_axis<K: BrowserPageKey>(state: &mut State<K>, id: K, event: PointerAxisFrame) {
-    let Some((surface, origin, location)) = state.windows.get(&id).and_then(|window| {
-        let location = window.pointer_location;
-        let (surface, origin) = pointer_target(window, location)?;
-        Some((surface, origin, location))
-    }) else {
+    if !state.windows.contains_key(&id) {
         return;
-    };
+    }
     let pointer = state.pointer.clone();
-    let serial = state.next_serial();
     let time = state.time();
-    pointer.motion(
-        state,
-        Some((surface, origin.into())),
-        &MotionEvent {
-            location: location.into(),
-            serial,
-            time,
-        },
-    );
     let mut frame = AxisFrame::new(time).source(match event.source {
         PointerAxisSource::Finger => AxisSource::Finger,
         PointerAxisSource::Continuous => AxisSource::Continuous,
@@ -2101,17 +2183,16 @@ fn pointer_pinch<K: BrowserPageKey>(state: &mut State<K>, id: K, event: PinchGes
 }
 
 fn keyboard_key<K: BrowserPageKey>(state: &mut State<K>, id: K, keycode: u32, pressed: bool) {
-    let Some(surface) = state
+    if state
         .windows
         .get(&id)
         .and_then(|w| w.toplevel.as_ref())
-        .map(|t| t.wl_surface().clone())
-    else {
+        .is_none()
+    {
         return;
-    };
+    }
     let keyboard = state.keyboard.clone();
     let serial = state.next_serial();
-    keyboard.set_focus(state, Some(surface), serial);
     let time = state.time();
     keyboard.input::<(), _>(
         state,
@@ -2151,13 +2232,10 @@ fn complete_surface_callbacks(surface: &WlSurface, time: u32) {
     );
 }
 
-fn drain_frame_callbacks(toplevel: &ToplevelSurface) -> Vec<wl_callback::WlCallback> {
+fn drain_frame_callbacks(surfaces: &[WlSurface]) -> Vec<wl_callback::WlCallback> {
     let mut callbacks = Vec::new();
-    with_surface_tree_downward(
-        toplevel.wl_surface(),
-        (),
-        |_, _, &()| TraversalAction::DoChildren(()),
-        |_surface, states, &()| {
+    for surface in surfaces {
+        with_states(surface, |states| {
             callbacks.append(
                 &mut states
                     .cached_state
@@ -2165,14 +2243,20 @@ fn drain_frame_callbacks(toplevel: &ToplevelSurface) -> Vec<wl_callback::WlCallb
                     .current()
                     .frame_callbacks,
             );
-        },
-        |_, _, &()| true,
-    );
+        });
+    }
     callbacks
 }
 
 fn send_frame_callbacks(window: &mut WindowState, time: u32, commit_id: u64) {
-    if let Some(callbacks) = window.dma_frame_callbacks.remove(&commit_id) {
+    let completed = window
+        .dma_frame_callbacks
+        .keys()
+        .copied()
+        .filter(|scene_id| *scene_id <= commit_id)
+        .collect::<Vec<_>>();
+    for scene_id in completed {
+        let callbacks = window.dma_frame_callbacks.remove(&scene_id).unwrap();
         for callback in callbacks {
             callback.done(time);
         }
@@ -2191,29 +2275,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_shm_subsurfaces_may_be_discarded_without_composition() {
-        use smithay::wayland::shell::xdg::{XDG_POPUP_ROLE, XDG_TOPLEVEL_ROLE};
-
-        let shm = BufferType::Shm;
-        let dma = BufferType::Dma;
-        let cases = [
-            (true, Some(XDG_TOPLEVEL_ROLE), Some(&shm), false),
-            (true, Some(XDG_TOPLEVEL_ROLE), Some(&dma), false),
-            (false, Some(SUBSURFACE_ROLE), Some(&shm), true),
-            (false, Some(SUBSURFACE_ROLE), Some(&dma), false),
-            (false, Some(SUBSURFACE_ROLE), None, false),
-            (false, Some(XDG_POPUP_ROLE), Some(&shm), false),
-        ];
-        for (is_root, role, buffer_type, expected) in cases {
-            assert_eq!(
-                permits_uncomposited_shm_subsurface(is_root, role, buffer_type),
-                expected,
-                "is_root={is_root}, role={role:?}, buffer_type={buffer_type:?}"
-            );
-        }
-    }
-
-    #[test]
     fn popup_pixels_are_normalized_to_straight_alpha_bgra() {
         let mut xrgb = [3, 2, 1, 0];
         normalize_shm_pixels(wl_shm::Format::Xrgb8888, &mut xrgb);
@@ -2225,24 +2286,6 @@ mod tests {
     }
 
     #[test]
-    fn frame_mailbox_keeps_only_the_latest_auxiliary_snapshot() {
-        let (sender, receiver) = browser_event_channel();
-        sender.send(BrowserEvent::Auxiliary(AuxiliarySnapshot {
-            barrier: 1,
-            frames: Vec::new(),
-        }));
-        sender.send(BrowserEvent::Auxiliary(AuxiliarySnapshot {
-            barrier: 2,
-            frames: Vec::new(),
-        }));
-        let event = futures_lite::future::block_on(receiver.recv()).unwrap();
-        assert!(matches!(
-            event,
-            BrowserEvent::Auxiliary(AuxiliarySnapshot { barrier: 2, .. })
-        ));
-    }
-
-    #[test]
     fn chrome_wrapper_has_safe_default() {
         if std::env::var_os("RHO_CHROME_BIN").is_none() {
             assert_eq!(chrome_wrapper(), "google-chrome-stable");
@@ -2250,13 +2293,12 @@ mod tests {
     }
 
     #[test]
-    fn frame_mailbox_keeps_only_the_latest_dma_commit() {
+    fn scene_mailbox_preserves_imports_attached_but_hidden_in_latest_scene() {
         fn frame(id: u64, releases: Arc<AtomicUsize>) -> DmaBufFrame {
             let fd = std::fs::File::open("/dev/null").unwrap();
             let fence = std::fs::File::open("/dev/null").unwrap();
             DmaBufFrame {
                 id,
-                barrier: 0,
                 width: 1,
                 height: 1,
                 fourcc: 0,
@@ -2264,8 +2306,6 @@ mod tests {
                 stride: 4,
                 offset: 0,
                 y_inverted: false,
-                source_origin: (0, 0),
-                source_size: (1, 1),
                 fd: fd.into(),
                 acquire_fence: fence.into(),
                 release: Some(Box::new(move || {
@@ -2273,15 +2313,42 @@ mod tests {
                 })),
             }
         }
+        fn node(buffer_id: u64) -> SceneNode {
+            SceneNode {
+                surface_id: buffer_id,
+                buffer_id,
+                origin: (0.0, 0.0),
+                destination: (1.0, 1.0),
+                source: ((0.0, 0.0), (1.0, 1.0)),
+            }
+        }
 
         let releases = Arc::new(AtomicUsize::new(0));
         let (sender, receiver) = browser_event_channel();
-        sender.send(BrowserEvent::DmaBuf(frame(1, releases.clone())));
-        sender.send(BrowserEvent::DmaBuf(frame(2, releases.clone())));
-        assert_eq!(releases.load(Ordering::SeqCst), 1);
+        sender.send(BrowserEvent::Scene(SceneUpdate {
+            id: 1,
+            barrier: 1,
+            logical_size: (1, 1),
+            imports: vec![BufferImport::DmaBuf(frame(7, releases.clone()))],
+            attached: vec![7],
+            nodes: vec![node(7)],
+        }));
+        sender.send(BrowserEvent::Scene(SceneUpdate {
+            id: 2,
+            barrier: 2,
+            logical_size: (1, 1),
+            imports: Vec::new(),
+            attached: vec![7],
+            nodes: Vec::new(),
+        }));
+        assert_eq!(releases.load(Ordering::SeqCst), 0);
         let event = futures_lite::future::block_on(receiver.recv()).unwrap();
-        assert!(matches!(event, BrowserEvent::DmaBuf(frame) if frame.id == 2));
-        assert_eq!(releases.load(Ordering::SeqCst), 2);
+        assert!(matches!(
+            event,
+            BrowserEvent::Scene(SceneUpdate { id: 2, imports, .. })
+                if matches!(imports.as_slice(), [BufferImport::DmaBuf(frame)] if frame.id == 7)
+        ));
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
     }
 
     #[test]
@@ -2294,12 +2361,15 @@ mod tests {
             events,
             dma_frame_callbacks: HashMap::new(),
             pointer_frames: HashMap::new(),
+            hit_scenes: HashMap::new(),
             pointer_location: (0.0, 0.0),
-            auxiliary_ids: HashMap::new(),
-            auxiliary_frames: HashMap::new(),
+            surface_slots: HashMap::new(),
+            pending_imports: HashMap::new(),
+            next_scene_id: 1,
             unbound_barrier: Some(9),
             pending_barriers: Vec::new(),
             acked_barrier: 0,
+            committed_barrier: 0,
             opened_at: Instant::now(),
         };
 
@@ -2313,18 +2383,6 @@ mod tests {
     fn converts_evdev_codes_to_xkb_codes() {
         assert_eq!(xkb_keycode(14), 22); // Backspace
         assert_eq!(xkb_keycode(28), 36); // Enter
-    }
-
-    #[test]
-    fn clamps_window_geometry_to_dma_buf_source() {
-        assert_eq!(
-            clamped_source_rect(Some(((10, 20), (80, 60))), 120, 100),
-            ((10, 20), (80, 60))
-        );
-        assert_eq!(
-            clamped_source_rect(Some(((-5, 90), (20, 20))), 120, 100),
-            ((0, 90), (15, 10))
-        );
     }
 
     #[test]
@@ -2353,12 +2411,9 @@ mod tests {
     }
 
     #[test]
-    fn pointer_coordinates_follow_cropped_source() {
-        let frame = PointerFrame {
-            origin: (10, 20),
-            size: (80, 60),
-        };
-        assert_eq!(mapped_pointer(frame, (160, 120), 0.0, 0.0), (10.0, 20.0));
-        assert_eq!(mapped_pointer(frame, (160, 120), 80.0, 60.0), (50.0, 50.0));
+    fn pointer_coordinates_follow_the_painted_scene() {
+        let frame = PointerFrame;
+        assert_eq!(mapped_pointer(frame, 0.0, 0.0), (0.0, 0.0));
+        assert_eq!(mapped_pointer(frame, 80.0, 60.0), (80.0, 60.0));
     }
 }

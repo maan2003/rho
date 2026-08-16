@@ -1685,6 +1685,21 @@ impl WgpuRenderer {
                     {
                         #[cfg(target_os = "linux")]
                         for surface in &scene.surfaces[surfaces] {
+                            let ((source_x, source_y), (source_width, source_height)) =
+                                surface.source_rect;
+                            anyhow::ensure!(
+                                source_x.is_finite()
+                                    && source_y.is_finite()
+                                    && source_width.is_finite()
+                                    && source_height.is_finite()
+                                    && source_x >= 0.0
+                                    && source_y >= 0.0
+                                    && source_width > 0.0
+                                    && source_height > 0.0
+                                    && source_x + source_width <= surface.dma_buf.width() as f32
+                                    && source_y + source_height <= surface.dma_buf.height() as f32,
+                                "DMA-BUF source rectangle is invalid or out of bounds"
+                            );
                             let imported = self
                                 .imported_dma_bufs
                                 .get(&surface.dma_buf.lease_id())
@@ -1694,16 +1709,12 @@ impl WgpuRenderer {
                                 bounds: surface.bounds.into(),
                                 content_mask: surface.content_mask.bounds.into(),
                                 texture_origin: [
-                                    surface.dma_buf.source_origin().0 as f32
-                                        / surface.dma_buf.width() as f32,
-                                    surface.dma_buf.source_origin().1 as f32
-                                        / surface.dma_buf.height() as f32,
+                                    source_x / surface.dma_buf.width() as f32,
+                                    source_y / surface.dma_buf.height() as f32,
                                 ],
                                 texture_size: [
-                                    surface.dma_buf.source_size().0 as f32
-                                        / surface.dma_buf.width() as f32,
-                                    surface.dma_buf.source_size().1 as f32
-                                        / surface.dma_buf.height() as f32,
+                                    source_width / surface.dma_buf.width() as f32,
+                                    source_height / surface.dma_buf.height() as f32,
                                 ],
                                 opaque: (surface.dma_buf.fourcc() == u32::from_le_bytes(*b"XR24"))
                                     as u32,

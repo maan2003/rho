@@ -4595,7 +4595,12 @@ impl Window {
 
     /// Paint a synchronized Linux DMA-BUF into the scene.
     #[cfg(target_os = "linux")]
-    pub fn paint_surface(&mut self, bounds: Bounds<Pixels>, dma_buf: crate::LinuxDmaBufSurface) {
+    pub fn paint_surface(
+        &mut self,
+        bounds: Bounds<Pixels>,
+        dma_buf: crate::LinuxDmaBufSurface,
+        source_rect: ((f32, f32), (f32, f32)),
+    ) {
         use crate::PaintSurface;
 
         self.invalidator.debug_assert_paint();
@@ -4604,6 +4609,7 @@ impl Window {
             bounds: self.snap_bounds(bounds),
             content_mask: self.snapped_content_mask(),
             dma_buf,
+            source_rect,
         });
     }
 

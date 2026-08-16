@@ -63,8 +63,6 @@ struct LinuxDmaBufSurfaceInner {
     pub stride: u32,
     pub offset: u32,
     pub y_inverted: bool,
-    pub source_origin: (u32, u32),
-    pub source_size: (u32, u32),
     pub fd: Mutex<Option<OwnedFd>>,
     pub acquire_fence: Mutex<Option<OwnedFd>>,
     pub submitted: Mutex<Option<Box<dyn FnOnce() + Send>>>,
@@ -83,8 +81,6 @@ impl LinuxDmaBufSurface {
         stride: u32,
         offset: u32,
         y_inverted: bool,
-        source_origin: (u32, u32),
-        source_size: (u32, u32),
         fd: OwnedFd,
         acquire_fence: OwnedFd,
         submitted: impl FnOnce() + Send + 'static,
@@ -101,8 +97,6 @@ impl LinuxDmaBufSurface {
             stride,
             offset,
             y_inverted,
-            source_origin,
-            source_size,
             fd: Mutex::new(Some(fd)),
             acquire_fence: Mutex::new(Some(acquire_fence)),
             submitted: Mutex::new(Some(Box::new(submitted))),
@@ -146,12 +140,6 @@ impl LinuxDmaBufSurface {
     }
     pub fn y_inverted(&self) -> bool {
         self.0.y_inverted
-    }
-    pub fn source_origin(&self) -> (u32, u32) {
-        self.0.source_origin
-    }
-    pub fn source_size(&self) -> (u32, u32) {
-        self.0.source_size
     }
     /// Takes the one-shot import handles without partially consuming them.
     #[doc(hidden)]

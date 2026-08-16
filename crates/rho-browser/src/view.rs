@@ -1,7 +1,7 @@
 //! A GPUI portal onto a durable client-local web page.
 
 use std::cell::Cell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -14,8 +14,8 @@ use gpui::{
 };
 use image::{Frame, RgbaImage};
 use rho_browser_wayland::{
-    BrowserEvent, BrowserSession, PinchGesture, PointerAxisDirection, PointerAxisFrame,
-    PointerAxisSource,
+    BrowserEvent, BrowserSession, BufferImport, PinchGesture, PointerAxisDirection,
+    PointerAxisFrame, PointerAxisSource, SceneNode,
 };
 use theme::ActiveTheme as _;
 
@@ -24,21 +24,20 @@ use crate::runtime::{BrowserRuntime, BrowserWindow};
 
 struct RuntimePageState {
     session: Option<BrowserSession<BrowserWindow>>,
-    dma_buf: Option<LinuxDmaBufSurface>,
-    auxiliary: Vec<AuxiliarySurface>,
+    buffers: HashMap<u64, BrowserBuffer>,
+    scene: Vec<SceneNode>,
+    scene_id: Option<u64>,
+    painted_scene_id: Option<u64>,
+    invalidated_through: u64,
     presented_barrier: u64,
     status: Option<String>,
     sent_size: Rc<Cell<(u32, u32, u32)>>,
 }
 
 #[derive(Clone)]
-struct AuxiliarySurface {
-    id: u64,
-    x: i32,
-    y: i32,
-    width: u32,
-    height: u32,
-    image: Arc<RenderImage>,
+enum BrowserBuffer {
+    DmaBuf(LinuxDmaBufSurface),
+    Shm(Arc<RenderImage>),
 }
 
 /// The singleton live Chrome surface shared by every logical page view.
@@ -67,102 +66,146 @@ impl BrowserModel {
                 if this
                     .update(cx, |model, cx| {
                         match event {
-                            BrowserEvent::DmaBuf(mut frame) => {
-                                if !frame_is_eligible(
+                            BrowserEvent::Scene(mut scene) => {
+                                if model.runtime.session.is_none() {
+                                    return;
+                                }
+                                // Imports are leases independent of whether this scene is
+                                // eligible for the current page handoff. A later coalesced
+                                // scene may still reference them without re-importing.
+                                let mut import_failed = false;
+                                for import in scene.imports.drain(..) {
+                                    let (id, buffer) = match import {
+                                        BufferImport::DmaBuf(mut frame) => {
+                                            let Ok(fd) = frame.duplicate_fd() else {
+                                                model.runtime.status =
+                                                    Some("duplicate Chrome DMA-BUF failed".into());
+                                                import_failed = true;
+                                                continue;
+                                            };
+                                            let Ok(acquire) = frame.duplicate_acquire_fence()
+                                            else {
+                                                model.runtime.status = Some(
+                                                    "duplicate Chrome acquire fence failed".into(),
+                                                );
+                                                import_failed = true;
+                                                continue;
+                                            };
+                                            let id = frame.id;
+                                            let surface = LinuxDmaBufSurface::new(
+                                                id,
+                                                frame.width,
+                                                frame.height,
+                                                frame.fourcc,
+                                                frame.modifier,
+                                                frame.stride,
+                                                frame.offset,
+                                                frame.y_inverted,
+                                                fd,
+                                                acquire,
+                                                || {},
+                                                frame.take_release(),
+                                            );
+                                            (id, BrowserBuffer::DmaBuf(surface))
+                                        }
+                                        BufferImport::Shm(frame) => {
+                                            let mut pixels = frame.pixels;
+                                            bgra_to_rgba(&mut pixels);
+                                            let Some(buffer) = RgbaImage::from_raw(
+                                                frame.width,
+                                                frame.height,
+                                                pixels,
+                                            ) else {
+                                                model.runtime.status =
+                                                    Some("invalid Chrome SHM surface".into());
+                                                import_failed = true;
+                                                continue;
+                                            };
+                                            (
+                                                frame.id,
+                                                BrowserBuffer::Shm(Arc::new(RenderImage::new(
+                                                    smallvec::SmallVec::from_const([Frame::new(
+                                                        buffer,
+                                                    )]),
+                                                ))),
+                                            )
+                                        }
+                                    };
+                                    if let Some(BrowserBuffer::Shm(image)) =
+                                        model.runtime.buffers.insert(id, buffer)
+                                    {
+                                        cx.drop_image(image, None);
+                                    }
+                                }
+                                let missing_buffer = scene.attached.iter().any(|buffer_id| {
+                                    !model.runtime.buffers.contains_key(buffer_id)
+                                });
+                                let eligible = frame_is_eligible(
                                     model.desired_page,
                                     model.focused_page,
                                     model.awaiting_frame,
-                                    frame.barrier,
-                                ) {
+                                    scene.barrier,
+                                );
+                                if import_failed || missing_buffer || !eligible {
+                                    if missing_buffer && !import_failed {
+                                        model.runtime.status =
+                                            Some("Chrome scene referenced a missing buffer".into());
+                                    }
+                                    let mut retained =
+                                        scene.attached.iter().copied().collect::<HashSet<_>>();
+                                    retained.extend(
+                                        model.runtime.scene.iter().map(|node| node.buffer_id),
+                                    );
+                                    model.runtime.buffers.retain(|buffer_id, buffer| {
+                                        let keep = retained.contains(buffer_id);
+                                        if !keep && let BrowserBuffer::Shm(image) = buffer {
+                                            cx.drop_image(image.clone(), None);
+                                        }
+                                        keep
+                                    });
                                     return;
                                 }
-                                let Some(session) = &model.runtime.session else {
-                                    return;
-                                };
-                                let Ok(fd) = frame.duplicate_fd() else {
-                                    model.runtime.status =
-                                        Some("duplicate Chrome DMA-BUF failed".into());
-                                    cx.notify();
-                                    return;
-                                };
-                                let Ok(acquire) = frame.duplicate_acquire_fence() else {
-                                    model.runtime.status =
-                                        Some("duplicate Chrome acquire fence failed".into());
-                                    cx.notify();
-                                    return;
-                                };
-                                let surface = LinuxDmaBufSurface::new(
-                                    frame.id,
-                                    frame.width,
-                                    frame.height,
-                                    frame.fourcc,
-                                    frame.modifier,
-                                    frame.stride,
-                                    frame.offset,
-                                    frame.y_inverted,
-                                    frame.source_origin,
-                                    frame.source_size,
-                                    fd,
-                                    acquire,
-                                    session.presentation_callback(frame.id),
-                                    frame.take_release(),
-                                );
+                                let referenced =
+                                    scene.attached.iter().copied().collect::<HashSet<_>>();
+                                model.runtime.buffers.retain(|buffer_id, buffer| {
+                                    let keep = referenced.contains(buffer_id);
+                                    if !keep && let BrowserBuffer::Shm(image) = buffer {
+                                        cx.drop_image(image.clone(), None);
+                                    }
+                                    keep
+                                });
                                 complete_frame_handoff(
                                     model.desired_page,
                                     &mut model.focused_page,
                                     &mut model.awaiting_frame,
-                                    frame.barrier,
+                                    scene.barrier,
                                 );
-                                model.runtime.presented_barrier = frame.barrier;
-                                model.runtime.dma_buf = Some(surface);
+                                model.runtime.presented_barrier = scene.barrier;
+                                model.runtime.scene_id = Some(scene.id);
+                                model.runtime.scene = scene.nodes;
                                 model.runtime.status = None;
                             }
-                            BrowserEvent::Auxiliary(snapshot) => {
-                                if !auxiliary_is_eligible(
-                                    model.desired_page,
-                                    model.focused_page,
-                                    model.awaiting_frame,
-                                    snapshot.barrier,
-                                ) || snapshot.barrier < model.runtime.presented_barrier
-                                {
-                                    return;
-                                }
-                                for surface in model.runtime.auxiliary.drain(..) {
-                                    cx.drop_image(surface.image, None);
-                                }
-                                model.runtime.auxiliary = snapshot
-                                    .frames
-                                    .into_iter()
-                                    .filter_map(|frame| {
-                                        let mut pixels = frame.pixels;
-                                        bgra_to_rgba(&mut pixels);
-                                        let buffer =
-                                            RgbaImage::from_raw(frame.width, frame.height, pixels)?;
-                                        Some(AuxiliarySurface {
-                                            id: frame.id,
-                                            x: frame.x,
-                                            y: frame.y,
-                                            width: frame.logical_width,
-                                            height: frame.logical_height,
-                                            image: Arc::new(RenderImage::new(
-                                                smallvec::SmallVec::from_const([Frame::new(
-                                                    buffer,
-                                                )]),
-                                            )),
-                                        })
-                                    })
-                                    .collect();
-                            }
-                            BrowserEvent::FrameRetired(commit_id) => {
-                                if model
+                            BrowserEvent::FrameRetired(buffer_id) => {
+                                let was_visible = model
                                     .runtime
-                                    .dma_buf
-                                    .as_ref()
-                                    .is_some_and(|frame| frame.id() == commit_id)
+                                    .scene
+                                    .iter()
+                                    .any(|node| node.buffer_id == buffer_id);
+                                if let Some(BrowserBuffer::Shm(image)) =
+                                    model.runtime.buffers.remove(&buffer_id)
                                 {
-                                    model.runtime.dma_buf = None;
+                                    cx.drop_image(image, None);
+                                }
+                                if was_visible {
+                                    if let Some(scene_id) = model.runtime.scene_id {
+                                        model.runtime.invalidated_through =
+                                            model.runtime.invalidated_through.max(scene_id);
+                                    }
+                                    model.runtime.scene.clear();
+                                    model.runtime.scene_id = None;
+                                    model.runtime.painted_scene_id = None;
                                     model.runtime.status =
-                                        Some("Chrome frame import was retired".into());
+                                        Some("Chrome surface import was retired".into());
                                 }
                             }
                             BrowserEvent::ToplevelReady => {
@@ -198,8 +241,11 @@ impl BrowserModel {
             presentation_owner: None,
             runtime: RuntimePageState {
                 session: Some(session),
-                dma_buf: None,
-                auxiliary: Vec::new(),
+                buffers: HashMap::new(),
+                scene: Vec::new(),
+                scene_id: None,
+                painted_scene_id: None,
+                invalidated_through: 0,
                 presented_barrier: 0,
                 status: Some("waiting for Chrome".into()),
                 sent_size: Rc::new(Cell::new((1280, 720, 1.0_f32.to_bits()))),
@@ -254,9 +300,16 @@ impl BrowserModel {
         // request named this page: the user can switch tabs in Chrome itself.
         self.focused_page = None;
         self.awaiting_frame = None;
-        self.runtime.dma_buf = None;
-        for surface in self.runtime.auxiliary.drain(..) {
-            cx.drop_image(surface.image, None);
+        if let Some(scene_id) = self.runtime.scene_id {
+            self.runtime.invalidated_through = self.runtime.invalidated_through.max(scene_id);
+        }
+        self.runtime.scene.clear();
+        self.runtime.scene_id = None;
+        self.runtime.painted_scene_id = None;
+        for (_, buffer) in self.runtime.buffers.drain() {
+            if let BrowserBuffer::Shm(image) = buffer {
+                cx.drop_image(image, None);
+            }
         }
         self.runtime.status = Some("switching browser page".into());
         self.presentation_owner = Some(owner);
@@ -297,18 +350,29 @@ impl BrowserModel {
     }
 
     fn pointer_motion(&self, x: f64, y: f64) {
-        if let (Some(session), Some(frame)) = (&self.runtime.session, &self.runtime.dma_buf) {
-            session.pointer_motion(frame.id(), x, y);
+        if let (Some(session), Some(scene_id)) =
+            (&self.runtime.session, self.runtime.painted_scene_id)
+        {
+            session.pointer_motion(scene_id, x, y);
         }
     }
 
-    fn pointer_button(&self, button: u32, pressed: bool) {
+    fn pointer_button(&self, button: u32, pressed: bool) -> bool {
+        if pressed && self.runtime.painted_scene_id.is_none() {
+            return false;
+        }
         if let Some(session) = &self.runtime.session {
             session.pointer_button(button, pressed);
+            true
+        } else {
+            false
         }
     }
 
     fn pointer_axis(&self, event: &LinuxPointerAxisEvent) {
+        if self.runtime.painted_scene_id.is_none() && event.stop == (false, false) {
+            return;
+        }
         if let Some(session) = &self.runtime.session {
             session.pointer_axis(PointerAxisFrame {
                 source: match event.source {
@@ -329,6 +393,10 @@ impl BrowserModel {
     }
 
     fn pinch(&self, event: LinuxPinchEvent) {
+        if self.runtime.painted_scene_id.is_none() && !matches!(event, LinuxPinchEvent::End { .. })
+        {
+            return;
+        }
         if let Some(session) = &self.runtime.session {
             session.pinch(match event {
                 LinuxPinchEvent::Begin { fingers, .. } => PinchGesture::Begin { fingers },
@@ -347,9 +415,15 @@ impl BrowserModel {
         }
     }
 
-    fn key(&self, keycode: u32, pressed: bool) {
+    fn key(&self, keycode: u32, pressed: bool) -> bool {
+        if pressed && self.runtime.painted_scene_id.is_none() {
+            return false;
+        }
         if let Some(session) = &self.runtime.session {
             session.key(keycode, pressed);
+            true
+        } else {
+            false
         }
     }
 }
@@ -364,17 +438,6 @@ fn frame_is_eligible(
         return desired == Some(page) && frame_barrier >= barrier;
     }
     desired == focused
-}
-
-fn auxiliary_is_eligible(
-    desired: Option<PageId>,
-    focused: Option<PageId>,
-    awaiting: Option<(u64, PageId)>,
-    snapshot_barrier: u64,
-) -> bool {
-    desired == focused
-        || awaiting
-            .is_some_and(|(barrier, page)| desired == Some(page) && snapshot_barrier >= barrier)
 }
 
 fn bgra_to_rgba(pixels: &mut [u8]) {
@@ -408,6 +471,7 @@ pub struct BrowserView {
     pressed_buttons: HashSet<u32>,
     finger_axes: (bool, bool),
     pinch_active: bool,
+    scheduled_scene: Option<u64>,
     blur_subscription: Option<Subscription>,
     focus_subscription: Option<Subscription>,
     _model_changed: Subscription,
@@ -430,6 +494,7 @@ impl BrowserView {
             pressed_buttons: HashSet::new(),
             finger_axes: (false, false),
             pinch_active: false,
+            scheduled_scene: None,
             blur_subscription: None,
             focus_subscription: None,
             _model_changed: model_changed,
@@ -471,8 +536,9 @@ impl BrowserView {
         }
         model.pointer_motion(x, y);
         let button = linux_button(event.button);
-        self.pressed_buttons.insert(button);
-        model.pointer_button(button, true);
+        if model.pointer_button(button, true) {
+            self.pressed_buttons.insert(button);
+        }
         cx.stop_propagation();
     }
 
@@ -482,8 +548,9 @@ impl BrowserView {
             return;
         }
         let button = linux_button(event.button);
-        self.pressed_buttons.remove(&button);
-        self.model.read(cx).pointer_button(button, false);
+        if self.pressed_buttons.remove(&button) {
+            self.model.read(cx).pointer_button(button, false);
+        }
         cx.stop_propagation();
     }
 
@@ -510,7 +577,10 @@ impl BrowserView {
                 self.finger_axes.1 = false;
             }
         }
-        self.model.read(cx).pointer_axis(event);
+        let (x, y) = self.local_position(event.position);
+        let model = self.model.read(cx);
+        model.pointer_motion(x, y);
+        model.pointer_axis(event);
         cx.stop_propagation();
     }
 
@@ -519,7 +589,14 @@ impl BrowserView {
             return;
         }
         self.pinch_active = !matches!(event, LinuxPinchEvent::End { .. });
-        self.model.read(cx).pinch(*event);
+        let model = self.model.read(cx);
+        if let LinuxPinchEvent::Begin { position, .. } | LinuxPinchEvent::Update { position, .. } =
+            event
+        {
+            let (x, y) = self.local_position(*position);
+            model.pointer_motion(x, y);
+        }
+        model.pinch(*event);
         cx.stop_propagation();
     }
 
@@ -529,8 +606,8 @@ impl BrowserView {
         }
         let PhysicalKey::LinuxEvdev(keycode) = event.key;
         if event.pressed {
-            if self.pressed_keys.insert(keycode) {
-                self.model.read(cx).key(keycode, true);
+            if !self.pressed_keys.contains(&keycode) && self.model.read(cx).key(keycode, true) {
+                self.pressed_keys.insert(keycode);
             }
         } else if self.pressed_keys.remove(&keycode) {
             self.model.read(cx).key(keycode, false);
@@ -604,12 +681,63 @@ impl Render for BrowserView {
                     })
                 }));
         }
+        // Rendering is synchronous with the Linux event loop: once this method
+        // builds a scene, no input can interleave before GPUI presents it.
+        // Advance hit testing here rather than in the next-frame callback,
+        // which runs before that next frame's draw.
+        let (owns_presentation, painted_scene_id) = {
+            let model = self.model.read(cx);
+            (
+                model.presentation_owner == Some(self.owner_id),
+                model
+                    .presents(self.owner_id, self.page_id)
+                    .then_some(model.runtime.scene_id)
+                    .flatten(),
+            )
+        };
+        if owns_presentation {
+            self.model.update(cx, |model, _| {
+                model.runtime.painted_scene_id = painted_scene_id;
+            });
+        }
         let model = self.model.read(cx);
         let colors = cx.theme().colors();
         let presents = model.presents(self.owner_id, self.page_id);
-        let dma_buf = presents.then(|| model.runtime.dma_buf.clone()).flatten();
-        let auxiliary = if presents {
-            model.runtime.auxiliary.clone()
+        if presents
+            && model.runtime.scene_id != self.scheduled_scene
+            && let (Some(scene_id), Some(session)) =
+                (model.runtime.scene_id, model.runtime.session.as_ref())
+        {
+            self.scheduled_scene = Some(scene_id);
+            let presented = session.presentation_callback(scene_id);
+            let browser = self.model.clone();
+            let owner_id = self.owner_id;
+            let page_id = self.page_id;
+            window.on_next_frame(move |_, cx| {
+                let painted = browser.update(cx, |model, _| {
+                    model.presents(owner_id, page_id)
+                        && scene_id > model.runtime.invalidated_through
+                });
+                if painted {
+                    presented();
+                }
+            });
+        }
+        let scene = if presents {
+            model
+                .runtime
+                .scene
+                .iter()
+                .map(|node| {
+                    let buffer = model
+                        .runtime
+                        .buffers
+                        .get(&node.buffer_id)
+                        .expect("accepted browser scene has every buffer")
+                        .clone();
+                    (node.clone(), buffer)
+                })
+                .collect::<Vec<_>>()
         } else {
             Vec::new()
         };
@@ -661,21 +789,29 @@ impl Render for BrowserView {
             .relative()
             .overflow_hidden()
             .bg(colors.editor_background)
-            .children(dma_buf.map(|frame| {
+            .children(scene.into_iter().map(|(node, buffer)| {
+                let content = match buffer {
+                    BrowserBuffer::DmaBuf(frame) => surface(frame)
+                        .source_rect(
+                            (node.source.0.0 as f32, node.source.0.1 as f32),
+                            (node.source.1.0 as f32, node.source.1.1 as f32),
+                        )
+                        .size_full()
+                        .object_fit(ObjectFit::Fill)
+                        .into_any_element(),
+                    BrowserBuffer::Shm(image) => img(image)
+                        .size_full()
+                        .object_fit(ObjectFit::Fill)
+                        .into_any_element(),
+                };
                 div()
+                    .id(("rho-browser-surface", node.surface_id))
                     .absolute()
-                    .size_full()
-                    .child(surface(frame).size_full().object_fit(ObjectFit::Fill))
-            }))
-            .children(auxiliary.into_iter().map(|surface| {
-                div()
-                    .id(("rho-browser-auxiliary", surface.id))
-                    .absolute()
-                    .left(px(surface.x as f32))
-                    .top(px(surface.y as f32))
-                    .w(px(surface.width as f32))
-                    .h(px(surface.height as f32))
-                    .child(img(surface.image).size_full().object_fit(ObjectFit::Fill))
+                    .left(px(node.origin.0 as f32))
+                    .top(px(node.origin.1 as f32))
+                    .w(px(node.destination.0 as f32))
+                    .h(px(node.destination.1 as f32))
+                    .child(content)
             }))
             .child(div().absolute().size_full().child(measure))
             .children(status.map(|status| {
@@ -684,8 +820,13 @@ impl Render for BrowserView {
                     .bottom_0()
                     .left_0()
                     .w_full()
-                    .p_2()
-                    .bg(colors.editor_subheader_background.opacity(0.92))
+                    .px_2()
+                    .py_1()
+                    .border_t_1()
+                    .border_color(colors.border_variant)
+                    .bg(colors.surface_background)
+                    .font(theme::theme_settings(cx).ui_font(cx).clone())
+                    .text_size(theme::theme_settings(cx).ui_font_size(cx))
                     .text_color(colors.text_muted)
                     .child(status)
             }))
@@ -714,24 +855,6 @@ mod tests {
         assert_eq!(focused, None, "eligibility alone must not enable input");
         complete_frame_handoff(Some(page), &mut focused, &mut awaiting, 7);
         assert_eq!(focused, Some(page));
-    }
-
-    #[test]
-    fn popup_snapshot_can_arrive_before_its_root_handoff_frame() {
-        let old_page = PageId(uuid::Uuid::from_u128(1));
-        let new_page = PageId(uuid::Uuid::from_u128(2));
-        assert!(!auxiliary_is_eligible(
-            Some(new_page),
-            Some(old_page),
-            Some((7, new_page)),
-            6,
-        ));
-        assert!(auxiliary_is_eligible(
-            Some(new_page),
-            Some(old_page),
-            Some((7, new_page)),
-            7,
-        ));
     }
 
     #[test]

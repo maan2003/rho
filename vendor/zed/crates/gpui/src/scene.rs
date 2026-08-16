@@ -773,6 +773,8 @@ pub struct PaintSurface {
     pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
     #[cfg(target_os = "linux")]
     pub dma_buf: crate::LinuxDmaBufSurface,
+    #[cfg(target_os = "linux")]
+    pub source_rect: ((f32, f32), (f32, f32)),
 }
 
 impl From<PaintSurface> for Primitive {

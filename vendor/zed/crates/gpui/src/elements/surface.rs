@@ -35,6 +35,8 @@ impl From<CVPixelBuffer> for SurfaceSource {
 pub struct Surface {
     source: SurfaceSource,
     object_fit: ObjectFit,
+    #[cfg(target_os = "linux")]
+    source_rect: Option<((f32, f32), (f32, f32))>,
     style: StyleRefinement,
 }
 
@@ -44,6 +46,8 @@ pub fn surface(source: impl Into<SurfaceSource>) -> Surface {
     Surface {
         source: source.into(),
         object_fit: ObjectFit::Contain,
+        #[cfg(target_os = "linux")]
+        source_rect: None,
         style: Default::default(),
     }
 }
@@ -52,6 +56,14 @@ impl Surface {
     /// Set the object fit for the image.
     pub fn object_fit(mut self, object_fit: ObjectFit) -> Self {
         self.object_fit = object_fit;
+        self
+    }
+
+    /// Selects the source rectangle, in DMA-BUF pixel coordinates, sampled by this paint.
+    /// The imported DMA-BUF lease is unchanged and can be repainted with new viewport state.
+    #[cfg(target_os = "linux")]
+    pub fn source_rect(mut self, origin: (f32, f32), size: (f32, f32)) -> Self {
+        self.source_rect = Some((origin, size));
         self
     }
 }
@@ -112,10 +124,16 @@ impl Element for Surface {
             }
             #[cfg(target_os = "linux")]
             SurfaceSource::DmaBuf(surface) => {
-                let source_size = surface.source_size();
-                let size = crate::size(source_size.0.into(), source_size.1.into());
+                let source_rect = self.source_rect.unwrap_or((
+                    (0.0, 0.0),
+                    (surface.width() as f32, surface.height() as f32),
+                ));
+                let size = crate::size(
+                    (source_rect.1.0.ceil() as u32).into(),
+                    (source_rect.1.1.ceil() as u32).into(),
+                );
                 let new_bounds = self.object_fit.get_bounds(bounds, size);
-                window.paint_surface(new_bounds, surface.clone());
+                window.paint_surface(new_bounds, surface.clone(), source_rect);
             }
             #[allow(unreachable_patterns)]
             _ => {}
