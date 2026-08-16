@@ -1035,12 +1035,20 @@ impl<K: BrowserPageKey> State<K> {
             bail!("Chromium SHM scene exceeds {MAX_SCENE_SHM_BYTES} bytes")
         }
         let window = self.windows.get_mut(&id).expect("known window");
+        let previous_barrier = window.committed_barrier;
         window.committed_barrier = committed_barrier_after_scene(
             window.committed_barrier,
             window.acked_barrier,
             barrier_anchor,
             new_visible_toplevel_dma,
         );
+        if window.committed_barrier != previous_barrier {
+            tracing::info!(
+                barrier = window.committed_barrier,
+                scene_id = window.next_scene_id,
+                "Chromium frame barrier reached a visible DMA scene"
+            );
+        }
         window
             .pending_imports
             .retain(|buffer_id, _| attached.contains(buffer_id));
@@ -1206,10 +1214,14 @@ impl<K: BrowserPageKey> CompositorHandler for State<K> {
             return;
         };
 
+        let mut transaction_root = surface.clone();
+        while let Some(parent) = smithay::wayland::compositor::get_parent(&transaction_root) {
+            transaction_root = parent;
+        }
         let barrier_anchor = self.windows[&id]
             .toplevel
             .as_ref()
-            .is_some_and(|toplevel| toplevel.wl_surface() == surface);
+            .is_some_and(|toplevel| toplevel.wl_surface() == &transaction_root);
         if let Err(error) = self.publish_scene(id, barrier_anchor) {
             self.windows[&id].events.send(BrowserEvent::Failed(
                 format!("invalid Chromium surface tree: {error:#}").into(),
