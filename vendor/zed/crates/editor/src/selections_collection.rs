@@ -993,7 +993,16 @@ impl<'snap, 'a> MutableSelectionsCollection<'snap, 'a> {
         &mut self,
         move_selection: &mut dyn FnMut(&DisplaySnapshot, &mut Selection<DisplayPoint>),
     ) {
-        let mut changed = false;
+        // Excerpt replacement can leave selections pointing at a path that is
+        // no longer present. They still resolve to a display position, but
+        // must be round-tripped through that position to become live anchors.
+        let mut changed = self.collection.disjoint.iter().any(|selection| {
+            !self.snapshot.can_resolve(&selection.start)
+                || !self.snapshot.can_resolve(&selection.end)
+        }) || self.collection.pending.as_ref().is_some_and(|pending| {
+            !self.snapshot.can_resolve(&pending.selection.start)
+                || !self.snapshot.can_resolve(&pending.selection.end)
+        });
         let display_map = self.display_snapshot();
         let selections = self.collection.all_display(&display_map);
         let selections = selections

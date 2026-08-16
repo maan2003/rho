@@ -483,6 +483,76 @@ fn user_messages_render_with_turn_gaps_and_gutters(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn initial_transcript_preserves_line_endings_when_placing_spans(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![user("first\r\nsecond\rthird")],
+            vec![assistant(
+                "answer\r\ncontinued\rfinished",
+                Some(UiMessagePhase::FinalAnswer),
+            )],
+        )),
+    );
+
+    let text = display_text(&workspace, cx);
+    assert!(text.contains("first\r\nsecond\rthird"), "{text:?}");
+    assert!(text.contains("answer\r\ncontinued\rfinished"), "{text:?}");
+}
+
+#[gpui::test]
+fn insert_recovers_cursor_from_replaced_transcript_excerpt(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(vec![user("old transcript")], Vec::new())),
+    );
+
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let offset = snapshot.text().find("old transcript").expect("transcript");
+                editor.change_selections(
+                    editor::SelectionEffects::no_scroll(),
+                    window,
+                    cx,
+                    |selections| {
+                        let offset = editor::MultiBufferOffset(offset);
+                        selections.select_ranges([offset..offset]);
+                    },
+                );
+            });
+        })
+        .expect("place cursor");
+
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(vec![user("replacement")], Vec::new())),
+    );
+
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.prepare_for_insert(window, cx);
+                let snapshot = editor.display_snapshot(cx);
+                let selection = editor.selections.newest_anchor();
+                assert!(snapshot.can_resolve(&selection.start));
+                assert!(snapshot.can_resolve(&selection.end));
+            });
+        })
+        .expect("prepare for insert");
+}
+
+#[gpui::test]
 fn last_response_has_a_blank_line_before_the_prompt(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     feed_frame(

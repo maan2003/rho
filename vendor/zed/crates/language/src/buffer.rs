@@ -2344,9 +2344,8 @@ impl Buffer {
         let base_version = self.version();
         cx.background_spawn(async move {
             let old_text = old_text.to_string();
-            let mut new_text = new_text.as_ref().to_owned();
+            let new_text = new_text.as_ref().to_owned();
             let line_ending = LineEnding::detect(&new_text);
-            LineEnding::normalize(&mut new_text);
             let edits = text_diff(&old_text, &new_text);
             Diff {
                 base_version,
