@@ -539,9 +539,9 @@ fn committed_barrier_after_scene(
     committed: u64,
     acknowledged: u64,
     barrier_anchor: bool,
-    new_toplevel_dma: bool,
+    new_visible_toplevel_dma: bool,
 ) -> u64 {
-    if barrier_anchor && new_toplevel_dma {
+    if barrier_anchor && new_visible_toplevel_dma {
         acknowledged
     } else {
         committed
@@ -835,7 +835,7 @@ impl<K: BrowserPageKey> State<K> {
         })?
     }
 
-    fn update_surface_buffer(&mut self, id: K, surface: &WlSurface) -> Result<bool> {
+    fn update_surface_buffer(&mut self, id: K, surface: &WlSurface) -> Result<Option<u64>> {
         let (assignment, buffer_delta, (acquire, mut release)) = with_states(surface, |states| {
             let mut attributes = states.cached_state.get::<SurfaceAttributes>();
             let current = attributes.current();
@@ -862,7 +862,7 @@ impl<K: BrowserPageKey> State<K> {
             if let Some(release) = release {
                 let _ = release.signal();
             }
-            return Ok(false);
+            return Ok(None);
         };
         if matches!(assignment, BufferAssignment::Removed) {
             self.windows
@@ -873,7 +873,7 @@ impl<K: BrowserPageKey> State<K> {
             if let Some(release) = release {
                 let _ = release.signal();
             }
-            return Ok(false);
+            return Ok(None);
         }
         let BufferAssignment::NewBuffer(buffer) = assignment else {
             unreachable!()
@@ -943,7 +943,7 @@ impl<K: BrowserPageKey> State<K> {
                 let window = self.windows.get_mut(&id).expect("known window");
                 window.surface_slots.insert(surface.id(), slot);
                 window.pending_imports.insert(buffer_id, import);
-                Ok(is_dma)
+                Ok(is_dma.then_some(buffer_id))
             }
             Err(error) => {
                 if let Some(release) = release {
@@ -983,10 +983,14 @@ impl<K: BrowserPageKey> State<K> {
                 |_, _, &()| true,
             );
         }
-        let mut new_toplevel_dma = false;
+        let mut new_toplevel_dma = std::collections::HashSet::new();
         for (index, surface) in surfaces.iter().enumerate() {
-            let is_dma = self.update_surface_buffer(id, surface)?;
-            new_toplevel_dma |= index < toplevel_surface_count && is_dma;
+            let dma_buffer = self.update_surface_buffer(id, surface)?;
+            if index < toplevel_surface_count
+                && let Some(buffer_id) = dma_buffer
+            {
+                new_toplevel_dma.insert(buffer_id);
+            }
         }
 
         let geometry = with_states(&root, |states| {
@@ -1000,6 +1004,9 @@ impl<K: BrowserPageKey> State<K> {
         let mut nodes = Vec::new();
         let mut hits = Vec::new();
         append_surface_tree(&root, root_origin, slots, &mut nodes, &mut hits)?;
+        let new_visible_toplevel_dma = nodes
+            .iter()
+            .any(|node| new_toplevel_dma.contains(&node.buffer_id));
 
         // PopupManager yields topmost first; GPUI paints bottom-to-top.
         let mut popups = PopupManager::popups_for_surface(&root).collect::<Vec<_>>();
@@ -1032,7 +1039,7 @@ impl<K: BrowserPageKey> State<K> {
             window.committed_barrier,
             window.acked_barrier,
             barrier_anchor,
-            new_toplevel_dma,
+            new_visible_toplevel_dma,
         );
         window
             .pending_imports
