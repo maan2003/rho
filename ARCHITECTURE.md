@@ -154,7 +154,10 @@ than by running a supervisor, extension protocol, or daemon process graph.
   this single composition path.
   The compositor is wake-driven, advertises per-surface fractional scale and a
   viewporter while keeping its shared synthetic output stable, and forwards
-  raw physical keys, pointer axes, and pinch phases to Chromium. `wl_shm`
+  raw physical keys, pointer axes, and pinch phases to Chromium. It advertises
+  `wp_cursor_shape_v1` and projects Chromium's named cursor requests onto the
+  GPUI browser region, letting the outer display server render the native
+  cursor rather than introducing a second cursor-surface renderer. `wl_shm`
   remains available only for ancillary Chromium surfaces; the root must remain
   an explicitly synchronized DMA-BUF.
   `rho-gui` only hosts the resulting GPUI page model/view. A full `:web-<uuid>:` tag

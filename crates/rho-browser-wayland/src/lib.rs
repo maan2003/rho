@@ -32,8 +32,8 @@ use smithay::desktop::{
 };
 use smithay::input::keyboard::{FilterResult, KeyboardHandle};
 use smithay::input::pointer::{
-    AxisFrame, ButtonEvent, Focus, GesturePinchBeginEvent, GesturePinchEndEvent,
-    GesturePinchUpdateEvent, MotionEvent, PointerHandle,
+    AxisFrame, ButtonEvent, CursorIcon, CursorImageStatus, Focus, GesturePinchBeginEvent,
+    GesturePinchEndEvent, GesturePinchUpdateEvent, MotionEvent, PointerHandle,
 };
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
@@ -59,6 +59,7 @@ use smithay::wayland::compositor::{
 use smithay::wayland::dmabuf::{
     DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf,
 };
+use smithay::wayland::cursor_shape::CursorShapeManagerState;
 use smithay::wayland::drm_syncobj::{
     DrmSyncPoint, DrmSyncobjCachedState, DrmSyncobjHandler, DrmSyncobjState,
     supports_syncobj_eventfd,
@@ -77,10 +78,11 @@ use smithay::wayland::shell::xdg::{
     ToplevelSurface, XdgShellHandler, XdgShellState,
 };
 use smithay::wayland::shm::{ShmHandler, ShmState, with_buffer_contents};
+use smithay::wayland::tablet_manager::TabletSeatHandler;
 use smithay::{
-    delegate_dmabuf, delegate_drm_syncobj, delegate_fractional_scale,
-    delegate_output, delegate_pointer_gestures, delegate_seat, delegate_shm,
-    delegate_viewporter, delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_cursor_shape, delegate_dmabuf, delegate_drm_syncobj, delegate_fractional_scale,
+    delegate_output, delegate_pointer_gestures, delegate_seat, delegate_shm, delegate_viewporter,
+    delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
 };
 
 const MAX_POPUP_BYTES: usize = 16 * 1024 * 1024;
@@ -192,10 +194,70 @@ impl Drop for DmaBufFrame {
 #[derive(Debug)]
 pub enum BrowserEvent {
     Scene(SceneUpdate),
+    Cursor(BrowserCursor),
     FrameRetired(u64),
     ToplevelReady,
     Closed,
     Failed(Arc<str>),
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BrowserCursor {
+    #[default]
+    Arrow,
+    IBeam,
+    Crosshair,
+    ClosedHand,
+    OpenHand,
+    PointingHand,
+    ResizeLeft,
+    ResizeRight,
+    ResizeLeftRight,
+    ResizeUp,
+    ResizeDown,
+    ResizeUpDown,
+    ResizeUpLeftDownRight,
+    ResizeUpRightDownLeft,
+    ResizeColumn,
+    ResizeRow,
+    VerticalText,
+    NotAllowed,
+    DragLink,
+    DragCopy,
+    ContextMenu,
+}
+
+fn browser_cursor(status: CursorImageStatus) -> BrowserCursor {
+    let CursorImageStatus::Named(icon) = status else {
+        return BrowserCursor::Arrow;
+    };
+    match icon {
+        CursorIcon::Pointer => BrowserCursor::PointingHand,
+        CursorIcon::Text => BrowserCursor::IBeam,
+        CursorIcon::VerticalText => BrowserCursor::VerticalText,
+        CursorIcon::Crosshair | CursorIcon::Cell => BrowserCursor::Crosshair,
+        CursorIcon::Grab => BrowserCursor::OpenHand,
+        CursorIcon::Grabbing => BrowserCursor::ClosedHand,
+        CursorIcon::WResize => BrowserCursor::ResizeLeft,
+        CursorIcon::EResize => BrowserCursor::ResizeRight,
+        CursorIcon::EwResize => BrowserCursor::ResizeLeftRight,
+        CursorIcon::NResize => BrowserCursor::ResizeUp,
+        CursorIcon::SResize => BrowserCursor::ResizeDown,
+        CursorIcon::NsResize => BrowserCursor::ResizeUpDown,
+        CursorIcon::NwResize | CursorIcon::SeResize | CursorIcon::NwseResize => {
+            BrowserCursor::ResizeUpLeftDownRight
+        }
+        CursorIcon::NeResize | CursorIcon::SwResize | CursorIcon::NeswResize => {
+            BrowserCursor::ResizeUpRightDownLeft
+        }
+        CursorIcon::ColResize => BrowserCursor::ResizeColumn,
+        CursorIcon::RowResize => BrowserCursor::ResizeRow,
+        CursorIcon::NoDrop | CursorIcon::NotAllowed => BrowserCursor::NotAllowed,
+        CursorIcon::Alias => BrowserCursor::DragLink,
+        CursorIcon::Copy => BrowserCursor::DragCopy,
+        CursorIcon::ContextMenu => BrowserCursor::ContextMenu,
+        _ => BrowserCursor::Arrow,
+    }
 }
 
 #[derive(Clone)]
@@ -515,6 +577,7 @@ struct State<K: BrowserPageKey> {
     _fractional_scale: FractionalScaleManagerState,
     _viewporter: ViewporterState,
     _pointer_gestures: PointerGesturesState,
+    _cursor_shape: CursorShapeManagerState,
     seat_state: SeatState<Self>,
     _seat: Seat<Self>,
     keyboard: KeyboardHandle<Self>,
@@ -1678,13 +1741,15 @@ impl<K: BrowserPageKey> SeatHandler for State<K> {
         &mut self.seat_state
     }
     fn focus_changed(&mut self, _seat: &Seat<Self>, _focused: Option<&WlSurface>) {}
-    fn cursor_image(
-        &mut self,
-        _seat: &Seat<Self>,
-        _image: smithay::input::pointer::CursorImageStatus,
-    ) {
+    fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
+        let cursor = browser_cursor(image);
+        for window in self.windows.values() {
+            window.events.send(BrowserEvent::Cursor(cursor));
+        }
     }
 }
+
+impl<K: BrowserPageKey> TabletSeatHandler for State<K> {}
 
 #[derive(Default)]
 struct ClientState {
@@ -1769,6 +1834,7 @@ delegate_seat!(@<K: BrowserPageKey> State<K>);
 delegate_fractional_scale!(@<K: BrowserPageKey> State<K>);
 delegate_viewporter!(@<K: BrowserPageKey> State<K>);
 delegate_pointer_gestures!(@<K: BrowserPageKey> State<K>);
+delegate_cursor_shape!(@<K: BrowserPageKey> State<K>);
 
 fn dma_buf_frame<K: BrowserPageKey>(
     id: u64,
@@ -1942,6 +2008,7 @@ fn run<K: BrowserPageKey>(
         _fractional_scale: FractionalScaleManagerState::new::<State<K>>(&dh),
         _viewporter: ViewporterState::new::<State<K>>(&dh),
         _pointer_gestures: PointerGesturesState::new::<State<K>>(&dh),
+        _cursor_shape: CursorShapeManagerState::new::<State<K>>(&dh),
         seat_state,
         _seat: seat,
         keyboard,
@@ -2656,6 +2723,26 @@ mod tests {
         assert_eq!(committed_barrier_after_scene(3, 7, true, true), 7);
         assert_eq!(committed_barrier_after_scene(3, 7, true, false), 3);
         assert_eq!(committed_barrier_after_scene(3, 7, false, true), 3);
+    }
+
+    #[test]
+    fn named_browser_cursors_map_to_host_cursor_shapes() {
+        assert_eq!(
+            browser_cursor(CursorImageStatus::Named(CursorIcon::Pointer)),
+            BrowserCursor::PointingHand
+        );
+        assert_eq!(
+            browser_cursor(CursorImageStatus::Named(CursorIcon::Text)),
+            BrowserCursor::IBeam
+        );
+        assert_eq!(
+            browser_cursor(CursorImageStatus::Named(CursorIcon::NwseResize)),
+            BrowserCursor::ResizeUpLeftDownRight
+        );
+        assert_eq!(
+            browser_cursor(CursorImageStatus::Hidden),
+            BrowserCursor::Arrow
+        );
     }
 
     #[test]

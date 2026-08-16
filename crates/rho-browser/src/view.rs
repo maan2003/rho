@@ -6,15 +6,16 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    AppContext as _, Context, Entity, EntityId, FocusHandle, Focusable, InteractiveElement as _,
-    IntoElement, LinuxAxisRelativeDirection, LinuxAxisSource, LinuxDmaBufSurface, LinuxPinchEvent,
-    LinuxPointerAxisEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    ParentElement as _, PhysicalKey, PhysicalKeyEvent, Render, RenderImage, Styled as _,
-    StyledImage as _, Subscription, Task, Window, canvas, div, img, px, surface,
+    AppContext as _, Context, CursorStyle, Entity, EntityId, FocusHandle, Focusable,
+    InteractiveElement as _, IntoElement, LinuxAxisRelativeDirection, LinuxAxisSource,
+    LinuxDmaBufSurface, LinuxPinchEvent, LinuxPointerAxisEvent, MouseButton, MouseDownEvent,
+    MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement as _, PhysicalKey, PhysicalKeyEvent,
+    Render, RenderImage, Styled as _, StyledImage as _, Subscription, Task, Window, canvas, div,
+    img, px, surface,
 };
 use image::{Frame, RgbaImage};
 use rho_browser_wayland::{
-    BrowserEvent, BrowserSession, BufferImport, PinchGesture, PointerAxisDirection,
+    BrowserCursor, BrowserEvent, BrowserSession, BufferImport, PinchGesture, PointerAxisDirection,
     PointerAxisFrame, PointerAxisSource, SceneNode,
 };
 use theme::ActiveTheme as _;
@@ -32,6 +33,7 @@ struct RuntimePageState {
     presented_barrier: u64,
     status: Option<String>,
     sent_size: Rc<Cell<(u32, u32, u32)>>,
+    cursor: BrowserCursor,
 }
 
 #[derive(Clone)]
@@ -250,6 +252,9 @@ impl BrowserModel {
                                         Some("Chrome surface import was retired".into());
                                 }
                             }
+                            BrowserEvent::Cursor(cursor) => {
+                                model.runtime.cursor = cursor;
+                            }
                             BrowserEvent::ToplevelReady => {
                                 model.runtime.status = Some("Chrome is starting".into());
                             }
@@ -291,6 +296,7 @@ impl BrowserModel {
                 presented_barrier: 0,
                 status: Some("waiting for Chrome".into()),
                 sent_size: Rc::new(Cell::new((1280, 720, 1.0_f32.to_bits()))),
+                cursor: BrowserCursor::Arrow,
             },
             _events_task: events_task,
         }
@@ -530,6 +536,32 @@ fn frame_is_eligible(handoff: Option<PageHandoff>, frame_barrier: u64) -> bool {
 fn bgra_to_rgba(pixels: &mut [u8]) {
     for pixel in pixels.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
+    }
+}
+
+fn gpui_cursor(cursor: BrowserCursor) -> CursorStyle {
+    match cursor {
+        BrowserCursor::Arrow => CursorStyle::Arrow,
+        BrowserCursor::IBeam => CursorStyle::IBeam,
+        BrowserCursor::Crosshair => CursorStyle::Crosshair,
+        BrowserCursor::ClosedHand => CursorStyle::ClosedHand,
+        BrowserCursor::OpenHand => CursorStyle::OpenHand,
+        BrowserCursor::PointingHand => CursorStyle::PointingHand,
+        BrowserCursor::ResizeLeft => CursorStyle::ResizeLeft,
+        BrowserCursor::ResizeRight => CursorStyle::ResizeRight,
+        BrowserCursor::ResizeLeftRight => CursorStyle::ResizeLeftRight,
+        BrowserCursor::ResizeUp => CursorStyle::ResizeUp,
+        BrowserCursor::ResizeDown => CursorStyle::ResizeDown,
+        BrowserCursor::ResizeUpDown => CursorStyle::ResizeUpDown,
+        BrowserCursor::ResizeUpLeftDownRight => CursorStyle::ResizeUpLeftDownRight,
+        BrowserCursor::ResizeUpRightDownLeft => CursorStyle::ResizeUpRightDownLeft,
+        BrowserCursor::ResizeColumn => CursorStyle::ResizeColumn,
+        BrowserCursor::ResizeRow => CursorStyle::ResizeRow,
+        BrowserCursor::VerticalText => CursorStyle::IBeamCursorForVerticalLayout,
+        BrowserCursor::NotAllowed => CursorStyle::OperationNotAllowed,
+        BrowserCursor::DragLink => CursorStyle::DragLink,
+        BrowserCursor::DragCopy => CursorStyle::DragCopy,
+        BrowserCursor::ContextMenu => CursorStyle::ContextualMenu,
     }
 }
 
@@ -841,6 +873,11 @@ impl Render for BrowserView {
         } else {
             Some("browser is active in another pane".to_owned())
         };
+        let cursor = if presents {
+            gpui_cursor(model.runtime.cursor)
+        } else {
+            CursorStyle::Arrow
+        };
         let scale = window.scale_factor();
         let owner_id = self.owner_id;
         let browser = self.model.clone();
@@ -862,6 +899,7 @@ impl Render for BrowserView {
         div()
             .id("rho-browser")
             .track_focus(&self.focus_handle)
+            .cursor(cursor)
             .key_context("RhoBrowser")
             .on_mouse_move(cx.listener(Self::mouse_move))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::mouse_down))
