@@ -22,20 +22,20 @@ pub use store::{PageId, PageRecord, WebStore, WindowId, WindowRecord};
 pub use view::{BrowserModel as PageModel, BrowserView as PageView};
 
 pub struct WebState {
-    store: WebStore,
+    persisted_pages: WebStore,
     state_dir: std::path::PathBuf,
     runtime: Option<Arc<BrowserRuntime>>,
-    models: HashMap<PageId, Entity<PageModel>>,
+    live_pages: HashMap<PageId, Entity<PageModel>>,
 }
 
 impl Global for WebState {}
 
 pub fn init(store: WebStore, state_dir: &Path, cx: &mut App) {
     cx.set_global(WebState {
-        store,
+        persisted_pages: store,
         state_dir: state_dir.to_owned(),
         runtime: None,
-        models: HashMap::new(),
+        live_pages: HashMap::new(),
     });
 }
 
@@ -43,7 +43,9 @@ fn runtime(cx: &mut App) -> Result<Arc<BrowserRuntime>> {
     if let Some(runtime) = cx.global::<WebState>().runtime.clone() {
         return Ok(runtime);
     }
-    let dma_buf = gpui::linux_dmabuf_device().map(|device| DmaBufConfig {
+    let device = gpui::linux_dmabuf_device()
+        .ok_or_else(|| anyhow::anyhow!("GPUI's Vulkan device does not support DMA-BUF import"))?;
+    let dma_buf = DmaBufConfig {
         render_node: device.render_node.clone(),
         device_id: device.device_id,
         formats: device
@@ -51,7 +53,7 @@ fn runtime(cx: &mut App) -> Result<Arc<BrowserRuntime>> {
             .iter()
             .map(|format| (format.fourcc, format.modifier))
             .collect(),
-    });
+    };
     let state_dir = cx.global::<WebState>().state_dir.clone();
     let runtime = Arc::new(BrowserRuntime::launch(&state_dir, dma_buf)?);
     cx.update_global::<WebState, _>(|web, _| web.runtime = Some(runtime.clone()));
@@ -59,39 +61,40 @@ fn runtime(cx: &mut App) -> Result<Arc<BrowserRuntime>> {
 }
 
 pub fn create_page(launch_url: String, cx: &mut App) -> Task<Result<PageRecord>> {
-    let store = cx.global::<WebState>().store.clone();
+    let store = cx.global::<WebState>().persisted_pages.clone();
     cx.background_spawn(async move { store.create_page(launch_url).await })
 }
 
 pub fn open_page_record(record: PageRecord, cx: &mut App) -> Entity<PageModel> {
-    if let Some(model) = cx.global::<WebState>().models.get(&record.id) {
+    if let Some(model) = cx.global::<WebState>().live_pages.get(&record.id) {
         return model.clone();
     }
     let id = record.id;
-    let launch = runtime(cx).and_then(|runtime| runtime.open(&record.launch_url, (1280, 720)));
+    let launch =
+        runtime(cx).and_then(|runtime| runtime.open(record.id, &record.launch_url, (1280, 720)));
     let model = cx.new(|cx| PageModel::new_record(record, launch, cx));
     cx.update_global::<WebState, _>(|web, _| {
-        web.models.insert(id, model.clone());
+        web.live_pages.insert(id, model.clone());
     });
     model
 }
 
 pub fn open_page(id: PageId, cx: &mut App) -> Option<Entity<PageModel>> {
-    if let Some(model) = cx.global::<WebState>().models.get(&id) {
+    if let Some(model) = cx.global::<WebState>().live_pages.get(&id) {
         return Some(model.clone());
     }
-    let record = cx.global::<WebState>().store.get_page(id)?;
+    let record = cx.global::<WebState>().persisted_pages.get_page(id)?;
     Some(open_page_record(record, cx))
 }
 
 pub fn pages(cx: &App) -> Vec<PageRecord> {
     cx.try_global::<WebState>()
-        .map(|web| web.store.list_pages())
+        .map(|web| web.persisted_pages.list_pages())
         .unwrap_or_default()
 }
 
 pub fn page_handle(id: PageId, cx: &App) -> String {
-    cx.global::<WebState>().store.page_handle(id)
+    cx.global::<WebState>().persisted_pages.page_handle(id)
 }
 
 pub fn page_name(page: &PageRecord) -> String {

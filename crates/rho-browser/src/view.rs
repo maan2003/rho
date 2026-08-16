@@ -1,173 +1,203 @@
 //! A GPUI portal onto a durable client-local web page.
 
 use std::cell::Cell;
+use std::collections::HashSet;
 use std::rc::Rc;
-use std::sync::Arc;
-use std::time::Duration;
 
 use gpui::{
-    Context, Entity, FocusHandle, Focusable, InteractiveElement as _, IntoElement, KeyDownEvent,
-    KeyUpEvent, LinuxDmaBufSurface, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    ObjectFit, ParentElement as _, Render, RenderImage, Styled as _, StyledImage as _,
-    Subscription, Task, Window, canvas, div, img, surface,
+    Context, Entity, FocusHandle, Focusable, InteractiveElement as _, IntoElement,
+    LinuxAxisRelativeDirection, LinuxAxisSource, LinuxDmaBufSurface, LinuxPinchEvent,
+    LinuxPointerAxisEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
+    ParentElement as _, PhysicalKey, PhysicalKeyEvent, Render, Styled as _, Subscription, Task,
+    Window, canvas, div, surface,
 };
-use image::{Frame, RgbaImage};
-use rho_browser_wayland::{BrowserEvent, BrowserSession};
-use smallvec::smallvec;
+use rho_browser_wayland::{
+    BrowserEvent, BrowserSession, PinchGesture, PointerAxisDirection, PointerAxisFrame,
+    PointerAxisSource,
+};
 
 use crate::PageRecord;
 
-pub struct BrowserModel {
-    record: PageRecord,
-    session: Option<BrowserSession>,
-    frame: Option<Arc<RenderImage>>,
+struct RuntimePageState {
+    session: Option<BrowserSession<crate::PageId>>,
     dma_buf: Option<LinuxDmaBufSurface>,
     status: Option<String>,
-    sent_size: Rc<Cell<(u32, u32)>>,
-    _task: Task<()>,
+    sent_size: Rc<Cell<(u32, u32, u32)>>,
+}
+
+/// The persisted and live state associated with one durable page ID.
+pub struct BrowserModel {
+    persisted: PageRecord,
+    runtime: RuntimePageState,
+    _events_task: Task<()>,
 }
 
 impl BrowserModel {
     pub fn new_record(
-        record: PageRecord,
-        launch: anyhow::Result<BrowserSession>,
+        persisted: PageRecord,
+        launch: anyhow::Result<BrowserSession<crate::PageId>>,
         cx: &mut Context<Self>,
     ) -> Self {
         let (session, status) = match launch {
             Ok(session) => (Some(session), Some("waiting for Chrome".into())),
             Err(error) => (None, Some(format!("Chrome failed: {error:#}"))),
         };
-        let task = cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor()
-                    .timer(Duration::from_millis(8))
-                    .await;
-                let keep_running = this
+        let events = session.as_ref().map(BrowserSession::events);
+        let events_task = cx.spawn(async move |this, cx| {
+            let Some(events) = events else { return };
+            while let Ok(event) = events.recv().await {
+                let terminal = matches!(event, BrowserEvent::Closed | BrowserEvent::Failed(_));
+                if this
                     .update(cx, |model, cx| {
-                        let mut changed = false;
-                        while let Some(event) = model
-                            .session
-                            .as_ref()
-                            .and_then(|session| session.try_recv())
-                        {
-                            changed = true;
-                            match event {
-                                BrowserEvent::Frame(frame) => {
-                                    let Some(buffer) = RgbaImage::from_raw(
-                                        frame.width,
-                                        frame.height,
-                                        frame.rgba.to_vec(),
-                                    ) else {
-                                        model.status = Some("Chrome sent an invalid frame".into());
-                                        continue;
-                                    };
-                                    model.frame =
-                                        Some(Arc::new(RenderImage::new(smallvec![Frame::new(
-                                            buffer
-                                        )])));
-                                    model.dma_buf = None;
-                                    model.status = None;
-                                }
-                                BrowserEvent::DmaBuf(mut frame) => {
-                                    let Some(session) = &model.session else {
-                                        continue;
-                                    };
-                                    let Ok(fd) = frame.duplicate_fd() else {
-                                        model.status =
-                                            Some("duplicate Chrome DMA-BUF failed".into());
-                                        continue;
-                                    };
-                                    let Ok(acquire) = frame.duplicate_acquire_fence() else {
-                                        model.status =
-                                            Some("duplicate Chrome acquire fence failed".into());
-                                        continue;
-                                    };
-                                    model.dma_buf = Some(LinuxDmaBufSurface::new(
-                                        frame.id,
-                                        frame.width,
-                                        frame.height,
-                                        frame.fourcc,
-                                        frame.modifier,
-                                        frame.stride,
-                                        frame.offset,
-                                        frame.y_inverted,
-                                        frame.source_origin,
-                                        frame.source_size,
-                                        fd,
-                                        acquire,
-                                        session.presentation_callback(frame.id),
-                                        frame.take_release(),
-                                    ));
-                                    model.frame = None;
-                                    model.status = None;
-                                }
-                                BrowserEvent::Cleared => {
-                                    model.dma_buf = None;
-                                    model.frame = None;
-                                }
-                                BrowserEvent::ToplevelReady => {
-                                    model.status = Some("Chrome is starting".into())
-                                }
-                                BrowserEvent::Failed(error) => {
-                                    model.status = Some(format!("browser failed: {error}"));
-                                    model.session = None;
+                        match event {
+                            BrowserEvent::DmaBuf(mut frame) => {
+                                let Some(session) = &model.runtime.session else {
+                                    return;
+                                };
+                                let Ok(fd) = frame.duplicate_fd() else {
+                                    model.runtime.status =
+                                        Some("duplicate Chrome DMA-BUF failed".into());
+                                    cx.notify();
+                                    return;
+                                };
+                                let Ok(acquire) = frame.duplicate_acquire_fence() else {
+                                    model.runtime.status =
+                                        Some("duplicate Chrome acquire fence failed".into());
+                                    cx.notify();
+                                    return;
+                                };
+                                model.runtime.dma_buf = Some(LinuxDmaBufSurface::new(
+                                    frame.id,
+                                    frame.width,
+                                    frame.height,
+                                    frame.fourcc,
+                                    frame.modifier,
+                                    frame.stride,
+                                    frame.offset,
+                                    frame.y_inverted,
+                                    frame.source_origin,
+                                    frame.source_size,
+                                    fd,
+                                    acquire,
+                                    session.presentation_callback(frame.id),
+                                    frame.take_release(),
+                                ));
+                                model.runtime.status = None;
+                            }
+                            BrowserEvent::FrameRetired(commit_id) => {
+                                if model
+                                    .runtime
+                                    .dma_buf
+                                    .as_ref()
+                                    .is_some_and(|frame| frame.id() == commit_id)
+                                {
+                                    model.runtime.dma_buf = None;
+                                    model.runtime.status =
+                                        Some("Chrome frame import was retired".into());
                                 }
                             }
+                            BrowserEvent::ToplevelReady => {
+                                model.runtime.status = Some("Chrome is starting".into());
+                            }
+                            BrowserEvent::Closed => {
+                                model.runtime.status = Some("browser closed".into());
+                                model.runtime.session = None;
+                            }
+                            BrowserEvent::Failed(error) => {
+                                model.runtime.status = Some(format!("browser failed: {error}"));
+                                model.runtime.session = None;
+                            }
                         }
-                        if changed {
-                            cx.notify();
-                        }
-                        model.session.is_some()
+                        cx.notify();
                     })
-                    .unwrap_or(false);
-                if !keep_running {
+                    .is_err()
+                {
+                    return;
+                }
+                if terminal {
                     return;
                 }
             }
         });
         Self {
-            record,
-            session,
-            frame: None,
-            dma_buf: None,
-            status,
-            sent_size: Rc::new(Cell::new((0, 0))),
-            _task: task,
+            persisted,
+            runtime: RuntimePageState {
+                session,
+                dma_buf: None,
+                status,
+                sent_size: Rc::new(Cell::new((0, 0, 0))),
+            },
+            _events_task: events_task,
         }
     }
 
     pub fn record(&self) -> &PageRecord {
-        &self.record
+        &self.persisted
     }
 
-    fn resize(&self, width: u32, height: u32) {
-        if self.sent_size.replace((width, height)) != (width, height)
-            && let Some(session) = &self.session
+    fn resize(&self, width: u32, height: u32, scale: f32) {
+        let scale = (scale * 120.0).round() / 120.0;
+        let requested = (width, height, scale.to_bits());
+        if self.runtime.sent_size.replace(requested) != requested
+            && let Some(session) = &self.runtime.session
         {
-            session.resize(width, height);
-        }
-    }
-
-    fn presented(&self) {
-        if let Some(session) = &self.session {
-            session.presented();
+            session.resize(width, height, scale);
         }
     }
 
     fn pointer_motion(&self, x: f64, y: f64) {
-        if let Some(session) = &self.session {
-            session.pointer_motion(x, y);
+        if let (Some(session), Some(frame)) = (&self.runtime.session, &self.runtime.dma_buf) {
+            session.pointer_motion(frame.id(), x, y);
         }
     }
 
     fn pointer_button(&self, button: u32, pressed: bool) {
-        if let Some(session) = &self.session {
+        if let Some(session) = &self.runtime.session {
             session.pointer_button(button, pressed);
         }
     }
 
+    fn pointer_axis(&self, event: &LinuxPointerAxisEvent) {
+        if let Some(session) = &self.runtime.session {
+            session.pointer_axis(PointerAxisFrame {
+                source: match event.source {
+                    LinuxAxisSource::Finger => PointerAxisSource::Finger,
+                    LinuxAxisSource::Continuous => PointerAxisSource::Continuous,
+                    LinuxAxisSource::Wheel => PointerAxisSource::Wheel,
+                    LinuxAxisSource::WheelTilt => PointerAxisSource::WheelTilt,
+                },
+                value: event.value,
+                v120: event.v120,
+                stop: event.stop,
+                relative_direction: (
+                    axis_direction(event.relative_direction.0),
+                    axis_direction(event.relative_direction.1),
+                ),
+            });
+        }
+    }
+
+    fn pinch(&self, event: LinuxPinchEvent) {
+        if let Some(session) = &self.runtime.session {
+            session.pinch(match event {
+                LinuxPinchEvent::Begin { fingers, .. } => PinchGesture::Begin { fingers },
+                LinuxPinchEvent::Update {
+                    delta,
+                    scale,
+                    rotation,
+                    ..
+                } => PinchGesture::Update {
+                    delta,
+                    scale,
+                    rotation,
+                },
+                LinuxPinchEvent::End { cancelled } => PinchGesture::End { cancelled },
+            });
+        }
+    }
+
     fn key(&self, keycode: u32, pressed: bool) {
-        if let Some(session) = &self.session {
+        if let Some(session) = &self.runtime.session {
             session.key(keycode, pressed);
         }
     }
@@ -177,6 +207,11 @@ pub struct BrowserView {
     model: Entity<BrowserModel>,
     focus_handle: FocusHandle,
     origin: Rc<Cell<(f32, f32)>>,
+    pressed_keys: HashSet<u32>,
+    pressed_buttons: HashSet<u32>,
+    finger_axes: (bool, bool),
+    pinch_active: bool,
+    blur_subscription: Option<Subscription>,
     _model_changed: Subscription,
 }
 
@@ -187,6 +222,11 @@ impl BrowserView {
             model,
             focus_handle: cx.focus_handle(),
             origin: Rc::new(Cell::new((0.0, 0.0))),
+            pressed_keys: HashSet::new(),
+            pressed_buttons: HashSet::new(),
+            finger_axes: (false, false),
+            pinch_active: false,
+            blur_subscription: None,
             _model_changed: model_changed,
         }
     }
@@ -213,51 +253,85 @@ impl BrowserView {
         let (x, y) = self.local_position(event.position);
         let model = self.model.read(cx);
         model.pointer_motion(x, y);
-        model.pointer_button(linux_button(event.button), true);
+        let button = linux_button(event.button);
+        self.pressed_buttons.insert(button);
+        model.pointer_button(button, true);
         cx.stop_propagation();
     }
 
     fn mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.model
-            .read(cx)
-            .pointer_button(linux_button(event.button), false);
+        let button = linux_button(event.button);
+        self.pressed_buttons.remove(&button);
+        self.model.read(cx).pointer_button(button, false);
         cx.stop_propagation();
     }
 
-    fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.forward_key(&event.keystroke, true, cx);
-    }
-
-    fn key_up(&mut self, event: &KeyUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        self.forward_key(&event.keystroke, false, cx);
-    }
-
-    fn forward_key(&self, keystroke: &gpui::Keystroke, pressed: bool, cx: &mut Context<Self>) {
-        let Some(keycode) = evdev_keycode(&keystroke.key) else {
-            return;
-        };
-        let model = self.model.read(cx);
-        let modifiers = [
-            (keystroke.modifiers.control, 29),
-            (keystroke.modifiers.alt, 56),
-            (keystroke.modifiers.shift, 42),
-        ];
-        if pressed {
-            for (active, code) in modifiers {
-                if active {
-                    model.key(code, true);
-                }
+    fn pointer_axis(
+        &mut self,
+        event: &LinuxPointerAxisEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.source == LinuxAxisSource::Finger {
+            if event.value.0 != 0.0 {
+                self.finger_axes.0 = true;
             }
-            model.key(keycode, true);
-        } else {
-            model.key(keycode, false);
-            for (active, code) in modifiers.into_iter().rev() {
-                if active {
-                    model.key(code, false);
-                }
+            if event.value.1 != 0.0 {
+                self.finger_axes.1 = true;
+            }
+            if event.stop.0 {
+                self.finger_axes.0 = false;
+            }
+            if event.stop.1 {
+                self.finger_axes.1 = false;
             }
         }
+        self.model.read(cx).pointer_axis(event);
         cx.stop_propagation();
+    }
+
+    fn pinch(&mut self, event: &LinuxPinchEvent, _: &mut Window, cx: &mut Context<Self>) {
+        self.pinch_active = !matches!(event, LinuxPinchEvent::End { .. });
+        self.model.read(cx).pinch(*event);
+        cx.stop_propagation();
+    }
+
+    fn physical_key(&mut self, event: &PhysicalKeyEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let PhysicalKey::LinuxEvdev(keycode) = event.key;
+        if event.pressed {
+            if self.pressed_keys.insert(keycode) {
+                self.model.read(cx).key(keycode, true);
+            }
+        } else if self.pressed_keys.remove(&keycode) {
+            self.model.read(cx).key(keycode, false);
+        }
+        cx.stop_propagation();
+    }
+
+    fn release_input(&mut self, cx: &mut Context<Self>) {
+        let model = self.model.read(cx);
+        for keycode in self.pressed_keys.drain() {
+            model.key(keycode, false);
+        }
+        for button in self.pressed_buttons.drain() {
+            model.pointer_button(button, false);
+        }
+        if std::mem::take(&mut self.finger_axes) != (false, false) {
+            model.pointer_axis(&LinuxPointerAxisEvent {
+                position: Default::default(),
+                source: LinuxAxisSource::Finger,
+                value: (0.0, 0.0),
+                v120: (None, None),
+                stop: (true, true),
+                relative_direction: (
+                    LinuxAxisRelativeDirection::Identical,
+                    LinuxAxisRelativeDirection::Identical,
+                ),
+            });
+        }
+        if std::mem::take(&mut self.pinch_active) {
+            model.pinch(LinuxPinchEvent::End { cancelled: true });
+        }
     }
 }
 
@@ -270,72 +344,11 @@ fn linux_button(button: MouseButton) -> u32 {
     }
 }
 
-fn evdev_keycode(key: &str) -> Option<u32> {
-    Some(match key {
-        "a" => 30,
-        "b" => 48,
-        "c" => 46,
-        "d" => 32,
-        "e" => 18,
-        "f" => 33,
-        "g" => 34,
-        "h" => 35,
-        "i" => 23,
-        "j" => 36,
-        "k" => 37,
-        "l" => 38,
-        "m" => 50,
-        "n" => 49,
-        "o" => 24,
-        "p" => 25,
-        "q" => 16,
-        "r" => 19,
-        "s" => 31,
-        "t" => 20,
-        "u" => 22,
-        "v" => 47,
-        "w" => 17,
-        "x" => 45,
-        "y" => 21,
-        "z" => 44,
-        "1" => 2,
-        "2" => 3,
-        "3" => 4,
-        "4" => 5,
-        "5" => 6,
-        "6" => 7,
-        "7" => 8,
-        "8" => 9,
-        "9" => 10,
-        "0" => 11,
-        "escape" => 1,
-        "backspace" => 14,
-        "tab" => 15,
-        "enter" => 28,
-        "space" => 57,
-        "left" => 105,
-        "right" => 106,
-        "up" => 103,
-        "down" => 108,
-        "home" => 102,
-        "end" => 107,
-        "pageup" => 104,
-        "pagedown" => 109,
-        "delete" => 111,
-        "insert" => 110,
-        "-" => 12,
-        "=" => 13,
-        "[" => 26,
-        "]" => 27,
-        ";" => 39,
-        "'" => 40,
-        "`" => 41,
-        "\\" => 43,
-        "," => 51,
-        "." => 52,
-        "/" => 53,
-        _ => return None,
-    })
+fn axis_direction(direction: LinuxAxisRelativeDirection) -> PointerAxisDirection {
+    match direction {
+        LinuxAxisRelativeDirection::Identical => PointerAxisDirection::Identical,
+        LinuxAxisRelativeDirection::Inverted => PointerAxisDirection::Inverted,
+    }
 }
 
 impl Focusable for BrowserView {
@@ -345,11 +358,16 @@ impl Focusable for BrowserView {
 }
 
 impl Render for BrowserView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.blur_subscription.is_none() {
+            self.blur_subscription = Some(cx.on_blur(&self.focus_handle, window, |this, _, cx| {
+                this.release_input(cx)
+            }));
+        }
         let model = self.model.read(cx);
-        let frame = model.frame.clone();
-        let dma_buf = model.dma_buf.clone();
-        let status = model.status.clone();
+        let dma_buf = model.runtime.dma_buf.clone();
+        let status = model.runtime.status.clone();
+        let scale = window.scale_factor();
         let browser = self.model.clone();
         let origin = self.origin.clone();
         let measure = canvas(
@@ -357,14 +375,9 @@ impl Render for BrowserView {
                 origin.set((f32::from(bounds.origin.x), f32::from(bounds.origin.y)));
                 let width = f32::from(bounds.size.width).round().max(1.0) as u32;
                 let height = f32::from(bounds.size.height).round().max(1.0) as u32;
-                browser.read(cx).resize(width, height);
+                browser.read(cx).resize(width, height, scale);
             },
-            {
-                let browser = self.model.clone();
-                move |_, _, window, _| {
-                    window.on_next_frame(move |_, cx| browser.read(cx).presented());
-                }
-            },
+            |_, _, _, _| {},
         )
         .size_full();
 
@@ -379,18 +392,17 @@ impl Render for BrowserView {
             .on_mouse_up(MouseButton::Left, cx.listener(Self::mouse_up))
             .on_mouse_up(MouseButton::Right, cx.listener(Self::mouse_up))
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::mouse_up))
-            .on_key_down(cx.listener(Self::key_down))
-            .on_key_up(cx.listener(Self::key_up))
+            .on_linux_pointer_axis(cx.listener(Self::pointer_axis))
+            .on_linux_pinch(cx.listener(Self::pinch))
+            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            .on_pinch(|_, _, cx| cx.stop_propagation())
+            .on_physical_key(cx.listener(Self::physical_key))
+            .on_key_down(|_, _, cx| cx.stop_propagation())
+            .on_key_up(|_, _, cx| cx.stop_propagation())
             .size_full()
             .relative()
             .overflow_hidden()
             .bg(gpui::black())
-            .children(frame.map(|frame| {
-                div()
-                    .absolute()
-                    .size_full()
-                    .child(img(frame).size_full().object_fit(ObjectFit::Fill))
-            }))
             .children(dma_buf.map(|frame| {
                 div()
                     .absolute()

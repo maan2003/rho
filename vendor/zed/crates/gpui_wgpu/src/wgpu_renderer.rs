@@ -1842,9 +1842,11 @@ impl WgpuRenderer {
             .collect();
         let stale_ids: Vec<_> = self
             .imported_dma_bufs
-            .keys()
-            .filter(|id| !active.contains(id))
-            .copied()
+            .iter()
+            .filter(|(id, imported)| {
+                !active.contains(id) && imported.surface.renderer_is_sole_owner()
+            })
+            .map(|(&id, _)| id)
             .collect();
         let mut new_imports = HashMap::new();
         for surface in &scene.surfaces {
@@ -1870,13 +1872,10 @@ impl WgpuRenderer {
 
     #[cfg(target_os = "linux")]
     fn import_dma_buf(&self, surface: gpui::LinuxDmaBufSurface) -> Result<ImportedDmaBuf> {
-        let fd = surface
-            .take_fd()
-            .context("DMA-BUF plane was already imported")?;
+        let (fd, fence) = surface
+            .take_import_payload()
+            .context("DMA-BUF plane or acquire fence was already imported")?;
         let mut rejection = ImportRejectionGuard(Some(surface.clone()));
-        let fence = surface
-            .take_acquire_fence()
-            .context("DMA-BUF acquire fence was already imported")?;
         let usage = wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_SRC;
         let descriptor = wgpu::TextureDescriptor {
             label: Some("chrome_dma_buf"),

@@ -5015,7 +5015,7 @@ impl Window {
         // doesn't show hover highlights on the item under the mouse cursor.
         let old_modality = self.last_input_modality;
         self.last_input_modality = match &event {
-            PlatformInput::KeyDown(_) => InputModality::Keyboard,
+            PlatformInput::PhysicalKey(_) | PlatformInput::KeyDown(_) => InputModality::Keyboard,
             PlatformInput::MouseMove(_) | PlatformInput::MouseDown(_) => InputModality::Mouse,
             PlatformInput::Touch(_) => InputModality::Touch,
             _ => self.last_input_modality,
@@ -5122,7 +5122,10 @@ impl Window {
                 }
             },
             PlatformInput::Touch(touch) => PlatformInput::Touch(touch),
-            PlatformInput::KeyDown(_) | PlatformInput::KeyUp(_) => event,
+            PlatformInput::PhysicalKey(_) | PlatformInput::KeyDown(_) | PlatformInput::KeyUp(_) => {
+                event
+            }
+            PlatformInput::LinuxPointerAxis(_) | PlatformInput::LinuxPinch(_) => event,
         };
 
         if let Some(any_mouse_event) = event.mouse_event() {

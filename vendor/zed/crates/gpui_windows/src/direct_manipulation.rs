@@ -182,6 +182,7 @@ impl DirectManipulationEventHandler {
                     .borrow_mut()
                     .push(PlatformInput::Pinch(PinchEvent {
                         position,
+                        fingers: 0,
                         delta: 0.0,
                         modifiers,
                         phase: TouchPhase::Ended,
@@ -306,6 +307,7 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
                     .borrow_mut()
                     .push(PlatformInput::Pinch(PinchEvent {
                         position,
+                        fingers: 0,
                         delta: 0.0,
                         modifiers,
                         phase: TouchPhase::Started,
@@ -337,6 +339,7 @@ impl IDirectManipulationViewportEventHandler_Impl for DirectManipulationEventHan
                     .borrow_mut()
                     .push(PlatformInput::Pinch(PinchEvent {
                         position,
+                        fingers: 0,
                         delta: scale_delta - 1.0,
                         modifiers,
                         phase: TouchPhase::Moved,

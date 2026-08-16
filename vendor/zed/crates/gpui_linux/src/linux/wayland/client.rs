@@ -360,6 +360,13 @@ pub(crate) struct WaylandClientState {
     vertical_modifier: f32,
     horizontal_modifier: f32,
     scroll_event_received: bool,
+    raw_axis_value: (f64, f64),
+    raw_axis_v120: (Option<i32>, Option<i32>),
+    raw_axis_stop: (bool, bool),
+    raw_axis_relative_direction: (
+        gpui::LinuxAxisRelativeDirection,
+        gpui::LinuxAxisRelativeDirection,
+    ),
     enter_token: Option<()>,
     button_pressed: Option<MouseButton>,
     mouse_focused_window: Option<WaylandWindowStatePtr>,
@@ -909,6 +916,13 @@ impl WaylandClient {
             },
             capslock: Capslock { on: false },
             scroll_event_received: false,
+            raw_axis_value: (0.0, 0.0),
+            raw_axis_v120: (None, None),
+            raw_axis_stop: (false, false),
+            raw_axis_relative_direction: (
+                gpui::LinuxAxisRelativeDirection::Identical,
+                gpui::LinuxAxisRelativeDirection::Identical,
+            ),
             axis_source: AxisSource::Wheel,
             mouse_location: None,
             continuous_scroll_delta: None,
@@ -1881,6 +1895,14 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                     return;
                 };
 
+                let physical = PlatformInput::PhysicalKey(gpui::PhysicalKeyEvent {
+                    key: gpui::PhysicalKey::LinuxEvdev(key),
+                    pressed: key_state == wl_keyboard::KeyState::Pressed,
+                });
+                drop(state);
+                focused_window.handle_input(physical);
+                state = client.borrow_mut();
+
                 let keymap_state = state.keymap_state.as_ref().unwrap();
                 let keycode = Keycode::from(key + MIN_KEYCODE);
                 let keysym = keymap_state.key_get_one_sym(keycode);
@@ -2320,6 +2342,11 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 value,
                 ..
             } => {
+                match axis {
+                    wl_pointer::Axis::HorizontalScroll => state.raw_axis_value.0 += value,
+                    wl_pointer::Axis::VerticalScroll => state.raw_axis_value.1 += value,
+                    _ => {}
+                }
                 if state.axis_source == AxisSource::Wheel {
                     return;
                 }
@@ -2352,6 +2379,15 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 axis: WEnum::Value(axis),
                 discrete,
             } => {
+                match axis {
+                    wl_pointer::Axis::HorizontalScroll => {
+                        state.raw_axis_v120.0 = Some(discrete.saturating_mul(120));
+                    }
+                    wl_pointer::Axis::VerticalScroll => {
+                        state.raw_axis_v120.1 = Some(discrete.saturating_mul(120));
+                    }
+                    _ => {}
+                }
                 state.scroll_event_received = true;
                 let axis = if state.modifiers.shift {
                     wl_pointer::Axis::HorizontalScroll
@@ -2379,6 +2415,11 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 axis: WEnum::Value(axis),
                 value120,
             } => {
+                match axis {
+                    wl_pointer::Axis::HorizontalScroll => state.raw_axis_v120.0 = Some(value120),
+                    wl_pointer::Axis::VerticalScroll => state.raw_axis_v120.1 = Some(value120),
+                    _ => {}
+                }
                 state.scroll_event_received = true;
                 let axis = if state.modifiers.shift {
                     wl_pointer::Axis::HorizontalScroll
@@ -2403,32 +2444,94 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                     _ => unreachable!(),
                 }
             }
+            wl_pointer::Event::AxisStop {
+                axis: WEnum::Value(axis),
+                ..
+            } => match axis {
+                wl_pointer::Axis::HorizontalScroll => {
+                    state.raw_axis_stop.0 = true;
+                }
+                wl_pointer::Axis::VerticalScroll => {
+                    state.raw_axis_stop.1 = true;
+                }
+                _ => {}
+            },
+            wl_pointer::Event::AxisRelativeDirection {
+                axis: WEnum::Value(axis),
+                direction: WEnum::Value(direction),
+            } => {
+                let direction = match direction {
+                    wl_pointer::AxisRelativeDirection::Identical => {
+                        gpui::LinuxAxisRelativeDirection::Identical
+                    }
+                    wl_pointer::AxisRelativeDirection::Inverted => {
+                        gpui::LinuxAxisRelativeDirection::Inverted
+                    }
+                    _ => gpui::LinuxAxisRelativeDirection::Identical,
+                };
+                match axis {
+                    wl_pointer::Axis::HorizontalScroll => {
+                        state.raw_axis_relative_direction.0 = direction;
+                    }
+                    wl_pointer::Axis::VerticalScroll => {
+                        state.raw_axis_relative_direction.1 = direction;
+                    }
+                    _ => {}
+                }
+            }
             wl_pointer::Event::Frame => {
+                let mut inputs = Vec::with_capacity(2);
+                if state.raw_axis_value != (0.0, 0.0)
+                    || state.raw_axis_v120 != (None, None)
+                    || state.raw_axis_stop != (false, false)
+                {
+                    inputs.push(PlatformInput::LinuxPointerAxis(
+                        gpui::LinuxPointerAxisEvent {
+                            position: state.mouse_location.unwrap(),
+                            source: match state.axis_source {
+                                AxisSource::Finger => gpui::LinuxAxisSource::Finger,
+                                AxisSource::Continuous => gpui::LinuxAxisSource::Continuous,
+                                AxisSource::Wheel => gpui::LinuxAxisSource::Wheel,
+                                AxisSource::WheelTilt => gpui::LinuxAxisSource::WheelTilt,
+                                _ => gpui::LinuxAxisSource::Continuous,
+                            },
+                            value: std::mem::take(&mut state.raw_axis_value),
+                            v120: std::mem::take(&mut state.raw_axis_v120),
+                            stop: std::mem::take(&mut state.raw_axis_stop),
+                            relative_direction: std::mem::replace(
+                                &mut state.raw_axis_relative_direction,
+                                (
+                                    gpui::LinuxAxisRelativeDirection::Identical,
+                                    gpui::LinuxAxisRelativeDirection::Identical,
+                                ),
+                            ),
+                        },
+                    ));
+                }
                 if state.scroll_event_received {
                     state.scroll_event_received = false;
                     let continuous = state.continuous_scroll_delta.take();
                     let discrete = state.discrete_scroll_delta.take();
                     if let Some(continuous) = continuous {
-                        if let Some(window) = state.mouse_focused_window.clone() {
-                            let input = PlatformInput::ScrollWheel(ScrollWheelEvent {
-                                position: state.mouse_location.unwrap(),
-                                delta: ScrollDelta::Pixels(continuous),
-                                modifiers: state.modifiers,
-                                touch_phase: TouchPhase::Moved,
-                            });
-                            drop(state);
-                            window.handle_input(input);
-                        }
-                    } else if let Some(discrete) = discrete
-                        && let Some(window) = state.mouse_focused_window.clone()
-                    {
-                        let input = PlatformInput::ScrollWheel(ScrollWheelEvent {
+                        inputs.push(PlatformInput::ScrollWheel(ScrollWheelEvent {
+                            position: state.mouse_location.unwrap(),
+                            delta: ScrollDelta::Pixels(continuous),
+                            modifiers: state.modifiers,
+                            touch_phase: TouchPhase::Moved,
+                        }));
+                    } else if let Some(discrete) = discrete {
+                        inputs.push(PlatformInput::ScrollWheel(ScrollWheelEvent {
                             position: state.mouse_location.unwrap(),
                             delta: ScrollDelta::Lines(discrete),
                             modifiers: state.modifiers,
                             touch_phase: TouchPhase::Moved,
-                        });
-                        drop(state);
+                        }));
+                    }
+                }
+                let window = state.mouse_focused_window.clone();
+                drop(state);
+                if let Some(window) = window {
+                    for input in inputs {
                         window.handle_input(input);
                     }
                 }
@@ -2476,46 +2579,75 @@ impl Dispatch<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1, ()>
                 serial: _,
                 time: _,
                 surface: _,
-                fingers: _,
+                fingers,
             } => {
                 state.pinch_scale = 1.0;
+                let raw = PlatformInput::LinuxPinch(gpui::LinuxPinchEvent::Begin {
+                    position: state.mouse_location.unwrap_or(point(px(0.0), px(0.0))),
+                    fingers,
+                });
                 let input = PlatformInput::Pinch(PinchEvent {
                     position: state.mouse_location.unwrap_or(point(px(0.0), px(0.0))),
+                    fingers,
                     delta: 0.0,
                     modifiers: state.modifiers,
                     phase: TouchPhase::Started,
                 });
                 drop(state);
+                window.handle_input(raw);
                 window.handle_input(input);
             }
-            zwp_pointer_gesture_pinch_v1::Event::Update { time: _, scale, .. } => {
+            zwp_pointer_gesture_pinch_v1::Event::Update {
+                time: _,
+                dx,
+                dy,
+                scale,
+                rotation,
+            } => {
                 let new_absolute_scale = scale as f32;
                 let previous_scale = state.pinch_scale;
                 let zoom_delta = new_absolute_scale - previous_scale;
                 state.pinch_scale = new_absolute_scale;
 
+                let raw = PlatformInput::LinuxPinch(gpui::LinuxPinchEvent::Update {
+                    position: state.mouse_location.unwrap_or(point(px(0.0), px(0.0))),
+                    delta: (dx, dy),
+                    scale,
+                    rotation,
+                });
                 let input = PlatformInput::Pinch(PinchEvent {
                     position: state.mouse_location.unwrap_or(point(px(0.0), px(0.0))),
+                    fingers: 0,
                     delta: zoom_delta,
                     modifiers: state.modifiers,
                     phase: TouchPhase::Moved,
                 });
                 drop(state);
+                window.handle_input(raw);
                 window.handle_input(input);
             }
             zwp_pointer_gesture_pinch_v1::Event::End {
                 serial: _,
                 time: _,
-                cancelled: _,
+                cancelled,
             } => {
                 state.pinch_scale = 1.0;
+                let raw = PlatformInput::LinuxPinch(gpui::LinuxPinchEvent::End {
+                    cancelled: cancelled != 0,
+                });
                 let input = PlatformInput::Pinch(PinchEvent {
                     position: state.mouse_location.unwrap_or(point(px(0.0), px(0.0))),
+                    fingers: 0,
                     delta: 0.0,
                     modifiers: state.modifiers,
-                    phase: TouchPhase::Ended,
+                    phase: if cancelled != 0 {
+                        TouchPhase::Cancelled
+                    } else {
+                        TouchPhase::Ended
+                    },
                 });
                 drop(state);
+                window.handle_input(raw);
                 window.handle_input(input);
             }
             _ => {}

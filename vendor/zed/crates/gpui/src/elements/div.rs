@@ -20,11 +20,11 @@ use crate::{
     Display, Element, ElementId, Entity, EntityId, ExternalDragPayload, ExternalDragPayloadSource,
     FocusHandle, Global, GlobalElementId, Hitbox, HitboxBehavior, HitboxId, InspectorElementId,
     IntoElement, IsZero, KeyContext, KeyDownEvent, KeyUpEvent, KeyboardButton, KeyboardClickEvent,
-    LayoutId, ModifiersChangedEvent, MouseButton, MouseClickEvent, MouseDownEvent, MouseExitEvent,
-    MouseMoveEvent, MousePressureEvent, MouseUpEvent, OngoingScroll, Overflow, ParentElement,
-    PinchEvent, Pixels, Point, Render, ScrollWheelEvent, SharedString, Size, Style,
-    StyleRefinement, Styled, Task, TooltipId, Visibility, Window, WindowControlArea, point, px,
-    size,
+    LayoutId, LinuxPinchEvent, LinuxPointerAxisEvent, ModifiersChangedEvent, MouseButton,
+    MouseClickEvent, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent,
+    MouseUpEvent, OngoingScroll, Overflow, ParentElement, PhysicalKeyEvent, PinchEvent, Pixels,
+    Point, Render, ScrollWheelEvent, SharedString, Size, Style, StyleRefinement, Styled, Task,
+    TooltipId, Visibility, Window, WindowControlArea, point, px, size,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -518,6 +518,46 @@ impl Interactivity {
         self.key_up_listeners
             .push(Box::new(move |event, phase, window, cx| {
                 if phase == DispatchPhase::Capture {
+                    listener(event, window, cx)
+                }
+            }));
+    }
+
+    /// Bind a callback to raw physical key transitions during the bubble phase.
+    pub fn on_physical_key(
+        &mut self,
+        listener: impl Fn(&PhysicalKeyEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.physical_key_listeners
+            .push(Box::new(move |event, phase, window, cx| {
+                if phase == DispatchPhase::Bubble {
+                    listener(event, window, cx)
+                }
+            }));
+    }
+
+    /// Bind a callback to unnormalized Linux pointer-axis frames.
+    pub fn on_linux_pointer_axis(
+        &mut self,
+        listener: impl Fn(&LinuxPointerAxisEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.linux_pointer_axis_listeners.push(Box::new(
+            move |event, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
+                    listener(event, window, cx)
+                }
+            },
+        ));
+    }
+
+    /// Bind a callback to unnormalized Linux pinch gestures.
+    pub fn on_linux_pinch(
+        &mut self,
+        listener: impl Fn(&LinuxPinchEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.linux_pinch_listeners
+            .push(Box::new(move |event, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
                     listener(event, window, cx)
                 }
             }));
@@ -1115,6 +1155,33 @@ pub trait InteractiveElement: Sized {
         self
     }
 
+    /// Bind a callback to raw physical key transitions during the bubble phase.
+    fn on_physical_key(
+        mut self,
+        listener: impl Fn(&PhysicalKeyEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().on_physical_key(listener);
+        self
+    }
+
+    /// Bind a callback to unnormalized Linux pointer-axis frames.
+    fn on_linux_pointer_axis(
+        mut self,
+        listener: impl Fn(&LinuxPointerAxisEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().on_linux_pointer_axis(listener);
+        self
+    }
+
+    /// Bind a callback to unnormalized Linux pinch gestures.
+    fn on_linux_pinch(
+        mut self,
+        listener: impl Fn(&LinuxPinchEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().on_linux_pinch(listener);
+        self
+    }
+
     /// Bind the given callback to modifiers changing events.
     /// The fluent API equivalent to [`Interactivity::on_modifiers_changed`].
     ///
@@ -1652,6 +1719,12 @@ pub(crate) type ScrollWheelListener =
 pub(crate) type PinchListener =
     Box<dyn Fn(&PinchEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
 
+pub(crate) type LinuxPointerAxisListener =
+    Box<dyn Fn(&LinuxPointerAxisEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
+
+pub(crate) type LinuxPinchListener =
+    Box<dyn Fn(&LinuxPinchEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
+
 pub(crate) type ClickListener = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App) + 'static>;
 
 pub(crate) struct DragListener {
@@ -1677,6 +1750,9 @@ pub(crate) type KeyDownListener =
 
 pub(crate) type KeyUpListener =
     Box<dyn Fn(&KeyUpEvent, DispatchPhase, &mut Window, &mut App) + 'static>;
+
+pub(crate) type PhysicalKeyListener =
+    Box<dyn Fn(&PhysicalKeyEvent, DispatchPhase, &mut Window, &mut App) + 'static>;
 
 pub(crate) type ModifiersChangedListener =
     Box<dyn Fn(&ModifiersChangedEvent, &mut Window, &mut App) + 'static>;
@@ -2062,8 +2138,11 @@ pub struct Interactivity {
     pub(crate) mouse_exit_listeners: Vec<MouseExitListener>,
     pub(crate) scroll_wheel_listeners: Vec<ScrollWheelListener>,
     pub(crate) pinch_listeners: Vec<PinchListener>,
+    pub(crate) linux_pointer_axis_listeners: Vec<LinuxPointerAxisListener>,
+    pub(crate) linux_pinch_listeners: Vec<LinuxPinchListener>,
     pub(crate) key_down_listeners: Vec<KeyDownListener>,
     pub(crate) key_up_listeners: Vec<KeyUpListener>,
+    pub(crate) physical_key_listeners: Vec<PhysicalKeyListener>,
     pub(crate) modifiers_changed_listeners: Vec<ModifiersChangedListener>,
     pub(crate) action_listeners: Vec<(TypeId, ActionListener)>,
     pub(crate) drop_listeners: Vec<(TypeId, DropListener)>,
@@ -2713,6 +2792,20 @@ impl Interactivity {
             })
         }
 
+        for listener in self.linux_pointer_axis_listeners.drain(..) {
+            let hitbox = hitbox.clone();
+            window.on_mouse_event(move |event: &LinuxPointerAxisEvent, phase, window, cx| {
+                listener(event, phase, &hitbox, window, cx);
+            })
+        }
+
+        for listener in self.linux_pinch_listeners.drain(..) {
+            let hitbox = hitbox.clone();
+            window.on_mouse_event(move |event: &LinuxPinchEvent, phase, window, cx| {
+                listener(event, phase, &hitbox, window, cx);
+            })
+        }
+
         if self.hover_style.is_some()
             || self.base_style.mouse_cursor.is_some()
             || cx.active_drag.is_some() && !self.drag_over_styles.is_empty()
@@ -3138,6 +3231,7 @@ impl Interactivity {
     fn paint_keyboard_listeners(&mut self, window: &mut Window, _cx: &mut App) {
         let key_down_listeners = mem::take(&mut self.key_down_listeners);
         let key_up_listeners = mem::take(&mut self.key_up_listeners);
+        let physical_key_listeners = mem::take(&mut self.physical_key_listeners);
         let modifiers_changed_listeners = mem::take(&mut self.modifiers_changed_listeners);
         let action_listeners = mem::take(&mut self.action_listeners);
         if let Some(context) = self.key_context.clone() {
@@ -3152,6 +3246,12 @@ impl Interactivity {
 
         for listener in key_up_listeners {
             window.on_key_event(move |event: &KeyUpEvent, phase, window, cx| {
+                listener(event, phase, window, cx);
+            })
+        }
+
+        for listener in physical_key_listeners {
+            window.on_key_event(move |event: &PhysicalKeyEvent, phase, window, cx| {
                 listener(event, phase, window, cx);
             })
         }

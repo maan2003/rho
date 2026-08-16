@@ -117,6 +117,15 @@ impl LinuxDmaBufSurface {
     pub fn lease_id(&self) -> u64 {
         self.0.lease_id
     }
+    /// Returns whether the renderer is the sole owner of this imported lease.
+    ///
+    /// An owner outside the renderer means the surface can return to a future
+    /// scene. Its DMA-BUF and acquire fence are one-shot, so the renderer must
+    /// retain that import rather than attempting to import it again later.
+    #[doc(hidden)]
+    pub fn renderer_is_sole_owner(&self) -> bool {
+        Arc::strong_count(&self.0) == 1
+    }
     pub fn width(&self) -> u32 {
         self.0.width
     }
@@ -144,13 +153,15 @@ impl LinuxDmaBufSurface {
     pub fn source_size(&self) -> (u32, u32) {
         self.0.source_size
     }
+    /// Takes the one-shot import handles without partially consuming them.
     #[doc(hidden)]
-    pub fn take_fd(&self) -> Option<OwnedFd> {
-        self.0.fd.lock().unwrap().take()
-    }
-    #[doc(hidden)]
-    pub fn take_acquire_fence(&self) -> Option<OwnedFd> {
-        self.0.acquire_fence.lock().unwrap().take()
+    pub fn take_import_payload(&self) -> Option<(OwnedFd, OwnedFd)> {
+        let mut fd = self.0.fd.lock().unwrap();
+        let mut fence = self.0.acquire_fence.lock().unwrap();
+        if fd.is_none() || fence.is_none() {
+            return None;
+        }
+        Some((fd.take().unwrap(), fence.take().unwrap()))
     }
     #[doc(hidden)]
     pub fn submitted(&self) {

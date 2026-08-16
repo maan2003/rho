@@ -13644,10 +13644,10 @@ name = "rho-browser"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel 2.5.0",
  "bytes",
  "futures-lite 2.6.1",
  "gpui",
- "image",
  "libc",
  "prefix-id",
  "rand 0.8.7",
@@ -13655,7 +13655,6 @@ dependencies = [
  "rho-browser-wayland",
  "rho-db",
  "senax-encoder",
- "smallvec",
  "tempfile",
  "url",
 ]
@@ -13665,6 +13664,9 @@ name = "rho-browser-wayland"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-channel 2.5.0",
+ "calloop",
+ "futures-lite 2.6.1",
  "libc",
  "smithay",
  "tracing",

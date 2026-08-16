@@ -82,6 +82,11 @@ AI APIs.
   compositor accepts the exactly-one-pending-page/exactly-one-unbound-toplevel
   case for stock builds that omit the initial token. Ambiguous matches and all
   later tokenless windows fail closed after ten seconds instead of guessing.
+  Browser content also fails closed unless GPUI and Chromium share an
+  importable DMA-BUF format on the selected DRM render node and explicit-sync
+  eventfd support. Root SHM content, missing acquire/release points,
+  unsupported buffer transforms, and content-bearing subsurfaces are rejected
+  rather than copied through CPU memory or displayed under a guessed mapping.
 - Long-running `exec_command` processes are retained only in their owning
   agent's in-memory command-session table. `write_stdin` requires that local
   numeric session id; waits are capped at five minutes and dropping the agent

@@ -126,6 +126,17 @@ than by running a supervisor, extension protocol, or daemon process graph.
   builds omit the initial token; ambiguous and later tokenless windows fail
   closed. No debugging protocol, extension, injected page script, or title
   convention participates.
+  The durable `PageId` is also the live runtime key: the persistent store and
+  the in-memory page-model registry hold different state for the same ID, with
+  no translated session/page identity. Hiding a preview retains its model,
+  Chromium surface, and current frame for instant reopening.
+  Browser content is a DMA-BUF-only pipeline with explicit synchronization;
+  GPUI retains each imported Vulkan image while its page model owns the lease.
+  The compositor is wake-driven, advertises per-surface fractional scale and a
+  viewporter while keeping its shared synthetic output stable, and forwards
+  raw physical keys, pointer axes, and pinch phases to Chromium. `wl_shm`
+  remains available only for ancillary Chromium surfaces such as cursors and
+  is never copied into browser content.
   `rho-gui` only hosts the resulting GPUI page model/view. A `:web-xxxx:` tag
   on an ordinary Desk heading is a portal to the client-local page, just as an
   agent tag is a portal to an agent; selecting the heading uses the same

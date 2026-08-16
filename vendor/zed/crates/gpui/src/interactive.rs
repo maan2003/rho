@@ -20,6 +20,96 @@ pub trait MouseEvent: InputEvent {}
 /// A gesture event from the platform.
 pub trait GestureEvent: InputEvent {}
 
+/// A platform-native physical key location.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PhysicalKey {
+    /// A Linux evdev key code, without the XKB offset.
+    LinuxEvdev(u32),
+}
+
+/// A physical key transition before layout, compose, or repeat processing.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct PhysicalKeyEvent {
+    /// The platform-native physical key.
+    pub key: PhysicalKey,
+    /// Whether the key was pressed (`true`) or released (`false`).
+    pub pressed: bool,
+}
+
+impl Sealed for PhysicalKeyEvent {}
+impl InputEvent for PhysicalKeyEvent {
+    fn to_platform_input(self) -> PlatformInput {
+        PlatformInput::PhysicalKey(self)
+    }
+}
+impl KeyEvent for PhysicalKeyEvent {}
+
+/// Linux pointer-axis source, preserving Wayland protocol semantics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub enum LinuxAxisSource {
+    Finger,
+    Continuous,
+    Wheel,
+    WheelTilt,
+}
+
+/// Linux pointer-axis direction relative to physical motion.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(missing_docs)]
+pub enum LinuxAxisRelativeDirection {
+    Identical,
+    Inverted,
+}
+
+/// An unnormalized Wayland pointer-axis frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[allow(missing_docs)]
+pub struct LinuxPointerAxisEvent {
+    pub position: Point<Pixels>,
+    pub source: LinuxAxisSource,
+    pub value: (f64, f64),
+    pub v120: (Option<i32>, Option<i32>),
+    pub stop: (bool, bool),
+    pub relative_direction: (LinuxAxisRelativeDirection, LinuxAxisRelativeDirection),
+}
+
+impl Sealed for LinuxPointerAxisEvent {}
+impl InputEvent for LinuxPointerAxisEvent {
+    fn to_platform_input(self) -> PlatformInput {
+        PlatformInput::LinuxPointerAxis(self)
+    }
+}
+impl MouseEvent for LinuxPointerAxisEvent {}
+
+/// An unnormalized Wayland pinch gesture event.
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[allow(missing_docs)]
+pub enum LinuxPinchEvent {
+    Begin {
+        position: Point<Pixels>,
+        fingers: u32,
+    },
+    Update {
+        position: Point<Pixels>,
+        delta: (f64, f64),
+        scale: f64,
+        rotation: f64,
+    },
+    End {
+        cancelled: bool,
+    },
+}
+
+impl Sealed for LinuxPinchEvent {}
+impl InputEvent for LinuxPinchEvent {
+    fn to_platform_input(self) -> PlatformInput {
+        PlatformInput::LinuxPinch(self)
+    }
+}
+impl MouseEvent for LinuxPinchEvent {}
+impl GestureEvent for LinuxPinchEvent {}
+
 /// The key down event equivalent for the platform.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KeyDownEvent {
@@ -563,6 +653,9 @@ pub struct PinchEvent {
     /// The position of the pinch center on the window.
     pub position: Point<Pixels>,
 
+    /// Number of fingers in the gesture, when reported by the platform.
+    pub fingers: u32,
+
     /// The zoom delta for this event.
     /// Positive values indicate zooming in, negative values indicate zooming out.
     /// For example, 0.1 represents a 10% zoom increase.
@@ -760,6 +853,12 @@ impl MouseEvent for FileDropEvent {}
 /// An enum corresponding to all kinds of platform input events.
 #[derive(Clone, Debug)]
 pub enum PlatformInput {
+    /// A raw physical key transition.
+    PhysicalKey(PhysicalKeyEvent),
+    /// An unnormalized Linux pointer-axis frame.
+    LinuxPointerAxis(LinuxPointerAxisEvent),
+    /// An unnormalized Linux pinch gesture.
+    LinuxPinch(LinuxPinchEvent),
     /// A key was pressed.
     KeyDown(KeyDownEvent),
     /// A key was released.
@@ -789,6 +888,9 @@ pub enum PlatformInput {
 impl PlatformInput {
     pub(crate) fn mouse_event(&self) -> Option<&dyn Any> {
         match self {
+            PlatformInput::PhysicalKey { .. } => None,
+            PlatformInput::LinuxPointerAxis(event) => Some(event),
+            PlatformInput::LinuxPinch(event) => Some(event),
             PlatformInput::KeyDown { .. } => None,
             PlatformInput::KeyUp { .. } => None,
             PlatformInput::ModifiersChanged { .. } => None,
@@ -806,6 +908,8 @@ impl PlatformInput {
 
     pub(crate) fn keyboard_event(&self) -> Option<&dyn Any> {
         match self {
+            PlatformInput::PhysicalKey(event) => Some(event),
+            PlatformInput::LinuxPointerAxis(_) | PlatformInput::LinuxPinch(_) => None,
             PlatformInput::KeyDown(event) => Some(event),
             PlatformInput::KeyUp(event) => Some(event),
             PlatformInput::ModifiersChanged(event) => Some(event),

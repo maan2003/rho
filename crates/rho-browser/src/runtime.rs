@@ -9,7 +9,7 @@ use std::thread;
 use anyhow::{Context as _, Result, bail};
 use rho_browser_wayland::{BrowserCompositor, BrowserSession, DmaBufConfig, chrome_wrapper};
 
-use crate::store::validate_launch_url;
+use crate::store::{PageId, validate_launch_url};
 
 /// One stock Chromium identity and one private Wayland compositor. Window
 /// association prefers xdg-activation-v1: the compositor issues the token,
@@ -17,14 +17,14 @@ use crate::store::validate_launch_url;
 /// compositor also accepts the unambiguous one-window case for Chromium
 /// builds that omit the token on their first process launch.
 pub(crate) struct BrowserRuntime {
-    compositor: BrowserCompositor,
+    compositor: BrowserCompositor<PageId>,
     profile: PathBuf,
     _profile_lock: File,
     chrome: Mutex<Option<Child>>,
 }
 
 impl BrowserRuntime {
-    pub(crate) fn launch(state_dir: &Path, dma_buf: Option<DmaBufConfig>) -> Result<Self> {
+    pub(crate) fn launch(state_dir: &Path, dma_buf: DmaBufConfig) -> Result<Self> {
         let profile = state_dir.join("chromium");
         std::fs::create_dir_all(&profile)?;
         let profile_lock = OpenOptions::new()
@@ -46,9 +46,14 @@ impl BrowserRuntime {
         })
     }
 
-    pub(crate) fn open(&self, target: &str, size: (u32, u32)) -> Result<BrowserSession> {
+    pub(crate) fn open(
+        &self,
+        id: PageId,
+        target: &str,
+        size: (u32, u32),
+    ) -> Result<BrowserSession<PageId>> {
         validate_launch_url(target)?;
-        let session = self.compositor.open(size)?;
+        let session = self.compositor.open(id, size)?;
         let mut command = Command::new(chrome_wrapper());
         command
             .env("WAYLAND_DISPLAY", self.compositor.socket_name())
