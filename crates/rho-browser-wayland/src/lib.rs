@@ -53,8 +53,8 @@ use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
     SUBSURFACE_ROLE, SubsurfaceCachedState, SubsurfaceUserData, SurfaceAttributes,
-    TraversalAction, get_role, is_sync_subsurface, with_states, with_surface_tree_downward,
-    with_surface_tree_upward,
+    SurfaceData, TraversalAction, get_role, is_sync_subsurface, with_states,
+    with_surface_tree_downward, with_surface_tree_upward,
 };
 use smithay::wayland::dmabuf::{
     DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier, get_dmabuf,
@@ -601,16 +601,12 @@ fn surface_mapping(
     }
 }
 
-fn surface_node_mapping(surface: &WlSurface, slot: SurfaceSlot) -> Result<SurfaceMapping> {
-    let (viewport, buffer_scale, buffer_transform) = with_states(surface, |states| {
-        let mut viewport = states.cached_state.get::<ViewportCachedState>();
-        let mut attributes = states.cached_state.get::<SurfaceAttributes>();
-        (
-            *viewport.current(),
-            attributes.current().buffer_scale,
-            attributes.current().buffer_transform,
-        )
-    });
+fn surface_node_mapping(states: &SurfaceData, slot: SurfaceSlot) -> Result<SurfaceMapping> {
+    let mut viewport = states.cached_state.get::<ViewportCachedState>();
+    let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+    let viewport = *viewport.current();
+    let buffer_scale = attributes.current().buffer_scale;
+    let buffer_transform = attributes.current().buffer_transform;
     if buffer_transform != wl_output::Transform::Normal {
         bail!("unsupported buffer transform {buffer_transform:?}")
     }
@@ -630,9 +626,7 @@ fn surface_node_mapping(surface: &WlSurface, slot: SurfaceSlot) -> Result<Surfac
         i32::try_from(slot.width / buffer_scale_u32)?,
         i32::try_from(slot.height / buffer_scale_u32)?,
     );
-    if !with_states(surface, |states| {
-        smithay::wayland::viewporter::ensure_viewport_valid(states, logical_buffer_size.into())
-    }) {
+    if !smithay::wayland::viewporter::ensure_viewport_valid(states, logical_buffer_size.into()) {
         bail!("invalid viewport state")
     }
     if slot.shm_bytes != 0 && viewport.src.is_some() {
@@ -662,15 +656,13 @@ fn surface_node_mapping(surface: &WlSurface, slot: SurfaceSlot) -> Result<Surfac
     Ok(mapping)
 }
 
-fn subsurface_offset(surface: &WlSurface) -> (i32, i32) {
-    if get_role(surface) != Some(SUBSURFACE_ROLE) {
+fn subsurface_offset(states: &SurfaceData) -> (i32, i32) {
+    if states.role != Some(SUBSURFACE_ROLE) {
         return (0, 0);
     }
-    with_states(surface, |states| {
-        let mut subsurface = states.cached_state.get::<SubsurfaceCachedState>();
-        let location = subsurface.current().location;
-        (location.x, location.y)
-    })
+    let mut subsurface = states.cached_state.get::<SubsurfaceCachedState>();
+    let location = subsurface.current().location;
+    (location.x, location.y)
 }
 
 fn append_surface_tree(
@@ -684,23 +676,25 @@ fn append_surface_tree(
     with_surface_tree_upward(
         root,
         root_origin,
-        |surface, _, parent_origin| {
+        |surface, states, parent_origin| {
             if !slots.contains_key(&surface.id()) {
                 return TraversalAction::SkipChildren;
             }
-            let offset = subsurface_offset(surface);
+            // Smithay holds this surface's tree mutex during traversal. Use the
+            // supplied state rather than re-entering `with_states`/`get_role`.
+            let offset = subsurface_offset(states);
             TraversalAction::DoChildren((parent_origin.0 + offset.0, parent_origin.1 + offset.1))
         },
-        |surface, _, parent_origin| {
+        |surface, states, parent_origin| {
             if error.borrow().is_some() {
                 return;
             }
             let Some(slot) = slots.get(&surface.id()).copied() else {
                 return;
             };
-            let offset = subsurface_offset(surface);
+            let offset = subsurface_offset(states);
             let origin = (parent_origin.0 + offset.0, parent_origin.1 + offset.1);
-            match surface_node_mapping(surface, slot) {
+            match surface_node_mapping(states, slot) {
                 Ok(mapping) => {
                     let origin = (f64::from(origin.0), f64::from(origin.1));
                     let destination = (
@@ -720,14 +714,12 @@ fn append_surface_tree(
                             ),
                         ),
                     });
-                    let input_region = with_states(surface, |states| {
-                        states
-                            .cached_state
-                            .get::<SurfaceAttributes>()
-                            .current()
-                            .input_region
-                            .clone()
-                    });
+                    let input_region = states
+                        .cached_state
+                        .get::<SurfaceAttributes>()
+                        .current()
+                        .input_region
+                        .clone();
                     hits.push(HitNode {
                         surface: surface.clone(),
                         origin,
