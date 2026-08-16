@@ -10,10 +10,13 @@ version.workspace = true
 [dependencies]
 anyhow.workspace = true
 gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"] }
+image = { version = "0.25", default-features = false }
 libc.workspace = true
 rho-browser-wayland.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+smallvec = "1"
+theme = { path = "../../vendor/zed/crates/theme" }
 url.workspace = true
 uuid.workspace = true
 

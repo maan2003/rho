@@ -9,13 +9,15 @@ use gpui::{
     AppContext as _, Context, Entity, EntityId, FocusHandle, Focusable, InteractiveElement as _,
     IntoElement, LinuxAxisRelativeDirection, LinuxAxisSource, LinuxDmaBufSurface, LinuxPinchEvent,
     LinuxPointerAxisEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    ParentElement as _, PhysicalKey, PhysicalKeyEvent, Render, Styled as _, Subscription, Task,
-    Window, canvas, div, surface,
+    ParentElement as _, PhysicalKey, PhysicalKeyEvent, Render, RenderImage, Styled as _,
+    StyledImage as _, Subscription, Task, Window, canvas, div, img, px, surface,
 };
+use image::{Frame, RgbaImage};
 use rho_browser_wayland::{
     BrowserEvent, BrowserSession, PinchGesture, PointerAxisDirection, PointerAxisFrame,
     PointerAxisSource,
 };
+use theme::ActiveTheme as _;
 
 use crate::PageId;
 use crate::runtime::{BrowserRuntime, BrowserWindow};
@@ -23,8 +25,20 @@ use crate::runtime::{BrowserRuntime, BrowserWindow};
 struct RuntimePageState {
     session: Option<BrowserSession<BrowserWindow>>,
     dma_buf: Option<LinuxDmaBufSurface>,
+    auxiliary: Vec<AuxiliarySurface>,
+    presented_barrier: u64,
     status: Option<String>,
     sent_size: Rc<Cell<(u32, u32, u32)>>,
+}
+
+#[derive(Clone)]
+struct AuxiliarySurface {
+    id: u64,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    image: Arc<RenderImage>,
 }
 
 /// The singleton live Chrome surface shared by every logical page view.
@@ -99,8 +113,45 @@ impl BrowserModel {
                                     &mut model.awaiting_frame,
                                     frame.barrier,
                                 );
+                                model.runtime.presented_barrier = frame.barrier;
                                 model.runtime.dma_buf = Some(surface);
                                 model.runtime.status = None;
+                            }
+                            BrowserEvent::Auxiliary(snapshot) => {
+                                if !auxiliary_is_eligible(
+                                    model.desired_page,
+                                    model.focused_page,
+                                    model.awaiting_frame,
+                                    snapshot.barrier,
+                                ) || snapshot.barrier < model.runtime.presented_barrier
+                                {
+                                    return;
+                                }
+                                for surface in model.runtime.auxiliary.drain(..) {
+                                    cx.drop_image(surface.image, None);
+                                }
+                                model.runtime.auxiliary = snapshot
+                                    .frames
+                                    .into_iter()
+                                    .filter_map(|frame| {
+                                        let mut pixels = frame.pixels;
+                                        bgra_to_rgba(&mut pixels);
+                                        let buffer =
+                                            RgbaImage::from_raw(frame.width, frame.height, pixels)?;
+                                        Some(AuxiliarySurface {
+                                            id: frame.id,
+                                            x: frame.x,
+                                            y: frame.y,
+                                            width: frame.logical_width,
+                                            height: frame.logical_height,
+                                            image: Arc::new(RenderImage::new(
+                                                smallvec::SmallVec::from_const([Frame::new(
+                                                    buffer,
+                                                )]),
+                                            )),
+                                        })
+                                    })
+                                    .collect();
                             }
                             BrowserEvent::FrameRetired(commit_id) => {
                                 if model
@@ -148,6 +199,8 @@ impl BrowserModel {
             runtime: RuntimePageState {
                 session: Some(session),
                 dma_buf: None,
+                auxiliary: Vec::new(),
+                presented_barrier: 0,
                 status: Some("waiting for Chrome".into()),
                 sent_size: Rc::new(Cell::new((1280, 720, 1.0_f32.to_bits()))),
             },
@@ -202,6 +255,9 @@ impl BrowserModel {
         self.focused_page = None;
         self.awaiting_frame = None;
         self.runtime.dma_buf = None;
+        for surface in self.runtime.auxiliary.drain(..) {
+            cx.drop_image(surface.image, None);
+        }
         self.runtime.status = Some("switching browser page".into());
         self.presentation_owner = Some(owner);
         self.focus(page, cx);
@@ -308,6 +364,23 @@ fn frame_is_eligible(
         return desired == Some(page) && frame_barrier >= barrier;
     }
     desired == focused
+}
+
+fn auxiliary_is_eligible(
+    desired: Option<PageId>,
+    focused: Option<PageId>,
+    awaiting: Option<(u64, PageId)>,
+    snapshot_barrier: u64,
+) -> bool {
+    desired == focused
+        || awaiting
+            .is_some_and(|(barrier, page)| desired == Some(page) && snapshot_barrier >= barrier)
+}
+
+fn bgra_to_rgba(pixels: &mut [u8]) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
+        pixel.swap(0, 2);
+    }
 }
 
 fn complete_frame_handoff(
@@ -532,8 +605,14 @@ impl Render for BrowserView {
                 }));
         }
         let model = self.model.read(cx);
+        let colors = cx.theme().colors();
         let presents = model.presents(self.owner_id, self.page_id);
         let dma_buf = presents.then(|| model.runtime.dma_buf.clone()).flatten();
+        let auxiliary = if presents {
+            model.runtime.auxiliary.clone()
+        } else {
+            Vec::new()
+        };
         let status = if presents {
             model.runtime.status.clone()
         } else if model.presentation_owner == Some(self.owner_id) {
@@ -581,12 +660,22 @@ impl Render for BrowserView {
             .size_full()
             .relative()
             .overflow_hidden()
-            .bg(gpui::black())
+            .bg(colors.editor_background)
             .children(dma_buf.map(|frame| {
                 div()
                     .absolute()
                     .size_full()
                     .child(surface(frame).size_full().object_fit(ObjectFit::Fill))
+            }))
+            .children(auxiliary.into_iter().map(|surface| {
+                div()
+                    .id(("rho-browser-auxiliary", surface.id))
+                    .absolute()
+                    .left(px(surface.x as f32))
+                    .top(px(surface.y as f32))
+                    .w(px(surface.width as f32))
+                    .h(px(surface.height as f32))
+                    .child(img(surface.image).size_full().object_fit(ObjectFit::Fill))
             }))
             .child(div().absolute().size_full().child(measure))
             .children(status.map(|status| {
@@ -596,8 +685,8 @@ impl Render for BrowserView {
                     .left_0()
                     .w_full()
                     .p_2()
-                    .bg(gpui::black().opacity(0.8))
-                    .text_color(gpui::white())
+                    .bg(colors.editor_subheader_background.opacity(0.92))
+                    .text_color(colors.text_muted)
                     .child(status)
             }))
     }
@@ -625,5 +714,30 @@ mod tests {
         assert_eq!(focused, None, "eligibility alone must not enable input");
         complete_frame_handoff(Some(page), &mut focused, &mut awaiting, 7);
         assert_eq!(focused, Some(page));
+    }
+
+    #[test]
+    fn popup_snapshot_can_arrive_before_its_root_handoff_frame() {
+        let old_page = PageId(uuid::Uuid::from_u128(1));
+        let new_page = PageId(uuid::Uuid::from_u128(2));
+        assert!(!auxiliary_is_eligible(
+            Some(new_page),
+            Some(old_page),
+            Some((7, new_page)),
+            6,
+        ));
+        assert!(auxiliary_is_eligible(
+            Some(new_page),
+            Some(old_page),
+            Some((7, new_page)),
+            7,
+        ));
+    }
+
+    #[test]
+    fn popup_pixels_are_rgba_at_the_gpui_image_boundary() {
+        let mut pixels = [3, 2, 1, 255, 30, 20, 10, 128];
+        bgra_to_rgba(&mut pixels);
+        assert_eq!(pixels, [1, 2, 3, 255, 10, 20, 30, 128]);
     }
 }

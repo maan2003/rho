@@ -25,9 +25,13 @@ use smithay::backend::allocator::{Buffer as _, Format, Fourcc, Modifier};
 use smithay::backend::drm::DrmDeviceFd;
 use smithay::backend::input::{Axis, AxisSource, ButtonState, KeyState, Keycode};
 use smithay::backend::renderer::{BufferType, buffer_type};
+use smithay::desktop::{
+    PopupKeyboardGrab, PopupKind, PopupManager, PopupPointerGrab, PopupUngrabStrategy,
+    get_popup_toplevel_coords,
+};
 use smithay::input::keyboard::{FilterResult, KeyboardHandle};
 use smithay::input::pointer::{
-    AxisFrame, ButtonEvent, GesturePinchBeginEvent, GesturePinchEndEvent,
+    AxisFrame, ButtonEvent, Focus, GesturePinchBeginEvent, GesturePinchEndEvent,
     GesturePinchUpdateEvent, MotionEvent, PointerHandle,
 };
 use smithay::input::{Seat, SeatHandler, SeatState};
@@ -36,11 +40,13 @@ use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_to
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason, ObjectId};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::reexports::wayland_server::protocol::{wl_buffer, wl_callback, wl_output, wl_seat};
+use smithay::reexports::wayland_server::protocol::{
+    wl_buffer, wl_callback, wl_output, wl_seat, wl_shm,
+};
 use smithay::reexports::wayland_server::{
     Client, Display, DisplayHandle, ListeningSocket, Resource,
 };
-use smithay::utils::{Serial, Transform};
+use smithay::utils::{Logical, Rectangle, Serial, Transform};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{
     BufferAssignment, CompositorClientState, CompositorHandler, CompositorState,
@@ -65,14 +71,17 @@ use smithay::wayland::xdg_activation::{XdgActivationHandler, XdgActivationState,
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::wayland::shell::xdg::{
     Configure, PopupSurface, PositionerState, SurfaceCachedState as XdgSurfaceCachedState,
-    ToplevelSurface, XdgShellHandler, XdgShellState,
+    ToplevelSurface, XDG_POPUP_ROLE, XdgShellHandler, XdgShellState,
 };
-use smithay::wayland::shm::{ShmHandler, ShmState};
+use smithay::wayland::shm::{ShmHandler, ShmState, with_buffer_contents};
 use smithay::{
     delegate_compositor, delegate_dmabuf, delegate_drm_syncobj, delegate_fractional_scale,
     delegate_output, delegate_pointer_gestures, delegate_seat, delegate_shm,
     delegate_viewporter, delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
 };
+
+const MAX_POPUP_BYTES: usize = 16 * 1024 * 1024;
+const MAX_AUXILIARY_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct DmaBufConfig {
@@ -97,6 +106,26 @@ pub struct DmaBufFrame {
     pub fd: OwnedFd,
     pub acquire_fence: OwnedFd,
     release: Option<Box<dyn FnOnce() + Send>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ShmFrame {
+    pub id: u64,
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+    pub logical_width: u32,
+    pub logical_height: u32,
+    /// Straight-alpha BGRA pixels in Wayland SHM's native little-endian layout.
+    /// The GPUI view converts them to RGBA at the `RgbaImage` boundary.
+    pub pixels: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub struct AuxiliarySnapshot {
+    pub barrier: u64,
+    pub frames: Vec<ShmFrame>,
 }
 
 impl DmaBufFrame {
@@ -135,6 +164,7 @@ impl Drop for DmaBufFrame {
 #[derive(Debug)]
 pub enum BrowserEvent {
     DmaBuf(DmaBufFrame),
+    Auxiliary(AuxiliarySnapshot),
     FrameRetired(u64),
     ToplevelReady,
     Closed,
@@ -154,6 +184,13 @@ impl BrowserEventSender {
             && let Some(position) = queue
                 .iter()
                 .position(|queued| matches!(queued, BrowserEvent::DmaBuf(_)))
+        {
+            queue.remove(position);
+        }
+        if matches!(event, BrowserEvent::Auxiliary(_))
+            && let Some(position) = queue
+                .iter()
+                .position(|queued| matches!(queued, BrowserEvent::Auxiliary(_)))
         {
             queue.remove(position);
         }
@@ -392,6 +429,8 @@ struct WindowState {
     dma_frame_callbacks: HashMap<u64, Vec<wl_callback::WlCallback>>,
     pointer_frames: HashMap<u64, PointerFrame>,
     pointer_location: (f64, f64),
+    auxiliary_ids: HashMap<ObjectId, u64>,
+    auxiliary_frames: HashMap<u64, ShmFrame>,
     unbound_barrier: Option<u64>,
     pending_barriers: Vec<(Serial, u64)>,
     acked_barrier: u64,
@@ -427,7 +466,9 @@ struct State<K: BrowserPageKey> {
     allow_initial_unambiguous_toplevel: bool,
     surface_windows: HashMap<ObjectId, K>,
     next_buffer_id: u64,
+    next_auxiliary_id: u64,
     commands: channel::Sender<RuntimeCommand<K>>,
+    popup_manager: PopupManager,
 }
 
 #[derive(Clone, Copy)]
@@ -451,6 +492,51 @@ fn permits_uncomposited_shm_subsurface(
     buffer_type: Option<&BufferType>,
 ) -> bool {
     !is_root && role == Some(SUBSURFACE_ROLE) && matches!(buffer_type, Some(BufferType::Shm))
+}
+
+fn normalize_shm_pixels(format: wl_shm::Format, pixels: &mut [u8]) {
+    if format == wl_shm::Format::Xrgb8888 {
+        for pixel in pixels.as_chunks_mut::<4>().0 {
+            pixel[3] = 0xff;
+        }
+    } else {
+        for pixel in pixels.as_chunks_mut::<4>().0 {
+            let alpha = u16::from(pixel[3]);
+            if alpha == 0 {
+                pixel[..3].fill(0);
+            } else if alpha < 255 {
+                for channel in &mut pixel[..3] {
+                    *channel = ((u16::from(*channel) * 255 + alpha / 2) / alpha).min(255) as u8;
+                }
+            }
+        }
+    }
+}
+
+fn popup_logical_size(surface: &WlSurface, width: u32, height: u32) -> Result<(u32, u32)> {
+    let (viewport, buffer_scale, buffer_transform) = with_states(surface, |states| {
+        let mut viewport = states.cached_state.get::<ViewportCachedState>();
+        let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+        (
+            *viewport.current(),
+            attributes.current().buffer_scale,
+            attributes.current().buffer_transform,
+        )
+    });
+    if buffer_transform != wl_output::Transform::Normal {
+        bail!("unsupported buffer transform {buffer_transform:?}")
+    }
+    if viewport.src.is_some() || viewport.dst.is_some() {
+        bail!("popup viewport cropping or destination scaling is unsupported")
+    }
+    if buffer_scale <= 0 {
+        bail!("non-positive popup buffer scale {buffer_scale}")
+    }
+    let scale = u32::try_from(buffer_scale)?;
+    if !width.is_multiple_of(scale) || !height.is_multiple_of(scale) {
+        bail!("popup dimensions {width}x{height} are not divisible by scale {scale}")
+    }
+    Ok((width / scale, height / scale))
 }
 
 fn surface_mapping(
@@ -496,6 +582,187 @@ impl<K: BrowserPageKey> State<K> {
             root = parent;
         }
         self.surface_windows.get(&root.id()).copied()
+    }
+
+    fn popup_origin(&self, id: K, surface: &WlSurface) -> Option<(i32, i32)> {
+        let root = self.windows[&id].toplevel.as_ref()?.wl_surface();
+        PopupManager::popups_for_surface(root).find_map(|(popup, offset)| {
+            (popup.wl_surface() == surface).then(|| {
+                let geometry = popup.geometry();
+                let origin = offset - geometry.loc;
+                (origin.x, origin.y)
+            })
+        })
+    }
+
+    fn constrain_popup(&self, id: K, surface: &PopupSurface, positioner: PositionerState) {
+        let size = self.windows[&id].size;
+        let mut target =
+            Rectangle::<i32, Logical>::from_size((size.0 as i32, size.1 as i32).into());
+        target.loc -= get_popup_toplevel_coords(&PopupKind::Xdg(surface.clone()));
+        surface.with_pending_state(|state| {
+            state.geometry = positioner.get_unconstrained_geometry(target);
+            state.positioner = positioner;
+        });
+    }
+
+    fn send_auxiliary_snapshot(&self, id: K) {
+        let window = &self.windows[&id];
+        if window.toplevel.is_none() {
+            return;
+        }
+        let mut frames = window
+            .auxiliary_frames
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        frames.sort_unstable_by_key(|frame| frame.id);
+        window
+            .events
+            .send(BrowserEvent::Auxiliary(AuxiliarySnapshot {
+                barrier: window.acked_barrier,
+                frames,
+            }));
+    }
+
+    fn snapshot_shm_popup(
+        &self,
+        id: K,
+        surface: &WlSurface,
+        buffer: &wl_buffer::WlBuffer,
+    ) -> Result<ShmFrame> {
+        const MAX_POPUP_DIMENSION: u32 = 4096;
+
+        let auxiliary_id = *self.windows[&id]
+            .auxiliary_ids
+            .get(&surface.id())
+            .context("untracked Chromium popup")?;
+        let (x, y) = self
+            .popup_origin(id, surface)
+            .context("Chromium popup is outside the tracked popup tree")?;
+        with_buffer_contents(buffer, |pointer, pool_len, data| -> Result<ShmFrame> {
+            let width = u32::try_from(data.width).context("negative popup width")?;
+            let height = u32::try_from(data.height).context("negative popup height")?;
+            let stride = usize::try_from(data.stride).context("negative popup stride")?;
+            let offset = usize::try_from(data.offset).context("negative popup offset")?;
+            if width == 0
+                || height == 0
+                || width > MAX_POPUP_DIMENSION
+                || height > MAX_POPUP_DIMENSION
+            {
+                bail!("popup dimensions are outside the supported bounds: {width}x{height}")
+            }
+            if !matches!(
+                data.format,
+                wl_shm::Format::Argb8888 | wl_shm::Format::Xrgb8888
+            ) {
+                bail!("unsupported popup SHM format {:?}", data.format)
+            }
+            let row_bytes = usize::try_from(width)?
+                .checked_mul(4)
+                .context("popup row overflow")?;
+            if stride < row_bytes {
+                bail!("popup stride {stride} is shorter than row {row_bytes}")
+            }
+            let pixel_bytes = row_bytes
+                .checked_mul(usize::try_from(height)?)
+                .context("popup size overflow")?;
+            if pixel_bytes > MAX_POPUP_BYTES {
+                bail!("popup exceeds {MAX_POPUP_BYTES} bytes")
+            }
+            let last_row = stride
+                .checked_mul(usize::try_from(height - 1)?)
+                .and_then(|bytes| offset.checked_add(bytes))
+                .and_then(|start| start.checked_add(row_bytes))
+                .context("popup pool range overflow")?;
+            if last_row > pool_len {
+                bail!("popup buffer exceeds its SHM pool")
+            }
+            let mut pixels = vec![0_u8; pixel_bytes];
+            for row in 0..usize::try_from(height)? {
+                // The pool can change concurrently, so copy directly from the
+                // validated raw range without creating a Rust slice into it.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        pointer.add(offset + row * stride),
+                        pixels.as_mut_ptr().add(row * row_bytes),
+                        row_bytes,
+                    );
+                }
+            }
+            normalize_shm_pixels(data.format, &mut pixels);
+            let (logical_width, logical_height) = popup_logical_size(surface, width, height)?;
+            Ok(ShmFrame {
+                id: auxiliary_id,
+                x,
+                y,
+                width,
+                height,
+                logical_width,
+                logical_height,
+                pixels,
+            })
+        })?
+    }
+
+    fn clear_popup_frame(&mut self, id: K, surface: &WlSurface) {
+        let Some(auxiliary_id) = self.windows[&id].auxiliary_ids.get(&surface.id()).copied() else {
+            return;
+        };
+        if self
+            .windows
+            .get_mut(&id)
+            .expect("popup window exists")
+            .auxiliary_frames
+            .remove(&auxiliary_id)
+            .is_some()
+        {
+            self.send_auxiliary_snapshot(id);
+        }
+    }
+
+    fn refresh_popup_tree(&mut self, id: K) {
+        let result = (|| -> Result<()> {
+            let root = self.windows[&id]
+                .toplevel
+                .as_ref()
+                .context("popup tree has no root")?
+                .wl_surface();
+            let updates = PopupManager::popups_for_surface(root)
+                .filter_map(|(popup, offset)| {
+                    let auxiliary_id = *self.windows[&id]
+                        .auxiliary_ids
+                        .get(&popup.wl_surface().id())?;
+                    let frame = self.windows[&id].auxiliary_frames.get(&auxiliary_id)?;
+                    Some((popup, offset, auxiliary_id, frame.width, frame.height))
+                })
+                .map(|(popup, offset, auxiliary_id, width, height)| {
+                    let origin = offset - popup.geometry().loc;
+                    let logical_size = popup_logical_size(popup.wl_surface(), width, height)?;
+                    Ok((auxiliary_id, origin, logical_size))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let window = self
+                .windows
+                .get_mut(&id)
+                .context("popup window disappeared")?;
+            for (auxiliary_id, origin, logical_size) in updates {
+                let frame = window
+                    .auxiliary_frames
+                    .get_mut(&auxiliary_id)
+                    .context("popup frame disappeared")?;
+                (frame.x, frame.y) = (origin.x, origin.y);
+                (frame.logical_width, frame.logical_height) = logical_size;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            self.windows[&id].events.send(BrowserEvent::Failed(
+                format!("invalid Chromium SHM popup state: {error:#}").into(),
+            ));
+        } else {
+            self.send_auxiliary_snapshot(id);
+        }
     }
 
     fn bind_toplevel(&mut self, id: K, root: ObjectId) {
@@ -596,6 +863,7 @@ impl<K: BrowserPageKey> CompositorHandler for State<K> {
             .compositor
     }
     fn commit(&mut self, surface: &WlSurface) {
+        self.popup_manager.commit(surface);
         let wid = self.window_id_for_surface(surface);
         let is_root = wid.is_some_and(|id| {
             self.windows
@@ -625,6 +893,10 @@ impl<K: BrowserPageKey> CompositorHandler for State<K> {
         let buffer = match buffer {
             Some(BufferAssignment::NewBuffer(b)) => b,
             Some(BufferAssignment::Removed) => {
+                if role == Some(XDG_POPUP_ROLE) {
+                    self.clear_popup_frame(wid, surface);
+                    self.refresh_popup_tree(wid);
+                }
                 if let Some(r) = release {
                     let _ = r.signal();
                 }
@@ -633,6 +905,9 @@ impl<K: BrowserPageKey> CompositorHandler for State<K> {
                 return;
             }
             None => {
+                if role == Some(XDG_POPUP_ROLE) {
+                    self.refresh_popup_tree(wid);
+                }
                 if let Some(r) = release {
                     let _ = r.signal();
                 }
@@ -642,6 +917,56 @@ impl<K: BrowserPageKey> CompositorHandler for State<K> {
         };
         let buffer_type = buffer_type(&buffer);
         if permits_uncomposited_shm_subsurface(is_root, role, buffer_type.as_ref()) {
+            if let Some(r) = release {
+                let _ = r.signal();
+            }
+            buffer.release();
+            complete_surface_callbacks(surface, self.time());
+            return;
+        }
+        if role == Some(XDG_POPUP_ROLE) && matches!(buffer_type, Some(BufferType::Shm)) {
+            match self.snapshot_shm_popup(wid, surface, &buffer) {
+                Ok(frame) => {
+                    let window = self.windows.get_mut(&wid).expect("popup window exists");
+                    let retained_bytes = window
+                        .auxiliary_frames
+                        .iter()
+                        .filter(|(id, _)| **id != frame.id)
+                        .try_fold(0_usize, |bytes, (_, retained)| {
+                            bytes.checked_add(retained.pixels.len())
+                        });
+                    let Some(total_bytes) =
+                        retained_bytes.and_then(|bytes| bytes.checked_add(frame.pixels.len()))
+                    else {
+                        window.events.send(BrowserEvent::Failed(
+                            "Chromium SHM popup snapshot size overflow".into(),
+                        ));
+                        if let Some(r) = release.take() {
+                            let _ = r.signal();
+                        }
+                        buffer.release();
+                        complete_surface_callbacks(surface, self.time());
+                        return;
+                    };
+                    if total_bytes > MAX_AUXILIARY_BYTES {
+                        window.events.send(BrowserEvent::Failed(
+                            format!("Chromium SHM popup tree exceeds {MAX_AUXILIARY_BYTES} bytes")
+                                .into(),
+                        ));
+                        if let Some(r) = release.take() {
+                            let _ = r.signal();
+                        }
+                        buffer.release();
+                        complete_surface_callbacks(surface, self.time());
+                        return;
+                    }
+                    window.auxiliary_frames.insert(frame.id, frame);
+                    self.refresh_popup_tree(wid);
+                }
+                Err(error) => self.windows[&wid].events.send(BrowserEvent::Failed(
+                    format!("invalid Chromium SHM popup: {error:#}").into(),
+                )),
+            }
             if let Some(r) = release {
                 let _ = r.signal();
             }
@@ -797,16 +1122,109 @@ impl<K: BrowserPageKey> XdgShellHandler for State<K> {
             w.events.send(BrowserEvent::Closed);
         }
     }
-    fn new_popup(&mut self, surface: PopupSurface, _: PositionerState) {
-        if let Some(parent) = surface.get_parent_surface()
+    fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
+        let window_id = if let Some(parent) = surface.get_parent_surface()
             && let Some(id) = self.window_id_for_surface(&parent)
         {
-            self.surface_windows.insert(surface.wl_surface().id(), id);
+            let object_id = surface.wl_surface().id();
+            self.surface_windows.insert(object_id.clone(), id);
+            let auxiliary_id = self.next_auxiliary_id;
+            let Some(next_auxiliary_id) = self.next_auxiliary_id.checked_add(1) else {
+                self.windows[&id].events.send(BrowserEvent::Failed(
+                    "Chromium popup identifier space exhausted".into(),
+                ));
+                return;
+            };
+            self.next_auxiliary_id = next_auxiliary_id;
+            self.windows
+                .get_mut(&id)
+                .expect("popup window exists")
+                .auxiliary_ids
+                .insert(object_id, auxiliary_id);
+            Some(id)
+        } else {
+            None
+        };
+        let _ = self
+            .popup_manager
+            .track_popup(PopupKind::Xdg(surface.clone()));
+        if let Some(window_id) = window_id {
+            self.constrain_popup(window_id, &surface, positioner);
         }
         let _ = surface.send_configure();
     }
-    fn grab(&mut self, _: PopupSurface, _: wl_seat::WlSeat, _: Serial) {}
-    fn reposition_request(&mut self, surface: PopupSurface, _: PositionerState, token: u32) {
+
+    fn popup_destroyed(&mut self, surface: PopupSurface) {
+        let object_id = surface.wl_surface().id();
+        if let Some(window_id) = self.surface_windows.remove(&object_id)
+            && let Some(auxiliary_id) = self
+                .windows
+                .get_mut(&window_id)
+                .expect("popup window exists")
+                .auxiliary_ids
+                .remove(&object_id)
+        {
+            let window = self
+                .windows
+                .get_mut(&window_id)
+                .expect("popup window exists");
+            window.auxiliary_frames.remove(&auxiliary_id);
+            self.send_auxiliary_snapshot(window_id);
+        }
+        self.popup_manager.cleanup();
+    }
+    fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {
+        let Some(window_id) = self.window_id_for_surface(surface.wl_surface()) else {
+            return;
+        };
+        let Some(root) = self.windows[&window_id]
+            .toplevel
+            .as_ref()
+            .map(|toplevel| toplevel.wl_surface().clone())
+        else {
+            return;
+        };
+        let Some(seat) = Seat::from_resource(&seat) else {
+            return;
+        };
+        let Ok(mut grab) =
+            self.popup_manager
+                .grab_popup::<Self>(root, PopupKind::Xdg(surface), &seat, serial)
+        else {
+            return;
+        };
+        if let Some(keyboard) = seat.get_keyboard() {
+            if keyboard.is_grabbed()
+                && !(keyboard.has_grab(serial)
+                    || keyboard.has_grab(grab.previous_serial().unwrap_or(serial)))
+            {
+                grab.ungrab(PopupUngrabStrategy::All);
+                return;
+            }
+            keyboard.set_focus(self, grab.current_grab(), serial);
+            keyboard.set_grab(self, PopupKeyboardGrab::new(&grab), serial);
+        }
+        if let Some(pointer) = seat.get_pointer() {
+            if pointer.is_grabbed()
+                && !(pointer.has_grab(serial)
+                    || pointer.has_grab(grab.previous_serial().unwrap_or_else(|| grab.serial())))
+            {
+                grab.ungrab(PopupUngrabStrategy::All);
+                return;
+            }
+            pointer.set_grab(self, PopupPointerGrab::new(&grab), serial, Focus::Keep);
+        }
+    }
+    fn reposition_request(
+        &mut self,
+        surface: PopupSurface,
+        positioner: PositionerState,
+        token: u32,
+    ) {
+        let Some(window_id) = self.window_id_for_surface(surface.wl_surface()) else {
+            return;
+        };
+        self.constrain_popup(window_id, &surface, positioner);
         surface.send_repositioned(token);
     }
 }
@@ -1196,7 +1614,9 @@ fn run<K: BrowserPageKey>(
         allow_initial_unambiguous_toplevel: true,
         surface_windows: HashMap::new(),
         next_buffer_id: 1,
+        next_auxiliary_id: 1,
         commands: sender,
+        popup_manager: PopupManager::default(),
     };
     let _ = ready.send(Ok(socket));
     let result = service_loop(event_loop, display, listener, &mut state, commands);
@@ -1234,6 +1654,7 @@ fn service_loop<K: BrowserPageKey>(
             Generic::new(display, Interest::READ, PollMode::Level),
             |_, display, state| {
                 unsafe { display.get_mut() }.dispatch_clients(state)?;
+                state.popup_manager.cleanup();
                 state.bind_unambiguous_toplevel();
                 unsafe { display.get_mut() }.flush_clients()?;
                 Ok(PostAction::Continue)
@@ -1285,6 +1706,8 @@ fn handle_runtime_command<K: BrowserPageKey>(
                     dma_frame_callbacks: HashMap::new(),
                     pointer_frames: HashMap::new(),
                     pointer_location: (0.0, 0.0),
+                    auxiliary_ids: HashMap::new(),
+                    auxiliary_frames: HashMap::new(),
                     unbound_barrier: None,
                     pending_barriers: Vec::new(),
                     acked_barrier: 0,
@@ -1482,11 +1905,32 @@ fn track_unbound_barrier(window: &mut WindowState, serial: Serial) {
         window.pending_barriers.push((serial, barrier));
     }
 }
+
+fn pointer_target(window: &WindowState, location: (f64, f64)) -> Option<(WlSurface, (f64, f64))> {
+    let root = window.toplevel.as_ref()?.wl_surface().clone();
+    let mut target = (root.clone(), (0.0, 0.0));
+    let mut popups = PopupManager::popups_for_surface(&root)
+        .filter_map(|(popup, _)| {
+            let auxiliary_id = *window.auxiliary_ids.get(&popup.wl_surface().id())?;
+            let frame = window.auxiliary_frames.get(&auxiliary_id)?;
+            Some((auxiliary_id, popup, frame))
+        })
+        .collect::<Vec<_>>();
+    popups.sort_unstable_by_key(|(auxiliary_id, _, _)| *auxiliary_id);
+    for (_, popup, frame) in popups {
+        let left = f64::from(frame.x);
+        let top = f64::from(frame.y);
+        let right = left + f64::from(frame.logical_width);
+        let bottom = top + f64::from(frame.logical_height);
+        if location.0 >= left && location.0 < right && location.1 >= top && location.1 < bottom {
+            target = (popup.wl_surface().clone(), (left, top));
+        }
+    }
+    Some(target)
+}
+
 fn pointer_motion<K: BrowserPageKey>(state: &mut State<K>, id: K, commit_id: u64, x: f64, y: f64) {
     let Some(w) = state.windows.get(&id) else {
-        return;
-    };
-    let Some(surface) = w.toplevel.as_ref().map(|t| t.wl_surface().clone()) else {
         return;
     };
     let Some(frame) = w.pointer_frames.get(&commit_id).copied() else {
@@ -1494,6 +1938,9 @@ fn pointer_motion<K: BrowserPageKey>(state: &mut State<K>, id: K, commit_id: u64
     };
     let size = w.size;
     let (x, y) = mapped_pointer(frame, size, x, y);
+    let Some((surface, origin)) = pointer_target(w, (x, y)) else {
+        return;
+    };
     if let Some(window) = state.windows.get_mut(&id) {
         window.pointer_location = (x, y);
     }
@@ -1503,7 +1950,7 @@ fn pointer_motion<K: BrowserPageKey>(state: &mut State<K>, id: K, commit_id: u64
         time: state.time(),
     };
     let pointer = state.pointer.clone();
-    pointer.motion(state, Some((surface, (0.0, 0.0).into())), &event);
+    pointer.motion(state, Some((surface, origin.into())), &event);
     pointer.frame(state);
 }
 
@@ -1514,11 +1961,10 @@ fn mapped_pointer(frame: PointerFrame, window_size: (u32, u32), x: f64, y: f64) 
     )
 }
 fn pointer_button<K: BrowserPageKey>(state: &mut State<K>, id: K, button: u32, pressed: bool) {
-    let Some((surface, location)) = state.windows.get(&id).and_then(|window| {
-        Some((
-            window.toplevel.as_ref()?.wl_surface().clone(),
-            window.pointer_location,
-        ))
+    let Some((surface, origin, location)) = state.windows.get(&id).and_then(|window| {
+        let location = window.pointer_location;
+        let (surface, origin) = pointer_target(window, location)?;
+        Some((surface, origin, location))
     }) else {
         return;
     };
@@ -1527,7 +1973,7 @@ fn pointer_button<K: BrowserPageKey>(state: &mut State<K>, id: K, button: u32, p
     let time = state.time();
     pointer.motion(
         state,
-        Some((surface, (0.0, 0.0).into())),
+        Some((surface, origin.into())),
         &MotionEvent {
             location: location.into(),
             serial,
@@ -1551,11 +1997,10 @@ fn pointer_button<K: BrowserPageKey>(state: &mut State<K>, id: K, button: u32, p
 }
 
 fn pointer_axis<K: BrowserPageKey>(state: &mut State<K>, id: K, event: PointerAxisFrame) {
-    let Some((surface, location)) = state.windows.get(&id).and_then(|window| {
-        Some((
-            window.toplevel.as_ref()?.wl_surface().clone(),
-            window.pointer_location,
-        ))
+    let Some((surface, origin, location)) = state.windows.get(&id).and_then(|window| {
+        let location = window.pointer_location;
+        let (surface, origin) = pointer_target(window, location)?;
+        Some((surface, origin, location))
     }) else {
         return;
     };
@@ -1564,7 +2009,7 @@ fn pointer_axis<K: BrowserPageKey>(state: &mut State<K>, id: K, event: PointerAx
     let time = state.time();
     pointer.motion(
         state,
-        Some((surface, (0.0, 0.0).into())),
+        Some((surface, origin.into())),
         &MotionEvent {
             location: location.into(),
             serial,
@@ -1769,6 +2214,35 @@ mod tests {
     }
 
     #[test]
+    fn popup_pixels_are_normalized_to_straight_alpha_bgra() {
+        let mut xrgb = [3, 2, 1, 0];
+        normalize_shm_pixels(wl_shm::Format::Xrgb8888, &mut xrgb);
+        assert_eq!(xrgb, [3, 2, 1, 255]);
+
+        let mut argb = [32, 64, 96, 128, 10, 20, 30, 0, 3, 2, 1, 255];
+        normalize_shm_pixels(wl_shm::Format::Argb8888, &mut argb);
+        assert_eq!(argb, [64, 128, 191, 128, 0, 0, 0, 0, 3, 2, 1, 255]);
+    }
+
+    #[test]
+    fn frame_mailbox_keeps_only_the_latest_auxiliary_snapshot() {
+        let (sender, receiver) = browser_event_channel();
+        sender.send(BrowserEvent::Auxiliary(AuxiliarySnapshot {
+            barrier: 1,
+            frames: Vec::new(),
+        }));
+        sender.send(BrowserEvent::Auxiliary(AuxiliarySnapshot {
+            barrier: 2,
+            frames: Vec::new(),
+        }));
+        let event = futures_lite::future::block_on(receiver.recv()).unwrap();
+        assert!(matches!(
+            event,
+            BrowserEvent::Auxiliary(AuxiliarySnapshot { barrier: 2, .. })
+        ));
+    }
+
+    #[test]
     fn chrome_wrapper_has_safe_default() {
         if std::env::var_os("RHO_CHROME_BIN").is_none() {
             assert_eq!(chrome_wrapper(), "google-chrome-stable");
@@ -1821,6 +2295,8 @@ mod tests {
             dma_frame_callbacks: HashMap::new(),
             pointer_frames: HashMap::new(),
             pointer_location: (0.0, 0.0),
+            auxiliary_ids: HashMap::new(),
+            auxiliary_frames: HashMap::new(),
             unbound_barrier: Some(9),
             pending_barriers: Vec::new(),
             acked_barrier: 0,

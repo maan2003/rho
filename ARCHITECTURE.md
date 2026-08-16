@@ -136,12 +136,17 @@ than by running a supervisor, extension protocol, or daemon process graph.
   CDP, remote debugging, content script, or website injection participates.
   Browser content is a DMA-BUF-only pipeline with explicit synchronization;
   GPUI retains each imported Vulkan image while its page model owns the lease.
+  Chromium `xdg_popup` widgets remain visible through a bounded auxiliary path:
+  the compositor validates and snapshots ARGB/XRGB SHM rows, GPUI uploads the
+  resulting small images after the zero-copy root, and pointer hit-testing stays
+  in the compositor's tracked popup tree. Wayland overlay delegation is disabled
+  defensively so website content remains on the root surface.
   The compositor is wake-driven, advertises per-surface fractional scale and a
   viewporter while keeping its shared synthetic output stable, and forwards
   raw physical keys, pointer axes, and pinch phases to Chromium. `wl_shm`
-  remains available only for ancillary Chromium surfaces such as cursors and
-  browser-chrome input subsurfaces; those buffers are acknowledged but never
-  copied into browser content.
+  remains available only for ancillary Chromium surfaces. Browser-chrome
+  subsurfaces are acknowledged without composition; popup copies are isolated
+  overlays and are never folded into the browser content DMA-BUF.
   `rho-gui` only hosts the resulting GPUI page model/view. A full `:web-<uuid>:` tag
   on an ordinary Desk heading is a portal to the client-local page, just as an
   agent tag is a portal to an agent; selecting the heading uses the same

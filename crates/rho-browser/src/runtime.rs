@@ -70,7 +70,9 @@ impl BrowserRuntime {
             // Chrome 137–141 gates command-line extension loading behind this
             // feature. Newer branded builds require one manual Load unpacked;
             // Chromium and Chrome for Testing continue to honor the switch.
-            .arg("--disable-features=DisableLoadExtensionCommandLineSwitch")
+            .arg(
+                "--disable-features=DisableLoadExtensionCommandLineSwitch,WaylandOverlayDelegation",
+            )
             .arg(format!("--load-extension={}", extension.display()))
             .arg(format!(
                 "--xdg-activation-token={}",
