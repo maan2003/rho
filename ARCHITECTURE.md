@@ -130,8 +130,9 @@ than by running a supervisor, extension protocol, or daemon process graph.
   but non-interactive during that handoff; Wayland ordering establishes frame
   readiness, not semantic pixel ownership by a Chrome tab.
   Valid compositor scenes continue to replace the displayed scene and receive
-  presentation callbacks while input is gated, so Chromium frame pacing cannot
-  deadlock behind application-level page readiness. The extension
+  presentation callbacks from a GPUI paint hook in the current outer frame
+  while input is gated. This follows nested-compositor pacing and avoids both
+  application-readiness deadlocks and an extra outer-refresh delay. The extension
   explicitly discards the previous tab, bounding loaded
   renderer and surface memory while Chrome retains per-page history metadata.
   The compositor issues one XDG activation token for the singleton toplevel and

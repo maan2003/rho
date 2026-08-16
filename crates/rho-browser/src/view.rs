@@ -825,29 +825,17 @@ impl Render for BrowserView {
         let model = self.model.read(cx);
         let colors = cx.theme().colors();
         let presents = model.presents(self.owner_id, self.page_id);
-        if owns_presentation
+        let presented = if owns_presentation
             && model.runtime.scene_id != self.scheduled_scene
             && let (Some(scene_id), Some(session)) =
                 (model.runtime.scene_id, model.runtime.session.as_ref())
         {
             self.scheduled_scene = Some(scene_id);
-            let presented = session.presentation_callback(scene_id);
-            let browser = self.model.clone();
-            let owner_id = self.owner_id;
-            let page_id = self.page_id;
-            window.on_next_frame(move |_, cx| {
-                let painted = browser.update(cx, |model, _| {
-                    model.presentation_owner == Some(owner_id)
-                        && model
-                            .handoff
-                            .is_some_and(|handoff| handoff.target == page_id)
-                        && scene_id > model.runtime.invalidated_through
-                });
-                if painted {
-                    presented();
-                }
-            });
-        }
+            (scene_id > model.runtime.invalidated_through)
+                .then(|| session.presentation_callback(scene_id))
+        } else {
+            None
+        };
         let scene = if owns_presentation {
             model
                 .runtime
@@ -892,7 +880,14 @@ impl Render for BrowserView {
                     browser.resize(width, height, scale);
                 }
             },
-            |_, _, _, _| {},
+            move |_, _, _, _| {
+                if let Some(presented) = presented {
+                    // Match a nested compositor: unblock the client's next
+                    // frame after this scene has been painted into GPUI's
+                    // current frame, rather than one outer refresh later.
+                    presented();
+                }
+            },
         )
         .size_full();
 
