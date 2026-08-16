@@ -152,8 +152,6 @@ fn run() -> Result<()> {
             let cpu = rho_profiling::CpuProfiler::start(path)?;
             let frame_path = rho_profiling::sidecar_path(cpu.path(), ".frames.json");
             let editor_path = rho_profiling::sidecar_path(cpu.path(), ".editor.json");
-            gpui::profiler::set_frame_trace_enabled(true);
-            gpui::profiler::set_editor_trace_enabled(true);
             Ok::<_, anyhow::Error>(GuiProfiler {
                 cpu,
                 frames: gpui::profiler::FrameTimingCollector::new(),
@@ -168,6 +166,7 @@ fn run() -> Result<()> {
         .transpose()?;
     let specs = host_specs(&args)?;
     let client_state_dir = default_client_state_dir()?;
+    rho_gui::telemetry::enable();
 
     gpui_platform::application()
         .with_assets(RhoAssets)
@@ -231,7 +230,6 @@ fn run() -> Result<()> {
 }
 
 fn finish_profiling(mut profiler: GuiProfiler) {
-    gpui::profiler::set_editor_trace_enabled(false);
     let mut frames = std::mem::take(
         &mut *profiler
             .collected_frames
@@ -254,7 +252,6 @@ fn finish_profiling(mut profiler: GuiProfiler) {
     drop(editor_collector);
     drop(collected_editor);
     editor.sort_unstable_by_key(|event| (event.start, event.kind as u8));
-    gpui::profiler::set_frame_trace_enabled(false);
     match profiler.cpu.finish_with_gui_spans(
         frame_timeline_spans(&frames, profiler.draw_tid),
         editor_timeline_spans(&editor),

@@ -59,6 +59,19 @@ AI APIs.
 - Provider debug logs under the rho state directory may contain full inference
   request bodies, tool results, and raw provider events; treat them like
   transcripts.
+- The native GUI always retains fixed-size in-memory rings of GPUI frame timing
+  and numeric editor/display-pipeline timing. An explicit
+  `Ctrl-Alt-Shift-P` action sends a versioned JSON snapshot (at most 8 MiB) over
+  the already authenticated connection to one active daemon. It contains
+  precise timings, numeric window/thread IDs, edit counts, affected row ranges,
+  map row totals, pending-batch counts, display flags, and embedded-browser
+  scene/barrier IDs with production, coalescing, receipt, scheduling, paint,
+  and frame-ack timing. Browser markers contain no URLs, pixels, or page
+  content; snapshots contain no buffer text or filesystem paths. The daemon
+  chooses a unique filename and writes a mode-0600 file under
+  `dirs::state_dir()/rho/gui-telemetry` (normally
+  `~/.local/state/rho/gui-telemetry`). There is no automatic upload, expiry, or
+  deletion; users control retention of these local diagnostic files.
 - Opt-in GUI and daemon Dial9 profiles contain thread names, function symbols,
   local source paths, precise activity timing, and frontend marker metadata.
   GUI editor markers include numeric edit counts, affected row ranges, map row
@@ -66,7 +79,8 @@ AI APIs.
   file paths.
   They do not intentionally include transcript data, but remain local
   diagnostic files whose destination and retention are the user's
-  responsibility. On Linux, Dial9 normally samples through `perf_event_open`;
+  responsibility. Always-on timing collection does not enable Dial9 or CPU
+  sampling. On Linux, Dial9 normally samples through `perf_event_open`;
   its clock-timer fallback owns process-global `SIGPROF`, installs a chained
   process-global `SIGSEGV` handler for safe stack reads, and samples only
   registered threads. The `SIGSEGV` handler is not restored, but profiling
@@ -74,8 +88,8 @@ AI APIs.
   in-process profiler using `SIGPROF`. Perf sampling frequency is per
   inherited thread, and inherited child-process samples are collected before
   Dial9 discards them, so overhead can scale with process and subprocess
-  parallelism. GUI frame timings are retained in memory until shutdown, and
-  the single-file trace grows linearly with profiled CPU/frame activity.
+  parallelism. The single-file trace grows linearly with profiled CPU/frame
+  activity.
   Dial9 symbolization and compression materialize the whole segment in memory
   during shutdown; profiling is intended only for bounded diagnostic runs.
 - Shell/apply-patch tools can affect the caller's workspace and must remain
@@ -87,6 +101,12 @@ AI APIs.
   single path component, and records process start identities before sending
   signals during cleanup. Applications launched in a driver session are not
   sandboxed and retain the invoking user's authority.
+  The driver sets an exact process-local marker for rho-browser's QA-only SHM
+  root transport; ordinary GUI launches cannot silently select it. The path
+  accepts only checked ARGB/XRGB buffers, copies validated rows into owned
+  memory, releases the source immediately, retains the 16 MiB ancillary and
+  32 MiB current-scene bounds, and preserves one-scene coalescing. It does not
+  test the production DMA-BUF/fence invariants.
 - Native embedded pages run an ordinary stock Chromium process with the invoking
   user's full authority and a persistent cookie/storage identity under the Rho
   client state directory; this is not a sandbox. `rho-browser` accepts only

@@ -336,6 +336,20 @@ async fn dial_visualization(
     }
 }
 
+async fn dial_gui_telemetry(dialer: ChannelDialer, snapshot: Vec<u8>) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        snapshot.len() <= rho_ui_proto::MAX_GUI_TELEMETRY_BYTES,
+        "GUI telemetry snapshot is too large"
+    );
+    let mut stream = dial_bulk_stream(dialer).await?;
+    write_frame(&mut stream, &ClientMessage::GuiTelemetryUpload { snapshot }).await?;
+    match read_frame::<_, ServerMessage>(&mut stream).await? {
+        ServerMessage::GuiTelemetryStored { path } => Ok(path),
+        ServerMessage::GuiTelemetryRefused { reason } => anyhow::bail!(reason),
+        _ => anyhow::bail!("unexpected reply to GuiTelemetryUpload"),
+    }
+}
+
 /// Opens a low-priority one-shot/bulk stream. Unlike terminal streams this
 /// deliberately keeps iroh's default priority below interactive traffic.
 async fn dial_bulk_stream(dialer: ChannelDialer) -> anyhow::Result<rho_rpc::Stream> {
@@ -591,6 +605,22 @@ impl DiffClient {
 }
 
 impl Connection {
+    pub fn upload_gui_telemetry_task(
+        &self,
+        snapshot: Vec<u8>,
+        cx: &App,
+    ) -> Task<anyhow::Result<String>> {
+        let dialer = self.dialer.lock().unwrap().clone();
+        let task = Tokio::spawn(cx, async move {
+            let dialer = dialer.context("not connected to rho-daemon")?;
+            dial_gui_telemetry(dialer, snapshot).await
+        });
+        cx.spawn(async move |_| {
+            task.await
+                .map_err(|error| anyhow::anyhow!("GUI telemetry task failed: {error}"))?
+        })
+    }
+
     /// Target-neutral GPUI task API used by portable terminal surfaces.
     pub fn open_terminal_task(
         &self,
@@ -1132,6 +1162,8 @@ async fn run(
             | ServerMessage::DiffBaseContents { .. }
             | ServerMessage::DiffUnchanged { .. }
             | ServerMessage::DiffRefused { .. }
+            | ServerMessage::GuiTelemetryStored { .. }
+            | ServerMessage::GuiTelemetryRefused { .. }
             | ServerMessage::RealtimeOpened { .. }
             | ServerMessage::RealtimeRefused { .. }
             | ServerMessage::AgentStreamOpened { .. }

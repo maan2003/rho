@@ -27,6 +27,9 @@ pub mod rho_assets;
 mod sampler;
 pub(crate) mod shell_view;
 pub mod style;
+#[cfg(feature = "native")]
+#[doc(hidden)]
+pub mod telemetry;
 pub(crate) mod terminal_view;
 pub mod transcript;
 pub mod transient;
@@ -107,6 +110,7 @@ actions!(
         ShellPagerAll,
         ShellPagerQuit,
         VoiceToggle,
+        UploadGuiTelemetry,
         ZulipOpenRow,
         ZulipNextUnread,
         ZulipLoadOlder,
@@ -192,6 +196,7 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         ),
         KeyBinding::new("ctrl-shift-v", PastePrompt, Some("RhoGui > Editor")),
         KeyBinding::new("shift-escape", BrowserExit, Some("RhoGui > RhoBrowser")),
+        KeyBinding::new("ctrl-alt-shift-p", UploadGuiTelemetry, Some("RhoGui")),
         // A Comint-style shell submits complete input lines to the daemon;
         // its transcript remains an ordinary Vim-navigable editor buffer.
         KeyBinding::new(

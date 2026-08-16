@@ -688,6 +688,13 @@ fn browser_menu() -> Transient {
 
 fn status_menu() -> Transient {
     Transient::new("status")
+        .item(
+            "p",
+            "upload GUI performance snapshot",
+            |workspace, _, cx| {
+                workspace.cmd_upload_gui_telemetry(cx);
+            },
+        )
         .item("u", "usage…", |workspace, window, cx| {
             workspace.open_transient(usage_root_menu(), window, cx);
         })

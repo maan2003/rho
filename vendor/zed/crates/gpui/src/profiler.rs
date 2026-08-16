@@ -734,8 +734,9 @@ impl FrameTiming {
     }
 }
 
-// Allow 16MiB of frame timing entries.
-const MAX_FRAME_TIMINGS: usize = (16 * 1024 * 1024) / core::mem::size_of::<FrameTiming>();
+// Keep one MiB of frame timing entries. This ring is enabled in Rho's GUI in
+// normal operation, so its memory cost must remain small and fixed.
+const MAX_FRAME_TIMINGS: usize = (1024 * 1024) / core::mem::size_of::<FrameTiming>();
 
 struct FrameTimings {
     timings: VecDeque<FrameTiming>,
@@ -763,7 +764,6 @@ pub fn set_frame_trace_enabled(enabled: bool) -> bool {
         let mut frames = FRAME_TIMINGS.lock();
         frames.timings.clear();
         frames.timings.shrink_to_fit();
-        frames.total_pushed = 0;
     }
     true
 }
@@ -794,6 +794,11 @@ pub fn record_frame_timing(timing: FrameTiming) {
 /// cursor so each call to [`Self::collect_unseen`] returns only new entries.
 pub struct FrameTimingCollector {
     cursor: u64,
+}
+
+/// Returns a non-destructive copy of the current bounded frame timing ring.
+pub fn snapshot_frame_timings() -> Vec<FrameTiming> {
+    FRAME_TIMINGS.lock().timings.iter().copied().collect()
 }
 
 /// A timed text/display pipeline operation. Payloads are numeric by design so
@@ -831,14 +836,16 @@ pub enum EditorTimingKind {
     WrapMapUpdate = 8,
 }
 
-const MAX_EDITOR_TIMINGS: usize = (16 * 1024 * 1024) / core::mem::size_of::<EditorTiming>();
+const MAX_EDITOR_TIMINGS: usize = (1024 * 1024) / core::mem::size_of::<EditorTiming>();
 
 struct EditorTimings {
     timings: VecDeque<EditorTiming>,
+    total_pushed: u64,
 }
 
 static EDITOR_TIMINGS: spin::Mutex<EditorTimings> = spin::Mutex::new(EditorTimings {
     timings: VecDeque::new(),
+    total_pushed: 0,
 });
 
 static EDITOR_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
@@ -876,6 +883,7 @@ fn record_editor_timing(timing: EditorTiming, generation: u64) {
         timings.timings.pop_front();
     }
     timings.timings.push_back(timing);
+    timings.total_pushed += 1;
 }
 
 /// Records elapsed time on drop, including early-return paths.
@@ -970,28 +978,36 @@ impl Drop for EditorTimingGuard {
 
 #[expect(missing_docs)]
 pub struct EditorTimingCollector {
-    spare: VecDeque<EditorTiming>,
+    cursor: u64,
 }
 
 #[expect(missing_docs)]
 impl EditorTimingCollector {
     pub fn new() -> Self {
         Self {
-            spare: VecDeque::with_capacity(MAX_EDITOR_TIMINGS),
+            cursor: EDITOR_TIMINGS.lock().total_pushed,
         }
     }
 
     pub fn collect_unseen(&mut self) -> Vec<EditorTiming> {
-        let mut batch = std::mem::take(&mut self.spare);
-        {
-            let mut timings = EDITOR_TIMINGS.lock();
-            std::mem::swap(&mut timings.timings, &mut batch);
-        }
-        let unseen = batch.iter().copied().collect();
-        batch.clear();
-        self.spare = batch;
+        let timings = EDITOR_TIMINGS.lock();
+        let buffer_len = timings.timings.len() as u64;
+        let buffer_start = timings.total_pushed.saturating_sub(buffer_len);
+        let skip = self.cursor.saturating_sub(buffer_start) as usize;
+        let unseen = timings
+            .timings
+            .iter()
+            .skip(skip.min(timings.timings.len()))
+            .copied()
+            .collect();
+        self.cursor = timings.total_pushed;
         unseen
     }
+}
+
+/// Returns a non-destructive copy of the current bounded editor timing ring.
+pub fn snapshot_editor_timings() -> Vec<EditorTiming> {
+    EDITOR_TIMINGS.lock().timings.iter().copied().collect()
 }
 
 impl Default for FrameTimingCollector {
@@ -1024,5 +1040,38 @@ impl FrameTimingCollector {
             .collect();
         self.cursor = frames.total_pushed;
         unseen
+    }
+}
+
+#[cfg(test)]
+mod timing_ring_tests {
+    use super::*;
+
+    static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn editor_timing_snapshot_is_non_destructive_and_bounded() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        set_editor_trace_enabled(false);
+        set_editor_trace_enabled(true);
+        for _ in 0..MAX_EDITOR_TIMINGS + 17 {
+            drop(EditorTimingGuard::new(EditorTimingKind::BufferEdit));
+        }
+        let first = snapshot_editor_timings();
+        let second = snapshot_editor_timings();
+        assert_eq!(first.len(), MAX_EDITOR_TIMINGS);
+        assert_eq!(second.len(), first.len());
+        set_editor_trace_enabled(false);
+    }
+
+    #[test]
+    fn editor_collector_survives_trace_toggle() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        set_editor_trace_enabled(false);
+        let mut collector = EditorTimingCollector::new();
+        set_editor_trace_enabled(true);
+        drop(EditorTimingGuard::new(EditorTimingKind::BufferEdit));
+        assert_eq!(collector.collect_unseen().len(), 1);
+        set_editor_trace_enabled(false);
     }
 }

@@ -34,6 +34,8 @@ pub use workspace::{FileReadResult, FileSaveResult, WorkspaceClientFrame, Worksp
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
 /// Window represented by each point in the agent-cost distribution graph.
 pub const AGENT_COST_WINDOW_DAYS: u64 = 7;
+/// Maximum encoded GUI performance snapshot accepted by the daemon.
+pub const MAX_GUI_TELEMETRY_BYTES: usize = 8 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the daemon.
 pub const IROH_ALPN: &[u8] = b"rho/ui/3";
 #[cfg(not(target_family = "wasm"))]
@@ -300,6 +302,11 @@ pub enum ClientMessage {
         /// Dirty Zed buffers whose paths may not yet exist in jj's disk
         /// snapshot. The daemon supplies their immutable parent side.
         include_paths: Vec<Utf8PathBuf>,
+    },
+    /// One-shot request on a fresh stream. The daemon persists this bounded,
+    /// client-produced performance snapshot under its state directory.
+    GuiTelemetryUpload {
+        snapshot: Vec<u8>,
     },
     /// Requests the daemon account's weekly ChatGPT Codex allowance.
     ChatGptUsage,
@@ -689,6 +696,12 @@ pub enum ServerMessage {
         commit_id: String,
     },
     DiffRefused {
+        reason: String,
+    },
+    GuiTelemetryStored {
+        path: String,
+    },
+    GuiTelemetryRefused {
         reason: String,
     },
     ChatGptUsage {
@@ -1443,6 +1456,25 @@ mod tests {
                 }],
                 truncated: false,
             },
+        };
+        let bytes = senax_encoder::pack(&response).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(response, decoded);
+    }
+
+    #[test]
+    fn gui_telemetry_messages_round_trip() {
+        let request = ClientMessage::GuiTelemetryUpload {
+            snapshot: br#"{"version":1}"#.to_vec(),
+        };
+        let bytes = senax_encoder::pack(&request).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(request, decoded);
+
+        let response = ServerMessage::GuiTelemetryStored {
+            path: "/state/rho/gui-telemetry/snapshot.json".to_owned(),
         };
         let bytes = senax_encoder::pack(&response).unwrap();
         let mut slice: &[u8] = &bytes;

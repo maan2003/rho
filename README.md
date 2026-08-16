@@ -28,6 +28,22 @@ bare while one host is attached and gain a `host/` prefix once several are
 
 ## Profiling
 
+The native GUI always keeps a small rolling in-memory history of GPUI frame
+draw/dirty latency and numeric editor/display-pipeline timings. Press
+`Ctrl-Alt-Shift-P` (or `space s p`) to upload a versioned JSON snapshot to the
+daemon owning the selected agent; with no selected agent the normal primary
+attached host is used. The daemon stores it as a new mode-0600 file under
+`~/.local/state/rho/gui-telemetry/` (or the platform state-directory
+equivalent). Snapshots contain timing/count/row-range data, window and thread
+numeric IDs, application metadata, and typed numeric embedded-browser pipeline
+markers. Browser markers correlate scene production, mailbox
+coalescing/receipt, GPUI scheduling/paint, and Wayland frame acknowledgement by
+scene/barrier ID; they contain no URLs, pixels, or page content. Snapshots
+contain no buffer text or filesystem paths.
+Collection is bounded in memory; uploads happen only on this explicit action.
+Files are not automatically expired or uploaded elsewhere and remain until the
+user deletes them.
+
 `just profile-gui` builds with frame pointers and runs the optimized GUI with
 Dial9 CPU sampling. Closing the GUI writes `rho-gui-profile.0.bin.gz`, a
 symbolized Dial9 trace containing timestamped CPU stacks and

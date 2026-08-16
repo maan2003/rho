@@ -3,10 +3,12 @@ use std::os::fd::AsRawFd as _;
 use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 use anyhow::{Context as _, Result, bail};
-use rho_browser_wayland::{BrowserCompositor, BrowserSession, DmaBufConfig, chrome_wrapper};
+use rho_browser_wayland::{BrowserCompositor, BrowserRenderConfig, BrowserSession, chrome_wrapper};
 use serde_json::json;
 
 use crate::native_host::{Bridge, socket_path, write_installation};
@@ -19,17 +21,18 @@ pub(crate) struct BrowserWindow;
 /// Wayland compositor. Logical pages live as extension-owned tabs inside the
 /// singleton browser window.
 pub(crate) struct BrowserRuntime {
-    _compositor: BrowserCompositor<BrowserWindow>,
-    bridge: Bridge,
+    compositor: Mutex<Option<BrowserCompositor<BrowserWindow>>>,
+    bridge: Mutex<Option<Arc<Bridge>>>,
     _profile: PathBuf,
-    _profile_lock: File,
+    profile_lock: Mutex<Option<File>>,
     chrome: Mutex<Option<Child>>,
+    shutdown_started: AtomicBool,
 }
 
 impl BrowserRuntime {
     pub(crate) fn launch(
         state_dir: &Path,
-        dma_buf: DmaBufConfig,
+        render: BrowserRenderConfig,
     ) -> Result<(Self, BrowserSession<BrowserWindow>)> {
         let profile = state_dir.join("chromium");
         let extension = state_dir.join("chromium-extension");
@@ -50,7 +53,8 @@ impl BrowserRuntime {
         write_installation(&profile, &extension, &executable)?;
         configure_vertical_tabs(&profile)?;
         let bridge = Bridge::bind(socket_path()?)?;
-        let compositor = BrowserCompositor::launch(dma_buf)?;
+        let software_shm = matches!(render, BrowserRenderConfig::SoftwareShmQa);
+        let compositor = BrowserCompositor::launch(render)?;
         let session = compositor.open(BrowserWindow, (1280, 720))?;
 
         let mut command = Command::new(chrome_wrapper());
@@ -79,15 +83,19 @@ impl BrowserRuntime {
                 session.activation_token()
             ))
             .arg(format!("--user-data-dir={}", profile.display()));
+        if software_shm {
+            command.arg("--disable-gpu");
+        }
         command.process_group(0);
         let child = command.spawn().context("launch stock Chromium")?;
         Ok((
             Self {
-                _compositor: compositor,
-                bridge,
+                compositor: Mutex::new(Some(compositor)),
+                bridge: Mutex::new(Some(Arc::new(bridge))),
                 _profile: profile,
-                _profile_lock: profile_lock,
+                profile_lock: Mutex::new(Some(profile_lock)),
                 chrome: Mutex::new(Some(child)),
+                shutdown_started: AtomicBool::new(false),
             },
             session,
         ))
@@ -95,27 +103,60 @@ impl BrowserRuntime {
 
     pub(crate) fn create_page(&self, target: &str) -> Result<PageRecord> {
         validate_launch_url(target)?;
-        let value = self.bridge.request("create", json!({ "url": target }))?;
+        let bridge = self.bridge()?;
+        let value = bridge.request("create", json!({ "url": target }))?;
         serde_json::from_value(value).context("decode created browser page")
     }
 
     pub(crate) fn focus_page(&self, id: PageId) -> Result<()> {
-        self.bridge.request("focus", json!({ "id": id.0 }))?;
+        self.bridge()?.request("focus", json!({ "id": id.0 }))?;
         Ok(())
     }
 
     pub(crate) fn close_page(&self, id: PageId) -> Result<()> {
-        self.bridge.request("close", json!({ "id": id.0 }))?;
+        self.bridge()?.request("close", json!({ "id": id.0 }))?;
         Ok(())
     }
+
+    fn bridge(&self) -> Result<Arc<Bridge>> {
+        self.bridge
+            .lock()
+            .unwrap()
+            .clone()
+            .context("browser runtime is shut down")
+    }
+
+    /// Starts one non-blocking teardown of Chrome and its private compositor.
+    /// The profile lock is released only after Chrome has been reaped.
+    pub(crate) fn shutdown_background(&self) {
+        if !begin_shutdown(&self.shutdown_started) {
+            return;
+        }
+        let child = self.chrome.lock().unwrap().take();
+        let compositor = self.compositor.lock().unwrap().take();
+        let bridge = self.bridge.lock().unwrap().take();
+        let profile_lock = self.profile_lock.lock().unwrap().take();
+        thread::spawn(move || {
+            if let Some(mut child) = child {
+                unsafe { libc::kill(-(child.id() as i32), libc::SIGTERM) };
+                let _ = child.wait();
+            }
+            drop(compositor);
+            drop(bridge);
+            drop(profile_lock);
+        });
+    }
+}
+
+fn begin_shutdown(started: &AtomicBool) -> bool {
+    started
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_ok()
 }
 
 impl Drop for BrowserRuntime {
     fn drop(&mut self) {
-        if let Some(mut child) = self.chrome.lock().unwrap().take() {
-            unsafe { libc::kill(-(child.id() as i32), libc::SIGTERM) };
-            let _ = child.wait();
-        }
+        self.shutdown_background();
     }
 }
 
@@ -152,6 +193,13 @@ fn configure_vertical_tabs(profile: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runtime_shutdown_starts_only_once() {
+        let started = AtomicBool::new(false);
+        assert!(begin_shutdown(&started));
+        assert!(!begin_shutdown(&started));
+    }
 
     #[test]
     fn enables_collapsed_vertical_tabs_without_losing_other_preferences() {

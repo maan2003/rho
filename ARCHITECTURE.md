@@ -113,6 +113,19 @@ than by running a supervisor, extension protocol, or daemon process graph.
   re-encoded as single-frame PNG pixels before persistence or provider upload.
   Source metadata, profiles, animation, and encoding are intentionally
   discarded.
+  Native `rho-gui` enables GPUI's fixed-size frame and numeric editor-pipeline
+  timing rings by default. `rho-browser-wayland` also retains a small numeric
+  scene-pipeline ring spanning compositor scene production/coalescing, GUI
+  receipt and scheduling/paint, and the presentation command that releases
+  Chromium's Wayland frame callbacks. Scene and handoff barrier IDs correlate
+  these stages without retaining URLs or pixels. An explicit global action
+  serializes a capped, versioned JSON snapshot and sends it on a fresh
+  low-priority stream to the
+  selected agent's host (falling back to the existing primary-host rule). The
+  daemon, not the client, allocates a unique private file below
+  `dirs::state_dir()/rho/gui-telemetry`; it applies no automatic retention.
+  This path is independent of the opt-in Dial9 CPU sampler and preserves the
+  existing `--cpu-profile` export.
   The Desk is one daemon-owned Zed CRDT text document per attached host. Its
   org-like headings derive structure rather than receiving structural RPCs.
   Visible agent-handle tags at the end of heading lines are the filing source
@@ -167,6 +180,13 @@ than by running a supervisor, extension protocol, or daemon process graph.
   the same versioned scene, stacking order, geometry, and input regions. Wayland
   overlay delegation remains disabled so every visible client surface follows
   this single composition path.
+  The isolated `rho wayland` QA driver has a software-only exception for hosts
+  without a Vulkan DRM render node. It advertises neither DMA-BUF nor
+  DRM-syncobj to Chromium, accepts the root through the existing checked,
+  bounded owned-SHM snapshot path, and uploads it through GPUI. Ordinary GUI
+  launches remain DMA-BUF-only and fail closed. This exercises real Chromium
+  lifecycle, focus, input, and restoration, but not production DMA-BUF import
+  or explicit synchronization.
   The compositor is wake-driven, advertises per-surface fractional scale and a
   viewporter while keeping its shared synthetic output stable, and forwards
   raw physical keys, pointer axes, and pinch phases to Chromium. It advertises
@@ -220,7 +240,8 @@ than by running a supervisor, extension protocol, or daemon process graph.
   controlling programs in isolated headless Sway sessions. It wraps the
   compositor's IPC plus `grim` and `wtype`; the Nix build embeds those tool
   paths and Mesa's software Vulkan driver rather than relying on the caller's
-  environment.
+  environment. Mixed key, text, and wait steps remain on one virtual keyboard
+  so compositor enter/leave cannot race application input or modal actions.
 - The daemon snapshots the user's login-shell environment and passes it
   explicitly to `rho-workspaces` for daemon-owned commands. Workspace-control
   subprocesses use that environment directly; agent execution shells and

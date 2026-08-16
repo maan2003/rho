@@ -87,12 +87,70 @@ use smithay::{
 
 const MAX_POPUP_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SCENE_SHM_BYTES: usize = 32 * 1024 * 1024;
+const MAX_BROWSER_TIMINGS: usize = 4_096;
+
+/// One stage in the Chromium-to-GPUI scene presentation pipeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum BrowserTimingKind {
+    SceneProduced = 1,
+    SceneCoalesced = 2,
+    SceneReceived = 3,
+    SceneScheduled = 4,
+    ScenePainted = 5,
+    FrameAcknowledged = 6,
+}
+
+/// Numeric-only timing marker retained in a fixed-size process-wide ring.
+#[derive(Clone, Copy, Debug)]
+pub struct BrowserTiming {
+    pub kind: BrowserTimingKind,
+    pub scene_id: u64,
+    pub barrier: u64,
+    pub related_scene_id: Option<u64>,
+    pub at: Instant,
+    pub duration: Option<Duration>,
+}
+
+static BROWSER_TIMINGS: Mutex<VecDeque<BrowserTiming>> = Mutex::new(VecDeque::new());
+
+pub fn record_browser_timing(
+    kind: BrowserTimingKind,
+    scene_id: u64,
+    barrier: u64,
+    related_scene_id: Option<u64>,
+    duration: Option<Duration>,
+) {
+    let mut timings = BROWSER_TIMINGS.lock().unwrap();
+    if timings.len() >= MAX_BROWSER_TIMINGS {
+        timings.pop_front();
+    }
+    timings.push_back(BrowserTiming {
+        kind,
+        scene_id,
+        barrier,
+        related_scene_id,
+        at: Instant::now(),
+        duration,
+    });
+}
+
+/// Returns a non-destructive copy of the bounded browser-pipeline timing ring.
+pub fn snapshot_browser_timings() -> Vec<BrowserTiming> {
+    BROWSER_TIMINGS.lock().unwrap().iter().copied().collect()
+}
 
 #[derive(Clone, Debug)]
 pub struct DmaBufConfig {
     pub render_node: PathBuf,
     pub device_id: u64,
     pub formats: Arc<[(u32, u64)]>,
+}
+
+pub enum BrowserRenderConfig {
+    DmaBuf(DmaBufConfig),
+    /// Bounded owned SHM snapshots for software-only isolated QA sessions.
+    SoftwareShmQa,
 }
 
 pub struct DmaBufFrame {
@@ -156,6 +214,7 @@ pub struct SceneUpdate {
     pub attached: Vec<u64>,
     /// Surface nodes in bottom-to-top paint order.
     pub nodes: Vec<SceneNode>,
+    pub produced_at: Instant,
 }
 
 impl DmaBufFrame {
@@ -275,6 +334,17 @@ impl BrowserEventSender {
                 .position(|queued| matches!(queued, BrowserEvent::Scene(_)))
             && let BrowserEvent::Scene(mut previous) = queue.remove(position).unwrap()
         {
+            record_browser_timing(
+                BrowserTimingKind::SceneCoalesced,
+                previous.id,
+                previous.barrier,
+                Some(incoming.id),
+                Some(
+                    incoming
+                        .produced_at
+                        .saturating_duration_since(previous.produced_at),
+                ),
+            );
             let referenced = incoming
                 .attached
                 .iter()
@@ -384,7 +454,7 @@ pub enum PinchGesture {
 enum PageCommand {
     Resize(u32, u32, f64),
     FrameBarrier(u64, u32, u32, f64),
-    Presented(u64),
+    Presented { scene_id: u64, barrier: u64 },
     Retired(u64),
     PointerMotion { commit_id: u64, x: f64, y: f64 },
     PointerButton { button: u32, pressed: bool },
@@ -412,7 +482,7 @@ pub struct BrowserCompositor<K: BrowserPageKey> {
     thread: Option<thread::JoinHandle<()>>,
 }
 impl<K: BrowserPageKey> BrowserCompositor<K> {
-    pub fn launch(dma_buf: DmaBufConfig) -> Result<Self> {
+    pub fn launch(render: BrowserRenderConfig) -> Result<Self> {
         let (tx, rx) = channel::channel();
         let tx2 = tx.clone();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
@@ -420,7 +490,7 @@ impl<K: BrowserPageKey> BrowserCompositor<K> {
         let thread = thread::Builder::new()
             .name("rho-browser-wayland".into())
             .spawn(move || {
-                if let Err(e) = run(rx, ready_tx, dma_buf, tx2) {
+                if let Err(e) = run(rx, ready_tx, render, tx2) {
                     let _ = errors.send(Err(anyhow::anyhow!("{e:#}")));
                 }
             })
@@ -513,11 +583,18 @@ impl<K: BrowserPageKey> BrowserSession<K> {
     pub fn events(&self) -> BrowserEventReceiver {
         self.events.clone()
     }
-    pub fn presentation_callback(&self, commit_id: u64) -> impl FnOnce() + Send + 'static {
+    pub fn presentation_callback(
+        &self,
+        scene_id: u64,
+        barrier: u64,
+    ) -> impl FnOnce() + Send + 'static {
         let tx = self.commands.clone();
         let id = self.id;
         move || {
-            let _ = tx.send(RuntimeCommand::Page(id, PageCommand::Presented(commit_id)));
+            let _ = tx.send(RuntimeCommand::Page(
+                id,
+                PageCommand::Presented { scene_id, barrier },
+            ));
         }
     }
 }
@@ -542,6 +619,7 @@ struct WindowState {
     pending_barriers: Vec<(Serial, u64)>,
     acked_barrier: u64,
     committed_barrier: u64,
+    terminal_failure: bool,
     opened_at: Instant,
 }
 
@@ -570,9 +648,10 @@ struct State<K: BrowserPageKey> {
     _decoration: XdgDecorationState,
     shm: ShmState,
     dmabuf: DmabufState,
-    _dmabuf_global: DmabufGlobal,
-    syncobj: DrmSyncobjState,
+    _dmabuf_global: Option<DmabufGlobal>,
+    syncobj: Option<DrmSyncobjState>,
     dma_formats: Arc<[(u32, u64)]>,
+    allow_root_shm: bool,
     _output: Output,
     _fractional_scale: FractionalScaleManagerState,
     _viewporter: ViewporterState,
@@ -602,13 +681,25 @@ fn committed_barrier_after_scene(
     committed: u64,
     acknowledged: u64,
     barrier_anchor: bool,
-    visible_toplevel_dma: bool,
+    visible_accepted_root: bool,
 ) -> u64 {
-    if barrier_anchor && visible_toplevel_dma {
+    if barrier_anchor && visible_accepted_root {
         acknowledged
     } else {
         committed
     }
+}
+
+fn shm_surface_limit(is_root: bool, allow_root_shm: bool, retained_bytes: usize) -> Result<usize> {
+    let per_surface = if is_root && allow_root_shm {
+        MAX_SCENE_SHM_BYTES
+    } else {
+        MAX_POPUP_BYTES
+    };
+    let remaining = MAX_SCENE_SHM_BYTES
+        .checked_sub(retained_bytes)
+        .context("existing Chromium SHM scene exceeds its byte budget")?;
+    Ok(per_surface.min(remaining))
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -750,6 +841,22 @@ fn map_surface_state(states: &SurfaceData, slot: SurfaceSlot) -> Result<MappedSu
     })
 }
 
+fn discard_surface_buffer(surface: &WlSurface) {
+    let (assignment, release) = with_states(surface, |states| {
+        let mut attributes = states.cached_state.get::<SurfaceAttributes>();
+        let assignment = attributes.current().buffer.take();
+        let mut sync = states.cached_state.get::<DrmSyncobjCachedState>();
+        let release = sync.current().release_point.take();
+        (assignment, release)
+    });
+    if let Some(release) = release {
+        let _ = release.signal();
+    }
+    if let Some(BufferAssignment::NewBuffer(buffer)) = assignment {
+        buffer.release();
+    }
+}
+
 fn snapshot_surface_tree(
     root: &WlSurface,
     root_origin: (i32, i32),
@@ -851,7 +958,12 @@ impl<K: BrowserPageKey> State<K> {
         });
     }
 
-    fn snapshot_shm(&self, buffer_id: u64, buffer: &wl_buffer::WlBuffer) -> Result<ShmFrame> {
+    fn snapshot_shm(
+        &self,
+        buffer_id: u64,
+        buffer: &wl_buffer::WlBuffer,
+        max_bytes: usize,
+    ) -> Result<ShmFrame> {
         const MAX_SURFACE_DIMENSION: u32 = 8192;
 
         with_buffer_contents(buffer, |pointer, pool_len, data| -> Result<ShmFrame> {
@@ -881,8 +993,8 @@ impl<K: BrowserPageKey> State<K> {
             let pixel_bytes = row_bytes
                 .checked_mul(usize::try_from(height)?)
                 .context("SHM size overflow")?;
-            if pixel_bytes > MAX_POPUP_BYTES {
-                bail!("SHM surface exceeds {MAX_POPUP_BYTES} bytes")
+            if pixel_bytes > max_bytes {
+                bail!("SHM surface exceeds {max_bytes} bytes")
             }
             let last_row = stride
                 .checked_mul(usize::try_from(height - 1)?)
@@ -1044,10 +1156,19 @@ impl<K: BrowserPageKey> State<K> {
                 if acquire.is_some() {
                     bail!("Chromium SHM surface unexpectedly used explicit synchronization")
                 }
-                if is_root {
+                if is_root && !self.allow_root_shm {
                     bail!("Chromium root surface did not provide the required zero-copy DMA-BUF")
                 }
-                let frame = self.snapshot_shm(buffer_id, &buffer)?;
+                let retained_bytes = self.windows[&id]
+                    .surface_slots
+                    .iter()
+                    .filter(|(object_id, _)| **object_id != surface.id())
+                    .try_fold(0_usize, |total, (_, slot)| {
+                        total.checked_add(slot.shm_bytes)
+                    })
+                    .context("Chromium SHM scene size overflow")?;
+                let max_bytes = shm_surface_limit(is_root, self.allow_root_shm, retained_bytes)?;
+                let frame = self.snapshot_shm(buffer_id, &buffer, max_bytes)?;
                 let slot = SurfaceSlot {
                     buffer_id,
                     width: frame.width,
@@ -1087,7 +1208,20 @@ impl<K: BrowserPageKey> State<K> {
         }
     }
 
+    fn fail_window(&mut self, id: K, error: Arc<str>) {
+        let window = self.windows.get_mut(&id).expect("known window");
+        if window.terminal_failure {
+            return;
+        }
+        window.terminal_failure = true;
+        window.pending_imports.clear();
+        window.events.send(BrowserEvent::Failed(error));
+    }
+
     fn publish_scene(&mut self, id: K, barrier_anchor: bool) -> Result<()> {
+        if self.windows[&id].terminal_failure {
+            bail!("browser window is already terminally failed")
+        }
         let root = self.windows[&id]
             .toplevel
             .as_ref()
@@ -1180,10 +1314,10 @@ impl<K: BrowserPageKey> State<K> {
         // is sufficient for handoff readiness as long as the atomic scene still
         // contains a validated DMA-BUF; requiring a fresh attachment wedges on
         // ordinary swapchain reuse.
-        let visible_toplevel_dma = nodes.iter().any(|node| {
-            slots
-                .values()
-                .any(|slot| slot.buffer_id == node.buffer_id && slot.shm_bytes == 0)
+        let visible_accepted_root = nodes.iter().any(|node| {
+            slots.values().any(|slot| {
+                slot.buffer_id == node.buffer_id && (slot.shm_bytes == 0 || self.allow_root_shm)
+            })
         });
 
         // PopupManager yields topmost first; GPUI paints bottom-to-top.
@@ -1219,7 +1353,7 @@ impl<K: BrowserPageKey> State<K> {
                 barrier_anchor,
                 new_toplevel_dma = new_toplevel_dma.len(),
                 new_visible_toplevel_dma,
-                visible_toplevel_dma,
+                visible_accepted_root,
                 surfaces = surfaces.len(),
                 toplevel_surfaces = toplevel_surface_count,
                 nodes = nodes.len(),
@@ -1231,13 +1365,13 @@ impl<K: BrowserPageKey> State<K> {
             window.committed_barrier,
             window.acked_barrier,
             barrier_anchor,
-            visible_toplevel_dma,
+            visible_accepted_root,
         );
         if window.committed_barrier != previous_barrier {
             tracing::info!(
                 barrier = window.committed_barrier,
                 scene_id = window.next_scene_id,
-                "Chromium frame barrier reached a visible DMA scene"
+                "Chromium frame barrier reached a visible accepted scene"
             );
         }
         window
@@ -1258,6 +1392,14 @@ impl<K: BrowserPageKey> State<K> {
         window
             .dma_frame_callbacks
             .insert(scene_id, drain_frame_callbacks(&surfaces));
+        let produced_at = Instant::now();
+        record_browser_timing(
+            BrowserTimingKind::SceneProduced,
+            scene_id,
+            window.committed_barrier,
+            None,
+            None,
+        );
         window.events.send(BrowserEvent::Scene(SceneUpdate {
             id: scene_id,
             barrier: window.committed_barrier,
@@ -1265,6 +1407,7 @@ impl<K: BrowserPageKey> State<K> {
             imports,
             attached: attached.into_iter().collect(),
             nodes,
+            produced_at,
         }));
         Ok(())
     }
@@ -1280,6 +1423,15 @@ impl<K: BrowserPageKey> State<K> {
         let Some((surface, _)) = self.unbound_toplevels.remove(&root) else {
             return;
         };
+        if let Some(client) = surface.wl_surface().client()
+            && let Some(client) = client.get_data::<ClientState>()
+        {
+            client
+                .events
+                .lock()
+                .unwrap()
+                .push(self.windows[&id].events.clone());
+        }
         let (size, scale) = {
             let window = &self.windows[&id];
             (window.size, window.scale)
@@ -1371,14 +1523,23 @@ impl<K: BrowserPageKey> CompositorHandler for State<K> {
             return;
         };
         if let Err(error) = self.publish_scene(id, false) {
-            self.windows[&id].events.send(BrowserEvent::Failed(
+            self.fail_window(
+                id,
                 format!("invalid Chromium surface tree after subsurface creation: {error:#}")
                     .into(),
-            ));
+            );
         }
     }
     fn commit(&mut self, surface: &WlSurface) {
         self.popup_manager.commit(surface);
+
+        if let Some(id) = self.window_id_for_surface(surface)
+            && self.windows[&id].terminal_failure
+        {
+            discard_surface_buffer(surface);
+            complete_surface_callbacks(surface, self.time());
+            return;
+        }
 
         // A synchronized child's current state is applied by Smithay when its
         // effectively-unsynchronized ancestor commits. Taking it here would
@@ -1444,9 +1605,10 @@ impl<K: BrowserPageKey> CompositorHandler for State<K> {
                 ?error,
                 "browser handoff failed to publish a surface-tree commit"
             );
-            self.windows[&id].events.send(BrowserEvent::Failed(
+            self.fail_window(
+                id,
                 format!("invalid Chromium surface tree: {error:#}").into(),
-            ));
+            );
         }
     }
     fn destroyed(&mut self, surface: &WlSurface) {
@@ -1470,9 +1632,10 @@ impl<K: BrowserPageKey> CompositorHandler for State<K> {
             if get_role(surface) == Some(SUBSURFACE_ROLE)
                 && let Err(error) = self.publish_scene(id, false)
             {
-                self.windows[&id].events.send(BrowserEvent::Failed(
+                self.fail_window(
+                    id,
                     format!("invalid Chromium surface tree after removal: {error:#}").into(),
-                ));
+                );
             }
         }
         // XdgShellHandler::toplevel_destroyed owns root teardown. Keeping the
@@ -1571,9 +1734,10 @@ impl<K: BrowserPageKey> XdgShellHandler for State<K> {
         if let Some(window_id) = window_id
             && let Err(error) = self.publish_scene(window_id, false)
         {
-            self.windows[&window_id].events.send(BrowserEvent::Failed(
+            self.fail_window(
+                window_id,
                 format!("invalid Chromium popup tree after removal: {error:#}").into(),
-            ));
+            );
         }
     }
     fn grab(&mut self, surface: PopupSurface, seat: wl_seat::WlSeat, serial: Serial) {
@@ -1713,7 +1877,7 @@ impl<K: BrowserPageKey> DmabufHandler for State<K> {
 }
 impl<K: BrowserPageKey> DrmSyncobjHandler for State<K> {
     fn drm_syncobj_state(&mut self) -> Option<&mut DrmSyncobjState> {
-        Some(&mut self.syncobj)
+        self.syncobj.as_mut()
     }
 }
 impl<K: BrowserPageKey> OutputHandler for State<K> {}
@@ -1751,13 +1915,20 @@ impl<K: BrowserPageKey> SeatHandler for State<K> {
 
 impl<K: BrowserPageKey> TabletSeatHandler for State<K> {}
 
-#[derive(Default)]
 struct ClientState {
     compositor: CompositorClientState,
+    events: Arc<Mutex<Vec<BrowserEventSender>>>,
 }
 impl ClientData for ClientState {
     fn initialized(&self, _client_id: ClientId) {}
-    fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {}
+    fn disconnected(&self, _client_id: ClientId, _reason: DisconnectReason) {
+        let events = self.events.lock().unwrap().clone();
+        for events in events {
+            events.send(BrowserEvent::Failed(
+                "Chromium disconnected from the embedded compositor".into(),
+            ));
+        }
+    }
 }
 
 impl<K: BrowserPageKey> Dispatch<WlSubsurface, SubsurfaceUserData> for State<K> {
@@ -1793,9 +1964,10 @@ impl<K: BrowserPageKey> Dispatch<WlSubsurface, SubsurfaceUserData> for State<K> 
         // lease as hidden attached state so recreating the role can remap it,
         // but republish after Smithay removes it from the surface tree.
         if let Err(error) = state.publish_scene(window_id, false) {
-            state.windows[&window_id].events.send(BrowserEvent::Failed(
+            state.fail_window(
+                window_id,
                 format!("invalid Chromium surface tree after subsurface removal: {error:#}").into(),
-            ));
+            );
         }
     }
 }
@@ -1931,7 +2103,7 @@ impl Drop for ReleasePointGuard {
 fn run<K: BrowserPageKey>(
     commands: channel::Channel<RuntimeCommand<K>>,
     ready: mpsc::SyncSender<Result<OsString>>,
-    config: DmaBufConfig,
+    render: BrowserRenderConfig,
     sender: channel::Sender<RuntimeCommand<K>>,
 ) -> Result<()> {
     let event_loop: EventLoop<'static, State<K>> =
@@ -1963,35 +2135,50 @@ fn run<K: BrowserPageKey>(
         .context("create embedded Chrome keyboard")?;
     let pointer = seat.add_pointer();
     let mut dmabuf = DmabufState::new();
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(&config.render_node)
-        .with_context(|| format!("open DRM render node {}", config.render_node.display()))?;
-    let drm = DrmDeviceFd::new(OwnedFd::from(file).into());
-    if !supports_syncobj_eventfd(&drm) {
-        bail!("GPU does not support explicit-sync eventfd required for zero-copy browser frames");
-    }
-    let fs = config
-        .formats
-        .iter()
-        .filter_map(|&(fourcc, modifier)| {
-            Some(Format {
-                code: Fourcc::try_from(fourcc).ok()?,
-                modifier: Modifier::from(modifier),
-            })
-        })
-        .collect::<Vec<_>>();
-    if fs.is_empty() {
-        bail!("GPUI did not provide any importable DMA-BUF formats");
-    }
-    let feedback =
-        smithay::wayland::dmabuf::DmabufFeedbackBuilder::new(config.device_id as libc::dev_t, fs)
+    let (global, syncobj, formats, allow_root_shm) = match render {
+        BrowserRenderConfig::DmaBuf(config) => {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&config.render_node)
+                .with_context(|| {
+                    format!("open DRM render node {}", config.render_node.display())
+                })?;
+            let drm = DrmDeviceFd::new(OwnedFd::from(file).into());
+            if !supports_syncobj_eventfd(&drm) {
+                bail!(
+                    "GPU does not support explicit-sync eventfd required for zero-copy browser frames"
+                );
+            }
+            let fs = config
+                .formats
+                .iter()
+                .filter_map(|&(fourcc, modifier)| {
+                    Some(Format {
+                        code: Fourcc::try_from(fourcc).ok()?,
+                        modifier: Modifier::from(modifier),
+                    })
+                })
+                .collect::<Vec<_>>();
+            if fs.is_empty() {
+                bail!("GPUI did not provide any importable DMA-BUF formats");
+            }
+            let feedback = smithay::wayland::dmabuf::DmabufFeedbackBuilder::new(
+                config.device_id as libc::dev_t,
+                fs,
+            )
             .build()
             .context("build DMA-BUF feedback")?;
-    let global = dmabuf.create_global_with_default_feedback::<State<K>>(&dh, &feedback);
-    let syncobj = DrmSyncobjState::new::<State<K>>(&dh, drm);
-    let formats = Arc::clone(&config.formats);
+            let global = dmabuf.create_global_with_default_feedback::<State<K>>(&dh, &feedback);
+            (
+                Some(global),
+                Some(DrmSyncobjState::new::<State<K>>(&dh, drm)),
+                Arc::clone(&config.formats),
+                false,
+            )
+        }
+        BrowserRenderConfig::SoftwareShmQa => (None, None, Arc::from([]), true),
+    };
     let mut state = State {
         loop_handle,
         display_handle: dh.clone(),
@@ -2004,6 +2191,7 @@ fn run<K: BrowserPageKey>(
         _dmabuf_global: global,
         syncobj,
         dma_formats: formats,
+        allow_root_shm,
         _output: output,
         _fractional_scale: FractionalScaleManagerState::new::<State<K>>(&dh),
         _viewporter: ViewporterState::new::<State<K>>(&dh),
@@ -2048,9 +2236,13 @@ fn service_loop<K: BrowserPageKey>(
             Generic::new(listener, Interest::READ, PollMode::Level),
             |_, listener, state| {
                 while let Some(stream) = unsafe { listener.get_mut() }.accept()? {
-                    state
-                        .display_handle
-                        .insert_client(stream, Arc::new(ClientState::default()))?;
+                    state.display_handle.insert_client(
+                        stream,
+                        Arc::new(ClientState {
+                            compositor: CompositorClientState::default(),
+                            events: Arc::new(Mutex::new(Vec::new())),
+                        }),
+                    )?;
                 }
                 Ok(PostAction::Continue)
             },
@@ -2121,6 +2313,7 @@ fn handle_runtime_command<K: BrowserPageKey>(
                     pending_barriers: Vec::new(),
                     acked_barrier: 0,
                     committed_barrier: 0,
+                    terminal_failure: false,
                     opened_at: Instant::now(),
                 },
             );
@@ -2206,12 +2399,19 @@ fn handle_page_command<K: BrowserPageKey>(state: &mut State<K>, id: K, c: PageCo
         PageCommand::FrameBarrier(barrier, w, h, scale) => {
             frame_barrier(state, id, barrier, w, h, scale)
         }
-        PageCommand::Presented(commit) => {
+        PageCommand::Presented { scene_id, barrier } => {
             let time = state.time();
             if let Some(w) = state.windows.get_mut(&id) {
-                send_frame_callbacks(w, time, commit);
-                w.pointer_frames.retain(|scene, _| *scene >= commit);
-                w.hit_scenes.retain(|scene, _| *scene >= commit);
+                send_frame_callbacks(w, time, scene_id);
+                record_browser_timing(
+                    BrowserTimingKind::FrameAcknowledged,
+                    scene_id,
+                    barrier,
+                    None,
+                    None,
+                );
+                w.pointer_frames.retain(|scene, _| *scene >= scene_id);
+                w.hit_scenes.retain(|scene, _| *scene >= scene_id);
             }
         }
         PageCommand::Retired(commit) => {
@@ -2223,10 +2423,11 @@ fn handle_page_command<K: BrowserPageKey>(state: &mut State<K>, id: K, c: PageCo
                 before != window.surface_slots.len()
             });
             if removed_attached && let Err(error) = state.publish_scene(id, false) {
-                state.windows[&id].events.send(BrowserEvent::Failed(
+                state.fail_window(
+                    id,
                     format!("invalid Chromium surface tree after buffer retirement: {error:#}")
                         .into(),
-                ));
+                );
             }
             if let Some(window) = state.windows.get(&id) {
                 window.events.send(BrowserEvent::FrameRetired(commit));
@@ -2671,6 +2872,7 @@ mod tests {
             imports: vec![BufferImport::DmaBuf(frame(7, releases.clone()))],
             attached: vec![7],
             nodes: vec![node(7)],
+            produced_at: Instant::now(),
         }));
         sender.send(BrowserEvent::Scene(SceneUpdate {
             id: 2,
@@ -2679,6 +2881,7 @@ mod tests {
             imports: Vec::new(),
             attached: vec![7],
             nodes: Vec::new(),
+            produced_at: Instant::now(),
         }));
         assert_eq!(releases.load(Ordering::SeqCst), 0);
         let event = futures_lite::future::block_on(receiver.recv()).unwrap();
@@ -2688,6 +2891,24 @@ mod tests {
                 if matches!(imports.as_slice(), [BufferImport::DmaBuf(frame)] if frame.id == 7)
         ));
         assert_eq!(releases.load(Ordering::SeqCst), 1);
+        assert!(snapshot_browser_timings().iter().any(|timing| {
+            timing.kind == BrowserTimingKind::SceneCoalesced
+                && timing.scene_id == 1
+                && timing.related_scene_id == Some(2)
+        }));
+    }
+
+    #[test]
+    fn browser_timing_history_is_bounded() {
+        for scene_id in 0..MAX_BROWSER_TIMINGS as u64 + 17 {
+            record_browser_timing(BrowserTimingKind::SceneProduced, scene_id, 0, None, None);
+        }
+        let timings = snapshot_browser_timings();
+        assert_eq!(timings.len(), MAX_BROWSER_TIMINGS);
+        assert!(timings.iter().any(|timing| {
+            timing.kind == BrowserTimingKind::SceneProduced
+                && timing.scene_id == MAX_BROWSER_TIMINGS as u64 + 16
+        }));
     }
 
     #[test]
@@ -2709,6 +2930,7 @@ mod tests {
             pending_barriers: Vec::new(),
             acked_barrier: 0,
             committed_barrier: 0,
+            terminal_failure: false,
             opened_at: Instant::now(),
         };
 
@@ -2719,10 +2941,24 @@ mod tests {
     }
 
     #[test]
-    fn visible_dma_scene_advances_barrier_at_transaction_anchor() {
+    fn visible_accepted_scene_advances_barrier_at_transaction_anchor() {
         assert_eq!(committed_barrier_after_scene(3, 7, true, true), 7);
         assert_eq!(committed_barrier_after_scene(3, 7, true, false), 3);
         assert_eq!(committed_barrier_after_scene(3, 7, false, true), 3);
+    }
+
+    #[test]
+    fn qa_root_shm_uses_scene_limit_without_expanding_popup_limit() {
+        assert_eq!(
+            shm_surface_limit(true, true, 0).unwrap(),
+            MAX_SCENE_SHM_BYTES
+        );
+        assert_eq!(shm_surface_limit(false, true, 0).unwrap(), MAX_POPUP_BYTES);
+        assert_eq!(shm_surface_limit(true, false, 0).unwrap(), MAX_POPUP_BYTES);
+        assert_eq!(
+            shm_surface_limit(true, true, MAX_POPUP_BYTES).unwrap(),
+            MAX_POPUP_BYTES
+        );
     }
 
     #[test]

@@ -51,11 +51,17 @@ rho wayland --session gui click 500 300
 rho wayland --session gui click 500 300 --button right
 rho wayland --session gui type 'literal text'
 rho wayland --session gui key ctrl+enter
+rho wayland --session gui input \
+  'key:escape' 'key:space' 'wait:100' 'key:g' 'key:n' \
+  'text:https://example.com' 'key:enter'
 ```
 
 Supported key modifiers are `ctrl`, `alt`, `shift`, and `super`. Common key
 names such as `enter`, `escape`, `tab`, arrows, `home`, `end`, `pageup`, and
 `pagedown` are normalized for `wtype`.
+`key` accepts space-separated sequences such as `escape g g`. Use `input` when
+keys, literal text, and UI-settling waits must share one virtual keyboard;
+steps are `key:CHORD`, `text:TEXT`, and `wait:MILLISECONDS`.
 
 After every input that changes the interface, wait briefly or check observable
 state, then take another screenshot. Do not assume a click succeeded solely

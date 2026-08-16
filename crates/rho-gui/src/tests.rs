@@ -2425,6 +2425,17 @@ fn submit_prompt_bubbles_from_the_editor_to_the_workspace(cx: &mut TestAppContex
     );
 }
 
+#[gpui::test]
+fn upload_gui_telemetry_action_reports_when_no_daemon_is_connected(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    cx.dispatch_action(*workspace, crate::UploadGuiTelemetry);
+    let text = display_text(&workspace, cx);
+    assert!(
+        text.contains("performance snapshot: no daemon is connected"),
+        "telemetry action should reach the workspace and fail nonfatally: {text:?}"
+    );
+}
+
 /// Restore flow: the agent's first frame is a snapshot that already carries
 /// `context_used` (daemon loaded it from the event log / transcript). The
 /// status chips must show it without any live turn happening.

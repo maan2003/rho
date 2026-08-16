@@ -18,6 +18,13 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(3);
 const DEFAULT_OUTPUT_WIDTH: u32 = 2560;
 const DEFAULT_OUTPUT_HEIGHT: u32 = 1664;
 const DEFAULT_OUTPUT_SCALE: u32 = 2;
+// A new wtype process creates a new virtual keyboard. Give the compositor time
+// to advertise its keymap and keyboard-enter before sending the first press;
+// otherwise that press is represented only in wl_keyboard.enter and clients
+// such as GPUI (correctly) never receive it as a key event.
+const VIRTUAL_KEYBOARD_SETTLE_MS: u32 = 50;
+const KEY_SEQUENCE_DELAY_MS: u32 = 30;
+const VIRTUAL_KEYBOARD_RELEASE_SETTLE_MS: u32 = 50;
 const SWAY: &str = match option_env!("RHO_WAYLAND_SWAY") {
     Some(path) => path,
     None => "sway",
@@ -83,7 +90,11 @@ enum DriverCommand {
     },
     /// Type literal text through the virtual keyboard protocol.
     Type { text: String },
-    /// Send a key or chord, for example `enter` or `ctrl+shift+p`.
+    /// Run key, text, and wait steps through one persistent virtual keyboard.
+    /// Steps use `key:CHORD`, `text:TEXT`, or `wait:MILLISECONDS`.
+    Input { steps: Vec<String> },
+    /// Send keys or chords in one keyboard session, for example `enter`,
+    /// `ctrl+shift+p`, or `escape g g`.
     Key { chord: String },
     /// Stop the application and compositor and remove the session directory.
     Stop,
@@ -197,7 +208,12 @@ pub(crate) fn run(args: WaylandArgs) -> Result<()> {
         }
         DriverCommand::Type { text } => {
             let session = load_live_session(&root)?;
-            run_wayland_command(&session, WTYPE, [OsString::from("--"), text.into()])
+            run_wayland_command(&session, WTYPE, wtype_text_args(text))
+        }
+        DriverCommand::Input { steps } => {
+            let session = load_live_session(&root)?;
+            let args = wtype_input_args(&steps)?;
+            run_wayland_command(&session, WTYPE, args)
         }
         DriverCommand::Key { chord } => {
             let session = load_live_session(&root)?;
@@ -518,6 +534,10 @@ fn run_wayland_command(
 }
 
 fn configure_software_rendering(command: &mut Command) {
+    // The isolated driver has no DRM render node on software-only hosts. This
+    // exact marker enables rho-browser's bounded owned-SHM QA transport; normal
+    // rho-gui launches remain DMA-BUF-only and fail closed.
+    command.env("RHO_BROWSER_SOFTWARE_SHM", "1");
     if std::env::var_os("LIBGL_ALWAYS_SOFTWARE").is_none() {
         command.env("LIBGL_ALWAYS_SOFTWARE", "1");
     }
@@ -540,6 +560,31 @@ fn checked_output(program: &str, status: ExitStatus, stdout: &[u8], stderr: &[u8
 }
 
 fn wtype_key_args(chord: &str) -> Result<Vec<OsString>> {
+    let chords = chord.split_ascii_whitespace().collect::<Vec<_>>();
+    if chords.is_empty() {
+        bail!("key sequence is empty");
+    }
+    let mut args = vec![
+        OsString::from("-s"),
+        OsString::from(VIRTUAL_KEYBOARD_SETTLE_MS.to_string()),
+    ];
+    for (index, chord) in chords.into_iter().enumerate() {
+        if index > 0 {
+            args.extend([
+                OsString::from("-s"),
+                OsString::from(KEY_SEQUENCE_DELAY_MS.to_string()),
+            ]);
+        }
+        append_wtype_chord(&mut args, chord)?;
+    }
+    args.extend([
+        OsString::from("-s"),
+        OsString::from(VIRTUAL_KEYBOARD_RELEASE_SETTLE_MS.to_string()),
+    ]);
+    Ok(args)
+}
+
+fn append_wtype_chord(args: &mut Vec<OsString>, chord: &str) -> Result<()> {
     let mut parts: Vec<_> = chord.split('+').collect();
     let key = parts
         .pop()
@@ -574,7 +619,6 @@ fn wtype_key_args(chord: &str) -> Result<Vec<OsString>> {
         other => other.to_owned(),
     };
 
-    let mut args = Vec::new();
     for modifier in &modifiers {
         args.extend([OsString::from("-M"), OsString::from(modifier)]);
     }
@@ -582,6 +626,56 @@ fn wtype_key_args(chord: &str) -> Result<Vec<OsString>> {
     for modifier in modifiers.iter().rev() {
         args.extend([OsString::from("-m"), OsString::from(modifier)]);
     }
+    Ok(())
+}
+
+fn wtype_text_args(text: String) -> Vec<OsString> {
+    vec![
+        OsString::from("-s"),
+        OsString::from(VIRTUAL_KEYBOARD_SETTLE_MS.to_string()),
+        OsString::from("--"),
+        OsString::from(text),
+    ]
+}
+
+fn wtype_input_args(steps: &[String]) -> Result<Vec<OsString>> {
+    if steps.is_empty() {
+        bail!("input requires at least one step");
+    }
+    let mut args = vec![
+        OsString::from("-s"),
+        OsString::from(VIRTUAL_KEYBOARD_SETTLE_MS.to_string()),
+    ];
+    for (index, step) in steps.iter().enumerate() {
+        if index > 0 {
+            args.extend([
+                OsString::from("-s"),
+                OsString::from(KEY_SEQUENCE_DELAY_MS.to_string()),
+            ]);
+        }
+        if let Some(chord) = step.strip_prefix("key:") {
+            append_wtype_chord(&mut args, chord)?;
+        } else if let Some(text) = step.strip_prefix("text:") {
+            if text.starts_with('-') {
+                bail!("input text beginning with '-' is not supported by wtype step mode");
+            }
+            args.push(OsString::from(text));
+        } else if let Some(milliseconds) = step.strip_prefix("wait:") {
+            let milliseconds = milliseconds
+                .parse::<u32>()
+                .context("input wait is not a millisecond integer")?;
+            args.extend([
+                OsString::from("-s"),
+                OsString::from(milliseconds.to_string()),
+            ]);
+        } else {
+            bail!("input step must begin with key:, text:, or wait:");
+        }
+    }
+    args.extend([
+        OsString::from("-s"),
+        OsString::from(VIRTUAL_KEYBOARD_RELEASE_SETTLE_MS.to_string()),
+    ]);
     Ok(args)
 }
 
@@ -732,7 +826,51 @@ mod tests {
         assert_eq!(
             args,
             [
-                "-M", "ctrl", "-M", "shift", "-k", "Return", "-m", "shift", "-m", "ctrl"
+                "-s", "50", "-M", "ctrl", "-M", "shift", "-k", "Return", "-m", "shift", "-m",
+                "ctrl", "-s", "50"
+            ]
+        );
+    }
+
+    #[test]
+    fn single_keys_wait_for_keyboard_enter_before_pressing() {
+        for (chord, key) in [("escape", "Escape"), ("space", "space")] {
+            let args = wtype_key_args(chord).unwrap();
+            let args: Vec<_> = args.iter().map(|arg| arg.to_string_lossy()).collect();
+            assert_eq!(args, ["-s", "50", "-k", key, "-s", "50"]);
+        }
+    }
+
+    #[test]
+    fn text_waits_for_keyboard_enter_before_its_first_character() {
+        let args = wtype_text_args("abc".into());
+        let args: Vec<_> = args.iter().map(|arg| arg.to_string_lossy()).collect();
+        assert_eq!(args, ["-s", "50", "--", "abc"]);
+    }
+
+    #[test]
+    fn vim_and_leader_sequences_share_one_virtual_keyboard() {
+        let args = wtype_key_args("escape g g space").unwrap();
+        let args: Vec<_> = args.iter().map(|arg| arg.to_string_lossy()).collect();
+        assert_eq!(
+            args,
+            [
+                "-s", "50", "-k", "Escape", "-s", "30", "-k", "g", "-s", "30", "-k", "g", "-s",
+                "30", "-k", "space", "-s", "50"
+            ]
+        );
+    }
+
+    #[test]
+    fn mixed_input_workflow_uses_one_virtual_keyboard() {
+        let steps = ["key:escape", "text:* QA", "key:enter"].map(str::to_owned);
+        let args = wtype_input_args(&steps).unwrap();
+        let args: Vec<_> = args.iter().map(|arg| arg.to_string_lossy()).collect();
+        assert_eq!(
+            args,
+            [
+                "-s", "50", "-k", "Escape", "-s", "30", "* QA", "-s", "30", "-k", "Return", "-s",
+                "50"
             ]
         );
     }

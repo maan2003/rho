@@ -25,6 +25,7 @@ use crate::runtime::{BrowserRuntime, BrowserWindow};
 
 struct RuntimePageState {
     session: Option<BrowserSession<BrowserWindow>>,
+    terminal: bool,
     buffers: HashMap<u64, BrowserBuffer>,
     scene: Vec<SceneNode>,
     scene_id: Option<u64>,
@@ -83,6 +84,13 @@ impl BrowserModel {
                     .update(cx, |model, cx| {
                         match event {
                             BrowserEvent::Scene(mut scene) => {
+                                rho_browser_wayland::record_browser_timing(
+                                    rho_browser_wayland::BrowserTimingKind::SceneReceived,
+                                    scene.id,
+                                    scene.barrier,
+                                    None,
+                                    Some(scene.produced_at.elapsed()),
+                                );
                                 if model.runtime.session.is_none() {
                                     tracing::info!(
                                         scene_id = scene.id,
@@ -259,13 +267,11 @@ impl BrowserModel {
                                 model.runtime.status = Some("Chrome is starting".into());
                             }
                             BrowserEvent::Closed => {
-                                model.runtime.status = Some("browser closed".into());
-                                model.runtime.session = None;
+                                model.transition_terminal("browser closed".into(), cx);
                             }
                             BrowserEvent::Failed(error) => {
                                 tracing::error!(%error, "browser compositor reported a terminal failure");
-                                model.runtime.status = Some(format!("browser failed: {error}"));
-                                model.runtime.session = None;
+                                model.transition_terminal(format!("browser failed: {error}"), cx);
                             }
                         }
                         cx.notify();
@@ -288,6 +294,7 @@ impl BrowserModel {
             presentation_owner: None,
             runtime: RuntimePageState {
                 session: Some(session),
+                terminal: false,
                 buffers: HashMap::new(),
                 scene: Vec::new(),
                 scene_id: None,
@@ -303,6 +310,9 @@ impl BrowserModel {
     }
 
     pub(crate) fn focus(&mut self, id: PageId, cx: &mut Context<Self>) {
+        if self.runtime.terminal || self.runtime.session.is_none() {
+            return;
+        }
         if self.handoff.is_none_or(|handoff| handoff.target != id) {
             self.request_handoff(id);
         }
@@ -327,6 +337,9 @@ impl BrowserModel {
     }
 
     fn start_focus(&mut self, cx: &mut Context<Self>) {
+        if self.runtime.terminal || self.runtime.session.is_none() {
+            return;
+        }
         if self.active_focus.is_some() {
             return;
         }
@@ -350,6 +363,10 @@ impl BrowserModel {
             let result = request.await;
             let _ = this.update(cx, |model, cx| {
                 model.active_focus = None;
+                if model.runtime.terminal || model.runtime.session.is_none() {
+                    cx.notify();
+                    return;
+                }
                 let current = model.handoff;
                 tracing::info!(
                     succeeded = result.is_ok(),
@@ -377,6 +394,9 @@ impl BrowserModel {
     }
 
     fn claim_presentation(&mut self, owner: EntityId, page: PageId, cx: &mut Context<Self>) {
+        if self.runtime.terminal || self.runtime.session.is_none() {
+            return;
+        }
         // A fresh portal claim must refocus Chrome even if our last confirmed
         // request named this page: the user can switch tabs in Chrome itself.
         self.request_handoff(page);
@@ -391,6 +411,20 @@ impl BrowserModel {
         );
         self.start_focus(cx);
         cx.notify();
+    }
+
+    fn transition_terminal(&mut self, status: String, cx: &mut Context<Self>) {
+        if !transition_terminal_state(
+            &mut self.runtime,
+            &mut self.handoff,
+            &mut self.active_focus,
+            status,
+            |image| cx.drop_image(image, None),
+        ) {
+            return;
+        }
+        self.browser.shutdown_background();
+        crate::reset_runtime(&self.browser, cx);
     }
 
     fn begin_frame_barrier(&mut self, handoff: PageHandoff) {
@@ -522,6 +556,47 @@ impl BrowserModel {
         } else {
             false
         }
+    }
+}
+
+fn transition_terminal_state(
+    runtime: &mut RuntimePageState,
+    handoff: &mut Option<PageHandoff>,
+    active_focus: &mut Option<PageId>,
+    status: String,
+    mut drop_image: impl FnMut(Arc<RenderImage>),
+) -> bool {
+    if runtime.terminal {
+        return false;
+    }
+    runtime.terminal = true;
+    runtime.session = None;
+    *handoff = None;
+    *active_focus = None;
+    runtime.scene.clear();
+    runtime.scene_id = None;
+    runtime.painted_scene_id = None;
+    runtime.presented_barrier = 0;
+    for (_, buffer) in runtime.buffers.drain() {
+        if let BrowserBuffer::Shm(image) = buffer {
+            drop_image(image);
+        }
+    }
+    runtime.status = Some(status);
+    true
+}
+
+fn browser_status(
+    runtime: &RuntimePageState,
+    presents: bool,
+    owns_presentation: bool,
+) -> Option<String> {
+    if runtime.terminal || runtime.session.is_none() || presents {
+        runtime.status.clone()
+    } else if owns_presentation {
+        Some("switching browser page".to_owned())
+    } else {
+        Some("browser is active in another pane".to_owned())
     }
 }
 
@@ -831,8 +906,21 @@ impl Render for BrowserView {
                 (model.runtime.scene_id, model.runtime.session.as_ref())
         {
             self.scheduled_scene = Some(scene_id);
-            (scene_id > model.runtime.invalidated_through)
-                .then(|| session.presentation_callback(scene_id))
+            (scene_id > model.runtime.invalidated_through).then(|| {
+                rho_browser_wayland::record_browser_timing(
+                    rho_browser_wayland::BrowserTimingKind::SceneScheduled,
+                    scene_id,
+                    model.runtime.presented_barrier,
+                    None,
+                    None,
+                );
+                (
+                    scene_id,
+                    model.runtime.presented_barrier,
+                    std::time::Instant::now(),
+                    session.presentation_callback(scene_id, model.runtime.presented_barrier),
+                )
+            })
         } else {
             None
         };
@@ -854,13 +942,11 @@ impl Render for BrowserView {
         } else {
             Vec::new()
         };
-        let status = if presents {
-            model.runtime.status.clone()
-        } else if model.presentation_owner == Some(self.owner_id) {
-            Some("switching browser page".to_owned())
-        } else {
-            Some("browser is active in another pane".to_owned())
-        };
+        let status = browser_status(
+            &model.runtime,
+            presents,
+            model.presentation_owner == Some(self.owner_id),
+        );
         let cursor = if presents {
             gpui_cursor(model.runtime.cursor)
         } else {
@@ -881,10 +967,17 @@ impl Render for BrowserView {
                 }
             },
             move |_, _, _, _| {
-                if let Some(presented) = presented {
+                if let Some((scene_id, barrier, scheduled_at, presented)) = presented {
                     // Match a nested compositor: unblock the client's next
                     // frame after this scene has been painted into GPUI's
                     // current frame, rather than one outer refresh later.
+                    rho_browser_wayland::record_browser_timing(
+                        rho_browser_wayland::BrowserTimingKind::ScenePainted,
+                        scene_id,
+                        barrier,
+                        None,
+                        Some(scheduled_at.elapsed()),
+                    );
                     presented();
                 }
             },
@@ -989,5 +1082,74 @@ mod tests {
         let mut pixels = [3, 2, 1, 255, 30, 20, 10, 128];
         bgra_to_rgba(&mut pixels);
         assert_eq!(pixels, [1, 2, 3, 255, 10, 20, 30, 128]);
+    }
+
+    #[test]
+    fn terminal_event_during_handoff_clears_frames_and_reports_failure_once() {
+        let page = PageId(uuid::Uuid::new_v4());
+        let image = Arc::new(RenderImage::new(smallvec::SmallVec::from_const([
+            Frame::new(RgbaImage::new(1, 1)),
+        ])));
+        let mut runtime = RuntimePageState {
+            session: None,
+            terminal: false,
+            buffers: HashMap::from([(7, BrowserBuffer::Shm(image))]),
+            scene: vec![SceneNode {
+                surface_id: 1,
+                buffer_id: 7,
+                origin: (0.0, 0.0),
+                destination: (1.0, 1.0),
+                source: ((0.0, 0.0), (1.0, 1.0)),
+            }],
+            scene_id: Some(9),
+            painted_scene_id: Some(9),
+            invalidated_through: 0,
+            presented_barrier: 4,
+            status: Some("switching browser page".into()),
+            sent_size: Rc::new(Cell::new((1, 1, 1.0_f32.to_bits()))),
+            cursor: BrowserCursor::Arrow,
+        };
+        let mut handoff = Some(PageHandoff {
+            generation: 1,
+            target: page,
+            phase: HandoffPhase::AwaitingFrame { barrier: 5 },
+        });
+        let mut active_focus = Some(page);
+        let mut dropped = 0;
+
+        assert!(transition_terminal_state(
+            &mut runtime,
+            &mut handoff,
+            &mut active_focus,
+            "browser failed: disconnected".into(),
+            |_| dropped += 1,
+        ));
+        assert!(runtime.terminal);
+        assert!(runtime.session.is_none());
+        assert!(runtime.buffers.is_empty());
+        assert!(runtime.scene.is_empty());
+        assert_eq!(runtime.scene_id, None);
+        assert_eq!(runtime.painted_scene_id, None);
+        assert_eq!(runtime.presented_barrier, 0);
+        assert_eq!(handoff, None);
+        assert_eq!(active_focus, None);
+        assert_eq!(dropped, 1);
+        assert_eq!(
+            browser_status(&runtime, false, true).as_deref(),
+            Some("browser failed: disconnected")
+        );
+
+        assert!(!transition_terminal_state(
+            &mut runtime,
+            &mut handoff,
+            &mut active_focus,
+            "browser closed".into(),
+            |_| dropped += 1,
+        ));
+        assert_eq!(
+            runtime.status.as_deref(),
+            Some("browser failed: disconnected")
+        );
+        assert_eq!(dropped, 1);
     }
 }

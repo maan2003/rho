@@ -62,7 +62,7 @@ use crate::{
     MinibufferNext, MinibufferPrevious, PaneBack, PaneClose, PaneFocusNext, PaneSplitDown,
     PaneSplitRight, PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof,
     ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit, SubmitPrompt, TaskBoard,
-    VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow, ZulipQuit,
+    UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow, ZulipQuit,
 };
 
 /// What a pane shows: stable identity plus the live view. Surfaces live
@@ -2760,6 +2760,7 @@ impl Workspace {
                 let record = match record {
                     Ok(record) => record,
                     Err(error) => {
+                        tracing::error!(%error, "browser page creation failed");
                         let message = format!("browser: {error:#}");
                         this.notice_on(None, &message, StyleClass::SystemInfo, cx);
                         return;
@@ -2806,6 +2807,73 @@ impl Workspace {
 
     pub(crate) fn cmd_version(&mut self, cx: &mut Context<Self>) {
         self.notice_on(None, env!("CARGO_PKG_VERSION"), StyleClass::SystemInfo, cx);
+    }
+
+    #[cfg(feature = "native")]
+    pub(crate) fn cmd_upload_gui_telemetry(&mut self, cx: &mut Context<Self>) {
+        let host = match self.registry.selected_agent().copied() {
+            Some(agent_id) => self.host_of(agent_id),
+            None => self.hosts.primary(),
+        };
+        let Some(host) = host.filter(|host| self.hosts.is_online(*host)) else {
+            self.notice_on(
+                None,
+                "performance snapshot: no daemon is connected",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        let snapshot = match crate::telemetry::snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.notice_on(
+                    None,
+                    &format!("performance snapshot failed: {error:#}"),
+                    StyleClass::StatusError,
+                    cx,
+                );
+                return;
+            }
+        };
+        let Some(connection) = self.hosts.connection(host) else {
+            return;
+        };
+        let task = connection.upload_gui_telemetry_task(snapshot, cx);
+        self.notice_on(
+            None,
+            "uploading GUI performance snapshot…",
+            StyleClass::SystemInfo,
+            cx,
+        );
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(path) => this.notice_on(
+                    None,
+                    &format!("GUI performance snapshot stored at {path}"),
+                    StyleClass::SystemInfo,
+                    cx,
+                ),
+                Err(error) => this.notice_on(
+                    None,
+                    &format!("performance snapshot upload failed: {error:#}"),
+                    StyleClass::StatusError,
+                    cx,
+                ),
+            });
+        })
+        .detach();
+    }
+
+    #[cfg(all(target_family = "wasm", not(feature = "native")))]
+    pub(crate) fn cmd_upload_gui_telemetry(&mut self, cx: &mut Context<Self>) {
+        self.notice_on(
+            None,
+            "performance snapshots are available in the native GUI",
+            StyleClass::SystemInfo,
+            cx,
+        );
     }
 
     /// The attached daemons and how each is doing, as one notice line.
@@ -7169,6 +7237,9 @@ impl Render for Workspace {
                     StyleClass::SystemInfo,
                     cx,
                 );
+            }))
+            .on_action(cx.listener(|this, _: &UploadGuiTelemetry, _window, cx| {
+                this.cmd_upload_gui_telemetry(cx);
             }))
             .on_action(cx.listener(|this, _: &RoleCycle, window, cx| {
                 this.cycle_draft_field(window, cx);

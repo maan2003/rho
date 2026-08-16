@@ -518,6 +518,7 @@ async fn run_iroh_listener(
                             ClientMessage::ChannelOpen { .. }
                                 | ClientMessage::RealtimeOpen { .. }
                                 | ClientMessage::DiffSnapshot { .. }
+                                | ClientMessage::GuiTelemetryUpload { .. }
                                 | ClientMessage::VisualizationGet { .. }
                                 | ClientMessage::TerminalCreate { .. }
                                 | ClientMessage::TerminalAttach { .. }
@@ -1549,6 +1550,9 @@ where
     {
         return serve_diff_base_contents(agents, writer, workspace, operation_id, commit_id, paths)
             .await;
+    }
+    if let ClientMessage::GuiTelemetryUpload { snapshot } = first {
+        return serve_gui_telemetry_upload(writer, snapshot).await;
     }
     if let ClientMessage::VisualizationGet { id } = first {
         let mut writer = writer;
@@ -2937,6 +2941,7 @@ async fn handle_message(
         }
         ClientMessage::DiffSnapshot { .. }
         | ClientMessage::DiffBaseContents { .. }
+        | ClientMessage::GuiTelemetryUpload { .. }
         | ClientMessage::VisualizationGet { .. }
         | ClientMessage::TerminalCreate { .. }
         | ClientMessage::TerminalAttach { .. }
@@ -3239,6 +3244,76 @@ where
             .await
         }
     }
+}
+
+async fn serve_gui_telemetry_upload<W>(mut writer: W, snapshot: Vec<u8>) -> anyhow::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let response = if snapshot.len() > rho_ui_proto::MAX_GUI_TELEMETRY_BYTES {
+        ServerMessage::GuiTelemetryRefused {
+            reason: format!(
+                "GUI telemetry snapshot is too large ({} bytes; limit is {} bytes)",
+                snapshot.len(),
+                rho_ui_proto::MAX_GUI_TELEMETRY_BYTES
+            ),
+        }
+    } else {
+        let result = tokio::task::spawn_blocking(move || {
+            let state = dirs::state_dir().context("state directory not available")?;
+            persist_gui_telemetry(&state.join("rho"), &snapshot)
+        })
+        .await
+        .context("GUI telemetry storage task failed")?;
+        match result {
+            Ok(path) => ServerMessage::GuiTelemetryStored {
+                path: path.display().to_string(),
+            },
+            Err(error) => ServerMessage::GuiTelemetryRefused {
+                reason: format!("failed to store GUI telemetry: {error:#}"),
+            },
+        }
+    };
+    write_frame(&mut writer, &response).await
+}
+
+fn persist_gui_telemetry(state_root: &std::path::Path, snapshot: &[u8]) -> anyhow::Result<PathBuf> {
+    use std::io::Write as _;
+
+    anyhow::ensure!(
+        snapshot.len() <= rho_ui_proto::MAX_GUI_TELEMETRY_BYTES,
+        "GUI telemetry snapshot exceeds the {} byte limit",
+        rho_ui_proto::MAX_GUI_TELEMETRY_BYTES
+    );
+    let directory = state_root.join("gui-telemetry");
+    std::fs::create_dir_all(&directory)
+        .with_context(|| format!("create {}", directory.display()))?;
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    for suffix in 0_u16..=u16::MAX {
+        let path = directory.join(format!("gui-telemetry-{timestamp}-{suffix}.json"));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(mut file) => {
+                file.write_all(snapshot)
+                    .with_context(|| format!("write {}", path.display()))?;
+                file.sync_all()
+                    .with_context(|| format!("sync {}", path.display()))?;
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error).with_context(|| format!("create {}", path.display())),
+        }
+    }
+    anyhow::bail!("could not allocate a unique GUI telemetry filename")
 }
 
 /// Persists one jj working-copy snapshot and serves its bounded parent-side
@@ -3782,8 +3857,8 @@ mod tests {
     use super::{
         AgentUsageModel, GitProviderClaim, GitTransportBroker, MAX_IMAGE_BASE64_BYTES,
         MAX_INPUT_IMAGES, claude_quota_history, configure_octo_git_transport,
-        hourly_global_usage_series, merge_hourly_agent_cost_bucket, prepare_image_content,
-        quota_burn, quota_summaries, validate_image_content,
+        hourly_global_usage_series, merge_hourly_agent_cost_bucket, persist_gui_telemetry,
+        prepare_image_content, quota_burn, quota_summaries, validate_image_content,
     };
 
     #[test]
@@ -4209,7 +4284,6 @@ mod tests {
                 .contains("10 MiB")
         );
     }
-
     #[tokio::test]
     async fn image_input_is_reencoded_from_pixels_before_queueing() {
         use std::io::Cursor;
@@ -4235,5 +4309,32 @@ mod tests {
         };
         assert_eq!(media_type, "image/png");
         assert_eq!(&data[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn gui_telemetry_storage_is_private_unique_and_bounded() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = persist_gui_telemetry(temp.path(), b"one").unwrap();
+        let second = persist_gui_telemetry(temp.path(), b"two").unwrap();
+        assert_ne!(first, second);
+        assert_eq!(std::fs::read(first.as_path()).unwrap(), b"one");
+        assert_eq!(std::fs::read(second.as_path()).unwrap(), b"two");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_eq!(
+                std::fs::metadata(first).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert!(
+            persist_gui_telemetry(
+                temp.path(),
+                &vec![0; rho_ui_proto::MAX_GUI_TELEMETRY_BYTES + 1]
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("exceeds")
+        );
     }
 }
