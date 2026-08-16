@@ -107,26 +107,38 @@ AI APIs.
   memory, releases the source immediately, retains the 16 MiB ancillary and
   32 MiB current-scene bounds, and preserves one-scene coalescing. It does not
   test the production DMA-BUF/fence invariants.
-- Native embedded pages run an ordinary stock Chromium process with the invoking
-  user's full authority and a persistent cookie/storage identity under the Rho
-  client state directory; this is not a sandbox. `rho-browser` accepts only
+- Native embedded pages run pinned Brave with the invoking user's full authority
+  and a persistent cookie/storage identity under the Rho client state directory.
+  A Bubblewrap mount namespace exposes the host normally but overlays `/etc` and
+  masks `/etc/brave/policies`, so the browser sees only Rho's mandatory policy at
+  `/etc/brave/policies/managed/rho.json`; this is policy isolation, not an access
+  sandbox. The mandatory policy disables
+  Rewards, Wallet/Web3, VPN, Leo, News, Talk, Tor, Playlist, Speedreader,
+  Wayback integration, Sync, background mode, product analytics, usage pings,
+  web discovery, metrics, command-line warnings, and default-browser prompts.
+  Brave receives a private `XDG_CONFIG_HOME` containing the native-messaging
+  manifest, so it neither reads nor writes the user's normal Brave config. It
+  keeps its nested namespace and Seccomp-BPF renderer sandbox; the SUID helper is
+  disabled because it cannot operate inside Bubblewrap's user namespace.
+  `RHO_CHROME_BIN` is a development/QA escape hatch that selects another browser
+  and deliberately bypasses this Brave policy namespace. `rho-browser` accepts only
   bounded HTTP(S) launch URLs, holds an exclusive advisory lock on that identity,
-  and exposes Chromium only to one private Wayland socket. One bundled MV3
+  and exposes Brave only to one private Wayland socket. One bundled MV3
   extension has `tabs`, `tabGroups`, `storage`, and `nativeMessaging`
   privileges, but no host permission or content script. It owns UUID page
-  metadata inside the isolated Chrome profile, associates UUIDs with restored
+  metadata inside the isolated browser profile, associates UUIDs with restored
   tabs through `rho:<uuid>` group titles, activates requested tabs, and
   discards inactive tabs. Websites cannot read or modify that browser UI
-  metadata through the extension. Chrome native messaging starts a copy of the
+  metadata through the extension. Brave native messaging starts a copy of the
   `rho-gui` executable in bounded stdio-relay mode; it connects to the existing
   GUI through `$XDG_RUNTIME_DIR/rho-browser.sock`, whose filesystem mode is
   0600. The socket is a same-user trust boundary and uses no additional
   authentication. No TCP listener, CDP/remote debugging, or injected website
   script participates. The compositor-issued `xdg-activation-v1` token binds
-  the singleton Chrome toplevel; after a short grace period it also accepts the
+  the singleton Brave toplevel; after a short grace period it also accepts the
   exactly-one-pending-window/exactly-one-unbound-toplevel case for builds that
   omit the token. Additional or ambiguous toplevels fail closed.
-  Browser content also fails closed unless GPUI and Chromium share an
+  Browser content also fails closed unless GPUI and Brave share an
   importable DMA-BUF format on the selected DRM render node and explicit-sync
   eventfd support. Root SHM content, missing acquire/release points on any
   DMA-BUF surface, unsupported buffer transforms, and non-SHM/non-DMA-BUF

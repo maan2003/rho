@@ -103,7 +103,7 @@ settings = { path = "../../vendor/zed/crates/settings" }
 text = { path = "../../vendor/zed/crates/text" }
 theme = { path = "../../vendor/zed/crates/theme" }
 theme_settings = { path = "../../vendor/zed/crates/theme_settings" }
-tokio = { workspace = true, features = ["io-util", "net", "process", "rt"], optional = true }
+tokio = { workspace = true, features = ["io-util", "net", "process", "rt", "signal"], optional = true }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
 tree-sitter = "0.26"

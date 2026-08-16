@@ -2803,9 +2803,18 @@ fn send_frame_callbacks(window: &mut WindowState, time: u32, commit_id: u64) {
     }
 }
 
-/// Resolves the Chrome wrapper without ever selecting an underlying ELF.
+/// Resolves the stock browser wrapper without ever selecting an underlying ELF.
 pub fn chrome_wrapper() -> OsString {
-    std::env::var_os("RHO_CHROME_BIN").unwrap_or_else(|| OsString::from("google-chrome-stable"))
+    std::env::var_os("RHO_CHROME_BIN").unwrap_or_else(|| {
+        option_env!("RHO_BRAVE_BIN").map_or_else(|| OsString::from("brave"), OsString::from)
+    })
+}
+
+/// Resolves Bubblewrap for the private Brave policy mount namespace.
+pub fn bubblewrap_wrapper() -> OsString {
+    std::env::var_os("RHO_BWRAP_BIN").unwrap_or_else(|| {
+        option_env!("RHO_BWRAP_BIN").map_or_else(|| OsString::from("bwrap"), OsString::from)
+    })
 }
 
 #[cfg(test)]
@@ -2826,9 +2835,12 @@ mod tests {
     }
 
     #[test]
-    fn chrome_wrapper_has_safe_default() {
-        if std::env::var_os("RHO_CHROME_BIN").is_none() {
-            assert_eq!(chrome_wrapper(), "google-chrome-stable");
+    fn browser_wrappers_have_safe_defaults() {
+        if std::env::var_os("RHO_CHROME_BIN").is_none() && option_env!("RHO_BRAVE_BIN").is_none() {
+            assert_eq!(chrome_wrapper(), "brave");
+        }
+        if std::env::var_os("RHO_BWRAP_BIN").is_none() && option_env!("RHO_BWRAP_BIN").is_none() {
+            assert_eq!(bubblewrap_wrapper(), "bwrap");
         }
     }
 

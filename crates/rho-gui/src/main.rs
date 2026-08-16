@@ -215,6 +215,8 @@ fn run() -> Result<()> {
                 return;
             }
 
+            quit_on_termination_signal(cx);
+
             rho_browser::init(&client_state_dir, cx);
             cx.activate(true);
 
@@ -227,6 +229,31 @@ fn run() -> Result<()> {
         });
 
     Ok(())
+}
+
+fn quit_on_termination_signal(cx: &mut App) {
+    let signal = gpui_tokio::Tokio::spawn(cx, async {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+        let mut interrupt =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+        let signal = tokio::select! {
+            _ = terminate.recv() => "SIGTERM",
+            _ = interrupt.recv() => "SIGINT",
+        };
+        Ok::<_, std::io::Error>(signal)
+    });
+    cx.spawn(async move |cx| match signal.await {
+        Ok(Ok(signal)) => {
+            tracing::info!(signal, "termination signal received; quitting");
+            cx.update(|cx| cx.quit());
+        }
+        Ok(Err(error)) => {
+            tracing::error!(%error, "failed to register termination signal handler")
+        }
+        Err(error) => tracing::error!(%error, "termination signal handler task failed"),
+    })
+    .detach();
 }
 
 fn finish_profiling(mut profiler: GuiProfiler) {

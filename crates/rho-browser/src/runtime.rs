@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use anyhow::{Context as _, Result, bail};
-use rho_browser_wayland::{BrowserCompositor, BrowserRenderConfig, BrowserSession, chrome_wrapper};
+use rho_browser_wayland::{
+    BrowserCompositor, BrowserRenderConfig, BrowserSession, bubblewrap_wrapper, chrome_wrapper,
+};
 use serde_json::json;
 
 use crate::native_host::{Bridge, socket_path, write_installation};
@@ -17,7 +19,7 @@ use crate::store::{PageId, PageRecord, validate_launch_url};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct BrowserWindow;
 
-/// One stock Chromium identity, one normal Chrome window, and one private
+/// One persistent Brave identity, one normal browser window, and one private
 /// Wayland compositor. Logical pages live as extension-owned tabs inside the
 /// singleton browser window.
 pub(crate) struct BrowserRuntime {
@@ -35,6 +37,7 @@ impl BrowserRuntime {
         render: BrowserRenderConfig,
     ) -> Result<(Self, BrowserSession<BrowserWindow>)> {
         let profile = state_dir.join("chromium");
+        let brave_config = state_dir.join("brave-config");
         let extension = state_dir.join("chromium-extension");
         std::fs::create_dir_all(&profile)?;
         let profile_lock = OpenOptions::new()
@@ -50,14 +53,50 @@ impl BrowserRuntime {
         }
 
         let executable = std::env::current_exe().context("resolve rho-gui executable")?;
-        write_installation(&profile, &extension, &executable)?;
-        configure_vertical_tabs(&profile)?;
+        write_installation(&profile, &brave_config, &extension, &executable)?;
+        configure_browser_chrome(&profile)?;
+        let policy = write_brave_policy(state_dir)?;
         let bridge = Bridge::bind(socket_path()?)?;
         let software_shm = matches!(render, BrowserRenderConfig::SoftwareShmQa);
         let compositor = BrowserCompositor::launch(render)?;
         let session = compositor.open(BrowserWindow, (1280, 720))?;
 
-        let mut command = Command::new(chrome_wrapper());
+        let custom_browser = std::env::var_os("RHO_CHROME_BIN").is_some();
+        let mut command = if custom_browser {
+            Command::new(chrome_wrapper())
+        } else {
+            let mut command = Command::new(bubblewrap_wrapper());
+            command
+                // Bubblewrap is a mount boundary, not the browser sandbox: expose the
+                // host normally, but overlay /etc and mask host Brave policy so Rho's
+                // mandatory policy is exclusive to this browser process tree.
+                .args(["--bind", "/", "/", "--dev-bind", "/dev", "/dev"])
+                .args(["--overlay-src", "/etc", "--tmp-overlay", "/etc"])
+                .args([
+                    "--dir",
+                    "/etc/brave",
+                    "--tmpfs",
+                    "/etc/brave/policies",
+                    "--dir",
+                    "/etc/brave/policies/managed",
+                    "--ro-bind",
+                ])
+                .arg(&policy)
+                .arg("/etc/brave/policies/managed/rho.json")
+                .arg("--")
+                .arg(chrome_wrapper())
+                // A Bubblewrap user namespace cannot use Brave's SUID helper. Brave
+                // retains its namespace and Seccomp-BPF sandbox inside this boundary.
+                .arg("--disable-setuid-sandbox");
+            command
+        };
+        let disabled_features = if custom_browser {
+            "DisableLoadExtensionCommandLineSwitch,WaylandOverlayDelegation"
+        } else {
+            // The Nix Brave wrapper supplies the first two, but Chromium honors
+            // only the final --disable-features argument.
+            "OutdatedBuildDetector,UseChromeOSDirectVideoDecoder,DisableLoadExtensionCommandLineSwitch,WaylandOverlayDelegation"
+        };
         command
             .env("WAYLAND_DISPLAY", compositor.socket_name())
             .env("XDG_SESSION_TYPE", "wayland")
@@ -70,24 +109,32 @@ impl BrowserRuntime {
             .arg("--no-first-run")
             .arg("--no-default-browser-check")
             .arg("--restore-last-session")
-            .arg("--enable-features=VerticalTabs")
             // Chrome 137–141 gates command-line extension loading behind this
             // feature. Newer branded builds require one manual Load unpacked;
             // Chromium and Chrome for Testing continue to honor the switch.
-            .arg(
-                "--disable-features=DisableLoadExtensionCommandLineSwitch,WaylandOverlayDelegation",
-            )
+            .arg(format!("--disable-features={disabled_features}"))
             .arg(format!("--load-extension={}", extension.display()))
             .arg(format!(
                 "--xdg-activation-token={}",
                 session.activation_token()
             ))
             .arg(format!("--user-data-dir={}", profile.display()));
+        // Chrome's experimental vertical tabs need a feature switch. Brave's
+        // native implementation is selected by profile preferences instead;
+        // enabling Chromium's separate implementation crashes pinned Brave.
+        if custom_browser {
+            command.arg("--enable-features=VerticalTabs");
+        }
         if software_shm {
             command.arg("--disable-gpu");
         }
+        if !custom_browser {
+            // Brave only discovers per-user native messaging hosts under its
+            // XDG config tree, not under --user-data-dir.
+            command.env("XDG_CONFIG_HOME", &brave_config);
+        }
         command.process_group(0);
-        let child = command.spawn().context("launch stock Chromium")?;
+        let child = command.spawn().context("launch pinned Brave")?;
         Ok((
             Self {
                 compositor: Mutex::new(Some(compositor)),
@@ -160,10 +207,35 @@ impl Drop for BrowserRuntime {
     }
 }
 
-/// Chrome owns this file while running; the profile lock guarantees it is
-/// offline here. These ordinary, unprotected UI prefs only select Chrome's
-/// native collapsed vertical-tab presentation.
-fn configure_vertical_tabs(profile: &Path) -> Result<()> {
+/// Mandatory policy mounted privately into Brave's Linux policy directory.
+const BRAVE_POLICY: &str = r#"{
+  "BackgroundModeEnabled": false,
+  "BraveAIChatEnabled": false,
+  "BraveNewsDisabled": true,
+  "BraveP3AEnabled": false,
+  "BravePlaylistEnabled": false,
+  "BraveRewardsDisabled": true,
+  "BraveSpeedreaderEnabled": false,
+  "BraveStatsPingEnabled": false,
+  "BraveTalkDisabled": true,
+  "BraveVPNDisabled": true,
+  "BraveWalletDisabled": true,
+  "BraveWaybackMachineEnabled": false,
+  "BraveWebDiscoveryEnabled": false,
+  "CommandLineFlagSecurityWarningsEnabled": false,
+  "DefaultBrowserSettingEnabled": false,
+  "MetricsReportingEnabled": false,
+  "SyncDisabled": true,
+  "TorDisabled": true
+}"#;
+
+fn write_brave_policy(state_dir: &Path) -> Result<PathBuf> {
+    let path = state_dir.join("brave-policy.json");
+    std::fs::write(&path, BRAVE_POLICY)?;
+    Ok(path)
+}
+
+fn configure_browser_chrome(profile: &Path) -> Result<()> {
     let default = profile.join("Default");
     std::fs::create_dir_all(&default)?;
     let preferences = default.join("Preferences");
@@ -183,10 +255,66 @@ fn configure_vertical_tabs(profile: &Path) -> Result<()> {
         .context("Chrome vertical_tabs preference is not an object")?;
     vertical.insert("enabled".into(), true.into());
     vertical.insert("collapsed_state".into(), true.into());
-    vertical.insert("expand_on_hover".into(), false.into());
+    vertical.insert("expand_on_hover".into(), true.into());
+    set_preference(
+        &mut root,
+        &["brave", "tabs", "vertical_tabs_enabled"],
+        true.into(),
+    )?;
+    set_preference(
+        &mut root,
+        &["brave", "tabs", "vertical_tabs_collapsed"],
+        true.into(),
+    )?;
+    set_preference(
+        &mut root,
+        &[
+            "brave",
+            "tabs",
+            "vertical_tabs_hide_completely_when_collapsed",
+        ],
+        true.into(),
+    )?;
+    set_preference(
+        &mut root,
+        &["brave", "always_show_bookmark_bar_on_ntp"],
+        false.into(),
+    )?;
+    set_preference(
+        &mut root,
+        &["bookmark_bar", "show_tab_groups"],
+        false.into(),
+    )?;
+    set_preference(&mut root, &["auto_pin_new_tab_groups"], false.into())?;
+    // Rho terminates the managed browser process with SIGTERM and owns durable
+    // page restoration. Without this offline reset Brave mislabels that managed
+    // shutdown as a crash and overlays a Restore pages bubble on the next run.
+    set_preference(&mut root, &["profile", "exit_type"], "Normal".into())?;
     let temporary = preferences.with_extension("json.tmp");
     std::fs::write(&temporary, serde_json::to_vec(&root)?)?;
     std::fs::rename(temporary, preferences)?;
+    Ok(())
+}
+
+fn set_preference(
+    root: &mut serde_json::Value,
+    path: &[&str],
+    value: serde_json::Value,
+) -> Result<()> {
+    let (name, parents) = path.split_last().context("preference path is empty")?;
+    let mut current = root;
+    for parent in parents {
+        let object = current
+            .as_object_mut()
+            .context("Chrome Preferences entry is not an object")?;
+        current = object
+            .entry((*parent).to_owned())
+            .or_insert_with(|| json!({}));
+    }
+    current
+        .as_object_mut()
+        .context("Chrome Preferences parent is not an object")?
+        .insert((*name).to_owned(), value);
     Ok(())
 }
 
@@ -202,17 +330,41 @@ mod tests {
     }
 
     #[test]
-    fn enables_collapsed_vertical_tabs_without_losing_other_preferences() {
+    fn configures_hidden_brave_tabs_without_losing_other_preferences() {
         let temp = tempfile::tempdir().unwrap();
         let default = temp.path().join("Default");
         std::fs::create_dir(&default).unwrap();
         std::fs::write(default.join("Preferences"), br#"{"other":{"kept":true}}"#).unwrap();
-        configure_vertical_tabs(temp.path()).unwrap();
+        configure_browser_chrome(temp.path()).unwrap();
         let value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(default.join("Preferences")).unwrap()).unwrap();
         assert_eq!(value["other"]["kept"], true);
         assert_eq!(value["vertical_tabs"]["enabled"], true);
         assert_eq!(value["vertical_tabs"]["collapsed_state"], true);
-        assert_eq!(value["vertical_tabs"]["expand_on_hover"], false);
+        assert_eq!(value["vertical_tabs"]["expand_on_hover"], true);
+        assert_eq!(value["brave"]["tabs"]["vertical_tabs_enabled"], true);
+        assert_eq!(value["brave"]["tabs"]["vertical_tabs_collapsed"], true);
+        assert_eq!(
+            value["brave"]["tabs"]["vertical_tabs_hide_completely_when_collapsed"],
+            true
+        );
+        assert_eq!(value["brave"]["always_show_bookmark_bar_on_ntp"], false);
+        assert_eq!(value["bookmark_bar"]["show_tab_groups"], false);
+        assert_eq!(value["auto_pin_new_tab_groups"], false);
+        assert_eq!(value["profile"]["exit_type"], "Normal");
+    }
+
+    #[test]
+    fn brave_policy_disables_consumer_features_and_telemetry() {
+        let policy: serde_json::Value = serde_json::from_str(BRAVE_POLICY).unwrap();
+        assert_eq!(policy["BraveRewardsDisabled"], true);
+        assert_eq!(policy["BraveWalletDisabled"], true);
+        assert_eq!(policy["BraveVPNDisabled"], true);
+        assert_eq!(policy["BraveAIChatEnabled"], false);
+        assert_eq!(policy["BraveNewsDisabled"], true);
+        assert_eq!(policy["BraveP3AEnabled"], false);
+        assert_eq!(policy["BraveStatsPingEnabled"], false);
+        assert_eq!(policy["CommandLineFlagSecurityWarningsEnabled"], false);
+        assert_eq!(policy["SyncDisabled"], true);
     }
 }

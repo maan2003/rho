@@ -262,8 +262,7 @@
           cargoToml = ./crates/rho-gui-web/Cargo.toml;
           cargoLock = ./crates/rho-gui-web/Cargo.lock;
           CARGO_BUILD_TARGET = "wasm32-unknown-unknown";
-          CFLAGS_wasm32_unknown_unknown =
-            "${webuiToolchain.commonArgs.CFLAGS_wasm32_unknown_unknown} -matomics -mbulk-memory -I${buildSrc}/vendor/zed/tooling/tree_sitter_wasm/include";
+          CFLAGS_wasm32_unknown_unknown = "${webuiToolchain.commonArgs.CFLAGS_wasm32_unknown_unknown} -matomics -mbulk-memory -I${buildSrc}/vendor/zed/tooling/tree_sitter_wasm/include";
           nativeBuildInputs = [
             pkgs.lld
             pkgs.python3
@@ -374,6 +373,8 @@
               env.RHO_WAYLAND_GRIM = "${pkgs.grim}/bin/grim";
               env.RHO_WAYLAND_WTYPE = "${pkgs.wtype}/bin/wtype";
               env.RHO_WAYLAND_VK_DRIVER_FILES = "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.${pkgs.stdenv.hostPlatform.parsed.cpu.name}.json";
+              env.RHO_BRAVE_BIN = "${pkgs.brave}/bin/brave";
+              env.RHO_BWRAP_BIN = "${pkgs.bubblewrap}/bin/bwrap";
               env.LK_CUSTOM_WEBRTC = webrtcPrebuilt;
               env.RUSTY_V8_ARCHIVE = rustyV8Archive;
               postPatch = ''
@@ -557,9 +558,13 @@
           RHO_WAYLAND_GRIM = "${pkgs.grim}/bin/grim";
           RHO_WAYLAND_WTYPE = "${pkgs.wtype}/bin/wtype";
           RHO_WAYLAND_VK_DRIVER_FILES = "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.${pkgs.stdenv.hostPlatform.parsed.cpu.name}.json";
+          RHO_BRAVE_BIN = "${pkgs.brave}/bin/brave";
+          RHO_BWRAP_BIN = "${pkgs.bubblewrap}/bin/bwrap";
           packages = [
             selfciMq
             pkgs.cargo-nextest
+            pkgs.brave
+            pkgs.bubblewrap
             pkgs.clang
             pkgs.cmake
             pkgs.pkg-config

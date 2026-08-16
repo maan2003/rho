@@ -144,12 +144,20 @@ than by running a supervisor, extension protocol, or daemon process graph.
   Native web pages are client-local first-class resources owned by `rho-browser`.
   They use extension-generated UUID `PageId`s written in full as Desk tags.
   One embedded MV3 extension owns the durable page registry inside the implicit
-  persistent Chromium profile: `chrome.storage.local` retains page metadata and
-  one single-tab group titled `rho:<uuid>` attaches the ID to Chrome's restored
+  persistent Brave profile. Rho launches pinned Brave inside a private Bubblewrap
+  mount namespace that overlays `/etc` and masks the host Brave policy directory;
+  a mandatory process-local policy disables Brave consumer services and telemetry
+  without reading or changing host policy.
+  Brave's `XDG_CONFIG_HOME` is also private to Rho state so its native-messaging
+  manifest and auxiliary product state do not touch the user's Brave config.
+  Native vertical tabs are collapsed and hidden until edge hover, the bookmarks
+  bar and saved-group row are hidden, and the address toolbar remains visible.
+  `chrome.storage.local` retains page metadata and
+  one single-tab group titled `rho:<uuid>` attaches the ID to Brave's restored
   tab and navigation history. Runtime tab and group IDs are never persisted.
   Rho sends only direct create/focus/close requests and does not mirror or
   receive an eager registry.
-  All pages share one normal Chromium window and one private Smithay compositor
+  All pages share one normal Brave window and one private Smithay compositor
   surface, so exactly one page is visible. Switching a Rho page activates its
   tab. A generation-scoped handoff serializes extension focus requests and gates
   input until a DMA-BUF commit acknowledges a deliberately changed
@@ -161,9 +169,9 @@ than by running a supervisor, extension protocol, or daemon process graph.
   while input is gated. This follows nested-compositor pacing and avoids both
   application-readiness deadlocks and an extra outer-refresh delay. The extension
   explicitly discards the previous tab, bounding loaded
-  renderer and surface memory while Chrome retains per-page history metadata.
+  renderer and surface memory while Brave retains per-page history metadata.
   The compositor issues one XDG activation token for the singleton toplevel and
-  retains the unambiguous first-window fallback for stock Chromium builds that
+  retains the unambiguous first-window fallback for Chromium-family builds that
   omit it. Extension native messaging reaches `rho-gui` through a tiny stdio
   relay and a mode-0600 Unix socket under `XDG_RUNTIME_DIR`; no TCP listener,
   CDP, remote debugging, content script, or website injection participates.
@@ -174,7 +182,7 @@ than by running a supervisor, extension protocol, or daemon process graph.
   subsurface commits are reconciled only at their transaction anchor and the
   compositor copies lock-bound Smithay state into an immutable tree snapshot;
   the resulting bottom-to-top scene carries per-node position, viewport crop,
-  destination size, and input region. Chromium SHM chrome and `xdg_popup`
+  destination size, and input region. Brave/Chromium SHM chrome and `xdg_popup`
   widgets use the bounded exception: the compositor validates and snapshots
   ARGB/XRGB rows into owned memory for GPUI/WGPU upload. Pointer hit-testing uses
   the same versioned scene, stacking order, geometry, and input regions. Wayland
@@ -182,18 +190,18 @@ than by running a supervisor, extension protocol, or daemon process graph.
   this single composition path.
   The isolated `rho wayland` QA driver has a software-only exception for hosts
   without a Vulkan DRM render node. It advertises neither DMA-BUF nor
-  DRM-syncobj to Chromium, accepts the root through the existing checked,
+  DRM-syncobj to Brave, accepts the root through the existing checked,
   bounded owned-SHM snapshot path, and uploads it through GPUI. Ordinary GUI
-  launches remain DMA-BUF-only and fail closed. This exercises real Chromium
+  launches remain DMA-BUF-only and fail closed. This exercises real Brave/Chromium
   lifecycle, focus, input, and restoration, but not production DMA-BUF import
   or explicit synchronization.
   The compositor is wake-driven, advertises per-surface fractional scale and a
   viewporter while keeping its shared synthetic output stable, and forwards
-  raw physical keys, pointer axes, and pinch phases to Chromium. It advertises
-  `wp_cursor_shape_v1` and projects Chromium's named cursor requests onto the
+  raw physical keys, pointer axes, and pinch phases to Brave. It advertises
+  `wp_cursor_shape_v1` and projects Brave's named cursor requests onto the
   GPUI browser region, letting the outer display server render the native
   cursor rather than introducing a second cursor-surface renderer. `wl_shm`
-  remains available only for ancillary Chromium surfaces; the root must remain
+  remains available only for ancillary Brave surfaces; the root must remain
   an explicitly synchronized DMA-BUF.
   `rho-gui` only hosts the resulting GPUI page model/view. A full `:web-<uuid>:` tag
   on an ordinary Desk heading is a portal to the client-local page, just as an

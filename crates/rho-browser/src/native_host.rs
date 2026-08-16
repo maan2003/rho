@@ -290,7 +290,12 @@ fn write_frame(writer: &mut impl Write, body: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub fn write_installation(profile: &Path, extension: &Path, executable: &Path) -> Result<()> {
+pub fn write_installation(
+    profile: &Path,
+    brave_config: &Path,
+    extension: &Path,
+    executable: &Path,
+) -> Result<()> {
     fs::create_dir_all(extension)?;
     fs::write(
         extension.join("manifest.json"),
@@ -304,18 +309,20 @@ pub fn write_installation(profile: &Path, extension: &Path, executable: &Path) -
         extension.join("parking.html"),
         include_str!("../extension/parking.html"),
     )?;
-    let hosts = profile.join("NativeMessagingHosts");
-    fs::create_dir_all(&hosts)?;
-    fs::write(
-        hosts.join(format!("{HOST_NAME}.json")),
-        serde_json::to_vec_pretty(&json!({
-            "name": HOST_NAME,
-            "description": "Rho browser Unix-socket bridge",
-            "path": executable,
-            "type": "stdio",
-            "allowed_origins": [EXTENSION_ORIGIN],
-        }))?,
-    )?;
+    let manifest = serde_json::to_vec_pretty(&json!({
+        "name": HOST_NAME,
+        "description": "Rho browser Unix-socket bridge",
+        "path": executable,
+        "type": "stdio",
+        "allowed_origins": [EXTENSION_ORIGIN],
+    }))?;
+    for hosts in [
+        profile.join("NativeMessagingHosts"),
+        brave_config.join("BraveSoftware/Brave-Browser/NativeMessagingHosts"),
+    ] {
+        fs::create_dir_all(&hosts)?;
+        fs::write(hosts.join(format!("{HOST_NAME}.json")), &manifest)?;
+    }
     Ok(())
 }
 
@@ -351,15 +358,24 @@ mod tests {
     fn installation_uses_the_fixed_extension_identity() {
         let temp = tempfile::tempdir().unwrap();
         let profile = temp.path().join("profile");
+        let brave_config = temp.path().join("brave-config");
         let extension = temp.path().join("extension");
         let executable = temp.path().join("rho-gui");
-        write_installation(&profile, &extension, &executable).unwrap();
+        write_installation(&profile, &brave_config, &extension, &executable).unwrap();
         let host: Value = serde_json::from_slice(
             &fs::read(profile.join("NativeMessagingHosts/dev.rho.browser.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(host["allowed_origins"][0], EXTENSION_ORIGIN);
         assert_eq!(host["path"], executable.to_string_lossy().as_ref());
+        assert_eq!(
+            fs::read(
+                brave_config
+                    .join("BraveSoftware/Brave-Browser/NativeMessagingHosts/dev.rho.browser.json")
+            )
+            .unwrap(),
+            serde_json::to_vec_pretty(&host).unwrap()
+        );
         let manifest: Value =
             serde_json::from_slice(&fs::read(extension.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(manifest["manifest_version"], 3);
