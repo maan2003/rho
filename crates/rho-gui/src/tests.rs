@@ -504,7 +504,7 @@ fn initial_transcript_preserves_line_endings_when_placing_spans(cx: &mut TestApp
 }
 
 #[gpui::test]
-fn insert_recovers_cursor_from_replaced_transcript_excerpt(cx: &mut TestAppContext) {
+fn selection_actions_recover_cursor_from_replaced_transcript_excerpt(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     feed_frame(
         &workspace,
@@ -542,6 +542,16 @@ fn insert_recovers_cursor_from_replaced_transcript_excerpt(cx: &mut TestAppConte
     workspace
         .update(cx, |_, window, cx| {
             editor.update(cx, |editor, cx| {
+                let transcript_id = editor
+                    .buffer()
+                    .read(cx)
+                    .all_buffers()
+                    .into_iter()
+                    .find(|buffer| buffer.read(cx).text().contains("replacement"))
+                    .expect("replacement transcript buffer")
+                    .read(cx)
+                    .remote_id();
+                editor.fold_buffer(transcript_id, cx);
                 editor.prepare_for_insert(window, cx);
                 let snapshot = editor.display_snapshot(cx);
                 let selection = editor.selections.newest_anchor();

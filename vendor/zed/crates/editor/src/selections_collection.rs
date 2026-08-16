@@ -562,10 +562,11 @@ impl SelectionsCollection {
         snapshot: &DisplaySnapshot,
         change: impl FnOnce(&mut MutableSelectionsCollection<'_, '_>) -> R,
     ) -> (bool, R) {
+        let selections_changed = self.refresh_unresolvable_anchors(snapshot);
         let mut mutable_collection = MutableSelectionsCollection {
             snapshot,
             collection: self,
-            selections_changed: false,
+            selections_changed,
         };
 
         let result = change(&mut mutable_collection);
@@ -614,6 +615,30 @@ impl SelectionsCollection {
             }
         }
         (mutable_collection.selections_changed, result)
+    }
+
+    fn refresh_unresolvable_anchors(&mut self, snapshot: &DisplaySnapshot) -> bool {
+        let buffer = snapshot.buffer_snapshot();
+        let refresh = |anchor: &mut Anchor| {
+            if snapshot.can_resolve(anchor) {
+                return false;
+            }
+            let bias = anchor.bias();
+            let offset = anchor.to_offset(buffer);
+            *anchor = buffer.anchor_at(offset, bias);
+            true
+        };
+
+        let mut changed = false;
+        for selection in Arc::make_mut(&mut self.disjoint) {
+            changed |= refresh(&mut selection.start);
+            changed |= refresh(&mut selection.end);
+        }
+        if let Some(pending) = &mut self.pending {
+            changed |= refresh(&mut pending.selection.start);
+            changed |= refresh(&mut pending.selection.end);
+        }
+        changed
     }
 
     pub fn next_selection_id(&self) -> usize {
@@ -993,16 +1018,7 @@ impl<'snap, 'a> MutableSelectionsCollection<'snap, 'a> {
         &mut self,
         move_selection: &mut dyn FnMut(&DisplaySnapshot, &mut Selection<DisplayPoint>),
     ) {
-        // Excerpt replacement can leave selections pointing at a path that is
-        // no longer present. They still resolve to a display position, but
-        // must be round-tripped through that position to become live anchors.
-        let mut changed = self.collection.disjoint.iter().any(|selection| {
-            !self.snapshot.can_resolve(&selection.start)
-                || !self.snapshot.can_resolve(&selection.end)
-        }) || self.collection.pending.as_ref().is_some_and(|pending| {
-            !self.snapshot.can_resolve(&pending.selection.start)
-                || !self.snapshot.can_resolve(&pending.selection.end)
-        });
+        let mut changed = false;
         let display_map = self.display_snapshot();
         let selections = self.collection.all_display(&display_map);
         let selections = selections
