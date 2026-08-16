@@ -128,7 +128,10 @@ than by running a supervisor, extension protocol, or daemon process graph.
   input until a DMA-BUF commit acknowledges a deliberately changed
   post-activation XDG configure. The previous atomic scene may remain visible
   but non-interactive during that handoff; Wayland ordering establishes frame
-  readiness, not semantic pixel ownership by a Chrome tab. The extension
+  readiness, not semantic pixel ownership by a Chrome tab.
+  Valid compositor scenes continue to replace the displayed scene and receive
+  presentation callbacks while input is gated, so Chromium frame pacing cannot
+  deadlock behind application-level page readiness. The extension
   explicitly discards the previous tab, bounding loaded
   renderer and surface memory while Chrome retains per-page history metadata.
   The compositor issues one XDG activation token for the singleton toplevel and

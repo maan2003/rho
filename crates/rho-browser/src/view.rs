@@ -175,7 +175,7 @@ impl BrowserModel {
                                     model.handoff,
                                     scene.barrier,
                                 );
-                                if import_failed || missing_buffer || !eligible {
+                                if import_failed || missing_buffer {
                                     if awaiting_barrier.is_some() {
                                         tracing::info!(
                                             scene_id = scene.id,
@@ -183,8 +183,7 @@ impl BrowserModel {
                                             ?awaiting_barrier,
                                             import_failed,
                                             missing_buffer,
-                                            eligible,
-                                            "browser handoff rejected a compositor scene"
+                                            "browser handoff rejected an invalid compositor scene"
                                         );
                                     }
                                     if missing_buffer && !import_failed {
@@ -214,18 +213,19 @@ impl BrowserModel {
                                     }
                                     keep
                                 });
-                                complete_frame_handoff(&mut model.handoff, scene.barrier);
-                                if awaiting_barrier.is_some() {
+                                if eligible {
+                                    complete_frame_handoff(&mut model.handoff, scene.barrier);
+                                    model.runtime.status = None;
+                                } else if awaiting_barrier.is_some() {
                                     tracing::info!(
                                         scene_id = scene.id,
                                         scene_barrier = scene.barrier,
-                                        "browser handoff accepted a compositor scene"
+                                        "browser handoff displayed a scene while keeping input gated"
                                     );
                                 }
                                 model.runtime.presented_barrier = scene.barrier;
                                 model.runtime.scene_id = Some(scene.id);
                                 model.runtime.scene = scene.nodes;
-                                model.runtime.status = None;
                             }
                             BrowserEvent::FrameRetired(buffer_id) => {
                                 let was_visible = model
@@ -793,7 +793,7 @@ impl Render for BrowserView {
         let model = self.model.read(cx);
         let colors = cx.theme().colors();
         let presents = model.presents(self.owner_id, self.page_id);
-        if presents
+        if owns_presentation
             && model.runtime.scene_id != self.scheduled_scene
             && let (Some(scene_id), Some(session)) =
                 (model.runtime.scene_id, model.runtime.session.as_ref())
@@ -805,7 +805,10 @@ impl Render for BrowserView {
             let page_id = self.page_id;
             window.on_next_frame(move |_, cx| {
                 let painted = browser.update(cx, |model, _| {
-                    model.presents(owner_id, page_id)
+                    model.presentation_owner == Some(owner_id)
+                        && model
+                            .handoff
+                            .is_some_and(|handoff| handoff.target == page_id)
                         && scene_id > model.runtime.invalidated_through
                 });
                 if painted {
