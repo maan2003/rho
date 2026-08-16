@@ -36,6 +36,7 @@ const EXEC_DESCRIPTION_TEMPLATE: &str = r#"Run JavaScript code to orchestrate/co
 - Global helpers:
 - `exit()`: Immediately ends the current script successfully (like an early return from the top level).
 - `text(value: string | number | boolean | undefined | null)`: Appends a text item to this script's output. Non-string values are stringified with `JSON.stringify(...)` when possible.
+- `image(item)`: Appends one image item returned by an image-producing nested tool, for example `image((await tools.view_image({path: "plot.png"})).content[0])`.
 - `notify(value: string | number | boolean | undefined | null)`: immediately injects an extra `custom_tool_call_output` for the current `exec` call. Values are stringified like `text(...)`.
 - `setTimeout(callback: () => void, delayMs?: number)`: schedules a callback to run later and returns a timeout id. Pending timeouts do not keep `exec` alive by themselves; await an explicit promise if you need to wait for one.
 - `clearTimeout(timeoutId?: number)`: cancels a timeout created by `setTimeout`.
@@ -91,10 +92,47 @@ impl NestedTool {
         self
     }
 
+    /// Describe the JavaScript wrapper produced when this nested tool returns
+    /// typed images alongside its ordinary value.
+    pub fn with_image_output(mut self, output_schema: JsonValue) -> Self {
+        self.output_schema = Some(image_output_schema(output_schema));
+        self
+    }
+
     /// The identifier scripts use: `tools.<global_name>(...)`.
     pub fn global_name(&self) -> String {
         normalize_code_mode_identifier(self.name.as_str())
     }
+}
+
+fn image_output_schema(output_schema: JsonValue) -> JsonValue {
+    serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["output", "content"],
+        "properties": {
+            "output": output_schema,
+            "content": {
+                "type": "array",
+                "description": "Opaque image items returned by the tool.",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["type", "image_id"],
+                    "properties": {
+                        "type": {
+                            "const": "image",
+                            "description": "Image content item."
+                        },
+                        "image_id": {
+                            "type": "integer",
+                            "description": "Cell-scoped opaque image identifier; pass the containing item to image()."
+                        }
+                    }
+                }
+            }
+        }
+    })
 }
 
 pub fn exec_tool_spec(nested_tools: &[NestedTool]) -> ToolSpec {

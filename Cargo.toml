@@ -22,6 +22,7 @@ members = [
   "crates/rho-browser-wayland",
   "crates/rho-touch-keyboard",
   "crates/rho-inference",
+  "crates/rho-image",
   "crates/rho-iroh-auth",
   "crates/rho-pr-monitor",
   "crates/rho-profiling",
@@ -117,6 +118,7 @@ rho-daemon = { path = "crates/rho-daemon" }
 rho-db = { path = "crates/rho-db" }
 rho-shell-proto = { path = "crates/rho-shell-proto" }
 rho-inference = { path = "crates/rho-inference" }
+rho-image = { path = "crates/rho-image" }
 rho-openai-realtime = { path = "crates/rho-openai-realtime" }
 rho-rtc = { path = "crates/rho-rtc" }
 rho-registry = { path = "crates/rho-registry" }

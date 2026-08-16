@@ -243,6 +243,25 @@ pub enum ContentPart {
     },
 }
 
+/// A decoded and normalized image suitable for provider input.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, Pack, Unpack)]
+pub struct ImageContent {
+    pub media_type: String,
+    pub data: Vec<u8>,
+    #[senax(default)]
+    pub detail: ImageDetail,
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode, Pack, Unpack,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageDetail {
+    #[default]
+    High,
+    Original,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 #[serde(rename_all = "snake_case")]
 pub enum MessagePhase {
@@ -288,6 +307,9 @@ pub enum ToolOutputStatus {
 pub struct ToolOutput {
     /// Sent to the model verbatim.
     pub output: Arc<String>,
+    /// Typed image items sent to the model after the textual output.
+    #[senax(default)]
+    pub images: Arc<Vec<ImageContent>>,
     /// Harness/UI metadata only; not included in the provider wire payload.
     pub status: ToolOutputStatus,
 }
@@ -660,6 +682,29 @@ mod tests {
         Box::new(TestProviderSpecificData {
             item_id: "item_1".to_owned(),
         })
+    }
+
+    #[test]
+    fn tool_output_without_images_decodes_from_legacy_shape() {
+        #[derive(Encode)]
+        struct LegacyToolOutput {
+            output: Arc<String>,
+            status: ToolOutputStatus,
+        }
+
+        let mut encoded = bytes::BytesMut::new();
+        senax_encoder::encode_to(
+            &LegacyToolOutput {
+                output: Arc::new("done".to_owned()),
+                status: ToolOutputStatus::Success,
+            },
+            &mut encoded,
+        )
+        .unwrap();
+        let decoded = <ToolOutput as senax_encoder::Decoder>::decode(&mut encoded).unwrap();
+        assert_eq!(decoded.output.as_str(), "done");
+        assert!(decoded.images.is_empty());
+        assert_eq!(decoded.status, ToolOutputStatus::Success);
     }
 
     #[test]

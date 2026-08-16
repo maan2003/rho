@@ -35,6 +35,7 @@ mod claude;
 #[cfg(feature = "code-mode")]
 mod code_mode;
 pub mod db;
+mod image_tool;
 pub mod iris_tools;
 mod lazy;
 pub mod multi_agent_tools;
@@ -1046,6 +1047,7 @@ async fn code_mode_tool_body(
     match serde_json::from_str::<rho_code_mode::WaitArgs>(&call.arguments) {
         Ok(args) => session.wait(args).await,
         Err(error) => ToolOutput {
+            images: std::sync::Arc::new(Vec::new()),
             output: Arc::new(format!("invalid wait arguments: {error}")),
             status: ToolOutputStatus::Error,
         },
@@ -1058,6 +1060,7 @@ fn error_tool_result(call: &ToolCall, started_at: UnixMs, error: anyhow::Error) 
         call_id: call.id.clone(),
         tool_type: call.tool_type,
         body: ToolOutput {
+            images: std::sync::Arc::new(Vec::new()),
             output: Arc::new(error.to_string()),
             status: ToolOutputStatus::Error,
         },
@@ -1095,6 +1098,7 @@ fn agent_tool_specs(
     if multi_agent {
         specs.extend(multi_agent_tools::agent_tool_specs(role));
     }
+    specs.push(image_tool::ImageTools::spec());
     if !function_tools_only {
         specs.push(rho_web_search::web_search_spec());
     }
@@ -1107,6 +1111,7 @@ fn agent_tool_specs(
 fn start_code_mode(
     enabled: bool,
     shell_tools: &ShellTools,
+    image_tools: &image_tool::ImageTools,
     multi_agent: Option<&MultiAgentTools>,
     web_search: &WebSearchTools,
     control: mpsc::WeakUnboundedSender<AgentControl>,
@@ -1114,7 +1119,7 @@ fn start_code_mode(
     if !enabled {
         return None;
     }
-    match code_mode::start_session(shell_tools, multi_agent, web_search, control) {
+    match code_mode::start_session(shell_tools, image_tools, multi_agent, web_search, control) {
         Ok(session) => Some(Arc::new(session)),
         Err(error) => {
             eprintln!("rho-agent: code mode unavailable, using direct tools: {error}");
@@ -1127,6 +1132,7 @@ fn start_code_mode(
 fn start_code_mode(
     _enabled: bool,
     _shell_tools: &ShellTools,
+    _image_tools: &image_tool::ImageTools,
     _multi_agent: Option<&MultiAgentTools>,
     _web_search: &WebSearchTools,
     _control: mpsc::WeakUnboundedSender<AgentControl>,
@@ -1241,6 +1247,7 @@ struct ExecutionContext {
     view: Arc<View>,
     system_prompt: Arc<str>,
     shell_tools: ShellTools,
+    image_tools: image_tool::ImageTools,
     web_search: WebSearchTools,
     web_search_enabled: bool,
     tool_specs: Arc<[ToolSpec]>,
@@ -1267,9 +1274,11 @@ impl ExecutionContext {
             Arc::clone(&view),
         )
         .with_env("RHO_AGENT_ID", agent_id.encoded());
+        let image_tools = image_tool::ImageTools::new(Arc::clone(&view));
         let code_mode = start_code_mode(
             code_mode_enabled,
             &shell_tools,
+            &image_tools,
             agent_tools_enabled.then_some(()).and(multi_agent),
             &web_search,
             control,
@@ -1292,6 +1301,7 @@ impl ExecutionContext {
             view,
             system_prompt,
             shell_tools,
+            image_tools,
             web_search,
             web_search_enabled: !function_tools_only,
             tool_specs,
@@ -2010,6 +2020,9 @@ impl AgentLoop {
                                             continue;
                                         }
                                         let shell_tools = execution.shell_tools.clone();
+                                        let image_tools = (call.name.as_str()
+                                            == image_tool::VIEW_IMAGE_TOOL_NAME)
+                                            .then(|| execution.image_tools.clone());
                                         let web_search = (execution.web_search_enabled
                                             && call.name.as_str()
                                                 == rho_web_search::WEB_SEARCH_TOOL_NAME)
@@ -2028,12 +2041,15 @@ impl AgentLoop {
                                             let tool_type = call.tool_type;
                                             let (body, metadata) = if let Some(web_search) = web_search {
                                                 (web_search.call(call, context).await, None)
+                                            } else if let Some(image_tools) = image_tools {
+                                                (image_tools.call(call).await, None)
                                             } else if let Some(iris_tools) = iris_tools {
                                                 (iris_tools.call(call).await, None)
                                             } else if let Some(tools) = agent_tools {
                                                 (multi_agent_tools::call_agent_tool(tools, call).await, None)
                                             } else if iris_role {
                                                 (ToolOutput {
+            images: std::sync::Arc::new(Vec::new()),
                                                     output: Arc::new("unsupported Iris tool".to_owned()),
                                                     status: ToolOutputStatus::Error,
                                                 }, None)
@@ -2310,6 +2326,7 @@ impl AgentLoop {
             call_id: wait.call_id.clone(),
             tool_type: preview.call.tool_type,
             body: ToolOutput {
+                images: std::sync::Arc::new(Vec::new()),
                 output: Arc::new(body),
                 status: ToolOutputStatus::Success,
             },
@@ -2713,6 +2730,7 @@ fn interrupted_tool_result(call: &ToolCall) -> ToolResult {
         call_id: call.id.clone(),
         tool_type: call.tool_type,
         body: ToolOutput {
+            images: std::sync::Arc::new(Vec::new()),
             output: Arc::new(
                 "Tool execution was interrupted by a daemon restart. It may have completed \
                  partially."
@@ -2824,6 +2842,7 @@ mod tests {
                 call_id: ToolCallId::try_from(id).unwrap(),
                 tool_type: rho_core::ToolType::Function,
                 body: ToolOutput {
+                    images: std::sync::Arc::new(Vec::new()),
                     output: Arc::new("ok".to_owned()),
                     status: ToolOutputStatus::Success,
                 },

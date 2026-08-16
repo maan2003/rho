@@ -5,7 +5,8 @@ than by running a supervisor, extension protocol, or daemon process graph.
 
 ## Crate layering
 
-- `rho-core` owns the shared vocabulary: transcript items, inference requests,
+- `rho-core` owns the shared vocabulary: transcript items, normalized image
+  content for user messages and tool results, inference requests,
   inference events and responses, tool calls/results, usage, agent identities,
   roles and dispositions, message delivery and phases, and opaque
   provider items. It should stay policy-light.
@@ -42,6 +43,10 @@ than by running a supervisor, extension protocol, or daemon process graph.
   routes a lease to the loaded runtime. `AgentPool` also owns persistent
   agent-response subscription edges: terminal successes and failures are
   delivered to current subscribers as normal agent mail.
+  Native agents expose a view-aware `view_image` tool. Image-producing nested
+  tools return opaque image items to code mode, where `image(item)` explicitly
+  appends one to the enclosing `exec` or `wait` result rather than implicitly
+  adding every nested result to model context.
 - `rho-claude-usage` is an isolated Claude Code subscription-quota adapter. It
   owns the hardened PTY process, `/usage` interaction, terminal emulation,
   parsing, polling cadence, and retry policy. The daemon only consumes parsed
@@ -103,6 +108,11 @@ than by running a supervisor, extension protocol, or daemon process graph.
   Each attached daemon is a named GUI host. Host-scoped settings and new-agent
   creation route through that identity explicitly; choosing a project never
   silently changes a draft's selected host.
+  User and tool images are decoded under fixed dimension/allocation limits,
+  resized to the selected high- or original-detail prompt patch budget, and
+  re-encoded as single-frame PNG pixels before persistence or provider upload.
+  Source metadata, profiles, animation, and encoding are intentionally
+  discarded.
   The Desk is one daemon-owned Zed CRDT text document per attached host. Its
   org-like headings derive structure rather than receiving structural RPCs.
   Visible agent-handle tags at the end of heading lines are the filing source

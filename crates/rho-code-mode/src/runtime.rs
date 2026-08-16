@@ -96,8 +96,20 @@ async fn op_call_tool(
             Err(deno_error::JsErrorBox::generic("exec cell terminated"))
         }
         output = dispatch => match output.status {
-            ToolOutputStatus::Success => serde_json::to_string(&output.value)
-                .map_err(|error| deno_error::JsErrorBox::generic(error.to_string())),
+            ToolOutputStatus::Success => {
+                let value = if output.images.is_empty() {
+                    output.value
+                } else {
+                    let content = cell.retain_nested_images(output.images)
+                        .map_err(deno_error::JsErrorBox::generic)?
+                        .into_iter().map(|image_id| {
+                        json!({"type": "image", "image_id": image_id})
+                    }).collect::<Vec<_>>();
+                    json!({"output": output.value, "content": content})
+                };
+                serde_json::to_string(&value)
+                    .map_err(|error| deno_error::JsErrorBox::generic(error.to_string()))
+            },
             ToolOutputStatus::Error | ToolOutputStatus::Cancelled => {
                 Err(deno_error::JsErrorBox::generic(
                     output.value.as_str().map(str::to_owned).unwrap_or_else(|| output.value.to_string())
@@ -105,6 +117,13 @@ async fn op_call_tool(
             }
         },
     }
+}
+
+#[op2(fast)]
+fn op_image(state: Rc<RefCell<OpState>>, #[smi] cell_id: u32, #[smi] image_id: u32) -> bool {
+    let ctx = op_ctx(&state);
+    ctx.cell(cell_id)
+        .is_some_and(|cell| cell.is_running() && cell.append_nested_image(image_id))
 }
 
 #[op2(fast)]
@@ -165,6 +184,7 @@ deno_core::extension!(
     ops = [
         op_call_tool,
         op_text,
+        op_image,
         op_notify,
         op_yield,
         op_exit,

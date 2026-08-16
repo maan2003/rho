@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures::future::BoxFuture;
-use rho_core::{ToolCall, ToolCallId, ToolExecutionContext, ToolOutput, ToolOutputStatus};
+use rho_core::{
+    ImageContent, ToolCall, ToolCallId, ToolExecutionContext, ToolOutput, ToolOutputStatus,
+};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use tokio::sync::mpsc;
@@ -43,7 +45,18 @@ pub trait ToolDispatcher: Send + Sync + 'static {
 /// same result as text, but scripts receive this structured value directly.
 pub struct NestedToolOutput {
     pub value: JsonValue,
+    pub images: Vec<ImageContent>,
     pub status: ToolOutputStatus,
+}
+
+impl NestedToolOutput {
+    pub fn from_tool_output(output: ToolOutput) -> Self {
+        Self {
+            value: JsonValue::String(output.output.as_ref().clone()),
+            images: output.images.as_ref().clone(),
+            status: output.status,
+        }
+    }
 }
 
 /// Arguments of the `wait` tool.
@@ -294,7 +307,16 @@ fn format_response(
         ),
     };
 
-    let mut body = cell.drain_new_output().join("\n");
+    let drained = cell.drain_new_output();
+    let mut text = Vec::new();
+    let mut images = Vec::new();
+    for item in drained {
+        match item {
+            crate::cell::CellOutput::Text(item) => text.push(item),
+            crate::cell::CellOutput::Image(item) => images.push(item),
+        }
+    }
+    let mut body = text.join("\n");
     if let Some(error) = error {
         if !body.is_empty() {
             body.push('\n');
@@ -308,6 +330,7 @@ fn format_response(
         output: Arc::new(format!(
             "{status_line}\nWall time {wall_time_seconds:.1} seconds\nOutput:\n{body}"
         )),
+        images: Arc::new(images),
         status: output_status,
     }
 }
@@ -317,6 +340,7 @@ fn missing_cell_output(cell_id: &str) -> ToolOutput {
         output: Arc::new(format!(
             "Script failed\nWall time 0.0 seconds\nOutput:\nScript error:\nexec cell {cell_id} not found"
         )),
+        images: Arc::new(Vec::new()),
         status: ToolOutputStatus::Error,
     }
 }
@@ -324,6 +348,7 @@ fn missing_cell_output(cell_id: &str) -> ToolOutput {
 fn error_output(error: String) -> ToolOutput {
     ToolOutput {
         output: Arc::new(error),
+        images: Arc::new(Vec::new()),
         status: ToolOutputStatus::Error,
     }
 }

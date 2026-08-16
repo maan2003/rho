@@ -2625,11 +2625,11 @@ async fn handle_message(
         ClientMessage::NewAgent {
             role,
             start,
-            content,
+            mut content,
             desk_anchor,
         } => {
-            if let Some(content) = content.as_deref() {
-                validate_image_content(content)?;
+            if let Some(content) = content.as_mut() {
+                prepare_image_content(content).await?;
             }
             // Subscription and the AgentCreated announcement ride the pool's
             // creation broadcast (all connections, including this one).
@@ -2771,10 +2771,10 @@ async fn handle_message(
         }
         ClientMessage::SendUserMessage {
             agent_id,
-            content,
+            mut content,
             delivery,
         } => {
-            validate_image_content(&content)?;
+            prepare_image_content(&mut content).await?;
             let agent = agents
                 .get(agent_id)
                 .await
@@ -3732,6 +3732,24 @@ fn validate_image_content(content: &[ContentPart]) -> anyhow::Result<()> {
     Ok(())
 }
 
+async fn prepare_image_content(content: &mut [ContentPart]) -> anyhow::Result<()> {
+    validate_image_content(content)?;
+    for part in content.iter_mut() {
+        let ContentPart::Image { media_type, data } = part else {
+            continue;
+        };
+        let source = std::mem::take(data);
+        let prepared = rho_image::prepare(source).await?;
+        let encoded = prepared.content.data.len().div_ceil(3).saturating_mul(4);
+        if encoded > MAX_IMAGE_BASE64_BYTES {
+            anyhow::bail!("prepared image exceeds the 10 MiB encoded limit");
+        }
+        *media_type = prepared.content.media_type;
+        *data = prepared.content.data;
+    }
+    validate_image_content(content)
+}
+
 fn validate_label(label: &str) -> anyhow::Result<()> {
     if label.trim().is_empty() {
         anyhow::bail!("label cannot be empty");
@@ -3764,8 +3782,8 @@ mod tests {
     use super::{
         AgentUsageModel, GitProviderClaim, GitTransportBroker, MAX_IMAGE_BASE64_BYTES,
         MAX_INPUT_IMAGES, claude_quota_history, configure_octo_git_transport,
-        hourly_global_usage_series, merge_hourly_agent_cost_bucket, quota_burn, quota_summaries,
-        validate_image_content,
+        hourly_global_usage_series, merge_hourly_agent_cost_bucket, prepare_image_content,
+        quota_burn, quota_summaries, validate_image_content,
     };
 
     #[test]
@@ -4190,5 +4208,32 @@ mod tests {
                 .to_string()
                 .contains("10 MiB")
         );
+    }
+
+    #[tokio::test]
+    async fn image_input_is_reencoded_from_pixels_before_queueing() {
+        use std::io::Cursor;
+
+        use image::{DynamicImage, ImageBuffer, Rgba};
+
+        let source =
+            DynamicImage::ImageRgba8(ImageBuffer::from_pixel(2, 1, Rgba([10, 20, 30, 255])));
+        let mut encoded = Cursor::new(Vec::new());
+        source
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+        let mut content = vec![ContentPart::Image {
+            // The actual bytes, rather than this permitted but incorrect label,
+            // determine the normalized output.
+            media_type: "image/jpeg".to_owned(),
+            data: encoded.into_inner(),
+        }];
+
+        prepare_image_content(&mut content).await.unwrap();
+        let ContentPart::Image { media_type, data } = &content[0] else {
+            panic!("expected image")
+        };
+        assert_eq!(media_type, "image/png");
+        assert_eq!(&data[..8], b"\x89PNG\r\n\x1a\n");
     }
 }

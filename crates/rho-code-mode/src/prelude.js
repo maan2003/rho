@@ -78,6 +78,14 @@ globalThis.__rhoInit = (toolList) => {
     tools,
     ALL_TOOLS: allTools,
     text: (value) => ops.op_text(current, stringify(value)),
+    image: (item) => {
+      if (
+        typeof item !== "object" || item === null || item.type !== "image" ||
+        !Number.isSafeInteger(item.image_id) || !ops.op_image(current, item.image_id)
+      ) {
+        throw new TypeError("image() expects an image item returned by a nested tool");
+      }
+    },
     notify: (value) => ops.op_notify(current, stringify(value)),
     yield_control: () => ops.op_yield(current),
     exit: () => {

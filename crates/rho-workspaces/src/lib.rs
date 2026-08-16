@@ -18,7 +18,10 @@
 use std::collections::HashMap;
 use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::{File, OpenOptions};
-use std::os::fd::{BorrowedFd, OwnedFd, RawFd};
+use std::io::Read as _;
+use std::mem::size_of;
+use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd};
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
@@ -1162,6 +1165,67 @@ impl View {
         sandbox_join(self.entries[0].checkout().as_std_path(), path)
     }
 
+    /// Reads one regular file with a hard byte limit. Sandbox paths are
+    /// resolved by the kernel beneath the selected checkout, so concurrent
+    /// symlink or rename changes cannot escape the workdir between validation
+    /// and open.
+    pub async fn read_file_bounded(&self, path: &Path, max_len: usize) -> anyhow::Result<Vec<u8>> {
+        anyhow::ensure!(
+            max_len <= 64 * 1024 * 1024,
+            "bounded file read limit exceeds 64 MiB"
+        );
+        let sandboxed = self.entries[0].is_sandbox();
+        let (root, path) = if sandboxed {
+            if path.is_absolute() {
+                self.entries
+                    .iter()
+                    .find_map(|entry| {
+                        path.strip_prefix(entry.repo().as_std_path())
+                            .ok()
+                            .map(|relative| {
+                                (
+                                    entry.checkout().as_std_path().to_owned(),
+                                    relative.to_owned(),
+                                )
+                            })
+                    })
+                    .with_context(|| {
+                        format!(
+                            "sandbox file path is outside every workdir: {}",
+                            path.display()
+                        )
+                    })?
+            } else {
+                (
+                    self.entries[0].checkout().as_std_path().to_owned(),
+                    path.to_owned(),
+                )
+            }
+        } else {
+            let visible = if path.is_absolute() {
+                path.to_owned()
+            } else {
+                self.entries[0].repo().as_std_path().join(path)
+            };
+            (PathBuf::new(), self.resolve_host_path(&visible))
+        };
+
+        tokio::task::spawn_blocking(move || {
+            let file = if sandboxed {
+                open_beneath(&root, &path)?
+            } else {
+                File::open(&path)?
+            };
+            anyhow::ensure!(file.metadata()?.is_file(), "path is not a regular file");
+            let mut contents = Vec::new();
+            file.take(max_len as u64 + 1).read_to_end(&mut contents)?;
+            anyhow::ensure!(contents.len() <= max_len, "file exceeds {max_len} bytes");
+            Ok(contents)
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("bounded file read task failed: {error}"))?
+    }
+
     /// Commits every jj entry's checkout state into its repo. Called at turn
     /// boundaries so the user's jj view follows the agent's work in each
     /// workdir.
@@ -1178,6 +1242,41 @@ impl View {
             failures.join("; ")
         );
         Ok(())
+    }
+}
+
+#[repr(C)]
+struct OpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
+fn open_beneath(root: &Path, path: &Path) -> anyhow::Result<File> {
+    let root = File::open(root)?;
+    let path = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| anyhow::anyhow!("file path contains a NUL byte"))?;
+    let how = OpenHow {
+        flags: (libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64,
+        mode: 0,
+        resolve: 0x02 | 0x08, // RESOLVE_NO_MAGICLINKS | RESOLVE_BENEATH
+    };
+    // SAFETY: `path` and `how` remain valid for the syscall. On success the
+    // returned descriptor is newly owned by this process.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root.as_raw_fd(),
+            path.as_ptr(),
+            &how,
+            size_of::<OpenHow>(),
+        )
+    } as i32;
+    if fd < 0 {
+        Err(std::io::Error::last_os_error().into())
+    } else {
+        // SAFETY: successful openat2 returned a new owned file descriptor.
+        Ok(unsafe { File::from_raw_fd(fd) })
     }
 }
 
@@ -1422,8 +1521,18 @@ mod tests {
 
     use super::{
         PathOverrides, Repo, UserEnvironment, WorkspaceDiffContent, WorkspaceDiffStatus,
-        WorkspaceDiffTarget, copy_mtime_if_same, sandbox_join,
+        WorkspaceDiffTarget, copy_mtime_if_same, open_beneath, sandbox_join,
     };
+
+    #[test]
+    fn bounded_sandbox_open_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        symlink(outside.path(), root.path().join("escape")).unwrap();
+        assert!(open_beneath(root.path(), std::path::Path::new("escape")).is_err());
+    }
 
     #[tokio::test]
     async fn repo_cache_weakly_deduplicates_workspaces() {

@@ -831,6 +831,7 @@ impl Agent {
                         call_id: call.id.clone(),
                         tool_type: call.tool_type,
                         body: ToolOutput {
+                            images: std::sync::Arc::new(Vec::new()),
                             output: Arc::new(String::new()),
                             status: ToolOutputStatus::Cancelled,
                         },
@@ -1112,6 +1113,7 @@ impl Agent {
             Some(tool) => tool.run(call.clone(), SourceWaker::new(Arc::clone(&self.wake))),
             None => Box::new(BornExited {
                 output: ToolOutput {
+                    images: std::sync::Arc::new(Vec::new()),
                     output: Arc::new(format!("unknown tool: {}", call.name.as_str())),
                     status: ToolOutputStatus::Error,
                 },

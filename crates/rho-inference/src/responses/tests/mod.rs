@@ -150,6 +150,7 @@ fn tool_result_success(call_id: ToolCallId, content: impl Into<String>) -> ToolR
         call_id,
         tool_type: ToolType::Function,
         body: ToolOutput {
+            images: std::sync::Arc::new(Vec::new()),
             output: Arc::from(content.into()),
             status: ToolOutputStatus::Success,
         },

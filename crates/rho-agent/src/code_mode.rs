@@ -13,6 +13,7 @@ use rho_tool_shell::ShellTools;
 use rho_web_search::WebSearchTools;
 use tokio::sync::mpsc;
 
+use crate::image_tool::{ImageTools, VIEW_IMAGE_TOOL_NAME};
 use crate::multi_agent_tools::{self, MultiAgentTools};
 use crate::{AgentControl, ToolUpdate};
 
@@ -50,6 +51,7 @@ fn nested_tools(shell_tools: &ShellTools, role: Option<crate::db::AgentRole>) ->
     } else {
         shell_tools.specs()
     };
+    specs.push(ImageTools::spec());
     if let Some(role) = role {
         specs.extend(multi_agent_tools::agent_tool_specs(role));
     }
@@ -57,7 +59,13 @@ fn nested_tools(shell_tools: &ShellTools, role: Option<crate::db::AgentRole>) ->
     specs
         .iter()
         .map(|spec| {
-            let tool = NestedTool::from_spec(spec);
+            let mut tool = NestedTool::from_spec(spec);
+            if spec.name.as_str() == VIEW_IMAGE_TOOL_NAME {
+                tool = tool.with_image_output(serde_json::json!({
+                    "type": "string",
+                    "description": "A short confirmation containing the loaded path and prepared dimensions."
+                }));
+            }
             match ShellTools::code_mode_output_schema(spec.name.as_str()) {
                 Some(schema) => tool.with_output_schema(schema),
                 None => tool,
@@ -68,6 +76,7 @@ fn nested_tools(shell_tools: &ShellTools, role: Option<crate::db::AgentRole>) ->
 
 struct Dispatcher {
     shell_tools: ShellTools,
+    image_tools: ImageTools,
     multi_agent: Option<MultiAgentTools>,
     web_search: WebSearchTools,
     /// Nested calls run on the agent's runtime, not the code-mode thread's
@@ -91,26 +100,34 @@ impl ToolDispatcher for Dispatcher {
             .flatten();
         let web_search = (call.name.as_str() == rho_web_search::WEB_SEARCH_TOOL_NAME)
             .then(|| self.web_search.clone());
+        let image_tools =
+            (call.name.as_str() == VIEW_IMAGE_TOOL_NAME).then(|| self.image_tools.clone());
         let task = self.runtime.spawn(async move {
             if let Some(web_search) = web_search {
                 let output = web_search.call(call, context).await;
                 NestedToolOutput {
+                    images: Vec::new(),
                     value: serde_json::Value::String(output.output.as_ref().clone()),
                     status: output.status,
                 }
+            } else if let Some(image_tools) = image_tools {
+                NestedToolOutput::from_tool_output(image_tools.call(call).await)
             } else if let Some(tools) = agent_tools {
                 let output = multi_agent_tools::call_agent_tool(tools, call).await;
                 NestedToolOutput {
+                    images: Vec::new(),
                     value: serde_json::Value::String(output.output.as_ref().clone()),
                     status: output.status,
                 }
             } else {
                 match shell_tools.call_code_mode(call).await {
                     Ok(value) => NestedToolOutput {
+                        images: Vec::new(),
                         value,
                         status: ToolOutputStatus::Success,
                     },
                     Err(error) => NestedToolOutput {
+                        images: Vec::new(),
                         value: serde_json::Value::String(error.to_string()),
                         status: ToolOutputStatus::Error,
                     },
@@ -121,6 +138,7 @@ impl ToolDispatcher for Dispatcher {
             match task.await {
                 Ok(output) => output,
                 Err(_) => NestedToolOutput {
+                    images: Vec::new(),
                     value: serde_json::Value::String("nested tool task failed".to_owned()),
                     status: ToolOutputStatus::Error,
                 },
@@ -145,12 +163,14 @@ impl ToolDispatcher for Dispatcher {
 /// Must be called on the agent's runtime; blocks briefly for V8 startup.
 pub(crate) fn start_session(
     shell_tools: &ShellTools,
+    image_tools: &ImageTools,
     multi_agent: Option<&MultiAgentTools>,
     web_search: &WebSearchTools,
     control: mpsc::WeakUnboundedSender<AgentControl>,
 ) -> Result<CodeModeSession, String> {
     let dispatcher = Arc::new(Dispatcher {
         shell_tools: shell_tools.clone(),
+        image_tools: image_tools.clone(),
         multi_agent: multi_agent.cloned(),
         web_search: web_search.clone(),
         runtime: tokio::runtime::Handle::current(),
@@ -193,6 +213,27 @@ mod tests {
         assert!(!exec.contains("wait_agent"), "{exec}");
         assert!(exec.contains("ask_advisor"), "{exec}");
         assert!(!exec.contains("async function wait"), "{exec}");
+        assert!(
+            exec.contains(
+                r#"view_image(args: {
+  // Image detail level. Defaults to `high`; use `original` to preserve exact resolution within the original-detail safety limits.
+  detail?: "high" | "original";
+  // Image path, relative to the primary workdir or absolute.
+  path: string;
+}): Promise<{
+  // Opaque image items returned by the tool.
+  content: Array<{
+  // Cell-scoped opaque image identifier; pass the containing item to image().
+  image_id: number;
+  // Image content item.
+  type: "image";
+}>;
+  // A short confirmation containing the loaded path and prepared dimensions.
+  output: string;
+}>;"#
+            ),
+            "{exec}"
+        );
     }
 
     #[test]

@@ -673,10 +673,34 @@ fn convert_tool_result(result: ToolResult) -> Value {
         ToolType::Function => "function_call_output",
         ToolType::Custom => "custom_tool_call_output",
     };
+    let output = if result.body.images.is_empty() {
+        json!(result.body.output.as_ref())
+    } else {
+        use base64::Engine as _;
+        let mut content = Vec::with_capacity(result.body.images.len() + 1);
+        if !result.body.output.is_empty() {
+            content.push(json!({
+                "type": "input_text",
+                "text": result.body.output.as_ref(),
+            }));
+        }
+        content.extend(result.body.images.iter().map(|image| {
+            json!({
+                "type": "input_image",
+                "image_url": format!(
+                    "data:{};base64,{}",
+                    image.media_type,
+                    base64::engine::general_purpose::STANDARD.encode(&image.data)
+                ),
+                "detail": image.detail,
+            })
+        }));
+        Value::Array(content)
+    };
     json!({
         "type": output_type,
         "call_id": result.call_id.as_str(),
-        "output": result.body.output.as_ref(),
+        "output": output,
     })
 }
 

@@ -29,6 +29,7 @@ rho-core.workspace = true
 rho-db.workspace = true
 rho-shell-proto.workspace = true
 rho-inference.workspace = true
+rho-image.workspace = true
 rho-openai-realtime.workspace = true
 rho-iroh-auth = { workspace = true, features = ["server"] }
 rho-pr-monitor.workspace = true
@@ -52,5 +53,6 @@ url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }
 rho-shell.workspace = true
 senax-encoder.workspace = true

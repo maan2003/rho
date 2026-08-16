@@ -586,6 +586,7 @@ fn parse<T: for<'de> Deserialize<'de>>(call: &ToolCall) -> anyhow::Result<T> {
 
 fn tool_ok(output: String) -> ToolOutput {
     ToolOutput {
+        images: std::sync::Arc::new(Vec::new()),
         output: Arc::new(output),
         status: ToolOutputStatus::Success,
     }
@@ -593,6 +594,7 @@ fn tool_ok(output: String) -> ToolOutput {
 
 fn tool_error(error: impl Into<String>) -> ToolOutput {
     ToolOutput {
+        images: std::sync::Arc::new(Vec::new()),
         output: Arc::new(error.into()),
         status: ToolOutputStatus::Error,
     }

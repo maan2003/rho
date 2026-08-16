@@ -488,6 +488,7 @@ mod tests {
                         call_id,
                         tool_type: ToolType::Function,
                         body: ToolOutput {
+                            images: std::sync::Arc::new(Vec::new()),
                             output: Arc::new("hi".to_owned()),
                             status: ToolOutputStatus::Success,
                         },

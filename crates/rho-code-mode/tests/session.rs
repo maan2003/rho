@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use rho_code_mode::{CodeModeSession, NestedTool, NestedToolOutput, ToolDispatcher, WaitArgs};
-use rho_core::{ToolCall, ToolCallId, ToolOutputStatus, ToolSpec, ToolType};
+use rho_core::{ImageContent, ToolCall, ToolCallId, ToolOutputStatus, ToolSpec, ToolType};
 use serde_json::json;
 
 struct FakeDispatcher {
@@ -30,20 +30,33 @@ impl ToolDispatcher for FakeDispatcher {
         Box::pin(async move {
             match call.name.as_str() {
                 "echo" => NestedToolOutput {
+                    images: Vec::new(),
                     value: json!(format!("echo:{}", call.arguments)),
                     status: ToolOutputStatus::Success,
                 },
                 "structured" => NestedToolOutput {
+                    images: Vec::new(),
                     value: json!({"session_id": 42, "output": "ready"}),
                     status: ToolOutputStatus::Success,
                 },
                 "context" => NestedToolOutput {
+                    images: Vec::new(),
                     value: json!(context.model.as_ref()),
+                    status: ToolOutputStatus::Success,
+                },
+                "image_source" => NestedToolOutput {
+                    images: vec![ImageContent {
+                        media_type: "image/png".to_owned(),
+                        data: vec![1, 2, 3],
+                        detail: rho_core::ImageDetail::Original,
+                    }],
+                    value: json!("loaded"),
                     status: ToolOutputStatus::Success,
                 },
                 "slow_echo" => {
                     tokio::time::sleep(Duration::from_millis(300)).await;
                     NestedToolOutput {
+                        images: Vec::new(),
                         value: json!("slow done"),
                         status: ToolOutputStatus::Success,
                     }
@@ -54,10 +67,12 @@ impl ToolDispatcher for FakeDispatcher {
                     unreachable!()
                 }
                 "fail" => NestedToolOutput {
+                    images: Vec::new(),
                     value: json!("tool exploded"),
                     status: ToolOutputStatus::Error,
                 },
                 other => NestedToolOutput {
+                    images: Vec::new(),
                     value: json!(format!("unknown tool {other}")),
                     status: ToolOutputStatus::Error,
                 },
@@ -78,18 +93,26 @@ fn exec_id() -> ToolCallId {
 }
 
 fn nested_tools() -> Vec<NestedTool> {
-    ["echo", "structured", "context", "slow_echo", "hang", "fail"]
-        .into_iter()
-        .map(|name| {
-            NestedTool::from_spec(&ToolSpec {
-                name: name.try_into().unwrap(),
-                tool_type: ToolType::Function,
-                description: format!("test tool {name}"),
-                input_schema: json!({ "type": "object", "properties": {} }),
-                format: None,
-            })
+    [
+        "echo",
+        "structured",
+        "context",
+        "image_source",
+        "slow_echo",
+        "hang",
+        "fail",
+    ]
+    .into_iter()
+    .map(|name| {
+        NestedTool::from_spec(&ToolSpec {
+            name: name.try_into().unwrap(),
+            tool_type: ToolType::Function,
+            description: format!("test tool {name}"),
+            input_schema: json!({ "type": "object", "properties": {} }),
+            format: None,
         })
-        .collect()
+    })
+    .collect()
 }
 
 #[tokio::test]
@@ -108,6 +131,55 @@ async fn nested_tool_returns_a_structured_javascript_value() {
         result.output
     );
     assert!(result.output.contains("42:ready"), "{}", result.output);
+}
+
+#[tokio::test]
+async fn image_helper_appends_a_nested_tool_image_with_its_detail() {
+    let session = CodeModeSession::new(nested_tools(), FakeDispatcher::new()).unwrap();
+    let result = session
+        .execute(
+            exec_id(),
+            "const result = await tools.image_source({}); text(result.output); image(result.content[0])",
+        )
+        .await;
+    assert_eq!(
+        result.status,
+        ToolOutputStatus::Success,
+        "{}",
+        result.output
+    );
+    assert!(result.output.contains("loaded"), "{}", result.output);
+    assert_eq!(
+        result.images.as_ref(),
+        &[ImageContent {
+            media_type: "image/png".to_owned(),
+            data: vec![1, 2, 3],
+            detail: rho_core::ImageDetail::Original,
+        }]
+    );
+}
+
+#[tokio::test]
+async fn image_helper_enforces_cell_lifetime_count_after_handles_are_consumed() {
+    let session = CodeModeSession::new(nested_tools(), FakeDispatcher::new()).unwrap();
+    let result = session
+        .execute(
+            exec_id(),
+            r#"
+for (let i = 0; i < 21; i++) {
+  const result = await tools.image_source({});
+  image(result.content[0]);
+}
+"#,
+        )
+        .await;
+    assert_eq!(result.status, ToolOutputStatus::Error, "{}", result.output);
+    assert!(
+        result.output.contains("image limit exceeded"),
+        "{}",
+        result.output
+    );
+    assert_eq!(result.images.len(), 20);
 }
 
 fn session() -> (CodeModeSession, Arc<FakeDispatcher>) {

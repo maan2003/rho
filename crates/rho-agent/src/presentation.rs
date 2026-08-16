@@ -615,6 +615,7 @@ fn tool_results(items: &[InferenceResponseItem]) -> Vec<ToolResult> {
                     call_id: id.clone(),
                     tool_type: *tool_type,
                     body: ToolOutput {
+                        images: std::sync::Arc::new(Vec::new()),
                         output: Arc::new("presentation recorded".to_owned()),
                         status: ToolOutputStatus::Success,
                     },

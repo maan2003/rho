@@ -13598,6 +13598,7 @@ dependencies = [
  "chrono",
  "dirs",
  "futures 0.3.33",
+ "image",
  "prefix-id",
  "rand 0.8.7",
  "redb",
@@ -13607,6 +13608,7 @@ dependencies = [
  "rho-context-config",
  "rho-core",
  "rho-db",
+ "rho-image",
  "rho-inference",
  "rho-tool-shell",
  "rho-web-search",
@@ -13792,6 +13794,7 @@ dependencies = [
  "clap",
  "dirs",
  "futures 0.3.33",
+ "image",
  "iroh",
  "json-stream",
  "libc",
@@ -13806,6 +13809,7 @@ dependencies = [
  "rho-claude-usage",
  "rho-core",
  "rho-db",
+ "rho-image",
  "rho-inference",
  "rho-iroh-auth",
  "rho-openai-realtime",
@@ -13918,6 +13922,16 @@ dependencies = [
  "wasm-bindgen-futures",
  "web-sys",
  "zeroize",
+]
+
+[[package]]
+name = "rho-image"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "image",
+ "rho-core",
+ "tokio",
 ]
 
 [[package]]

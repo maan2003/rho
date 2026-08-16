@@ -28,6 +28,7 @@ rho-context-config.workspace = true
 rho-core.workspace = true
 rho-db.workspace = true
 rho-inference.workspace = true
+rho-image.workspace = true
 rho-tool-shell.workspace = true
 rho-workspaces.workspace = true
 rho-web-search.workspace = true
@@ -39,3 +40,4 @@ tokio.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+image = { version = "0.25", default-features = false, features = ["png"] }

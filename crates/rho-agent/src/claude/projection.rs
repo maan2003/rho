@@ -343,6 +343,7 @@ fn project_tool_result(content: &Value) -> anyhow::Result<Option<ToolResult>> {
         call_id: ToolCallId::try_from(tool_use_id)?,
         tool_type: ToolType::Function,
         body: ToolOutput {
+            images: std::sync::Arc::new(Vec::new()),
             output: Arc::new(output),
             status,
         },

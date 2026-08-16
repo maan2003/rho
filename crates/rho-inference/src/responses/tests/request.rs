@@ -610,6 +610,11 @@ fn serializes_custom_tool_calls_and_results() {
         call_id: tool_call_id("call-1"),
         tool_type: ToolType::Custom,
         body: ToolOutput {
+            images: Arc::new(vec![rho_core::ImageContent {
+                media_type: "image/png".to_owned(),
+                data: vec![1, 2, 3],
+                detail: rho_core::ImageDetail::Original,
+            }]),
             output: Arc::from("custom output".to_owned()),
             status: rho_core::ToolOutputStatus::Success,
         },
@@ -669,7 +674,13 @@ fn serializes_custom_tool_calls_and_results() {
     assert_eq!(json["input"][0]["id"], "ctc_call-1");
     assert_eq!(json["input"][0]["input"], "*** Begin Patch\n*** End Patch");
     assert_eq!(json["input"][1]["type"], "custom_tool_call_output");
-    assert_eq!(json["input"][1]["output"], "custom output");
+    assert_eq!(
+        json["input"][1]["output"],
+        json!([
+            {"type": "input_text", "text": "custom output"},
+            {"type": "input_image", "image_url": "data:image/png;base64,AQID", "detail": "original"}
+        ])
+    );
 }
 
 #[test]

@@ -29,6 +29,17 @@ AI APIs.
   request/retry task.
 - Inference APIs and streamed inference events are remote, semi-trusted inputs and
   must be parsed defensively.
+- Authenticated clients and view-aware tools may supply image files. Rho accepts
+  at most 20 user images within the UI frame budget and 10 MiB per source,
+  decodes each under fixed dimension and allocation limits, resizes to a bounded
+  vision patch/pixel budget, and writes a fresh single-frame PNG before durable
+  context or provider upload. This strips container metadata, color profiles,
+  animation, and the source encoding. `view_image` detail `original` preserves
+  resolution only within its separate 6,000-pixel/10,000-patch budget. In
+  sandbox views, `view_image` uses the
+  same checked in-process path mapping as patch writes and rejects paths outside
+  the workdirs; ordinary views retain their documented ambient filesystem
+  authority.
 - A watched agent presentation sidecar sends a bounded (10 KiB total, 1 KiB
   per message), text-only recent transcript excerpt to Luna to derive a
   title/activity cache. Native agents commit source events directly; Claude
