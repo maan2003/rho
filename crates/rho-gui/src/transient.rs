@@ -43,6 +43,7 @@ pub struct Transient {
     quota_usage: Option<Vec<rho_ui_proto::QuotaSeries>>,
     active_auth_namespaces: Vec<String>,
     global_usage: Option<Vec<rho_ui_proto::AgentUsageSeries>>,
+    agent_cost_usage: Option<Vec<Vec<rho_ui_proto::AgentCostSeries>>>,
     usage_days: u64,
 }
 
@@ -54,6 +55,7 @@ impl Transient {
             quota_usage: None,
             active_auth_namespaces: Vec::new(),
             global_usage: None,
+            agent_cost_usage: None,
             usage_days: 7,
         }
     }
@@ -235,6 +237,74 @@ impl Transient {
                                             .child("now"),
                                     ),
                             ),
+                    ),
+                )
+                .into_any_element();
+        }
+        if self.title == "agent cost"
+            && let Some(series) = &self.agent_cost_usage
+        {
+            let days = self.usage_days;
+            let now = crate::workspace::now_ms();
+            let points = agent_cost_percentile_points(series, now, days);
+            let scale = agent_cost_scale(&points);
+            let p50: Hsla = colors.terminal_ansi_cyan.into();
+            let p90: Hsla = colors.terminal_ansi_yellow.into();
+            let p99: Hsla = colors.terminal_ansi_red.into();
+            let grid: Hsla = colors.text_muted.opacity(0.22).into();
+            let mut curve_labels = div().relative().h(px(220.)).w(px(44.));
+            if let Some((_, latest)) = points.last() {
+                for (label, value, color) in [
+                    ("p50", latest[0], p50),
+                    ("p90", latest[1], p90),
+                    ("p99", latest[2], p99),
+                ] {
+                    let top = (agent_cost_y_ratio(value, scale) * 208.0).clamp(0.0, 208.0);
+                    curve_labels = curve_labels
+                        .child(div().absolute().top(px(top)).text_color(color).child(label));
+                }
+            }
+            return bottom_strip(text_style, cx)
+                .child(
+                    div().px_2().pb_1().child(
+                        div()
+                            .flex()
+                            .items_start()
+                            .text_size(px(11.))
+                            .text_color(muted)
+                            .child(
+                                div()
+                                    .h(px(220.))
+                                    .w(px(64.))
+                                    .pr_2()
+                                    .flex()
+                                    .flex_col()
+                                    .items_end()
+                                    .justify_between()
+                                    .children(
+                                        (scale.min_power..=scale.max_power)
+                                            .rev()
+                                            .map(format_agent_cost_tick),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .child(div().w(px(832.)).h(px(220.)).child(agent_cost_chart(
+                                        points, now, days, scale, p50, p90, p99, grid,
+                                    )))
+                                    .child(
+                                        div()
+                                            .mt_1()
+                                            .flex()
+                                            .w(px(832.))
+                                            .justify_between()
+                                            .child(format!("−{days}d"))
+                                            .child("now"),
+                                    ),
+                            )
+                            .child(curve_labels),
                     ),
                 )
                 .into_any_element();
@@ -670,6 +740,16 @@ pub fn usage_root_menu() -> Transient {
                 workspace.open_usage_share_transient(30, window, cx);
             },
         )
+        .item("a", "GPT agent cost · 7d", |workspace, window, cx| {
+            workspace.open_agent_cost_transient(7, window, cx);
+        })
+        .item(
+            "shift-a",
+            "GPT agent cost · 30d",
+            |workspace, window, cx| {
+                workspace.open_agent_cost_transient(30, window, cx);
+            },
+        )
 }
 
 pub fn usage_menu(
@@ -694,6 +774,13 @@ pub fn global_usage_menu(series: Vec<rho_ui_proto::AgentUsageSeries>, days: u64)
 pub fn usage_share_menu(series: Vec<rho_ui_proto::AgentUsageSeries>, days: u64) -> Transient {
     let mut menu = Transient::new("model usage share");
     menu.global_usage = Some(series);
+    menu.usage_days = days;
+    menu
+}
+
+pub fn agent_cost_menu(series: Vec<Vec<rho_ui_proto::AgentCostSeries>>, days: u64) -> Transient {
+    let mut menu = Transient::new("agent cost");
+    menu.agent_cost_usage = Some(series);
     menu.usage_days = days;
     menu
 }
@@ -893,6 +980,208 @@ fn pchip_endpoint(width: f64, adjacent_width: f64, secant: f64, adjacent: f64) -
         slope = 3.0 * secant;
     }
     slope
+}
+
+#[derive(Clone, Copy)]
+struct AgentCostScale {
+    min_power: i32,
+    max_power: i32,
+}
+
+/// Hourly P50/P90/P99 of trailing-seven-day GPT-family cost per agent. Each
+/// hourly cross-section becomes a log-cost histogram; EMA is applied to its
+/// mass before extracting quantiles so busier hours carry proportionally more
+/// evidence without averaging per-host percentiles.
+fn agent_cost_percentile_points(
+    hosts: &[Vec<rho_ui_proto::AgentCostSeries>],
+    now: u64,
+    days: u64,
+) -> Vec<(u64, [f64; 3])> {
+    const HOUR_MS: u64 = 60 * 60 * 1_000;
+    const COST_WINDOW_HOURS: u64 = rho_ui_proto::AGENT_COST_WINDOW_DAYS * 24;
+    const HISTOGRAM_BINS: usize = 256;
+    const MIN_LOG_COST: f64 = -3.0;
+    const MAX_LOG_COST: f64 = 5.0;
+
+    let visible_start = now.saturating_sub(days * 24 * HOUR_MS);
+    let end_bucket = (now / HOUR_MS * HOUR_MS).saturating_sub(HOUR_MS);
+    let half_life_hours = if days <= 7 { 12.0 } else { 48.0 };
+    let decay = 0.5_f64.powf(1.0 / half_life_hours);
+    let mut hourly = HashMap::<u64, Vec<((usize, rho_ui_proto::AgentId), f64)>>::new();
+    let mut first_bucket = end_bucket;
+
+    for (host_index, series_set) in hosts.iter().enumerate() {
+        for series in series_set {
+            if !matches!(series.model.as_str(), "gpt" | "terra" | "luna" | "unknown") {
+                continue;
+            }
+            for bucket in &series.buckets {
+                let bucket_start = bucket.bucket_start_ms / HOUR_MS * HOUR_MS;
+                first_bucket = first_bucket.min(bucket_start);
+                hourly.entry(bucket_start).or_default().push((
+                    (host_index, series.agent_id),
+                    bucket_cost_usd(bucket, &series.model),
+                ));
+            }
+        }
+    }
+
+    let mut rolling = HashMap::<(usize, rho_ui_proto::AgentId), f64>::new();
+    let mut smoothed_histogram = [0.0; HISTOGRAM_BINS];
+    let mut points = Vec::new();
+    let mut bucket_start = first_bucket;
+    while bucket_start <= end_bucket {
+        let expired_at = bucket_start.saturating_sub(COST_WINDOW_HOURS * HOUR_MS);
+        if let Some(expired) = hourly.get(&expired_at) {
+            for (agent, cost) in expired {
+                if let Some(total) = rolling.get_mut(agent) {
+                    *total = (*total - cost).max(0.0);
+                }
+            }
+            rolling.retain(|_, total| *total > f64::EPSILON);
+        }
+        if let Some(current) = hourly.get(&bucket_start) {
+            for (agent, cost) in current {
+                *rolling.entry(*agent).or_default() += cost;
+            }
+        }
+
+        let mut histogram = [0.0; HISTOGRAM_BINS];
+        for cost in rolling.values().copied().filter(|cost| *cost > 0.0) {
+            let ratio = ((cost.log10() - MIN_LOG_COST) / (MAX_LOG_COST - MIN_LOG_COST))
+                .clamp(0.0, 1.0 - f64::EPSILON);
+            histogram[(ratio * HISTOGRAM_BINS as f64) as usize] += 1.0;
+        }
+        for (smoothed, current) in smoothed_histogram.iter_mut().zip(histogram) {
+            *smoothed = *smoothed * decay + current * (1.0 - decay);
+        }
+        let total = smoothed_histogram.iter().sum::<f64>();
+        if total >= 0.01 && bucket_start >= visible_start {
+            let percentiles = [0.5, 0.9, 0.99].map(|percentile| {
+                histogram_percentile(&smoothed_histogram, percentile, MIN_LOG_COST, MAX_LOG_COST)
+            });
+            points.push((bucket_start.saturating_add(HOUR_MS).min(now), percentiles));
+        }
+        bucket_start = bucket_start.saturating_add(HOUR_MS);
+    }
+    points
+}
+
+fn histogram_percentile(histogram: &[f64], percentile: f64, min_log: f64, max_log: f64) -> f64 {
+    let target = histogram.iter().sum::<f64>() * percentile;
+    let mut cumulative = 0.0;
+    for (index, weight) in histogram.iter().copied().enumerate() {
+        let previous = cumulative;
+        cumulative += weight;
+        if cumulative >= target && weight > 0.0 {
+            let within = ((target - previous) / weight).clamp(0.0, 1.0);
+            let width = (max_log - min_log) / histogram.len() as f64;
+            return 10.0_f64.powf(min_log + (index as f64 + within) * width);
+        }
+    }
+    10.0_f64.powf(max_log)
+}
+
+fn agent_cost_scale(points: &[(u64, [f64; 3])]) -> AgentCostScale {
+    let min = points
+        .iter()
+        .map(|(_, values)| values[0])
+        .filter(|value| *value > 0.0)
+        .min_by(f64::total_cmp)
+        .unwrap_or(0.1);
+    let max = points
+        .iter()
+        .map(|(_, values)| values[2])
+        .max_by(f64::total_cmp)
+        .unwrap_or(10.0);
+    let min_power = min.log10().floor() as i32;
+    let mut max_power = max.log10().ceil() as i32;
+    if max_power <= min_power {
+        max_power = min_power + 1;
+    }
+    AgentCostScale {
+        min_power,
+        max_power,
+    }
+}
+
+fn agent_cost_y_ratio(value: f64, scale: AgentCostScale) -> f32 {
+    let span = f64::from(scale.max_power - scale.min_power).max(1.0);
+    (1.0 - (value.max(10.0_f64.powi(scale.min_power)).log10() - f64::from(scale.min_power)) / span)
+        .clamp(0.0, 1.0) as f32
+}
+
+fn format_agent_cost_tick(power: i32) -> String {
+    match power {
+        3 => "$1k".to_owned(),
+        4 => "$10k".to_owned(),
+        5 => "$100k".to_owned(),
+        power if power >= 0 => format!("${}", 10_u64.pow(power as u32)),
+        -1 => "$0.10".to_owned(),
+        -2 => "$0.01".to_owned(),
+        _ => "$0.001".to_owned(),
+    }
+}
+
+#[expect(clippy::too_many_arguments)]
+fn agent_cost_chart(
+    points: Vec<(u64, [f64; 3])>,
+    now: u64,
+    days: u64,
+    scale: AgentCostScale,
+    p50: Hsla,
+    p90: Hsla,
+    p99: Hsla,
+    grid: Hsla,
+) -> impl IntoElement {
+    canvas(
+        move |_, _, _| {},
+        move |bounds, _, window, _| {
+            const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
+            let window_ms = days * DAY_MS;
+            let start = now.saturating_sub(window_ms);
+            for power in scale.min_power..=scale.max_power {
+                let y = bounds.origin.y
+                    + bounds.size.height * agent_cost_y_ratio(10.0_f64.powi(power), scale);
+                paint_grid_line(
+                    point(bounds.origin.x, y),
+                    point(bounds.right(), y),
+                    grid,
+                    window,
+                );
+            }
+            let mut midnight = start.div_ceil(DAY_MS) * DAY_MS;
+            if midnight == start {
+                midnight = midnight.saturating_add(DAY_MS);
+            }
+            while midnight < now {
+                let x_ratio = midnight.saturating_sub(start) as f64 / window_ms.max(1) as f64;
+                let x = bounds.origin.x + bounds.size.width * x_ratio as f32;
+                paint_grid_line(
+                    point(x, bounds.origin.y),
+                    point(x, bounds.bottom()),
+                    grid,
+                    window,
+                );
+                midnight = midnight.saturating_add(DAY_MS);
+            }
+            for (index, color) in [p50, p90, p99].into_iter().enumerate() {
+                let curve = points
+                    .iter()
+                    .map(|(at, values)| {
+                        let x_ratio = at.saturating_sub(start) as f64 / window_ms.max(1) as f64;
+                        point(
+                            bounds.origin.x + bounds.size.width * x_ratio.clamp(0.0, 1.0) as f32,
+                            bounds.origin.y
+                                + bounds.size.height * agent_cost_y_ratio(values[index], scale),
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                paint_usage_segment(&curve, color, window);
+            }
+        },
+    )
+    .size_full()
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -1436,6 +1725,65 @@ mod tests {
         assert_eq!(bucket_cost_usd(&usage, "gpt"), 41.75);
         assert_eq!(bucket_cost_usd(&usage, "terra"), 20.875);
         assert_eq!(bucket_cost_usd(&usage, "luna"), 8.35);
+    }
+
+    #[test]
+    fn agent_cost_percentiles_keep_same_counter_agents_separate_across_hosts() {
+        const HOUR_MS: u64 = 60 * 60 * 1_000;
+        let agent_id =
+            rho_ui_proto::AgentId::from_counter(1, &rho_ui_proto::AgentIdDomain(0)).unwrap();
+        let series = |output_tokens| {
+            vec![rho_ui_proto::AgentCostSeries {
+                agent_id,
+                model: "gpt".to_owned(),
+                buckets: vec![rho_ui_proto::AgentUsageBucket {
+                    bucket_start_ms: 10 * HOUR_MS,
+                    output_tokens,
+                    requests: 1,
+                    ..Default::default()
+                }],
+            }]
+        };
+        let now = 40 * HOUR_MS + HOUR_MS / 2;
+        let points = agent_cost_percentile_points(&[series(1_000_000), series(10_000_000)], now, 7);
+        let latest = points.last().unwrap().1;
+        assert!(
+            latest[0] < 100.0,
+            "p50 merged colliding host ids: {latest:?}"
+        );
+        assert!(latest[2] > 250.0, "p99 lost the second host: {latest:?}");
+        assert!(latest[0] <= latest[1] && latest[1] <= latest[2]);
+    }
+
+    #[test]
+    fn agent_cost_percentiles_ignore_the_current_partial_hour() {
+        const HOUR_MS: u64 = 60 * 60 * 1_000;
+        let agent_id =
+            rho_ui_proto::AgentId::from_counter(1, &rho_ui_proto::AgentIdDomain(0)).unwrap();
+        let now = 40 * HOUR_MS + HOUR_MS / 2;
+        let points = agent_cost_percentile_points(
+            &[vec![rho_ui_proto::AgentCostSeries {
+                agent_id,
+                model: "gpt".to_owned(),
+                buckets: vec![
+                    rho_ui_proto::AgentUsageBucket {
+                        bucket_start_ms: 10 * HOUR_MS,
+                        output_tokens: 1_000_000,
+                        requests: 1,
+                        ..Default::default()
+                    },
+                    rho_ui_proto::AgentUsageBucket {
+                        bucket_start_ms: 40 * HOUR_MS,
+                        output_tokens: 10_000_000,
+                        requests: 1,
+                        ..Default::default()
+                    },
+                ],
+            }]],
+            now,
+            7,
+        );
+        assert!(points.last().unwrap().1[2] < 100.0);
     }
 
     #[test]

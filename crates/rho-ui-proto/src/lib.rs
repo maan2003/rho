@@ -32,6 +32,8 @@ pub use workspace::{FileReadResult, FileSaveResult, WorkspaceClientFrame, Worksp
 
 /// Maximum accepted frame payload size.
 pub const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
+/// Window represented by each point in the agent-cost distribution graph.
+pub const AGENT_COST_WINDOW_DAYS: u64 = 7;
 /// ALPN identifying this protocol on iroh connections to the daemon.
 pub const IROH_ALPN: &[u8] = b"rho/ui/3";
 #[cfg(not(target_family = "wasm"))]
@@ -307,6 +309,11 @@ pub enum ClientMessage {
         since_ms: u64,
     },
     GlobalUsage {
+        since_ms: u64,
+    },
+    /// Raw per-agent usage needed to form cost distributions beginning at
+    /// `since_ms`. The daemon includes the fixed trailing-window lookback.
+    AgentCostDistribution {
         since_ms: u64,
     },
     /// Stores an immutable visualization snapshot and replies with
@@ -703,6 +710,9 @@ pub enum ServerMessage {
     GlobalUsage {
         series: Vec<AgentUsageSeries>,
     },
+    AgentCostDistribution {
+        series: Vec<AgentCostSeries>,
+    },
     VisualizationRecorded {
         id: String,
     },
@@ -775,6 +785,15 @@ pub struct AgentUsageBucket {
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct AgentUsageSeries {
+    pub model: String,
+    pub buckets: Vec<AgentUsageBucket>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct AgentCostSeries {
+    /// Host-local identity. Clients combining hosts must keep the host in the
+    /// distribution key rather than merging equal counters.
+    pub agent_id: AgentId,
     pub model: String,
     pub buckets: Vec<AgentUsageBucket>,
 }
@@ -1185,6 +1204,33 @@ mod tests {
                 buckets: vec![AgentUsageBucket {
                     bucket_start_ms: 300_000,
                     input_tokens: 10,
+                    ..AgentUsageBucket::default()
+                }],
+            }],
+        };
+        let bytes = senax_encoder::pack(&message).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn agent_cost_distribution_response_round_trips() {
+        let request = ClientMessage::AgentCostDistribution { since_ms: 42 };
+        let bytes = senax_encoder::pack(&request).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(request, decoded);
+
+        let agent_id = AgentId::from_counter(7, &AgentIdDomain(1)).unwrap();
+        let message = ServerMessage::AgentCostDistribution {
+            series: vec![AgentCostSeries {
+                agent_id,
+                model: "gpt".to_owned(),
+                buckets: vec![AgentUsageBucket {
+                    bucket_start_ms: 3_600_000,
+                    output_tokens: 10,
+                    requests: 1,
                     ..AgentUsageBucket::default()
                 }],
             }],

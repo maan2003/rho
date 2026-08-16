@@ -102,6 +102,7 @@ pub enum ConnEvent {
     QuotaUsage(Vec<rho_ui_proto::QuotaSummary>),
     QuotaHistory(Vec<rho_ui_proto::QuotaSeries>),
     GlobalUsage(Vec<rho_ui_proto::AgentUsageSeries>),
+    AgentCostDistribution(Vec<rho_ui_proto::AgentCostSeries>),
     ServerError(String),
     Recovering(std::time::Duration),
     Recovered,
@@ -1032,6 +1033,9 @@ async fn run(
             ServerMessage::QuotaHistory { series } => Some(ConnEvent::QuotaHistory(series)),
             ServerMessage::AgentUsage { .. } => None,
             ServerMessage::GlobalUsage { series } => Some(ConnEvent::GlobalUsage(series)),
+            ServerMessage::AgentCostDistribution { series } => {
+                Some(ConnEvent::AgentCostDistribution(series))
+            }
             ServerMessage::GitTransportRequested {
                 request_id,
                 provider_id,

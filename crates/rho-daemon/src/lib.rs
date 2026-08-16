@@ -20,10 +20,10 @@ use rho_inference::Inference;
 use rho_ui_proto::remote::AgentRemoteEncoder;
 use rho_ui_proto::server::{Server, ServerConnection};
 use rho_ui_proto::{
-    AgentUsageBucket as UiAgentUsageBucket, AgentUsageSeries, AuthState, ClientMessage, JoinTarget,
-    LandLeaseHolder, LandStatus, McpAgentToolRequest, McpAgentToolResponse, QuotaPoint,
-    QuotaSeries, QuotaSummary, ServerMessage, StartMode, UiAgentSummary, UiAttention, UiProject,
-    UiTurnReport, WorkspaceInfo, read_frame, write_frame,
+    AgentCostSeries, AgentUsageBucket as UiAgentUsageBucket, AgentUsageSeries, AuthState,
+    ClientMessage, JoinTarget, LandLeaseHolder, LandStatus, McpAgentToolRequest,
+    McpAgentToolResponse, QuotaPoint, QuotaSeries, QuotaSummary, ServerMessage, StartMode,
+    UiAgentSummary, UiAttention, UiProject, UiTurnReport, WorkspaceInfo, read_frame, write_frame,
 };
 use tokio::sync::{Mutex, Mutex as TokioMutex, OwnedMutexGuard, broadcast, mpsc, oneshot, watch};
 
@@ -2075,6 +2075,75 @@ fn hourly_global_usage_series(
     .collect()
 }
 
+fn hourly_agent_cost_series(
+    db: &RhoDb,
+    since: rho_core::UnixMs,
+) -> anyhow::Result<Vec<AgentCostSeries>> {
+    const MAX_HOURLY_AGENT_COST_BUCKETS: usize = 500_000;
+
+    let read = db.read();
+    let mut hourly = BTreeMap::new();
+    for (agent_id, _) in read.list_agents() {
+        for bucket in read.agent_usage(agent_id, since) {
+            if !matches!(
+                bucket.model,
+                AgentUsageModel::GPT
+                    | AgentUsageModel::TERRA
+                    | AgentUsageModel::LUNA
+                    | AgentUsageModel::UNKNOWN
+            ) {
+                continue;
+            }
+            merge_hourly_agent_cost_bucket(
+                &mut hourly,
+                agent_id,
+                bucket,
+                MAX_HOURLY_AGENT_COST_BUCKETS,
+            )?;
+        }
+    }
+
+    let mut series = BTreeMap::<(AgentId, AgentUsageModel), Vec<UiAgentUsageBucket>>::new();
+    for ((agent_id, model, _), bucket) in hourly {
+        series
+            .entry((agent_id, model))
+            .or_default()
+            .push(ui_agent_usage_bucket(bucket));
+    }
+    Ok(series
+        .into_iter()
+        .map(|((agent_id, model), buckets)| AgentCostSeries {
+            agent_id,
+            model: model.name().to_owned(),
+            buckets,
+        })
+        .collect())
+}
+
+fn merge_hourly_agent_cost_bucket(
+    hourly: &mut BTreeMap<(AgentId, AgentUsageModel, u64), rho_agent::db::AgentUsageBucket>,
+    agent_id: AgentId,
+    bucket: rho_agent::db::AgentUsageBucket,
+    max_buckets: usize,
+) -> anyhow::Result<()> {
+    const HOUR_MS: u64 = 60 * 60 * 1_000;
+
+    let bucket_start_ms = bucket.bucket_start_ms / HOUR_MS * HOUR_MS;
+    hourly
+        .entry((agent_id, bucket.model, bucket_start_ms))
+        .or_insert_with(|| rho_agent::db::AgentUsageBucket {
+            bucket_start_ms,
+            model: bucket.model,
+            ..rho_agent::db::AgentUsageBucket::default()
+        })
+        .add(&bucket);
+    anyhow::ensure!(
+        hourly.len() <= max_buckets,
+        "agent cost history exceeds {max_buckets} hourly buckets"
+    );
+    Ok(())
+}
+
 fn quota_history(db: &RhoDb, inference: &Inference) -> Vec<QuotaSeries> {
     let mut series = claude_quota_history(db);
     let since = rho_core::UnixMs(
@@ -2370,6 +2439,24 @@ async fn handle_message(
                 .global_agent_usage(rho_core::UnixMs(since_ms));
             let series = hourly_global_usage_series(usage);
             let _ = outgoing_tx.send(ServerMessage::GlobalUsage { series });
+            Ok(Refresh::None)
+        }
+        ClientMessage::AgentCostDistribution { since_ms } => {
+            const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
+            const MAX_HISTORY_DAYS: u64 = 30 + 14 + rho_ui_proto::AGENT_COST_WINDOW_DAYS;
+
+            agents.pool.flush_agent_usage(None).await;
+            let now = rho_core::UnixMs::now().0;
+            let earliest = since_ms
+                .saturating_sub(rho_ui_proto::AGENT_COST_WINDOW_DAYS * DAY_MS)
+                .max(now.saturating_sub(MAX_HISTORY_DAYS * DAY_MS));
+            let response = match hourly_agent_cost_series(&agents.db, rho_core::UnixMs(earliest)) {
+                Ok(series) => ServerMessage::AgentCostDistribution { series },
+                Err(error) => ServerMessage::Error {
+                    message: error.to_string(),
+                },
+            };
+            let _ = outgoing_tx.send(response);
             Ok(Refresh::None)
         }
         ClientMessage::ShellStart { request_id, agent } => {
@@ -3664,6 +3751,7 @@ fn expand_home(path: &Utf8Path) -> Option<Utf8PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::ffi::{OsStr, OsString};
     use std::sync::Arc;
 
@@ -3675,7 +3763,8 @@ mod tests {
     use super::{
         AgentUsageModel, GitProviderClaim, GitTransportBroker, MAX_IMAGE_BASE64_BYTES,
         MAX_INPUT_IMAGES, claude_quota_history, configure_octo_git_transport,
-        hourly_global_usage_series, quota_burn, quota_summaries, validate_image_content,
+        hourly_global_usage_series, merge_hourly_agent_cost_bucket, quota_burn, quota_summaries,
+        validate_image_content,
     };
 
     #[test]
@@ -3710,6 +3799,24 @@ mod tests {
         assert_eq!(series[0].buckets[0].requests, 2);
         assert_eq!(series[1].model, "gpt");
         assert_eq!(series[1].buckets[0].bucket_start_ms, 60 * 60 * 1_000);
+    }
+
+    #[test]
+    fn agent_cost_history_rejects_more_than_its_hourly_bucket_limit() {
+        let agent_id =
+            rho_agent::db::AgentId::from_counter(1, &rho_core::AgentIdDomain(0)).unwrap();
+        let bucket = |bucket_start_ms| rho_agent::db::AgentUsageBucket {
+            bucket_start_ms,
+            model: AgentUsageModel::GPT,
+            requests: 1,
+            ..Default::default()
+        };
+        let mut hourly = BTreeMap::new();
+        merge_hourly_agent_cost_bucket(&mut hourly, agent_id, bucket(0), 1).unwrap();
+        assert!(
+            merge_hourly_agent_cost_bucket(&mut hourly, agent_id, bucket(60 * 60 * 1_000), 1,)
+                .is_err()
+        );
     }
 
     #[test]

@@ -180,6 +180,8 @@ impl Workspace {
             quota_history_days: 7,
             global_usage: HashMap::new(),
             global_usage_days: 7,
+            agent_cost_usage: HashMap::new(),
+            agent_cost_days: 7,
             duration_timer: None,
             contexts: HashMap::new(),
             surfaces: HashMap::new(),

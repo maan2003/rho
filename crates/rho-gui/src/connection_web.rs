@@ -101,6 +101,7 @@ pub enum ConnEvent {
     QuotaUsage(Vec<rho_ui_proto::QuotaSummary>),
     QuotaHistory(Vec<rho_ui_proto::QuotaSeries>),
     GlobalUsage(Vec<rho_ui_proto::AgentUsageSeries>),
+    AgentCostDistribution(Vec<rho_ui_proto::AgentCostSeries>),
     ServerError(String),
     Recovering(std::time::Duration),
     Recovered,
@@ -417,6 +418,9 @@ fn handle_host_message(
         ServerMessage::QuotaUsage { summaries } => Some(ConnEvent::QuotaUsage(summaries.clone())),
         ServerMessage::QuotaHistory { series } => Some(ConnEvent::QuotaHistory(series.clone())),
         ServerMessage::GlobalUsage { series } => Some(ConnEvent::GlobalUsage(series.clone())),
+        ServerMessage::AgentCostDistribution { series } => {
+            Some(ConnEvent::AgentCostDistribution(series.clone()))
+        }
         ServerMessage::Error { message } => Some(ConnEvent::ServerError(message.clone())),
         ServerMessage::DeskSnapshot {
             snapshot,

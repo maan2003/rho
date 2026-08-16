@@ -297,6 +297,8 @@ pub struct Workspace {
     quota_history_days: u64,
     global_usage: HashMap<HostId, Vec<rho_ui_proto::AgentUsageSeries>>,
     global_usage_days: u64,
+    agent_cost_usage: HashMap<HostId, Vec<rho_ui_proto::AgentCostSeries>>,
+    agent_cost_days: u64,
     duration_timer: Option<Task<()>>,
     /// Attention chime output; lazily opened on the first play.
     #[cfg(feature = "native")]
@@ -762,6 +764,8 @@ impl Workspace {
             quota_history_days: 7,
             global_usage: HashMap::new(),
             global_usage_days: 7,
+            agent_cost_usage: HashMap::new(),
+            agent_cost_days: 7,
             duration_timer: None,
             chime: Chime,
             contexts: HashMap::new(),
@@ -848,6 +852,7 @@ impl Workspace {
         self.quota_summaries.remove(&host);
         self.quota_history.remove(&host);
         self.global_usage.remove(&host);
+        self.agent_cost_usage.remove(&host);
         self.workdirs.retain(|workdir| workdir.host != host);
         self.remote_projects.retain(|(owner, _), _| *owner != host);
         self.registry.detach_host(host);
@@ -1365,6 +1370,20 @@ impl Workspace {
                 }
                 cx.notify();
             }
+            ConnEvent::AgentCostDistribution(series) => {
+                self.agent_cost_usage.insert(host, series);
+                if self
+                    .transient
+                    .as_ref()
+                    .is_some_and(|transient| transient.title() == "agent cost")
+                {
+                    self.transient = Some(crate::transient::agent_cost_menu(
+                        self.merged_agent_cost_usage(),
+                        self.agent_cost_days,
+                    ));
+                }
+                cx.notify();
+            }
             ConnEvent::TurnCancelled => {
                 // Cancellation is an acknowledgement for an in-flight action,
                 // not transcript content. The system notice buffer is
@@ -1630,6 +1649,10 @@ impl Workspace {
                 .sort_by_key(|bucket| bucket.bucket_start_ms);
         }
         merged
+    }
+
+    fn merged_agent_cost_usage(&self) -> Vec<Vec<rho_ui_proto::AgentCostSeries>> {
+        self.agent_cost_usage.values().cloned().collect()
     }
 
     fn submit_prompt(&mut self, _: &SubmitPrompt, window: &mut Window, cx: &mut Context<Self>) {
@@ -5284,6 +5307,26 @@ impl Workspace {
         });
         self.open_transient(
             crate::transient::usage_share_menu(self.merged_global_usage(), days),
+            window,
+            cx,
+        );
+    }
+
+    pub(crate) fn open_agent_cost_transient(
+        &mut self,
+        days: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        const DAY_MS: u64 = 24 * 60 * 60 * 1_000;
+        self.agent_cost_days = days;
+        let ema_warmup_days = if days <= 7 { 4 } else { 14 };
+        self.hosts
+            .broadcast(|| ClientMessage::AgentCostDistribution {
+                since_ms: now_ms().saturating_sub((days + ema_warmup_days) * DAY_MS),
+            });
+        self.open_transient(
+            crate::transient::agent_cost_menu(self.merged_agent_cost_usage(), days),
             window,
             cx,
         );
