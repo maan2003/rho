@@ -78,9 +78,10 @@ AI APIs.
   routing uses compositor-issued, one-shot `xdg-activation-v1` tokens passed in
   `XDG_ACTIVATION_TOKEN`; it does not enable CDP/remote debugging, load an
   extension, inject website script, or expose a loopback bootstrap service.
-  Chromium must propagate activation tokens through its existing-profile process
-  handoff; otherwise the page fails closed after ten seconds instead of guessing
-  which unbound toplevel belongs to it.
+  On the first Chromium launch only, after a short token grace period, the
+  compositor accepts the exactly-one-pending-page/exactly-one-unbound-toplevel
+  case for stock builds that omit the initial token. Ambiguous matches and all
+  later tokenless windows fail closed after ten seconds instead of guessing.
 - Long-running `exec_command` processes are retained only in their owning
   agent's in-memory command-session table. `write_stdin` requires that local
   numeric session id; waits are capped at five minutes and dropping the agent

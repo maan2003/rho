@@ -53,16 +53,16 @@ use crate::store::{AgentStore, FrameSummary};
 use crate::style::{RoleFamily, StyleClass};
 use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
-    AgentDone, AgentHide, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, DashboardArchive,
-    DashboardBack, DashboardCycleGlobal, DashboardDeleteEmpty, DashboardDemote, DashboardGoto,
-    DashboardHeadingAbove, DashboardHeadingBelow, DashboardJump, DashboardNewAgent, DashboardNow,
-    DashboardPromote, DashboardRenameTopic, DashboardReply, DashboardStaff, DashboardSubmit,
-    DashboardToggleAgentTree, DashboardToggleSubagents, DashboardUndo, GitApprovalAllow,
-    GitApprovalDeny, MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext,
-    MinibufferPrevious, PaneBack, PaneClose, PaneFocusNext, PaneSplitDown, PaneSplitRight,
-    PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt,
-    ShellPagerAll, ShellPagerMore, ShellPagerQuit, SubmitPrompt, TaskBoard, VoiceToggle,
-    ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow, ZulipQuit,
+    AgentDone, AgentHide, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, BrowserExit,
+    DashboardArchive, DashboardBack, DashboardCycleGlobal, DashboardDeleteEmpty, DashboardDemote,
+    DashboardGoto, DashboardHeadingAbove, DashboardHeadingBelow, DashboardJump, DashboardNewAgent,
+    DashboardNow, DashboardPromote, DashboardRenameTopic, DashboardReply, DashboardStaff,
+    DashboardSubmit, DashboardToggleAgentTree, DashboardToggleSubagents, DashboardUndo,
+    GitApprovalAllow, GitApprovalDeny, MinibufferCancel, MinibufferComplete, MinibufferConfirm,
+    MinibufferNext, MinibufferPrevious, PaneBack, PaneClose, PaneFocusNext, PaneSplitDown,
+    PaneSplitRight, PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof,
+    ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit, SubmitPrompt, TaskBoard,
+    VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow, ZulipQuit,
 };
 
 /// What a pane shows: stable identity plus the live view. Surfaces live
@@ -2753,17 +2753,8 @@ impl Workspace {
                     return;
                 }
                 this.refresh_dashboard(window, cx);
-                let model = rho_browser::open_page_record(record, cx);
-                let view = cx.new(|cx| rho_browser::PageView::new(model, cx));
-                let surface = Self::wrap_surface(
-                    SurfaceKey::Browser(id),
-                    SurfaceView::Browser(view),
-                    window,
-                    cx,
-                );
-                this.display_surface(surface);
-                this.focus_active_surface(window, cx);
-                cx.notify();
+                this.preview_browser_page(id, window, cx);
+                this.focus_rail(window, cx);
             });
         })
         .detach();
@@ -6520,7 +6511,16 @@ impl Workspace {
 
     fn dashboard_mode(&self, window: &Window, cx: &App) -> bool {
         let dashboard = self.dashboard.focus_handle(cx);
-        dashboard.is_focused(window) || self.overlay_return_focus.as_ref() == Some(&dashboard)
+        #[cfg(feature = "native")]
+        let browser_preview_focused = self
+            .dashboard_web_preview
+            .as_ref()
+            .is_some_and(|(_, view)| view.read(cx).focus_handle(cx).is_focused(window));
+        #[cfg(not(feature = "native"))]
+        let browser_preview_focused = false;
+        dashboard.is_focused(window)
+            || self.overlay_return_focus.as_ref() == Some(&dashboard)
+            || browser_preview_focused
     }
 
     /// Hidden surfaces stay alive as editor buffers, but they must not turn
@@ -6928,6 +6928,9 @@ impl Render for Workspace {
             .key_context("RhoGui")
             .on_action(cx.listener(Self::submit_prompt))
             .on_action(cx.listener(Self::paste_prompt))
+            .on_action(cx.listener(|this, _: &BrowserExit, window, cx| {
+                this.focus_rail(window, cx);
+            }))
             .on_action(cx.listener(Self::shell_interrupt))
             .on_action(cx.listener(Self::toggle_voice))
             .on_action(cx.listener(Self::shell_eof))

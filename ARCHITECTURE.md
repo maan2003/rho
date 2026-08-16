@@ -120,8 +120,12 @@ than by running a supervisor, extension protocol, or daemon process graph.
   machine seed, and allocation counters are persisted in a separate client
   `RhoDb`, one implicit persistent Chromium user-data directory, and one private shared
   Smithay compositor. The compositor issues one-shot XDG activation tokens and
-  binds each new XDG toplevel only when Chromium applies its token; no debugging
-  protocol, extension, injected page script, or title convention participates.
+  normally binds each new XDG toplevel only when Chromium applies its token. A
+  one-time first-launch fallback accepts exactly one pending page and one
+  unbound toplevel after a short grace period because some stock Chromium
+  builds omit the initial token; ambiguous and later tokenless windows fail
+  closed. No debugging protocol, extension, injected page script, or title
+  convention participates.
   `rho-gui` only hosts the resulting GPUI page model/view. A `:web-xxxx:` tag
   on an ordinary Desk heading is a portal to the client-local page, just as an
   agent tag is a portal to an agent; selecting the heading uses the same

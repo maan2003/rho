@@ -81,6 +81,7 @@ actions!(
         PaneClose,
         PaneFocusNext,
         PaneBack,
+        BrowserExit,
         RailFocus,
         RailOpen,
         RootTransient,
@@ -190,6 +191,7 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             Some("RhoGui > Editor && vim_mode == insert"),
         ),
         KeyBinding::new("ctrl-shift-v", PastePrompt, Some("RhoGui > Editor")),
+        KeyBinding::new("shift-escape", BrowserExit, Some("RhoGui > RhoBrowser")),
         // A Comint-style shell submits complete input lines to the daemon;
         // its transcript remains an ordinary Vim-navigable editor buffer.
         KeyBinding::new(

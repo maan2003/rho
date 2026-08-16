@@ -152,10 +152,14 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 struct SurfaceParams {
     bounds: PodBounds,
     content_mask: PodBounds,
+    texture_origin: [f32; 2],
+    texture_size: [f32; 2],
     opaque: u32,
     y_inverted: u32,
     _pad: [u32; 2],
 }
+
+const _: () = assert!(std::mem::size_of::<SurfaceParams>() == 64);
 
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -1689,6 +1693,18 @@ impl WgpuRenderer {
                             let params = SurfaceParams {
                                 bounds: surface.bounds.into(),
                                 content_mask: surface.content_mask.bounds.into(),
+                                texture_origin: [
+                                    surface.dma_buf.source_origin().0 as f32
+                                        / surface.dma_buf.width() as f32,
+                                    surface.dma_buf.source_origin().1 as f32
+                                        / surface.dma_buf.height() as f32,
+                                ],
+                                texture_size: [
+                                    surface.dma_buf.source_size().0 as f32
+                                        / surface.dma_buf.width() as f32,
+                                    surface.dma_buf.source_size().1 as f32
+                                        / surface.dma_buf.height() as f32,
+                                ],
                                 opaque: (surface.dma_buf.fourcc() == u32::from_le_bytes(*b"XR24"))
                                     as u32,
                                 y_inverted: surface.dma_buf.y_inverted() as u32,

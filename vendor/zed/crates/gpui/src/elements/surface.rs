@@ -112,7 +112,8 @@ impl Element for Surface {
             }
             #[cfg(target_os = "linux")]
             SurfaceSource::DmaBuf(surface) => {
-                let size = crate::size(surface.width().into(), surface.height().into());
+                let source_size = surface.source_size();
+                let size = crate::size(source_size.0.into(), source_size.1.into());
                 let new_bounds = self.object_fit.get_bounds(bounds, size);
                 window.paint_surface(new_bounds, surface.clone());
             }

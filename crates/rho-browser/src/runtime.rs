@@ -12,8 +12,10 @@ use rho_browser_wayland::{BrowserCompositor, BrowserSession, DmaBufConfig, chrom
 use crate::store::validate_launch_url;
 
 /// One stock Chromium identity and one private Wayland compositor. Window
-/// association is exclusively xdg-activation-v1: the compositor issues the
-/// token, Chromium applies it to the new surface, and websites never see it.
+/// association prefers xdg-activation-v1: the compositor issues the token,
+/// Chromium applies it to the new surface, and websites never see it. The
+/// compositor also accepts the unambiguous one-window case for Chromium
+/// builds that omit the token on their first process launch.
 pub(crate) struct BrowserRuntime {
     compositor: BrowserCompositor,
     profile: PathBuf,

@@ -72,6 +72,8 @@ pub struct DmaBufFrame {
     pub stride: u32,
     pub offset: u32,
     pub y_inverted: bool,
+    pub source_origin: (u32, u32),
+    pub source_size: (u32, u32),
     pub fd: OwnedFd,
     pub acquire_fence: OwnedFd,
     release: Option<Box<dyn FnOnce() + Send>>,
@@ -296,6 +298,7 @@ struct State {
     activation_windows: HashMap<String, u64>,
     unbound_toplevels: HashMap<ObjectId, (ToplevelSurface, Instant)>,
     pending_activations: HashMap<ObjectId, u64>,
+    allow_initial_unambiguous_toplevel: bool,
     surface_windows: HashMap<ObjectId, u64>,
     next_buffer_id: u64,
     commands: mpsc::Sender<RuntimeCommand>,
@@ -326,15 +329,17 @@ impl State {
     }
 
     fn bind_toplevel(&mut self, id: u64, root: ObjectId) {
+        if self
+            .windows
+            .get(&id)
+            .is_none_or(|window| window.toplevel.is_some())
+        {
+            return;
+        }
         let Some((surface, _)) = self.unbound_toplevels.remove(&root) else {
             return;
         };
-        let Some(window) = self.windows.get_mut(&id) else {
-            return;
-        };
-        if window.toplevel.is_some() {
-            return;
-        }
+        let window = self.windows.get_mut(&id).expect("pending window exists");
         let size = window.size;
         surface.with_pending_state(|state| {
             state.size = Some((size.0 as i32, size.1 as i32).into());
@@ -342,6 +347,7 @@ impl State {
         });
         surface.send_configure();
         window.toplevel = Some(surface);
+        self.allow_initial_unambiguous_toplevel = false;
         self.surface_windows.insert(root, id);
         self.activation_windows
             .retain(|_, window_id| *window_id != id);
@@ -353,6 +359,40 @@ impl State {
             .as_ref()
             .map(|top| top.wl_surface().clone());
         keyboard.set_focus(self, focus, serial);
+    }
+
+    fn bind_unambiguous_toplevel(&mut self) {
+        if !self.allow_initial_unambiguous_toplevel {
+            return;
+        }
+        let roots = self.unbound_toplevels.keys().cloned().collect::<Vec<_>>();
+        let windows = self
+            .windows
+            .iter()
+            .filter(|(_, window)| window.toplevel.is_none())
+            .map(|(&id, _)| id)
+            .collect::<Vec<_>>();
+        if roots.len() > 1 || windows.len() > 1 {
+            self.allow_initial_unambiguous_toplevel = false;
+            return;
+        }
+        let ([root], [id]) = (roots.as_slice(), windows.as_slice()) else {
+            return;
+        };
+        if self.pending_activations.contains_key(root) {
+            return;
+        }
+        if self.unbound_toplevels[root].1.elapsed() < Duration::from_millis(250) {
+            return;
+        }
+        if self
+            .pending_activations
+            .values()
+            .any(|pending| pending == id)
+        {
+            return;
+        }
+        self.bind_toplevel(*id, root.clone());
     }
 }
 
@@ -429,11 +469,13 @@ impl CompositorHandler for State {
             if is_root && let (Some(a), Some(r)) = (acquire, release.take()) {
                 let bid = self.next_buffer_id;
                 self.next_buffer_id = self.next_buffer_id.wrapping_add(1).max(1);
-                if let Ok(f) = dma_buf_frame(bid, dmabuf, a, r, wid, self.commands.clone()) {
+                let source = dma_source_rect(surface, dmabuf.size().w, dmabuf.size().h);
+                if let Ok(f) = dma_buf_frame(bid, dmabuf, source, a, r, wid, self.commands.clone())
+                {
                     let w = self.windows.get_mut(&wid).expect("known window");
                     w.pointer_frame = PointerFrame {
-                        origin: (0, 0),
-                        size: (f.width, f.height),
+                        origin: (f.source_origin.0 as i32, f.source_origin.1 as i32),
+                        size: f.source_size,
                     };
                     if let Some(t) = &w.toplevel {
                         w.dma_frame_callbacks.insert(bid, drain_frame_callbacks(t));
@@ -539,6 +581,7 @@ impl XdgActivationHandler for State {
         let Some(id) = self.activation_windows.get(&token.to_string()).copied() else {
             return;
         };
+        self.allow_initial_unambiguous_toplevel = false;
         self.activation.remove_token(&token);
         let root = surface.id();
         if self.unbound_toplevels.contains_key(&root) {
@@ -695,6 +738,7 @@ fn copy_shm_frame(buffer: &wl_buffer::WlBuffer) -> Result<ShmFrame> {
 fn dma_buf_frame(
     id: u64,
     dmabuf: &Dmabuf,
+    source: ((u32, u32), (u32, u32)),
     acquire: DrmSyncPoint,
     release: DrmSyncPoint,
     window_id: u64,
@@ -728,6 +772,8 @@ fn dma_buf_frame(
         stride,
         offset,
         y_inverted: dmabuf.y_inverted(),
+        source_origin: source.0,
+        source_size: source.1,
         fd,
         acquire_fence,
         release: Some(Box::new(move || {
@@ -738,6 +784,55 @@ fn dma_buf_frame(
             let _ = commands.send(RuntimeCommand::Page(window_id, PageCommand::Retired(id)));
         })),
     })
+}
+
+fn dma_source_rect(
+    surface: &WlSurface,
+    buffer_width: i32,
+    buffer_height: i32,
+) -> ((u32, u32), (u32, u32)) {
+    let geometry = with_states(surface, |states| {
+        let mut cached = states.cached_state.get::<XdgSurfaceCachedState>();
+        cached.current().geometry
+    });
+    clamped_source_rect(
+        geometry.map(|geometry| {
+            (
+                (geometry.loc.x, geometry.loc.y),
+                (geometry.size.w, geometry.size.h),
+            )
+        }),
+        buffer_width,
+        buffer_height,
+    )
+}
+
+fn clamped_source_rect(
+    geometry: Option<((i32, i32), (i32, i32))>,
+    buffer_width: i32,
+    buffer_height: i32,
+) -> ((u32, u32), (u32, u32)) {
+    let Some(((x, y), (width, height))) = geometry else {
+        return (
+            (0, 0),
+            (buffer_width.max(1) as u32, buffer_height.max(1) as u32),
+        );
+    };
+    let left = x.clamp(0, buffer_width);
+    let top = y.clamp(0, buffer_height);
+    let right = x.saturating_add(width).clamp(left, buffer_width);
+    let bottom = y.saturating_add(height).clamp(top, buffer_height);
+    if right == left || bottom == top {
+        (
+            (0, 0),
+            (buffer_width.max(1) as u32, buffer_height.max(1) as u32),
+        )
+    } else {
+        (
+            (left as u32, top as u32),
+            ((right - left) as u32, (bottom - top) as u32),
+        )
+    }
 }
 
 struct ReleasePointGuard(Option<DrmSyncPoint>);
@@ -970,6 +1065,7 @@ fn run(
         activation_windows: HashMap::new(),
         unbound_toplevels: HashMap::new(),
         pending_activations: HashMap::new(),
+        allow_initial_unambiguous_toplevel: true,
         surface_windows: HashMap::new(),
         next_buffer_id: 1,
         commands: sender,
@@ -1044,9 +1140,13 @@ fn service_loop(
             state
                 .activation_windows
                 .retain(|_, window_id| *window_id != id);
+            state
+                .pending_activations
+                .retain(|_, window_id| *window_id != id);
             if let Some(window) = state.windows.remove(&id) {
                 let _ = window.events.send(BrowserEvent::Failed(
-                    "Chromium did not apply its XDG activation token; install a release with launch-token propagation".into()));
+                    "Chromium did not provide an unambiguous activated window".into(),
+                ));
             }
         }
         state.unbound_toplevels.retain(|_, (surface, created)| {
@@ -1060,6 +1160,11 @@ fn service_loop(
         display
             .dispatch_clients(state)
             .context("dispatch Chrome Wayland requests")?;
+        // Some stock Chromium builds don't propagate activation tokens on the
+        // first process launch. Dispatch queued token requests first, then
+        // fall back only when one pending page and one top-level make the
+        // match unambiguous.
+        state.bind_unambiguous_toplevel();
         display
             .flush_clients()
             .context("flush Chrome Wayland events")?;
@@ -1088,6 +1193,7 @@ fn handle_page_command(state: &mut State, id: u64, c: PageCommand) {
         PageCommand::Key { keycode, pressed } => keyboard_key(state, id, keycode, pressed),
         PageCommand::Close => {
             state.activation_windows.retain(|_, v| *v != id);
+            state.pending_activations.retain(|_, v| *v != id);
             if let Some(t) = state.windows.get(&id).and_then(|w| w.toplevel.as_ref()) {
                 t.send_close()
             } else {
@@ -1132,8 +1238,7 @@ fn pointer_motion(state: &mut State, id: u64, x: f64, y: f64) {
         return;
     };
     let (frame, size) = (w.pointer_frame, w.size);
-    let x = f64::from(frame.origin.0) + x.max(0.0) * f64::from(frame.size.0) / f64::from(size.0);
-    let y = f64::from(frame.origin.1) + y.max(0.0) * f64::from(frame.size.1) / f64::from(size.1);
+    let (x, y) = mapped_pointer(frame, size, x, y);
     if let Some(window) = state.windows.get_mut(&id) {
         window.pointer_location = (x, y);
     }
@@ -1145,6 +1250,13 @@ fn pointer_motion(state: &mut State, id: u64, x: f64, y: f64) {
     let pointer = state.pointer.clone();
     pointer.motion(state, Some((surface, (0.0, 0.0).into())), &event);
     pointer.frame(state);
+}
+
+fn mapped_pointer(frame: PointerFrame, window_size: (u32, u32), x: f64, y: f64) -> (f64, f64) {
+    (
+        f64::from(frame.origin.0) + x.max(0.0) * f64::from(frame.size.0) / f64::from(window_size.0),
+        f64::from(frame.origin.1) + y.max(0.0) * f64::from(frame.size.1) / f64::from(window_size.1),
+    )
 }
 fn pointer_button(state: &mut State, id: u64, button: u32, pressed: bool) {
     let Some((surface, location)) = state.windows.get(&id).and_then(|window| {
@@ -1197,7 +1309,7 @@ fn keyboard_key(state: &mut State, id: u64, keycode: u32, pressed: bool) {
     let time = state.time();
     keyboard.input::<(), _>(
         state,
-        Keycode::from(keycode),
+        Keycode::from(xkb_keycode(keycode)),
         if pressed {
             KeyState::Pressed
         } else {
@@ -1207,6 +1319,10 @@ fn keyboard_key(state: &mut State, id: u64, keycode: u32, pressed: bool) {
         time,
         |_, _, _| FilterResult::Forward,
     );
+}
+
+fn xkb_keycode(evdev_keycode: u32) -> u32 {
+    evdev_keycode + 8
 }
 
 fn complete_surface_callbacks(surface: &WlSurface, time: u32) {
@@ -1322,5 +1438,33 @@ mod tests {
         assert_eq!(unpremultiply(64, 128), 128);
         assert_eq!(unpremultiply(255, 128), 255);
         assert_eq!(unpremultiply(37, 255), 37);
+    }
+
+    #[test]
+    fn converts_evdev_codes_to_xkb_codes() {
+        assert_eq!(xkb_keycode(14), 22); // Backspace
+        assert_eq!(xkb_keycode(28), 36); // Enter
+    }
+
+    #[test]
+    fn clamps_window_geometry_to_dma_buf_source() {
+        assert_eq!(
+            clamped_source_rect(Some(((10, 20), (80, 60))), 120, 100),
+            ((10, 20), (80, 60))
+        );
+        assert_eq!(
+            clamped_source_rect(Some(((-5, 90), (20, 20))), 120, 100),
+            ((0, 90), (15, 10))
+        );
+    }
+
+    #[test]
+    fn pointer_coordinates_follow_cropped_source() {
+        let frame = PointerFrame {
+            origin: (10, 20),
+            size: (80, 60),
+        };
+        assert_eq!(mapped_pointer(frame, (160, 120), 0.0, 0.0), (10.0, 20.0));
+        assert_eq!(mapped_pointer(frame, (160, 120), 80.0, 60.0), (50.0, 50.0));
     }
 }

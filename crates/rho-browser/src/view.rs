@@ -91,6 +91,8 @@ impl BrowserModel {
                                         frame.stride,
                                         frame.offset,
                                         frame.y_inverted,
+                                        frame.source_origin,
+                                        frame.source_size,
                                         fd,
                                         acquire,
                                         session.presentation_callback(frame.id),

@@ -15,7 +15,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
-use gpui::{App, AppContext as _, BorrowAppContext as _, Entity, Global, Task, WeakEntity};
+use gpui::{App, AppContext as _, BorrowAppContext as _, Entity, Global, Task};
 use rho_browser_wayland::DmaBufConfig;
 use runtime::BrowserRuntime;
 pub use store::{PageId, PageRecord, WebStore, WindowId, WindowRecord};
@@ -25,7 +25,7 @@ pub struct WebState {
     store: WebStore,
     state_dir: std::path::PathBuf,
     runtime: Option<Arc<BrowserRuntime>>,
-    models: HashMap<PageId, WeakEntity<PageModel>>,
+    models: HashMap<PageId, Entity<PageModel>>,
 }
 
 impl Global for WebState {}
@@ -64,31 +64,21 @@ pub fn create_page(launch_url: String, cx: &mut App) -> Task<Result<PageRecord>>
 }
 
 pub fn open_page_record(record: PageRecord, cx: &mut App) -> Entity<PageModel> {
-    if let Some(model) = cx
-        .global::<WebState>()
-        .models
-        .get(&record.id)
-        .and_then(WeakEntity::upgrade)
-    {
-        return model;
+    if let Some(model) = cx.global::<WebState>().models.get(&record.id) {
+        return model.clone();
     }
     let id = record.id;
     let launch = runtime(cx).and_then(|runtime| runtime.open(&record.launch_url, (1280, 720)));
     let model = cx.new(|cx| PageModel::new_record(record, launch, cx));
     cx.update_global::<WebState, _>(|web, _| {
-        web.models.insert(id, model.downgrade());
+        web.models.insert(id, model.clone());
     });
     model
 }
 
 pub fn open_page(id: PageId, cx: &mut App) -> Option<Entity<PageModel>> {
-    if let Some(model) = cx
-        .global::<WebState>()
-        .models
-        .get(&id)
-        .and_then(WeakEntity::upgrade)
-    {
-        return Some(model);
+    if let Some(model) = cx.global::<WebState>().models.get(&id) {
+        return Some(model.clone());
     }
     let record = cx.global::<WebState>().store.get_page(id)?;
     Some(open_page_record(record, cx))

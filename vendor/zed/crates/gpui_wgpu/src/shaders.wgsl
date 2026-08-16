@@ -1402,6 +1402,8 @@ fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
 struct SurfaceParams {
     bounds: Bounds,
     content_mask: Bounds,
+    texture_origin: vec2<f32>,
+    texture_size: vec2<f32>,
     opaque: u32,
     y_inverted: u32,
     _pad: vec2<u32>,
@@ -1423,7 +1425,7 @@ fn vs_surface(@builtin(vertex_index) vertex_id: u32) -> SurfaceVarying {
 
     var out = SurfaceVarying();
     out.position = to_device_position(unit_vertex, surface_locals.bounds);
-    out.texture_position = unit_vertex;
+    out.texture_position = surface_locals.texture_origin + unit_vertex * surface_locals.texture_size;
     out.clip_distances = distance_from_clip_rect(unit_vertex, surface_locals.bounds, surface_locals.content_mask);
     return out;
 }
@@ -1443,5 +1445,13 @@ fn fs_surface(input: SurfaceVarying) -> @location(0) vec4<f32> {
     if (surface_locals.opaque != 0u) {
         color.a = 1.0;
     }
-    return color;
+    if (color.a == 0.0) {
+        return color;
+    }
+    // Wayland ARGB buffers contain premultiplied, sRGB-encoded channels.
+    // Convert the straight color into GPUI's framebuffer colorimetry, then
+    // restore premultiplication for this pipeline's blend state.
+    let alpha = color.a;
+    let converted = srgba_asset_to_framebuffer(vec4<f32>(color.rgb / alpha, alpha));
+    return vec4<f32>(converted.rgb * alpha, alpha);
 }
