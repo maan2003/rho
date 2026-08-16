@@ -68,7 +68,25 @@ impl BrowserModel {
                         match event {
                             BrowserEvent::Scene(mut scene) => {
                                 if model.runtime.session.is_none() {
+                                    tracing::info!(
+                                        scene_id = scene.id,
+                                        scene_barrier = scene.barrier,
+                                        "browser handoff ignored a scene after session shutdown"
+                                    );
                                     return;
+                                }
+                                let awaiting_barrier =
+                                    model.awaiting_frame.map(|(barrier, _)| barrier);
+                                if awaiting_barrier.is_some() {
+                                    tracing::info!(
+                                        scene_id = scene.id,
+                                        scene_barrier = scene.barrier,
+                                        ?awaiting_barrier,
+                                        imports = scene.imports.len(),
+                                        attached = scene.attached.len(),
+                                        nodes = scene.nodes.len(),
+                                        "browser handoff received a compositor scene"
+                                    );
                                 }
                                 // Imports are leases independent of whether this scene is
                                 // eligible for the current page handoff. A later coalesced
@@ -147,6 +165,17 @@ impl BrowserModel {
                                     scene.barrier,
                                 );
                                 if import_failed || missing_buffer || !eligible {
+                                    if awaiting_barrier.is_some() {
+                                        tracing::info!(
+                                            scene_id = scene.id,
+                                            scene_barrier = scene.barrier,
+                                            ?awaiting_barrier,
+                                            import_failed,
+                                            missing_buffer,
+                                            eligible,
+                                            "browser handoff rejected a compositor scene"
+                                        );
+                                    }
                                     if missing_buffer && !import_failed {
                                         model.runtime.status =
                                             Some("Chrome scene referenced a missing buffer".into());
@@ -180,6 +209,13 @@ impl BrowserModel {
                                     &mut model.awaiting_frame,
                                     scene.barrier,
                                 );
+                                if awaiting_barrier.is_some() {
+                                    tracing::info!(
+                                        scene_id = scene.id,
+                                        scene_barrier = scene.barrier,
+                                        "browser handoff accepted a compositor scene"
+                                    );
+                                }
                                 model.runtime.presented_barrier = scene.barrier;
                                 model.runtime.scene_id = Some(scene.id);
                                 model.runtime.scene = scene.nodes;
@@ -270,12 +306,22 @@ impl BrowserModel {
             return;
         }
         self.focus_in_flight = true;
+        tracing::info!(
+            had_focused_page = self.focused_page.is_some(),
+            awaiting_frame = self.awaiting_frame.is_some(),
+            "browser handoff requested extension tab focus"
+        );
         let browser = self.browser.clone();
         let request = cx.background_spawn(async move { browser.focus_page(id) });
         cx.spawn(async move |this, cx| {
             let result = request.await;
             let _ = this.update(cx, |model, cx| {
                 model.focus_in_flight = false;
+                tracing::info!(
+                    succeeded = result.is_ok(),
+                    still_desired = model.desired_page == Some(id),
+                    "browser handoff extension tab focus completed"
+                );
                 match result {
                     Ok(()) if model.desired_page == Some(id) => model.begin_frame_barrier(id),
                     Ok(()) => {}
@@ -303,6 +349,12 @@ impl BrowserModel {
         self.runtime.painted_scene_id = None;
         self.runtime.status = Some("switching browser page".into());
         self.presentation_owner = Some(owner);
+        tracing::info!(
+            previous_scene = ?self.runtime.scene_id,
+            previous_barrier = self.runtime.presented_barrier,
+            had_focus_request = self.focus_in_flight,
+            "browser portal claimed presentation"
+        );
         self.focus(page, cx);
         cx.notify();
     }
@@ -318,8 +370,20 @@ impl BrowserModel {
         };
         self.runtime.sent_size.set((probe_width, height, scale));
         if let Some(session) = &self.runtime.session {
+            tracing::info!(
+                barrier,
+                width = probe_width,
+                height,
+                scale = f32::from_bits(scale),
+                "browser handoff sent a compositor frame barrier"
+            );
             session.frame_barrier(barrier, probe_width, height, f32::from_bits(scale));
             self.awaiting_frame = Some((barrier, page));
+        } else {
+            tracing::info!(
+                barrier,
+                "browser handoff could not send barrier: no session"
+            );
         }
     }
 
@@ -687,6 +751,15 @@ impl Render for BrowserView {
         };
         if owns_presentation {
             self.model.update(cx, |model, _| {
+                if model.runtime.painted_scene_id != painted_scene_id
+                    && (model.runtime.painted_scene_id.is_none() || painted_scene_id.is_none())
+                {
+                    tracing::info!(
+                        previous_scene = ?model.runtime.painted_scene_id,
+                        new_scene = ?painted_scene_id,
+                        "browser portal changed its painted scene"
+                    );
+                }
                 model.runtime.painted_scene_id = painted_scene_id;
             });
         }

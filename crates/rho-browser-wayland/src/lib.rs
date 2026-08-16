@@ -1036,6 +1036,25 @@ impl<K: BrowserPageKey> State<K> {
         }
         let window = self.windows.get_mut(&id).expect("known window");
         let previous_barrier = window.committed_barrier;
+        let diagnosing_handoff = !window.pending_barriers.is_empty()
+            || window.unbound_barrier.is_some()
+            || window.acked_barrier > window.committed_barrier;
+        if diagnosing_handoff {
+            tracing::info!(
+                scene_id = window.next_scene_id,
+                committed_barrier = window.committed_barrier,
+                acked_barrier = window.acked_barrier,
+                pending_configures = window.pending_barriers.len(),
+                barrier_anchor,
+                new_toplevel_dma = new_toplevel_dma.len(),
+                new_visible_toplevel_dma,
+                surfaces = surfaces.len(),
+                toplevel_surfaces = toplevel_surface_count,
+                nodes = nodes.len(),
+                attached = attached.len(),
+                "browser handoff compositor scene diagnostic"
+            );
+        }
         window.committed_barrier = committed_barrier_after_scene(
             window.committed_barrier,
             window.acked_barrier,
@@ -1193,6 +1212,20 @@ impl<K: BrowserPageKey> CompositorHandler for State<K> {
         // effectively-unsynchronized ancestor commits. Taking it here would
         // split one Wayland transaction into unrelated GPUI frames.
         if is_sync_subsurface(surface) {
+            if let Some(id) = self.window_id_for_surface(surface) {
+                let window = &self.windows[&id];
+                if !window.pending_barriers.is_empty()
+                    || window.acked_barrier > window.committed_barrier
+                {
+                    tracing::info!(
+                        surface = ?surface.id(),
+                        acked_barrier = window.acked_barrier,
+                        committed_barrier = window.committed_barrier,
+                        pending_configures = window.pending_barriers.len(),
+                        "browser handoff deferred a synchronized child commit"
+                    );
+                }
+            }
             return;
         }
 
@@ -1222,6 +1255,18 @@ impl<K: BrowserPageKey> CompositorHandler for State<K> {
             .toplevel
             .as_ref()
             .is_some_and(|toplevel| toplevel.wl_surface() == &transaction_root);
+        let window = &self.windows[&id];
+        if !window.pending_barriers.is_empty() || window.acked_barrier > window.committed_barrier {
+            tracing::info!(
+                surface = ?surface.id(),
+                transaction_root = ?transaction_root.id(),
+                barrier_anchor,
+                acked_barrier = window.acked_barrier,
+                committed_barrier = window.committed_barrier,
+                pending_configures = window.pending_barriers.len(),
+                "browser handoff processing an effective surface commit"
+            );
+        }
         if let Err(error) = self.publish_scene(id, barrier_anchor) {
             self.windows[&id].events.send(BrowserEvent::Failed(
                 format!("invalid Chromium surface tree: {error:#}").into(),
@@ -1283,6 +1328,8 @@ impl<K: BrowserPageKey> XdgShellHandler for State<K> {
             return;
         };
         let window = self.windows.get_mut(&id).expect("configured window exists");
+        let previous_barrier = window.acked_barrier;
+        let previous_pending = window.pending_barriers.len();
         let mut acknowledged = window.acked_barrier;
         window.pending_barriers.retain(|(serial, barrier)| {
             if *serial <= configure.serial {
@@ -1293,6 +1340,16 @@ impl<K: BrowserPageKey> XdgShellHandler for State<K> {
             }
         });
         window.acked_barrier = acknowledged;
+        if previous_pending > 0 {
+            tracing::info!(
+                serial = ?configure.serial,
+                previous_barrier,
+                acked_barrier = window.acked_barrier,
+                pending_before = previous_pending,
+                pending_after = window.pending_barriers.len(),
+                "browser handoff received Chromium configure ACK"
+            );
+        }
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
@@ -2031,15 +2088,33 @@ fn frame_barrier<K: BrowserPageKey>(
     scale: f64,
 ) {
     let Some(window) = state.windows.get_mut(&id) else {
+        tracing::info!(
+            barrier,
+            "browser handoff dropped barrier for missing window"
+        );
         return;
     };
     if width == 0 || height == 0 || !scale.is_finite() || scale <= 0.0 {
+        tracing::info!(
+            barrier,
+            width,
+            height,
+            scale,
+            "browser handoff rejected invalid barrier"
+        );
         return;
     }
     window.size = (width, height);
     window.scale = scale;
     let Some(toplevel) = &window.toplevel else {
         window.unbound_barrier = Some(barrier);
+        tracing::info!(
+            barrier,
+            width,
+            height,
+            scale,
+            "browser handoff queued barrier before toplevel binding"
+        );
         return;
     };
     with_states(toplevel.wl_surface(), |states| {
@@ -2051,6 +2126,15 @@ fn frame_barrier<K: BrowserPageKey>(
         .with_pending_state(|pending| pending.size = Some((width as i32, height as i32).into()));
     let serial = toplevel.send_configure();
     window.pending_barriers.push((serial, barrier));
+    tracing::info!(
+        barrier,
+        serial = ?serial,
+        width,
+        height,
+        scale,
+        pending_configures = window.pending_barriers.len(),
+        "browser handoff sent Chromium configure"
+    );
 }
 
 fn track_unbound_barrier(window: &mut WindowState, serial: Serial) {
