@@ -593,8 +593,7 @@ pub fn root_menu() -> Transient {
             workspace.cmd_term(true, window, cx);
         })
         .item("g", "browser…", |workspace, window, cx| {
-            workspace.preview_recent_browser_page(window, cx);
-            workspace.open_transient(browser_menu(rho_browser::pages(cx)), window, cx);
+            workspace.open_transient(browser_menu(), window, cx);
         })
         .item("p", "projects…", |workspace, window, cx| {
             workspace.open_transient(projects_menu(), window, cx);
@@ -611,25 +610,10 @@ pub fn root_menu() -> Transient {
         .item("q", "quit", |_, _, cx| cx.quit())
 }
 
-fn browser_menu(pages: Vec<rho_browser::PageRecord>) -> Transient {
-    const KEYS: [&str; 9] = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
-    let mut menu = Transient::new("browser").item("n", "new page", |workspace, window, cx| {
+fn browser_menu() -> Transient {
+    Transient::new("browser").item("n", "new page", |workspace, window, cx| {
         workspace.cmd_browser(window, cx);
-    });
-    for (key, page) in KEYS.into_iter().zip(pages) {
-        let id = page.id;
-        let mut characters = page.launch_url.chars();
-        let prefix = characters.by_ref().take(72).collect::<String>();
-        let label = if characters.next().is_some() {
-            format!("{prefix}…")
-        } else {
-            prefix
-        };
-        menu = menu.item(key, label, move |workspace, window, cx| {
-            workspace.open_browser_page(id, window, cx);
-        });
-    }
-    menu
+    })
 }
 
 fn status_menu() -> Transient {

@@ -74,14 +74,21 @@ AI APIs.
   user's full authority and a persistent cookie/storage identity under the Rho
   client state directory; this is not a sandbox. `rho-browser` accepts only
   bounded HTTP(S) launch URLs, holds an exclusive advisory lock on that identity,
-  and exposes Chromium only to one private shared Wayland socket. Page-to-surface
-  routing uses compositor-issued, one-shot `xdg-activation-v1` tokens passed in
-  `XDG_ACTIVATION_TOKEN`; it does not enable CDP/remote debugging, load an
-  extension, inject website script, or expose a loopback bootstrap service.
-  On the first Chromium launch only, after a short token grace period, the
-  compositor accepts the exactly-one-pending-page/exactly-one-unbound-toplevel
-  case for stock builds that omit the initial token. Ambiguous matches and all
-  later tokenless windows fail closed after ten seconds instead of guessing.
+  and exposes Chromium only to one private Wayland socket. One bundled MV3
+  extension has `tabs`, `tabGroups`, `storage`, and `nativeMessaging`
+  privileges, but no host permission or content script. It owns UUID page
+  metadata inside the isolated Chrome profile, associates UUIDs with restored
+  tabs through `rho:<uuid>` group titles, activates requested tabs, and
+  discards inactive tabs. Websites cannot read or modify that browser UI
+  metadata through the extension. Chrome native messaging starts a copy of the
+  `rho-gui` executable in bounded stdio-relay mode; it connects to the existing
+  GUI through `$XDG_RUNTIME_DIR/rho-browser.sock`, whose filesystem mode is
+  0600. The socket is a same-user trust boundary and uses no additional
+  authentication. No TCP listener, CDP/remote debugging, or injected website
+  script participates. The compositor-issued `xdg-activation-v1` token binds
+  the singleton Chrome toplevel; after a short grace period it also accepts the
+  exactly-one-pending-window/exactly-one-unbound-toplevel case for builds that
+  omit the token. Additional or ambiguous toplevels fail closed.
   Browser content also fails closed unless GPUI and Chromium share an
   importable DMA-BUF format on the selected DRM render node and explicit-sync
   eventfd support. Root SHM content, missing acquire/release points,

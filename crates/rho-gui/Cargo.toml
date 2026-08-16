@@ -30,20 +30,17 @@ native = [
   "dep:languages",
   "dep:node_runtime",
   "dep:octo-types",
-  "dep:prefix-id",
   "dep:project",
   "dep:release_channel",
   "dep:rho-iroh-auth",
   "dep:rho-profiling",
   "dep:rho-browser",
-  "dep:rho-db",
   "dep:rho-rpc",
   "dep:rho-zulip",
   "dep:rodio",
   "dep:rustls",
   "dep:search",
   "dep:semver",
-  "dep:senax-encoder",
   "dep:tracing-subscriber",
   "dep:tokio",
   "dep:util",
@@ -51,7 +48,6 @@ native = [
   "dep:vim_mode_setting",
   "editor/native",
   "languages/load-grammars",
-  "prefix-id/redb",
   "rho-rpc/native-client",
 ]
 
@@ -80,12 +76,10 @@ multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
 node_runtime = { path = "../../vendor/zed/crates/node_runtime", optional = true }
 octo-types = { workspace = true, optional = true }
 path = { path = "../../vendor/zed/crates/path" }
-prefix-id = { workspace = true, optional = true }
 project = { path = "../../vendor/zed/crates/project", optional = true }
 release_channel = { path = "../../vendor/zed/crates/release_channel", optional = true }
 rho-core.workspace = true
 rho-browser = { workspace = true, optional = true }
-rho-db = { workspace = true, optional = true }
 rho-iroh-auth = { workspace = true, optional = true }
 rho-profiling = { workspace = true, optional = true }
 rho-rtc.workspace = true
@@ -103,7 +97,6 @@ rustc-hash = "2.1.0"
 rustls = { workspace = true, optional = true }
 search = { path = "../../vendor/zed/crates/search", optional = true }
 semver = { version = "1.0", features = ["serde"], optional = true }
-senax-encoder = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 settings = { path = "../../vendor/zed/crates/settings" }

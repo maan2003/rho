@@ -115,21 +115,25 @@ than by running a supervisor, extension protocol, or daemon process graph.
   `rho-gui` supplies its context strip, theme mapping, and focus/show policy,
   while GPUI web owns only the immediate pointer-down routing region.
   Native web pages are client-local first-class resources owned by `rho-browser`.
-  They use typed compact prefix IDs (`web-<prefix>`, written as Desk tags like
-  `:web-xxxx:`) whose encoded IDs,
-  machine seed, and allocation counters are persisted in a separate client
-  `RhoDb`, one implicit persistent Chromium user-data directory, and one private shared
-  Smithay compositor. The compositor issues one-shot XDG activation tokens and
-  normally binds each new XDG toplevel only when Chromium applies its token. A
-  one-time first-launch fallback accepts exactly one pending page and one
-  unbound toplevel after a short grace period because some stock Chromium
-  builds omit the initial token; ambiguous and later tokenless windows fail
-  closed. No debugging protocol, extension, injected page script, or title
-  convention participates.
-  The durable `PageId` is also the live runtime key: the persistent store and
-  the in-memory page-model registry hold different state for the same ID, with
-  no translated session/page identity. Hiding a preview retains its model,
-  Chromium surface, and current frame for instant reopening.
+  They use extension-generated UUID `PageId`s written in full as Desk tags.
+  One embedded MV3 extension owns the durable page registry inside the implicit
+  persistent Chromium profile: `chrome.storage.local` retains page metadata and
+  one single-tab group titled `rho:<uuid>` attaches the ID to Chrome's restored
+  tab and navigation history. Runtime tab and group IDs are never persisted.
+  Rho sends only direct create/focus/close requests and does not mirror or
+  receive an eager registry.
+  All pages share one normal Chromium window and one private Smithay compositor
+  surface, so exactly one page is visible. Switching a Rho page activates its
+  tab. Presentation waits for a DMA-BUF commit that acknowledges a deliberately
+  changed post-activation XDG configure, so an outgoing or prematurely
+  committed frame cannot be attributed to the new page. The extension explicitly
+  discards the previous tab, bounding loaded
+  renderer and surface memory while Chrome retains per-page history metadata.
+  The compositor issues one XDG activation token for the singleton toplevel and
+  retains the unambiguous first-window fallback for stock Chromium builds that
+  omit it. Extension native messaging reaches `rho-gui` through a tiny stdio
+  relay and a mode-0600 Unix socket under `XDG_RUNTIME_DIR`; no TCP listener,
+  CDP, remote debugging, content script, or website injection participates.
   Browser content is a DMA-BUF-only pipeline with explicit synchronization;
   GPUI retains each imported Vulkan image while its page model owns the lease.
   The compositor is wake-driven, advertises per-surface fractional scale and a
@@ -138,7 +142,7 @@ than by running a supervisor, extension protocol, or daemon process graph.
   remains available only for ancillary Chromium surfaces such as cursors and
   browser-chrome input subsurfaces; those buffers are acknowledged but never
   copied into browser content.
-  `rho-gui` only hosts the resulting GPUI page model/view. A `:web-xxxx:` tag
+  `rho-gui` only hosts the resulting GPUI page model/view. A full `:web-<uuid>:` tag
   on an ordinary Desk heading is a portal to the client-local page, just as an
   agent tag is a portal to an agent; selecting the heading uses the same
   right-hand preview card. Daemons do not own browser state.

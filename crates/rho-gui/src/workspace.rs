@@ -2678,7 +2678,7 @@ impl Workspace {
             self.notice_on(None, &message, StyleClass::SystemInfo, cx);
             return;
         };
-        let view = cx.new(|cx| rho_browser::PageView::new(model, cx));
+        let view = cx.new(|cx| rho_browser::PageView::new(model, id, cx));
         let surface = Self::wrap_surface(
             SurfaceKey::Browser(id),
             SurfaceView::Browser(view),
@@ -2744,6 +2744,7 @@ impl Workspace {
                 let id = record.id;
                 let tag = id.to_string();
                 if !this.dashboard.tag_cursor_heading_with_page(&tag, cx) {
+                    rho_browser::close_page(id, cx).detach();
                     this.notice_on(
                         None,
                         "new web: heading disappeared",
@@ -3526,13 +3527,6 @@ impl Workspace {
     }
 
     #[cfg(feature = "native")]
-    pub fn preview_recent_browser_page(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(page) = rho_browser::pages(cx).into_iter().next() {
-            self.preview_browser_page(page.id, window, cx);
-        }
-    }
-
-    #[cfg(feature = "native")]
     fn preview_browser_page(
         &mut self,
         id: rho_browser::PageId,
@@ -3549,7 +3543,7 @@ impl Workspace {
         let Some(model) = rho_browser::open_page(id, cx) else {
             return;
         };
-        let view = cx.new(|cx| rho_browser::PageView::new(model, cx));
+        let view = cx.new(|cx| rho_browser::PageView::new(model, id, cx));
         self.dashboard_preview = None;
         self.hosts.focus_agent(None);
         self.dashboard_web_preview = Some((id, view));
@@ -4400,8 +4394,6 @@ impl Workspace {
     /// their source. The reconcile is idempotent and cheap, so calling
     /// it from several funnels is fine.
     pub(crate) fn refresh_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        #[cfg(feature = "native")]
-        self.dashboard.set_browser_pages(rho_browser::pages(cx));
         self.dashboard.autofill_titles(&self.registry, cx);
         self.dashboard.sync(&self.registry, window, cx);
     }
@@ -4616,7 +4608,10 @@ impl Workspace {
             #[cfg(feature = "native")]
             SurfaceView::Browser(view) => {
                 let model = view.read(cx).model().clone();
-                let view = cx.new(|cx| rho_browser::PageView::new(model, cx));
+                let SurfaceKey::Browser(id) = surface.key else {
+                    unreachable!("browser view has browser surface key")
+                };
+                let view = cx.new(|cx| rho_browser::PageView::new(model, id, cx));
                 Self::wrap_surface(surface.key.clone(), SurfaceView::Browser(view), window, cx)
             }
             // Chat surfaces hold one editor over one conversation: a split

@@ -1,16 +1,16 @@
 //! Native web-page resources for rho.
 //!
-//! This crate owns client-local page identity and persistence, browser runtime
-//! integration, and GPUI page views. The daemon and Desk remain unaware of
-//! client-local browser processes.
+//! The bundled extension owns client-local page identity and persistence; this
+//! crate owns browser runtime integration and GPUI page views. The daemon and
+//! Desk remain unaware of client-local browser processes.
 
 #![cfg(target_os = "linux")]
 
+pub mod native_host;
 mod runtime;
 mod store;
 mod view;
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -18,24 +18,22 @@ use anyhow::Result;
 use gpui::{App, AppContext as _, BorrowAppContext as _, Entity, Global, Task};
 use rho_browser_wayland::DmaBufConfig;
 use runtime::BrowserRuntime;
-pub use store::{PageId, PageRecord, WebStore, WindowId, WindowRecord};
+pub use store::{PageId, PageRecord};
 pub use view::{BrowserModel as PageModel, BrowserView as PageView};
 
 pub struct WebState {
-    persisted_pages: WebStore,
     state_dir: std::path::PathBuf,
     runtime: Option<Arc<BrowserRuntime>>,
-    live_pages: HashMap<PageId, Entity<PageModel>>,
+    model: Option<Entity<PageModel>>,
 }
 
 impl Global for WebState {}
 
-pub fn init(store: WebStore, state_dir: &Path, cx: &mut App) {
+pub fn init(state_dir: &Path, cx: &mut App) {
     cx.set_global(WebState {
-        persisted_pages: store,
         state_dir: state_dir.to_owned(),
         runtime: None,
-        live_pages: HashMap::new(),
+        model: None,
     });
 }
 
@@ -55,46 +53,35 @@ fn runtime(cx: &mut App) -> Result<Arc<BrowserRuntime>> {
             .collect(),
     };
     let state_dir = cx.global::<WebState>().state_dir.clone();
-    let runtime = Arc::new(BrowserRuntime::launch(&state_dir, dma_buf)?);
-    cx.update_global::<WebState, _>(|web, _| web.runtime = Some(runtime.clone()));
+    let (runtime, session) = BrowserRuntime::launch(&state_dir, dma_buf)?;
+    let runtime = Arc::new(runtime);
+    let model = cx.new(|cx| PageModel::new(runtime.clone(), session, cx));
+    cx.update_global::<WebState, _>(|web, _| {
+        web.runtime = Some(runtime.clone());
+        web.model = Some(model);
+    });
     Ok(runtime)
 }
 
 pub fn create_page(launch_url: String, cx: &mut App) -> Task<Result<PageRecord>> {
-    let store = cx.global::<WebState>().persisted_pages.clone();
-    cx.background_spawn(async move { store.create_page(launch_url).await })
-}
-
-pub fn open_page_record(record: PageRecord, cx: &mut App) -> Entity<PageModel> {
-    if let Some(model) = cx.global::<WebState>().live_pages.get(&record.id) {
-        return model.clone();
-    }
-    let id = record.id;
-    let launch =
-        runtime(cx).and_then(|runtime| runtime.open(record.id, &record.launch_url, (1280, 720)));
-    let model = cx.new(|cx| PageModel::new_record(record, launch, cx));
-    cx.update_global::<WebState, _>(|web, _| {
-        web.live_pages.insert(id, model.clone());
-    });
-    model
+    let runtime = runtime(cx);
+    cx.background_spawn(async move { runtime?.create_page(&launch_url) })
 }
 
 pub fn open_page(id: PageId, cx: &mut App) -> Option<Entity<PageModel>> {
-    if let Some(model) = cx.global::<WebState>().live_pages.get(&id) {
-        return Some(model.clone());
-    }
-    let record = cx.global::<WebState>().persisted_pages.get_page(id)?;
-    Some(open_page_record(record, cx))
+    runtime(cx).ok()?;
+    let model = cx.global::<WebState>().model.clone()?;
+    model.update(cx, |model, cx| model.focus(id, cx));
+    Some(model)
 }
 
-pub fn pages(cx: &App) -> Vec<PageRecord> {
-    cx.try_global::<WebState>()
-        .map(|web| web.persisted_pages.list_pages())
-        .unwrap_or_default()
+pub fn close_page(id: PageId, cx: &mut App) -> Task<Result<()>> {
+    let runtime = runtime(cx);
+    cx.background_spawn(async move { runtime?.close_page(id) })
 }
 
-pub fn page_handle(id: PageId, cx: &App) -> String {
-    cx.global::<WebState>().persisted_pages.page_handle(id)
+pub fn page_handle(id: PageId, _cx: &App) -> String {
+    id.to_string()
 }
 
 pub fn page_name(page: &PageRecord) -> String {

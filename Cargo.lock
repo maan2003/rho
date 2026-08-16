@@ -13644,19 +13644,15 @@ name = "rho-browser"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-channel 2.5.0",
- "bytes",
  "futures-lite 2.6.1",
  "gpui",
  "libc",
- "prefix-id",
- "rand 0.8.7",
- "redb",
  "rho-browser-wayland",
- "rho-db",
- "senax-encoder",
+ "serde",
+ "serde_json",
  "tempfile",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -13879,12 +13875,10 @@ dependencies = [
  "octo-types",
  "org-element",
  "path",
- "prefix-id",
  "project",
  "release_channel",
  "rho-browser",
  "rho-core",
- "rho-db",
  "rho-iroh-auth",
  "rho-profiling",
  "rho-registry",
@@ -13899,7 +13893,6 @@ dependencies = [
  "rustls",
  "search",
  "semver",
- "senax-encoder",
  "serde",
  "serde_json",
  "settings",

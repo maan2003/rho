@@ -8,18 +8,14 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-async-channel = "2.5"
-bytes.workspace = true
 anyhow.workspace = true
 gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"] }
-redb.workspace = true
 libc.workspace = true
-prefix-id = { workspace = true, default-features = false }
-rand.workspace = true
-url.workspace = true
 rho-browser-wayland.workspace = true
-rho-db.workspace = true
-senax-encoder.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+url.workspace = true
+uuid.workspace = true
 
 [dev-dependencies]
 futures-lite = "2"

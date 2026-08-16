@@ -64,8 +64,8 @@ use smithay::wayland::viewporter::ViewportCachedState;
 use smithay::wayland::xdg_activation::{XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData};
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::wayland::shell::xdg::{
-    PopupSurface, PositionerState, SurfaceCachedState as XdgSurfaceCachedState, ToplevelSurface,
-    XdgShellHandler, XdgShellState,
+    Configure, PopupSurface, PositionerState, SurfaceCachedState as XdgSurfaceCachedState,
+    ToplevelSurface, XdgShellHandler, XdgShellState,
 };
 use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::{
@@ -83,6 +83,8 @@ pub struct DmaBufConfig {
 
 pub struct DmaBufFrame {
     pub id: u64,
+    /// The newest host-requested frame barrier acknowledged before this commit.
+    pub barrier: u64,
     pub width: u32,
     pub height: u32,
     pub fourcc: u32,
@@ -239,6 +241,7 @@ pub enum PinchGesture {
 
 enum PageCommand {
     Resize(u32, u32, f64),
+    FrameBarrier(u64, u32, u32, f64),
     Presented(u64),
     Retired(u64),
     PointerMotion { commit_id: u64, x: f64, y: f64 },
@@ -343,6 +346,13 @@ impl<K: BrowserPageKey> BrowserSession<K> {
             self.send(PageCommand::Resize(w, h, f64::from(scale)))
         }
     }
+    /// Requests a deliberately changed configure. A DMA frame carrying this
+    /// barrier value was committed after Chrome acknowledged that configure.
+    pub fn frame_barrier(&self, barrier: u64, w: u32, h: u32, scale: f32) {
+        if w > 0 && h > 0 && scale.is_finite() && scale > 0.0 {
+            self.send(PageCommand::FrameBarrier(barrier, w, h, f64::from(scale)))
+        }
+    }
     pub fn pointer_motion(&self, commit_id: u64, x: f64, y: f64) {
         self.send(PageCommand::PointerMotion { commit_id, x, y })
     }
@@ -382,6 +392,8 @@ struct WindowState {
     dma_frame_callbacks: HashMap<u64, Vec<wl_callback::WlCallback>>,
     pointer_frames: HashMap<u64, PointerFrame>,
     pointer_location: (f64, f64),
+    pending_barriers: Vec<(Serial, u64)>,
+    acked_barrier: u64,
     opened_at: Instant,
 }
 
@@ -658,8 +670,10 @@ impl<K: BrowserPageKey> CompositorHandler for State<K> {
                             return;
                         }
                     };
+                let barrier = self.windows[&wid].acked_barrier;
                 match dma_buf_frame(bid, dmabuf, source, a, r, wid, self.commands.clone()) {
-                    Ok(frame) => {
+                    Ok(mut frame) => {
+                        frame.barrier = barrier;
                         let window = self.windows.get_mut(&wid).expect("known window");
                         window.pointer_frames.insert(bid, pointer_frame);
                         if let Some(toplevel) = &window.toplevel {
@@ -746,6 +760,26 @@ impl<K: BrowserPageKey> XdgShellHandler for State<K> {
         if let Some(id) = self.pending_activations.remove(&root) {
             self.bind_toplevel(id, root);
         }
+    }
+
+    fn ack_configure(&mut self, surface: WlSurface, configure: Configure) {
+        let Configure::Toplevel(configure) = configure else {
+            return;
+        };
+        let Some(id) = self.window_id_for_surface(&surface) else {
+            return;
+        };
+        let window = self.windows.get_mut(&id).expect("configured window exists");
+        let mut acknowledged = window.acked_barrier;
+        window.pending_barriers.retain(|(serial, barrier)| {
+            if *serial <= configure.serial {
+                acknowledged = acknowledged.max(*barrier);
+                false
+            } else {
+                true
+            }
+        });
+        window.acked_barrier = acknowledged;
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
@@ -941,6 +975,7 @@ fn dma_buf_frame<K: BrowserPageKey>(
     let release = release.0.take().expect("release point available");
     Ok(DmaBufFrame {
         id,
+        barrier: 0,
         width: u32::try_from(size.w).context("invalid DMA-BUF width")?,
         height: u32::try_from(size.h).context("invalid DMA-BUF height")?,
         fourcc: format.code as u32,
@@ -1245,6 +1280,8 @@ fn handle_runtime_command<K: BrowserPageKey>(
                     dma_frame_callbacks: HashMap::new(),
                     pointer_frames: HashMap::new(),
                     pointer_location: (0.0, 0.0),
+                    pending_barriers: Vec::new(),
+                    acked_barrier: 0,
                     opened_at: Instant::now(),
                 },
             );
@@ -1327,6 +1364,9 @@ fn schedule_toplevel_deadlines<K: BrowserPageKey>(
 fn handle_page_command<K: BrowserPageKey>(state: &mut State<K>, id: K, c: PageCommand) {
     match c {
         PageCommand::Resize(w, h, scale) => resize(state, id, w, h, scale),
+        PageCommand::FrameBarrier(barrier, w, h, scale) => {
+            frame_barrier(state, id, barrier, w, h, scale)
+        }
         PageCommand::Presented(commit) => {
             let time = state.time();
             if let Some(w) = state.windows.get_mut(&id) {
@@ -1398,6 +1438,36 @@ fn resize<K: BrowserPageKey>(state: &mut State<K>, id: K, width: u32, height: u3
         t.with_pending_state(|p| p.size = Some((width as i32, height as i32).into()));
         t.send_configure();
     }
+}
+
+fn frame_barrier<K: BrowserPageKey>(
+    state: &mut State<K>,
+    id: K,
+    barrier: u64,
+    width: u32,
+    height: u32,
+    scale: f64,
+) {
+    let Some(window) = state.windows.get_mut(&id) else {
+        return;
+    };
+    if width == 0 || height == 0 || !scale.is_finite() || scale <= 0.0 {
+        return;
+    }
+    window.size = (width, height);
+    window.scale = scale;
+    let Some(toplevel) = &window.toplevel else {
+        return;
+    };
+    with_states(toplevel.wl_surface(), |states| {
+        with_fractional_scale(states, |fractional| {
+            fractional.set_preferred_scale(scale);
+        });
+    });
+    toplevel
+        .with_pending_state(|pending| pending.size = Some((width as i32, height as i32).into()));
+    let serial = toplevel.send_configure();
+    window.pending_barriers.push((serial, barrier));
 }
 fn pointer_motion<K: BrowserPageKey>(state: &mut State<K>, id: K, commit_id: u64, x: f64, y: f64) {
     let Some(w) = state.windows.get(&id) else {
@@ -1699,6 +1769,7 @@ mod tests {
             let fence = std::fs::File::open("/dev/null").unwrap();
             DmaBufFrame {
                 id,
+                barrier: 0,
                 width: 1,
                 height: 1,
                 fourcc: 0,

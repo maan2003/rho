@@ -239,8 +239,6 @@ pub struct Dashboard {
     /// boundary onto a headerless buffer draws nothing, so this is what
     /// keeps the interleaved excerpts seamless.
     headers_disabled: std::collections::HashSet<BufferId>,
-    #[cfg(feature = "native")]
-    browser_pages: Vec<rho_browser::PageRecord>,
 }
 
 impl Dashboard {
@@ -298,14 +296,7 @@ impl Dashboard {
             placeholder_ids: Vec::new(),
             last_synced: None,
             headers_disabled: std::collections::HashSet::new(),
-            #[cfg(feature = "native")]
-            browser_pages: Vec::new(),
         }
-    }
-
-    #[cfg(feature = "native")]
-    pub fn set_browser_pages(&mut self, pages: Vec<rho_browser::PageRecord>) {
-        self.browser_pages = pages;
     }
 
     /// Registers every current buffer (rows and Desk documents) as
@@ -509,17 +500,8 @@ impl Dashboard {
         for (host, text) in documents {
             for heading in parse(text) {
                 for tag in &heading.tags {
-                    let Some(prefix) = tag.strip_prefix("web-") else {
-                        continue;
-                    };
-                    let mut matches = self
-                        .browser_pages
-                        .iter()
-                        .filter(|page| page.id.0.encoded().starts_with(prefix));
-                    if let Some(page) = matches.next()
-                        && matches.next().is_none()
-                    {
-                        by_heading.insert((*host, heading.heading_range.start), page.id);
+                    if let Ok(page_id) = tag.parse::<rho_browser::PageId>() {
+                        by_heading.insert((*host, heading.heading_range.start), page_id);
                     }
                 }
             }

@@ -106,6 +106,14 @@ struct EditorRecord {
 }
 
 fn main() {
+    let arguments = std::env::args().collect::<Vec<_>>();
+    if rho_browser::native_host::is_invocation(&arguments) {
+        if let Err(error) = rho_browser::native_host::run() {
+            eprintln!("rho browser native host: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     init_tracing();
     if let Err(error) = run() {
         eprintln!("rho-gui: {error:#}");
@@ -125,9 +133,9 @@ fn init_tracing() {
     tracing::info!("rho-gui tracing initialized");
 }
 
-fn default_client_db_path() -> Result<PathBuf> {
+fn default_client_state_dir() -> Result<PathBuf> {
     let base = dirs::state_dir().ok_or_else(|| anyhow::anyhow!("state directory not available"))?;
-    Ok(base.join("rho").join("rho-client.redb"))
+    Ok(base.join("rho"))
 }
 
 fn run() -> Result<()> {
@@ -159,14 +167,7 @@ fn run() -> Result<()> {
         })
         .transpose()?;
     let specs = host_specs(&args)?;
-    let client_db_path = default_client_db_path()?;
-    let client_state_dir = client_db_path
-        .parent()
-        .expect("client DB has parent")
-        .to_owned();
-    let web_store = futures::executor::block_on(rho_browser::WebStore::open(rho_db::RhoDb::open(
-        client_db_path,
-    )));
+    let client_state_dir = default_client_state_dir()?;
 
     gpui_platform::application()
         .with_assets(RhoAssets)
@@ -215,7 +216,7 @@ fn run() -> Result<()> {
                 return;
             }
 
-            rho_browser::init(web_store.clone(), &client_state_dir, cx);
+            rho_browser::init(&client_state_dir, cx);
             cx.activate(true);
 
             if let Err(error) = cx.open_window(WindowOptions::default(), move |window, cx| {

@@ -3,10 +3,11 @@
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::{
-    Context, Entity, FocusHandle, Focusable, InteractiveElement as _, IntoElement,
-    LinuxAxisRelativeDirection, LinuxAxisSource, LinuxDmaBufSurface, LinuxPinchEvent,
+    AppContext as _, Context, Entity, EntityId, FocusHandle, Focusable, InteractiveElement as _,
+    IntoElement, LinuxAxisRelativeDirection, LinuxAxisSource, LinuxDmaBufSurface, LinuxPinchEvent,
     LinuxPointerAxisEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
     ParentElement as _, PhysicalKey, PhysicalKeyEvent, Render, Styled as _, Subscription, Task,
     Window, canvas, div, surface,
@@ -16,41 +17,51 @@ use rho_browser_wayland::{
     PointerAxisSource,
 };
 
-use crate::PageRecord;
+use crate::PageId;
+use crate::runtime::{BrowserRuntime, BrowserWindow};
 
 struct RuntimePageState {
-    session: Option<BrowserSession<crate::PageId>>,
+    session: Option<BrowserSession<BrowserWindow>>,
     dma_buf: Option<LinuxDmaBufSurface>,
     status: Option<String>,
     sent_size: Rc<Cell<(u32, u32, u32)>>,
 }
 
-/// The persisted and live state associated with one durable page ID.
+/// The singleton live Chrome surface shared by every logical page view.
 pub struct BrowserModel {
-    persisted: PageRecord,
+    browser: Arc<BrowserRuntime>,
+    focused_page: Option<PageId>,
+    desired_page: Option<PageId>,
+    focus_in_flight: bool,
+    next_frame_barrier: u64,
+    awaiting_frame: Option<(u64, PageId)>,
+    presentation_owner: Option<EntityId>,
     runtime: RuntimePageState,
     _events_task: Task<()>,
 }
 
 impl BrowserModel {
-    pub fn new_record(
-        persisted: PageRecord,
-        launch: anyhow::Result<BrowserSession<crate::PageId>>,
+    pub(crate) fn new(
+        browser: Arc<BrowserRuntime>,
+        session: BrowserSession<BrowserWindow>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let (session, status) = match launch {
-            Ok(session) => (Some(session), Some("waiting for Chrome".into())),
-            Err(error) => (None, Some(format!("Chrome failed: {error:#}"))),
-        };
-        let events = session.as_ref().map(BrowserSession::events);
+        let events = session.events();
         let events_task = cx.spawn(async move |this, cx| {
-            let Some(events) = events else { return };
             while let Ok(event) = events.recv().await {
                 let terminal = matches!(event, BrowserEvent::Closed | BrowserEvent::Failed(_));
                 if this
                     .update(cx, |model, cx| {
                         match event {
                             BrowserEvent::DmaBuf(mut frame) => {
+                                if !accept_frame(
+                                    model.desired_page,
+                                    &mut model.focused_page,
+                                    &mut model.awaiting_frame,
+                                    frame.barrier,
+                                ) {
+                                    return;
+                                }
                                 let Some(session) = &model.runtime.session else {
                                     return;
                                 };
@@ -120,19 +131,96 @@ impl BrowserModel {
             }
         });
         Self {
-            persisted,
+            browser,
+            focused_page: None,
+            desired_page: None,
+            focus_in_flight: false,
+            next_frame_barrier: 1,
+            awaiting_frame: None,
+            presentation_owner: None,
             runtime: RuntimePageState {
-                session,
+                session: Some(session),
                 dma_buf: None,
-                status,
-                sent_size: Rc::new(Cell::new((0, 0, 0))),
+                status: Some("waiting for Chrome".into()),
+                sent_size: Rc::new(Cell::new((1280, 720, 1.0_f32.to_bits()))),
             },
             _events_task: events_task,
         }
     }
 
-    pub fn record(&self) -> &PageRecord {
-        &self.persisted
+    pub(crate) fn focus(&mut self, id: PageId, cx: &mut Context<Self>) {
+        self.desired_page = Some(id);
+        self.start_focus(cx);
+    }
+
+    fn start_focus(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.desired_page else {
+            return;
+        };
+        if self.focus_in_flight
+            || self.focused_page == Some(id)
+            || self.awaiting_frame.is_some_and(|(_, page)| page == id)
+        {
+            return;
+        }
+        self.focus_in_flight = true;
+        let browser = self.browser.clone();
+        let request = cx.background_spawn(async move { browser.focus_page(id) });
+        cx.spawn(async move |this, cx| {
+            let result = request.await;
+            let _ = this.update(cx, |model, cx| {
+                model.focus_in_flight = false;
+                match result {
+                    Ok(()) if model.desired_page == Some(id) => model.begin_frame_barrier(id),
+                    Ok(()) => {}
+                    Err(error) => {
+                        model.runtime.status = Some(format!("browser: {error:#}"));
+                        if model.desired_page == Some(id) {
+                            model.desired_page = None;
+                        }
+                    }
+                }
+                if model.desired_page != model.focused_page && model.awaiting_frame.is_none() {
+                    model.start_focus(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn claim_presentation(&mut self, owner: EntityId, page: PageId, cx: &mut Context<Self>) {
+        // A fresh portal claim must refocus Chrome even if our last confirmed
+        // request named this page: the user can switch tabs in Chrome itself.
+        self.focused_page = None;
+        self.awaiting_frame = None;
+        self.runtime.dma_buf = None;
+        self.runtime.status = Some("switching browser page".into());
+        self.presentation_owner = Some(owner);
+        self.focus(page, cx);
+        cx.notify();
+    }
+
+    fn begin_frame_barrier(&mut self, page: PageId) {
+        let barrier = self.next_frame_barrier;
+        self.next_frame_barrier = self.next_frame_barrier.wrapping_add(1).max(1);
+        let (width, height, scale) = self.runtime.sent_size.get();
+        let probe_width = if width == u32::MAX {
+            width - 1
+        } else {
+            width + 1
+        };
+        self.runtime.sent_size.set((probe_width, height, scale));
+        if let Some(session) = &self.runtime.session {
+            session.frame_barrier(barrier, probe_width, height, f32::from_bits(scale));
+            self.awaiting_frame = Some((barrier, page));
+        }
+    }
+
+    fn presents(&self, owner: EntityId, page: PageId) -> bool {
+        self.presentation_owner == Some(owner)
+            && self.desired_page == Some(page)
+            && self.focused_page == Some(page)
     }
 
     fn resize(&self, width: u32, height: u32, scale: f32) {
@@ -203,8 +291,27 @@ impl BrowserModel {
     }
 }
 
+fn accept_frame(
+    desired: Option<PageId>,
+    focused: &mut Option<PageId>,
+    awaiting: &mut Option<(u64, PageId)>,
+    frame_barrier: u64,
+) -> bool {
+    if let Some((barrier, page)) = *awaiting {
+        if desired != Some(page) || frame_barrier < barrier {
+            return false;
+        }
+        *focused = Some(page);
+        *awaiting = None;
+        return true;
+    }
+    desired == *focused
+}
+
 pub struct BrowserView {
     model: Entity<BrowserModel>,
+    owner_id: EntityId,
+    page_id: PageId,
     focus_handle: FocusHandle,
     origin: Rc<Cell<(f32, f32)>>,
     pressed_keys: HashSet<u32>,
@@ -212,14 +319,21 @@ pub struct BrowserView {
     finger_axes: (bool, bool),
     pinch_active: bool,
     blur_subscription: Option<Subscription>,
+    focus_subscription: Option<Subscription>,
     _model_changed: Subscription,
 }
 
 impl BrowserView {
-    pub fn new(model: Entity<BrowserModel>, cx: &mut Context<Self>) -> Self {
+    pub fn new(model: Entity<BrowserModel>, page_id: PageId, cx: &mut Context<Self>) -> Self {
+        let owner_id = cx.entity_id();
         let model_changed = cx.observe(&model, |_, _, cx| cx.notify());
+        model.update(cx, |model, cx| {
+            model.claim_presentation(owner_id, page_id, cx)
+        });
         Self {
             model,
+            owner_id,
+            page_id,
             focus_handle: cx.focus_handle(),
             origin: Rc::new(Cell::new((0.0, 0.0))),
             pressed_keys: HashSet::new(),
@@ -227,6 +341,7 @@ impl BrowserView {
             finger_axes: (false, false),
             pinch_active: false,
             blur_subscription: None,
+            focus_subscription: None,
             _model_changed: model_changed,
         }
     }
@@ -244,6 +359,9 @@ impl BrowserView {
     }
 
     fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.model.read(cx).presents(self.owner_id, self.page_id) {
+            return;
+        }
         let (x, y) = self.local_position(event.position);
         self.model.read(cx).pointer_motion(x, y);
     }
@@ -251,7 +369,16 @@ impl BrowserView {
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         self.focus_handle.focus(window, cx);
         let (x, y) = self.local_position(event.position);
+        self.model.update(cx, |model, cx| {
+            if !model.presents(self.owner_id, self.page_id) {
+                model.claim_presentation(self.owner_id, self.page_id, cx);
+            }
+        });
         let model = self.model.read(cx);
+        if !model.presents(self.owner_id, self.page_id) {
+            cx.stop_propagation();
+            return;
+        }
         model.pointer_motion(x, y);
         let button = linux_button(event.button);
         self.pressed_buttons.insert(button);
@@ -260,6 +387,10 @@ impl BrowserView {
     }
 
     fn mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.model.read(cx).presents(self.owner_id, self.page_id) {
+            self.pressed_buttons.remove(&linux_button(event.button));
+            return;
+        }
         let button = linux_button(event.button);
         self.pressed_buttons.remove(&button);
         self.model.read(cx).pointer_button(button, false);
@@ -272,6 +403,9 @@ impl BrowserView {
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.model.read(cx).presents(self.owner_id, self.page_id) {
+            return;
+        }
         if event.source == LinuxAxisSource::Finger {
             if event.value.0 != 0.0 {
                 self.finger_axes.0 = true;
@@ -291,12 +425,18 @@ impl BrowserView {
     }
 
     fn pinch(&mut self, event: &LinuxPinchEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.model.read(cx).presents(self.owner_id, self.page_id) {
+            return;
+        }
         self.pinch_active = !matches!(event, LinuxPinchEvent::End { .. });
         self.model.read(cx).pinch(*event);
         cx.stop_propagation();
     }
 
     fn physical_key(&mut self, event: &PhysicalKeyEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if !self.model.read(cx).presents(self.owner_id, self.page_id) {
+            return;
+        }
         let PhysicalKey::LinuxEvdev(keycode) = event.key;
         if event.pressed {
             if self.pressed_keys.insert(keycode) {
@@ -364,10 +504,29 @@ impl Render for BrowserView {
                 this.release_input(cx)
             }));
         }
+        if self.focus_subscription.is_none() {
+            let page_id = self.page_id;
+            let owner_id = self.owner_id;
+            self.focus_subscription =
+                Some(cx.on_focus(&self.focus_handle, window, move |this, _, cx| {
+                    this.model.update(cx, |model, cx| {
+                        model.claim_presentation(owner_id, page_id, cx)
+                    })
+                }));
+        }
         let model = self.model.read(cx);
-        let dma_buf = model.runtime.dma_buf.clone();
-        let status = model.runtime.status.clone();
+        let presents = model.presents(self.owner_id, self.page_id);
+        let dma_buf = presents.then(|| model.runtime.dma_buf.clone()).flatten();
+        let status = if presents {
+            model.runtime.status.clone()
+        } else if model.presentation_owner == Some(self.owner_id) {
+            Some("switching browser page".to_owned())
+        } else {
+            Some("browser is active in another pane".to_owned())
+        };
         let scale = window.scale_factor();
+        let owner_id = self.owner_id;
+        let page_id = self.page_id;
         let browser = self.model.clone();
         let origin = self.origin.clone();
         let measure = canvas(
@@ -375,7 +534,10 @@ impl Render for BrowserView {
                 origin.set((f32::from(bounds.origin.x), f32::from(bounds.origin.y)));
                 let width = f32::from(bounds.size.width).round().max(1.0) as u32;
                 let height = f32::from(bounds.size.height).round().max(1.0) as u32;
-                browser.read(cx).resize(width, height, scale);
+                let browser = browser.read(cx);
+                if browser.presents(owner_id, page_id) {
+                    browser.resize(width, height, scale);
+                }
             },
             |_, _, _, _| {},
         )
@@ -421,5 +583,28 @@ impl Render for BrowserView {
                     .text_color(gpui::white())
                     .child(status)
             }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pre_response_frame_cannot_complete_focus_without_configure_barrier() {
+        let page = PageId(uuid::Uuid::new_v4());
+        let mut focused = None;
+        let mut awaiting = None;
+
+        // A target-looking frame may arrive before the activation RPC reply.
+        assert!(!accept_frame(Some(page), &mut focused, &mut awaiting, 0));
+        assert_eq!(focused, None);
+
+        // RPC completion installs a configure barrier. No ordinary later frame
+        // can unblock presentation; only the post-ACK barrier commit can.
+        awaiting = Some((7, page));
+        assert!(!accept_frame(Some(page), &mut focused, &mut awaiting, 0));
+        assert!(accept_frame(Some(page), &mut focused, &mut awaiting, 7));
+        assert_eq!(focused, Some(page));
     }
 }
