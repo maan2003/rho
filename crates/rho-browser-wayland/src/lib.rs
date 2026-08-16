@@ -392,6 +392,7 @@ struct WindowState {
     dma_frame_callbacks: HashMap<u64, Vec<wl_callback::WlCallback>>,
     pointer_frames: HashMap<u64, PointerFrame>,
     pointer_location: (f64, f64),
+    unbound_barrier: Option<u64>,
     pending_barriers: Vec<(Serial, u64)>,
     acked_barrier: u64,
     opened_at: Instant,
@@ -523,11 +524,15 @@ impl<K: BrowserPageKey> State<K> {
             state.size = Some((size.0 as i32, size.1 as i32).into());
             state.states.set(xdg_toplevel::State::Activated);
         });
-        surface.send_configure();
+        let serial = surface.send_configure();
         self.windows
             .get_mut(&id)
             .expect("pending window exists")
             .toplevel = Some(surface);
+        track_unbound_barrier(
+            self.windows.get_mut(&id).expect("pending window exists"),
+            serial,
+        );
         self.allow_initial_unambiguous_toplevel = false;
         self.activation_windows
             .retain(|_, window_id| *window_id != id);
@@ -1280,6 +1285,7 @@ fn handle_runtime_command<K: BrowserPageKey>(
                     dma_frame_callbacks: HashMap::new(),
                     pointer_frames: HashMap::new(),
                     pointer_location: (0.0, 0.0),
+                    unbound_barrier: None,
                     pending_barriers: Vec::new(),
                     acked_barrier: 0,
                     opened_at: Instant::now(),
@@ -1457,6 +1463,7 @@ fn frame_barrier<K: BrowserPageKey>(
     window.size = (width, height);
     window.scale = scale;
     let Some(toplevel) = &window.toplevel else {
+        window.unbound_barrier = Some(barrier);
         return;
     };
     with_states(toplevel.wl_surface(), |states| {
@@ -1468,6 +1475,12 @@ fn frame_barrier<K: BrowserPageKey>(
         .with_pending_state(|pending| pending.size = Some((width as i32, height as i32).into()));
     let serial = toplevel.send_configure();
     window.pending_barriers.push((serial, barrier));
+}
+
+fn track_unbound_barrier(window: &mut WindowState, serial: Serial) {
+    if let Some(barrier) = window.unbound_barrier.take() {
+        window.pending_barriers.push((serial, barrier));
+    }
 }
 fn pointer_motion<K: BrowserPageKey>(state: &mut State<K>, id: K, commit_id: u64, x: f64, y: f64) {
     let Some(w) = state.windows.get(&id) else {
@@ -1795,6 +1808,29 @@ mod tests {
         let event = futures_lite::future::block_on(receiver.recv()).unwrap();
         assert!(matches!(event, BrowserEvent::DmaBuf(frame) if frame.id == 2));
         assert_eq!(releases.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn barrier_requested_before_toplevel_bind_tracks_initial_configure() {
+        let (events, _receiver) = browser_event_channel();
+        let mut window = WindowState {
+            toplevel: None,
+            size: (1281, 720),
+            scale: 1.0,
+            events,
+            dma_frame_callbacks: HashMap::new(),
+            pointer_frames: HashMap::new(),
+            pointer_location: (0.0, 0.0),
+            unbound_barrier: Some(9),
+            pending_barriers: Vec::new(),
+            acked_barrier: 0,
+            opened_at: Instant::now(),
+        };
+
+        track_unbound_barrier(&mut window, 42_u32.into());
+
+        assert_eq!(window.unbound_barrier, None);
+        assert_eq!(window.pending_barriers, vec![(42_u32.into(), 9)]);
     }
 
     #[test]

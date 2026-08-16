@@ -54,10 +54,10 @@ impl BrowserModel {
                     .update(cx, |model, cx| {
                         match event {
                             BrowserEvent::DmaBuf(mut frame) => {
-                                if !accept_frame(
+                                if !frame_is_eligible(
                                     model.desired_page,
-                                    &mut model.focused_page,
-                                    &mut model.awaiting_frame,
+                                    model.focused_page,
+                                    model.awaiting_frame,
                                     frame.barrier,
                                 ) {
                                     return;
@@ -77,7 +77,7 @@ impl BrowserModel {
                                     cx.notify();
                                     return;
                                 };
-                                model.runtime.dma_buf = Some(LinuxDmaBufSurface::new(
+                                let surface = LinuxDmaBufSurface::new(
                                     frame.id,
                                     frame.width,
                                     frame.height,
@@ -92,7 +92,14 @@ impl BrowserModel {
                                     acquire,
                                     session.presentation_callback(frame.id),
                                     frame.take_release(),
-                                ));
+                                );
+                                complete_frame_handoff(
+                                    model.desired_page,
+                                    &mut model.focused_page,
+                                    &mut model.awaiting_frame,
+                                    frame.barrier,
+                                );
+                                model.runtime.dma_buf = Some(surface);
                                 model.runtime.status = None;
                             }
                             BrowserEvent::FrameRetired(commit_id) => {
@@ -291,21 +298,31 @@ impl BrowserModel {
     }
 }
 
-fn accept_frame(
+fn frame_is_eligible(
+    desired: Option<PageId>,
+    focused: Option<PageId>,
+    awaiting: Option<(u64, PageId)>,
+    frame_barrier: u64,
+) -> bool {
+    if let Some((barrier, page)) = awaiting {
+        return desired == Some(page) && frame_barrier >= barrier;
+    }
+    desired == focused
+}
+
+fn complete_frame_handoff(
     desired: Option<PageId>,
     focused: &mut Option<PageId>,
     awaiting: &mut Option<(u64, PageId)>,
     frame_barrier: u64,
-) -> bool {
-    if let Some((barrier, page)) = *awaiting {
-        if desired != Some(page) || frame_barrier < barrier {
-            return false;
-        }
+) {
+    if let Some((barrier, page)) = *awaiting
+        && desired == Some(page)
+        && frame_barrier >= barrier
+    {
         *focused = Some(page);
         *awaiting = None;
-        return true;
     }
-    desired == *focused
 }
 
 pub struct BrowserView {
@@ -597,14 +614,16 @@ mod tests {
         let mut awaiting = None;
 
         // A target-looking frame may arrive before the activation RPC reply.
-        assert!(!accept_frame(Some(page), &mut focused, &mut awaiting, 0));
+        assert!(!frame_is_eligible(Some(page), focused, awaiting, 0));
         assert_eq!(focused, None);
 
         // RPC completion installs a configure barrier. No ordinary later frame
         // can unblock presentation; only the post-ACK barrier commit can.
         awaiting = Some((7, page));
-        assert!(!accept_frame(Some(page), &mut focused, &mut awaiting, 0));
-        assert!(accept_frame(Some(page), &mut focused, &mut awaiting, 7));
+        assert!(!frame_is_eligible(Some(page), focused, awaiting, 0));
+        assert!(frame_is_eligible(Some(page), focused, awaiting, 7));
+        assert_eq!(focused, None, "eligibility alone must not enable input");
+        complete_frame_handoff(Some(page), &mut focused, &mut awaiting, 7);
         assert_eq!(focused, Some(page));
     }
 }
