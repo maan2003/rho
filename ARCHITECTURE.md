@@ -169,6 +169,13 @@ than by running a supervisor, extension protocol, or daemon process graph.
   post-activation XDG configure. The previous atomic scene may remain visible
   but non-interactive during that handoff; Wayland ordering establishes frame
   readiness, not semantic pixel ownership by a Chrome tab.
+  Browser input separates pointer targeting from keyboard focus, following
+  niri's default click-to-focus policy. Mouse presses focus and activate the
+  portal under the pointer. Wheel, touchpad-axis, and pinch input activate and
+  target that portal without moving keyboard focus; a later key event reclaims
+  presentation for the keyboard-focused portal. Pointer motion alone never
+  activates an inactive portal, and leaving a presented portal sends an
+  explicit nested-Wayland pointer leave so website hover state cannot persist.
   Valid compositor scenes continue to replace the displayed scene and receive
   presentation callbacks from a GPUI paint hook in the current outer frame
   while input is gated. This follows nested-compositor pacing and avoids both

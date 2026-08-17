@@ -11,8 +11,8 @@ use gpui::{
     InteractiveElement as _, IntoElement, LinuxAxisRelativeDirection, LinuxAxisSource,
     LinuxDmaBufSurface, LinuxPinchEvent, LinuxPointerAxisEvent, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement as _, PhysicalKey, PhysicalKeyEvent,
-    Render, RenderImage, Styled as _, StyledImage as _, Subscription, Task, Window, canvas, div,
-    img, px, surface,
+    Render, RenderImage, StatefulInteractiveElement as _, Styled as _, StyledImage as _,
+    Subscription, Task, Window, canvas, div, img, px, surface,
 };
 use image::{Frame, RgbaImage};
 use rho_browser_wayland::{
@@ -594,6 +594,12 @@ impl BrowserModel {
         }
     }
 
+    fn pointer_leave(&self) {
+        if let Some(session) = &self.runtime.session {
+            session.pointer_leave();
+        }
+    }
+
     fn pointer_button(&self, button: u32, pressed: bool) -> bool {
         if pressed && self.runtime.painted_scene_id.is_none() {
             return false;
@@ -630,26 +636,12 @@ impl BrowserModel {
         }
     }
 
-    fn pinch(&self, event: LinuxPinchEvent) {
-        if self.runtime.painted_scene_id.is_none() && !matches!(event, LinuxPinchEvent::End { .. })
-        {
+    fn pinch(&self, gesture: PinchGesture) {
+        if self.runtime.painted_scene_id.is_none() && !matches!(gesture, PinchGesture::End { .. }) {
             return;
         }
         if let Some(session) = &self.runtime.session {
-            session.pinch(match event {
-                LinuxPinchEvent::Begin { fingers, .. } => PinchGesture::Begin { fingers },
-                LinuxPinchEvent::Update {
-                    delta,
-                    scale,
-                    rotation,
-                    ..
-                } => PinchGesture::Update {
-                    delta,
-                    scale,
-                    rotation,
-                },
-                LinuxPinchEvent::End { cancelled } => PinchGesture::End { cancelled },
-            });
+            session.pinch(gesture);
         }
     }
 
@@ -775,22 +767,22 @@ fn complete_frame_handoff(handoff: &mut Option<PageHandoff>, frame_barrier: u64)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PointerReplayState {
+enum InputReplayState {
     Waiting,
     Ready,
     Cancel,
 }
 
 #[derive(Clone, Debug)]
-struct QueuedPointer {
+struct QueuedInput {
     generation: u64,
-    events: Vec<QueuedPointerEvent>,
+    events: Vec<QueuedInputEvent>,
 }
 
-const MAX_QUEUED_POINTER_EVENTS: usize = 256;
+const MAX_QUEUED_INPUT_EVENTS: usize = 256;
 
 #[derive(Clone, Copy, Debug)]
-enum QueuedPointerEvent {
+enum QueuedInputEvent {
     Motion {
         position: (f64, f64),
     },
@@ -803,18 +795,27 @@ enum QueuedPointerEvent {
         position: (f64, f64),
         event: LinuxPointerAxisEvent,
     },
+    Leave,
+    Pinch {
+        position: Option<(f64, f64)>,
+        gesture: PinchGesture,
+    },
+    Key {
+        keycode: u32,
+        pressed: bool,
+    },
 }
 
-impl QueuedPointer {
-    fn push(&mut self, event: QueuedPointerEvent) -> Result<()> {
-        if let QueuedPointerEvent::Motion { position } = event
-            && let Some(QueuedPointerEvent::Motion { position: previous }) = self.events.last_mut()
+impl QueuedInput {
+    fn push(&mut self, event: QueuedInputEvent) -> Result<()> {
+        if let QueuedInputEvent::Motion { position } = event
+            && let Some(QueuedInputEvent::Motion { position: previous }) = self.events.last_mut()
         {
             *previous = position;
             return Ok(());
         }
         anyhow::ensure!(
-            self.events.len() < MAX_QUEUED_POINTER_EVENTS,
+            self.events.len() < MAX_QUEUED_INPUT_EVENTS,
             "queued browser pointer input overflowed"
         );
         self.events.push(event);
@@ -823,7 +824,7 @@ impl QueuedPointer {
 
     fn record_release(&mut self, button: u32, position: (f64, f64)) -> Result<bool> {
         let pressed = self.events.iter().rev().find_map(|event| match event {
-            QueuedPointerEvent::Button {
+            QueuedInputEvent::Button {
                 button: queued_button,
                 pressed,
                 ..
@@ -833,7 +834,7 @@ impl QueuedPointer {
         if pressed != Some(true) {
             return Ok(false);
         }
-        self.push(QueuedPointerEvent::Button {
+        self.push(QueuedInputEvent::Button {
             position,
             button,
             pressed: false,
@@ -842,25 +843,25 @@ impl QueuedPointer {
     }
 }
 
-fn pointer_replay_state(
+fn input_replay_state(
     generation: u64,
     owner: EntityId,
     page: PageId,
     presentation_owner: Option<EntityId>,
     handoff: Option<PageHandoff>,
     painted_scene_id: Option<u64>,
-) -> PointerReplayState {
+) -> InputReplayState {
     let Some(handoff) = handoff.filter(|handoff| {
         presentation_owner == Some(owner)
             && handoff.target == page
             && handoff.generation == generation
     }) else {
-        return PointerReplayState::Cancel;
+        return InputReplayState::Cancel;
     };
     if handoff.phase == HandoffPhase::Ready && painted_scene_id.is_some() {
-        PointerReplayState::Ready
+        InputReplayState::Ready
     } else {
-        PointerReplayState::Waiting
+        InputReplayState::Waiting
     }
 }
 
@@ -870,9 +871,10 @@ pub struct BrowserView {
     page_id: PageId,
     focus_handle: FocusHandle,
     origin: Rc<Cell<(f32, f32)>>,
+    last_pointer_position: (f64, f64),
     pressed_keys: HashSet<u32>,
     pressed_buttons: HashSet<u32>,
-    queued_pointer: Option<QueuedPointer>,
+    queued_input: Option<QueuedInput>,
     claiming_pointer_focus: bool,
     finger_axes: (bool, bool),
     last_axis_time: u32,
@@ -896,9 +898,10 @@ impl BrowserView {
             page_id,
             focus_handle: cx.focus_handle(),
             origin: Rc::new(Cell::new((0.0, 0.0))),
+            last_pointer_position: (0.0, 0.0),
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
-            queued_pointer: None,
+            queued_input: None,
             claiming_pointer_focus: false,
             finger_axes: (false, false),
             last_axis_time: 0,
@@ -922,49 +925,50 @@ impl BrowserView {
         )
     }
 
-    fn queue_pointer_event(&mut self, generation: u64, event: QueuedPointerEvent) {
+    fn queue_input_event(&mut self, generation: u64, event: QueuedInputEvent) {
         if self
-            .queued_pointer
+            .queued_input
             .as_ref()
             .is_none_or(|queued| queued.generation != generation)
         {
-            self.queued_pointer = Some(QueuedPointer {
+            self.queued_input = Some(QueuedInput {
                 generation,
                 events: Vec::new(),
             });
         }
-        if self.queued_pointer.as_mut().unwrap().push(event).is_err() {
-            self.queued_pointer = None;
+        if self.queued_input.as_mut().unwrap().push(event).is_err() {
+            self.queued_input = None;
         }
     }
 
     fn queue_button_release(&mut self, button: u32, position: (f64, f64)) -> bool {
-        let Some(queued) = &mut self.queued_pointer else {
+        let Some(queued) = &mut self.queued_input else {
             return false;
         };
         match queued.record_release(button, position) {
             Ok(queued) => queued,
             Err(_) => {
-                self.queued_pointer = None;
+                self.queued_input = None;
                 true
             }
         }
     }
 
-    fn claim_for_pointer(
+    fn claim_for_input(
         &mut self,
-        was_focused: bool,
+        focus_keyboard: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<u64> {
+        let was_focused = self.focus_handle.is_focused(window);
         let generation = self.model.update(cx, |model, cx| {
-            if was_focused && model.owns_page(self.owner_id, self.page_id) {
+            if model.owns_page(self.owner_id, self.page_id) && (!focus_keyboard || was_focused) {
                 model.handoff.map(|handoff| handoff.generation)
             } else {
                 model.claim_or_join_presentation(self.owner_id, self.page_id, cx)
             }
         });
-        if !was_focused {
+        if focus_keyboard && !was_focused {
             // GPUI dispatches on_focus during a later draw, so this is consumed
             // by that callback rather than reset immediately after focus().
             self.claiming_pointer_focus = true;
@@ -975,8 +979,9 @@ impl BrowserView {
 
     fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
         let (x, y) = self.local_position(event.position);
-        if let Some(generation) = self.queued_pointer.as_ref().map(|queued| queued.generation) {
-            self.queue_pointer_event(generation, QueuedPointerEvent::Motion { position: (x, y) });
+        self.last_pointer_position = (x, y);
+        if let Some(generation) = self.queued_input.as_ref().map(|queued| queued.generation) {
+            self.queue_input_event(generation, QueuedInputEvent::Motion { position: (x, y) });
             return;
         }
         if !self.model.read(cx).presents(self.owner_id, self.page_id) {
@@ -987,16 +992,17 @@ impl BrowserView {
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let (x, y) = self.local_position(event.position);
+        self.last_pointer_position = (x, y);
         let button = linux_button(event.button);
         let was_focused = self.focus_handle.is_focused(window);
-        if self.queued_pointer.is_some()
+        if self.queued_input.is_some()
             || !was_focused
             || !self.model.read(cx).presents(self.owner_id, self.page_id)
         {
-            if let Some(generation) = self.claim_for_pointer(was_focused, window, cx) {
-                self.queue_pointer_event(
+            if let Some(generation) = self.claim_for_input(true, window, cx) {
+                self.queue_input_event(
                     generation,
-                    QueuedPointerEvent::Button {
+                    QueuedInputEvent::Button {
                         position: (x, y),
                         button,
                         pressed: true,
@@ -1037,6 +1043,7 @@ impl BrowserView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let finger_was_active = self.finger_axes != (false, false);
         if event.source == LinuxAxisSource::Finger {
             self.last_axis_time = event.time;
             if event.value.0 != 0.0 {
@@ -1052,16 +1059,25 @@ impl BrowserView {
                 self.finger_axes.1 = false;
             }
         }
+        let orphaned_finger_stop = event.source == LinuxAxisSource::Finger
+            && !finger_was_active
+            && event.value == (0.0, 0.0)
+            && event.v120 == (None, None)
+            && event.stop != (false, false)
+            && self.queued_input.is_none()
+            && !self.model.read(cx).presents(self.owner_id, self.page_id);
+        if orphaned_finger_stop {
+            cx.stop_propagation();
+            return;
+        }
         let (x, y) = self.local_position(event.position);
-        let was_focused = self.focus_handle.is_focused(window);
-        if self.queued_pointer.is_some()
-            || !was_focused
-            || !self.model.read(cx).presents(self.owner_id, self.page_id)
+        self.last_pointer_position = (x, y);
+        if self.queued_input.is_some() || !self.model.read(cx).presents(self.owner_id, self.page_id)
         {
-            if let Some(generation) = self.claim_for_pointer(was_focused, window, cx) {
-                self.queue_pointer_event(
+            if let Some(generation) = self.claim_for_input(false, window, cx) {
+                self.queue_input_event(
                     generation,
-                    QueuedPointerEvent::Axis {
+                    QueuedInputEvent::Axis {
                         position: (x, y),
                         event: *event,
                     },
@@ -1076,27 +1092,64 @@ impl BrowserView {
         cx.stop_propagation();
     }
 
-    fn pinch(&mut self, event: &LinuxPinchEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.model.read(cx).presents(self.owner_id, self.page_id) {
+    fn pinch(&mut self, event: &LinuxPinchEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let pinch_was_active = self.pinch_active;
+        let position = match event {
+            LinuxPinchEvent::Begin { position, .. } | LinuxPinchEvent::Update { position, .. } => {
+                Some(self.local_position(*position))
+            }
+            LinuxPinchEvent::End { .. } => None,
+        };
+        if let Some(position) = position {
+            self.last_pointer_position = position;
+        }
+        let gesture = pinch_gesture(*event);
+        self.pinch_active = !matches!(gesture, PinchGesture::End { .. });
+        if matches!(gesture, PinchGesture::End { .. })
+            && !pinch_was_active
+            && self.queued_input.is_none()
+            && !self.model.read(cx).presents(self.owner_id, self.page_id)
+        {
+            cx.stop_propagation();
             return;
         }
-        self.pinch_active = !matches!(event, LinuxPinchEvent::End { .. });
-        let model = self.model.read(cx);
-        if let LinuxPinchEvent::Begin { position, .. } | LinuxPinchEvent::Update { position, .. } =
-            event
+        if self.queued_input.is_some() || !self.model.read(cx).presents(self.owner_id, self.page_id)
         {
-            let (x, y) = self.local_position(*position);
+            if let Some(generation) = self.claim_for_input(false, window, cx) {
+                self.queue_input_event(generation, QueuedInputEvent::Pinch { position, gesture });
+            }
+            cx.stop_propagation();
+            return;
+        }
+        let model = self.model.read(cx);
+        if let Some((x, y)) = position {
             model.pointer_motion(x, y);
         }
-        model.pinch(*event);
+        model.pinch(gesture);
         cx.stop_propagation();
     }
 
-    fn physical_key(&mut self, event: &PhysicalKeyEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.model.read(cx).presents(self.owner_id, self.page_id) {
+    fn physical_key(
+        &mut self,
+        event: &PhysicalKeyEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let PhysicalKey::LinuxEvdev(keycode) = event.key;
+        if self.queued_input.is_some() || !self.model.read(cx).presents(self.owner_id, self.page_id)
+        {
+            if let Some(generation) = self.claim_for_input(false, window, cx) {
+                self.queue_input_event(
+                    generation,
+                    QueuedInputEvent::Key {
+                        keycode,
+                        pressed: event.pressed,
+                    },
+                );
+            }
+            cx.stop_propagation();
             return;
         }
-        let PhysicalKey::LinuxEvdev(keycode) = event.key;
         if event.pressed {
             if !self.pressed_keys.contains(&keycode) && self.model.read(cx).key(keycode, true) {
                 self.pressed_keys.insert(keycode);
@@ -1107,17 +1160,72 @@ impl BrowserView {
         cx.stop_propagation();
     }
 
+    fn hover_changed(&mut self, hovered: &bool, _: &mut Window, cx: &mut Context<Self>) {
+        if *hovered {
+            return;
+        }
+        let finger_axes = std::mem::take(&mut self.finger_axes);
+        let pinch_active = std::mem::take(&mut self.pinch_active);
+        let axis_stop = (finger_axes != (false, false)).then(|| LinuxPointerAxisEvent {
+            position: Default::default(),
+            time: self.last_axis_time,
+            source: LinuxAxisSource::Finger,
+            value: (0.0, 0.0),
+            v120: (None, None),
+            stop: finger_axes,
+            relative_direction: (
+                LinuxAxisRelativeDirection::Identical,
+                LinuxAxisRelativeDirection::Identical,
+            ),
+        });
+        if let Some(generation) = self.queued_input.as_ref().map(|queued| queued.generation) {
+            if let Some(event) = axis_stop {
+                self.queue_input_event(
+                    generation,
+                    QueuedInputEvent::Axis {
+                        position: self.last_pointer_position,
+                        event,
+                    },
+                );
+            }
+            if pinch_active {
+                self.queue_input_event(
+                    generation,
+                    QueuedInputEvent::Pinch {
+                        position: None,
+                        gesture: PinchGesture::End { cancelled: true },
+                    },
+                );
+            }
+            self.queue_input_event(generation, QueuedInputEvent::Leave);
+        } else if self.model.read(cx).presents(self.owner_id, self.page_id) {
+            let model = self.model.read(cx);
+            if let Some(event) = axis_stop {
+                model.pointer_axis(&event);
+            }
+            if pinch_active {
+                model.pinch(PinchGesture::End { cancelled: true });
+            }
+            model.pointer_leave();
+        }
+    }
+
     fn release_input(&mut self, cx: &mut Context<Self>) {
-        self.queued_pointer = None;
+        self.queued_input = None;
         self.claiming_pointer_focus = false;
         let model = self.model.read(cx);
+        let presents = model.presents(self.owner_id, self.page_id);
         for keycode in self.pressed_keys.drain() {
-            model.key(keycode, false);
+            if presents {
+                model.key(keycode, false);
+            }
         }
         for button in self.pressed_buttons.drain() {
-            model.pointer_button(button, false);
+            if presents {
+                model.pointer_button(button, false);
+            }
         }
-        if std::mem::take(&mut self.finger_axes) != (false, false) {
+        if std::mem::take(&mut self.finger_axes) != (false, false) && presents {
             model.pointer_axis(&LinuxPointerAxisEvent {
                 position: Default::default(),
                 time: self.last_axis_time,
@@ -1131,9 +1239,26 @@ impl BrowserView {
                 ),
             });
         }
-        if std::mem::take(&mut self.pinch_active) {
-            model.pinch(LinuxPinchEvent::End { cancelled: true });
+        if std::mem::take(&mut self.pinch_active) && presents {
+            model.pinch(PinchGesture::End { cancelled: true });
         }
+    }
+}
+
+fn pinch_gesture(event: LinuxPinchEvent) -> PinchGesture {
+    match event {
+        LinuxPinchEvent::Begin { fingers, .. } => PinchGesture::Begin { fingers },
+        LinuxPinchEvent::Update {
+            delta,
+            scale,
+            rotation,
+            ..
+        } => PinchGesture::Update {
+            delta,
+            scale,
+            rotation,
+        },
+        LinuxPinchEvent::End { cancelled } => PinchGesture::End { cancelled },
     }
 }
 
@@ -1174,7 +1299,6 @@ impl Render for BrowserView {
                     if std::mem::take(&mut this.claiming_pointer_focus) {
                         return;
                     }
-                    this.queued_pointer = None;
                     this.model.update(cx, |model, cx| {
                         model.claim_or_join_presentation(owner_id, page_id, cx);
                     })
@@ -1208,14 +1332,10 @@ impl Render for BrowserView {
                 model.runtime.painted_scene_id = painted_scene_id;
             });
         }
-        if self.queued_pointer.is_some() && !self.focus_handle.is_focused(window) {
-            self.queued_pointer = None;
-            self.claiming_pointer_focus = false;
-        }
-        if let Some(queued) = self.queued_pointer.clone() {
+        if let Some(queued) = self.queued_input.clone() {
             let replay_state = {
                 let model = self.model.read(cx);
-                pointer_replay_state(
+                input_replay_state(
                     queued.generation,
                     self.owner_id,
                     self.page_id,
@@ -1225,17 +1345,21 @@ impl Render for BrowserView {
                 )
             };
             match replay_state {
-                PointerReplayState::Waiting => {}
-                PointerReplayState::Cancel => self.queued_pointer = None,
-                PointerReplayState::Ready => {
-                    self.queued_pointer = None;
+                InputReplayState::Waiting => {}
+                InputReplayState::Cancel => {
+                    self.queued_input = None;
+                    self.finger_axes = (false, false);
+                    self.pinch_active = false;
+                }
+                InputReplayState::Ready => {
+                    self.queued_input = None;
                     let model = self.model.read(cx);
                     for event in queued.events {
                         match event {
-                            QueuedPointerEvent::Motion { position } => {
+                            QueuedInputEvent::Motion { position } => {
                                 model.pointer_motion(position.0, position.1);
                             }
-                            QueuedPointerEvent::Button {
+                            QueuedInputEvent::Button {
                                 position,
                                 button,
                                 pressed,
@@ -1249,9 +1373,28 @@ impl Render for BrowserView {
                                     model.pointer_button(button, false);
                                 }
                             }
-                            QueuedPointerEvent::Axis { position, event } => {
+                            QueuedInputEvent::Axis { position, event } => {
                                 model.pointer_motion(position.0, position.1);
                                 model.pointer_axis(&event);
+                            }
+                            QueuedInputEvent::Leave => model.pointer_leave(),
+                            QueuedInputEvent::Pinch { position, gesture } => {
+                                if let Some((x, y)) = position {
+                                    model.pointer_motion(x, y);
+                                }
+                                self.pinch_active = !matches!(gesture, PinchGesture::End { .. });
+                                model.pinch(gesture);
+                            }
+                            QueuedInputEvent::Key { keycode, pressed } => {
+                                if pressed {
+                                    if !self.pressed_keys.contains(&keycode)
+                                        && model.key(keycode, true)
+                                    {
+                                        self.pressed_keys.insert(keycode);
+                                    }
+                                } else if self.pressed_keys.remove(&keycode) {
+                                    model.key(keycode, false);
+                                }
                             }
                         }
                     }
@@ -1348,6 +1491,7 @@ impl Render for BrowserView {
         div()
             .id("rho-browser")
             .track_focus(&self.focus_handle)
+            .on_hover(cx.listener(Self::hover_changed))
             .cursor(cursor)
             .key_context("RhoBrowser")
             .on_mouse_move(cx.listener(Self::mouse_move))
@@ -1417,7 +1561,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn queued_pointer_waits_for_its_painted_handoff_and_cancels_when_superseded() {
+    fn queued_input_waits_for_its_painted_handoff_and_cancels_when_superseded() {
         let owner = EntityId::from(1);
         let other_owner = EntityId::from(2);
         let page = PageId(uuid::Uuid::new_v4());
@@ -1429,19 +1573,19 @@ mod tests {
         };
 
         assert_eq!(
-            pointer_replay_state(7, owner, page, Some(owner), Some(handoff), None),
-            PointerReplayState::Waiting
+            input_replay_state(7, owner, page, Some(owner), Some(handoff), None),
+            InputReplayState::Waiting
         );
         assert_eq!(
-            pointer_replay_state(7, owner, page, Some(owner), Some(handoff), Some(9)),
-            PointerReplayState::Ready
+            input_replay_state(7, owner, page, Some(owner), Some(handoff), Some(9)),
+            InputReplayState::Ready
         );
         assert_eq!(
-            pointer_replay_state(7, owner, page, Some(other_owner), Some(handoff), Some(9)),
-            PointerReplayState::Cancel
+            input_replay_state(7, owner, page, Some(other_owner), Some(handoff), Some(9)),
+            InputReplayState::Cancel
         );
         assert_eq!(
-            pointer_replay_state(
+            input_replay_state(
                 7,
                 owner,
                 page,
@@ -1452,15 +1596,15 @@ mod tests {
                 }),
                 Some(9)
             ),
-            PointerReplayState::Cancel
+            InputReplayState::Cancel
         );
     }
 
     #[test]
-    fn queued_pointer_preserves_order_and_records_only_its_matching_release() {
-        let mut queued = QueuedPointer {
+    fn queued_input_preserves_order_and_records_only_its_matching_release() {
+        let mut queued = QueuedInput {
             generation: 1,
-            events: vec![QueuedPointerEvent::Button {
+            events: vec![QueuedInputEvent::Button {
                 position: (0.0, 0.0),
                 button: 0x110,
                 pressed: true,
@@ -1469,12 +1613,12 @@ mod tests {
         assert!(!queued.record_release(0x111, (1.0, 1.0)).unwrap());
         assert_eq!(queued.events.len(), 1);
         queued
-            .push(QueuedPointerEvent::Motion {
+            .push(QueuedInputEvent::Motion {
                 position: (1.0, 1.0),
             })
             .unwrap();
         queued
-            .push(QueuedPointerEvent::Motion {
+            .push(QueuedInputEvent::Motion {
                 position: (2.0, 2.0),
             })
             .unwrap();
@@ -1482,11 +1626,11 @@ mod tests {
         assert!(matches!(
             queued.events.as_slice(),
             [
-                QueuedPointerEvent::Button { pressed: true, .. },
-                QueuedPointerEvent::Motion {
+                QueuedInputEvent::Button { pressed: true, .. },
+                QueuedInputEvent::Motion {
                     position: (2.0, 2.0)
                 },
-                QueuedPointerEvent::Button { pressed: false, .. }
+                QueuedInputEvent::Button { pressed: false, .. }
             ]
         ));
     }

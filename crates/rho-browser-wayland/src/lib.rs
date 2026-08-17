@@ -458,6 +458,7 @@ enum PageCommand {
     Presented { scene_id: u64, barrier: u64 },
     Retired(u64),
     PointerMotion { commit_id: u64, x: f64, y: f64 },
+    PointerLeave,
     PointerButton { button: u32, pressed: bool },
     PointerAxis(PointerAxisFrame),
     Pinch(PinchGesture),
@@ -586,6 +587,9 @@ impl<K: BrowserPageKey> BrowserSession<K> {
     }
     pub fn pointer_motion(&self, commit_id: u64, x: f64, y: f64) {
         self.send(PageCommand::PointerMotion { commit_id, x, y })
+    }
+    pub fn pointer_leave(&self) {
+        self.send(PageCommand::PointerLeave)
     }
     pub fn pointer_button(&self, button: u32, pressed: bool) {
         self.send(PageCommand::PointerButton { button, pressed })
@@ -2507,6 +2511,7 @@ fn handle_page_command<K: BrowserPageKey>(state: &mut State<K>, id: K, c: PageCo
         PageCommand::PointerMotion { commit_id, x, y } => {
             queue_pointer_motion(state, id, commit_id, x, y)
         }
+        PageCommand::PointerLeave => queue_pointer_leave(state, id),
         PageCommand::PointerButton { button, pressed } => {
             queue_input(state, id, OrderedInput::PointerButton { button, pressed })
         }
@@ -2810,6 +2815,21 @@ fn queue_pointer_motion<K: BrowserPageKey>(
         return;
     };
     queue_input(state, id, OrderedInput::PointerMotion(motion));
+}
+
+fn queue_pointer_leave<K: BrowserPageKey>(state: &mut State<K>, id: K) {
+    let Some(window) = state.windows.get(&id) else {
+        return;
+    };
+    let motion = pointer_leave_motion(window.pointer_location);
+    queue_input(state, id, OrderedInput::PointerMotion(motion));
+}
+
+fn pointer_leave_motion(location: (f64, f64)) -> ResolvedPointerMotion {
+    ResolvedPointerMotion {
+        location,
+        target: None,
+    }
 }
 
 const FLING_VELOCITY_WINDOW: Duration = Duration::from_millis(200);
@@ -3606,6 +3626,17 @@ mod tests {
         let frame = PointerFrame;
         assert_eq!(mapped_pointer(frame, 0.0, 0.0), (0.0, 0.0));
         assert_eq!(mapped_pointer(frame, 80.0, 60.0), (80.0, 60.0));
+    }
+
+    #[test]
+    fn pointer_leave_clears_the_nested_surface_without_moving_the_cursor() {
+        assert_eq!(
+            pointer_leave_motion((80.0, 60.0)),
+            ResolvedPointerMotion {
+                location: (80.0, 60.0),
+                target: None,
+            }
+        );
     }
 
     #[test]
