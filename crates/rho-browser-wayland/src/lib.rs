@@ -1568,10 +1568,16 @@ impl<K: BrowserPageKey> CompositorHandler for State<K> {
             .expect("known browser client")
             .compositor
     }
-    fn new_subsurface(&mut self, _surface: &WlSurface, parent: &WlSurface) {
+    fn new_subsurface(&mut self, surface: &WlSurface, parent: &WlSurface) {
         let Some(id) = self.window_id_for_surface(parent) else {
             return;
         };
+        let scale = self.windows[&id].scale;
+        with_states(surface, |states| {
+            with_fractional_scale(states, |fractional| {
+                fractional.set_preferred_scale(scale);
+            });
+        });
         if let Err(error) = self.publish_scene(id, false) {
             self.fail_window(
                 id,

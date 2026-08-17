@@ -183,8 +183,9 @@ than by running a supervisor, extension protocol, or daemon process graph.
   subsurface commits are reconciled only at their transaction anchor and the
   compositor copies lock-bound Smithay state into an immutable tree snapshot;
   the resulting bottom-to-top scene carries per-node position, viewport crop,
-  destination size, and input region. Popup registration reapplies the owning
-  window's fractional scale in case the scale object preceded the XDG role.
+  destination size, and input region. Popup and subsurface role registration
+  reapply the owning window's fractional scale in case the scale object preceded
+  the role.
   Brave/Chromium SHM chrome and `xdg_popup` widgets use the bounded exception:
   the compositor validates and snapshots ARGB/XRGB rows into owned memory for
   GPUI/WGPU upload. Pointer hit-testing uses
