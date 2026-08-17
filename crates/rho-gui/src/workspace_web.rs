@@ -407,7 +407,14 @@ impl Render for Workspace {
                     }
                 }),
             )
-            .child(div().flex_1().overflow_hidden().child(body))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(body),
+            )
             .children(show_keyboard.then(|| self.web.touch_keyboard.clone().into_any_element()));
 
         if phone {
