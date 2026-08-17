@@ -535,7 +535,6 @@ impl Dashboard {
         (by_heading, referenced)
     }
 
-    #[cfg(feature = "native")]
     /// Regenerates the listing: the host documents are sliced at bound
     /// headings, generated rows and drafts are interleaved between the
     /// slices, and highlights and lamps reapplied. The cursor follows
