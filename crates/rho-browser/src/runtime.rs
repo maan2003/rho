@@ -294,6 +294,14 @@ fn configure_browser_chrome(profile: &Path) -> Result<()> {
         false.into(),
     )?;
     set_preference(&mut root, &["auto_pin_new_tab_groups"], false.into())?;
+    // Rho owns and rewrites this isolated profile's unpacked extension. Keep
+    // developer mode enabled so Brave reloads the command-line extension from
+    // disk on startup instead of retaining an older registered service worker.
+    set_preference(
+        &mut root,
+        &["extensions", "ui", "developer_mode"],
+        true.into(),
+    )?;
     // Rho terminates the managed browser process with SIGTERM and owns durable
     // page restoration. Without this offline reset Brave mislabels that managed
     // shutdown as a crash and overlays a Restore pages bubble on the next run.
@@ -359,6 +367,7 @@ mod tests {
         assert_eq!(value["brave"]["always_show_bookmark_bar_on_ntp"], false);
         assert_eq!(value["bookmark_bar"]["show_tab_groups"], false);
         assert_eq!(value["auto_pin_new_tab_groups"], false);
+        assert_eq!(value["extensions"]["ui"]["developer_mode"], true);
         assert_eq!(value["profile"]["exit_type"], "Normal");
     }
 

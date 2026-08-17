@@ -127,7 +127,10 @@ AI APIs.
   and deliberately bypasses this Brave policy namespace. `rho-browser` accepts only
   bounded HTTP(S) launch URLs, holds an exclusive advisory lock on that identity,
   and exposes Brave only to one private Wayland socket. One bundled MV3
-  extension has `tabs`, `tabGroups`, `storage`, and `nativeMessaging`
+  extension is loaded unpacked with developer mode enabled in this isolated
+  profile so updated worker code is registered on browser restart; its source
+  is still supplied only by the installed `rho-gui` binary. The extension has
+  `tabs`, `tabGroups`, `storage`, and `nativeMessaging`
   privileges, but no host permission or content script. It owns UUID page
   metadata inside the isolated browser profile, associates UUIDs with restored
   tabs through `rho:<uuid>` group titles and activates requested tabs. Brave's
