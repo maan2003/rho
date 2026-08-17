@@ -1,5 +1,6 @@
 const HOST = "dev.rho.browser";
 const MARKER = "rho:";
+const LOADED_PAGE_LIMIT = 10;
 const pageTabs = new Map();
 const tabPages = new Map();
 let port;
@@ -140,8 +141,19 @@ async function reconcile() {
   tabs = await chrome.tabs.query({ windowType: "normal" });
   const active = (await chrome.tabs.query({ active: true, lastFocusedWindow: true }))[0];
   previousActiveTab = active?.id;
-  for (const tab of tabs) {
-    if (!tab.active) chrome.tabs.discard(tab.id).catch(() => {});
+  await enforceLoadedPageLimit();
+}
+
+async function enforceLoadedPageLimit() {
+  const pageTabIds = new Set(pageTabs.values());
+  const loaded = (await chrome.tabs.query({ windowType: "normal" }))
+    .filter((tab) => pageTabIds.has(tab.id) && !tab.discarded)
+    .sort((a, b) => {
+      if (a.active !== b.active) return a.active ? -1 : 1;
+      return (b.lastAccessed || 0) - (a.lastAccessed || 0);
+    });
+  for (const tab of loaded.slice(LOADED_PAGE_LIMIT)) {
+    await chrome.tabs.discard(tab.id).catch(() => {});
   }
 }
 
@@ -173,6 +185,7 @@ async function createPage(url) {
     tab = await chrome.tabs.update(tab.id, { url, active: true });
     const record = { id, launch_url: url, created_at_ms: Date.now() };
     await chrome.storage.local.set({ [pageKey(id)]: record });
+    await enforceLoadedPageLimit();
     return record;
   }
   if (canonicalWindowId === undefined) await reconcile();
@@ -203,8 +216,8 @@ async function activatePage(id) {
     if (oldTab?.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
       chrome.tabGroups.update(oldTab.groupId, { collapsed: true }).catch(() => {});
     }
-    chrome.tabs.discard(old).catch(() => {});
   }
+  await enforceLoadedPageLimit();
   return { id };
 }
 

@@ -168,8 +168,9 @@ than by running a supervisor, extension protocol, or daemon process graph.
   presentation callbacks from a GPUI paint hook in the current outer frame
   while input is gated. This follows nested-compositor pacing and avoids both
   application-readiness deadlocks and an extra outer-refresh delay. The extension
-  explicitly discards the previous tab, bounding loaded
-  renderer and surface memory while Brave retains per-page history metadata.
+  retains the ten most recently accessed page tabs as a loaded LRU and discards
+  older inactive tabs, while Brave retains every page's tab, group, history, and
+  durable metadata.
   The compositor issues one XDG activation token for the singleton toplevel and
   retains the unambiguous first-window fallback for Chromium-family builds that
   omit it. Extension native messaging reaches `rho-gui` through a tiny stdio
@@ -182,9 +183,11 @@ than by running a supervisor, extension protocol, or daemon process graph.
   subsurface commits are reconciled only at their transaction anchor and the
   compositor copies lock-bound Smithay state into an immutable tree snapshot;
   the resulting bottom-to-top scene carries per-node position, viewport crop,
-  destination size, and input region. Brave/Chromium SHM chrome and `xdg_popup`
-  widgets use the bounded exception: the compositor validates and snapshots
-  ARGB/XRGB rows into owned memory for GPUI/WGPU upload. Pointer hit-testing uses
+  destination size, and input region. Popup registration reapplies the owning
+  window's fractional scale in case the scale object preceded the XDG role.
+  Brave/Chromium SHM chrome and `xdg_popup` widgets use the bounded exception:
+  the compositor validates and snapshots ARGB/XRGB rows into owned memory for
+  GPUI/WGPU upload. Pointer hit-testing uses
   the same versioned scene, stacking order, geometry, and input regions. Wayland
   overlay delegation remains disabled so every visible client surface follows
   this single composition path.
@@ -197,7 +200,16 @@ than by running a supervisor, extension protocol, or daemon process graph.
   or explicit synchronization.
   The compositor is wake-driven, advertises per-surface fractional scale and a
   viewporter while keeping its shared synthetic output stable, and forwards
-  raw physical keys, pointer axes, and pinch phases to Brave. It advertises
+  raw physical keys, pointer axes, and pinch phases to Brave. Finger-axis source
+  timestamps are translated into the nested compositor clock, and queued frames
+  are paced at their original cadence so Chromium cannot infer a false fling
+  velocity while the compositor catches up. A per-window input FIFO prevents
+  later motion, button, pinch, or key events from overtaking those frames;
+  queued motions resolve their painted-scene target before scene history is
+  pruned. Tab focus and removal atomically freeze input admission, drain the FIFO,
+  synthesize releases from compositor-owned input state, and wait for an
+  acknowledgement before changing Brave tabs. Admission resumes only after the
+  new tab's frame handoff completes. It advertises
   `wp_cursor_shape_v1` and projects Brave's named cursor requests onto the
   GPUI browser region, letting the outer display server render the native
   cursor rather than introducing a second cursor-surface renderer. `wl_shm`

@@ -361,6 +361,7 @@ pub(crate) struct WaylandClientState {
     horizontal_modifier: f32,
     scroll_event_received: bool,
     raw_axis_value: (f64, f64),
+    raw_axis_time: Option<u32>,
     raw_axis_v120: (Option<i32>, Option<i32>),
     raw_axis_stop: (bool, bool),
     raw_axis_relative_direction: (
@@ -917,6 +918,7 @@ impl WaylandClient {
             capslock: Capslock { on: false },
             scroll_event_received: false,
             raw_axis_value: (0.0, 0.0),
+            raw_axis_time: None,
             raw_axis_v120: (None, None),
             raw_axis_stop: (false, false),
             raw_axis_relative_direction: (
@@ -2339,9 +2341,10 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
             }
             wl_pointer::Event::Axis {
                 axis: WEnum::Value(axis),
+                time,
                 value,
-                ..
             } => {
+                state.raw_axis_time = Some(time);
                 match axis {
                     wl_pointer::Axis::HorizontalScroll => state.raw_axis_value.0 += value,
                     wl_pointer::Axis::VerticalScroll => state.raw_axis_value.1 += value,
@@ -2445,17 +2448,20 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 }
             }
             wl_pointer::Event::AxisStop {
+                time,
                 axis: WEnum::Value(axis),
-                ..
-            } => match axis {
-                wl_pointer::Axis::HorizontalScroll => {
-                    state.raw_axis_stop.0 = true;
+            } => {
+                state.raw_axis_time = Some(time);
+                match axis {
+                    wl_pointer::Axis::HorizontalScroll => {
+                        state.raw_axis_stop.0 = true;
+                    }
+                    wl_pointer::Axis::VerticalScroll => {
+                        state.raw_axis_stop.1 = true;
+                    }
+                    _ => {}
                 }
-                wl_pointer::Axis::VerticalScroll => {
-                    state.raw_axis_stop.1 = true;
-                }
-                _ => {}
-            },
+            }
             wl_pointer::Event::AxisRelativeDirection {
                 axis: WEnum::Value(axis),
                 direction: WEnum::Value(direction),
@@ -2488,6 +2494,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                     inputs.push(PlatformInput::LinuxPointerAxis(
                         gpui::LinuxPointerAxisEvent {
                             position: state.mouse_location.unwrap(),
+                            time: state.raw_axis_time.take().unwrap_or_default(),
                             source: match state.axis_source {
                                 AxisSource::Finger => gpui::LinuxAxisSource::Finger,
                                 AxisSource::Continuous => gpui::LinuxAxisSource::Continuous,

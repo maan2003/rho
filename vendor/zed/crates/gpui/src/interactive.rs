@@ -67,6 +67,7 @@ pub enum LinuxAxisRelativeDirection {
 #[allow(missing_docs)]
 pub struct LinuxPointerAxisEvent {
     pub position: Point<Pixels>,
+    pub time: u32,
     pub source: LinuxAxisSource,
     pub value: (f64, f64),
     pub v120: (Option<i32>, Option<i32>),

@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::sync::Arc;
 
+use anyhow::{Context as _, Result};
 use gpui::{
     AppContext as _, Context, CursorStyle, Entity, EntityId, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, LinuxAxisRelativeDirection, LinuxAxisSource,
@@ -56,6 +57,7 @@ struct PageHandoff {
     generation: u64,
     target: PageId,
     phase: HandoffPhase,
+    input_generation: Option<u64>,
 }
 
 /// The singleton live Chrome surface shared by every logical page view.
@@ -65,6 +67,8 @@ pub struct BrowserModel {
     active_focus: Option<PageId>,
     next_handoff_generation: u64,
     next_frame_barrier: u64,
+    next_input_freeze: u64,
+    input_freeze: Option<u64>,
     presentation_owner: Option<EntityId>,
     runtime: RuntimePageState,
     _events_task: Task<()>,
@@ -224,7 +228,19 @@ impl BrowserModel {
                                     keep
                                 });
                                 if eligible {
+                                    let was_awaiting = awaiting_barrier.is_some();
+                                    let input_generation = model
+                                        .handoff
+                                        .and_then(|handoff| handoff.input_generation);
                                     complete_frame_handoff(&mut model.handoff, scene.barrier);
+                                    if was_awaiting
+                                        && model.handoff.is_some_and(|handoff| {
+                                            handoff.phase == HandoffPhase::Ready
+                                        })
+                                        && let Some(generation) = input_generation
+                                    {
+                                        model.unfreeze_input(generation);
+                                    }
                                     model.runtime.status = None;
                                 } else if awaiting_barrier.is_some() {
                                     tracing::info!(
@@ -291,6 +307,8 @@ impl BrowserModel {
             active_focus: None,
             next_handoff_generation: 1,
             next_frame_barrier: 1,
+            next_input_freeze: 1,
+            input_freeze: None,
             presentation_owner: None,
             runtime: RuntimePageState {
                 session: Some(session),
@@ -326,6 +344,7 @@ impl BrowserModel {
             generation,
             target,
             phase: HandoffPhase::Requested,
+            input_generation: None,
         });
     }
 
@@ -349,7 +368,17 @@ impl BrowserModel {
         if handoff.phase != HandoffPhase::Requested {
             return;
         }
+        let (input_generation, input_barrier) = match self.input_barrier() {
+            Ok(transition) => transition,
+            Err(error) => {
+                self.runtime.status = Some(format!("browser: {error:#}"));
+                self.handoff = None;
+                cx.notify();
+                return;
+            }
+        };
         let id = handoff.target;
+        handoff.input_generation = Some(input_generation);
         handoff.phase = HandoffPhase::Focusing;
         self.handoff = Some(handoff);
         self.active_focus = Some(id);
@@ -358,7 +387,10 @@ impl BrowserModel {
             "browser handoff requested extension tab focus"
         );
         let browser = self.browser.clone();
-        let request = cx.background_spawn(async move { browser.focus_page(id) });
+        let request = cx.background_spawn(async move {
+            input_barrier.await?;
+            browser.focus_page(id)
+        });
         cx.spawn(async move |this, cx| {
             let result = request.await;
             let _ = this.update(cx, |model, cx| {
@@ -380,6 +412,7 @@ impl BrowserModel {
                         }
                     }
                     Err(error) => {
+                        model.unfreeze_input(input_generation);
                         if current.is_some_and(|handoff| handoff.target == id) {
                             model.runtime.status = Some(format!("browser: {error:#}"));
                             model.handoff = None;
@@ -391,6 +424,56 @@ impl BrowserModel {
             });
         })
         .detach();
+    }
+
+    pub(crate) fn input_barrier(
+        &mut self,
+    ) -> Result<(
+        u64,
+        impl std::future::Future<Output = Result<()>> + Send + 'static + use<>,
+    )> {
+        let generation = self.next_input_freeze;
+        self.next_input_freeze = self.next_input_freeze.wrapping_add(1).max(1);
+        let barrier = self
+            .runtime
+            .session
+            .as_ref()
+            .context("browser compositor session is unavailable")?
+            .input_barrier(generation)?;
+        self.input_freeze = Some(generation);
+        Ok((generation, barrier))
+    }
+
+    fn unfreeze_input(&mut self, generation: u64) {
+        if self.input_freeze != Some(generation) {
+            return;
+        }
+        if let Some(session) = &self.runtime.session {
+            session.unfreeze_input(generation);
+        }
+        self.input_freeze = None;
+    }
+
+    pub(crate) fn prepare_close(
+        &mut self,
+        id: PageId,
+    ) -> Result<Option<impl std::future::Future<Output = Result<()>> + Send + 'static + use<>>>
+    {
+        match close_transition(self.handoff, id) {
+            CloseTransition::Inactive => return Ok(None),
+            CloseTransition::CancelRequested => {
+                self.presentation_owner = None;
+                self.runtime.painted_scene_id = None;
+                self.handoff = None;
+                return Ok(None);
+            }
+            CloseTransition::FreezeActive => {}
+        }
+        self.presentation_owner = None;
+        self.runtime.painted_scene_id = None;
+        self.handoff = None;
+        let (_, barrier) = self.input_barrier()?;
+        Ok(Some(barrier))
     }
 
     fn claim_presentation(&mut self, owner: EntityId, page: PageId, cx: &mut Context<Self>) {
@@ -506,6 +589,7 @@ impl BrowserModel {
         }
         if let Some(session) = &self.runtime.session {
             session.pointer_axis(PointerAxisFrame {
+                time: event.time,
                 source: match event.source {
                     LinuxAxisSource::Finger => PointerAxisSource::Finger,
                     LinuxAxisSource::Continuous => PointerAxisSource::Continuous,
@@ -556,6 +640,24 @@ impl BrowserModel {
         } else {
             false
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CloseTransition {
+    Inactive,
+    CancelRequested,
+    FreezeActive,
+}
+
+fn close_transition(handoff: Option<PageHandoff>, id: PageId) -> CloseTransition {
+    match handoff.filter(|handoff| handoff.target == id) {
+        None => CloseTransition::Inactive,
+        Some(PageHandoff {
+            phase: HandoffPhase::Requested,
+            ..
+        }) => CloseTransition::CancelRequested,
+        Some(_) => CloseTransition::FreezeActive,
     }
 }
 
@@ -658,6 +760,7 @@ pub struct BrowserView {
     pressed_keys: HashSet<u32>,
     pressed_buttons: HashSet<u32>,
     finger_axes: (bool, bool),
+    last_axis_time: u32,
     pinch_active: bool,
     scheduled_scene: Option<u64>,
     blur_subscription: Option<Subscription>,
@@ -681,6 +784,7 @@ impl BrowserView {
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
             finger_axes: (false, false),
+            last_axis_time: 0,
             pinch_active: false,
             scheduled_scene: None,
             blur_subscription: None,
@@ -752,6 +856,7 @@ impl BrowserView {
             return;
         }
         if event.source == LinuxAxisSource::Finger {
+            self.last_axis_time = event.time;
             if event.value.0 != 0.0 {
                 self.finger_axes.0 = true;
             }
@@ -814,6 +919,7 @@ impl BrowserView {
         if std::mem::take(&mut self.finger_axes) != (false, false) {
             model.pointer_axis(&LinuxPointerAxisEvent {
                 position: Default::default(),
+                time: self.last_axis_time,
                 source: LinuxAxisSource::Finger,
                 value: (0.0, 0.0),
                 v120: (None, None),
@@ -1062,6 +1168,7 @@ mod tests {
             generation: 1,
             target: page,
             phase: HandoffPhase::Focusing,
+            input_generation: Some(1),
         });
 
         // A target-looking frame may arrive before the activation RPC reply.
@@ -1075,6 +1182,33 @@ mod tests {
         assert_ne!(handoff.unwrap().phase, HandoffPhase::Ready);
         complete_frame_handoff(&mut handoff, 7);
         assert_eq!(handoff.unwrap().phase, HandoffPhase::Ready);
+        assert_eq!(handoff.unwrap().input_generation, Some(1));
+    }
+
+    #[test]
+    fn queued_handoff_target_close_is_cancelled_not_treated_as_inactive() {
+        let page = PageId(uuid::Uuid::new_v4());
+        let other = PageId(uuid::Uuid::new_v4());
+        let mut handoff = PageHandoff {
+            generation: 1,
+            target: page,
+            phase: HandoffPhase::Requested,
+            input_generation: None,
+        };
+        assert_eq!(
+            close_transition(Some(handoff), page),
+            CloseTransition::CancelRequested
+        );
+        handoff.phase = HandoffPhase::Focusing;
+        handoff.input_generation = Some(3);
+        assert_eq!(
+            close_transition(Some(handoff), page),
+            CloseTransition::FreezeActive
+        );
+        assert_eq!(
+            close_transition(Some(handoff), other),
+            CloseTransition::Inactive
+        );
     }
 
     #[test]
@@ -1113,6 +1247,7 @@ mod tests {
             generation: 1,
             target: page,
             phase: HandoffPhase::AwaitingFrame { barrier: 5 },
+            input_generation: Some(1),
         });
         let mut active_focus = Some(page);
         let mut dropped = 0;

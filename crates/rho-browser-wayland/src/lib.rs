@@ -6,7 +6,7 @@
 
 #![cfg(target_os = "linux")]
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::cell::RefCell;
 use std::ffi::OsString;
 use std::hash::Hash;
@@ -429,6 +429,7 @@ pub enum PointerAxisDirection {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PointerAxisFrame {
+    pub time: u32,
     pub source: PointerAxisSource,
     pub value: (f64, f64),
     pub v120: (Option<i32>, Option<i32>),
@@ -461,7 +462,25 @@ enum PageCommand {
     PointerAxis(PointerAxisFrame),
     Pinch(PinchGesture),
     Key { keycode: u32, pressed: bool },
+    InputBarrier(u64, async_channel::Sender<()>),
+    UnfreezeInput(u64),
     Close,
+}
+
+#[derive(Debug)]
+enum OrderedInput {
+    PointerMotion(ResolvedPointerMotion),
+    PointerButton { button: u32, pressed: bool },
+    PointerAxis(PointerAxisFrame),
+    Pinch(PinchGesture),
+    Key { keycode: u32, pressed: bool },
+    InputBarrier(async_channel::Sender<()>),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ResolvedPointerMotion {
+    location: (f64, f64),
+    target: Option<(WlSurface, (f64, f64))>,
 }
 enum RuntimeCommand<K> {
     Open {
@@ -580,6 +599,27 @@ impl<K: BrowserPageKey> BrowserSession<K> {
     pub fn key(&self, keycode: u32, pressed: bool) {
         self.send(PageCommand::Key { keycode, pressed })
     }
+    pub fn input_barrier(
+        &self,
+        generation: u64,
+    ) -> Result<impl std::future::Future<Output = Result<()>> + Send + 'static + use<K>> {
+        let (acknowledge, acknowledged) = async_channel::bounded(1);
+        self.commands
+            .send(RuntimeCommand::Page(
+                self.id,
+                PageCommand::InputBarrier(generation, acknowledge),
+            ))
+            .map_err(|_| anyhow::anyhow!("browser compositor stopped"))?;
+        Ok(async move {
+            acknowledged
+                .recv()
+                .await
+                .context("browser input barrier was cancelled")
+        })
+    }
+    pub fn unfreeze_input(&self, generation: u64) {
+        self.send(PageCommand::UnfreezeInput(generation));
+    }
     pub fn events(&self) -> BrowserEventReceiver {
         self.events.clone()
     }
@@ -612,6 +652,16 @@ struct WindowState {
     pointer_frames: HashMap<u64, PointerFrame>,
     hit_scenes: HashMap<u64, Vec<HitNode>>,
     pointer_location: (f64, f64),
+    axis_clock_anchor: Option<(u32, u32)>,
+    pending_input: VecDeque<OrderedInput>,
+    last_axis_delivery: Option<(u32, Instant)>,
+    input_timer_pending: bool,
+    input_freeze: Option<u64>,
+    active_finger_axes: (bool, bool),
+    last_finger_axis_time: u32,
+    active_buttons: HashSet<u32>,
+    active_keys: HashSet<u32>,
+    pinch_active: bool,
     surface_slots: HashMap<ObjectId, SurfaceSlot>,
     pending_imports: HashMap<u64, BufferImport>,
     next_scene_id: u64,
@@ -1715,6 +1765,12 @@ impl<K: BrowserPageKey> XdgShellHandler for State<K> {
             .popup_manager
             .track_popup(PopupKind::Xdg(surface.clone()));
         if let Some(window_id) = window_id {
+            let scale = self.windows[&window_id].scale;
+            with_states(surface.wl_surface(), |states| {
+                with_fractional_scale(states, |fractional| {
+                    fractional.set_preferred_scale(scale);
+                });
+            });
             self.constrain_popup(window_id, &surface, positioner);
         }
         let _ = surface.send_configure();
@@ -2306,6 +2362,16 @@ fn handle_runtime_command<K: BrowserPageKey>(
                     pointer_frames: HashMap::new(),
                     hit_scenes: HashMap::new(),
                     pointer_location: (0.0, 0.0),
+                    axis_clock_anchor: None,
+                    pending_input: VecDeque::new(),
+                    last_axis_delivery: None,
+                    input_timer_pending: false,
+                    input_freeze: None,
+                    active_finger_axes: (false, false),
+                    last_finger_axis_time: 0,
+                    active_buttons: HashSet::new(),
+                    active_keys: HashSet::new(),
+                    pinch_active: false,
                     surface_slots: HashMap::new(),
                     pending_imports: HashMap::new(),
                     next_scene_id: 1,
@@ -2410,8 +2476,7 @@ fn handle_page_command<K: BrowserPageKey>(state: &mut State<K>, id: K, c: PageCo
                     None,
                     None,
                 );
-                w.pointer_frames.retain(|scene, _| *scene >= scene_id);
-                w.hit_scenes.retain(|scene, _| *scene >= scene_id);
+                prune_pointer_scenes(&mut w.pointer_frames, &mut w.hit_scenes, scene_id);
             }
         }
         PageCommand::Retired(commit) => {
@@ -2434,17 +2499,37 @@ fn handle_page_command<K: BrowserPageKey>(state: &mut State<K>, id: K, c: PageCo
             }
         }
         PageCommand::PointerMotion { commit_id, x, y } => {
-            pointer_motion(state, id, commit_id, x, y)
+            queue_pointer_motion(state, id, commit_id, x, y)
         }
         PageCommand::PointerButton { button, pressed } => {
-            pointer_button(state, id, button, pressed)
+            queue_input(state, id, OrderedInput::PointerButton { button, pressed })
         }
-        PageCommand::PointerAxis(frame) => pointer_axis(state, id, frame),
-        PageCommand::Pinch(gesture) => pointer_pinch(state, id, gesture),
-        PageCommand::Key { keycode, pressed } => keyboard_key(state, id, keycode, pressed),
+        PageCommand::PointerAxis(frame) => queue_input(state, id, OrderedInput::PointerAxis(frame)),
+        PageCommand::Pinch(gesture) => queue_input(state, id, OrderedInput::Pinch(gesture)),
+        PageCommand::Key { keycode, pressed } => {
+            queue_input(state, id, OrderedInput::Key { keycode, pressed })
+        }
+        PageCommand::InputBarrier(generation, acknowledge) => {
+            let Some(window) = state.windows.get_mut(&id) else {
+                return;
+            };
+            window.input_freeze = Some(generation);
+            window
+                .pending_input
+                .push_back(OrderedInput::InputBarrier(acknowledge));
+            schedule_input_delivery(state, id);
+        }
+        PageCommand::UnfreezeInput(generation) => {
+            if let Some(window) = state.windows.get_mut(&id) {
+                clear_input_freeze(&mut window.input_freeze, generation);
+            }
+        }
         PageCommand::Close => {
             state.activation_windows.retain(|_, v| *v != id);
             state.pending_activations.retain(|_, v| *v != id);
+            if let Some(window) = state.windows.get_mut(&id) {
+                window.pending_input.clear();
+            }
             if let Some(t) = state.windows.get(&id).and_then(|w| w.toplevel.as_ref()) {
                 t.send_close()
             } else {
@@ -2557,11 +2642,11 @@ fn track_unbound_barrier(window: &mut WindowState, serial: Serial) {
 }
 
 fn pointer_target(
-    window: &WindowState,
+    hit_scenes: &HashMap<u64, Vec<HitNode>>,
     scene_id: u64,
     location: (f64, f64),
 ) -> Option<(WlSurface, (f64, f64))> {
-    for hit in window.hit_scenes.get(&scene_id)?.iter().rev() {
+    for hit in hit_scenes.get(&scene_id)?.iter().rev() {
         let local = (location.0 - hit.origin.0, location.1 - hit.origin.1);
         if local.0 < 0.0
             || local.1 < 0.0
@@ -2580,17 +2665,40 @@ fn pointer_target(
     None
 }
 
-fn pointer_motion<K: BrowserPageKey>(state: &mut State<K>, id: K, commit_id: u64, x: f64, y: f64) {
-    let Some(w) = state.windows.get(&id) else {
-        return;
-    };
-    let Some(frame) = w.pointer_frames.get(&commit_id).copied() else {
-        return;
-    };
+fn prune_pointer_scenes(
+    pointer_frames: &mut HashMap<u64, PointerFrame>,
+    hit_scenes: &mut HashMap<u64, Vec<HitNode>>,
+    presented_scene_id: u64,
+) {
+    pointer_frames.retain(|scene, _| *scene >= presented_scene_id);
+    hit_scenes.retain(|scene, _| *scene >= presented_scene_id);
+}
+
+fn resolve_pointer_motion(
+    pointer_frames: &HashMap<u64, PointerFrame>,
+    hit_scenes: &HashMap<u64, Vec<HitNode>>,
+    commit_id: u64,
+    x: f64,
+    y: f64,
+) -> Option<ResolvedPointerMotion> {
+    let frame = pointer_frames.get(&commit_id).copied()?;
     let (x, y) = mapped_pointer(frame, x, y);
-    let target = pointer_target(w, commit_id, (x, y));
+    Some(ResolvedPointerMotion {
+        location: (x, y),
+        target: pointer_target(hit_scenes, commit_id, (x, y)),
+    })
+}
+
+fn deliver_pointer_motion<K: BrowserPageKey>(
+    state: &mut State<K>,
+    id: K,
+    motion: ResolvedPointerMotion,
+) {
+    let (x, y) = motion.location;
     if let Some(window) = state.windows.get_mut(&id) {
         window.pointer_location = (x, y);
+    } else {
+        return;
     }
     let event = MotionEvent {
         location: (x, y).into(),
@@ -2600,7 +2708,9 @@ fn pointer_motion<K: BrowserPageKey>(state: &mut State<K>, id: K, commit_id: u64
     let pointer = state.pointer.clone();
     pointer.motion(
         state,
-        target.map(|(surface, origin)| (surface, origin.into())),
+        motion
+            .target
+            .map(|(surface, origin)| (surface, origin.into())),
         &event,
     );
     pointer.frame(state);
@@ -2610,7 +2720,10 @@ fn mapped_pointer(_frame: PointerFrame, x: f64, y: f64) -> (f64, f64) {
     (x.max(0.0), y.max(0.0))
 }
 fn pointer_button<K: BrowserPageKey>(state: &mut State<K>, id: K, button: u32, pressed: bool) {
-    if !state.windows.contains_key(&id) {
+    let Some(window) = state.windows.get_mut(&id) else {
+        return;
+    };
+    if !track_binary_input(&mut window.active_buttons, button, pressed) {
         return;
     }
     let pointer = state.pointer.clone();
@@ -2632,12 +2745,256 @@ fn pointer_button<K: BrowserPageKey>(state: &mut State<K>, id: K, button: u32, p
     pointer.frame(state);
 }
 
-fn pointer_axis<K: BrowserPageKey>(state: &mut State<K>, id: K, event: PointerAxisFrame) {
-    if !state.windows.contains_key(&id) {
+fn track_binary_input(active: &mut HashSet<u32>, code: u32, pressed: bool) -> bool {
+    if pressed {
+        active.insert(code);
+        true
+    } else {
+        active.remove(&code)
+    }
+}
+
+fn active_release_codes(active: &HashSet<u32>) -> Vec<u32> {
+    active.iter().copied().collect()
+}
+
+fn queue_input<K: BrowserPageKey>(state: &mut State<K>, id: K, input: OrderedInput) {
+    let Some(window) = state.windows.get_mut(&id) else {
+        return;
+    };
+    if !admit_input(
+        window.input_freeze.is_some(),
+        &mut window.pending_input,
+        input,
+    ) {
         return;
     }
+    schedule_input_delivery(state, id);
+}
+
+fn admit_input(frozen: bool, pending: &mut VecDeque<OrderedInput>, input: OrderedInput) -> bool {
+    if frozen {
+        return false;
+    }
+    pending.push_back(input);
+    true
+}
+
+fn clear_input_freeze(active: &mut Option<u64>, generation: u64) -> bool {
+    if *active != Some(generation) {
+        return false;
+    }
+    *active = None;
+    true
+}
+
+fn queue_pointer_motion<K: BrowserPageKey>(
+    state: &mut State<K>,
+    id: K,
+    commit_id: u64,
+    x: f64,
+    y: f64,
+) {
+    let Some(window) = state.windows.get(&id) else {
+        return;
+    };
+    let Some(motion) =
+        resolve_pointer_motion(&window.pointer_frames, &window.hit_scenes, commit_id, x, y)
+    else {
+        return;
+    };
+    queue_input(state, id, OrderedInput::PointerMotion(motion));
+}
+
+const FLING_VELOCITY_WINDOW: Duration = Duration::from_millis(200);
+
+fn axis_pacing_delay(
+    previous: Option<(u32, Instant)>,
+    next: &PointerAxisFrame,
+    now: Instant,
+) -> Duration {
+    if next.source != PointerAxisSource::Finger {
+        return Duration::ZERO;
+    }
+    let Some((previous_time, delivered_at)) = previous else {
+        return Duration::ZERO;
+    };
+    let source_interval = Duration::from_millis(u64::from(next.time.wrapping_sub(previous_time)));
+    if source_interval > FLING_VELOCITY_WINDOW {
+        return Duration::ZERO;
+    }
+    (delivered_at + source_interval).saturating_duration_since(now)
+}
+
+fn input_pacing_delay(
+    previous: Option<(u32, Instant)>,
+    next: &OrderedInput,
+    now: Instant,
+) -> Duration {
+    match next {
+        OrderedInput::PointerAxis(frame) => axis_pacing_delay(previous, frame, now),
+        _ => Duration::ZERO,
+    }
+}
+
+fn dequeue_ready_input(
+    pending: &mut VecDeque<OrderedInput>,
+    previous: Option<(u32, Instant)>,
+    now: Instant,
+) -> Result<Option<OrderedInput>, Duration> {
+    let Some(next) = pending.front() else {
+        return Ok(None);
+    };
+    let delay = input_pacing_delay(previous, next, now);
+    if delay.is_zero() {
+        Ok(pending.pop_front())
+    } else {
+        Err(delay)
+    }
+}
+
+fn schedule_input_delivery<K: BrowserPageKey>(state: &mut State<K>, id: K) {
+    loop {
+        let now = Instant::now();
+        let Some(window) = state.windows.get_mut(&id) else {
+            return;
+        };
+        if window.input_timer_pending {
+            return;
+        }
+        let delay =
+            match dequeue_ready_input(&mut window.pending_input, window.last_axis_delivery, now) {
+                Ok(Some(input)) => {
+                    deliver_input(state, id, input);
+                    continue;
+                }
+                Ok(None) => return,
+                Err(delay) => delay,
+            };
+        window.input_timer_pending = true;
+        tracing::debug!(
+            delay_ms = delay.as_secs_f64() * 1000.0,
+            queued = window.pending_input.len(),
+            "pacing ordered browser input behind touchpad axis frames"
+        );
+        let handle = state.loop_handle.clone();
+        let opened_at = window.opened_at;
+        let registration = handle.insert_source(Timer::from_duration(delay), move |_, _, state| {
+            let Some(window) = state
+                .windows
+                .get_mut(&id)
+                .filter(|window| window.opened_at == opened_at)
+            else {
+                return TimeoutAction::Drop;
+            };
+            window.input_timer_pending = false;
+            schedule_input_delivery(state, id);
+            let _ = state.display_handle.flush_clients();
+            TimeoutAction::Drop
+        });
+        if registration.is_err() {
+            let event = state.windows.get_mut(&id).and_then(|window| {
+                window.input_timer_pending = false;
+                window.pending_input.pop_front()
+            });
+            if let Some(event) = event {
+                deliver_input(state, id, event);
+                continue;
+            }
+        }
+        return;
+    }
+}
+
+fn deliver_input<K: BrowserPageKey>(state: &mut State<K>, id: K, input: OrderedInput) {
+    match input {
+        OrderedInput::PointerMotion(motion) => deliver_pointer_motion(state, id, motion),
+        OrderedInput::PointerButton { button, pressed } => {
+            pointer_button(state, id, button, pressed)
+        }
+        OrderedInput::PointerAxis(frame) => deliver_pointer_axis(state, id, frame),
+        OrderedInput::Pinch(gesture) => pointer_pinch(state, id, gesture),
+        OrderedInput::Key { keycode, pressed } => keyboard_key(state, id, keycode, pressed),
+        OrderedInput::InputBarrier(acknowledge) => {
+            release_active_input(state, id);
+            let _ = state.display_handle.flush_clients();
+            let _ = acknowledge.try_send(());
+        }
+    }
+}
+
+fn release_active_input<K: BrowserPageKey>(state: &mut State<K>, id: K) {
+    let Some(window) = state.windows.get_mut(&id) else {
+        return;
+    };
+    let buttons = active_release_codes(&window.active_buttons);
+    let keys = active_release_codes(&window.active_keys);
+    let finger_axes = window.active_finger_axes;
+    let finger_time = window.last_finger_axis_time;
+    let pinch_active = window.pinch_active;
+
+    for keycode in keys {
+        keyboard_key(state, id, keycode, false);
+    }
+    for button in buttons {
+        pointer_button(state, id, button, false);
+    }
+    if finger_axes != (false, false) {
+        deliver_pointer_axis(
+            state,
+            id,
+            PointerAxisFrame {
+                time: finger_time,
+                source: PointerAxisSource::Finger,
+                value: (0.0, 0.0),
+                v120: (None, None),
+                stop: finger_axes,
+                relative_direction: (
+                    PointerAxisDirection::Identical,
+                    PointerAxisDirection::Identical,
+                ),
+            },
+        );
+    }
+    if pinch_active {
+        pointer_pinch(state, id, PinchGesture::End { cancelled: true });
+    }
+}
+
+fn deliver_pointer_axis<K: BrowserPageKey>(
+    state: &mut State<K>,
+    id: K,
+    mut event: PointerAxisFrame,
+) {
+    let local_now = state.time();
+    let Some(window) = state.windows.get_mut(&id) else {
+        return;
+    };
+    if event.source == PointerAxisSource::Finger {
+        event.stop = filter_finger_stops(window.active_finger_axes, event.value, event.stop);
+        if event.value == (0.0, 0.0) && event.v120 == (None, None) && event.stop == (false, false) {
+            return;
+        }
+        window.last_finger_axis_time = event.time;
+        window.last_axis_delivery = Some((event.time, Instant::now()));
+        if event.value.0 != 0.0 {
+            window.active_finger_axes.0 = true;
+        }
+        if event.value.1 != 0.0 {
+            window.active_finger_axes.1 = true;
+        }
+        if event.stop.0 {
+            window.active_finger_axes.0 = false;
+        }
+        if event.stop.1 {
+            window.active_finger_axes.1 = false;
+        }
+        if window.active_finger_axes == (false, false) {
+            window.last_axis_delivery = None;
+        }
+    }
+    let time = translate_axis_time(&mut window.axis_clock_anchor, event.time, local_now);
     let pointer = state.pointer.clone();
-    let time = state.time();
     let mut frame = AxisFrame::new(time).source(match event.source {
         PointerAxisSource::Finger => AxisSource::Finger,
         PointerAxisSource::Continuous => AxisSource::Continuous,
@@ -2676,8 +3033,27 @@ fn pointer_axis<K: BrowserPageKey>(state: &mut State<K>, id: K, event: PointerAx
     pointer.frame(state);
 }
 
+fn filter_finger_stops(
+    active: (bool, bool),
+    value: (f64, f64),
+    requested: (bool, bool),
+) -> (bool, bool) {
+    (
+        requested.0 && (active.0 || value.0 != 0.0),
+        requested.1 && (active.1 || value.1 != 0.0),
+    )
+}
+
+fn translate_axis_time(anchor: &mut Option<(u32, u32)>, outer: u32, local_now: u32) -> u32 {
+    let (outer_anchor, local_anchor) = *anchor.get_or_insert((outer, local_now));
+    local_anchor.wrapping_add(outer.wrapping_sub(outer_anchor))
+}
+
 fn pointer_pinch<K: BrowserPageKey>(state: &mut State<K>, id: K, event: PinchGesture) {
-    if !state.windows.contains_key(&id) {
+    let Some(window) = state.windows.get_mut(&id) else {
+        return;
+    };
+    if !track_pinch(&mut window.pinch_active, event) {
         return;
     }
     let pointer = state.pointer.clone();
@@ -2722,13 +3098,25 @@ fn pointer_pinch<K: BrowserPageKey>(state: &mut State<K>, id: K, event: PinchGes
     }
 }
 
+fn track_pinch(active: &mut bool, event: PinchGesture) -> bool {
+    match event {
+        PinchGesture::Begin { .. } => {
+            *active = true;
+            true
+        }
+        PinchGesture::Update { .. } => *active,
+        PinchGesture::End { .. } => std::mem::replace(active, false),
+    }
+}
+
 fn keyboard_key<K: BrowserPageKey>(state: &mut State<K>, id: K, keycode: u32, pressed: bool) {
-    if state
-        .windows
-        .get(&id)
-        .and_then(|w| w.toplevel.as_ref())
-        .is_none()
-    {
+    let Some(window) = state.windows.get_mut(&id) else {
+        return;
+    };
+    if window.toplevel.is_none() {
+        return;
+    }
+    if !track_binary_input(&mut window.active_keys, keycode, pressed) {
         return;
     }
     let keyboard = state.keyboard.clone();
@@ -2823,6 +3211,20 @@ mod tests {
 
     use super::*;
 
+    fn axis_frame(time: u32, source: PointerAxisSource) -> PointerAxisFrame {
+        PointerAxisFrame {
+            time,
+            source,
+            value: (0.0, 0.0),
+            v120: (None, None),
+            stop: (false, false),
+            relative_direction: (
+                PointerAxisDirection::Identical,
+                PointerAxisDirection::Identical,
+            ),
+        }
+    }
+
     #[test]
     fn popup_pixels_are_normalized_to_straight_alpha_bgra() {
         let mut xrgb = [3, 2, 1, 0];
@@ -2842,6 +3244,165 @@ mod tests {
         if std::env::var_os("RHO_BWRAP_BIN").is_none() && option_env!("RHO_BWRAP_BIN").is_none() {
             assert_eq!(bubblewrap_wrapper(), "bwrap");
         }
+    }
+
+    #[test]
+    fn axis_time_preserves_outer_intervals_in_the_nested_clock() {
+        let mut anchor = None;
+        assert_eq!(translate_axis_time(&mut anchor, u32::MAX - 4, 900), 900);
+        assert_eq!(translate_axis_time(&mut anchor, 3, 999), 908);
+    }
+
+    #[test]
+    fn finger_axis_pacing_preserves_cadence_without_delaying_live_input() {
+        let now = Instant::now();
+        let finger = |time| axis_frame(time, PointerAxisSource::Finger);
+        assert_eq!(axis_pacing_delay(None, &finger(10), now), Duration::ZERO);
+        assert_eq!(
+            axis_pacing_delay(Some((10, now)), &finger(18), now),
+            Duration::from_millis(8)
+        );
+        assert_eq!(
+            axis_pacing_delay(Some((10, now - Duration::from_millis(8))), &finger(18), now),
+            Duration::ZERO
+        );
+        assert_eq!(
+            axis_pacing_delay(Some((u32::MAX - 4, now)), &finger(3), now),
+            Duration::from_millis(8)
+        );
+        assert_eq!(
+            axis_pacing_delay(Some((10, now)), &finger(211), now),
+            Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn ordered_input_cannot_overtake_a_paced_finger_frame() {
+        let now = Instant::now();
+        let mut queued = VecDeque::from([
+            OrderedInput::PointerAxis(axis_frame(18, PointerAxisSource::Finger)),
+            OrderedInput::PointerAxis(axis_frame(1_000, PointerAxisSource::Wheel)),
+            OrderedInput::PointerMotion(ResolvedPointerMotion {
+                location: (10.0, 20.0),
+                target: None,
+            }),
+            OrderedInput::PointerButton {
+                button: 0x110,
+                pressed: true,
+            },
+        ]);
+
+        assert_eq!(
+            dequeue_ready_input(&mut queued, Some((10, now)), now).unwrap_err(),
+            Duration::from_millis(8)
+        );
+        assert_eq!(queued.len(), 4);
+        assert!(matches!(
+            dequeue_ready_input(&mut queued, Some((10, now)), now + Duration::from_millis(8)),
+            Ok(Some(OrderedInput::PointerAxis(PointerAxisFrame {
+                source: PointerAxisSource::Finger,
+                ..
+            })))
+        ));
+        assert!(matches!(
+            dequeue_ready_input(&mut queued, Some((18, now)), now),
+            Ok(Some(OrderedInput::PointerAxis(PointerAxisFrame {
+                source: PointerAxisSource::Wheel,
+                ..
+            })))
+        ));
+        assert!(matches!(
+            dequeue_ready_input(&mut queued, None, now),
+            Ok(Some(OrderedInput::PointerMotion(_)))
+        ));
+        assert!(matches!(
+            dequeue_ready_input(&mut queued, None, now),
+            Ok(Some(OrderedInput::PointerButton { .. }))
+        ));
+    }
+
+    #[test]
+    fn frozen_input_cutoff_rejects_events_after_its_paced_barrier() {
+        let now = Instant::now();
+        let (acknowledge, acknowledged) = async_channel::bounded(1);
+        let mut queued = VecDeque::new();
+        assert!(admit_input(
+            false,
+            &mut queued,
+            OrderedInput::PointerAxis(axis_frame(18, PointerAxisSource::Finger))
+        ));
+        queued.push_back(OrderedInput::InputBarrier(acknowledge.clone()));
+        assert!(!admit_input(
+            true,
+            &mut queued,
+            OrderedInput::PointerButton {
+                button: 0x110,
+                pressed: false,
+            }
+        ));
+        assert!(!admit_input(
+            true,
+            &mut queued,
+            OrderedInput::Key {
+                keycode: 30,
+                pressed: true,
+            }
+        ));
+        assert_eq!(queued.len(), 2);
+
+        assert_eq!(
+            dequeue_ready_input(&mut queued, Some((10, now)), now).unwrap_err(),
+            Duration::from_millis(8)
+        );
+        assert!(acknowledged.try_recv().is_err());
+        assert!(matches!(
+            dequeue_ready_input(&mut queued, Some((10, now)), now + Duration::from_millis(8)),
+            Ok(Some(OrderedInput::PointerAxis(_)))
+        ));
+        assert!(matches!(
+            dequeue_ready_input(&mut queued, None, now),
+            Ok(Some(OrderedInput::InputBarrier(_)))
+        ));
+        acknowledge.try_send(()).unwrap();
+        assert_eq!(acknowledged.try_recv(), Ok(()));
+
+        let mut active_freeze = Some(2);
+        assert!(!clear_input_freeze(&mut active_freeze, 1));
+        assert_eq!(active_freeze, Some(2));
+        assert!(clear_input_freeze(&mut active_freeze, 2));
+        assert_eq!(active_freeze, None);
+
+        let mut buttons = HashSet::new();
+        assert!(track_binary_input(&mut buttons, 0x110, true));
+        let synthetic_releases = active_release_codes(&buttons);
+        assert_eq!(synthetic_releases, vec![0x110]);
+        assert!(buttons.contains(&0x110));
+        for button in synthetic_releases {
+            assert!(track_binary_input(&mut buttons, button, false));
+        }
+        assert!(!track_binary_input(&mut buttons, 0x110, false));
+
+        let mut pinch_active = false;
+        assert!(track_pinch(
+            &mut pinch_active,
+            PinchGesture::Begin { fingers: 2 }
+        ));
+        assert!(track_pinch(
+            &mut pinch_active,
+            PinchGesture::End { cancelled: true }
+        ));
+        assert!(!track_pinch(
+            &mut pinch_active,
+            PinchGesture::End { cancelled: false }
+        ));
+        assert_eq!(
+            filter_finger_stops((true, false), (0.0, 0.0), (true, true)),
+            (true, false)
+        );
+        assert_eq!(
+            filter_finger_stops((false, false), (0.0, 0.0), (true, true)),
+            (false, false)
+        );
     }
 
     #[test]
@@ -2935,6 +3496,16 @@ mod tests {
             pointer_frames: HashMap::new(),
             hit_scenes: HashMap::new(),
             pointer_location: (0.0, 0.0),
+            axis_clock_anchor: None,
+            pending_input: VecDeque::new(),
+            last_axis_delivery: None,
+            input_timer_pending: false,
+            input_freeze: None,
+            active_finger_axes: (false, false),
+            last_finger_axis_time: 0,
+            active_buttons: HashSet::new(),
+            active_keys: HashSet::new(),
+            pinch_active: false,
             surface_slots: HashMap::new(),
             pending_imports: HashMap::new(),
             next_scene_id: 1,
@@ -3029,5 +3600,19 @@ mod tests {
         let frame = PointerFrame;
         assert_eq!(mapped_pointer(frame, 0.0, 0.0), (0.0, 0.0));
         assert_eq!(mapped_pointer(frame, 80.0, 60.0), (80.0, 60.0));
+    }
+
+    #[test]
+    fn resolved_motion_survives_presentation_pruning_its_scene() {
+        let mut pointer_frames = HashMap::from([(4, PointerFrame)]);
+        let mut hit_scenes: HashMap<u64, Vec<HitNode>> = HashMap::from([(4, Vec::new())]);
+        let motion = resolve_pointer_motion(&pointer_frames, &hit_scenes, 4, 80.0, 60.0).unwrap();
+
+        prune_pointer_scenes(&mut pointer_frames, &mut hit_scenes, 5);
+
+        assert_eq!(motion.location, (80.0, 60.0));
+        assert_eq!(motion.target, None);
+        assert!(!pointer_frames.contains_key(&4));
+        assert!(!hit_scenes.contains_key(&4));
     }
 }

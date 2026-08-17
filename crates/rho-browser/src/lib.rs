@@ -102,7 +102,16 @@ pub fn open_page(id: PageId, cx: &mut App) -> Option<Entity<PageModel>> {
 
 pub fn close_page(id: PageId, cx: &mut App) -> Task<Result<()>> {
     let runtime = runtime(cx);
-    cx.background_spawn(async move { runtime?.close_page(id) })
+    let model = cx.global::<WebState>().model.clone();
+    let close_barrier = model.map(|model| model.update(cx, |model, _| model.prepare_close(id)));
+    cx.background_spawn(async move {
+        if let Some(close_barrier) = close_barrier
+            && let Some(close_barrier) = close_barrier?
+        {
+            close_barrier.await?;
+        }
+        runtime?.close_page(id)
+    })
 }
 
 pub fn page_handle(id: PageId, _cx: &App) -> String {
