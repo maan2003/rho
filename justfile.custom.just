@@ -42,7 +42,7 @@ deploy-webui:
   cd "$deploy"
   jj git remote set-url origin "$remote"
   # The wasm bundle exceeds jj's default new-file snapshot cap.
-  jj config set --repo snapshot.max-new-file-size 33554432
+  jj config set --repo snapshot.max-new-file-size 67108864
   jj new 'root()' -m "deploy $(basename "$bundle")"
   cp -r --no-preserve=mode,ownership "$bundle"/. .
   # Pages runs Jekyll on branch deploys unless told not to.
