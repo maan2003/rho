@@ -378,6 +378,7 @@ impl BrowserModel {
             }
         };
         let id = handoff.target;
+        let generation = handoff.generation;
         handoff.input_generation = Some(input_generation);
         handoff.phase = HandoffPhase::Focusing;
         self.handoff = Some(handoff);
@@ -402,18 +403,20 @@ impl BrowserModel {
                 let current = model.handoff;
                 tracing::info!(
                     succeeded = result.is_ok(),
-                    still_desired = current.is_some_and(|handoff| handoff.target == id),
+                    still_desired = current.is_some_and(|handoff| handoff.generation == generation),
                     "browser handoff extension tab focus completed"
                 );
                 match result {
                     Ok(()) => {
-                        if let Some(handoff) = current.filter(|handoff| handoff.target == id) {
+                        if let Some(handoff) = matching_handoff(current, generation) {
                             model.begin_frame_barrier(handoff);
+                        } else {
+                            model.unfreeze_input(input_generation);
                         }
                     }
                     Err(error) => {
                         model.unfreeze_input(input_generation);
-                        if current.is_some_and(|handoff| handoff.target == id) {
+                        if current.is_some_and(|handoff| handoff.generation == generation) {
                             model.runtime.status = Some(format!("browser: {error:#}"));
                             model.handoff = None;
                         }
@@ -841,6 +844,24 @@ impl QueuedInput {
         })?;
         Ok(true)
     }
+
+    fn record_key_release(&mut self, keycode: u32) -> Result<bool> {
+        let pressed = self.events.iter().rev().find_map(|event| match event {
+            QueuedInputEvent::Key {
+                keycode: queued_keycode,
+                pressed,
+            } if *queued_keycode == keycode => Some(*pressed),
+            _ => None,
+        });
+        if pressed != Some(true) {
+            return Ok(false);
+        }
+        self.push(QueuedInputEvent::Key {
+            keycode,
+            pressed: false,
+        })?;
+        Ok(true)
+    }
 }
 
 fn input_replay_state(
@@ -954,6 +975,19 @@ impl BrowserView {
         }
     }
 
+    fn queue_key_release(&mut self, keycode: u32) -> bool {
+        let Some(queued) = &mut self.queued_input else {
+            return false;
+        };
+        match queued.record_key_release(keycode) {
+            Ok(queued) => queued,
+            Err(_) => {
+                self.queued_input = None;
+                true
+            }
+        }
+    }
+
     fn claim_for_input(
         &mut self,
         focus_keyboard: bool,
@@ -1043,37 +1077,35 @@ impl BrowserView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let finger_was_active = self.finger_axes != (false, false);
+        let finger_was_active = track_finger_axis(&mut self.finger_axes, event);
         if event.source == LinuxAxisSource::Finger {
             self.last_axis_time = event.time;
-            if event.value.0 != 0.0 {
-                self.finger_axes.0 = true;
-            }
-            if event.value.1 != 0.0 {
-                self.finger_axes.1 = true;
-            }
-            if event.stop.0 {
-                self.finger_axes.0 = false;
-            }
-            if event.stop.1 {
-                self.finger_axes.1 = false;
-            }
         }
-        let orphaned_finger_stop = event.source == LinuxAxisSource::Finger
-            && !finger_was_active
+        let cleanup_only = event.source == LinuxAxisSource::Finger
             && event.value == (0.0, 0.0)
             && event.v120 == (None, None)
-            && event.stop != (false, false)
-            && self.queued_input.is_none()
-            && !self.model.read(cx).presents(self.owner_id, self.page_id);
-        if orphaned_finger_stop {
+            && event.stop != (false, false);
+        let (x, y) = self.local_position(event.position);
+        self.last_pointer_position = (x, y);
+        let presents = self.model.read(cx).presents(self.owner_id, self.page_id);
+        if event.source == LinuxAxisSource::Finger && finger_was_active && !presents {
+            if let Some(generation) = self.queued_input.as_ref().map(|queued| queued.generation) {
+                self.queue_input_event(
+                    generation,
+                    QueuedInputEvent::Axis {
+                        position: (x, y),
+                        event: *event,
+                    },
+                );
+            }
             cx.stop_propagation();
             return;
         }
-        let (x, y) = self.local_position(event.position);
-        self.last_pointer_position = (x, y);
-        if self.queued_input.is_some() || !self.model.read(cx).presents(self.owner_id, self.page_id)
-        {
+        if cleanup_only && !presents {
+            cx.stop_propagation();
+            return;
+        }
+        if self.queued_input.is_some() || !presents {
             if let Some(generation) = self.claim_for_input(false, window, cx) {
                 self.queue_input_event(
                     generation,
@@ -1104,17 +1136,25 @@ impl BrowserView {
             self.last_pointer_position = position;
         }
         let gesture = pinch_gesture(*event);
-        self.pinch_active = !matches!(gesture, PinchGesture::End { .. });
-        if matches!(gesture, PinchGesture::End { .. })
-            && !pinch_was_active
-            && self.queued_input.is_none()
-            && !self.model.read(cx).presents(self.owner_id, self.page_id)
-        {
+        let begins = matches!(gesture, PinchGesture::Begin { .. });
+        let ends = matches!(gesture, PinchGesture::End { .. });
+        let presents = self.model.read(cx).presents(self.owner_id, self.page_id);
+        if !begins && !pinch_was_active {
+            self.pinch_active = false;
             cx.stop_propagation();
             return;
         }
-        if self.queued_input.is_some() || !self.model.read(cx).presents(self.owner_id, self.page_id)
-        {
+        self.pinch_active = !ends;
+        if !begins && !presents {
+            if let Some(generation) = self.queued_input.as_ref().map(|queued| queued.generation) {
+                self.queue_input_event(generation, QueuedInputEvent::Pinch { position, gesture });
+            } else {
+                self.pinch_active = false;
+            }
+            cx.stop_propagation();
+            return;
+        }
+        if self.queued_input.is_some() || !presents {
             if let Some(generation) = self.claim_for_input(false, window, cx) {
                 self.queue_input_event(generation, QueuedInputEvent::Pinch { position, gesture });
             }
@@ -1136,8 +1176,19 @@ impl BrowserView {
         cx: &mut Context<Self>,
     ) {
         let PhysicalKey::LinuxEvdev(keycode) = event.key;
-        if self.queued_input.is_some() || !self.model.read(cx).presents(self.owner_id, self.page_id)
-        {
+        let presents = self.model.read(cx).presents(self.owner_id, self.page_id);
+        if !event.pressed {
+            if self.queue_key_release(keycode) {
+                cx.stop_propagation();
+                return;
+            }
+            if !presents {
+                self.pressed_keys.remove(&keycode);
+                cx.stop_propagation();
+                return;
+            }
+        }
+        if self.queued_input.is_some() || !presents {
             if let Some(generation) = self.claim_for_input(false, window, cx) {
                 self.queue_input_event(
                     generation,
@@ -1245,6 +1296,30 @@ impl BrowserView {
     }
 }
 
+fn matching_handoff(handoff: Option<PageHandoff>, generation: u64) -> Option<PageHandoff> {
+    handoff.filter(|handoff| handoff.generation == generation)
+}
+
+fn track_finger_axis(active: &mut (bool, bool), event: &LinuxPointerAxisEvent) -> bool {
+    let was_active = *active != (false, false);
+    if event.source != LinuxAxisSource::Finger {
+        return was_active;
+    }
+    if event.value.0 != 0.0 {
+        active.0 = true;
+    }
+    if event.value.1 != 0.0 {
+        active.1 = true;
+    }
+    if event.stop.0 {
+        active.0 = false;
+    }
+    if event.stop.1 {
+        active.1 = false;
+    }
+    was_active
+}
+
 fn pinch_gesture(event: LinuxPinchEvent) -> PinchGesture {
     match event {
         LinuxPinchEvent::Begin { fingers, .. } => PinchGesture::Begin { fingers },
@@ -1348,7 +1423,6 @@ impl Render for BrowserView {
                 InputReplayState::Waiting => {}
                 InputReplayState::Cancel => {
                     self.queued_input = None;
-                    self.finger_axes = (false, false);
                     self.pinch_active = false;
                 }
                 InputReplayState::Ready => {
@@ -1633,6 +1707,69 @@ mod tests {
                 QueuedInputEvent::Button { pressed: false, .. }
             ]
         ));
+
+        queued
+            .push(QueuedInputEvent::Key {
+                keycode: 30,
+                pressed: true,
+            })
+            .unwrap();
+        assert!(!queued.record_key_release(31).unwrap());
+        assert!(queued.record_key_release(30).unwrap());
+        assert!(matches!(
+            queued.events.as_slice(),
+            [
+                ..,
+                QueuedInputEvent::Key {
+                    keycode: 30,
+                    pressed: true
+                },
+                QueuedInputEvent::Key {
+                    keycode: 30,
+                    pressed: false
+                }
+            ]
+        ));
+    }
+
+    #[test]
+    fn focus_completion_matches_generation_not_a_repeated_page_target() {
+        let page = PageId(uuid::Uuid::new_v4());
+        let latest = PageHandoff {
+            generation: 3,
+            target: page,
+            phase: HandoffPhase::Requested,
+            input_generation: None,
+        };
+
+        assert_eq!(matching_handoff(Some(latest), 1), None);
+        assert_eq!(matching_handoff(Some(latest), 3), Some(latest));
+    }
+
+    #[test]
+    fn finger_sequence_remains_active_across_multiple_continuation_frames() {
+        let mut active = (true, false);
+        let mut event = LinuxPointerAxisEvent {
+            position: Default::default(),
+            time: 1,
+            source: LinuxAxisSource::Finger,
+            value: (1.0, 0.0),
+            v120: (None, None),
+            stop: (false, false),
+            relative_direction: (
+                LinuxAxisRelativeDirection::Identical,
+                LinuxAxisRelativeDirection::Identical,
+            ),
+        };
+
+        assert!(track_finger_axis(&mut active, &event));
+        assert!(track_finger_axis(&mut active, &event));
+        assert_eq!(active, (true, false));
+
+        event.value = (0.0, 0.0);
+        event.stop = (true, false);
+        assert!(track_finger_axis(&mut active, &event));
+        assert_eq!(active, (false, false));
     }
 
     #[test]
