@@ -13,7 +13,7 @@ use gpui::{App, AppContext as _, WindowOptions};
 use rho_gui::rho_assets::RhoAssets;
 use rho_gui::workspace::{AttachTarget, HostSpec, Workspace};
 use rho_gui::*;
-use settings::SettingsStore;
+use settings::{RegisterSetting, Settings, SettingsContent, SettingsStore};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -36,6 +36,24 @@ struct Args {
     /// Write a Dial9 CPU/frame trace on exit (requires a frame-pointer build).
     #[arg(long, value_name = "FILE")]
     cpu_profile: Option<PathBuf>,
+}
+
+#[derive(RegisterSetting)]
+struct TextRenderingModeSetting(settings::TextRenderingMode);
+
+impl Settings for TextRenderingModeSetting {
+    fn from_settings(content: &SettingsContent) -> Self {
+        Self(content.workspace.text_rendering_mode.unwrap())
+    }
+}
+
+fn apply_text_rendering_mode(cx: &mut App) {
+    let mode = match TextRenderingModeSetting::get_global(cx).0 {
+        settings::TextRenderingMode::PlatformDefault => gpui::TextRenderingMode::PlatformDefault,
+        settings::TextRenderingMode::Subpixel => gpui::TextRenderingMode::Subpixel,
+        settings::TextRenderingMode::Grayscale => gpui::TextRenderingMode::Grayscale,
+    };
+    cx.set_text_rendering_mode(mode);
 }
 
 struct GuiProfiler {
@@ -490,6 +508,9 @@ fn init_app(cx: &mut App) -> Result<()> {
     // modal editing, so vim mode is forced rather than left to settings.
     store.override_global(vim_mode_setting::VimModeSetting(true));
     cx.set_global(store);
+    apply_text_rendering_mode(cx);
+    cx.observe_global::<SettingsStore>(apply_text_rendering_mode)
+        .detach();
     theme_settings::init(theme::LoadThemes::All(Box::new(RhoAssets)), cx);
     release_channel::init(semver::Version::new(0, 1, 0), cx);
     editor::init(cx);
