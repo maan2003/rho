@@ -329,6 +329,12 @@ pub struct Workspace {
     /// Client-local web page shown in the same right-hand preview card.
     #[cfg(feature = "native")]
     dashboard_web_preview: Option<(rho_browser::PageId, Entity<rho_browser::PageView>)>,
+    /// Browser resources referenced by the last reconciled Desk documents.
+    #[cfg(feature = "native")]
+    browser_pages: HashSet<rho_browser::PageId>,
+    /// Unreferenced browser pages waiting out the Desk edit grace period.
+    #[cfg(feature = "native")]
+    browser_page_gc: HashMap<rho_browser::PageId, Task<()>>,
     /// Read-only document shown when the synthetic Iris row is targeted.
     iris_preview: Entity<editor::Editor>,
     /// Each daemon's hidden persisted Iris coordinator. These identities stay
@@ -776,6 +782,8 @@ impl Workspace {
             desk_edit_subscriptions: HashMap::new(),
             dashboard_preview: None,
             dashboard_web_preview: None,
+            browser_pages: HashSet::new(),
+            browser_page_gc: HashMap::new(),
             iris_preview,
             iris_agents: HashMap::new(),
             zulip: None,
@@ -2702,6 +2710,7 @@ impl Workspace {
             self.notice_on(None, &message, StyleClass::SystemInfo, cx);
             return;
         };
+        self.scan_browser_pages_for_gc(cx);
         let view = cx.new(|cx| rho_browser::PageView::new(model, id, cx));
         let surface = Self::wrap_surface(
             SurfaceKey::Browser(id),
@@ -3635,6 +3644,7 @@ impl Workspace {
         let Some(model) = rho_browser::open_page(id, cx) else {
             return;
         };
+        self.scan_browser_pages_for_gc(cx);
         let view = cx.new(|cx| rho_browser::PageView::new(model, id, cx));
         self.dashboard_preview = None;
         self.hosts.focus_agent(None);
@@ -4488,6 +4498,71 @@ impl Workspace {
     pub(crate) fn refresh_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dashboard.autofill_titles(&self.registry, cx);
         self.dashboard.sync(&self.registry, window, cx);
+        #[cfg(feature = "native")]
+        {
+            let pages = self.dashboard.page_ids();
+            if pages != self.browser_pages {
+                for page in &pages {
+                    self.browser_page_gc.remove(page);
+                }
+                let removed = self
+                    .browser_pages
+                    .difference(&pages)
+                    .copied()
+                    .collect::<Vec<_>>();
+                self.browser_pages = pages;
+                for page in removed {
+                    self.schedule_browser_page_gc(page, cx);
+                }
+                self.scan_browser_pages_for_gc(cx);
+            }
+        }
+    }
+
+    #[cfg(feature = "native")]
+    fn scan_browser_pages_for_gc(&mut self, cx: &mut Context<Self>) {
+        let Some(list) = rho_browser::list_pages_if_running(cx) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let pages = list.await;
+            let _ = this.update(cx, |this, cx| match pages {
+                Ok(pages) => {
+                    let retained = this.dashboard.page_ids();
+                    for page in pages {
+                        if retained.contains(&page.id) {
+                            this.browser_page_gc.remove(&page.id);
+                        } else {
+                            this.schedule_browser_page_gc(page.id, cx);
+                        }
+                    }
+                }
+                Err(error) => tracing::warn!(%error, "list browser pages for reconciliation"),
+            });
+        })
+        .detach();
+    }
+
+    #[cfg(feature = "native")]
+    fn schedule_browser_page_gc(&mut self, page: rho_browser::PageId, cx: &mut Context<Self>) {
+        const GRACE: Duration = Duration::from_secs(10 * 60);
+        if self.browser_page_gc.contains_key(&page) || self.dashboard.page_ids().contains(&page) {
+            return;
+        }
+        let gc = cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(GRACE).await;
+            let _ = this.update(cx, |this, cx| {
+                this.browser_page_gc.remove(&page);
+                if this.dashboard.page_ids().contains(&page) {
+                    return;
+                }
+                tracing::info!(page_id = %page, "closing unreferenced browser page after grace period");
+                if let Some(close) = rho_browser::close_page_if_running(page, cx) {
+                    close.detach();
+                }
+            });
+        });
+        self.browser_page_gc.insert(page, gc);
     }
 
     #[cfg(test)]

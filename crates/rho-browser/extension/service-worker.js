@@ -1,6 +1,5 @@
 const HOST = "dev.rho.browser";
 const MARKER = "rho:";
-const LOADED_PAGE_LIMIT = 10;
 const pageTabs = new Map();
 const tabPages = new Map();
 let port;
@@ -28,9 +27,35 @@ function pageIdFromTitle(title) {
     : undefined;
 }
 
+function reportTabState(state, tab, pageId = tabPages.get(tab?.id), reason = "") {
+  if (!port || !pageId) return;
+  try {
+    port.postMessage({
+      event: "tab-state",
+      state,
+      reason,
+      page_id: pageId,
+      tab_id: tab?.id,
+      active: tab?.active,
+      audible: tab?.audible,
+      auto_discardable: tab?.autoDiscardable,
+      discarded: tab?.discarded,
+      frozen: tab?.frozen,
+      status: tab?.status,
+    });
+  } catch (_) {}
+}
+
 async function rememberPage(id, tab, createdAt = Date.now(), launchUrl = tab.url || "") {
+  // Rho used to opt managed pages out of Brave's Memory Saver. Restore the
+  // browser default for existing profiles and let Brave apply its native
+  // eligibility checks before discarding a page.
+  if (!tab.autoDiscardable) {
+    tab = await chrome.tabs.update(tab.id, { autoDiscardable: true });
+  }
   pageTabs.set(id, tab.id);
   tabPages.set(tab.id, id);
+  reportTabState("registered", tab, id);
   const key = pageKey(id);
   const old = (await chrome.storage.local.get(key))[key];
   await chrome.storage.local.set({
@@ -141,20 +166,6 @@ async function reconcile() {
   tabs = await chrome.tabs.query({ windowType: "normal" });
   const active = (await chrome.tabs.query({ active: true, lastFocusedWindow: true }))[0];
   previousActiveTab = active?.id;
-  await enforceLoadedPageLimit();
-}
-
-async function enforceLoadedPageLimit() {
-  const pageTabIds = new Set(pageTabs.values());
-  const loaded = (await chrome.tabs.query({ windowType: "normal" }))
-    .filter((tab) => pageTabIds.has(tab.id) && !tab.discarded)
-    .sort((a, b) => {
-      if (a.active !== b.active) return a.active ? -1 : 1;
-      return (b.lastAccessed || 0) - (a.lastAccessed || 0);
-    });
-  for (const tab of loaded.slice(LOADED_PAGE_LIMIT)) {
-    await chrome.tabs.discard(tab.id).catch(() => {});
-  }
 }
 
 async function findPage(id) {
@@ -185,7 +196,6 @@ async function createPage(url) {
     tab = await chrome.tabs.update(tab.id, { url, active: true });
     const record = { id, launch_url: url, created_at_ms: Date.now() };
     await chrome.storage.local.set({ [pageKey(id)]: record });
-    await enforceLoadedPageLimit();
     return record;
   }
   if (canonicalWindowId === undefined) await reconcile();
@@ -204,7 +214,9 @@ async function activatePage(id) {
     await reconcile();
     tab = await findPage(id);
   }
-  await chrome.tabs.update(tab.id, { active: true });
+  reportTabState("focus-requested", tab, id);
+  tab = await chrome.tabs.update(tab.id, { active: true });
+  reportTabState("focus-completed", tab, id);
   await chrome.windows.update(tab.windowId, { focused: true });
   if (tab.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
     await chrome.tabGroups.update(tab.groupId, { collapsed: false });
@@ -217,7 +229,6 @@ async function activatePage(id) {
       chrome.tabGroups.update(oldTab.groupId, { collapsed: true }).catch(() => {});
     }
   }
-  await enforceLoadedPageLimit();
   return { id };
 }
 
@@ -293,6 +304,7 @@ chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
   if (removeInfo.isWindowClosing || parkingTabs.delete(tabId)) return;
   const id = tabPages.get(tabId);
   if (!id) return;
+  reportTabState("removed", { id: tabId }, id, "tab-removed");
   tabPages.delete(tabId);
   pageTabs.delete(id);
   chrome.storage.local.remove(pageKey(id));
@@ -304,6 +316,20 @@ chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
   tabPages.delete(removedTabId);
   tabPages.set(addedTabId, id);
   pageTabs.set(id, addedTabId);
+  chrome.tabs.get(addedTabId).then(
+    (tab) => reportTabState("replaced", tab, id, "tab-replaced"),
+    () => {},
+  );
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  const id = tabPages.get(tabId);
+  if (!id) return;
+  const lifecycle = ["discarded", "frozen", "status"]
+    .filter((field) => Object.hasOwn(changeInfo, field));
+  if (lifecycle.length > 0) {
+    reportTabState("updated", tab, id, lifecycle.join(","));
+  }
 });
 
 chrome.tabGroups.onUpdated.addListener((group) => {

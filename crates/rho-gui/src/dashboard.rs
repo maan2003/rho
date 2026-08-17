@@ -195,6 +195,10 @@ pub struct Dashboard {
     heading_agents: HashMap<(HostId, usize), Vec<AgentId>>,
     #[cfg(feature = "native")]
     heading_pages: HashMap<(HostId, usize), rho_browser::PageId>,
+    /// Every page tag, including additional tags on a heading whose preview
+    /// can display only one page.
+    #[cfg(feature = "native")]
+    referenced_pages: HashSet<rho_browser::PageId>,
     /// Roots whose binding tag lives inside an `:archive:` zone, as of the
     /// last sync. Archived agents are muted: no chime, quiet decorations.
     archived_agents: HashSet<AgentId>,
@@ -282,6 +286,8 @@ impl Dashboard {
             heading_agents: HashMap::new(),
             #[cfg(feature = "native")]
             heading_pages: HashMap::new(),
+            #[cfg(feature = "native")]
+            referenced_pages: HashSet::new(),
             archived_agents: HashSet::new(),
             replies: Vec::new(),
             reply_subscriptions: HashMap::new(),
@@ -331,6 +337,11 @@ impl Dashboard {
 
     pub fn focus_handle(&self, cx: &App) -> gpui::FocusHandle {
         self.editor.read(cx).focus_handle(cx)
+    }
+
+    #[cfg(feature = "native")]
+    pub fn page_ids(&self) -> HashSet<rho_browser::PageId> {
+        self.referenced_pages.clone()
     }
 
     fn buffer_for_key(&self, key: &LineKey) -> Option<&Entity<Buffer>> {
@@ -493,22 +504,27 @@ impl Dashboard {
 
     #[cfg(feature = "native")]
     fn resolve_page_bindings(
-        &self,
         documents: &[(HostId, String)],
-    ) -> HashMap<(HostId, usize), rho_browser::PageId> {
+    ) -> (
+        HashMap<(HostId, usize), rho_browser::PageId>,
+        HashSet<rho_browser::PageId>,
+    ) {
         let mut by_heading = HashMap::new();
+        let mut referenced = HashSet::new();
         for (host, text) in documents {
             for heading in parse(text) {
                 for tag in &heading.tags {
                     if let Ok(page_id) = tag.parse::<rho_browser::PageId>() {
                         by_heading.insert((*host, heading.heading_range.start), page_id);
+                        referenced.insert(page_id);
                     }
                 }
             }
         }
-        by_heading
+        (by_heading, referenced)
     }
 
+    #[cfg(feature = "native")]
     /// Regenerates the listing: the host documents are sliced at bound
     /// headings, generated rows and drafts are interleaved between the
     /// slices, and highlights and lamps reapplied. The cursor follows
@@ -526,7 +542,7 @@ impl Dashboard {
             .collect::<Vec<_>>();
         let filed = self.resolve_bindings(registry, &documents);
         #[cfg(feature = "native")]
-        let filed_pages = self.resolve_page_bindings(&documents);
+        let (filed_pages, referenced_pages) = Self::resolve_page_bindings(&documents);
         self.archived_agents = archived_roots(&documents, &filed);
 
         // Empty reply drafts the cursor has left are dead weight; drop them.
@@ -642,7 +658,7 @@ impl Dashboard {
             && {
                 #[cfg(feature = "native")]
                 {
-                    self.heading_pages == filed_pages
+                    self.heading_pages == filed_pages && self.referenced_pages == referenced_pages
                 }
                 #[cfg(not(feature = "native"))]
                 {
@@ -819,6 +835,7 @@ impl Dashboard {
         #[cfg(feature = "native")]
         {
             self.heading_pages = filed_pages;
+            self.referenced_pages = referenced_pages;
         }
 
         // The cursor follows its buffer: anchors survive any reconcile
@@ -3315,6 +3332,22 @@ mod tests {
         let text = "* Topic\n:agent: eng-abcd\njudgment\n:project: rho\nmore\n";
         let heading = parse(text).remove(0);
         assert_eq!(prose_for(text, &heading), "judgment\nmore");
+    }
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn every_page_tag_is_retained_when_one_heading_has_multiple_pages() {
+        let first = "web-00000000-0000-4000-8000-000000000001"
+            .parse::<rho_browser::PageId>()
+            .unwrap();
+        let second = "web-00000000-0000-4000-8000-000000000002"
+            .parse::<rho_browser::PageId>()
+            .unwrap();
+        let documents = vec![(HostId(1), format!("* Topic :{}:{}:\n", first, second))];
+
+        let (headings, referenced) = Dashboard::resolve_page_bindings(&documents);
+        assert_eq!(headings.len(), 1);
+        assert_eq!(referenced, HashSet::from([first, second]));
     }
 
     #[test]

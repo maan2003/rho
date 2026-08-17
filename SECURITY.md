@@ -116,6 +116,9 @@ AI APIs.
   Rewards, Wallet/Web3, VPN, Leo, News, Talk, Tor, Playlist, Speedreader,
   Wayback integration, Sync, background mode, product analytics, usage pings,
   web discovery, metrics, command-line warnings, and default-browser prompts.
+  It also enables Brave's maximum-savings Memory Saver mode; page unloading is
+  performed by Brave's native eligibility policy rather than forced through the
+  extension API.
   Brave receives a private `XDG_CONFIG_HOME` containing the native-messaging
   manifest, so it neither reads nor writes the user's normal Brave config. It
   keeps its nested namespace and Seccomp-BPF renderer sandbox; the SUID helper is
@@ -127,9 +130,13 @@ AI APIs.
   extension has `tabs`, `tabGroups`, `storage`, and `nativeMessaging`
   privileges, but no host permission or content script. It owns UUID page
   metadata inside the isolated browser profile, associates UUIDs with restored
-  tabs through `rho:<uuid>` group titles, activates requested tabs, and
-  discards inactive tabs. Websites cannot read or modify that browser UI
-  metadata through the extension. Brave native messaging starts a copy of the
+  tabs through `rho:<uuid>` group titles and activates requested tabs. Brave's
+  native Memory Saver discards eligible inactive tabs. Websites cannot read or
+  modify that browser UI metadata through the extension. URL-free lifecycle
+  diagnostics sent over the
+  native bridge contain page UUIDs, ephemeral tab IDs, and tab state booleans,
+  but no URLs, titles, pixels, or page content. Brave native messaging starts a
+  copy of the
   `rho-gui` executable in bounded stdio-relay mode; it connects to the existing
   GUI through `$XDG_RUNTIME_DIR/rho-browser.sock`, whose filesystem mode is
   0600. The socket is a same-user trust boundary and uses no additional

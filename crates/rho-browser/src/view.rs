@@ -496,6 +496,29 @@ impl BrowserModel {
         cx.notify();
     }
 
+    fn owns_page(&self, owner: EntityId, page: PageId) -> bool {
+        self.presentation_owner == Some(owner)
+            && self.handoff.is_some_and(|handoff| handoff.target == page)
+    }
+
+    fn claim_or_join_presentation(
+        &mut self,
+        owner: EntityId,
+        page: PageId,
+        cx: &mut Context<Self>,
+    ) -> Option<u64> {
+        let in_progress = self.owns_page(owner, page)
+            && self
+                .handoff
+                .is_some_and(|handoff| handoff.phase != HandoffPhase::Ready);
+        if !in_progress {
+            self.claim_presentation(owner, page, cx);
+        }
+        self.handoff
+            .filter(|handoff| self.presentation_owner == Some(owner) && handoff.target == page)
+            .map(|handoff| handoff.generation)
+    }
+
     fn transition_terminal(&mut self, status: String, cx: &mut Context<Self>) {
         if !transition_terminal_state(
             &mut self.runtime,
@@ -547,10 +570,10 @@ impl BrowserModel {
     }
 
     fn presents(&self, owner: EntityId, page: PageId) -> bool {
-        self.presentation_owner == Some(owner)
-            && self.handoff.is_some_and(|handoff| {
-                handoff.target == page && handoff.phase == HandoffPhase::Ready
-            })
+        self.owns_page(owner, page)
+            && self
+                .handoff
+                .is_some_and(|handoff| handoff.phase == HandoffPhase::Ready)
     }
 
     fn resize(&self, width: u32, height: u32, scale: f32) {
@@ -751,6 +774,96 @@ fn complete_frame_handoff(handoff: &mut Option<PageHandoff>, frame_barrier: u64)
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PointerReplayState {
+    Waiting,
+    Ready,
+    Cancel,
+}
+
+#[derive(Clone, Debug)]
+struct QueuedPointer {
+    generation: u64,
+    events: Vec<QueuedPointerEvent>,
+}
+
+const MAX_QUEUED_POINTER_EVENTS: usize = 256;
+
+#[derive(Clone, Copy, Debug)]
+enum QueuedPointerEvent {
+    Motion {
+        position: (f64, f64),
+    },
+    Button {
+        position: (f64, f64),
+        button: u32,
+        pressed: bool,
+    },
+    Axis {
+        position: (f64, f64),
+        event: LinuxPointerAxisEvent,
+    },
+}
+
+impl QueuedPointer {
+    fn push(&mut self, event: QueuedPointerEvent) -> Result<()> {
+        if let QueuedPointerEvent::Motion { position } = event
+            && let Some(QueuedPointerEvent::Motion { position: previous }) = self.events.last_mut()
+        {
+            *previous = position;
+            return Ok(());
+        }
+        anyhow::ensure!(
+            self.events.len() < MAX_QUEUED_POINTER_EVENTS,
+            "queued browser pointer input overflowed"
+        );
+        self.events.push(event);
+        Ok(())
+    }
+
+    fn record_release(&mut self, button: u32, position: (f64, f64)) -> Result<bool> {
+        let pressed = self.events.iter().rev().find_map(|event| match event {
+            QueuedPointerEvent::Button {
+                button: queued_button,
+                pressed,
+                ..
+            } if *queued_button == button => Some(*pressed),
+            _ => None,
+        });
+        if pressed != Some(true) {
+            return Ok(false);
+        }
+        self.push(QueuedPointerEvent::Button {
+            position,
+            button,
+            pressed: false,
+        })?;
+        Ok(true)
+    }
+}
+
+fn pointer_replay_state(
+    generation: u64,
+    owner: EntityId,
+    page: PageId,
+    presentation_owner: Option<EntityId>,
+    handoff: Option<PageHandoff>,
+    painted_scene_id: Option<u64>,
+) -> PointerReplayState {
+    let Some(handoff) = handoff.filter(|handoff| {
+        presentation_owner == Some(owner)
+            && handoff.target == page
+            && handoff.generation == generation
+    }) else {
+        return PointerReplayState::Cancel;
+    };
+    if handoff.phase == HandoffPhase::Ready && painted_scene_id.is_some() {
+        PointerReplayState::Ready
+    } else {
+        PointerReplayState::Waiting
+    }
+}
+
 pub struct BrowserView {
     model: Entity<BrowserModel>,
     owner_id: EntityId,
@@ -759,6 +872,8 @@ pub struct BrowserView {
     origin: Rc<Cell<(f32, f32)>>,
     pressed_keys: HashSet<u32>,
     pressed_buttons: HashSet<u32>,
+    queued_pointer: Option<QueuedPointer>,
+    claiming_pointer_focus: bool,
     finger_axes: (bool, bool),
     last_axis_time: u32,
     pinch_active: bool,
@@ -783,6 +898,8 @@ impl BrowserView {
             origin: Rc::new(Cell::new((0.0, 0.0))),
             pressed_keys: HashSet::new(),
             pressed_buttons: HashSet::new(),
+            queued_pointer: None,
+            claiming_pointer_focus: false,
             finger_axes: (false, false),
             last_axis_time: 0,
             pinch_active: false,
@@ -805,29 +922,92 @@ impl BrowserView {
         )
     }
 
+    fn queue_pointer_event(&mut self, generation: u64, event: QueuedPointerEvent) {
+        if self
+            .queued_pointer
+            .as_ref()
+            .is_none_or(|queued| queued.generation != generation)
+        {
+            self.queued_pointer = Some(QueuedPointer {
+                generation,
+                events: Vec::new(),
+            });
+        }
+        if self.queued_pointer.as_mut().unwrap().push(event).is_err() {
+            self.queued_pointer = None;
+        }
+    }
+
+    fn queue_button_release(&mut self, button: u32, position: (f64, f64)) -> bool {
+        let Some(queued) = &mut self.queued_pointer else {
+            return false;
+        };
+        match queued.record_release(button, position) {
+            Ok(queued) => queued,
+            Err(_) => {
+                self.queued_pointer = None;
+                true
+            }
+        }
+    }
+
+    fn claim_for_pointer(
+        &mut self,
+        was_focused: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<u64> {
+        let generation = self.model.update(cx, |model, cx| {
+            if was_focused && model.owns_page(self.owner_id, self.page_id) {
+                model.handoff.map(|handoff| handoff.generation)
+            } else {
+                model.claim_or_join_presentation(self.owner_id, self.page_id, cx)
+            }
+        });
+        if !was_focused {
+            // GPUI dispatches on_focus during a later draw, so this is consumed
+            // by that callback rather than reset immediately after focus().
+            self.claiming_pointer_focus = true;
+            self.focus_handle.focus(window, cx);
+        }
+        generation
+    }
+
     fn mouse_move(&mut self, event: &MouseMoveEvent, _: &mut Window, cx: &mut Context<Self>) {
+        let (x, y) = self.local_position(event.position);
+        if let Some(generation) = self.queued_pointer.as_ref().map(|queued| queued.generation) {
+            self.queue_pointer_event(generation, QueuedPointerEvent::Motion { position: (x, y) });
+            return;
+        }
         if !self.model.read(cx).presents(self.owner_id, self.page_id) {
             return;
         }
-        let (x, y) = self.local_position(event.position);
         self.model.read(cx).pointer_motion(x, y);
     }
 
     fn mouse_down(&mut self, event: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        self.focus_handle.focus(window, cx);
         let (x, y) = self.local_position(event.position);
-        self.model.update(cx, |model, cx| {
-            if !model.presents(self.owner_id, self.page_id) {
-                model.claim_presentation(self.owner_id, self.page_id, cx);
+        let button = linux_button(event.button);
+        let was_focused = self.focus_handle.is_focused(window);
+        if self.queued_pointer.is_some()
+            || !was_focused
+            || !self.model.read(cx).presents(self.owner_id, self.page_id)
+        {
+            if let Some(generation) = self.claim_for_pointer(was_focused, window, cx) {
+                self.queue_pointer_event(
+                    generation,
+                    QueuedPointerEvent::Button {
+                        position: (x, y),
+                        button,
+                        pressed: true,
+                    },
+                );
             }
-        });
-        let model = self.model.read(cx);
-        if !model.presents(self.owner_id, self.page_id) {
             cx.stop_propagation();
             return;
         }
+        let model = self.model.read(cx);
         model.pointer_motion(x, y);
-        let button = linux_button(event.button);
         if model.pointer_button(button, true) {
             self.pressed_buttons.insert(button);
         }
@@ -835,11 +1015,16 @@ impl BrowserView {
     }
 
     fn mouse_up(&mut self, event: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.model.read(cx).presents(self.owner_id, self.page_id) {
-            self.pressed_buttons.remove(&linux_button(event.button));
+        let button = linux_button(event.button);
+        let position = self.local_position(event.position);
+        if self.queue_button_release(button, position) {
+            cx.stop_propagation();
             return;
         }
-        let button = linux_button(event.button);
+        if !self.model.read(cx).presents(self.owner_id, self.page_id) {
+            self.pressed_buttons.remove(&button);
+            return;
+        }
         if self.pressed_buttons.remove(&button) {
             self.model.read(cx).pointer_button(button, false);
         }
@@ -849,12 +1034,9 @@ impl BrowserView {
     fn pointer_axis(
         &mut self,
         event: &LinuxPointerAxisEvent,
-        _: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.model.read(cx).presents(self.owner_id, self.page_id) {
-            return;
-        }
         if event.source == LinuxAxisSource::Finger {
             self.last_axis_time = event.time;
             if event.value.0 != 0.0 {
@@ -871,6 +1053,23 @@ impl BrowserView {
             }
         }
         let (x, y) = self.local_position(event.position);
+        let was_focused = self.focus_handle.is_focused(window);
+        if self.queued_pointer.is_some()
+            || !was_focused
+            || !self.model.read(cx).presents(self.owner_id, self.page_id)
+        {
+            if let Some(generation) = self.claim_for_pointer(was_focused, window, cx) {
+                self.queue_pointer_event(
+                    generation,
+                    QueuedPointerEvent::Axis {
+                        position: (x, y),
+                        event: *event,
+                    },
+                );
+            }
+            cx.stop_propagation();
+            return;
+        }
         let model = self.model.read(cx);
         model.pointer_motion(x, y);
         model.pointer_axis(event);
@@ -909,6 +1108,8 @@ impl BrowserView {
     }
 
     fn release_input(&mut self, cx: &mut Context<Self>) {
+        self.queued_pointer = None;
+        self.claiming_pointer_focus = false;
         let model = self.model.read(cx);
         for keycode in self.pressed_keys.drain() {
             model.key(keycode, false);
@@ -970,8 +1171,12 @@ impl Render for BrowserView {
             let owner_id = self.owner_id;
             self.focus_subscription =
                 Some(cx.on_focus(&self.focus_handle, window, move |this, _, cx| {
+                    if std::mem::take(&mut this.claiming_pointer_focus) {
+                        return;
+                    }
+                    this.queued_pointer = None;
                     this.model.update(cx, |model, cx| {
-                        model.claim_presentation(owner_id, page_id, cx)
+                        model.claim_or_join_presentation(owner_id, page_id, cx);
                     })
                 }));
         }
@@ -1002,6 +1207,56 @@ impl Render for BrowserView {
                 }
                 model.runtime.painted_scene_id = painted_scene_id;
             });
+        }
+        if self.queued_pointer.is_some() && !self.focus_handle.is_focused(window) {
+            self.queued_pointer = None;
+            self.claiming_pointer_focus = false;
+        }
+        if let Some(queued) = self.queued_pointer.clone() {
+            let replay_state = {
+                let model = self.model.read(cx);
+                pointer_replay_state(
+                    queued.generation,
+                    self.owner_id,
+                    self.page_id,
+                    model.presentation_owner,
+                    model.handoff,
+                    model.runtime.painted_scene_id,
+                )
+            };
+            match replay_state {
+                PointerReplayState::Waiting => {}
+                PointerReplayState::Cancel => self.queued_pointer = None,
+                PointerReplayState::Ready => {
+                    self.queued_pointer = None;
+                    let model = self.model.read(cx);
+                    for event in queued.events {
+                        match event {
+                            QueuedPointerEvent::Motion { position } => {
+                                model.pointer_motion(position.0, position.1);
+                            }
+                            QueuedPointerEvent::Button {
+                                position,
+                                button,
+                                pressed,
+                            } => {
+                                model.pointer_motion(position.0, position.1);
+                                if pressed {
+                                    if model.pointer_button(button, true) {
+                                        self.pressed_buttons.insert(button);
+                                    }
+                                } else if self.pressed_buttons.remove(&button) {
+                                    model.pointer_button(button, false);
+                                }
+                            }
+                            QueuedPointerEvent::Axis { position, event } => {
+                                model.pointer_motion(position.0, position.1);
+                                model.pointer_axis(&event);
+                            }
+                        }
+                    }
+                }
+            }
         }
         let model = self.model.read(cx);
         let colors = cx.theme().colors();
@@ -1160,6 +1415,81 @@ impl Render for BrowserView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn queued_pointer_waits_for_its_painted_handoff_and_cancels_when_superseded() {
+        let owner = EntityId::from(1);
+        let other_owner = EntityId::from(2);
+        let page = PageId(uuid::Uuid::new_v4());
+        let handoff = PageHandoff {
+            generation: 7,
+            target: page,
+            phase: HandoffPhase::Ready,
+            input_generation: Some(3),
+        };
+
+        assert_eq!(
+            pointer_replay_state(7, owner, page, Some(owner), Some(handoff), None),
+            PointerReplayState::Waiting
+        );
+        assert_eq!(
+            pointer_replay_state(7, owner, page, Some(owner), Some(handoff), Some(9)),
+            PointerReplayState::Ready
+        );
+        assert_eq!(
+            pointer_replay_state(7, owner, page, Some(other_owner), Some(handoff), Some(9)),
+            PointerReplayState::Cancel
+        );
+        assert_eq!(
+            pointer_replay_state(
+                7,
+                owner,
+                page,
+                Some(owner),
+                Some(PageHandoff {
+                    generation: 8,
+                    ..handoff
+                }),
+                Some(9)
+            ),
+            PointerReplayState::Cancel
+        );
+    }
+
+    #[test]
+    fn queued_pointer_preserves_order_and_records_only_its_matching_release() {
+        let mut queued = QueuedPointer {
+            generation: 1,
+            events: vec![QueuedPointerEvent::Button {
+                position: (0.0, 0.0),
+                button: 0x110,
+                pressed: true,
+            }],
+        };
+        assert!(!queued.record_release(0x111, (1.0, 1.0)).unwrap());
+        assert_eq!(queued.events.len(), 1);
+        queued
+            .push(QueuedPointerEvent::Motion {
+                position: (1.0, 1.0),
+            })
+            .unwrap();
+        queued
+            .push(QueuedPointerEvent::Motion {
+                position: (2.0, 2.0),
+            })
+            .unwrap();
+        assert!(queued.record_release(0x110, (2.0, 2.0)).unwrap());
+        assert!(matches!(
+            queued.events.as_slice(),
+            [
+                QueuedPointerEvent::Button { pressed: true, .. },
+                QueuedPointerEvent::Motion {
+                    position: (2.0, 2.0)
+                },
+                QueuedPointerEvent::Button { pressed: false, .. }
+            ]
+        ));
+    }
 
     #[test]
     fn pre_response_frame_cannot_complete_focus_without_configure_barrier() {

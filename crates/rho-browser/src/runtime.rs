@@ -135,6 +135,7 @@ impl BrowserRuntime {
         }
         command.process_group(0);
         let child = command.spawn().context("launch pinned Brave")?;
+        tracing::info!(pid = child.id(), "launched Brave browser");
         Ok((
             Self {
                 compositor: Mutex::new(Some(compositor)),
@@ -163,6 +164,11 @@ impl BrowserRuntime {
     pub(crate) fn close_page(&self, id: PageId) -> Result<()> {
         self.bridge()?.request("close", json!({ "id": id.0 }))?;
         Ok(())
+    }
+
+    pub(crate) fn list_pages(&self) -> Result<Vec<PageRecord>> {
+        let value = self.bridge()?.request("list", json!({ "limit": 1000 }))?;
+        serde_json::from_value(value).context("decode browser page list")
     }
 
     fn bridge(&self) -> Result<Arc<Bridge>> {
@@ -224,6 +230,8 @@ const BRAVE_POLICY: &str = r#"{
   "BraveWebDiscoveryEnabled": false,
   "CommandLineFlagSecurityWarningsEnabled": false,
   "DefaultBrowserSettingEnabled": false,
+  "HighEfficiencyModeEnabled": true,
+  "MemorySaverModeSavings": 2,
   "MetricsReportingEnabled": false,
   "SyncDisabled": true,
   "TorDisabled": true
@@ -365,6 +373,8 @@ mod tests {
         assert_eq!(policy["BraveP3AEnabled"], false);
         assert_eq!(policy["BraveStatsPingEnabled"], false);
         assert_eq!(policy["CommandLineFlagSecurityWarningsEnabled"], false);
+        assert_eq!(policy["HighEfficiencyModeEnabled"], true);
+        assert_eq!(policy["MemorySaverModeSavings"], 2);
         assert_eq!(policy["SyncDisabled"], true);
     }
 }

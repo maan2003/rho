@@ -216,6 +216,7 @@ fn install_connection(stream: UnixStream, inner: &Arc<BridgeInner>) {
             .shutdown(std::net::Shutdown::Both);
     }
     inner.connected.notify_all();
+    tracing::info!("browser extension connected");
     let weak = Arc::downgrade(inner);
     thread::spawn(move || read_responses(reader, connection, weak));
 }
@@ -229,6 +230,9 @@ fn read_responses(
         let Ok(message) = serde_json::from_slice::<Value>(&frame) else {
             continue;
         };
+        if log_tab_state(&message) {
+            continue;
+        }
         let Some(id) = message.get("id").and_then(Value::as_u64) else {
             continue;
         };
@@ -247,6 +251,7 @@ fn read_responses(
         let _ = reply.send(result);
     }
     fail_pending(&connection, "browser extension disconnected");
+    tracing::warn!("browser extension disconnected");
     if let Some(inner) = inner.upgrade() {
         let mut current = inner.connection.lock().unwrap();
         if current
@@ -256,6 +261,35 @@ fn read_responses(
             *current = None;
         }
     }
+}
+
+fn log_tab_state(message: &Value) -> bool {
+    if message.get("event").and_then(Value::as_str) != Some("tab-state") {
+        return false;
+    }
+    let text = |field: &str, max: usize| {
+        message
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| value.len() <= max)
+            .unwrap_or("")
+    };
+    tracing::info!(
+        state = text("state", 32),
+        reason = text("reason", 64),
+        page_id = text("page_id", 64),
+        tab_id = message.get("tab_id").and_then(|value| value.as_i64()),
+        active = message.get("active").and_then(|value| value.as_bool()),
+        audible = message.get("audible").and_then(|value| value.as_bool()),
+        auto_discardable = message
+            .get("auto_discardable")
+            .and_then(|value| value.as_bool()),
+        discarded = message.get("discarded").and_then(|value| value.as_bool()),
+        frozen = message.get("frozen").and_then(|value| value.as_bool()),
+        status = text("status", 16),
+        "browser extension tab lifecycle"
+    );
+    true
 }
 
 fn fail_pending(connection: &Connection, error: &str) {
@@ -352,6 +386,18 @@ mod tests {
             "rho-gui".into(),
             "chrome-extension://other/".into()
         ]));
+    }
+
+    #[test]
+    fn recognizes_only_url_free_tab_lifecycle_diagnostics() {
+        assert!(log_tab_state(&json!({
+            "event": "tab-state",
+            "state": "updated",
+            "page_id": "00000000-0000-0000-0000-000000000000",
+            "tab_id": 7,
+            "discarded": true,
+        })));
+        assert!(!log_tab_state(&json!({ "id": 7, "ok": true })));
     }
 
     #[test]

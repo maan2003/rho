@@ -155,6 +155,11 @@ than by running a supervisor, extension protocol, or daemon process graph.
   `chrome.storage.local` retains page metadata and
   one single-tab group titled `rho:<uuid>` attaches the ID to Brave's restored
   tab and navigation history. Runtime tab and group IDs are never persisted.
+  The current set of `:web-<uuid>:` Desk tags is authoritative. After the
+  browser starts and whenever that set changes, the GUI schedules extension
+  pages that no Desk document references for collection after a ten-minute
+  grace period; restoring a tag during ordinary cut/paste or text movement
+  cancels that collection.
   Rho sends only direct create/focus/close requests and does not mirror or
   receive an eager registry.
   All pages share one normal Brave window and one private Smithay compositor
@@ -168,9 +173,14 @@ than by running a supervisor, extension protocol, or daemon process graph.
   presentation callbacks from a GPUI paint hook in the current outer frame
   while input is gated. This follows nested-compositor pacing and avoids both
   application-readiness deadlocks and an extra outer-refresh delay. The extension
-  retains the ten most recently accessed page tabs as a loaded LRU and discards
-  older inactive tabs, while Brave retains every page's tab, group, history, and
-  durable metadata.
+  leaves registered page tabs auto-discardable and mandatory browser policy
+  enables Brave's maximum-savings Memory Saver mode. Brave therefore applies
+  its native eligibility checks and discards eligible background pages after
+  its aggressive inactivity interval, while retaining every page's tab, group,
+  history, and durable metadata.
+  The extension emits URL-free tab lifecycle diagnostics (focus, replacement,
+  removal, loading, freezing, and discarding) through the native bridge so a
+  browser-level unload can be distinguished from a website player reset.
   The compositor issues one XDG activation token for the singleton toplevel and
   retains the unambiguous first-window fallback for Chromium-family builds that
   omit it. Extension native messaging reaches `rho-gui` through a tiny stdio

@@ -102,6 +102,19 @@ pub fn open_page(id: PageId, cx: &mut App) -> Option<Entity<PageModel>> {
 
 pub fn close_page(id: PageId, cx: &mut App) -> Task<Result<()>> {
     let runtime = runtime(cx);
+    close_page_with_runtime(id, runtime, cx)
+}
+
+pub fn close_page_if_running(id: PageId, cx: &mut App) -> Option<Task<Result<()>>> {
+    let runtime = cx.global::<WebState>().runtime.clone()?;
+    Some(close_page_with_runtime(id, Ok(runtime), cx))
+}
+
+fn close_page_with_runtime(
+    id: PageId,
+    runtime: Result<Arc<BrowserRuntime>>,
+    cx: &mut App,
+) -> Task<Result<()>> {
     let model = cx.global::<WebState>().model.clone();
     let close_barrier = model.map(|model| model.update(cx, |model, _| model.prepare_close(id)));
     cx.background_spawn(async move {
@@ -112,6 +125,11 @@ pub fn close_page(id: PageId, cx: &mut App) -> Task<Result<()>> {
         }
         runtime?.close_page(id)
     })
+}
+
+pub fn list_pages_if_running(cx: &mut App) -> Option<Task<Result<Vec<PageRecord>>>> {
+    let runtime = cx.global::<WebState>().runtime.clone()?;
+    Some(cx.background_spawn(async move { runtime.list_pages() }))
 }
 
 pub fn page_handle(id: PageId, _cx: &App) -> String {
