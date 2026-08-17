@@ -59,7 +59,7 @@ impl Inference {
         prompt_cache_key: PromptCacheKey,
     ) -> InferenceSession {
         match model {
-            InferenceModel::Gemini35FlashLow => {
+            InferenceModel::Gemini37FlashLow => {
                 InferenceSession::new_antigravity(profile, prompt_cache_key)
             }
             _ => InferenceSession::new_responses(self.clone(), profile, model, prompt_cache_key),

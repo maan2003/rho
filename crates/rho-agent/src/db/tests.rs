@@ -333,7 +333,7 @@ fn agent_role_resolves_opinionated_bindings() {
     ));
     assert_eq!(
         profile(EngineerIntelligence::Gemini).deep_model(),
-        Some(InferenceModel::Gemini35FlashLow)
+        Some(InferenceModel::Gemini37FlashLow)
     );
     assert_eq!(
         AgentRole::Advisor {

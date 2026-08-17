@@ -20,7 +20,7 @@ pub enum InferenceModel {
     Gpt56Sol,
     Gpt56Luna,
     Gpt56Terra,
-    Gemini35FlashLow,
+    Gemini37FlashLow,
 }
 
 impl InferenceModel {
@@ -30,7 +30,7 @@ impl InferenceModel {
             Self::Gpt56Sol => "gpt-5.6-sol",
             Self::Gpt56Luna => "gpt-5.6-luna",
             Self::Gpt56Terra => "gpt-5.6-terra",
-            Self::Gemini35FlashLow => "gemini-3.5-flash-low",
+            Self::Gemini37FlashLow => "gemini-3.7-flash-low",
         }
     }
 }

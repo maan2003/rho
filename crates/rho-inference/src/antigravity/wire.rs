@@ -8,7 +8,7 @@ use rho_core::{
 use senax_encoder::{Decode, Decoder, Encode, TaggedSenax};
 use serde_json::{Value, json};
 
-pub(crate) const MODEL_ID: &str = "gemini-3.5-flash-low";
+pub(crate) const MODEL_ID: &str = "gemini-3.7-flash-tiered";
 
 #[derive(Clone, Copy, Debug, Decode, Encode, Eq, PartialEq)]
 pub(crate) enum ThoughtSignatureAttachment {
@@ -126,7 +126,7 @@ pub(crate) fn build_request(
     let mut inner = json!({
         "contents": contents,
         "generationConfig": {
-            "thinkingConfig": {"thinkingBudget": 4000, "includeThoughts": false}
+            "thinkingConfig": {"thinkingBudget": 1000, "includeThoughts": false}
         }
     });
     if !request.instructions.trim().is_empty() {
@@ -374,7 +374,7 @@ mod tests {
         assert_eq!(value["model"], MODEL_ID);
         assert_eq!(
             value["request"]["generationConfig"]["thinkingConfig"]["thinkingBudget"],
-            4000
+            1000
         );
     }
 

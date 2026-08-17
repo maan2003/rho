@@ -71,7 +71,7 @@ pub fn render_agent_surface(
     let profile = binding
         .deep_config()
         .ok_or_else(|| anyhow::anyhow!("role has no inference profile"))?;
-    let function_tools_only = binding.deep_model() == Some(InferenceModel::Gemini35FlashLow);
+    let function_tools_only = binding.deep_model() == Some(InferenceModel::Gemini37FlashLow);
     let code_mode = cfg!(feature = "code-mode") && profile.code_mode;
     let shell_tools = ShellTools::new(
         std::time::Duration::from_secs(DEFAULT_TIMEOUT_SECS),
@@ -717,7 +717,7 @@ impl Agent {
         // Role policy wins over persisted profiles created before PM code mode
         // was disabled.
         let code_mode_enabled = cfg!(feature = "code-mode") && config.code_mode && !role.is_pm();
-        let function_tools_only = model == InferenceModel::Gemini35FlashLow;
+        let function_tools_only = model == InferenceModel::Gemini37FlashLow;
         let web_search = WebSearchTools::new(inference.clone(), agent_id.encoded().to_owned());
         let inference_session = inference.deep_session(config, model, prompt_cache_key);
         let iris_tools = (role == db::AgentRole::Iris).then(|| {
@@ -785,7 +785,7 @@ impl Agent {
             usage_provider: match model {
                 db::InferenceModel::Gpt56Terra => db::AgentUsageModel::TERRA,
                 db::InferenceModel::Gpt56Luna => db::AgentUsageModel::LUNA,
-                db::InferenceModel::Gemini35FlashLow => db::AgentUsageModel::GEMINI,
+                db::InferenceModel::Gemini37FlashLow => db::AgentUsageModel::GEMINI,
                 _ => db::AgentUsageModel::GPT,
             },
         }));

@@ -23,7 +23,7 @@ than by running a supervisor, extension protocol, or daemon process graph.
   `Inference` polls every enabled configured namespace and the GUI keeps each
   host/namespace history as an independent graph series.
   The explicit `eng-gemini` binding is a narrow exception: its deep session
-  uses Antigravity `gemini-3.5-flash-low` with one manually configured profile,
+  uses Antigravity `gemini-3.7-flash-low` with one manually configured profile,
   full transcript replay, and function tools only. It never enters ChatGPT
   account routing. Generated title/activity sidecars remain on ChatGPT.
 - `rho-agent` owns the opinionated harness policy: queueing, retries/tool

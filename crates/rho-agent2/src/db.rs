@@ -249,6 +249,7 @@ pub(crate) enum PersistedModel {
     Gpt56Sol,
     Gpt56Luna,
     Gpt56Terra,
+    // Stable persisted tag; new sessions resolve it to Gemini 3.7 Flash Low.
     Gemini35FlashLow,
 }
 
@@ -259,7 +260,7 @@ impl From<InferenceModel> for PersistedModel {
             InferenceModel::Gpt56Sol => Self::Gpt56Sol,
             InferenceModel::Gpt56Luna => Self::Gpt56Luna,
             InferenceModel::Gpt56Terra => Self::Gpt56Terra,
-            InferenceModel::Gemini35FlashLow => Self::Gemini35FlashLow,
+            InferenceModel::Gemini37FlashLow => Self::Gemini35FlashLow,
         }
     }
 }
@@ -271,7 +272,7 @@ impl From<PersistedModel> for InferenceModel {
             PersistedModel::Gpt56Sol => Self::Gpt56Sol,
             PersistedModel::Gpt56Luna => Self::Gpt56Luna,
             PersistedModel::Gpt56Terra => Self::Gpt56Terra,
-            PersistedModel::Gemini35FlashLow => Self::Gemini35FlashLow,
+            PersistedModel::Gemini35FlashLow => Self::Gemini37FlashLow,
         }
     }
 }

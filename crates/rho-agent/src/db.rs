@@ -203,7 +203,7 @@ fn usage_model(record: &AgentRecord) -> AgentUsageModel {
         AgentRuntime::Rho { .. } => match record.binding.deep_model() {
             Some(InferenceModel::Gpt56Terra) => AgentUsageModel::TERRA,
             Some(InferenceModel::Gpt56Luna) => AgentUsageModel::LUNA,
-            Some(InferenceModel::Gemini35FlashLow) => AgentUsageModel::GEMINI,
+            Some(InferenceModel::Gemini37FlashLow) => AgentUsageModel::GEMINI,
             _ => AgentUsageModel::GPT,
         },
         AgentRuntime::Claude { .. } => match record.binding.claude_model() {
@@ -646,7 +646,7 @@ impl SessionBinding {
                 Some(InferenceModel::Gpt56Terra)
             }
             Self::CoordinatorSol(_) => Some(InferenceModel::Gpt56Sol),
-            Self::AntigravityFlashLow(_) => Some(InferenceModel::Gemini35FlashLow),
+            Self::AntigravityFlashLow(_) => Some(InferenceModel::Gemini37FlashLow),
             Self::ClaudeFable { .. } | Self::ClaudeOpus { .. } | Self::ClaudeAdvisor { .. } => None,
         }
     }

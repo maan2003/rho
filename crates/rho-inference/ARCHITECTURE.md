@@ -3,7 +3,7 @@
 `rho-inference` provides concrete inference provider integrations for rho. Its
 public API is intentionally provider-neutral. Normal deep, title, and status
 sessions use the OpenAI Responses WebSocket protocol. The explicit
-`gemini-3.5-flash-low` deep model instead dispatches to the reduced Antigravity
+`gemini-3.7-flash-low` deep model instead dispatches to the reduced Antigravity
 GenerateContent backend.
 
 ## Public API boundary

@@ -140,7 +140,7 @@ impl AgentHandle {
         instructions: impl Into<String>,
     ) -> anyhow::Result<Self> {
         anyhow::ensure!(
-            model != InferenceModel::Gemini35FlashLow,
+            model != InferenceModel::Gemini37FlashLow,
             "rho-agent2 does not support the reduced Antigravity transcript protocol"
         );
         let (id, next_event, record) = store

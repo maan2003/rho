@@ -61,10 +61,10 @@ impl InferenceSession {
 
     pub fn set_deep_config(&mut self, profile: InferenceProfile, model: InferenceModel) -> bool {
         match &mut self.inner {
-            SessionImpl::Responses(session) if model != InferenceModel::Gemini35FlashLow => {
+            SessionImpl::Responses(session) if model != InferenceModel::Gemini37FlashLow => {
                 session.set_deep_config(profile, model)
             }
-            SessionImpl::Antigravity(session) if model == InferenceModel::Gemini35FlashLow => {
+            SessionImpl::Antigravity(session) if model == InferenceModel::Gemini37FlashLow => {
                 session.set_profile(profile);
                 true
             }
