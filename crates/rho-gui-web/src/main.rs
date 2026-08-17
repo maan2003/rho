@@ -23,7 +23,6 @@ fn main() {
                 )
                 .result()
                 .expect("load web user settings");
-            store.override_global(vim_mode_setting::VimModeSetting(true));
             cx.set_global(store);
             theme_settings::init(theme::LoadThemes::All(Box::new(RhoAssets)), cx);
             editor::init(cx);

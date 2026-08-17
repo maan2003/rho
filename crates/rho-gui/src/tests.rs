@@ -9,7 +9,7 @@ use rho_ui_proto::remote::{
     AgentRemoteFrame, UiAgentState, UiAgentStatus, UiBlock, UiBlockDiff, UiBlockUpdate,
     UiBlocksDiff, UiMessagePhase, UiTextDiff, UiTool, UiToolDiff, UiToolStatus,
 };
-use settings::SettingsStore;
+use settings::{Settings, SettingsStore};
 
 use crate::connection::{ConnEvent, HostEvent};
 use crate::registry::HostId;
@@ -39,6 +39,22 @@ fn init_test_app(cx: &mut App) {
     command_palette::init(cx);
     search::init(cx);
     vim::init(cx);
+}
+
+#[gpui::test]
+fn shared_modal_init_selects_vim_over_bundled_helix_default(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        assets::Assets.load_test_fonts(cx);
+        let store = SettingsStore::new(cx, crate::rho_assets::RHO_DEFAULT_SETTINGS);
+        cx.set_global(store);
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        editor::init(cx);
+
+        crate::init_vim_mode(cx).expect("initialize Vim mode");
+
+        assert!(vim_mode_setting::VimModeSetting::get_global(cx).0);
+        assert!(!vim_mode_setting::HelixModeSetting::get_global(cx).0);
+    });
 }
 
 fn bind_test_keymaps(cx: &mut App) {

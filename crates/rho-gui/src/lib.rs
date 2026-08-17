@@ -351,12 +351,29 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
 /// every Rho GUI frontend. Platform-specific actions remain harmless when
 /// their corresponding surface is unavailable; their contexts never match.
 pub fn init_vim_mode(cx: &mut App) -> anyhow::Result<()> {
+    // Rho is Vim-first. The bundled Zed defaults currently enable Helix, and
+    // the modal engine gives Helix precedence when both settings are true.
+    // Force the complete mode choice here so every frontend initializes the
+    // same key contexts rather than merely enabling the shared modal engine.
+    let settings = cx.global_mut::<settings::SettingsStore>();
+    settings.override_global(vim_mode_setting::VimModeSetting(true));
+    settings.override_global(vim_mode_setting::HelixModeSetting(false));
     vim::init(cx);
     let default_key_bindings =
         settings::KeymapFile::load_asset_allow_partial_failure(settings::DEFAULT_KEYMAP_PATH, cx)?;
     cx.bind_keys(default_key_bindings);
     let vim_key_bindings =
         settings::KeymapFile::load_asset_allow_partial_failure(settings::VIM_KEYMAP_PATH, cx)?;
+    anyhow::ensure!(
+        cx.build_action("vim::Left", None).is_ok(),
+        "Vim actions are missing from the application registry"
+    );
+    anyhow::ensure!(
+        vim_key_bindings
+            .iter()
+            .any(|binding| binding.action().name() == "vim::Left"),
+        "the Vim keymap did not load its core motion bindings"
+    );
     cx.bind_keys(vim_key_bindings);
     bind_rho_key_overrides(cx);
     Ok(())

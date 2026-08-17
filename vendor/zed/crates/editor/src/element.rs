@@ -745,8 +745,14 @@ impl EditorElement {
     }
 
     #[cfg(not(feature = "native"))]
-    fn register_actions(&self, window: &mut Window, _: &mut App) {
+    fn register_actions(&self, window: &mut Window, cx: &mut App) {
         let editor = &self.editor;
+        editor.update(cx, |editor, cx| {
+            for action in editor.editor_actions.borrow().values() {
+                (action)(editor, window, cx)
+            }
+        });
+
         register_action(editor, window, Editor::move_left);
         register_action(editor, window, Editor::move_right);
         register_action(editor, window, Editor::move_up);

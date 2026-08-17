@@ -504,9 +504,6 @@ fn init_app(cx: &mut App) -> Result<()> {
         .set_user_settings(&user_settings, cx)
         .result()
         .with_context(|| format!("failed to load settings from {}", settings_path.display()))?;
-    // Rho is vim-first: the pane vocabulary and the `:` command line assume
-    // modal editing, so vim mode is forced rather than left to settings.
-    store.override_global(vim_mode_setting::VimModeSetting(true));
     cx.set_global(store);
     apply_text_rendering_mode(cx);
     cx.observe_global::<SettingsStore>(apply_text_rendering_mode)
