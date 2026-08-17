@@ -195,12 +195,21 @@ impl Vim {
                 if kind.linewise() {
                     text.push('\n');
                 }
+                #[cfg(feature = "zed-workspace")]
                 clipboard_selections.push(ClipboardSelection::for_buffer(
                     text.len() - initial_len,
                     false,
                     start..end,
                     &buffer,
                     editor.project(),
+                    cx,
+                ));
+                #[cfg(not(feature = "zed-workspace"))]
+                clipboard_selections.push(ClipboardSelection::for_buffer(
+                    text.len() - initial_len,
+                    false,
+                    start..end,
+                    &buffer,
                     cx,
                 ));
             }

@@ -128,7 +128,7 @@ struct GlobalParams {
     premultiplied_alpha: u32,
     output_color_space: u32,
     framebuffer_is_srgb: u32,
-    pad: u32,
+    _pad: [u32; 3],
 }
 
 #[repr(C)]
@@ -1516,7 +1516,7 @@ impl WgpuRenderer {
             },
             output_color_space: self.rendering_params.output_color_space as u32,
             framebuffer_is_srgb: self.surface_config.format.is_srgb() as u32,
-            pad: 0,
+            _pad: [0; 3],
         };
 
         let path_globals = GlobalParams {

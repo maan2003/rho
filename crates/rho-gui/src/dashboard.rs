@@ -17,10 +17,9 @@ use std::ops::Range;
 use editor::{Editor, EditorMode, HighlightKey, Inlay, SizingBehavior};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, Focusable as _, HighlightStyle, WeakEntity, Window};
-use language::{Buffer, Capability, Point};
+use language::{Buffer, Capability, InlayId, Point};
 use multi_buffer::composition::{Composition, CompositionSpec, CutSpec, RowSpec, SectionSpec};
 use multi_buffer::{MultiBuffer, ToOffset as _};
-use project::InlayId;
 use rho_ui_proto::desk::{DeskHeading, DeskHeadingState, parse};
 use rho_ui_proto::{AgentId, UiAttention};
 use text::{BufferId, ToOffset as _};
@@ -255,6 +254,7 @@ impl Dashboard {
             multi_buffer
         });
         let editor = cx.new(|cx| {
+            #[cfg(feature = "native")]
             let mut editor = Editor::new(
                 EditorMode::Full {
                     scale_ui_elements_with_buffer_font_size: true,
@@ -263,6 +263,17 @@ impl Dashboard {
                 },
                 multi_buffer.clone(),
                 None,
+                window,
+                cx,
+            );
+            #[cfg(not(feature = "native"))]
+            let mut editor = Editor::new(
+                EditorMode::Full {
+                    scale_ui_elements_with_buffer_font_size: true,
+                    show_active_line_background: false,
+                    sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
+                },
+                multi_buffer.clone(),
                 window,
                 cx,
             );

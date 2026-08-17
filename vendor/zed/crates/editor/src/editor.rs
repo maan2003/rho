@@ -162,6 +162,7 @@ pub use git::{
 pub(crate) use git::{DiffHunkKey, StoredReviewComment};
 #[cfg(feature = "native")]
 use git::{DiffReviewDragState, DiffReviewOverlay, InlineBlamePopover};
+#[cfg(feature = "native")]
 pub(crate) use git::{DisplayDiffHunk, PhantomDiffReviewIndicator};
 #[cfg(feature = "native")]
 pub use hover_popover::hover_markdown_style;
@@ -2442,6 +2443,7 @@ impl Editor {
 
         #[cfg(feature = "native")]
         let mut code_action_providers = Vec::new();
+        #[cfg(feature = "native")]
         if let Some(project) = project.clone() {
             code_action_providers.push(Rc::new(project) as Rc<_>);
         }
@@ -2713,6 +2715,7 @@ impl Editor {
             text_style_refinement: None,
             #[cfg(feature = "native")]
             load_diff_task: None,
+            #[cfg(feature = "native")]
             diff_hunk_delegate: None,
             minimap: None,
             change_list: ChangeList::new(),
@@ -2742,6 +2745,7 @@ impl Editor {
             colorize_brackets_task: Task::ready(()),
         };
 
+        #[cfg(feature = "native")]
         if let Some(project) = editor.project.clone() {
             editor.load_diff_task = Some(
                 editor

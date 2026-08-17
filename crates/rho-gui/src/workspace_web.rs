@@ -188,8 +188,8 @@ impl Workspace {
             active_context: ContextId::Draft,
             dashboard,
             desk_sync: crate::desk_view::DeskSync::default(),
+            desk_edit_subscriptions: HashMap::new(),
             dashboard_preview: None,
-            dashboard_dirty: true,
             iris_preview,
             iris_agents: HashMap::new(),
             minibuffer: None,
@@ -272,8 +272,6 @@ impl Render for Workspace {
         let editor = self.active_editor(cx);
         let text_style = editor.update(cx, |editor, cx| editor.style(cx).text.clone());
         let connection_status = self.render_connection_status(&text_style, cx);
-        self.sync_dashboard_if_dirty(window, cx);
-
         let narrow = window.viewport_size().width < px(700.);
         let phone = coarse_pointer() && narrow;
         let home = self.dashboard_mode(window, cx);

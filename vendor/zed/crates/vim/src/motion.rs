@@ -13,7 +13,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use std::{f64, ops::Range};
 
-use workspace::searchable::Direction;
+use crate::Direction;
 
 use crate::{
     Vim,

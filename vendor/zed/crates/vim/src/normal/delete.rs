@@ -5,8 +5,10 @@ use crate::{
     state::Mode,
 };
 use collections::{HashMap, HashSet};
+#[cfg(feature = "zed-workspace")]
+use editor::EditPredictionRequestTrigger;
 use editor::{
-    Bias, DisplayPoint, EditPredictionRequestTrigger,
+    Bias, DisplayPoint,
     display_map::{DisplaySnapshot, ToDisplayPoint},
 };
 use gpui::{Context, Window};
@@ -84,6 +86,7 @@ impl Vim {
                         selection.collapse_to(cursor, selection.goal)
                     });
                 });
+                #[cfg(feature = "zed-workspace")]
                 editor.refresh_edit_prediction(
                     true,
                     false,
@@ -198,6 +201,7 @@ impl Vim {
                         selection.collapse_to(cursor, selection.goal)
                     });
                 });
+                #[cfg(feature = "zed-workspace")]
                 editor.refresh_edit_prediction(
                     true,
                     false,

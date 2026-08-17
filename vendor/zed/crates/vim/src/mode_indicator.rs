@@ -1,7 +1,8 @@
 use gpui::{
     App, Context, Element, Entity, FontWeight, Render, Subscription, WeakEntity, Window, div,
 };
-use ui::text_for_keystrokes;
+use ui::{IntoElement, SharedString, prelude::*, text_for_keystrokes};
+#[cfg(feature = "zed-workspace")]
 use workspace::{HideStatusItem, StatusItemView, item::ItemHandle, ui::prelude::*};
 
 use crate::{Vim, VimEvent, VimGlobals};
@@ -180,6 +181,7 @@ impl Render for ModeIndicator {
     }
 }
 
+#[cfg(feature = "zed-workspace")]
 impl StatusItemView for ModeIndicator {
     fn set_active_pane_item(
         &mut self,

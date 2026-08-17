@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::Direction;
 use collections::HashMap;
 use editor::{
     Bias, DisplayPoint, Editor, MultiBufferOffset, SelectionEffects,
@@ -9,10 +10,10 @@ use editor::{
 use gpui::{Context, Window, actions};
 use language::{Point, Selection, SelectionGoal};
 use multi_buffer::MultiBufferRow;
+#[cfg(feature = "zed-workspace")]
 use search::BufferSearchBar;
 use text::TransactionId;
 use util::ResultExt;
-use workspace::searchable::Direction;
 
 use crate::{
     Vim,
@@ -98,12 +99,15 @@ pub fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
 
     Vim::action(editor, cx, Vim::select_next);
     Vim::action(editor, cx, Vim::select_previous);
-    Vim::action(editor, cx, |vim, _: &SelectNextMatch, window, cx| {
-        vim.select_match(Direction::Next, window, cx);
-    });
-    Vim::action(editor, cx, |vim, _: &SelectPreviousMatch, window, cx| {
-        vim.select_match(Direction::Prev, window, cx);
-    });
+    #[cfg(feature = "zed-workspace")]
+    {
+        Vim::action(editor, cx, |vim, _: &SelectNextMatch, window, cx| {
+            vim.select_match(Direction::Next, window, cx);
+        });
+        Vim::action(editor, cx, |vim, _: &SelectPreviousMatch, window, cx| {
+            vim.select_match(Direction::Prev, window, cx);
+        });
+    }
 
     Vim::action(editor, cx, |vim, _: &SelectLargerSyntaxNode, window, cx| {
         let count = Vim::take_count(cx).unwrap_or(1);
@@ -845,6 +849,7 @@ impl Vim {
         });
     }
 
+    #[cfg(feature = "zed-workspace")]
     pub fn select_match(
         &mut self,
         direction: Direction,

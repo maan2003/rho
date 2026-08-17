@@ -13879,6 +13879,7 @@ dependencies = [
  "languages",
  "libc",
  "multi_buffer",
+ "n0-future",
  "node_runtime",
  "octo-types",
  "org-element",

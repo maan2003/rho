@@ -2092,8 +2092,6 @@ impl EditorElement {
         Some(button)
     }
 
-    #[cfg(feature = "native")]
-
     /// Lays out end-of-line hints for every visible row that carries
     /// one: pure paint after the line's content, no display-space
     /// footprint (see [`Editor::set_eol_hints`]).
@@ -2155,6 +2153,7 @@ impl EditorElement {
         elements
     }
 
+    #[cfg(feature = "native")]
     fn layout_inline_blame(
         &self,
         display_row: DisplayRow,
@@ -6635,8 +6634,6 @@ impl EditorElement {
         }
     }
 
-    #[cfg(feature = "native")]
-
     fn paint_eol_hints(&mut self, layout: &mut EditorLayout, window: &mut Window, cx: &mut App) {
         let elements = std::mem::take(&mut layout.eol_hint_layouts);
         if elements.is_empty() {
@@ -6649,6 +6646,7 @@ impl EditorElement {
         })
     }
 
+    #[cfg(feature = "native")]
     fn paint_inline_blame(&mut self, layout: &mut EditorLayout, window: &mut Window, cx: &mut App) {
         if let Some(mut blame_layout) = layout.inline_blame_layout.take() {
             window.paint_layer(layout.position_map.text_hitbox.bounds, |window| {

@@ -39,9 +39,7 @@ pub(crate) mod zed_remote;
 
 // The registry and per-agent frame store live in a shared crate. These aliases
 // preserve the existing module paths in the client views.
-use gpui::actions;
-#[cfg(feature = "native")]
-use gpui::{App, KeyBinding};
+use gpui::{App, KeyBinding, actions};
 pub use rho_registry as registry;
 pub use rho_registry::store;
 
@@ -160,7 +158,6 @@ pub fn distribution(values: impl IntoIterator<Item = u64>, scale: f64) -> Distri
     }
 }
 
-#[cfg(feature = "native")]
 #[doc(hidden)]
 pub fn bind_rho_key_overrides(cx: &mut App) {
     // Keep draft field navigation available in vim normal mode. The bundled
@@ -348,6 +345,21 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             KeyBinding::new("g r", DashboardRenameTopic, Some(context)),
         ]);
     }
+}
+
+/// Initializes the modal editor engine and the exact keymap stack shared by
+/// every Rho GUI frontend. Platform-specific actions remain harmless when
+/// their corresponding surface is unavailable; their contexts never match.
+pub fn init_vim_mode(cx: &mut App) -> anyhow::Result<()> {
+    vim::init(cx);
+    let default_key_bindings =
+        settings::KeymapFile::load_asset_allow_partial_failure(settings::DEFAULT_KEYMAP_PATH, cx)?;
+    cx.bind_keys(default_key_bindings);
+    let vim_key_bindings =
+        settings::KeymapFile::load_asset_allow_partial_failure(settings::VIM_KEYMAP_PATH, cx)?;
+    cx.bind_keys(vim_key_bindings);
+    bind_rho_key_overrides(cx);
+    Ok(())
 }
 
 #[cfg(all(test, feature = "native"))]

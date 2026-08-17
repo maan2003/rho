@@ -516,16 +516,7 @@ fn init_app(cx: &mut App) -> Result<()> {
     editor::init(cx);
     command_palette::init(cx);
     search::init(cx);
-    vim::init(cx);
-    let default_key_bindings =
-        settings::KeymapFile::load_asset_allow_partial_failure(settings::DEFAULT_KEYMAP_PATH, cx)
-            .context("failed to load default keymap")?;
-    cx.bind_keys(default_key_bindings);
-    let vim_key_bindings =
-        settings::KeymapFile::load_asset_allow_partial_failure(settings::VIM_KEYMAP_PATH, cx)
-            .context("failed to load vim keymap")?;
-    cx.bind_keys(vim_key_bindings);
-    bind_rho_key_overrides(cx);
+    rho_gui::init_vim_mode(cx).context("failed to initialize Rho Vim mode")?;
     Ok(())
 }
 

@@ -1,7 +1,7 @@
 //! Direct browser iroh connection to the daemon's `rho/ui/3` protocol.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::str::FromStr as _;
 use std::sync::{Arc, Mutex};
@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use camino::Utf8PathBuf;
 use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
 use futures::channel::oneshot;
+use futures::future::{AbortHandle, Abortable};
 use futures::{SinkExt as _, StreamExt as _};
 use gpui::App;
 use hkdf::Hkdf;
@@ -163,6 +164,7 @@ pub struct Connection {
     target: Option<AttachTarget>,
     shell_requests: Arc<Mutex<ShellControlRequests>>,
     dialer: Rc<RefCell<Option<rho_rpc::Dialer>>>,
+    reconnect_abort: Rc<RefCell<Option<AbortHandle>>>,
 }
 
 enum Command {
@@ -439,6 +441,15 @@ fn handle_host_message(
     }
 }
 
+fn shell_request_id(message: &ClientMessage) -> Option<u64> {
+    match message {
+        ClientMessage::ShellStart { request_id, .. }
+        | ClientMessage::ShellList { request_id, .. }
+        | ClientMessage::ShellClose { request_id, .. } => Some(*request_id),
+        _ => None,
+    }
+}
+
 /// Creates a locked browser host. Call Connection::authorize from the
 /// corresponding user gesture; hosts are never authorized in a batch.
 pub fn spawn(
@@ -459,6 +470,7 @@ pub fn spawn(
         target: Some(target),
         shell_requests: Arc::new(Mutex::new(ShellControlRequests::default())),
         dialer: Rc::new(RefCell::new(None)),
+        reconnect_abort: Rc::new(RefCell::new(None)),
     }
 }
 
@@ -723,6 +735,7 @@ impl Connection {
                 target: None,
                 shell_requests: Arc::new(Mutex::new(ShellControlRequests::default())),
                 dialer: Rc::new(RefCell::new(None)),
+                reconnect_abort: Rc::new(RefCell::new(None)),
             },
             event_rx,
         )
@@ -855,31 +868,80 @@ impl Connection {
     }
 
     fn start(&self, daemon: EndpointId) {
-        let Some(receiver) = self.receiver.borrow_mut().take() else {
+        let Some(mut receiver) = self.receiver.borrow_mut().take() else {
             return;
         };
         let events = self.events.clone();
         let host_sink = self.host_sink.clone();
         let shell_requests = Arc::clone(&self.shell_requests);
         let dialer = Rc::clone(&self.dialer);
+        let receiver_slot = Rc::clone(&self.receiver);
+        let reconnect_abort = Rc::clone(&self.reconnect_abort);
+        let (abort, registration) = AbortHandle::new_pair();
+        *reconnect_abort.borrow_mut() = Some(abort);
         self.emit_phase(Phase::Connecting);
         spawn_local(async move {
-            if let Err(error) = run(
-                daemon,
-                receiver,
-                events.clone(),
-                host_sink.clone(),
-                shell_requests,
-                dialer,
+            let _ = Abortable::new(
+                async move {
+                    let endpoint = match browser_endpoint(daemon).await {
+                        Ok(endpoint) => endpoint,
+                        Err(error) => {
+                            *receiver_slot.borrow_mut() = Some(receiver);
+                            let reason = format!("{error:#}");
+                            let _ =
+                                events.unbounded_send(Event::Phase(Phase::Failed(reason.clone())));
+                            if let Some(sink) = host_sink {
+                                sink.send(ConnEvent::Disconnected(reason));
+                                sink.send(ConnEvent::AuthorizationRequired);
+                            }
+                            reconnect_abort.borrow_mut().take();
+                            return;
+                        }
+                    };
+                    let mut retry = std::time::Duration::from_secs(1);
+                    loop {
+                        let _ = events.unbounded_send(Event::Phase(Phase::Connecting));
+                        match run(
+                            daemon,
+                            &endpoint,
+                            &mut receiver,
+                            events.clone(),
+                            host_sink.clone(),
+                            Arc::clone(&shell_requests),
+                            Rc::clone(&dialer),
+                        )
+                        .await
+                        {
+                            Ok(RunOutcome::EnrollmentRequired) => {
+                                // Enrollment codes are bound to this TLS connection. Retrying would
+                                // replace the code while the user is approving it. The enrollment
+                                // card tells the user to reload after approval; dropping the page
+                                // aborts this wait and the new connection will be trusted.
+                                conn_log("waiting for daemon enrollment approval and page reload");
+                                futures::future::pending::<()>().await;
+                            }
+                            Err(error) => {
+                                *dialer.borrow_mut() = None;
+                                let reason = format!("{error:#}");
+                                let _ = events
+                                    .unbounded_send(Event::Phase(Phase::Failed(reason.clone())));
+                                if let Some(sink) = &host_sink {
+                                    sink.send(ConnEvent::Disconnected(reason));
+                                    sink.send(ConnEvent::Recovering(retry));
+                                }
+                                conn_log(&format!(
+                                    "connection failed; retrying in {}s: {error:#}",
+                                    retry.as_secs()
+                                ));
+                            }
+                        }
+                        n0_future::time::sleep(retry).await;
+                        retry = (retry * 2).min(std::time::Duration::from_secs(30));
+                    }
+                },
+                registration,
             )
-            .await
-            {
-                let reason = format!("{error:#}");
-                let _ = events.unbounded_send(Event::Phase(Phase::Failed(reason.clone())));
-                if let Some(sink) = host_sink {
-                    sink.send(ConnEvent::Disconnected(reason));
-                }
-            }
+            .await;
         });
     }
 
@@ -893,6 +955,15 @@ impl Connection {
                 Phase::Connecting | Phase::Online => {}
             }
         }
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if let Some(abort) = self.reconnect_abort.borrow_mut().take() {
+            abort.abort();
+        }
+        self.shell_requests.lock().unwrap().pending.clear();
     }
 }
 
@@ -980,22 +1051,20 @@ fn conn_log(message: &str) {
     web_sys::console::log_1(&JsValue::from_str(&format!("[rho-conn] {message}")));
 }
 
+enum RunOutcome {
+    EnrollmentRequired,
+}
+
 async fn run(
     daemon: EndpointId,
-    mut receiver: UnboundedReceiver<Command>,
+    endpoint: &iroh::Endpoint,
+    receiver: &mut UnboundedReceiver<Command>,
     events: UnboundedSender<Event>,
     host_sink: Option<HostSink>,
     shell_requests: Arc<Mutex<ShellControlRequests>>,
     dialer: Rc<RefCell<Option<rho_rpc::Dialer>>>,
-) -> anyhow::Result<()> {
-    conn_log("unlocking passkey identity");
-    let secret = passkey_secret(daemon).await?;
-    conn_log("passkey identity ready; binding browser iroh endpoint");
-    let endpoint = rho_rpc::bind_browser_iroh_client(secret).await?;
-    conn_log(&format!(
-        "endpoint bound as {}; dialing daemon",
-        endpoint.id()
-    ));
+) -> anyhow::Result<RunOutcome> {
+    conn_log(&format!("dialing daemon from endpoint {}", endpoint.id()));
     let connection = endpoint
         .connect(daemon, rho_ui_proto::IROH_ALPN)
         .await
@@ -1010,7 +1079,7 @@ async fn run(
             if let Some(sink) = &host_sink {
                 sink.send(ConnEvent::EnrollmentRequired(code));
             }
-            return Ok(());
+            return Ok(RunOutcome::EnrollmentRequired);
         }
         rho_iroh_auth::ClientAuthResult::Unavailable => {
             anyhow::bail!("daemon cannot accept another enrollment right now")
@@ -1028,16 +1097,27 @@ async fn run(
     let mut recv = rho_rpc::Reader::new(recv);
     rho_ui_proto::write_frame(&mut send, &ClientMessage::Subscribe).await?;
     rho_ui_proto::write_frame(&mut send, &ClientMessage::DeskSubscribe).await?;
+    let _ = events.unbounded_send(Event::Phase(Phase::Online));
+    if let Some(sink) = &host_sink {
+        sink.send(ConnEvent::Recovered);
+    }
     let channel_connection = connection.clone();
-    spawn_local(async move {
+    let attempted_shell_requests = Rc::new(RefCell::new(HashSet::new()));
+    let send_attempted_shell_requests = Rc::clone(&attempted_shell_requests);
+    let send_commands = async {
         while let Some(command) = receiver.next().await {
             match command {
                 Command::Control(message) => {
+                    if let Some(request_id) = shell_request_id(&message) {
+                        send_attempted_shell_requests
+                            .borrow_mut()
+                            .insert(request_id);
+                    }
                     if rho_ui_proto::write_frame(&mut send, &message)
                         .await
                         .is_err()
                     {
-                        break;
+                        anyhow::bail!("daemon control connection closed")
                     }
                 }
                 Command::Realtime {
@@ -1051,12 +1131,34 @@ async fn run(
                 }
             }
         }
-    });
-    futures::try_join!(
+        Ok::<(), anyhow::Error>(())
+    };
+    let result = futures::try_join!(
+        send_commands,
         read_loop(&events, host_sink.as_ref(), &shell_requests, &mut recv),
         read_agent_streams(events.clone(), host_sink.clone(), connection)
-    )?;
-    Ok(())
+    );
+    if let Err(error) = &result {
+        let reason = format!("daemon connection lost: {error:#}");
+        let attempted = attempted_shell_requests.take();
+        let mut requests = shell_requests.lock().unwrap();
+        for request_id in attempted {
+            if let Some(response) = requests.pending.remove(&request_id) {
+                let _ = response.send(ShellControlReply::Failed(reason.clone()));
+            }
+        }
+    }
+    result?;
+    anyhow::bail!("daemon connection tasks stopped")
+}
+
+async fn browser_endpoint(daemon: EndpointId) -> anyhow::Result<iroh::Endpoint> {
+    conn_log("unlocking passkey identity");
+    let secret = passkey_secret(daemon).await?;
+    conn_log("passkey identity ready; binding browser iroh endpoint");
+    let endpoint = rho_rpc::bind_browser_iroh_client(secret).await?;
+    conn_log(&format!("endpoint bound as {}", endpoint.id()));
+    Ok(endpoint)
 }
 
 async fn dial_realtime(

@@ -2760,6 +2760,16 @@ impl Workspace {
         );
     }
 
+    #[cfg(all(target_family = "wasm", not(feature = "native")))]
+    pub fn cmd_browser(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.notice_on(
+            None,
+            "browser pages are available in the native client",
+            StyleClass::SystemInfo,
+            cx,
+        );
+    }
+
     #[cfg(feature = "native")]
     fn create_browser_page(&mut self, url: String, cx: &mut Context<Self>) {
         let create = rho_browser::create_page(url, cx);
@@ -3620,7 +3630,10 @@ impl Workspace {
         let view = self.materialize_model(&agent_id, window, cx);
         view.update(cx, |view, cx| view.tick_timers(now_ms(), cx));
         self.dashboard_preview = Some(agent_id);
-        self.dashboard_web_preview = None;
+        #[cfg(feature = "native")]
+        {
+            self.dashboard_web_preview = None;
+        }
         self.hosts
             .focus_agent(self.host_of(agent_id).map(|host| (host, agent_id)));
         self.ensure_duration_timer(cx);
@@ -3745,11 +3758,18 @@ impl Workspace {
     /// Hides the preview pane: the cursor is on a header, prose, or an
     /// unstaffed heading, so no agent claims the frame.
     fn clear_dashboard_preview(&mut self, cx: &mut Context<Self>) {
-        if self.dashboard_preview.is_none() && self.dashboard_web_preview.is_none() {
+        #[cfg(feature = "native")]
+        let web_preview_empty = self.dashboard_web_preview.is_none();
+        #[cfg(not(feature = "native"))]
+        let web_preview_empty = true;
+        if self.dashboard_preview.is_none() && web_preview_empty {
             return;
         }
         self.dashboard_preview = None;
-        self.dashboard_web_preview = None;
+        #[cfg(feature = "native")]
+        {
+            self.dashboard_web_preview = None;
+        }
         self.hosts.focus_agent(None);
         cx.notify();
     }
@@ -3782,6 +3802,7 @@ impl Workspace {
                 "term {}/{terminal_id}",
                 self.registry.agent_id_label(*agent_id)
             ),
+            #[cfg(feature = "native")]
             SurfaceKey::Browser(browser) => browser.to_string(),
             SurfaceKey::ZulipInbox => "zulip".to_owned(),
             SurfaceKey::ZulipNarrow { label } => label.clone(),
@@ -3796,6 +3817,7 @@ impl Workspace {
             SurfaceKey::Shell(_) => "shell",
             SurfaceKey::Diff { .. } => "diff",
             SurfaceKey::Terminal { .. } => "terminal",
+            #[cfg(feature = "native")]
             SurfaceKey::Browser(_) => "browser",
             SurfaceKey::ZulipInbox => "zulip inbox",
             SurfaceKey::ZulipNarrow { .. } => "zulip",
@@ -4694,6 +4716,7 @@ impl Workspace {
             SurfaceKey::Terminal { .. } => {
                 unreachable!("terminal surfaces are created by open_terminal_surface")
             }
+            #[cfg(feature = "native")]
             SurfaceKey::Browser(_) => {
                 unreachable!("browser surfaces are created by cmd_browser")
             }
@@ -4859,6 +4882,7 @@ impl Workspace {
                 self.registry.select_agent(agent_id);
                 Some(agent_id)
             }
+            #[cfg(feature = "native")]
             SurfaceKey::Browser(_) => None,
             SurfaceKey::Diff { agent_id } => {
                 self.registry.select_agent(agent_id);
@@ -6579,10 +6603,11 @@ impl Workspace {
         let home = self.dashboard_mode(window, cx);
         let iris = false;
         self.sync_diff_visibility(!home, cx);
-        let show_panes = !home
-            || iris
-            || self.dashboard_preview.is_some()
-            || self.dashboard_web_preview.is_some();
+        #[cfg(feature = "native")]
+        let web_preview_visible = self.dashboard_web_preview.is_some();
+        #[cfg(not(feature = "native"))]
+        let web_preview_visible = false;
+        let show_panes = !home || iris || self.dashboard_preview.is_some() || web_preview_visible;
         let rail = home.then(|| self.render_rail(show_panes, text_style, cx));
         // Same hairline the rail uses against the panes.
         let separator_color = cx.theme().colors().border_variant.opacity(0.6);

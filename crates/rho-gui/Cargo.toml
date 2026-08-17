@@ -44,8 +44,7 @@ native = [
   "dep:tracing-subscriber",
   "dep:tokio",
   "dep:util",
-  "dep:vim",
-  "dep:vim_mode_setting",
+  "vim/zed-workspace",
   "editor/native",
   "languages/load-grammars",
   "rho-rpc/native-client",
@@ -111,8 +110,8 @@ tree-sitter-md = { git = "https://github.com/tree-sitter-grammars/tree-sitter-ma
 org-element = { version = "0.1.0", default-features = false }
 ui = { path = "../../vendor/zed/crates/ui" }
 util = { path = "../../vendor/zed/crates/util", optional = true }
-vim = { path = "../../vendor/zed/crates/vim", optional = true }
-vim_mode_setting = { path = "../../vendor/zed/crates/vim_mode_setting", optional = true }
+vim = { path = "../../vendor/zed/crates/vim", default-features = false }
+vim_mode_setting = { path = "../../vendor/zed/crates/vim_mode_setting" }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"] }
@@ -132,6 +131,7 @@ console_error_panic_hook = "0.1"
 hkdf = "0.12"
 iroh = { workspace = true, features = ["tls-ring"] }
 js-sys = "0.3"
+n0-future = "0.3"
 rho-touch-keyboard = { path = "../rho-touch-keyboard" }
 rho-iroh-auth.workspace = true
 rho-rpc = { workspace = true, features = ["browser-client"] }

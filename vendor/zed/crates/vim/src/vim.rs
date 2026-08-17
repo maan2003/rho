@@ -4,6 +4,7 @@
 mod test;
 
 mod change_list;
+#[cfg(feature = "zed-workspace")]
 mod command;
 mod digraph;
 mod helix;
@@ -37,9 +38,11 @@ use language::{CursorShape, Point, Selection, SelectionGoal, TransactionId};
 pub use mode_indicator::ModeIndicator;
 use motion::Motion;
 use multi_buffer::ToPoint as _;
+#[cfg(feature = "zed-workspace")]
 use normal::search::SearchSubmit;
 use object::Object;
 use schemars::JsonSchema;
+#[cfg(feature = "zed-workspace")]
 use search::BufferSearchBar;
 use serde::Deserialize;
 use settings::RegisterSetting;
@@ -55,12 +58,17 @@ use theme_settings::ThemeSettings;
 use ui::{IntoElement, SharedString, px};
 use vim_mode_setting::HelixModeSetting;
 use vim_mode_setting::VimModeSetting;
+#[cfg(feature = "zed-workspace")]
 use workspace::{self, Pane, Workspace};
 
-use crate::{
-    normal::{GoToPreviousTab, GoToTab},
-    state::ReplayableAction,
-};
+#[cfg(feature = "zed-workspace")]
+use crate::normal::{GoToPreviousTab, GoToTab};
+use crate::state::ReplayableAction;
+
+#[cfg(not(feature = "zed-workspace"))]
+pub(crate) use language::Direction;
+#[cfg(feature = "zed-workspace")]
+pub(crate) use workspace::searchable::Direction;
 
 enum HelixJumpNavigationOverlay {}
 
@@ -288,6 +296,7 @@ pub fn init(cx: &mut App) {
 
     cx.observe_new(Vim::register).detach();
 
+    #[cfg(feature = "zed-workspace")]
     cx.observe_new(|workspace: &mut Workspace, _, _| {
         workspace.register_action(|workspace, _: &ToggleVimMode, _, cx| {
             let fs = workspace.app_state().fs.clone();
@@ -703,6 +712,7 @@ impl Vim {
                 vim.switch_mode(Mode::VisualLine, false, window, cx)
             });
 
+            #[cfg(feature = "zed-workspace")]
             Vim::action(
                 editor,
                 cx,
@@ -934,6 +944,7 @@ impl Vim {
             Vim::action(editor, cx, |vim, _: &Tab, window, cx| {
                 vim.input_ignored(" ".into(), window, cx)
             });
+            #[cfg(feature = "zed-workspace")]
             Vim::action(
                 editor,
                 cx,
@@ -996,6 +1007,7 @@ impl Vim {
             insert::register(editor, cx);
             helix::register(editor, cx);
             motion::register(editor, cx);
+            #[cfg(feature = "zed-workspace")]
             command::register(editor, cx);
             replace::register(editor, cx);
             indent::register(editor, cx);
@@ -1056,10 +1068,12 @@ impl Vim {
         self.editor.upgrade()
     }
 
+    #[cfg(feature = "zed-workspace")]
     pub fn workspace(&self, window: &Window, cx: &App) -> Option<Entity<Workspace>> {
         Workspace::for_window(window, cx)
     }
 
+    #[cfg(feature = "zed-workspace")]
     pub fn pane(&self, window: &Window, cx: &Context<Self>) -> Option<Entity<Pane>> {
         let pane = self
             .workspace(window, cx)
@@ -1234,6 +1248,7 @@ impl Vim {
         });
         self.operator_stack.clear();
         self.selected_register.take();
+        #[cfg(feature = "zed-workspace")]
         self.cancel_running_command(window, cx);
         if mode == Mode::Normal || mode != last_mode {
             self.current_tx.take();
@@ -1555,6 +1570,7 @@ impl Vim {
         // If editor gains focus while search bar is still open (not dismissed),
         // the user has explicitly navigated away - clear prior_selections so we
         // don't restore to the old position if they later dismiss the search.
+        #[cfg(feature = "zed-workspace")]
         if !self.search.prior_selections.is_empty() {
             if let Some(pane) = self.pane(window, cx) {
                 let search_still_open = pane
@@ -1581,11 +1597,16 @@ impl Vim {
         let editor = editor.read(cx);
         let editor_mode = editor.mode();
 
+        #[cfg(feature = "zed-workspace")]
+        let is_following = editor.leader_id().is_some();
+        #[cfg(not(feature = "zed-workspace"))]
+        let is_following = false;
+
         if editor_mode.is_full()
             && !newest_selection_empty
             && self.mode == Mode::Normal
             // When following someone, don't switch vim mode.
-            && editor.leader_id().is_none()
+            && !is_following
         {
             if preserve_selection {
                 self.switch_mode(Mode::Visual, true, window, cx);
@@ -2026,6 +2047,7 @@ impl Vim {
     fn local_selections_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(editor) = self.editor() else { return };
 
+        #[cfg(feature = "zed-workspace")]
         if editor.read(cx).leader_id().is_some() {
             return;
         }
@@ -2285,6 +2307,7 @@ impl Vim {
                     self.multi_replace(text, window, cx)
                 }
 
+                #[cfg(feature = "zed-workspace")]
                 if self.mode == Mode::Normal {
                     self.update_editor(cx, |_, editor, cx| {
                         editor.accept_edit_prediction(
@@ -2336,6 +2359,7 @@ impl Vim {
         editor.set_autoindent(state.autoindent);
         editor.set_cursor_offset_on_selection(state.cursor_offset_on_selection);
         editor.selections.set_line_mode(state.line_mode);
+        #[cfg(feature = "zed-workspace")]
         editor.set_edit_predictions_hidden_for_vim_mode(state.hide_edit_predictions, window, cx);
     }
 

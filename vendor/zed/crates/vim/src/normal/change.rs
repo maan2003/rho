@@ -4,8 +4,10 @@ use crate::{
     object::Object,
     state::Mode,
 };
+#[cfg(feature = "zed-workspace")]
+use editor::EditPredictionRequestTrigger;
 use editor::{
-    Bias, DisplayPoint, EditPredictionRequestTrigger,
+    Bias, DisplayPoint,
     display_map::{DisplaySnapshot, ToDisplayPoint},
     movement::TextLayoutDetails,
 };
@@ -90,6 +92,7 @@ impl Vim {
                 if let Some(kind) = motion_kind {
                     vim.copy_selections_content(editor, kind, window, cx);
                     editor.delete_selections_with_linked_edits(window, cx);
+                    #[cfg(feature = "zed-workspace")]
                     editor.refresh_edit_prediction(
                         true,
                         false,
@@ -133,6 +136,7 @@ impl Vim {
                     };
                     vim.copy_selections_content(editor, kind, window, cx);
                     editor.delete_selections_with_linked_edits(window, cx);
+                    #[cfg(feature = "zed-workspace")]
                     editor.refresh_edit_prediction(
                         true,
                         false,

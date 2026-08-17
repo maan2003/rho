@@ -16,6 +16,7 @@ rho-gui = { path = "../rho-gui", default-features = false }
 settings = { path = "../../vendor/zed/crates/settings" }
 theme = { path = "../../vendor/zed/crates/theme" }
 theme_settings = { path = "../../vendor/zed/crates/theme_settings" }
+vim_mode_setting = { path = "../../vendor/zed/crates/vim_mode_setting" }
 zed_actions = { path = "../../vendor/zed/crates/zed_actions" }
 
 [patch.crates-io]

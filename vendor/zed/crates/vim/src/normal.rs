@@ -6,6 +6,7 @@ pub(crate) mod mark;
 pub(crate) mod paste;
 pub(crate) mod repeat;
 mod scroll;
+#[cfg(feature = "zed-workspace")]
 pub(crate) mod search;
 pub mod substitute;
 mod toggle_comments;
@@ -222,6 +223,7 @@ pub(crate) fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
         vim.join_lines_impl(false, window, cx);
     });
 
+    #[cfg(feature = "zed-workspace")]
     Vim::action(editor, cx, |vim, _: &GoToPreviousReference, window, cx| {
         let count = Vim::take_count(cx);
         vim.update_editor(cx, |_, editor, cx| {
@@ -237,6 +239,7 @@ pub(crate) fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
         });
     });
 
+    #[cfg(feature = "zed-workspace")]
     Vim::action(editor, cx, |vim, _: &GoToNextReference, window, cx| {
         let count = Vim::take_count(cx);
         vim.update_editor(cx, |_, editor, cx| {
@@ -387,6 +390,7 @@ pub(crate) fn register(editor: &mut Editor, cx: &mut Context<Vim>) {
 
     repeat::register(editor, cx);
     scroll::register(editor, cx);
+    #[cfg(feature = "zed-workspace")]
     search::register(editor, cx);
     substitute::register(editor, cx);
     increment::register(editor, cx);
@@ -433,6 +437,7 @@ impl Vim {
                 window,
                 cx,
             ),
+            #[cfg(feature = "zed-workspace")]
             Some(Operator::ShellCommand) => {
                 self.shell_command_motion(motion, times, forced_motion, window, cx)
             }
@@ -520,6 +525,7 @@ impl Vim {
                 Some(Operator::AutoIndent) => {
                     self.indent_object(object, around, IndentDirection::Auto, times, window, cx)
                 }
+                #[cfg(feature = "zed-workspace")]
                 Some(Operator::ShellCommand) => {
                     self.shell_command_object(object, around, window, cx);
                 }

@@ -13,35 +13,48 @@ path = "src/vim.rs"
 doctest = false
 
 [features]
+default = ["zed-workspace"]
 neovim = ["nvim-rs", "async-compat", "async-trait", "tokio"]
+zed-workspace = [
+  "editor/native",
+  "dep:command_palette",
+  "dep:command_palette_hooks",
+  "dep:db",
+  "dep:fuzzy",
+  "dep:picker",
+  "dep:project",
+  "dep:search",
+  "dep:task",
+  "dep:workspace",
+]
 
 [dependencies]
 anyhow.workspace = true
 async-compat = { workspace = true, "optional" = true }
 async-trait = { workspace = true, "optional" = true }
 collections.workspace = true
-command_palette.workspace = true
-command_palette_hooks.workspace = true
-db.workspace = true
-editor.workspace = true
+command_palette = { workspace = true, optional = true }
+command_palette_hooks = { workspace = true, optional = true }
+db = { workspace = true, optional = true }
+editor = { path = "../editor", default-features = false }
 env_logger.workspace = true
 futures.workspace = true
-fuzzy.workspace = true
+fuzzy = { workspace = true, optional = true }
 gpui.workspace = true
 itertools.workspace = true
 language.workspace = true
 log.workspace = true
 multi_buffer.workspace = true
 nvim-rs = { git = "https://github.com/KillTheMule/nvim-rs", rev = "764dd270c642f77f10f3e19d05cc178a6cbe69f3", features = ["use_tokio"], optional = true }
-picker.workspace = true
-project.workspace = true
+picker = { workspace = true, optional = true }
+project = { workspace = true, optional = true }
 regex.workspace = true
 schemars.workspace = true
-search.workspace = true
+search = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 settings.workspace = true
-task.workspace = true
+task = { workspace = true, optional = true }
 text.workspace = true
 theme.workspace = true
 theme_settings.workspace = true
@@ -51,7 +64,7 @@ ui.workspace = true
 util.workspace = true
 util_macros.workspace = true
 vim_mode_setting.workspace = true
-workspace.workspace = true
+workspace = { workspace = true, optional = true }
 zed_actions.workspace = true
 
 [dev-dependencies]
