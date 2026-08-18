@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, height=device-height, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#111318" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta
+      http-equiv="Content-Security-Policy"
+      content="default-src 'none'; script-src 'self' 'sha256-i90JJOrYysYSJXSH1b8NxkkWycpsHWTrwTUAgggi6/E=' 'sha256-BOjTiqxIs4mzNFKObCQXNguf+C/s8+CktEKVmBAMkeU=' 'sha256-K0zmEHC2EXARo0aFZERNUpaUkYGhMeFHfPX9DAV1vKk=' 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'self' https: wss:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+    />
+    <title>Rho</title>
+    <!-- GitHub Pages cannot set COOP/COEP response headers. This worker adds
+         them to the next (controlled) navigation, then reloads this page. -->
+    
+    <script>
+      if (!crossOriginIsolated && "serviceWorker" in navigator) {
+        navigator.serviceWorker.addEventListener(
+          "controllerchange", () => location.reload(), { once: true },
+        );
+        navigator.serviceWorker.register("./coi-serviceworker.js", { scope: "./" })
+          .catch((error) => console.error("Unable to enable cross-origin isolation", error));
+      }
+    </script>
+    
+<script type="module">
+import init, * as bindings from './rho-gui-web-5063b621244dba8b.js';
+const wasm = await init({ module_or_path: './rho-gui-web-5063b621244dba8b_bg.wasm' });
+
+
+window.wasmBindings = bindings;
+
+
+dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
+
+</script>
+    <style>
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      html, body { height: 100%; background: #111318; }
+      /* The canvas fills the whole screen, status bar and home indicator
+         included; the app reads the safe-area insets via __rhoSafeArea and
+         keeps its own content clear of them. */
+      :root {
+        --rho-sa-top: env(safe-area-inset-top, 0px);
+        --rho-sa-right: env(safe-area-inset-right, 0px);
+        --rho-sa-bottom: env(safe-area-inset-bottom, 0px);
+        --rho-sa-left: env(safe-area-inset-left, 0px);
+      }
+      canvas { display: block; width: 100%; height: 100%; outline: none; }
+    </style>
+    <script>
+      // Keyboard haptics. Android exposes navigator.vibrate. iOS has no web
+      // vibration API; toggling a switch-style checkbox produces the system
+      // haptic, but iOS 26.5 patched *programmatic* clicks, so __rhoHaptic
+      // (called on key commit) only helps iOS 17.4-26.4. For later iOS the
+      // keyboard region gets an invisible real switch overlay: the finger's
+      // genuine tap toggles it (still haptic), and the overlay forwards
+      // cloned pointer events to the canvas so typing works unchanged. The
+      // clones shift pointerId so GPUI's pointer capture cannot steal the
+      // real pointer stream from the switch mid-tap.
+      (function () {
+        let toggle = null;
+        function ensureToggle() {
+          if (toggle) return toggle;
+          const label = document.createElement("label");
+          label.style.cssText =
+            "position:fixed;top:0;left:0;width:0;height:0;overflow:hidden;opacity:0;pointer-events:none";
+          const input = document.createElement("input");
+          input.type = "checkbox";
+          input.setAttribute("switch", "");
+          label.appendChild(input);
+          document.body.appendChild(label);
+          toggle = label;
+          return toggle;
+        }
+        window.__rhoHaptic = function () {
+          if (navigator.vibrate) {
+            navigator.vibrate(8);
+            return;
+          }
+          try { ensureToggle().click(); } catch (_) {}
+        };
+
+        let overlay = null;
+        let lastTop = null;
+        function ensureOverlay() {
+          if (overlay) return overlay;
+          overlay = document.createElement("div");
+          overlay.style.cssText =
+            "position:fixed;left:0;right:0;bottom:0;display:none;z-index:10;" +
+            "touch-action:none;-webkit-tap-highlight-color:transparent;";
+          const input = document.createElement("input");
+          input.type = "checkbox";
+          input.setAttribute("switch", "");
+          input.setAttribute("aria-hidden", "true");
+          input.tabIndex = -1;
+          input.style.cssText =
+            "position:absolute;inset:0;width:100%;height:100%;margin:0;opacity:0;";
+          overlay.appendChild(input);
+          const forward = (e) => {
+            const canvas = document.querySelector("canvas");
+            if (!canvas) return;
+            canvas.dispatchEvent(new PointerEvent(e.type, {
+              pointerId: e.pointerId + 10000,
+              pointerType: e.pointerType,
+              isPrimary: e.isPrimary,
+              clientX: e.clientX, clientY: e.clientY,
+              screenX: e.screenX, screenY: e.screenY,
+              button: e.button, buttons: e.buttons,
+              bubbles: false, cancelable: true,
+            }));
+          };
+          for (const type of ["pointerdown", "pointermove", "pointerup", "pointercancel"]) {
+            overlay.addEventListener(type, forward);
+          }
+          document.body.appendChild(overlay);
+          return overlay;
+        }
+        window.__rhoSafeArea = function () {
+          const style = getComputedStyle(document.documentElement);
+          const read = (name) => parseFloat(style.getPropertyValue(name)) || 0;
+          return [
+            read("--rho-sa-top"),
+            read("--rho-sa-right"),
+            read("--rho-sa-bottom"),
+            read("--rho-sa-left"),
+          ];
+        };
+        window.__rhoHapticRegion = function (top) {
+          if (top === lastTop) return;
+          lastTop = top;
+          const el = ensureOverlay();
+          if (top == null || top < 0) {
+            el.style.display = "none";
+            return;
+          }
+          const canvas = document.querySelector("canvas");
+          const base = canvas ? canvas.getBoundingClientRect().top : 0;
+          el.style.top = base + top + "px";
+          el.style.display = "block";
+        };
+      })();
+    </script>
+  <link rel="modulepreload" href="./rho-gui-web-5063b621244dba8b.js" crossorigin="anonymous" integrity="sha384-3ACCY6UCJsPzgwQK6X79DMT2dBlg5Nru4JIC+qOyRV0mQo7h2OlK3mN+UVRRsLpk"><link rel="preload" href="./rho-gui-web-5063b621244dba8b_bg.wasm" crossorigin="anonymous" integrity="sha384-bVJXZRTl+oxCKpGZ5tBA8r2RcMDEryr1LvZ8qzyE6tU+dv0SAidgKICMIKrihyvL" as="fetch" type="application/wasm"></head>
+  <body></body>
+</html>
