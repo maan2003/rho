@@ -107,7 +107,7 @@ AI APIs.
   memory, releases the source immediately, retains the 16 MiB ancillary and
   32 MiB current-scene bounds, and preserves one-scene coalescing. It does not
   test the production DMA-BUF/fence invariants.
-- Native embedded pages run pinned Brave with the invoking user's full authority
+- Native embedded pages run pinned Brave Origin with the invoking user's full authority
   and a persistent cookie/storage identity under the Rho client state directory.
   A Bubblewrap mount namespace exposes the host normally but overlays `/etc` and
   masks `/etc/brave/policies`, so the browser sees only Rho's mandatory policy at
@@ -119,8 +119,10 @@ AI APIs.
   It also enables Brave's maximum-savings Memory Saver mode; page unloading is
   performed by Brave's native eligibility policy rather than forced through the
   extension API.
-  Brave receives a private `XDG_CONFIG_HOME` containing the native-messaging
+  Brave Origin receives a private `XDG_CONFIG_HOME` containing the native-messaging
   manifest, so it neither reads nor writes the user's normal Brave config. It
+  also records Origin's Linux free-tier acceptance in the private browser profile to suppress
+  first-launch product onboarding. It
   keeps its nested namespace and Seccomp-BPF renderer sandbox; the SUID helper is
   disabled because it cannot operate inside Bubblewrap's user namespace.
   `RHO_CHROME_BIN` is a development/QA escape hatch that selects another browser

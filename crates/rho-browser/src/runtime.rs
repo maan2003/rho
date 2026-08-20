@@ -19,9 +19,9 @@ use crate::store::{PageId, PageRecord, validate_launch_url};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct BrowserWindow;
 
-/// One persistent Brave identity, one normal browser window, and one private
-/// Wayland compositor. Logical pages live as extension-owned tabs inside the
-/// singleton browser window.
+/// One persistent Brave Origin identity, one normal browser window, and one
+/// private Wayland compositor. Logical pages live as extension-owned tabs
+/// inside the singleton browser window.
 pub(crate) struct BrowserRuntime {
     compositor: Mutex<Option<BrowserCompositor<BrowserWindow>>>,
     bridge: Mutex<Option<Arc<Bridge>>>,
@@ -119,9 +119,9 @@ impl BrowserRuntime {
                 session.activation_token()
             ))
             .arg(format!("--user-data-dir={}", profile.display()));
-        // Chrome's experimental vertical tabs need a feature switch. Brave's
+        // Chrome's experimental vertical tabs need a feature switch. Brave Origin's
         // native implementation is selected by profile preferences instead;
-        // enabling Chromium's separate implementation crashes pinned Brave.
+        // enabling Chromium's separate implementation crashes pinned Brave Origin.
         if custom_browser {
             command.arg("--enable-features=VerticalTabs");
         }
@@ -134,8 +134,8 @@ impl BrowserRuntime {
             command.env("XDG_CONFIG_HOME", &brave_config);
         }
         command.process_group(0);
-        let child = command.spawn().context("launch pinned Brave")?;
-        tracing::info!(pid = child.id(), "launched Brave browser");
+        let child = command.spawn().context("launch pinned Brave Origin")?;
+        tracing::info!(pid = child.id(), "launched Brave Origin browser");
         Ok((
             Self {
                 compositor: Mutex::new(Some(compositor)),
@@ -213,7 +213,8 @@ impl Drop for BrowserRuntime {
     }
 }
 
-/// Mandatory policy mounted privately into Brave's Linux policy directory.
+/// Mandatory policy mounted privately into Brave Origin's Linux policy
+/// directory.
 const BRAVE_POLICY: &str = r#"{
   "BackgroundModeEnabled": false,
   "BraveAIChatEnabled": false,
@@ -309,6 +310,26 @@ fn configure_browser_chrome(profile: &Path) -> Result<()> {
     let temporary = preferences.with_extension("json.tmp");
     std::fs::write(&temporary, serde_json::to_vec(&root)?)?;
     std::fs::rename(temporary, preferences)?;
+
+    // Origin otherwise intercepts the first browser window with a product
+    // onboarding dialog. Linux explicitly offers the branded build for free;
+    // record that local choice before launch so extension-owned pages remain
+    // the only windows in Rho's private compositor.
+    let local_state = profile.join("Local State");
+    let mut root = match std::fs::read(&local_state) {
+        Ok(bytes) => serde_json::from_slice::<serde_json::Value>(&bytes)
+            .context("decode Brave Origin Local State")?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => json!({}),
+        Err(error) => return Err(error.into()),
+    };
+    set_preference(
+        &mut root,
+        &["brave", "origin", "free_tier_accepted"],
+        true.into(),
+    )?;
+    let temporary = profile.join("Local State.tmp");
+    std::fs::write(&temporary, serde_json::to_vec(&root)?)?;
+    std::fs::rename(temporary, local_state)?;
     Ok(())
 }
 
@@ -369,6 +390,10 @@ mod tests {
         assert_eq!(value["auto_pin_new_tab_groups"], false);
         assert_eq!(value["extensions"]["ui"]["developer_mode"], true);
         assert_eq!(value["profile"]["exit_type"], "Normal");
+        let local_state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(temp.path().join("Local State")).unwrap())
+                .unwrap();
+        assert_eq!(local_state["brave"]["origin"]["free_tier_accepted"], true);
     }
 
     #[test]

@@ -3220,7 +3220,7 @@ fn send_frame_callbacks(window: &mut WindowState, time: u32, commit_id: u64) {
 /// Resolves the stock browser wrapper without ever selecting an underlying ELF.
 pub fn chrome_wrapper() -> OsString {
     std::env::var_os("RHO_CHROME_BIN").unwrap_or_else(|| {
-        option_env!("RHO_BRAVE_BIN").map_or_else(|| OsString::from("brave"), OsString::from)
+        option_env!("RHO_BRAVE_BIN").map_or_else(|| OsString::from("brave-origin"), OsString::from)
     })
 }
 
@@ -3265,7 +3265,7 @@ mod tests {
     #[test]
     fn browser_wrappers_have_safe_defaults() {
         if std::env::var_os("RHO_CHROME_BIN").is_none() && option_env!("RHO_BRAVE_BIN").is_none() {
-            assert_eq!(chrome_wrapper(), "brave");
+            assert_eq!(chrome_wrapper(), "brave-origin");
         }
         if std::env::var_os("RHO_BWRAP_BIN").is_none() && option_env!("RHO_BWRAP_BIN").is_none() {
             assert_eq!(bubblewrap_wrapper(), "bwrap");

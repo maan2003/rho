@@ -352,7 +352,7 @@ pub fn write_installation(
     }))?;
     for hosts in [
         profile.join("NativeMessagingHosts"),
-        brave_config.join("BraveSoftware/Brave-Browser/NativeMessagingHosts"),
+        brave_config.join("BraveSoftware/Brave-Origin/NativeMessagingHosts"),
     ] {
         fs::create_dir_all(&hosts)?;
         fs::write(hosts.join(format!("{HOST_NAME}.json")), &manifest)?;
@@ -417,7 +417,7 @@ mod tests {
         assert_eq!(
             fs::read(
                 brave_config
-                    .join("BraveSoftware/Brave-Browser/NativeMessagingHosts/dev.rho.browser.json")
+                    .join("BraveSoftware/Brave-Origin/NativeMessagingHosts/dev.rho.browser.json")
             )
             .unwrap(),
             serde_json::to_vec_pretty(&host).unwrap()

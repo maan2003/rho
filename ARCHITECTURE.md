@@ -144,12 +144,14 @@ than by running a supervisor, extension protocol, or daemon process graph.
   Native web pages are client-local first-class resources owned by `rho-browser`.
   They use extension-generated UUID `PageId`s written in full as Desk tags.
   One embedded MV3 extension owns the durable page registry inside the implicit
-  persistent Brave profile. Rho launches pinned Brave inside a private Bubblewrap
+  persistent Brave Origin profile. Rho launches pinned Brave Origin inside a private Bubblewrap
   mount namespace that overlays `/etc` and masks the host Brave policy directory;
   a mandatory process-local policy disables Brave consumer services and telemetry
   without reading or changing host policy.
-  Brave's `XDG_CONFIG_HOME` is also private to Rho state so its native-messaging
-  manifest and auxiliary product state do not touch the user's Brave config.
+  Brave Origin's `XDG_CONFIG_HOME` is also private to Rho state so its native-messaging
+  manifest and auxiliary product state do not touch the user's Brave config. Rho records
+  Origin's Linux free-tier acceptance in that private profile before first launch so product
+  onboarding cannot replace an extension-owned page.
   Native vertical tabs are collapsed and hidden until edge hover, the bookmarks
   bar and saved-group row are hidden, and the address toolbar remains visible.
   `chrome.storage.local` retains page metadata and
