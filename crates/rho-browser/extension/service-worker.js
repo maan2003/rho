@@ -1,10 +1,8 @@
 const HOST = "dev.rho.browser";
-const MARKER = "rho:";
 const pageTabs = new Map();
 const tabPages = new Map();
 let port;
 let reconnectTimer;
-let previousActiveTab;
 let operations = Promise.resolve();
 let canonicalWindowId;
 const parkingTabs = new Set();
@@ -19,12 +17,16 @@ function pageKey(id) {
   return `page:${id}`;
 }
 
-function pageIdFromTitle(title) {
-  if (!title?.startsWith(MARKER)) return undefined;
-  const id = title.slice(MARKER.length);
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)
-    ? id
-    : undefined;
+async function getPageId(tabId) {
+  return chrome.rhoPrivate.tabs.getId(tabId);
+}
+
+async function setPageId(tabId, id) {
+  await chrome.rhoPrivate.tabs.setId(tabId, id);
+}
+
+async function removePageId(tabId) {
+  await chrome.rhoPrivate.tabs.removeId(tabId);
 }
 
 function reportTabState(state, tab, pageId = tabPages.get(tab?.id), reason = "") {
@@ -47,6 +49,9 @@ function reportTabState(state, tab, pageId = tabPages.get(tab?.id), reason = "")
 }
 
 async function rememberPage(id, tab, createdAt = Date.now(), launchUrl = tab.url || "") {
+  // Re-emit the session command after restore so the browser-owned UUID is
+  // part of both the restored tab and the newly recording session.
+  await setPageId(tab.id, id);
   // Rho used to opt managed pages out of Brave's Memory Saver. Restore the
   // browser default for existing profiles and let Brave apply its native
   // eligibility checks before discarding a page.
@@ -69,15 +74,6 @@ async function rememberPage(id, tab, createdAt = Date.now(), launchUrl = tab.url
 }
 
 async function makePage(tab, id = crypto.randomUUID()) {
-  if (tab.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
-    await chrome.tabs.ungroup(tab.id);
-  }
-  const groupId = await chrome.tabs.group({ tabIds: [tab.id] });
-  await chrome.tabGroups.update(groupId, {
-    title: `${MARKER}${id}`,
-    collapsed: !tab.active,
-    color: "grey",
-  });
   await rememberPage(id, await chrome.tabs.get(tab.id));
   return id;
 }
@@ -85,52 +81,28 @@ async function makePage(tab, id = crypto.randomUUID()) {
 async function reconcile() {
   pageTabs.clear();
   tabPages.clear();
-  let groups = await chrome.tabGroups.query({});
-  for (const group of groups) {
-    const id = pageIdFromTitle(group.title);
-    if (!id) continue;
-    const tabs = await chrome.tabs.query({ groupId: group.id });
-    if (tabs.length === 0) continue;
-    if (pageTabs.has(id)) {
-      for (const duplicate of tabs) await makePage(duplicate);
-      continue;
-    }
-    await rememberPage(id, tabs[0]);
-    for (const extra of tabs.slice(1)) await chrome.tabs.ungroup(extra.id);
-  }
-
   let tabs = await chrome.tabs.query({ windowType: "normal" });
   const windows = await chrome.windows.getAll({ windowTypes: ["normal"] });
   if (!windows.some((window) => window.id === canonicalWindowId)) {
     canonicalWindowId = windows.find((window) => window.focused)?.id ?? windows[0]?.id;
   }
   if (canonicalWindowId !== undefined) {
-    groups = await chrome.tabGroups.query({});
-    for (const group of groups) {
-      if (group.windowId !== canonicalWindowId) {
-        await chrome.tabGroups.move(group.id, { windowId: canonicalWindowId, index: -1 });
-      }
-    }
-    tabs = await chrome.tabs.query({ windowType: "normal" });
     for (const tab of tabs) {
-      if (
-        tab.windowId !== canonicalWindowId &&
-        tab.groupId === chrome.tabGroups.TAB_GROUP_ID_NONE
-      ) {
+      if (tab.windowId !== canonicalWindowId) {
         await chrome.tabs.move(tab.id, { windowId: canonicalWindowId, index: -1 });
       }
     }
   }
 
-  // Moving groups between windows allocates new runtime group IDs.
-  pageTabs.clear();
-  tabPages.clear();
-  groups = await chrome.tabGroups.query({});
-  for (const group of groups) {
-    const id = pageIdFromTitle(group.title);
+  tabs = await chrome.tabs.query({ windowType: "normal" });
+  for (const tab of tabs) {
+    const id = await getPageId(tab.id);
     if (!id) continue;
-    const grouped = await chrome.tabs.query({ groupId: group.id });
-    if (grouped[0]) await rememberPage(id, grouped[0]);
+    if (pageTabs.has(id)) {
+      await makePage(tab);
+    } else {
+      await rememberPage(id, tab);
+    }
   }
 
   // Extension storage is authoritative if Chrome could not restore a tab.
@@ -155,17 +127,18 @@ async function reconcile() {
     try {
       const parsed = new URL(record.launch_url);
       if (parsed.protocol !== "http:" && parsed.protocol !== "https:") continue;
-      const tab = await chrome.tabs.create({
-        windowId: canonicalWindowId,
-        url: record.launch_url,
-        active: false,
-      });
+      let tab = tabs.find(
+        (candidate) => !tabPages.has(candidate.id) && candidate.url === record.launch_url,
+      );
+      tab ??= await chrome.tabs.create({
+          windowId: canonicalWindowId,
+          url: record.launch_url,
+          active: false,
+        });
       await makePage(tab, record.id);
     } catch (_) {}
   }
   tabs = await chrome.tabs.query({ windowType: "normal" });
-  const active = (await chrome.tabs.query({ active: true, lastFocusedWindow: true }))[0];
-  previousActiveTab = active?.id;
 }
 
 async function findPage(id) {
@@ -218,17 +191,6 @@ async function activatePage(id) {
   tab = await chrome.tabs.update(tab.id, { active: true });
   reportTabState("focus-completed", tab, id);
   await chrome.windows.update(tab.windowId, { focused: true });
-  if (tab.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
-    await chrome.tabGroups.update(tab.groupId, { collapsed: false });
-  }
-  const old = previousActiveTab;
-  previousActiveTab = tab.id;
-  if (old !== undefined && old !== tab.id) {
-    const oldTab = await chrome.tabs.get(old).catch(() => undefined);
-    if (oldTab?.groupId !== chrome.tabGroups.TAB_GROUP_ID_NONE) {
-      chrome.tabGroups.update(oldTab.groupId, { collapsed: true }).catch(() => {});
-    }
-  }
   return { id };
 }
 
@@ -238,6 +200,7 @@ async function closePage(id) {
   const key = pageKey(id);
   const record = (await chrome.storage.local.get(key))[key];
   await chrome.storage.local.set({ [key]: { ...record, closing: true } });
+  await removePageId(tab.id);
   pageTabs.delete(id);
   tabPages.delete(tab.id);
   await chrome.tabs.remove(tab.id);
@@ -316,6 +279,7 @@ chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
   tabPages.delete(removedTabId);
   tabPages.set(addedTabId, id);
   pageTabs.set(id, addedTabId);
+  setPageId(addedTabId, id).catch(() => {});
   chrome.tabs.get(addedTabId).then(
     (tab) => reportTabState("replaced", tab, id, "tab-replaced"),
     () => {},
@@ -332,14 +296,19 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   }
 });
 
-chrome.tabGroups.onUpdated.addListener((group) => {
-  enqueue(async () => {
-    const tabs = await chrome.tabs.query({ groupId: group.id });
-    const id = tabs[0] && tabPages.get(tabs[0].id);
-    if (id && group.title !== `${MARKER}${id}`) {
-      await chrome.tabGroups.update(group.id, { title: `${MARKER}${id}` });
-    }
-  }).catch(() => {});
+chrome.runtime.onMessage.addListener((message, sender) => {
+  if (
+    sender.id !== chrome.runtime.id ||
+    !sender.tab?.active ||
+    (sender.documentLifecycle && sender.documentLifecycle !== "active") ||
+    message?.type !== "rho-browser-command"
+  ) return;
+  switch (message.command) {
+    case "back": return chrome.tabs.goBack(sender.tab.id);
+    case "forward": return chrome.tabs.goForward(sender.tab.id);
+    case "reload": return chrome.tabs.reload(sender.tab.id);
+    default: return undefined;
+  }
 });
 
 chrome.windows.onCreated.addListener(() => {

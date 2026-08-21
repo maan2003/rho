@@ -11,6 +11,9 @@ Exceptions:
 - crates/senax-encoder and crates/senax-encoder/derive are vendored upstream
   projects licensed under MIT OR Apache-2.0. Their license texts remain in
   crates/senax-encoder/LICENSE-MIT and crates/senax-encoder/LICENSE-APACHE.
+- crates/rho-browser/extension/content-script.js adapts VimFx's n-ary Huffman
+  implementation under the MIT license. Its license text remains in
+  crates/rho-browser/extension/VIMFX-LICENSE-MIT.
 
 The Mozilla Public License requires distributors of executable forms to inform
 recipients how to obtain the corresponding source. The canonical Rho source is

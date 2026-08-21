@@ -109,10 +109,9 @@ AI APIs.
   test the production DMA-BUF/fence invariants.
 - Native embedded pages run pinned Brave Origin with the invoking user's full authority
   and a persistent cookie/storage identity under the Rho client state directory.
-  A Bubblewrap mount namespace exposes the host normally but overlays `/etc` and
-  masks `/etc/brave/policies`, so the browser sees only Rho's mandatory policy at
-  `/etc/brave/policies/managed/rho.json`; this is policy isolation, not an access
-  sandbox. The mandatory policy disables
+  Rho does not synthesize or mount browser policy. The NixOS Home Manager Brave
+  module installs user-level policy into the dedicated Rho profile before launch.
+  That policy disables
   Rewards, Wallet/Web3, VPN, Leo, News, Talk, Tor, Playlist, Speedreader,
   Wayback integration, Sync, background mode, product analytics, usage pings,
   web discovery, metrics, command-line warnings, and default-browser prompts.
@@ -121,23 +120,34 @@ AI APIs.
   extension API.
   Brave Origin receives a private `XDG_CONFIG_HOME` containing the native-messaging
   manifest, so it neither reads nor writes the user's normal Brave config. It
-  also records Origin's Linux free-tier acceptance in the private browser profile to suppress
-  first-launch product onboarding. It
-  keeps its nested namespace and Seccomp-BPF renderer sandbox; the SUID helper is
-  disabled because it cannot operate inside Bubblewrap's user namespace.
-  `RHO_CHROME_BIN` is a development/QA escape hatch that selects another browser
-  and deliberately bypasses this Brave policy namespace. `rho-browser` accepts only
+  also receives Nix-owned profile preferences recording Origin's Linux free-tier
+  acceptance to suppress first-launch product onboarding. Brave retains its native
+  process and renderer sandboxes.
+  `RHO_CUSTOM_BRAVE_BIN` selects the locally built, Rho-patched Brave artifact;
+  the NixOS Brave profile sets it to a configuration wrapper around its pinned
+  package. There is no stock-browser fallback: `rho-browser` requires the
+  component loader and private tab API from that build. It accepts only
   bounded HTTP(S) launch URLs, holds an exclusive advisory lock on that identity,
   and exposes Brave only to one private Wayland socket. One bundled MV3
-  extension is loaded unpacked with developer mode enabled in this isolated
-  profile so updated worker code is registered on browser restart; its source
-  is still supplied only by the installed `rho-gui` binary. The extension has
-  `tabs`, `tabGroups`, `storage`, and `nativeMessaging`
-  privileges, but no host permission or content script. It owns UUID page
-  metadata inside the isolated browser profile, associates UUIDs with restored
-  tabs through `rho:<uuid>` group titles and activates requested tabs. Brave's
-  native Memory Saver discards eligible inactive tabs. Websites cannot read or
-  modify that browser UI metadata through the extension. URL-free lifecycle
+  extension is registered by Rho's custom Brave build as a component extension
+  from the isolated client-state directory. Updated worker and DOM-adapter code
+  is therefore registered on browser restart without rebuilding Brave; its
+  source is still supplied only by the installed `rho-gui` binary.
+  The extension has `tabs`, `storage`, and `nativeMessaging` privileges. The
+  allowlisted `rhoPrivate.tabs` API stores UUID page identity in browser tab
+  session data instead of exposing it through visible tab groups. Its bundled
+  content script runs on HTTP(S) documents only. Its isolated-world,
+  document-start `window` capture listener owns Vim modes and synchronously
+  consumes only matched commands; unmatched keys and editable controls continue
+  to the website as their original trusted events. The page agent performs
+  scrolling, focus, and visible-element hints locally. Browser history and
+  reload requests contain only a fixed command name and are handled by the
+  worker for the active sender tab. Hint activation currently uses DOM
+  `element.click()`, which is not a trusted synthetic click, though it executes
+  during the trusted key event's user-activation window. Brave's native Memory
+  Saver discards eligible inactive tabs. Websites cannot read or modify the
+  browser-owned UUID session metadata.
+  URL-free lifecycle
   diagnostics sent over the
   native bridge contain page UUIDs, ephemeral tab IDs, and tab state booleans,
   but no URLs, titles, pixels, or page content. Brave native messaging starts a
@@ -145,11 +155,10 @@ AI APIs.
   `rho-gui` executable in bounded stdio-relay mode; it connects to the existing
   GUI through `$XDG_RUNTIME_DIR/rho-browser.sock`, whose filesystem mode is
   0600. The socket is a same-user trust boundary and uses no additional
-  authentication. No TCP listener, CDP/remote debugging, or injected website
-  script participates. The compositor-issued `xdg-activation-v1` token binds
-  the singleton Brave toplevel; after a short grace period it also accepts the
-  exactly-one-pending-window/exactly-one-unbound-toplevel case for builds that
-  omit the token. Additional or ambiguous toplevels fail closed.
+  authentication. No TCP listener, CDP/remote debugging, or arbitrary injected
+  website script participates. The compositor binds only an
+  exactly-one-pending-window/exactly-one-unbound-top-level pair; no activation
+  token is issued or accepted. Additional or ambiguous top-levels fail closed.
   Browser content also fails closed unless GPUI and Brave share an
   importable DMA-BUF format on the selected DRM render node and explicit-sync
   eventfd support. Root SHM content, missing acquire/release points on any
