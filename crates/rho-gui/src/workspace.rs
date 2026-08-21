@@ -7271,14 +7271,12 @@ impl Render for Workspace {
             )
             .on_action(
                 cx.listener(|this, _: &DashboardToggleSubagents, window, cx| {
-                    if !this.dashboard_verb_applies(window, cx)
-                        && !(this.dashboard.is_focused(window, cx)
-                            && this.dashboard.cursor_on_unfiled_header(cx))
+                    if !this.dashboard.is_focused(window, cx)
+                        || !this.dashboard.toggle_subagents(cx)
                     {
                         cx.propagate();
                         return;
                     }
-                    this.dashboard.toggle_subagents(cx);
                     this.refresh_dashboard(window, cx);
                 }),
             )

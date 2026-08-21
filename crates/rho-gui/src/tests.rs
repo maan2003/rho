@@ -3862,6 +3862,36 @@ fn tab_cycles_folds_on_a_staffed_heading(cx: &mut TestAppContext) {
     let expanded = display(cx);
     assert!(expanded.contains("kid stuff"), "expanded: {expanded:?}");
 
+    // The footer advertises `Tab fold`, not `Tab fold only while the
+    // caret is on the title`. A body position still belongs to this
+    // heading and must cycle the same subtree.
+    let body_offset = desk_text.find("body").expect("body offset") + 1;
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.dashboard_editor().update(cx, |editor, cx| {
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    let offset = editor::MultiBufferOffset(body_offset);
+                    selections.select_ranges([offset..offset]);
+                });
+            });
+        })
+        .expect("move caret into heading body");
+    cx.simulate_keystrokes(*workspace, "tab");
+    cx.run_until_parked();
+    let folded_from_body = display(cx);
+    assert!(
+        !folded_from_body.contains("body"),
+        "folded: {folded_from_body:?}"
+    );
+    assert!(
+        !folded_from_body.contains("Kid"),
+        "folded: {folded_from_body:?}"
+    );
+
+    // Restore the expanded state for the append assertion below.
+    cx.simulate_keystrokes(*workspace, "tab tab");
+    cx.run_until_parked();
+
     // `A` on the heading: the position past the concealed tag is not
     // restable, so append lands at the visible title end and the typed
     // text stays ahead of the binding.

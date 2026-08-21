@@ -1576,7 +1576,8 @@ impl Dashboard {
 
     /// Org-style visibility cycling on the heading under the cursor.
     pub fn toggle_subagents(&mut self, cx: &mut Context<Workspace>) -> bool {
-        if let Some(CursorPlace::Row(LineKey::Unfiled(host))) = self.cursor_place(cx) {
+        let cursor_place = self.cursor_place(cx);
+        if let Some(CursorPlace::Row(LineKey::Unfiled(host))) = cursor_place.clone() {
             if !self.collapsed_unfiled.remove(&host) {
                 self.collapsed_unfiled.insert(host);
             }
@@ -1590,6 +1591,21 @@ impl Dashboard {
             return false;
         };
         let headings = parse(&text);
+        if matches!(
+            cursor_place,
+            Some(CursorPlace::Doc(cursor_host, cursor_offset))
+                if cursor_host == host
+                    && headings.iter().any(|heading| {
+                        heading.heading_range.start == offset
+                            && cursor_offset > heading.heading_range.end
+                    })
+        ) {
+            // A fold cannot contain its caret: display synchronization
+            // deliberately lifts such folds. Move a body caret to its
+            // owning heading before cycling so `Tab fold` works from the
+            // whole topic rather than immediately reopening itself.
+            self.cursor_to_doc(host, offset, cx);
+        }
         let current: Vec<(usize, Range<usize>)> = self
             .collapsed_ranges(&[(host, text.clone())], cx)
             .into_iter()
