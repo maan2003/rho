@@ -8,7 +8,7 @@
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta
       http-equiv="Content-Security-Policy"
-      content="default-src 'none'; script-src 'self' 'sha256-i90JJOrYysYSJXSH1b8NxkkWycpsHWTrwTUAgggi6/E=' 'sha256-BOjTiqxIs4mzNFKObCQXNguf+C/s8+CktEKVmBAMkeU=' 'sha256-K0zmEHC2EXARo0aFZERNUpaUkYGhMeFHfPX9DAV1vKk=' 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'self' https: wss:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
+      content="default-src 'none'; script-src 'self' 'sha256-i90JJOrYysYSJXSH1b8NxkkWycpsHWTrwTUAgggi6/E=' 'sha256-y174bdhWBW2bHRj15XlKI4YxtzObvvvok0lVF6AZ4FM=' 'sha256-K0zmEHC2EXARo0aFZERNUpaUkYGhMeFHfPX9DAV1vKk=' 'wasm-unsafe-eval'; worker-src 'self' blob:; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; connect-src 'self' https: wss:; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'"
     />
     <title>Rho</title>
     <!-- GitHub Pages cannot set COOP/COEP response headers. This worker adds
@@ -25,8 +25,8 @@
     </script>
     
 <script type="module">
-import init, * as bindings from './rho-gui-web-5063b621244dba8b.js';
-const wasm = await init({ module_or_path: './rho-gui-web-5063b621244dba8b_bg.wasm' });
+import init, * as bindings from './rho-gui-web-1290994acbfec4c0.js';
+const wasm = await init({ module_or_path: './rho-gui-web-1290994acbfec4c0_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -142,6 +142,6 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
         };
       })();
     </script>
-  <link rel="modulepreload" href="./rho-gui-web-5063b621244dba8b.js" crossorigin="anonymous" integrity="sha384-3ACCY6UCJsPzgwQK6X79DMT2dBlg5Nru4JIC+qOyRV0mQo7h2OlK3mN+UVRRsLpk"><link rel="preload" href="./rho-gui-web-5063b621244dba8b_bg.wasm" crossorigin="anonymous" integrity="sha384-bVJXZRTl+oxCKpGZ5tBA8r2RcMDEryr1LvZ8qzyE6tU+dv0SAidgKICMIKrihyvL" as="fetch" type="application/wasm"></head>
+  <link rel="modulepreload" href="./rho-gui-web-1290994acbfec4c0.js" crossorigin="anonymous" integrity="sha384-3ACCY6UCJsPzgwQK6X79DMT2dBlg5Nru4JIC+qOyRV0mQo7h2OlK3mN+UVRRsLpk"><link rel="preload" href="./rho-gui-web-1290994acbfec4c0_bg.wasm" crossorigin="anonymous" integrity="sha384-72gGn4eBslTL7VTEauNHU3luuSaJJhZKMXkfsBZx50TOqspPXbn1DgIElxYGPd6q" as="fetch" type="application/wasm"></head>
   <body></body>
 </html>
