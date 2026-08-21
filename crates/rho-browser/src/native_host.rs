@@ -160,13 +160,12 @@ fn extension_setup_error() -> String {
         .map(|state| state.join("rho/chromium-extension"));
     match extension {
         Some(extension) => format!(
-            "Rho browser extension did not connect; in chrome://extensions enable Developer mode \
-             and Load unpacked {}",
+            "Rho component extension did not connect from {}; verify the Nix-built Brave wrapper",
             extension.display()
         ),
-        None => "Rho browser extension did not connect; in chrome://extensions enable Developer \
-                 mode and Load unpacked from the Rho client state directory"
-            .to_owned(),
+        None => {
+            "Rho component extension did not connect; verify the Nix-built Brave wrapper".to_owned()
+        }
     }
 }
 
@@ -340,6 +339,14 @@ pub fn write_installation(
         include_str!("../extension/service-worker.js"),
     )?;
     fs::write(
+        extension.join("content-script.js"),
+        include_str!("../extension/content-script.js"),
+    )?;
+    fs::write(
+        extension.join("VIMFX-LICENSE-MIT"),
+        include_str!("../extension/VIMFX-LICENSE-MIT"),
+    )?;
+    fs::write(
         extension.join("parking.html"),
         include_str!("../extension/parking.html"),
     )?;
@@ -425,6 +432,19 @@ mod tests {
         let manifest: Value =
             serde_json::from_slice(&fs::read(extension.join("manifest.json")).unwrap()).unwrap();
         assert_eq!(manifest["manifest_version"], 3);
+        assert_eq!(manifest["content_scripts"][0]["run_at"], "document_start");
+        assert_eq!(manifest["content_scripts"][0]["all_frames"], true);
+        let worker = fs::read_to_string(extension.join("service-worker.js")).unwrap();
+        assert!(worker.contains("chrome.rhoPrivate"));
+        assert!(!worker.contains("chrome.tabGroups"));
+        assert!(!worker.contains("fallbackTabKey"));
+        assert!(!worker.contains("onCommand"));
+        assert!(!worker.contains("completeHints"));
+        let content = fs::read_to_string(extension.join("content-script.js")).unwrap();
+        assert!(content.contains("addEventListener(\"keydown\", onKeyDown, true)"));
+        assert!(!content.contains("__rhoHandleCommand"));
+        assert!(!content.contains("__rhoComponentController"));
+        assert!(extension.join("VIMFX-LICENSE-MIT").is_file());
     }
 
     #[test]

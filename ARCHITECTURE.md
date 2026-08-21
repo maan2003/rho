@@ -144,19 +144,21 @@ than by running a supervisor, extension protocol, or daemon process graph.
   Native web pages are client-local first-class resources owned by `rho-browser`.
   They use extension-generated UUID `PageId`s written in full as Desk tags.
   One embedded MV3 extension owns the durable page registry inside the implicit
-  persistent Brave Origin profile. Rho launches pinned Brave Origin inside a private Bubblewrap
-  mount namespace that overlays `/etc` and masks the host Brave policy directory;
-  a mandatory process-local policy disables Brave consumer services and telemetry
-  without reading or changing host policy.
+  persistent Brave Origin profile. Rho launches the Brave executable selected by
+  the environment but does not own browser policy or profile preferences. The
+  NixOS Home Manager configuration supplies a dedicated wrapper which installs
+  user-level policy into that profile and merges the declarative Brave preferences
+  immediately before launch.
   Brave Origin's `XDG_CONFIG_HOME` is also private to Rho state so its native-messaging
-  manifest and auxiliary product state do not touch the user's Brave config. Rho records
-  Origin's Linux free-tier acceptance in that private profile before first launch so product
-  onboarding cannot replace an extension-owned page.
-  Native vertical tabs are collapsed and hidden until edge hover, the bookmarks
+  manifest and auxiliary product state do not touch the user's Brave config. The
+  Nix-owned profile preferences record Origin's Linux free-tier acceptance so
+  product onboarding cannot replace an extension-owned page.
+  Native vertical tabs are collapsed and fully hidden, the bookmarks
   bar and saved-group row are hidden, and the address toolbar remains visible.
-  `chrome.storage.local` retains page metadata and
-  one single-tab group titled `rho:<uuid>` attaches the ID to Brave's restored
-  tab and navigation history. Runtime tab and group IDs are never persisted.
+  `chrome.storage.local` retains page metadata while the allowlisted
+  `rhoPrivate.tabs` API attaches the UUID to browser-owned tab data. Session
+  restore persists that value in `SessionTab.extra_data`; runtime tab IDs are
+  never persisted and no tab groups encode Rho state.
   The current set of `:web-<uuid>:` Desk tags is authoritative. After the
   browser starts and whenever that set changes, the GUI schedules extension
   pages that no Desk document references for collection after a ten-minute
@@ -185,16 +187,26 @@ than by running a supervisor, extension protocol, or daemon process graph.
   leaves registered page tabs auto-discardable and mandatory browser policy
   enables Brave's maximum-savings Memory Saver mode. Brave therefore applies
   its native eligibility checks and discards eligible background pages after
-  its aggressive inactivity interval, while retaining every page's tab, group,
+  its aggressive inactivity interval, while retaining every page's tab,
   history, and durable metadata.
+  Rho's custom Brave build registers the bundled control plane from the
+  client-state directory as a component extension, so its HTTP(S) worker and
+  page agent can change without rebuilding Brave. Each document-start content
+  script owns its Normal, Ignore, count, prefix, and Hints state and installs an
+  isolated-world capture listener on `window`. It synchronously consumes Vim
+  commands; unmatched keys and editable controls retain the original trusted
+  browser event. The same agent performs scrolling, focus, hint discovery, and
+  hint activation. `i` enters Ignore mode and Shift-Escape leaves it, while
+  Ctrl-Shift-Escape remains the compositor escape hatch back to the Desk.
+  Browser-native history and reload requests go through the component worker.
   The extension emits URL-free tab lifecycle diagnostics (focus, replacement,
   removal, loading, freezing, and discarding) through the native bridge so a
   browser-level unload can be distinguished from a website player reset.
-  The compositor issues one XDG activation token for the singleton toplevel and
-  retains the unambiguous first-window fallback for Chromium-family builds that
-  omit it. Extension native messaging reaches `rho-gui` through a tiny stdio
+  The compositor binds the sole unbound XDG top-level directly to the sole
+  browser session; no activation token or multi-window routing participates.
+  Extension native messaging reaches `rho-gui` through a tiny stdio
   relay and a mode-0600 Unix socket under `XDG_RUNTIME_DIR`; no TCP listener,
-  CDP, remote debugging, content script, or website injection participates.
+  CDP, remote debugging, or arbitrary website injection participates.
   Browser content is composed directly in GPUI/WGPU from an atomic Wayland
   surface-tree scene. Every DMA-BUF surface has explicit acquire/release
   synchronization, and GPUI retains each imported Vulkan image while its page

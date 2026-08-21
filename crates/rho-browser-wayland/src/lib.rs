@@ -71,7 +71,6 @@ use smithay::wayland::fractional_scale::{
 use smithay::wayland::pointer_gestures::PointerGesturesState;
 use smithay::wayland::viewporter::ViewporterState;
 use smithay::wayland::viewporter::ViewportCachedState;
-use smithay::wayland::xdg_activation::{XdgActivationHandler, XdgActivationState, XdgActivationToken, XdgActivationTokenData};
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
 use smithay::wayland::shell::xdg::{
     Configure, PopupSurface, PositionerState, SurfaceCachedState as XdgSurfaceCachedState,
@@ -82,7 +81,7 @@ use smithay::wayland::tablet_manager::TabletSeatHandler;
 use smithay::{
     delegate_cursor_shape, delegate_dmabuf, delegate_drm_syncobj, delegate_fractional_scale,
     delegate_output, delegate_pointer_gestures, delegate_seat, delegate_shm, delegate_viewporter,
-    delegate_xdg_activation, delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_xdg_decoration, delegate_xdg_shell,
 };
 
 const MAX_POPUP_BYTES: usize = 16 * 1024 * 1024;
@@ -488,7 +487,6 @@ enum RuntimeCommand<K> {
         id: K,
         size: (u32, u32),
         events: BrowserEventSender,
-        activation_reply: mpsc::SyncSender<String>,
     },
     Page(K, PageCommand),
     Shutdown,
@@ -532,23 +530,13 @@ impl<K: BrowserPageKey> BrowserCompositor<K> {
             bail!("browser dimensions must be nonzero")
         };
         let (events, rx) = browser_event_channel();
-        let (activation_reply, activation_rx) = mpsc::sync_channel(1);
         self.commands
-            .send(RuntimeCommand::Open {
-                id,
-                size,
-                events,
-                activation_reply,
-            })
+            .send(RuntimeCommand::Open { id, size, events })
             .map_err(|_| anyhow::anyhow!("browser compositor stopped"))?;
-        let activation_token = activation_rx
-            .recv_timeout(Duration::from_secs(2))
-            .context("browser compositor did not issue an activation token")?;
         Ok(BrowserSession {
             id,
             commands: self.commands.clone(),
             events: rx,
-            activation_token,
         })
     }
 }
@@ -564,14 +552,10 @@ pub struct BrowserSession<K: BrowserPageKey> {
     id: K,
     commands: channel::Sender<RuntimeCommand<K>>,
     events: BrowserEventReceiver,
-    activation_token: String,
 }
 impl<K: BrowserPageKey> BrowserSession<K> {
     fn send(&self, c: PageCommand) {
         let _ = self.commands.send(RuntimeCommand::Page(self.id, c));
-    }
-    pub fn activation_token(&self) -> &str {
-        &self.activation_token
     }
     pub fn resize(&self, w: u32, h: u32, scale: f32) {
         if w > 0 && h > 0 && scale.is_finite() && scale > 0.0 {
@@ -698,7 +682,6 @@ struct State<K: BrowserPageKey> {
     display_handle: DisplayHandle,
     compositor: CompositorState,
     shell: XdgShellState,
-    activation: XdgActivationState,
     _decoration: XdgDecorationState,
     shm: ShmState,
     dmabuf: DmabufState,
@@ -718,10 +701,7 @@ struct State<K: BrowserPageKey> {
     serial: u32,
     started: Instant,
     windows: HashMap<K, WindowState>,
-    activation_windows: HashMap<String, K>,
     unbound_toplevels: HashMap<ObjectId, (ToplevelSurface, Instant)>,
-    pending_activations: HashMap<ObjectId, K>,
-    allow_initial_unambiguous_toplevel: bool,
     surface_windows: HashMap<ObjectId, K>,
     next_buffer_id: u64,
     commands: channel::Sender<RuntimeCommand<K>>,
@@ -1510,9 +1490,6 @@ impl<K: BrowserPageKey> State<K> {
             self.windows.get_mut(&id).expect("pending window exists"),
             serial,
         );
-        self.allow_initial_unambiguous_toplevel = false;
-        self.activation_windows
-            .retain(|_, window_id| *window_id != id);
         self.windows[&id].events.send(BrowserEvent::ToplevelReady);
         let keyboard = self.keyboard.clone();
         let serial = self.next_serial();
@@ -1524,9 +1501,6 @@ impl<K: BrowserPageKey> State<K> {
     }
 
     fn bind_unambiguous_toplevel(&mut self) {
-        if !self.allow_initial_unambiguous_toplevel {
-            return;
-        }
         let roots = self.unbound_toplevels.keys().cloned().collect::<Vec<_>>();
         let windows = self
             .windows
@@ -1535,25 +1509,11 @@ impl<K: BrowserPageKey> State<K> {
             .map(|(&id, _)| id)
             .collect::<Vec<_>>();
         if roots.len() > 1 || windows.len() > 1 {
-            self.allow_initial_unambiguous_toplevel = false;
             return;
         }
         let ([root], [id]) = (roots.as_slice(), windows.as_slice()) else {
             return;
         };
-        if self.pending_activations.contains_key(root) {
-            return;
-        }
-        if self.unbound_toplevels[root].1.elapsed() < Duration::from_millis(250) {
-            return;
-        }
-        if self
-            .pending_activations
-            .values()
-            .any(|pending| pending == id)
-        {
-            return;
-        }
         self.bind_toplevel(*id, root.clone());
     }
 }
@@ -1674,7 +1634,6 @@ impl<K: BrowserPageKey> CompositorHandler for State<K> {
     fn destroyed(&mut self, surface: &WlSurface) {
         let Some(id) = self.window_id_for_surface(surface) else {
             self.unbound_toplevels.remove(&surface.id());
-            self.pending_activations.remove(&surface.id());
             return;
         };
         let is_root = self
@@ -1714,9 +1673,7 @@ impl<K: BrowserPageKey> XdgShellHandler for State<K> {
         self.unbound_toplevels
             .insert(root.clone(), (surface, created));
         schedule_toplevel_deadlines(self, root.clone(), created);
-        if let Some(id) = self.pending_activations.remove(&root) {
-            self.bind_toplevel(id, root);
-        }
+        self.bind_unambiguous_toplevel();
     }
 
     fn ack_configure(&mut self, surface: WlSurface, configure: Configure) {
@@ -1754,7 +1711,6 @@ impl<K: BrowserPageKey> XdgShellHandler for State<K> {
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         let root = surface.wl_surface().id();
         self.unbound_toplevels.remove(&root);
-        self.pending_activations.remove(&root);
         if let Some(id) = self.surface_windows.remove(&root)
             && let Some(w) = self.windows.remove(&id)
         {
@@ -1859,30 +1815,6 @@ impl<K: BrowserPageKey> XdgShellHandler for State<K> {
         };
         self.constrain_popup(window_id, &surface, positioner);
         surface.send_repositioned(token);
-    }
-}
-
-impl<K: BrowserPageKey> XdgActivationHandler for State<K> {
-    fn activation_state(&mut self) -> &mut XdgActivationState {
-        &mut self.activation
-    }
-    fn request_activation(
-        &mut self,
-        token: XdgActivationToken,
-        _data: XdgActivationTokenData,
-        surface: WlSurface,
-    ) {
-        let Some(id) = self.activation_windows.get(&token.to_string()).copied() else {
-            return;
-        };
-        self.allow_initial_unambiguous_toplevel = false;
-        self.activation.remove_token(&token);
-        let root = surface.id();
-        if self.unbound_toplevels.contains_key(&root) {
-            self.bind_toplevel(id, root);
-        } else {
-            self.pending_activations.insert(root, id);
-        }
     }
 }
 
@@ -2062,7 +1994,6 @@ smithay::reexports::wayland_server::delegate_dispatch!(@<K: BrowserPageKey> Stat
     smithay::reexports::wayland_server::protocol::wl_subcompositor::WlSubcompositor: ()
 ] => CompositorState);
 delegate_xdg_shell!(@<K: BrowserPageKey> State<K>);
-delegate_xdg_activation!(@<K: BrowserPageKey> State<K>);
 delegate_xdg_decoration!(@<K: BrowserPageKey> State<K>);
 delegate_shm!(@<K: BrowserPageKey> State<K>);
 delegate_dmabuf!(@<K: BrowserPageKey> State<K>);
@@ -2250,7 +2181,6 @@ fn run<K: BrowserPageKey>(
         display_handle: dh.clone(),
         compositor: CompositorState::new::<State<K>>(&dh),
         shell: XdgShellState::new::<State<K>>(&dh),
-        activation: XdgActivationState::new::<State<K>>(&dh),
         _decoration: XdgDecorationState::new::<State<K>>(&dh),
         shm: ShmState::new::<State<K>>(&dh, vec![]),
         dmabuf,
@@ -2270,10 +2200,7 @@ fn run<K: BrowserPageKey>(
         serial: 1,
         started: Instant::now(),
         windows: HashMap::new(),
-        activation_windows: HashMap::new(),
         unbound_toplevels: HashMap::new(),
-        pending_activations: HashMap::new(),
-        allow_initial_unambiguous_toplevel: true,
         surface_windows: HashMap::new(),
         next_buffer_id: 1,
         commands: sender,
@@ -2350,17 +2277,7 @@ fn handle_runtime_command<K: BrowserPageKey>(
     command: RuntimeCommand<K>,
 ) -> bool {
     match command {
-        RuntimeCommand::Open {
-            id,
-            size,
-            events,
-            activation_reply,
-        } => {
-            let activation_token = state.activation.create_external_token(None).0.to_string();
-            state
-                .activation_windows
-                .insert(activation_token.clone(), id);
-            let _ = activation_reply.send(activation_token);
+        RuntimeCommand::Open { id, size, events } => {
             state.windows.insert(
                 id,
                 WindowState {
@@ -2416,15 +2333,9 @@ fn schedule_window_expiry<K: BrowserPageKey>(state: &State<K>, id: K) {
             if !still_pending {
                 return TimeoutAction::Drop;
             }
-            state
-                .activation_windows
-                .retain(|_, window_id| *window_id != id);
-            state
-                .pending_activations
-                .retain(|_, window_id| *window_id != id);
             if let Some(window) = state.windows.remove(&id) {
                 window.events.send(BrowserEvent::Failed(
-                    "Chromium did not provide an unambiguous activated window".into(),
+                    "Chromium did not provide an unambiguous top-level window".into(),
                 ));
             }
             let _ = state.display_handle.flush_clients();
@@ -2438,21 +2349,6 @@ fn schedule_toplevel_deadlines<K: BrowserPageKey>(
     root: ObjectId,
     created: Instant,
 ) {
-    let fallback_root = root.clone();
-    let _ = state.loop_handle.insert_source(
-        Timer::from_duration(Duration::from_millis(250)),
-        move |_, _, state| {
-            if state
-                .unbound_toplevels
-                .get(&fallback_root)
-                .is_some_and(|(_, current)| *current == created)
-            {
-                state.bind_unambiguous_toplevel();
-                let _ = state.display_handle.flush_clients();
-            }
-            TimeoutAction::Drop
-        },
-    );
     let _ = state.loop_handle.insert_source(
         Timer::from_duration(Duration::from_secs(10)),
         move |_, _, state| {
@@ -2536,8 +2432,6 @@ fn handle_page_command<K: BrowserPageKey>(state: &mut State<K>, id: K, c: PageCo
             }
         }
         PageCommand::Close => {
-            state.activation_windows.retain(|_, v| *v != id);
-            state.pending_activations.retain(|_, v| *v != id);
             if let Some(window) = state.windows.get_mut(&id) {
                 window.pending_input.clear();
             }
@@ -3217,20 +3111,6 @@ fn send_frame_callbacks(window: &mut WindowState, time: u32, commit_id: u64) {
     }
 }
 
-/// Resolves the stock browser wrapper without ever selecting an underlying ELF.
-pub fn chrome_wrapper() -> OsString {
-    std::env::var_os("RHO_CHROME_BIN").unwrap_or_else(|| {
-        option_env!("RHO_BRAVE_BIN").map_or_else(|| OsString::from("brave-origin"), OsString::from)
-    })
-}
-
-/// Resolves Bubblewrap for the private Brave policy mount namespace.
-pub fn bubblewrap_wrapper() -> OsString {
-    std::env::var_os("RHO_BWRAP_BIN").unwrap_or_else(|| {
-        option_env!("RHO_BWRAP_BIN").map_or_else(|| OsString::from("bwrap"), OsString::from)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -3260,16 +3140,6 @@ mod tests {
         let mut argb = [32, 64, 96, 128, 10, 20, 30, 0, 3, 2, 1, 255];
         normalize_shm_pixels(wl_shm::Format::Argb8888, &mut argb);
         assert_eq!(argb, [64, 128, 191, 128, 0, 0, 0, 0, 3, 2, 1, 255]);
-    }
-
-    #[test]
-    fn browser_wrappers_have_safe_defaults() {
-        if std::env::var_os("RHO_CHROME_BIN").is_none() && option_env!("RHO_BRAVE_BIN").is_none() {
-            assert_eq!(chrome_wrapper(), "brave-origin");
-        }
-        if std::env::var_os("RHO_BWRAP_BIN").is_none() && option_env!("RHO_BWRAP_BIN").is_none() {
-            assert_eq!(bubblewrap_wrapper(), "bwrap");
-        }
     }
 
     #[test]

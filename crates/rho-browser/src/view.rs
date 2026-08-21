@@ -8,11 +8,11 @@ use std::sync::Arc;
 use anyhow::{Context as _, Result};
 use gpui::{
     AppContext as _, Context, CursorStyle, Entity, EntityId, FocusHandle, Focusable,
-    InteractiveElement as _, IntoElement, LinuxAxisRelativeDirection, LinuxAxisSource,
-    LinuxDmaBufSurface, LinuxPinchEvent, LinuxPointerAxisEvent, MouseButton, MouseDownEvent,
-    MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement as _, PhysicalKey, PhysicalKeyEvent,
-    Render, RenderImage, StatefulInteractiveElement as _, Styled as _, StyledImage as _,
-    Subscription, Task, Window, canvas, div, img, px, surface,
+    InteractiveElement as _, IntoElement, KeyDownEvent, LinuxAxisRelativeDirection,
+    LinuxAxisSource, LinuxDmaBufSurface, LinuxPinchEvent, LinuxPointerAxisEvent, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement as _, PhysicalKey,
+    PhysicalKeyEvent, Render, RenderImage, StatefulInteractiveElement as _, Styled as _,
+    StyledImage as _, Subscription, Task, Window, canvas, div, img, px, surface,
 };
 use image::{Frame, RgbaImage};
 use rho_browser_wayland::{
@@ -510,11 +510,7 @@ impl BrowserModel {
         page: PageId,
         cx: &mut Context<Self>,
     ) -> Option<u64> {
-        let in_progress = self.owns_page(owner, page)
-            && self
-                .handoff
-                .is_some_and(|handoff| handoff.phase != HandoffPhase::Ready);
-        if !in_progress {
+        if !self.owns_page(owner, page) {
             self.claim_presentation(owner, page, cx);
         }
         self.handoff
@@ -894,6 +890,7 @@ pub struct BrowserView {
     origin: Rc<Cell<(f32, f32)>>,
     last_pointer_position: (f64, f64),
     pressed_keys: HashSet<u32>,
+    pending_key: Option<(u32, Option<u64>)>,
     pressed_buttons: HashSet<u32>,
     queued_input: Option<QueuedInput>,
     claiming_pointer_focus: bool,
@@ -921,6 +918,7 @@ impl BrowserView {
             origin: Rc::new(Cell::new((0.0, 0.0))),
             last_pointer_position: (0.0, 0.0),
             pressed_keys: HashSet::new(),
+            pending_key: None,
             pressed_buttons: HashSet::new(),
             queued_input: None,
             claiming_pointer_focus: false,
@@ -1177,18 +1175,21 @@ impl BrowserView {
     ) {
         let PhysicalKey::LinuxEvdev(keycode) = event.key;
         let presents = self.model.read(cx).presents(self.owner_id, self.page_id);
-        if !event.pressed {
-            if self.queue_key_release(keycode) {
-                cx.stop_propagation();
-                return;
+        if event.pressed && !is_modifier_keycode(keycode) {
+            let generation = if self.queued_input.is_some() || !presents {
+                self.claim_for_input(false, window, cx)
+            } else {
+                None
+            };
+            if let Some(previous) = self.pending_key.replace((keycode, generation))
+                && previous.0 != keycode
+            {
+                self.forward_key_press(previous.0, previous.1, cx);
             }
-            if !presents {
-                self.pressed_keys.remove(&keycode);
-                cx.stop_propagation();
-                return;
-            }
+            cx.stop_propagation();
+            return;
         }
-        if self.queued_input.is_some() || !presents {
+        if event.pressed && (self.queued_input.is_some() || !presents) {
             if let Some(generation) = self.claim_for_input(false, window, cx) {
                 self.queue_input_event(
                     generation,
@@ -1205,10 +1206,51 @@ impl BrowserView {
             if !self.pressed_keys.contains(&keycode) && self.model.read(cx).key(keycode, true) {
                 self.pressed_keys.insert(keycode);
             }
+            cx.stop_propagation();
+            return;
+        }
+
+        if self.pending_key.is_some_and(|pending| pending.0 == keycode) {
+            let (_, generation) = self.pending_key.take().unwrap();
+            self.forward_key_press(keycode, generation, cx);
+            if !self.queue_key_release(keycode) && self.pressed_keys.remove(&keycode) {
+                self.model.read(cx).key(keycode, false);
+            }
+        } else if self.queue_key_release(keycode) {
+            // The matching press will be replayed after the handoff.
+        } else if !presents {
+            self.pressed_keys.remove(&keycode);
         } else if self.pressed_keys.remove(&keycode) {
             self.model.read(cx).key(keycode, false);
         }
         cx.stop_propagation();
+    }
+
+    fn key_down(&mut self, event: &KeyDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if event.is_held {
+            cx.stop_propagation();
+            return;
+        }
+        let Some((keycode, generation)) = self.pending_key.take() else {
+            cx.stop_propagation();
+            return;
+        };
+        self.forward_key_press(keycode, generation, cx);
+        cx.stop_propagation();
+    }
+
+    fn forward_key_press(&mut self, keycode: u32, generation: Option<u64>, cx: &mut Context<Self>) {
+        if let Some(generation) = generation {
+            self.queue_input_event(
+                generation,
+                QueuedInputEvent::Key {
+                    keycode,
+                    pressed: true,
+                },
+            );
+        } else if !self.pressed_keys.contains(&keycode) && self.model.read(cx).key(keycode, true) {
+            self.pressed_keys.insert(keycode);
+        }
     }
 
     fn hover_changed(&mut self, hovered: &bool, _: &mut Window, cx: &mut Context<Self>) {
@@ -1263,6 +1305,7 @@ impl BrowserView {
 
     fn release_input(&mut self, cx: &mut Context<Self>) {
         self.queued_input = None;
+        self.pending_key = None;
         self.claiming_pointer_focus = false;
         let model = self.model.read(cx);
         let presents = model.presents(self.owner_id, self.page_id);
@@ -1344,6 +1387,10 @@ fn linux_button(button: MouseButton) -> u32 {
         MouseButton::Middle => 0x112,
         MouseButton::Navigate(_) => 0x113,
     }
+}
+
+fn is_modifier_keycode(keycode: u32) -> bool {
+    matches!(keycode, 29 | 42 | 54 | 56 | 58 | 69 | 97 | 100 | 125 | 126)
 }
 
 fn axis_direction(direction: LinuxAxisRelativeDirection) -> PointerAxisDirection {
@@ -1580,7 +1627,7 @@ impl Render for BrowserView {
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .on_pinch(|_, _, cx| cx.stop_propagation())
             .on_physical_key(cx.listener(Self::physical_key))
-            .on_key_down(|_, _, cx| cx.stop_propagation())
+            .on_key_down(cx.listener(Self::key_down))
             .on_key_up(|_, _, cx| cx.stop_propagation())
             .size_full()
             .relative()

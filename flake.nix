@@ -41,12 +41,6 @@
             flakebox.overlays.default
           ];
         };
-        # Brave does not publish an Intel macOS Origin archive. Keep that
-        # existing flake target evaluable with regular Brave until it does.
-        browserPackage =
-          if system == "x86_64-darwin" then pkgs.brave else pkgs.brave-origin;
-        browserProgram = pkgs.lib.getExe browserPackage;
-
         projectName = "rho";
         octoGit = pkgs.git.overrideAttrs (old: {
           patches = (old.patches or [ ]) ++ [
@@ -378,8 +372,6 @@
               env.RHO_WAYLAND_GRIM = "${pkgs.grim}/bin/grim";
               env.RHO_WAYLAND_WTYPE = "${pkgs.wtype}/bin/wtype";
               env.RHO_WAYLAND_VK_DRIVER_FILES = "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.${pkgs.stdenv.hostPlatform.parsed.cpu.name}.json";
-              env.RHO_BRAVE_BIN = browserProgram;
-              env.RHO_BWRAP_BIN = "${pkgs.bubblewrap}/bin/bwrap";
               env.LK_CUSTOM_WEBRTC = webrtcPrebuilt;
               env.RUSTY_V8_ARCHIVE = rustyV8Archive;
               postPatch = ''
@@ -563,13 +555,9 @@
           RHO_WAYLAND_GRIM = "${pkgs.grim}/bin/grim";
           RHO_WAYLAND_WTYPE = "${pkgs.wtype}/bin/wtype";
           RHO_WAYLAND_VK_DRIVER_FILES = "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.${pkgs.stdenv.hostPlatform.parsed.cpu.name}.json";
-          RHO_BRAVE_BIN = browserProgram;
-          RHO_BWRAP_BIN = "${pkgs.bubblewrap}/bin/bwrap";
           packages = [
             selfciMq
             pkgs.cargo-nextest
-            browserPackage
-            pkgs.bubblewrap
             pkgs.clang
             pkgs.cmake
             pkgs.pkg-config

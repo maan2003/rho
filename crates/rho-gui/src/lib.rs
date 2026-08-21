@@ -192,7 +192,14 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             Some("RhoGui > Editor && vim_mode == insert"),
         ),
         KeyBinding::new("ctrl-shift-v", PastePrompt, Some("RhoGui > Editor")),
-        KeyBinding::new("shift-escape", BrowserExit, Some("RhoGui > RhoBrowser")),
+        // Shift-Escape belongs to the VimFx-style browser layer: it leaves
+        // Ignore mode. Keep one explicit Rho escape hatch outside that
+        // vocabulary for returning to the Desk from any website.
+        KeyBinding::new(
+            "ctrl-shift-escape",
+            BrowserExit,
+            Some("RhoGui > RhoBrowser"),
+        ),
         KeyBinding::new("ctrl-alt-shift-p", UploadGuiTelemetry, Some("RhoGui")),
         // A Comint-style shell submits complete input lines to the daemon;
         // its transcript remains an ordinary Vim-navigable editor buffer.
