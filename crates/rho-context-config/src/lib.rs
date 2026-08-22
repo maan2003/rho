@@ -60,12 +60,26 @@ const DISCOVERY_WARNING_AFTER: Duration = Duration::from_millis(100);
 const DISCOVERY_ERROR_AFTER: Duration = Duration::from_secs(1);
 const BUNDLED_SKILLS_DIR: Option<&str> = option_env!("RHO_BUNDLED_SKILLS_DIR");
 
+/// Bundled skills live at the compile-time path when one was embedded (the
+/// Nix package build), otherwise at `../share/rho/skills` relative to the
+/// running executable so relocatable binary distributions find their own
+/// copy.
+fn bundled_skills_dir() -> Option<PathBuf> {
+    if let Some(dir) = BUNDLED_SKILLS_DIR {
+        return Some(PathBuf::from(dir));
+    }
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?.parent()?.join("share/rho/skills");
+    dir.is_dir().then_some(dir)
+}
+
 impl DiscoveredContext {
     pub fn discover(visible_repo_root: &Utf8Path, checkout_root: &Utf8Path) -> Self {
         let mut budget = DiscoveryBudget::new();
         let config_dir = dirs::config_dir();
         let config_dir = config_dir.as_deref();
-        let bundled_skills_dir = BUNDLED_SKILLS_DIR.map(Path::new);
+        let bundled_skills_dir = bundled_skills_dir();
+        let bundled_skills_dir = bundled_skills_dir.as_deref();
         let agents_candidates = agents_md_candidates(visible_repo_root, checkout_root, config_dir);
         let (agents_files, mut diagnostics) =
             discover_agents_md_from_candidates(&agents_candidates, &mut budget);
