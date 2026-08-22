@@ -203,8 +203,16 @@ than by running a supervisor, extension protocol, or daemon process graph.
   Extension native messaging reaches `rho-gui` through a tiny stdio
   relay and a mode-0600 Unix socket under `XDG_RUNTIME_DIR`; no TCP listener,
   CDP, remote debugging, or arbitrary website injection participates.
-  Browser content is composed directly in GPUI/WGPU from an atomic Wayland
-  surface-tree scene. Every DMA-BUF surface has explicit acquire/release
+  Browser content defaults to composition in GPUI/WGPU from an atomic Wayland
+  surface-tree scene. `RHO_BROWSER_PASSTHROUGH=1` enables the guarded fast path:
+  a single full-rect, untransformed DMA-BUF scene is attached directly to a
+  desynchronized host Wayland subsurface below the GPUI root, with an ordered
+  alpha hole at the portal's paint position. A dedicated queue and thread own
+  the child protocols, and outer explicit synchronization retains exactly-once
+  buffer release. Promotion keeps a distinct previous texture visible until the
+  child is presented; other scene shapes demote to the texture path. Real host
+  frame and presentation events are then relayed to Chromium for the exact
+  nested scene. Every DMA-BUF surface has explicit acquire/release
   synchronization, and GPUI retains each imported Vulkan image while its page
   model owns the lease; Smithay does not render or flatten the tree. Synchronized
   subsurface commits are reconciled only at their transaction anchor and the
@@ -217,8 +225,8 @@ than by running a supervisor, extension protocol, or daemon process graph.
   the compositor validates and snapshots ARGB/XRGB rows into owned memory for
   GPUI/WGPU upload. Pointer hit-testing uses
   the same versioned scene, stacking order, geometry, and input regions. Wayland
-  overlay delegation remains disabled so every visible client surface follows
-  this single composition path.
+  overlay delegation remains disabled; passthrough is a Rho compositor choice,
+  not Chromium overlay delegation.
   The isolated `rho wayland` QA driver has a software-only exception for hosts
   without a Vulkan DRM render node. It advertises neither DMA-BUF nor
   DRM-syncobj to Brave, accepts the root through the existing checked,
@@ -228,11 +236,10 @@ than by running a supervisor, extension protocol, or daemon process graph.
   or explicit synchronization.
   The compositor is wake-driven, advertises per-surface fractional scale and a
   viewporter while keeping its shared synthetic output stable, and forwards
-  raw physical keys, pointer axes, and pinch phases to Brave. Finger-axis source
-  timestamps are translated into the nested compositor clock, and queued frames
-  are paced at their original cadence so Chromium cannot infer a false fling
-  velocity while the compositor catches up. A per-window input FIFO prevents
-  later motion, button, pinch, or key events from overtaking those frames;
+  raw physical keys, pointer axes, and pinch phases to Brave. Input timestamps
+  use the shared host `CLOCK_MONOTONIC` millisecond domain and the compositor
+  drains its per-window FIFO immediately in arrival order, so later motion,
+  button, pinch, or key events cannot overtake earlier input;
   queued motions resolve their painted-scene target before scene history is
   pruned. Tab focus and removal atomically freeze input admission, drain the FIFO,
   synthesize releases from compositor-owned input state, and wait for an

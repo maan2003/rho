@@ -163,13 +163,18 @@ AI APIs.
   eventfd support. Root SHM content, missing acquire/release points on any
   DMA-BUF surface, unsupported buffer transforms, and non-SHM/non-DMA-BUF
   ancillary buffers are rejected rather than displayed under a guessed mapping.
+  The opt-in host-subsurface passthrough additionally requires the host to
+  advertise the exact DMA-BUF format/modifier and Linux explicit synchronization;
+  fenced releases are not returned to Brave until their sync files signal.
   Synchronized commits are published as one versioned surface tree, preventing
   buffers or hit-test geometry from different Wayland transactions from mixing.
   Ancillary SHM buffers are the bounded exception: only ARGB8888 and XRGB8888
   rows with checked dimensions, stride, pool range, per-surface size, and total
   scene size are copied into owned memory and released immediately. GPUI/WGPU
   performs the only rendering; Smithay retains protocol, popup/grab, and input
-  state but does not render browser pixels.
+  state but does not render browser pixels. With `RHO_BROWSER_PASSTHROUGH=1`, an
+  eligible single-node DMA-BUF is instead sampled by the host compositor through
+  a below-parent subsurface; all other scenes retain the GPUI/WGPU path.
 - Long-running `exec_command` processes are retained only in their owning
   agent's in-memory command-session table. `write_stdin` requires that local
   numeric session id; waits are capped at five minutes and dropping the agent
