@@ -640,10 +640,7 @@ struct WindowState {
     pointer_frames: HashMap<u64, PointerFrame>,
     hit_scenes: HashMap<u64, Vec<HitNode>>,
     pointer_location: (f64, f64),
-    axis_clock_anchor: Option<(u32, u32)>,
     pending_input: VecDeque<OrderedInput>,
-    last_axis_delivery: Option<(u32, Instant)>,
-    input_timer_pending: bool,
     input_freeze: Option<u64>,
     active_finger_axes: (bool, bool),
     last_finger_axis_time: u32,
@@ -699,7 +696,6 @@ struct State<K: BrowserPageKey> {
     keyboard: KeyboardHandle<Self>,
     pointer: PointerHandle<Self>,
     serial: u32,
-    started: Instant,
     windows: HashMap<K, WindowState>,
     unbound_toplevels: HashMap<ObjectId, (ToplevelSurface, Instant)>,
     surface_windows: HashMap<ObjectId, K>,
@@ -752,6 +748,18 @@ struct MappedSurface {
 struct SurfaceTreeSnapshot {
     nodes: Vec<SceneNode>,
     hits: Vec<HitNode>,
+}
+
+fn monotonic_time_ms() -> u32 {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // CLOCK_MONOTONIC is also the clock used by the outer Wayland compositor
+    // for input event timestamps.
+    let result = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
+    assert_eq!(result, 0, "CLOCK_MONOTONIC must be available on Linux");
+    (time.tv_sec as u64 * 1_000 + time.tv_nsec as u64 / 1_000_000) as u32
 }
 
 fn normalize_shm_pixels(format: wl_shm::Format, pixels: &mut [u8]) {
@@ -971,7 +979,7 @@ impl<K: BrowserPageKey> State<K> {
     }
 
     fn time(&self) -> u32 {
-        self.started.elapsed().as_millis() as u32
+        monotonic_time_ms()
     }
     fn window_id_for_surface(&self, surface: &WlSurface) -> Option<K> {
         let mut root = surface.clone();
@@ -2198,7 +2206,6 @@ fn run<K: BrowserPageKey>(
         keyboard,
         pointer,
         serial: 1,
-        started: Instant::now(),
         windows: HashMap::new(),
         unbound_toplevels: HashMap::new(),
         surface_windows: HashMap::new(),
@@ -2289,10 +2296,7 @@ fn handle_runtime_command<K: BrowserPageKey>(
                     pointer_frames: HashMap::new(),
                     hit_scenes: HashMap::new(),
                     pointer_location: (0.0, 0.0),
-                    axis_clock_anchor: None,
                     pending_input: VecDeque::new(),
-                    last_axis_delivery: None,
-                    input_timer_pending: false,
                     input_freeze: None,
                     active_finger_axes: (false, false),
                     last_finger_axis_time: 0,
@@ -2726,103 +2730,18 @@ fn pointer_leave_motion(location: (f64, f64)) -> ResolvedPointerMotion {
     }
 }
 
-const FLING_VELOCITY_WINDOW: Duration = Duration::from_millis(200);
-
-fn axis_pacing_delay(
-    previous: Option<(u32, Instant)>,
-    next: &PointerAxisFrame,
-    now: Instant,
-) -> Duration {
-    if next.source != PointerAxisSource::Finger {
-        return Duration::ZERO;
-    }
-    let Some((previous_time, delivered_at)) = previous else {
-        return Duration::ZERO;
-    };
-    let source_interval = Duration::from_millis(u64::from(next.time.wrapping_sub(previous_time)));
-    if source_interval > FLING_VELOCITY_WINDOW {
-        return Duration::ZERO;
-    }
-    (delivered_at + source_interval).saturating_duration_since(now)
-}
-
-fn input_pacing_delay(
-    previous: Option<(u32, Instant)>,
-    next: &OrderedInput,
-    now: Instant,
-) -> Duration {
-    match next {
-        OrderedInput::PointerAxis(frame) => axis_pacing_delay(previous, frame, now),
-        _ => Duration::ZERO,
-    }
-}
-
-fn dequeue_ready_input(
-    pending: &mut VecDeque<OrderedInput>,
-    previous: Option<(u32, Instant)>,
-    now: Instant,
-) -> Result<Option<OrderedInput>, Duration> {
-    let Some(next) = pending.front() else {
-        return Ok(None);
-    };
-    let delay = input_pacing_delay(previous, next, now);
-    if delay.is_zero() {
-        Ok(pending.pop_front())
-    } else {
-        Err(delay)
-    }
+fn dequeue_ready_input(pending: &mut VecDeque<OrderedInput>) -> Option<OrderedInput> {
+    pending.pop_front()
 }
 
 fn schedule_input_delivery<K: BrowserPageKey>(state: &mut State<K>, id: K) {
     loop {
-        let now = Instant::now();
-        let Some(window) = state.windows.get_mut(&id) else {
-            return;
-        };
-        if window.input_timer_pending {
-            return;
-        }
-        let delay =
-            match dequeue_ready_input(&mut window.pending_input, window.last_axis_delivery, now) {
-                Ok(Some(input)) => {
-                    deliver_input(state, id, input);
-                    continue;
-                }
-                Ok(None) => return,
-                Err(delay) => delay,
-            };
-        window.input_timer_pending = true;
-        tracing::debug!(
-            delay_ms = delay.as_secs_f64() * 1000.0,
-            queued = window.pending_input.len(),
-            "pacing ordered browser input behind touchpad axis frames"
-        );
-        let handle = state.loop_handle.clone();
-        let opened_at = window.opened_at;
-        let registration = handle.insert_source(Timer::from_duration(delay), move |_, _, state| {
-            let Some(window) = state
-                .windows
-                .get_mut(&id)
-                .filter(|window| window.opened_at == opened_at)
-            else {
-                return TimeoutAction::Drop;
-            };
-            window.input_timer_pending = false;
-            schedule_input_delivery(state, id);
-            let _ = state.display_handle.flush_clients();
-            TimeoutAction::Drop
-        });
-        if registration.is_err() {
-            let event = state.windows.get_mut(&id).and_then(|window| {
-                window.input_timer_pending = false;
-                window.pending_input.pop_front()
-            });
-            if let Some(event) = event {
-                deliver_input(state, id, event);
-                continue;
-            }
-        }
-        return;
+        let input = state
+            .windows
+            .get_mut(&id)
+            .and_then(|window| dequeue_ready_input(&mut window.pending_input));
+        let Some(input) = input else { return };
+        deliver_input(state, id, input);
     }
 }
 
@@ -2886,7 +2805,6 @@ fn deliver_pointer_axis<K: BrowserPageKey>(
     id: K,
     mut event: PointerAxisFrame,
 ) {
-    let local_now = state.time();
     let Some(window) = state.windows.get_mut(&id) else {
         return;
     };
@@ -2896,7 +2814,6 @@ fn deliver_pointer_axis<K: BrowserPageKey>(
             return;
         }
         window.last_finger_axis_time = event.time;
-        window.last_axis_delivery = Some((event.time, Instant::now()));
         if event.value.0 != 0.0 {
             window.active_finger_axes.0 = true;
         }
@@ -2909,13 +2826,10 @@ fn deliver_pointer_axis<K: BrowserPageKey>(
         if event.stop.1 {
             window.active_finger_axes.1 = false;
         }
-        if window.active_finger_axes == (false, false) {
-            window.last_axis_delivery = None;
-        }
+        if window.active_finger_axes == (false, false) {}
     }
-    let time = translate_axis_time(&mut window.axis_clock_anchor, event.time, local_now);
     let pointer = state.pointer.clone();
-    let mut frame = AxisFrame::new(time).source(match event.source {
+    let mut frame = AxisFrame::new(event.time).source(match event.source {
         PointerAxisSource::Finger => AxisSource::Finger,
         PointerAxisSource::Continuous => AxisSource::Continuous,
         PointerAxisSource::Wheel => AxisSource::Wheel,
@@ -2962,11 +2876,6 @@ fn filter_finger_stops(
         requested.0 && (active.0 || value.0 != 0.0),
         requested.1 && (active.1 || value.1 != 0.0),
     )
-}
-
-fn translate_axis_time(anchor: &mut Option<(u32, u32)>, outer: u32, local_now: u32) -> u32 {
-    let (outer_anchor, local_anchor) = *anchor.get_or_insert((outer, local_now));
-    local_anchor.wrapping_add(outer.wrapping_sub(outer_anchor))
 }
 
 fn pointer_pinch<K: BrowserPageKey>(state: &mut State<K>, id: K, event: PinchGesture) {
@@ -3143,38 +3052,23 @@ mod tests {
     }
 
     #[test]
-    fn axis_time_preserves_outer_intervals_in_the_nested_clock() {
-        let mut anchor = None;
-        assert_eq!(translate_axis_time(&mut anchor, u32::MAX - 4, 900), 900);
-        assert_eq!(translate_axis_time(&mut anchor, 3, 999), 908);
+    fn compositor_time_uses_the_host_monotonic_clock() {
+        let before = monotonic_time_ms();
+        let mut time = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        assert_eq!(
+            unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) },
+            0
+        );
+        let after = monotonic_time_ms();
+        let clock = (time.tv_sec as u64 * 1_000 + time.tv_nsec as u64 / 1_000_000) as u32;
+        assert!(clock.wrapping_sub(before) <= after.wrapping_sub(before));
     }
 
     #[test]
-    fn finger_axis_pacing_preserves_cadence_without_delaying_live_input() {
-        let now = Instant::now();
-        let finger = |time| axis_frame(time, PointerAxisSource::Finger);
-        assert_eq!(axis_pacing_delay(None, &finger(10), now), Duration::ZERO);
-        assert_eq!(
-            axis_pacing_delay(Some((10, now)), &finger(18), now),
-            Duration::from_millis(8)
-        );
-        assert_eq!(
-            axis_pacing_delay(Some((10, now - Duration::from_millis(8))), &finger(18), now),
-            Duration::ZERO
-        );
-        assert_eq!(
-            axis_pacing_delay(Some((u32::MAX - 4, now)), &finger(3), now),
-            Duration::from_millis(8)
-        );
-        assert_eq!(
-            axis_pacing_delay(Some((10, now)), &finger(211), now),
-            Duration::ZERO
-        );
-    }
-
-    #[test]
-    fn ordered_input_cannot_overtake_a_paced_finger_frame() {
-        let now = Instant::now();
+    fn ordered_input_is_dequeued_immediately_without_overtaking() {
         let mut queued = VecDeque::from([
             OrderedInput::PointerAxis(axis_frame(18, PointerAxisSource::Finger)),
             OrderedInput::PointerAxis(axis_frame(1_000, PointerAxisSource::Wheel)),
@@ -3188,38 +3082,33 @@ mod tests {
             },
         ]);
 
-        assert_eq!(
-            dequeue_ready_input(&mut queued, Some((10, now)), now).unwrap_err(),
-            Duration::from_millis(8)
-        );
-        assert_eq!(queued.len(), 4);
         assert!(matches!(
-            dequeue_ready_input(&mut queued, Some((10, now)), now + Duration::from_millis(8)),
-            Ok(Some(OrderedInput::PointerAxis(PointerAxisFrame {
+            dequeue_ready_input(&mut queued),
+            Some(OrderedInput::PointerAxis(PointerAxisFrame {
                 source: PointerAxisSource::Finger,
                 ..
-            })))
+            }))
         ));
         assert!(matches!(
-            dequeue_ready_input(&mut queued, Some((18, now)), now),
-            Ok(Some(OrderedInput::PointerAxis(PointerAxisFrame {
+            dequeue_ready_input(&mut queued),
+            Some(OrderedInput::PointerAxis(PointerAxisFrame {
                 source: PointerAxisSource::Wheel,
                 ..
-            })))
+            }))
         ));
         assert!(matches!(
-            dequeue_ready_input(&mut queued, None, now),
-            Ok(Some(OrderedInput::PointerMotion(_)))
+            dequeue_ready_input(&mut queued),
+            Some(OrderedInput::PointerMotion(_))
         ));
         assert!(matches!(
-            dequeue_ready_input(&mut queued, None, now),
-            Ok(Some(OrderedInput::PointerButton { .. }))
+            dequeue_ready_input(&mut queued),
+            Some(OrderedInput::PointerButton { .. })
         ));
+        assert!(dequeue_ready_input(&mut queued).is_none());
     }
 
     #[test]
-    fn frozen_input_cutoff_rejects_events_after_its_paced_barrier() {
-        let now = Instant::now();
+    fn frozen_input_cutoff_rejects_events_after_its_ordered_barrier() {
         let (acknowledge, acknowledged) = async_channel::bounded(1);
         let mut queued = VecDeque::new();
         assert!(admit_input(
@@ -3246,18 +3135,14 @@ mod tests {
         ));
         assert_eq!(queued.len(), 2);
 
-        assert_eq!(
-            dequeue_ready_input(&mut queued, Some((10, now)), now).unwrap_err(),
-            Duration::from_millis(8)
-        );
         assert!(acknowledged.try_recv().is_err());
         assert!(matches!(
-            dequeue_ready_input(&mut queued, Some((10, now)), now + Duration::from_millis(8)),
-            Ok(Some(OrderedInput::PointerAxis(_)))
+            dequeue_ready_input(&mut queued),
+            Some(OrderedInput::PointerAxis(_))
         ));
         assert!(matches!(
-            dequeue_ready_input(&mut queued, None, now),
-            Ok(Some(OrderedInput::InputBarrier(_)))
+            dequeue_ready_input(&mut queued),
+            Some(OrderedInput::InputBarrier(_))
         ));
         acknowledge.try_send(()).unwrap();
         assert_eq!(acknowledged.try_recv(), Ok(()));
@@ -3392,10 +3277,7 @@ mod tests {
             pointer_frames: HashMap::new(),
             hit_scenes: HashMap::new(),
             pointer_location: (0.0, 0.0),
-            axis_clock_anchor: None,
             pending_input: VecDeque::new(),
-            last_axis_delivery: None,
-            input_timer_pending: false,
             input_freeze: None,
             active_finger_axes: (false, false),
             last_finger_axis_time: 0,
