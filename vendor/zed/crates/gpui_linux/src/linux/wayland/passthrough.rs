@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     os::fd::{AsFd, AsRawFd},
     sync::{Arc, mpsc},
     thread,
@@ -10,8 +10,8 @@ use anyhow::{Context as _, Result, bail};
 use calloop::{EventLoop, channel};
 use calloop_wayland_source::WaylandSource;
 use gpui::{
-    Bounds, LinuxWaylandPassthrough, LinuxWaylandPassthroughBuffer,
-    LinuxWaylandPassthroughEvent, Pixels,
+    Bounds, LinuxWaylandPassthrough, LinuxWaylandPassthroughBuffer, LinuxWaylandPassthroughEvent,
+    Pixels,
 };
 use wayland_client::{
     Connection, Dispatch, QueueHandle, delegate_noop,
@@ -22,9 +22,7 @@ use wayland_client::{
     },
 };
 use wayland_protocols::wp::{
-    linux_dmabuf::zv1::client::{
-        zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1,
-    },
+    linux_dmabuf::zv1::client::{zwp_linux_buffer_params_v1, zwp_linux_dmabuf_v1},
     linux_explicit_synchronization::zv1::client::{
         zwp_linux_buffer_release_v1, zwp_linux_explicit_synchronization_v1,
         zwp_linux_surface_synchronization_v1,
@@ -37,7 +35,11 @@ type EventSink = Arc<dyn Fn(LinuxWaylandPassthroughEvent) + Send + Sync>;
 
 enum Command {
     Geometry(Bounds<Pixels>, mpsc::SyncSender<Result<()>>),
-    Present(u64, LinuxWaylandPassthroughBuffer, mpsc::SyncSender<Result<()>>),
+    Present(
+        u64,
+        LinuxWaylandPassthroughBuffer,
+        mpsc::SyncSender<Result<()>>,
+    ),
     Hide,
     Stop,
 }
@@ -94,6 +96,7 @@ struct State {
     qh: QueueHandle<Self>,
     events: EventSink,
     buffers: HashMap<u64, wl_buffer::WlBuffer>,
+    formats: HashSet<(u32, u64)>,
 }
 
 impl State {
@@ -111,6 +114,13 @@ impl State {
     }
 
     fn present(&mut self, scene_id: u64, buffer: LinuxWaylandPassthroughBuffer) -> Result<()> {
+        if !self.formats.contains(&(buffer.fourcc, buffer.modifier)) {
+            bail!(
+                "host compositor does not advertise DMA-BUF format {:#x} modifier {:#x}",
+                buffer.fourcc,
+                buffer.modifier
+            );
+        }
         let lease_id = buffer.surface.lease_id();
         let wl_buffer = if let Some(existing) = self.buffers.get(&lease_id) {
             existing.clone()
@@ -129,10 +139,20 @@ impl State {
                 );
             }
             let wl_buffer = params.create_immed(
-                buffer.width.try_into().context("DMA-BUF width exceeds Wayland")?,
-                buffer.height.try_into().context("DMA-BUF height exceeds Wayland")?,
+                buffer
+                    .width
+                    .try_into()
+                    .context("DMA-BUF width exceeds Wayland")?,
+                buffer
+                    .height
+                    .try_into()
+                    .context("DMA-BUF height exceeds Wayland")?,
                 buffer.fourcc,
-                zwp_linux_buffer_params_v1::Flags::empty(),
+                if buffer.y_inverted {
+                    zwp_linux_buffer_params_v1::Flags::YInvert
+                } else {
+                    zwp_linux_buffer_params_v1::Flags::empty()
+                },
                 &self.qh,
                 BufferData {
                     surface: buffer.surface.clone(),
@@ -147,11 +167,13 @@ impl State {
         self.surface.attach(Some(&wl_buffer), 0, 0);
         self.synchronization
             .set_acquire_fence(buffer.acquire_fence.as_fd());
-        self.synchronization
-            .get_release(&self.qh, BufferData {
+        self.synchronization.get_release(
+            &self.qh,
+            BufferData {
                 surface: buffer.surface.clone(),
                 lease_id,
-            });
+            },
+        );
         self.surface.frame(&self.qh, CommitData(scene_id));
         self.presentation
             .feedback(&self.surface, &self.qh, CommitData(scene_id));
@@ -208,7 +230,9 @@ fn run(
         .bind(&qh, 1..=1, ())
         .context("host lacks wp_viewporter")?;
     let dmabuf: zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1 = globals
-        .bind(&qh, 3..=4, ())
+        // Bind v3 deliberately: its format/modifier events provide the safe
+        // import intersection without parsing v4's feedback-table mmap.
+        .bind(&qh, 3..=3, ())
         .context("host lacks linux-dmabuf v3")?;
     let explicit: zwp_linux_explicit_synchronization_v1::ZwpLinuxExplicitSynchronizationV1 =
         globals
@@ -234,8 +258,11 @@ fn run(
         qh,
         events,
         buffers: HashMap::new(),
+        formats: HashSet::new(),
     };
-    queue.roundtrip(&mut state).context("initialize passthrough globals")?;
+    queue
+        .roundtrip(&mut state)
+        .context("initialize passthrough globals")?;
 
     let mut event_loop = EventLoop::<State>::try_new().context("create passthrough event loop")?;
     let signal = event_loop.get_signal();
@@ -261,7 +288,9 @@ fn run(
         .insert(event_loop.handle())
         .map_err(|_| anyhow::anyhow!("install passthrough Wayland queue"))?;
     let _ = ready.send(Ok(()));
-    event_loop.run(None, &mut state, |_| {}).context("dispatch passthrough queue")
+    event_loop
+        .run(None, &mut state, |_| {})
+        .context("dispatch passthrough queue")
 }
 
 impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
@@ -282,26 +311,52 @@ delegate_noop!(State: ignore wl_subsurface::WlSubsurface);
 delegate_noop!(State: ignore wl_surface::WlSurface);
 delegate_noop!(State: ignore wp_viewporter::WpViewporter);
 delegate_noop!(State: ignore wp_viewport::WpViewport);
-delegate_noop!(State: ignore zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1);
 delegate_noop!(State: ignore zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1);
 delegate_noop!(State: ignore zwp_linux_explicit_synchronization_v1::ZwpLinuxExplicitSynchronizationV1);
 delegate_noop!(State: ignore zwp_linux_surface_synchronization_v1::ZwpLinuxSurfaceSynchronizationV1);
 delegate_noop!(State: ignore wp_presentation::WpPresentation);
 
-impl Dispatch<wl_buffer::WlBuffer, BufferData> for State {
+impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for State {
     fn event(
         state: &mut Self,
-        proxy: &wl_buffer::WlBuffer,
+        _: &zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
+        event: zwp_linux_dmabuf_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match event {
+            zwp_linux_dmabuf_v1::Event::Modifier {
+                format,
+                modifier_hi,
+                modifier_lo,
+            } => {
+                state.formats.insert((
+                    format,
+                    (u64::from(modifier_hi) << 32) | u64::from(modifier_lo),
+                ));
+            }
+            zwp_linux_dmabuf_v1::Event::Format { format } => {
+                // DRM_FORMAT_MOD_INVALID is the implicit-modifier sentinel.
+                state.formats.insert((format, u64::MAX));
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_buffer::WlBuffer, BufferData> for State {
+    fn event(
+        _: &mut Self,
+        _: &wl_buffer::WlBuffer,
         event: wl_buffer::Event,
         data: &BufferData,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if matches!(event, wl_buffer::Event::Release) {
-            state.buffers.remove(&data.lease_id);
-            proxy.destroy();
-            data.surface.released();
-        }
+        // Explicit synchronization owns the release. wl_buffer.release is not
+        // sufficient: it may precede the fenced-release fence being signaled.
+        let _ = (event, data);
     }
 }
 
@@ -385,7 +440,10 @@ impl Dispatch<zwp_linux_buffer_release_v1::ZwpLinuxBufferReleaseV1, BufferData> 
                     // A sync_file becomes readable once all constituent fences signal.
                     loop {
                         let result = unsafe { libc::poll(&mut descriptor, 1, -1) };
-                        if result >= 0 || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+                        if result >= 0
+                            || std::io::Error::last_os_error().kind()
+                                != std::io::ErrorKind::Interrupted
+                        {
                             break;
                         }
                     }

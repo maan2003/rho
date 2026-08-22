@@ -4172,6 +4172,12 @@ impl Window {
     /// primitives they are applied after all GPUI content. This is intended for
     /// native compositor children placed below the window's root surface.
     pub fn paint_hole(&mut self, bounds: Bounds<Pixels>) {
+        self.paint_rounded_hole(bounds, Corners::default());
+    }
+
+    /// Punch a transparent rounded hole through the completed window frame.
+    /// Corner radii use the same conventions as an ordinary GPUI quad.
+    pub fn paint_rounded_hole(&mut self, bounds: Bounds<Pixels>, corner_radii: Corners<Pixels>) {
         self.invalidator.debug_assert_paint();
 
         let bounds = self.snap_bounds(bounds);
@@ -4185,8 +4191,16 @@ impl Window {
             order: 0,
             bounds: clipped,
             content_mask: ContentMask { bounds: clipped },
+            corner_radii: corner_radii.scale(self.scale_factor()),
             ..Default::default()
         });
+    }
+
+    /// Punch a compositor-child hole only when the current element is fully
+    /// opaque and its rectangular clip contains the complete child bounds.
+    pub fn compositor_child_hole_eligible(&self, bounds: Bounds<Pixels>) -> bool {
+        self.invalidator.debug_assert_paint();
+        self.element_opacity == 1.0 && self.content_mask().bounds.intersect(&bounds) == bounds
     }
 
     /// Create a host-compositor child surface below this window.

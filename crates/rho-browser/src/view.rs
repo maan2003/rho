@@ -2,6 +2,7 @@
 
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
+use std::os::fd::{AsFd as _, OwnedFd};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -9,15 +10,17 @@ use anyhow::{Context as _, Result};
 use gpui::{
     AppContext as _, Context, CursorStyle, Entity, EntityId, FocusHandle, Focusable,
     InteractiveElement as _, IntoElement, KeyDownEvent, LinuxAxisRelativeDirection,
-    LinuxAxisSource, LinuxDmaBufSurface, LinuxPinchEvent, LinuxPointerAxisEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement as _, PhysicalKey,
-    PhysicalKeyEvent, Render, RenderImage, StatefulInteractiveElement as _, Styled as _,
-    StyledImage as _, Subscription, Task, Window, canvas, div, img, px, surface,
+    LinuxAxisSource, LinuxDmaBufSurface, LinuxPinchEvent, LinuxPointerAxisEvent,
+    LinuxWaylandDmaBufPlane, LinuxWaylandPassthrough, LinuxWaylandPassthroughBuffer,
+    LinuxWaylandPassthroughEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    ObjectFit, ParentElement as _, PhysicalKey, PhysicalKeyEvent, Render, RenderImage,
+    StatefulInteractiveElement as _, Styled as _, StyledImage as _, Subscription, Task, Window,
+    canvas, div, img, px, surface,
 };
 use image::{Frame, RgbaImage};
 use rho_browser_wayland::{
-    BrowserCursor, BrowserEvent, BrowserSession, BufferImport, PinchGesture, PointerAxisDirection,
-    PointerAxisFrame, PointerAxisSource, SceneNode,
+    BrowserCursor, BrowserEvent, BrowserSession, BufferImport, HostPresentation, PinchGesture,
+    PointerAxisDirection, PointerAxisFrame, PointerAxisSource, SceneNode,
 };
 use theme::ActiveTheme as _;
 
@@ -30,6 +33,7 @@ struct RuntimePageState {
     buffers: HashMap<u64, BrowserBuffer>,
     scene: Vec<SceneNode>,
     scene_id: Option<u64>,
+    logical_size: (u32, u32),
     painted_scene_id: Option<u64>,
     invalidated_through: u64,
     presented_barrier: u64,
@@ -40,8 +44,40 @@ struct RuntimePageState {
 
 #[derive(Clone)]
 enum BrowserBuffer {
-    DmaBuf(LinuxDmaBufSurface),
+    DmaBuf(BrowserDmaBuf),
     Shm(Arc<RenderImage>),
+}
+
+#[derive(Clone)]
+struct BrowserDmaBuf {
+    surface: LinuxDmaBufSurface,
+    planes: Arc<[(Arc<OwnedFd>, u32, u32)]>,
+    acquire_fence: Arc<OwnedFd>,
+}
+
+impl BrowserDmaBuf {
+    fn passthrough_buffer(&self) -> std::io::Result<LinuxWaylandPassthroughBuffer> {
+        Ok(LinuxWaylandPassthroughBuffer {
+            surface: self.surface.clone(),
+            width: self.surface.width(),
+            height: self.surface.height(),
+            fourcc: self.surface.fourcc(),
+            modifier: self.surface.modifier(),
+            y_inverted: self.surface.y_inverted(),
+            planes: self
+                .planes
+                .iter()
+                .map(|(fd, offset, stride)| {
+                    Ok(LinuxWaylandDmaBufPlane {
+                        fd: fd.as_fd().try_clone_to_owned()?,
+                        offset: *offset,
+                        stride: *stride,
+                    })
+                })
+                .collect::<std::io::Result<_>>()?,
+            acquire_fence: self.acquire_fence.as_fd().try_clone_to_owned()?,
+        })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -122,6 +158,23 @@ impl BrowserModel {
                                 for import in scene.imports.drain(..) {
                                     let (id, buffer) = match import {
                                         BufferImport::DmaBuf(mut frame) => {
+                                            let Ok(passthrough_planes) = frame.duplicate_planes()
+                                            else {
+                                                model.runtime.status = Some(
+                                                    "duplicate Chrome DMA-BUF planes failed".into(),
+                                                );
+                                                import_failed = true;
+                                                continue;
+                                            };
+                                            let Ok(passthrough_acquire) =
+                                                frame.duplicate_acquire_fence()
+                                            else {
+                                                model.runtime.status = Some(
+                                                    "duplicate Chrome acquire fence failed".into(),
+                                                );
+                                                import_failed = true;
+                                                continue;
+                                            };
                                             let Ok(fd) = frame.duplicate_fd() else {
                                                 model.runtime.status =
                                                     Some("duplicate Chrome DMA-BUF failed".into());
@@ -151,7 +204,21 @@ impl BrowserModel {
                                                 || {},
                                                 frame.take_release(),
                                             );
-                                            (id, BrowserBuffer::DmaBuf(surface))
+                                            let planes = passthrough_planes
+                                                .into_iter()
+                                                .map(|plane| {
+                                                    (Arc::new(plane.fd), plane.offset, plane.stride)
+                                                })
+                                                .collect::<Vec<_>>()
+                                                .into();
+                                            (
+                                                id,
+                                                BrowserBuffer::DmaBuf(BrowserDmaBuf {
+                                                    surface,
+                                                    planes,
+                                                    acquire_fence: Arc::new(passthrough_acquire),
+                                                }),
+                                            )
                                         }
                                         BufferImport::Shm(frame) => {
                                             let mut pixels = frame.pixels;
@@ -251,6 +318,7 @@ impl BrowserModel {
                                 }
                                 model.runtime.presented_barrier = scene.barrier;
                                 model.runtime.scene_id = Some(scene.id);
+                                model.runtime.logical_size = scene.logical_size;
                                 model.runtime.scene = scene.nodes;
                             }
                             BrowserEvent::FrameRetired(buffer_id) => {
@@ -316,6 +384,7 @@ impl BrowserModel {
                 buffers: HashMap::new(),
                 scene: Vec::new(),
                 scene_id: None,
+                logical_size: (1280, 720),
                 painted_scene_id: None,
                 invalidated_through: 0,
                 presented_barrier: 0,
@@ -724,6 +793,48 @@ fn frame_is_eligible(handoff: Option<PageHandoff>, frame_barrier: u64) -> bool {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PassthroughPaintState {
+    positioned: Option<u64>,
+    submitted: Option<u64>,
+    presented: Option<u64>,
+    active: bool,
+}
+
+fn browser_passthrough_enabled() -> bool {
+    // Keep the texture path as the default until compositor coverage has been
+    // validated broadly. Flipping the default later is intentionally one line.
+    std::env::var_os("RHO_BROWSER_PASSTHROUGH").is_some_and(|value| value == "1")
+}
+
+fn passthrough_scene<'a>(
+    nodes: &'a [SceneNode],
+    logical_size: (u32, u32),
+    buffers: &'a HashMap<u64, BrowserBuffer>,
+) -> Option<(u64, &'a BrowserDmaBuf)> {
+    let [node] = nodes else { return None };
+    let BrowserBuffer::DmaBuf(buffer) = buffers.get(&node.buffer_id)? else {
+        return None;
+    };
+    passthrough_node_eligible(
+        node,
+        logical_size,
+        (buffer.surface.width(), buffer.surface.height()),
+    )
+    .then_some((node.buffer_id, buffer))
+}
+
+fn passthrough_node_eligible(
+    node: &SceneNode,
+    logical_size: (u32, u32),
+    buffer_size: (u32, u32),
+) -> bool {
+    node.source.0 == (0.0, 0.0)
+        && node.source.1 == (f64::from(buffer_size.0), f64::from(buffer_size.1))
+        && node.origin == (0.0, 0.0)
+        && node.destination == (f64::from(logical_size.0), f64::from(logical_size.1))
+}
+
 fn bgra_to_rgba(pixels: &mut [u8]) {
     for pixel in pixels.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
@@ -898,6 +1009,13 @@ pub struct BrowserView {
     last_axis_time: u32,
     pinch_active: bool,
     scheduled_scene: Option<u64>,
+    passthrough: Option<Arc<dyn LinuxWaylandPassthrough>>,
+    passthrough_attempted: bool,
+    passthrough_state: Rc<Cell<PassthroughPaintState>>,
+    passthrough_events: Option<Task<()>>,
+    passthrough_timing_enabled: bool,
+    fallback_scene_id: Option<u64>,
+    fallback_scene: Vec<(SceneNode, BrowserBuffer)>,
     blur_subscription: Option<Subscription>,
     focus_subscription: Option<Subscription>,
     _model_changed: Subscription,
@@ -926,6 +1044,13 @@ impl BrowserView {
             last_axis_time: 0,
             pinch_active: false,
             scheduled_scene: None,
+            passthrough: None,
+            passthrough_attempted: false,
+            passthrough_state: Rc::new(Cell::new(PassthroughPaintState::default())),
+            passthrough_events: None,
+            passthrough_timing_enabled: false,
+            fallback_scene_id: None,
+            fallback_scene: Vec::new(),
             blur_subscription: None,
             focus_subscription: None,
             _model_changed: model_changed,
@@ -1408,6 +1533,74 @@ impl Focusable for BrowserView {
 
 impl Render for BrowserView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if browser_passthrough_enabled() && !self.passthrough_attempted {
+            self.passthrough_attempted = true;
+            let (events_tx, events_rx) = async_channel::unbounded();
+            match window.create_wayland_passthrough(move |event| {
+                let _ = events_tx.try_send(event);
+            }) {
+                Some(Ok(passthrough)) => {
+                    let paint_state = self.passthrough_state.clone();
+                    let model = self.model.clone();
+                    self.passthrough_events = Some(cx.spawn(async move |this, cx| {
+                        while let Ok(event) = events_rx.recv().await {
+                            let _ = this.update(cx, |_, cx| {
+                                let model = model.read(cx);
+                                let Some(session) = model.runtime.session.as_ref() else {
+                                    return;
+                                };
+                                match event {
+                                    LinuxWaylandPassthroughEvent::Frame {
+                                        scene_id,
+                                        callback_time,
+                                    } => session.host_frame(scene_id, callback_time),
+                                    LinuxWaylandPassthroughEvent::Presented {
+                                        scene_id,
+                                        timestamp,
+                                        refresh,
+                                        sequence,
+                                        flags,
+                                    } => {
+                                        session.host_presentation(
+                                            scene_id,
+                                            HostPresentation::Presented {
+                                                timestamp,
+                                                refresh,
+                                                sequence,
+                                                flags,
+                                            },
+                                        );
+                                        let mut state = paint_state.get();
+                                        if state.submitted == Some(scene_id) {
+                                            state.presented = Some(scene_id);
+                                            paint_state.set(state);
+                                            cx.notify();
+                                        }
+                                    }
+                                    LinuxWaylandPassthroughEvent::Discarded { scene_id } => {
+                                        session.host_presentation(
+                                            scene_id,
+                                            HostPresentation::Discarded,
+                                        );
+                                        let mut state = paint_state.get();
+                                        if state.submitted == Some(scene_id) {
+                                            state.presented = None;
+                                            paint_state.set(state);
+                                            cx.notify();
+                                        }
+                                    }
+                                }
+                            });
+                        }
+                    }));
+                    self.passthrough = Some(passthrough);
+                }
+                Some(Err(error)) => {
+                    tracing::warn!(?error, "Wayland browser passthrough unavailable");
+                }
+                None => {}
+            }
+        }
         if self.blur_subscription.is_none() {
             self.blur_subscription = Some(cx.on_blur(&self.focus_handle, window, |this, _, cx| {
                 this.release_input(cx)
@@ -1553,7 +1746,7 @@ impl Render for BrowserView {
         } else {
             None
         };
-        let scene = if owns_presentation {
+        let current_scene = if owns_presentation {
             model
                 .runtime
                 .scene
@@ -1571,6 +1764,36 @@ impl Render for BrowserView {
         } else {
             Vec::new()
         };
+        let candidate = owns_presentation
+            .then(|| {
+                passthrough_scene(
+                    &model.runtime.scene,
+                    model.runtime.logical_size,
+                    &model.runtime.buffers,
+                )
+                .and_then(|(_, buffer)| Some((model.runtime.scene_id?, buffer.clone())))
+            })
+            .flatten();
+        // A lease is claimed by exactly one presentation path. Keep the last
+        // texture scene as the covering frame while a newer, never-rendered
+        // lease is promoted to the child surface.
+        let (scene, passthrough_scene) = if let Some((scene_id, buffer)) = candidate
+            && self.passthrough.is_some()
+            && self.fallback_scene_id.is_some()
+            && self.fallback_scene_id != Some(scene_id)
+        {
+            (self.fallback_scene.clone(), Some((scene_id, buffer)))
+        } else {
+            self.fallback_scene_id = model.runtime.scene_id;
+            self.fallback_scene = current_scene.clone();
+            (current_scene, None)
+        };
+        if passthrough_scene.is_some() && !self.passthrough_timing_enabled {
+            if let Some(session) = model.runtime.session.as_ref() {
+                session.enable_presentation_passthrough();
+                self.passthrough_timing_enabled = true;
+            }
+        }
         let status = browser_status(
             &model.runtime,
             presents,
@@ -1585,6 +1808,8 @@ impl Render for BrowserView {
         let owner_id = self.owner_id;
         let browser = self.model.clone();
         let origin = self.origin.clone();
+        let passthrough = self.passthrough.clone();
+        let passthrough_state = self.passthrough_state.clone();
         let measure = canvas(
             move |bounds, _, cx| {
                 origin.set((f32::from(bounds.origin.x), f32::from(bounds.origin.y)));
@@ -1595,7 +1820,70 @@ impl Render for BrowserView {
                     browser.resize(width, height, scale);
                 }
             },
-            move |_, _, _, _| {
+            move |bounds, _, window, _| {
+                let mut state = passthrough_state.get();
+                let compositor_eligible = passthrough.is_some()
+                    && passthrough_scene.is_some()
+                    && window.compositor_child_hole_eligible(bounds);
+                if compositor_eligible {
+                    let passthrough = passthrough.as_ref().unwrap();
+                    let (scene_id, buffer) = passthrough_scene.as_ref().unwrap();
+                    if state.positioned != Some(*scene_id)
+                        && passthrough.set_geometry(bounds).is_ok()
+                    {
+                        state.positioned = Some(*scene_id);
+                        let scene_id = *scene_id;
+                        let buffer = buffer.clone();
+                        let passthrough = passthrough.clone();
+                        let paint_state = passthrough_state.clone();
+                        // place_below, position, and viewport destination are
+                        // parent-latched. Commit the desynchronized child only
+                        // after this GPUI frame has committed those requests.
+                        window.on_next_frame(move |_, cx| {
+                            let mut state = paint_state.get();
+                            if state.positioned != Some(scene_id) {
+                                return;
+                            }
+                            match buffer
+                                .passthrough_buffer()
+                                .map_err(anyhow::Error::from)
+                                .and_then(|buffer| passthrough.present(scene_id, buffer))
+                            {
+                                Ok(()) => {
+                                    state.submitted = Some(scene_id);
+                                    state.presented = None;
+                                }
+                                Err(error) => {
+                                    tracing::warn!(?error, "present browser DMA-BUF passthrough");
+                                    passthrough.hide();
+                                    state = PassthroughPaintState::default();
+                                }
+                            }
+                            paint_state.set(state);
+                            cx.notify(owner_id);
+                        });
+                    }
+                    // Promotion keeps painting the texture until niri confirms
+                    // the child commit was presented. Because hole punching is
+                    // an after-content pass, ordinary GPUI overlays remain above
+                    // the child once the hole becomes active.
+                    if state.presented != Some(*scene_id) {
+                        state.active = false;
+                    } else {
+                        window.paint_hole(bounds);
+                        state.active = true;
+                    }
+                } else {
+                    if state.submitted.is_some()
+                        && let Some(passthrough) = passthrough.clone()
+                    {
+                        // The opaque texture is drawn before the asynchronous
+                        // null attach, so demotion cannot expose stale child pixels.
+                        window.on_next_frame(move |_, _| passthrough.hide());
+                    }
+                    state = PassthroughPaintState::default();
+                }
+                passthrough_state.set(state);
                 if let Some((scene_id, barrier, scheduled_at, presented)) = presented {
                     // Match a nested compositor: unblock the client's next
                     // frame after this scene has been painted into GPUI's
@@ -1639,7 +1927,7 @@ impl Render for BrowserView {
             .bg(colors.editor_background)
             .children(scene.into_iter().map(|(node, buffer)| {
                 let content = match buffer {
-                    BrowserBuffer::DmaBuf(frame) => surface(frame)
+                    BrowserBuffer::DmaBuf(frame) => surface(frame.surface)
                         .source_rect(
                             (node.source.0.0 as f32, node.source.0.1 as f32),
                             (node.source.1.0 as f32, node.source.1.1 as f32),
@@ -1881,6 +2169,23 @@ mod tests {
     }
 
     #[test]
+    fn passthrough_requires_one_full_untransformed_scene_node() {
+        let mut node = SceneNode {
+            surface_id: 1,
+            buffer_id: 2,
+            origin: (0.0, 0.0),
+            destination: (640.0, 480.0),
+            source: ((0.0, 0.0), (1280.0, 960.0)),
+        };
+        assert!(passthrough_node_eligible(&node, (640, 480), (1280, 960)));
+        node.origin.0 = 1.0;
+        assert!(!passthrough_node_eligible(&node, (640, 480), (1280, 960)));
+        node.origin.0 = 0.0;
+        node.source.1.0 = 1279.0;
+        assert!(!passthrough_node_eligible(&node, (640, 480), (1280, 960)));
+    }
+
+    #[test]
     fn terminal_event_during_handoff_clears_frames_and_reports_failure_once() {
         let page = PageId(uuid::Uuid::new_v4());
         let image = Arc::new(RenderImage::new(smallvec::SmallVec::from_const([
@@ -1898,6 +2203,7 @@ mod tests {
                 source: ((0.0, 0.0), (1.0, 1.0)),
             }],
             scene_id: Some(9),
+            logical_size: (1, 1),
             painted_scene_id: Some(9),
             invalidated_through: 0,
             presented_barrier: 4,

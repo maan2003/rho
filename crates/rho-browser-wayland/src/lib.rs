@@ -168,8 +168,17 @@ pub struct DmaBufFrame {
     pub offset: u32,
     pub y_inverted: bool,
     pub fd: OwnedFd,
+    /// Additional DMA-BUF planes after the first plane above.
+    pub additional_planes: Vec<DmaBufPlane>,
     pub acquire_fence: OwnedFd,
     release: Option<Box<dyn FnOnce() + Send>>,
+}
+
+#[derive(Debug)]
+pub struct DmaBufPlane {
+    pub fd: OwnedFd,
+    pub stride: u32,
+    pub offset: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -227,6 +236,22 @@ impl DmaBufFrame {
     }
     pub fn duplicate_acquire_fence(&self) -> std::io::Result<OwnedFd> {
         self.acquire_fence.as_fd().try_clone_to_owned()
+    }
+    pub fn duplicate_planes(&self) -> std::io::Result<Vec<DmaBufPlane>> {
+        let mut planes = Vec::with_capacity(1 + self.additional_planes.len());
+        planes.push(DmaBufPlane {
+            fd: self.fd.as_fd().try_clone_to_owned()?,
+            stride: self.stride,
+            offset: self.offset,
+        });
+        for plane in &self.additional_planes {
+            planes.push(DmaBufPlane {
+                fd: plane.fd.as_fd().try_clone_to_owned()?,
+                stride: plane.stride,
+                offset: plane.offset,
+            });
+        }
+        Ok(planes)
     }
     pub fn take_release(&mut self) -> Box<dyn FnOnce() + Send> {
         self.release
@@ -2142,9 +2167,6 @@ fn dma_buf_frame<K: BrowserPageKey>(
             "browser handoff began DMA-BUF frame preparation"
         );
     }
-    if dmabuf.num_planes() != 1 {
-        bail!("only single-plane DMA-BUFs are supported");
-    }
     let size = dmabuf.size();
     let format = dmabuf.format();
     if diagnosing_handoff {
@@ -2156,12 +2178,21 @@ fn dma_buf_frame<K: BrowserPageKey>(
             "browser handoff read DMA-BUF metadata"
         );
     }
-    let fd = dmabuf
+    let mut planes = dmabuf
         .handles()
-        .next()
-        .context("DMA-BUF has no plane")?
-        .try_clone_to_owned()
-        .context("duplicate DMA-BUF plane")?;
+        .zip(dmabuf.strides())
+        .zip(dmabuf.offsets())
+        .map(|((fd, stride), offset)| {
+            Ok(DmaBufPlane {
+                fd: fd.try_clone_to_owned().context("duplicate DMA-BUF plane")?,
+                stride,
+                offset,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let first = (!planes.is_empty())
+        .then(|| planes.remove(0))
+        .context("DMA-BUF has no plane")?;
     if diagnosing_handoff {
         tracing::info!(
             buffer_id = id,
@@ -2181,8 +2212,6 @@ fn dma_buf_frame<K: BrowserPageKey>(
             "browser handoff exported the acquire sync file"
         );
     }
-    let stride = dmabuf.strides().next().context("DMA-BUF has no stride")?;
-    let offset = dmabuf.offsets().next().context("DMA-BUF has no offset")?;
     let keep_alive = dmabuf.clone();
     let release = release.0.take().expect("release point available");
     let (window_id, commands) = retirement;
@@ -2192,10 +2221,11 @@ fn dma_buf_frame<K: BrowserPageKey>(
         height: u32::try_from(size.h).context("invalid DMA-BUF height")?,
         fourcc: format.code as u32,
         modifier: u64::from(format.modifier),
-        stride,
-        offset,
+        stride: first.stride,
+        offset: first.offset,
         y_inverted: dmabuf.y_inverted(),
-        fd,
+        fd: first.fd,
+        additional_planes: planes,
         acquire_fence,
         release: Some(Box::new(move || {
             let _keep_alive = keep_alive;
@@ -3573,6 +3603,7 @@ mod tests {
                 offset: 0,
                 y_inverted: false,
                 fd: fd.into(),
+                additional_planes: Vec::new(),
                 acquire_fence: fence.into(),
                 release: Some(Box::new(move || {
                     releases.fetch_add(1, Ordering::SeqCst);

@@ -191,6 +191,7 @@ pub struct LinuxWaylandPassthroughBuffer {
     pub height: u32,
     pub fourcc: u32,
     pub modifier: u64,
+    pub y_inverted: bool,
     pub planes: Vec<LinuxWaylandDmaBufPlane>,
     pub acquire_fence: OwnedFd,
 }
@@ -222,11 +223,7 @@ pub trait LinuxWaylandPassthrough: Send + Sync {
     /// sent before the caller's following parent-surface commit.
     fn set_geometry(&self, bounds: crate::Bounds<crate::Pixels>) -> anyhow::Result<()>;
     /// Attach and commit a new DMA-BUF scene.
-    fn present(
-        &self,
-        scene_id: u64,
-        buffer: LinuxWaylandPassthroughBuffer,
-    ) -> anyhow::Result<()>;
+    fn present(&self, scene_id: u64, buffer: LinuxWaylandPassthroughBuffer) -> anyhow::Result<()>;
     /// Unmap the child. Already committed buffers retain their release owner.
     fn hide(&self);
 }

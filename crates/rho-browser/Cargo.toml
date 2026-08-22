@@ -9,6 +9,7 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+async-channel = "2"
 dirs.workspace = true
 gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"] }
 image = { version = "0.25", default-features = false }
