@@ -1014,6 +1014,7 @@ pub struct BrowserView {
     passthrough: Option<Arc<dyn LinuxWaylandPassthrough>>,
     passthrough_attempted: bool,
     passthrough_state: Rc<Cell<PassthroughPaintState>>,
+    passthrough_failed: Rc<Cell<bool>>,
     passthrough_events: Option<Task<()>>,
     passthrough_timing_enabled: Rc<Cell<bool>>,
     fallback_scene_id: Option<u64>,
@@ -1059,6 +1060,7 @@ impl BrowserView {
             passthrough: None,
             passthrough_attempted: false,
             passthrough_state: Rc::new(Cell::new(PassthroughPaintState::default())),
+            passthrough_failed: Rc::new(Cell::new(false)),
             passthrough_events: None,
             passthrough_timing_enabled: Rc::new(Cell::new(false)),
             fallback_scene_id: None,
@@ -1792,6 +1794,7 @@ impl Render for BrowserView {
         // lease is promoted to the child surface.
         let (scene, passthrough_scene) = if let Some((scene_id, buffer)) = candidate
             && self.passthrough.is_some()
+            && !self.passthrough_failed.get()
             && self.fallback_scene_id.is_some()
             && self.fallback_scene_id != Some(scene_id)
             && !self.fallback_scene.iter().any(|(_, fallback)| {
@@ -1827,6 +1830,7 @@ impl Render for BrowserView {
         let origin = self.origin.clone();
         let passthrough = self.passthrough.clone();
         let passthrough_state = self.passthrough_state.clone();
+        let passthrough_failed = self.passthrough_failed.clone();
         let passthrough_timing_enabled = self.passthrough_timing_enabled.clone();
         let timing_model = self.model.clone();
         let passthrough_owner = model.passthrough_owner.clone();
@@ -1876,6 +1880,7 @@ impl Render for BrowserView {
                                 Err(error) => {
                                     tracing::warn!(?error, "present browser DMA-BUF passthrough");
                                     passthrough.hide();
+                                    passthrough_failed.set(true);
                                     state = PassthroughPaintState::default();
                                 }
                             }

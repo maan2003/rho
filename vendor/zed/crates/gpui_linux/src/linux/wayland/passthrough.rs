@@ -101,6 +101,7 @@ struct State {
     events: EventSink,
     buffers: HashMap<u64, wl_buffer::WlBuffer>,
     formats: HashSet<(u32, u64)>,
+    presentation_clock_monotonic: bool,
 }
 
 impl State {
@@ -118,6 +119,9 @@ impl State {
     }
 
     fn present(&mut self, scene_id: u64, buffer: LinuxWaylandPassthroughBuffer) -> Result<()> {
+        if !self.presentation_clock_monotonic {
+            bail!("host wp_presentation clock is not CLOCK_MONOTONIC");
+        }
         if !self.formats.contains(&(buffer.fourcc, buffer.modifier)) {
             bail!(
                 "host compositor does not advertise DMA-BUF format {:#x} modifier {:#x}",
@@ -267,6 +271,7 @@ fn run(
         events,
         buffers: HashMap::new(),
         formats: HashSet::new(),
+        presentation_clock_monotonic: false,
     };
     queue
         .roundtrip(&mut state)
@@ -322,7 +327,21 @@ delegate_noop!(State: ignore wp_viewport::WpViewport);
 delegate_noop!(State: ignore zwp_linux_buffer_params_v1::ZwpLinuxBufferParamsV1);
 delegate_noop!(State: ignore zwp_linux_explicit_synchronization_v1::ZwpLinuxExplicitSynchronizationV1);
 delegate_noop!(State: ignore zwp_linux_surface_synchronization_v1::ZwpLinuxSurfaceSynchronizationV1);
-delegate_noop!(State: ignore wp_presentation::WpPresentation);
+
+impl Dispatch<wp_presentation::WpPresentation, ()> for State {
+    fn event(
+        state: &mut Self,
+        _: &wp_presentation::WpPresentation,
+        event: wp_presentation::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wp_presentation::Event::ClockId { clk_id } = event {
+            state.presentation_clock_monotonic = clk_id == libc::CLOCK_MONOTONIC as u32;
+        }
+    }
+}
 
 impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for State {
     fn event(
