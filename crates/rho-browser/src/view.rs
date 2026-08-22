@@ -1562,7 +1562,9 @@ impl Render for BrowserView {
                 if let Some(passthrough) = this.passthrough.take() {
                     // The release frame first closes the ordered parent hole;
                     // only then may dropping the handle unmap/destroy the child.
-                    window.on_next_frame(move |_, _| drop(passthrough));
+                    window.on_next_frame(move |window, _| {
+                        window.on_next_frame(move |_, _| drop(passthrough));
+                    });
                 }
             }));
         }
@@ -1821,6 +1823,9 @@ impl Render for BrowserView {
             && !self.passthrough_failed.get()
             && self.fallback_scene_id.is_some()
             && self.fallback_scene_id != Some(scene_id)
+            && self.fallback_scene.iter().all(|(_, buffer)| {
+                !matches!(buffer, BrowserBuffer::DmaBuf(buffer) if !buffer.surface.texture_route_available())
+            })
             && !self.fallback_scene.iter().any(|(_, fallback)| {
                 matches!(fallback, BrowserBuffer::DmaBuf(fallback) if fallback.surface.lease_id() == buffer.surface.lease_id())
             })
@@ -1881,6 +1886,8 @@ impl Render for BrowserView {
                             tracing::warn!(?error, "position browser DMA-BUF passthrough");
                             passthrough_failed.set(true);
                             state = PassthroughPaintState::default();
+                            let passthrough = passthrough.clone();
+                            window.on_next_frame(move |_, _| passthrough.hide());
                             cx.notify(owner_id);
                         } else {
                             state.positioned = Some(*scene_id);
@@ -1891,7 +1898,7 @@ impl Render for BrowserView {
                             // place_below, position, and viewport destination are
                             // parent-latched. Commit the desynchronized child only
                             // after this GPUI frame has committed those requests.
-                            window.on_next_frame(move |_, cx| {
+                            window.on_next_frame(move |window, cx| {
                                 let mut state = paint_state.get();
                                 if state.positioned != Some(scene_id) {
                                     return;
@@ -1910,9 +1917,10 @@ impl Render for BrowserView {
                                             ?error,
                                             "present browser DMA-BUF passthrough"
                                         );
-                                        passthrough.hide();
                                         passthrough_failed.set(true);
                                         state = PassthroughPaintState::default();
+                                        let passthrough = passthrough.clone();
+                                        window.on_next_frame(move |_, _| passthrough.hide());
                                     }
                                 }
                                 paint_state.set(state);

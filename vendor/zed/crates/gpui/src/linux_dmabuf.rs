@@ -1,7 +1,7 @@
 use std::fmt;
 use std::os::fd::OwnedFd;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -69,6 +69,7 @@ struct LinuxDmaBufSurfaceInner {
     pub submitted: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     pub released: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     route_owner: AtomicU64,
+    released_flag: AtomicBool,
 }
 
 #[allow(missing_docs)]
@@ -104,6 +105,7 @@ impl LinuxDmaBufSurface {
             submitted: Mutex::new(Some(Box::new(submitted))),
             released: Mutex::new(Some(Box::new(released))),
             route_owner: AtomicU64::new(0),
+            released_flag: AtomicBool::new(false),
         }))
     }
 
@@ -168,6 +170,9 @@ impl LinuxDmaBufSurface {
     pub fn claim_wayland_passthrough(&self, owner: u64) -> bool {
         debug_assert_ne!(owner, 0);
         debug_assert_ne!(owner, u64::MAX);
+        if self.0.released_flag.load(Ordering::Acquire) {
+            return false;
+        }
         match self
             .0
             .route_owner
@@ -190,9 +195,15 @@ impl LinuxDmaBufSurface {
     }
     #[doc(hidden)]
     pub fn released(&self) {
+        self.0.released_flag.store(true, Ordering::Release);
         if let Some(callback) = self.0.released.lock().unwrap().take() {
             callback();
         }
+    }
+    /// Whether the presentation owner has completed this lease.
+    #[doc(hidden)]
+    pub fn is_released(&self) -> bool {
+        self.0.released_flag.load(Ordering::Acquire)
     }
 }
 

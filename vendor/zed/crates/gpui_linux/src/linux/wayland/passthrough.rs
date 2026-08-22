@@ -99,13 +99,14 @@ struct State {
     surface: wl_surface::WlSurface,
     subsurface: wl_subsurface::WlSubsurface,
     viewport: wp_viewport::WpViewport,
+    viewporter: wp_viewporter::WpViewporter,
     dmabuf: zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
     synchronization: zwp_linux_surface_synchronization_v1::ZwpLinuxSurfaceSynchronizationV1,
     presentation: wp_presentation::WpPresentation,
+    explicit: zwp_linux_explicit_synchronization_v1::ZwpLinuxExplicitSynchronizationV1,
     qh: QueueHandle<Self>,
     events: EventSink,
     buffers: HashMap<u64, wl_buffer::WlBuffer>,
-    released_leases: HashSet<u64>,
     formats: HashSet<(u32, u64)>,
     presentation_clock_monotonic: bool,
     loop_handle: LoopHandle<'static, Self>,
@@ -113,6 +114,8 @@ struct State {
     signal: LoopSignal,
     stopping: bool,
     pending_releases: usize,
+    connection: Connection,
+    finalized: bool,
 }
 
 impl State {
@@ -144,7 +147,7 @@ impl State {
             bail!("DMA-BUF lease is already claimed by another presentation path");
         }
         let lease_id = buffer.surface.lease_id();
-        if self.released_leases.contains(&lease_id) {
+        if buffer.surface.is_released() {
             bail!("DMA-BUF lease was already released by this passthrough surface");
         }
         let new_buffer = !self.buffers.contains_key(&lease_id);
@@ -215,8 +218,28 @@ impl State {
     fn release_finished(&mut self) {
         self.pending_releases = self.pending_releases.saturating_sub(1);
         if self.stopping && self.pending_releases == 0 {
-            self.signal.stop();
+            self.finalize_stop();
         }
+    }
+
+    fn finalize_stop(&mut self) {
+        if self.finalized {
+            return;
+        }
+        self.finalized = true;
+        self.hide();
+        self.synchronization.destroy();
+        self.viewport.destroy();
+        self.subsurface.destroy();
+        self.surface.destroy();
+        self.dmabuf.destroy();
+        self.presentation.destroy();
+        self.explicit.destroy();
+        self.viewporter.destroy();
+        if let Err(error) = self.connection.flush() {
+            log::warn!("flush Wayland passthrough teardown: {error}");
+        }
+        self.signal.stop();
     }
 }
 
@@ -291,13 +314,14 @@ fn run(
         surface,
         subsurface,
         viewport,
+        viewporter,
         dmabuf,
         synchronization,
         presentation,
+        explicit,
         qh,
         events,
         buffers: HashMap::new(),
-        released_leases: HashSet::new(),
         formats: HashSet::new(),
         presentation_clock_monotonic: false,
         loop_handle: event_loop.handle(),
@@ -305,6 +329,8 @@ fn run(
         signal: event_loop.get_signal(),
         stopping: false,
         pending_releases: 0,
+        connection: connection.clone(),
+        finalized: false,
     };
     queue
         .roundtrip(&mut state)
@@ -328,7 +354,7 @@ fn run(
                     state.hide();
                     state.stopping = true;
                     if state.pending_releases == 0 {
-                        state.signal.stop();
+                        state.finalize_stop();
                     }
                 }
             }
@@ -494,7 +520,6 @@ impl Dispatch<zwp_linux_buffer_release_v1::ZwpLinuxBufferReleaseV1, BufferData> 
                 if let Some(buffer) = state.buffers.remove(&data.lease_id) {
                     buffer.destroy();
                 }
-                state.released_leases.insert(data.lease_id);
                 surface.released();
                 state.release_finished();
             }
@@ -514,7 +539,6 @@ impl Dispatch<zwp_linux_buffer_release_v1::ZwpLinuxBufferReleaseV1, BufferData> 
                         if let Some(buffer) = state.buffers.remove(&lease_id) {
                             buffer.destroy();
                         }
-                        state.released_leases.insert(lease_id);
                         surface.released();
                         state.release_finished();
                         Ok(PostAction::Remove)
@@ -524,7 +548,6 @@ impl Dispatch<zwp_linux_buffer_release_v1::ZwpLinuxBufferReleaseV1, BufferData> 
                     if let Some(buffer) = state.buffers.remove(&lease_id) {
                         buffer.destroy();
                     }
-                    state.released_leases.insert(lease_id);
                     state.release_finished();
                     let file = unsafe { error.inserted.get_mut() }
                         .try_clone()
