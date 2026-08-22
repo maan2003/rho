@@ -126,6 +126,7 @@ pub struct WaylandWindowState {
     pub(crate) force_render_after_recovery: bool,
     renderer_presented: bool,
     host_presentation: Option<HostVsync>,
+    passthrough_surface_created: bool,
     in_progress_configure: Option<InProgressConfigure>,
     resize_throttle: bool,
     in_progress_window_controls: Option<WindowControls>,
@@ -657,6 +658,7 @@ impl WaylandWindowState {
             force_render_after_recovery: false,
             renderer_presented: false,
             host_presentation: None,
+            passthrough_surface_created: false,
             in_progress_window_controls: None,
             window_controls: WindowControls::default(),
             client_inset: None,
@@ -1529,7 +1531,10 @@ impl PlatformWindow for WaylandWindow {
         &self,
         events: Box<dyn Fn(gpui::LinuxWaylandPassthroughEvent) + Send + Sync>,
     ) -> Option<anyhow::Result<Arc<dyn gpui::LinuxWaylandPassthrough>>> {
-        let state = self.borrow();
+        let mut state = self.borrow_mut();
+        // Keep the swapchain alpha mode stable across promotion/demotion. A
+        // reconfigure on the exact hole transition can stall or flash.
+        state.passthrough_surface_created = true;
         let connection = state.client.get_client().borrow().connection.clone();
         Some(super::passthrough::create(
             connection,
@@ -1839,7 +1844,7 @@ impl PlatformWindow for WaylandWindow {
             return;
         }
 
-        let transparent = state.is_transparent() || !scene.holes.is_empty();
+        let transparent = state.is_transparent() || state.passthrough_surface_created;
         state.renderer.update_transparency(transparent);
         update_scene_opaque_region(&state, scene);
         if let Some(presentation) = state.globals.presentation.as_ref() {
@@ -2060,6 +2065,10 @@ fn update_scene_opaque_region(state: &WaylandWindowState, scene: &Scene) {
     if state.background_appearance != WindowBackgroundAppearance::Opaque
         || state.decorations != WindowDecorations::Server
     {
+        // Decorations/background can change after an opaque region was set.
+        // Explicitly clear it so a stale full-window region cannot hide a
+        // transparent hole and its below-parent child.
+        state.surface.set_opaque_region(None);
         return;
     }
 
