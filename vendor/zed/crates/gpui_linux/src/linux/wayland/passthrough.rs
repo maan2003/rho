@@ -20,10 +20,9 @@ use gpui::{
 };
 use wayland_client::{
     Connection, Dispatch, QueueHandle, delegate_noop,
-    globals::{GlobalListContents, registry_queue_init},
+    globals::GlobalList,
     protocol::{
-        wl_buffer, wl_callback, wl_compositor, wl_registry, wl_subcompositor, wl_subsurface,
-        wl_surface,
+        wl_buffer, wl_callback, wl_compositor, wl_subcompositor, wl_subsurface, wl_surface,
     },
 };
 use wayland_protocols::wp::{
@@ -37,6 +36,53 @@ use wayland_protocols::wp::{
 };
 
 type EventSink = Arc<dyn Fn(LinuxWaylandPassthroughEvent) + Send + Sync>;
+
+#[repr(C)]
+struct DmaBufImportSyncFile {
+    flags: u32,
+    fd: i32,
+}
+
+const DMA_BUF_SYNC_WRITE: u32 = 2;
+// _IOW('b', 3, struct dma_buf_import_sync_file) on Linux. The UAPI struct is
+// two 32-bit fields and the generic ioctl encoding is stable across supported
+// Linux architectures.
+const DMA_BUF_IOCTL_IMPORT_SYNC_FILE: libc::c_ulong =
+    (1 << 30) | (8 << 16) | ((b'b' as libc::c_ulong) << 8) | 3;
+
+fn import_implicit_acquire_fence(
+    planes: &[gpui::LinuxWaylandDmaBufPlane],
+    fence: std::os::fd::BorrowedFd<'_>,
+) -> std::io::Result<()> {
+    for plane in planes {
+        let import = DmaBufImportSyncFile {
+            flags: DMA_BUF_SYNC_WRITE,
+            fd: fence.as_raw_fd(),
+        };
+        let result = unsafe {
+            libc::ioctl(
+                plane.fd.as_raw_fd(),
+                DMA_BUF_IOCTL_IMPORT_SYNC_FILE,
+                &import,
+            )
+        };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn wait_sync_file(fd: i32) {
+    let mut descriptor = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    while unsafe { libc::poll(&mut descriptor, 1, -1) } < 0
+        && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+    {}
+}
 
 enum Command {
     Geometry(Bounds<Pixels>, mpsc::SyncSender<Result<()>>),
@@ -90,6 +136,7 @@ impl LinuxWaylandPassthrough for Handle {
 struct BufferData {
     surface: gpui::LinuxDmaBufSurface,
     lease_id: u64,
+    explicit_release: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -101,9 +148,9 @@ struct State {
     viewport: wp_viewport::WpViewport,
     viewporter: wp_viewporter::WpViewporter,
     dmabuf: zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1,
-    synchronization: zwp_linux_surface_synchronization_v1::ZwpLinuxSurfaceSynchronizationV1,
+    synchronization: Option<zwp_linux_surface_synchronization_v1::ZwpLinuxSurfaceSynchronizationV1>,
     presentation: wp_presentation::WpPresentation,
-    explicit: zwp_linux_explicit_synchronization_v1::ZwpLinuxExplicitSynchronizationV1,
+    explicit: Option<zwp_linux_explicit_synchronization_v1::ZwpLinuxExplicitSynchronizationV1>,
     qh: QueueHandle<Self>,
     events: EventSink,
     buffers: HashMap<u64, wl_buffer::WlBuffer>,
@@ -114,6 +161,7 @@ struct State {
     signal: LoopSignal,
     stopping: bool,
     pending_releases: usize,
+    pending_presentations: usize,
     connection: Connection,
     finalized: bool,
 }
@@ -152,6 +200,15 @@ impl State {
         }
         let new_buffer = !self.buffers.contains_key(&lease_id);
         if new_buffer {
+            if self.synchronization.is_none()
+                && let Err(error) =
+                    import_implicit_acquire_fence(&buffer.planes, buffer.acquire_fence.as_fd())
+            {
+                log::warn!(
+                    "import DMA-BUF implicit acquire fence failed ({error}); waiting synchronously"
+                );
+                wait_sync_file(buffer.acquire_fence.as_raw_fd());
+            }
             let params = self.dmabuf.create_params(&self.qh, ());
             let modifier_hi = (buffer.modifier >> 32) as u32;
             let modifier_lo = buffer.modifier as u32;
@@ -184,21 +241,24 @@ impl State {
                 BufferData {
                     surface: buffer.surface.clone(),
                     lease_id,
+                    explicit_release: self.synchronization.is_some(),
                 },
             );
             params.destroy();
             self.buffers.insert(lease_id, wl_buffer.clone());
             self.surface.attach(Some(&wl_buffer), 0, 0);
             self.surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
-            self.synchronization
-                .set_acquire_fence(buffer.acquire_fence.as_fd());
-            self.synchronization.get_release(
-                &self.qh,
-                BufferData {
-                    surface: buffer.surface.clone(),
-                    lease_id,
-                },
-            );
+            if let Some(synchronization) = self.synchronization.as_ref() {
+                synchronization.set_acquire_fence(buffer.acquire_fence.as_fd());
+                synchronization.get_release(
+                    &self.qh,
+                    BufferData {
+                        surface: buffer.surface.clone(),
+                        lease_id,
+                        explicit_release: true,
+                    },
+                );
+            }
             self.pending_releases += 1;
             buffer.surface.submitted();
         }
@@ -206,6 +266,7 @@ impl State {
         self.surface.frame(&self.qh, CommitData(scene_id));
         self.presentation
             .feedback(&self.surface, &self.qh, CommitData(scene_id));
+        self.pending_presentations += 1;
         self.surface.commit();
         Ok(())
     }
@@ -217,8 +278,21 @@ impl State {
 
     fn release_finished(&mut self) {
         self.pending_releases = self.pending_releases.saturating_sub(1);
-        if self.stopping && self.pending_releases == 0 {
-            self.finalize_stop();
+        self.maybe_stop();
+    }
+
+    fn presentation_finished(&mut self) {
+        self.pending_presentations = self.pending_presentations.saturating_sub(1);
+        self.maybe_stop();
+    }
+
+    fn maybe_stop(&self) {
+        if self.stopping
+            && self.finalized
+            && self.pending_releases == 0
+            && self.pending_presentations == 0
+        {
+            self.signal.stop();
         }
     }
 
@@ -228,23 +302,29 @@ impl State {
         }
         self.finalized = true;
         self.hide();
-        self.synchronization.destroy();
+        if let Some(synchronization) = self.synchronization.as_ref() {
+            synchronization.destroy();
+        }
         self.viewport.destroy();
         self.subsurface.destroy();
         self.surface.destroy();
         self.dmabuf.destroy();
         self.presentation.destroy();
-        self.explicit.destroy();
+        if let Some(explicit) = self.explicit.as_ref() {
+            explicit.destroy();
+        }
         self.viewporter.destroy();
         if let Err(error) = self.connection.flush() {
             log::warn!("flush Wayland passthrough teardown: {error}");
         }
-        self.signal.stop();
+        self.maybe_stop();
     }
 }
 
 pub(super) fn create(
     connection: Connection,
+    global_list: Arc<GlobalList>,
+    compositor: wl_compositor::WlCompositor,
     parent: wl_surface::WlSurface,
     events: EventSink,
 ) -> Result<Arc<dyn LinuxWaylandPassthrough>> {
@@ -255,7 +335,16 @@ pub(super) fn create(
     let thread = thread::Builder::new()
         .name("gpui-wayland-passthrough".into())
         .spawn(move || {
-            let result = run(connection, parent, events, receiver, ready_tx, owner_id);
+            let result = run(
+                connection,
+                global_list,
+                compositor,
+                parent,
+                events,
+                receiver,
+                ready_tx,
+                owner_id,
+            );
             if let Err(error) = result {
                 log::error!("Wayland passthrough thread failed: {error:#}");
             }
@@ -272,18 +361,16 @@ pub(super) fn create(
 
 fn run(
     connection: Connection,
+    globals: Arc<GlobalList>,
+    compositor: wl_compositor::WlCompositor,
     parent: wl_surface::WlSurface,
     events: EventSink,
     receiver: channel::Channel<Command>,
     ready: mpsc::SyncSender<Result<()>>,
     owner_id: u64,
 ) -> Result<()> {
-    let (globals, mut queue) =
-        registry_queue_init::<State>(&connection).context("create passthrough event queue")?;
+    let mut queue = connection.new_event_queue::<State>();
     let qh = queue.handle();
-    let compositor: wl_compositor::WlCompositor = globals
-        .bind(&qh, 1..=6, ())
-        .context("host lacks wl_compositor")?;
     let subcompositor: wl_subcompositor::WlSubcompositor = globals
         .bind(&qh, 1..=1, ())
         .context("host lacks wl_subcompositor")?;
@@ -295,20 +382,21 @@ fn run(
         // import intersection without parsing v4's feedback-table mmap.
         .bind(&qh, 3..=3, ())
         .context("host lacks linux-dmabuf v3")?;
-    let explicit: zwp_linux_explicit_synchronization_v1::ZwpLinuxExplicitSynchronizationV1 =
-        globals
-            .bind(&qh, 1..=2, ())
-            .context("host lacks linux explicit synchronization")?;
+    let explicit: Option<zwp_linux_explicit_synchronization_v1::ZwpLinuxExplicitSynchronizationV1> =
+        globals.bind(&qh, 1..=2, ()).ok();
     let presentation: wp_presentation::WpPresentation = globals
         .bind(&qh, 1..=2, ())
         .context("host lacks wp_presentation")?;
 
     let surface = compositor.create_surface(&qh, ());
     let subsurface = subcompositor.get_subsurface(&surface, &parent, &qh, ());
+    subcompositor.destroy();
     subsurface.place_below(&parent);
     subsurface.set_desync();
     let viewport = viewporter.get_viewport(&surface, &qh, ());
-    let synchronization = explicit.get_synchronization(&surface, &qh, ());
+    let synchronization = explicit
+        .as_ref()
+        .map(|explicit| explicit.get_synchronization(&surface, &qh, ()));
     let mut event_loop = EventLoop::<State>::try_new().context("create passthrough event loop")?;
     let mut state = State {
         surface,
@@ -329,6 +417,7 @@ fn run(
         signal: event_loop.get_signal(),
         stopping: false,
         pending_releases: 0,
+        pending_presentations: 0,
         connection: connection.clone(),
         finalized: false,
     };
@@ -351,11 +440,8 @@ fn run(
                 }
                 Command::Hide => state.hide(),
                 Command::Stop => {
-                    state.hide();
                     state.stopping = true;
-                    if state.pending_releases == 0 {
-                        state.finalize_stop();
-                    }
+                    state.finalize_stop();
                 }
             }
         })
@@ -367,18 +453,6 @@ fn run(
     event_loop
         .run(None, &mut state, |_| {})
         .context("dispatch passthrough queue")
-}
-
-impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for State {
-    fn event(
-        _: &mut Self,
-        _: &wl_registry::WlRegistry,
-        _: wl_registry::Event,
-        _: &GlobalListContents,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-    }
 }
 
 delegate_noop!(State: ignore wl_compositor::WlCompositor);
@@ -437,16 +511,19 @@ impl Dispatch<zwp_linux_dmabuf_v1::ZwpLinuxDmabufV1, ()> for State {
 
 impl Dispatch<wl_buffer::WlBuffer, BufferData> for State {
     fn event(
-        _: &mut Self,
-        _: &wl_buffer::WlBuffer,
+        state: &mut Self,
+        buffer: &wl_buffer::WlBuffer,
         event: wl_buffer::Event,
         data: &BufferData,
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        // Explicit synchronization owns the release. wl_buffer.release is not
-        // sufficient: it may precede the fenced-release fence being signaled.
-        let _ = (event, data);
+        if matches!(event, wl_buffer::Event::Release) && !data.explicit_release {
+            state.buffers.remove(&data.lease_id);
+            buffer.destroy();
+            data.surface.released();
+            state.release_finished();
+        }
     }
 }
 
@@ -496,9 +573,11 @@ impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, CommitData> for 
                     sequence: (u64::from(seq_hi) << 32) | u64::from(seq_lo),
                     flags: flags.into_result().map(|flags| flags.bits()).unwrap_or(0),
                 });
+                state.presentation_finished();
             }
             wp_presentation_feedback::Event::Discarded => {
                 (state.events)(LinuxWaylandPassthroughEvent::Discarded { scene_id: data.0 });
+                state.presentation_finished();
             }
             _ => {}
         }

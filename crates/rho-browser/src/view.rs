@@ -1631,7 +1631,7 @@ impl Render for BrowserView {
                     self.passthrough = Some(passthrough);
                 }
                 Some(Err(error)) => {
-                    tracing::warn!(?error, "Wayland browser passthrough unavailable");
+                    tracing::error!(?error, "RHO_BROWSER_PASSTHROUGH requested but unavailable");
                 }
                 None => {}
             }

@@ -1535,9 +1535,14 @@ impl PlatformWindow for WaylandWindow {
         // Keep the swapchain alpha mode stable across promotion/demotion. A
         // reconfigure on the exact hole transition can stall or flash.
         state.passthrough_surface_created = true;
-        let connection = state.client.get_client().borrow().connection.clone();
+        let client = state.client.get_client();
+        let client = client.borrow();
+        let connection = client.connection.clone();
+        let global_list = client.global_list.clone();
         Some(super::passthrough::create(
             connection,
+            global_list,
+            state.globals.compositor.clone(),
             state.surface.clone(),
             events.into(),
         ))

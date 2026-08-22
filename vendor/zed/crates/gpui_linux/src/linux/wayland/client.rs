@@ -4,6 +4,7 @@ use std::{
     os::fd::{AsRawFd, BorrowedFd},
     path::PathBuf,
     rc::{Rc, Weak},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -243,7 +244,7 @@ pub struct ColorManagerCapabilities {
 
 impl Globals {
     fn new(
-        globals: GlobalList,
+        globals: &GlobalList,
         executor: ForegroundExecutor,
         qh: QueueHandle<WaylandClientStatePtr>,
         seat: wl_seat::WlSeat,
@@ -328,6 +329,7 @@ pub struct Output {
 
 pub(crate) struct WaylandClientState {
     pub connection: Connection,
+    pub global_list: Arc<GlobalList>,
     serial_tracker: SerialTracker,
     globals: Globals,
     pub gpu_context: GpuContext,
@@ -809,8 +811,9 @@ impl WaylandClient {
         let gpu_context = Rc::new(RefCell::new(None));
 
         let seat = seat.unwrap();
+        let global_list = Arc::new(globals);
         let globals = Globals::new(
-            globals,
+            &global_list,
             common.foreground_executor.clone(),
             qh.clone(),
             seat.clone(),
@@ -873,6 +876,7 @@ impl WaylandClient {
 
         let state = Rc::new(RefCell::new(WaylandClientState {
             connection: conn.clone(),
+            global_list,
             serial_tracker: SerialTracker::new(),
             globals,
             gpu_context,
