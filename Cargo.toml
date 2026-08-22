@@ -183,6 +183,11 @@ incremental = false
 inherits = "dev"
 lto = "off"
 
+# Thin LTO trims the enormous monomorphized .text sections (the six release
+# binaries total over 400MB without it) at a modest link-time cost.
+[profile.release]
+lto = "thin"
+
 [profile.profiling]
 debug = "line-tables-only"
 inherits = "release"
