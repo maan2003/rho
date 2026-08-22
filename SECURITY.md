@@ -132,7 +132,9 @@ AI APIs.
   from the isolated client-state directory. Updated worker and DOM-adapter code
   is therefore registered on browser restart without rebuilding Brave; its
   source is still supplied only by the installed `rho-gui` binary.
-  The extension has `tabs`, `storage`, and `nativeMessaging` privileges. The
+  The extension has `tabs`, `storage`, `clipboardWrite`, and `nativeMessaging`
+  privileges. Clipboard writes occur only for explicit Vim copy commands
+  handled synchronously from trusted keyboard input. The
   allowlisted `rhoPrivate.tabs` API stores UUID page identity in browser tab
   session data instead of exposing it through visible tab groups. Its bundled
   content script runs on HTTP(S) documents only. Its isolated-world,
@@ -140,7 +142,10 @@ AI APIs.
   consumes matched commands, active prefixes/counts, and unmodified Hints-mode
   input; unmatched top-level keys and focused-control conflicts continue to the
   website as their original trusted events. The page agent performs nested
-  native smooth scrolling, focus, and visible-element label/text hints locally.
+  native smooth scrolling, focus, visible-element label/text hints, caret/find,
+  and scroll marks locally. Find text and hint candidate text are not persisted
+  or sent to the worker. An explicit `gB` command stores only the page origin in
+  extension-local blacklist state.
   Browser history and
   reload requests contain only a fixed command name and are handled by the
   worker for the active sender tab. Hint activation currently uses DOM

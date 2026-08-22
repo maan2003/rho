@@ -14,6 +14,8 @@
   let nextHintGeneration = 0;
   let mode = "normal";
   let ignoreRemaining;
+  let ignoreReason;
+  let returnToIgnore = false;
   let currentKeyTree;
   let count = "";
   let lastInputTime = 0;
@@ -23,7 +25,25 @@
   let focusInputs;
   let hintRefreshPending = false;
   let ignoreKeyEventsUntil = 0;
+  let captureKey;
+  let findState;
+  let lastFind = "";
+  let lastFindOptions = {};
+  let findMatches = [];
+  let findMatchIndex = -1;
+  let caretSelecting = false;
+  const scrollMarks = new Map();
+  const scrollJumpList = [];
+  let scrollJumpIndex = -1;
   const keyDispositions = new Map();
+
+  // VimFx owns one synchronous key state and marker namespace per tab. MV3
+  // gives each out-of-process frame an independent isolated world, while
+  // service-worker messaging is asynchronous and cannot decide whether the
+  // current key event must be cancelled. Keep the per-document implementation
+  // until the Brave fork exposes a tab-scoped pre-target key/marker router.
+  // VIMFX PARITY TODO(rhoPrivate.vim):
+  // const tabVim = chrome.rhoPrivate.vim.attachTabKeyRouter();
 
   function activeElement(root = document) {
     let element = root.activeElement;
@@ -52,6 +72,11 @@
     return element?.matches?.(
       'input[type="checkbox"], input[type="radio"], input[type="file"], input[type="color"], input[type="date"], input[type="time"], input[type="datetime-local"], input[type="month"], input[type="week"], video, audio, embed, object',
     );
+  }
+
+  function isIgnoreModeElement(element) {
+    return element?.hasAttribute?.("data-wasavi-state")
+      || element?.closest?.("#wasavi_container");
   }
 
   function showBadge(label) {
@@ -97,7 +122,7 @@
   }
 
   function elementRect(element) {
-    const style = getComputedStyle(element);
+    const style = element.ownerDocument.defaultView.getComputedStyle(element);
     if (style.visibility === "hidden" || style.display === "none") return undefined;
     return [...element.getClientRects()].find(
       (rect) =>
@@ -108,6 +133,41 @@
         rect.top < innerHeight &&
         rect.left < innerWidth,
     );
+  }
+
+  function elementShape(root, element) {
+    const style = element.ownerDocument.defaultView.getComputedStyle(element);
+    if (style.visibility === "hidden" || style.display === "none") return undefined;
+    const rects = [...element.getClientRects()]
+      .map((rect) => ({
+        left: Math.max(0, rect.left),
+        top: Math.max(0, rect.top),
+        right: Math.min(innerWidth, rect.right),
+        bottom: Math.min(innerHeight, rect.bottom),
+      }))
+      .filter((rect) => rect.right - rect.left >= 4 && rect.bottom - rect.top >= 4);
+    if (rects.length === 0) return undefined;
+    const area = rects.reduce(
+      (total, rect) => total + (rect.right - rect.left) * (rect.bottom - rect.top),
+      0,
+    );
+    for (const rect of rects) {
+      let x = rect.left + 1;
+      const y = Math.round((rect.top + rect.bottom) / 2);
+      for (let attempt = 0; attempt < 2 && x < rect.right; attempt += 1) {
+        const covering = root.elementFromPoint?.(x, y)
+          ?? element.ownerDocument.elementFromPoint(x, y);
+        if (!covering || covering === element || element.contains(covering)) {
+          return {
+            rect: new DOMRect(rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top),
+            area,
+          };
+        }
+        const coveringRect = covering.getBoundingClientRect();
+        x = Math.max(x + 1, coveringRect.right + 1);
+      }
+    }
+    return undefined;
   }
 
   function isScrollable(element, axis) {
@@ -240,9 +300,55 @@
 
   function scrollViewportSize(element, axis) {
     if (element === document.scrollingElement) {
-      return axis === "x" ? innerWidth : innerHeight;
+      if (axis === "x") return innerWidth;
+      let headerBottom = 0;
+      let footerTop = innerHeight;
+      const maxHeight = innerHeight / 3;
+      const minWidth = Math.min(innerWidth / 2, 800);
+      for (const candidate of document.querySelectorAll("div, ul, nav, header, footer, section")) {
+        const rect = candidate.getBoundingClientRect();
+        if (rect.height > maxHeight || rect.width < minWidth
+            || getComputedStyle(candidate).position !== "fixed") continue;
+        if (rect.top <= headerBottom && rect.bottom > headerBottom) headerBottom = rect.bottom;
+        if (rect.bottom >= footerTop && rect.top < footerTop) footerTop = rect.top;
+      }
+      return Math.max(0, footerTop - headerBottom);
     }
     return axis === "x" ? element.clientWidth : element.clientHeight;
+  }
+
+  function scrollPosition(element = scrollTarget()) {
+    return { element, left: element?.scrollLeft ?? 0, top: element?.scrollTop ?? 0 };
+  }
+
+  function restoreScrollPosition(position) {
+    if (!position?.element?.isConnected) return;
+    position.element.scrollTo({
+      left: position.left,
+      top: position.top,
+      behavior: "smooth",
+    });
+  }
+
+  function addScrollJump() {
+    const position = scrollPosition();
+    const previous = scrollJumpList.at(-1);
+    if (previous?.element === position.element
+        && previous.left === position.left && previous.top === position.top) return;
+    if (scrollJumpIndex >= 0) scrollJumpList.splice(scrollJumpIndex + 1);
+    scrollJumpList.push(position);
+    if (scrollJumpList.length > 100) scrollJumpList.shift();
+    scrollJumpIndex = scrollJumpList.length - 1;
+  }
+
+  function moveScrollJump(direction, amount) {
+    if (scrollJumpList.length === 0) return;
+    if (direction < 0 && scrollJumpIndex === scrollJumpList.length - 1) addScrollJump();
+    scrollJumpIndex = Math.max(
+      0,
+      Math.min(scrollJumpList.length - 1, scrollJumpIndex + direction * amount),
+    );
+    restoreScrollPosition(scrollJumpList[scrollJumpIndex]);
   }
 
   function runScroll(command, amount, repeat) {
@@ -267,6 +373,7 @@
     const behavior = "smooth";
 
     if (["top", "bottom", "far-left", "far-right"].includes(command)) {
+      addScrollJump();
       const options = { behavior };
       if (command === "top") options.top = 0;
       if (command === "bottom") options.top = element.scrollHeight;
@@ -356,6 +463,229 @@
     return Boolean(hadFocusedControl);
   }
 
+  function copyText(text) {
+    navigator.clipboard?.writeText(String(text)).catch(() => {});
+  }
+
+  function startKeyCapture(callback) {
+    captureKey = callback;
+    setMode("capture");
+  }
+
+  function markScrollPosition(key) {
+    scrollMarks.set(key, scrollPosition());
+  }
+
+  function jumpToScrollMark(key) {
+    const position = scrollMarks.get(key);
+    if (!position) return;
+    scrollMarks.set("'", scrollPosition());
+    addScrollJump();
+    restoreScrollPosition(position);
+  }
+
+  function goUpPath(amount) {
+    const url = new URL(location.href);
+    const parts = url.pathname.split("/").filter(Boolean);
+    parts.splice(Math.max(0, parts.length - amount));
+    url.pathname = `/${parts.join("/")}${parts.length ? "/" : ""}`;
+    url.search = "";
+    url.hash = "";
+    location.assign(url.href);
+  }
+
+  function goToRoot() {
+    location.assign(new URL("/", location.href).href);
+  }
+
+  const PREVIOUS_PATTERNS = ["prev", "previous", "‹", "«", "◀", "←", "<<", "<", "back", "newer"];
+  const NEXT_PATTERNS = ["next", "›", "»", "▶", "→", ">>", ">", "more", "older"];
+
+  function followPattern(patterns) {
+    const candidates = [...document.querySelectorAll("a, button, input[type='button']")];
+    for (const element of candidates) {
+      if (!elementRect(element)) continue;
+      const text = [
+        element.innerText,
+        element.value,
+        element.rel,
+        element.getAttribute("role"),
+        element.getAttribute("aria-label"),
+        element.getAttribute("data-tooltip"),
+      ].filter(Boolean).join(" ").trim().toLowerCase();
+      if (patterns.some((pattern) => text === pattern
+          || (pattern.length > 2 && text.includes(pattern)))) {
+        clickCurrent(element);
+        return;
+      }
+    }
+  }
+
+  function setCaretAt(element, select = false) {
+    const selection = getSelection();
+    if (!selection) return;
+    const range = document.createRange();
+    range.selectNodeContents(element);
+    if (!select) range.collapse(true);
+    selection.removeAllRanges();
+    selection.addRange(range);
+    caretSelecting = select;
+    setMode("caret");
+  }
+
+  function moveCaret(direction, granularity) {
+    getSelection()?.modify(caretSelecting ? "extend" : "move", direction, granularity);
+  }
+
+  function leaveCaret({ copy = false } = {}) {
+    if (copy) copyText(getSelection()?.toString() ?? "");
+    caretSelecting = false;
+    setMode("normal");
+  }
+
+  function findAgain(backwards = false) {
+    if (!lastFind) return;
+    if (findMatches.length === 0) updateFindMatches();
+    if (findMatches.length === 0) return;
+    findMatchIndex = (
+      findMatchIndex + (backwards ? -1 : 1) + findMatches.length
+    ) % findMatches.length;
+    const range = findMatches[findMatchIndex];
+    const selection = getSelection();
+    selection.removeAllRanges();
+    selection.addRange(range);
+    range.startContainer.parentElement?.scrollIntoView({ block: "center", behavior: "smooth" });
+  }
+
+  function updateFindMatches() {
+    findMatches = [];
+    findMatchIndex = -1;
+    CSS.highlights?.delete("rho-vim-find");
+    document.getElementById("__rho_vim_find_style")?.remove();
+    if (!lastFind) return;
+    const needle = lastFind.toLowerCase();
+    const root = lastFindOptions.linksOnly ? document.querySelectorAll("a") : [document.body];
+    for (const container of root) {
+      const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
+      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+        const text = node.data.toLowerCase();
+        let offset = 0;
+        while ((offset = text.indexOf(needle, offset)) >= 0) {
+          const range = document.createRange();
+          range.setStart(node, offset);
+          range.setEnd(node, offset + needle.length);
+          findMatches.push(range);
+          offset += Math.max(1, needle.length);
+        }
+      }
+    }
+    if (lastFindOptions.highlightAll && globalThis.Highlight && CSS.highlights) {
+      CSS.highlights.set("rho-vim-find", new Highlight(...findMatches));
+      const style = document.createElement("style");
+      style.id = "__rho_vim_find_style";
+      style.textContent = "::highlight(rho-vim-find){background:#ffd54f;color:#111}";
+      document.documentElement.append(style);
+    }
+  }
+
+  function closeFind() {
+    findState?.host.remove();
+    findState = undefined;
+    setMode("normal");
+  }
+
+  function startFind(options = {}) {
+    if (findState) return;
+    lastFindOptions = options;
+    const host = document.createElement("div");
+    host.id = "__rho_vim_find";
+    Object.assign(host.style, {
+      all: "initial",
+      position: "fixed",
+      top: "10px",
+      right: "12px",
+      zIndex: "2147483647",
+    });
+    const shadow = host.attachShadow({ mode: "closed" });
+    const input = document.createElement("input");
+    input.value = lastFind;
+    input.placeholder = "Find";
+    input.setAttribute("aria-label", "Find in page");
+    input.style.cssText = "width:260px;padding:5px 8px;border:1px solid #9b6a00;border-radius:3px;background:#fff;color:#111;font:13px sans-serif;box-shadow:0 2px 8px #0006";
+    input.addEventListener("input", (event) => {
+      event.stopPropagation();
+      lastFind = input.value;
+      updateFindMatches();
+      findAgain(false);
+    });
+    for (const type of ["beforeinput", "compositionstart", "compositionupdate", "compositionend"]) {
+      input.addEventListener(type, (event) => event.stopPropagation());
+    }
+    shadow.append(input);
+    document.documentElement.append(host);
+    findState = { host, input };
+    setMode("find");
+    input.focus();
+    input.select();
+  }
+
+  function toggleHelp() {
+    const old = document.getElementById("__rho_vim_help");
+    if (old) {
+      old.remove();
+      return;
+    }
+    const help = document.createElement("pre");
+    help.id = "__rho_vim_help";
+    help.textContent = `Rho Vim / VimFx\n\nScroll  h j k l  d u  Space  gg G  0 ^ $\nHistory H L   Reload r/R   Stop s\nHints   f  yf copy  ef focus  ec context  v/av/yv text\nFind    /  n N   Inputs gi   Ignore i   Quote I\nMarks   m{key}  '{key}  g[ g]\nPath    gu gU   Copy URL yy\nCaret   h j k l b w 0 ^ $ v o y Esc\nHelp    ?`;
+    Object.assign(help.style, {
+      all: "initial",
+      whiteSpace: "pre",
+      position: "fixed",
+      top: "50%",
+      left: "50%",
+      transform: "translate(-50%, -50%)",
+      zIndex: "2147483647",
+      padding: "18px",
+      color: "#eee",
+      background: "#202124f5",
+      border: "1px solid #777",
+      borderRadius: "5px",
+      font: "13px/1.55 monospace",
+      boxShadow: "0 6px 30px #000a",
+      pointerEvents: "none",
+    });
+    document.documentElement.append(help);
+  }
+
+  const BLACKLIST_KEY = "vimfx.blacklist";
+
+  async function toggleBlacklist() {
+    const origin = location.origin;
+    const stored = await chrome.storage.local.get(BLACKLIST_KEY);
+    const blacklist = new Set(stored[BLACKLIST_KEY] ?? []);
+    if (blacklist.delete(origin)) {
+      ignoreReason = undefined;
+      setMode("normal");
+    } else {
+      blacklist.add(origin);
+      ignoreReason = "blacklist";
+      ignoreRemaining = undefined;
+      setMode("ignore");
+    }
+    await chrome.storage.local.set({ [BLACKLIST_KEY]: [...blacklist] });
+  }
+
+  if (globalThis.chrome?.storage?.local) {
+    chrome.storage.local.get(BLACKLIST_KEY).then((stored) => {
+      if ((stored[BLACKLIST_KEY] ?? []).includes(location.origin)) {
+        ignoreReason = "blacklist";
+        ignoreRemaining = undefined;
+        setMode("ignore");
+      }
+    }).catch(() => {});
+  }
+
   function elementText(element) {
     return [
       element.innerText,
@@ -410,19 +740,15 @@
       if (seen.has(element)) return;
       seen.add(element);
       if (!isActionableElement(element)) return;
-      const rect = elementRect(element);
-      if (!rect) return;
-      const x = Math.max(0, Math.min(innerWidth - 1, rect.left + 1));
-      const y = Math.max(0, Math.min(innerHeight - 1, rect.top + rect.height / 2));
-      const covering = root.elementFromPoint?.(x, y)
-        ?? element.ownerDocument.elementFromPoint(x, y);
-      if (covering && covering !== element && !element.contains(covering)) return;
+      const shape = elementShape(root, element);
+      if (!shape) return;
+      const { rect } = shape;
       items.push({
         element,
         rect,
         text: elementText(element),
         scrollable: isScrollable(element, "x") || isScrollable(element, "y"),
-        weight: Math.max(1, rect.width * rect.height),
+        weight: Math.max(1, shape.area),
       });
     };
     for (const root of walkRoots()) {
@@ -432,6 +758,74 @@
       for (const element of root.querySelectorAll("*")) {
         if (scrollableElements.has(element)) consider(root, element);
       }
+    }
+    const links = new Map();
+    return items.filter((item) => {
+      const href = item.element.href;
+      if (!href || item.element.hasAttribute?.("onclick")) return true;
+      const existing = links.get(href);
+      if (!existing) {
+        links.set(href, item);
+        return true;
+      }
+      existing.weight += item.weight;
+      return false;
+    });
+  }
+
+  function complementaryElements(excluded) {
+    const excludedElements = new Set(excluded.map((item) => item.element));
+    const items = [];
+    for (const root of walkRoots()) {
+      for (const element of root.querySelectorAll("*")) {
+        if (excludedElements.has(element) || element === document.body
+            || element === document.documentElement) continue;
+        const shape = elementShape(root, element);
+        if (!shape) continue;
+        items.push({
+          element,
+          rect: shape.rect,
+          text: elementText(element),
+          scrollable: false,
+          weight: Math.max(1, shape.area),
+          complementary: true,
+        });
+      }
+    }
+    return items;
+  }
+
+  function selectableTextElements() {
+    const items = [];
+    for (const root of walkRoots()) {
+      for (const element of root.querySelectorAll(
+        "p, pre, code, blockquote, li, dt, dd, td, th, h1, h2, h3, h4, h5, h6, div, span",
+      )) {
+        const hasDirectText = [...element.childNodes]
+          .some((node) => node.nodeType === Node.TEXT_NODE && node.data.trim().length > 1);
+        if (!hasDirectText) continue;
+        const shape = elementShape(root, element);
+        if (!shape) continue;
+        items.push({
+          element,
+          rect: shape.rect,
+          text: elementText(element),
+          scrollable: false,
+          weight: Math.max(1, shape.area),
+        });
+      }
+    }
+    return items;
+  }
+
+  function hintElementsForAction(action) {
+    if (["caret", "select", "copy-text"].includes(action)) return selectableTextElements();
+    const items = actionableElements();
+    if (action === "copy") {
+      return items.filter((item) => item.element.href || isTypingElement(item.element));
+    }
+    if (action === "focus") {
+      return items.filter((item) => item.scrollable || item.element.tabIndex >= 0);
     }
     return items;
   }
@@ -534,9 +928,28 @@
   }
 
   function activateHint(item, byText = false) {
+    const { action, count: hintCount } = hints;
     clearHints();
     if (byText) ignoreKeyEventsUntil = performance.now() + HINT_TEXT_TIMEOUT_MS;
-    if (isTypingElement(item.element) || item.element.matches("select")) {
+    if (action === "copy") {
+      copyText(item.element.href || item.element.value || item.element.innerText || "");
+    } else if (action === "focus") {
+      item.element.focus({ preventScroll: true });
+      item.element.select?.();
+    } else if (action === "context") {
+      // VIMFX PARITY TODO(rhoPrivate.vim): dispatch a trusted context-menu
+      // gesture through the renderer input pipeline.
+      item.element.dispatchEvent(new MouseEvent("contextmenu", {
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+        clientX: item.rect.left + 1,
+        clientY: item.rect.top + item.rect.height / 2,
+      }));
+    } else if (action === "caret" || action === "select" || action === "copy-text") {
+      setCaretAt(item.element, action !== "caret");
+      if (action === "copy-text") leaveCaret({ copy: true });
+    } else if (isTypingElement(item.element) || item.element.matches("select")) {
       item.element.focus();
       item.element.select?.();
     } else if (item.scrollable) {
@@ -544,6 +957,9 @@
       item.element.focus({ preventScroll: true });
     } else {
       clickCurrent(item.element);
+    }
+    if (action === "multiple" && hintCount > 1) {
+      setTimeout(() => startHints("multiple", hintCount - 1), 200);
     }
   }
 
@@ -593,12 +1009,54 @@
     requestAnimationFrame(refreshHintMarkers);
   }
 
-  function enterHints(generation) {
-    const items = actionableElements();
+  function addHintMarkers(items) {
+    assignHints(items);
+    items.forEach((item, index) => {
+      const marker = document.createElement("span");
+      marker.textContent = item.hint;
+      marker.style.zIndex = String(index + 1);
+      item.marker = marker;
+      hints.shadow.append(marker);
+    });
+  }
+
+  function toggleComplementaryHints() {
+    if (!hints.complementaryItems) {
+      hints.complementaryItems = complementaryElements(hints.primaryItems);
+      addHintMarkers(hints.complementaryItems);
+    }
+    for (const item of hints.items) item.marker.style.display = "none";
+    hints.complementary = !hints.complementary;
+    hints.items = hints.complementary ? hints.complementaryItems : hints.primaryItems;
+    hints.enteredHint = "";
+    hints.enteredText = "";
+    refreshHintMarkers();
+  }
+
+  function rotateOverlappingHints(forward) {
+    const visible = hints.items.filter((item) => item.marker.style.display !== "none");
+    const visited = new Set();
+    for (const first of visible) {
+      if (visited.has(first)) continue;
+      const stack = visible.filter((item) => {
+        const overlaps = item.rect.left < first.rect.right && item.rect.right > first.rect.left
+          && item.rect.top < first.rect.bottom && item.rect.bottom > first.rect.top;
+        if (overlaps) visited.add(item);
+        return overlaps;
+      });
+      if (stack.length < 2) continue;
+      const levels = stack.map((item) => item.marker.style.zIndex || "0");
+      if (forward) levels.push(levels.shift());
+      else levels.unshift(levels.pop());
+      stack.forEach((item, index) => { item.marker.style.zIndex = levels[index]; });
+    }
+  }
+
+  function enterHints(generation, action = "current", hintCount = 1) {
+    const items = hintElementsForAction(action);
     if (items.length === 0) return false;
     clearHints();
     hintGeneration = generation;
-    assignHints(items);
 
     const host = document.createElement("div");
     host.id = "__rho_vim_hints";
@@ -627,14 +1085,20 @@
       b { color: #b00020; }
     `;
     shadow.append(style);
-    for (const item of items) {
-      const marker = document.createElement("span");
-      marker.textContent = item.hint;
-      item.marker = marker;
-      shadow.append(marker);
-    }
     document.documentElement.appendChild(host);
-    hints = { host, items, enteredHint: "", enteredText: "" };
+    hints = {
+      host,
+      shadow,
+      items,
+      primaryItems: items,
+      complementaryItems: undefined,
+      complementary: false,
+      enteredHint: "",
+      enteredText: "",
+      action,
+      count: hintCount,
+    };
+    addHintMarkers(items);
     refreshHintMarkers();
     return true;
   }
@@ -644,6 +1108,10 @@
     const key = event.key;
     if (key === "Escape") {
       clearHints();
+      return;
+    }
+    if (key === "Backspace" && event.ctrlKey) {
+      toggleComplementaryHints();
       return;
     }
     if (key === "Backspace") {
@@ -657,11 +1125,12 @@
       if (match) activateHint(match, Boolean(hints.enteredText));
       return;
     }
-    if ((key === " " && (event.ctrlKey || event.shiftKey))
-        || (key === "Backspace" && event.ctrlKey)
-        || key === "ArrowUp") {
-      // VimFx parity TODO: rotate overlapping markers, toggle the
-      // complementary candidate pass, and increase multi-follow count.
+    if (key === " " && (event.ctrlKey || event.shiftKey)) {
+      rotateOverlappingHints(event.ctrlKey);
+      return;
+    }
+    if (key === "ArrowUp") {
+      hints.count += 1;
       return;
     }
     if (key.length !== 1 || event.ctrlKey || event.altKey || event.metaKey) return;
@@ -694,6 +1163,14 @@
     lastInputTime = 0;
   }
 
+  function finishUnquote() {
+    if (!returnToIgnore) return;
+    returnToIgnore = false;
+    ignoreReason = "explicit";
+    ignoreRemaining = undefined;
+    setMode("ignore");
+  }
+
   function command(run, { repeatable = false } = {}) {
     return { run, repeatable };
   }
@@ -714,30 +1191,74 @@
     H: command((amount) => runBrowserCommand("back", amount), { repeatable: true }),
     L: command((amount) => runBrowserCommand("forward", amount), { repeatable: true }),
     r: command((amount) => runBrowserCommand("reload", amount), { repeatable: true }),
+    R: command((amount) => runBrowserCommand("reload-force", amount), { repeatable: true }),
+    s: command(() => window.stop()),
     Escape: command(() => escapeNormalMode()),
-    f: command(() => startHints()),
+    f: command((amount) => startHints("current", amount)),
     // VimFx parity TODO: `F` opens a hinted link in a background tab. Rho must
     // create a managed PageId and Desk-owned page rather than an orphan Brave
     // tab before this binding can be enabled.
     // F: command(() => startHintsInManagedTab()),
     i: command(() => {
       ignoreRemaining = undefined;
+      ignoreReason = "explicit";
       setMode("ignore");
     }),
     I: command((amount) => {
       ignoreRemaining = amount;
+      ignoreReason = "quote";
       setMode("ignore");
     }),
+    m: command(() => startKeyCapture(markScrollPosition)),
+    "'": command(() => startKeyCapture(jumpToScrollMark)),
+    "[": command(() => followPattern(PREVIOUS_PATTERNS)),
+    "]": command(() => followPattern(NEXT_PATTERNS)),
+    "/": command(() => startFind()),
+    n: command(() => findAgain(false)),
+    N: command(() => findAgain(true)),
+    v: command(() => startHints("caret")),
+    "?": command(() => toggleHelp()),
+    y: {
+      y: command(() => copyText(location.href)),
+      f: command(() => startHints("copy")),
+      v: command(() => startHints("copy-text")),
+      // t: duplicate tab requires a Desk-owned PageId.
+    },
+    e: {
+      f: command(() => startHints("focus")),
+      c: command(() => startHints("context")),
+      // t/w/p: tab/window/private-window actions require Desk page creation.
+    },
+    a: {
+      v: command(() => startHints("select")),
+      // f: multi-follow requires managed background-page creation.
+      "/": command(() => startFind({ highlightAll: true })),
+      r: command(() => runBrowserCommand("reload-all", 1)),
+      R: command(() => runBrowserCommand("reload-all-force", 1)),
+      s: command(() => runBrowserCommand("stop-all", 1)),
+    },
     g: {
       g: command((amount, event) => runScroll("top", amount, event.repeat)),
       i: command((amount, _event, explicitCount) => focusTextInput(explicitCount ? amount : undefined)),
+      u: command((amount) => goUpPath(amount)),
+      U: command(() => goToRoot()),
+      "[": command((amount) => moveScrollJump(-1, amount)),
+      "]": command((amount) => moveScrollJump(1, amount)),
+      B: command(() => toggleBlacklist()),
+      "/": command(() => startFind({ linksOnly: true })),
+      // H: browser history popup is native Brave UI and intentionally omitted.
+      // r: reader mode needs a fixed rhoPrivate browser command.
+      // C: reload-config becomes active when key configuration is externalized.
+      // T/t/l/L/J/K/w/0/^/$/p/X/x: tab commands require Desk handoff support.
     },
+    // o/O/p/P/gh: omnibox, search, paste-and-go, and home need rhoPrivate.vim.
+    // t/T/J/K/x/X/w/W: native tab/window commands must not bypass PageId ownership.
   };
   currentKeyTree = COMMANDS;
 
-  function startHints() {
+  function startHints(action = "current", hintCount = 1) {
     nextHintGeneration = (nextHintGeneration + 1) || 1;
-    if (enterHints(nextHintGeneration)) setMode("hints");
+    if (enterHints(nextHintGeneration, action, hintCount)) setMode("hints");
   }
 
   function runBrowserCommand(name, amount) {
@@ -753,9 +1274,18 @@
     event.stopImmediatePropagation();
   }
 
+  function shieldEvent(event) {
+    event.stopImmediatePropagation();
+  }
+
   function consume(event, repeatCommand) {
     keyDispositions.set(event.code, { consumed: true, repeatCommand });
     stopEvent(event);
+  }
+
+  function shield(event) {
+    keyDispositions.set(event.code, { consumed: false, shielded: true });
+    shieldEvent(event);
   }
 
   function keyName(event) {
@@ -777,6 +1307,57 @@
     return false;
   }
 
+  function handleCaretKey(event) {
+    const key = keyName(event);
+    const moves = {
+      h: ["backward", "character"],
+      l: ["forward", "character"],
+      j: ["forward", "line"],
+      k: ["backward", "line"],
+      b: ["backward", "word"],
+      w: ["forward", "word"],
+      0: ["backward", "lineboundary"],
+      "^": ["backward", "lineboundary"],
+      "$": ["forward", "lineboundary"],
+    };
+    if (moves[key]) {
+      const amount = Math.max(1, count ? Number(count) : 1);
+      for (let index = 0; index < amount; index += 1) moveCaret(...moves[key]);
+      count = "";
+      return true;
+    }
+    if (/^\d$/.test(key) && !(key === "0" && !count)) {
+      count = String(Math.min(9999, Number(`${count}${key}`)));
+      return true;
+    }
+    count = "";
+    if (key === "v") {
+      caretSelecting = !caretSelecting;
+      return true;
+    }
+    if (key === "o") {
+      const selection = getSelection();
+      if (selection && !selection.isCollapsed) {
+        const range = selection.getRangeAt(0);
+        const end = range.cloneRange();
+        end.collapse(caretSelecting);
+        selection.removeAllRanges();
+        selection.addRange(end);
+      }
+      caretSelecting = true;
+      return true;
+    }
+    if (key === "y") {
+      leaveCaret({ copy: true });
+      return true;
+    }
+    if (key === "Escape") {
+      leaveCaret();
+      return true;
+    }
+    return false;
+  }
+
   function onKeyDown(event) {
     if (!event.isTrusted) return;
     const disposition = keyDispositions.get(event.code);
@@ -794,6 +1375,33 @@
       return;
     }
 
+    if (mode === "capture") {
+      const key = keyName(event);
+      if (!key) return;
+      if (key !== "Escape" && key.length === 1) captureKey?.(key);
+      captureKey = undefined;
+      setMode("normal");
+      consume(event);
+      return;
+    }
+
+    if (mode === "find") {
+      if (event.key === "Escape" || event.key === "Enter") {
+        closeFind();
+        consume(event);
+      } else {
+        // Keep find text private from page listeners without cancelling the
+        // input element's native editing default.
+        shield(event);
+      }
+      return;
+    }
+
+    if (mode === "caret") {
+      if (handleCaretKey(event)) consume(event);
+      return;
+    }
+
     if (mode === "ignore") {
       if (ignoreRemaining !== undefined) {
         ignoreRemaining -= 1;
@@ -804,13 +1412,17 @@
       } else if (!event.ctrlKey && !event.altKey && !event.metaKey && event.shiftKey
                  && event.key === "Escape") {
         ignoreRemaining = undefined;
+        ignoreReason = undefined;
+        setMode("normal");
+        resetInput();
+        consume(event);
+      } else if (!event.ctrlKey && !event.altKey && !event.metaKey
+                 && event.shiftKey && event.key === "F1") {
+        returnToIgnore = true;
         setMode("normal");
         resetInput();
         consume(event);
       }
-      // VimFx parity TODO: Shift-F1 temporarily returns to Normal mode for one
-      // command, then re-enters explicit Ignore mode.
-      // if (key === "<s-f1>") unquoteOneNormalCommand();
       return;
     }
 
@@ -833,6 +1445,7 @@
     if (!event.ctrlKey && !event.altKey && !event.metaKey && event.key === "Tab"
         && moveInputFocus(event.shiftKey ? -1 : 1)) {
       consume(event);
+      finishUnquote();
       return;
     }
 
@@ -840,11 +1453,13 @@
     const focused = activeElement();
     if (key !== "Escape" && focusConflict(event, focused)) {
       resetInput();
+      finishUnquote();
       return;
     }
 
     if (!key) {
       resetInput();
+      finishUnquote();
       return;
     }
 
@@ -861,6 +1476,7 @@
         resetInput();
         const shouldConsume = match.run(amount, event, explicitCount) !== false;
         if (shouldConsume) consume(event, match.repeatable ? match : undefined);
+        finishUnquote();
       } else {
         currentKeyTree = match;
         consume(event);
@@ -875,21 +1491,33 @@
     }
 
     resetInput();
+    finishUnquote();
     if (!topLevel) consume(event);
   }
 
   addEventListener("keydown", onKeyDown, true);
+  globalThis.chrome?.runtime?.onMessage?.addListener((message) => {
+    if (message?.type === "rho-vim-stop") window.stop();
+  });
   addEventListener("keyup", (event) => {
     if (!event.isTrusted) return;
     const disposition = keyDispositions.get(event.code);
     keyDispositions.delete(event.code);
     if (disposition?.consumed) stopEvent(event);
+    else if (disposition?.shielded) shieldEvent(event);
   }, true);
   addEventListener("blur", (event) => {
     if (event.isTrusted) keyDispositions.clear();
   }, true);
   addEventListener("focus", (event) => {
-    if (!event.isTrusted || !isTypingElement(event.target)) return;
+    if (!event.isTrusted) return;
+    if (isIgnoreModeElement(event.target)) {
+      ignoreReason = "focus";
+      ignoreRemaining = undefined;
+      setMode("ignore");
+      return;
+    }
+    if (!isTypingElement(event.target)) return;
     lastFocusedTextInput = event.target;
     hasFocusedTextInput = true;
 
@@ -898,6 +1526,15 @@
     // thieves while suppressing the resulting focus events.
     // VIMFX PARITY TODO(rhoPrivate.vim):
     // if (preventAutofocus && lastFocusMethod() === PROGRAMMATIC) event.target.blur();
+  }, true);
+  addEventListener("blur", (event) => {
+    if (!event.isTrusted || ignoreReason !== "focus") return;
+    setTimeout(() => {
+      if (!isIgnoreModeElement(activeElement())) {
+        ignoreReason = undefined;
+        setMode("normal");
+      }
+    }, 50);
   }, true);
   addEventListener("mousedown", (event) => {
     if (!event.isTrusted) return;

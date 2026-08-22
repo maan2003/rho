@@ -420,8 +420,15 @@ mod tests {
         assert_eq!(manifest["manifest_version"], 3);
         assert_eq!(manifest["content_scripts"][0]["run_at"], "document_start");
         assert_eq!(manifest["content_scripts"][0]["all_frames"], true);
+        assert!(
+            manifest["permissions"]
+                .as_array()
+                .unwrap()
+                .contains(&Value::String("clipboardWrite".into()))
+        );
         let worker = fs::read_to_string(extension.join("service-worker.js")).unwrap();
         assert!(worker.contains("chrome.rhoPrivate"));
+        assert!(worker.contains("reload-all-force"));
         assert!(!worker.contains("chrome.tabGroups"));
         assert!(!worker.contains("fallbackTabKey"));
         assert!(!worker.contains("onCommand"));
@@ -433,6 +440,10 @@ mod tests {
         assert!(content.contains("function scrollTarget()"));
         assert!(content.contains("const behavior = \"smooth\""));
         assert!(content.contains("enteredText"));
+        assert!(content.contains("function handleCaretKey(event)"));
+        assert!(content.contains("function updateFindMatches()"));
+        assert!(content.contains("function toggleComplementaryHints()"));
+        assert!(content.contains("function jumpToScrollMark(key)"));
         assert!(content.contains("VIMFX PARITY TODO(rhoPrivate.vim)"));
         assert!(!content.contains("__rhoHandleCommand"));
         assert!(!content.contains("__rhoComponentController"));

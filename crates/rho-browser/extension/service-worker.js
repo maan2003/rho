@@ -315,6 +315,23 @@ chrome.runtime.onMessage.addListener((message, sender) => {
     case "back": return chrome.tabs.goBack(sender.tab.id);
     case "forward": return chrome.tabs.goForward(sender.tab.id);
     case "reload": return chrome.tabs.reload(sender.tab.id);
+    case "reload-force": return chrome.tabs.reload(sender.tab.id, { bypassCache: true });
+    case "reload-all": return Promise.all(
+      [...tabPages.keys()].map((tabId) => chrome.tabs.reload(tabId).catch(() => {})),
+    );
+    case "reload-all-force": return Promise.all(
+      [...tabPages.keys()].map((tabId) => chrome.tabs.reload(
+        tabId,
+        { bypassCache: true },
+      ).catch(() => {})),
+    );
+    case "stop-all": return Promise.all(
+      [...tabPages.keys()].map((tabId) => chrome.tabs.sendMessage(
+        tabId,
+        { type: "rho-vim-stop" },
+        { frameId: 0 },
+      ).catch(() => {})),
+    );
     default: return undefined;
   }
 });
