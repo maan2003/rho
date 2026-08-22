@@ -43,6 +43,7 @@ use wayland_protocols::wp::color_management::v1::client::{
 use wayland_protocols::wp::pointer_gestures::zv1::client::{
     zwp_pointer_gesture_pinch_v1, zwp_pointer_gestures_v1,
 };
+use wayland_protocols::wp::presentation_time::client::{wp_presentation, wp_presentation_feedback};
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_offer_v1::{
     self, ZwpPrimarySelectionOfferV1,
 };
@@ -217,6 +218,7 @@ pub struct Globals {
     pub shm: wl_shm::WlShm,
     pub seat: wl_seat::WlSeat,
     pub viewporter: Option<wp_viewporter::WpViewporter>,
+    pub presentation: Option<wp_presentation::WpPresentation>,
     pub fractional_scale_manager:
         Option<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1>,
     pub decoration_manager: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
@@ -273,6 +275,7 @@ impl Globals {
             seat,
             wm_base: globals.bind(&qh, 1..=5, ()).unwrap(),
             viewporter: globals.bind(&qh, 1..=1, ()).ok(),
+            presentation: globals.bind(&qh, 1..=2, ()).ok(),
             fractional_scale_manager: globals.bind(&qh, 1..=1, ()).ok(),
             decoration_manager: globals.bind(&qh, 1..=1, ()).ok(),
             layer_shell: globals.bind(&qh, 1..=5, ()).ok(),
@@ -294,6 +297,7 @@ pub struct InProgressOutput {
     position: Option<Point<DevicePixels>>,
     size: Option<Size<DevicePixels>>,
     subpixel: Option<wl_output::Subpixel>,
+    refresh_period: Option<Duration>,
 }
 
 impl InProgressOutput {
@@ -305,6 +309,7 @@ impl InProgressOutput {
                 scale,
                 bounds: Bounds::new(position, size),
                 subpixel: self.subpixel,
+                refresh_period: self.refresh_period,
             })
         } else {
             None
@@ -318,6 +323,7 @@ pub struct Output {
     pub scale: i32,
     pub bounds: Bounds<DevicePixels>,
     pub subpixel: Option<wl_output::Subpixel>,
+    pub refresh_period: Option<Duration>,
 }
 
 pub(crate) struct WaylandClientState {
@@ -1492,9 +1498,45 @@ impl Dispatch<WlCallback, ObjectId> for WaylandClientStatePtr {
         };
         drop(state);
 
-        if let wl_callback::Event::Done { .. } = event {
-            window.frame();
+        if let wl_callback::Event::Done { callback_data } = event {
+            window.frame_at(callback_data);
         }
+    }
+}
+
+delegate_noop!(WaylandClientStatePtr: ignore wp_presentation::WpPresentation);
+
+impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, ObjectId>
+    for WaylandClientStatePtr
+{
+    fn event(
+        state: &mut Self,
+        _: &wp_presentation_feedback::WpPresentationFeedback,
+        event: wp_presentation_feedback::Event,
+        surface_id: &ObjectId,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let wp_presentation_feedback::Event::Presented {
+            tv_sec_hi,
+            tv_sec_lo,
+            tv_nsec,
+            refresh,
+            ..
+        } = event
+        else {
+            return;
+        };
+        let client = state.get_client();
+        let mut state = client.borrow_mut();
+        let Some(window) = get_window(&mut state, surface_id) else {
+            return;
+        };
+        drop(state);
+        window.presented(
+            Duration::new((u64::from(tv_sec_hi) << 32) | u64::from(tv_sec_lo), tv_nsec),
+            (refresh != 0).then(|| Duration::from_nanos(u64::from(refresh))),
+        );
     }
 }
 
@@ -1557,8 +1599,19 @@ impl Dispatch<wl_output::WlOutput, ()> for WaylandClientStatePtr {
                     in_progress_output.subpixel = Some(subpixel);
                 }
             }
-            wl_output::Event::Mode { width, height, .. } => {
-                in_progress_output.size = Some(size(DevicePixels(width), DevicePixels(height)))
+            wl_output::Event::Mode {
+                width,
+                height,
+                refresh,
+                flags,
+            } => {
+                in_progress_output.size = Some(size(DevicePixels(width), DevicePixels(height)));
+                if matches!(flags, WEnum::Value(flags) if flags.contains(wl_output::Mode::Current))
+                    && refresh > 0
+                {
+                    in_progress_output.refresh_period =
+                        Some(Duration::from_secs_f64(1_000.0 / f64::from(refresh)));
+                }
             }
             wl_output::Event::Done => {
                 if let Some(complete) = in_progress_output.complete() {

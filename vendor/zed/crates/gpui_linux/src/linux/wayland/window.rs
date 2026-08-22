@@ -4,6 +4,7 @@ use std::{
     ptr::NonNull,
     rc::Rc,
     sync::Arc,
+    time::Duration,
 };
 
 use collections::{FxHashMap, HashMap};
@@ -33,10 +34,10 @@ use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
 use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, ExternalDragPayload, GpuSpecs,
-    Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
-    PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size,
-    Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowControls, WindowDecorations, WindowKind, WindowParams,
+    HostVsync, Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput,
+    PlatformInputHandler, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
+    ResizeEdge, Scene, Size, Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea, WindowControls, WindowDecorations, WindowKind, WindowParams,
     layer_shell::{Anchor, LayerShellNotSupportedError},
     popup::PopupOptions,
     px, size,
@@ -124,6 +125,7 @@ pub struct WaylandWindowState {
     hovered: bool,
     pub(crate) force_render_after_recovery: bool,
     renderer_presented: bool,
+    host_presentation: Option<HostVsync>,
     in_progress_configure: Option<InProgressConfigure>,
     resize_throttle: bool,
     in_progress_window_controls: Option<WindowControls>,
@@ -654,6 +656,7 @@ impl WaylandWindowState {
             hovered: false,
             force_render_after_recovery: false,
             renderer_presented: false,
+            host_presentation: None,
             in_progress_window_controls: None,
             window_controls: WindowControls::default(),
             client_inset: None,
@@ -871,6 +874,67 @@ impl WaylandWindowStatePtr {
     }
 
     pub fn frame(&self) {
+        self.request_frame(None);
+    }
+
+    pub fn frame_at(&self, _callback_data: u32) {
+        if let Some(host_vsync) = self.state.borrow().host_presentation {
+            self.request_frame(Some(host_vsync));
+            return;
+        }
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        let host_vsync = (unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } == 0)
+            .then(|| {
+                let state = self.state.borrow();
+                let refresh_period = state
+                    .display
+                    .as_ref()
+                    .and_then(|(_, output)| output.refresh_period)
+                    .or_else(|| {
+                        state
+                            .outputs
+                            .values()
+                            .find_map(|output| output.refresh_period)
+                    });
+                Some(HostVsync {
+                    timestamp: Duration::new(now.tv_sec as u64, now.tv_nsec as u32),
+                    refresh_period,
+                })
+            })
+            .flatten();
+        self.request_frame(host_vsync);
+    }
+
+    pub fn presented(&self, timestamp: Duration, refresh_period: Option<Duration>) {
+        let mut state = self.state.borrow_mut();
+        let refresh_period = refresh_period
+            .or_else(|| {
+                state
+                    .host_presentation
+                    .and_then(|timing| timing.refresh_period)
+            })
+            .or_else(|| {
+                state
+                    .display
+                    .as_ref()
+                    .and_then(|(_, output)| output.refresh_period)
+            })
+            .or_else(|| {
+                state
+                    .outputs
+                    .values()
+                    .find_map(|output| output.refresh_period)
+            });
+        state.host_presentation = Some(HostVsync {
+            timestamp,
+            refresh_period,
+        });
+    }
+
+    fn request_frame(&self, host_vsync: Option<HostVsync>) {
         let mut state = self.state.borrow_mut();
         state.surface.frame(&state.globals.qh, state.surface.id());
         state.resize_throttle = false;
@@ -882,6 +946,7 @@ impl WaylandWindowStatePtr {
         if let Some(fun) = cb.request_frame.as_mut() {
             fun(RequestFrameOptions {
                 force_render,
+                host_vsync,
                 ..Default::default()
             });
             self.update_ime_enabled();
@@ -1761,6 +1826,9 @@ impl PlatformWindow for WaylandWindow {
             return;
         }
 
+        if let Some(presentation) = state.globals.presentation.as_ref() {
+            presentation.feedback(&state.surface, &state.globals.qh, state.surface.id());
+        }
         state.renderer_presented = state.renderer.draw(scene);
 
         if state.renderer.needs_redraw() {

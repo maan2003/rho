@@ -6,12 +6,12 @@ use crate::{
     Capslock, Color, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
     DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
     EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
+    HostVsync, Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+    Keystroke, KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent,
+    MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels,
+    PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
+    PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams,
+    RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
     SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
     StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
     SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextRenderingMode, TextStyle,
@@ -1161,6 +1161,7 @@ pub struct Window {
     input_latency_tracker: InputLatencyTracker,
     last_input_modality: InputModality,
     pub(crate) refreshing: bool,
+    host_vsync: Option<HostVsync>,
     pub(crate) activation_observers: SubscriberSet<(), AnyObserver>,
     pub(crate) focus: Option<FocusId>,
     focus_enabled: bool,
@@ -1618,6 +1619,11 @@ impl Window {
                     deferred_force_render |= request_frame_options.force_render;
                     return;
                 }
+                if let Some(host_vsync) = request_frame_options.host_vsync {
+                    handle
+                        .update(&mut cx, |_, window, _| window.host_vsync = Some(host_vsync))
+                        .log_err();
+                }
                 // Take the deferred flag first: `||` short-circuits, and leaving
                 // the flag set when this request already forces a render would
                 // force a second, redundant render on the next frame.
@@ -1929,6 +1935,7 @@ impl Window {
             input_latency_tracker: InputLatencyTracker::new()?,
             last_input_modality: InputModality::Mouse,
             refreshing: false,
+            host_vsync: None,
             activation_observers: SubscriberSet::new(),
             focus: None,
             focus_enabled: true,
@@ -1948,6 +1955,11 @@ impl Window {
                 initial_window_title,
             ),
         })
+    }
+
+    /// Most recent host-compositor vblank observed for this window.
+    pub fn host_vsync(&self) -> Option<HostVsync> {
+        self.host_vsync
     }
 
     pub(crate) fn new_focus_listener(

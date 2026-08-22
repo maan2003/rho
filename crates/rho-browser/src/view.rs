@@ -1523,6 +1523,10 @@ impl Render for BrowserView {
             }
         }
         let model = self.model.read(cx);
+        if let (Some(session), Some(vsync)) = (model.runtime.session.as_ref(), window.host_vsync())
+        {
+            session.host_vsync(vsync.timestamp, vsync.refresh_period);
+        }
         let colors = cx.theme().colors();
         let presents = model.presents(self.owner_id, self.page_id);
         let presented = if owns_presentation

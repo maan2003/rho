@@ -729,6 +729,16 @@ pub struct RequestFrameOptions {
     pub require_presentation: bool,
     /// Force refresh of all rendering states when true.
     pub force_render: bool,
+    pub host_vsync: Option<HostVsync>,
+}
+
+/// Timing of a host-compositor vblank, in the host's monotonic clock domain.
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub struct HostVsync {
+    /// Presentation timestamp in the host compositor's monotonic clock.
+    pub timestamp: Duration,
+    /// Fixed refresh period of the output presenting the window.
+    pub refresh_period: Option<Duration>,
 }
 
 /// The application's lifecycle phase, as owned and reported by a mobile OS.

@@ -454,14 +454,31 @@ pub enum PinchGesture {
 enum PageCommand {
     Resize(u32, u32, f64),
     FrameBarrier(u64, u32, u32, f64),
-    Presented { scene_id: u64, barrier: u64 },
+    Presented {
+        scene_id: u64,
+        barrier: u64,
+    },
+    HostVsync {
+        timestamp: Duration,
+        refresh: Option<Duration>,
+    },
     Retired(u64),
-    PointerMotion { commit_id: u64, x: f64, y: f64 },
+    PointerMotion {
+        commit_id: u64,
+        x: f64,
+        y: f64,
+    },
     PointerLeave,
-    PointerButton { button: u32, pressed: bool },
+    PointerButton {
+        button: u32,
+        pressed: bool,
+    },
     PointerAxis(PointerAxisFrame),
     Pinch(PinchGesture),
-    Key { keycode: u32, pressed: bool },
+    Key {
+        keycode: u32,
+        pressed: bool,
+    },
     InputBarrier(u64, async_channel::Sender<()>),
     UnfreezeInput(u64),
     Close,
@@ -611,6 +628,11 @@ impl<K: BrowserPageKey> BrowserSession<K> {
     pub fn events(&self) -> BrowserEventReceiver {
         self.events.clone()
     }
+    /// Updates the host compositor's real vblank clock. Frame callbacks are
+    /// completed at the next predicted vblank in this clock domain.
+    pub fn host_vsync(&self, timestamp: Duration, refresh: Option<Duration>) {
+        self.send(PageCommand::HostVsync { timestamp, refresh });
+    }
     pub fn presentation_callback(
         &self,
         scene_id: u64,
@@ -637,6 +659,8 @@ struct WindowState {
     scale: f64,
     events: BrowserEventSender,
     dma_frame_callbacks: HashMap<u64, Vec<wl_callback::WlCallback>>,
+    scheduled_vsync: Option<u64>,
+    host_vsync: Option<(Duration, Option<Duration>, u64)>,
     pointer_frames: HashMap<u64, PointerFrame>,
     hit_scenes: HashMap<u64, Vec<HitNode>>,
     pointer_location: (f64, f64),
@@ -686,7 +710,7 @@ struct State<K: BrowserPageKey> {
     syncobj: Option<DrmSyncobjState>,
     dma_formats: Arc<[(u32, u64)]>,
     allow_root_shm: bool,
-    _output: Output,
+    output: Output,
     _fractional_scale: FractionalScaleManagerState,
     _viewporter: ViewporterState,
     _pointer_gestures: PointerGesturesState,
@@ -750,7 +774,7 @@ struct SurfaceTreeSnapshot {
     hits: Vec<HitNode>,
 }
 
-fn monotonic_time_ms() -> u32 {
+fn monotonic_time() -> Duration {
     let mut time = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -759,7 +783,11 @@ fn monotonic_time_ms() -> u32 {
     // for input event timestamps.
     let result = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) };
     assert_eq!(result, 0, "CLOCK_MONOTONIC must be available on Linux");
-    (time.tv_sec as u64 * 1_000 + time.tv_nsec as u64 / 1_000_000) as u32
+    Duration::new(time.tv_sec as u64, time.tv_nsec as u32)
+}
+
+fn monotonic_time_ms() -> u32 {
+    monotonic_time().as_millis() as u32
 }
 
 fn normalize_shm_pixels(format: wl_shm::Format, pixels: &mut [u8]) {
@@ -1451,6 +1479,7 @@ impl<K: BrowserPageKey> State<K> {
             nodes,
             produced_at,
         }));
+        schedule_frame_delivery(self, id, scene_id);
         Ok(())
     }
 
@@ -1479,7 +1508,7 @@ impl<K: BrowserPageKey> State<K> {
             (window.size, window.scale)
         };
         self.surface_windows.insert(root.clone(), id);
-        self._output.enter(surface.wl_surface());
+        self.output.enter(surface.wl_surface());
         with_states(surface.wl_surface(), |states| {
             with_fractional_scale(states, |fractional| {
                 fractional.set_preferred_scale(scale);
@@ -2196,7 +2225,7 @@ fn run<K: BrowserPageKey>(
         syncobj,
         dma_formats: formats,
         allow_root_shm,
-        _output: output,
+        output,
         _fractional_scale: FractionalScaleManagerState::new::<State<K>>(&dh),
         _viewporter: ViewporterState::new::<State<K>>(&dh),
         _pointer_gestures: PointerGesturesState::new::<State<K>>(&dh),
@@ -2293,6 +2322,8 @@ fn handle_runtime_command<K: BrowserPageKey>(
                     scale: 1.0,
                     events,
                     dma_frame_callbacks: HashMap::new(),
+                    scheduled_vsync: None,
+                    host_vsync: None,
                     pointer_frames: HashMap::new(),
                     hit_scenes: HashMap::new(),
                     pointer_location: (0.0, 0.0),
@@ -2376,9 +2407,7 @@ fn handle_page_command<K: BrowserPageKey>(state: &mut State<K>, id: K, c: PageCo
             frame_barrier(state, id, barrier, w, h, scale)
         }
         PageCommand::Presented { scene_id, barrier } => {
-            let time = state.time();
             if let Some(w) = state.windows.get_mut(&id) {
-                send_frame_callbacks(w, time, scene_id);
                 record_browser_timing(
                     BrowserTimingKind::FrameAcknowledged,
                     scene_id,
@@ -2387,6 +2416,20 @@ fn handle_page_command<K: BrowserPageKey>(state: &mut State<K>, id: K, c: PageCo
                     None,
                 );
                 prune_pointer_scenes(&mut w.pointer_frames, &mut w.hit_scenes, scene_id);
+            }
+        }
+        PageCommand::HostVsync { timestamp, refresh } => {
+            let scene = if let Some(window) = state.windows.get_mut(&id) {
+                let generation = window
+                    .host_vsync
+                    .map_or(1, |(_, _, generation)| generation.wrapping_add(1));
+                window.host_vsync = Some((timestamp, refresh, generation));
+                window.dma_frame_callbacks.keys().copied().max()
+            } else {
+                None
+            };
+            if let Some(scene_id) = scene {
+                schedule_frame_delivery(state, id, scene_id);
             }
         }
         PageCommand::Retired(commit) => {
@@ -3005,6 +3048,55 @@ fn drain_frame_callbacks(surfaces: &[WlSurface]) -> Vec<wl_callback::WlCallback>
     callbacks
 }
 
+fn predicted_next_vsync(timestamp: Duration, refresh: Duration, now: Duration) -> Duration {
+    if timestamp > now || refresh.is_zero() {
+        return timestamp.max(now);
+    }
+    let elapsed = now - timestamp;
+    let periods = elapsed.as_nanos() / refresh.as_nanos() + 1;
+    timestamp + refresh.mul_f64(periods as f64)
+}
+
+fn schedule_frame_delivery<K: BrowserPageKey>(state: &mut State<K>, id: K, scene_id: u64) {
+    let Some(window) = state.windows.get_mut(&id) else {
+        return;
+    };
+    if !window.dma_frame_callbacks.contains_key(&scene_id) {
+        return;
+    }
+    let Some((timestamp, refresh, generation)) = window.host_vsync else {
+        return;
+    };
+    if window.scheduled_vsync == Some(generation) {
+        return;
+    }
+    window.scheduled_vsync = Some(generation);
+    let now = monotonic_time();
+    let predicted = refresh
+        .map(|refresh| predicted_next_vsync(timestamp, refresh, now))
+        .unwrap_or(now);
+    let opened_at = window.opened_at;
+    let registration = state.loop_handle.insert_source(
+        Timer::from_duration(predicted.saturating_sub(now)),
+        move |_, _, state| {
+            if let Some(window) = state
+                .windows
+                .get_mut(&id)
+                .filter(|window| window.opened_at == opened_at)
+            {
+                send_frame_callbacks(window, predicted.as_millis() as u32, scene_id);
+            }
+            let _ = state.display_handle.flush_clients();
+            TimeoutAction::Drop
+        },
+    );
+    if registration.is_err()
+        && let Some(window) = state.windows.get_mut(&id)
+    {
+        send_frame_callbacks(window, monotonic_time_ms(), scene_id);
+    }
+}
+
 fn send_frame_callbacks(window: &mut WindowState, time: u32, commit_id: u64) {
     let completed = window
         .dma_frame_callbacks
@@ -3065,6 +3157,27 @@ mod tests {
         let after = monotonic_time_ms();
         let clock = (time.tv_sec as u64 * 1_000 + time.tv_nsec as u64 / 1_000_000) as u32;
         assert!(clock.wrapping_sub(before) <= after.wrapping_sub(before));
+    }
+
+    #[test]
+    fn frame_clock_targets_the_first_vsync_strictly_after_commit() {
+        let refresh = Duration::from_millis(8);
+        assert_eq!(
+            predicted_next_vsync(
+                Duration::from_millis(1_000),
+                refresh,
+                Duration::from_millis(1_017)
+            ),
+            Duration::from_millis(1_024)
+        );
+        assert_eq!(
+            predicted_next_vsync(
+                Duration::from_millis(1_024),
+                refresh,
+                Duration::from_millis(1_024)
+            ),
+            Duration::from_millis(1_032)
+        );
     }
 
     #[test]
@@ -3274,6 +3387,8 @@ mod tests {
             scale: 1.0,
             events,
             dma_frame_callbacks: HashMap::new(),
+            scheduled_vsync: None,
+            host_vsync: None,
             pointer_frames: HashMap::new(),
             hit_scenes: HashMap::new(),
             pointer_location: (0.0, 0.0),
