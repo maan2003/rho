@@ -716,14 +716,44 @@ pub struct FrameTiming {
     pub invalidations: u64,
     /// When `Window::draw` started.
     pub draw_start: Instant,
+    /// When root layout and prepaint finished.
+    pub prepaint_end: Instant,
+    /// When root painting, including accessibility updates, finished.
+    pub paint_end: Instant,
     /// When `Window::draw` finished.
     pub draw_end: Instant,
+}
+
+/// CPU time spent submitting a rendered scene to the platform renderer.
+#[derive(Debug, Copy, Clone)]
+pub struct PresentTiming {
+    /// The window whose scene was submitted.
+    pub window_id: WindowId,
+    /// When platform presentation started.
+    pub start: Instant,
+    /// When the platform renderer returned.
+    pub end: Instant,
 }
 
 impl FrameTiming {
     /// Time spent inside `Window::draw`.
     pub fn draw_duration(&self) -> Duration {
         self.draw_end.duration_since(self.draw_start)
+    }
+
+    /// Time spent setting up the frame, laying it out, and prepainting it.
+    pub fn prepaint_duration(&self) -> Duration {
+        self.prepaint_end.duration_since(self.draw_start)
+    }
+
+    /// Time spent painting the frame and updating its accessibility tree.
+    pub fn paint_duration(&self) -> Duration {
+        self.paint_end.duration_since(self.prepaint_end)
+    }
+
+    /// Time spent finishing and swapping frame state after painting.
+    pub fn finish_duration(&self) -> Duration {
+        self.draw_end.duration_since(self.paint_end)
     }
 
     /// Time from the frame's first invalidation to the end of its draw, if the
@@ -747,6 +777,7 @@ static FRAME_TIMINGS: spin::Mutex<FrameTimings> = spin::Mutex::new(FrameTimings 
     timings: VecDeque::new(),
     total_pushed: 0,
 });
+static PRESENT_TIMINGS: spin::Mutex<VecDeque<PresentTiming>> = spin::Mutex::new(VecDeque::new());
 
 static FRAME_TRACE_ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -764,6 +795,9 @@ pub fn set_frame_trace_enabled(enabled: bool) -> bool {
         let mut frames = FRAME_TIMINGS.lock();
         frames.timings.clear();
         frames.timings.shrink_to_fit();
+        let mut presents = PRESENT_TIMINGS.lock();
+        presents.clear();
+        presents.shrink_to_fit();
     }
     true
 }
@@ -788,6 +822,25 @@ pub fn record_frame_timing(timing: FrameTiming) {
     }
     frames.timings.push_back(timing);
     frames.total_pushed += 1;
+}
+
+/// Records CPU time spent in the platform renderer for one presentation.
+pub fn record_present_timing(timing: PresentTiming) {
+    if !frame_trace_enabled() {
+        return;
+    }
+    std::hint::cold_path();
+
+    let mut presents = PRESENT_TIMINGS.lock();
+    if presents.len() >= MAX_FRAME_TIMINGS {
+        presents.pop_front();
+    }
+    presents.push_back(timing);
+}
+
+/// Returns the buffered platform presentation timings in chronological order.
+pub fn snapshot_present_timings() -> Vec<PresentTiming> {
+    PRESENT_TIMINGS.lock().iter().copied().collect()
 }
 
 /// Drains frame timings recorded after this collector was created, tracking a

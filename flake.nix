@@ -132,7 +132,7 @@
                     CC = "${pkgs.stdenv.cc}/bin/cc";
                     CXX = "${pkgs.stdenv.cc}/bin/c++";
                     CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER = "${pkgs.pkgsCross.musl64.stdenv.cc}/bin/x86_64-unknown-linux-musl-gcc";
-                    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS = "--cfg tokio_unstable";
+                    CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_RUSTFLAGS = "--cfg tokio_unstable -Cforce-frame-pointers=yes";
                   };
                 };
               };
@@ -381,8 +381,8 @@
                   --replace-fail 'warnings = { level = "deny" }' \
                     'warnings = { level = "warn" }'
               '';
-              CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "--cfg tokio_unstable";
-              CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "--cfg tokio_unstable";
+              CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "--cfg tokio_unstable -Cforce-frame-pointers=yes";
+              CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS = "--cfg tokio_unstable -Cforce-frame-pointers=yes";
             };
             cargoVendorDirBase = craneLibBase.vendorCargoDeps { };
             cargoVendorDir = pkgs.runCommand "rho-cargo-vendor-deps" { } ''
@@ -573,9 +573,9 @@
             ${public-skills.packages.${system}.install}/bin/install-maan2003-skills
             # Flakebox sets target-specific RUSTFLAGS (wild linker), which
             # shadow build.rustflags from .cargo/config.toml; re-add the
-            # tokio_unstable cfg that dial9-tokio-telemetry needs.
-            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="''${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS:-} --cfg tokio_unstable"
-            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="''${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS:-} --cfg tokio_unstable"
+            # flags that dial9-tokio-telemetry and CPU stack capture need.
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="''${CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS:-} --cfg tokio_unstable -Cforce-frame-pointers=yes"
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="''${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS:-} --cfg tokio_unstable -Cforce-frame-pointers=yes"
           '';
         };
       }

@@ -2937,8 +2937,9 @@ impl Window {
                 self.rendered_frame.input_handlers.push(Some(input_handler));
             }
         }
+        let (mut prepaint_end, mut paint_end) = (draw_started_at, draw_started_at);
         if !cx.mode.skip_drawing() {
-            self.draw_roots(cx);
+            (prepaint_end, paint_end) = self.draw_roots(cx, draw_started_at.is_some());
         }
         self.dirty_views.clear();
         self.next_frame.window_active = self.active.get();
@@ -3017,12 +3018,15 @@ impl Window {
         self.needs_present.set(true);
 
         if let Some(draw_start) = draw_started_at {
+            let draw_end = Instant::now();
             profiler::record_frame_timing(profiler::FrameTiming {
                 window_id: self.handle.window_id(),
                 dirty_at: frame_dirty.dirty_at,
                 invalidations: frame_dirty.invalidations,
                 draw_start,
-                draw_end: Instant::now(),
+                prepaint_end: prepaint_end.unwrap_or(draw_start),
+                paint_end: paint_end.unwrap_or(draw_start),
+                draw_end,
             });
         }
 
@@ -3055,7 +3059,15 @@ impl Window {
 
     #[profiling::function]
     fn present(&mut self) {
+        let present_start = profiler::frame_trace_enabled().then(Instant::now);
         self.platform_window.draw(&self.rendered_frame.scene);
+        if let Some(start) = present_start {
+            profiler::record_present_timing(profiler::PresentTiming {
+                window_id: self.handle.window_id(),
+                start,
+                end: Instant::now(),
+            });
+        }
         #[cfg(feature = "input-latency-histogram")]
         self.input_latency_tracker.record_frame_presented();
         self.needs_present.set(false);
@@ -3080,7 +3092,11 @@ impl Window {
         self.input_latency_tracker.snapshot()
     }
 
-    fn draw_roots(&mut self, cx: &mut App) {
+    fn draw_roots(
+        &mut self,
+        cx: &mut App,
+        trace_phases: bool,
+    ) -> (Option<Instant>, Option<Instant>) {
         self.invalidator.set_phase(DrawPhase::Prepaint);
         self.tooltip_bounds.take();
 
@@ -3150,6 +3166,7 @@ impl Window {
         self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
 
         // Now actually paint the elements.
+        let prepaint_end = trace_phases.then(Instant::now);
         self.invalidator.set_phase(DrawPhase::Paint);
         root_element.paint(self, cx);
 
@@ -3195,6 +3212,7 @@ impl Window {
                 self.platform_window.a11y_tree_update(tree_update);
             }
         }
+        (prepaint_end, trace_phases.then(Instant::now))
     }
 
     fn prepaint_tooltip(&mut self, cx: &mut App) -> Option<AnyElement> {

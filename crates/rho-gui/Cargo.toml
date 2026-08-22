@@ -41,6 +41,7 @@ native = [
   "dep:rustls",
   "dep:search",
   "dep:semver",
+  "dep:tempfile",
   "dep:tracing-subscriber",
   "dep:tokio",
   "dep:util",
@@ -52,6 +53,7 @@ native = [
 
 [dependencies]
 anyhow.workspace = true
+base64.workspace = true
 assets = { path = "../../vendor/zed/crates/assets" }
 buffer_diff.workspace = true
 camino.workspace = true
@@ -103,6 +105,7 @@ text = { path = "../../vendor/zed/crates/text" }
 theme = { path = "../../vendor/zed/crates/theme" }
 theme_settings = { path = "../../vendor/zed/crates/theme_settings" }
 tokio = { workspace = true, features = ["io-util", "net", "process", "rt", "signal"], optional = true }
+tempfile = { workspace = true, optional = true }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"], optional = true }
 tree-sitter = "0.26"

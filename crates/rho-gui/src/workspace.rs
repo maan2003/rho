@@ -116,6 +116,26 @@ enum SurfaceView {
     ZulipNarrow(Entity<rho_zulip::ui::NarrowView>),
 }
 
+impl SurfaceView {
+    fn telemetry_kind(&self) -> crate::telemetry::SurfaceKind {
+        use crate::telemetry::SurfaceKind;
+        match self {
+            Self::Draft { .. } => SurfaceKind::Draft,
+            Self::Transcript { .. } => SurfaceKind::Transcript,
+            Self::File(_) => SurfaceKind::File,
+            Self::Shell { .. } => SurfaceKind::Shell,
+            Self::Diff(_) => SurfaceKind::Diff,
+            Self::Terminal(_) => SurfaceKind::Terminal,
+            #[cfg(feature = "native")]
+            Self::Browser(_) => SurfaceKind::Browser,
+            #[cfg(feature = "native")]
+            Self::ZulipInbox(_) => SurfaceKind::ZulipInbox,
+            #[cfg(feature = "native")]
+            Self::ZulipNarrow(_) => SurfaceKind::ZulipNarrow,
+        }
+    }
+}
+
 impl PartialEq for Surface {
     fn eq(&self, other: &Self) -> bool {
         self.key == other.key
@@ -6601,6 +6621,22 @@ impl Workspace {
         // Modal overlays borrow keyboard focus; the frame stays in the mode
         // recorded beneath the overlay for its whole replacement chain.
         let home = self.dashboard_mode(window, cx);
+        let focused_surface = if home {
+            crate::telemetry::SurfaceKind::Dashboard
+        } else {
+            self.active_tree().focused().surface.view.telemetry_kind()
+        };
+        let visible_surfaces = if home {
+            focused_surface.bit()
+        } else {
+            self.active_tree()
+                .panes()
+                .into_iter()
+                .fold(0, |flags, pane| {
+                    flags | pane.surface.view.telemetry_kind().bit()
+                })
+        };
+        crate::telemetry::record_surfaces(focused_surface, visible_surfaces);
         let iris = false;
         self.sync_diff_visibility(!home, cx);
         #[cfg(feature = "native")]

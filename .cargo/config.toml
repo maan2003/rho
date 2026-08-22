@@ -11,4 +11,4 @@ codegen-backend = "cranelift"
 codegen-backend = "llvm"
 
 [build]
-rustflags = ["--cfg", "tokio_unstable"]
+rustflags = ["--cfg", "tokio_unstable", "-Cforce-frame-pointers=yes"]

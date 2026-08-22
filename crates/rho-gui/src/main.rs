@@ -77,6 +77,9 @@ struct FrameProfile {
 struct FrameSummary {
     frame_count: usize,
     draw_ms: Distribution,
+    prepaint_ms: Distribution,
+    paint_ms: Distribution,
+    finish_ms: Distribution,
     dirty_to_draw_ms: Distribution,
     invalidations: Distribution,
 }
@@ -86,6 +89,9 @@ struct FrameRecord {
     window_id: u64,
     draw_start_ns: u64,
     draw_ns: u64,
+    prepaint_ns: u64,
+    paint_ns: u64,
+    finish_ns: u64,
     dirty_to_draw_ns: Option<u64>,
     invalidations: u64,
 }
@@ -185,6 +191,11 @@ fn run() -> Result<()> {
     let specs = host_specs(&args)?;
     let client_state_dir = default_client_state_dir()?;
     rho_gui::telemetry::enable();
+    if profiler.is_none()
+        && let Err(error) = rho_gui::telemetry::enable_passive_cpu_profile()
+    {
+        tracing::warn!(%error, "passive GUI CPU profiling is unavailable");
+    }
 
     gpui_platform::application()
         .with_assets(RhoAssets)
@@ -223,6 +234,7 @@ fn run() -> Result<()> {
                 if let Some(profiler) = profiler.take() {
                     finish_profiling(profiler);
                 }
+                rho_gui::telemetry::shutdown_passive_cpu_profile();
                 std::future::ready(())
             })
             .detach();
@@ -448,6 +460,9 @@ fn export_frame_profile(path: &Path, timings: Vec<gpui::profiler::FrameTiming>) 
                 .map(|anchor| duration_ns(timing.draw_start.duration_since(anchor)))
                 .unwrap_or(0),
             draw_ns: duration_ns(timing.draw_duration()),
+            prepaint_ns: duration_ns(timing.prepaint_duration()),
+            paint_ns: duration_ns(timing.paint_duration()),
+            finish_ns: duration_ns(timing.finish_duration()),
             dirty_to_draw_ns: timing.dirty_to_draw_duration().map(duration_ns),
             invalidations: timing.invalidations,
         })
@@ -455,6 +470,9 @@ fn export_frame_profile(path: &Path, timings: Vec<gpui::profiler::FrameTiming>) 
     let summary = FrameSummary {
         frame_count: frames.len(),
         draw_ms: distribution(frames.iter().map(|frame| frame.draw_ns), 1_000_000.0),
+        prepaint_ms: distribution(frames.iter().map(|frame| frame.prepaint_ns), 1_000_000.0),
+        paint_ms: distribution(frames.iter().map(|frame| frame.paint_ns), 1_000_000.0),
+        finish_ms: distribution(frames.iter().map(|frame| frame.finish_ns), 1_000_000.0),
         dirty_to_draw_ms: distribution(
             frames.iter().filter_map(|frame| frame.dirty_to_draw_ns),
             1_000_000.0,

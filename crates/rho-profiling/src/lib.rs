@@ -1,5 +1,6 @@
-//! Opt-in Dial9 profiling shared by Rho executables.
+//! Dial9 CPU profiling shared by Rho executables.
 
+use std::collections::BTreeMap;
 use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -110,6 +111,32 @@ impl CpuProfiler {
         remove_if_exists(&dial9_raw_output_path(&path))?;
         let writer = RotatingWriter::single_file(&path)
             .with_context(|| format!("create Dial9 trace {}", path.display()))?;
+        Self::start_with_writer(path, output_path, writer)
+    }
+
+    /// Starts a bounded profiler whose self-contained segments rotate by time.
+    pub fn start_rolling(
+        path: impl Into<PathBuf>,
+        rotation_period: Duration,
+        max_total_size: u64,
+    ) -> anyhow::Result<Self> {
+        let path = absolute_path(path.into())?;
+        let output_path = dial9_output_path(&path);
+        let writer = RotatingWriter::builder()
+            .base_path(&path)
+            .max_file_size(max_total_size)
+            .max_total_size(max_total_size)
+            .rotation_period(rotation_period)
+            .build()
+            .with_context(|| format!("create rolling Dial9 trace {}", path.display()))?;
+        Self::start_with_writer(path, output_path, writer)
+    }
+
+    fn start_with_writer(
+        path: PathBuf,
+        output_path: PathBuf,
+        writer: RotatingWriter,
+    ) -> anyhow::Result<Self> {
         let guard = TelemetryCore::builder()
             .writer(writer)
             .trace_path(path.clone())
@@ -135,6 +162,70 @@ impl CpuProfiler {
             guard,
             handle,
         })
+    }
+
+    /// Copies the newest sealed rolling segments, oldest first.
+    pub fn snapshot_segments(&self, limit: usize) -> anyhow::Result<Vec<Vec<u8>>> {
+        let parent = self.path.parent().unwrap_or_else(|| Path::new("."));
+        let stem = self.path.file_stem().unwrap_or_default().to_string_lossy();
+        let mut segments = BTreeMap::<u32, (Option<PathBuf>, Option<PathBuf>)>::new();
+        for entry in std::fs::read_dir(parent)? {
+            let path = entry?.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let Some(rest) = name
+                .strip_prefix(stem.as_ref())
+                .and_then(|name| name.strip_prefix('.'))
+            else {
+                continue;
+            };
+            let Some((index, suffix)) = rest.split_once(".bin") else {
+                continue;
+            };
+            if !suffix.is_empty() && suffix != ".gz" {
+                continue;
+            }
+            let Ok(index) = index.parse() else {
+                continue;
+            };
+            let paths = segments.entry(index).or_default();
+            if suffix == ".gz" {
+                paths.1 = Some(path);
+            } else {
+                paths.0 = Some(path);
+            }
+        }
+        // Active files end in `.bin.active`, which the suffix filter above
+        // intentionally excludes. Only self-contained sealed segments remain.
+        let skip = segments.len().saturating_sub(limit);
+        segments
+            .into_values()
+            .skip(skip)
+            .filter_map(|(raw, compressed)| {
+                for path in compressed.into_iter().chain(raw) {
+                    match std::fs::read(&path) {
+                        Ok(bytes) => return Some(Ok(bytes)),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => {
+                            return Some(Err(error).with_context(|| {
+                                format!("read Dial9 segment {}", path.display())
+                            }));
+                        }
+                    }
+                }
+                // The background processor may replace or evict a segment
+                // between read_dir and read. A missing segment is harmless.
+                None
+            })
+            .collect()
+    }
+
+    /// Stops a rolling profiler and flushes its current segment.
+    pub fn shutdown(self) -> anyhow::Result<()> {
+        self.guard
+            .graceful_shutdown(Duration::from_secs(30))
+            .context("finish Dial9 trace")
     }
 
     pub fn path(&self) -> &Path {
@@ -253,6 +344,12 @@ pub fn current_tid() -> u64 {
         // SAFETY: pthread_self has no arguments or memory-safety preconditions.
         unsafe { libc::pthread_self() as u64 }
     }
+}
+
+/// Returns Dial9's monotonic timestamp so external timing rings can align to
+/// it.
+pub fn monotonic_ns() -> u64 {
+    clock_monotonic_ns()
 }
 
 pub fn sidecar_path(path: &Path, suffix: &str) -> PathBuf {
