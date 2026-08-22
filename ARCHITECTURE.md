@@ -210,8 +210,9 @@ than by running a supervisor, extension protocol, or daemon process graph.
   alpha hole at the portal's paint position. A dedicated queue and thread own
   the child protocols. Outer explicit synchronization is used when available;
   otherwise acquire fences are imported into DMA-BUF reservation objects and
-  `wl_buffer.release` retains exactly-once buffer release. Promotion keeps a distinct previous texture visible until the
-  child is presented; other scene shapes demote to the texture path. Real host
+  the host's implicit completion fences are exported and waited after
+  `wl_buffer.release`. Promotion keeps a distinct previous texture visible
+  until the child is presented; other scene shapes demote to the texture path. Real host
   frame and presentation events are then relayed to Chromium for the exact
   nested scene. Every DMA-BUF surface has explicit acquire/release
   synchronization, and GPUI retains each imported Vulkan image while its page

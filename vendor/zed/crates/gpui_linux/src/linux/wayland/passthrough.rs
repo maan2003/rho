@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
-    os::fd::{AsFd, AsRawFd},
+    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -49,6 +49,8 @@ const DMA_BUF_SYNC_WRITE: u32 = 2;
 // Linux architectures.
 const DMA_BUF_IOCTL_IMPORT_SYNC_FILE: libc::c_ulong =
     (1 << 30) | (8 << 16) | ((b'b' as libc::c_ulong) << 8) | 3;
+const DMA_BUF_IOCTL_EXPORT_SYNC_FILE: libc::c_ulong =
+    (3 << 30) | (8 << 16) | ((b'b' as libc::c_ulong) << 8) | 2;
 
 fn import_implicit_acquire_fence(
     planes: &[gpui::LinuxWaylandDmaBufPlane],
@@ -73,15 +75,57 @@ fn import_implicit_acquire_fence(
     Ok(())
 }
 
-fn wait_sync_file(fd: i32) {
+fn wait_fd(fd: i32, events: i16) -> std::io::Result<()> {
     let mut descriptor = libc::pollfd {
         fd,
-        events: libc::POLLIN,
+        events,
         revents: 0,
     };
-    while unsafe { libc::poll(&mut descriptor, 1, -1) } < 0
-        && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
-    {}
+    loop {
+        let result = unsafe { libc::poll(&mut descriptor, 1, -1) };
+        if result > 0 {
+            if descriptor.revents & (libc::POLLERR | libc::POLLNVAL) != 0
+                || descriptor.revents & events == 0
+            {
+                return Err(std::io::Error::other(
+                    "poll reported an invalid release fence",
+                ));
+            }
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if result < 0 && error.kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return Err(error);
+    }
+}
+
+fn wait_sync_file(fd: i32) -> std::io::Result<()> {
+    wait_fd(fd, libc::POLLIN)
+}
+
+fn export_implicit_release_fences(planes: &[OwnedFd]) -> std::io::Result<Vec<OwnedFd>> {
+    planes
+        .iter()
+        .map(|plane| {
+            let mut export = DmaBufImportSyncFile {
+                flags: DMA_BUF_SYNC_WRITE,
+                fd: -1,
+            };
+            let result = unsafe {
+                libc::ioctl(
+                    plane.as_raw_fd(),
+                    DMA_BUF_IOCTL_EXPORT_SYNC_FILE,
+                    &mut export,
+                )
+            };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(unsafe { OwnedFd::from_raw_fd(export.fd) })
+        })
+        .collect()
 }
 
 enum Command {
@@ -92,6 +136,7 @@ enum Command {
         mpsc::SyncSender<Result<()>>,
     ),
     Hide,
+    ImplicitReleaseComplete(Option<gpui::LinuxDmaBufSurface>),
     Stop,
 }
 
@@ -137,6 +182,7 @@ struct BufferData {
     surface: gpui::LinuxDmaBufSurface,
     lease_id: u64,
     explicit_release: bool,
+    implicit_planes: Vec<OwnedFd>,
 }
 
 #[derive(Clone, Copy)]
@@ -164,6 +210,7 @@ struct State {
     pending_presentations: usize,
     connection: Connection,
     finalized: bool,
+    commands: channel::Sender<Command>,
 }
 
 impl State {
@@ -207,8 +254,19 @@ impl State {
                 log::warn!(
                     "import DMA-BUF implicit acquire fence failed ({error}); waiting synchronously"
                 );
-                wait_sync_file(buffer.acquire_fence.as_raw_fd());
+                wait_sync_file(buffer.acquire_fence.as_raw_fd())
+                    .context("wait for DMA-BUF acquire fence")?;
             }
+            let implicit_planes = if self.synchronization.is_none() {
+                buffer
+                    .planes
+                    .iter()
+                    .map(|plane| plane.fd.as_fd().try_clone_to_owned())
+                    .collect::<std::io::Result<Vec<_>>>()
+                    .context("retain DMA-BUF planes for implicit release fencing")?
+            } else {
+                Vec::new()
+            };
             let params = self.dmabuf.create_params(&self.qh, ());
             let modifier_hi = (buffer.modifier >> 32) as u32;
             let modifier_lo = buffer.modifier as u32;
@@ -242,6 +300,7 @@ impl State {
                     surface: buffer.surface.clone(),
                     lease_id,
                     explicit_release: self.synchronization.is_some(),
+                    implicit_planes,
                 },
             );
             params.destroy();
@@ -256,6 +315,7 @@ impl State {
                         surface: buffer.surface.clone(),
                         lease_id,
                         explicit_release: true,
+                        implicit_planes: Vec::new(),
                     },
                 );
             }
@@ -331,6 +391,7 @@ pub(super) fn create(
     static NEXT_OWNER_ID: AtomicU64 = AtomicU64::new(1);
     let owner_id = NEXT_OWNER_ID.fetch_add(1, Ordering::Relaxed);
     let (commands, receiver) = channel::channel();
+    let worker_commands = commands.clone();
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let thread = thread::Builder::new()
         .name("gpui-wayland-passthrough".into())
@@ -342,6 +403,7 @@ pub(super) fn create(
                 parent,
                 events,
                 receiver,
+                worker_commands,
                 ready_tx,
                 owner_id,
             );
@@ -366,6 +428,7 @@ fn run(
     parent: wl_surface::WlSurface,
     events: EventSink,
     receiver: channel::Channel<Command>,
+    commands: channel::Sender<Command>,
     ready: mpsc::SyncSender<Result<()>>,
     owner_id: u64,
 ) -> Result<()> {
@@ -420,6 +483,7 @@ fn run(
         pending_presentations: 0,
         connection: connection.clone(),
         finalized: false,
+        commands,
     };
     queue
         .roundtrip(&mut state)
@@ -439,6 +503,12 @@ fn run(
                     let _ = reply.send(state.present(scene_id, buffer));
                 }
                 Command::Hide => state.hide(),
+                Command::ImplicitReleaseComplete(surface) => {
+                    if let Some(surface) = surface {
+                        surface.released();
+                    }
+                    state.release_finished();
+                }
                 Command::Stop => {
                     state.stopping = true;
                     state.finalize_stop();
@@ -521,8 +591,60 @@ impl Dispatch<wl_buffer::WlBuffer, BufferData> for State {
         if matches!(event, wl_buffer::Event::Release) && !data.explicit_release {
             state.buffers.remove(&data.lease_id);
             buffer.destroy();
-            data.surface.released();
-            state.release_finished();
+            let waits = match export_implicit_release_fences(&data.implicit_planes) {
+                Ok(fences) => fences
+                    .into_iter()
+                    .map(|fence| (fence, libc::POLLIN))
+                    .collect::<Vec<_>>(),
+                Err(error) => {
+                    log::warn!(
+                        "export DMA-BUF implicit release fence failed ({error}); waiting on reservation objects"
+                    );
+                    match data
+                        .implicit_planes
+                        .iter()
+                        .map(|plane| plane.as_fd().try_clone_to_owned())
+                        .collect::<std::io::Result<Vec<_>>>()
+                    {
+                        Ok(planes) => planes
+                            .into_iter()
+                            .map(|plane| (plane, libc::POLLOUT))
+                            .collect(),
+                        Err(error) => {
+                            log::error!("retain DMA-BUF planes for release wait: {error}");
+                            Vec::new()
+                        }
+                    }
+                }
+            };
+            let commands = state.commands.clone();
+            let surface = data.surface.clone();
+            thread::spawn(move || {
+                let result = (!waits.is_empty())
+                    .then(|| {
+                        waits
+                            .iter()
+                            .try_for_each(|(fd, events)| wait_fd(fd.as_raw_fd(), *events))
+                    })
+                    .unwrap_or_else(|| {
+                        Err(std::io::Error::other("no implicit release wait handles"))
+                    });
+                if let Err(error) = result {
+                    log::error!("wait for implicit DMA-BUF release: {error}");
+                    // Fail closed: finish worker accounting without ever
+                    // signaling Chromium's explicit release point.
+                    std::mem::forget(surface);
+                    let _ = commands.send(Command::ImplicitReleaseComplete(None));
+                    return;
+                }
+                let guard = surface.clone();
+                if commands
+                    .send(Command::ImplicitReleaseComplete(Some(surface)))
+                    .is_err()
+                {
+                    std::mem::forget(guard);
+                }
+            });
         }
     }
 }
@@ -628,21 +750,21 @@ impl Dispatch<zwp_linux_buffer_release_v1::ZwpLinuxBufferReleaseV1, BufferData> 
                         buffer.destroy();
                     }
                     state.release_finished();
-                    let file = unsafe { error.inserted.get_mut() }
-                        .try_clone()
-                        .expect("clone release fence after calloop insertion failure");
-                    thread::spawn(move || {
-                        let mut descriptor = libc::pollfd {
-                            fd: file.as_raw_fd(),
-                            events: libc::POLLIN,
-                            revents: 0,
-                        };
-                        while unsafe { libc::poll(&mut descriptor, 1, -1) } < 0
-                            && std::io::Error::last_os_error().kind()
-                                == std::io::ErrorKind::Interrupted
-                        {}
-                        fallback_surface.released();
-                    });
+                    match unsafe { error.inserted.get_mut() }.try_clone() {
+                        Ok(file) => thread::spawn(move || {
+                            if let Err(error) = wait_sync_file(file.as_raw_fd()) {
+                                log::error!("wait for explicit DMA-BUF release fence: {error}");
+                                std::mem::forget(fallback_surface);
+                            } else {
+                                fallback_surface.released();
+                            }
+                        }),
+                        Err(error) => {
+                            log::error!("clone explicit DMA-BUF release fence: {error}");
+                            std::mem::forget(fallback_surface);
+                            return;
+                        }
+                    };
                 }
             }
             _ => {}

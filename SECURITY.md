@@ -166,8 +166,9 @@ AI APIs.
   The opt-in host-subsurface passthrough additionally requires the host to
   advertise the exact DMA-BUF format/modifier. Where the host lacks Wayland's
   legacy explicit-sync protocol (including niri), Rho imports Chromium's acquire
-  sync file into every DMA-BUF plane's implicit reservation object before attach
-  and treats `wl_buffer.release` as the release boundary. With explicit sync,
+  sync file into every DMA-BUF plane's implicit reservation object before attach.
+  At `wl_buffer.release`, it exports and waits for all implicit reader/writer
+  fences before returning the buffer to Chromium. With explicit sync,
   fenced releases are not returned to Brave until their sync files signal.
   Synchronized commits are published as one versioned surface tree, preventing
   buffers or hit-test geometry from different Wayland transactions from mixing.
