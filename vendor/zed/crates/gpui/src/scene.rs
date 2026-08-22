@@ -44,6 +44,11 @@ pub struct Scene {
     layer_stack: Vec<DrawOrder>,
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
+    /// Transparent regions which are written after all ordinary primitives.
+    ///
+    /// These allow a compositor-owned child surface below the GPUI surface to
+    /// remain visible without constraining the ordering of ordinary GPUI paint.
+    pub holes: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
     pub underlines: Vec<Underline>,
     pub monochrome_sprites: Vec<MonochromeSprite>,
@@ -61,6 +66,7 @@ impl Scene {
         self.paths.clear();
         self.shadows.clear();
         self.quads.clear();
+        self.holes.clear();
         self.underlines.clear();
         self.monochrome_sprites.clear();
         self.subpixel_sprites.clear();

@@ -4166,6 +4166,29 @@ impl Window {
         }
     }
 
+    /// Punch a transparent rectangular hole through the completed window frame.
+    ///
+    /// Holes are clipped by the current content mask, but unlike ordinary
+    /// primitives they are applied after all GPUI content. This is intended for
+    /// native compositor children placed below the window's root surface.
+    pub fn paint_hole(&mut self, bounds: Bounds<Pixels>) {
+        self.invalidator.debug_assert_paint();
+
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        let clipped = bounds.intersect(&content_mask.bounds);
+        if clipped.is_empty() {
+            return;
+        }
+
+        self.next_frame.scene.holes.push(Quad {
+            order: 0,
+            bounds: clipped,
+            content_mask: ContentMask { bounds: clipped },
+            ..Default::default()
+        });
+    }
+
     /// Paint the given `Path` into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.

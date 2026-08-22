@@ -208,6 +208,7 @@ pub enum WgpuOutputColorSpace {
 
 struct WgpuPipelines {
     quads: wgpu::RenderPipeline,
+    holes: wgpu::RenderPipeline,
     shadows: wgpu::RenderPipeline,
     path_rasterization: wgpu::RenderPipeline,
     paths: wgpu::RenderPipeline,
@@ -232,6 +233,7 @@ struct InstanceBinding {
 
 struct InstanceBindings {
     quads: InstanceBinding,
+    holes: InstanceBinding,
     shadows: InstanceBinding,
     underlines: InstanceBinding,
     monochrome_sprites: InstanceBinding,
@@ -1046,6 +1048,27 @@ impl WgpuRenderer {
             &shader_module,
         );
 
+        // The fragment shader produces transparent pixels for the default
+        // Quad value. With blending disabled those pixels replace the final
+        // framebuffer contents, exposing a compositor child below the root
+        // surface rather than merely alpha-blending a no-op over GPUI content.
+        let holes = create_pipeline(
+            "holes",
+            "vs_quad",
+            "fs_quad",
+            &layouts.globals,
+            &layouts.instances,
+            None,
+            wgpu::PrimitiveTopology::TriangleStrip,
+            &[Some(wgpu::ColorTargetState {
+                format: surface_format,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            1,
+            &shader_module,
+        );
+
         let shadows = create_pipeline(
             "shadows",
             "vs_shadow",
@@ -1197,6 +1220,7 @@ impl WgpuRenderer {
 
         WgpuPipelines {
             quads,
+            holes,
             shadows,
             path_rasterization,
             paths,
@@ -1767,6 +1791,13 @@ impl WgpuRenderer {
                     }
                 }
             }
+
+            self.draw_instances(
+                &instance_bindings.holes,
+                &self.resources().pipelines.holes,
+                0..scene.holes.len() as u32,
+                &mut pass,
+            );
         }
 
         #[cfg(target_os = "linux")]
@@ -2074,6 +2105,11 @@ impl WgpuRenderer {
                 "quads_bind_group",
                 instance_offset,
                 &scene.quads,
+            )?,
+            holes: self.write_instance_binding(
+                "holes_bind_group",
+                instance_offset,
+                &scene.holes,
             )?,
             shadows: self.write_instance_binding(
                 "shadows_bind_group",

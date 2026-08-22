@@ -1826,6 +1826,9 @@ impl PlatformWindow for WaylandWindow {
             return;
         }
 
+        let transparent = state.is_transparent() || !scene.holes.is_empty();
+        state.renderer.update_transparency(transparent);
+        update_scene_opaque_region(&state, scene);
         if let Some(presentation) = state.globals.presentation.as_ref() {
             presentation.feedback(&state.surface, &state.globals.qh, state.surface.id());
         }
@@ -2038,6 +2041,41 @@ impl PlatformWindow for WaylandWindow {
     fn a11y_update_window_bounds(&self) {
         // Wayland doesn't expose window position, so this is a no-op
     }
+}
+
+fn update_scene_opaque_region(state: &WaylandWindowState, scene: &Scene) {
+    if state.background_appearance != WindowBackgroundAppearance::Opaque
+        || state.decorations != WindowDecorations::Server
+    {
+        return;
+    }
+
+    let region = state
+        .globals
+        .compositor
+        .create_region(&state.globals.qh, ());
+    let opaque_area = state
+        .window_bounds
+        .map(|value| f32::from(value) as i32)
+        .inset(f32::from(state.inset()) as i32);
+    region.add(
+        opaque_area.origin.x,
+        opaque_area.origin.y,
+        opaque_area.size.width,
+        opaque_area.size.height,
+    );
+
+    let scale = state.scale.max(f32::EPSILON);
+    for hole in &scene.holes {
+        let bounds = hole.bounds.intersect(&hole.content_mask.bounds);
+        let left = (bounds.origin.x.0 / scale).floor() as i32;
+        let top = (bounds.origin.y.0 / scale).floor() as i32;
+        let right = (bounds.right().0 / scale).ceil() as i32;
+        let bottom = (bounds.bottom().0 / scale).ceil() as i32;
+        region.subtract(left, top, right - left, bottom - top);
+    }
+    state.surface.set_opaque_region(Some(&region));
+    region.destroy();
 }
 
 struct TrivialActivationHandler {
