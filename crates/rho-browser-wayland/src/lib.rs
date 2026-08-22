@@ -13,6 +13,7 @@ use std::hash::Hash;
 use std::os::fd::{AsFd as _, OwnedFd};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -38,6 +39,7 @@ use smithay::input::pointer::{
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
+use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel;
 use smithay::reexports::wayland_server::backend::{ClientData, ClientId, DisconnectReason, ObjectId};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -69,6 +71,9 @@ use smithay::wayland::fractional_scale::{
     FractionalScaleHandler, FractionalScaleManagerState, with_fractional_scale,
 };
 use smithay::wayland::pointer_gestures::PointerGesturesState;
+use smithay::wayland::presentation::{
+    PresentationFeedbackCachedState, PresentationFeedbackCallback, PresentationState, Refresh,
+};
 use smithay::wayland::viewporter::ViewporterState;
 use smithay::wayland::viewporter::ViewportCachedState;
 use smithay::wayland::shell::xdg::decoration::{XdgDecorationHandler, XdgDecorationState};
@@ -80,8 +85,8 @@ use smithay::wayland::shm::{ShmHandler, ShmState, with_buffer_contents};
 use smithay::wayland::tablet_manager::TabletSeatHandler;
 use smithay::{
     delegate_cursor_shape, delegate_dmabuf, delegate_drm_syncobj, delegate_fractional_scale,
-    delegate_output, delegate_pointer_gestures, delegate_seat, delegate_shm, delegate_viewporter,
-    delegate_xdg_decoration, delegate_xdg_shell,
+    delegate_output, delegate_pointer_gestures, delegate_presentation, delegate_seat, delegate_shm,
+    delegate_viewporter, delegate_xdg_decoration, delegate_xdg_shell,
 };
 
 const MAX_POPUP_BYTES: usize = 16 * 1024 * 1024;
@@ -451,6 +456,20 @@ pub enum PinchGesture {
     },
 }
 
+/// The outer compositor's resolution of feedback requested for one scene.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HostPresentation {
+    Presented {
+        /// Presentation time in the host's `CLOCK_MONOTONIC` domain.
+        timestamp: Duration,
+        refresh: Duration,
+        sequence: u64,
+        /// Raw `wp_presentation_feedback.kind` bits from the outer compositor.
+        flags: u32,
+    },
+    Discarded,
+}
+
 enum PageCommand {
     Resize(u32, u32, f64),
     FrameBarrier(u64, u32, u32, f64),
@@ -461,6 +480,17 @@ enum PageCommand {
     HostVsync {
         timestamp: Duration,
         refresh: Option<Duration>,
+    },
+    EnablePresentationPassthrough,
+    HostPresentation {
+        session_generation: u64,
+        scene_id: u64,
+        presentation: HostPresentation,
+    },
+    HostFrame {
+        session_generation: u64,
+        scene_id: u64,
+        callback_time: u32,
     },
     Retired(u64),
     PointerMotion {
@@ -502,6 +532,7 @@ struct ResolvedPointerMotion {
 enum RuntimeCommand<K> {
     Open {
         id: K,
+        session_generation: u64,
         size: (u32, u32),
         events: BrowserEventSender,
     },
@@ -514,6 +545,7 @@ impl<T: Copy + Eq + Hash + Send + 'static> BrowserPageKey for T {}
 pub struct BrowserCompositor<K: BrowserPageKey> {
     commands: channel::Sender<RuntimeCommand<K>>,
     socket: OsString,
+    next_session_generation: AtomicU64,
     thread: Option<thread::JoinHandle<()>>,
 }
 impl<K: BrowserPageKey> BrowserCompositor<K> {
@@ -536,6 +568,7 @@ impl<K: BrowserPageKey> BrowserCompositor<K> {
         Ok(Self {
             commands: tx,
             socket,
+            next_session_generation: AtomicU64::new(1),
             thread: Some(thread),
         })
     }
@@ -546,12 +579,19 @@ impl<K: BrowserPageKey> BrowserCompositor<K> {
         if size.0 == 0 || size.1 == 0 {
             bail!("browser dimensions must be nonzero")
         };
+        let session_generation = self.next_session_generation.fetch_add(1, Ordering::Relaxed);
         let (events, rx) = browser_event_channel();
         self.commands
-            .send(RuntimeCommand::Open { id, size, events })
+            .send(RuntimeCommand::Open {
+                id,
+                session_generation,
+                size,
+                events,
+            })
             .map_err(|_| anyhow::anyhow!("browser compositor stopped"))?;
         Ok(BrowserSession {
             id,
+            session_generation,
             commands: self.commands.clone(),
             events: rx,
         })
@@ -567,6 +607,7 @@ impl<K: BrowserPageKey> Drop for BrowserCompositor<K> {
 }
 pub struct BrowserSession<K: BrowserPageKey> {
     id: K,
+    session_generation: u64,
     commands: channel::Sender<RuntimeCommand<K>>,
     events: BrowserEventReceiver,
 }
@@ -633,6 +674,30 @@ impl<K: BrowserPageKey> BrowserSession<K> {
     pub fn host_vsync(&self, timestamp: Duration, refresh: Option<Duration>) {
         self.send(PageCommand::HostVsync { timestamp, refresh });
     }
+    /// Switches this session from predicted frame delivery to relaying real
+    /// outer frame and presentation callbacks. This also advertises the nested
+    /// `wp_presentation` global to Chromium.
+    pub fn enable_presentation_passthrough(&self) {
+        self.send(PageCommand::EnablePresentationPassthrough);
+    }
+    /// Resolves presentation feedback associated with `scene_id` from the
+    /// corresponding outer compositor feedback object.
+    pub fn host_presentation(&self, scene_id: u64, presentation: HostPresentation) {
+        self.send(PageCommand::HostPresentation {
+            session_generation: self.session_generation,
+            scene_id,
+            presentation,
+        });
+    }
+    /// Completes nested frame callbacks through `scene_id` from the exact
+    /// outer `wl_surface.frame` event associated with that scene.
+    pub fn host_frame(&self, scene_id: u64, callback_time: u32) {
+        self.send(PageCommand::HostFrame {
+            session_generation: self.session_generation,
+            scene_id,
+            callback_time,
+        });
+    }
     pub fn presentation_callback(
         &self,
         scene_id: u64,
@@ -654,11 +719,16 @@ impl<K: BrowserPageKey> Drop for BrowserSession<K> {
     }
 }
 struct WindowState {
+    session_generation: u64,
     toplevel: Option<ToplevelSurface>,
     size: (u32, u32),
     scale: f64,
     events: BrowserEventSender,
     dma_frame_callbacks: HashMap<u64, Vec<wl_callback::WlCallback>>,
+    presentation_feedback: HashMap<u64, Vec<PresentationFeedbackCallback>>,
+    presentation_passthrough: bool,
+    last_host_presentation_scene: Option<u64>,
+    last_host_frame_scene: Option<u64>,
     scheduled_vsync: Option<u64>,
     host_vsync: Option<(Duration, Option<Duration>, u64)>,
     pointer_frames: HashMap<u64, PointerFrame>,
@@ -715,6 +785,7 @@ struct State<K: BrowserPageKey> {
     _viewporter: ViewporterState,
     _pointer_gestures: PointerGesturesState,
     _cursor_shape: CursorShapeManagerState,
+    presentation: Option<PresentationState>,
     seat_state: SeatState<Self>,
     _seat: Seat<Self>,
     keyboard: KeyboardHandle<Self>,
@@ -1454,6 +1525,15 @@ impl<K: BrowserPageKey> State<K> {
             .collect();
         let scene_id = window.next_scene_id;
         window.next_scene_id = window.next_scene_id.wrapping_add(1).max(1);
+        let presentation_feedback = with_states(&root, |states| {
+            std::mem::take(
+                &mut states
+                    .cached_state
+                    .get::<PresentationFeedbackCachedState>()
+                    .current()
+                    .callbacks,
+            )
+        });
         // Hit nodes and GPUI use the same window-local coordinate space. The
         // root's XDG geometry offset is already represented by its node origin.
         let pointer_frame = PointerFrame;
@@ -1462,6 +1542,9 @@ impl<K: BrowserPageKey> State<K> {
         window
             .dma_frame_callbacks
             .insert(scene_id, drain_frame_callbacks(&surfaces));
+        window
+            .presentation_feedback
+            .insert(scene_id, presentation_feedback);
         let produced_at = Instant::now();
         record_browser_timing(
             BrowserTimingKind::SceneProduced,
@@ -2016,6 +2099,7 @@ smithay::reexports::wayland_server::delegate_global_dispatch!(@<K: BrowserPageKe
 smithay::reexports::wayland_server::delegate_dispatch!(@<K: BrowserPageKey> State<K>: [
     smithay::reexports::wayland_server::protocol::wl_compositor::WlCompositor: ()
 ] => CompositorState);
+delegate_presentation!(@<K: BrowserPageKey> State<K>);
 smithay::reexports::wayland_server::delegate_dispatch!(@<K: BrowserPageKey> State<K>: [
     smithay::reexports::wayland_server::protocol::wl_surface::WlSurface:
         smithay::wayland::compositor::SurfaceUserData
@@ -2230,6 +2314,7 @@ fn run<K: BrowserPageKey>(
         _viewporter: ViewporterState::new::<State<K>>(&dh),
         _pointer_gestures: PointerGesturesState::new::<State<K>>(&dh),
         _cursor_shape: CursorShapeManagerState::new::<State<K>>(&dh),
+        presentation: None,
         seat_state,
         _seat: seat,
         keyboard,
@@ -2313,15 +2398,25 @@ fn handle_runtime_command<K: BrowserPageKey>(
     command: RuntimeCommand<K>,
 ) -> bool {
     match command {
-        RuntimeCommand::Open { id, size, events } => {
+        RuntimeCommand::Open {
+            id,
+            session_generation,
+            size,
+            events,
+        } => {
             state.windows.insert(
                 id,
                 WindowState {
+                    session_generation,
                     toplevel: None,
                     size,
                     scale: 1.0,
                     events,
                     dma_frame_callbacks: HashMap::new(),
+                    presentation_feedback: HashMap::new(),
+                    presentation_passthrough: false,
+                    last_host_presentation_scene: None,
+                    last_host_frame_scene: None,
                     scheduled_vsync: None,
                     host_vsync: None,
                     pointer_frames: HashMap::new(),
@@ -2430,6 +2525,53 @@ fn handle_page_command<K: BrowserPageKey>(state: &mut State<K>, id: K, c: PageCo
             };
             if let Some(scene_id) = scene {
                 schedule_frame_delivery(state, id, scene_id);
+            }
+        }
+        PageCommand::EnablePresentationPassthrough => {
+            let Some(window) = state.windows.get_mut(&id) else {
+                return;
+            };
+            window.presentation_passthrough = true;
+            window.scheduled_vsync = None;
+            if state.presentation.is_none() {
+                state.presentation = Some(PresentationState::new::<State<K>>(
+                    &state.display_handle,
+                    libc::CLOCK_MONOTONIC as u32,
+                ));
+            }
+        }
+        PageCommand::HostPresentation {
+            session_generation,
+            scene_id,
+            presentation,
+        } => {
+            let current_generation = state
+                .windows
+                .get(&id)
+                .map(|window| window.session_generation);
+            if current_generation == Some(session_generation) {
+                relay_host_presentation(state, id, scene_id, presentation);
+            }
+        }
+        PageCommand::HostFrame {
+            session_generation,
+            scene_id,
+            callback_time,
+        } => {
+            let Some(window) = state
+                .windows
+                .get_mut(&id)
+                .filter(|window| window.session_generation == session_generation)
+            else {
+                return;
+            };
+            if accept_host_scene(
+                window.presentation_passthrough,
+                &mut window.last_host_frame_scene,
+                window.next_scene_id,
+                scene_id,
+            ) {
+                send_frame_callbacks(window, callback_time, scene_id);
             }
         }
         PageCommand::Retired(commit) => {
@@ -3048,6 +3190,89 @@ fn drain_frame_callbacks(surfaces: &[WlSurface]) -> Vec<wl_callback::WlCallback>
     callbacks
 }
 
+fn presentation_kind(flags: u32) -> wp_presentation_feedback::Kind {
+    let mut kind = wp_presentation_feedback::Kind::empty();
+    for (bit, value) in [
+        (1, wp_presentation_feedback::Kind::Vsync),
+        (2, wp_presentation_feedback::Kind::HwClock),
+        (4, wp_presentation_feedback::Kind::HwCompletion),
+        (8, wp_presentation_feedback::Kind::ZeroCopy),
+    ] {
+        if flags & bit != 0 {
+            kind |= value;
+        }
+    }
+    kind
+}
+
+fn accept_host_scene(
+    passthrough: bool,
+    last_scene: &mut Option<u64>,
+    next_scene: u64,
+    scene: u64,
+) -> bool {
+    if !passthrough
+        || scene == 0
+        || scene >= next_scene
+        || last_scene.is_some_and(|last| scene <= last)
+    {
+        return false;
+    }
+    *last_scene = Some(scene);
+    true
+}
+
+fn relay_host_presentation<K: BrowserPageKey>(
+    state: &mut State<K>,
+    id: K,
+    scene_id: u64,
+    presentation: HostPresentation,
+) {
+    let Some(window) = state.windows.get_mut(&id) else {
+        return;
+    };
+    if !accept_host_scene(
+        window.presentation_passthrough,
+        &mut window.last_host_presentation_scene,
+        window.next_scene_id,
+        scene_id,
+    ) {
+        return;
+    }
+
+    let feedback_scenes = window
+        .presentation_feedback
+        .keys()
+        .copied()
+        .filter(|pending| *pending <= scene_id)
+        .collect::<Vec<_>>();
+    for pending_scene in feedback_scenes {
+        let feedback = window
+            .presentation_feedback
+            .remove(&pending_scene)
+            .expect("known presentation feedback scene");
+        for callback in feedback {
+            match presentation {
+                HostPresentation::Presented {
+                    timestamp,
+                    refresh,
+                    sequence,
+                    flags,
+                } if pending_scene == scene_id => callback.presented(
+                    &state.output,
+                    timestamp,
+                    Refresh::fixed(refresh),
+                    sequence,
+                    presentation_kind(flags),
+                ),
+                HostPresentation::Presented { .. } | HostPresentation::Discarded => {
+                    callback.discarded()
+                }
+            }
+        }
+    }
+}
+
 fn predicted_next_vsync(timestamp: Duration, refresh: Duration, now: Duration) -> Duration {
     if timestamp > now || refresh.is_zero() {
         return timestamp.max(now);
@@ -3064,6 +3289,9 @@ fn schedule_frame_delivery<K: BrowserPageKey>(state: &mut State<K>, id: K, scene
     if !window.dma_frame_callbacks.contains_key(&scene_id) {
         return;
     }
+    if window.presentation_passthrough {
+        return;
+    }
     let Some((timestamp, refresh, generation)) = window.host_vsync else {
         return;
     };
@@ -3076,20 +3304,19 @@ fn schedule_frame_delivery<K: BrowserPageKey>(state: &mut State<K>, id: K, scene
         .map(|refresh| predicted_next_vsync(timestamp, refresh, now))
         .unwrap_or(now);
     let opened_at = window.opened_at;
-    let registration = state.loop_handle.insert_source(
-        Timer::from_duration(predicted.saturating_sub(now)),
-        move |_, _, state| {
-            if let Some(window) = state
-                .windows
-                .get_mut(&id)
-                .filter(|window| window.opened_at == opened_at)
-            {
-                send_frame_callbacks(window, predicted.as_millis() as u32, scene_id);
-            }
-            let _ = state.display_handle.flush_clients();
-            TimeoutAction::Drop
-        },
-    );
+    let registration =
+        state.loop_handle.insert_source(
+            Timer::from_duration(predicted.saturating_sub(now)),
+            move |_, _, state| {
+                if let Some(window) = state.windows.get_mut(&id).filter(|window| {
+                    window.opened_at == opened_at && !window.presentation_passthrough
+                }) {
+                    send_frame_callbacks(window, predicted.as_millis() as u32, scene_id);
+                }
+                let _ = state.display_handle.flush_clients();
+                TimeoutAction::Drop
+            },
+        );
     if registration.is_err()
         && let Some(window) = state.windows.get_mut(&id)
     {
@@ -3178,6 +3405,38 @@ mod tests {
             ),
             Duration::from_millis(1_032)
         );
+    }
+
+    #[test]
+    fn presentation_passthrough_accepts_only_new_published_scene_generations() {
+        let mut last_presentation = None;
+        assert!(!accept_host_scene(false, &mut last_presentation, 4, 1));
+        assert_eq!(last_presentation, None);
+
+        assert!(!accept_host_scene(true, &mut last_presentation, 4, 0));
+        assert!(!accept_host_scene(true, &mut last_presentation, 4, 4));
+        assert!(accept_host_scene(true, &mut last_presentation, 4, 2));
+        assert_eq!(last_presentation, Some(2));
+        assert!(!accept_host_scene(true, &mut last_presentation, 5, 1));
+        assert!(!accept_host_scene(true, &mut last_presentation, 5, 2));
+        assert!(accept_host_scene(true, &mut last_presentation, 5, 4));
+        assert_eq!(last_presentation, Some(4));
+
+        // wl_surface.frame and wp_presentation resolve independently for the
+        // same scene, but each rejects a duplicate or older generation.
+        let mut last_frame = None;
+        assert!(accept_host_scene(true, &mut last_frame, 5, 4));
+        assert!(!accept_host_scene(true, &mut last_frame, 5, 4));
+    }
+
+    #[test]
+    fn presentation_flags_relay_only_protocol_defined_bits() {
+        let all = presentation_kind(1 | 2 | 4 | 8 | 0x8000_0000);
+        assert!(all.contains(wp_presentation_feedback::Kind::Vsync));
+        assert!(all.contains(wp_presentation_feedback::Kind::HwClock));
+        assert!(all.contains(wp_presentation_feedback::Kind::HwCompletion));
+        assert!(all.contains(wp_presentation_feedback::Kind::ZeroCopy));
+        assert_eq!(all.bits(), 1 | 2 | 4 | 8);
     }
 
     #[test]
@@ -3382,11 +3641,16 @@ mod tests {
     fn barrier_requested_before_toplevel_bind_tracks_initial_configure() {
         let (events, _receiver) = browser_event_channel();
         let mut window = WindowState {
+            session_generation: 1,
             toplevel: None,
             size: (1281, 720),
             scale: 1.0,
             events,
             dma_frame_callbacks: HashMap::new(),
+            presentation_feedback: HashMap::new(),
+            presentation_passthrough: false,
+            last_host_presentation_scene: None,
+            last_host_frame_scene: None,
             scheduled_vsync: None,
             host_vsync: None,
             pointer_frames: HashMap::new(),
