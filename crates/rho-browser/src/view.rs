@@ -106,6 +106,7 @@ pub struct BrowserModel {
     next_input_freeze: u64,
     input_freeze: Option<u64>,
     presentation_owner: Option<EntityId>,
+    passthrough_owner: Rc<Cell<Option<EntityId>>>,
     runtime: RuntimePageState,
     _events_task: Task<()>,
 }
@@ -378,6 +379,7 @@ impl BrowserModel {
             next_input_freeze: 1,
             input_freeze: None,
             presentation_owner: None,
+            passthrough_owner: Rc::new(Cell::new(None)),
             runtime: RuntimePageState {
                 session: Some(session),
                 terminal: false,
@@ -1019,12 +1021,22 @@ pub struct BrowserView {
     blur_subscription: Option<Subscription>,
     focus_subscription: Option<Subscription>,
     _model_changed: Subscription,
+    _release: Subscription,
 }
 
 impl BrowserView {
     pub fn new(model: Entity<BrowserModel>, page_id: PageId, cx: &mut Context<Self>) -> Self {
         let owner_id = cx.entity_id();
         let model_changed = cx.observe(&model, |_, _, cx| cx.notify());
+        let release = cx.on_release(|this, cx| {
+            let model = this.model.read(cx);
+            if model.passthrough_owner.get() == Some(this.owner_id) {
+                model.passthrough_owner.set(None);
+                if let Some(session) = model.runtime.session.as_ref() {
+                    session.disable_presentation_passthrough();
+                }
+            }
+        });
         model.update(cx, |model, cx| {
             model.claim_presentation(owner_id, page_id, cx)
         });
@@ -1054,6 +1066,7 @@ impl BrowserView {
             blur_subscription: None,
             focus_subscription: None,
             _model_changed: model_changed,
+            _release: release,
         }
     }
 
@@ -1795,6 +1808,7 @@ impl Render for BrowserView {
             if let Some(session) = model.runtime.session.as_ref() {
                 session.enable_presentation_passthrough();
                 self.passthrough_timing_enabled.set(true);
+                model.passthrough_owner.set(Some(self.owner_id));
             }
         }
         let status = browser_status(
@@ -1815,6 +1829,7 @@ impl Render for BrowserView {
         let passthrough_state = self.passthrough_state.clone();
         let passthrough_timing_enabled = self.passthrough_timing_enabled.clone();
         let timing_model = self.model.clone();
+        let passthrough_owner = model.passthrough_owner.clone();
         let measure = canvas(
             move |bounds, _, cx| {
                 origin.set((f32::from(bounds.origin.x), f32::from(bounds.origin.y)));
@@ -1880,9 +1895,12 @@ impl Render for BrowserView {
                     }
                 } else {
                     if passthrough_timing_enabled.replace(false)
-                        && let Some(session) = timing_model.read(cx).runtime.session.as_ref()
+                        && passthrough_owner.get() == Some(owner_id)
                     {
-                        session.disable_presentation_passthrough();
+                        passthrough_owner.set(None);
+                        if let Some(session) = timing_model.read(cx).runtime.session.as_ref() {
+                            session.disable_presentation_passthrough();
+                        }
                     }
                     if state.submitted.is_some()
                         && let Some(passthrough) = passthrough.clone()
