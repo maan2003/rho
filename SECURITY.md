@@ -108,26 +108,25 @@ AI APIs.
   32 MiB current-scene bounds, and preserves one-scene coalescing. It does not
   test the production DMA-BUF/fence invariants.
 - Native embedded pages run pinned Brave Origin with the invoking user's full authority
-  and a persistent cookie/storage identity under the Rho client state directory.
-  Rho does not synthesize or mount browser policy. The NixOS Home Manager Brave
-  module installs user-level policy into the dedicated Rho profile before launch.
-  That policy disables
+  and the ordinary Brave Origin cookie/storage identity. Rho does not synthesize
+  or mount browser policy. The NixOS Home Manager Brave module installs user-level
+  policy for Brave Origin. That policy disables
   Rewards, Wallet/Web3, VPN, Leo, News, Talk, Tor, Playlist, Speedreader,
   Wayback integration, Sync, background mode, product analytics, usage pings,
   web discovery, metrics, command-line warnings, and default-browser prompts.
   It also enables Brave's maximum-savings Memory Saver mode; page unloading is
   performed by Brave's native eligibility policy rather than forced through the
   extension API.
-  Brave Origin receives a private `XDG_CONFIG_HOME` containing the native-messaging
-  manifest, so it neither reads nor writes the user's normal Brave config. It
-  also receives Nix-owned profile preferences recording Origin's Linux free-tier
-  acceptance to suppress first-launch product onboarding. Brave retains its native
-  process and renderer sandboxes.
+  Rho installs its native-messaging manifest in Brave Origin's ordinary XDG config
+  tree. Ordinary Brave and Rho must never run concurrently: Chromium's singleton
+  is scoped to the user-data directory, and Rho terminates the process it starts.
+  Brave retains its native process and renderer sandboxes.
   `RHO_CUSTOM_BRAVE_BIN` selects the locally built, Rho-patched Brave artifact;
   the NixOS Brave profile sets it to a configuration wrapper around its pinned
   package. There is no stock-browser fallback: `rho-browser` requires the
-  component loader and private tab API from that build. It accepts only
-  bounded HTTP(S) launch URLs, holds an exclusive advisory lock on that identity,
+  component loader and private tab API from that build. The Nix wrapper adds the
+  process-scoped tab-strip hiding switch. Rho accepts only bounded HTTP(S) launch
+  URLs, holds an exclusive advisory lock on its runtime,
   and exposes Brave only to one private Wayland socket. One bundled MV3
   extension is registered by Rho's custom Brave build as a component extension
   from the isolated client-state directory. Updated worker and DOM-adapter code

@@ -143,18 +143,14 @@ than by running a supervisor, extension protocol, or daemon process graph.
   while GPUI web owns only the immediate pointer-down routing region.
   Native web pages are client-local first-class resources owned by `rho-browser`.
   They use extension-generated UUID `PageId`s written in full as Desk tags.
-  One embedded MV3 extension owns the durable page registry inside the implicit
+  One embedded MV3 extension owns the durable page registry inside the ordinary
   persistent Brave Origin profile. Rho launches the Brave executable selected by
   the environment but does not own browser policy or profile preferences. The
-  NixOS Home Manager configuration supplies a dedicated wrapper which installs
-  user-level policy into that profile and merges the declarative Brave preferences
-  immediately before launch.
-  Brave Origin's `XDG_CONFIG_HOME` is also private to Rho state so its native-messaging
-  manifest and auxiliary product state do not touch the user's Brave config. The
-  Nix-owned profile preferences record Origin's Linux free-tier acceptance so
-  product onboarding cannot replace an extension-owned page.
-  Native vertical tabs are collapsed and fully hidden, the bookmarks
-  bar and saved-group row are hidden, and the address toolbar remains visible.
+  NixOS Home Manager configuration supplies a dedicated wrapper which adds the
+  process-scoped switch that hides the native tab strip.
+  The native-messaging manifest is installed in Brave Origin's ordinary XDG config
+  tree. Ordinary Brave and Rho therefore have serial ownership of one browser
+  profile and must never run concurrently. The address toolbar remains visible.
   `chrome.storage.local` retains page metadata while the allowlisted
   `rhoPrivate.tabs` API attaches the UUID to browser-owned tab data. Session
   restore persists that value in `SessionTab.extra_data`; runtime tab IDs are
