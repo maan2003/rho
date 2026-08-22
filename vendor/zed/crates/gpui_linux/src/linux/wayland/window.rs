@@ -1525,6 +1525,19 @@ impl rwh::HasDisplayHandle for WaylandWindow {
 }
 
 impl PlatformWindow for WaylandWindow {
+    fn create_linux_wayland_passthrough(
+        &self,
+        events: Box<dyn Fn(gpui::LinuxWaylandPassthroughEvent) + Send + Sync>,
+    ) -> Option<anyhow::Result<Arc<dyn gpui::LinuxWaylandPassthrough>>> {
+        let state = self.borrow();
+        let connection = state.client.get_client().borrow().connection.clone();
+        Some(super::passthrough::create(
+            connection,
+            state.surface.clone(),
+            events.into(),
+        ))
+    }
+
     fn bounds(&self) -> Bounds<Pixels> {
         self.borrow().bounds
     }

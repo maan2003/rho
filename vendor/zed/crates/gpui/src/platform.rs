@@ -812,6 +812,14 @@ pub enum TextInputStateChange {
 
 #[expect(missing_docs)]
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
+    /// Create a below-parent Wayland child surface. Non-Wayland platforms do
+    /// not expose this compositor fast path.
+    fn create_linux_wayland_passthrough(
+        &self,
+        _events: Box<dyn Fn(crate::LinuxWaylandPassthroughEvent) + Send + Sync>,
+    ) -> Option<anyhow::Result<Arc<dyn crate::LinuxWaylandPassthrough>>> {
+        None
+    }
     /// Routes touch contacts inside `bounds` as immediate mouse presses instead of
     /// platform gestures. Intended for latency-sensitive, canvas-rendered controls
     /// such as an on-screen keyboard. Platforms without touch may ignore this.

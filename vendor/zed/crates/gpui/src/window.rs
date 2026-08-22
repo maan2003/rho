@@ -4189,6 +4189,16 @@ impl Window {
         });
     }
 
+    /// Create a host-compositor child surface below this window.
+    #[cfg(target_os = "linux")]
+    pub fn create_wayland_passthrough(
+        &self,
+        events: impl Fn(crate::LinuxWaylandPassthroughEvent) + Send + Sync + 'static,
+    ) -> Option<anyhow::Result<Arc<dyn crate::LinuxWaylandPassthrough>>> {
+        self.platform_window
+            .create_linux_wayland_passthrough(Box::new(events))
+    }
+
     /// Paint the given `Path` into the scene for the next frame at the current z-index.
     ///
     /// This method should only be called as part of the paint phase of element drawing.

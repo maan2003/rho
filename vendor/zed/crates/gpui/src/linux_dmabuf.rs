@@ -3,6 +3,7 @@ use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::Duration;
 
 /// A DMA-BUF format proven importable by GPUI's selected Vulkan device.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -171,6 +172,63 @@ impl Drop for LinuxDmaBufSurfaceInner {
             callback();
         }
     }
+}
+
+/// One plane of a DMA-BUF imported by a compositor-owned Wayland child.
+#[derive(Debug)]
+#[allow(missing_docs)]
+pub struct LinuxWaylandDmaBufPlane {
+    pub fd: OwnedFd,
+    pub offset: u32,
+    pub stride: u32,
+}
+
+/// A DMA-BUF commit for a compositor-owned Wayland child surface.
+#[allow(missing_docs)]
+pub struct LinuxWaylandPassthroughBuffer {
+    pub surface: LinuxDmaBufSurface,
+    pub width: u32,
+    pub height: u32,
+    pub fourcc: u32,
+    pub modifier: u64,
+    pub planes: Vec<LinuxWaylandDmaBufPlane>,
+    pub acquire_fence: OwnedFd,
+}
+
+/// Host-compositor feedback for one child-surface commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(missing_docs)]
+pub enum LinuxWaylandPassthroughEvent {
+    Frame {
+        scene_id: u64,
+        callback_time: u32,
+    },
+    Presented {
+        scene_id: u64,
+        timestamp: Duration,
+        refresh: Duration,
+        sequence: u64,
+        flags: u32,
+    },
+    Discarded {
+        scene_id: u64,
+    },
+}
+
+/// A below-parent Wayland child used to present DMA-BUFs without sampling them
+/// through GPUI's renderer.
+pub trait LinuxWaylandPassthrough: Send + Sync {
+    /// Update logical child geometry. Completion means the position request was
+    /// sent before the caller's following parent-surface commit.
+    fn set_geometry(&self, bounds: crate::Bounds<crate::Pixels>) -> anyhow::Result<()>;
+    /// Attach and commit a new DMA-BUF scene.
+    fn present(
+        &self,
+        scene_id: u64,
+        buffer: LinuxWaylandPassthroughBuffer,
+    ) -> anyhow::Result<()>;
+    /// Unmap the child. Already committed buffers retain their release owner.
+    fn hide(&self);
 }
 
 impl PartialEq for LinuxDmaBufSurface {

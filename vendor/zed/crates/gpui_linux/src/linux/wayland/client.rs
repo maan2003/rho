@@ -327,6 +327,7 @@ pub struct Output {
 }
 
 pub(crate) struct WaylandClientState {
+    pub connection: Connection,
     serial_tracker: SerialTracker,
     globals: Globals,
     pub gpu_context: GpuContext,
@@ -871,6 +872,7 @@ impl WaylandClient {
             .unwrap();
 
         let state = Rc::new(RefCell::new(WaylandClientState {
+            connection: conn.clone(),
             serial_tracker: SerialTracker::new(),
             globals,
             gpu_context,
