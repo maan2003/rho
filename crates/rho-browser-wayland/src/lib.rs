@@ -506,7 +506,12 @@ enum PageCommand {
         timestamp: Duration,
         refresh: Option<Duration>,
     },
-    EnablePresentationPassthrough,
+    EnablePresentationPassthrough {
+        session_generation: u64,
+    },
+    DisablePresentationPassthrough {
+        session_generation: u64,
+    },
     HostPresentation {
         session_generation: u64,
         scene_id: u64,
@@ -703,7 +708,16 @@ impl<K: BrowserPageKey> BrowserSession<K> {
     /// outer frame and presentation callbacks. This also advertises the nested
     /// `wp_presentation` global to Chromium.
     pub fn enable_presentation_passthrough(&self) {
-        self.send(PageCommand::EnablePresentationPassthrough);
+        self.send(PageCommand::EnablePresentationPassthrough {
+            session_generation: self.session_generation,
+        });
+    }
+    /// Returns this session to predicted host-vsync frame delivery and
+    /// discards presentation feedback still pending from passthrough.
+    pub fn disable_presentation_passthrough(&self) {
+        self.send(PageCommand::DisablePresentationPassthrough {
+            session_generation: self.session_generation,
+        });
     }
     /// Resolves presentation feedback associated with `scene_id` from the
     /// corresponding outer compositor feedback object.
@@ -775,6 +789,34 @@ struct WindowState {
     committed_barrier: u64,
     terminal_failure: bool,
     opened_at: Instant,
+}
+
+impl Drop for WindowState {
+    fn drop(&mut self) {
+        for feedback in self
+            .presentation_feedback
+            .drain()
+            .flat_map(|(_, value)| value)
+        {
+            feedback.discarded();
+        }
+    }
+}
+
+fn disable_window_presentation_passthrough(window: &mut WindowState) -> Option<u64> {
+    if !window.presentation_passthrough {
+        return None;
+    }
+    window.presentation_passthrough = false;
+    window.scheduled_vsync = None;
+    for feedback in window
+        .presentation_feedback
+        .drain()
+        .flat_map(|(_, value)| value)
+    {
+        feedback.discarded();
+    }
+    window.dma_frame_callbacks.keys().copied().max()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1567,9 +1609,15 @@ impl<K: BrowserPageKey> State<K> {
         window
             .dma_frame_callbacks
             .insert(scene_id, drain_frame_callbacks(&surfaces));
-        window
-            .presentation_feedback
-            .insert(scene_id, presentation_feedback);
+        if window.presentation_passthrough {
+            window
+                .presentation_feedback
+                .insert(scene_id, presentation_feedback);
+        } else {
+            for feedback in presentation_feedback {
+                feedback.discarded();
+            }
+        }
         let produced_at = Instant::now();
         record_browser_timing(
             BrowserTimingKind::SceneProduced,
@@ -2190,6 +2238,9 @@ fn dma_buf_frame<K: BrowserPageKey>(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    if planes.len() != dmabuf.num_planes() {
+        bail!("DMA-BUF plane metadata is incomplete");
+    }
     let first = (!planes.is_empty())
         .then(|| planes.remove(0))
         .context("DMA-BUF has no plane")?;
@@ -2557,8 +2608,12 @@ fn handle_page_command<K: BrowserPageKey>(state: &mut State<K>, id: K, c: PageCo
                 schedule_frame_delivery(state, id, scene_id);
             }
         }
-        PageCommand::EnablePresentationPassthrough => {
-            let Some(window) = state.windows.get_mut(&id) else {
+        PageCommand::EnablePresentationPassthrough { session_generation } => {
+            let Some(window) = state
+                .windows
+                .get_mut(&id)
+                .filter(|window| window.session_generation == session_generation)
+            else {
                 return;
             };
             window.presentation_passthrough = true;
@@ -2568,6 +2623,31 @@ fn handle_page_command<K: BrowserPageKey>(state: &mut State<K>, id: K, c: PageCo
                     &state.display_handle,
                     libc::CLOCK_MONOTONIC as u32,
                 ));
+            }
+        }
+        PageCommand::DisablePresentationPassthrough { session_generation } => {
+            let scene = {
+                let Some(window) = state
+                    .windows
+                    .get_mut(&id)
+                    .filter(|window| window.session_generation == session_generation)
+                else {
+                    return;
+                };
+                disable_window_presentation_passthrough(window)
+            };
+            if !state
+                .windows
+                .values()
+                .any(|window| window.presentation_passthrough)
+                && let Some(presentation) = state.presentation.take()
+            {
+                state
+                    .display_handle
+                    .disable_global::<State<K>>(presentation.global());
+            }
+            if let Some(scene_id) = scene {
+                schedule_frame_delivery(state, id, scene_id);
             }
         }
         PageCommand::HostPresentation {
@@ -3668,10 +3748,9 @@ mod tests {
         }));
     }
 
-    #[test]
-    fn barrier_requested_before_toplevel_bind_tracks_initial_configure() {
+    fn window_for_test() -> WindowState {
         let (events, _receiver) = browser_event_channel();
-        let mut window = WindowState {
+        WindowState {
             session_generation: 1,
             toplevel: None,
             size: (1281, 720),
@@ -3697,18 +3776,41 @@ mod tests {
             surface_slots: HashMap::new(),
             pending_imports: HashMap::new(),
             next_scene_id: 1,
-            unbound_barrier: Some(9),
+            unbound_barrier: None,
             pending_barriers: Vec::new(),
             acked_barrier: 0,
             committed_barrier: 0,
             terminal_failure: false,
             opened_at: Instant::now(),
-        };
+        }
+    }
+
+    #[test]
+    fn barrier_requested_before_toplevel_bind_tracks_initial_configure() {
+        let mut window = window_for_test();
+        window.unbound_barrier = Some(9);
 
         track_unbound_barrier(&mut window, 42_u32.into());
 
         assert_eq!(window.unbound_barrier, None);
         assert_eq!(window.pending_barriers, vec![(42_u32.into(), 9)]);
+    }
+
+    #[test]
+    fn disabling_presentation_passthrough_resumes_predicted_frame_delivery() {
+        let mut window = window_for_test();
+        window.presentation_passthrough = true;
+        window.scheduled_vsync = Some(7);
+        window.dma_frame_callbacks.insert(2, Vec::new());
+        window.dma_frame_callbacks.insert(4, Vec::new());
+
+        assert_eq!(
+            disable_window_presentation_passthrough(&mut window),
+            Some(4)
+        );
+        assert!(!window.presentation_passthrough);
+        assert_eq!(window.scheduled_vsync, None);
+        assert_eq!(disable_window_presentation_passthrough(&mut window), None);
     }
 
     #[test]

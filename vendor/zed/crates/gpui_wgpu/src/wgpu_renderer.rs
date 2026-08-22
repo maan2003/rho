@@ -1629,6 +1629,12 @@ impl WgpuRenderer {
                         instance_range(range),
                         &mut pass,
                     ),
+                    PrimitiveBatch::Holes(range) => self.draw_instances(
+                        &instance_bindings.holes,
+                        &self.resources().pipelines.holes,
+                        instance_range(range),
+                        &mut pass,
+                    ),
                     PrimitiveBatch::Shadows(range) => self.draw_instances(
                         &instance_bindings.shadows,
                         &self.resources().pipelines.shadows,
@@ -1791,13 +1797,6 @@ impl WgpuRenderer {
                     }
                 }
             }
-
-            self.draw_instances(
-                &instance_bindings.holes,
-                &self.resources().pipelines.holes,
-                0..scene.holes.len() as u32,
-                &mut pass,
-            );
         }
 
         #[cfg(target_os = "linux")]

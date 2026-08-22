@@ -114,6 +114,10 @@ impl Scene {
                 quad.order = order;
                 self.quads.push(*quad);
             }
+            Primitive::Hole(hole) => {
+                hole.order = order;
+                self.holes.push(*hole);
+            }
             Primitive::Path(path) => {
                 path.order = order;
                 path.id = PathId(self.paths.len());
@@ -144,6 +148,10 @@ impl Scene {
             .push(PaintOperation::Primitive(primitive));
     }
 
+    pub(crate) fn insert_hole(&mut self, hole: Quad) {
+        self.insert_primitive(Primitive::Hole(hole));
+    }
+
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
             match operation {
@@ -157,6 +165,7 @@ impl Scene {
     pub fn finish(&mut self) {
         self.shadows.sort_by_key(|shadow| shadow.order);
         self.quads.sort_by_key(|quad| quad.order);
+        self.holes.sort_by_key(|hole| hole.order);
         self.paths.sort_by_key(|path| path.order);
         self.underlines.sort_by_key(|underline| underline.order);
         self.monochrome_sprites
@@ -181,6 +190,8 @@ impl Scene {
             shadows_iter: self.shadows.iter().peekable(),
             quads_start: 0,
             quads_iter: self.quads.iter().peekable(),
+            holes_start: 0,
+            holes_iter: self.holes.iter().peekable(),
             paths_start: 0,
             paths_iter: self.paths.iter().peekable(),
             underlines_start: 0,
@@ -209,6 +220,7 @@ pub(crate) enum PrimitiveKind {
     Shadow,
     #[default]
     Quad,
+    Hole,
     Path,
     Underline,
     MonochromeSprite,
@@ -228,6 +240,7 @@ pub(crate) enum PaintOperation {
 pub enum Primitive {
     Shadow(Shadow),
     Quad(Quad),
+    Hole(Quad),
     Path(Path<ScaledPixels>),
     Underline(Underline),
     MonochromeSprite(MonochromeSprite),
@@ -242,6 +255,7 @@ impl Primitive {
         match self {
             Primitive::Shadow(shadow) => &shadow.bounds,
             Primitive::Quad(quad) => &quad.bounds,
+            Primitive::Hole(hole) => &hole.bounds,
             Primitive::Path(path) => &path.bounds,
             Primitive::Underline(underline) => &underline.bounds,
             Primitive::MonochromeSprite(sprite) => &sprite.bounds,
@@ -255,6 +269,7 @@ impl Primitive {
         match self {
             Primitive::Shadow(shadow) => &shadow.content_mask,
             Primitive::Quad(quad) => &quad.content_mask,
+            Primitive::Hole(hole) => &hole.content_mask,
             Primitive::Path(path) => &path.content_mask,
             Primitive::Underline(underline) => &underline.content_mask,
             Primitive::MonochromeSprite(sprite) => &sprite.content_mask,
@@ -277,6 +292,8 @@ struct BatchIterator<'a> {
     shadows_iter: Peekable<slice::Iter<'a, Shadow>>,
     quads_start: usize,
     quads_iter: Peekable<slice::Iter<'a, Quad>>,
+    holes_start: usize,
+    holes_iter: Peekable<slice::Iter<'a, Quad>>,
     paths_start: usize,
     paths_iter: Peekable<slice::Iter<'a, Path<ScaledPixels>>>,
     underlines_start: usize,
@@ -301,6 +318,7 @@ impl<'a> Iterator for BatchIterator<'a> {
                 PrimitiveKind::Shadow,
             ),
             (self.quads_iter.peek().map(|q| q.order), PrimitiveKind::Quad),
+            (self.holes_iter.peek().map(|q| q.order), PrimitiveKind::Hole),
             (self.paths_iter.peek().map(|q| q.order), PrimitiveKind::Path),
             (
                 self.underlines_iter.peek().map(|u| u.order),
@@ -361,6 +379,20 @@ impl<'a> Iterator for BatchIterator<'a> {
                 }
                 self.quads_start = quads_end;
                 Some(PrimitiveBatch::Quads(quads_start..quads_end))
+            }
+            PrimitiveKind::Hole => {
+                let holes_start = self.holes_start;
+                let mut holes_end = holes_start + 1;
+                self.holes_iter.next();
+                while self
+                    .holes_iter
+                    .next_if(|hole| (hole.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    holes_end += 1;
+                }
+                self.holes_start = holes_end;
+                Some(PrimitiveBatch::Holes(holes_start..holes_end))
             }
             PrimitiveKind::Path => {
                 let paths_start = self.paths_start;
@@ -483,6 +515,7 @@ impl<'a> Iterator for BatchIterator<'a> {
 pub enum PrimitiveBatch {
     Shadows(Range<usize>),
     Quads(Range<usize>),
+    Holes(Range<usize>),
     Paths(Range<usize>),
     Underlines(Range<usize>),
     MonochromeSprites {
@@ -507,6 +540,7 @@ impl PrimitiveBatch {
         match self {
             Self::Shadows(range) => format!("shadows ({})", range.len()),
             Self::Quads(range) => format!("quads ({})", range.len()),
+            Self::Holes(range) => format!("holes ({})", range.len()),
             Self::Paths(range) => format!("paths ({})", range.len()),
             Self::Underlines(range) => format!("underlines ({})", range.len()),
             Self::MonochromeSprites { texture_id, range } => {

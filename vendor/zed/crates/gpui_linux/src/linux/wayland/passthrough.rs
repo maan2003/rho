@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     os::fd::{AsFd, AsRawFd},
-    sync::{Arc, mpsc},
+    sync::{Arc, Mutex, mpsc},
     thread,
     time::Duration,
 };
@@ -46,11 +46,15 @@ enum Command {
 
 struct Handle {
     commands: channel::Sender<Command>,
+    thread: Mutex<Option<thread::JoinHandle<()>>>,
 }
 
 impl Drop for Handle {
     fn drop(&mut self) {
         let _ = self.commands.send(Command::Stop);
+        if let Some(thread) = self.thread.get_mut().unwrap().take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -165,6 +169,7 @@ impl State {
         };
 
         self.surface.attach(Some(&wl_buffer), 0, 0);
+        self.surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
         self.synchronization
             .set_acquire_fence(buffer.acquire_fence.as_fd());
         self.synchronization.get_release(
@@ -195,7 +200,7 @@ pub(super) fn create(
 ) -> Result<Arc<dyn LinuxWaylandPassthrough>> {
     let (commands, receiver) = channel::channel();
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-    thread::Builder::new()
+    let thread = thread::Builder::new()
         .name("gpui-wayland-passthrough".into())
         .spawn(move || {
             let result = run(connection, parent, events, receiver, ready_tx);
@@ -207,7 +212,10 @@ pub(super) fn create(
     ready_rx
         .recv()
         .map_err(|_| anyhow::anyhow!("Wayland passthrough setup thread stopped"))??;
-    Ok(Arc::new(Handle { commands }))
+    Ok(Arc::new(Handle {
+        commands,
+        thread: Mutex::new(Some(thread)),
+    }))
 }
 
 fn run(

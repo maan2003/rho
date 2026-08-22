@@ -1013,7 +1013,7 @@ pub struct BrowserView {
     passthrough_attempted: bool,
     passthrough_state: Rc<Cell<PassthroughPaintState>>,
     passthrough_events: Option<Task<()>>,
-    passthrough_timing_enabled: bool,
+    passthrough_timing_enabled: Rc<Cell<bool>>,
     fallback_scene_id: Option<u64>,
     fallback_scene: Vec<(SceneNode, BrowserBuffer)>,
     blur_subscription: Option<Subscription>,
@@ -1048,7 +1048,7 @@ impl BrowserView {
             passthrough_attempted: false,
             passthrough_state: Rc::new(Cell::new(PassthroughPaintState::default())),
             passthrough_events: None,
-            passthrough_timing_enabled: false,
+            passthrough_timing_enabled: Rc::new(Cell::new(false)),
             fallback_scene_id: None,
             fallback_scene: Vec::new(),
             blur_subscription: None,
@@ -1781,6 +1781,9 @@ impl Render for BrowserView {
             && self.passthrough.is_some()
             && self.fallback_scene_id.is_some()
             && self.fallback_scene_id != Some(scene_id)
+            && !self.fallback_scene.iter().any(|(_, fallback)| {
+                matches!(fallback, BrowserBuffer::DmaBuf(fallback) if fallback.surface.lease_id() == buffer.surface.lease_id())
+            })
         {
             (self.fallback_scene.clone(), Some((scene_id, buffer)))
         } else {
@@ -1788,10 +1791,10 @@ impl Render for BrowserView {
             self.fallback_scene = current_scene.clone();
             (current_scene, None)
         };
-        if passthrough_scene.is_some() && !self.passthrough_timing_enabled {
+        if passthrough_scene.is_some() && !self.passthrough_timing_enabled.get() {
             if let Some(session) = model.runtime.session.as_ref() {
                 session.enable_presentation_passthrough();
-                self.passthrough_timing_enabled = true;
+                self.passthrough_timing_enabled.set(true);
             }
         }
         let status = browser_status(
@@ -1810,6 +1813,8 @@ impl Render for BrowserView {
         let origin = self.origin.clone();
         let passthrough = self.passthrough.clone();
         let passthrough_state = self.passthrough_state.clone();
+        let passthrough_timing_enabled = self.passthrough_timing_enabled.clone();
+        let timing_model = self.model.clone();
         let measure = canvas(
             move |bounds, _, cx| {
                 origin.set((f32::from(bounds.origin.x), f32::from(bounds.origin.y)));
@@ -1820,7 +1825,7 @@ impl Render for BrowserView {
                     browser.resize(width, height, scale);
                 }
             },
-            move |bounds, _, window, _| {
+            move |bounds, _, window, cx| {
                 let mut state = passthrough_state.get();
                 let compositor_eligible = passthrough.is_some()
                     && passthrough_scene.is_some()
@@ -1874,6 +1879,11 @@ impl Render for BrowserView {
                         state.active = true;
                     }
                 } else {
+                    if passthrough_timing_enabled.replace(false)
+                        && let Some(session) = timing_model.read(cx).runtime.session.as_ref()
+                    {
+                        session.disable_presentation_passthrough();
+                    }
                     if state.submitted.is_some()
                         && let Some(passthrough) = passthrough.clone()
                     {

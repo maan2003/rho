@@ -4187,7 +4187,7 @@ impl Window {
             return;
         }
 
-        self.next_frame.scene.holes.push(Quad {
+        self.next_frame.scene.insert_hole(Quad {
             order: 0,
             bounds: clipped,
             content_mask: ContentMask { bounds: clipped },
