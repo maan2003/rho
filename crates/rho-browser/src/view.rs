@@ -1021,6 +1021,7 @@ pub struct BrowserView {
     fallback_scene: Vec<(SceneNode, BrowserBuffer)>,
     blur_subscription: Option<Subscription>,
     focus_subscription: Option<Subscription>,
+    release_in_subscription: Option<Subscription>,
     _model_changed: Subscription,
     _release: Subscription,
 }
@@ -1067,6 +1068,7 @@ impl BrowserView {
             fallback_scene: Vec::new(),
             blur_subscription: None,
             focus_subscription: None,
+            release_in_subscription: None,
             _model_changed: model_changed,
             _release: release,
         }
@@ -1548,6 +1550,22 @@ impl Focusable for BrowserView {
 
 impl Render for BrowserView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.release_in_subscription.is_none() {
+            self.release_in_subscription = Some(cx.on_release_in(window, |this, window, cx| {
+                let model = this.model.read(cx);
+                if model.passthrough_owner.get() == Some(this.owner_id) {
+                    model.passthrough_owner.set(None);
+                    if let Some(session) = model.runtime.session.as_ref() {
+                        session.disable_presentation_passthrough();
+                    }
+                }
+                if let Some(passthrough) = this.passthrough.take() {
+                    // The release frame first closes the ordered parent hole;
+                    // only then may dropping the handle unmap/destroy the child.
+                    window.on_next_frame(move |_, _| drop(passthrough));
+                }
+            }));
+        }
         if browser_passthrough_enabled() && !self.passthrough_attempted {
             self.passthrough_attempted = true;
             let (events_tx, events_rx) = async_channel::unbounded();
@@ -1761,7 +1779,13 @@ impl Render for BrowserView {
         } else {
             None
         };
-        let current_scene = if owns_presentation {
+        let texture_route_available = model.runtime.scene.iter().all(|node| {
+            !matches!(
+                model.runtime.buffers.get(&node.buffer_id),
+                Some(BrowserBuffer::DmaBuf(buffer)) if !buffer.surface.texture_route_available()
+            )
+        });
+        let current_scene = if owns_presentation && texture_route_available {
             model
                 .runtime
                 .scene
@@ -1852,51 +1876,59 @@ impl Render for BrowserView {
                 if compositor_eligible {
                     let passthrough = passthrough.as_ref().unwrap();
                     let (scene_id, buffer) = passthrough_scene.as_ref().unwrap();
-                    if state.positioned != Some(*scene_id)
-                        && passthrough.set_geometry(bounds).is_ok()
-                    {
-                        state.positioned = Some(*scene_id);
-                        let scene_id = *scene_id;
-                        let buffer = buffer.clone();
-                        let passthrough = passthrough.clone();
-                        let paint_state = passthrough_state.clone();
-                        // place_below, position, and viewport destination are
-                        // parent-latched. Commit the desynchronized child only
-                        // after this GPUI frame has committed those requests.
-                        window.on_next_frame(move |_, cx| {
-                            let mut state = paint_state.get();
-                            if state.positioned != Some(scene_id) {
-                                return;
-                            }
-                            match buffer
-                                .passthrough_buffer()
-                                .map_err(anyhow::Error::from)
-                                .and_then(|buffer| passthrough.present(scene_id, buffer))
-                            {
-                                Ok(()) => {
-                                    state.submitted = Some(scene_id);
-                                    state.presented = None;
-                                }
-                                Err(error) => {
-                                    tracing::warn!(?error, "present browser DMA-BUF passthrough");
-                                    passthrough.hide();
-                                    passthrough_failed.set(true);
-                                    state = PassthroughPaintState::default();
-                                }
-                            }
-                            paint_state.set(state);
+                    if state.positioned != Some(*scene_id) {
+                        if let Err(error) = passthrough.set_geometry(bounds) {
+                            tracing::warn!(?error, "position browser DMA-BUF passthrough");
+                            passthrough_failed.set(true);
+                            state = PassthroughPaintState::default();
                             cx.notify(owner_id);
-                        });
+                        } else {
+                            state.positioned = Some(*scene_id);
+                            let scene_id = *scene_id;
+                            let buffer = buffer.clone();
+                            let passthrough = passthrough.clone();
+                            let paint_state = passthrough_state.clone();
+                            // place_below, position, and viewport destination are
+                            // parent-latched. Commit the desynchronized child only
+                            // after this GPUI frame has committed those requests.
+                            window.on_next_frame(move |_, cx| {
+                                let mut state = paint_state.get();
+                                if state.positioned != Some(scene_id) {
+                                    return;
+                                }
+                                match buffer
+                                    .passthrough_buffer()
+                                    .map_err(anyhow::Error::from)
+                                    .and_then(|buffer| passthrough.present(scene_id, buffer))
+                                {
+                                    Ok(()) => {
+                                        state.submitted = Some(scene_id);
+                                        state.presented = None;
+                                    }
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            ?error,
+                                            "present browser DMA-BUF passthrough"
+                                        );
+                                        passthrough.hide();
+                                        passthrough_failed.set(true);
+                                        state = PassthroughPaintState::default();
+                                    }
+                                }
+                                paint_state.set(state);
+                                cx.notify(owner_id);
+                            });
+                        }
                     }
                     // Promotion keeps painting the texture until niri confirms
                     // the child commit was presented. Because hole punching is
                     // an after-content pass, ordinary GPUI overlays remain above
                     // the child once the hole becomes active.
-                    if state.presented != Some(*scene_id) {
-                        state.active = false;
-                    } else {
-                        window.paint_hole(bounds);
+                    if state.presented == Some(*scene_id) {
                         state.active = true;
+                    }
+                    if state.active {
+                        window.paint_hole(bounds);
                     }
                 } else {
                     if passthrough_timing_enabled.replace(false)

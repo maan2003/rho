@@ -68,6 +68,7 @@ struct LinuxDmaBufSurfaceInner {
     pub acquire_fence: Mutex<Option<OwnedFd>>,
     pub submitted: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     pub released: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    route_owner: AtomicU64,
 }
 
 #[allow(missing_docs)]
@@ -102,6 +103,7 @@ impl LinuxDmaBufSurface {
             acquire_fence: Mutex::new(Some(acquire_fence)),
             submitted: Mutex::new(Some(Box::new(submitted))),
             released: Mutex::new(Some(Box::new(released))),
+            route_owner: AtomicU64::new(0),
         }))
     }
 
@@ -150,7 +152,35 @@ impl LinuxDmaBufSurface {
         if fd.is_none() || fence.is_none() {
             return None;
         }
+        if self
+            .0
+            .route_owner
+            .compare_exchange(0, u64::MAX, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return None;
+        }
         Some((fd.take().unwrap(), fence.take().unwrap()))
+    }
+    /// Claim this lease for one Wayland passthrough surface. Repeated commits
+    /// by the same owner are allowed; WGPU and other child surfaces are not.
+    #[doc(hidden)]
+    pub fn claim_wayland_passthrough(&self, owner: u64) -> bool {
+        debug_assert_ne!(owner, 0);
+        debug_assert_ne!(owner, u64::MAX);
+        match self
+            .0
+            .route_owner
+            .compare_exchange(0, owner, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => true,
+            Err(current) => current == owner,
+        }
+    }
+    /// Whether this lease is unclaimed or already owned by WGPU.
+    #[doc(hidden)]
+    pub fn texture_route_available(&self) -> bool {
+        matches!(self.0.route_owner.load(Ordering::Acquire), 0 | u64::MAX)
     }
     #[doc(hidden)]
     pub fn submitted(&self) {
@@ -242,5 +272,47 @@ impl fmt::Debug for LinuxDmaBufSurface {
             .field("fourcc", &self.fourcc())
             .field("modifier", &self.modifier())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn surface(releases: Arc<AtomicUsize>) -> LinuxDmaBufSurface {
+        LinuxDmaBufSurface::new(
+            1,
+            1,
+            1,
+            0,
+            0,
+            4,
+            0,
+            false,
+            std::fs::File::open("/dev/null").unwrap().into(),
+            std::fs::File::open("/dev/null").unwrap().into(),
+            || {},
+            move || {
+                releases.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+    }
+
+    #[test]
+    fn dma_buf_lease_has_one_presentation_route_and_one_release() {
+        let releases = Arc::new(AtomicUsize::new(0));
+        let passthrough = surface(releases.clone());
+        assert!(passthrough.claim_wayland_passthrough(7));
+        assert!(passthrough.claim_wayland_passthrough(7));
+        assert!(!passthrough.claim_wayland_passthrough(8));
+        assert!(passthrough.take_import_payload().is_none());
+        passthrough.released();
+        passthrough.released();
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
+
+        let texture = surface(Arc::new(AtomicUsize::new(0)));
+        assert!(texture.take_import_payload().is_some());
+        assert!(!texture.claim_wayland_passthrough(7));
     }
 }

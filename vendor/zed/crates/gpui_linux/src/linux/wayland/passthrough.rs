@@ -1,13 +1,18 @@
 use std::{
     collections::{HashMap, HashSet},
+    fs::File,
     os::fd::{AsFd, AsRawFd},
-    sync::{Arc, Mutex, mpsc},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+        mpsc,
+    },
     thread,
     time::Duration,
 };
 
 use anyhow::{Context as _, Result, bail};
-use calloop::{EventLoop, channel};
+use calloop::{EventLoop, LoopHandle, LoopSignal, PostAction, channel, generic::Generic};
 use calloop_wayland_source::WaylandSource;
 use gpui::{
     Bounds, LinuxWaylandPassthrough, LinuxWaylandPassthroughBuffer, LinuxWaylandPassthroughEvent,
@@ -100,8 +105,14 @@ struct State {
     qh: QueueHandle<Self>,
     events: EventSink,
     buffers: HashMap<u64, wl_buffer::WlBuffer>,
+    released_leases: HashSet<u64>,
     formats: HashSet<(u32, u64)>,
     presentation_clock_monotonic: bool,
+    loop_handle: LoopHandle<'static, Self>,
+    owner_id: u64,
+    signal: LoopSignal,
+    stopping: bool,
+    pending_releases: usize,
 }
 
 impl State {
@@ -129,10 +140,15 @@ impl State {
                 buffer.modifier
             );
         }
+        if !buffer.surface.claim_wayland_passthrough(self.owner_id) {
+            bail!("DMA-BUF lease is already claimed by another presentation path");
+        }
         let lease_id = buffer.surface.lease_id();
-        let wl_buffer = if let Some(existing) = self.buffers.get(&lease_id) {
-            existing.clone()
-        } else {
+        if self.released_leases.contains(&lease_id) {
+            bail!("DMA-BUF lease was already released by this passthrough surface");
+        }
+        let new_buffer = !self.buffers.contains_key(&lease_id);
+        if new_buffer {
             let params = self.dmabuf.create_params(&self.qh, ());
             let modifier_hi = (buffer.modifier >> 32) as u32;
             let modifier_lo = buffer.modifier as u32;
@@ -169,31 +185,38 @@ impl State {
             );
             params.destroy();
             self.buffers.insert(lease_id, wl_buffer.clone());
-            wl_buffer
-        };
+            self.surface.attach(Some(&wl_buffer), 0, 0);
+            self.surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
+            self.synchronization
+                .set_acquire_fence(buffer.acquire_fence.as_fd());
+            self.synchronization.get_release(
+                &self.qh,
+                BufferData {
+                    surface: buffer.surface.clone(),
+                    lease_id,
+                },
+            );
+            self.pending_releases += 1;
+            buffer.surface.submitted();
+        }
 
-        self.surface.attach(Some(&wl_buffer), 0, 0);
-        self.surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
-        self.synchronization
-            .set_acquire_fence(buffer.acquire_fence.as_fd());
-        self.synchronization.get_release(
-            &self.qh,
-            BufferData {
-                surface: buffer.surface.clone(),
-                lease_id,
-            },
-        );
         self.surface.frame(&self.qh, CommitData(scene_id));
         self.presentation
             .feedback(&self.surface, &self.qh, CommitData(scene_id));
         self.surface.commit();
-        buffer.surface.submitted();
         Ok(())
     }
 
     fn hide(&self) {
         self.surface.attach(None, 0, 0);
         self.surface.commit();
+    }
+
+    fn release_finished(&mut self) {
+        self.pending_releases = self.pending_releases.saturating_sub(1);
+        if self.stopping && self.pending_releases == 0 {
+            self.signal.stop();
+        }
     }
 }
 
@@ -202,12 +225,14 @@ pub(super) fn create(
     parent: wl_surface::WlSurface,
     events: EventSink,
 ) -> Result<Arc<dyn LinuxWaylandPassthrough>> {
+    static NEXT_OWNER_ID: AtomicU64 = AtomicU64::new(1);
+    let owner_id = NEXT_OWNER_ID.fetch_add(1, Ordering::Relaxed);
     let (commands, receiver) = channel::channel();
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
     let thread = thread::Builder::new()
         .name("gpui-wayland-passthrough".into())
         .spawn(move || {
-            let result = run(connection, parent, events, receiver, ready_tx);
+            let result = run(connection, parent, events, receiver, ready_tx, owner_id);
             if let Err(error) = result {
                 log::error!("Wayland passthrough thread failed: {error:#}");
             }
@@ -228,6 +253,7 @@ fn run(
     events: EventSink,
     receiver: channel::Channel<Command>,
     ready: mpsc::SyncSender<Result<()>>,
+    owner_id: u64,
 ) -> Result<()> {
     let (globals, mut queue) =
         registry_queue_init::<State>(&connection).context("create passthrough event queue")?;
@@ -260,6 +286,7 @@ fn run(
     subsurface.set_desync();
     let viewport = viewporter.get_viewport(&surface, &qh, ());
     let synchronization = explicit.get_synchronization(&surface, &qh, ());
+    let mut event_loop = EventLoop::<State>::try_new().context("create passthrough event loop")?;
     let mut state = State {
         surface,
         subsurface,
@@ -270,15 +297,19 @@ fn run(
         qh,
         events,
         buffers: HashMap::new(),
+        released_leases: HashSet::new(),
         formats: HashSet::new(),
         presentation_clock_monotonic: false,
+        loop_handle: event_loop.handle(),
+        owner_id,
+        signal: event_loop.get_signal(),
+        stopping: false,
+        pending_releases: 0,
     };
     queue
         .roundtrip(&mut state)
         .context("initialize passthrough globals")?;
 
-    let mut event_loop = EventLoop::<State>::try_new().context("create passthrough event loop")?;
-    let signal = event_loop.get_signal();
     event_loop
         .handle()
         .insert_source(receiver, move |event, _, state| {
@@ -293,7 +324,13 @@ fn run(
                     let _ = reply.send(state.present(scene_id, buffer));
                 }
                 Command::Hide => state.hide(),
-                Command::Stop => signal.stop(),
+                Command::Stop => {
+                    state.hide();
+                    state.stopping = true;
+                    if state.pending_releases == 0 {
+                        state.signal.stop();
+                    }
+                }
             }
         })
         .map_err(|_| anyhow::anyhow!("install passthrough command queue"))?;
@@ -451,31 +488,60 @@ impl Dispatch<zwp_linux_buffer_release_v1::ZwpLinuxBufferReleaseV1, BufferData> 
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        if let Some(buffer) = state.buffers.remove(&data.lease_id) {
-            buffer.destroy();
-        }
         let surface = data.surface.clone();
         match event {
-            zwp_linux_buffer_release_v1::Event::ImmediateRelease => surface.released(),
+            zwp_linux_buffer_release_v1::Event::ImmediateRelease => {
+                if let Some(buffer) = state.buffers.remove(&data.lease_id) {
+                    buffer.destroy();
+                }
+                state.released_leases.insert(data.lease_id);
+                surface.released();
+                state.release_finished();
+            }
             zwp_linux_buffer_release_v1::Event::FencedRelease { fence } => {
-                thread::spawn(move || {
-                    let mut descriptor = libc::pollfd {
-                        fd: fence.as_raw_fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    };
-                    // A sync_file becomes readable once all constituent fences signal.
-                    loop {
-                        let result = unsafe { libc::poll(&mut descriptor, 1, -1) };
-                        if result >= 0
-                            || std::io::Error::last_os_error().kind()
-                                != std::io::ErrorKind::Interrupted
-                        {
-                            break;
+                // Keep fence waiting on the dedicated calloop thread so
+                // presentation/frame dispatch remains nonblocking without
+                // creating a waiter thread for every frame.
+                let lease_id = data.lease_id;
+                let fallback_surface = surface.clone();
+                if let Err(mut error) = state.loop_handle.insert_source(
+                    Generic::new(
+                        File::from(fence),
+                        calloop::Interest::READ,
+                        calloop::Mode::Level,
+                    ),
+                    move |_, _, state| {
+                        if let Some(buffer) = state.buffers.remove(&lease_id) {
+                            buffer.destroy();
                         }
+                        state.released_leases.insert(lease_id);
+                        surface.released();
+                        state.release_finished();
+                        Ok(PostAction::Remove)
+                    },
+                ) {
+                    log::error!("register DMA-BUF release fence: {}", error.error);
+                    if let Some(buffer) = state.buffers.remove(&lease_id) {
+                        buffer.destroy();
                     }
-                    surface.released();
-                });
+                    state.released_leases.insert(lease_id);
+                    state.release_finished();
+                    let file = unsafe { error.inserted.get_mut() }
+                        .try_clone()
+                        .expect("clone release fence after calloop insertion failure");
+                    thread::spawn(move || {
+                        let mut descriptor = libc::pollfd {
+                            fd: file.as_raw_fd(),
+                            events: libc::POLLIN,
+                            revents: 0,
+                        };
+                        while unsafe { libc::poll(&mut descriptor, 1, -1) } < 0
+                            && std::io::Error::last_os_error().kind()
+                                == std::io::ErrorKind::Interrupted
+                        {}
+                        fallback_surface.released();
+                    });
+                }
             }
             _ => {}
         }
