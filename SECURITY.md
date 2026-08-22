@@ -137,9 +137,11 @@ AI APIs.
   session data instead of exposing it through visible tab groups. Its bundled
   content script runs on HTTP(S) documents only. Its isolated-world,
   document-start `window` capture listener owns Vim modes and synchronously
-  consumes only matched commands; unmatched keys and editable controls continue
-  to the website as their original trusted events. The page agent performs
-  scrolling, focus, and visible-element hints locally. Browser history and
+  consumes matched commands, active prefixes/counts, and unmodified Hints-mode
+  input; unmatched top-level keys and focused-control conflicts continue to the
+  website as their original trusted events. The page agent performs nested
+  native smooth scrolling, focus, and visible-element label/text hints locally.
+  Browser history and
   reload requests contain only a fixed command name and are handled by the
   worker for the active sender tab. Hint activation currently uses DOM
   `element.click()`, which is not a trusted synthetic click, though it executes

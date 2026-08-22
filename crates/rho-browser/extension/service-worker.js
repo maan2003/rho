@@ -304,6 +304,14 @@ chrome.runtime.onMessage.addListener((message, sender) => {
     message?.type !== "rho-browser-command"
   ) return;
   switch (message.command) {
+    // VIMFX PARITY TODO(rhoPrivate.vim): Chromium's extension API only moves
+    // one history entry. Replace these with historyGo(tabId, signedCount) when
+    // the Brave fork exposes its NavigationController through the fixed
+    // component-extension API.
+    // case "back": return chrome.rhoPrivate.vim.historyGo(
+    //   sender.tab.id, -Math.max(1, message.count || 1));
+    // case "forward": return chrome.rhoPrivate.vim.historyGo(
+    //   sender.tab.id, Math.max(1, message.count || 1));
     case "back": return chrome.tabs.goBack(sender.tab.id);
     case "forward": return chrome.tabs.goForward(sender.tab.id);
     case "reload": return chrome.tabs.reload(sender.tab.id);

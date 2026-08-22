@@ -428,6 +428,12 @@ mod tests {
         assert!(!worker.contains("completeHints"));
         let content = fs::read_to_string(extension.join("content-script.js")).unwrap();
         assert!(content.contains("addEventListener(\"keydown\", onKeyDown, true)"));
+        assert!(content.contains("const INPUT_TIMEOUT_MS = 2000"));
+        assert!(content.contains("class ScrollableElements"));
+        assert!(content.contains("function scrollTarget()"));
+        assert!(content.contains("const behavior = \"smooth\""));
+        assert!(content.contains("enteredText"));
+        assert!(content.contains("VIMFX PARITY TODO(rhoPrivate.vim)"));
         assert!(!content.contains("__rhoHandleCommand"));
         assert!(!content.contains("__rhoComponentController"));
         assert!(extension.join("VIMFX-LICENSE-MIT").is_file());

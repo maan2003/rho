@@ -188,10 +188,13 @@ than by running a supervisor, extension protocol, or daemon process graph.
   Rho's custom Brave build registers the bundled control plane from the
   client-state directory as a component extension, so its HTTP(S) worker and
   page agent can change without rebuilding Brave. Each document-start content
-  script owns its Normal, Ignore, count, prefix, and Hints state and installs an
-  isolated-world capture listener on `window`. It synchronously consumes Vim
-  commands; unmatched keys and editable controls retain the original trusted
-  browser event. The same agent performs scrolling, focus, hint discovery, and
+  script owns its Normal, Ignore, key-tree/count, and Hints state and installs
+  an isolated-world capture listener on `window`. It synchronously consumes Vim
+  commands; unmatched top-level keys and conflicting focused-control keys retain
+  the original trusted browser event. Prefixes and counts expire together after
+  two seconds. The same agent selects focused or visible nested scroll containers
+  for native smooth scrolling, remembers text-input focus for `gi`, and performs
+  visible-element hint discovery, label/text matching, marker repositioning, and
   hint activation. `i` enters Ignore mode and Shift-Escape leaves it, while
   Ctrl-Shift-Escape remains the compositor escape hatch back to the Desk.
   Browser-native history and reload requests go through the component worker.
