@@ -1,7 +1,7 @@
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd as _;
 use std::os::unix::process::CommandExt as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -17,14 +17,12 @@ use crate::store::{PageId, PageRecord, validate_launch_url};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct BrowserWindow;
 
-/// One persistent Brave Origin identity, one normal browser window, and one
-/// private Wayland compositor. Logical pages live as extension-owned tabs
-/// inside the singleton browser window.
+/// One normal Brave Origin window and one private Wayland compositor. Logical
+/// pages live as extension-owned tabs inside the singleton browser window.
 pub(crate) struct BrowserRuntime {
     compositor: Mutex<Option<BrowserCompositor<BrowserWindow>>>,
     bridge: Mutex<Option<Arc<Bridge>>>,
-    _profile: PathBuf,
-    profile_lock: Mutex<Option<File>>,
+    runtime_lock: Mutex<Option<File>>,
     chrome: Mutex<Option<Child>>,
     shutdown_started: AtomicBool,
 }
@@ -34,24 +32,20 @@ impl BrowserRuntime {
         state_dir: &Path,
         render: BrowserRenderConfig,
     ) -> Result<(Self, BrowserSession<BrowserWindow>)> {
-        let profile = state_dir.join("chromium");
-        let brave_config = state_dir.join("brave-config");
+        let brave_config = dirs::config_dir().context("resolve user config directory")?;
         let extension = state_dir.join("chromium-extension");
-        std::fs::create_dir_all(&profile)?;
-        let profile_lock = OpenOptions::new()
+        let runtime_lock = OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
             .open(state_dir.join("chromium.lock"))?;
-        if unsafe { libc::flock(profile_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            bail!(
-                "the persistent Rho browser identity is already in use by another rho-gui process"
-            );
+        if unsafe { libc::flock(runtime_lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            bail!("the Rho browser runtime is already in use by another rho-gui process");
         }
 
         let executable = std::env::current_exe().context("resolve rho-gui executable")?;
-        write_installation(&profile, &brave_config, &extension, &executable)?;
+        write_installation(&brave_config, &extension, &executable)?;
         let bridge = Bridge::bind(socket_path()?)?;
         let software_shm = matches!(render, BrowserRenderConfig::SoftwareShmQa);
         let compositor = BrowserCompositor::launch(render)?;
@@ -75,14 +69,10 @@ impl BrowserRuntime {
             .arg("--no-default-browser-check")
             .arg("--restore-last-session")
             .arg(format!("--disable-features={disabled_features}"))
-            .arg(format!("--user-data-dir={}", profile.display()))
             .arg(format!("--rho-component-extension={}", extension.display()));
         if software_shm {
             command.arg("--disable-gpu");
         }
-        // Brave only discovers per-user native messaging hosts under its XDG
-        // config tree, not under --user-data-dir.
-        command.env("XDG_CONFIG_HOME", &brave_config);
         command.process_group(0);
         let child = command.spawn().context("launch pinned Brave Origin")?;
         tracing::info!(pid = child.id(), "launched Brave Origin browser");
@@ -90,8 +80,7 @@ impl BrowserRuntime {
             Self {
                 compositor: Mutex::new(Some(compositor)),
                 bridge: Mutex::new(Some(Arc::new(bridge))),
-                _profile: profile,
-                profile_lock: Mutex::new(Some(profile_lock)),
+                runtime_lock: Mutex::new(Some(runtime_lock)),
                 chrome: Mutex::new(Some(child)),
                 shutdown_started: AtomicBool::new(false),
             },
@@ -130,7 +119,7 @@ impl BrowserRuntime {
     }
 
     /// Starts one non-blocking teardown of Chrome and its private compositor.
-    /// The profile lock is released only after Chrome has been reaped.
+    /// The runtime lock is released only after Chrome has been reaped.
     pub(crate) fn shutdown_background(&self) {
         if !begin_shutdown(&self.shutdown_started) {
             return;
@@ -138,7 +127,7 @@ impl BrowserRuntime {
         let child = self.chrome.lock().unwrap().take();
         let compositor = self.compositor.lock().unwrap().take();
         let bridge = self.bridge.lock().unwrap().take();
-        let profile_lock = self.profile_lock.lock().unwrap().take();
+        let runtime_lock = self.runtime_lock.lock().unwrap().take();
         thread::spawn(move || {
             if let Some(mut child) = child {
                 unsafe { libc::kill(-(child.id() as i32), libc::SIGTERM) };
@@ -146,7 +135,7 @@ impl BrowserRuntime {
             }
             drop(compositor);
             drop(bridge);
-            drop(profile_lock);
+            drop(runtime_lock);
         });
     }
 }

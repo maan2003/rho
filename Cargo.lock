@@ -13646,6 +13646,7 @@ name = "rho-browser"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "dirs",
  "futures-lite 2.6.1",
  "gpui",
  "image",
