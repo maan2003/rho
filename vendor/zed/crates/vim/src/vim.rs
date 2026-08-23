@@ -188,6 +188,12 @@ actions!(
         SwitchToVisualBlockMode,
         /// Switches to Helix-style normal mode.
         SwitchToHelixNormalMode,
+        /// Enters application-owned deal review mode.
+        EnterDealMode,
+        /// Leaves deal review mode for the corresponding normal mode.
+        ExitDealMode,
+        /// Starts inserting at the current deal heading.
+        DealInsert,
         /// Clears any pending operators.
         ClearOperators,
         /// Clears the exchange register.
@@ -506,6 +512,14 @@ pub fn init(cx: &mut App) {
     .detach();
 }
 
+/// Consumes the count accumulated by normal-style modal key bindings.
+///
+/// Application-owned modes can use this to give their commands the same
+/// count semantics as built-in Vim and Helix actions.
+pub fn take_count(cx: &mut App) -> Option<usize> {
+    Vim::take_count(cx)
+}
+
 #[derive(Clone)]
 pub(crate) struct VimAddon {
     pub(crate) entity: Entity<Vim>,
@@ -528,6 +542,7 @@ pub(crate) struct Vim {
     pub temp_mode: bool,
     pub status_label: Option<SharedString>,
     pub exit_temporary_mode: bool,
+    allow_deal_transition: bool,
 
     operator_stack: Vec<Operator>,
     pub(crate) replacements: Vec<(Range<editor::Anchor>, String)>,
@@ -598,6 +613,7 @@ impl Vim {
             last_mode,
             temp_mode: false,
             exit_temporary_mode: false,
+            allow_deal_transition: false,
             operator_stack: Vec::new(),
             replacements: Vec::new(),
 
@@ -728,6 +744,44 @@ impl Vim {
                     vim.switch_mode(Mode::HelixNormal, true, window, cx)
                 },
             );
+            Vim::action(editor, cx, |vim, _: &EnterDealMode, window, cx| {
+                let mode = if HelixModeSetting::get_global(cx).0 {
+                    Mode::HelixDeal
+                } else {
+                    Mode::Deal
+                };
+                vim.switch_mode(mode, true, window, cx)
+            });
+            Vim::action(editor, cx, |vim, _: &ExitDealMode, window, cx| {
+                let mode = match vim.mode {
+                    Mode::HelixDeal => Mode::HelixNormal,
+                    Mode::Deal => Mode::Normal,
+                    _ => return,
+                };
+                vim.allow_deal_transition = true;
+                vim.switch_mode(mode, true, window, cx)
+            });
+            Vim::action(editor, cx, |vim, _: &DealInsert, window, cx| {
+                let helix = vim.mode == Mode::HelixDeal;
+                if !helix && vim.mode != Mode::Deal {
+                    return;
+                }
+                vim.start_recording(cx);
+                vim.prepare_for_insert(window, cx);
+                if helix {
+                    vim.update_editor(cx, |_, editor, cx| {
+                        editor.change_selections(Default::default(), window, cx, |s| {
+                            s.move_with(&mut |_map, selection| {
+                                if !selection.is_empty() {
+                                    selection.collapse_to(selection.start, SelectionGoal::None);
+                                }
+                            });
+                        });
+                    });
+                }
+                vim.allow_deal_transition = true;
+                vim.switch_mode(Mode::Insert, false, window, cx)
+            });
             Vim::action(editor, cx, |_, _: &PushForcedMotion, _, cx| {
                 Vim::globals(cx).forced_motion = true;
             });
@@ -1227,6 +1281,12 @@ impl Vim {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if matches!(self.mode, Mode::Deal | Mode::HelixDeal) {
+            if !self.allow_deal_transition {
+                return;
+            }
+            self.allow_deal_transition = false;
+        }
         if self.temp_mode && mode == Mode::Normal {
             self.temp_mode = false;
             self.switch_mode(Mode::Normal, leave_selections, window, cx);
@@ -1421,7 +1481,7 @@ impl Vim {
     pub fn cursor_shape(&self, cx: &App) -> CursorShape {
         let cursor_shape = VimSettings::get_global(cx).cursor_shape;
         match self.mode {
-            Mode::Normal => {
+            Mode::Normal | Mode::Deal => {
                 if let Some(operator) = self.operator_stack.last() {
                     match operator {
                         // Vim jump labels are transient navigation, so keep the
@@ -1444,7 +1504,7 @@ impl Vim {
                     cursor_shape.normal
                 }
             }
-            Mode::HelixNormal => cursor_shape.normal,
+            Mode::HelixNormal | Mode::HelixDeal => cursor_shape.normal,
             Mode::Replace => cursor_shape.replace,
             Mode::Visual | Mode::VisualLine | Mode::VisualBlock | Mode::HelixSelect => {
                 cursor_shape.visual
@@ -1480,6 +1540,8 @@ impl Vim {
             }
             Mode::Normal
             | Mode::HelixNormal
+            | Mode::Deal
+            | Mode::HelixDeal
             | Mode::Replace
             | Mode::Visual
             | Mode::VisualLine
@@ -1500,8 +1562,9 @@ impl Vim {
             | Mode::VisualBlock
             | Mode::Replace
             | Mode::HelixNormal
+            | Mode::HelixDeal
             | Mode::HelixSelect => false,
-            Mode::Normal => true,
+            Mode::Normal | Mode::Deal => true,
         }
     }
 
@@ -1513,8 +1576,14 @@ impl Vim {
             Mode::Replace => "replace",
             Mode::HelixNormal => "helix_normal",
             Mode::HelixSelect => "helix_select",
+            Mode::Deal => "normal",
+            Mode::HelixDeal => "helix_normal",
         }
         .to_string();
+
+        if matches!(self.mode, Mode::Deal | Mode::HelixDeal) {
+            context.add("VimDeal");
+        }
 
         let mut operator_id = "none";
 
@@ -2030,7 +2099,7 @@ impl Vim {
                 });
                 self.switch_mode(Mode::Normal, true, window, cx)
             }
-            Mode::Normal => {
+            Mode::Normal | Mode::Deal => {
                 self.update_editor(cx, |_, editor, cx| {
                     editor.change_selections(SelectionEffects::no_scroll(), window, cx, |s| {
                         s.move_with(&mut |map, selection| {
@@ -2040,7 +2109,7 @@ impl Vim {
                     })
                 });
             }
-            Mode::Insert | Mode::Replace | Mode::HelixNormal => {}
+            Mode::Insert | Mode::Replace | Mode::HelixNormal | Mode::HelixDeal => {}
         }
     }
 

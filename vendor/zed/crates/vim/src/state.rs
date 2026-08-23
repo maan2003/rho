@@ -59,6 +59,10 @@ pub enum Mode {
     VisualBlock,
     HelixNormal,
     HelixSelect,
+    /// A read-only, application-owned review mode with Vim-style motions.
+    Deal,
+    /// A read-only, application-owned review mode with Helix-style motions.
+    HelixDeal,
 }
 
 impl Display for Mode {
@@ -72,6 +76,7 @@ impl Display for Mode {
             Mode::VisualBlock => write!(f, "VISUAL BLOCK"),
             Mode::HelixNormal => write!(f, "NORMAL"),
             Mode::HelixSelect => write!(f, "SELECT"),
+            Mode::Deal | Mode::HelixDeal => write!(f, "DEAL"),
         }
     }
 }
@@ -80,21 +85,32 @@ impl Mode {
     pub fn is_visual(&self) -> bool {
         match self {
             Self::Visual | Self::VisualLine | Self::VisualBlock | Self::HelixSelect => true,
-            Self::Normal | Self::Insert | Self::Replace | Self::HelixNormal => false,
+            Self::Normal
+            | Self::Insert
+            | Self::Replace
+            | Self::HelixNormal
+            | Self::Deal
+            | Self::HelixDeal => false,
         }
     }
 
     pub fn is_helix(&self) -> bool {
-        matches!(self, Self::HelixNormal | Self::HelixSelect)
+        matches!(
+            self,
+            Self::HelixNormal | Self::HelixSelect | Self::HelixDeal
+        )
     }
 
     /// `HelixNormal` qualifies because its cursor is itself a one-character selection.
     pub fn has_selection(&self) -> bool {
-        self.is_visual() || matches!(self, Self::HelixNormal)
+        self.is_visual() || matches!(self, Self::HelixNormal | Self::HelixDeal)
     }
 
     pub fn is_normal(&self) -> bool {
-        matches!(self, Self::Normal | Self::HelixNormal)
+        matches!(
+            self,
+            Self::Normal | Self::HelixNormal | Self::Deal | Self::HelixDeal
+        )
     }
 }
 

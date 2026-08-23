@@ -71,7 +71,6 @@ const DEAL_PRIORITY_CUTOFF: usize = 8;
 const BLOCKED_REPLY_HEAD_START: f64 = 1.0;
 const BLOCKED_REPLY_SLOPE_PER_DAY: f64 = 12.0;
 const FYI_REPLY_PACE_DAYS: f64 = 3.0;
-const DEAL_HINT: &str = "r reply · d done · x discard · z snooze · t todo · n next · q quit";
 
 struct DealCardHighlight;
 
@@ -125,8 +124,9 @@ struct DealSession {
     anchors: Vec<Option<(HostId, text::Anchor)>>,
     boundary_anchors: Vec<Option<text::Anchor>>,
     index: usize,
-    verdicts: usize,
-    verdict_recorded: bool,
+    dealt_count: usize,
+    total_alive: usize,
+    resolved: Vec<bool>,
 }
 
 struct ListingVisibility<'a> {
@@ -291,6 +291,7 @@ pub struct Dashboard {
     collapsed_unfiled: HashSet<HostId>,
     /// Shows only literal editable Desk source, with no generated UI.
     raw_mode: bool,
+    deal_active: bool,
     deal: Option<DealSession>,
     queue_depth: DealQueueDepth,
     queue_depth_revision: Option<u64>,
@@ -377,6 +378,7 @@ impl Dashboard {
             global_cycle: 0,
             collapsed_unfiled: HashSet::new(),
             raw_mode: false,
+            deal_active: false,
             deal: None,
             queue_depth: DealQueueDepth::default(),
             queue_depth_revision: None,
@@ -440,7 +442,36 @@ impl Dashboard {
         self.focus_handle(cx).is_focused(window)
     }
 
-    pub fn set_source(&mut self, host: HostId, source: WeakEntity<Buffer>) {
+    pub fn set_source(
+        &mut self,
+        host: HostId,
+        source: WeakEntity<Buffer>,
+        cx: &mut Context<Workspace>,
+    ) {
+        if let Some(source) = source.upgrade() {
+            if self.deal_active {
+                source.update(cx, |buffer, cx| buffer.set_capability(Capability::Read, cx));
+            }
+            if let Some(deal) = &mut self.deal {
+                let snapshot = source.read(cx).snapshot();
+                for (index, card) in deal.cards.iter().enumerate() {
+                    if card.host == host
+                        && let Some(offset) = card.heading_offset
+                    {
+                        let offset = offset.min(snapshot.len());
+                        deal.anchors[index] = Some((host, snapshot.anchor_before(offset)));
+                        deal.boundary_anchors[index] = Some(snapshot.anchor_after(offset));
+                    }
+                }
+                if self.deal_active
+                    && let Some(card) = deal.cards.get(deal.index)
+                    && card.host == host
+                    && let Some(offset) = card.heading_offset
+                {
+                    self.pending_doc_cursor = Some((host, offset.min(snapshot.len())));
+                }
+            }
+        }
         self.hosts.insert(host, source);
     }
 
@@ -451,7 +482,7 @@ impl Dashboard {
     }
 
     pub fn deal_mode(&self) -> bool {
-        self.deal.is_some()
+        self.deal_active
     }
 
     pub fn deal_waiting(&self) -> usize {
@@ -488,40 +519,93 @@ impl Dashboard {
             .filter_map(|host| self.source_text(*host, cx).map(|text| (*host, text)))
             .collect::<Vec<_>>();
         let queue = assemble_deal_queue(&documents, &deal_agent_facts(registry), now, seed);
-        let cards = queue.cards;
-        let anchors = cards
-            .iter()
-            .map(|card| {
-                let offset = card.heading_offset?;
-                let source = self.hosts.get(&card.host)?.upgrade()?;
-                Some((card.host, source.read(cx).anchor_before(offset)))
-            })
-            .collect::<Vec<_>>();
-        // The before-biased anchor remains the card's durable identity.
-        // Its after-biased mate only disambiguates an insertion made exactly
-        // at the heading boundary, where both sides otherwise resolve to
-        // different content.
-        let boundary_anchors = cards
-            .iter()
-            .map(|card| {
-                let offset = card.heading_offset?;
-                let source = self.hosts.get(&card.host)?.upgrade()?;
-                Some(source.read(cx).anchor_after(offset))
-            })
-            .collect();
-        self.raw_mode = false;
-        for source in self.hosts.values().filter_map(WeakEntity::upgrade) {
-            source.update(cx, |buffer, cx| buffer.set_capability(Capability::Read, cx));
+        if self
+            .deal
+            .as_ref()
+            .is_some_and(|deal| deal.index >= deal.cards.len())
+        {
+            self.deal = None;
         }
-        self.deal = Some(DealSession {
-            cards,
-            anchors,
-            boundary_anchors,
-            index: 0,
-            verdicts: 0,
-            verdict_recorded: false,
-        });
-        if let Some(card) = self.current_deal_card() {
+        if self.deal.is_some() {
+            let index = self.deal.as_ref().unwrap().index;
+            for card_index in index..self.deal.as_ref().unwrap().cards.len() {
+                self.refresh_deal_offset(card_index, cx);
+            }
+            let mut card_index = self.deal.as_ref().unwrap().cards.len();
+            while card_index > index {
+                card_index -= 1;
+                let live = self
+                    .deal
+                    .as_ref()
+                    .and_then(|deal| deal.cards.get(card_index))
+                    .is_some_and(|card| queue.is_live(card));
+                if !live {
+                    let deal = self.deal.as_mut().unwrap();
+                    deal.cards.remove(card_index);
+                    deal.anchors.remove(card_index);
+                    deal.boundary_anchors.remove(card_index);
+                    deal.resolved.remove(card_index);
+                }
+            }
+            if let Some(deal) = &mut self.deal {
+                deal.total_alive = queue.total_alive;
+            }
+            if self
+                .deal
+                .as_ref()
+                .is_some_and(|deal| deal.index >= deal.cards.len())
+            {
+                self.deal = None;
+            }
+        }
+        if self.deal.is_none() {
+            let cards = queue.cards;
+            let anchors = cards
+                .iter()
+                .map(|card| {
+                    let offset = card.heading_offset?;
+                    let source = self.hosts.get(&card.host)?.upgrade()?;
+                    Some((card.host, source.read(cx).anchor_before(offset)))
+                })
+                .collect::<Vec<_>>();
+            // The before-biased anchor remains the card's durable identity.
+            // Its after-biased mate only disambiguates an insertion made exactly
+            // at the heading boundary.
+            let boundary_anchors = cards
+                .iter()
+                .map(|card| {
+                    let offset = card.heading_offset?;
+                    let source = self.hosts.get(&card.host)?.upgrade()?;
+                    Some(source.read(cx).anchor_after(offset))
+                })
+                .collect();
+            let card_count = cards.len();
+            self.deal = Some(DealSession {
+                cards,
+                anchors,
+                boundary_anchors,
+                index: 0,
+                dealt_count: queue.dealt_count,
+                total_alive: queue.total_alive,
+                resolved: vec![false; card_count],
+            });
+        }
+        self.raw_mode = false;
+        self.deal_active = self
+            .deal
+            .as_ref()
+            .is_some_and(|deal| !deal.cards.is_empty());
+        for source in self.hosts.values().filter_map(WeakEntity::upgrade) {
+            let capability = if self.deal_active {
+                Capability::Read
+            } else {
+                Capability::ReadWrite
+            };
+            source.update(cx, |buffer, cx| buffer.set_capability(capability, cx));
+        }
+        if self.deal_active
+            && let Some(card) = self.current_deal_card()
+        {
             if let Some(offset) = card.heading_offset {
                 self.pending_doc_cursor = Some((card.host, offset));
             } else if let Some(agent_id) = card.agent_id {
@@ -538,7 +622,7 @@ impl Dashboard {
     }
 
     pub fn exit_deal_mode(&mut self, cx: &mut Context<Workspace>) -> bool {
-        let exited = self.deal.take().is_some();
+        let exited = std::mem::take(&mut self.deal_active);
         if exited {
             for source in self.hosts.values().filter_map(WeakEntity::upgrade) {
                 source.update(cx, |buffer, cx| {
@@ -551,12 +635,19 @@ impl Dashboard {
     }
 
     pub fn advance_deal(&mut self, cx: &mut Context<Workspace>) -> bool {
+        if !self.deal_active {
+            return false;
+        }
         let Some(deal) = &mut self.deal else {
             return false;
         };
         if deal.index < deal.cards.len() {
             deal.index += 1;
-            deal.verdict_recorded = false;
+        }
+        if deal.index >= deal.cards.len() {
+            self.deal = None;
+            self.exit_deal_mode(cx);
+            return true;
         }
         self.refresh_current_deal_offset(cx);
         if let Some(card) = self.current_deal_card() {
@@ -576,14 +667,44 @@ impl Dashboard {
         true
     }
 
+    pub fn previous_deal(&mut self, cx: &mut Context<Workspace>) -> bool {
+        let Some(deal) = &mut self.deal else {
+            return false;
+        };
+        if !self.deal_active || deal.index == 0 {
+            return false;
+        }
+        deal.index -= 1;
+        self.refresh_current_deal_offset(cx);
+        if let Some(card) = self.current_deal_card()
+            && let Some(offset) = card.heading_offset
+        {
+            self.pending_doc_cursor = Some((card.host, offset));
+        }
+        self.last_synced = None;
+        true
+    }
+
+    pub fn discard_deal_session(&mut self, cx: &mut Context<Workspace>) {
+        self.deal = None;
+        self.exit_deal_mode(cx);
+    }
+
     fn refresh_current_deal_offset(&mut self, cx: &App) -> bool {
+        let Some(index) = self.deal.as_ref().map(|deal| deal.index) else {
+            return false;
+        };
+        self.refresh_deal_offset(index, cx)
+    }
+
+    fn refresh_deal_offset(&mut self, index: usize, cx: &App) -> bool {
         let Some(deal) = &self.deal else {
             return false;
         };
-        if deal.index >= deal.cards.len() {
+        if index >= deal.cards.len() {
             return false;
         }
-        let Some((host, anchor)) = deal.anchors.get(deal.index).and_then(Clone::clone) else {
+        let Some((host, anchor)) = deal.anchors.get(index).and_then(Clone::clone) else {
             return true;
         };
         let Some(source) = self.hosts.get(&host).and_then(|source| source.upgrade()) else {
@@ -593,13 +714,13 @@ impl Dashboard {
         let before_offset = anchor.to_offset(&snapshot);
         let after_offset = deal
             .boundary_anchors
-            .get(deal.index)
+            .get(index)
             .and_then(Clone::clone)
             .map(|anchor| anchor.to_offset(&snapshot))
             .unwrap_or(before_offset);
         let text = snapshot.text();
         let headings = parse(&text);
-        let previous_breadcrumb = &deal.cards[deal.index].breadcrumb;
+        let previous_breadcrumb = &deal.cards[index].breadcrumb;
         let previous_leaf = previous_breadcrumb
             .rsplit(" › ")
             .next()
@@ -649,16 +770,16 @@ impl Dashboard {
             });
         if let Some((offset, breadcrumb)) = found
             && let Some(deal) = &mut self.deal
-            && let Some(card) = deal.cards.get_mut(deal.index)
+            && let Some(card) = deal.cards.get_mut(index)
         {
             card.heading_offset = Some(offset);
             card.breadcrumb = breadcrumb;
-            deal.anchors[deal.index] = Some((host, snapshot.anchor_before(offset)));
-            deal.boundary_anchors[deal.index] = Some(snapshot.anchor_after(offset));
+            deal.anchors[index] = Some((host, snapshot.anchor_before(offset)));
+            deal.boundary_anchors[index] = Some(snapshot.anchor_after(offset));
             return true;
         }
         if let Some(deal) = &mut self.deal
-            && let Some(card) = deal.cards.get_mut(deal.index)
+            && let Some(card) = deal.cards.get_mut(index)
         {
             card.heading_offset = None;
         }
@@ -666,17 +787,18 @@ impl Dashboard {
     }
 
     pub fn deal_accepts_verdict(&self) -> bool {
-        self.deal
-            .as_ref()
-            .is_some_and(|deal| !deal.verdict_recorded && deal.index < deal.cards.len())
+        self.deal_active
+            && self
+                .deal
+                .as_ref()
+                .is_some_and(|deal| deal.index < deal.cards.len() && !deal.resolved[deal.index])
     }
 
     pub fn record_deal_verdict(&mut self) {
         if let Some(deal) = &mut self.deal
-            && !deal.verdict_recorded
+            && !deal.resolved[deal.index]
         {
-            deal.verdict_recorded = true;
-            deal.verdicts += 1;
+            deal.resolved[deal.index] = true;
         }
     }
 
@@ -685,19 +807,26 @@ impl Dashboard {
         deal.cards.get(deal.index)
     }
 
-    pub fn open_plain_deal_heading(&mut self, cx: &mut Context<Workspace>) -> bool {
-        let card = self.current_deal_card().cloned();
-        let Some(DealCard {
-            host,
-            heading_offset: Some(offset),
-            agent_id: None,
-            ..
-        }) = card
+    pub fn prepare_deal_insert(&mut self, cx: &mut Context<Workspace>) -> bool {
+        if !self.refresh_current_deal_offset(cx) {
+            return false;
+        }
+        let Some(card) = self.current_deal_card() else {
+            return false;
+        };
+        let Some(offset) = card.heading_offset else {
+            return false;
+        };
+        let Some(text) = self.source_text(card.host, cx) else {
+            return false;
+        };
+        let Some(heading) = parse(&text)
+            .into_iter()
+            .find(|heading| heading.heading_range.start == offset)
         else {
             return false;
         };
-        self.exit_deal_mode(cx);
-        self.pending_doc_cursor = Some((host, offset));
+        self.pending_doc_cursor = Some((card.host, heading.title_range.start));
         true
     }
 
@@ -755,7 +884,7 @@ impl Dashboard {
         )
     }
 
-    pub fn write_deal_property(
+    fn write_deal_property(
         &mut self,
         kind: rho_ui_proto::desk::TemporalMarkKind,
         at: chrono::NaiveDateTime,
@@ -1025,7 +1154,7 @@ impl Dashboard {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        if self.deal.is_some() {
+        if self.deal_active {
             self.refresh_current_deal_offset(cx);
         }
         let documents = self
@@ -1101,7 +1230,7 @@ impl Dashboard {
 
         let draft_topic = self.new_draft.as_ref().map(|(topic, _, _)| *topic);
         let collapsed = self.collapsed_ranges(&documents, cx);
-        let fold_ranges = if self.raw_mode || self.deal.is_some() {
+        let fold_ranges = if self.raw_mode || self.deal_active {
             Vec::new()
         } else {
             self.effective_fold_ranges(&documents, &collapsed, cx)
@@ -1134,10 +1263,10 @@ impl Dashboard {
             )
         };
         #[cfg(feature = "native")]
-        if !self.raw_mode && self.deal.is_none() {
+        if !self.raw_mode && !self.deal_active {
             decorations.extend(page_heading_decorations(&documents, &filed_pages));
         }
-        let cursor_doc = if self.deal.is_some() {
+        let cursor_doc = if self.deal_active {
             None
         } else {
             match &cursor_place {
@@ -1148,7 +1277,7 @@ impl Dashboard {
         let conceals = if self.raw_mode {
             Vec::new()
         } else {
-            heading_conceals(&documents, cursor_doc, self.deal.is_none())
+            heading_conceals(&documents, cursor_doc, !self.deal_active)
         };
 
         // Render reconciles every frame, so most passes are registry
@@ -1954,34 +2083,6 @@ impl Dashboard {
         self.archive_heading(host, offset, cx)
     }
 
-    pub fn archive_deal_heading(&mut self, cx: &mut Context<Workspace>) -> bool {
-        if !self.deal_accepts_verdict() || !self.refresh_current_deal_offset(cx) {
-            return false;
-        }
-        let Some(card) = self.current_deal_card() else {
-            return false;
-        };
-        let Some(offset) = card.heading_offset else {
-            return false;
-        };
-        let archived = self.archive_heading(card.host, offset, cx);
-        if archived && let Some(deal) = &mut self.deal {
-            if let Some(card) = deal.cards.get_mut(deal.index) {
-                card.heading_offset = None;
-            }
-            if let Some(anchor) = deal.anchors.get_mut(deal.index) {
-                *anchor = None;
-            }
-            if let Some(anchor) = deal.boundary_anchors.get_mut(deal.index) {
-                *anchor = None;
-            }
-            // `archive_heading` aimed the ordinary Desk cursor at the archive
-            // zone, which is outside the still-current narrowed card.
-            self.pending_doc_cursor = None;
-        }
-        archived
-    }
-
     fn archive_heading(
         &mut self,
         host: HostId,
@@ -2385,7 +2486,9 @@ impl Dashboard {
     }
 
     pub fn hint(&self, _cx: &mut Context<Workspace>) -> String {
-        if let Some(deal) = &self.deal {
+        if self.deal_active
+            && let Some(deal) = &self.deal
+        {
             return deal_hint(deal);
         }
         format!(
@@ -2433,19 +2536,23 @@ impl Dashboard {
         segments: &[Segment],
         cx: &mut Context<Workspace>,
     ) {
-        let range = self.current_deal_card().and_then(|card| {
-            let offset = card.heading_offset?;
-            let (_, text) = documents.iter().find(|(host, _)| *host == card.host)?;
-            let heading = parse(text)
-                .into_iter()
-                .find(|heading| heading.heading_range.start == offset)?;
-            self.projected_source_range(
-                card.host,
-                heading.heading_range.start..heading.subtree_range.end,
-                segments,
-                cx,
-            )
-        });
+        let range = self
+            .deal_active
+            .then(|| self.current_deal_card())
+            .flatten()
+            .and_then(|card| {
+                let offset = card.heading_offset?;
+                let (_, text) = documents.iter().find(|(host, _)| *host == card.host)?;
+                let heading = parse(text)
+                    .into_iter()
+                    .find(|heading| heading.heading_range.start == offset)?;
+                self.projected_source_range(
+                    card.host,
+                    heading.heading_range.start..heading.subtree_range.end,
+                    segments,
+                    cx,
+                )
+            });
         self.editor.update(cx, |editor, cx| {
             editor.clear_row_highlights::<DealCardHighlight>();
             if let Some(range) = range {
@@ -4172,17 +4279,15 @@ pub fn assemble_deal_queue(
 
 fn deal_hint(deal: &DealSession) -> String {
     let Some(card) = deal.cards.get(deal.index) else {
-        return format!(
-            "✓ Desk dealt — {} verdict{} · q quit",
-            deal.verdicts,
-            if deal.verdicts == 1 { "" } else { "s" }
-        );
+        return "Desk deal complete".to_owned();
     };
     format!(
-        "{} · {}/{} · {DEAL_HINT}",
+        "{} · {}/{} · {} dealt · {} waiting",
         card.label,
         deal.index + 1,
-        deal.cards.len()
+        deal.cards.len(),
+        deal.dealt_count,
+        deal.total_alive,
     )
 }
 
@@ -4815,10 +4920,14 @@ mod tests {
             boundary_anchors: vec![None, None],
             cards,
             index: 1,
-            verdicts: 0,
-            verdict_recorded: false,
+            dealt_count: 2,
+            total_alive: 9,
+            resolved: vec![false, false],
         };
-        assert!(deal_hint(&deal).starts_with("todo · ripe 2d · 2/2 · r reply"));
+        assert_eq!(
+            deal_hint(&deal),
+            "todo · ripe 2d · 2/2 · 2 dealt · 9 waiting"
+        );
     }
 
     #[test]

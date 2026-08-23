@@ -705,12 +705,12 @@ impl Vim {
                         });
                     }
                 }
-                Mode::Normal | Mode::Replace | Mode::Insert => {
+                Mode::Normal | Mode::Deal | Mode::Replace | Mode::Insert => {
                     if self.active_operator().is_none() {
                         return;
                     }
                 }
-                Mode::HelixNormal | Mode::HelixSelect => {}
+                Mode::HelixNormal | Mode::HelixDeal | Mode::HelixSelect => {}
             }
         }
 
@@ -731,7 +731,7 @@ impl Vim {
         let active_operator = self.active_operator();
         let mut waiting_operator: Option<Operator> = None;
         match self.mode {
-            Mode::Normal | Mode::Replace | Mode::Insert => {
+            Mode::Normal | Mode::Deal | Mode::Replace | Mode::Insert => {
                 if active_operator == Some(Operator::AddSurrounds { target: None }) {
                     waiting_operator = Some(Operator::AddSurrounds {
                         target: Some(SurroundsType::Motion(motion)),
@@ -744,7 +744,9 @@ impl Vim {
                 self.visual_motion(motion, count, window, cx)
             }
 
-            Mode::HelixNormal => self.helix_normal_motion(motion, count, window, cx),
+            Mode::HelixNormal | Mode::HelixDeal => {
+                self.helix_normal_motion(motion, count, window, cx)
+            }
             Mode::HelixSelect => self.helix_select_motion(motion, count, window, cx),
         }
         self.clear_operator(window, cx);

@@ -54,12 +54,12 @@ use crate::style::{RoleFamily, StyleClass};
 use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
     AgentDone, AgentHide, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, BrowserExit,
-    DashboardArchive, DashboardBack, DashboardCycleGlobal, DashboardDealArchive,
-    DashboardDealDefer1, DashboardDealDefer3, DashboardDealDefer7, DashboardDealDefer30,
-    DashboardDealDiscard, DashboardDealDone, DashboardDealExit, DashboardDealNext,
-    DashboardDealOpen, DashboardDealSkip, DashboardDeleteEmpty, DashboardDemote, DashboardGoto,
-    DashboardHeadingAbove, DashboardHeadingBelow, DashboardJump, DashboardNewAgent, DashboardNow,
-    DashboardPromote, DashboardRenameTopic, DashboardReply, DashboardStaff, DashboardSubmit,
+    DashboardArchive, DashboardBack, DashboardCycleGlobal, DashboardDealDiscard, DashboardDealDone,
+    DashboardDealExit, DashboardDealHelp, DashboardDealInsert, DashboardDealNext,
+    DashboardDealPrevious, DashboardDealRefresh, DashboardDealReply, DashboardDealSnooze,
+    DashboardDealTodo, DashboardDeleteEmpty, DashboardDemote, DashboardGoto, DashboardHeadingAbove,
+    DashboardHeadingBelow, DashboardJump, DashboardNewAgent, DashboardNow, DashboardPromote,
+    DashboardRenameTopic, DashboardReply, DashboardStaff, DashboardSubmit,
     DashboardToggleAgentTree, DashboardToggleSubagents, DashboardUndo, GitApprovalAllow,
     GitApprovalDeny, MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext,
     MinibufferPrevious, PaneBack, PaneClose, PaneFocusNext, PaneSplitDown, PaneSplitRight,
@@ -341,6 +341,8 @@ pub struct Workspace {
     /// The dashboard: the rail as a real editor buffer, ambient chrome
     /// beside the active tree.
     dashboard: crate::dashboard::Dashboard,
+    /// Compact Helix-style key guide shown on deal entry and `?`.
+    deal_help_visible: bool,
     /// Canonical per-host CRDT Desk buffers shared by dashboard and source
     /// views.
     desk_sync: DeskSync,
@@ -801,6 +803,7 @@ impl Workspace {
             surfaces: HashMap::new(),
             active_context: ContextId::Draft,
             dashboard,
+            deal_help_visible: false,
             desk_sync: DeskSync::default(),
             desk_edit_subscriptions: HashMap::new(),
             dashboard_preview: None,
@@ -1181,7 +1184,7 @@ impl Workspace {
                 let buffer = self
                     .desk_sync
                     .apply_snapshot(host, snapshot, replica_id, cx);
-                self.dashboard.set_source(host, buffer.downgrade());
+                self.dashboard.set_source(host, buffer.downgrade(), cx);
                 // Structure follows the text: any edit to the desk buffer
                 // (vim in the excerpts, or a CRDT op from another client)
                 // re-parses and reconciles.
@@ -5350,47 +5353,38 @@ impl Workspace {
     }
 
     pub(crate) fn toggle_dashboard_deal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        vim::take_count(cx);
+        window.focus(&self.dashboard.focus_handle(cx), cx);
         if self.dashboard.deal_mode() {
             self.dashboard.exit_deal_mode(cx);
+            self.deal_help_visible = false;
+            if let Ok(action) = cx.build_action("vim::ExitDealMode", None) {
+                window.dispatch_action(action, cx);
+            }
         } else {
             let now = chrono::Local::now().fixed_offset();
             let seed = now.timestamp_nanos_opt().unwrap_or_default() as u64;
             self.dashboard
                 .enter_deal_mode(&self.registry, now, seed, cx);
+            self.deal_help_visible = self.dashboard.deal_mode();
+            if self.dashboard.deal_mode()
+                && let Ok(action) = cx.build_action("vim::EnterDealMode", None)
+            {
+                window.dispatch_action(action, cx);
+            }
         }
         self.refresh_dashboard(window, cx);
-        window.focus(&self.dashboard.focus_handle(cx), cx);
         cx.notify();
     }
 
-    fn dashboard_deal_property(
-        &mut self,
-        kind: rho_ui_proto::desk::TemporalMarkKind,
-        days: u64,
-        pace_days: Option<u32>,
-        advance: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.dashboard.deal_mode() {
-            cx.propagate();
-            return;
+    fn finish_dashboard_deal_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.deal_help_visible = false;
+        if !self.dashboard.deal_mode()
+            && let Ok(action) = cx.build_action("vim::ExitDealMode", None)
+        {
+            window.dispatch_action(action, cx);
         }
-        let today = chrono::Local::now().date_naive();
-        let date = today
-            .checked_add_days(chrono::Days::new(days))
-            .unwrap_or(today);
-        if self.dashboard.write_deal_property(
-            kind,
-            date.and_hms_opt(0, 0, 0).unwrap(),
-            pace_days,
-            cx,
-        ) {
-            if advance {
-                self.dashboard.advance_deal(cx);
-            }
-            self.refresh_dashboard(window, cx);
-        }
+        self.refresh_dashboard(window, cx);
     }
 
     pub(crate) fn configure_dashboard_staff(
@@ -6501,17 +6495,16 @@ impl Workspace {
             .pl(px(24.))
             .pr(px(24.))
             .child(self.render_dashboard_header(text_style, cx));
-        let dashboard = div()
+        let mut dashboard = div()
             .id("dashboard-rail")
-            .key_context(if self.dashboard.deal_mode() {
-                "RhoDashboardDeal"
-            } else {
-                "RhoDashboardNormal"
-            })
             .flex_grow(1.0)
             .min_h_0()
+            .relative()
             .overflow_hidden()
             .child(self.dashboard.editor().clone());
+        if self.dashboard.deal_mode() && self.deal_help_visible {
+            dashboard = dashboard.child(self.render_deal_help(cx));
+        }
         let hint = div()
             .flex_none()
             .pt(px(4.))
@@ -6527,6 +6520,39 @@ impl Workspace {
             .capture_any_mouse_up(cx.listener(Self::dashboard_pointer_up));
         let container = container.child(dashboard);
         container.child(hint).into_any_element()
+    }
+
+    fn render_deal_help(&self, cx: &Context<Self>) -> gpui::AnyElement {
+        let colors = cx.theme().colors();
+        let row = |keys: &'static str, meaning: &'static str| {
+            div()
+                .flex()
+                .gap_2()
+                .child(div().w(px(54.)).text_color(colors.text_accent).child(keys))
+                .child(meaning)
+        };
+        div()
+            .absolute()
+            .top_2()
+            .right_2()
+            .p_2()
+            .border_1()
+            .border_color(colors.border_variant)
+            .rounded_sm()
+            .shadow_md()
+            .bg(colors.element_background)
+            .text_color(colors.text)
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(row("d / x", "done / discard"))
+            .child(row("[count] s", "snooze days"))
+            .child(row("t / r", "todo / reply"))
+            .child(row("n / N", "next / previous"))
+            .child(row("i", "edit heading"))
+            .child(row("q / Esc", "leave deal"))
+            .child(row("R / ?", "fresh deal / help"))
+            .into_any_element()
     }
 
     /// The dashboard-only two-line masthead.
@@ -7393,110 +7419,120 @@ impl Render for Workspace {
                 this.prompt_dashboard_rename_topic(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardDealExit, window, cx| {
+                vim::take_count(cx);
                 if this.dashboard.exit_deal_mode(cx) {
-                    this.refresh_dashboard(window, cx);
+                    this.finish_dashboard_deal_action(window, cx);
                 } else {
                     cx.propagate();
-                }
-            }))
-            .on_action(cx.listener(|this, _: &DashboardDealOpen, window, cx| {
-                if this.dashboard.deal_mode() {
-                    if this.dashboard.open_plain_deal_heading(cx) {
-                        this.refresh_dashboard(window, cx);
-                    } else {
-                        this.dashboard_open(window, cx);
-                    }
-                } else {
-                    cx.propagate();
-                }
-            }))
-            .on_action(cx.listener(|this, _: &DashboardDealArchive, window, cx| {
-                if !this.dashboard.deal_accepts_verdict() {
-                    cx.propagate();
-                    return;
-                }
-                if this.dashboard.archive_deal_heading(cx) {
-                    this.dashboard.record_deal_verdict();
-                    this.dashboard.advance_deal(cx);
-                    this.refresh_dashboard(window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &DashboardDealNext, window, cx| {
+                vim::take_count(cx);
                 if this.dashboard.advance_deal(cx) {
-                    this.refresh_dashboard(window, cx);
+                    this.finish_dashboard_deal_action(window, cx);
                 } else {
                     cx.propagate();
                 }
             }))
+            .on_action(cx.listener(|this, _: &DashboardDealPrevious, window, cx| {
+                vim::take_count(cx);
+                if this.dashboard.previous_deal(cx) {
+                    this.deal_help_visible = false;
+                    this.refresh_dashboard(window, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &DashboardDealDone, window, cx| {
-                this.dashboard_deal_property(
-                    rho_ui_proto::desk::TemporalMarkKind::Done,
-                    0,
-                    None,
-                    false,
-                    window,
-                    cx,
-                );
+                vim::take_count(cx);
+                let today = chrono::Local::now().date_naive();
+                if this.dashboard.write_deal_done(today, cx) {
+                    this.dashboard.record_deal_verdict();
+                    this.dashboard.advance_deal(cx);
+                    this.finish_dashboard_deal_action(window, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &DashboardDealDiscard, window, cx| {
-                this.dashboard_deal_property(
-                    rho_ui_proto::desk::TemporalMarkKind::Discarded,
-                    0,
-                    None,
-                    false,
-                    window,
-                    cx,
-                );
+                vim::take_count(cx);
+                let today = chrono::Local::now().date_naive();
+                if this.dashboard.write_deal_discarded(today, cx) {
+                    this.dashboard.record_deal_verdict();
+                    this.dashboard.advance_deal(cx);
+                    this.finish_dashboard_deal_action(window, cx);
+                }
             }))
-            .on_action(cx.listener(|this, _: &DashboardDealSkip, window, cx| {
-                this.dashboard_deal_property(
-                    rho_ui_proto::desk::TemporalMarkKind::Skip,
-                    1,
-                    None,
-                    true,
-                    window,
-                    cx,
-                );
+            .on_action(cx.listener(|this, _: &DashboardDealSnooze, window, cx| {
+                let count = vim::take_count(cx).unwrap_or(1) as u32;
+                let today = chrono::Local::now().date_naive();
+                if this.dashboard.write_deal_snooze(count, today, cx) {
+                    this.dashboard.record_deal_verdict();
+                    this.dashboard.advance_deal(cx);
+                    this.finish_dashboard_deal_action(window, cx);
+                }
             }))
-            .on_action(cx.listener(|this, _: &DashboardDealDefer1, window, cx| {
-                this.dashboard_deal_property(
-                    rho_ui_proto::desk::TemporalMarkKind::Defer,
-                    1,
-                    Some(1),
-                    false,
-                    window,
-                    cx,
-                );
+            .on_action(cx.listener(|this, _: &DashboardDealTodo, window, cx| {
+                vim::take_count(cx);
+                let today = chrono::Local::now().date_naive();
+                if this.dashboard.write_deal_todo(today, cx) {
+                    this.dashboard.record_deal_verdict();
+                    this.dashboard.advance_deal(cx);
+                    this.finish_dashboard_deal_action(window, cx);
+                }
             }))
-            .on_action(cx.listener(|this, _: &DashboardDealDefer3, window, cx| {
-                this.dashboard_deal_property(
-                    rho_ui_proto::desk::TemporalMarkKind::Defer,
-                    3,
-                    Some(3),
-                    false,
-                    window,
-                    cx,
-                );
+            .on_action(cx.listener(|this, _: &DashboardDealRefresh, window, cx| {
+                vim::take_count(cx);
+                if !this.dashboard.deal_mode() {
+                    cx.propagate();
+                    return;
+                }
+                this.dashboard.discard_deal_session(cx);
+                let now = chrono::Local::now().fixed_offset();
+                let seed = now.timestamp_nanos_opt().unwrap_or_default() as u64;
+                this.dashboard
+                    .enter_deal_mode(&this.registry, now, seed, cx);
+                this.deal_help_visible = true;
+                this.refresh_dashboard(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &DashboardDealDefer7, window, cx| {
-                this.dashboard_deal_property(
-                    rho_ui_proto::desk::TemporalMarkKind::Defer,
-                    7,
-                    Some(7),
-                    false,
-                    window,
-                    cx,
-                );
+            .on_action(cx.listener(|this, _: &DashboardDealInsert, window, cx| {
+                vim::take_count(cx);
+                if !this.dashboard.prepare_deal_insert(cx) || !this.dashboard.exit_deal_mode(cx) {
+                    return;
+                }
+                this.deal_help_visible = false;
+                this.refresh_dashboard(window, cx);
+                if let Ok(action) = cx.build_action("vim::DealInsert", None) {
+                    window.dispatch_action(action, cx);
+                }
             }))
-            .on_action(cx.listener(|this, _: &DashboardDealDefer30, window, cx| {
-                this.dashboard_deal_property(
-                    rho_ui_proto::desk::TemporalMarkKind::Defer,
-                    30,
-                    Some(30),
-                    false,
-                    window,
-                    cx,
-                );
+            .on_action(cx.listener(|this, _: &DashboardDealReply, window, cx| {
+                vim::take_count(cx);
+                let Some(card) = this.dashboard.current_deal_card().cloned() else {
+                    return;
+                };
+                if !this.dashboard.exit_deal_mode(cx) {
+                    return;
+                }
+                this.deal_help_visible = false;
+                if let Ok(action) = cx.build_action("vim::ExitDealMode", None) {
+                    window.dispatch_action(action, cx);
+                }
+                let topic = card.heading_offset.map(|offset| (card.host, offset));
+                let agent_id = card.agent_id.or_else(|| {
+                    topic.and_then(|topic| this.dashboard.first_agent_for_topic(topic))
+                });
+                if let Some(agent_id) = agent_id {
+                    this.dashboard.open_reply(agent_id, window, cx);
+                } else {
+                    this.dashboard.open_new_draft(topic, window, cx);
+                }
+                this.dashboard_focus_draft(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DashboardDealHelp, _, cx| {
+                vim::take_count(cx);
+                if this.dashboard.deal_mode() {
+                    this.deal_help_visible = true;
+                    cx.notify();
+                } else {
+                    cx.propagate();
+                }
             }))
             .on_action(
                 cx.listener(|this, _: &DashboardToggleAgentTree, window, cx| {
@@ -7531,14 +7567,6 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &DashboardArchive, window, cx| {
                 if !this.dashboard.is_focused(window, cx) {
                     cx.propagate();
-                    return;
-                }
-                if this.dashboard.deal_mode() {
-                    if this.dashboard.archive_deal_heading(cx) {
-                        this.dashboard.record_deal_verdict();
-                        this.dashboard.advance_deal(cx);
-                        this.refresh_dashboard(window, cx);
-                    }
                     return;
                 }
                 if this.dashboard.archive_cursor_heading(cx) {

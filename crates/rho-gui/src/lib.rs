@@ -75,15 +75,15 @@ actions!(
         DashboardRenameTopic,
         DashboardDealExit,
         DashboardDealNext,
+        DashboardDealPrevious,
         DashboardDealDone,
-        DashboardDealOpen,
-        DashboardDealArchive,
         DashboardDealDiscard,
-        DashboardDealSkip,
-        DashboardDealDefer1,
-        DashboardDealDefer3,
-        DashboardDealDefer7,
-        DashboardDealDefer30,
+        DashboardDealSnooze,
+        DashboardDealTodo,
+        DashboardDealReply,
+        DashboardDealRefresh,
+        DashboardDealInsert,
+        DashboardDealHelp,
         RoleCycle,
         RoleCycleGroup,
         TaskBoard,
@@ -328,7 +328,11 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
     // the space menu, so `o`, `d`, and `x` keep their vim meaning.
     // Navigation uses vim-idiomatic `g`-prefixed gotos and works anywhere.
     cx.bind_keys([
-        KeyBinding::new("ctrl-z", DashboardUndo, Some("RhoDashboard > Editor")),
+        KeyBinding::new(
+            "ctrl-z",
+            DashboardUndo,
+            Some("RhoDashboard > Editor && !VimDeal"),
+        ),
         // Enter sends from insert mode, but only inside draft rows —
         // ephemeral message buffers, not document text (esc-o for the
         // rare multi-line message). The handler propagates everywhere
@@ -340,8 +344,8 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         ),
     ]);
     for context in [
-        "RhoDashboard > Editor && vim_mode == normal",
-        "RhoDashboard > Editor && vim_mode == helix_normal",
+        "RhoDashboard > Editor && vim_mode == normal && !VimDeal",
+        "RhoDashboard > Editor && vim_mode == helix_normal && !VimDeal",
     ] {
         cx.bind_keys([
             KeyBinding::new("enter", DashboardGoto, Some(context)),
@@ -363,27 +367,21 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             KeyBinding::new("g r", DashboardRenameTopic, Some(context)),
         ]);
     }
-    for context in [
-        "RhoDashboard > RhoDashboardDeal > Editor && vim_mode == normal",
-        "RhoDashboard > RhoDashboardDeal > Editor && vim_mode == helix_normal",
-    ] {
-        cx.bind_keys([
-            KeyBinding::new("q", DashboardDealExit, Some(context)),
-            KeyBinding::new("escape", DashboardDealExit, Some(context)),
-            KeyBinding::new("n", DashboardDealNext, Some(context)),
-            KeyBinding::new("enter", DashboardDealNext, Some(context)),
-            KeyBinding::new("o", DashboardDealOpen, Some(context)),
-            KeyBinding::new("r", DashboardReply, Some(context)),
-            KeyBinding::new("a", DashboardDealArchive, Some(context)),
-            KeyBinding::new("d", DashboardDealDone, Some(context)),
-            KeyBinding::new("x", DashboardDealDiscard, Some(context)),
-            KeyBinding::new("s", DashboardDealSkip, Some(context)),
-            KeyBinding::new("f f", DashboardDealDefer1, Some(context)),
-            KeyBinding::new("f 3", DashboardDealDefer3, Some(context)),
-            KeyBinding::new("f 7", DashboardDealDefer7, Some(context)),
-            KeyBinding::new("f 0", DashboardDealDefer30, Some(context)),
-        ]);
-    }
+    let context = "RhoDashboard > Editor && VimDeal";
+    cx.bind_keys([
+        KeyBinding::new("q", DashboardDealExit, Some(context)),
+        KeyBinding::new("escape", DashboardDealExit, Some(context)),
+        KeyBinding::new("n", DashboardDealNext, Some(context)),
+        KeyBinding::new("shift-n", DashboardDealPrevious, Some(context)),
+        KeyBinding::new("d", DashboardDealDone, Some(context)),
+        KeyBinding::new("x", DashboardDealDiscard, Some(context)),
+        KeyBinding::new("s", DashboardDealSnooze, Some(context)),
+        KeyBinding::new("t", DashboardDealTodo, Some(context)),
+        KeyBinding::new("r", DashboardDealReply, Some(context)),
+        KeyBinding::new("shift-r", DashboardDealRefresh, Some(context)),
+        KeyBinding::new("i", DashboardDealInsert, Some(context)),
+        KeyBinding::new("?", DashboardDealHelp, Some(context)),
+    ]);
 }
 
 /// Initializes the modal editor engine and the exact keymap stack shared by
