@@ -105,6 +105,7 @@ pub struct DealCard {
 struct DealSession {
     cards: Vec<DealCard>,
     anchors: Vec<Option<(HostId, text::Anchor)>>,
+    boundary_anchors: Vec<Option<text::Anchor>>,
     index: usize,
     verdicts: usize,
     verdict_recorded: bool,
@@ -441,6 +442,21 @@ impl Dashboard {
             .map_or(0, |deal| deal.cards.len().saturating_sub(deal.index))
     }
 
+    #[cfg(test)]
+    pub fn deal_highlight_active_for_test(&self, cx: &App) -> bool {
+        self.editor
+            .read(cx)
+            .highlighted_rows::<DealCardHighlight>(cx)
+            .next()
+            .is_some()
+    }
+
+    #[cfg(test)]
+    pub fn current_deal_topic_for_test(&self) -> Option<(HostId, usize, &str)> {
+        let card = self.current_deal_card()?;
+        Some((card.host, card.heading_offset?, card.breadcrumb.as_str()))
+    }
+
     pub fn enter_deal_mode(
         &mut self,
         registry: &AgentRegistry,
@@ -461,6 +477,18 @@ impl Dashboard {
                 let source = self.hosts.get(&card.host)?.upgrade()?;
                 Some((card.host, source.read(cx).anchor_before(offset)))
             })
+            .collect::<Vec<_>>();
+        // The before-biased anchor remains the card's durable identity.
+        // Its after-biased mate only disambiguates an insertion made exactly
+        // at the heading boundary, where both sides otherwise resolve to
+        // different content.
+        let boundary_anchors = cards
+            .iter()
+            .map(|card| {
+                let offset = card.heading_offset?;
+                let source = self.hosts.get(&card.host)?.upgrade()?;
+                Some(source.read(cx).anchor_after(offset))
+            })
             .collect();
         self.raw_mode = false;
         for source in self.hosts.values().filter_map(WeakEntity::upgrade) {
@@ -469,6 +497,7 @@ impl Dashboard {
         self.deal = Some(DealSession {
             cards,
             anchors,
+            boundary_anchors,
             index: 0,
             verdicts: 0,
             verdict_recorded: false,
@@ -542,9 +571,43 @@ impl Dashboard {
             return false;
         };
         let snapshot = source.read(cx).snapshot();
-        let offset = anchor.to_offset(&snapshot);
+        let before_offset = anchor.to_offset(&snapshot);
+        let after_offset = deal
+            .boundary_anchors
+            .get(deal.index)
+            .and_then(Clone::clone)
+            .map(|anchor| anchor.to_offset(&snapshot))
+            .unwrap_or(before_offset);
         let text = snapshot.text();
         let headings = parse(&text);
+        let previous_breadcrumb = &deal.cards[deal.index].breadcrumb;
+        let offset = [before_offset, after_offset]
+            .into_iter()
+            .find(|offset| {
+                headings.iter().enumerate().any(|(index, heading)| {
+                    heading.heading_range.start == *offset
+                        && heading_breadcrumb(&headings, index) == *previous_breadcrumb
+                })
+            })
+            .or_else(|| {
+                headings.iter().enumerate().find_map(|(index, heading)| {
+                    (heading_breadcrumb(&headings, index) == *previous_breadcrumb)
+                        .then_some(heading.heading_range.start)
+                })
+            })
+            .or_else(|| {
+                headings
+                    .iter()
+                    .any(|heading| heading.heading_range.start == before_offset)
+                    .then_some(before_offset)
+            })
+            .or_else(|| {
+                headings
+                    .iter()
+                    .any(|heading| heading.heading_range.start == after_offset)
+                    .then_some(after_offset)
+            })
+            .unwrap_or(after_offset.max(before_offset));
         let found = headings
             .iter()
             .enumerate()
@@ -561,6 +624,8 @@ impl Dashboard {
         {
             card.heading_offset = Some(offset);
             card.breadcrumb = breadcrumb;
+            deal.anchors[deal.index] = Some((host, snapshot.anchor_before(offset)));
+            deal.boundary_anchors[deal.index] = Some(snapshot.anchor_after(offset));
             return true;
         }
         if let Some(deal) = &mut self.deal
@@ -914,6 +979,9 @@ impl Dashboard {
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
+        if self.deal.is_some() {
+            self.refresh_current_deal_offset(cx);
+        }
         let documents = self
             .hosts
             .keys()
@@ -1304,8 +1372,8 @@ impl Dashboard {
         self.apply_heading_chrome(&decorations, &fold_ranges, cx);
         self.apply_tag_conceals(&conceals, cx);
         self.apply_subtree_folds(&fold_ranges, cx);
-        self.apply_sticky_headings(&documents, cx);
-        self.apply_deal_highlight(&documents, cx);
+        self.apply_sticky_headings(&documents, &segments, cx);
+        self.apply_deal_highlight(&documents, &segments, cx);
         self.nudge_caret_off_folds(window, cx);
         self.last_synced = Some((
             documents,
@@ -1334,7 +1402,7 @@ impl Dashboard {
                 return;
             };
             let anchor = buffer.read(cx).anchor_after(0);
-            self.select_buffer_anchor(anchor, window, cx);
+            self.select_buffer_anchor(anchor, None, window, cx);
             return;
         }
         let Some(id) = self.element_keys.get(key) else {
@@ -1347,12 +1415,7 @@ impl Dashboard {
             return;
         };
         self.editor.update(cx, |editor, cx| {
-            let effects = if self.deal.is_some() {
-                SelectionEffects::scroll(Autoscroll::top_relative(2.))
-            } else {
-                Default::default()
-            };
-            editor.change_selections(effects, window, cx, |selections| {
+            editor.change_selections(Default::default(), window, cx, |selections| {
                 selections.select_anchor_ranges([anchor..anchor]);
             });
         });
@@ -1372,12 +1435,29 @@ impl Dashboard {
         };
         let buffer = buffer.read(cx);
         let anchor = buffer.anchor_after(offset.min(buffer.len()));
-        self.select_buffer_anchor(anchor, window, cx);
+        let autoscroll = self.deal.as_ref().map(|_| {
+            let headings = parse(&buffer.text());
+            let ancestors = headings
+                .iter()
+                .find(|heading| heading.heading_range.start == offset)
+                .map_or(0, |heading| {
+                    let mut count = 0;
+                    let mut parent = heading.parent;
+                    while let Some(index) = parent {
+                        count += 1;
+                        parent = headings[index].parent;
+                    }
+                    count
+                });
+            Autoscroll::top_relative((ancestors + 2) as f64)
+        });
+        self.select_buffer_anchor(anchor, autoscroll, window, cx);
     }
 
     fn select_buffer_anchor(
         &self,
         anchor: text::Anchor,
+        autoscroll: Option<Autoscroll>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
@@ -1386,7 +1466,8 @@ impl Dashboard {
             return;
         };
         self.editor.update(cx, |editor, cx| {
-            editor.change_selections(Default::default(), window, cx, |selections| {
+            let effects = autoscroll.map_or_else(Default::default, SelectionEffects::scroll);
+            editor.change_selections(effects, window, cx, |selections| {
                 selections.select_anchor_ranges([anchor..anchor]);
             });
         });
@@ -1842,6 +1923,9 @@ impl Dashboard {
             if let Some(anchor) = deal.anchors.get_mut(deal.index) {
                 *anchor = None;
             }
+            if let Some(anchor) = deal.boundary_anchors.get_mut(deal.index) {
+                *anchor = None;
+            }
             // `archive_heading` aimed the ordinary Desk cursor at the archive
             // zone, which is outside the still-current narrowed card.
             self.pending_doc_cursor = None;
@@ -2264,22 +2348,28 @@ impl Dashboard {
     /// Supplies Desk's org hierarchy to Zed's existing sticky-scroll renderer.
     /// The source anchors survive ordinary edits; sync rebuilds the hierarchy
     /// when headings themselves are added, removed, or reparented.
-    fn apply_sticky_headings(&self, documents: &[(HostId, String)], cx: &mut Context<Workspace>) {
-        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+    fn apply_sticky_headings(
+        &self,
+        documents: &[(HostId, String)],
+        segments: &[Segment],
+        cx: &mut Context<Workspace>,
+    ) {
+        if self.raw_mode {
+            self.editor.update(cx, |editor, cx| {
+                editor.set_custom_sticky_header_ranges(Some(Vec::new()), cx)
+            });
+            return;
+        }
         let mut ranges = Vec::new();
         for (host, text) in documents {
-            let Some(buffer) = self.hosts.get(host).and_then(WeakEntity::upgrade) else {
-                continue;
-            };
-            let buffer = buffer.read(cx);
             for heading in parse(text) {
-                let start = buffer.anchor_before(heading.heading_range.start);
-                let end = buffer.anchor_after(heading.subtree_range.end);
-                if let (Some(start), Some(end)) = (
-                    snapshot.anchor_in_excerpt(start),
-                    snapshot.anchor_in_excerpt(end),
+                if let Some(range) = self.projected_source_range(
+                    *host,
+                    heading.heading_range.start..heading.subtree_range.end,
+                    segments,
+                    cx,
                 ) {
-                    ranges.push(start..end);
+                    ranges.push(range);
                 }
             }
         }
@@ -2288,19 +2378,23 @@ impl Dashboard {
         });
     }
 
-    fn apply_deal_highlight(&self, documents: &[(HostId, String)], cx: &mut Context<Workspace>) {
+    fn apply_deal_highlight(
+        &self,
+        documents: &[(HostId, String)],
+        segments: &[Segment],
+        cx: &mut Context<Workspace>,
+    ) {
         let range = self.current_deal_card().and_then(|card| {
             let offset = card.heading_offset?;
             let (_, text) = documents.iter().find(|(host, _)| *host == card.host)?;
             let heading = parse(text)
                 .into_iter()
                 .find(|heading| heading.heading_range.start == offset)?;
-            let buffer = self.hosts.get(&card.host)?.upgrade()?;
-            let buffer = buffer.read(cx);
-            let snapshot = self.multi_buffer.read(cx).snapshot(cx);
-            Some(
-                snapshot.anchor_in_excerpt(buffer.anchor_before(heading.heading_range.start))?
-                    ..snapshot.anchor_in_excerpt(buffer.anchor_after(heading.subtree_range.end))?,
+            self.projected_source_range(
+                card.host,
+                heading.heading_range.start..heading.subtree_range.end,
+                segments,
+                cx,
             )
         });
         self.editor.update(cx, |editor, cx| {
@@ -2322,6 +2416,35 @@ impl Dashboard {
                 );
             }
         });
+    }
+
+    /// Maps a source range into the composed Desk, clipping its end to the
+    /// last projected slice when generated rows or another host trim the
+    /// source tail from this section.
+    fn projected_source_range(
+        &self,
+        host: HostId,
+        source_range: Range<usize>,
+        segments: &[Segment],
+        cx: &mut Context<Workspace>,
+    ) -> Option<Range<multi_buffer::Anchor>> {
+        let projected_end = segments
+            .iter()
+            .filter_map(|segment| match segment {
+                Segment::Doc {
+                    host: segment_host,
+                    range,
+                    ..
+                } if *segment_host == host => Some(range.end),
+                _ => None,
+            })
+            .max()?;
+        let buffer = self.hosts.get(&host)?.upgrade()?;
+        let buffer = buffer.read(cx);
+        let start = buffer.anchor_before(source_range.start);
+        let end = buffer.anchor_after(source_range.end.min(projected_end));
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        Some(snapshot.anchor_in_excerpt(start)?..snapshot.anchor_in_excerpt(end)?)
     }
 
     fn apply_highlights(
@@ -4619,6 +4742,7 @@ mod tests {
         ];
         let deal = DealSession {
             anchors: vec![None, None],
+            boundary_anchors: vec![None, None],
             cards,
             index: 1,
             verdicts: 0,

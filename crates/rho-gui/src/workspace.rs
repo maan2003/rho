@@ -4524,6 +4524,16 @@ impl Workspace {
     }
 
     #[cfg(test)]
+    pub(crate) fn dashboard_deal_highlight_for_test(&self, cx: &App) -> bool {
+        self.dashboard.deal_highlight_active_for_test(cx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dashboard_deal_topic_for_test(&self) -> Option<(HostId, usize, &str)> {
+        self.dashboard.current_deal_topic_for_test()
+    }
+
+    #[cfg(test)]
     pub(crate) fn dashboard_hint_for_test(&self, cx: &mut Context<Self>) -> String {
         self.dashboard.hint(cx)
     }

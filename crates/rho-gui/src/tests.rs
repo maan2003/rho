@@ -4715,14 +4715,65 @@ fn desk_deal_verdict_advances_to_empty_and_exit_restores_document(cx: &mut TestA
     );
     workspace
         .update(cx, |workspace, _, cx| {
+            assert!(workspace.dashboard_deal_highlight_for_test(cx));
             assert_eq!(
                 workspace.dashboard_cursor_topic_for_test(cx),
                 Some((HostId::default(), original.find("* One").unwrap()))
             );
         })
         .unwrap();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace
+                .desk_buffer_for_test(HostId::default())
+                .unwrap()
+                .update(cx, |buffer, cx| {
+                    buffer.edit([(0..0, "preface\n")], None, cx)
+                });
+            workspace.sync_dashboard(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert!(workspace.dashboard_deal_highlight_for_test(cx));
+            assert_eq!(
+                workspace.dashboard_deal_topic_for_test(),
+                Some((
+                    HostId::default(),
+                    "preface\n".len() + original.find("* One").unwrap(),
+                    "One"
+                ))
+            );
+            assert_eq!(
+                workspace.dashboard_cursor_topic_for_test(cx),
+                Some((
+                    HostId::default(),
+                    "preface\n".len() + original.find("* One").unwrap()
+                ))
+            );
+        })
+        .unwrap();
     cx.simulate_keystrokes(*workspace, "> >");
     cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let raw = workspace
+                .desk_buffer_for_test(HostId::default())
+                .unwrap()
+                .read(cx)
+                .text();
+            assert_eq!(raw, "preface\n* Finished\n:done: 2026-01-01\n** One");
+            assert_eq!(
+                workspace.dashboard_deal_topic_for_test(),
+                Some((
+                    HostId::default(),
+                    "preface\n".len() + original.find("* One").unwrap(),
+                    "Finished › One"
+                ))
+            );
+        })
+        .unwrap();
     cx.simulate_keystrokes(*workspace, "d");
     cx.run_until_parked();
     cx.simulate_keystrokes(*workspace, "n");
@@ -4814,6 +4865,7 @@ fn desk_deal_cards_focus_in_place_read_only_skippable_and_openable(cx: &mut Test
     );
     workspace
         .update(cx, |workspace, _, cx| {
+            assert!(workspace.dashboard_deal_highlight_for_test(cx));
             assert_eq!(
                 workspace.dashboard_cursor_topic_for_test(cx),
                 Some((HostId::default(), original.find("* One").unwrap()))
@@ -4854,6 +4906,7 @@ fn desk_deal_cards_focus_in_place_read_only_skippable_and_openable(cx: &mut Test
     );
     workspace
         .update(cx, |workspace, _, cx| {
+            assert!(workspace.dashboard_deal_highlight_for_test(cx));
             assert_eq!(
                 workspace.dashboard_cursor_topic_for_test(cx),
                 Some((HostId::default(), original.find("* Two").unwrap()))
@@ -4881,6 +4934,7 @@ fn desk_deal_cards_focus_in_place_read_only_skippable_and_openable(cx: &mut Test
     );
     workspace
         .update(cx, |workspace, _, cx| {
+            assert!(workspace.dashboard_deal_highlight_for_test(cx));
             assert_eq!(
                 workspace.dashboard_cursor_topic_for_test(cx),
                 Some((HostId::default(), original.find("* Three").unwrap()))
@@ -4902,6 +4956,136 @@ fn desk_deal_cards_focus_in_place_read_only_skippable_and_openable(cx: &mut Test
                 workspace.dashboard_cursor_topic_for_test(cx),
                 Some((HostId::default(), original.find("* Three").unwrap()))
             );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn desk_deal_card_survives_a_heading_inserted_at_its_exact_boundary(cx: &mut TestAppContext) {
+    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
+
+    let original = "* Intro\n* Target\n:deadline: 2020-01-01\nbody\n";
+    let target = original.find("* Target").unwrap();
+    let mut source =
+        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
+    let operation = DeskOperation::from_text(&source.edit([(0..0, original)]));
+    let snapshot = DeskSnapshot {
+        text: source.snapshot().text(),
+        operations: vec![operation],
+        transactions: Vec::new(),
+        replicas: Vec::new(),
+    };
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskSnapshot {
+                    snapshot,
+                    replica_id: 42,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+            workspace.toggle_dashboard_deal(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert_eq!(
+                workspace.dashboard_cursor_topic_for_test(cx),
+                Some((HostId::default(), target))
+            );
+            workspace
+                .desk_buffer_for_test(HostId::default())
+                .unwrap()
+                .update(cx, |buffer, cx| {
+                    buffer.edit([(target..target, "* New\n")], None, cx)
+                });
+            workspace.sync_dashboard(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert!(workspace.dashboard_deal_highlight_for_test(cx));
+            assert_eq!(
+                workspace.dashboard_deal_topic_for_test(),
+                Some((HostId::default(), target + "* New\n".len(), "Target"))
+            );
+            assert_eq!(
+                workspace.dashboard_cursor_topic_for_test(cx),
+                Some((HostId::default(), target + "* New\n".len()))
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn desk_deal_scrolls_a_deep_heading_below_its_sticky_ancestors(cx: &mut TestAppContext) {
+    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
+
+    let padding = (0..50)
+        .map(|index| format!("context {index}\n"))
+        .collect::<String>();
+    let original = format!(
+        "* Root\n{padding}** Area\n*** Project\n**** Thread\n***** Target\n:deadline: 2020-01-01\n{padding}"
+    );
+    let target_offset = original.find("***** Target").unwrap();
+    let mut source =
+        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
+    let operation = DeskOperation::from_text(&source.edit([(0..0, original.as_str())]));
+    let snapshot = DeskSnapshot {
+        text: source.snapshot().text(),
+        operations: vec![operation],
+        transactions: Vec::new(),
+        replicas: Vec::new(),
+    };
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskSnapshot {
+                    snapshot,
+                    replica_id: 42,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+            window.focus(&workspace.dashboard_editor().read(cx).focus_handle(cx), cx);
+            workspace.toggle_dashboard_deal(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace.dashboard_cursor_topic_for_test(cx),
+                Some((HostId::default(), target_offset))
+            );
+            workspace.dashboard_editor().update(cx, |editor, cx| {
+                let snapshot = editor.display_snapshot(cx);
+                let cursor_row = editor
+                    .selections
+                    .newest::<language::Point>(&snapshot)
+                    .head()
+                    .row as f64;
+                let scroll_top = editor.scroll_position(cx).y;
+                assert!(scroll_top > 0., "deep card did not scroll");
+                assert!(
+                    (cursor_row - scroll_top - 6.).abs() < 0.1,
+                    "card should leave two context rows below four sticky ancestors: cursor={cursor_row}, scroll={scroll_top}"
+                );
+            });
         })
         .unwrap();
 }

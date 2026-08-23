@@ -2098,7 +2098,9 @@ impl Editor {
         self.sticky_headers_task = cx.spawn(async move |this, cx| {
             let sticky_headers = background_task.await;
             this.update(cx, |this, cx| {
-                if this.sticky_headers.as_ref() != Some(&sticky_headers) {
+                if this.custom_sticky_headers.is_none()
+                    && this.sticky_headers.as_ref() != Some(&sticky_headers)
+                {
                     this.sticky_headers = Some(sticky_headers);
                     cx.notify();
                 }
@@ -2137,6 +2139,10 @@ impl Editor {
             self.custom_sticky_headers = headers;
             cx.notify();
         }
+    }
+
+    pub fn has_custom_sticky_headers(&self) -> bool {
+        self.custom_sticky_headers.is_some()
     }
 
     fn new_internal(

@@ -9274,7 +9274,7 @@ impl Element for EditorElement {
                     );
                     #[cfg(feature = "native")]
                     let sticky_headers = if !is_minimap
-                        && is_singleton
+                        && (is_singleton || self.editor.read(cx).has_custom_sticky_headers())
                         && EditorSettings::get_global(cx).sticky_scroll.enabled
                     {
                         let relative = self.editor.read(cx).relative_line_numbers(cx);
