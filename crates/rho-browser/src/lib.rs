@@ -18,7 +18,8 @@ use anyhow::Result;
 use gpui::{App, AppContext as _, BorrowAppContext as _, Entity, Global, Task};
 use rho_browser_wayland::{BrowserRenderConfig, DmaBufConfig};
 pub use rho_browser_wayland::{
-    BrowserTiming, BrowserTimingKind, record_browser_timing, snapshot_browser_timings,
+    BrowserTiming, BrowserTimingKind, ExtensionFrameStats, record_browser_timing,
+    snapshot_browser_timings, snapshot_extension_frame_stats,
 };
 use runtime::BrowserRuntime;
 pub use store::{PageId, PageRecord};

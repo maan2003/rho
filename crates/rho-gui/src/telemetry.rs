@@ -87,6 +87,7 @@ struct Snapshot<'a> {
     frames: Vec<FrameRecord>,
     editor: Vec<EditorRecord>,
     browser: Vec<BrowserRecord>,
+    browser_frames: Vec<BrowserFrameRecord>,
 }
 
 #[derive(Serialize)]
@@ -149,6 +150,18 @@ struct BrowserRecord {
     related_scene_id: Option<u64>,
     at_ns: u64,
     duration_ns: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct BrowserFrameRecord {
+    tab_id: i64,
+    at_ns: u64,
+    frames: u32,
+    window_ms: u32,
+    mean_interval_us: u32,
+    p95_interval_us: u32,
+    max_interval_us: u32,
+    long_frames: u32,
 }
 
 pub fn enable() {
@@ -322,9 +335,22 @@ fn snapshot_with_cpu_profiles(cpu_profiles: &[Vec<u8>]) -> anyhow::Result<Vec<u8
             duration_ns: timing.duration.map(duration_ns),
         })
         .collect();
+    let browser_frames = rho_browser::snapshot_extension_frame_stats()
+        .into_iter()
+        .map(|stats| BrowserFrameRecord {
+            tab_id: stats.tab_id,
+            at_ns: duration_ns(stats.at.saturating_duration_since(started)),
+            frames: stats.frames,
+            window_ms: stats.window_ms,
+            mean_interval_us: stats.mean_interval_us,
+            p95_interval_us: stats.p95_interval_us,
+            max_interval_us: stats.max_interval_us,
+            long_frames: stats.long_frames,
+        })
+        .collect();
     let bytes = serde_json::to_vec_pretty(&Snapshot {
         schema: "dev.rho.gui-performance-snapshot",
-        version: 6,
+        version: 7,
         captured_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -366,6 +392,7 @@ fn snapshot_with_cpu_profiles(cpu_profiles: &[Vec<u8>]) -> anyhow::Result<Vec<u8
         frames,
         editor,
         browser,
+        browser_frames,
     })?;
     anyhow::ensure!(
         bytes.len() <= rho_ui_proto::MAX_GUI_TELEMETRY_BYTES,
@@ -383,6 +410,7 @@ fn browser_stage_name(kind: rho_browser::BrowserTimingKind) -> &'static str {
         SceneScheduled => "scene_scheduled",
         ScenePainted => "scene_painted",
         FrameAcknowledged => "frame_acknowledged",
+        FrameCallbackSent => "frame_callback_sent",
     }
 }
 

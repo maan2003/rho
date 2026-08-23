@@ -103,6 +103,7 @@ pub enum BrowserTimingKind {
     SceneScheduled = 4,
     ScenePainted = 5,
     FrameAcknowledged = 6,
+    FrameCallbackSent = 7,
 }
 
 /// Numeric-only timing marker retained in a fixed-size process-wide ring.
@@ -142,6 +143,37 @@ pub fn record_browser_timing(
 /// Returns a non-destructive copy of the bounded browser-pipeline timing ring.
 pub fn snapshot_browser_timings() -> Vec<BrowserTiming> {
     BROWSER_TIMINGS.lock().unwrap().iter().copied().collect()
+}
+
+/// Renderer-side requestAnimationFrame cadence stats reported by the
+/// component extension; the ground truth for how often Chromium was
+/// actually allowed to produce frames.
+#[derive(Clone, Copy, Debug)]
+pub struct ExtensionFrameStats {
+    pub tab_id: i64,
+    pub at: Instant,
+    pub frames: u32,
+    pub window_ms: u32,
+    pub mean_interval_us: u32,
+    pub p95_interval_us: u32,
+    pub max_interval_us: u32,
+    pub long_frames: u32,
+}
+
+const MAX_EXTENSION_FRAME_STATS: usize = 1024;
+static EXTENSION_FRAME_STATS: Mutex<VecDeque<ExtensionFrameStats>> = Mutex::new(VecDeque::new());
+
+pub fn record_extension_frame_stats(stats: ExtensionFrameStats) {
+    let mut ring = EXTENSION_FRAME_STATS.lock().unwrap();
+    if ring.len() >= MAX_EXTENSION_FRAME_STATS {
+        ring.pop_front();
+    }
+    ring.push_back(stats);
+}
+
+/// Returns a non-destructive copy of the bounded extension frame-stats ring.
+pub fn snapshot_extension_frame_stats() -> Vec<ExtensionFrameStats> {
+    EXTENSION_FRAME_STATS.lock().unwrap().iter().copied().collect()
 }
 
 #[derive(Clone, Debug)]
@@ -768,8 +800,8 @@ struct WindowState {
     presentation_passthrough: bool,
     last_host_presentation_scene: Option<u64>,
     last_host_frame_scene: Option<u64>,
-    scheduled_vsync: Option<u64>,
-    host_vsync: Option<(Duration, Option<Duration>, u64)>,
+    frame_timer_pending: bool,
+    host_vsync: Option<(Duration, Option<Duration>)>,
     pointer_frames: HashMap<u64, PointerFrame>,
     hit_scenes: HashMap<u64, Vec<HitNode>>,
     pointer_location: (f64, f64),
@@ -808,7 +840,7 @@ fn disable_window_presentation_passthrough(window: &mut WindowState) -> Option<u
         return None;
     }
     window.presentation_passthrough = false;
-    window.scheduled_vsync = None;
+    window.frame_timer_pending = false;
     for feedback in window
         .presentation_feedback
         .drain()
@@ -2498,7 +2530,7 @@ fn handle_runtime_command<K: BrowserPageKey>(
                     presentation_passthrough: false,
                     last_host_presentation_scene: None,
                     last_host_frame_scene: None,
-                    scheduled_vsync: None,
+                    frame_timer_pending: false,
                     host_vsync: None,
                     pointer_frames: HashMap::new(),
                     hit_scenes: HashMap::new(),
@@ -2596,10 +2628,7 @@ fn handle_page_command<K: BrowserPageKey>(state: &mut State<K>, id: K, c: PageCo
         }
         PageCommand::HostVsync { timestamp, refresh } => {
             let scene = if let Some(window) = state.windows.get_mut(&id) {
-                let generation = window
-                    .host_vsync
-                    .map_or(1, |(_, _, generation)| generation.wrapping_add(1));
-                window.host_vsync = Some((timestamp, refresh, generation));
+                window.host_vsync = Some((timestamp, refresh));
                 window.dma_frame_callbacks.keys().copied().max()
             } else {
                 None
@@ -2617,7 +2646,7 @@ fn handle_page_command<K: BrowserPageKey>(state: &mut State<K>, id: K, c: PageCo
                 return;
             };
             window.presentation_passthrough = true;
-            window.scheduled_vsync = None;
+            window.frame_timer_pending = false;
             if state.presentation.is_none() {
                 state.presentation = Some(PresentationState::new::<State<K>>(
                     &state.display_handle,
@@ -3402,26 +3431,34 @@ fn schedule_frame_delivery<K: BrowserPageKey>(state: &mut State<K>, id: K, scene
     if window.presentation_passthrough {
         return;
     }
-    let Some((timestamp, refresh, generation)) = window.host_vsync else {
-        return;
-    };
-    if window.scheduled_vsync == Some(generation) {
+    if window.frame_timer_pending {
         return;
     }
-    window.scheduled_vsync = Some(generation);
+    // Extrapolate the next tick from the last vsync sample so delivery never
+    // waits on the host window painting again; an idle host would otherwise
+    // starve Chromium of frame callbacks entirely.
     let now = monotonic_time();
-    let predicted = refresh
-        .map(|refresh| predicted_next_vsync(timestamp, refresh, now))
-        .unwrap_or(now);
+    let predicted = match window.host_vsync {
+        Some((timestamp, Some(refresh))) => predicted_next_vsync(timestamp, refresh, now),
+        _ => now,
+    };
+    window.frame_timer_pending = true;
     let opened_at = window.opened_at;
     let registration =
         state.loop_handle.insert_source(
             Timer::from_duration(predicted.saturating_sub(now)),
             move |_, _, state| {
-                if let Some(window) = state.windows.get_mut(&id).filter(|window| {
-                    window.opened_at == opened_at && !window.presentation_passthrough
-                }) {
-                    send_frame_callbacks(window, predicted.as_millis() as u32, scene_id);
+                if let Some(window) = state
+                    .windows
+                    .get_mut(&id)
+                    .filter(|window| window.opened_at == opened_at)
+                {
+                    window.frame_timer_pending = false;
+                    if !window.presentation_passthrough
+                        && let Some(pending) = window.dma_frame_callbacks.keys().copied().max()
+                    {
+                        send_frame_callbacks(window, predicted.as_millis() as u32, pending);
+                    }
                 }
                 let _ = state.display_handle.flush_clients();
                 TimeoutAction::Drop
@@ -3430,6 +3467,7 @@ fn schedule_frame_delivery<K: BrowserPageKey>(state: &mut State<K>, id: K, scene
     if registration.is_err()
         && let Some(window) = state.windows.get_mut(&id)
     {
+        window.frame_timer_pending = false;
         send_frame_callbacks(window, monotonic_time_ms(), scene_id);
     }
 }
@@ -3443,6 +3481,13 @@ fn send_frame_callbacks(window: &mut WindowState, time: u32, commit_id: u64) {
         .collect::<Vec<_>>();
     for scene_id in completed {
         let callbacks = window.dma_frame_callbacks.remove(&scene_id).unwrap();
+        record_browser_timing(
+            BrowserTimingKind::FrameCallbackSent,
+            scene_id,
+            0,
+            Some(commit_id),
+            None,
+        );
         for callback in callbacks {
             callback.done(time);
         }
@@ -3761,7 +3806,7 @@ mod tests {
             presentation_passthrough: false,
             last_host_presentation_scene: None,
             last_host_frame_scene: None,
-            scheduled_vsync: None,
+            frame_timer_pending: false,
             host_vsync: None,
             pointer_frames: HashMap::new(),
             hit_scenes: HashMap::new(),
@@ -3800,7 +3845,7 @@ mod tests {
     fn disabling_presentation_passthrough_resumes_predicted_frame_delivery() {
         let mut window = window_for_test();
         window.presentation_passthrough = true;
-        window.scheduled_vsync = Some(7);
+        window.frame_timer_pending = true;
         window.dma_frame_callbacks.insert(2, Vec::new());
         window.dma_frame_callbacks.insert(4, Vec::new());
 
@@ -3809,7 +3854,7 @@ mod tests {
             Some(4)
         );
         assert!(!window.presentation_passthrough);
-        assert_eq!(window.scheduled_vsync, None);
+        assert!(!window.frame_timer_pending);
         assert_eq!(disable_window_presentation_passthrough(&mut window), None);
     }
 

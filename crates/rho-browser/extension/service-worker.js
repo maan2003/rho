@@ -336,6 +336,29 @@ chrome.runtime.onMessage.addListener((message, sender) => {
   }
 });
 
+chrome.runtime.onMessage.addListener((message, sender) => {
+  if (
+    sender.id !== chrome.runtime.id ||
+    message?.type !== "rho-frame-telemetry" ||
+    !sender.tab
+  ) return;
+  const pageId = tabPages.get(sender.tab.id);
+  if (!port || !pageId) return;
+  try {
+    port.postMessage({
+      event: "frame-telemetry",
+      page_id: pageId,
+      tab_id: sender.tab.id,
+      frames: message.frames | 0,
+      window_ms: message.window_ms | 0,
+      mean_interval_us: message.mean_interval_us | 0,
+      p95_interval_us: message.p95_interval_us | 0,
+      max_interval_us: message.max_interval_us | 0,
+      long_frames: message.long_frames | 0,
+    });
+  } catch (_) {}
+});
+
 chrome.windows.onCreated.addListener(() => {
   enqueue(reconcile).catch(() => {});
 });

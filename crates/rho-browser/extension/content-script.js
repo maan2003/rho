@@ -1408,3 +1408,54 @@
   addEventListener("resize", scheduleHintRefresh, true);
   addEventListener("scroll", scheduleHintRefresh, true);
 })();
+
+// Frame cadence telemetry: sample requestAnimationFrame intervals in short
+// bursts so rho can correlate renderer-side pacing with its compositor
+// pipeline without keeping the page rendering continuously.
+(() => {
+  if (window !== window.top) return;
+  const BURST_FRAMES = 90;
+  const BURST_INTERVAL_MS = 15000;
+  let intervals = [];
+  let last = null;
+  let active = false;
+  const flush = () => {
+    if (intervals.length < 2) { intervals = []; return; }
+    const sorted = [...intervals].sort((a, b) => a - b);
+    const sum = intervals.reduce((a, b) => a + b, 0);
+    chrome.runtime.sendMessage({
+      type: "rho-frame-telemetry",
+      frames: intervals.length,
+      window_ms: Math.round(sum),
+      mean_interval_us: Math.round((sum / intervals.length) * 1000),
+      p95_interval_us: Math.round(sorted[Math.floor(sorted.length * 0.95)] * 1000),
+      max_interval_us: Math.round(sorted[sorted.length - 1] * 1000),
+      long_frames: intervals.filter((interval) => interval > 25).length,
+    }).catch(() => {});
+    intervals = [];
+  };
+  const tick = (now) => {
+    if (!active) return;
+    if (last !== null) intervals.push(now - last);
+    last = now;
+    if (intervals.length >= BURST_FRAMES) {
+      active = false;
+      flush();
+      return;
+    }
+    requestAnimationFrame(tick);
+  };
+  const start = () => {
+    if (active || document.visibilityState !== "visible") return;
+    active = true;
+    last = null;
+    requestAnimationFrame(tick);
+  };
+  document.addEventListener("visibilitychange", () => {
+    active = false;
+    intervals = [];
+    last = null;
+  });
+  setInterval(start, BURST_INTERVAL_MS);
+  start();
+})();

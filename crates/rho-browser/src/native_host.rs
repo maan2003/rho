@@ -232,6 +232,9 @@ fn read_responses(
         if log_tab_state(&message) {
             continue;
         }
+        if record_frame_telemetry(&message) {
+            continue;
+        }
         let Some(id) = message.get("id").and_then(Value::as_u64) else {
             continue;
         };
@@ -260,6 +263,30 @@ fn read_responses(
             *current = None;
         }
     }
+}
+
+fn record_frame_telemetry(message: &Value) -> bool {
+    if message.get("event").and_then(Value::as_str) != Some("frame-telemetry") {
+        return false;
+    }
+    let number = |field: &str| {
+        message
+            .get(field)
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(0)
+    };
+    rho_browser_wayland::record_extension_frame_stats(rho_browser_wayland::ExtensionFrameStats {
+        tab_id: message.get("tab_id").and_then(Value::as_i64).unwrap_or(0),
+        at: Instant::now(),
+        frames: number("frames"),
+        window_ms: number("window_ms"),
+        mean_interval_us: number("mean_interval_us"),
+        p95_interval_us: number("p95_interval_us"),
+        max_interval_us: number("max_interval_us"),
+        long_frames: number("long_frames"),
+    });
+    true
 }
 
 fn log_tab_state(message: &Value) -> bool {
