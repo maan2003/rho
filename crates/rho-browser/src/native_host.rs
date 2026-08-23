@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Read, Write};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -69,7 +69,7 @@ struct BridgeInner {
 
 struct Connection {
     writer: Mutex<UnixStream>,
-    pending: Mutex<HashMap<u64, mpsc::Sender<Result<Value, String>>>>,
+    pending: Mutex<HashMap<u64, mpsc::Sender<Result<(Value, Option<u32>), String>>>>,
 }
 
 impl Bridge {
@@ -135,18 +135,27 @@ impl Bridge {
             "method": method,
             "params": params,
         }))?;
+        let sent_at = Instant::now();
         if let Err(error) = write_frame(&mut *connection.writer.lock().unwrap(), &message) {
             connection.pending.lock().unwrap().remove(&id);
             return Err(error).context("send browser extension request");
         }
         match receive.recv_timeout(RESPONSE_TIMEOUT) {
-            Ok(Ok(value)) => Ok(value),
-            Ok(Err(error)) => bail!("browser extension: {error}"),
+            Ok(Ok((value, handler_us))) => {
+                record_extension_command(method, sent_at, handler_us, true);
+                Ok(value)
+            }
+            Ok(Err(error)) => {
+                record_extension_command(method, sent_at, None, false);
+                bail!("browser extension: {error}")
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 connection.pending.lock().unwrap().remove(&id);
+                record_extension_command(method, sent_at, None, false);
                 bail!("browser extension request timed out: {method}")
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
+                record_extension_command(method, sent_at, None, false);
                 bail!("browser extension disconnected during {method}")
             }
         }
@@ -215,6 +224,7 @@ fn install_connection(stream: UnixStream, inner: &Arc<BridgeInner>) {
             .shutdown(std::net::Shutdown::Both);
     }
     inner.connected.notify_all();
+    record_extension_command("__connect", Instant::now(), None, true);
     tracing::info!("browser extension connected");
     let weak = Arc::downgrade(inner);
     thread::spawn(move || read_responses(reader, connection, weak));
@@ -242,7 +252,14 @@ fn read_responses(
             continue;
         };
         let result = if message.get("ok").and_then(Value::as_bool) == Some(true) {
-            Ok(message.get("result").cloned().unwrap_or(Value::Null))
+            let handler_us = message
+                .get("handler_us")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok());
+            Ok((
+                message.get("result").cloned().unwrap_or(Value::Null),
+                handler_us,
+            ))
         } else {
             Err(message
                 .get("error")
@@ -253,6 +270,7 @@ fn read_responses(
         let _ = reply.send(result);
     }
     fail_pending(&connection, "browser extension disconnected");
+    record_extension_command("__disconnect", Instant::now(), None, false);
     tracing::warn!("browser extension disconnected");
     if let Some(inner) = inner.upgrade() {
         let mut current = inner.connection.lock().unwrap();
@@ -263,6 +281,45 @@ fn read_responses(
             *current = None;
         }
     }
+}
+
+/// Per-request timing for the native-messaging bridge. round_trip includes
+/// MV3 service-worker wakeup; handler_us is the worker-measured execution
+/// time, so the difference localizes transport plus cold-start latency.
+#[derive(Clone, Debug)]
+pub struct ExtensionCommandStats {
+    pub method: String,
+    pub at: Instant,
+    pub round_trip_us: u32,
+    pub handler_us: Option<u32>,
+    pub ok: bool,
+}
+
+const MAX_EXTENSION_COMMAND_STATS: usize = 1024;
+static EXTENSION_COMMAND_STATS: Mutex<VecDeque<ExtensionCommandStats>> =
+    Mutex::new(VecDeque::new());
+
+fn record_extension_command(method: &str, at: Instant, handler_us: Option<u32>, ok: bool) {
+    let round_trip_us = at
+        .elapsed()
+        .as_micros()
+        .min(u128::from(u32::MAX)) as u32;
+    let mut ring = EXTENSION_COMMAND_STATS.lock().unwrap();
+    if ring.len() >= MAX_EXTENSION_COMMAND_STATS {
+        ring.pop_front();
+    }
+    ring.push_back(ExtensionCommandStats {
+        method: method.to_owned(),
+        at,
+        round_trip_us,
+        handler_us,
+        ok,
+    });
+}
+
+/// Returns a non-destructive copy of the bounded bridge command-stats ring.
+pub fn snapshot_extension_command_stats() -> Vec<ExtensionCommandStats> {
+    EXTENSION_COMMAND_STATS.lock().unwrap().iter().cloned().collect()
 }
 
 fn record_frame_telemetry(message: &Value) -> bool {

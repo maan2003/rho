@@ -88,6 +88,7 @@ struct Snapshot<'a> {
     editor: Vec<EditorRecord>,
     browser: Vec<BrowserRecord>,
     browser_frames: Vec<BrowserFrameRecord>,
+    browser_commands: Vec<BrowserCommandRecord>,
 }
 
 #[derive(Serialize)]
@@ -150,6 +151,15 @@ struct BrowserRecord {
     related_scene_id: Option<u64>,
     at_ns: u64,
     duration_ns: Option<u64>,
+}
+
+#[derive(Serialize)]
+struct BrowserCommandRecord {
+    method: String,
+    at_ns: u64,
+    round_trip_us: u32,
+    handler_us: Option<u32>,
+    ok: bool,
 }
 
 #[derive(Serialize)]
@@ -348,6 +358,16 @@ fn snapshot_with_cpu_profiles(cpu_profiles: &[Vec<u8>]) -> anyhow::Result<Vec<u8
             long_frames: stats.long_frames,
         })
         .collect();
+    let browser_commands = rho_browser::snapshot_extension_command_stats()
+        .into_iter()
+        .map(|stats| BrowserCommandRecord {
+            at_ns: duration_ns(stats.at.saturating_duration_since(started)),
+            method: stats.method,
+            round_trip_us: stats.round_trip_us,
+            handler_us: stats.handler_us,
+            ok: stats.ok,
+        })
+        .collect();
     let bytes = serde_json::to_vec_pretty(&Snapshot {
         schema: "dev.rho.gui-performance-snapshot",
         version: 7,
@@ -393,6 +413,7 @@ fn snapshot_with_cpu_profiles(cpu_profiles: &[Vec<u8>]) -> anyhow::Result<Vec<u8
         editor,
         browser,
         browser_frames,
+        browser_commands,
     })?;
     anyhow::ensure!(
         bytes.len() <= rho_ui_proto::MAX_GUI_TELEMETRY_BYTES,

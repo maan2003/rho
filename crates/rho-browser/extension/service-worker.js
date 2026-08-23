@@ -252,9 +252,11 @@ function connect() {
   clearTimeout(reconnectTimer);
   port = chrome.runtime.connectNative(HOST);
   port.onMessage.addListener((message) => {
+    const received = performance.now();
+    const handlerUs = () => Math.round((performance.now() - received) * 1000);
     enqueue(() => dispatch(message)).then(
-      (result) => port?.postMessage({ id: message.id, ok: true, result }),
-      (error) => port?.postMessage({ id: message.id, ok: false, error: String(error?.message || error) }),
+      (result) => port?.postMessage({ id: message.id, ok: true, result, handler_us: handlerUs() }),
+      (error) => port?.postMessage({ id: message.id, ok: false, error: String(error?.message || error), handler_us: handlerUs() }),
     );
   });
   port.onDisconnect.addListener(() => {
