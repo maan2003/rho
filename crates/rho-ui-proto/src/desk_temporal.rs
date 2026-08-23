@@ -9,6 +9,7 @@ pub enum TemporalMarkKind {
     Todo,
     Defer,
     Reminder,
+    Skip,
     Done,
     Discarded,
 }
@@ -20,6 +21,7 @@ impl TemporalMarkKind {
             Self::Todo => "todo",
             Self::Defer => "defer",
             Self::Reminder => "reminder",
+            Self::Skip => "skip",
             Self::Done => "done",
             Self::Discarded => "discarded",
         }
@@ -34,6 +36,8 @@ impl TemporalMarkKind {
             Some(Self::Defer)
         } else if key.eq_ignore_ascii_case("reminder") {
             Some(Self::Reminder)
+        } else if key.eq_ignore_ascii_case("skip") {
+            Some(Self::Skip)
         } else if key.eq_ignore_ascii_case("done") {
             Some(Self::Done)
         } else if key.eq_ignore_ascii_case("discarded") {
@@ -48,12 +52,12 @@ impl TemporalMarkKind {
             Self::Deadline | Self::Todo => 7,
             Self::Defer => 30,
             Self::Reminder => 1,
-            Self::Done | Self::Discarded => 0,
+            Self::Skip | Self::Done | Self::Discarded => 0,
         }
     }
 
     fn accepts_pace(self) -> bool {
-        !matches!(self, Self::Done | Self::Discarded)
+        !matches!(self, Self::Skip | Self::Done | Self::Discarded)
     }
 }
 
@@ -117,9 +121,11 @@ pub fn priority(mark: &TemporalMark, now: NaiveDateTime) -> f64 {
             let phase = elapsed.rem_euclid(pace);
             -phase.min(pace - phase)
         }
-        TemporalMarkKind::Reminder if elapsed < 0.0 => -1_000_000.0 - elapsed.abs(),
+        TemporalMarkKind::Reminder if elapsed < 0.0 => f64::NEG_INFINITY,
         TemporalMarkKind::Reminder => -elapsed / pace,
-        TemporalMarkKind::Done | TemporalMarkKind::Discarded => f64::NEG_INFINITY,
+        TemporalMarkKind::Skip | TemporalMarkKind::Done | TemporalMarkKind::Discarded => {
+            f64::NEG_INFINITY
+        }
     }
 }
 
@@ -195,12 +201,25 @@ mod tests {
     #[test]
     fn reminder_surfaces_once_then_forgivingly_sinks() {
         let mark = mark(TemporalMarkKind::Reminder, 10, 2);
-        assert!(priority(&mark, at(9)) < -1_000_000.0);
+        assert_eq!(priority(&mark, at(9)), f64::NEG_INFINITY);
+        assert_eq!(priority(&mark, at(1)), f64::NEG_INFINITY);
         assert_eq!(priority(&mark, at(10)), 0.0);
         assert_eq!(priority(&mark, at(12)), -1.0);
         assert_eq!(priority(&mark, at(14)), -2.0);
         assert!(!surfaced(&mark, at(10), 0.0));
         assert!(surfaced(&mark, at(10), -0.01));
+    }
+
+    #[test]
+    fn skip_has_no_pace_and_never_surfaces_on_its_own() {
+        assert!(TemporalMark::parse(TemporalMarkKind::Skip, "2026-08-10 2d").is_none());
+        let mark = mark(TemporalMarkKind::Skip, 10, 0);
+        assert_eq!(priority(&mark, at(9)), f64::NEG_INFINITY);
+        assert_eq!(priority(&mark, at(11)), f64::NEG_INFINITY);
+        assert_eq!(
+            property_line(TemporalMarkKind::Skip, at(10), None),
+            ":skip: 2026-08-10\n"
+        );
     }
 
     #[test]

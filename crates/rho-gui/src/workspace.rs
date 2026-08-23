@@ -4513,6 +4513,24 @@ impl Workspace {
         self.dashboard.sync(&self.registry, window, cx);
     }
 
+    #[cfg(test)]
+    pub(crate) fn dashboard_deal_mode_for_test(&self) -> bool {
+        self.dashboard.deal_mode()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dashboard_hint_for_test(&self, cx: &mut Context<Self>) -> String {
+        self.dashboard.hint(cx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn dashboard_cursor_topic_for_test(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<(HostId, usize)> {
+        self.dashboard.cursor_topic(cx)
+    }
+
     /// The desk half of a quick spawn, without the daemon round-trip:
     /// appends the placeholder heading and writes the tag the daemon
     /// would, binding `agent_id` there. Returns the heading offset.
@@ -5309,7 +5327,7 @@ impl Workspace {
 
     pub(crate) fn toggle_dashboard_deal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.dashboard.deal_mode() {
-            self.dashboard.exit_deal_mode();
+            self.dashboard.exit_deal_mode(cx);
         } else {
             let now = chrono::Local::now().naive_local();
             let seed = now.and_utc().timestamp_nanos_opt().unwrap_or_default() as u64;
@@ -5325,6 +5343,7 @@ impl Workspace {
         &mut self,
         kind: rho_ui_proto::desk::TemporalMarkKind,
         days: u64,
+        pace_days: Option<u32>,
         advance: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -5337,10 +5356,12 @@ impl Workspace {
         let date = today
             .checked_add_days(chrono::Days::new(days))
             .unwrap_or(today);
-        if self
-            .dashboard
-            .write_deal_property(kind, date.and_hms_opt(0, 0, 0).unwrap(), cx)
-        {
+        if self.dashboard.write_deal_property(
+            kind,
+            date.and_hms_opt(0, 0, 0).unwrap(),
+            pace_days,
+            cx,
+        ) {
             if advance {
                 self.dashboard.advance_deal(cx);
             }
@@ -7348,7 +7369,7 @@ impl Render for Workspace {
                 this.prompt_dashboard_rename_topic(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardDealExit, window, cx| {
-                if this.dashboard.exit_deal_mode() {
+                if this.dashboard.exit_deal_mode(cx) {
                     this.refresh_dashboard(window, cx);
                 } else {
                     cx.propagate();
@@ -7356,7 +7377,11 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &DashboardDealOpen, window, cx| {
                 if this.dashboard.deal_mode() {
-                    this.dashboard_open(window, cx);
+                    if this.dashboard.open_plain_deal_heading(cx) {
+                        this.refresh_dashboard(window, cx);
+                    } else {
+                        this.dashboard_open(window, cx);
+                    }
                 } else {
                     cx.propagate();
                 }
@@ -7368,6 +7393,7 @@ impl Render for Workspace {
                 }
                 if this.dashboard.archive_deal_heading(cx) {
                     this.dashboard.record_deal_verdict();
+                    this.dashboard.advance_deal(cx);
                     this.refresh_dashboard(window, cx);
                 }
             }))
@@ -7382,6 +7408,7 @@ impl Render for Workspace {
                 this.dashboard_deal_property(
                     rho_ui_proto::desk::TemporalMarkKind::Done,
                     0,
+                    None,
                     false,
                     window,
                     cx,
@@ -7391,6 +7418,7 @@ impl Render for Workspace {
                 this.dashboard_deal_property(
                     rho_ui_proto::desk::TemporalMarkKind::Discarded,
                     0,
+                    None,
                     false,
                     window,
                     cx,
@@ -7398,8 +7426,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &DashboardDealSkip, window, cx| {
                 this.dashboard_deal_property(
-                    rho_ui_proto::desk::TemporalMarkKind::Reminder,
+                    rho_ui_proto::desk::TemporalMarkKind::Skip,
                     1,
+                    None,
                     true,
                     window,
                     cx,
@@ -7407,8 +7436,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &DashboardDealDefer1, window, cx| {
                 this.dashboard_deal_property(
-                    rho_ui_proto::desk::TemporalMarkKind::Reminder,
+                    rho_ui_proto::desk::TemporalMarkKind::Defer,
                     1,
+                    Some(1),
                     false,
                     window,
                     cx,
@@ -7416,8 +7446,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &DashboardDealDefer3, window, cx| {
                 this.dashboard_deal_property(
-                    rho_ui_proto::desk::TemporalMarkKind::Reminder,
+                    rho_ui_proto::desk::TemporalMarkKind::Defer,
                     3,
+                    Some(3),
                     false,
                     window,
                     cx,
@@ -7425,8 +7456,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &DashboardDealDefer7, window, cx| {
                 this.dashboard_deal_property(
-                    rho_ui_proto::desk::TemporalMarkKind::Reminder,
+                    rho_ui_proto::desk::TemporalMarkKind::Defer,
                     7,
+                    Some(7),
                     false,
                     window,
                     cx,
@@ -7434,8 +7466,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &DashboardDealDefer30, window, cx| {
                 this.dashboard_deal_property(
-                    rho_ui_proto::desk::TemporalMarkKind::Reminder,
+                    rho_ui_proto::desk::TemporalMarkKind::Defer,
                     30,
+                    Some(30),
                     false,
                     window,
                     cx,
@@ -7479,6 +7512,7 @@ impl Render for Workspace {
                 if this.dashboard.deal_mode() {
                     if this.dashboard.archive_deal_heading(cx) {
                         this.dashboard.record_deal_verdict();
+                        this.dashboard.advance_deal(cx);
                         this.refresh_dashboard(window, cx);
                     }
                     return;

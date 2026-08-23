@@ -4674,6 +4674,213 @@ fn desk_deal_verdict_advances_to_empty_and_exit_restores_document(cx: &mut TestA
     assert!(display.contains("One"), "{display:?}");
 }
 
+#[gpui::test]
+fn desk_deal_cards_are_isolated_read_only_skippable_and_openable(cx: &mut TestAppContext) {
+    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
+
+    let original = "* One\n:deadline: 2020-01-01\none body\n* Two\n:deadline: 2020-01-02\ntwo body\n* Three\n:deadline: 2020-01-03\nthree body\n";
+    let mut source =
+        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
+    let operation = DeskOperation::from_text(&source.edit([(0..0, original)]));
+    let snapshot = DeskSnapshot {
+        text: source.snapshot().text(),
+        operations: vec![operation],
+        transactions: Vec::new(),
+        replicas: Vec::new(),
+    };
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskSnapshot {
+                    snapshot,
+                    replica_id: 42,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+            window.focus(&workspace.dashboard_editor().read(cx).focus_handle(cx), cx);
+            workspace.toggle_dashboard_deal(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let first = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .dashboard_editor()
+                .update(cx, |editor, cx| editor.display_text(cx))
+        })
+        .unwrap();
+    assert!(first.contains("resurfaced · 1/3  One"), "{first:?}");
+    assert!(first.contains("one body"), "{first:?}");
+    assert!(!first.contains(":deadline:"), "{first:?}");
+    assert!(
+        !first.contains("* Two") && !first.contains("two body"),
+        "{first:?}"
+    );
+
+    cx.simulate_keystrokes(*workspace, "i shift-m escape");
+    cx.run_until_parked();
+    let raw = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .desk_buffer_for_test(HostId::default())
+                .unwrap()
+                .read(cx)
+                .text()
+        })
+        .unwrap();
+    assert_eq!(raw, original, "deal view must not edit Desk source");
+
+    cx.simulate_keystrokes(*workspace, "n");
+    cx.run_until_parked();
+    let second = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .dashboard_editor()
+                .update(cx, |editor, cx| editor.display_text(cx))
+        })
+        .unwrap();
+    assert!(second.contains("resurfaced · 2/3  Two"), "{second:?}");
+    assert!(
+        second.contains("two body") && !second.contains("one body"),
+        "{second:?}"
+    );
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace.dashboard_hint_for_test(cx),
+                "2 waiting · deal mode"
+            );
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "enter");
+    cx.run_until_parked();
+    let third = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .dashboard_editor()
+                .update(cx, |editor, cx| editor.display_text(cx))
+        })
+        .unwrap();
+    assert!(third.contains("resurfaced · 3/3  Three"), "{third:?}");
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace.dashboard_hint_for_test(cx),
+                "1 waiting · deal mode"
+            );
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "o");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert!(!workspace.dashboard_deal_mode_for_test());
+            assert_eq!(
+                workspace.dashboard_cursor_topic_for_test(cx),
+                Some((HostId::default(), original.find("* Three").unwrap()))
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn desk_deal_defer_skip_and_archive_verdicts_write_and_advance(cx: &mut TestAppContext) {
+    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
+
+    let mut original = (1..=6)
+        .map(|day| format!("* Card {day}\n:deadline: 2020-01-{day:02}\nbody {day}\n"))
+        .collect::<String>();
+    original = original.replacen(
+        ":deadline: 2020-01-01\n",
+        ":skip: 2019-01-01\n:deadline: 2020-01-01\n",
+        1,
+    );
+    let mut source =
+        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
+    let operation = DeskOperation::from_text(&source.edit([(0..0, original)]));
+    let snapshot = DeskSnapshot {
+        text: source.snapshot().text(),
+        operations: vec![operation],
+        transactions: Vec::new(),
+        replicas: Vec::new(),
+    };
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskSnapshot {
+                    snapshot,
+                    replica_id: 42,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+            window.focus(&workspace.dashboard_editor().read(cx).focus_handle(cx), cx);
+            workspace.toggle_dashboard_deal(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    for keys in ["f f n", "f 3 n", "f 7 n", "f 0 n"] {
+        cx.simulate_keystrokes(*workspace, keys);
+        cx.run_until_parked();
+    }
+    // Skip advances immediately, and archive must do the same.
+    cx.simulate_keystrokes(*workspace, "s");
+    cx.run_until_parked();
+    let after_skip = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .dashboard_editor()
+                .update(cx, |editor, cx| editor.display_text(cx))
+        })
+        .unwrap();
+    assert!(after_skip.contains("Card 6"), "{after_skip:?}");
+    cx.simulate_keystrokes(*workspace, "a");
+    cx.run_until_parked();
+
+    let raw = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .desk_buffer_for_test(HostId::default())
+                .unwrap()
+                .read(cx)
+                .text()
+        })
+        .unwrap();
+    let today = chrono::Local::now().date_naive();
+    for (day, pace) in [(1_i64, 1), (3, 3), (7, 7), (30, 30)] {
+        let date = today
+            .checked_add_signed(chrono::Duration::days(day))
+            .unwrap();
+        assert!(raw.contains(&format!(":defer: {date} {pace}d")), "{raw:?}");
+    }
+    let tomorrow = today.succ_opt().unwrap();
+    assert!(raw.contains(&format!(":skip: {tomorrow}")), "{raw:?}");
+    assert!(!raw.contains(":reminder:"), "{raw:?}");
+    assert!(!raw.contains(":skip: 2019-01-01"), "{raw:?}");
+    assert!(raw.contains("Archive :archive:"), "{raw:?}");
+    let dealt = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .dashboard_editor()
+                .update(cx, |editor, cx| editor.display_text(cx))
+        })
+        .unwrap();
+    assert!(dealt.contains("Desk dealt — 6 verdicts"), "{dealt:?}");
+}
+
 /// Sending a quick-spawn draft removes its row out from under the
 /// cursor; the cursor must land somewhere resolvable (the new heading)
 /// before vim's NormalBefore touches the selection, or it panics on a

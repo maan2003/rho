@@ -19,7 +19,11 @@ fn desk_sizes() -> Vec<usize> {
     vec![10, 50, 150]
 }
 
-fn build_desk(heading_count: usize, rows_per_heading: usize, cx: &mut BenchAppContext) -> DeskFixture {
+fn build_desk(
+    heading_count: usize,
+    rows_per_heading: usize,
+    cx: &mut BenchAppContext,
+) -> DeskFixture {
     let mut text = String::new();
     let mut cut_positions = Vec::new();
     for index in 0..heading_count {
@@ -41,7 +45,9 @@ fn build_desk(heading_count: usize, rows_per_heading: usize, cx: &mut BenchAppCo
                 buffer: cx.update(|cx| {
                     cx.new(|cx| {
                         let mut buffer = Buffer::local(
-                            format!("· agent-{index}-{row} — working on part {row} of topic {index}"),
+                            format!(
+                                "· agent-{index}-{row} — working on part {row} of topic {index}"
+                            ),
                             cx,
                         );
                         buffer.set_capability(Capability::Read, cx);
@@ -70,6 +76,8 @@ fn build_desk(heading_count: usize, rows_per_heading: usize, cx: &mut BenchAppCo
     let spec = CompositionSpec {
         sections: vec![SectionSpec {
             host,
+            start: 0,
+            end: None,
             lead: Vec::new(),
             cuts,
         }],

@@ -50,6 +50,10 @@ pub struct SectionSpec {
     /// documents use zero; narrowed projections can omit an arbitrary prefix
     /// without materializing a synthetic empty excerpt at offset zero.
     pub start: usize,
+    /// Host offset where this projected section ends. Narrowed projections
+    /// use this to omit a suffix without relying on a cut whose endpoint can
+    /// still include the following line when converted to an excerpt point.
+    pub end: Option<usize>,
     /// Rows shown before the section's first slice — e.g. a group
     /// header naming the host.
     pub lead: Vec<RowSpec>,
@@ -242,7 +246,23 @@ impl Composition {
         let mut desired = Vec::new();
         for section in &spec.sections {
             let host_id = section.host.read(cx).remote_id();
-            let len = section.host.read(cx).len();
+            let host_len = section.host.read(cx).len();
+            let mut len = section.end.unwrap_or(host_len).min(host_len);
+            // Excerpt point ranges include the row containing their endpoint.
+            // A narrowed byte boundary at the start of the following line must
+            // therefore end before the separating newline, or that following
+            // line becomes visible in the section.
+            if len < host_len
+                && len > 0
+                && section
+                    .host
+                    .read(cx)
+                    .text_for_range(len - 1..len)
+                    .collect::<String>()
+                    == "\n"
+            {
+                len -= 1;
+            }
             for row in &section.lead {
                 desired.push(DesiredElement {
                     id: ElementId::Row(row.id),
@@ -459,6 +479,7 @@ mod tests {
             sections: vec![SectionSpec {
                 host: host.clone(),
                 start: 0,
+                end: None,
                 lead: Vec::new(),
                 cuts: vec![CutSpec {
                     id: 1,
@@ -580,6 +601,7 @@ mod tests {
             sections: vec![SectionSpec {
                 host,
                 start: 0,
+                end: None,
                 lead: Vec::new(),
                 cuts: vec![CutSpec {
                     id: 1,
@@ -629,6 +651,7 @@ mod tests {
             sections: vec![SectionSpec {
                 host: host.clone(),
                 start: 0,
+                end: None,
                 lead: Vec::new(),
                 cuts: vec![CutSpec {
                     id: 1,
@@ -656,6 +679,7 @@ mod tests {
             sections: vec![SectionSpec {
                 host: host.clone(),
                 start: 0,
+                end: None,
                 lead: Vec::new(),
                 cuts: vec![],
             }],
@@ -684,12 +708,14 @@ mod tests {
                 SectionSpec {
                     host: host_a.clone(),
                     start: 0,
+                    end: None,
                     lead: Vec::new(),
                     cuts: vec![],
                 },
                 SectionSpec {
                     host: host_b.clone(),
                     start: 0,
+                    end: None,
                     lead: Vec::new(),
                     cuts: vec![],
                 },
@@ -709,6 +735,26 @@ mod tests {
             sections: vec![SectionSpec {
                 host,
                 start: "hidden\n".len(),
+                end: None,
+                lead: Vec::new(),
+                cuts: Vec::new(),
+            }],
+            tail: Vec::new(),
+        };
+        cx.update(|cx| composition.sync(&multibuffer, &spec, cx));
+        assert_eq!(text(&multibuffer, cx), "card\n");
+    }
+
+    #[gpui::test]
+    fn test_section_can_end_before_following_line(cx: &mut TestAppContext) {
+        let multibuffer = build(cx);
+        let host = buffer("card\nnext heading\n", cx);
+        let mut composition = Composition::default();
+        let spec = CompositionSpec {
+            sections: vec![SectionSpec {
+                host,
+                start: 0,
+                end: Some("card\n".len()),
                 lead: Vec::new(),
                 cuts: Vec::new(),
             }],

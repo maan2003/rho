@@ -188,7 +188,11 @@ pub fn parse(text: &str) -> Vec<DeskHeading> {
                     property_state = match kind {
                         TemporalMarkKind::Done => Some(DeskHeadingState::Done),
                         TemporalMarkKind::Discarded => Some(DeskHeadingState::Discarded),
-                        _ => None,
+                        TemporalMarkKind::Deadline
+                        | TemporalMarkKind::Todo
+                        | TemporalMarkKind::Defer
+                        | TemporalMarkKind::Reminder
+                        | TemporalMarkKind::Skip => None,
                     };
                 }
                 headings[index].temporal_marks.push(mark);

@@ -74,6 +74,17 @@ pub enum DealSection {
     Random,
 }
 
+impl DealSection {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NeedsYou => "needs you",
+            Self::Finished => "finished",
+            Self::Resurfaced => "resurfaced",
+            Self::Random => "random",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DealCard {
     pub section: DealSection,
@@ -444,6 +455,11 @@ impl Dashboard {
             })
             .collect();
         self.raw_mode = false;
+        for source in self.hosts.values().filter_map(WeakEntity::upgrade) {
+            source.update(cx, |buffer, cx| buffer.set_capability(Capability::Read, cx));
+        }
+        self.editor
+            .update(cx, |editor, _| editor.set_read_only(true));
         self.deal = Some(DealSession {
             cards,
             anchors,
@@ -467,8 +483,17 @@ impl Dashboard {
         self.last_synced = None;
     }
 
-    pub fn exit_deal_mode(&mut self) -> bool {
+    pub fn exit_deal_mode(&mut self, cx: &mut Context<Workspace>) -> bool {
         let exited = self.deal.take().is_some();
+        if exited {
+            for source in self.hosts.values().filter_map(WeakEntity::upgrade) {
+                source.update(cx, |buffer, cx| {
+                    buffer.set_capability(Capability::ReadWrite, cx)
+                });
+            }
+            self.editor
+                .update(cx, |editor, _| editor.set_read_only(false));
+        }
         self.last_synced = None;
         exited
     }
@@ -477,9 +502,6 @@ impl Dashboard {
         let Some(deal) = &mut self.deal else {
             return false;
         };
-        if deal.index < deal.cards.len() && !deal.verdict_recorded {
-            return true;
-        }
         if deal.index < deal.cards.len() {
             deal.index += 1;
             deal.verdict_recorded = false;
@@ -499,6 +521,8 @@ impl Dashboard {
             }
         }
         self.last_synced = None;
+        self.editor
+            .update(cx, |editor, _| editor.set_read_only(true));
         true
     }
 
@@ -565,10 +589,27 @@ impl Dashboard {
         deal.cards.get(deal.index)
     }
 
+    pub fn open_plain_deal_heading(&mut self, cx: &mut Context<Workspace>) -> bool {
+        let card = self.current_deal_card().cloned();
+        let Some(DealCard {
+            host,
+            heading_offset: Some(offset),
+            agent_id: None,
+            ..
+        }) = card
+        else {
+            return false;
+        };
+        self.exit_deal_mode(cx);
+        self.pending_doc_cursor = Some((host, offset));
+        true
+    }
+
     pub fn write_deal_property(
         &mut self,
         kind: rho_ui_proto::desk::TemporalMarkKind,
         at: chrono::NaiveDateTime,
+        pace_days: Option<u32>,
         cx: &mut Context<Workspace>,
     ) -> bool {
         if !self.deal_accepts_verdict() {
@@ -584,7 +625,7 @@ impl Dashboard {
             let Some(text) = self.source_text(card.host, cx) else {
                 return false;
             };
-            let line = rho_ui_proto::desk::temporal::property_line(kind, at, None);
+            let line = rho_ui_proto::desk::temporal::property_line(kind, at, pace_days);
             let separator = if text.is_empty() || text.ends_with('\n') {
                 ""
             } else {
@@ -609,7 +650,7 @@ impl Dashboard {
             self.record_deal_verdict();
             return true;
         };
-        self.set_heading_property(card.host, offset, kind, at, cx)
+        self.set_heading_property(card.host, offset, kind, at, pace_days, cx)
     }
 
     fn set_heading_property(
@@ -618,6 +659,7 @@ impl Dashboard {
         offset: usize,
         kind: rho_ui_proto::desk::TemporalMarkKind,
         at: chrono::NaiveDateTime,
+        pace_days: Option<u32>,
         cx: &mut Context<Workspace>,
     ) -> bool {
         let Some(text) = self.source_text(host, cx) else {
@@ -630,7 +672,8 @@ impl Dashboard {
             return false;
         };
         let key = kind.property_key();
-        let line = rho_ui_proto::desk::temporal::property_line(kind, at, None);
+        let line = rho_ui_proto::desk::temporal::property_line(kind, at, pace_days);
+        let mut edits = Vec::new();
         let edit = if let Some(property) = heading
             .properties
             .iter()
@@ -653,12 +696,30 @@ impl Dashboard {
                 },
             )
         };
-        let delta = edit.1.len() as isize - (edit.0.end - edit.0.start) as isize;
-        let edit_start = edit.0.start;
+        edits.push(edit);
+        if kind != TemporalMarkKind::Skip {
+            edits.extend(heading.properties.iter().filter_map(|property| {
+                if !property.key.eq_ignore_ascii_case("skip") {
+                    return None;
+                }
+                let mark = TemporalMark::parse(TemporalMarkKind::Skip, &property.value)?;
+                (mark.at <= at).then(|| {
+                    let end = property.line_range.end
+                        + usize::from(text.as_bytes().get(property.line_range.end) == Some(&b'\n'));
+                    (property.line_range.start..end, String::new())
+                })
+            }));
+        }
+        edits.sort_by_key(|(range, _)| range.start);
+        let delta = edits
+            .iter()
+            .map(|edit| edit.1.len() as isize - (edit.0.end - edit.0.start) as isize)
+            .sum::<isize>();
+        let edit_start = edits[0].0.start;
         self.hosts[&host]
             .upgrade()
             .unwrap()
-            .update(cx, |buffer, cx| buffer.edit([edit], None, cx));
+            .update(cx, |buffer, cx| buffer.edit(edits, None, cx));
         if delta != 0
             && let Some(deal) = &mut self.deal
         {
@@ -702,6 +763,10 @@ impl Dashboard {
             );
         }
         self.pending_cursor = Some(key);
+        if self.deal.is_some() {
+            self.editor
+                .update(cx, |editor, _| editor.set_read_only(false));
+        }
         cx.notify();
     }
 
@@ -920,7 +985,7 @@ impl Dashboard {
         // Staffed headings wear their agents as end-of-line inlays, not
         // rows, so the decoration strings join the fingerprint: attention
         // changes must not vanish into the early-out.
-        let mut decorations = if self.raw_mode || self.deal.is_some() {
+        let mut decorations = if self.raw_mode {
             Vec::new()
         } else {
             heading_decorations(
@@ -935,14 +1000,18 @@ impl Dashboard {
         if !self.raw_mode && self.deal.is_none() {
             decorations.extend(page_heading_decorations(&documents, &filed_pages));
         }
-        let cursor_doc = match &cursor_place {
-            Some(CursorPlace::Doc(host, offset)) => Some((*host, *offset)),
-            _ => None,
+        let cursor_doc = if self.deal.is_some() {
+            None
+        } else {
+            match &cursor_place {
+                Some(CursorPlace::Doc(host, offset)) => Some((*host, *offset)),
+                _ => None,
+            }
         };
-        let conceals = if self.raw_mode || self.deal.is_some() {
+        let conceals = if self.raw_mode {
             Vec::new()
         } else {
-            heading_conceals(&documents, cursor_doc)
+            heading_conceals(&documents, cursor_doc, self.deal.is_none())
         };
 
         // Render reconciles every frame, so most passes are registry
@@ -1074,6 +1143,7 @@ impl Dashboard {
                             spec.sections.push(SectionSpec {
                                 host: buffer,
                                 start: range.start,
+                                end: None,
                                 lead: std::mem::take(&mut pending_rows),
                                 cuts: Vec::new(),
                             });
@@ -1101,6 +1171,9 @@ impl Dashboard {
         // A section's trailing blank lines hide behind a final rowless
         // cut, so the listing's spacers control the spacing after it.
         for (section, (last_end, host_len)) in spec.sections.iter_mut().zip(&section_ends) {
+            if self.deal.is_some() {
+                section.end = Some(*last_end);
+            }
             if last_end < host_len {
                 section.cuts.push(CutSpec {
                     id: u64::MAX,
@@ -2886,6 +2959,7 @@ const HEADING_STARS: [&str; 4] = ["◉", "○", "✸", "✿"];
 fn heading_conceals(
     documents: &[(HostId, String)],
     cursor: Option<(HostId, usize)>,
+    conceal_property_newline: bool,
 ) -> Vec<(HostId, Range<usize>, String, editor::display_map::CaretRest)> {
     use editor::display_map::CaretRest;
     let mut conceals = Vec::new();
@@ -2918,11 +2992,12 @@ fn heading_conceals(
                     continue;
                 }
                 let start = property.line_range.start.saturating_sub(1);
-                let range = if text.as_bytes().get(start) == Some(&b'\n') {
-                    start..property.line_range.end
-                } else {
-                    property.line_range.clone()
-                };
+                let range =
+                    if conceal_property_newline && text.as_bytes().get(start) == Some(&b'\n') {
+                        start..property.line_range.end
+                    } else {
+                        property.line_range.clone()
+                    };
                 if !caret.is_some_and(|caret| range.start < caret && caret < range.end) {
                     conceals.push((*host, range, String::new(), CaretRest::Start));
                 }
@@ -3054,29 +3129,19 @@ fn display_mark(heading: &DeskHeading, now: chrono::NaiveDateTime) -> Option<Str
     }?;
     let elapsed = now.signed_duration_since(mark.at).num_seconds() as f64 / 86_400.0;
     let days = elapsed.abs().ceil() as u64;
+    let date = mark.at.format("%b %-d").to_string().to_lowercase();
     Some(match mark.kind {
         TemporalMarkKind::Deadline if priority(mark, now) == f64::NEG_INFINITY => return None,
-        TemporalMarkKind::Deadline if elapsed > 0.0 => format!("late {days}d"),
-        TemporalMarkKind::Deadline => format!("deadline {days}d"),
-        TemporalMarkKind::Todo => format!("todo {days}d"),
-        TemporalMarkKind::Defer => {
-            let phase = elapsed.rem_euclid(mark.pace_days as f64);
-            let back = if phase == 0.0 {
-                0
-            } else {
-                (mark.pace_days as f64 - phase).ceil() as u64
-            };
-            format!("back {back}d")
+        TemporalMarkKind::Deadline if elapsed > 0.0 => {
+            format!("deadline {date} · late {days}d")
         }
-        TemporalMarkKind::Reminder => format!("reminder {days}d"),
-        TemporalMarkKind::Done => format!(
-            "done {}",
-            mark.at.format("%b %-d").to_string().to_lowercase()
-        ),
-        TemporalMarkKind::Discarded => format!(
-            "discarded {}",
-            mark.at.format("%b %-d").to_string().to_lowercase()
-        ),
+        TemporalMarkKind::Deadline => format!("deadline {date} · {}d", mark.pace_days),
+        TemporalMarkKind::Todo => format!("todo {date} · {}d", mark.pace_days),
+        TemporalMarkKind::Defer => format!("defer {date} · {}d", mark.pace_days),
+        TemporalMarkKind::Reminder => format!("reminder {date} · {}d", mark.pace_days),
+        TemporalMarkKind::Skip => format!("skipped until {date}"),
+        TemporalMarkKind::Done => format!("done {date}"),
+        TemporalMarkKind::Discarded => format!("discarded {date}"),
     })
 }
 
@@ -3458,10 +3523,12 @@ pub fn assemble_deal_queue(
                     TemporalMarkKind::Done | TemporalMarkKind::Discarded
                 )
             });
-            let deferred = heading
-                .temporal_marks
-                .iter()
-                .any(|mark| mark.kind == TemporalMarkKind::Reminder && mark.at > now);
+            let deferred = heading.temporal_marks.iter().any(|mark| {
+                matches!(
+                    mark.kind,
+                    TemporalMarkKind::Reminder | TemporalMarkKind::Skip
+                ) && mark.at > now
+            });
             let agents = heading
                 .tags
                 .iter()
@@ -3589,6 +3656,13 @@ pub fn assemble_deal_queue(
         if terminal {
             continue;
         }
+        if heading
+            .temporal_marks
+            .iter()
+            .any(|mark| mark.kind == TemporalMarkKind::Skip && mark.at > now)
+        {
+            continue;
+        }
         let best = heading
             .temporal_marks
             .iter()
@@ -3686,7 +3760,21 @@ fn generate_deal(
     let mut segments = Vec::new();
     let mut crumb = Line::new(LineKey::DealBreadcrumb, RowTarget::None);
     crumb.span(Some(DashClass::Muted), |text| {
-        text.push_str(&card.breadcrumb)
+        let section_index = deal.cards[..deal.index]
+            .iter()
+            .filter(|candidate| candidate.section == card.section)
+            .count()
+            + 1;
+        let section_total = deal
+            .cards
+            .iter()
+            .filter(|candidate| candidate.section == card.section)
+            .count();
+        text.push_str(&format!(
+            "{} · {section_index}/{section_total}  {}",
+            card.section.label(),
+            card.breadcrumb
+        ));
     });
     segments.push(Segment::Line(crumb));
     if let Some(offset) = card.heading_offset
@@ -4201,6 +4289,93 @@ mod tests {
             cards
                 .iter()
                 .all(|card| !card.breadcrumb.contains("Archive"))
+        );
+    }
+
+    #[test]
+    fn active_skip_gates_every_other_deal_signal_until_its_date() {
+        let (registry, host) = registry(Vec::new());
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+        let text = "* Snoozed deadline\n:skip: 2026-08-24\n:deadline: 2020-01-01\n* Expired skip\n:skip: 2026-08-22\n:deadline: 2020-01-01\n".to_owned();
+        let cards = assemble_deal_queue(&[(host, text)], &registry, now, 7);
+        assert!(
+            cards
+                .iter()
+                .all(|card| card.breadcrumb != "Snoozed deadline")
+        );
+        assert!(cards.iter().any(|card| card.breadcrumb == "Expired skip"));
+    }
+
+    #[test]
+    fn deal_chrome_names_the_current_section_and_position() {
+        let (registry, host) = registry(Vec::new());
+        let cards = vec![
+            DealCard {
+                section: DealSection::Resurfaced,
+                host,
+                heading_offset: Some(0),
+                agent_id: None,
+                agent_tag: None,
+                breadcrumb: "One".into(),
+            },
+            DealCard {
+                section: DealSection::Resurfaced,
+                host,
+                heading_offset: Some(6),
+                agent_id: None,
+                agent_tag: None,
+                breadcrumb: "Two".into(),
+            },
+        ];
+        let deal = DealSession {
+            anchors: vec![None, None],
+            cards,
+            index: 1,
+            verdicts: 0,
+            verdict_recorded: false,
+        };
+        let segments = generate_deal(
+            &registry,
+            &[(host, "* One\n* Two\n".into())],
+            &HashMap::new(),
+            &deal,
+            &[],
+        );
+        let Segment::Line(chrome) = &segments[0] else {
+            panic!("missing chrome")
+        };
+        assert_eq!(chrome.text, "resurfaced · 2/2  Two");
+    }
+
+    #[test]
+    fn valid_active_marks_have_terse_display_labels() {
+        let text = "* Ship\n:deadline: 2026-08-30 7d\n* Broken\n:deadline: nonsense 7d\n";
+        let heading = parse(text).remove(0);
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
+            .unwrap()
+            .and_time(chrono::NaiveTime::MIN);
+        assert_eq!(
+            display_mark(&heading, now).as_deref(),
+            Some("deadline aug 30 · 7d")
+        );
+        let malformed = parse("* Ship\n:deadline: nonsense 7d\n").remove(0);
+        assert_eq!(display_mark(&malformed, now), None);
+        let concealed_source = heading_conceals(&[(HostId(1), text.to_owned())], None, true)
+            .into_iter()
+            .map(|(_, range, _, _)| &text[range])
+            .collect::<Vec<_>>();
+        assert!(
+            concealed_source
+                .iter()
+                .any(|source| source.contains(":deadline: 2026-08-30 7d"))
+        );
+        assert!(
+            concealed_source
+                .iter()
+                .all(|source| !source.contains(":deadline: nonsense 7d"))
         );
     }
 
