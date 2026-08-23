@@ -2560,12 +2560,16 @@ impl Workspace {
             self.dashboard.is_focused(window, cx),
             self.dashboard.cursor_target(&self.registry, cx),
         ) {
-            self.dashboard.set_cursor_heading_state(
+            self.dashboard.set_cursor_heading_property(
                 if hide {
-                    crate::dashboard::ParsedHeadingState::Discarded
+                    rho_ui_proto::desk::TemporalMarkKind::Discarded
                 } else {
-                    crate::dashboard::ParsedHeadingState::Done
+                    rho_ui_proto::desk::TemporalMarkKind::Done
                 },
+                chrono::Local::now()
+                    .date_naive()
+                    .and_time(chrono::NaiveTime::MIN),
+                None,
                 cx,
             );
             return;

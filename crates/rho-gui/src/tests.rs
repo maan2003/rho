@@ -4483,6 +4483,101 @@ fn insert_mode_enter_stays_a_newline_in_desk_text(cx: &mut TestAppContext) {
     );
 }
 
+/// Verdict verbs record their date as ordinary Desk properties. Composed
+/// mode conceals those source lines; raw mode exposes them unchanged.
+#[gpui::test]
+fn desk_verdict_keys_write_dated_properties(cx: &mut TestAppContext) {
+    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
+
+    let mut source =
+        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
+    let operation = DeskOperation::from_text(&source.edit([(0..0, "* One TODO\n* Two DONE\n")]));
+    let snapshot = DeskSnapshot {
+        text: source.snapshot().text(),
+        operations: vec![operation],
+        transactions: Vec::new(),
+        replicas: Vec::new(),
+    };
+    let workspace = test_workspace(cx);
+    cx.update(bind_test_keymaps);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskSnapshot {
+                    snapshot,
+                    replica_id: 42,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+            let editor = workspace.dashboard_editor();
+            window.focus(&editor.read(cx).focus_handle(cx), cx);
+            editor.update(cx, |editor, cx| {
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    selections.select_ranges([
+                        editor::MultiBufferOffset(2)..editor::MultiBufferOffset(2)
+                    ]);
+                });
+            });
+        })
+        .expect("set up Desk");
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes(*workspace, "escape space a d");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.sync_dashboard(window, cx);
+            let second = workspace
+                .desk_buffer_for_test(HostId::default())
+                .unwrap()
+                .read(cx)
+                .text()
+                .find("* Two")
+                .unwrap()
+                + 2;
+            workspace.dashboard_editor().update(cx, |editor, cx| {
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    let second = editor::MultiBufferOffset(second);
+                    selections.select_ranges([second..second]);
+                });
+            });
+        })
+        .expect("select second heading");
+    cx.simulate_keystrokes(*workspace, "space a shift-d");
+    cx.run_until_parked();
+
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let raw = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .desk_buffer_for_test(HostId::default())
+                .unwrap()
+                .read(cx)
+                .text()
+        })
+        .expect("read Desk source");
+    assert!(
+        raw.contains(&format!("* One TODO\n:done: {today}\n")),
+        "{raw:?}"
+    );
+    assert!(
+        raw.contains(&format!("* Two DONE\n:discarded: {today}\n")),
+        "{raw:?}"
+    );
+    let display = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .dashboard_editor()
+                .update(cx, |editor, cx| editor.display_text(cx))
+        })
+        .expect("read composed Desk");
+    assert!(!display.contains(":done:"), "{display:?}");
+    assert!(!display.contains(":discarded:"), "{display:?}");
+}
+
 /// Sending a quick-spawn draft removes its row out from under the
 /// cursor; the cursor must land somewhere resolvable (the new heading)
 /// before vim's NormalBefore touches the selection, or it panics on a

@@ -9,6 +9,10 @@ use text::{Buffer, BufferId, EditOperation, FullOffset, Operation, UndoOperation
 
 use crate::AgentId;
 
+#[path = "desk_temporal.rs"]
+pub mod temporal;
+pub use temporal::{TemporalMark, TemporalMarkKind};
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum DeskHeadingState {
     Todo,
@@ -42,6 +46,9 @@ pub struct DeskProperty {
 pub struct DeskHeading {
     pub depth: usize,
     pub state: Option<DeskHeadingState>,
+    /// Successfully parsed dated properties, in document order. Each kind
+    /// appears at most once; the first property with that key owns it.
+    pub temporal_marks: Vec<TemporalMark>,
     pub title: String,
     /// The first `:agent:` value under this heading, whether or not it parses.
     pub agent_value: Option<String>,
@@ -130,6 +137,7 @@ pub fn parse(text: &str) -> Vec<DeskHeading> {
         headings.push(DeskHeading {
             depth,
             state,
+            temporal_marks: Vec::new(),
             title: title.to_owned(),
             agent_value: None,
             duplicate_agent: false,
@@ -156,6 +164,8 @@ pub fn parse(text: &str) -> Vec<DeskHeading> {
         let end = heading_lines
             .get(index + 1)
             .map_or(text.len(), |next| lines[*next].start);
+        let mut seen_temporal = std::collections::BTreeSet::new();
+        let mut property_state = None;
         for line in lines
             .iter()
             .skip(line_index + 1)
@@ -170,6 +180,19 @@ pub fn parse(text: &str) -> Vec<DeskHeading> {
                 line_range: line.start..line.end,
                 value_range: line.start + value_start..line.start + value_start + value.len(),
             };
+            if let Some(kind) = TemporalMarkKind::from_property_key(key)
+                && seen_temporal.insert(kind)
+                && let Some(mark) = TemporalMark::parse(kind, value)
+            {
+                if property_state.is_none() {
+                    property_state = match kind {
+                        TemporalMarkKind::Done => Some(DeskHeadingState::Done),
+                        TemporalMarkKind::Discarded => Some(DeskHeadingState::Discarded),
+                        _ => None,
+                    };
+                }
+                headings[index].temporal_marks.push(mark);
+            }
             if key.eq_ignore_ascii_case("agent") && headings[index].agent_value.is_none() {
                 headings[index].agent_value = Some(value.to_owned());
                 headings[index].duplicate_agent = !seen_agents.insert(value.to_owned());
@@ -177,6 +200,9 @@ pub fn parse(text: &str) -> Vec<DeskHeading> {
                 headings[index].project = Some(value.to_owned());
             }
             headings[index].properties.push(property);
+        }
+        if property_state.is_some() {
+            headings[index].state = property_state;
         }
         headings[index].body_range = lines[line_index].full_end..end;
         // Trailing blank lines separate this subtree from what follows.
@@ -637,5 +663,45 @@ mod tests {
             agent.encoded()
         ));
         assert_eq!(headings[0].agent_value.as_deref(), Some("not-an-agent"));
+    }
+
+    #[test]
+    fn temporal_properties_are_typed_case_insensitive_and_first_wins() {
+        use chrono::{NaiveDate, NaiveTime};
+
+        let text = "* legacy TODO\n:ToDo: 2026-08-23 12:30 9d\n:todo: 2026-09-01\n:DEADLINE: not-a-date\n:deadline: 2026-08-30\n:reminder: 2026-08-30\n";
+        let headings = parse(text);
+        let heading = &headings[0];
+        assert_eq!(heading.state, Some(DeskHeadingState::Todo));
+        assert_eq!(heading.temporal_marks.len(), 2);
+        assert_eq!(heading.temporal_marks[0].kind, TemporalMarkKind::Todo);
+        assert_eq!(heading.temporal_marks[0].pace_days, 9);
+        assert_eq!(
+            heading.temporal_marks[0].at,
+            NaiveDate::from_ymd_opt(2026, 8, 23)
+                .unwrap()
+                .and_time(NaiveTime::from_hms_opt(12, 30, 0).unwrap())
+        );
+        assert_eq!(heading.temporal_marks[1].kind, TemporalMarkKind::Reminder);
+        assert_eq!(heading.temporal_marks[1].pace_days, 1);
+        assert_eq!(
+            heading.properties.len(),
+            5,
+            "all source properties remain visible data"
+        );
+    }
+
+    #[test]
+    fn terminal_properties_override_legacy_keywords_in_document_order() {
+        let headings = parse(
+            "* old DONE\n:discarded: 2026-08-24\n:done: 2026-08-25\n* old DISCARDED\n:done: 2026-08-26\n",
+        );
+        assert_eq!(headings[0].state, Some(DeskHeadingState::Discarded));
+        assert_eq!(headings[1].state, Some(DeskHeadingState::Done));
+        assert_eq!(headings[0].title, "old");
+        assert!(
+            headings[0].state_range.is_some(),
+            "legacy source range remains addressable"
+        );
     }
 }

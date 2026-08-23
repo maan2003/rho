@@ -20,7 +20,8 @@ use gpui::{App, Context, Entity, Focusable as _, HighlightStyle, WeakEntity, Win
 use language::{Buffer, Capability, InlayId, Point};
 use multi_buffer::composition::{Composition, CompositionSpec, CutSpec, RowSpec, SectionSpec};
 use multi_buffer::{MultiBuffer, ToOffset as _};
-use rho_ui_proto::desk::{DeskHeading, DeskHeadingState, parse};
+use rho_ui_proto::desk::temporal::{priority, property_line};
+use rho_ui_proto::desk::{DeskHeading, DeskHeadingState, TemporalMark, TemporalMarkKind, parse};
 use rho_ui_proto::{AgentId, UiAttention};
 use text::{BufferId, ToOffset as _};
 use theme::ActiveTheme as _;
@@ -50,7 +51,6 @@ const DRAFT_TEXT_KEY: HighlightKey =
     HighlightKey::SyntaxTreeView(DASHBOARD_KEY_BASE + 2 * DashClass::ALL.len());
 const WEB_HEADING_DECORATION: &str = "\0web";
 
-pub type ParsedHeadingState = DeskHeadingState;
 type DraftTopic = Option<(HostId, usize)>;
 type DraftState = (DraftTopic, Entity<Buffer>, gpui::Subscription);
 type SyncSnapshot = (
@@ -1312,9 +1312,13 @@ impl Dashboard {
             });
     }
 
-    pub fn set_cursor_heading_state(
+    /// Write or replace a dated property on the heading line under the
+    /// cursor. The visible Desk text remains the only state.
+    pub fn set_cursor_heading_property(
         &mut self,
-        state: ParsedHeadingState,
+        kind: TemporalMarkKind,
+        at: chrono::NaiveDateTime,
+        pace_days: Option<u32>,
         cx: &mut Context<Workspace>,
     ) {
         let Some((host, offset)) = self.cursor_heading_line(cx) else {
@@ -1329,29 +1333,37 @@ impl Dashboard {
         else {
             return;
         };
-        // The keyword sits to the right of the title; the (concealed) tag
-        // token stays at the very end, riding along unchanged.
-        let title = if heading.title.is_empty() {
-            String::new()
+        let line = property_line(kind, at, pace_days);
+        let first_other_terminal = heading.properties.iter().position(|property| {
+            TemporalMarkKind::from_property_key(&property.key).is_some_and(|property_kind| {
+                property_kind != kind
+                    && matches!(
+                        property_kind,
+                        TemporalMarkKind::Done | TemporalMarkKind::Discarded
+                    )
+                    && matches!(kind, TemporalMarkKind::Done | TemporalMarkKind::Discarded)
+            })
+        });
+        let same = heading
+            .properties
+            .iter()
+            .position(|property| property.key.eq_ignore_ascii_case(kind.property_key()));
+        let replace = same.filter(|same| first_other_terminal.is_none_or(|other| same < &other));
+        let (range, replacement) = if let Some(index) = replace {
+            let property = &heading.properties[index];
+            let end = property.line_range.end
+                + usize::from(text.as_bytes().get(property.line_range.end) == Some(&b'\n'));
+            (property.line_range.start..end, line)
         } else {
-            format!(" {}", heading.title)
+            let insertion = heading.heading_range.end
+                + usize::from(text.as_bytes().get(heading.heading_range.end) == Some(&b'\n'));
+            (insertion..insertion, line)
         };
-        let replacement = format!(
-            "{}{} {}{}",
-            "*".repeat(heading.depth),
-            title,
-            state.keyword(),
-            heading
-                .tags_range
-                .as_ref()
-                .map(|range| format!(" {}", &text[range.clone()]))
-                .unwrap_or_default(),
-        );
         self.hosts[&host]
             .upgrade()
             .unwrap()
             .update(cx, |buffer, cx| {
-                buffer.edit([(heading.heading_range, replacement)], None, cx)
+                buffer.edit([(range, replacement)], None, cx)
             });
     }
 
@@ -2339,7 +2351,14 @@ fn doc_spans(text: &str) -> Vec<(DashClass, Range<usize>)> {
             Some(DeskHeadingState::Done | DeskHeadingState::Discarded) => DashClass::Muted,
             None => DashClass::for_depth(heading.depth),
         };
-        let title_class = DashClass::for_depth(heading.depth);
+        let title_class = if matches!(
+            heading.state,
+            Some(DeskHeadingState::Done | DeskHeadingState::Discarded)
+        ) {
+            DashClass::Muted
+        } else {
+            DashClass::for_depth(heading.depth)
+        };
         if let Some(state_range) = &heading.state_range {
             spans.push((state_class, state_range.clone()));
         }
@@ -2534,6 +2553,26 @@ fn heading_conceals(
                 bullet.push(' ');
                 conceals.push((*host, stars, bullet, CaretRest::End));
             }
+            let mut seen_temporal = std::collections::BTreeSet::new();
+            for property in &heading.properties {
+                let Some(kind) = TemporalMarkKind::from_property_key(&property.key) else {
+                    continue;
+                };
+                if !seen_temporal.insert(kind)
+                    || TemporalMark::parse(kind, &property.value).is_none()
+                {
+                    continue;
+                }
+                let start = property.line_range.start.saturating_sub(1);
+                let range = if text.as_bytes().get(start) == Some(&b'\n') {
+                    start..property.line_range.end
+                } else {
+                    property.line_range.clone()
+                };
+                if !caret.is_some_and(|caret| range.start < caret && caret < range.end) {
+                    conceals.push((*host, range, String::new(), CaretRest::Start));
+                }
+            }
             let Some(tags_range) = heading.tags_range else {
                 continue;
             };
@@ -2603,6 +2642,10 @@ fn heading_decorations(
                 .iter()
                 .any(|zone| zone.contains(&heading.heading_range.start));
             let mut label = String::new();
+            if let Some(mark) = display_mark(heading, chrono::Local::now().naive_local()) {
+                label.push_str("  ");
+                label.push_str(&mark);
+            }
             for agent_id in agents {
                 // Archived agents read as quiet no matter what they want.
                 let attention = if archived {
@@ -2638,6 +2681,49 @@ fn heading_decorations(
         }
     }
     decorations
+}
+
+fn display_mark(heading: &DeskHeading, now: chrono::NaiveDateTime) -> Option<String> {
+    let mark = match heading.state {
+        Some(DeskHeadingState::Done) => heading
+            .temporal_marks
+            .iter()
+            .find(|mark| mark.kind == TemporalMarkKind::Done),
+        Some(DeskHeadingState::Discarded) => heading
+            .temporal_marks
+            .iter()
+            .find(|mark| mark.kind == TemporalMarkKind::Discarded),
+        _ => heading
+            .temporal_marks
+            .iter()
+            .max_by(|left, right| priority(left, now).total_cmp(&priority(right, now))),
+    }?;
+    let elapsed = now.signed_duration_since(mark.at).num_seconds() as f64 / 86_400.0;
+    let days = elapsed.abs().ceil() as u64;
+    Some(match mark.kind {
+        TemporalMarkKind::Deadline if priority(mark, now) == f64::NEG_INFINITY => return None,
+        TemporalMarkKind::Deadline if elapsed > 0.0 => format!("late {days}d"),
+        TemporalMarkKind::Deadline => format!("deadline {days}d"),
+        TemporalMarkKind::Todo => format!("todo {days}d"),
+        TemporalMarkKind::Defer => {
+            let phase = elapsed.rem_euclid(mark.pace_days as f64);
+            let back = if phase == 0.0 {
+                0
+            } else {
+                (mark.pace_days as f64 - phase).ceil() as u64
+            };
+            format!("back {back}d")
+        }
+        TemporalMarkKind::Reminder => format!("reminder {days}d"),
+        TemporalMarkKind::Done => format!(
+            "done {}",
+            mark.at.format("%b %-d").to_string().to_lowercase()
+        ),
+        TemporalMarkKind::Discarded => format!(
+            "discarded {}",
+            mark.at.format("%b %-d").to_string().to_lowercase()
+        ),
+    })
 }
 
 #[cfg(feature = "native")]
