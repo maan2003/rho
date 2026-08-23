@@ -440,7 +440,7 @@ impl Dashboard {
     pub fn enter_deal_mode(
         &mut self,
         registry: &AgentRegistry,
-        now: chrono::NaiveDateTime,
+        now: chrono::DateTime<chrono::FixedOffset>,
         seed: u64,
         cx: &mut Context<Workspace>,
     ) {
@@ -930,7 +930,7 @@ impl Dashboard {
             self.queue_depth = assemble_deal_queue(
                 &documents,
                 &deal_agent_facts(registry),
-                now.naive_local(),
+                now.fixed_offset(),
                 0,
             )
             .len();
@@ -3560,12 +3560,12 @@ fn deal_agent_facts(registry: &AgentRegistry) -> Vec<DealAgentFacts> {
         .collect()
 }
 
-fn reply_priority(ended: rho_core::UnixMs, hinted: bool, now: chrono::NaiveDateTime) -> f64 {
-    let now_ms = now.and_local_timezone(chrono::Local).single().map_or_else(
-        || now.and_utc().timestamp_millis(),
-        |at| at.timestamp_millis(),
-    );
-    let elapsed_days = (now_ms - ended.0 as i64) as f64 / 86_400_000.0;
+fn reply_priority(
+    ended: rho_core::UnixMs,
+    hinted: bool,
+    now: chrono::DateTime<chrono::FixedOffset>,
+) -> f64 {
+    let elapsed_days = (now.timestamp_millis() - ended.0 as i64) as f64 / 86_400_000.0;
     elapsed_days - if hinted { 0.25 } else { 7.0 }
 }
 
@@ -3575,12 +3575,13 @@ fn reply_priority(ended: rho_core::UnixMs, hinted: bool, now: chrono::NaiveDateT
 pub fn assemble_deal_queue(
     documents: &[(HostId, String)],
     agent_facts: &[DealAgentFacts],
-    now: chrono::NaiveDateTime,
+    now: chrono::DateTime<chrono::FixedOffset>,
     seed: u64,
 ) -> Vec<DealCard> {
     use rho_ui_proto::desk::TemporalMarkKind;
     use rho_ui_proto::desk::temporal::{is_overdue_deadline, priority, surfaced};
 
+    let desk_now = now.naive_local();
     let by_id = agent_facts
         .iter()
         .map(|agent| (agent.agent_id, agent))
@@ -3632,7 +3633,7 @@ pub fn assemble_deal_queue(
                 matches!(
                     mark.kind,
                     TemporalMarkKind::Defer | TemporalMarkKind::Reminder | TemporalMarkKind::Skip
-                ) && mark.at > now
+                ) && mark.at > desk_now
             });
             let agents = heading
                 .tags
@@ -3754,25 +3755,26 @@ pub fn assemble_deal_queue(
             continue;
         }
         if heading.temporal_marks.iter().any(|mark| {
-            matches!(mark.kind, TemporalMarkKind::Defer | TemporalMarkKind::Skip) && mark.at > now
+            matches!(mark.kind, TemporalMarkKind::Defer | TemporalMarkKind::Skip)
+                && mark.at > desk_now
         }) {
             continue;
         }
         let best = heading
             .temporal_marks
             .iter()
-            .filter(|mark| surfaced(mark, now, DEAL_SURFACE_THRESHOLD))
+            .filter(|mark| surfaced(mark, desk_now, DEAL_SURFACE_THRESHOLD))
             .max_by(|a, b| {
-                let a_overdue = is_overdue_deadline(a, now);
-                let b_overdue = is_overdue_deadline(b, now);
+                let a_overdue = is_overdue_deadline(a, desk_now);
+                let b_overdue = is_overdue_deadline(b, desk_now);
                 a_overdue
                     .cmp(&b_overdue)
-                    .then_with(|| priority(a, now).total_cmp(&priority(b, now)))
+                    .then_with(|| priority(a, desk_now).total_cmp(&priority(b, desk_now)))
             });
         if let Some(mark) = best {
             resurfaced.push((
-                is_overdue_deadline(mark, now),
-                priority(mark, now),
+                is_overdue_deadline(mark, desk_now),
+                priority(mark, desk_now),
                 DealCard {
                     section: DealSection::Resurfaced,
                     host,
@@ -3790,7 +3792,7 @@ pub fn assemble_deal_queue(
         } else if !heading
             .temporal_marks
             .iter()
-            .any(|mark| mark.kind == TemporalMarkKind::Reminder && mark.at > now)
+            .any(|mark| mark.kind == TemporalMarkKind::Reminder && mark.at > desk_now)
             && agents
                 .iter()
                 .flat_map(|agent| descendants(*agent))
@@ -4356,7 +4358,9 @@ mod tests {
         let now = chrono::NaiveDate::from_ymd_opt(2026, 2, 1)
             .unwrap()
             .and_hms_opt(12, 0, 0)
-            .unwrap();
+            .unwrap()
+            .and_utc()
+            .fixed_offset();
         let cards = assemble_deal_queue(&[(host, text)], &deal_agent_facts(&registry), now, 7);
         assert_eq!(cards[0].section, DealSection::NeedsYou);
         assert_eq!(cards[0].agent_id, Some(loud.agent_id));
@@ -4396,8 +4400,10 @@ mod tests {
         let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
             .unwrap()
             .and_hms_opt(12, 0, 0)
-            .unwrap();
-        let text = "* Snoozed deadline\n:skip: 2026-08-24\n:deadline: 2020-01-01\n* Expired skip\n:skip: 2026-08-22\n:deadline: 2020-01-01\n".to_owned();
+            .unwrap()
+            .and_utc()
+            .fixed_offset();
+        let text = "* Snoozed deadline\n:skip: 2026-08-24\n:deadline: 2020-01-01\n* Expired skip\n:skip: 2026-08-22\n:deadline: 2020-01-01\n* Deferred\n:defer: 2026-08-24\n:deadline: 2020-01-01\n".to_owned();
         let cards = assemble_deal_queue(&[(host, text)], &deal_agent_facts(&registry), now, 7);
         assert!(
             cards
@@ -4413,8 +4419,10 @@ mod tests {
         let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
             .unwrap()
             .and_hms_opt(12, 0, 0)
-            .unwrap();
-        let at = |days: i64| UnixMs((now.and_utc().timestamp_millis() - days * 86_400_000) as u64);
+            .unwrap()
+            .and_utc()
+            .fixed_offset();
+        let at = |days: i64| UnixMs((now.timestamp_millis() - days * 86_400_000) as u64);
         let mut owed = agent(1, None, UiAttention::Quiet, 0);
         owed.facts = rho_ui_proto::UiAgentFacts {
             turn_running: false,
@@ -4457,14 +4465,14 @@ mod tests {
         let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
             .unwrap()
             .and_hms_opt(12, 0, 0)
-            .unwrap();
+            .unwrap()
+            .and_utc()
+            .fixed_offset();
         let root = agent(1, None, UiAttention::Quiet, 0);
         let mut child = agent(2, Some(root.agent_id), UiAttention::Quiet, 0);
         child.facts = rho_ui_proto::UiAgentFacts {
             turn_running: false,
-            last_turn_ended: Some(UnixMs(
-                (now.and_utc().timestamp_millis() - 86_400_000) as u64,
-            )),
+            last_turn_ended: Some(UnixMs((now.timestamp_millis() - 86_400_000) as u64)),
             last_user_message_at: UnixMs(0),
             needs_you_hint: false,
         };
@@ -4482,8 +4490,10 @@ mod tests {
         let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
             .unwrap()
             .and_hms_opt(12, 0, 0)
-            .unwrap();
-        let ended = UnixMs((now.and_utc().timestamp_millis() - 86_400_000) as u64);
+            .unwrap()
+            .and_utc()
+            .fixed_offset();
+        let ended = UnixMs((now.timestamp_millis() - 86_400_000) as u64);
         let mut owed = agent(1, None, UiAttention::Quiet, 0);
         owed.facts = rho_ui_proto::UiAgentFacts {
             turn_running: false,

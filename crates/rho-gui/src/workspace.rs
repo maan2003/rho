@@ -5343,8 +5343,8 @@ impl Workspace {
         if self.dashboard.deal_mode() {
             self.dashboard.exit_deal_mode(cx);
         } else {
-            let now = chrono::Local::now().naive_local();
-            let seed = now.and_utc().timestamp_nanos_opt().unwrap_or_default() as u64;
+            let now = chrono::Local::now().fixed_offset();
+            let seed = now.timestamp_nanos_opt().unwrap_or_default() as u64;
             self.dashboard
                 .enter_deal_mode(&self.registry, now, seed, cx);
         }
