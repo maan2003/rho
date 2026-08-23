@@ -534,10 +534,6 @@ enum PageCommand {
         scene_id: u64,
         barrier: u64,
     },
-    HostVsync {
-        timestamp: Duration,
-        refresh: Option<Duration>,
-    },
     EnablePresentationPassthrough {
         session_generation: u64,
     },
@@ -731,14 +727,9 @@ impl<K: BrowserPageKey> BrowserSession<K> {
     pub fn events(&self) -> BrowserEventReceiver {
         self.events.clone()
     }
-    /// Updates the host compositor's real vblank clock. Frame callbacks are
-    /// completed at the next predicted vblank in this clock domain.
-    pub fn host_vsync(&self, timestamp: Duration, refresh: Option<Duration>) {
-        self.send(PageCommand::HostVsync { timestamp, refresh });
-    }
-    /// Switches this session from predicted frame delivery to relaying real
-    /// outer frame and presentation callbacks. This also advertises the nested
-    /// `wp_presentation` global to Chromium.
+    /// Switches this session from paint-acknowledgement frame delivery to
+    /// relaying real outer frame and presentation callbacks. This also
+    /// advertises the nested `wp_presentation` global to Chromium.
     pub fn enable_presentation_passthrough(&self) {
         self.send(PageCommand::EnablePresentationPassthrough {
             session_generation: self.session_generation,
@@ -800,8 +791,6 @@ struct WindowState {
     presentation_passthrough: bool,
     last_host_presentation_scene: Option<u64>,
     last_host_frame_scene: Option<u64>,
-    frame_timer_pending: bool,
-    host_vsync: Option<(Duration, Option<Duration>)>,
     pointer_frames: HashMap<u64, PointerFrame>,
     hit_scenes: HashMap<u64, Vec<HitNode>>,
     pointer_location: (f64, f64),
@@ -840,7 +829,6 @@ fn disable_window_presentation_passthrough(window: &mut WindowState) -> Option<u
         return None;
     }
     window.presentation_passthrough = false;
-    window.frame_timer_pending = false;
     for feedback in window
         .presentation_feedback
         .drain()
@@ -1667,7 +1655,6 @@ impl<K: BrowserPageKey> State<K> {
             nodes,
             produced_at,
         }));
-        schedule_frame_delivery(self, id, scene_id);
         Ok(())
     }
 
@@ -2530,8 +2517,6 @@ fn handle_runtime_command<K: BrowserPageKey>(
                     presentation_passthrough: false,
                     last_host_presentation_scene: None,
                     last_host_frame_scene: None,
-                    frame_timer_pending: false,
-                    host_vsync: None,
                     pointer_frames: HashMap::new(),
                     hit_scenes: HashMap::new(),
                     pointer_location: (0.0, 0.0),
@@ -2624,17 +2609,11 @@ fn handle_page_command<K: BrowserPageKey>(state: &mut State<K>, id: K, c: PageCo
                     None,
                 );
                 prune_pointer_scenes(&mut w.pointer_frames, &mut w.hit_scenes, scene_id);
-            }
-        }
-        PageCommand::HostVsync { timestamp, refresh } => {
-            let scene = if let Some(window) = state.windows.get_mut(&id) {
-                window.host_vsync = Some((timestamp, refresh));
-                window.dma_frame_callbacks.keys().copied().max()
-            } else {
-                None
-            };
-            if let Some(scene_id) = scene {
-                schedule_frame_delivery(state, id, scene_id);
+                // The host consumed this scene, so Chromium may render the
+                // next one. Passthrough submissions also complete callbacks
+                // through the relayed outer frame event; whichever arrives
+                // first drains the entry.
+                send_frame_callbacks(w, monotonic_time_ms(), scene_id);
             }
         }
         PageCommand::EnablePresentationPassthrough { session_generation } => {
@@ -2646,7 +2625,6 @@ fn handle_page_command<K: BrowserPageKey>(state: &mut State<K>, id: K, c: PageCo
                 return;
             };
             window.presentation_passthrough = true;
-            window.frame_timer_pending = false;
             if state.presentation.is_none() {
                 state.presentation = Some(PresentationState::new::<State<K>>(
                     &state.display_handle,
@@ -2675,8 +2653,12 @@ fn handle_page_command<K: BrowserPageKey>(state: &mut State<K>, id: K, c: PageCo
                     .display_handle
                     .disable_global::<State<K>>(presentation.global());
             }
-            if let Some(scene_id) = scene {
-                schedule_frame_delivery(state, id, scene_id);
+            // Complete anything the passthrough path left pending; the paint
+            // acknowledgements resume completing callbacks from here.
+            if let Some(scene_id) = scene
+                && let Some(window) = state.windows.get_mut(&id)
+            {
+                send_frame_callbacks(window, monotonic_time_ms(), scene_id);
             }
         }
         PageCommand::HostPresentation {
@@ -3412,66 +3394,6 @@ fn relay_host_presentation<K: BrowserPageKey>(
     }
 }
 
-fn predicted_next_vsync(timestamp: Duration, refresh: Duration, now: Duration) -> Duration {
-    if timestamp > now || refresh.is_zero() {
-        return timestamp.max(now);
-    }
-    let elapsed = now - timestamp;
-    let periods = elapsed.as_nanos() / refresh.as_nanos() + 1;
-    timestamp + refresh.mul_f64(periods as f64)
-}
-
-fn schedule_frame_delivery<K: BrowserPageKey>(state: &mut State<K>, id: K, scene_id: u64) {
-    let Some(window) = state.windows.get_mut(&id) else {
-        return;
-    };
-    if !window.dma_frame_callbacks.contains_key(&scene_id) {
-        return;
-    }
-    if window.presentation_passthrough {
-        return;
-    }
-    if window.frame_timer_pending {
-        return;
-    }
-    // Extrapolate the next tick from the last vsync sample so delivery never
-    // waits on the host window painting again; an idle host would otherwise
-    // starve Chromium of frame callbacks entirely.
-    let now = monotonic_time();
-    let predicted = match window.host_vsync {
-        Some((timestamp, Some(refresh))) => predicted_next_vsync(timestamp, refresh, now),
-        _ => now,
-    };
-    window.frame_timer_pending = true;
-    let opened_at = window.opened_at;
-    let registration =
-        state.loop_handle.insert_source(
-            Timer::from_duration(predicted.saturating_sub(now)),
-            move |_, _, state| {
-                if let Some(window) = state
-                    .windows
-                    .get_mut(&id)
-                    .filter(|window| window.opened_at == opened_at)
-                {
-                    window.frame_timer_pending = false;
-                    if !window.presentation_passthrough
-                        && let Some(pending) = window.dma_frame_callbacks.keys().copied().max()
-                    {
-                        send_frame_callbacks(window, predicted.as_millis() as u32, pending);
-                    }
-                }
-                let _ = state.display_handle.flush_clients();
-                TimeoutAction::Drop
-            },
-        );
-    if registration.is_err()
-        && let Some(window) = state.windows.get_mut(&id)
-    {
-        window.frame_timer_pending = false;
-        send_frame_callbacks(window, monotonic_time_ms(), scene_id);
-    }
-}
-
 fn send_frame_callbacks(window: &mut WindowState, time: u32, commit_id: u64) {
     let completed = window
         .dma_frame_callbacks
@@ -3539,27 +3461,6 @@ mod tests {
         let after = monotonic_time_ms();
         let clock = (time.tv_sec as u64 * 1_000 + time.tv_nsec as u64 / 1_000_000) as u32;
         assert!(clock.wrapping_sub(before) <= after.wrapping_sub(before));
-    }
-
-    #[test]
-    fn frame_clock_targets_the_first_vsync_strictly_after_commit() {
-        let refresh = Duration::from_millis(8);
-        assert_eq!(
-            predicted_next_vsync(
-                Duration::from_millis(1_000),
-                refresh,
-                Duration::from_millis(1_017)
-            ),
-            Duration::from_millis(1_024)
-        );
-        assert_eq!(
-            predicted_next_vsync(
-                Duration::from_millis(1_024),
-                refresh,
-                Duration::from_millis(1_024)
-            ),
-            Duration::from_millis(1_032)
-        );
     }
 
     #[test]
@@ -3806,8 +3707,6 @@ mod tests {
             presentation_passthrough: false,
             last_host_presentation_scene: None,
             last_host_frame_scene: None,
-            frame_timer_pending: false,
-            host_vsync: None,
             pointer_frames: HashMap::new(),
             hit_scenes: HashMap::new(),
             pointer_location: (0.0, 0.0),
@@ -3842,10 +3741,9 @@ mod tests {
     }
 
     #[test]
-    fn disabling_presentation_passthrough_resumes_predicted_frame_delivery() {
+    fn disabling_presentation_passthrough_reports_the_newest_pending_scene() {
         let mut window = window_for_test();
         window.presentation_passthrough = true;
-        window.frame_timer_pending = true;
         window.dma_frame_callbacks.insert(2, Vec::new());
         window.dma_frame_callbacks.insert(4, Vec::new());
 
@@ -3854,7 +3752,6 @@ mod tests {
             Some(4)
         );
         assert!(!window.presentation_passthrough);
-        assert!(!window.frame_timer_pending);
         assert_eq!(disable_window_presentation_passthrough(&mut window), None);
     }
 

@@ -321,6 +321,16 @@ impl BrowserModel {
                                 model.runtime.scene_id = Some(scene.id);
                                 model.runtime.logical_size = scene.logical_size;
                                 model.runtime.scene = scene.nodes;
+                                // No view will paint this scene, so acknowledge
+                                // it here; otherwise Chromium's frame callbacks
+                                // would starve while the page is hidden.
+                                if model.presentation_owner.is_none()
+                                    && let Some(session) = model.runtime.session.as_ref()
+                                {
+                                    (session
+                                        .presentation_callback(scene.id, scene.barrier))(
+                                    );
+                                }
                             }
                             BrowserEvent::FrameRetired(buffer_id) => {
                                 let was_visible = model
@@ -801,12 +811,6 @@ struct PassthroughPaintState {
     submitted: Option<u64>,
     presented: Option<u64>,
     active: bool,
-}
-
-fn browser_passthrough_enabled() -> bool {
-    // Keep the texture path as the default until compositor coverage has been
-    // validated broadly. Flipping the default later is intentionally one line.
-    std::env::var_os("RHO_BROWSER_PASSTHROUGH").is_some_and(|value| value == "1")
 }
 
 fn passthrough_scene<'a>(
@@ -1568,7 +1572,7 @@ impl Render for BrowserView {
                 }
             }));
         }
-        if browser_passthrough_enabled() && !self.passthrough_attempted {
+        if !self.passthrough_attempted {
             self.passthrough_attempted = true;
             let (events_tx, events_rx) = async_channel::unbounded();
             match window.create_wayland_passthrough(move |event| {
@@ -1631,7 +1635,7 @@ impl Render for BrowserView {
                     self.passthrough = Some(passthrough);
                 }
                 Some(Err(error)) => {
-                    tracing::error!(?error, "RHO_BROWSER_PASSTHROUGH requested but unavailable");
+                    tracing::error!(?error, "browser DMA-BUF passthrough unavailable");
                 }
                 None => {}
             }
@@ -1751,10 +1755,6 @@ impl Render for BrowserView {
             }
         }
         let model = self.model.read(cx);
-        if let (Some(session), Some(vsync)) = (model.runtime.session.as_ref(), window.host_vsync())
-        {
-            session.host_vsync(vsync.timestamp, vsync.refresh_period);
-        }
         let colors = cx.theme().colors();
         let presents = model.presents(self.owner_id, self.page_id);
         let presented = if owns_presentation
