@@ -3669,7 +3669,7 @@ pub fn assemble_deal_queue(
     let mut finished = Vec::new();
     let mut visible_agents = HashSet::new();
     let mut claimed_topics = HashSet::new();
-    let mut candidate_agents = agent_facts
+    let owed_agents = agent_facts
         .iter()
         .filter_map(|agent| {
             let ended = agent.facts.last_turn_ended?;
@@ -3680,6 +3680,10 @@ pub fn assemble_deal_queue(
                 reply_priority(ended, agent.facts.needs_you_hint, now),
             ))
         })
+        .collect::<Vec<_>>();
+    visible_agents.extend(owed_agents.iter().map(|(agent_id, ..)| *agent_id));
+    let mut candidate_agents = owed_agents
+        .into_iter()
         .filter(|(_, _, _, priority)| *priority > DEAL_SURFACE_THRESHOLD)
         .collect::<Vec<_>>();
     candidate_agents.sort_by(|a, b| {
@@ -3699,7 +3703,6 @@ pub fn assemble_deal_queue(
         {
             continue;
         }
-        visible_agents.insert(agent_id);
         let topic = agent_topics.get(&agent_id);
         if topic.is_some_and(|topic| claimed_topics.contains(&(topic.0, topic.1))) {
             continue;
