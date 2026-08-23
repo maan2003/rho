@@ -750,6 +750,13 @@ impl Vim {
                 } else {
                     Mode::Deal
                 };
+                vim.update_editor(cx, |_, editor, cx| {
+                    editor.change_selections(Default::default(), window, cx, |selections| {
+                        selections.move_with(&mut |_, selection| {
+                            selection.collapse_to(selection.head(), SelectionGoal::None);
+                        });
+                    });
+                });
                 vim.switch_mode(mode, true, window, cx)
             });
             Vim::action(editor, cx, |vim, _: &ExitDealMode, window, cx| {
@@ -1562,9 +1569,8 @@ impl Vim {
             | Mode::VisualBlock
             | Mode::Replace
             | Mode::HelixNormal
-            | Mode::HelixDeal
             | Mode::HelixSelect => false,
-            Mode::Normal | Mode::Deal => true,
+            Mode::Normal | Mode::Deal | Mode::HelixDeal => true,
         }
     }
 
@@ -1576,13 +1582,13 @@ impl Vim {
             Mode::Replace => "replace",
             Mode::HelixNormal => "helix_normal",
             Mode::HelixSelect => "helix_select",
-            Mode::Deal => "normal",
-            Mode::HelixDeal => "helix_normal",
+            Mode::Deal | Mode::HelixDeal => "deal",
         }
         .to_string();
 
         if matches!(self.mode, Mode::Deal | Mode::HelixDeal) {
             context.add("VimDeal");
+            context.add("VimControl");
         }
 
         let mut operator_id = "none";

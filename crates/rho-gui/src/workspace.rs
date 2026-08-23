@@ -55,9 +55,9 @@ use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
     AgentDone, AgentHide, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, BrowserExit,
     DashboardArchive, DashboardBack, DashboardCycleGlobal, DashboardDealDiscard, DashboardDealDone,
-    DashboardDealExit, DashboardDealHelp, DashboardDealInsert, DashboardDealNext,
-    DashboardDealPrevious, DashboardDealRefresh, DashboardDealReply, DashboardDealSnooze,
-    DashboardDealTodo, DashboardDeleteEmpty, DashboardDemote, DashboardGoto, DashboardHeadingAbove,
+    DashboardDealExit, DashboardDealInsert, DashboardDealNext, DashboardDealPrevious,
+    DashboardDealRefresh, DashboardDealReply, DashboardDealSnooze, DashboardDealTodo,
+    DashboardDeleteEmpty, DashboardDemote, DashboardGoto, DashboardHeadingAbove,
     DashboardHeadingBelow, DashboardJump, DashboardNewAgent, DashboardNow, DashboardPromote,
     DashboardRenameTopic, DashboardReply, DashboardStaff, DashboardSubmit,
     DashboardToggleAgentTree, DashboardToggleSubagents, DashboardUndo, GitApprovalAllow,
@@ -6527,31 +6527,47 @@ impl Workspace {
         let row = |keys: &'static str, meaning: &'static str| {
             div()
                 .flex()
+                .items_center()
                 .gap_2()
-                .child(div().w(px(54.)).text_color(colors.text_accent).child(keys))
-                .child(meaning)
+                .child(
+                    div()
+                        .w(px(76.))
+                        .px_1()
+                        .rounded_sm()
+                        .bg(colors.element_selected)
+                        .text_color(colors.text_accent)
+                        .child(keys),
+                )
+                .child(div().text_color(colors.text_muted).child(meaning))
         };
         div()
             .absolute()
-            .top_2()
-            .right_2()
-            .p_2()
+            .top_3()
+            .right_3()
+            .w(px(244.))
+            .p_3()
             .border_1()
             .border_color(colors.border_variant)
-            .rounded_sm()
+            .rounded_md()
             .shadow_md()
             .bg(colors.element_background)
             .text_color(colors.text)
             .flex()
             .flex_col()
-            .gap_1()
+            .gap_2()
+            .child(
+                div()
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(colors.text_accent)
+                    .child("Deal"),
+            )
+            .child(row("n / N", "next / previous card"))
             .child(row("d / x", "done / discard"))
             .child(row("[count] s", "snooze days"))
-            .child(row("t / r", "todo / reply"))
-            .child(row("n / N", "next / previous"))
-            .child(row("i", "edit heading"))
-            .child(row("q / Esc", "leave deal"))
-            .child(row("R / ?", "fresh deal / help"))
+            .child(row("t", "todo"))
+            .child(row("r / i", "reply / insert"))
+            .child(row("R", "redeal"))
+            .child(row("q / Esc", "exit"))
             .into_any_element()
     }
 
@@ -7524,15 +7540,6 @@ impl Render for Workspace {
                     this.dashboard.open_new_draft(topic, window, cx);
                 }
                 this.dashboard_focus_draft(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &DashboardDealHelp, _, cx| {
-                vim::take_count(cx);
-                if this.dashboard.deal_mode() {
-                    this.deal_help_visible = true;
-                    cx.notify();
-                } else {
-                    cx.propagate();
-                }
             }))
             .on_action(
                 cx.listener(|this, _: &DashboardToggleAgentTree, window, cx| {

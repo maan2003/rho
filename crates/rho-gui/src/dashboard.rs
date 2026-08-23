@@ -2492,7 +2492,7 @@ impl Dashboard {
             return deal_hint(deal);
         }
         format!(
-            "{} dealt · {} waiting · enter open · r reply · o staff · d/x verdict · Tab fold · gn attention",
+            "{} dealt · {} waiting",
             self.queue_depth.dealt_count, self.queue_depth.total_alive
         )
     }

@@ -4925,6 +4925,38 @@ fn desk_deal_session_resumes_and_insert_escape_returns_to_normal(cx: &mut TestAp
                         .dashboard_hint_for_test(cx)
                         .contains(" · 1/3 · 3 dealt · 3 waiting")
             );
+            workspace.dashboard_editor().update(cx, |editor, cx| {
+                let snapshot = editor.display_snapshot(cx);
+                assert!(
+                    editor
+                        .selections
+                        .newest::<editor::MultiBufferOffset>(&snapshot)
+                        .is_empty(),
+                    "Helix Deal must use a cursor, not a selection"
+                );
+            });
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "enter");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace
+                    .dashboard_deal_topic_for_test()
+                    .map(|(_, _, breadcrumb)| breadcrumb),
+                Some("One")
+            );
+            workspace.dashboard_editor().update(cx, |editor, cx| {
+                let snapshot = editor.display_snapshot(cx);
+                assert!(
+                    editor
+                        .selections
+                        .newest::<editor::MultiBufferOffset>(&snapshot)
+                        .is_empty()
+                );
+            });
         })
         .unwrap();
 
@@ -4980,6 +5012,16 @@ fn desk_deal_session_resumes_and_insert_escape_returns_to_normal(cx: &mut TestAp
         .update(cx, |workspace, _, cx| {
             assert!(!workspace.dashboard_deal_mode_for_test());
             assert!(!workspace.dashboard_deal_highlight_for_test(cx));
+            workspace.dashboard_editor().update(cx, |editor, cx| {
+                let snapshot = editor.display_snapshot(cx);
+                assert!(
+                    editor
+                        .selections
+                        .newest::<editor::MultiBufferOffset>(&snapshot)
+                        .is_empty(),
+                    "exiting Deal must not leave a selection behind"
+                );
+            });
         })
         .unwrap();
 
@@ -5330,6 +5372,12 @@ fn desk_deal_counted_snooze_todo_and_refresh_write_and_redeal(cx: &mut TestAppCo
     };
     cx.update(bind_test_keymaps);
     let workspace = test_workspace(cx);
+    cx.update(|cx| {
+        let settings = cx.global_mut::<SettingsStore>();
+        settings.override_global(vim_mode_setting::VimModeSetting(true));
+        settings.override_global(vim_mode_setting::HelixModeSetting(false));
+    });
+    cx.run_until_parked();
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(
@@ -5347,6 +5395,14 @@ fn desk_deal_counted_snooze_todo_and_refresh_write_and_redeal(cx: &mut TestAppCo
         })
         .unwrap();
     cx.run_until_parked();
+
+    cx.simulate_keystrokes(*workspace, "n shift-n");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert!(workspace.dashboard_hint_for_test(cx).contains("1/6"));
+        })
+        .unwrap();
 
     cx.simulate_keystrokes(*workspace, "3 s");
     cx.run_until_parked();

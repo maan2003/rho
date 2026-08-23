@@ -83,7 +83,6 @@ actions!(
         DashboardDealReply,
         DashboardDealRefresh,
         DashboardDealInsert,
-        DashboardDealHelp,
         RoleCycle,
         RoleCycleGroup,
         TaskBoard,
@@ -367,7 +366,7 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             KeyBinding::new("g r", DashboardRenameTopic, Some(context)),
         ]);
     }
-    let context = "RhoDashboard > Editor && VimDeal";
+    let context = "RhoDashboard > Editor && VimDeal && vim_mode == deal";
     cx.bind_keys([
         KeyBinding::new("q", DashboardDealExit, Some(context)),
         KeyBinding::new("escape", DashboardDealExit, Some(context)),
@@ -380,7 +379,6 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         KeyBinding::new("r", DashboardDealReply, Some(context)),
         KeyBinding::new("shift-r", DashboardDealRefresh, Some(context)),
         KeyBinding::new("i", DashboardDealInsert, Some(context)),
-        KeyBinding::new("?", DashboardDealHelp, Some(context)),
     ]);
 }
 

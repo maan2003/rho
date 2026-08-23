@@ -61,7 +61,7 @@ pub enum Mode {
     HelixSelect,
     /// A read-only, application-owned review mode with Vim-style motions.
     Deal,
-    /// A read-only, application-owned review mode with Helix-style motions.
+    /// A read-only review mode entered from Helix, with cursor-only motions.
     HelixDeal,
 }
 
@@ -103,7 +103,7 @@ impl Mode {
 
     /// `HelixNormal` qualifies because its cursor is itself a one-character selection.
     pub fn has_selection(&self) -> bool {
-        self.is_visual() || matches!(self, Self::HelixNormal | Self::HelixDeal)
+        self.is_visual() || matches!(self, Self::HelixNormal)
     }
 
     pub fn is_normal(&self) -> bool {
