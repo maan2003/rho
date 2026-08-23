@@ -1665,6 +1665,7 @@ impl Render for BrowserView {
                     if let Some(session) = model.runtime.session.as_ref() {
                         session.disable_presentation_passthrough();
                     }
+                    record_handoff_event(0, "pt-release", 0);
                 }
                 if let Some(passthrough) = this.passthrough.take() {
                     // The release frame first closes the ordered parent hole;
@@ -1682,6 +1683,7 @@ impl Render for BrowserView {
                 let _ = events_tx.try_send(event);
             }) {
                 Some(Ok(passthrough)) => {
+                    record_handoff_event(0, "pt-attach-ok", 0);
                     let paint_state = self.passthrough_state.clone();
                     let model = self.model.clone();
                     self.passthrough_events = Some(cx.spawn(async move |this, cx| {
@@ -1739,8 +1741,11 @@ impl Render for BrowserView {
                 }
                 Some(Err(error)) => {
                     tracing::error!(?error, "browser DMA-BUF passthrough unavailable");
+                    record_handoff_event(0, "pt-attach-error", 0);
                 }
-                None => {}
+                None => {
+                    record_handoff_event(0, "pt-unsupported", 0);
+                }
             }
         }
         if self.blur_subscription.is_none() {
@@ -1946,6 +1951,11 @@ impl Render for BrowserView {
             session.enable_presentation_passthrough();
             self.passthrough_timing_enabled.set(true);
             model.passthrough_owner.set(Some(self.owner_id));
+            record_handoff_event(
+                0,
+                "pt-promote",
+                passthrough_scene.as_ref().map_or(0, |(id, _)| *id),
+            );
         }
         let status = browser_status(
             &model.runtime,
@@ -1988,6 +1998,7 @@ impl Render for BrowserView {
                     if state.positioned != Some(*scene_id) {
                         if let Err(error) = passthrough.set_geometry(bounds) {
                             tracing::warn!(?error, "position browser DMA-BUF passthrough");
+                            record_handoff_event(0, "pt-geometry-failed", *scene_id);
                             passthrough_failed.set(true);
                             state = PassthroughPaintState::default();
                             let passthrough = passthrough.clone();
@@ -2021,6 +2032,7 @@ impl Render for BrowserView {
                                             ?error,
                                             "present browser DMA-BUF passthrough"
                                         );
+                                        record_handoff_event(0, "pt-present-failed", scene_id);
                                         passthrough_failed.set(true);
                                         state = PassthroughPaintState::default();
                                         let passthrough = passthrough.clone();
