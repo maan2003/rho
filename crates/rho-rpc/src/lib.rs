@@ -670,12 +670,29 @@ where
     R: AsyncRead + Unpin,
     T: Unpacker,
 {
-    let (payload, ()) = read_frame_with(reader, max_len, |_| async {}).await?;
+    read_frame_optional(reader, max_len)
+        .await?
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::UnexpectedEof).into())
+}
+
+/// Reads and decodes one bounded frame, returning `None` only for clean EOF
+/// before any bytes of the next decompressed length prefix.
+pub async fn read_frame_optional<R, T>(
+    reader: &mut R,
+    max_len: usize,
+) -> anyhow::Result<Option<(T, usize)>>
+where
+    R: AsyncRead + Unpin,
+    T: Unpacker,
+{
+    let Some((payload, ())) = read_frame_with_optional(reader, max_len, |_| async {}).await? else {
+        return Ok(None);
+    };
     let len = payload.len();
     let mut payload = payload.as_slice();
     let value = senax_encoder::unpack(&mut payload).context("unpack protocol frame")?;
     anyhow::ensure!(payload.is_empty(), "trailing bytes in protocol frame");
-    Ok((value, len))
+    Ok(Some((value, len)))
 }
 
 /// Reads one bounded frame while allowing a caller to reserve its declared
@@ -854,6 +871,46 @@ mod tests {
             .unwrap();
         let (message, _): (String, _) = read_frame(&mut receiver, 1024).await.unwrap();
         assert_eq!(message, "hello zstd");
+    }
+
+    #[tokio::test]
+    async fn clean_stream_shutdown_after_frame_returns_eof() {
+        let (left, right) = tokio::io::duplex(4096);
+        let (_, mut writer) = Stream::new(tokio::io::empty(), left).into_split();
+        let (mut reader, _) = Stream::new(right, tokio::io::sink()).into_split();
+
+        write_frame(&mut writer, &"last frame".to_owned(), 1024)
+            .await
+            .unwrap();
+        writer.shutdown().await.unwrap();
+
+        let (message, _): (String, _) = read_frame(&mut reader, 1024).await.unwrap();
+        assert_eq!(message, "last frame");
+        assert!(
+            read_frame_optional::<_, String>(&mut reader, 1024)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn unfinished_zstd_stream_after_frame_is_an_error() {
+        let (left, right) = tokio::io::duplex(4096);
+        let (_, mut writer) = Stream::new(tokio::io::empty(), left).into_split();
+        let (mut reader, _) = Stream::new(right, tokio::io::sink()).into_split();
+
+        write_frame(&mut writer, &"last frame".to_owned(), 1024)
+            .await
+            .unwrap();
+        drop(writer);
+
+        let (message, _): (String, _) = read_frame(&mut reader, 1024).await.unwrap();
+        assert_eq!(message, "last frame");
+        let error = read_frame_optional::<_, String>(&mut reader, 1024)
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("zstd stream did not finish"));
     }
 
     #[tokio::test]

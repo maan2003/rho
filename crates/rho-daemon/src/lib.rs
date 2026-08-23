@@ -1700,15 +1700,23 @@ where
     let result = loop {
         let message = match first.take() {
             Some(message) => message,
-            None => match read_frame::<_, ClientMessage>(&mut reader).await {
-                Ok(message) => message,
-                Err(error) => {
-                    for (repo, _) in &land_leases {
-                        agents.clear_land_holder(repo).await;
+            None => {
+                match rho_ui_proto::read_frame_optional::<_, ClientMessage>(&mut reader).await {
+                    Ok(Some(message)) => message,
+                    Ok(None) => {
+                        for (repo, _) in &land_leases {
+                            agents.clear_land_holder(repo).await;
+                        }
+                        break Ok(());
                     }
-                    break Err(error);
+                    Err(error) => {
+                        for (repo, _) in &land_leases {
+                            agents.clear_land_holder(repo).await;
+                        }
+                        break Err(error);
+                    }
                 }
-            },
+            }
         };
         match handle_message(
             &agents,

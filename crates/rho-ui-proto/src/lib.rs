@@ -927,6 +927,18 @@ where
         .map(|(value, _)| value)
 }
 
+/// Read and decode one frame, returning `None` after a cleanly finished
+/// compressed stream at a frame boundary.
+pub async fn read_frame_optional<R, T>(reader: &mut R) -> anyhow::Result<Option<T>>
+where
+    R: AsyncRead + Unpin,
+    T: Unpacker,
+{
+    rho_rpc::read_frame_optional(reader, MAX_FRAME_LEN)
+        .await
+        .map(|frame| frame.map(|(value, _)| value))
+}
+
 /// Read and decode one frame with a protocol-specific bound smaller than the
 /// global UI-frame ceiling.
 pub async fn read_frame_limited<R, T>(reader: &mut R, max_len: usize) -> anyhow::Result<T>

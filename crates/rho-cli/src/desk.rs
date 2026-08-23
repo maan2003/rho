@@ -70,6 +70,7 @@ async fn cat(socket_path: &Path) -> Result<()> {
         match client.recv().await? {
             ServerMessage::DeskDocument { text } => {
                 print!("{text}");
+                client.shutdown().await?;
                 return Ok(());
             }
             ServerMessage::Error { message } => bail!("{message}"),
@@ -127,6 +128,7 @@ async fn checkout(socket_path: &Path, file: &Path, agent: Option<String>) -> Res
                     base_path.display()
                 );
                 println!("edit the file, then run: rho desk apply {}", file.display());
+                client.shutdown().await?;
                 return Ok(());
             }
             ServerMessage::Error { message } => bail!("{message}"),
@@ -169,6 +171,7 @@ async fn apply(socket_path: &Path, file: &Path) -> Result<()> {
                 base.snapshot.text = new_text;
                 write_base(&base_path, &base)?;
                 println!("applied desk edit (sequence {})", record.sequence);
+                client.shutdown().await?;
                 return Ok(());
             }
             ServerMessage::Error { message } => bail!("{message}"),
