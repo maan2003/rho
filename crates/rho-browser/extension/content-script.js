@@ -26,7 +26,7 @@
   let hintRefreshPending = false;
   let ignoreKeyEventsUntil = 0;
   let captureKey;
-  let caretSelecting = false;
+  let captureTimer;
   const scrollMarks = new Map();
   const scrollJumpList = [];
   let scrollJumpIndex = -1;
@@ -458,13 +458,27 @@
     return Boolean(hadFocusedControl);
   }
 
+  function blurActivePageControl() {
+    const focused = activeElement();
+    if (focused && focused !== document.body && focused !== document.documentElement) {
+      focused.blur?.();
+    }
+  }
+
   function copyText(text) {
     navigator.clipboard?.writeText(String(text)).catch(() => {});
   }
 
   function startKeyCapture(callback) {
+    clearTimeout(captureTimer);
     captureKey = callback;
     setMode("capture");
+    captureTimer = setTimeout(() => {
+      if (mode !== "capture" || captureKey !== callback) return;
+      captureKey = undefined;
+      captureTimer = undefined;
+      setMode("normal");
+    }, INPUT_TIMEOUT_MS);
   }
 
   function markScrollPosition(key) {
@@ -496,46 +510,35 @@
   const PREVIOUS_PATTERNS = ["prev", "previous", "‹", "«", "◀", "←", "<<", "<", "back", "newer"];
   const NEXT_PATTERNS = ["next", "›", "»", "▶", "→", ">>", ">", "more", "older"];
 
-  function followPattern(patterns) {
+  function followPattern(relation, patterns) {
+    const related = document.querySelector(`link[rel~="${relation}"][href], a[rel~="${relation}"][href]`);
+    if (related) {
+      if (related.localName === "link") location.assign(related.href);
+      else clickCurrent(related);
+      return;
+    }
     const candidates = [...document.querySelectorAll("a, button, input[type='button']")];
-    for (const element of candidates) {
+    const ranked = [];
+    for (const [order, element] of candidates.entries()) {
       if (!elementRect(element)) continue;
-      const text = [
+      const fields = [
         element.innerText,
         element.value,
-        element.rel,
         element.getAttribute("role"),
         element.getAttribute("aria-label"),
         element.getAttribute("data-tooltip"),
-      ].filter(Boolean).join(" ").trim().toLowerCase();
-      if (patterns.some((pattern) => text === pattern
-          || (pattern.length > 2 && text.includes(pattern)))) {
-        clickCurrent(element);
-        return;
+      ].filter(Boolean).map((value) => value.trim().toLowerCase());
+      let score = 0;
+      for (const field of fields) {
+        if (patterns.includes(field)) score = Math.max(score, 2);
+        else if (patterns.some((pattern) => pattern.length > 2 && field.includes(pattern))) {
+          score = Math.max(score, 1);
+        }
       }
+      if (score) ranked.push({ element, score, order });
     }
-  }
-
-  function setCaretAt(element, select = false) {
-    const selection = getSelection();
-    if (!selection) return;
-    const range = document.createRange();
-    range.selectNodeContents(element);
-    if (!select) range.collapse(true);
-    selection.removeAllRanges();
-    selection.addRange(range);
-    caretSelecting = select;
-    setMode("caret");
-  }
-
-  function moveCaret(direction, granularity) {
-    getSelection()?.modify(caretSelecting ? "extend" : "move", direction, granularity);
-  }
-
-  function leaveCaret({ copy = false } = {}) {
-    if (copy) copyText(getSelection()?.toString() ?? "");
-    caretSelecting = false;
-    setMode("normal");
+    ranked.sort((a, b) => b.score - a.score || a.order - b.order);
+    if (ranked[0]) clickCurrent(ranked[0].element);
   }
 
   function toggleHelp() {
@@ -546,7 +549,7 @@
     }
     const help = document.createElement("pre");
     help.id = "__rho_vim_help";
-    help.textContent = `Rho Vim / VimFx\n\nScroll  h j k l  d u  Space  gg G  0 ^ $\nHistory H L   Reload r/R   Stop s\nHints   f  yf copy  ef focus  ec context  v/av/yv text\nInputs  gi   Ignore i   Quote I\nMarks   m{key}  '{key}  g[ g]\nPath    gu gU   Copy URL yy\nCaret   h j k l b w 0 ^ $ v o y Esc\nHelp    ?`;
+    help.textContent = `Rho Vim / VimFx\n\nScroll  h j k l  d u  Space  gg G  0 ^ $\nHistory H L   Reload r/R   Stop s\nHints   f  yf copy  ef focus  ec context\nInputs  gi   Ignore i   Quote I\nMarks   m{key}  '{key}  g[ g]\nPath    gu gU   Copy URL yy\nHelp    ?`;
     Object.assign(help.style, {
       all: "initial",
       whiteSpace: "pre",
@@ -727,8 +730,32 @@
     return items;
   }
 
+  function contextMenuElements() {
+    const items = actionableElements();
+    const seen = new Set(items.map((item) => item.element));
+    for (const root of walkRoots()) {
+      for (const element of root.querySelectorAll("img, audio, video, canvas, embed, object")) {
+        if (seen.has(element)) continue;
+        const shape = elementShape(root, element);
+        if (!shape) continue;
+        seen.add(element);
+        items.push({
+          element,
+          rect: shape.rect,
+          text: elementText(element),
+          scrollable: false,
+          weight: Math.max(1, shape.area),
+        });
+      }
+    }
+    for (const item of selectableTextElements()) {
+      if (!seen.has(item.element)) items.push(item);
+    }
+    return items;
+  }
+
   function hintElementsForAction(action) {
-    if (["caret", "select", "copy-text"].includes(action)) return selectableTextElements();
+    if (action === "context") return contextMenuElements();
     const items = actionableElements();
     if (action === "copy") {
       return items.filter((item) => item.element.href || isTypingElement(item.element));
@@ -855,20 +882,18 @@
         clientX: item.rect.left + 1,
         clientY: item.rect.top + item.rect.height / 2,
       }));
-    } else if (action === "caret" || action === "select" || action === "copy-text") {
-      setCaretAt(item.element, action !== "caret");
-      if (action === "copy-text") leaveCaret({ copy: true });
     } else if (isTypingElement(item.element) || item.element.matches("select")) {
       item.element.focus();
-      item.element.select?.();
     } else if (item.scrollable) {
       if (!item.element.hasAttribute("tabindex")) item.element.tabIndex = -1;
       item.element.focus({ preventScroll: true });
     } else {
       clickCurrent(item.element);
     }
-    if (action === "multiple" && hintCount > 1) {
-      setTimeout(() => startHints("multiple", hintCount - 1), 200);
+    const canRepeat = ["copy", "focus", "context"].includes(action)
+      || (action === "current" && !item.element.href);
+    if (canRepeat && hintCount > 1) {
+      setTimeout(() => startHints(action, hintCount - 1), 200);
     }
   }
 
@@ -1120,27 +1145,29 @@
     }),
     m: command(() => startKeyCapture(markScrollPosition)),
     "'": command(() => startKeyCapture(jumpToScrollMark)),
-    "[": command(() => followPattern(PREVIOUS_PATTERNS)),
-    "]": command(() => followPattern(NEXT_PATTERNS)),
+    "[": command(() => followPattern("prev", PREVIOUS_PATTERNS)),
+    "]": command(() => followPattern("next", NEXT_PATTERNS)),
     // VimFx parity TODO(rhoPrivate.vim.find):
     // "/": command(() => nativeFind({})),
     // n: command(() => nativeFindAgain(false)),
     // N: command(() => nativeFindAgain(true)),
-    v: command(() => startHints("caret")),
+    // VimFx parity TODO(rhoPrivate.vim.caret): expose Chromium's native caret
+    // browsing controller, then restore v/av/yv and Caret-mode bindings here.
+    // v: command(() => nativeCaret({ select: false })),
     "?": command(() => toggleHelp()),
     y: {
       y: command(() => copyText(location.href)),
-      f: command(() => startHints("copy")),
-      v: command(() => startHints("copy-text")),
+      f: command((amount) => startHints("copy", amount)),
+      // v: command(() => nativeCaretCopy()),
       // t: duplicate tab requires a Desk-owned PageId.
     },
     e: {
-      f: command(() => startHints("focus")),
-      c: command(() => startHints("context")),
+      f: command((amount) => startHints("focus", amount)),
+      c: command((amount) => startHints("context", amount)),
       // t/w/p: tab/window/private-window actions require Desk page creation.
     },
     a: {
-      v: command(() => startHints("select")),
+      // v: command(() => nativeCaret({ select: true })),
       // f: multi-follow requires managed background-page creation.
       // "/": command(() => nativeFind({ highlightAll: true })),
       r: command(() => runBrowserCommand("reload-all", 1)),
@@ -1208,57 +1235,6 @@
     return false;
   }
 
-  function handleCaretKey(event) {
-    const key = keyName(event);
-    const moves = {
-      h: ["backward", "character"],
-      l: ["forward", "character"],
-      j: ["forward", "line"],
-      k: ["backward", "line"],
-      b: ["backward", "word"],
-      w: ["forward", "word"],
-      0: ["backward", "lineboundary"],
-      "^": ["backward", "lineboundary"],
-      "$": ["forward", "lineboundary"],
-    };
-    if (moves[key]) {
-      const amount = Math.max(1, count ? Number(count) : 1);
-      for (let index = 0; index < amount; index += 1) moveCaret(...moves[key]);
-      count = "";
-      return true;
-    }
-    if (/^\d$/.test(key) && !(key === "0" && !count)) {
-      count = String(Math.min(9999, Number(`${count}${key}`)));
-      return true;
-    }
-    count = "";
-    if (key === "v") {
-      caretSelecting = !caretSelecting;
-      return true;
-    }
-    if (key === "o") {
-      const selection = getSelection();
-      if (selection && !selection.isCollapsed) {
-        const range = selection.getRangeAt(0);
-        const end = range.cloneRange();
-        end.collapse(caretSelecting);
-        selection.removeAllRanges();
-        selection.addRange(end);
-      }
-      caretSelecting = true;
-      return true;
-    }
-    if (key === "y") {
-      leaveCaret({ copy: true });
-      return true;
-    }
-    if (key === "Escape") {
-      leaveCaret();
-      return true;
-    }
-    return false;
-  }
-
   function onKeyDown(event) {
     if (!event.isTrusted) return;
     const disposition = keyDispositions.get(event.code);
@@ -1280,14 +1256,11 @@
       const key = keyName(event);
       if (!key) return;
       if (key !== "Escape" && key.length === 1) captureKey?.(key);
+      clearTimeout(captureTimer);
       captureKey = undefined;
+      captureTimer = undefined;
       setMode("normal");
       consume(event);
-      return;
-    }
-
-    if (mode === "caret") {
-      if (handleCaretKey(event)) consume(event);
       return;
     }
 
@@ -1300,6 +1273,7 @@
         }
       } else if (!event.ctrlKey && !event.altKey && !event.metaKey && event.shiftKey
                  && event.key === "Escape") {
+        if (ignoreReason !== "focus") blurActivePageControl();
         ignoreRemaining = undefined;
         ignoreReason = undefined;
         setMode("normal");
@@ -1307,6 +1281,7 @@
         consume(event);
       } else if (!event.ctrlKey && !event.altKey && !event.metaKey
                  && event.shiftKey && event.key === "F1") {
+        if (ignoreReason !== "focus") blurActivePageControl();
         returnToIgnore = true;
         setMode("normal");
         resetInput();

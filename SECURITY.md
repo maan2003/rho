@@ -142,8 +142,8 @@ AI APIs.
   consumes matched commands, active prefixes/counts, and unmodified Hints-mode
   input; unmatched top-level keys and focused-control conflicts continue to the
   website as their original trusted events. The page agent performs nested
-  native smooth scrolling, focus, visible-element label/text hints, caret, and
-  scroll marks locally. Find remains disabled pending native browser integration.
+  native smooth scrolling, focus, visible-element label/text hints, and scroll
+  marks locally. Find and Caret remain disabled pending native browser integration.
   Hint candidate text is not persisted or sent to the worker. An explicit `gB`
   command stores only the page origin in
   extension-local blacklist state.

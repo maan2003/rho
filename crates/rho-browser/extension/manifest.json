@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Rho Browser Pages",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "description": "Rho's bundled page registry and per-document Vim agent.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAlqFwF6BhEbCZbtyp8iSzvfbWNjLraa46jB4DDAF+qXi4Xf8c63qFrJOp7vu5usVj7ogt4951N5Dn7uPUQdVnT7MWz3jTfQvwBJ4NoY7BXvTTesFjSSb1rmCWXXXqHpZLCBtr2fPktW8SFDpAhcCgxMJboEtnWq3eKGBpJPca9sSZBKPhk06VTqTErAUwwQ0cTQvEhpf1G2mW6crGtO6tgfpJtqpr3mZMxVfK/E5DPmgT8T4bIsObGEGJ9GAQB2mbdbK1UoNdDIja10zoX6joAv4ou4NYSrdGKtj37SyhvHzAv7maKlY99kECpaMo0eXxMmm4NjDsVw81TQueSfot8wIDAQAB",
   "permissions": ["clipboardWrite", "nativeMessaging", "storage", "tabs"],
