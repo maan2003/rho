@@ -90,10 +90,9 @@ pub struct DealQueue {
     pub cards: Vec<DealCard>,
     /// Number of live headings whose winning mark is above the queue floor.
     pub total_alive: usize,
-    /// Number selected by global priority, excluding the Random tail.
+    /// Number selected by global priority.
     pub dealt_count: usize,
     priority_topics: HashSet<(HostId, usize)>,
-    random_topics: HashSet<(HostId, usize)>,
 }
 
 impl DealQueue {
@@ -103,12 +102,7 @@ impl DealQueue {
         let Some(offset) = card.heading_offset else {
             return false;
         };
-        let topic = (card.host, offset);
-        if card.label == "random" {
-            self.random_topics.contains(&topic)
-        } else {
-            self.priority_topics.contains(&topic)
-        }
+        self.priority_topics.contains(&(card.host, offset))
     }
 }
 
@@ -510,7 +504,6 @@ impl Dashboard {
         &mut self,
         registry: &AgentRegistry,
         now: chrono::DateTime<chrono::FixedOffset>,
-        seed: u64,
         cx: &mut Context<Workspace>,
     ) {
         let documents = self
@@ -518,7 +511,7 @@ impl Dashboard {
             .keys()
             .filter_map(|host| self.source_text(*host, cx).map(|text| (*host, text)))
             .collect::<Vec<_>>();
-        let queue = assemble_deal_queue(&documents, &deal_agent_facts(registry), now, seed);
+        let queue = assemble_deal_queue(&documents, &deal_agent_facts(registry), now);
         if self
             .deal
             .as_ref()
@@ -1181,12 +1174,8 @@ impl Dashboard {
             || self.queue_depth_revision != Some(deal_revision)
             || self.queue_depth_minute != Some(minute)
         {
-            let queue = assemble_deal_queue(
-                &documents,
-                &deal_agent_facts(registry),
-                now.fixed_offset(),
-                0,
-            );
+            let queue =
+                assemble_deal_queue(&documents, &deal_agent_facts(registry), now.fixed_offset());
             self.queue_depth = DealQueueDepth {
                 dealt_count: queue.dealt_count,
                 total_alive: queue.total_alive,
@@ -4032,7 +4021,6 @@ pub fn assemble_deal_queue(
     documents: &[(HostId, String)],
     agent_facts: &[DealAgentFacts],
     now: chrono::DateTime<chrono::FixedOffset>,
-    seed: u64,
 ) -> DealQueue {
     use rho_ui_proto::desk::temporal::priority;
 
@@ -4233,54 +4221,18 @@ pub fn assemble_deal_queue(
             .then_with(|| b.virtual_reply.cmp(&a.virtual_reply))
             .then_with(|| a.order.cmp(&b.order))
     });
-    let mut cards = ranked
+    let cards = ranked
         .into_iter()
         .take(DEAL_PRIORITY_CUTOFF)
         .map(|ranked| ranked.card)
         .collect::<Vec<_>>();
     let dealt_count = cards.len();
-    let dealt_topics = cards
-        .iter()
-        .filter_map(|card| card.heading_offset.map(|offset| (card.host, offset)))
-        .collect::<HashSet<_>>();
-
-    let random_topics = heading_rows
-        .iter()
-        .filter(|row| !row.gated)
-        .map(|row| (row.host, row.heading.heading_range.start))
-        .collect::<HashSet<_>>();
-    let mut random_pool = heading_rows
-        .iter()
-        .filter(|row| {
-            !row.gated && !dealt_topics.contains(&(row.host, row.heading.heading_range.start))
-        })
-        .collect::<Vec<_>>();
-    if !random_pool.is_empty() {
-        let mut mixed = seed.wrapping_add(0x9e3779b97f4a7c15);
-        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
-        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d049bb133111eb);
-        mixed ^= mixed >> 31;
-        let row = random_pool.swap_remove(mixed as usize % random_pool.len());
-        let agent_id = row.agents.first().copied();
-        cards.push(DealCard {
-            label: "random".to_owned(),
-            priority: f64::NEG_INFINITY,
-            host: row.host,
-            heading_offset: Some(row.heading.heading_range.start),
-            agent_id,
-            agent_tag: agent_id
-                .and_then(|agent| by_id.get(&agent))
-                .map(|agent| agent.tag.clone()),
-            breadcrumb: row.breadcrumb.clone(),
-        });
-    }
 
     DealQueue {
         cards,
         total_alive,
         dealt_count,
         priority_topics,
-        random_topics,
     }
 }
 
@@ -4731,7 +4683,7 @@ mod tests {
             "* One-day ripe todo\n:todo: 2026-08-15 7d\n* Blocked :eng-{}:\n",
             &blocked.agent_id.encoded()[..4]
         );
-        let queue = assemble_deal_queue(&[(host, text)], &deal_agent_facts(&reg), now, 0);
+        let queue = assemble_deal_queue(&[(host, text)], &deal_agent_facts(&reg), now);
         assert_eq!(queue.cards[0].label, "blocked · 0h");
         assert_eq!(queue.cards[0].priority, 1.0);
         assert_eq!(queue.cards[1].label, "todo · ripe 1d");
@@ -4745,7 +4697,7 @@ mod tests {
             "* Three-day ripe todo\n:todo: 2026-08-13 7d\n* Blocked :eng-{}:\n",
             &blocked.agent_id.encoded()[..4]
         );
-        let queue = assemble_deal_queue(&[(host, text)], &deal_agent_facts(&reg), now, 0);
+        let queue = assemble_deal_queue(&[(host, text)], &deal_agent_facts(&reg), now);
         assert_eq!(queue.cards[0].label, "todo · ripe 3d");
         assert_eq!(queue.cards[0].priority, 3.0);
         assert_eq!(queue.cards[1].label, "blocked · 2h");
@@ -4772,7 +4724,7 @@ mod tests {
             "* Ripe todo\n:todo: 2026-08-16 7d\n* Reminder\n:reminder: 2026-08-23\n* FYI :eng-{}:\n",
             &fyi.agent_id.encoded()[..4]
         );
-        let queue = assemble_deal_queue(&[(host, text.clone())], &deal_agent_facts(&reg), now, 0);
+        let queue = assemble_deal_queue(&[(host, text.clone())], &deal_agent_facts(&reg), now);
         let fyi_card = queue.cards.iter().find(|card| card.label == "fyi").unwrap();
         let reminder = queue
             .cards
@@ -4795,13 +4747,14 @@ mod tests {
         fyi.facts.last_turn_ended = Some(UnixMs(
             (now.timestamp_millis() - chrono::Duration::days(3).num_milliseconds()) as u64,
         ));
+        let fyi_id = fyi.agent_id;
         let (reg, _) = registry(vec![fyi]);
-        let queue = assemble_deal_queue(&[(host, text)], &deal_agent_facts(&reg), now, 0);
-        assert!(queue.cards.iter().all(|card| card.label != "fyi"));
+        let queue = assemble_deal_queue(&[(host, text)], &deal_agent_facts(&reg), now);
+        assert!(queue.cards.iter().all(|card| card.agent_id != Some(fyi_id)));
     }
 
     #[test]
-    fn floor_cutoff_random_tail_and_liveness_are_distinct() {
+    fn floor_cutoff_returns_only_the_top_eight_live_claims() {
         let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
             .unwrap()
             .and_hms_opt(12, 0, 0)
@@ -4814,11 +4767,10 @@ mod tests {
         }
         text.push_str("* At floor\n:todo: 2026-08-15 9d\n");
         let host = HostId(1);
-        let queue = assemble_deal_queue(&[(host, text)], &[], now, 7);
+        let queue = assemble_deal_queue(&[(host, text)], &[], now);
         assert_eq!(queue.total_alive, 10);
         assert_eq!(queue.dealt_count, DEAL_PRIORITY_CUTOFF);
-        assert_eq!(queue.cards.len(), DEAL_PRIORITY_CUTOFF + 1);
-        assert_eq!(queue.cards.last().unwrap().label, "random");
+        assert_eq!(queue.cards.len(), DEAL_PRIORITY_CUTOFF);
         let ninth_ranked = DealCard {
             label: "todo".into(),
             priority: 0.0,
@@ -4858,7 +4810,7 @@ mod tests {
 :defer: 2026-08-22 1d
 :deadline: 2020-01-01
 ";
-        let queue = assemble_deal_queue(&[(HostId(1), text.to_owned())], &[], now, 0);
+        let queue = assemble_deal_queue(&[(HostId(1), text.to_owned())], &[], now);
         assert!(queue.cards.iter().any(|card| card.breadcrumb == "Alive"));
         assert!(queue.cards.iter().all(|card| {
             ![

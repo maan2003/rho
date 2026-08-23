@@ -5368,9 +5368,7 @@ impl Workspace {
             }
         } else {
             let now = chrono::Local::now().fixed_offset();
-            let seed = now.timestamp_nanos_opt().unwrap_or_default() as u64;
-            self.dashboard
-                .enter_deal_mode(&self.registry, now, seed, cx);
+            self.dashboard.enter_deal_mode(&self.registry, now, cx);
             self.deal_help_visible = self.dashboard.deal_mode();
             if self.dashboard.deal_mode()
                 && let Ok(action) = cx.build_action("vim::EnterDealMode", None)
@@ -7512,9 +7510,7 @@ impl Render for Workspace {
                 }
                 this.dashboard.discard_deal_session(cx);
                 let now = chrono::Local::now().fixed_offset();
-                let seed = now.timestamp_nanos_opt().unwrap_or_default() as u64;
-                this.dashboard
-                    .enter_deal_mode(&this.registry, now, seed, cx);
+                this.dashboard.enter_deal_mode(&this.registry, now, cx);
                 this.deal_help_visible = true;
                 this.refresh_dashboard(window, cx);
             }))

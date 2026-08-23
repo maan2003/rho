@@ -4666,7 +4666,7 @@ fn desk_verdict_keys_write_dated_properties(cx: &mut TestAppContext) {
 fn desk_deal_verdict_advances_to_empty_and_exit_restores_document(cx: &mut TestAppContext) {
     use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
 
-    let original = "* Finished\n:done: 2026-01-01\n* One";
+    let original = "* Finished\n:done: 2026-01-01\n* One\n:todo: 2000-01-01 1d";
     let mut source =
         text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
     let operation = DeskOperation::from_text(&source.edit([(0..0, original)]));
@@ -4769,7 +4769,7 @@ fn desk_deal_verdict_advances_to_empty_and_exit_restores_document(cx: &mut TestA
                 .unwrap()
                 .read(cx)
                 .text();
-            assert_eq!(raw, "preface\n* Finished\n:done: 2026-01-01\n* One");
+            assert_eq!(raw, format!("preface\n{original}"));
             assert_eq!(
                 workspace.dashboard_deal_topic_for_test(),
                 Some((
@@ -5357,7 +5357,10 @@ fn desk_deal_reply_draft_is_writable_while_desk_source_stays_read_only(cx: &mut 
         turn_report: None,
         labels: Vec::new(),
     };
-    let original = format!("* Reply target :eng-{}:\nAgent body.\n", agent_id.encoded());
+    let original = format!(
+        "* Reply target :eng-{}:\n:todo: 2000-01-01 1d\nAgent body.\n",
+        agent_id.encoded()
+    );
     let mut source =
         text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
     let operation = DeskOperation::from_text(&source.edit([(0..0, original.as_str())]));
