@@ -3560,13 +3560,8 @@ fn deal_agent_facts(registry: &AgentRegistry) -> Vec<DealAgentFacts> {
         .collect()
 }
 
-fn reply_priority(
-    ended: rho_core::UnixMs,
-    hinted: bool,
-    now: chrono::DateTime<chrono::FixedOffset>,
-) -> f64 {
-    let elapsed_days = (now.timestamp_millis() - ended.0 as i64) as f64 / 86_400_000.0;
-    elapsed_days - if hinted { 0.25 } else { 7.0 }
+fn reply_priority(ended: rho_core::UnixMs, now: chrono::DateTime<chrono::FixedOffset>) -> f64 {
+    (now.timestamp_millis() - ended.0 as i64) as f64 / 86_400_000.0
 }
 
 /// Builds one deterministic deal from Desk text and per-agent facts. Text order
@@ -3678,7 +3673,7 @@ pub fn assemble_deal_queue(
                 agent.agent_id,
                 ended,
                 agent.facts.needs_you_hint,
-                reply_priority(ended, agent.facts.needs_you_hint, now),
+                reply_priority(ended, now),
             ))
         })
         .collect::<Vec<_>>();
@@ -4461,7 +4456,7 @@ mod tests {
     }
 
     #[test]
-    fn unsurfaced_owed_child_keeps_filed_ancestor_out_of_random() {
+    fn owed_child_filed_on_ancestor_appears_once_outside_random() {
         let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
             .unwrap()
             .and_hms_opt(12, 0, 0)
@@ -4476,17 +4471,20 @@ mod tests {
             last_user_message_at: UnixMs(0),
             needs_you_hint: false,
         };
-        let (reg, host) = registry(vec![root.clone(), child]);
+        let (reg, host) = registry(vec![root.clone(), child.clone()]);
         let text = format!(
             "* Parent :eng-{}:
 ",
             &root.agent_id.encoded()[..4]
         );
-        assert!(assemble_deal_queue(&[(host, text)], &deal_agent_facts(&reg), now, 1).is_empty());
+        let cards = assemble_deal_queue(&[(host, text)], &deal_agent_facts(&reg), now, 1);
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].agent_id, Some(child.agent_id));
+        assert_eq!(cards[0].section, DealSection::Finished);
     }
 
     #[test]
-    fn reply_hint_changes_pace_not_owed_status_and_heading_gates_apply() {
+    fn reply_hint_changes_section_not_owed_status_and_heading_gates_apply() {
         let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
             .unwrap()
             .and_hms_opt(12, 0, 0)
@@ -4507,11 +4505,8 @@ mod tests {
 ",
             &owed.agent_id.encoded()[..4]
         );
-        assert!(
-            assemble_deal_queue(&[(host, plain.clone())], &deal_agent_facts(&reg), now, 1)
-                .iter()
-                .all(|card| !matches!(card.section, DealSection::NeedsYou | DealSection::Finished))
-        );
+        let cards = assemble_deal_queue(&[(host, plain.clone())], &deal_agent_facts(&reg), now, 1);
+        assert_eq!(cards[0].section, DealSection::Finished);
 
         owed.facts.needs_you_hint = true;
         let (reg, _) = registry(vec![owed.clone()]);
