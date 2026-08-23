@@ -14,7 +14,10 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 
-use editor::{Editor, EditorMode, HighlightKey, Inlay, SizingBehavior};
+use editor::scroll::Autoscroll;
+use editor::{
+    Editor, EditorMode, HighlightKey, Inlay, RowHighlightOptions, SelectionEffects, SizingBehavior,
+};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, Focusable as _, HighlightStyle, WeakEntity, Window};
 use language::{Buffer, Capability, InlayId, Point};
@@ -65,6 +68,9 @@ type ArchiveEdits = (Vec<(Range<usize>, String)>, usize);
 
 const DEAL_SURFACE_THRESHOLD: f64 = -0.01;
 const DEAL_RESURFACED_CAP: usize = 10;
+const DEAL_HINT: &str = "o open · r reply · d done · a archive · f{f,3,7,0} defer · x discard · s tomorrow · n next · q quit";
+
+struct DealCardHighlight;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DealSection {
@@ -132,8 +138,6 @@ enum LineKey {
     NewDraft(Option<(HostId, usize)>),
     /// An empty line separating listing regions.
     Spacer(HostId),
-    DealBreadcrumb,
-    DealHint,
 }
 
 /// One place an agent's shared runtime row is projected. The occurrence is
@@ -985,23 +989,19 @@ impl Dashboard {
         } else {
             self.effective_fold_ranges(&documents, &collapsed, cx)
         };
-        let segments = if let Some(deal) = &self.deal {
-            generate_deal(registry, &documents, &filed, deal, &self.replies)
-        } else {
-            generate(
-                registry,
-                &documents,
-                &filed,
-                &fold_ranges,
-                ListingVisibility {
-                    collapsed_unfiled: &self.collapsed_unfiled,
-                    expanded_portals: &self.expanded_portals,
-                    raw: self.raw_mode,
-                },
-                &self.replies,
-                draft_topic,
-            )
-        };
+        let segments = generate(
+            registry,
+            &documents,
+            &filed,
+            &fold_ranges,
+            ListingVisibility {
+                collapsed_unfiled: &self.collapsed_unfiled,
+                expanded_portals: &self.expanded_portals,
+                raw: self.raw_mode,
+            },
+            &self.replies,
+            draft_topic,
+        );
         // Staffed headings wear their agents as end-of-line inlays, not
         // rows, so the decoration strings join the fingerprint: attention
         // changes must not vanish into the early-out.
@@ -1191,9 +1191,6 @@ impl Dashboard {
         // A section's trailing blank lines hide behind a final rowless
         // cut, so the listing's spacers control the spacing after it.
         for (section, (last_end, host_len)) in spec.sections.iter_mut().zip(&section_ends) {
-            if self.deal.is_some() {
-                section.end = Some(*last_end);
-            }
             if last_end < host_len {
                 section.cuts.push(CutSpec {
                     id: u64::MAX,
@@ -1307,6 +1304,8 @@ impl Dashboard {
         self.apply_heading_chrome(&decorations, &fold_ranges, cx);
         self.apply_tag_conceals(&conceals, cx);
         self.apply_subtree_folds(&fold_ranges, cx);
+        self.apply_sticky_headings(&documents, cx);
+        self.apply_deal_highlight(&documents, cx);
         self.nudge_caret_off_folds(window, cx);
         self.last_synced = Some((
             documents,
@@ -1348,7 +1347,12 @@ impl Dashboard {
             return;
         };
         self.editor.update(cx, |editor, cx| {
-            editor.change_selections(Default::default(), window, cx, |selections| {
+            let effects = if self.deal.is_some() {
+                SelectionEffects::scroll(Autoscroll::top_relative(2.))
+            } else {
+                Default::default()
+            };
+            editor.change_selections(effects, window, cx, |selections| {
                 selections.select_anchor_ranges([anchor..anchor]);
             });
         });
@@ -2248,13 +2252,76 @@ impl Dashboard {
     }
 
     pub fn hint(&self, _cx: &mut Context<Workspace>) -> String {
-        if self.deal.is_some() {
-            return format!("{} waiting · deal mode", self.deal_waiting());
+        if let Some(deal) = &self.deal {
+            return deal_hint(deal);
         }
         format!(
             "{} waiting · enter open · r reply · o staff · d/x verdict · Tab fold · gn attention",
             self.queue_depth
         )
+    }
+
+    /// Supplies Desk's org hierarchy to Zed's existing sticky-scroll renderer.
+    /// The source anchors survive ordinary edits; sync rebuilds the hierarchy
+    /// when headings themselves are added, removed, or reparented.
+    fn apply_sticky_headings(&self, documents: &[(HostId, String)], cx: &mut Context<Workspace>) {
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let mut ranges = Vec::new();
+        for (host, text) in documents {
+            let Some(buffer) = self.hosts.get(host).and_then(WeakEntity::upgrade) else {
+                continue;
+            };
+            let buffer = buffer.read(cx);
+            for heading in parse(text) {
+                let start = buffer.anchor_before(heading.heading_range.start);
+                let end = buffer.anchor_after(heading.subtree_range.end);
+                if let (Some(start), Some(end)) = (
+                    snapshot.anchor_in_excerpt(start),
+                    snapshot.anchor_in_excerpt(end),
+                ) {
+                    ranges.push(start..end);
+                }
+            }
+        }
+        self.editor.update(cx, |editor, cx| {
+            editor.set_custom_sticky_header_ranges(Some(ranges), cx)
+        });
+    }
+
+    fn apply_deal_highlight(&self, documents: &[(HostId, String)], cx: &mut Context<Workspace>) {
+        let range = self.current_deal_card().and_then(|card| {
+            let offset = card.heading_offset?;
+            let (_, text) = documents.iter().find(|(host, _)| *host == card.host)?;
+            let heading = parse(text)
+                .into_iter()
+                .find(|heading| heading.heading_range.start == offset)?;
+            let buffer = self.hosts.get(&card.host)?.upgrade()?;
+            let buffer = buffer.read(cx);
+            let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+            Some(
+                snapshot.anchor_in_excerpt(buffer.anchor_before(heading.heading_range.start))?
+                    ..snapshot.anchor_in_excerpt(buffer.anchor_after(heading.subtree_range.end))?,
+            )
+        });
+        self.editor.update(cx, |editor, cx| {
+            editor.clear_row_highlights::<DealCardHighlight>();
+            if let Some(range) = range {
+                editor.highlight_rows::<DealCardHighlight>(
+                    range,
+                    |cx| {
+                        cx.theme()
+                            .colors()
+                            .editor_highlighted_line_background
+                            .into()
+                    },
+                    RowHighlightOptions {
+                        autoscroll: false,
+                        include_gutter: true,
+                    },
+                    cx,
+                );
+            }
+        });
     }
 
     fn apply_highlights(
@@ -3828,101 +3895,28 @@ pub fn assemble_deal_queue(
     cards
 }
 
-fn generate_deal(
-    registry: &AgentRegistry,
-    documents: &[(HostId, String)],
-    filed: &HashMap<(HostId, usize), Vec<AgentId>>,
-    deal: &DealSession,
-    replies: &[AgentId],
-) -> Vec<Segment> {
+fn deal_hint(deal: &DealSession) -> String {
     let Some(card) = deal.cards.get(deal.index) else {
-        let mut line = Line::new(LineKey::DealBreadcrumb, RowTarget::None);
-        line.span(Some(DashClass::Heading), |text| {
-            text.push_str(&format!(
-                "✓ Desk dealt — {} verdict{}",
-                deal.verdicts,
-                if deal.verdicts == 1 { "" } else { "s" }
-            ))
-        });
-        return vec![Segment::Line(line)];
-    };
-    let mut segments = Vec::new();
-    let mut crumb = Line::new(LineKey::DealBreadcrumb, RowTarget::None);
-    crumb.span(Some(DashClass::Muted), |text| {
-        let section_index = deal.cards[..deal.index]
-            .iter()
-            .filter(|candidate| candidate.section == card.section)
-            .count()
-            + 1;
-        let section_total = deal
-            .cards
-            .iter()
-            .filter(|candidate| candidate.section == card.section)
-            .count();
-        text.push_str(&format!(
-            "{} · {section_index}/{section_total}  {}",
-            card.section.label(),
-            card.breadcrumb
-        ));
-    });
-    segments.push(Segment::Line(crumb));
-    if let Some(offset) = card.heading_offset
-        && let Some((_, text)) = documents.iter().find(|(host, _)| *host == card.host)
-        && let Some(heading) = parse(text)
-            .into_iter()
-            .find(|heading| heading.heading_range.start == offset)
-    {
-        segments.push(Segment::Doc {
-            host: card.host,
-            range: heading.heading_range.clone(),
-            id: 0,
-        });
-        let roots = filed.get(&(card.host, offset)).cloned().unwrap_or_default();
-        let roots = if let Some(agent) = card.agent_id {
-            vec![agent]
-        } else {
-            roots
-        };
-        for root in roots {
-            let occurrence = AgentOccurrence::Filed {
-                host: card.host,
-                heading: offset as u64,
-                portal: root,
-            };
-            segments.extend(
-                agent_tree_lines(registry, &[root], occurrence, Some((card.host, offset)))
-                    .into_iter()
-                    .map(Segment::Line),
-            );
-            if replies.contains(&root) {
-                segments.push(Segment::Line(Line::new(
-                    LineKey::Reply(root),
-                    RowTarget::Reply(root),
-                )));
-            }
-        }
-        if heading.body_range.start < heading.subtree_range.end {
-            segments.push(Segment::Doc {
-                host: card.host,
-                range: heading.body_range.start..heading.subtree_range.end,
-                id: 1,
-            });
-        }
-    } else if let Some(agent) = card.agent_id {
-        let occurrence = AgentOccurrence::Unfiled {
-            host: card.host,
-            portal: agent,
-        };
-        segments.extend(
-            agent_tree_lines(registry, &[agent], occurrence, None)
-                .into_iter()
-                .map(Segment::Line),
+        return format!(
+            "✓ Desk dealt — {} verdict{} · q quit",
+            deal.verdicts,
+            if deal.verdicts == 1 { "" } else { "s" }
         );
-    }
-    let mut hint = Line::new(LineKey::DealHint, RowTarget::None);
-    hint.span(Some(DashClass::Muted), |text| text.push_str("o open · r reply · d done · a archive · f{f,3,7,0} defer · x discard · s tomorrow · n next · q quit"));
-    segments.push(Segment::Line(hint));
-    segments
+    };
+    let section_index = deal.cards[..deal.index]
+        .iter()
+        .filter(|candidate| candidate.section == card.section)
+        .count()
+        + 1;
+    let section_total = deal
+        .cards
+        .iter()
+        .filter(|candidate| candidate.section == card.section)
+        .count();
+    format!(
+        "{} · {section_index}/{section_total} · {DEAL_HINT}",
+        card.section.label()
+    )
 }
 
 /// Ends a document slice before a cut point's newline, so the synthetic
@@ -4604,7 +4598,7 @@ mod tests {
 
     #[test]
     fn deal_chrome_names_the_current_section_and_position() {
-        let (registry, host) = registry(Vec::new());
+        let host = HostId(1);
         let cards = vec![
             DealCard {
                 section: DealSection::Resurfaced,
@@ -4630,17 +4624,7 @@ mod tests {
             verdicts: 0,
             verdict_recorded: false,
         };
-        let segments = generate_deal(
-            &registry,
-            &[(host, "* One\n* Two\n".into())],
-            &HashMap::new(),
-            &deal,
-            &[],
-        );
-        let Segment::Line(chrome) = &segments[0] else {
-            panic!("missing chrome")
-        };
-        assert_eq!(chrome.text, "resurfaced · 2/2  Two");
+        assert!(deal_hint(&deal).starts_with("resurfaced · 2/2 · o open"));
     }
 
     #[test]

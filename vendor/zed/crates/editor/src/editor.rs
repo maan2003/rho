@@ -1325,6 +1325,7 @@ pub struct Editor {
     outline_symbols_at_cursor: Option<(BufferId, Vec<OutlineItem<Anchor>>)>,
     sticky_headers_task: Task<()>,
     sticky_headers: Option<Vec<OutlineItem<Anchor>>>,
+    custom_sticky_headers: Option<Vec<OutlineItem<Anchor>>>,
     pub(crate) colorize_brackets_task: Task<()>,
 }
 
@@ -2040,6 +2041,9 @@ impl Editor {
         if !self.mode.is_full() {
             return;
         }
+        if self.custom_sticky_headers.is_some() {
+            return;
+        }
         let multi_buffer = display_snapshot.buffer_snapshot().clone();
         let scroll_anchor = self
             .scroll_manager
@@ -2101,6 +2105,38 @@ impl Editor {
             })
             .ok();
         });
+    }
+
+    /// Uses the given structural ranges for sticky-scroll headers instead of
+    /// language outline items. Each range starts on the header row and ends at
+    /// the end of the region it owns. Passing `None` restores language-driven
+    /// sticky headers.
+    pub fn set_custom_sticky_header_ranges(
+        &mut self,
+        ranges: Option<Vec<Range<Anchor>>>,
+        cx: &mut Context<Self>,
+    ) {
+        let headers = ranges.map(|ranges| {
+            ranges
+                .into_iter()
+                .map(|range| OutlineItem {
+                    depth: 0,
+                    range: range.clone(),
+                    selection_range: range.start..range.start,
+                    source_range_for_text: range.start..range.start,
+                    text: Default::default(),
+                    highlight_ranges: Vec::new(),
+                    name_ranges: Vec::new(),
+                    body_range: None,
+                    annotation_range: None,
+                })
+                .collect::<Vec<_>>()
+        });
+        if self.custom_sticky_headers != headers {
+            self.sticky_headers = headers.clone();
+            self.custom_sticky_headers = headers;
+            cx.notify();
+        }
     }
 
     fn new_internal(
@@ -2740,6 +2776,7 @@ impl Editor {
             outline_symbols_at_cursor: None,
             sticky_headers_task: Task::ready(()),
             sticky_headers: None,
+            custom_sticky_headers: None,
             colorize_brackets_task: Task::ready(()),
         };
 

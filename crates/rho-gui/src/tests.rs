@@ -4666,10 +4666,10 @@ fn desk_verdict_keys_write_dated_properties(cx: &mut TestAppContext) {
 fn desk_deal_verdict_advances_to_empty_and_exit_restores_document(cx: &mut TestAppContext) {
     use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
 
+    let original = "* Finished\n:done: 2026-01-01\n* One";
     let mut source =
         text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
-    let operation =
-        DeskOperation::from_text(&source.edit([(0..0, "* Finished\n:done: 2026-01-01\n* One")]));
+    let operation = DeskOperation::from_text(&source.edit([(0..0, original)]));
     let snapshot = DeskSnapshot {
         text: source.snapshot().text(),
         operations: vec![operation],
@@ -4710,23 +4710,31 @@ fn desk_deal_verdict_advances_to_empty_and_exit_restores_document(cx: &mut TestA
         .expect("read dealt card");
     assert!(dealt.contains("One"), "deal did not show card: {dealt:?}");
     assert!(
-        !dealt.contains("Finished"),
-        "deal leaked text before the card: {dealt:?}"
+        dealt.contains("Finished"),
+        "deal narrowed the Desk: {dealt:?}"
     );
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace.dashboard_cursor_topic_for_test(cx),
+                Some((HostId::default(), original.find("* One").unwrap()))
+            );
+        })
+        .unwrap();
     cx.simulate_keystrokes(*workspace, "> >");
     cx.run_until_parked();
     cx.simulate_keystrokes(*workspace, "d");
     cx.run_until_parked();
     cx.simulate_keystrokes(*workspace, "n");
     cx.run_until_parked();
-    let empty = workspace
+    workspace
         .update(cx, |workspace, _, cx| {
-            workspace
-                .dashboard_editor()
-                .update(cx, |editor, cx| editor.display_text(cx))
+            assert_eq!(
+                workspace.dashboard_hint_for_test(cx),
+                "✓ Desk dealt — 1 verdict · q quit"
+            );
         })
-        .expect("read empty deal");
-    assert!(empty.contains("Desk dealt — 1 verdict"), "{empty:?}");
+        .expect("read completed deal chrome");
 
     cx.simulate_keystrokes(*workspace, "q");
     cx.run_until_parked();
@@ -4749,7 +4757,7 @@ fn desk_deal_verdict_advances_to_empty_and_exit_restores_document(cx: &mut TestA
 }
 
 #[gpui::test]
-fn desk_deal_cards_are_isolated_read_only_skippable_and_openable(cx: &mut TestAppContext) {
+fn desk_deal_cards_focus_in_place_read_only_skippable_and_openable(cx: &mut TestAppContext) {
     use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
 
     let original = "* One\n:deadline: 2020-01-01\none body\n* Two\n:deadline: 2020-01-02\ntwo body\n* Three\n:deadline: 2020-01-03\nthree body\n";
@@ -4789,7 +4797,6 @@ fn desk_deal_cards_are_isolated_read_only_skippable_and_openable(cx: &mut TestAp
                 .update(cx, |editor, cx| editor.display_text(cx))
         })
         .unwrap();
-    assert!(first.contains("resurfaced · 1/3  One"), "{first:?}");
     assert!(first.contains("one body"), "{first:?}");
     assert!(!first.contains(":deadline:"), "{first:?}");
     let lines = first.lines().collect::<Vec<_>>();
@@ -4802,9 +4809,22 @@ fn desk_deal_cards_are_isolated_read_only_skippable_and_openable(cx: &mut TestAp
         "concealed property row must not leave a blank spacer: {first:?}"
     );
     assert!(
-        !first.contains("* Two") && !first.contains("two body"),
+        first.contains("two body") && first.contains("three body"),
         "{first:?}"
     );
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace.dashboard_cursor_topic_for_test(cx),
+                Some((HostId::default(), original.find("* One").unwrap()))
+            );
+            assert!(
+                workspace
+                    .dashboard_hint_for_test(cx)
+                    .starts_with("resurfaced · 1/3 · o open")
+            );
+        })
+        .unwrap();
 
     cx.simulate_keystrokes(*workspace, "i shift-m escape");
     cx.run_until_parked();
@@ -4828,16 +4848,20 @@ fn desk_deal_cards_are_isolated_read_only_skippable_and_openable(cx: &mut TestAp
                 .update(cx, |editor, cx| editor.display_text(cx))
         })
         .unwrap();
-    assert!(second.contains("resurfaced · 2/3  Two"), "{second:?}");
     assert!(
-        second.contains("two body") && !second.contains("one body"),
+        second.contains("one body") && second.contains("two body"),
         "{second:?}"
     );
     workspace
         .update(cx, |workspace, _, cx| {
             assert_eq!(
-                workspace.dashboard_hint_for_test(cx),
-                "2 waiting · deal mode"
+                workspace.dashboard_cursor_topic_for_test(cx),
+                Some((HostId::default(), original.find("* Two").unwrap()))
+            );
+            assert!(
+                workspace
+                    .dashboard_hint_for_test(cx)
+                    .starts_with("resurfaced · 2/3 · o open")
             );
         })
         .unwrap();
@@ -4851,12 +4875,20 @@ fn desk_deal_cards_are_isolated_read_only_skippable_and_openable(cx: &mut TestAp
                 .update(cx, |editor, cx| editor.display_text(cx))
         })
         .unwrap();
-    assert!(third.contains("resurfaced · 3/3  Three"), "{third:?}");
+    assert!(
+        third.contains("one body") && third.contains("three body"),
+        "{third:?}"
+    );
     workspace
         .update(cx, |workspace, _, cx| {
             assert_eq!(
-                workspace.dashboard_hint_for_test(cx),
-                "1 waiting · deal mode"
+                workspace.dashboard_cursor_topic_for_test(cx),
+                Some((HostId::default(), original.find("* Three").unwrap()))
+            );
+            assert!(
+                workspace
+                    .dashboard_hint_for_test(cx)
+                    .starts_with("resurfaced · 3/3 · o open")
             );
         })
         .unwrap();
@@ -5056,14 +5088,14 @@ fn desk_deal_defer_skip_and_archive_verdicts_write_and_advance(cx: &mut TestAppC
     assert!(!raw.contains(":reminder:"), "{raw:?}");
     assert!(!raw.contains(":skip: 2019-01-01"), "{raw:?}");
     assert!(raw.contains("Archive :archive:"), "{raw:?}");
-    let dealt = workspace
+    workspace
         .update(cx, |workspace, _, cx| {
-            workspace
-                .dashboard_editor()
-                .update(cx, |editor, cx| editor.display_text(cx))
+            assert_eq!(
+                workspace.dashboard_hint_for_test(cx),
+                "✓ Desk dealt — 6 verdicts · q quit"
+            );
         })
         .unwrap();
-    assert!(dealt.contains("Desk dealt — 6 verdicts"), "{dealt:?}");
 }
 
 /// Sending a quick-spawn draft removes its row out from under the
