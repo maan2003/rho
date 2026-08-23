@@ -188,8 +188,8 @@ than by running a supervisor, extension protocol, or daemon process graph.
   Rho's custom Brave build registers the bundled control plane from the
   client-state directory as a component extension, so its HTTP(S) worker and
   page agent can change without rebuilding Brave. Each document-start content
-  script owns its Normal, Ignore, Caret, Find, mark-capture, key-tree/count,
-  and Hints state and installs
+  script owns its Normal, Ignore, Caret, mark-capture, key-tree/count, and
+  Hints state and installs
   an isolated-world capture listener on `window`. It synchronously consumes Vim
   commands; unmatched top-level keys and conflicting focused-control keys retain
   the original trusted browser event. Prefixes and counts expire together after
@@ -197,8 +197,9 @@ than by running a supervisor, extension protocol, or daemon process graph.
   for native smooth scrolling, remembers text-input focus for `gi`, and performs
   visible-element hint discovery, label/text matching, complementary and
   overlapping marker handling, marker repositioning, and action-specific hint
-  activation. Page-local state also owns scroll marks/jumps, find repetition,
-  URL/path commands, and an origin blacklist. Native tab/window commands remain
+  activation. Page-local state also owns scroll marks/jumps, URL/path commands,
+  and an origin blacklist. Find commands remain disabled until the Brave fork
+  exposes native Chromium find-controller integration. Native tab/window commands remain
   unavailable because they cannot bypass Desk-owned `PageId` creation and the
   compositor handoff. `i` enters Ignore mode and Shift-Escape leaves it, while
   Ctrl-Shift-Escape remains the compositor escape hatch back to the Desk.

@@ -26,11 +26,6 @@
   let hintRefreshPending = false;
   let ignoreKeyEventsUntil = 0;
   let captureKey;
-  let findState;
-  let lastFind = "";
-  let lastFindOptions = {};
-  let findMatches = [];
-  let findMatchIndex = -1;
   let caretSelecting = false;
   const scrollMarks = new Map();
   const scrollJumpList = [];
@@ -543,92 +538,6 @@
     setMode("normal");
   }
 
-  function findAgain(backwards = false) {
-    if (!lastFind) return;
-    if (findMatches.length === 0) updateFindMatches();
-    if (findMatches.length === 0) return;
-    findMatchIndex = (
-      findMatchIndex + (backwards ? -1 : 1) + findMatches.length
-    ) % findMatches.length;
-    const range = findMatches[findMatchIndex];
-    const selection = getSelection();
-    selection.removeAllRanges();
-    selection.addRange(range);
-    range.startContainer.parentElement?.scrollIntoView({ block: "center", behavior: "smooth" });
-  }
-
-  function updateFindMatches() {
-    findMatches = [];
-    findMatchIndex = -1;
-    CSS.highlights?.delete("rho-vim-find");
-    document.getElementById("__rho_vim_find_style")?.remove();
-    if (!lastFind) return;
-    const needle = lastFind.toLowerCase();
-    const root = lastFindOptions.linksOnly ? document.querySelectorAll("a") : [document.body];
-    for (const container of root) {
-      const walker = document.createTreeWalker(container, NodeFilter.SHOW_TEXT);
-      for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-        const text = node.data.toLowerCase();
-        let offset = 0;
-        while ((offset = text.indexOf(needle, offset)) >= 0) {
-          const range = document.createRange();
-          range.setStart(node, offset);
-          range.setEnd(node, offset + needle.length);
-          findMatches.push(range);
-          offset += Math.max(1, needle.length);
-        }
-      }
-    }
-    if (lastFindOptions.highlightAll && globalThis.Highlight && CSS.highlights) {
-      CSS.highlights.set("rho-vim-find", new Highlight(...findMatches));
-      const style = document.createElement("style");
-      style.id = "__rho_vim_find_style";
-      style.textContent = "::highlight(rho-vim-find){background:#ffd54f;color:#111}";
-      document.documentElement.append(style);
-    }
-  }
-
-  function closeFind() {
-    findState?.host.remove();
-    findState = undefined;
-    setMode("normal");
-  }
-
-  function startFind(options = {}) {
-    if (findState) return;
-    lastFindOptions = options;
-    const host = document.createElement("div");
-    host.id = "__rho_vim_find";
-    Object.assign(host.style, {
-      all: "initial",
-      position: "fixed",
-      top: "10px",
-      right: "12px",
-      zIndex: "2147483647",
-    });
-    const shadow = host.attachShadow({ mode: "closed" });
-    const input = document.createElement("input");
-    input.value = lastFind;
-    input.placeholder = "Find";
-    input.setAttribute("aria-label", "Find in page");
-    input.style.cssText = "width:260px;padding:5px 8px;border:1px solid #9b6a00;border-radius:3px;background:#fff;color:#111;font:13px sans-serif;box-shadow:0 2px 8px #0006";
-    input.addEventListener("input", (event) => {
-      event.stopPropagation();
-      lastFind = input.value;
-      updateFindMatches();
-      findAgain(false);
-    });
-    for (const type of ["beforeinput", "compositionstart", "compositionupdate", "compositionend"]) {
-      input.addEventListener(type, (event) => event.stopPropagation());
-    }
-    shadow.append(input);
-    document.documentElement.append(host);
-    findState = { host, input };
-    setMode("find");
-    input.focus();
-    input.select();
-  }
-
   function toggleHelp() {
     const old = document.getElementById("__rho_vim_help");
     if (old) {
@@ -637,7 +546,7 @@
     }
     const help = document.createElement("pre");
     help.id = "__rho_vim_help";
-    help.textContent = `Rho Vim / VimFx\n\nScroll  h j k l  d u  Space  gg G  0 ^ $\nHistory H L   Reload r/R   Stop s\nHints   f  yf copy  ef focus  ec context  v/av/yv text\nFind    /  n N   Inputs gi   Ignore i   Quote I\nMarks   m{key}  '{key}  g[ g]\nPath    gu gU   Copy URL yy\nCaret   h j k l b w 0 ^ $ v o y Esc\nHelp    ?`;
+    help.textContent = `Rho Vim / VimFx\n\nScroll  h j k l  d u  Space  gg G  0 ^ $\nHistory H L   Reload r/R   Stop s\nHints   f  yf copy  ef focus  ec context  v/av/yv text\nInputs  gi   Ignore i   Quote I\nMarks   m{key}  '{key}  g[ g]\nPath    gu gU   Copy URL yy\nCaret   h j k l b w 0 ^ $ v o y Esc\nHelp    ?`;
     Object.assign(help.style, {
       all: "initial",
       whiteSpace: "pre",
@@ -1213,9 +1122,10 @@
     "'": command(() => startKeyCapture(jumpToScrollMark)),
     "[": command(() => followPattern(PREVIOUS_PATTERNS)),
     "]": command(() => followPattern(NEXT_PATTERNS)),
-    "/": command(() => startFind()),
-    n: command(() => findAgain(false)),
-    N: command(() => findAgain(true)),
+    // VimFx parity TODO(rhoPrivate.vim.find):
+    // "/": command(() => nativeFind({})),
+    // n: command(() => nativeFindAgain(false)),
+    // N: command(() => nativeFindAgain(true)),
     v: command(() => startHints("caret")),
     "?": command(() => toggleHelp()),
     y: {
@@ -1232,7 +1142,7 @@
     a: {
       v: command(() => startHints("select")),
       // f: multi-follow requires managed background-page creation.
-      "/": command(() => startFind({ highlightAll: true })),
+      // "/": command(() => nativeFind({ highlightAll: true })),
       r: command(() => runBrowserCommand("reload-all", 1)),
       R: command(() => runBrowserCommand("reload-all-force", 1)),
       s: command(() => runBrowserCommand("stop-all", 1)),
@@ -1245,7 +1155,7 @@
       "[": command((amount) => moveScrollJump(-1, amount)),
       "]": command((amount) => moveScrollJump(1, amount)),
       B: command(() => toggleBlacklist()),
-      "/": command(() => startFind({ linksOnly: true })),
+      // "/": command(() => nativeFind({ linksOnly: true })),
       // H: browser history popup is native Brave UI and intentionally omitted.
       // r: reader mode needs a fixed rhoPrivate browser command.
       // C: reload-config becomes active when key configuration is externalized.
@@ -1274,18 +1184,9 @@
     event.stopImmediatePropagation();
   }
 
-  function shieldEvent(event) {
-    event.stopImmediatePropagation();
-  }
-
   function consume(event, repeatCommand) {
     keyDispositions.set(event.code, { consumed: true, repeatCommand });
     stopEvent(event);
-  }
-
-  function shield(event) {
-    keyDispositions.set(event.code, { consumed: false, shielded: true });
-    shieldEvent(event);
   }
 
   function keyName(event) {
@@ -1382,18 +1283,6 @@
       captureKey = undefined;
       setMode("normal");
       consume(event);
-      return;
-    }
-
-    if (mode === "find") {
-      if (event.key === "Escape" || event.key === "Enter") {
-        closeFind();
-        consume(event);
-      } else {
-        // Keep find text private from page listeners without cancelling the
-        // input element's native editing default.
-        shield(event);
-      }
       return;
     }
 
@@ -1504,7 +1393,6 @@
     const disposition = keyDispositions.get(event.code);
     keyDispositions.delete(event.code);
     if (disposition?.consumed) stopEvent(event);
-    else if (disposition?.shielded) shieldEvent(event);
   }, true);
   addEventListener("blur", (event) => {
     if (event.isTrusted) keyDispositions.clear();

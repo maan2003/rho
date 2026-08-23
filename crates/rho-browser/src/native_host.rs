@@ -441,7 +441,8 @@ mod tests {
         assert!(content.contains("const behavior = \"smooth\""));
         assert!(content.contains("enteredText"));
         assert!(content.contains("function handleCaretKey(event)"));
-        assert!(content.contains("function updateFindMatches()"));
+        assert!(content.contains("VimFx parity TODO(rhoPrivate.vim.find)"));
+        assert!(!content.contains("function updateFindMatches()"));
         assert!(content.contains("function toggleComplementaryHints()"));
         assert!(content.contains("function jumpToScrollMark(key)"));
         assert!(content.contains("VIMFX PARITY TODO(rhoPrivate.vim)"));
