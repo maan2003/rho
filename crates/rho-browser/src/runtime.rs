@@ -34,6 +34,8 @@ impl BrowserRuntime {
     ) -> Result<(Self, BrowserSession<BrowserWindow>)> {
         let brave_config = dirs::config_dir().context("resolve user config directory")?;
         let extension = state_dir.join("chromium-extension");
+        std::fs::create_dir_all(state_dir)
+            .with_context(|| format!("create browser state directory {}", state_dir.display()))?;
         let runtime_lock = OpenOptions::new()
             .create(true)
             .truncate(false)
@@ -51,8 +53,10 @@ impl BrowserRuntime {
         let compositor = BrowserCompositor::launch(render)?;
         let session = compositor.open(BrowserWindow, (1280, 720))?;
 
+        // PATH stays in sync with the deployed profile, unlike a store path
+        // baked into the session environment at login.
         let browser = std::env::var_os("RHO_CUSTOM_BRAVE_BIN")
-            .context("RHO_CUSTOM_BRAVE_BIN must select the Nix-built Rho Brave wrapper")?;
+            .unwrap_or_else(|| "rho-brave-origin".into());
         let mut command = Command::new(browser);
         // The Nix Brave wrapper supplies the first two, but Chromium honors
         // only the final --disable-features argument.
