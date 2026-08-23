@@ -20,7 +20,7 @@ use gpui::{App, Context, Entity, Focusable as _, HighlightStyle, WeakEntity, Win
 use language::{Buffer, Capability, InlayId, Point};
 use multi_buffer::composition::{Composition, CompositionSpec, CutSpec, RowSpec, SectionSpec};
 use multi_buffer::{MultiBuffer, ToOffset as _};
-use rho_ui_proto::desk::temporal::{priority, property_line};
+use rho_ui_proto::desk::temporal::{is_overdue_deadline, priority, property_line};
 use rho_ui_proto::desk::{DeskHeading, DeskHeadingState, TemporalMark, TemporalMarkKind, parse};
 use rho_ui_proto::{AgentId, UiAttention};
 use text::{BufferId, ToOffset as _};
@@ -458,8 +458,6 @@ impl Dashboard {
         for source in self.hosts.values().filter_map(WeakEntity::upgrade) {
             source.update(cx, |buffer, cx| buffer.set_capability(Capability::Read, cx));
         }
-        self.editor
-            .update(cx, |editor, _| editor.set_read_only(true));
         self.deal = Some(DealSession {
             cards,
             anchors,
@@ -491,8 +489,6 @@ impl Dashboard {
                     buffer.set_capability(Capability::ReadWrite, cx)
                 });
             }
-            self.editor
-                .update(cx, |editor, _| editor.set_read_only(false));
         }
         self.last_synced = None;
         exited
@@ -521,8 +517,6 @@ impl Dashboard {
             }
         }
         self.last_synced = None;
-        self.editor
-            .update(cx, |editor, _| editor.set_read_only(true));
         true
     }
 
@@ -763,11 +757,14 @@ impl Dashboard {
             );
         }
         self.pending_cursor = Some(key);
-        if self.deal.is_some() {
-            self.editor
-                .update(cx, |editor, _| editor.set_read_only(false));
-        }
         cx.notify();
+    }
+
+    #[cfg(test)]
+    pub fn reply_text_for_test(&self, agent_id: AgentId, cx: &App) -> Option<String> {
+        self.buffers
+            .get(&LineKey::Reply(agent_id))
+            .map(|buffer| buffer.read(cx).text())
     }
 
     /// Opens (or returns to) the inline new-agent draft. Like a reply
@@ -2992,12 +2989,15 @@ fn heading_conceals(
                     continue;
                 }
                 let start = property.line_range.start.saturating_sub(1);
-                let range =
-                    if conceal_property_newline && text.as_bytes().get(start) == Some(&b'\n') {
-                        start..property.line_range.end
-                    } else {
-                        property.line_range.clone()
-                    };
+                let range = if conceal_property_newline
+                    && text.as_bytes().get(start) == Some(&b'\n')
+                {
+                    start..property.line_range.end
+                } else {
+                    let end = property.line_range.end
+                        + usize::from(text.as_bytes().get(property.line_range.end) == Some(&b'\n'));
+                    property.line_range.start..end
+                };
                 if !caret.is_some_and(|caret| range.start < caret && caret < range.end) {
                     conceals.push((*host, range, String::new(), CaretRest::Start));
                 }
@@ -3127,12 +3127,16 @@ fn display_mark(heading: &DeskHeading, now: chrono::NaiveDateTime) -> Option<Str
             .iter()
             .max_by(|left, right| priority(left, now).total_cmp(&priority(right, now))),
     }?;
-    let elapsed = now.signed_duration_since(mark.at).num_seconds() as f64 / 86_400.0;
+    let elapsed = if mark.date_only {
+        now.date().signed_duration_since(mark.at.date()).num_days() as f64
+    } else {
+        now.signed_duration_since(mark.at).num_seconds() as f64 / 86_400.0
+    };
     let days = elapsed.abs().ceil() as u64;
     let date = mark.at.format("%b %-d").to_string().to_lowercase();
     Some(match mark.kind {
         TemporalMarkKind::Deadline if priority(mark, now) == f64::NEG_INFINITY => return None,
-        TemporalMarkKind::Deadline if elapsed > 0.0 => {
+        TemporalMarkKind::Deadline if is_overdue_deadline(mark, now) => {
             format!("deadline {date} · late {days}d")
         }
         TemporalMarkKind::Deadline => format!("deadline {date} · {}d", mark.pace_days),

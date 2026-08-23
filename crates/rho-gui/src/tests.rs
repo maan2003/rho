@@ -4718,6 +4718,15 @@ fn desk_deal_cards_are_isolated_read_only_skippable_and_openable(cx: &mut TestAp
     assert!(first.contains("resurfaced · 1/3  One"), "{first:?}");
     assert!(first.contains("one body"), "{first:?}");
     assert!(!first.contains(":deadline:"), "{first:?}");
+    let lines = first.lines().collect::<Vec<_>>();
+    let body_line = lines
+        .iter()
+        .position(|line| *line == "one body")
+        .expect("body line");
+    assert!(
+        body_line > 0 && lines[body_line - 1].contains("One"),
+        "concealed property row must not leave a blank spacer: {first:?}"
+    );
     assert!(
         !first.contains("* Two") && !first.contains("two body"),
         "{first:?}"
@@ -4787,6 +4796,107 @@ fn desk_deal_cards_are_isolated_read_only_skippable_and_openable(cx: &mut TestAp
                 workspace.dashboard_cursor_topic_for_test(cx),
                 Some((HostId::default(), original.find("* Three").unwrap()))
             );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn desk_deal_reply_draft_is_writable_while_desk_source_stays_read_only(cx: &mut TestAppContext) {
+    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
+    use rho_ui_proto::{
+        AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
+    };
+
+    let agent_id = agent(1);
+    let summary = UiAgentSummary {
+        agent_id,
+        parent_agent: None,
+        display_name: Some("reply target".to_owned()),
+        created_at: UnixMs(1),
+        updated_at: UnixMs(1),
+        role: AgentRole::default(),
+        workspace: WorkspaceInfo::UserCheckout {
+            repo: "/tmp".into(),
+        },
+        attention: UiAttention::NeedsInput,
+        last_active: UnixMs(1),
+        hidden: false,
+        disposition: AgentDisposition::Pending,
+        last_user_message_text: String::new(),
+        activity: None,
+        turn_report: None,
+        labels: Vec::new(),
+    };
+    let original = format!("* Reply target :eng-{}:\nAgent body.\n", agent_id.encoded());
+    let mut source =
+        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
+    let operation = DeskOperation::from_text(&source.edit([(0..0, original.as_str())]));
+    let snapshot = DeskSnapshot {
+        text: source.snapshot().text(),
+        operations: vec![operation],
+        transactions: Vec::new(),
+        replicas: Vec::new(),
+    };
+
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Ready {
+                    agents: vec![summary],
+                    iris_agent: None,
+                    projects: Vec::new(),
+                    auth: AuthState {
+                        namespaces: Vec::new(),
+                        disabled_namespaces: Vec::new(),
+                        active_namespace: None,
+                    },
+                    machine_seed: 0,
+                    agent_counter: 100,
+                },
+                window,
+                cx,
+            );
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskSnapshot {
+                    snapshot,
+                    replica_id: 42,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+            window.focus(&workspace.dashboard_editor().read(cx).focus_handle(cx), cx);
+            workspace.toggle_dashboard_deal(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes(*workspace, "r");
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "d r a f t");
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace
+                    .dashboard_reply_text_for_test(agent_id, cx)
+                    .as_deref(),
+                Some("draft")
+            );
+            assert_eq!(
+                workspace
+                    .desk_buffer_for_test(HostId::default())
+                    .unwrap()
+                    .read(cx)
+                    .text(),
+                original
+            );
+            assert!(workspace.dashboard_deal_mode_for_test());
         })
         .unwrap();
 }

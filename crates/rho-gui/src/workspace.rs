@@ -4524,6 +4524,15 @@ impl Workspace {
     }
 
     #[cfg(test)]
+    pub(crate) fn dashboard_reply_text_for_test(
+        &self,
+        agent_id: rho_ui_proto::AgentId,
+        cx: &App,
+    ) -> Option<String> {
+        self.dashboard.reply_text_for_test(agent_id, cx)
+    }
+
+    #[cfg(test)]
     pub(crate) fn dashboard_cursor_topic_for_test(
         &self,
         cx: &mut Context<Self>,

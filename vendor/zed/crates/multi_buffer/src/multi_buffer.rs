@@ -2070,7 +2070,12 @@ impl MultiBuffer {
             BufferEvent::Reparsed => Event::Reparsed(buffer_id),
             BufferEvent::DiagnosticsUpdated => Event::DiagnosticsUpdated,
             BufferEvent::CapabilityChanged => {
-                self.capability = buffer.read(cx).capability();
+                // A heterogeneous multibuffer keeps its own capability and
+                // filters edits using each excerpt buffer's capability. Only
+                // a singleton mirrors the capability of its sole buffer.
+                if self.singleton {
+                    self.capability = buffer.read(cx).capability();
+                }
                 return;
             }
             BufferEvent::Operation { .. } | BufferEvent::ReloadNeeded => return,
@@ -6521,10 +6526,7 @@ impl MultiBufferSnapshot {
         Some(self.buffers.get(&buffer_id)?.primary_path())
     }
 
-    pub fn paths_for_buffer(
-        &self,
-        buffer_id: BufferId,
-    ) -> impl Iterator<Item = &PathKey> {
+    pub fn paths_for_buffer(&self, buffer_id: BufferId) -> impl Iterator<Item = &PathKey> {
         self.buffers
             .get(&buffer_id)
             .into_iter()
@@ -6938,7 +6940,11 @@ impl MultiBufferSnapshot {
 
         let mut all_buffer_path_keys = HashSet::default();
         for buffer in self.buffers.values() {
-            assert!(!buffer.paths.is_empty(), "buffer with no paths: {:#?}", self.buffers);
+            assert!(
+                !buffer.paths.is_empty(),
+                "buffer with no paths: {:#?}",
+                self.buffers
+            );
             assert!(
                 buffer.paths.is_sorted_by(|a, b| a.0 < b.0),
                 "buffer paths not sorted and deduplicated: {:#?}",

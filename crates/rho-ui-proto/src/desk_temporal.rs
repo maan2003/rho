@@ -65,6 +65,9 @@ impl TemporalMarkKind {
 pub struct TemporalMark {
     pub kind: TemporalMarkKind,
     pub at: NaiveDateTime,
+    /// Whether the source omitted an explicit time and follows calendar-day
+    /// rather than instant semantics.
+    pub date_only: bool,
     /// Lead, pace, or period, depending on `kind`, resolved to its default.
     pub pace_days: u32,
 }
@@ -74,10 +77,12 @@ impl TemporalMark {
         let mut words = value.split_whitespace();
         let date = NaiveDate::parse_from_str(words.next()?, "%Y-%m-%d").ok()?;
         let mut at = date.and_time(NaiveTime::MIN);
+        let mut date_only = true;
         let mut pace = None;
         if let Some(word) = words.next() {
             if let Ok(time) = NaiveTime::parse_from_str(word, "%H:%M") {
                 at = date.and_time(time);
+                date_only = false;
                 if let Some(word) = words.next() {
                     pace = Some(parse_days(word)?);
                 }
@@ -91,6 +96,7 @@ impl TemporalMark {
         Some(Self {
             kind,
             at,
+            date_only,
             pace_days: pace.unwrap_or_else(|| kind.default_pace_days()),
         })
     }
@@ -105,7 +111,11 @@ fn parse_days(value: &str) -> Option<u32> {
 }
 
 fn elapsed_days(mark: &TemporalMark, now: NaiveDateTime) -> f64 {
-    now.signed_duration_since(mark.at).num_seconds() as f64 / 86_400.0
+    if mark.date_only {
+        now.date().signed_duration_since(mark.at.date()).num_days() as f64
+    } else {
+        now.signed_duration_since(mark.at).num_seconds() as f64 / 86_400.0
+    }
 }
 
 /// A common days-scale priority. Larger values sort first.
@@ -134,7 +144,12 @@ pub fn surfaced(mark: &TemporalMark, now: NaiveDateTime, threshold: f64) -> bool
 }
 
 pub fn is_overdue_deadline(mark: &TemporalMark, now: NaiveDateTime) -> bool {
-    mark.kind == TemporalMarkKind::Deadline && now > mark.at
+    mark.kind == TemporalMarkKind::Deadline
+        && if mark.date_only {
+            now.date() > mark.at.date()
+        } else {
+            now > mark.at
+        }
 }
 
 /// Render one visible Desk property line. Midnight is kept date-only.
@@ -166,6 +181,7 @@ mod tests {
         TemporalMark {
             kind,
             at: at(day),
+            date_only: true,
             pace_days,
         }
     }
@@ -211,6 +227,38 @@ mod tests {
     }
 
     #[test]
+    fn date_only_reminders_and_deadlines_use_whole_calendar_days() {
+        let midday = |day| at(day) + Duration::hours(15);
+        let reminder = mark(TemporalMarkKind::Reminder, 10, 1);
+        assert_eq!(priority(&reminder, midday(9)), f64::NEG_INFINITY);
+        assert_eq!(priority(&reminder, midday(10)), 0.0);
+        assert!(surfaced(&reminder, midday(10), -0.01));
+        assert_eq!(priority(&reminder, midday(11)), -1.0);
+
+        let deadline = mark(TemporalMarkKind::Deadline, 10, 7);
+        assert_eq!(priority(&deadline, midday(10)), 0.0);
+        assert!(!is_overdue_deadline(&deadline, midday(10)));
+        assert_eq!(priority(&deadline, midday(11)), 1_000_001.0);
+        assert!(is_overdue_deadline(&deadline, midday(11)));
+
+        let todo = mark(TemporalMarkKind::Todo, 10, 7);
+        assert_eq!(priority(&todo, midday(17)), 0.0);
+    }
+
+    #[test]
+    fn explicitly_timed_marks_keep_instant_semantics() {
+        let reminder =
+            TemporalMark::parse(TemporalMarkKind::Reminder, "2026-08-10 12:00 1d").unwrap();
+        assert!(!reminder.date_only);
+        assert_eq!(
+            priority(&reminder, at(10) + Duration::hours(11)),
+            f64::NEG_INFINITY
+        );
+        assert_eq!(priority(&reminder, at(10) + Duration::hours(12)), 0.0);
+        assert!(priority(&reminder, at(10) + Duration::hours(15)) < 0.0);
+    }
+
+    #[test]
     fn skip_has_no_pace_and_never_surfaces_on_its_own() {
         assert!(TemporalMark::parse(TemporalMarkKind::Skip, "2026-08-10 2d").is_none());
         let mark = mark(TemporalMarkKind::Skip, 10, 0);
@@ -230,6 +278,7 @@ mod tests {
             at(10) + Duration::hours(12) + Duration::minutes(30)
         );
         assert_eq!(parsed.pace_days, 9);
+        assert!(!parsed.date_only);
         assert_eq!(
             property_line(TemporalMarkKind::Done, at(10), None),
             ":done: 2026-08-10\n"
