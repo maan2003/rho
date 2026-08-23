@@ -3753,11 +3753,9 @@ pub fn assemble_deal_queue(
         if terminal {
             continue;
         }
-        if heading
-            .temporal_marks
-            .iter()
-            .any(|mark| mark.kind == TemporalMarkKind::Skip && mark.at > now)
-        {
+        if heading.temporal_marks.iter().any(|mark| {
+            matches!(mark.kind, TemporalMarkKind::Defer | TemporalMarkKind::Skip) && mark.at > now
+        }) {
             continue;
         }
         let best = heading
@@ -3793,7 +3791,10 @@ pub fn assemble_deal_queue(
             .temporal_marks
             .iter()
             .any(|mark| mark.kind == TemporalMarkKind::Reminder && mark.at > now)
-            && agents.iter().all(|agent| !visible_agents.contains(agent))
+            && agents
+                .iter()
+                .flat_map(|agent| descendants(*agent))
+                .all(|agent| !visible_agents.contains(&agent))
         {
             random_pool.push(DealCard {
                 section: DealSection::Random,
@@ -4404,6 +4405,7 @@ mod tests {
                 .all(|card| card.breadcrumb != "Snoozed deadline")
         );
         assert!(cards.iter().any(|card| card.breadcrumb == "Expired skip"));
+        assert!(cards.iter().all(|card| card.breadcrumb != "Deferred"));
     }
 
     #[test]
@@ -4448,6 +4450,31 @@ mod tests {
                 .iter()
                 .all(|card| !matches!(card.section, DealSection::NeedsYou | DealSection::Finished))
         );
+    }
+
+    #[test]
+    fn unsurfaced_owed_child_keeps_filed_ancestor_out_of_random() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+        let root = agent(1, None, UiAttention::Quiet, 0);
+        let mut child = agent(2, Some(root.agent_id), UiAttention::Quiet, 0);
+        child.facts = rho_ui_proto::UiAgentFacts {
+            turn_running: false,
+            last_turn_ended: Some(UnixMs(
+                (now.and_utc().timestamp_millis() - 86_400_000) as u64,
+            )),
+            last_user_message_at: UnixMs(0),
+            needs_you_hint: false,
+        };
+        let (reg, host) = registry(vec![root.clone(), child]);
+        let text = format!(
+            "* Parent :eng-{}:
+",
+            &root.agent_id.encoded()[..4]
+        );
+        assert!(assemble_deal_queue(&[(host, text)], &deal_agent_facts(&reg), now, 1).is_empty());
     }
 
     #[test]
