@@ -324,6 +324,30 @@ pub fn snapshot_extension_command_stats() -> Vec<ExtensionCommandStats> {
     EXTENSION_COMMAND_STATS.lock().unwrap().iter().cloned().collect()
 }
 
+/// Tab lifecycle report from the extension: activation, page visibility as
+/// the renderer sees it, discard/freeze state. The direct signal for "the
+/// tab never actually became visible" handoff stalls.
+#[derive(Clone, Debug)]
+pub struct TabStateEvent {
+    pub at: Instant,
+    pub state: String,
+    pub reason: String,
+    pub page_id: String,
+    pub tab_id: i64,
+    pub active: Option<bool>,
+    pub discarded: Option<bool>,
+    pub frozen: Option<bool>,
+    pub status: String,
+}
+
+const MAX_TAB_STATE_EVENTS: usize = 512;
+static TAB_STATE_EVENTS: Mutex<VecDeque<TabStateEvent>> = Mutex::new(VecDeque::new());
+
+/// Returns a non-destructive copy of the bounded tab-state event ring.
+pub fn snapshot_tab_state_events() -> Vec<TabStateEvent> {
+    TAB_STATE_EVENTS.lock().unwrap().iter().cloned().collect()
+}
+
 fn record_frame_telemetry(message: &Value) -> bool {
     if message.get("event").and_then(Value::as_str) != Some("frame-telemetry") {
         return false;
@@ -374,6 +398,21 @@ fn log_tab_state(message: &Value) -> bool {
         status = text("status", 16),
         "browser extension tab lifecycle"
     );
+    let mut ring = TAB_STATE_EVENTS.lock().unwrap();
+    if ring.len() >= MAX_TAB_STATE_EVENTS {
+        ring.pop_front();
+    }
+    ring.push_back(TabStateEvent {
+        at: Instant::now(),
+        state: text("state", 32).to_owned(),
+        reason: text("reason", 64).to_owned(),
+        page_id: text("page_id", 64).to_owned(),
+        tab_id: message.get("tab_id").and_then(Value::as_i64).unwrap_or(0),
+        active: message.get("active").and_then(Value::as_bool),
+        discarded: message.get("discarded").and_then(Value::as_bool),
+        frozen: message.get("frozen").and_then(Value::as_bool),
+        status: text("status", 16).to_owned(),
+    });
     true
 }
 

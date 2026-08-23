@@ -104,6 +104,8 @@ pub enum BrowserTimingKind {
     ScenePainted = 5,
     FrameAcknowledged = 6,
     FrameCallbackSent = 7,
+    HostFrameCallbackSent = 8,
+    FallbackFrameCallbackSent = 9,
 }
 
 /// Numeric-only timing marker retained in a fixed-size process-wide ring.
@@ -2499,7 +2501,12 @@ fn service_loop<K: BrowserPageKey>(
                 // frame clock.
                 for window in state.windows.values_mut() {
                     if let Some(pending) = window.dma_frame_callbacks.keys().copied().max() {
-                        send_frame_callbacks(window, monotonic_time_ms(), pending);
+                        send_frame_callbacks(
+                            window,
+                            monotonic_time_ms(),
+                            pending,
+                            BrowserTimingKind::FallbackFrameCallbackSent,
+                        );
                     }
                 }
                 let _ = state.display_handle.flush_clients();
@@ -2632,7 +2639,12 @@ fn handle_page_command<K: BrowserPageKey>(state: &mut State<K>, id: K, c: PageCo
                 // next one. Passthrough submissions also complete callbacks
                 // through the relayed outer frame event; whichever arrives
                 // first drains the entry.
-                send_frame_callbacks(w, monotonic_time_ms(), scene_id);
+                send_frame_callbacks(
+                    w,
+                    monotonic_time_ms(),
+                    scene_id,
+                    BrowserTimingKind::FrameCallbackSent,
+                );
             }
         }
         PageCommand::EnablePresentationPassthrough { session_generation } => {
@@ -2677,7 +2689,12 @@ fn handle_page_command<K: BrowserPageKey>(state: &mut State<K>, id: K, c: PageCo
             if let Some(scene_id) = scene
                 && let Some(window) = state.windows.get_mut(&id)
             {
-                send_frame_callbacks(window, monotonic_time_ms(), scene_id);
+                send_frame_callbacks(
+                    window,
+                    monotonic_time_ms(),
+                    scene_id,
+                    BrowserTimingKind::FallbackFrameCallbackSent,
+                );
             }
         }
         PageCommand::HostPresentation {
@@ -2711,7 +2728,12 @@ fn handle_page_command<K: BrowserPageKey>(state: &mut State<K>, id: K, c: PageCo
                 window.next_scene_id,
                 scene_id,
             ) {
-                send_frame_callbacks(window, callback_time, scene_id);
+                send_frame_callbacks(
+                    window,
+                    callback_time,
+                    scene_id,
+                    BrowserTimingKind::HostFrameCallbackSent,
+                );
             }
         }
         PageCommand::Retired(commit) => {
@@ -3413,7 +3435,12 @@ fn relay_host_presentation<K: BrowserPageKey>(
     }
 }
 
-fn send_frame_callbacks(window: &mut WindowState, time: u32, commit_id: u64) {
+fn send_frame_callbacks(
+    window: &mut WindowState,
+    time: u32,
+    commit_id: u64,
+    kind: BrowserTimingKind,
+) {
     let completed = window
         .dma_frame_callbacks
         .keys()
@@ -3423,7 +3450,7 @@ fn send_frame_callbacks(window: &mut WindowState, time: u32, commit_id: u64) {
     for scene_id in completed {
         let callbacks = window.dma_frame_callbacks.remove(&scene_id).unwrap();
         record_browser_timing(
-            BrowserTimingKind::FrameCallbackSent,
+            kind,
             scene_id,
             0,
             Some(commit_id),

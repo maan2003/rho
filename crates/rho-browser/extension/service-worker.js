@@ -274,6 +274,14 @@ function connect() {
   });
 }
 
+chrome.tabs.onActivated.addListener(async ({ tabId }) => {
+  const id = tabPages.get(tabId);
+  if (!id) return;
+  try {
+    reportTabState("activated", await chrome.tabs.get(tabId), id);
+  } catch (_) {}
+});
+
 chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
   if (removeInfo.isWindowClosing || parkingTabs.delete(tabId)) return;
   const id = tabPages.get(tabId);
@@ -305,6 +313,15 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (lifecycle.length > 0) {
     reportTabState("updated", tab, id, lifecycle.join(","));
   }
+});
+
+chrome.runtime.onMessage.addListener((message, sender) => {
+  if (sender.id !== chrome.runtime.id || !sender.tab) return;
+  if (message?.type !== "rho-visibility") return;
+  // Top-level page visibility as the renderer sees it: the direct signal for
+  // "the tab never actually became visible" handoff stalls.
+  if (sender.frameId !== undefined && sender.frameId !== 0) return;
+  reportTabState(message.visible ? "page-visible" : "page-hidden", sender.tab);
 });
 
 chrome.runtime.onMessage.addListener((message, sender) => {

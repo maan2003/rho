@@ -96,6 +96,38 @@ struct PageHandoff {
     input_generation: Option<u64>,
 }
 
+/// One transition of the page-handoff state machine. Every phase waits on an
+/// external actor, so stall diagnosis needs the exact transition timeline.
+#[derive(Clone, Debug)]
+pub struct HandoffEvent {
+    pub at: std::time::Instant,
+    pub generation: u64,
+    pub event: &'static str,
+    pub barrier: u64,
+}
+
+const MAX_HANDOFF_EVENTS: usize = 256;
+static HANDOFF_EVENTS: std::sync::Mutex<std::collections::VecDeque<HandoffEvent>> =
+    std::sync::Mutex::new(std::collections::VecDeque::new());
+
+fn record_handoff_event(generation: u64, event: &'static str, barrier: u64) {
+    let mut ring = HANDOFF_EVENTS.lock().unwrap();
+    if ring.len() >= MAX_HANDOFF_EVENTS {
+        ring.pop_front();
+    }
+    ring.push_back(HandoffEvent {
+        at: std::time::Instant::now(),
+        generation,
+        event,
+        barrier,
+    });
+}
+
+/// Returns a non-destructive copy of the bounded handoff transition ring.
+pub fn snapshot_handoff_events() -> Vec<HandoffEvent> {
+    HANDOFF_EVENTS.lock().unwrap().iter().cloned().collect()
+}
+
 /// The singleton live Chrome surface shared by every logical page view.
 pub struct BrowserModel {
     browser: Arc<BrowserRuntime>,
@@ -427,6 +459,7 @@ impl BrowserModel {
             phase: HandoffPhase::Requested,
             input_generation: None,
         });
+        record_handoff_event(generation, "requested", 0);
     }
 
     fn awaiting_barrier(&self) -> Option<u64> {
@@ -464,6 +497,7 @@ impl BrowserModel {
         handoff.phase = HandoffPhase::Focusing;
         self.handoff = Some(handoff);
         self.active_focus = Some(id);
+        record_handoff_event(generation, "focusing", 0);
         tracing::info!(
             generation = handoff.generation,
             "browser handoff requested extension tab focus"
@@ -490,12 +524,15 @@ impl BrowserModel {
                 match result {
                     Ok(()) => {
                         if let Some(handoff) = matching_handoff(current, generation) {
+                            record_handoff_event(generation, "focus-ok", 0);
                             model.begin_frame_barrier(handoff);
                         } else {
+                            record_handoff_event(generation, "focus-orphaned", 0);
                             model.unfreeze_input(input_generation);
                         }
                     }
                     Err(error) => {
+                        record_handoff_event(generation, "focus-error", 0);
                         model.unfreeze_input(input_generation);
                         if current.is_some_and(|handoff| handoff.generation == generation) {
                             model.runtime.status = Some(format!("browser: {error:#}"));
@@ -618,6 +655,7 @@ impl BrowserModel {
                             phase = ?handoff.phase,
                             "browser handoff stalled; re-driving focus and barrier"
                         );
+                        record_handoff_event(generation, "re-drive", u64::from(attempt));
                         model.handoff = Some(PageHandoff {
                             phase: HandoffPhase::Requested,
                             input_generation: None,
@@ -687,6 +725,7 @@ impl BrowserModel {
                 "browser handoff sent a compositor frame barrier"
             );
             session.frame_barrier(barrier, probe_width, height, f32::from_bits(scale));
+            record_handoff_event(handoff.generation, "barrier-sent", barrier);
             if self
                 .handoff
                 .is_some_and(|current| current.generation == handoff.generation)
@@ -934,6 +973,7 @@ fn complete_frame_handoff(handoff: &mut Option<PageHandoff>, frame_barrier: u64)
         && frame_barrier >= barrier
     {
         current.phase = HandoffPhase::Ready;
+        record_handoff_event(current.generation, "ready", frame_barrier);
     }
 }
 

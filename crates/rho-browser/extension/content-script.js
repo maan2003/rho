@@ -1451,11 +1451,19 @@
     last = null;
     requestAnimationFrame(tick);
   };
+  const reportVisibility = () => {
+    chrome.runtime.sendMessage({
+      type: "rho-visibility",
+      visible: document.visibilityState === "visible",
+    }).catch(() => {});
+  };
   document.addEventListener("visibilitychange", () => {
     active = false;
     intervals = [];
     last = null;
+    reportVisibility();
   });
   setInterval(start, BURST_INTERVAL_MS);
   start();
+  reportVisibility();
 })();

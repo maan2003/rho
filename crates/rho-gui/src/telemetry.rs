@@ -89,6 +89,8 @@ struct Snapshot<'a> {
     browser: Vec<BrowserRecord>,
     browser_frames: Vec<BrowserFrameRecord>,
     browser_commands: Vec<BrowserCommandRecord>,
+    browser_handoffs: Vec<HandoffEventRecord>,
+    browser_tab_states: Vec<TabStateRecord>,
 }
 
 #[derive(Serialize)]
@@ -160,6 +162,27 @@ struct BrowserCommandRecord {
     round_trip_us: u32,
     handler_us: Option<u32>,
     ok: bool,
+}
+
+#[derive(Serialize)]
+struct HandoffEventRecord {
+    at_ns: u64,
+    generation: u64,
+    event: &'static str,
+    barrier: u64,
+}
+
+#[derive(Serialize)]
+struct TabStateRecord {
+    at_ns: u64,
+    state: String,
+    reason: String,
+    page_id: String,
+    tab_id: i64,
+    active: Option<bool>,
+    discarded: Option<bool>,
+    frozen: Option<bool>,
+    status: String,
 }
 
 #[derive(Serialize)]
@@ -368,9 +391,32 @@ fn snapshot_with_cpu_profiles(cpu_profiles: &[Vec<u8>]) -> anyhow::Result<Vec<u8
             ok: stats.ok,
         })
         .collect();
+    let browser_handoffs = rho_browser::snapshot_handoff_events()
+        .into_iter()
+        .map(|event| HandoffEventRecord {
+            at_ns: duration_ns(event.at.saturating_duration_since(started)),
+            generation: event.generation,
+            event: event.event,
+            barrier: event.barrier,
+        })
+        .collect();
+    let browser_tab_states = rho_browser::snapshot_tab_state_events()
+        .into_iter()
+        .map(|event| TabStateRecord {
+            at_ns: duration_ns(event.at.saturating_duration_since(started)),
+            state: event.state,
+            reason: event.reason,
+            page_id: event.page_id,
+            tab_id: event.tab_id,
+            active: event.active,
+            discarded: event.discarded,
+            frozen: event.frozen,
+            status: event.status,
+        })
+        .collect();
     let bytes = serde_json::to_vec_pretty(&Snapshot {
         schema: "dev.rho.gui-performance-snapshot",
-        version: 7,
+        version: 8,
         captured_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -414,6 +460,8 @@ fn snapshot_with_cpu_profiles(cpu_profiles: &[Vec<u8>]) -> anyhow::Result<Vec<u8
         browser,
         browser_frames,
         browser_commands,
+        browser_handoffs,
+        browser_tab_states,
     })?;
     anyhow::ensure!(
         bytes.len() <= rho_ui_proto::MAX_GUI_TELEMETRY_BYTES,
@@ -432,6 +480,8 @@ fn browser_stage_name(kind: rho_browser::BrowserTimingKind) -> &'static str {
         ScenePainted => "scene_painted",
         FrameAcknowledged => "frame_acknowledged",
         FrameCallbackSent => "frame_callback_sent",
+        HostFrameCallbackSent => "frame_callback_sent_host",
+        FallbackFrameCallbackSent => "frame_callback_sent_fallback",
     }
 }
 
@@ -488,7 +538,7 @@ mod tests {
         assert!(bytes.len() <= rho_ui_proto::MAX_GUI_TELEMETRY_BYTES);
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["schema"], "dev.rho.gui-performance-snapshot");
-        assert_eq!(value["version"], 7);
+        assert_eq!(value["version"], 8);
         assert_eq!(value["build"]["profile"], env!("RHO_BUILD_PROFILE"));
         assert_eq!(value["build"]["opt_level"], env!("RHO_BUILD_OPT_LEVEL"));
         assert_eq!(value["build"]["target"], env!("RHO_BUILD_TARGET"));
@@ -517,6 +567,8 @@ mod tests {
         assert!(value["browser"].as_array().unwrap().iter().any(|record| {
             record["stage"] == "scene_painted" && record["scene_id"] == 42 && record["barrier"] == 7
         }));
+        assert!(value["browser_handoffs"].is_array());
+        assert!(value["browser_tab_states"].is_array());
     }
 
     #[test]
