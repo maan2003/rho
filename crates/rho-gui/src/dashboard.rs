@@ -4706,6 +4706,48 @@ mod tests {
     }
 
     #[test]
+    fn structural_and_future_marks_gate_every_priority_source() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc()
+            .fixed_offset();
+        let text = "* Deferred
+:defer: 2026-08-24 1d
+:deadline: 2020-01-01
+* Reminded
+:reminder: 2026-08-24
+:deadline: 2020-01-01
+* Skipped
+:skip: 2026-08-24
+:deadline: 2020-01-01
+* Done
+:done: 2026-08-20
+:deadline: 2020-01-01
+* Archive :archive:
+** Archived
+:deadline: 2020-01-01
+* Alive
+:defer: 2026-08-22 1d
+:deadline: 2020-01-01
+";
+        let queue = assemble_deal_queue(&[(HostId(1), text.to_owned())], &[], now, 0);
+        assert!(queue.cards.iter().any(|card| card.breadcrumb == "Alive"));
+        assert!(queue.cards.iter().all(|card| {
+            ![
+                "Deferred",
+                "Reminded",
+                "Skipped",
+                "Done",
+                "Archive",
+                "Archive › Archived",
+            ]
+            .contains(&card.breadcrumb.as_str())
+        }));
+    }
+
+    #[test]
     fn snooze_supersedes_only_verdict_family_marks() {
         let text = "* Topic\n:deadline: 2026-08-30 7d\n:todo: 2026-08-20 7d\n:defer: 2026-08-24 1d\n:reminder: 2026-08-25 1d\n:skip: 2026-08-26\n:done: 2026-08-01\n";
         let heading = parse(text).remove(0);
