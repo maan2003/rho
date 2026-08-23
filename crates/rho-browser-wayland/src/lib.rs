@@ -1940,12 +1940,19 @@ impl<K: BrowserPageKey> XdgShellHandler for State<K> {
 
     // Denied, but the reply configure is mandatory to keep Chromium's state
     // machine moving; an unanswered request stalls it just like fullscreen.
+    // Unbound toplevels get their answer from the bind-time initial configure
+    // instead: replying before the client's initial commit would make this
+    // the initial configure, with no size and no Activated state.
     fn maximize_request(&mut self, surface: ToplevelSurface) {
-        let _ = surface.send_configure();
+        if self.surface_windows.contains_key(&surface.wl_surface().id()) {
+            let _ = surface.send_configure();
+        }
     }
 
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
-        let _ = surface.send_configure();
+        if self.surface_windows.contains_key(&surface.wl_surface().id()) {
+            let _ = surface.send_configure();
+        }
     }
 
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
@@ -2087,8 +2094,17 @@ impl<K: BrowserPageKey> State<K> {
                 state.size = Some((width as i32, height as i32).into());
             }
         });
-        let serial = toplevel.send_configure();
-        tracing::info!(fullscreen, serial = ?serial, "granted Chromium fullscreen change");
+        // An unbound toplevel gets the state from its bind-time initial
+        // configure; replying here would send a premature initial configure.
+        if self
+            .surface_windows
+            .contains_key(&toplevel.wl_surface().id())
+        {
+            let serial = toplevel.send_configure();
+            tracing::info!(fullscreen, serial = ?serial, "granted Chromium fullscreen change");
+        } else {
+            tracing::info!(fullscreen, "queued Chromium fullscreen change until bind");
+        }
     }
 
     fn set_server_side_decoration(&self, toplevel: ToplevelSurface) {

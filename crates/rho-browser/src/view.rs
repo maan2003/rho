@@ -756,6 +756,7 @@ impl BrowserModel {
         if self.runtime.sent_size.replace(requested) != requested
             && let Some(session) = &self.runtime.session
         {
+            record_handoff_event(0, "resize", u64::from(width) << 32 | u64::from(height));
             session.resize(width, height, scale);
         }
     }
@@ -1718,6 +1719,7 @@ impl Render for BrowserView {
                                         if state.submitted == Some(scene_id) {
                                             state.presented = Some(scene_id);
                                             paint_state.set(state);
+                                            record_handoff_event(0, "pt-confirm", scene_id);
                                             cx.notify();
                                         }
                                     }
@@ -2049,6 +2051,9 @@ impl Render for BrowserView {
                     // an after-content pass, ordinary GPUI overlays remain above
                     // the child once the hole becomes active.
                     if state.presented == Some(*scene_id) {
+                        if !state.active {
+                            record_handoff_event(0, "pt-hole", *scene_id);
+                        }
                         state.active = true;
                     }
                     if state.active {
@@ -2062,6 +2067,7 @@ impl Render for BrowserView {
                         if let Some(session) = timing_model.read(cx).runtime.session.as_ref() {
                             session.disable_presentation_passthrough();
                         }
+                        record_handoff_event(0, "pt-demote", 0);
                     }
                     if state.submitted.is_some()
                         && let Some(passthrough) = passthrough.clone()
