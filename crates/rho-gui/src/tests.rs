@@ -4499,7 +4499,17 @@ fn desk_verdict_keys_write_dated_properties(cx: &mut TestAppContext) {
         replicas: Vec::new(),
     };
     let workspace = test_workspace(cx);
-    cx.update(bind_test_keymaps);
+    cx.update(|cx| {
+        bind_test_keymaps(cx);
+        // Hide normally lives in the agent transient, whose root entry is
+        // absent when a heading has no agent. Bind the existing action so
+        // this test still drives the real keystroke/action/verb path.
+        cx.bind_keys([gpui::KeyBinding::new(
+            "ctrl-shift-x",
+            crate::AgentHide,
+            Some("RhoGui > Editor"),
+        )]);
+    });
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(
@@ -4525,7 +4535,7 @@ fn desk_verdict_keys_write_dated_properties(cx: &mut TestAppContext) {
         .expect("set up Desk");
     cx.run_until_parked();
 
-    cx.simulate_keystrokes(*workspace, "escape space a d");
+    cx.simulate_keystrokes(*workspace, "escape ctrl-shift-d");
     cx.run_until_parked();
     workspace
         .update(cx, |workspace, window, cx| {
@@ -4546,7 +4556,7 @@ fn desk_verdict_keys_write_dated_properties(cx: &mut TestAppContext) {
             });
         })
         .expect("select second heading");
-    cx.simulate_keystrokes(*workspace, "space a shift-d");
+    cx.simulate_keystrokes(*workspace, "ctrl-shift-x");
     cx.run_until_parked();
 
     let today = chrono::Local::now().format("%Y-%m-%d").to_string();

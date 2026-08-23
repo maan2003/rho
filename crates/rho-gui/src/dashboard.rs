@@ -4072,7 +4072,7 @@ mod tests {
 
     #[test]
     fn heading_lines_style_by_state() {
-        let text = "* TODO Ship it\n:project: rho\n* STAFFED Crewed\n* DONE Old\n";
+        let text = "* TODO Ship it\n:project: rho\n* STAFFED Crewed\n* DONE Old\n* Property terminal\n:done: 2026-08-24\n";
         let spans = doc_spans(text);
         assert!(
             spans
@@ -4086,19 +4086,22 @@ mod tests {
                 .any(|(class, range)| matches!(class, DashClass::StaffedHeading)
                     && &text[range.clone()] == "STAFFED")
         );
-        // A DONE heading's keyword fades but the title keeps the heading
-        // color — it should not read as a comment next to its body.
+        // Terminal headings fade as a whole. The derived property state
+        // drives the same styling even though its source line is concealed.
         assert!(
             spans
                 .iter()
                 .any(|(class, range)| matches!(class, DashClass::Muted)
                     && &text[range.clone()] == "DONE")
         );
+        assert!(spans.iter().any(
+            |(class, range)| matches!(class, DashClass::Muted) && &text[range.clone()] == "Old"
+        ));
         assert!(
             spans
                 .iter()
-                .any(|(class, range)| matches!(class, DashClass::Heading)
-                    && &text[range.clone()] == "Old")
+                .any(|(class, range)| matches!(class, DashClass::Muted)
+                    && &text[range.clone()] == "Property terminal")
         );
         assert!(
             spans
