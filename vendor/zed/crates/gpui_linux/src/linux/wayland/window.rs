@@ -125,6 +125,16 @@ pub struct WaylandWindowState {
     hovered: bool,
     pub(crate) force_render_after_recovery: bool,
     renderer_presented: bool,
+    /// Whether the last commit carried a buffer. A bufferless commit produces
+    /// no damage, so compositors that only repaint on damage (niri) never
+    /// deliver the requested frame callback; a dirty window must then drive
+    /// its own next frame via `wake_frame`.
+    frame_callback_reliable: bool,
+    /// A `wake_frame` task is already queued on the executor.
+    frame_wake_queued: bool,
+    /// A `wl_surface.frame` request is outstanding, so requesting another
+    /// would stack duplicate callbacks that all fire on the next repaint.
+    frame_callback_requested: bool,
     host_presentation: Option<HostVsync>,
     passthrough_surface_created: bool,
     in_progress_configure: Option<InProgressConfigure>,
@@ -657,6 +667,9 @@ impl WaylandWindowState {
             hovered: false,
             force_render_after_recovery: false,
             renderer_presented: false,
+            frame_callback_reliable: true,
+            frame_wake_queued: false,
+            frame_callback_requested: false,
             host_presentation: None,
             passthrough_surface_created: false,
             in_progress_window_controls: None,
@@ -880,6 +893,40 @@ impl WaylandWindowStatePtr {
     }
 
     pub fn frame_at(&self, _callback_data: u32) {
+        self.state.borrow_mut().frame_callback_requested = false;
+        self.produce_frame();
+    }
+
+    /// Drives a frame for a dirty window without relying on the compositor's
+    /// frame callback. After a bufferless commit no output damage exists, so
+    /// the callback requested last frame may never fire; without this, a
+    /// dirty window only repaints on external damage such as cursor movement.
+    pub fn wake_frame(&self) {
+        let mut state = self.state.borrow_mut();
+        if state.frame_callback_reliable || state.frame_wake_queued {
+            return;
+        }
+        state.frame_wake_queued = true;
+        let executor = state.globals.executor.clone();
+        drop(state);
+        // Deferred: the waker fires from inside the request_frame callback
+        // while `self.callbacks` is mutably borrowed.
+        let this = self.clone();
+        executor
+            .spawn(async move {
+                {
+                    let mut state = this.state.borrow_mut();
+                    state.frame_wake_queued = false;
+                    if state.frame_callback_reliable {
+                        return;
+                    }
+                }
+                this.produce_frame();
+            })
+            .detach();
+    }
+
+    fn produce_frame(&self) {
         // Bind before the branch: an if-let scrutinee would hold this borrow
         // across request_frame's borrow_mut and panic.
         let host_presentation = self.state.borrow().host_presentation;
@@ -941,7 +988,10 @@ impl WaylandWindowStatePtr {
 
     fn request_frame(&self, host_vsync: Option<HostVsync>) {
         let mut state = self.state.borrow_mut();
-        state.surface.frame(&state.globals.qh, state.surface.id());
+        if !state.frame_callback_requested {
+            state.surface.frame(&state.globals.qh, state.surface.id());
+            state.frame_callback_requested = true;
+        }
         state.resize_throttle = false;
         let force_render = state.force_render_after_recovery;
         state.force_render_after_recovery = false;
@@ -1784,6 +1834,18 @@ impl PlatformWindow for WaylandWindow {
         self.borrow().fullscreen
     }
 
+    fn frame_waker(&self) -> Option<Rc<dyn Fn()>> {
+        // Weak: the waker outlives the window inside the Invalidator.
+        let state = Rc::downgrade(&self.0.state);
+        let callbacks = Rc::downgrade(&self.0.callbacks);
+        Some(Rc::new(move || {
+            let (Some(state), Some(callbacks)) = (state.upgrade(), callbacks.upgrade()) else {
+                return;
+            };
+            WaylandWindowStatePtr { state, callbacks }.wake_frame();
+        }))
+    }
+
     fn on_request_frame(&self, callback: Box<dyn FnMut(RequestFrameOptions)>) {
         self.0.callbacks.borrow_mut().request_frame = Some(callback);
     }
@@ -1874,6 +1936,7 @@ impl PlatformWindow for WaylandWindow {
             state.surface.commit();
         }
 
+        state.frame_callback_reliable = state.renderer_presented;
         state.renderer_presented = false;
     }
 
