@@ -69,6 +69,7 @@ pub struct AgentRegistry {
     turn_reports: BTreeMap<AgentId, rho_ui_proto::UiTurnReport>,
     order: Vec<AgentId>,
     last_active: BTreeMap<AgentId, rho_core::UnixMs>,
+    facts: BTreeMap<AgentId, rho_ui_proto::UiAgentFacts>,
     hosts: BTreeMap<HostId, HostSnapshot>,
     summaries: Vec<UiAgentSummary>,
     agent_locations: BTreeMap<AgentId, usize>,
@@ -224,6 +225,7 @@ impl AgentRegistry {
                         .entry(agent.agent_id)
                         .or_insert_with(|| report.clone());
                 }
+                self.facts.insert(agent.agent_id, agent.facts);
                 let active = self
                     .last_active
                     .entry(agent.agent_id)
@@ -438,6 +440,16 @@ impl AgentRegistry {
     }
     pub fn agent_last_active(&self, agent_id: AgentId) -> Option<rho_core::UnixMs> {
         self.last_active.get(&agent_id).copied()
+    }
+    pub fn set_agent_facts(&mut self, agent_id: AgentId, facts: rho_ui_proto::UiAgentFacts) {
+        self.facts.insert(agent_id, facts);
+        self.last_active.insert(
+            agent_id,
+            facts.last_turn_ended.unwrap_or(facts.last_user_message_at),
+        );
+    }
+    pub fn agent_facts(&self, agent_id: AgentId) -> rho_ui_proto::UiAgentFacts {
+        self.facts.get(&agent_id).copied().unwrap_or_default()
     }
     fn agent_summary(&self, agent_id: AgentId) -> Option<&UiAgentSummary> {
         self.agent_locations

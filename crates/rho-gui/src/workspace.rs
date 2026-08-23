@@ -1301,7 +1301,9 @@ impl Workspace {
             ConnEvent::AgentAttention {
                 agent_id,
                 attention,
+                facts,
             } => {
+                self.registry.set_agent_facts(agent_id, facts);
                 // Chime on the rising edge into the user's court only when
                 // the agent is blocked or a needs-you report is already in
                 // hand (snooze expiry resurfacing a classified turn); a
@@ -1326,6 +1328,9 @@ impl Workspace {
                 cx.notify();
             }
             ConnEvent::AgentTurnReport { agent_id, report } => {
+                let mut facts = self.registry.agent_facts(agent_id);
+                facts.needs_you_hint = report.needs_you;
+                self.registry.set_agent_facts(agent_id, facts);
                 // The attention gate keeps snoozed agents silent: their
                 // reports arrive while attention is Quiet and surface only
                 // at snooze expiry.

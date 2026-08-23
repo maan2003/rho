@@ -90,6 +90,7 @@ pub enum ConnEvent {
     AgentAttention {
         agent_id: AgentId,
         attention: rho_ui_proto::UiAttention,
+        facts: rho_ui_proto::UiAgentFacts,
     },
     AgentTurnReport {
         agent_id: AgentId,
@@ -1044,9 +1045,11 @@ async fn run(
             ServerMessage::AgentAttention {
                 agent_id,
                 attention,
+                facts,
             } => Some(ConnEvent::AgentAttention {
                 agent_id,
                 attention,
+                facts,
             }),
             ServerMessage::AgentTurnReport { agent_id, report } => {
                 Some(ConnEvent::AgentTurnReport { agent_id, report })

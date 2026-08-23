@@ -574,6 +574,7 @@ pub enum ServerMessage {
     AgentAttention {
         agent_id: AgentId,
         attention: UiAttention,
+        facts: UiAgentFacts,
     },
     /// The turn-report one-shot classified an agent's finished turn.
     /// Broadcast so rails can split pending rows into needs-you and FYI.
@@ -835,6 +836,9 @@ pub struct UiAgentSummary {
     /// Recency tiebreak for rail sorting; clients keep it current from
     /// Working broadcasts.
     pub last_active: rho_core::UnixMs,
+    /// Durable/runtime facts from which clients may derive attention policy.
+    #[senax(default)]
+    pub facts: UiAgentFacts,
     /// The user filed this agent away (`AgentDisposition::Hidden`): fold it
     /// immediately instead of waiting out the rail's idle window.
     pub hidden: bool,
@@ -857,6 +861,17 @@ pub struct UiAgentSummary {
     /// Free-form markers ("pin", …); semantics live in the client's view
     /// layer.
     pub labels: Vec<String>,
+}
+
+/// Uninterpreted facts about an agent's user/turn chronology.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct UiAgentFacts {
+    pub turn_running: bool,
+    pub last_turn_ended: Option<rho_core::UnixMs>,
+    pub last_user_message_at: rho_core::UnixMs,
+    /// Model-produced hint about the last turn. It may affect presentation
+    /// pace, but must not decide whether a reply is owed.
+    pub needs_you_hint: bool,
 }
 
 /// What a finished turn asks of the user, derived by a small model from the

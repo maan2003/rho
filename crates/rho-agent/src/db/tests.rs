@@ -792,6 +792,10 @@ async fn turn_end_and_user_message_set_dispositions() {
         db.read().get_agent(agent_id).disposition,
         AgentDisposition::Pending
     );
+    assert_eq!(
+        db.read().get_agent(agent_id).last_turn_ended,
+        Some(UnixMs(2))
+    );
 
     let mut write = db.write().await;
     write.record_agent_user_message(UnixMs(5), agent_id, "  please\ncheck the   claims  ");
@@ -817,6 +821,10 @@ async fn turn_end_and_user_message_set_dispositions() {
     assert_eq!(
         db.read().get_agent(agent_id).disposition,
         AgentDisposition::Pending
+    );
+    assert_eq!(
+        db.read().get_agent(agent_id).last_turn_ended,
+        Some(UnixMs(150))
     );
 
     // A needs-you report leaves the verdict alone; an FYI settles like a

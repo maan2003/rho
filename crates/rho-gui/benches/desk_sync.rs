@@ -33,6 +33,7 @@ fn agent_summary(id: u64) -> UiAgentSummary {
         },
         attention: UiAttention::Quiet,
         last_active: UnixMs(id),
+        facts: Default::default(),
         hidden: false,
         disposition: AgentDisposition::Pending,
         last_user_message_text: "a recent user message that shows up as the row snippet".to_owned(),

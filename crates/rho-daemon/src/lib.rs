@@ -23,7 +23,8 @@ use rho_ui_proto::{
     AgentCostSeries, AgentUsageBucket as UiAgentUsageBucket, AgentUsageSeries, AuthState,
     ClientMessage, JoinTarget, LandLeaseHolder, LandStatus, McpAgentToolRequest,
     McpAgentToolResponse, QuotaPoint, QuotaSeries, QuotaSummary, ServerMessage, StartMode,
-    UiAgentSummary, UiAttention, UiProject, UiTurnReport, WorkspaceInfo, read_frame, write_frame,
+    UiAgentFacts, UiAgentSummary, UiAttention, UiProject, UiTurnReport, WorkspaceInfo, read_frame,
+    write_frame,
 };
 use tokio::sync::{Mutex, Mutex as TokioMutex, OwnedMutexGuard, broadcast, mpsc, oneshot, watch};
 
@@ -1052,6 +1053,7 @@ impl AgentRegistry {
             let _ = self.events.send(ServerMessage::AgentAttention {
                 agent_id: *agent_id,
                 attention: attention_level(kinds.get(agent_id), disposition),
+                facts: agent_facts(&self.db.read().get_agent(*agent_id), kinds.get(agent_id)),
             });
         }
     }
@@ -1075,9 +1077,13 @@ impl AgentRegistry {
                 created_at: agent.created_at,
                 updated_at: agent.updated_at,
                 workspace: agent.primary_workdir().clone(),
+                facts: agent_facts(&agent, kinds.get(&agent_id)),
                 display_name: agent.display_name.or(agent.generated_title),
                 attention: attention_level(kinds.get(&agent_id), agent.disposition),
-                last_active: agent.last_user_message.max(agent.created_at),
+                last_active: agent
+                    .last_turn_ended
+                    .unwrap_or(agent.last_user_message)
+                    .max(agent.created_at),
                 hidden: agent.disposition == AgentDisposition::Hidden,
                 disposition: agent.disposition,
                 last_user_message_text: agent.last_user_message_text,
@@ -1831,6 +1837,18 @@ fn is_blocked(kind: &AgentStateKind) -> bool {
 /// sub-agent turn ends only set it to Pending once the user has personally
 /// engaged the agent (see `settle_turn`), so untouched children stay quiet
 /// by construction.
+fn agent_facts(record: &rho_agent::db::AgentRecord, kind: Option<&AgentStateKind>) -> UiAgentFacts {
+    UiAgentFacts {
+        turn_running: kind.is_some_and(AgentStateKind::is_working),
+        last_turn_ended: record.last_turn_ended,
+        last_user_message_at: record.last_user_message,
+        needs_you_hint: record
+            .turn_report
+            .as_ref()
+            .is_some_and(|report| report.needs_you),
+    }
+}
+
 fn attention_level(kind: Option<&AgentStateKind>, disposition: AgentDisposition) -> UiAttention {
     if kind.is_some_and(AgentStateKind::is_working) {
         return UiAttention::Working;
@@ -1917,6 +1935,10 @@ fn spawn_turn_report_projection(agents: Arc<AgentRegistry>) {
                 let _ = agents.events.send(ServerMessage::AgentAttention {
                     agent_id: reported.agent_id,
                     attention: attention_level(kind.as_ref(), AgentDisposition::Done),
+                    facts: agent_facts(
+                        &agents.db.read().get_agent(reported.agent_id),
+                        kind.as_ref(),
+                    ),
                 });
             }
         }
@@ -1959,14 +1981,16 @@ async fn spawn_attention_watcher(
                 pool.flush_agent_usage(Some(agent_id)).await;
             }
             was_working = working;
-            let disposition = db.read().get_agent(agent_id).disposition;
-            let attention = attention_level(Some(&state.kind), disposition);
-            if last_sent != Some(attention) {
+            let record = db.read().get_agent(agent_id);
+            let attention = attention_level(Some(&state.kind), record.disposition);
+            let facts = agent_facts(&record, Some(&state.kind));
+            if last_sent != Some((attention, facts)) {
                 let _ = events.send(ServerMessage::AgentAttention {
                     agent_id,
                     attention,
+                    facts,
                 });
-                last_sent = Some(attention);
+                last_sent = Some((attention, facts));
             }
         }
     });
@@ -2319,6 +2343,7 @@ fn spawn_snooze_timer(
         let _ = events.send(ServerMessage::AgentAttention {
             agent_id,
             attention: attention_level(kind.as_ref(), disposition),
+            facts: agent_facts(&db.read().get_agent(agent_id), kind.as_ref()),
         });
     });
 }

@@ -346,6 +346,10 @@ pub struct AgentRecord {
     /// engagement signal, finishing is the agent's schedule.
     #[senax(default)]
     pub last_user_message: UnixMillis,
+    /// When the most recent turn returned the agent to idle. Unlike the
+    /// presentation disposition, this is a durable chronology fact.
+    #[senax(default)]
+    pub last_turn_ended: Option<UnixMillis>,
     /// A one-line snippet of that message, so summaries can say what the
     /// user last asked without replaying the transcript.
     #[senax(default)]
@@ -886,6 +890,7 @@ impl AgentProfileWriteTxnExt for WriteTxn {
             runtime,
             claude_rewind: None,
             last_user_message: now,
+            last_turn_ended: None,
             last_user_message_text: String::new(),
             labels: Vec::new(),
             disposition: AgentDisposition::Done,
@@ -1384,6 +1389,7 @@ impl AgentWriteTxnExt for WriteTxn {
         // and the activity label describes work that just stopped.
         agent.turn_report = None;
         agent.activity = None;
+        agent.last_turn_ended = Some(now);
         agents.insert(&agent_id, SenValue::borrowed(&agent));
     }
 

@@ -90,6 +90,7 @@ pub enum ConnEvent {
     AgentAttention {
         agent_id: AgentId,
         attention: rho_ui_proto::UiAttention,
+        facts: rho_ui_proto::UiAgentFacts,
     },
     AgentTurnReport {
         agent_id: AgentId,

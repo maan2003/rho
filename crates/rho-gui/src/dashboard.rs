@@ -4191,6 +4191,7 @@ mod tests {
             },
             attention,
             last_active: UnixMs(active),
+            facts: Default::default(),
             hidden: false,
             disposition: AgentDisposition::Pending,
             last_user_message_text: String::new(),
