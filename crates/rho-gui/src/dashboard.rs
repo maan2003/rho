@@ -449,7 +449,7 @@ impl Dashboard {
             .keys()
             .filter_map(|host| self.source_text(*host, cx).map(|text| (*host, text)))
             .collect::<Vec<_>>();
-        let cards = assemble_deal_queue(&documents, registry, now, seed);
+        let cards = assemble_deal_queue(&documents, &deal_agent_facts(registry), now, seed);
         let anchors = cards
             .iter()
             .map(|card| {
@@ -927,8 +927,13 @@ impl Dashboard {
             || self.queue_depth_revision != Some(deal_revision)
             || self.queue_depth_minute != Some(minute)
         {
-            self.queue_depth =
-                assemble_deal_queue(&documents, registry, now.naive_local(), 0).len();
+            self.queue_depth = assemble_deal_queue(
+                &documents,
+                &deal_agent_facts(registry),
+                now.naive_local(),
+                0,
+            )
+            .len();
             self.queue_depth_revision = Some(deal_revision);
             self.queue_depth_minute = Some(minute);
         }
@@ -3513,18 +3518,96 @@ fn heading_breadcrumb(headings: &[DeskHeading], index: usize) -> String {
     path.join(" › ")
 }
 
-/// Builds one deterministic deal from Desk text and registry state. Text order
+#[derive(Clone, Debug)]
+pub struct DealAgentFacts {
+    pub agent_id: AgentId,
+    pub parent: Option<AgentId>,
+    pub host: HostId,
+    pub role_prefix: &'static str,
+    pub encoded_id: String,
+    pub tag: String,
+    pub heading: String,
+    pub facts: rho_ui_proto::UiAgentFacts,
+}
+
+fn deal_agent_facts(registry: &AgentRegistry) -> Vec<DealAgentFacts> {
+    registry
+        .known_agents()
+        .filter_map(|agent_id| {
+            let host = registry.host_of_agent(*agent_id)?;
+            let tag = registry
+                .agent_id_label(*agent_id)
+                .rsplit('/')
+                .next()?
+                .to_owned();
+            Some(DealAgentFacts {
+                agent_id: *agent_id,
+                parent: registry.agent_parent(*agent_id),
+                host,
+                role_prefix: registry.agent_role(*agent_id)?.handle_prefix(),
+                encoded_id: agent_id.encoded(),
+                tag,
+                heading: registry
+                    .agent_human_name(*agent_id)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned(),
+                facts: registry.agent_facts(*agent_id),
+            })
+        })
+        .collect()
+}
+
+fn reply_priority(ended: rho_core::UnixMs, hinted: bool, now: chrono::NaiveDateTime) -> f64 {
+    let now_ms = now.and_local_timezone(chrono::Local).single().map_or_else(
+        || now.and_utc().timestamp_millis(),
+        |at| at.timestamp_millis(),
+    );
+    let elapsed_days = (now_ms - ended.0 as i64) as f64 / 86_400_000.0;
+    elapsed_days - if hinted { 0.25 } else { 7.0 }
+}
+
+/// Builds one deterministic deal from Desk text and per-agent facts. Text order
 /// breaks ties everywhere except resurfaced priority; `seed` chooses the one
 /// anti-starvation card without introducing persistent state.
 pub fn assemble_deal_queue(
     documents: &[(HostId, String)],
-    registry: &AgentRegistry,
+    agent_facts: &[DealAgentFacts],
     now: chrono::NaiveDateTime,
     seed: u64,
 ) -> Vec<DealCard> {
     use rho_ui_proto::desk::TemporalMarkKind;
     use rho_ui_proto::desk::temporal::{is_overdue_deadline, priority, surfaced};
 
+    let by_id = agent_facts
+        .iter()
+        .map(|agent| (agent.agent_id, agent))
+        .collect::<HashMap<_, _>>();
+    let resolve_tag = |host: HostId, tag: &str| {
+        let (role, prefix) = tag.split_once('-')?;
+        let mut matches = agent_facts.iter().filter(|agent| {
+            agent.host == host && agent.role_prefix == role && agent.encoded_id.starts_with(prefix)
+        });
+        let first = matches.next()?;
+        matches.next().is_none().then_some(first.agent_id)
+    };
+    let descendants = |root: AgentId| {
+        let mut result = vec![root];
+        let mut cursor = 0;
+        while cursor < result.len() {
+            let parent = result[cursor];
+            result.extend(
+                agent_facts
+                    .iter()
+                    .filter(|agent| agent.parent == Some(parent))
+                    .map(|agent| agent.agent_id),
+            );
+            cursor += 1;
+        }
+        result
+    };
     let mut heading_rows = Vec::new();
     let mut agent_topics: HashMap<AgentId, (HostId, usize, String, bool, bool, bool)> =
         HashMap::new();
@@ -3548,16 +3631,16 @@ pub fn assemble_deal_queue(
             let deferred = heading.temporal_marks.iter().any(|mark| {
                 matches!(
                     mark.kind,
-                    TemporalMarkKind::Reminder | TemporalMarkKind::Skip
+                    TemporalMarkKind::Defer | TemporalMarkKind::Reminder | TemporalMarkKind::Skip
                 ) && mark.at > now
             });
             let agents = heading
                 .tags
                 .iter()
-                .filter_map(|tag| registry.agent_by_tag(*host, tag))
+                .filter_map(|tag| resolve_tag(*host, tag))
                 .collect::<Vec<_>>();
             for agent in &agents {
-                for member in registry.agent_subtree(*agent) {
+                for member in descendants(*agent) {
                     let candidate = (
                         *host,
                         heading.heading_range.start,
@@ -3586,22 +3669,26 @@ pub fn assemble_deal_queue(
     let mut finished = Vec::new();
     let mut visible_agents = HashSet::new();
     let mut claimed_topics = HashSet::new();
-    let mut candidate_agents = registry.known_agents().copied().collect::<Vec<_>>();
-    candidate_agents.sort_by_cached_key(|agent_id| {
-        let needs_you = registry.attention(*agent_id) == UiAttention::NeedsInput
-            || registry
-                .agent_turn_report(*agent_id)
-                .is_some_and(|report| report.needs_you);
-        (
-            Reverse(needs_you),
-            Reverse(registry.attention(*agent_id)),
-            Reverse(registry.agent_last_active(*agent_id).unwrap_or_default()),
-            *agent_id,
-        )
+    let mut candidate_agents = agent_facts
+        .iter()
+        .filter_map(|agent| {
+            let ended = agent.facts.last_turn_ended?;
+            (!agent.facts.turn_running && ended > agent.facts.last_user_message_at).then_some((
+                agent.agent_id,
+                ended,
+                agent.facts.needs_you_hint,
+                reply_priority(ended, agent.facts.needs_you_hint, now),
+            ))
+        })
+        .filter(|(_, _, _, priority)| *priority > DEAL_SURFACE_THRESHOLD)
+        .collect::<Vec<_>>();
+    candidate_agents.sort_by(|a, b| {
+        b.2.cmp(&a.2)
+            .then_with(|| b.3.total_cmp(&a.3))
+            .then_with(|| a.0.cmp(&b.0))
     });
-    for agent_id in candidate_agents {
-        let attention = registry.attention(agent_id);
-        if attention < UiAttention::Pending {
+    for (agent_id, _ended, needs_you, _priority) in candidate_agents {
+        if !agent_topics.contains_key(&agent_id) {
             continue;
         }
         if agent_topics
@@ -3617,26 +3704,16 @@ pub fn assemble_deal_queue(
         if topic.is_some_and(|topic| claimed_topics.contains(&(topic.0, topic.1))) {
             continue;
         }
-        let agent_tag = registry
-            .agent_id_label(agent_id)
-            .rsplit('/')
-            .next()
-            .unwrap()
-            .to_owned();
-        let agent_heading = registry
-            .agent_human_name(agent_id)
-            .lines()
-            .next()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .unwrap_or(&agent_tag)
-            .to_owned();
+        let agent = by_id[&agent_id];
+        let agent_tag = agent.tag.clone();
+        let agent_heading = if agent.heading.is_empty() {
+            agent_tag.clone()
+        } else {
+            agent.heading.clone()
+        };
         let card = DealCard {
             section: DealSection::NeedsYou,
-            host: topic.map_or_else(
-                || registry.host_of_agent(agent_id).unwrap_or_default(),
-                |topic| topic.0,
-            ),
+            host: topic.map_or_else(|| agent.host, |topic| topic.0),
             heading_offset: topic.map(|topic| topic.1),
             agent_id: Some(agent_id),
             agent_tag: Some(agent_tag),
@@ -3645,10 +3722,6 @@ pub fn assemble_deal_queue(
         if let Some(topic) = topic {
             claimed_topics.insert((topic.0, topic.1));
         }
-        let needs_you = attention == UiAttention::NeedsInput
-            || registry
-                .agent_turn_report(agent_id)
-                .is_some_and(|report| report.needs_you);
         if needs_you {
             needs.push(card);
         } else {
@@ -3658,7 +3731,6 @@ pub fn assemble_deal_queue(
             });
         }
     }
-    needs.sort_by_key(|card| Reverse(registry.attention(card.agent_id.unwrap())));
 
     let mut resurfaced = Vec::new();
     let mut random_pool = Vec::new();
@@ -3706,12 +3778,10 @@ pub fn assemble_deal_queue(
                     heading_offset: Some(heading.heading_range.start),
                     agent_id: agents.first().copied(),
                     agent_tag: agents.first().map(|agent| {
-                        registry
-                            .agent_id_label(*agent)
-                            .rsplit('/')
-                            .next()
-                            .unwrap()
-                            .to_owned()
+                        by_id
+                            .get(agent)
+                            .map(|agent| agent.tag.clone())
+                            .unwrap_or_default()
                     }),
                     breadcrumb,
                 },
@@ -3727,14 +3797,10 @@ pub fn assemble_deal_queue(
                 host,
                 heading_offset: Some(heading.heading_range.start),
                 agent_id: agents.first().copied(),
-                agent_tag: agents.first().map(|agent| {
-                    registry
-                        .agent_id_label(*agent)
-                        .rsplit('/')
-                        .next()
-                        .unwrap()
-                        .to_owned()
-                }),
+                agent_tag: agents
+                    .first()
+                    .and_then(|agent| by_id.get(agent))
+                    .map(|agent| agent.tag.clone()),
                 breadcrumb,
             });
         }
@@ -4209,7 +4275,12 @@ mod tests {
             },
             attention,
             last_active: UnixMs(active),
-            facts: Default::default(),
+            facts: rho_ui_proto::UiAgentFacts {
+                turn_running: attention == UiAttention::Working,
+                last_turn_ended: (attention >= UiAttention::Pending).then_some(UnixMs(active)),
+                last_user_message_at: UnixMs(0),
+                needs_you_hint: attention == UiAttention::NeedsInput,
+            },
             hidden: false,
             disposition: AgentDisposition::Pending,
             last_user_message_text: String::new(),
@@ -4282,7 +4353,7 @@ mod tests {
             .unwrap()
             .and_hms_opt(12, 0, 0)
             .unwrap();
-        let cards = assemble_deal_queue(&[(host, text)], &registry, now, 7);
+        let cards = assemble_deal_queue(&[(host, text)], &deal_agent_facts(&registry), now, 7);
         assert_eq!(cards[0].section, DealSection::NeedsYou);
         assert_eq!(cards[0].agent_id, Some(loud.agent_id));
         assert_eq!(cards[1].section, DealSection::Finished);
@@ -4323,13 +4394,113 @@ mod tests {
             .and_hms_opt(12, 0, 0)
             .unwrap();
         let text = "* Snoozed deadline\n:skip: 2026-08-24\n:deadline: 2020-01-01\n* Expired skip\n:skip: 2026-08-22\n:deadline: 2020-01-01\n".to_owned();
-        let cards = assemble_deal_queue(&[(host, text)], &registry, now, 7);
+        let cards = assemble_deal_queue(&[(host, text)], &deal_agent_facts(&registry), now, 7);
         assert!(
             cards
                 .iter()
                 .all(|card| card.breadcrumb != "Snoozed deadline")
         );
         assert!(cards.iter().any(|card| card.breadcrumb == "Expired skip"));
+    }
+
+    #[test]
+    fn deal_agent_reply_is_derived_from_chronology_and_running_state() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+        let at = |days: i64| UnixMs((now.and_utc().timestamp_millis() - days * 86_400_000) as u64);
+        let mut owed = agent(1, None, UiAttention::Quiet, 0);
+        owed.facts = rho_ui_proto::UiAgentFacts {
+            turn_running: false,
+            last_turn_ended: Some(at(8)),
+            last_user_message_at: at(9),
+            needs_you_hint: false,
+        };
+        let (reg, host) = registry(vec![owed.clone()]);
+        let text = format!(
+            "* Topic :eng-{}:
+",
+            &owed.agent_id.encoded()[..4]
+        );
+        assert_eq!(
+            assemble_deal_queue(&[(host, text.clone())], &deal_agent_facts(&reg), now, 1)[0]
+                .section,
+            DealSection::Finished
+        );
+
+        owed.facts.turn_running = true;
+        let (reg, _) = registry(vec![owed.clone()]);
+        assert!(
+            assemble_deal_queue(&[(host, text.clone())], &deal_agent_facts(&reg), now, 1)
+                .iter()
+                .all(|card| !matches!(card.section, DealSection::NeedsYou | DealSection::Finished))
+        );
+
+        owed.facts.turn_running = false;
+        owed.facts.last_user_message_at = at(7);
+        let (reg, _) = registry(vec![owed.clone()]);
+        assert!(
+            assemble_deal_queue(&[(host, text)], &deal_agent_facts(&reg), now, 1)
+                .iter()
+                .all(|card| !matches!(card.section, DealSection::NeedsYou | DealSection::Finished))
+        );
+    }
+
+    #[test]
+    fn reply_hint_changes_pace_not_owed_status_and_heading_gates_apply() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+        let ended = UnixMs((now.and_utc().timestamp_millis() - 86_400_000) as u64);
+        let mut owed = agent(1, None, UiAttention::Quiet, 0);
+        owed.facts = rho_ui_proto::UiAgentFacts {
+            turn_running: false,
+            last_turn_ended: Some(ended),
+            last_user_message_at: UnixMs(0),
+            needs_you_hint: false,
+        };
+        let (reg, host) = registry(vec![owed.clone()]);
+        let plain = format!(
+            "* Topic :eng-{}:
+",
+            &owed.agent_id.encoded()[..4]
+        );
+        assert!(
+            assemble_deal_queue(&[(host, plain.clone())], &deal_agent_facts(&reg), now, 1)
+                .iter()
+                .all(|card| !matches!(card.section, DealSection::NeedsYou | DealSection::Finished))
+        );
+
+        owed.facts.needs_you_hint = true;
+        let (reg, _) = registry(vec![owed.clone()]);
+        let cards = assemble_deal_queue(&[(host, plain.clone())], &deal_agent_facts(&reg), now, 1);
+        assert_eq!(cards[0].section, DealSection::NeedsYou);
+
+        let skipped = format!(
+            "* Topic :eng-{}:
+:skip: 2026-08-24
+",
+            &owed.agent_id.encoded()[..4]
+        );
+        assert!(
+            assemble_deal_queue(&[(host, skipped)], &deal_agent_facts(&reg), now, 1)
+                .iter()
+                .all(|card| card.agent_id != Some(owed.agent_id))
+        );
+        let expired = format!(
+            "* Topic :eng-{}:\n:skip: 2026-08-22\n",
+            &owed.agent_id.encoded()[..4]
+        );
+        assert_eq!(
+            assemble_deal_queue(&[(host, expired)], &deal_agent_facts(&reg), now, 1)[0].section,
+            DealSection::NeedsYou
+        );
+        assert!(
+            assemble_deal_queue(&[(host, String::new())], &deal_agent_facts(&reg), now, 1)
+                .is_empty()
+        );
     }
 
     #[test]

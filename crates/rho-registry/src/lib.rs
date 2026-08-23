@@ -454,11 +454,15 @@ impl AgentRegistry {
         self.last_active.get(&agent_id).copied()
     }
     pub fn set_agent_facts(&mut self, agent_id: AgentId, facts: rho_ui_proto::UiAgentFacts) {
+        let changed = self.agent_facts(agent_id) != facts;
         self.facts.insert(agent_id, facts);
         self.last_active.insert(
             agent_id,
             facts.last_turn_ended.unwrap_or(facts.last_user_message_at),
         );
+        if changed {
+            self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
+        }
     }
     pub fn agent_facts(&self, agent_id: AgentId) -> rho_ui_proto::UiAgentFacts {
         self.facts.get(&agent_id).copied().unwrap_or_default()
@@ -586,7 +590,7 @@ impl AgentRegistry {
 
 #[cfg(test)]
 mod tests {
-    use rho_ui_proto::{AgentIdDomain, UiAttention, UiTurnReport};
+    use rho_ui_proto::{AgentIdDomain, UiAgentFacts, UiAttention, UiTurnReport};
 
     use super::*;
 
@@ -613,5 +617,16 @@ mod tests {
         assert_ne!(pending_revision, known_revision);
         registry.set_attention(agent_id, UiAttention::Pending);
         assert_eq!(registry.deal_count_revision(), pending_revision);
+
+        let facts = UiAgentFacts {
+            last_turn_ended: Some(rho_core::UnixMs(2)),
+            last_user_message_at: rho_core::UnixMs(1),
+            ..Default::default()
+        };
+        registry.set_agent_facts(agent_id, facts);
+        let facts_revision = registry.deal_count_revision();
+        assert_ne!(facts_revision, pending_revision);
+        registry.set_agent_facts(agent_id, facts);
+        assert_eq!(registry.deal_count_revision(), facts_revision);
     }
 }
