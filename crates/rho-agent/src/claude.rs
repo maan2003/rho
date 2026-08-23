@@ -43,6 +43,34 @@ use projection::{
 
 use crate::lazy::Lazy;
 
+/// Last real assistant-message timestamp in a persisted Claude transcript.
+/// Missing or malformed timestamps are ignored rather than replaced with an
+/// invented chronology value.
+pub fn last_assistant_message_at(
+    messages: &[rho_claude::SessionMessage],
+) -> Option<rho_core::UnixMs> {
+    messages
+        .iter()
+        .filter(|message| message.kind == rho_claude::SessionMessageKind::Assistant)
+        .filter_map(|message| message.timestamp.as_deref())
+        .filter_map(|timestamp| chrono::DateTime::parse_from_rfc3339(timestamp).ok())
+        .filter_map(|timestamp| timestamp.timestamp_millis().try_into().ok())
+        .map(rho_core::UnixMs)
+        .max()
+}
+
+/// Persists a legacy turn-end fact from transcript ground truth, if present.
+pub fn backfill_last_turn_ended_from_claude_messages(
+    write: &mut WriteTxn,
+    agent_id: AgentId,
+    messages: &[rho_claude::SessionMessage],
+) -> bool {
+    let Some(at) = last_assistant_message_at(messages) else {
+        return false;
+    };
+    write.backfill_agent_last_turn_ended(agent_id, at)
+}
+
 #[derive(Clone)]
 pub struct ClaudeAgent {
     state: Arc<RwLock<AgentState>>,
@@ -2100,6 +2128,74 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn legacy_turn_end_uses_last_real_assistant_transcript_timestamp() {
+        let session_id = Uuid::new_v4();
+        let message = |kind, timestamp: Option<&str>| rho_claude::SessionMessage {
+            kind,
+            uuid: Uuid::new_v4(),
+            session_id,
+            message: json!({}),
+            parent_tool_use_id: None,
+            timestamp: timestamp.map(str::to_owned),
+        };
+        let messages = vec![
+            message(
+                rho_claude::SessionMessageKind::Assistant,
+                Some("2026-07-01T10:00:00Z"),
+            ),
+            message(
+                rho_claude::SessionMessageKind::Assistant,
+                Some("not-a-timestamp"),
+            ),
+            message(
+                rho_claude::SessionMessageKind::User,
+                Some("2026-07-03T10:00:00Z"),
+            ),
+            message(
+                rho_claude::SessionMessageKind::Assistant,
+                Some("2026-07-02T10:00:00Z"),
+            ),
+        ];
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-07-02T10:00:00Z")
+            .unwrap()
+            .timestamp_millis() as u64;
+        assert_eq!(
+            last_assistant_message_at(&messages),
+            Some(rho_core::UnixMs(expected))
+        );
+        assert_eq!(
+            last_assistant_message_at(&[message(rho_claude::SessionMessageKind::Assistant, None,)]),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_record_is_backfilled_from_transcript_ground_truth() {
+        let (_temp, db, agent_id) = presentation_test_agent().await;
+        assert_eq!(db.read().get_agent(agent_id).last_turn_ended, None);
+        let messages = [rho_claude::SessionMessage {
+            kind: rho_claude::SessionMessageKind::Assistant,
+            uuid: Uuid::new_v4(),
+            session_id: Uuid::new_v4(),
+            message: json!({}),
+            parent_tool_use_id: None,
+            timestamp: Some("2026-06-01T00:00:00Z".to_owned()),
+        }];
+        let mut write = db.write().await;
+        assert!(backfill_last_turn_ended_from_claude_messages(
+            &mut write, agent_id, &messages,
+        ));
+        write.commit();
+        let expected = chrono::DateTime::parse_from_rfc3339("2026-06-01T00:00:00Z")
+            .unwrap()
+            .timestamp_millis() as u64;
+        assert_eq!(
+            db.read().get_agent(agent_id).last_turn_ended,
+            Some(rho_core::UnixMs(expected))
+        );
+    }
 
     async fn presentation_test_agent() -> (tempfile::TempDir, RhoDb, AgentId) {
         let temp = tempfile::tempdir().unwrap();

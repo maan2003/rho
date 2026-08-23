@@ -770,6 +770,31 @@ async fn presentation_history_folds_by_source_reachability_after_rewind() {
 }
 
 #[tokio::test]
+async fn legacy_turn_end_backfill_is_one_way_and_durable() {
+    let temp = tempfile::tempdir().unwrap();
+    let db = RhoDb::open(temp.path().join("rho.redb"));
+    let mut write = db.write().await;
+    write.init_agent_tables();
+    let agent_id = write.alloc_agent_id();
+    write.create_agent(
+        UnixMs(1),
+        agent_id,
+        None,
+        vec![test_workspace()],
+        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
+        test_agent_runtime(),
+        None,
+    );
+    assert!(write.backfill_agent_last_turn_ended(agent_id, UnixMs(20)));
+    assert!(!write.backfill_agent_last_turn_ended(agent_id, UnixMs(30)));
+    write.commit();
+    assert_eq!(
+        db.read().get_agent(agent_id).last_turn_ended,
+        Some(UnixMs(20))
+    );
+}
+
+#[tokio::test]
 async fn turn_end_and_user_message_set_dispositions() {
     let temp = tempfile::tempdir().unwrap();
     let db = RhoDb::open(temp.path().join("rho.redb"));

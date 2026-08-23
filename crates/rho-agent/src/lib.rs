@@ -32,6 +32,7 @@ use crate::multi_agent_tools::MultiAgentTools;
 use crate::pool::{AgentAssistantItemCompleted, AgentInputAccepted, AgentTurnCompleted};
 
 mod claude;
+pub use claude::{backfill_last_turn_ended_from_claude_messages, last_assistant_message_at};
 #[cfg(feature = "code-mode")]
 mod code_mode;
 pub mod db;

@@ -801,6 +801,10 @@ pub trait AgentWriteTxnExt {
     /// the expiry broadcast resurfaces whatever finished meanwhile.
     fn record_agent_turn_end(&mut self, now: UnixMillis, agent_id: AgentId);
 
+    /// Fills the chronology fact for records created before it existed.
+    /// Never overwrites a turn end recorded by a current runtime.
+    fn backfill_agent_last_turn_ended(&mut self, agent_id: AgentId, at: UnixMillis) -> bool;
+
     /// Stores the one-shot classification of the last finished turn. The
     /// caller checks the disposition is still `Pending` so a late result
     /// never describes a turn the user already answered.
@@ -1391,6 +1395,21 @@ impl AgentWriteTxnExt for WriteTxn {
         agent.activity = None;
         agent.last_turn_ended = Some(now);
         agents.insert(&agent_id, SenValue::borrowed(&agent));
+    }
+
+    fn backfill_agent_last_turn_ended(&mut self, agent_id: AgentId, at: UnixMillis) -> bool {
+        let mut agents = self.open_table(AGENTS);
+        let mut agent = agents
+            .get(&agent_id)
+            .expect("agent id missing")
+            .value()
+            .into_owned();
+        if agent.last_turn_ended.is_some() {
+            return false;
+        }
+        agent.last_turn_ended = Some(at);
+        agents.insert(&agent_id, SenValue::borrowed(&agent));
+        true
     }
 
     fn record_agent_turn_report(&mut self, agent_id: AgentId, report: &TurnReport) {

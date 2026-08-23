@@ -359,6 +359,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         )
         .await?,
     );
+    backfill_legacy_turn_end_times(&agents).await;
     agents.install_iris_tool_host();
     spawn_presentation_projection(Arc::clone(&agents));
     spawn_turn_report_projection(Arc::clone(&agents));
@@ -1821,6 +1822,55 @@ where
         }
     }
     Ok(())
+}
+
+/// Backfills chronology for Claude agents written before `last_turn_ended`
+/// existed. Native event records do not retain assistant timestamps, so they
+/// deliberately remain unknown rather than receiving an invented value.
+async fn backfill_legacy_turn_end_times(agents: &AgentRegistry) {
+    let kinds = agents.agent_state_kinds().await;
+    let candidates = agents
+        .db
+        .read()
+        .list_agents()
+        .into_iter()
+        .filter_map(|(agent_id, agent)| {
+            if agent.last_turn_ended.is_some()
+                || kinds.get(&agent_id).is_some_and(AgentStateKind::is_working)
+            {
+                return None;
+            }
+            let AgentRuntime::Claude { session_id } = agent.runtime else {
+                return None;
+            };
+            Some((
+                agent_id,
+                session_id,
+                agent.primary_workdir().repo().to_owned(),
+            ))
+        })
+        .collect::<Vec<_>>();
+
+    for (agent_id, session_id, cwd) in candidates {
+        let messages = match rho_claude::read_session_messages_by_id(
+            session_id,
+            &cwd,
+            rho_claude::SessionMessagesOptions::default(),
+        )
+        .await
+        {
+            Ok(messages) => messages,
+            Err(error) => {
+                tracing::warn!(?agent_id, %error, "could not read Claude transcript for turn-end backfill");
+                continue;
+            }
+        };
+        let mut write = agents.db.write().await;
+        if rho_agent::backfill_last_turn_ended_from_claude_messages(&mut write, agent_id, &messages)
+        {
+            write.commit();
+        }
+    }
 }
 
 /// Stuck rather than finished: the agent cannot proceed without the user.
