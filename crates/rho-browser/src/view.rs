@@ -1743,6 +1743,7 @@ impl Render for BrowserView {
                                         }
                                     }
                                     LinuxWaylandPassthroughEvent::Discarded { scene_id } => {
+                                        record_handoff_event(0, "pt-discard", scene_id);
                                         session.host_presentation(
                                             scene_id,
                                             HostPresentation::Discarded,
