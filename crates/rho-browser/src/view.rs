@@ -1836,12 +1836,13 @@ impl Render for BrowserView {
             self.fallback_scene = current_scene.clone();
             (current_scene, None)
         };
-        if passthrough_scene.is_some() && !self.passthrough_timing_enabled.get() {
-            if let Some(session) = model.runtime.session.as_ref() {
-                session.enable_presentation_passthrough();
-                self.passthrough_timing_enabled.set(true);
-                model.passthrough_owner.set(Some(self.owner_id));
-            }
+        if passthrough_scene.is_some()
+            && !self.passthrough_timing_enabled.get()
+            && let Some(session) = model.runtime.session.as_ref()
+        {
+            session.enable_presentation_passthrough();
+            self.passthrough_timing_enabled.set(true);
+            model.passthrough_owner.set(Some(self.owner_id));
         }
         let status = browser_status(
             &model.runtime,
