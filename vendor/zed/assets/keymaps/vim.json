@@ -2,7 +2,7 @@
   {
     // Application-owned review modes deliberately expose navigation without
     // inheriting Vim/Helix edit, object, or selection commands.
-    "context": "VimDeal && !menu",
+    "context": "VimDeal && vim_mode == deal && !menu",
     "bindings": {
       "left": "vim::Left",
       "h": "vim::Left",
@@ -38,10 +38,6 @@
       "shift-e": ["vim::NextWordEnd", { "ignore_punctuation": true }],
       "shift-b": ["vim::PreviousWordStart", { "ignore_punctuation": true }],
       "g shift-e": ["vim::PreviousWordEnd", { "ignore_punctuation": true }],
-      "/": "vim::Search",
-      "?": ["vim::Search", { "backwards": true }],
-      "*": "vim::MoveToNext",
-      "#": "vim::MoveToPrevious",
       "%": ["vim::Matching", { "match_quotes": true }],
       "f": ["vim::PushFindForward", { "before": false, "multiline": false }],
       "shift-f": ["vim::PushFindBackward", { "after": false, "multiline": false }],
@@ -83,7 +79,7 @@
     }
   },
   {
-    "context": "VimDeal && VimCount",
+    "context": "VimDeal && vim_mode == deal && VimCount",
     "bindings": {
       "0": ["vim::Number", 0]
     }

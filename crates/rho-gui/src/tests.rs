@@ -4949,6 +4949,39 @@ fn desk_deal_session_resumes_and_insert_escape_returns_to_normal(cx: &mut TestAp
         })
         .unwrap();
 
+    cx.simulate_keystrokes(*workspace, "l l");
+    cx.run_until_parked();
+    let before_find = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace.dashboard_editor().update(cx, |editor, cx| {
+                let snapshot = editor.display_snapshot(cx);
+                editor
+                    .selections
+                    .newest::<editor::MultiBufferOffset>(&snapshot)
+                    .head()
+                    .0
+            })
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "f h");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            workspace.dashboard_editor().update(cx, |editor, cx| {
+                let snapshot = editor.display_snapshot(cx);
+                assert_eq!(
+                    editor
+                        .selections
+                        .newest::<editor::MultiBufferOffset>(&snapshot)
+                        .head()
+                        .0,
+                    before_find,
+                    "Deal motion bindings must release find's target key"
+                );
+            });
+        })
+        .unwrap();
+
     cx.simulate_keystrokes(*workspace, "a f");
     cx.run_until_parked();
     workspace
