@@ -347,7 +347,6 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         "RhoDashboard > Editor && vim_mode == helix_normal && !VimDeal",
     ] {
         cx.bind_keys([
-            KeyBinding::new("enter", DashboardGoto, Some(context)),
             KeyBinding::new("r", DashboardReply, Some(context)),
             KeyBinding::new("shift-r", DashboardNewAgent, Some(context)),
             KeyBinding::new("tab", DashboardToggleSubagents, Some(context)),
@@ -386,13 +385,6 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
 /// every Rho GUI frontend. Platform-specific actions remain harmless when
 /// their corresponding surface is unavailable; their contexts never match.
 pub fn init_vim_mode(cx: &mut App) -> anyhow::Result<()> {
-    // Rho is Vim-first. The bundled Zed defaults currently enable Helix, and
-    // the modal engine gives Helix precedence when both settings are true.
-    // Force the complete mode choice here so every frontend initializes the
-    // same key contexts rather than merely enabling the shared modal engine.
-    let settings = cx.global_mut::<settings::SettingsStore>();
-    settings.override_global(vim_mode_setting::VimModeSetting(true));
-    settings.override_global(vim_mode_setting::HelixModeSetting(false));
     vim::init(cx);
     let default_key_bindings =
         settings::KeymapFile::load_asset_allow_partial_failure(settings::DEFAULT_KEYMAP_PATH, cx)?;

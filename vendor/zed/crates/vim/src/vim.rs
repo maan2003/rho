@@ -1588,7 +1588,6 @@ impl Vim {
 
         if matches!(self.mode, Mode::Deal | Mode::HelixDeal) {
             context.add("VimDeal");
-            context.add("VimControl");
         }
 
         let mut operator_id = "none";

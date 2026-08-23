@@ -42,7 +42,7 @@ fn init_test_app(cx: &mut App) {
 }
 
 #[gpui::test]
-fn shared_modal_init_selects_vim_over_bundled_helix_default(cx: &mut TestAppContext) {
+fn shared_modal_init_preserves_bundled_helix_default(cx: &mut TestAppContext) {
     cx.update(|cx| {
         assets::Assets.load_test_fonts(cx);
         let store = SettingsStore::new(cx, crate::rho_assets::RHO_DEFAULT_SETTINGS);
@@ -52,8 +52,8 @@ fn shared_modal_init_selects_vim_over_bundled_helix_default(cx: &mut TestAppCont
 
         crate::init_vim_mode(cx).expect("initialize Vim mode");
 
-        assert!(vim_mode_setting::VimModeSetting::get_global(cx).0);
-        assert!(!vim_mode_setting::HelixModeSetting::get_global(cx).0);
+        assert!(!vim_mode_setting::VimModeSetting::get_global(cx).0);
+        assert!(vim_mode_setting::HelixModeSetting::get_global(cx).0);
     });
 }
 
@@ -4920,7 +4920,7 @@ fn desk_deal_session_resumes_and_insert_escape_returns_to_normal(cx: &mut TestAp
             assert!(
                 workspace
                     .dashboard_hint_for_test(cx)
-                    .starts_with("deadline · ")
+                    .starts_with("DEAL · deadline · ")
                     && workspace
                         .dashboard_hint_for_test(cx)
                         .contains(" · 1/3 · 3 dealt · 3 waiting")
@@ -4933,6 +4933,55 @@ fn desk_deal_session_resumes_and_insert_escape_returns_to_normal(cx: &mut TestAp
                         .newest::<editor::MultiBufferOffset>(&snapshot)
                         .is_empty(),
                     "Helix Deal must use a cursor, not a selection"
+                );
+            });
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "r");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                workspace.dashboard_deal_mode_for_test(),
+                "reply must be inert on a non-agent deal card"
+            );
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "a f");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            workspace.dashboard_editor().update(cx, |editor, cx| {
+                let snapshot = editor.display_snapshot(cx);
+                assert!(
+                    editor
+                        .selections
+                        .newest::<editor::MultiBufferOffset>(&snapshot)
+                        .is_empty(),
+                    "unmatched Deal keys must not enter Helix object selection"
+                );
+            });
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "enter o a f enter");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace
+                    .dashboard_deal_topic_for_test()
+                    .map(|(_, _, breadcrumb)| breadcrumb),
+                Some("One")
+            );
+            workspace.dashboard_editor().update(cx, |editor, cx| {
+                let snapshot = editor.display_snapshot(cx);
+                assert!(
+                    editor
+                        .selections
+                        .newest::<editor::MultiBufferOffset>(&snapshot)
+                        .is_empty()
                 );
             });
         })
@@ -4983,7 +5032,7 @@ fn desk_deal_session_resumes_and_insert_escape_returns_to_normal(cx: &mut TestAp
             assert!(
                 workspace
                     .dashboard_hint_for_test(cx)
-                    .starts_with("deadline · ")
+                    .starts_with("DEAL · deadline · ")
                     && workspace
                         .dashboard_hint_for_test(cx)
                         .contains(" · 2/3 · 3 dealt · 3 waiting")
@@ -5416,6 +5465,7 @@ fn desk_deal_counted_snooze_todo_and_refresh_write_and_redeal(cx: &mut TestAppCo
         .update(cx, |workspace, _, cx| workspace.dashboard_hint_for_test(cx))
         .unwrap();
     assert!(before_refresh.contains("5/6"), "{before_refresh:?}");
+    assert!(before_refresh.contains("2 waiting"), "{before_refresh:?}");
 
     cx.simulate_keystrokes(*workspace, "shift-r");
     cx.run_until_parked();

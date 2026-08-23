@@ -341,6 +341,9 @@ pub struct Workspace {
     /// The dashboard: the rail as a real editor buffer, ambient chrome
     /// beside the active tree.
     dashboard: crate::dashboard::Dashboard,
+    /// The vendored modal engine's status item, kept visible in Rho's frame.
+    #[cfg(feature = "native")]
+    mode_indicator: Entity<vim::ModeIndicator>,
     /// Compact Helix-style key guide shown on deal entry and `?`.
     deal_help_visible: bool,
     /// Canonical per-host CRDT Desk buffers shared by dashboard and source
@@ -717,6 +720,7 @@ impl Workspace {
     pub fn new(specs: Vec<HostSpec>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (hosts, events) = Hosts::new();
         let workspace = cx.entity().downgrade();
+        let mode_indicator = cx.new(|cx| vim::ModeIndicator::new(window, cx));
         let draft_model = cx.new(|cx| DraftModel::new(workspace, cx));
         let event_task = cx.spawn(async move |this, cx| {
             let mut events: UnboundedReceiver<HostEvent> = events;
@@ -803,6 +807,7 @@ impl Workspace {
             surfaces: HashMap::new(),
             active_context: ContextId::Draft,
             dashboard,
+            mode_indicator,
             deal_help_visible: false,
             desk_sync: DeskSync::default(),
             desk_edit_subscriptions: HashMap::new(),
@@ -6531,20 +6536,26 @@ impl Workspace {
                 .gap_2()
                 .child(
                     div()
-                        .w(px(76.))
+                        .w(px(96.))
                         .px_1()
+                        .whitespace_nowrap()
                         .rounded_sm()
                         .bg(colors.element_selected)
                         .text_color(colors.text_accent)
                         .child(keys),
                 )
-                .child(div().text_color(colors.text_muted).child(meaning))
+                .child(
+                    div()
+                        .whitespace_nowrap()
+                        .text_color(colors.text_muted)
+                        .child(meaning),
+                )
         };
         div()
             .absolute()
             .top_3()
             .right_3()
-            .w(px(244.))
+            .w(px(288.))
             .p_3()
             .border_1()
             .border_color(colors.border_variant)
@@ -7523,6 +7534,9 @@ impl Render for Workspace {
                 let Some(card) = this.dashboard.current_deal_card().cloned() else {
                     return;
                 };
+                let Some(agent_id) = card.agent_id else {
+                    return;
+                };
                 if !this.dashboard.exit_deal_mode(cx) {
                     return;
                 }
@@ -7530,15 +7544,7 @@ impl Render for Workspace {
                 if let Ok(action) = cx.build_action("vim::ExitDealMode", None) {
                     window.dispatch_action(action, cx);
                 }
-                let topic = card.heading_offset.map(|offset| (card.host, offset));
-                let agent_id = card.agent_id.or_else(|| {
-                    topic.and_then(|topic| this.dashboard.first_agent_for_topic(topic))
-                });
-                if let Some(agent_id) = agent_id {
-                    this.dashboard.open_reply(agent_id, window, cx);
-                } else {
-                    this.dashboard.open_new_draft(topic, window, cx);
-                }
+                this.dashboard.open_reply(agent_id, window, cx);
                 this.dashboard_focus_draft(window, cx);
             }))
             .on_action(
@@ -7686,6 +7692,10 @@ impl Render for Workspace {
                 this.finish_git_approval(GitApprovalDecision::Deny, window, cx);
             }))
             .child(self.render_panes(window, &text_style, cx))
+            .child(
+                bottom_strip(&text_style, cx)
+                    .child(div().px_2().child(self.mode_indicator.clone())),
+            )
             .children(
                 match (
                     &self.pending_git_approval,

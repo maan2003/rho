@@ -548,7 +548,13 @@ impl Dashboard {
                 }
             }
             if let Some(deal) = &mut self.deal {
-                deal.total_alive = queue.total_alive;
+                let resolved_live = deal
+                    .cards
+                    .iter()
+                    .zip(&deal.resolved)
+                    .filter(|(card, resolved)| **resolved && queue.is_live(card))
+                    .count();
+                deal.total_alive = queue.total_alive.saturating_sub(resolved_live);
             }
             if self
                 .deal
@@ -799,6 +805,7 @@ impl Dashboard {
             && !deal.resolved[deal.index]
         {
             deal.resolved[deal.index] = true;
+            deal.total_alive = deal.total_alive.saturating_sub(1);
         }
     }
 
@@ -4282,7 +4289,7 @@ fn deal_hint(deal: &DealSession) -> String {
         return "Desk deal complete".to_owned();
     };
     format!(
-        "{} · {}/{} · {} dealt · {} waiting",
+        "DEAL · {} · {}/{} · {} dealt · {} waiting",
         card.label,
         deal.index + 1,
         deal.cards.len(),
@@ -4926,7 +4933,7 @@ mod tests {
         };
         assert_eq!(
             deal_hint(&deal),
-            "todo · ripe 2d · 2/2 · 2 dealt · 9 waiting"
+            "DEAL · todo · ripe 2d · 2/2 · 2 dealt · 9 waiting"
         );
     }
 
