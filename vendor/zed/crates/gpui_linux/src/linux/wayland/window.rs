@@ -880,7 +880,10 @@ impl WaylandWindowStatePtr {
     }
 
     pub fn frame_at(&self, _callback_data: u32) {
-        if let Some(host_vsync) = self.state.borrow().host_presentation {
+        // Bind before the branch: an if-let scrutinee would hold this borrow
+        // across request_frame's borrow_mut and panic.
+        let host_presentation = self.state.borrow().host_presentation;
+        if let Some(host_vsync) = host_presentation {
             self.request_frame(Some(host_vsync));
             return;
         }
