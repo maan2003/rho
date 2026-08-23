@@ -4110,8 +4110,12 @@ pub fn assemble_deal_queue(
     let total_alive = ranked.len();
     let mut ranked = ranked.into_values().collect::<Vec<_>>();
     ranked.sort_by(|a, b| {
-        b.priority
-            .total_cmp(&a.priority)
+        let priority_order = if a.priority == b.priority {
+            std::cmp::Ordering::Equal
+        } else {
+            b.priority.total_cmp(&a.priority)
+        };
+        priority_order
             .then_with(|| b.virtual_reply.cmp(&a.virtual_reply))
             .then_with(|| a.order.cmp(&b.order))
     });
@@ -4653,7 +4657,7 @@ mod tests {
         };
         let (reg, host) = registry(vec![fyi.clone()]);
         let text = format!(
-            "* Reminder\n:reminder: 2026-08-23\n* FYI :eng-{}:\n",
+            "* Ripe todo\n:todo: 2026-08-16 7d\n* Reminder\n:reminder: 2026-08-23\n* FYI :eng-{}:\n",
             &fyi.agent_id.encoded()[..4]
         );
         let queue = assemble_deal_queue(&[(host, text.clone())], &deal_agent_facts(&reg), now, 0);
@@ -4665,6 +4669,16 @@ mod tests {
             .unwrap();
         assert_eq!(fyi_card.priority, 0.0);
         assert_eq!(reminder.priority, 0.0);
+        assert_eq!(queue.cards[0].label, "fyi");
+        assert_eq!(
+            queue
+                .cards
+                .iter()
+                .find(|card| card.label == "todo · ripe 0d")
+                .unwrap()
+                .priority,
+            0.0
+        );
 
         fyi.facts.last_turn_ended = Some(UnixMs(
             (now.timestamp_millis() - chrono::Duration::days(3).num_milliseconds()) as u64,
