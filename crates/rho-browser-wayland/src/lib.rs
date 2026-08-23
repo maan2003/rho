@@ -1922,6 +1922,32 @@ impl<K: BrowserPageKey> XdgShellHandler for State<K> {
         }
     }
 
+    // Chromium serializes xdg state changes: after set_fullscreen it will not
+    // ack any further configure (nor submit frames) until one arrives carrying
+    // the requested state, so ignoring these requests wedges the whole window.
+    // The page fills the host view element, which is our whole "output".
+    fn fullscreen_request(
+        &mut self,
+        surface: ToplevelSurface,
+        _output: Option<wl_output::WlOutput>,
+    ) {
+        self.set_fullscreen(surface, true);
+    }
+
+    fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+        self.set_fullscreen(surface, false);
+    }
+
+    // Denied, but the reply configure is mandatory to keep Chromium's state
+    // machine moving; an unanswered request stalls it just like fullscreen.
+    fn maximize_request(&mut self, surface: ToplevelSurface) {
+        let _ = surface.send_configure();
+    }
+
+    fn unmaximize_request(&mut self, surface: ToplevelSurface) {
+        let _ = surface.send_configure();
+    }
+
     fn toplevel_destroyed(&mut self, surface: ToplevelSurface) {
         let root = surface.wl_surface().id();
         self.unbound_toplevels.remove(&root);
@@ -2047,6 +2073,24 @@ impl<K: BrowserPageKey> XdgDecorationHandler for State<K> {
 }
 
 impl<K: BrowserPageKey> State<K> {
+    fn set_fullscreen(&mut self, toplevel: ToplevelSurface, fullscreen: bool) {
+        let size = self
+            .window_id_for_surface(toplevel.wl_surface())
+            .map(|id| self.windows[&id].size);
+        toplevel.with_pending_state(|state| {
+            if fullscreen {
+                state.states.set(xdg_toplevel::State::Fullscreen);
+            } else {
+                state.states.unset(xdg_toplevel::State::Fullscreen);
+            }
+            if let Some((width, height)) = size {
+                state.size = Some((width as i32, height as i32).into());
+            }
+        });
+        let serial = toplevel.send_configure();
+        tracing::info!(fullscreen, serial = ?serial, "granted Chromium fullscreen change");
+    }
+
     fn set_server_side_decoration(&self, toplevel: ToplevelSurface) {
         toplevel.with_pending_state(|state| {
             state.decoration_mode = Some(DecorationMode::ServerSide);
