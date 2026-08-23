@@ -122,6 +122,17 @@ impl BrowserRuntime {
             .context("browser runtime is shut down")
     }
 
+    /// Reports whether the Chrome process has exited (or was already torn
+    /// down). Abrupt browser death does not reliably surface as a compositor
+    /// event — the client can disconnect before a toplevel ever bound — so
+    /// callers holding a cached runtime must health-check before reuse.
+    pub(crate) fn chrome_exited(&self) -> bool {
+        match self.chrome.lock().unwrap().as_mut() {
+            Some(child) => matches!(child.try_wait(), Ok(Some(_)) | Err(_)),
+            None => true,
+        }
+    }
+
     /// Starts one non-blocking teardown of Chrome and its private compositor.
     /// The runtime lock is released only after Chrome has been reaped.
     pub(crate) fn shutdown_background(&self) {

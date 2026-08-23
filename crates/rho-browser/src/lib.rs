@@ -49,7 +49,12 @@ pub fn init(state_dir: &Path, cx: &mut App) {
 
 fn runtime(cx: &mut App) -> Result<Arc<BrowserRuntime>> {
     if let Some(runtime) = cx.global::<WebState>().runtime.clone() {
-        return Ok(runtime);
+        if !runtime.chrome_exited() {
+            return Ok(runtime);
+        }
+        tracing::warn!("browser process died without a compositor event; relaunching");
+        runtime.shutdown_background();
+        reset_runtime(&runtime, cx);
     }
     let render = match gpui::linux_dmabuf_device() {
         Some(device) => BrowserRenderConfig::DmaBuf(DmaBufConfig {
