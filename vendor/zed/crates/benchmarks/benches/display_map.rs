@@ -2,13 +2,134 @@ use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_ma
 use editor::{MultiBuffer, display_map::*};
 use gpui::{AppContext as _, HighlightStyle, Hsla, TestDispatcher, font, px};
 use itertools::Itertools;
-use multi_buffer::MultiBufferOffset;
+use language::{Buffer, Capability, Point};
+use multi_buffer::{MultiBufferOffset, PathKey};
 use project::project_settings::DiagnosticSeverity;
 use rand::{Rng, SeedableRng, rngs::StdRng};
 use settings::SettingsStore;
-use std::{num::NonZeroU32, time::Duration};
+use std::{num::NonZeroU32, ops::Range, time::Duration};
 use text::Bias;
 use util::RandomCharIter;
+
+fn markdown_history(
+    cx: &mut gpui::TestAppContext,
+    turn_count: usize,
+) -> (gpui::Entity<DisplayMap>, Vec<Range<MultiBufferOffset>>) {
+    let multi_buffer = cx.new(|_| MultiBuffer::without_headers(Capability::Read));
+    for turn in 0..turn_count {
+        let text = format!(
+            "## Response {turn}\n\nThis is **important history** with `inline code`.\n\n{}\n",
+            "A long paragraph keeps the fixture representative of transcript wrapping. ".repeat(3)
+        );
+        let buffer = cx.new(|cx| Buffer::local(&text, cx));
+        let end = buffer.read_with(cx, |buffer, _| buffer.max_point());
+        multi_buffer.update(cx, |multi_buffer, cx| {
+            multi_buffer.set_excerpts_for_path(
+                PathKey::sorted(turn as u64),
+                buffer,
+                [Point::zero()..end],
+                0,
+                cx,
+            );
+        });
+    }
+
+    let snapshot = multi_buffer.read_with(cx, |multi_buffer, cx| multi_buffer.snapshot(cx));
+    let text = snapshot.text();
+    let mut ranges = Vec::new();
+    let mut cursor = 0;
+    for line in text.split_inclusive('\n') {
+        if line.starts_with("##") {
+            ranges.push(cursor..cursor + 3);
+        }
+        for needle in ["**", "`"] {
+            let mut rest = line;
+            let mut line_offset = 0;
+            while let Some(found) = rest.find(needle) {
+                let start = cursor + line_offset + found;
+                ranges.push(start..start + needle.len());
+                line_offset += found + needle.len();
+                rest = &rest[found + needle.len()..];
+            }
+        }
+        cursor += line.len();
+    }
+    let ranges = ranges
+        .into_iter()
+        .map(|range| MultiBufferOffset(range.start)..MultiBufferOffset(range.end))
+        .collect();
+    let map = cx.new(|cx| {
+        DisplayMap::new(
+            multi_buffer,
+            font("Courier"),
+            px(16.0),
+            None,
+            1,
+            1,
+            FoldPlaceholder::default(),
+            DiagnosticSeverity::Warning,
+            cx,
+        )
+    });
+    (map, ranges)
+}
+
+fn markdown_concealment_benchmark(c: &mut Criterion) {
+    let dispatcher = TestDispatcher::new(1);
+    let mut cx = gpui::TestAppContext::build(dispatcher, None);
+    cx.update(|cx| {
+        let store = SettingsStore::test(cx);
+        cx.set_global(store);
+        editor::init(cx);
+    });
+
+    let mut group = c.benchmark_group("Markdown concealment");
+    group.sample_size(20);
+    for turn_count in [100usize, 500] {
+        let (map, ranges) = markdown_history(&mut cx, turn_count);
+        cx.update(|cx| {
+            map.update(cx, |map, cx| {
+                map.replace_concealments(ranges.clone(), cx);
+            });
+        });
+        group.bench_with_input(
+            BenchmarkId::new("unchanged history refresh", turn_count),
+            &(&map, &ranges),
+            |bench, (map, ranges)| {
+                bench.iter(|| {
+                    cx.update(|cx| {
+                        map.update(cx, |map, cx| {
+                            map.replace_concealments(black_box((*ranges).clone()), cx);
+                        });
+                    });
+                });
+            },
+        );
+        let mut changed = ranges.clone();
+        let tail = changed.last().unwrap().end;
+        changed.push(tail + 1usize..tail + 2usize);
+        let use_changed = std::cell::Cell::new(true);
+        group.bench_with_input(
+            BenchmarkId::new("tail concealment changed", turn_count),
+            &(&map, &ranges, &changed),
+            |bench, (map, original, changed)| {
+                bench.iter(|| {
+                    let next = if use_changed.replace(!use_changed.get()) {
+                        *changed
+                    } else {
+                        *original
+                    };
+                    cx.update(|cx| {
+                        map.update(cx, |map, cx| {
+                            map.replace_concealments(black_box(next.clone()), cx);
+                        });
+                    });
+                });
+            },
+        );
+    }
+    group.finish();
+}
 
 fn to_tab_point_benchmark(c: &mut Criterion) {
     let dispatcher = TestDispatcher::new(1);
@@ -209,6 +330,7 @@ criterion_group!(
     benches,
     to_tab_point_benchmark,
     to_fold_point_benchmark,
-    create_highlight_endpoints_benchmark
+    create_highlight_endpoints_benchmark,
+    markdown_concealment_benchmark
 );
 criterion_main!(benches);

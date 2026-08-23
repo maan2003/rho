@@ -69,8 +69,10 @@ struct BridgeInner {
 
 struct Connection {
     writer: Mutex<UnixStream>,
-    pending: Mutex<HashMap<u64, mpsc::Sender<Result<(Value, Option<u32>), String>>>>,
+    pending: Mutex<PendingRequests>,
 }
+
+type PendingRequests = HashMap<u64, mpsc::Sender<Result<(Value, Option<u32>), String>>>;
 
 impl Bridge {
     pub fn bind(path: PathBuf) -> Result<Self> {

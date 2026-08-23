@@ -488,7 +488,7 @@ mod tests {
         assert!(bytes.len() <= rho_ui_proto::MAX_GUI_TELEMETRY_BYTES);
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["schema"], "dev.rho.gui-performance-snapshot");
-        assert_eq!(value["version"], 6);
+        assert_eq!(value["version"], 7);
         assert_eq!(value["build"]["profile"], env!("RHO_BUILD_PROFILE"));
         assert_eq!(value["build"]["opt_level"], env!("RHO_BUILD_OPT_LEVEL"));
         assert_eq!(value["build"]["target"], env!("RHO_BUILD_TARGET"));

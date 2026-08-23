@@ -715,8 +715,6 @@ type BackgroundHighlight = (
 );
 type GutterHighlight = (fn(&App) -> Hsla, Vec<Range<Anchor>>);
 
-struct SyntaxConcealment;
-
 #[derive(Default)]
 struct ScrollbarMarkerState {
     scrollbar_size: Size<Pixels>,
@@ -10059,15 +10057,9 @@ impl Editor {
         let snapshot = self.buffer.read(cx).snapshot(cx);
         let concealed = snapshot.concealed_ranges().collect::<Vec<_>>();
         self.syntax_concealments_dirty = false;
-        let type_id = TypeId::of::<SyntaxConcealment>();
         let display_map = self.display_map.clone();
-        let creases = concealed
-            .into_iter()
-            .filter(|range| !range.is_empty())
-            .map(|range| Crease::simple(range, FoldPlaceholder::concealed(type_id)))
-            .collect::<Vec<_>>();
         display_map.update(cx, |display_map, cx| {
-            display_map.replace_folds_with_type(type_id, creases, cx);
+            display_map.replace_concealments(concealed, cx);
         });
     }
 

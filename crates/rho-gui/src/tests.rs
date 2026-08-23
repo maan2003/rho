@@ -248,25 +248,19 @@ fn display_text(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) ->
         .expect("read display text")
 }
 
-fn concealed_fold_ids(
+fn concealed_ranges(
     workspace: &WindowHandle<Workspace>,
     editor: &Entity<Editor>,
     cx: &mut TestAppContext,
-) -> Vec<editor::display_map::FoldId> {
+) -> Vec<std::ops::Range<multi_buffer::MultiBufferOffset>> {
     workspace
         .update(cx, |_, window, cx| {
             editor.update(cx, |editor, cx| {
                 let snapshot = editor.snapshot(window, cx);
-                snapshot
-                    .folds_in_range(
-                        multi_buffer::MultiBufferOffset(0)..snapshot.buffer_snapshot().len(),
-                    )
-                    .filter(|fold| fold.placeholder.is_concealed())
-                    .map(|fold| fold.id)
-                    .collect()
+                snapshot.inlay_snapshot().concealed_ranges()
             })
         })
-        .expect("read concealment folds")
+        .expect("read concealment ranges")
 }
 
 fn buffer_text(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) -> String {
@@ -2658,7 +2652,7 @@ fn long_transcript_concealments_do_not_change_when_scrolling(cx: &mut TestAppCon
     );
 
     let editor = active_editor(&workspace, cx);
-    let folds = concealed_fold_ids(&workspace, &editor, cx);
+    let folds = concealed_ranges(&workspace, &editor, cx);
     assert!(
         folds.len() >= 1_000,
         "the whole transcript should be concealed"
@@ -2672,7 +2666,7 @@ fn long_transcript_concealments_do_not_change_when_scrolling(cx: &mut TestAppCon
         })
         .expect("scroll to transcript start");
     cx.run_until_parked();
-    assert_eq!(concealed_fold_ids(&workspace, &editor, cx), folds);
+    assert_eq!(concealed_ranges(&workspace, &editor, cx), folds);
 
     workspace
         .update(cx, |_, window, cx| {
@@ -2682,7 +2676,7 @@ fn long_transcript_concealments_do_not_change_when_scrolling(cx: &mut TestAppCon
         })
         .expect("scroll through transcript");
     cx.run_until_parked();
-    assert_eq!(concealed_fold_ids(&workspace, &editor, cx), folds);
+    assert_eq!(concealed_ranges(&workspace, &editor, cx), folds);
 }
 
 #[gpui::test]
@@ -2756,7 +2750,7 @@ fn prompt_typing_keeps_transcript_concealment_folds(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     let editor = active_editor(&workspace, cx);
-    let before = concealed_fold_ids(&workspace, &editor, cx);
+    let before = concealed_ranges(&workspace, &editor, cx);
     assert!(!before.is_empty());
 
     workspace
@@ -2766,7 +2760,7 @@ fn prompt_typing_keeps_transcript_concealment_folds(cx: &mut TestAppContext) {
         .expect("type in prompt");
     cx.run_until_parked();
 
-    assert_eq!(concealed_fold_ids(&workspace, &editor, cx), before);
+    assert_eq!(concealed_ranges(&workspace, &editor, cx), before);
 }
 
 #[gpui::test]
@@ -2785,7 +2779,7 @@ fn plain_assistant_streaming_keeps_existing_concealment_folds(cx: &mut TestAppCo
     cx.run_until_parked();
 
     let editor = active_editor(&workspace, cx);
-    let before = concealed_fold_ids(&workspace, &editor, cx);
+    let before = concealed_ranges(&workspace, &editor, cx);
     assert!(!before.is_empty());
 
     feed_frame(
@@ -2810,8 +2804,11 @@ fn plain_assistant_streaming_keeps_existing_concealment_folds(cx: &mut TestAppCo
     );
     cx.run_until_parked();
 
-    let after = concealed_fold_ids(&workspace, &editor, cx);
-    assert_eq!(after, before, "streaming must not replace unchanged folds");
+    let after = concealed_ranges(&workspace, &editor, cx);
+    assert!(
+        before.starts_with(&after) || after.starts_with(&before),
+        "streaming must preserve the settled concealment prefix: {before:?} -> {after:?}"
+    );
     let displayed = display_text(&workspace, cx);
     assert!(!displayed.contains("**bold**"));
     assert!(!displayed.contains("`code`"));

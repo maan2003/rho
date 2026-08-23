@@ -6,7 +6,8 @@
 //! we display as spaces and where to display custom blocks (like diagnostics).
 //! Seems like a lot? That's because it is. [`DisplayMap`] is conceptually made up
 //! of several smaller structures that form a hierarchy (starting at the bottom):
-//! - [`InlayMap`] that decides where the [`Inlay`]s should be displayed.
+//! - A concealment projection that omits syntax-derived source ranges.
+//! - [`InlayMap`] that composes that projection with the [`Inlay`]s to display.
 //! - [`FoldMap`] that decides where the fold indicators should be; it also tracks parts of a source file that are currently folded.
 //! - [`TabMap`] that keeps track of hard tabs in a buffer.
 //! - [`WrapMap`] that handles soft wrapping.
@@ -25,6 +26,8 @@
 //!   that has two variants:
 //!     - `Isomorphic`, representing a region of text that has no inlay hints (i.e.
 //!       is passed through the map transparently)
+//!     - `Concealed`, representing source text omitted before inlays are
+//!       inserted
 //!     - `Inlay`, representing a location where an inlay hint is to be inserted.
 //! - a `TransformSummary` type, which is usually a struct with two fields:
 //!   [`input: TextSummary`][`TextSummary`] and [`output: TextSummary`][`TextSummary`]. Here,
@@ -70,6 +73,7 @@
 mod dimensions;
 
 mod block_map;
+mod conceal_map;
 mod crease_map;
 mod custom_highlights;
 mod fold_map;
@@ -88,8 +92,8 @@ pub use block_map::{
 };
 pub use crease_map::*;
 pub use fold_map::{
-    CaretRest, ChunkRenderer, ChunkRendererContext, ChunkRendererId, Fold, FoldId,
-    FoldPlaceholder, FoldPoint,
+    CaretRest, ChunkRenderer, ChunkRendererContext, ChunkRendererId, Fold, FoldId, FoldPlaceholder,
+    FoldPoint,
 };
 pub use inlay_map::{InlayOffset, InlayPoint};
 pub use invisibles::{is_invisible, replacement};
@@ -916,6 +920,44 @@ impl DisplayMap {
             Crease::Block { .. } => None,
         });
         let (snapshot, edits) = fold_map.replace_folds_with_type(type_id, inline);
+        let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
+        let (snapshot, edits) = self
+            .wrap_map
+            .update(cx, |map, cx| map.sync(snapshot, edits, cx));
+        self.block_map.write(snapshot, edits, None);
+    }
+
+    /// Replaces syntax-derived source concealments. These are composed before
+    /// inlays and user folds, so tab stops and wrapping are calculated from the
+    /// text the user actually sees.
+    pub fn replace_concealments(
+        &mut self,
+        ranges: Vec<Range<MultiBufferOffset>>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.companion().is_some() {
+            return;
+        }
+        let buffer_snapshot = self.buffer.read(cx).snapshot(cx);
+        if self.inlay_map.concealments_match(ranges.clone()) {
+            return;
+        }
+        let buffer_edits = self.buffer_subscription.consume().into_inner();
+        let tab_size = Self::tab_size(&self.buffer, cx);
+
+        let (snapshot, edits) = self.inlay_map.sync(buffer_snapshot, buffer_edits);
+        let (snapshot, edits) = self.fold_map.read(snapshot, edits);
+        let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
+        let (snapshot, edits) = self
+            .wrap_map
+            .update(cx, |map, cx| map.sync(snapshot, edits, cx));
+        self.block_map.read(snapshot, edits, None);
+
+        let (snapshot, edits) = self.inlay_map.replace_concealments(ranges);
+        if edits.is_empty() {
+            return;
+        }
+        let (snapshot, edits) = self.fold_map.read(snapshot, edits);
         let (snapshot, edits) = self.tab_map.sync(snapshot, edits, tab_size);
         let (snapshot, edits) = self
             .wrap_map
@@ -2456,10 +2498,9 @@ impl DisplaySnapshot {
         for _ in 0..8 {
             let mut stepped = None;
             for fold in self.folds_in_range(
-                buffer_snapshot.clip_offset(
-                    MultiBufferOffset(offset.0.saturating_sub(1)),
-                    Bias::Left,
-                )..offset,
+                buffer_snapshot
+                    .clip_offset(MultiBufferOffset(offset.0.saturating_sub(1)), Bias::Left)
+                    ..offset,
             ) {
                 let range = fold.range.start.to_offset(buffer_snapshot)
                     ..fold.range.end.to_offset(buffer_snapshot);
