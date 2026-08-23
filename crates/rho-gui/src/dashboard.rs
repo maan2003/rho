@@ -66,39 +66,57 @@ type SyncSnapshot = (
 );
 type ArchiveEdits = (Vec<(Range<usize>, String)>, usize);
 
-const DEAL_SURFACE_THRESHOLD: f64 = -0.01;
-const DEAL_RESURFACED_CAP: usize = 10;
-const DEAL_HINT: &str = "o open · r reply · d done · a archive · f{f,3,7,0} defer · x discard · s tomorrow · n next · q quit";
+const DEAL_QUEUE_FLOOR: f64 = -1.0;
+const DEAL_PRIORITY_CUTOFF: usize = 8;
+const BLOCKED_REPLY_HEAD_START: f64 = 1.0;
+const BLOCKED_REPLY_SLOPE_PER_DAY: f64 = 12.0;
+const FYI_REPLY_PACE_DAYS: f64 = 3.0;
+const DEAL_HINT: &str = "r reply · d done · x discard · z snooze · t todo · n next · q quit";
 
 struct DealCardHighlight;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DealSection {
-    NeedsYou,
-    Finished,
-    Resurfaced,
-    Random,
-}
-
-impl DealSection {
-    fn label(self) -> &'static str {
-        match self {
-            Self::NeedsYou => "needs you",
-            Self::Finished => "finished",
-            Self::Resurfaced => "resurfaced",
-            Self::Random => "random",
-        }
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DealCard {
-    pub section: DealSection,
+    pub label: String,
+    pub priority: f64,
     pub host: HostId,
     pub heading_offset: Option<usize>,
     pub agent_id: Option<AgentId>,
     pub agent_tag: Option<String>,
     pub breadcrumb: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct DealQueue {
+    pub cards: Vec<DealCard>,
+    /// Number of live headings whose winning mark is above the queue floor.
+    pub total_alive: usize,
+    /// Number selected by global priority, excluding the Random tail.
+    pub dealt_count: usize,
+    priority_topics: HashSet<(HostId, usize)>,
+    random_topics: HashSet<(HostId, usize)>,
+}
+
+impl DealQueue {
+    /// Revalidates a persisted card without applying the current top-N cutoff
+    /// or changing its established order.
+    pub fn is_live(&self, card: &DealCard) -> bool {
+        let Some(offset) = card.heading_offset else {
+            return false;
+        };
+        let topic = (card.host, offset);
+        if card.label == "random" {
+            self.random_topics.contains(&topic)
+        } else {
+            self.priority_topics.contains(&topic)
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DealQueueDepth {
+    pub dealt_count: usize,
+    pub total_alive: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -274,7 +292,7 @@ pub struct Dashboard {
     /// Shows only literal editable Desk source, with no generated UI.
     raw_mode: bool,
     deal: Option<DealSession>,
-    queue_depth: usize,
+    queue_depth: DealQueueDepth,
     queue_depth_revision: Option<u64>,
     queue_depth_minute: Option<i64>,
     /// Portal occurrences whose complete runtime subtree is visible.
@@ -360,7 +378,7 @@ impl Dashboard {
             collapsed_unfiled: HashSet::new(),
             raw_mode: false,
             deal: None,
-            queue_depth: 0,
+            queue_depth: DealQueueDepth::default(),
             queue_depth_revision: None,
             queue_depth_minute: None,
             expanded_portals: HashSet::new(),
@@ -469,7 +487,8 @@ impl Dashboard {
             .keys()
             .filter_map(|host| self.source_text(*host, cx).map(|text| (*host, text)))
             .collect::<Vec<_>>();
-        let cards = assemble_deal_queue(&documents, &deal_agent_facts(registry), now, seed);
+        let queue = assemble_deal_queue(&documents, &deal_agent_facts(registry), now, seed);
+        let cards = queue.cards;
         let anchors = cards
             .iter()
             .map(|card| {
@@ -682,6 +701,60 @@ impl Dashboard {
         true
     }
 
+    pub fn write_deal_snooze(
+        &mut self,
+        count: u32,
+        today: chrono::NaiveDate,
+        cx: &mut Context<Workspace>,
+    ) -> bool {
+        let days = count.max(1);
+        self.write_deal_property(
+            TemporalMarkKind::Defer,
+            today.and_time(chrono::NaiveTime::MIN) + chrono::Duration::days(days.into()),
+            Some(days),
+            cx,
+        )
+    }
+
+    pub fn write_deal_todo(
+        &mut self,
+        today: chrono::NaiveDate,
+        cx: &mut Context<Workspace>,
+    ) -> bool {
+        self.write_deal_property(
+            TemporalMarkKind::Todo,
+            today.and_time(chrono::NaiveTime::MIN),
+            Some(7),
+            cx,
+        )
+    }
+
+    pub fn write_deal_done(
+        &mut self,
+        today: chrono::NaiveDate,
+        cx: &mut Context<Workspace>,
+    ) -> bool {
+        self.write_deal_property(
+            TemporalMarkKind::Done,
+            today.and_time(chrono::NaiveTime::MIN),
+            None,
+            cx,
+        )
+    }
+
+    pub fn write_deal_discarded(
+        &mut self,
+        today: chrono::NaiveDate,
+        cx: &mut Context<Workspace>,
+    ) -> bool {
+        self.write_deal_property(
+            TemporalMarkKind::Discarded,
+            today.and_time(chrono::NaiveTime::MIN),
+            None,
+            cx,
+        )
+    }
+
     pub fn write_deal_property(
         &mut self,
         kind: rho_ui_proto::desk::TemporalMarkKind,
@@ -748,45 +821,8 @@ impl Dashboard {
         else {
             return false;
         };
-        let key = kind.property_key();
         let line = rho_ui_proto::desk::temporal::property_line(kind, at, pace_days);
-        let mut edits = Vec::new();
-        let edit = if let Some(property) = heading
-            .properties
-            .iter()
-            .find(|property| property.key.eq_ignore_ascii_case(key))
-        {
-            (
-                property.line_range.clone(),
-                line.trim_end_matches('\n').to_owned(),
-            )
-        } else {
-            let followed_by_newline =
-                text.as_bytes().get(heading.heading_range.end) == Some(&b'\n');
-            let insertion = heading.heading_range.end + usize::from(followed_by_newline);
-            (
-                insertion..insertion,
-                if followed_by_newline {
-                    line
-                } else {
-                    format!("\n{line}")
-                },
-            )
-        };
-        edits.push(edit);
-        if kind != TemporalMarkKind::Skip {
-            edits.extend(heading.properties.iter().filter_map(|property| {
-                if !property.key.eq_ignore_ascii_case("skip") {
-                    return None;
-                }
-                let mark = TemporalMark::parse(TemporalMarkKind::Skip, &property.value)?;
-                (mark.at <= at).then(|| {
-                    let end = property.line_range.end
-                        + usize::from(text.as_bytes().get(property.line_range.end) == Some(&b'\n'));
-                    (property.line_range.start..end, String::new())
-                })
-            }));
-        }
+        let mut edits = heading_property_edits(&text, &heading, kind, line);
         edits.sort_by_key(|(range, _)| range.start);
         let delta = edits
             .iter()
@@ -1009,13 +1045,16 @@ impl Dashboard {
             || self.queue_depth_revision != Some(deal_revision)
             || self.queue_depth_minute != Some(minute)
         {
-            self.queue_depth = assemble_deal_queue(
+            let queue = assemble_deal_queue(
                 &documents,
                 &deal_agent_facts(registry),
                 now.fixed_offset(),
                 0,
-            )
-            .len();
+            );
+            self.queue_depth = DealQueueDepth {
+                dealt_count: queue.dealt_count,
+                total_alive: queue.total_alive,
+            };
             self.queue_depth_revision = Some(deal_revision);
             self.queue_depth_minute = Some(minute);
         }
@@ -2350,8 +2389,8 @@ impl Dashboard {
             return deal_hint(deal);
         }
         format!(
-            "{} waiting · enter open · r reply · o staff · d/x verdict · Tab fold · gn attention",
-            self.queue_depth
+            "{} dealt · {} waiting · enter open · r reply · o staff · d/x verdict · Tab fold · gn attention",
+            self.queue_depth.dealt_count, self.queue_depth.total_alive
         )
     }
 
@@ -3689,6 +3728,52 @@ fn truncate_chars(value: &str, limit: usize) -> String {
     result
 }
 
+fn heading_property_edits(
+    text: &str,
+    heading: &DeskHeading,
+    kind: TemporalMarkKind,
+    line: String,
+) -> Vec<(Range<usize>, String)> {
+    let key = kind.property_key();
+    let existing = heading
+        .properties
+        .iter()
+        .find(|property| property.key.eq_ignore_ascii_case(key));
+    let mut edits = vec![if let Some(property) = existing {
+        (
+            property.line_range.clone(),
+            line.trim_end_matches('\n').to_owned(),
+        )
+    } else {
+        let followed_by_newline = text.as_bytes().get(heading.heading_range.end) == Some(&b'\n');
+        let insertion = heading.heading_range.end + usize::from(followed_by_newline);
+        (
+            insertion..insertion,
+            if followed_by_newline {
+                line
+            } else {
+                format!("\n{line}")
+            },
+        )
+    }];
+    if kind == TemporalMarkKind::Defer {
+        edits.extend(heading.properties.iter().filter_map(|property| {
+            let verdict_family = ["defer", "reminder", "skip"]
+                .iter()
+                .any(|key| property.key.eq_ignore_ascii_case(key));
+            if !verdict_family
+                || existing.is_some_and(|target| target.line_range == property.line_range)
+            {
+                return None;
+            }
+            let end = property.line_range.end
+                + usize::from(text.as_bytes().get(property.line_range.end) == Some(&b'\n'));
+            Some((property.line_range.start..end, String::new()))
+        }));
+    }
+    edits
+}
+
 fn heading_portal_ids(headings: &[DeskHeading]) -> Vec<u64> {
     use std::hash::{Hash as _, Hasher as _};
 
@@ -3760,21 +3845,82 @@ fn deal_agent_facts(registry: &AgentRegistry) -> Vec<DealAgentFacts> {
         .collect()
 }
 
-fn reply_priority(ended: rho_core::UnixMs, now: chrono::DateTime<chrono::FixedOffset>) -> f64 {
+fn reply_wait_days(ended: rho_core::UnixMs, now: chrono::DateTime<chrono::FixedOffset>) -> f64 {
     (now.timestamp_millis() - ended.0 as i64) as f64 / 86_400_000.0
 }
 
-/// Builds one deterministic deal from Desk text and per-agent facts. Text order
-/// breaks ties everywhere except resurfaced priority; `seed` chooses the one
-/// anti-starvation card without introducing persistent state.
+fn blocked_reply_priority(wait_days: f64) -> f64 {
+    BLOCKED_REPLY_HEAD_START + BLOCKED_REPLY_SLOPE_PER_DAY * wait_days
+}
+
+fn fyi_reply_priority(wait_days: f64) -> f64 {
+    -wait_days / FYI_REPLY_PACE_DAYS
+}
+
+fn mark_elapsed_days(mark: &TemporalMark, now: chrono::NaiveDateTime) -> f64 {
+    if mark.date_only {
+        now.date().signed_duration_since(mark.at.date()).num_days() as f64
+    } else {
+        now.signed_duration_since(mark.at).num_seconds() as f64 / 86_400.0
+    }
+}
+
+fn age_label(days: f64) -> String {
+    if days < 1.0 {
+        format!("{}h", (days.max(0.0) * 24.0).floor() as u64)
+    } else {
+        format!("{}d", days.floor() as u64)
+    }
+}
+
+fn temporal_label(mark: &TemporalMark, now: chrono::NaiveDateTime, mark_priority: f64) -> String {
+    let elapsed = mark_elapsed_days(mark, now);
+    match mark.kind {
+        TemporalMarkKind::Deadline if elapsed > 0.0 => {
+            format!("deadline · {}d late", elapsed.floor() as u64)
+        }
+        TemporalMarkKind::Deadline => {
+            format!("deadline · {}d", (-elapsed).ceil() as u64)
+        }
+        TemporalMarkKind::Todo if mark_priority >= 0.0 => {
+            format!("todo · ripe {}d", mark_priority.floor() as u64)
+        }
+        TemporalMarkKind::Todo => "todo".to_owned(),
+        TemporalMarkKind::Reminder => "reminder".to_owned(),
+        TemporalMarkKind::Defer => "defer".to_owned(),
+        TemporalMarkKind::Skip | TemporalMarkKind::Done | TemporalMarkKind::Discarded => {
+            unreachable!("non-live marks cannot win")
+        }
+    }
+}
+
+#[derive(Clone)]
+struct DealHeading {
+    host: HostId,
+    order: usize,
+    heading: DeskHeading,
+    breadcrumb: String,
+    agents: Vec<AgentId>,
+    gated: bool,
+}
+
+#[derive(Clone)]
+struct RankedDealCard {
+    priority: f64,
+    virtual_reply: bool,
+    order: usize,
+    card: DealCard,
+}
+
+/// Builds one deterministic deal from Desk text and per-agent facts. Every
+/// live textual and virtual mark competes on one days-scale priority.
 pub fn assemble_deal_queue(
     documents: &[(HostId, String)],
     agent_facts: &[DealAgentFacts],
     now: chrono::DateTime<chrono::FixedOffset>,
     seed: u64,
-) -> Vec<DealCard> {
-    use rho_ui_proto::desk::TemporalMarkKind;
-    use rho_ui_proto::desk::temporal::{is_overdue_deadline, priority, surfaced};
+) -> DealQueue {
+    use rho_ui_proto::desk::temporal::priority;
 
     let desk_now = now.naive_local();
     let by_id = agent_facts
@@ -3804,9 +3950,10 @@ pub fn assemble_deal_queue(
         }
         result
     };
+
     let mut heading_rows = Vec::new();
-    let mut agent_topics: HashMap<AgentId, (HostId, usize, String, bool, bool, bool)> =
-        HashMap::new();
+    let mut agent_topics: HashMap<AgentId, (HostId, usize)> = HashMap::new();
+    let mut order = 0;
     for (host, text) in documents {
         let headings = parse(text);
         let archives = archive_zones(&headings);
@@ -3814,7 +3961,6 @@ pub fn assemble_deal_queue(
             let archived = archives.iter().any(|zone| {
                 zone.start <= heading.heading_range.start && heading.heading_range.start < zone.end
             });
-            let breadcrumb = heading_breadcrumb(&headings, index);
             let terminal = matches!(
                 heading.state,
                 Some(DeskHeadingState::Done | DeskHeadingState::Discarded)
@@ -3830,6 +3976,7 @@ pub fn assemble_deal_queue(
                     TemporalMarkKind::Defer | TemporalMarkKind::Reminder | TemporalMarkKind::Skip
                 ) && mark.at > desk_now
             });
+            let gated = archived || terminal || deferred;
             let agents = heading
                 .tags
                 .iter()
@@ -3837,195 +3984,186 @@ pub fn assemble_deal_queue(
                 .collect::<Vec<_>>();
             for agent in &agents {
                 for member in descendants(*agent) {
-                    let candidate = (
-                        *host,
-                        heading.heading_range.start,
-                        breadcrumb.clone(),
-                        archived,
-                        terminal,
-                        deferred,
-                    );
+                    let candidate = (*host, heading.heading_range.start);
                     agent_topics
                         .entry(member)
                         .and_modify(|current| {
-                            let current_eligible = !current.3 && !current.4 && !current.5;
-                            let candidate_eligible = !archived && !terminal && !deferred;
-                            if !current_eligible && candidate_eligible {
-                                *current = candidate.clone();
+                            let current_gated = heading_rows.iter().any(|row: &DealHeading| {
+                                row.host == current.0
+                                    && row.heading.heading_range.start == current.1
+                                    && row.gated
+                            });
+                            if current_gated && !gated {
+                                *current = candidate;
                             }
                         })
                         .or_insert(candidate);
                 }
             }
-            heading_rows.push((*host, index, heading.clone(), breadcrumb, archived, agents));
+            heading_rows.push(DealHeading {
+                host: *host,
+                order,
+                heading: heading.clone(),
+                breadcrumb: heading_breadcrumb(&headings, index),
+                agents,
+                gated,
+            });
+            order += 1;
         }
     }
 
-    let mut needs = Vec::new();
-    let mut finished = Vec::new();
-    let mut visible_agents = HashSet::new();
-    let mut claimed_topics = HashSet::new();
-    let owed_agents = agent_facts
+    let rows_by_topic = heading_rows
         .iter()
-        .filter_map(|agent| {
-            let ended = agent.facts.last_turn_ended?;
-            (!agent.facts.turn_running && ended > agent.facts.last_user_message_at).then_some((
-                agent.agent_id,
-                ended,
-                agent.facts.needs_you_hint,
-                reply_priority(ended, now),
-            ))
+        .map(|row| ((row.host, row.heading.heading_range.start), row))
+        .collect::<HashMap<_, _>>();
+    let mut ranked: HashMap<(HostId, usize), RankedDealCard> = HashMap::new();
+    let mut offer = |topic: (HostId, usize), candidate: RankedDealCard| {
+        ranked
+            .entry(topic)
+            .and_modify(|current| {
+                if candidate.priority > current.priority
+                    || (candidate.priority == current.priority
+                        && candidate.virtual_reply
+                        && !current.virtual_reply)
+                {
+                    *current = candidate.clone();
+                }
+            })
+            .or_insert(candidate);
+    };
+
+    for row in heading_rows.iter().filter(|row| !row.gated) {
+        let topic = (row.host, row.heading.heading_range.start);
+        for mark in &row.heading.temporal_marks {
+            let mark_priority = priority(mark, desk_now);
+            if mark_priority <= DEAL_QUEUE_FLOOR {
+                continue;
+            }
+            let agent_id = row.agents.first().copied();
+            offer(
+                topic,
+                RankedDealCard {
+                    priority: mark_priority,
+                    virtual_reply: false,
+                    order: row.order,
+                    card: DealCard {
+                        label: temporal_label(mark, desk_now, mark_priority),
+                        priority: mark_priority,
+                        host: row.host,
+                        heading_offset: Some(row.heading.heading_range.start),
+                        agent_id,
+                        agent_tag: agent_id
+                            .and_then(|agent| by_id.get(&agent))
+                            .map(|agent| agent.tag.clone()),
+                        breadcrumb: row.breadcrumb.clone(),
+                    },
+                },
+            );
+        }
+    }
+
+    for agent in agent_facts {
+        let Some(ended) = agent.facts.last_turn_ended else {
+            continue;
+        };
+        if agent.facts.turn_running || ended <= agent.facts.last_user_message_at {
+            continue;
+        }
+        let Some(topic) = agent_topics.get(&agent.agent_id).copied() else {
+            continue;
+        };
+        let Some(row) = rows_by_topic.get(&topic).copied().filter(|row| !row.gated) else {
+            continue;
+        };
+        let wait_days = reply_wait_days(ended, now);
+        let (reply_priority, label) = if agent.facts.needs_you_hint {
+            (
+                blocked_reply_priority(wait_days),
+                format!("blocked · {}", age_label(wait_days)),
+            )
+        } else {
+            (fyi_reply_priority(wait_days), "fyi".to_owned())
+        };
+        if reply_priority <= DEAL_QUEUE_FLOOR {
+            continue;
+        }
+        offer(
+            topic,
+            RankedDealCard {
+                priority: reply_priority,
+                virtual_reply: true,
+                order: row.order,
+                card: DealCard {
+                    label,
+                    priority: reply_priority,
+                    host: topic.0,
+                    heading_offset: Some(topic.1),
+                    agent_id: Some(agent.agent_id),
+                    agent_tag: Some(agent.tag.clone()),
+                    breadcrumb: row.breadcrumb.clone(),
+                },
+            },
+        );
+    }
+
+    let priority_topics = ranked.keys().copied().collect::<HashSet<_>>();
+    let total_alive = ranked.len();
+    let mut ranked = ranked.into_values().collect::<Vec<_>>();
+    ranked.sort_by(|a, b| {
+        b.priority
+            .total_cmp(&a.priority)
+            .then_with(|| b.virtual_reply.cmp(&a.virtual_reply))
+            .then_with(|| a.order.cmp(&b.order))
+    });
+    let mut cards = ranked
+        .into_iter()
+        .take(DEAL_PRIORITY_CUTOFF)
+        .map(|ranked| ranked.card)
+        .collect::<Vec<_>>();
+    let dealt_count = cards.len();
+    let dealt_topics = cards
+        .iter()
+        .filter_map(|card| card.heading_offset.map(|offset| (card.host, offset)))
+        .collect::<HashSet<_>>();
+
+    let random_topics = heading_rows
+        .iter()
+        .filter(|row| !row.gated)
+        .map(|row| (row.host, row.heading.heading_range.start))
+        .collect::<HashSet<_>>();
+    let mut random_pool = heading_rows
+        .iter()
+        .filter(|row| {
+            !row.gated && !dealt_topics.contains(&(row.host, row.heading.heading_range.start))
         })
         .collect::<Vec<_>>();
-    visible_agents.extend(owed_agents.iter().map(|(agent_id, ..)| *agent_id));
-    let mut candidate_agents = owed_agents
-        .into_iter()
-        .filter(|(_, _, _, priority)| *priority > DEAL_SURFACE_THRESHOLD)
-        .collect::<Vec<_>>();
-    candidate_agents.sort_by(|a, b| {
-        b.2.cmp(&a.2)
-            .then_with(|| b.3.total_cmp(&a.3))
-            .then_with(|| a.0.cmp(&b.0))
-    });
-    for (agent_id, _ended, needs_you, _priority) in candidate_agents {
-        if !agent_topics.contains_key(&agent_id) {
-            continue;
-        }
-        if agent_topics
-            .get(&agent_id)
-            .is_some_and(|(_, _, _, archived, terminal, deferred)| {
-                *archived || *terminal || *deferred
-            })
-        {
-            continue;
-        }
-        let topic = agent_topics.get(&agent_id);
-        if topic.is_some_and(|topic| claimed_topics.contains(&(topic.0, topic.1))) {
-            continue;
-        }
-        let agent = by_id[&agent_id];
-        let agent_tag = agent.tag.clone();
-        let agent_heading = if agent.heading.is_empty() {
-            agent_tag.clone()
-        } else {
-            agent.heading.clone()
-        };
-        let card = DealCard {
-            section: DealSection::NeedsYou,
-            host: topic.map_or_else(|| agent.host, |topic| topic.0),
-            heading_offset: topic.map(|topic| topic.1),
-            agent_id: Some(agent_id),
-            agent_tag: Some(agent_tag),
-            breadcrumb: topic.map_or(agent_heading, |topic| topic.2.clone()),
-        };
-        if let Some(topic) = topic {
-            claimed_topics.insert((topic.0, topic.1));
-        }
-        if needs_you {
-            needs.push(card);
-        } else {
-            finished.push(DealCard {
-                section: DealSection::Finished,
-                ..card
-            });
-        }
-    }
-
-    let mut resurfaced = Vec::new();
-    let mut random_pool = Vec::new();
-    for (host, _, heading, breadcrumb, archived, agents) in heading_rows {
-        if archived || claimed_topics.contains(&(host, heading.heading_range.start)) {
-            continue;
-        }
-        let terminal = matches!(
-            heading.state,
-            Some(DeskHeadingState::Done | DeskHeadingState::Discarded)
-        ) || heading.temporal_marks.iter().any(|mark| {
-            matches!(
-                mark.kind,
-                TemporalMarkKind::Done | TemporalMarkKind::Discarded
-            )
-        });
-        if terminal {
-            continue;
-        }
-        if heading.temporal_marks.iter().any(|mark| {
-            matches!(mark.kind, TemporalMarkKind::Defer | TemporalMarkKind::Skip)
-                && mark.at > desk_now
-        }) {
-            continue;
-        }
-        let best = heading
-            .temporal_marks
-            .iter()
-            .filter(|mark| surfaced(mark, desk_now, DEAL_SURFACE_THRESHOLD))
-            .max_by(|a, b| {
-                let a_overdue = is_overdue_deadline(a, desk_now);
-                let b_overdue = is_overdue_deadline(b, desk_now);
-                a_overdue
-                    .cmp(&b_overdue)
-                    .then_with(|| priority(a, desk_now).total_cmp(&priority(b, desk_now)))
-            });
-        if let Some(mark) = best {
-            resurfaced.push((
-                is_overdue_deadline(mark, desk_now),
-                priority(mark, desk_now),
-                DealCard {
-                    section: DealSection::Resurfaced,
-                    host,
-                    heading_offset: Some(heading.heading_range.start),
-                    agent_id: agents.first().copied(),
-                    agent_tag: agents.first().map(|agent| {
-                        by_id
-                            .get(agent)
-                            .map(|agent| agent.tag.clone())
-                            .unwrap_or_default()
-                    }),
-                    breadcrumb,
-                },
-            ));
-        } else if !heading
-            .temporal_marks
-            .iter()
-            .any(|mark| mark.kind == TemporalMarkKind::Reminder && mark.at > desk_now)
-            && agents
-                .iter()
-                .flat_map(|agent| descendants(*agent))
-                .all(|agent| !visible_agents.contains(&agent))
-        {
-            random_pool.push(DealCard {
-                section: DealSection::Random,
-                host,
-                heading_offset: Some(heading.heading_range.start),
-                agent_id: agents.first().copied(),
-                agent_tag: agents
-                    .first()
-                    .and_then(|agent| by_id.get(agent))
-                    .map(|agent| agent.tag.clone()),
-                breadcrumb,
-            });
-        }
-    }
-    resurfaced.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.total_cmp(&a.1)));
-
-    let mut cards = needs;
-    cards.extend(finished);
-    cards.extend(
-        resurfaced
-            .into_iter()
-            .take(DEAL_RESURFACED_CAP)
-            .map(|(_, _, card)| card),
-    );
     if !random_pool.is_empty() {
-        // SplitMix64 gives a stable, well-distributed session choice even
-        // when callers use adjacent seeds.
         let mut mixed = seed.wrapping_add(0x9e3779b97f4a7c15);
         mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
         mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d049bb133111eb);
         mixed ^= mixed >> 31;
-        cards.push(random_pool.swap_remove(mixed as usize % random_pool.len()));
+        let row = random_pool.swap_remove(mixed as usize % random_pool.len());
+        let agent_id = row.agents.first().copied();
+        cards.push(DealCard {
+            label: "random".to_owned(),
+            priority: f64::NEG_INFINITY,
+            host: row.host,
+            heading_offset: Some(row.heading.heading_range.start),
+            agent_id,
+            agent_tag: agent_id
+                .and_then(|agent| by_id.get(&agent))
+                .map(|agent| agent.tag.clone()),
+            breadcrumb: row.breadcrumb.clone(),
+        });
     }
-    cards
+
+    DealQueue {
+        cards,
+        total_alive,
+        dealt_count,
+        priority_topics,
+        random_topics,
+    }
 }
 
 fn deal_hint(deal: &DealSession) -> String {
@@ -4036,19 +4174,11 @@ fn deal_hint(deal: &DealSession) -> String {
             if deal.verdicts == 1 { "" } else { "s" }
         );
     };
-    let section_index = deal.cards[..deal.index]
-        .iter()
-        .filter(|candidate| candidate.section == card.section)
-        .count()
-        + 1;
-    let section_total = deal
-        .cards
-        .iter()
-        .filter(|candidate| candidate.section == card.section)
-        .count();
     format!(
-        "{} · {section_index}/{section_total} · {DEAL_HINT}",
-        card.section.label()
+        "{} · {}/{} · {DEAL_HINT}",
+        card.label,
+        deal.index + 1,
+        deal.cards.len()
     )
 }
 
@@ -4466,267 +4596,139 @@ mod tests {
     }
 
     #[test]
-    fn deal_queue_sections_attention_resurfacing_and_one_random_card() {
-        let loud = agent(1, None, UiAttention::NeedsInput, 30);
-        let finished = agent(2, None, UiAttention::Pending, 20);
-        let terminal = agent(3, None, UiAttention::Pending, 10);
-        let (registry, host) = registry(vec![loud.clone(), finished.clone(), terminal.clone()]);
-        let text = format!(
-            "* Needs :eng-{}:\n* Finished :eng-{}:\n:deadline: 2026-01-01\n* Terminal :eng-{}:\n:done: 2026-01-02\n* Overdue\n:deadline: 2026-01-01\n* Random one\n* Random two\n* Archive :archive:\n** Never\n:deadline: 2020-01-01\n",
-            &loud.agent_id.encoded()[..4],
-            &finished.agent_id.encoded()[..4],
-            &terminal.agent_id.encoded()[..4],
-        );
-        let now = chrono::NaiveDate::from_ymd_opt(2026, 2, 1)
-            .unwrap()
-            .and_hms_opt(12, 0, 0)
-            .unwrap()
-            .and_utc()
-            .fixed_offset();
-        let cards = assemble_deal_queue(&[(host, text)], &deal_agent_facts(&registry), now, 7);
-        assert_eq!(cards[0].section, DealSection::NeedsYou);
-        assert_eq!(cards[0].agent_id, Some(loud.agent_id));
-        assert_eq!(cards[1].section, DealSection::Finished);
-        assert_eq!(cards[1].agent_id, Some(finished.agent_id));
-        assert_eq!(cards[2].section, DealSection::Resurfaced);
-        assert_eq!(cards[2].breadcrumb, "Overdue");
-        assert!(
-            cards
-                .iter()
-                .all(|card| card.agent_id != Some(terminal.agent_id))
-        );
-        assert_eq!(
-            cards
-                .iter()
-                .filter(|card| card.breadcrumb == "Finished")
-                .count(),
-            1
-        );
-        assert_eq!(
-            cards
-                .iter()
-                .filter(|card| card.section == DealSection::Random)
-                .count(),
-            1
-        );
-        assert!(
-            cards
-                .iter()
-                .all(|card| !card.breadcrumb.contains("Archive"))
-        );
-    }
-
-    #[test]
-    fn deal_queue_only_includes_agents_filed_to_a_heading() {
-        let filed_root = agent(1, None, UiAttention::Quiet, 10);
-        let filed_child = agent(2, Some(filed_root.agent_id), UiAttention::Pending, 20);
-        let unfiled = agent(3, None, UiAttention::NeedsInput, 30);
-        let (registry, host) = registry(vec![
-            filed_root.clone(),
-            filed_child.clone(),
-            unfiled.clone(),
-        ]);
-        let text = format!("* Filed :eng-{}:\n", &filed_root.agent_id.encoded()[..4]);
-
-        let cards = assemble_deal_queue(
-            &[(host, text)],
-            &deal_agent_facts(&registry),
-            chrono::DateTime::UNIX_EPOCH.fixed_offset(),
-            7,
-        );
-
-        assert_eq!(cards.len(), 1);
-        assert_eq!(cards[0].agent_id, Some(filed_child.agent_id));
-        assert_eq!(cards[0].breadcrumb, "Filed");
-        assert!(
-            cards
-                .iter()
-                .all(|card| card.agent_id != Some(unfiled.agent_id))
-        );
-    }
-
-    #[test]
-    fn archived_subtrees_never_produce_deal_cards() {
-        let archived = agent(1, None, UiAttention::NeedsInput, 30);
-        let nested_archived = agent(2, None, UiAttention::Pending, 20);
-        let unfiled = agent(3, None, UiAttention::NeedsInput, 40);
-        let (registry, host) = registry(vec![archived.clone(), nested_archived.clone(), unfiled]);
-        let text = format!(
-            "* Archive :archive:\n\
-             ** webview :eng-{}:\n\
-             :deadline: 2020-01-01\n\
-             *** child heading\n\
-             :todo: 2020-01-02\n\
-             ** Archive :archive:\n\
-             *** nested webview :eng-{}:\n\
-             :reminder: 2020-01-03\n\
-             **** nested child\n\
-             :defer: 2020-01-04\n",
-            &archived.agent_id.encoded()[..4],
-            &nested_archived.agent_id.encoded()[..4],
-        );
-        let now = chrono::NaiveDate::from_ymd_opt(2026, 2, 1)
-            .unwrap()
-            .and_hms_opt(12, 0, 0)
-            .unwrap()
-            .and_utc()
-            .fixed_offset();
-
-        let cards = assemble_deal_queue(&[(host, text)], &deal_agent_facts(&registry), now, 7);
-
-        assert!(
-            cards.is_empty(),
-            "archived cards leaked into deal: {cards:?}"
-        );
-    }
-
-    #[test]
-    fn active_skip_gates_every_other_deal_signal_until_its_date() {
-        let (registry, host) = registry(Vec::new());
+    fn global_reply_and_text_priorities_share_one_scale() {
         let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
             .unwrap()
             .and_hms_opt(12, 0, 0)
             .unwrap()
             .and_utc()
             .fixed_offset();
-        let text = "* Snoozed deadline\n:skip: 2026-08-24\n:deadline: 2020-01-01\n* Expired skip\n:skip: 2026-08-22\n:deadline: 2020-01-01\n* Deferred\n:defer: 2026-08-24\n:deadline: 2020-01-01\n".to_owned();
-        let cards = assemble_deal_queue(&[(host, text)], &deal_agent_facts(&registry), now, 7);
-        assert!(
-            cards
-                .iter()
-                .all(|card| card.breadcrumb != "Snoozed deadline")
-        );
-        assert!(cards.iter().any(|card| card.breadcrumb == "Expired skip"));
-        assert!(cards.iter().all(|card| card.breadcrumb != "Deferred"));
-    }
-
-    #[test]
-    fn deal_agent_reply_is_derived_from_chronology_and_running_state() {
-        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
-            .unwrap()
-            .and_hms_opt(12, 0, 0)
-            .unwrap()
-            .and_utc()
-            .fixed_offset();
-        let at = |days: i64| UnixMs((now.timestamp_millis() - days * 86_400_000) as u64);
-        let mut owed = agent(1, None, UiAttention::Quiet, 0);
-        owed.facts = rho_ui_proto::UiAgentFacts {
+        let mut blocked = agent(1, None, UiAttention::Quiet, 0);
+        blocked.facts = rho_ui_proto::UiAgentFacts {
+            last_turn_ended: Some(UnixMs(now.timestamp_millis() as u64)),
+            last_user_message_at: UnixMs(0),
+            needs_you_hint: true,
             turn_running: false,
-            last_turn_ended: Some(at(8)),
-            last_user_message_at: at(9),
-            needs_you_hint: false,
         };
-        let (reg, host) = registry(vec![owed.clone()]);
+        let (reg, host) = registry(vec![blocked.clone()]);
         let text = format!(
-            "* Topic :eng-{}:
-",
-            &owed.agent_id.encoded()[..4]
+            "* One-day ripe todo\n:todo: 2026-08-15 7d\n* Blocked :eng-{}:\n",
+            &blocked.agent_id.encoded()[..4]
         );
-        assert_eq!(
-            assemble_deal_queue(&[(host, text.clone())], &deal_agent_facts(&reg), now, 1)[0]
-                .section,
-            DealSection::Finished
-        );
+        let queue = assemble_deal_queue(&[(host, text)], &deal_agent_facts(&reg), now, 0);
+        assert_eq!(queue.cards[0].label, "blocked · 0h");
+        assert_eq!(queue.cards[0].priority, 1.0);
+        assert_eq!(queue.cards[1].label, "todo · ripe 1d");
+        assert_eq!(queue.cards[1].priority, 1.0);
 
-        owed.facts.turn_running = true;
-        let (reg, _) = registry(vec![owed.clone()]);
-        assert!(
-            assemble_deal_queue(&[(host, text.clone())], &deal_agent_facts(&reg), now, 1)
-                .iter()
-                .all(|card| !matches!(card.section, DealSection::NeedsYou | DealSection::Finished))
+        blocked.facts.last_turn_ended = Some(UnixMs(
+            (now.timestamp_millis() - chrono::Duration::hours(2).num_milliseconds()) as u64,
+        ));
+        let (reg, host) = registry(vec![blocked.clone()]);
+        let text = format!(
+            "* Three-day ripe todo\n:todo: 2026-08-13 7d\n* Blocked :eng-{}:\n",
+            &blocked.agent_id.encoded()[..4]
         );
-
-        owed.facts.turn_running = false;
-        owed.facts.last_user_message_at = at(7);
-        let (reg, _) = registry(vec![owed.clone()]);
-        assert!(
-            assemble_deal_queue(&[(host, text)], &deal_agent_facts(&reg), now, 1)
-                .iter()
-                .all(|card| !matches!(card.section, DealSection::NeedsYou | DealSection::Finished))
-        );
+        let queue = assemble_deal_queue(&[(host, text)], &deal_agent_facts(&reg), now, 0);
+        assert_eq!(queue.cards[0].label, "todo · ripe 3d");
+        assert_eq!(queue.cards[0].priority, 3.0);
+        assert_eq!(queue.cards[1].label, "blocked · 2h");
+        assert_eq!(queue.cards[1].priority, 2.0);
     }
 
     #[test]
-    fn owed_child_filed_on_ancestor_appears_once_outside_random() {
+    fn fyi_matches_reminder_fresh_and_dies_at_the_floor_after_three_days() {
         let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
             .unwrap()
             .and_hms_opt(12, 0, 0)
             .unwrap()
             .and_utc()
             .fixed_offset();
-        let root = agent(1, None, UiAttention::Quiet, 0);
-        let mut child = agent(2, Some(root.agent_id), UiAttention::Quiet, 0);
-        child.facts = rho_ui_proto::UiAgentFacts {
-            turn_running: false,
-            last_turn_ended: Some(UnixMs((now.timestamp_millis() - 86_400_000) as u64)),
+        let mut fyi = agent(1, None, UiAttention::Quiet, 0);
+        fyi.facts = rho_ui_proto::UiAgentFacts {
+            last_turn_ended: Some(UnixMs(now.timestamp_millis() as u64)),
             last_user_message_at: UnixMs(0),
             needs_you_hint: false,
+            turn_running: false,
         };
-        let (reg, host) = registry(vec![root.clone(), child.clone()]);
+        let (reg, host) = registry(vec![fyi.clone()]);
         let text = format!(
-            "* Parent :eng-{}:
-",
-            &root.agent_id.encoded()[..4]
+            "* Reminder\n:reminder: 2026-08-23\n* FYI :eng-{}:\n",
+            &fyi.agent_id.encoded()[..4]
         );
-        let cards = assemble_deal_queue(&[(host, text)], &deal_agent_facts(&reg), now, 1);
-        assert_eq!(cards.len(), 1);
-        assert_eq!(cards[0].agent_id, Some(child.agent_id));
-        assert_eq!(cards[0].section, DealSection::Finished);
+        let queue = assemble_deal_queue(&[(host, text.clone())], &deal_agent_facts(&reg), now, 0);
+        let fyi_card = queue.cards.iter().find(|card| card.label == "fyi").unwrap();
+        let reminder = queue
+            .cards
+            .iter()
+            .find(|card| card.label == "reminder")
+            .unwrap();
+        assert_eq!(fyi_card.priority, 0.0);
+        assert_eq!(reminder.priority, 0.0);
+
+        fyi.facts.last_turn_ended = Some(UnixMs(
+            (now.timestamp_millis() - chrono::Duration::days(3).num_milliseconds()) as u64,
+        ));
+        let (reg, _) = registry(vec![fyi]);
+        let queue = assemble_deal_queue(&[(host, text)], &deal_agent_facts(&reg), now, 0);
+        assert!(queue.cards.iter().all(|card| card.label != "fyi"));
     }
 
     #[test]
-    fn reply_hint_changes_section_not_owed_status_and_heading_gates_apply() {
+    fn floor_cutoff_random_tail_and_liveness_are_distinct() {
         let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
             .unwrap()
             .and_hms_opt(12, 0, 0)
             .unwrap()
             .and_utc()
             .fixed_offset();
-        let ended = UnixMs((now.timestamp_millis() - 86_400_000) as u64);
-        let mut owed = agent(1, None, UiAttention::Quiet, 0);
-        owed.facts = rho_ui_proto::UiAgentFacts {
-            turn_running: false,
-            last_turn_ended: Some(ended),
-            last_user_message_at: UnixMs(0),
-            needs_you_hint: false,
+        let mut text = String::new();
+        for index in 0..10 {
+            text.push_str(&format!("* Todo {index}\n:todo: 2026-08-13 7d\n"));
+        }
+        text.push_str("* At floor\n:todo: 2026-08-15 9d\n");
+        let host = HostId(1);
+        let queue = assemble_deal_queue(&[(host, text)], &[], now, 7);
+        assert_eq!(queue.total_alive, 10);
+        assert_eq!(queue.dealt_count, DEAL_PRIORITY_CUTOFF);
+        assert_eq!(queue.cards.len(), DEAL_PRIORITY_CUTOFF + 1);
+        assert_eq!(queue.cards.last().unwrap().label, "random");
+        let ninth_ranked = DealCard {
+            label: "todo".into(),
+            priority: 0.0,
+            host,
+            heading_offset: Some("* Todo 0\n:todo: 2026-08-13 7d\n".len() * 8),
+            agent_id: None,
+            agent_tag: None,
+            breadcrumb: String::new(),
         };
-        let (reg, host) = registry(vec![owed.clone()]);
-        let plain = format!(
-            "* Topic :eng-{}:
-",
-            &owed.agent_id.encoded()[..4]
-        );
-        let cards = assemble_deal_queue(&[(host, plain.clone())], &deal_agent_facts(&reg), now, 1);
-        assert_eq!(cards[0].section, DealSection::Finished);
+        assert!(queue.is_live(&ninth_ranked));
+    }
 
-        owed.facts.needs_you_hint = true;
-        let (reg, _) = registry(vec![owed.clone()]);
-        let cards = assemble_deal_queue(&[(host, plain.clone())], &deal_agent_facts(&reg), now, 1);
-        assert_eq!(cards[0].section, DealSection::NeedsYou);
-
-        let skipped = format!(
-            "* Topic :eng-{}:
-:skip: 2026-08-24
-",
-            &owed.agent_id.encoded()[..4]
+    #[test]
+    fn snooze_supersedes_only_verdict_family_marks() {
+        let text = "* Topic\n:deadline: 2026-08-30 7d\n:todo: 2026-08-20 7d\n:defer: 2026-08-24 1d\n:reminder: 2026-08-25 1d\n:skip: 2026-08-26\n:done: 2026-08-01\n";
+        let heading = parse(text).remove(0);
+        let line = property_line(
+            TemporalMarkKind::Defer,
+            chrono::NaiveDate::from_ymd_opt(2026, 8, 27)
+                .unwrap()
+                .and_time(chrono::NaiveTime::MIN),
+            Some(4),
         );
-        assert!(
-            assemble_deal_queue(&[(host, skipped)], &deal_agent_facts(&reg), now, 1)
-                .iter()
-                .all(|card| card.agent_id != Some(owed.agent_id))
-        );
-        let expired = format!(
-            "* Topic :eng-{}:\n:skip: 2026-08-22\n",
-            &owed.agent_id.encoded()[..4]
-        );
-        assert_eq!(
-            assemble_deal_queue(&[(host, expired)], &deal_agent_facts(&reg), now, 1)[0].section,
-            DealSection::NeedsYou
-        );
-        assert!(
-            assemble_deal_queue(&[(host, String::new())], &deal_agent_facts(&reg), now, 1)
-                .is_empty()
-        );
+        let mut edits = heading_property_edits(text, &heading, TemporalMarkKind::Defer, line);
+        edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+        let mut result = text.to_owned();
+        for (range, replacement) in edits {
+            result.replace_range(range, &replacement);
+        }
+        assert!(result.contains(":deadline: 2026-08-30 7d"));
+        assert!(result.contains(":todo: 2026-08-20 7d"));
+        assert!(result.contains(":done: 2026-08-01"));
+        assert!(result.contains(":defer: 2026-08-27 4d"));
+        assert!(!result.contains(":reminder:"));
+        assert!(!result.contains(":skip:"));
+        assert_eq!(result.matches(":defer:").count(), 1);
     }
 
     #[test]
@@ -4734,7 +4736,8 @@ mod tests {
         let host = HostId(1);
         let cards = vec![
             DealCard {
-                section: DealSection::Resurfaced,
+                label: "reminder".into(),
+                priority: 0.0,
                 host,
                 heading_offset: Some(0),
                 agent_id: None,
@@ -4742,7 +4745,8 @@ mod tests {
                 breadcrumb: "One".into(),
             },
             DealCard {
-                section: DealSection::Resurfaced,
+                label: "todo · ripe 2d".into(),
+                priority: 2.0,
                 host,
                 heading_offset: Some(6),
                 agent_id: None,
@@ -4758,7 +4762,7 @@ mod tests {
             verdicts: 0,
             verdict_recorded: false,
         };
-        assert!(deal_hint(&deal).starts_with("resurfaced · 2/2 · o open"));
+        assert!(deal_hint(&deal).starts_with("todo · ripe 2d · 2/2 · r reply"));
     }
 
     #[test]

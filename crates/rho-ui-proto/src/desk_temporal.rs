@@ -124,7 +124,7 @@ pub fn priority(mark: &TemporalMark, now: NaiveDateTime) -> f64 {
     let pace = mark.pace_days as f64;
     match mark.kind {
         TemporalMarkKind::Deadline if elapsed < -pace => f64::NEG_INFINITY,
-        TemporalMarkKind::Deadline if elapsed <= 0.0 => elapsed,
+        TemporalMarkKind::Deadline if elapsed <= 0.0 => elapsed / pace,
         TemporalMarkKind::Deadline => 1_000_000.0 + elapsed,
         TemporalMarkKind::Todo => elapsed - pace,
         TemporalMarkKind::Defer => {
@@ -190,7 +190,11 @@ mod tests {
     fn deadline_hides_rises_then_pins_above_everything() {
         let mark = mark(TemporalMarkKind::Deadline, 20, 7);
         assert_eq!(priority(&mark, at(12)), f64::NEG_INFINITY);
-        assert_eq!(priority(&mark, at(13)), -7.0);
+        assert_eq!(priority(&mark, at(13)), -1.0);
+        assert!(!surfaced(&mark, at(13), -1.0));
+        assert_eq!(priority(&mark, at(14)), -6.0 / 7.0);
+        assert!(surfaced(&mark, at(14), -1.0));
+        assert_eq!(priority(&mark, at(19)), -1.0 / 7.0);
         assert_eq!(priority(&mark, at(20)), 0.0);
         assert_eq!(priority(&mark, at(21)), 1_000_001.0);
         assert!(priority(&mark, at(22)) > priority(&mark, at(21)));

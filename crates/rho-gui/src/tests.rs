@@ -4873,7 +4873,10 @@ fn desk_deal_cards_focus_in_place_read_only_skippable_and_openable(cx: &mut Test
             assert!(
                 workspace
                     .dashboard_hint_for_test(cx)
-                    .starts_with("resurfaced · 1/3 · o open")
+                    .starts_with("deadline · ")
+                    && workspace
+                        .dashboard_hint_for_test(cx)
+                        .contains(" · 1/3 · r reply")
             );
         })
         .unwrap();
@@ -4914,7 +4917,10 @@ fn desk_deal_cards_focus_in_place_read_only_skippable_and_openable(cx: &mut Test
             assert!(
                 workspace
                     .dashboard_hint_for_test(cx)
-                    .starts_with("resurfaced · 2/3 · o open")
+                    .starts_with("deadline · ")
+                    && workspace
+                        .dashboard_hint_for_test(cx)
+                        .contains(" · 2/3 · r reply")
             );
         })
         .unwrap();
@@ -4942,7 +4948,10 @@ fn desk_deal_cards_focus_in_place_read_only_skippable_and_openable(cx: &mut Test
             assert!(
                 workspace
                     .dashboard_hint_for_test(cx)
-                    .starts_with("resurfaced · 3/3 · o open")
+                    .starts_with("deadline · ")
+                    && workspace
+                        .dashboard_hint_for_test(cx)
+                        .contains(" · 3/3 · r reply")
             );
         })
         .unwrap();
