@@ -256,8 +256,13 @@ impl InlayChunks<'_> {
     pub fn seek(&mut self, new_range: Range<InlayOffset>) {
         self.transforms.seek(&new_range.start, Bias::Right);
 
-        let buffer_range = self.snapshot.to_buffer_offset(new_range.start)
-            ..self.snapshot.to_buffer_offset(new_range.end);
+        let buffer_range = self
+            .snapshot
+            .to_buffer_offset_after_concealment(new_range.start)
+            ..self
+                .snapshot
+                .to_buffer_offset_after_concealment(new_range.end);
+        self.max_buffer_offset = buffer_range.end;
         self.buffer_chunks.seek(buffer_range);
         self.inlay_chunks = None;
         self.buffer_chunk = None;
@@ -1094,6 +1099,22 @@ impl InlaySnapshot {
         }
     }
 
+    /// Maps an output offset to the source position after a zero-width
+    /// concealment at that offset. Chunk ranges use this for both bounds so
+    /// their source iterator agrees with the transform cursor when it steps
+    /// across concealed input.
+    fn to_buffer_offset_after_concealment(&self, offset: InlayOffset) -> MultiBufferOffset {
+        let (start, _, item) = self
+            .transforms
+            .find::<Dimensions<InlayOffset, MultiBufferOffset>, _>((), &offset, Bias::Right);
+        match item {
+            Some(Transform::Isomorphic(_)) => start.1 + (offset - start.0),
+            Some(Transform::Inlay(_)) => start.1,
+            Some(Transform::Concealed(summary)) => start.1 + summary.len,
+            None => self.buffer.len(),
+        }
+    }
+
     #[ztracing::instrument(skip_all)]
     pub fn to_inlay_offset(&self, offset: MultiBufferOffset) -> InlayOffset {
         let mut cursor = self
@@ -1426,7 +1447,8 @@ impl InlaySnapshot {
             .cursor::<Dimensions<InlayOffset, MultiBufferOffset>>(());
         cursor.seek(&range.start, Bias::Right);
 
-        let buffer_range = self.to_buffer_offset(range.start)..self.to_buffer_offset(range.end);
+        let buffer_range = self.to_buffer_offset_after_concealment(range.start)
+            ..self.to_buffer_offset_after_concealment(range.end);
         let max_buffer_offset = buffer_range.end;
         let buffer_chunks = CustomHighlightsChunks::new(
             buffer_range,
@@ -2182,6 +2204,23 @@ mod tests {
         let (snapshot, edits) =
             map.replace_concealments(vec![MultiBufferOffset(0)..MultiBufferOffset(3)]);
         assert_eq!(snapshot.text(), "a\tX");
+        for start in 0..=snapshot.len().0.0 {
+            for end in start..=snapshot.len().0.0 {
+                let actual = snapshot
+                    .chunks(
+                        InlayOffset(MultiBufferOffset(start))
+                            ..InlayOffset(MultiBufferOffset(end)),
+                        LanguageAwareStyling {
+                            tree_sitter: false,
+                            diagnostics: false,
+                        },
+                        Highlights::default(),
+                    )
+                    .map(|chunk| chunk.chunk.text)
+                    .collect::<String>();
+                assert_eq!(actual, &snapshot.text()[start..end]);
+            }
+        }
         assert_eq!(edits.len(), 1);
         assert_eq!(
             snapshot.to_inlay_offset(MultiBufferOffset(1)),
