@@ -385,6 +385,11 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
 /// every Rho GUI frontend. Platform-specific actions remain harmless when
 /// their corresponding surface is unavailable; their contexts never match.
 pub fn init_vim_mode(cx: &mut App) -> anyhow::Result<()> {
+    // Rho is Helix-first: force Helix on so no settings file can silently
+    // drop the user back into plain Vim.
+    let settings = cx.global_mut::<settings::SettingsStore>();
+    settings.override_global(vim_mode_setting::VimModeSetting(false));
+    settings.override_global(vim_mode_setting::HelixModeSetting(true));
     vim::init(cx);
     let default_key_bindings =
         settings::KeymapFile::load_asset_allow_partial_failure(settings::DEFAULT_KEYMAP_PATH, cx)?;
