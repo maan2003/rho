@@ -54,15 +54,18 @@ use crate::style::{RoleFamily, StyleClass};
 use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
     AgentDone, AgentHide, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, BrowserExit,
-    DashboardArchive, DashboardBack, DashboardCycleGlobal, DashboardDeleteEmpty, DashboardDemote,
-    DashboardGoto, DashboardHeadingAbove, DashboardHeadingBelow, DashboardJump, DashboardNewAgent,
-    DashboardNow, DashboardPromote, DashboardRenameTopic, DashboardReply, DashboardStaff,
-    DashboardSubmit, DashboardToggleAgentTree, DashboardToggleSubagents, DashboardUndo,
-    GitApprovalAllow, GitApprovalDeny, MinibufferCancel, MinibufferComplete, MinibufferConfirm,
-    MinibufferNext, MinibufferPrevious, PaneBack, PaneClose, PaneFocusNext, PaneSplitDown,
-    PaneSplitRight, PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof,
-    ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit, SubmitPrompt, TaskBoard,
-    UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow, ZulipQuit,
+    DashboardArchive, DashboardBack, DashboardCycleGlobal, DashboardDealArchive,
+    DashboardDealDefer1, DashboardDealDefer3, DashboardDealDefer7, DashboardDealDefer30,
+    DashboardDealDiscard, DashboardDealDone, DashboardDealExit, DashboardDealNext,
+    DashboardDealOpen, DashboardDealSkip, DashboardDeleteEmpty, DashboardDemote, DashboardGoto,
+    DashboardHeadingAbove, DashboardHeadingBelow, DashboardJump, DashboardNewAgent, DashboardNow,
+    DashboardPromote, DashboardRenameTopic, DashboardReply, DashboardStaff, DashboardSubmit,
+    DashboardToggleAgentTree, DashboardToggleSubagents, DashboardUndo, GitApprovalAllow,
+    GitApprovalDeny, MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext,
+    MinibufferPrevious, PaneBack, PaneClose, PaneFocusNext, PaneSplitDown, PaneSplitRight,
+    PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt,
+    ShellPagerAll, ShellPagerMore, ShellPagerQuit, SubmitPrompt, TaskBoard, UploadGuiTelemetry,
+    VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow, ZulipQuit,
 };
 
 /// What a pane shows: stable identity plus the live view. Surfaces live
@@ -5304,6 +5307,47 @@ impl Workspace {
         self.refresh_dashboard(window, cx);
     }
 
+    pub(crate) fn toggle_dashboard_deal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dashboard.deal_mode() {
+            self.dashboard.exit_deal_mode();
+        } else {
+            let now = chrono::Local::now().naive_local();
+            let seed = now.and_utc().timestamp_nanos_opt().unwrap_or_default() as u64;
+            self.dashboard
+                .enter_deal_mode(&self.registry, now, seed, cx);
+        }
+        self.refresh_dashboard(window, cx);
+        window.focus(&self.dashboard.focus_handle(cx), cx);
+        cx.notify();
+    }
+
+    fn dashboard_deal_property(
+        &mut self,
+        kind: rho_ui_proto::desk::TemporalMarkKind,
+        days: u64,
+        advance: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.dashboard.deal_mode() {
+            cx.propagate();
+            return;
+        }
+        let today = chrono::Local::now().date_naive();
+        let date = today
+            .checked_add_days(chrono::Days::new(days))
+            .unwrap_or(today);
+        if self
+            .dashboard
+            .write_deal_property(kind, date.and_hms_opt(0, 0, 0).unwrap(), cx)
+        {
+            if advance {
+                self.dashboard.advance_deal(cx);
+            }
+            self.refresh_dashboard(window, cx);
+        }
+    }
+
     pub(crate) fn configure_dashboard_staff(
         &mut self,
         window: &mut Window,
@@ -6414,6 +6458,11 @@ impl Workspace {
             .child(self.render_dashboard_header(text_style, cx));
         let dashboard = div()
             .id("dashboard-rail")
+            .key_context(if self.dashboard.deal_mode() {
+                "RhoDashboardDeal"
+            } else {
+                "RhoDashboardNormal"
+            })
             .flex_grow(1.0)
             .min_h_0()
             .overflow_hidden()
@@ -7298,6 +7347,100 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &DashboardRenameTopic, window, cx| {
                 this.prompt_dashboard_rename_topic(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &DashboardDealExit, window, cx| {
+                if this.dashboard.exit_deal_mode() {
+                    this.refresh_dashboard(window, cx);
+                } else {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &DashboardDealOpen, window, cx| {
+                if this.dashboard.deal_mode() {
+                    this.dashboard_open(window, cx);
+                } else {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &DashboardDealArchive, window, cx| {
+                if !this.dashboard.deal_accepts_verdict() {
+                    cx.propagate();
+                    return;
+                }
+                if this.dashboard.archive_deal_heading(cx) {
+                    this.dashboard.record_deal_verdict();
+                    this.refresh_dashboard(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &DashboardDealNext, window, cx| {
+                if this.dashboard.advance_deal(cx) {
+                    this.refresh_dashboard(window, cx);
+                } else {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &DashboardDealDone, window, cx| {
+                this.dashboard_deal_property(
+                    rho_ui_proto::desk::TemporalMarkKind::Done,
+                    0,
+                    false,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &DashboardDealDiscard, window, cx| {
+                this.dashboard_deal_property(
+                    rho_ui_proto::desk::TemporalMarkKind::Discarded,
+                    0,
+                    false,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &DashboardDealSkip, window, cx| {
+                this.dashboard_deal_property(
+                    rho_ui_proto::desk::TemporalMarkKind::Reminder,
+                    1,
+                    true,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &DashboardDealDefer1, window, cx| {
+                this.dashboard_deal_property(
+                    rho_ui_proto::desk::TemporalMarkKind::Reminder,
+                    1,
+                    false,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &DashboardDealDefer3, window, cx| {
+                this.dashboard_deal_property(
+                    rho_ui_proto::desk::TemporalMarkKind::Reminder,
+                    3,
+                    false,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &DashboardDealDefer7, window, cx| {
+                this.dashboard_deal_property(
+                    rho_ui_proto::desk::TemporalMarkKind::Reminder,
+                    7,
+                    false,
+                    window,
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &DashboardDealDefer30, window, cx| {
+                this.dashboard_deal_property(
+                    rho_ui_proto::desk::TemporalMarkKind::Reminder,
+                    30,
+                    false,
+                    window,
+                    cx,
+                );
+            }))
             .on_action(
                 cx.listener(|this, _: &DashboardToggleAgentTree, window, cx| {
                     if !this.dashboard.is_focused(window, cx)
@@ -7331,6 +7474,13 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &DashboardArchive, window, cx| {
                 if !this.dashboard.is_focused(window, cx) {
                     cx.propagate();
+                    return;
+                }
+                if this.dashboard.deal_mode() {
+                    if this.dashboard.archive_deal_heading(cx) {
+                        this.dashboard.record_deal_verdict();
+                        this.refresh_dashboard(window, cx);
+                    }
                     return;
                 }
                 if this.dashboard.archive_cursor_heading(cx) {

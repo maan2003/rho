@@ -635,6 +635,9 @@ pub fn root_menu() -> Transient {
         .item("e", "Desk raw source", |workspace, window, cx| {
             workspace.cmd_toggle_raw_desk(window, cx);
         })
+        .item("v", "deal Desk", |workspace, window, cx| {
+            workspace.toggle_dashboard_deal(window, cx);
+        })
         .item("b", "switch buffer…", |workspace, window, cx| {
             workspace.open_buffer_picker(window, cx);
         })

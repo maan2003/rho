@@ -73,6 +73,17 @@ actions!(
         DashboardDeleteEmpty,
         DashboardUndo,
         DashboardRenameTopic,
+        DashboardDealExit,
+        DashboardDealNext,
+        DashboardDealDone,
+        DashboardDealOpen,
+        DashboardDealArchive,
+        DashboardDealDiscard,
+        DashboardDealSkip,
+        DashboardDealDefer1,
+        DashboardDealDefer3,
+        DashboardDealDefer7,
+        DashboardDealDefer30,
         RoleCycle,
         RoleCycleGroup,
         TaskBoard,
@@ -350,6 +361,27 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             KeyBinding::new("g h", DashboardJump, Some(context)),
             // Not `c r`: a `c` prefix would shadow helix's change verb.
             KeyBinding::new("g r", DashboardRenameTopic, Some(context)),
+        ]);
+    }
+    for context in [
+        "RhoDashboard > RhoDashboardDeal > Editor && vim_mode == normal",
+        "RhoDashboard > RhoDashboardDeal > Editor && vim_mode == helix_normal",
+    ] {
+        cx.bind_keys([
+            KeyBinding::new("q", DashboardDealExit, Some(context)),
+            KeyBinding::new("escape", DashboardDealExit, Some(context)),
+            KeyBinding::new("n", DashboardDealNext, Some(context)),
+            KeyBinding::new("enter", DashboardDealNext, Some(context)),
+            KeyBinding::new("o", DashboardDealOpen, Some(context)),
+            KeyBinding::new("r", DashboardReply, Some(context)),
+            KeyBinding::new("a", DashboardDealArchive, Some(context)),
+            KeyBinding::new("d", DashboardDealDone, Some(context)),
+            KeyBinding::new("x", DashboardDealDiscard, Some(context)),
+            KeyBinding::new("s", DashboardDealSkip, Some(context)),
+            KeyBinding::new("f f", DashboardDealDefer1, Some(context)),
+            KeyBinding::new("f 3", DashboardDealDefer3, Some(context)),
+            KeyBinding::new("f 7", DashboardDealDefer7, Some(context)),
+            KeyBinding::new("f 0", DashboardDealDefer30, Some(context)),
         ]);
     }
 }

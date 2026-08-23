@@ -63,6 +63,36 @@ type SyncSnapshot = (
 );
 type ArchiveEdits = (Vec<(Range<usize>, String)>, usize);
 
+const DEAL_SURFACE_THRESHOLD: f64 = -0.01;
+const DEAL_RESURFACED_CAP: usize = 10;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DealSection {
+    NeedsYou,
+    Finished,
+    Resurfaced,
+    Random,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DealCard {
+    pub section: DealSection,
+    pub host: HostId,
+    pub heading_offset: Option<usize>,
+    pub agent_id: Option<AgentId>,
+    pub agent_tag: Option<String>,
+    pub breadcrumb: String,
+}
+
+#[derive(Clone, Debug)]
+struct DealSession {
+    cards: Vec<DealCard>,
+    anchors: Vec<Option<(HostId, text::Anchor)>>,
+    index: usize,
+    verdicts: usize,
+    verdict_recorded: bool,
+}
+
 struct ListingVisibility<'a> {
     collapsed_unfiled: &'a HashSet<HostId>,
     expanded_portals: &'a HashSet<AgentOccurrence>,
@@ -91,6 +121,8 @@ enum LineKey {
     NewDraft(Option<(HostId, usize)>),
     /// An empty line separating listing regions.
     Spacer(HostId),
+    DealBreadcrumb,
+    DealHint,
 }
 
 /// One place an agent's shared runtime row is projected. The occurrence is
@@ -225,6 +257,8 @@ pub struct Dashboard {
     collapsed_unfiled: HashSet<HostId>,
     /// Shows only literal editable Desk source, with no generated UI.
     raw_mode: bool,
+    deal: Option<DealSession>,
+    queue_depth: usize,
     /// Portal occurrences whose complete runtime subtree is visible.
     /// This is transient display state and is never written to Desk.
     expanded_portals: HashSet<AgentOccurrence>,
@@ -307,6 +341,8 @@ impl Dashboard {
             global_cycle: 0,
             collapsed_unfiled: HashSet::new(),
             raw_mode: false,
+            deal: None,
+            queue_depth: 0,
             expanded_portals: HashSet::new(),
             pending_cursor: None,
             pending_doc_cursor: None,
@@ -374,6 +410,269 @@ impl Dashboard {
         let source = self.hosts.get(&host)?.upgrade()?;
         let buffer = source.read(cx);
         Some(buffer.text_for_range(0..buffer.len()).collect())
+    }
+
+    pub fn deal_mode(&self) -> bool {
+        self.deal.is_some()
+    }
+
+    pub fn deal_waiting(&self) -> usize {
+        self.deal
+            .as_ref()
+            .map_or(0, |deal| deal.cards.len().saturating_sub(deal.index))
+    }
+
+    pub fn enter_deal_mode(
+        &mut self,
+        registry: &AgentRegistry,
+        now: chrono::NaiveDateTime,
+        seed: u64,
+        cx: &mut Context<Workspace>,
+    ) {
+        let documents = self
+            .hosts
+            .keys()
+            .filter_map(|host| self.source_text(*host, cx).map(|text| (*host, text)))
+            .collect::<Vec<_>>();
+        let cards = assemble_deal_queue(&documents, registry, now, seed);
+        let anchors = cards
+            .iter()
+            .map(|card| {
+                let offset = card.heading_offset?;
+                let source = self.hosts.get(&card.host)?.upgrade()?;
+                Some((card.host, source.read(cx).anchor_before(offset)))
+            })
+            .collect();
+        self.raw_mode = false;
+        self.deal = Some(DealSession {
+            cards,
+            anchors,
+            index: 0,
+            verdicts: 0,
+            verdict_recorded: false,
+        });
+        if let Some(card) = self.current_deal_card() {
+            if let Some(offset) = card.heading_offset {
+                self.pending_doc_cursor = Some((card.host, offset));
+            } else if let Some(agent_id) = card.agent_id {
+                self.pending_cursor = Some(LineKey::Agent {
+                    agent_id,
+                    occurrence: AgentOccurrence::Unfiled {
+                        host: card.host,
+                        portal: agent_id,
+                    },
+                });
+            }
+        }
+        self.last_synced = None;
+    }
+
+    pub fn exit_deal_mode(&mut self) -> bool {
+        let exited = self.deal.take().is_some();
+        self.last_synced = None;
+        exited
+    }
+
+    pub fn advance_deal(&mut self, cx: &mut Context<Workspace>) -> bool {
+        let Some(deal) = &mut self.deal else {
+            return false;
+        };
+        if deal.index < deal.cards.len() && !deal.verdict_recorded {
+            return true;
+        }
+        if deal.index < deal.cards.len() {
+            deal.index += 1;
+            deal.verdict_recorded = false;
+        }
+        self.refresh_current_deal_offset(cx);
+        if let Some(card) = self.current_deal_card() {
+            if let Some(offset) = card.heading_offset {
+                self.pending_doc_cursor = Some((card.host, offset));
+            } else if let Some(agent_id) = card.agent_id {
+                self.pending_cursor = Some(LineKey::Agent {
+                    agent_id,
+                    occurrence: AgentOccurrence::Unfiled {
+                        host: card.host,
+                        portal: agent_id,
+                    },
+                });
+            }
+        }
+        self.last_synced = None;
+        true
+    }
+
+    fn refresh_current_deal_offset(&mut self, cx: &App) -> bool {
+        let Some(deal) = &self.deal else {
+            return false;
+        };
+        if deal.index >= deal.cards.len() {
+            return false;
+        }
+        let Some((host, anchor)) = deal.anchors.get(deal.index).and_then(Clone::clone) else {
+            return true;
+        };
+        let Some(source) = self.hosts.get(&host).and_then(|source| source.upgrade()) else {
+            return false;
+        };
+        let snapshot = source.read(cx).snapshot();
+        let offset = anchor.to_offset(&snapshot);
+        let text = snapshot.text();
+        let headings = parse(&text);
+        let found = headings
+            .iter()
+            .enumerate()
+            .find(|(_, heading)| heading.heading_range.start == offset)
+            .map(|(index, heading)| {
+                (
+                    heading.heading_range.start,
+                    heading_breadcrumb(&headings, index),
+                )
+            });
+        if let Some((offset, breadcrumb)) = found
+            && let Some(deal) = &mut self.deal
+            && let Some(card) = deal.cards.get_mut(deal.index)
+        {
+            card.heading_offset = Some(offset);
+            card.breadcrumb = breadcrumb;
+            return true;
+        }
+        if let Some(deal) = &mut self.deal
+            && let Some(card) = deal.cards.get_mut(deal.index)
+        {
+            card.heading_offset = None;
+        }
+        false
+    }
+
+    pub fn deal_accepts_verdict(&self) -> bool {
+        self.deal
+            .as_ref()
+            .is_some_and(|deal| !deal.verdict_recorded && deal.index < deal.cards.len())
+    }
+
+    pub fn record_deal_verdict(&mut self) {
+        if let Some(deal) = &mut self.deal
+            && !deal.verdict_recorded
+        {
+            deal.verdict_recorded = true;
+            deal.verdicts += 1;
+        }
+    }
+
+    pub fn current_deal_card(&self) -> Option<&DealCard> {
+        let deal = self.deal.as_ref()?;
+        deal.cards.get(deal.index)
+    }
+
+    pub fn write_deal_property(
+        &mut self,
+        kind: rho_ui_proto::desk::TemporalMarkKind,
+        at: chrono::NaiveDateTime,
+        cx: &mut Context<Workspace>,
+    ) -> bool {
+        if !self.deal_accepts_verdict() {
+            return false;
+        }
+        if !self.refresh_current_deal_offset(cx) {
+            return false;
+        }
+        let Some(card) = self.current_deal_card().cloned() else {
+            return false;
+        };
+        let Some(offset) = card.heading_offset else {
+            let Some(text) = self.source_text(card.host, cx) else {
+                return false;
+            };
+            let line = rho_ui_proto::desk::temporal::property_line(kind, at, None);
+            let separator = if text.is_empty() || text.ends_with('\n') {
+                ""
+            } else {
+                "\n"
+            };
+            let Some(agent_tag) = card.agent_tag.as_deref() else {
+                return false;
+            };
+            let addition = format!("{separator}* Agent {agent_tag} :{agent_tag}:\n{line}");
+            let offset = text.len() + separator.len();
+            self.hosts[&card.host]
+                .upgrade()
+                .unwrap()
+                .update(cx, |buffer, cx| {
+                    buffer.edit([(text.len()..text.len(), addition)], None, cx)
+                });
+            if let Some(deal) = &mut self.deal
+                && let Some(current) = deal.cards.get_mut(deal.index)
+            {
+                current.heading_offset = Some(offset);
+            }
+            self.record_deal_verdict();
+            return true;
+        };
+        self.set_heading_property(card.host, offset, kind, at, cx)
+    }
+
+    fn set_heading_property(
+        &mut self,
+        host: HostId,
+        offset: usize,
+        kind: rho_ui_proto::desk::TemporalMarkKind,
+        at: chrono::NaiveDateTime,
+        cx: &mut Context<Workspace>,
+    ) -> bool {
+        let Some(text) = self.source_text(host, cx) else {
+            return false;
+        };
+        let Some(heading) = parse(&text)
+            .into_iter()
+            .find(|heading| heading.heading_range.start == offset)
+        else {
+            return false;
+        };
+        let key = kind.property_key();
+        let line = rho_ui_proto::desk::temporal::property_line(kind, at, None);
+        let edit = if let Some(property) = heading
+            .properties
+            .iter()
+            .find(|property| property.key.eq_ignore_ascii_case(key))
+        {
+            (
+                property.line_range.clone(),
+                line.trim_end_matches('\n').to_owned(),
+            )
+        } else {
+            let followed_by_newline =
+                text.as_bytes().get(heading.heading_range.end) == Some(&b'\n');
+            let insertion = heading.heading_range.end + usize::from(followed_by_newline);
+            (
+                insertion..insertion,
+                if followed_by_newline {
+                    line
+                } else {
+                    format!("\n{line}")
+                },
+            )
+        };
+        let delta = edit.1.len() as isize - (edit.0.end - edit.0.start) as isize;
+        let edit_start = edit.0.start;
+        self.hosts[&host]
+            .upgrade()
+            .unwrap()
+            .update(cx, |buffer, cx| buffer.edit([edit], None, cx));
+        if delta != 0
+            && let Some(deal) = &mut self.deal
+        {
+            for card in deal.cards.iter_mut().skip(deal.index + 1) {
+                if card.host == host
+                    && let Some(offset) = &mut card.heading_offset
+                    && *offset > edit_start
+                {
+                    *offset = offset.saturating_add_signed(delta);
+                }
+            }
+        }
+        self.record_deal_verdict();
+        true
     }
 
     /// Opens (or returns to) an inline reply draft under the agent's row.
@@ -551,6 +850,8 @@ impl Dashboard {
             .filter_map(|host| self.source_text(*host, cx).map(|text| (*host, text)))
             .collect::<Vec<_>>();
         let filed = self.resolve_bindings(registry, &documents);
+        self.queue_depth =
+            assemble_deal_queue(&documents, registry, chrono::Local::now().naive_local(), 0).len();
         #[cfg(feature = "native")]
         let (filed_pages, referenced_pages) = Self::resolve_page_bindings(&documents);
         self.archived_agents = archived_roots(&documents, &filed);
@@ -594,28 +895,32 @@ impl Dashboard {
 
         let draft_topic = self.new_draft.as_ref().map(|(topic, _, _)| *topic);
         let collapsed = self.collapsed_ranges(&documents, cx);
-        let fold_ranges = if self.raw_mode {
+        let fold_ranges = if self.raw_mode || self.deal.is_some() {
             Vec::new()
         } else {
             self.effective_fold_ranges(&documents, &collapsed, cx)
         };
-        let segments = generate(
-            registry,
-            &documents,
-            &filed,
-            &fold_ranges,
-            ListingVisibility {
-                collapsed_unfiled: &self.collapsed_unfiled,
-                expanded_portals: &self.expanded_portals,
-                raw: self.raw_mode,
-            },
-            &self.replies,
-            draft_topic,
-        );
+        let segments = if let Some(deal) = &self.deal {
+            generate_deal(registry, &documents, &filed, deal, &self.replies)
+        } else {
+            generate(
+                registry,
+                &documents,
+                &filed,
+                &fold_ranges,
+                ListingVisibility {
+                    collapsed_unfiled: &self.collapsed_unfiled,
+                    expanded_portals: &self.expanded_portals,
+                    raw: self.raw_mode,
+                },
+                &self.replies,
+                draft_topic,
+            )
+        };
         // Staffed headings wear their agents as end-of-line inlays, not
         // rows, so the decoration strings join the fingerprint: attention
         // changes must not vanish into the early-out.
-        let mut decorations = if self.raw_mode {
+        let mut decorations = if self.raw_mode || self.deal.is_some() {
             Vec::new()
         } else {
             heading_decorations(
@@ -627,14 +932,14 @@ impl Dashboard {
             )
         };
         #[cfg(feature = "native")]
-        if !self.raw_mode {
+        if !self.raw_mode && self.deal.is_none() {
             decorations.extend(page_heading_decorations(&documents, &filed_pages));
         }
         let cursor_doc = match &cursor_place {
             Some(CursorPlace::Doc(host, offset)) => Some((*host, *offset)),
             _ => None,
         };
-        let conceals = if self.raw_mode {
+        let conceals = if self.raw_mode || self.deal.is_some() {
             Vec::new()
         } else {
             heading_conceals(&documents, cursor_doc)
@@ -768,6 +1073,7 @@ impl Dashboard {
                             let host_len = buffer.read(cx).len();
                             spec.sections.push(SectionSpec {
                                 host: buffer,
+                                start: range.start,
                                 lead: std::mem::take(&mut pending_rows),
                                 cuts: Vec::new(),
                             });
@@ -1355,9 +1661,17 @@ impl Dashboard {
                 + usize::from(text.as_bytes().get(property.line_range.end) == Some(&b'\n'));
             (property.line_range.start..end, line)
         } else {
-            let insertion = heading.heading_range.end
-                + usize::from(text.as_bytes().get(heading.heading_range.end) == Some(&b'\n'));
-            (insertion..insertion, line)
+            let followed_by_newline =
+                text.as_bytes().get(heading.heading_range.end) == Some(&b'\n');
+            let insertion = heading.heading_range.end + usize::from(followed_by_newline);
+            (
+                insertion..insertion,
+                if followed_by_newline {
+                    line
+                } else {
+                    format!("\n{line}")
+                },
+            )
         };
         self.hosts[&host]
             .upgrade()
@@ -1410,6 +1724,40 @@ impl Dashboard {
         let Some((host, offset)) = self.cursor_topic(cx) else {
             return false;
         };
+        self.archive_heading(host, offset, cx)
+    }
+
+    pub fn archive_deal_heading(&mut self, cx: &mut Context<Workspace>) -> bool {
+        if !self.deal_accepts_verdict() || !self.refresh_current_deal_offset(cx) {
+            return false;
+        }
+        let Some(card) = self.current_deal_card() else {
+            return false;
+        };
+        let Some(offset) = card.heading_offset else {
+            return false;
+        };
+        let archived = self.archive_heading(card.host, offset, cx);
+        if archived && let Some(deal) = &mut self.deal {
+            if let Some(card) = deal.cards.get_mut(deal.index) {
+                card.heading_offset = None;
+            }
+            if let Some(anchor) = deal.anchors.get_mut(deal.index) {
+                *anchor = None;
+            }
+            // `archive_heading` aimed the ordinary Desk cursor at the archive
+            // zone, which is outside the still-current narrowed card.
+            self.pending_doc_cursor = None;
+        }
+        archived
+    }
+
+    fn archive_heading(
+        &mut self,
+        host: HostId,
+        offset: usize,
+        cx: &mut Context<Workspace>,
+    ) -> bool {
         let Some(text) = self.source_text(host, cx) else {
             return false;
         };
@@ -1806,8 +2154,14 @@ impl Dashboard {
         false
     }
 
-    pub fn hint(&self, _cx: &mut Context<Workspace>) -> &'static str {
-        "enter open · r reply · o staff · d/x verdict · Tab fold · gn attention"
+    pub fn hint(&self, _cx: &mut Context<Workspace>) -> String {
+        if self.deal.is_some() {
+            return format!("{} waiting · deal mode", self.deal_waiting());
+        }
+        format!(
+            "{} waiting · enter open · r reply · o staff · d/x verdict · Tab fold · gn attention",
+            self.queue_depth
+        )
     }
 
     fn apply_highlights(
@@ -3061,6 +3415,339 @@ fn heading_portal_ids(headings: &[DeskHeading]) -> Vec<u64> {
         .collect()
 }
 
+fn heading_breadcrumb(headings: &[DeskHeading], index: usize) -> String {
+    let mut path = vec![headings[index].title.as_str()];
+    let mut parent = headings[index].parent;
+    while let Some(parent_index) = parent {
+        path.push(headings[parent_index].title.as_str());
+        parent = headings[parent_index].parent;
+    }
+    path.reverse();
+    path.join(" › ")
+}
+
+/// Builds one deterministic deal from Desk text and registry state. Text order
+/// breaks ties everywhere except resurfaced priority; `seed` chooses the one
+/// anti-starvation card without introducing persistent state.
+pub fn assemble_deal_queue(
+    documents: &[(HostId, String)],
+    registry: &AgentRegistry,
+    now: chrono::NaiveDateTime,
+    seed: u64,
+) -> Vec<DealCard> {
+    use rho_ui_proto::desk::TemporalMarkKind;
+    use rho_ui_proto::desk::temporal::{is_overdue_deadline, priority, surfaced};
+
+    let mut heading_rows = Vec::new();
+    let mut agent_topics: HashMap<AgentId, (HostId, usize, String, bool, bool, bool)> =
+        HashMap::new();
+    for (host, text) in documents {
+        let headings = parse(text);
+        let archives = archive_zones(&headings);
+        for (index, heading) in headings.iter().enumerate() {
+            let archived = archives.iter().any(|zone| {
+                zone.start <= heading.heading_range.start && heading.heading_range.start < zone.end
+            });
+            let breadcrumb = heading_breadcrumb(&headings, index);
+            let terminal = matches!(
+                heading.state,
+                Some(DeskHeadingState::Done | DeskHeadingState::Discarded)
+            ) || heading.temporal_marks.iter().any(|mark| {
+                matches!(
+                    mark.kind,
+                    TemporalMarkKind::Done | TemporalMarkKind::Discarded
+                )
+            });
+            let deferred = heading
+                .temporal_marks
+                .iter()
+                .any(|mark| mark.kind == TemporalMarkKind::Reminder && mark.at > now);
+            let agents = heading
+                .tags
+                .iter()
+                .filter_map(|tag| registry.agent_by_tag(*host, tag))
+                .collect::<Vec<_>>();
+            for agent in &agents {
+                for member in registry.agent_subtree(*agent) {
+                    let candidate = (
+                        *host,
+                        heading.heading_range.start,
+                        breadcrumb.clone(),
+                        archived,
+                        terminal,
+                        deferred,
+                    );
+                    agent_topics
+                        .entry(member)
+                        .and_modify(|current| {
+                            let current_eligible = !current.3 && !current.4 && !current.5;
+                            let candidate_eligible = !archived && !terminal && !deferred;
+                            if !current_eligible && candidate_eligible {
+                                *current = candidate.clone();
+                            }
+                        })
+                        .or_insert(candidate);
+                }
+            }
+            heading_rows.push((*host, index, heading.clone(), breadcrumb, archived, agents));
+        }
+    }
+
+    let mut needs = Vec::new();
+    let mut finished = Vec::new();
+    let mut visible_agents = HashSet::new();
+    let mut claimed_topics = HashSet::new();
+    let mut candidate_agents = registry.known_agents().copied().collect::<Vec<_>>();
+    candidate_agents.sort_by_key(|agent_id| {
+        let needs_you = registry.attention(*agent_id) == UiAttention::NeedsInput
+            || registry
+                .agent_turn_report(*agent_id)
+                .is_some_and(|report| report.needs_you);
+        (
+            Reverse(needs_you),
+            Reverse(registry.attention(*agent_id)),
+            Reverse(registry.agent_last_active(*agent_id).unwrap_or_default()),
+            *agent_id,
+        )
+    });
+    for agent_id in candidate_agents {
+        let attention = registry.attention(agent_id);
+        if attention < UiAttention::Pending {
+            continue;
+        }
+        if agent_topics
+            .get(&agent_id)
+            .is_some_and(|(_, _, _, archived, terminal, deferred)| {
+                *archived || *terminal || *deferred
+            })
+        {
+            continue;
+        }
+        visible_agents.insert(agent_id);
+        let topic = agent_topics.get(&agent_id);
+        if topic.is_some_and(|topic| claimed_topics.contains(&(topic.0, topic.1))) {
+            continue;
+        }
+        let agent_tag = registry
+            .agent_id_label(agent_id)
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .to_owned();
+        let agent_heading = registry
+            .agent_human_name(agent_id)
+            .lines()
+            .next()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .unwrap_or(&agent_tag)
+            .to_owned();
+        let card = DealCard {
+            section: DealSection::NeedsYou,
+            host: topic.map_or_else(
+                || registry.host_of_agent(agent_id).unwrap_or_default(),
+                |topic| topic.0,
+            ),
+            heading_offset: topic.map(|topic| topic.1),
+            agent_id: Some(agent_id),
+            agent_tag: Some(agent_tag),
+            breadcrumb: topic.map_or(agent_heading, |topic| topic.2.clone()),
+        };
+        if let Some(topic) = topic {
+            claimed_topics.insert((topic.0, topic.1));
+        }
+        let needs_you = attention == UiAttention::NeedsInput
+            || registry
+                .agent_turn_report(agent_id)
+                .is_some_and(|report| report.needs_you);
+        if needs_you {
+            needs.push(card);
+        } else {
+            finished.push(DealCard {
+                section: DealSection::Finished,
+                ..card
+            });
+        }
+    }
+    needs.sort_by_key(|card| Reverse(registry.attention(card.agent_id.unwrap())));
+
+    let mut resurfaced = Vec::new();
+    let mut random_pool = Vec::new();
+    for (host, _, heading, breadcrumb, archived, agents) in heading_rows {
+        if archived || claimed_topics.contains(&(host, heading.heading_range.start)) {
+            continue;
+        }
+        let terminal = matches!(
+            heading.state,
+            Some(DeskHeadingState::Done | DeskHeadingState::Discarded)
+        ) || heading.temporal_marks.iter().any(|mark| {
+            matches!(
+                mark.kind,
+                TemporalMarkKind::Done | TemporalMarkKind::Discarded
+            )
+        });
+        if terminal {
+            continue;
+        }
+        let best = heading
+            .temporal_marks
+            .iter()
+            .filter(|mark| surfaced(mark, now, DEAL_SURFACE_THRESHOLD))
+            .max_by(|a, b| {
+                let a_overdue = is_overdue_deadline(a, now);
+                let b_overdue = is_overdue_deadline(b, now);
+                a_overdue
+                    .cmp(&b_overdue)
+                    .then_with(|| priority(a, now).total_cmp(&priority(b, now)))
+            });
+        if let Some(mark) = best {
+            resurfaced.push((
+                is_overdue_deadline(mark, now),
+                priority(mark, now),
+                DealCard {
+                    section: DealSection::Resurfaced,
+                    host,
+                    heading_offset: Some(heading.heading_range.start),
+                    agent_id: agents.first().copied(),
+                    agent_tag: agents.first().map(|agent| {
+                        registry
+                            .agent_id_label(*agent)
+                            .rsplit('/')
+                            .next()
+                            .unwrap()
+                            .to_owned()
+                    }),
+                    breadcrumb,
+                },
+            ));
+        } else if !heading
+            .temporal_marks
+            .iter()
+            .any(|mark| mark.kind == TemporalMarkKind::Reminder && mark.at > now)
+            && agents.iter().all(|agent| !visible_agents.contains(agent))
+        {
+            random_pool.push(DealCard {
+                section: DealSection::Random,
+                host,
+                heading_offset: Some(heading.heading_range.start),
+                agent_id: agents.first().copied(),
+                agent_tag: agents.first().map(|agent| {
+                    registry
+                        .agent_id_label(*agent)
+                        .rsplit('/')
+                        .next()
+                        .unwrap()
+                        .to_owned()
+                }),
+                breadcrumb,
+            });
+        }
+    }
+    resurfaced.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.total_cmp(&a.1)));
+
+    let mut cards = needs;
+    cards.extend(finished);
+    cards.extend(
+        resurfaced
+            .into_iter()
+            .take(DEAL_RESURFACED_CAP)
+            .map(|(_, _, card)| card),
+    );
+    if !random_pool.is_empty() {
+        // SplitMix64 gives a stable, well-distributed session choice even
+        // when callers use adjacent seeds.
+        let mut mixed = seed.wrapping_add(0x9e3779b97f4a7c15);
+        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d049bb133111eb);
+        mixed ^= mixed >> 31;
+        cards.push(random_pool.swap_remove(mixed as usize % random_pool.len()));
+    }
+    cards
+}
+
+fn generate_deal(
+    registry: &AgentRegistry,
+    documents: &[(HostId, String)],
+    filed: &HashMap<(HostId, usize), Vec<AgentId>>,
+    deal: &DealSession,
+    replies: &[AgentId],
+) -> Vec<Segment> {
+    let Some(card) = deal.cards.get(deal.index) else {
+        let mut line = Line::new(LineKey::DealBreadcrumb, RowTarget::None);
+        line.span(Some(DashClass::Heading), |text| {
+            text.push_str(&format!(
+                "✓ Desk dealt — {} verdict{}",
+                deal.verdicts,
+                if deal.verdicts == 1 { "" } else { "s" }
+            ))
+        });
+        return vec![Segment::Line(line)];
+    };
+    let mut segments = Vec::new();
+    let mut crumb = Line::new(LineKey::DealBreadcrumb, RowTarget::None);
+    crumb.span(Some(DashClass::Muted), |text| {
+        text.push_str(&card.breadcrumb)
+    });
+    segments.push(Segment::Line(crumb));
+    if let Some(offset) = card.heading_offset
+        && let Some((_, text)) = documents.iter().find(|(host, _)| *host == card.host)
+        && let Some(heading) = parse(text)
+            .into_iter()
+            .find(|heading| heading.heading_range.start == offset)
+    {
+        segments.push(Segment::Doc {
+            host: card.host,
+            range: heading.heading_range.clone(),
+            id: 0,
+        });
+        let roots = filed.get(&(card.host, offset)).cloned().unwrap_or_default();
+        let roots = if let Some(agent) = card.agent_id {
+            vec![agent]
+        } else {
+            roots
+        };
+        for root in roots {
+            let occurrence = AgentOccurrence::Filed {
+                host: card.host,
+                heading: offset as u64,
+                portal: root,
+            };
+            segments.extend(
+                agent_tree_lines(registry, &[root], occurrence, Some((card.host, offset)))
+                    .into_iter()
+                    .map(Segment::Line),
+            );
+            if replies.contains(&root) {
+                segments.push(Segment::Line(Line::new(
+                    LineKey::Reply(root),
+                    RowTarget::Reply(root),
+                )));
+            }
+        }
+        if heading.body_range.start < heading.subtree_range.end {
+            segments.push(Segment::Doc {
+                host: card.host,
+                range: heading.body_range.start..heading.subtree_range.end,
+                id: 1,
+            });
+        }
+    } else if let Some(agent) = card.agent_id {
+        let occurrence = AgentOccurrence::Unfiled {
+            host: card.host,
+            portal: agent,
+        };
+        segments.extend(
+            agent_tree_lines(registry, &[agent], occurrence, None)
+                .into_iter()
+                .map(Segment::Line),
+        );
+    }
+    let mut hint = Line::new(LineKey::DealHint, RowTarget::None);
+    hint.span(Some(DashClass::Muted), |text| text.push_str("o open · r reply · d done · a archive · f{f,3,7,0} defer · x discard · s tomorrow · n next · q quit"));
+    segments.push(Segment::Line(hint));
+    segments
+}
+
 /// Ends a document slice before a cut point's newline, so the synthetic
 /// newline between excerpts doesn't double it.
 /// Generate the listing without mutating Desk text: the documents are
@@ -3466,6 +4153,55 @@ mod tests {
     fn snippets_are_server_bounded_again_for_the_row() {
         assert_eq!(truncate_chars("short", 8), "short");
         assert_eq!(truncate_chars("123456789", 8), "1234567…");
+    }
+
+    #[test]
+    fn deal_queue_sections_attention_resurfacing_and_one_random_card() {
+        let loud = agent(1, None, UiAttention::NeedsInput, 30);
+        let finished = agent(2, None, UiAttention::Pending, 20);
+        let terminal = agent(3, None, UiAttention::Pending, 10);
+        let (registry, host) = registry(vec![loud.clone(), finished.clone(), terminal.clone()]);
+        let text = format!(
+            "* Needs :eng-{}:\n* Finished :eng-{}:\n:deadline: 2026-01-01\n* Terminal :eng-{}:\n:done: 2026-01-02\n* Overdue\n:deadline: 2026-01-01\n* Random one\n* Random two\n* Archive :archive:\n** Never\n:deadline: 2020-01-01\n",
+            &loud.agent_id.encoded()[..4],
+            &finished.agent_id.encoded()[..4],
+            &terminal.agent_id.encoded()[..4],
+        );
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 2, 1)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+        let cards = assemble_deal_queue(&[(host, text)], &registry, now, 7);
+        assert_eq!(cards[0].section, DealSection::NeedsYou);
+        assert_eq!(cards[0].agent_id, Some(loud.agent_id));
+        assert_eq!(cards[1].section, DealSection::Finished);
+        assert_eq!(cards[1].agent_id, Some(finished.agent_id));
+        assert_eq!(cards[2].section, DealSection::Resurfaced);
+        assert_eq!(cards[2].breadcrumb, "Overdue");
+        assert!(
+            cards
+                .iter()
+                .all(|card| card.agent_id != Some(terminal.agent_id))
+        );
+        assert_eq!(
+            cards
+                .iter()
+                .filter(|card| card.breadcrumb == "Finished")
+                .count(),
+            1
+        );
+        assert_eq!(
+            cards
+                .iter()
+                .filter(|card| card.section == DealSection::Random)
+                .count(),
+            1
+        );
+        assert!(
+            cards
+                .iter()
+                .all(|card| !card.breadcrumb.contains("Archive"))
+        );
     }
 
     #[test]

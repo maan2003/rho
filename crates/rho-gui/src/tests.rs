@@ -4588,6 +4588,92 @@ fn desk_verdict_keys_write_dated_properties(cx: &mut TestAppContext) {
     assert!(!display.contains(":discarded:"), "{display:?}");
 }
 
+#[gpui::test]
+fn desk_deal_verdict_advances_to_empty_and_exit_restores_document(cx: &mut TestAppContext) {
+    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
+
+    let mut source =
+        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
+    let operation =
+        DeskOperation::from_text(&source.edit([(0..0, "* Finished\n:done: 2026-01-01\n* One")]));
+    let snapshot = DeskSnapshot {
+        text: source.snapshot().text(),
+        operations: vec![operation],
+        transactions: Vec::new(),
+        replicas: Vec::new(),
+    };
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskSnapshot {
+                    snapshot,
+                    replica_id: 42,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+            window.focus(&workspace.dashboard_editor().read(cx).focus_handle(cx), cx);
+        })
+        .expect("set up Desk");
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.toggle_dashboard_deal(window, cx)
+        })
+        .expect("enter deal mode");
+    cx.run_until_parked();
+    let dealt = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .dashboard_editor()
+                .update(cx, |editor, cx| editor.display_text(cx))
+        })
+        .expect("read dealt card");
+    assert!(dealt.contains("One"), "deal did not show card: {dealt:?}");
+    assert!(
+        !dealt.contains("Finished"),
+        "deal leaked text before the card: {dealt:?}"
+    );
+    cx.simulate_keystrokes(*workspace, "> >");
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "d");
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "n");
+    cx.run_until_parked();
+    let empty = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .dashboard_editor()
+                .update(cx, |editor, cx| editor.display_text(cx))
+        })
+        .expect("read empty deal");
+    assert!(empty.contains("Desk dealt — 1 verdict"), "{empty:?}");
+
+    cx.simulate_keystrokes(*workspace, "q");
+    cx.run_until_parked();
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let (raw, display) = workspace
+        .update(cx, |workspace, _, cx| {
+            let raw = workspace
+                .desk_buffer_for_test(HostId::default())
+                .unwrap()
+                .read(cx)
+                .text();
+            let display = workspace
+                .dashboard_editor()
+                .update(cx, |editor, cx| editor.display_text(cx));
+            (raw, display)
+        })
+        .expect("read restored Desk");
+    assert!(raw.contains(&format!(":done: {today}")), "{raw:?}");
+    assert!(display.contains("One"), "{display:?}");
+}
+
 /// Sending a quick-spawn draft removes its row out from under the
 /// cursor; the cursor must land somewhere resolvable (the new heading)
 /// before vim's NormalBefore touches the selection, or it panics on a

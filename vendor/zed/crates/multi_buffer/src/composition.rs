@@ -46,6 +46,10 @@ pub struct CompositionSpec {
 #[derive(Clone)]
 pub struct SectionSpec {
     pub host: Entity<Buffer>,
+    /// Host offset where this projected section begins. Ordinary composed
+    /// documents use zero; narrowed projections can omit an arbitrary prefix
+    /// without materializing a synthetic empty excerpt at offset zero.
+    pub start: usize,
     /// Rows shown before the section's first slice — e.g. a group
     /// header naming the host.
     pub lead: Vec<RowSpec>,
@@ -143,8 +147,11 @@ impl Composition {
             .iter()
             .map(|element| (element.id.clone(), element.sort_key))
             .collect();
-        let keys = Self::assign_keys(&desired, &existing_keys)
-            .unwrap_or_else(|| (0..desired.len() as u64).map(|i| (i + 1) * KEY_GAP).collect());
+        let keys = Self::assign_keys(&desired, &existing_keys).unwrap_or_else(|| {
+            (0..desired.len() as u64)
+                .map(|i| (i + 1) * KEY_GAP)
+                .collect()
+        });
 
         let mut changed = false;
 
@@ -244,7 +251,7 @@ impl Composition {
                     },
                 });
             }
-            let mut slice_start = 0usize;
+            let mut slice_start = section.start.min(len);
             let mut slice_id = ElementId::SectionStart(host_id);
             for cut in &section.cuts {
                 let position = cut.position.min(len);
@@ -451,6 +458,7 @@ mod tests {
         CompositionSpec {
             sections: vec![SectionSpec {
                 host: host.clone(),
+                start: 0,
                 lead: Vec::new(),
                 cuts: vec![CutSpec {
                     id: 1,
@@ -571,6 +579,7 @@ mod tests {
         let spec = CompositionSpec {
             sections: vec![SectionSpec {
                 host,
+                start: 0,
                 lead: Vec::new(),
                 cuts: vec![CutSpec {
                     id: 1,
@@ -619,6 +628,7 @@ mod tests {
         let spec = CompositionSpec {
             sections: vec![SectionSpec {
                 host: host.clone(),
+                start: 0,
                 lead: Vec::new(),
                 cuts: vec![CutSpec {
                     id: 1,
@@ -645,6 +655,7 @@ mod tests {
         let spec = CompositionSpec {
             sections: vec![SectionSpec {
                 host: host.clone(),
+                start: 0,
                 lead: Vec::new(),
                 cuts: vec![],
             }],
@@ -672,11 +683,13 @@ mod tests {
             sections: vec![
                 SectionSpec {
                     host: host_a.clone(),
+                    start: 0,
                     lead: Vec::new(),
                     cuts: vec![],
                 },
                 SectionSpec {
                     host: host_b.clone(),
+                    start: 0,
                     lead: Vec::new(),
                     cuts: vec![],
                 },
@@ -685,5 +698,23 @@ mod tests {
         };
         cx.update(|cx| composition.sync(&multibuffer, &spec, cx));
         assert_eq!(text(&multibuffer, cx), "host a\nhost b");
+    }
+
+    #[gpui::test]
+    fn test_section_can_start_below_host_prefix(cx: &mut TestAppContext) {
+        let multibuffer = build(cx);
+        let host = buffer("hidden\ncard\n", cx);
+        let mut composition = Composition::default();
+        let spec = CompositionSpec {
+            sections: vec![SectionSpec {
+                host,
+                start: "hidden\n".len(),
+                lead: Vec::new(),
+                cuts: Vec::new(),
+            }],
+            tail: Vec::new(),
+        };
+        cx.update(|cx| composition.sync(&multibuffer, &spec, cx));
+        assert_eq!(text(&multibuffer, cx), "card\n");
     }
 }
