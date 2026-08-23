@@ -4390,6 +4390,70 @@ mod tests {
     }
 
     #[test]
+    fn deal_queue_only_includes_agents_filed_to_a_heading() {
+        let filed_root = agent(1, None, UiAttention::Quiet, 10);
+        let filed_child = agent(2, Some(filed_root.agent_id), UiAttention::Pending, 20);
+        let unfiled = agent(3, None, UiAttention::NeedsInput, 30);
+        let (registry, host) = registry(vec![
+            filed_root.clone(),
+            filed_child.clone(),
+            unfiled.clone(),
+        ]);
+        let text = format!("* Filed :eng-{}:\n", &filed_root.agent_id.encoded()[..4]);
+
+        let cards = assemble_deal_queue(
+            &[(host, text)],
+            &deal_agent_facts(&registry),
+            chrono::DateTime::UNIX_EPOCH.fixed_offset(),
+            7,
+        );
+
+        assert_eq!(cards.len(), 1);
+        assert_eq!(cards[0].agent_id, Some(filed_child.agent_id));
+        assert_eq!(cards[0].breadcrumb, "Filed");
+        assert!(
+            cards
+                .iter()
+                .all(|card| card.agent_id != Some(unfiled.agent_id))
+        );
+    }
+
+    #[test]
+    fn archived_subtrees_never_produce_deal_cards() {
+        let archived = agent(1, None, UiAttention::NeedsInput, 30);
+        let nested_archived = agent(2, None, UiAttention::Pending, 20);
+        let unfiled = agent(3, None, UiAttention::NeedsInput, 40);
+        let (registry, host) = registry(vec![archived.clone(), nested_archived.clone(), unfiled]);
+        let text = format!(
+            "* Archive :archive:\n\
+             ** webview :eng-{}:\n\
+             :deadline: 2020-01-01\n\
+             *** child heading\n\
+             :todo: 2020-01-02\n\
+             ** Archive :archive:\n\
+             *** nested webview :eng-{}:\n\
+             :reminder: 2020-01-03\n\
+             **** nested child\n\
+             :defer: 2020-01-04\n",
+            &archived.agent_id.encoded()[..4],
+            &nested_archived.agent_id.encoded()[..4],
+        );
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 2, 1)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc()
+            .fixed_offset();
+
+        let cards = assemble_deal_queue(&[(host, text)], &deal_agent_facts(&registry), now, 7);
+
+        assert!(
+            cards.is_empty(),
+            "archived cards leaked into deal: {cards:?}"
+        );
+    }
+
+    #[test]
     fn active_skip_gates_every_other_deal_signal_until_its_date() {
         let (registry, host) = registry(Vec::new());
         let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
