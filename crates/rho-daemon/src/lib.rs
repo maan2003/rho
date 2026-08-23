@@ -10,7 +10,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use futures::{FutureExt as _, StreamExt as _};
 use rho_agent::db::{
     AgentDisposition, AgentId, AgentReadTxnExt as _, AgentRole, AgentRuntime, AgentUsageModel,
-    AgentWriteTxnExt as _, QuotaModel, QuotaObservationRecord, QuotaProvider,
+    AgentWriteTxnExt as _, ClaudeRewind, QuotaModel, QuotaObservationRecord, QuotaProvider,
 };
 use rho_agent::pool::{AgentPool, RunningAgent};
 use rho_agent::{AgentStateKind, MessageDelivery};
@@ -1824,6 +1824,48 @@ where
     Ok(())
 }
 
+fn rewind_destination_materialized(
+    rewind: &ClaudeRewind,
+    messages: &[rho_claude::SessionMessage],
+) -> bool {
+    match rewind.resume_at {
+        Some(resume_at) => {
+            rho_claude::session_messages_through_assistant(messages, resume_at).is_some()
+        }
+        None => !messages.is_empty(),
+    }
+}
+
+fn rewind_source_prefix(
+    rewind: &ClaudeRewind,
+    messages: &[rho_claude::SessionMessage],
+) -> anyhow::Result<Vec<rho_claude::SessionMessage>> {
+    match rewind.resume_at {
+        Some(resume_at) => rho_claude::session_messages_through_assistant(messages, resume_at)
+            .context("Claude rewind point is no longer in the transcript"),
+        None => Ok(Vec::new()),
+    }
+}
+
+async fn selected_claude_messages_for_backfill(
+    session_id: uuid::Uuid,
+    rewind: Option<ClaudeRewind>,
+    cwd: &Utf8Path,
+) -> anyhow::Result<Vec<rho_claude::SessionMessage>> {
+    let options = rho_claude::SessionMessagesOptions::default();
+    let Some(rewind) = rewind else {
+        return rho_claude::read_session_messages_by_id(session_id, cwd, options).await;
+    };
+    let destination =
+        rho_claude::read_session_messages_by_id(rewind.session_id, cwd, options.clone()).await?;
+    if rewind_destination_materialized(&rewind, &destination) {
+        return Ok(destination);
+    }
+    let source =
+        rho_claude::read_session_messages_by_id(rewind.source_session_id, cwd, options).await?;
+    rewind_source_prefix(&rewind, &source)
+}
+
 /// Backfills chronology for Claude agents written before `last_turn_ended`
 /// existed. Native event records do not retain assistant timestamps, so they
 /// deliberately remain unknown rather than receiving an invented value.
@@ -1843,22 +1885,13 @@ async fn backfill_legacy_turn_end_times(agents: &AgentRegistry) {
             let AgentRuntime::Claude { session_id } = agent.runtime else {
                 return None;
             };
-            Some((
-                agent_id,
-                session_id,
-                agent.primary_workdir().repo().to_owned(),
-            ))
+            let cwd = agent.primary_workdir().repo().to_owned();
+            Some((agent_id, session_id, agent.claude_rewind, cwd))
         })
         .collect::<Vec<_>>();
 
-    for (agent_id, session_id, cwd) in candidates {
-        let messages = match rho_claude::read_session_messages_by_id(
-            session_id,
-            &cwd,
-            rho_claude::SessionMessagesOptions::default(),
-        )
-        .await
-        {
+    for (agent_id, session_id, rewind, cwd) in candidates {
+        let messages = match selected_claude_messages_for_backfill(session_id, rewind, &cwd).await {
             Ok(messages) => messages,
             Err(error) => {
                 tracing::warn!(?agent_id, %error, "could not read Claude transcript for turn-end backfill");
@@ -3932,7 +3965,9 @@ mod tests {
     use std::ffi::{OsStr, OsString};
     use std::sync::Arc;
 
-    use rho_agent::db::{AgentWriteTxnExt, QuotaModel, QuotaObservationRecord, QuotaProvider};
+    use rho_agent::db::{
+        AgentWriteTxnExt, ClaudeRewind, QuotaModel, QuotaObservationRecord, QuotaProvider,
+    };
     use rho_core::ContentPart;
     use rho_db::RhoDb;
     use rho_ui_proto::ServerMessage;
@@ -3941,8 +3976,76 @@ mod tests {
         AgentUsageModel, GitProviderClaim, GitTransportBroker, MAX_IMAGE_BASE64_BYTES,
         MAX_INPUT_IMAGES, claude_quota_history, configure_octo_git_transport,
         hourly_global_usage_series, merge_hourly_agent_cost_bucket, persist_gui_telemetry,
-        prepare_image_content, quota_burn, quota_summaries, validate_image_content,
+        prepare_image_content, quota_burn, quota_summaries, rewind_destination_materialized,
+        rewind_source_prefix, validate_image_content,
     };
+
+    fn assistant_message(uuid: uuid::Uuid, timestamp: &str) -> rho_claude::SessionMessage {
+        rho_claude::SessionMessage {
+            kind: rho_claude::SessionMessageKind::Assistant,
+            uuid,
+            session_id: uuid::Uuid::new_v4(),
+            message: serde_json::json!({}),
+            parent_tool_use_id: None,
+            timestamp: Some(timestamp.to_owned()),
+        }
+    }
+
+    #[test]
+    fn turn_end_backfill_honors_rewind_to_source_prefix() {
+        let retained = uuid::Uuid::new_v4();
+        let rewind = ClaudeRewind {
+            source_session_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            resume_at: Some(retained),
+        };
+        let source = vec![
+            assistant_message(retained, "2025-01-01T00:00:00Z"),
+            assistant_message(uuid::Uuid::new_v4(), "2025-01-02T00:00:00Z"),
+        ];
+
+        assert!(!rewind_destination_materialized(&rewind, &[]));
+        let selected = rewind_source_prefix(&rewind, &source).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].uuid, retained);
+        assert_eq!(
+            selected[0].timestamp.as_deref(),
+            Some("2025-01-01T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn turn_end_backfill_honors_rewind_to_empty_transcript() {
+        let rewind = ClaudeRewind {
+            source_session_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            resume_at: None,
+        };
+        let source = vec![assistant_message(
+            uuid::Uuid::new_v4(),
+            "2025-01-02T00:00:00Z",
+        )];
+
+        assert!(!rewind_destination_materialized(&rewind, &[]));
+        assert!(rewind_source_prefix(&rewind, &source).unwrap().is_empty());
+    }
+
+    #[test]
+    fn turn_end_backfill_prefers_materialized_rewind_destination() {
+        let retained = uuid::Uuid::new_v4();
+        let rewind = ClaudeRewind {
+            source_session_id: uuid::Uuid::new_v4(),
+            session_id: uuid::Uuid::new_v4(),
+            resume_at: Some(retained),
+        };
+        let destination = vec![assistant_message(retained, "2025-01-03T00:00:00Z")];
+
+        assert!(rewind_destination_materialized(&rewind, &destination));
+        assert_eq!(
+            destination[0].timestamp.as_deref(),
+            Some("2025-01-03T00:00:00Z")
+        );
+    }
 
     #[test]
     fn global_usage_response_rolls_five_minute_buckets_up_to_hours() {
