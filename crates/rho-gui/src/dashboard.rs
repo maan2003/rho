@@ -581,6 +581,15 @@ impl Dashboard {
         let text = snapshot.text();
         let headings = parse(&text);
         let previous_breadcrumb = &deal.cards[deal.index].breadcrumb;
+        let previous_leaf = previous_breadcrumb
+            .rsplit(" › ")
+            .next()
+            .unwrap_or(previous_breadcrumb);
+        let heading_at = |offset| {
+            headings
+                .iter()
+                .find(|heading| heading.heading_range.start == offset)
+        };
         let offset = [before_offset, after_offset]
             .into_iter()
             .find(|offset| {
@@ -590,23 +599,24 @@ impl Dashboard {
                 })
             })
             .or_else(|| {
-                headings.iter().enumerate().find_map(|(index, heading)| {
-                    (heading_breadcrumb(&headings, index) == *previous_breadcrumb)
-                        .then_some(heading.heading_range.start)
-                })
-            })
-            .or_else(|| {
-                headings
-                    .iter()
-                    .any(|heading| heading.heading_range.start == before_offset)
+                (before_offset == after_offset && heading_at(before_offset).is_some())
                     .then_some(before_offset)
             })
             .or_else(|| {
-                headings
-                    .iter()
-                    .any(|heading| heading.heading_range.start == after_offset)
-                    .then_some(after_offset)
+                [before_offset, after_offset].into_iter().find(|offset| {
+                    heading_at(*offset).is_some_and(|heading| heading.title == previous_leaf)
+                })
             })
+            .or_else(|| {
+                let mut matches = headings.iter().enumerate().filter_map(|(index, heading)| {
+                    (heading_breadcrumb(&headings, index) == *previous_breadcrumb)
+                        .then_some(heading.heading_range.start)
+                });
+                let matched = matches.next()?;
+                matches.next().is_none().then_some(matched)
+            })
+            .or_else(|| heading_at(before_offset).map(|_| before_offset))
+            .or_else(|| heading_at(after_offset).map(|_| after_offset))
             .unwrap_or(after_offset.max(before_offset));
         let found = headings
             .iter()

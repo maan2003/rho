@@ -4961,10 +4961,11 @@ fn desk_deal_cards_focus_in_place_read_only_skippable_and_openable(cx: &mut Test
 }
 
 #[gpui::test]
-fn desk_deal_card_survives_a_heading_inserted_at_its_exact_boundary(cx: &mut TestAppContext) {
+fn desk_deal_card_survives_boundary_inserts_and_duplicate_heading_renames(cx: &mut TestAppContext) {
     use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
 
-    let original = "* Intro\n* Target\n:deadline: 2020-01-01\nbody\n";
+    let original =
+        "* Intro\n* Target\n:deadline: 2020-01-01\nbody\n* Target\n:deadline: 2020-01-02\nother\n";
     let target = original.find("* Target").unwrap();
     let mut source =
         text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
@@ -5021,6 +5022,29 @@ fn desk_deal_card_survives_a_heading_inserted_at_its_exact_boundary(cx: &mut Tes
             assert_eq!(
                 workspace.dashboard_cursor_topic_for_test(cx),
                 Some((HostId::default(), target + "* New\n".len()))
+            );
+        })
+        .unwrap();
+
+    let shifted_target = target + "* New\n".len();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace
+                .desk_buffer_for_test(HostId::default())
+                .unwrap()
+                .update(cx, |buffer, cx| {
+                    let title = shifted_target + "* ".len();
+                    buffer.edit([(title..title + "Target".len(), "Renamed")], None, cx)
+                });
+            workspace.sync_dashboard(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(
+                workspace.dashboard_deal_topic_for_test(),
+                Some((HostId::default(), shifted_target, "Renamed"))
             );
         })
         .unwrap();
