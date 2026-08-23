@@ -187,6 +187,7 @@ lto = "off"
 # binaries total over 400MB without it) at a modest link-time cost.
 [profile.release]
 lto = "thin"
+debug = "line-tables-only"
 
 [profile.profiling]
 debug = "line-tables-only"
