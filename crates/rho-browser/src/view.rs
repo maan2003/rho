@@ -86,6 +86,10 @@ enum HandoffPhase {
     Focusing,
     AwaitingFrame { barrier: u64 },
     Ready,
+    /// The extension rejected the focus request (for example an unknown page
+    /// id). Holding the failed handoff keeps repaints from re-claiming and
+    /// retrying forever; only an explicit focus starts a new generation.
+    Failed,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -444,7 +448,10 @@ impl BrowserModel {
         if self.runtime.terminal || self.runtime.session.is_none() {
             return;
         }
-        if self.handoff.is_none_or(|handoff| handoff.target != id) {
+        if self
+            .handoff
+            .is_none_or(|handoff| handoff.target != id || handoff.phase == HandoffPhase::Failed)
+        {
             self.request_handoff(id);
         }
         self.start_focus(cx);
@@ -534,9 +541,12 @@ impl BrowserModel {
                     Err(error) => {
                         record_handoff_event(generation, "focus-error", 0);
                         model.unfreeze_input(input_generation);
-                        if current.is_some_and(|handoff| handoff.generation == generation) {
+                        if let Some(handoff) = matching_handoff(current, generation) {
                             model.runtime.status = Some(format!("browser: {error:#}"));
-                            model.handoff = None;
+                            model.handoff = Some(PageHandoff {
+                                phase: HandoffPhase::Failed,
+                                ..handoff
+                            });
                         }
                     }
                 }
@@ -641,6 +651,7 @@ impl BrowserModel {
                             return true;
                         };
                         if handoff.phase == HandoffPhase::Ready
+                            || handoff.phase == HandoffPhase::Failed
                             || model.runtime.terminal
                             || model.runtime.session.is_none()
                         {
@@ -844,7 +855,7 @@ fn close_transition(handoff: Option<PageHandoff>, id: PageId) -> CloseTransition
     match handoff.filter(|handoff| handoff.target == id) {
         None => CloseTransition::Inactive,
         Some(PageHandoff {
-            phase: HandoffPhase::Requested,
+            phase: HandoffPhase::Requested | HandoffPhase::Failed,
             ..
         }) => CloseTransition::CancelRequested,
         Some(_) => CloseTransition::FreezeActive,
@@ -882,8 +893,9 @@ fn browser_status(
     runtime: &RuntimePageState,
     presents: bool,
     owns_presentation: bool,
+    handoff_failed: bool,
 ) -> Option<String> {
-    if runtime.terminal || runtime.session.is_none() || presents {
+    if runtime.terminal || runtime.session.is_none() || presents || handoff_failed {
         runtime.status.clone()
     } else if owns_presentation {
         Some("switching browser page".to_owned())
@@ -1963,6 +1975,9 @@ impl Render for BrowserView {
             &model.runtime,
             presents,
             model.presentation_owner == Some(self.owner_id),
+            model
+                .handoff
+                .is_some_and(|handoff| handoff.phase == HandoffPhase::Failed),
         );
         let cursor = if presents {
             gpui_cursor(model.runtime.cursor)
@@ -2281,6 +2296,23 @@ mod tests {
     }
 
     #[test]
+    fn failed_handoff_cancels_close_without_an_input_barrier() {
+        let page = PageId(uuid::Uuid::new_v4());
+        let failed = PageHandoff {
+            generation: 3,
+            target: page,
+            phase: HandoffPhase::Failed,
+            input_generation: None,
+        };
+
+        assert_eq!(
+            close_transition(Some(failed), page),
+            CloseTransition::CancelRequested
+        );
+        assert!(!frame_is_eligible(Some(failed), u64::MAX));
+    }
+
+    #[test]
     fn finger_sequence_remains_active_across_multiple_continuation_frames() {
         let mut active = (true, false);
         let mut event = LinuxPointerAxisEvent {
@@ -2433,7 +2465,7 @@ mod tests {
         assert_eq!(active_focus, None);
         assert_eq!(dropped, 1);
         assert_eq!(
-            browser_status(&runtime, false, true).as_deref(),
+            browser_status(&runtime, false, true, false).as_deref(),
             Some("browser failed: disconnected")
         );
 

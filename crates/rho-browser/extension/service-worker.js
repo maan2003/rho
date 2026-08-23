@@ -162,7 +162,9 @@ async function createPage(url) {
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     throw new Error("browser URL must use http or https");
   }
-  let tab = (await chrome.tabs.query({ active: true, lastFocusedWindow: true }))[0];
+  // Inside the embedded compositor no window may ever hold OS focus, and
+  // lastFocusedWindow queries then reject with "No current window".
+  let tab = (await chrome.tabs.query({ active: true, lastFocusedWindow: true }).catch(() => []))[0];
   if (tab && (tab.url === "chrome://newtab/" || tab.url === "about:blank")) {
     let id = tabPages.get(tab.id);
     if (!id) id = await makePage(tab);
@@ -173,7 +175,15 @@ async function createPage(url) {
   }
   if (canonicalWindowId === undefined) await reconcile();
   const windowId = canonicalWindowId;
-  tab = await chrome.tabs.create({ windowId, url, active: true });
+  if (windowId === undefined) {
+    // Still no normal window (fresh profile before session restore):
+    // tabs.create would fall back to the nonexistent "current window".
+    const created = await chrome.windows.create({ url, focused: true });
+    canonicalWindowId = created.id;
+    tab = created.tabs?.[0] ?? (await chrome.tabs.query({ windowId: created.id }))[0];
+  } else {
+    tab = await chrome.tabs.create({ windowId, url, active: true });
+  }
   const id = await makePage(tab);
   const record = { id, launch_url: url, created_at_ms: Date.now() };
   await chrome.storage.local.set({ [pageKey(id)]: record });
