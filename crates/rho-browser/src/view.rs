@@ -1689,7 +1689,14 @@ impl Render for BrowserView {
                 }
             }));
         }
-        if !self.passthrough_attempted {
+        // Promotion is deadlocked on niri: the child sits below the opaque
+        // parent, the alpha hole is only punched after wp_presentation
+        // confirms the child, and niri never presents a fully occluded
+        // subsurface — so promoted pages stay blank until a resize demotes
+        // them. Keep the proven texture path until the dance is reworked.
+        if !self.passthrough_attempted
+            && std::env::var("RHO_BROWSER_PASSTHROUGH").as_deref() == Ok("1")
+        {
             self.passthrough_attempted = true;
             let (events_tx, events_rx) = async_channel::unbounded();
             match window.create_wayland_passthrough(move |event| {
