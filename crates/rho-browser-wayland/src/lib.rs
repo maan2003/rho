@@ -2488,6 +2488,25 @@ fn service_loop<K: BrowserPageKey>(
             let _ = state.display_handle.flush_clients();
         })
         .map_err(|_| anyhow::anyhow!("register browser command channel"))?;
+    handle
+        .insert_source(
+            Timer::from_duration(Duration::from_secs(1)),
+            |_, _, state: &mut State<K>| {
+                // Liveness floor, mirroring niri's fallback frame-callback
+                // timer: consumption acknowledgements normally complete
+                // callbacks within milliseconds, so anything still pending a
+                // tick later has lost its consumer and would wedge Chromium's
+                // frame clock.
+                for window in state.windows.values_mut() {
+                    if let Some(pending) = window.dma_frame_callbacks.keys().copied().max() {
+                        send_frame_callbacks(window, monotonic_time_ms(), pending);
+                    }
+                }
+                let _ = state.display_handle.flush_clients();
+                TimeoutAction::ToDuration(Duration::from_secs(1))
+            },
+        )
+        .map_err(|_| anyhow::anyhow!("register frame-callback fallback timer"))?;
     event_loop
         .run(None, state, |_| {})
         .context("run browser compositor event loop")

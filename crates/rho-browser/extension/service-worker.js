@@ -189,8 +189,17 @@ async function activatePage(id) {
   }
   reportTabState("focus-requested", tab, id);
   tab = await chrome.tabs.update(tab.id, { active: true });
-  reportTabState("focus-completed", tab, id);
   await chrome.windows.update(tab.windowId, { focused: true });
+  // tabs.update can resolve without the activation taking effect; a
+  // background renderer never draws, so the host would wait forever on the
+  // handoff frame. Verify and retry, and fail loudly instead of wedging.
+  for (let attempt = 0; !tab.active && attempt < 3; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    tab = await chrome.tabs.update(tab.id, { active: true });
+  }
+  tab = await chrome.tabs.get(tab.id);
+  reportTabState("focus-completed", tab, id);
+  if (!tab.active) throw new Error(`tab ${tab.id} did not become active`);
   return { id };
 }
 

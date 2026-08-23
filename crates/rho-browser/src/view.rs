@@ -577,7 +577,62 @@ impl BrowserModel {
             "browser portal claimed presentation"
         );
         self.start_focus(cx);
+        self.watch_handoff(cx);
         cx.notify();
+    }
+
+    /// Every handoff phase waits on an external actor (the extension applying
+    /// tab focus, Chromium answering the frame-barrier configure); if any of
+    /// them silently drops the request the handoff wedges until the user
+    /// clicks again. Re-drive a stalled handoff from the start so a wedge
+    /// costs seconds, not a user intervention.
+    fn watch_handoff(&mut self, cx: &mut Context<Self>) {
+        let Some(generation) = self.handoff.map(|handoff| handoff.generation) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            for attempt in 1..=5_u32 {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(2))
+                    .await;
+                let done = this
+                    .update(cx, |model, cx| {
+                        let Some(handoff) = model
+                            .handoff
+                            .filter(|handoff| handoff.generation == generation)
+                        else {
+                            return true;
+                        };
+                        if handoff.phase == HandoffPhase::Ready
+                            || model.runtime.terminal
+                            || model.runtime.session.is_none()
+                        {
+                            return true;
+                        }
+                        if model.active_focus.is_some() {
+                            return false;
+                        }
+                        tracing::warn!(
+                            generation,
+                            attempt,
+                            phase = ?handoff.phase,
+                            "browser handoff stalled; re-driving focus and barrier"
+                        );
+                        model.handoff = Some(PageHandoff {
+                            phase: HandoffPhase::Requested,
+                            input_generation: None,
+                            ..handoff
+                        });
+                        model.start_focus(cx);
+                        false
+                    })
+                    .unwrap_or(true);
+                if done {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn owns_page(&self, owner: EntityId, page: PageId) -> bool {
@@ -1035,13 +1090,21 @@ impl BrowserView {
         let owner_id = cx.entity_id();
         let model_changed = cx.observe(&model, |_, _, cx| cx.notify());
         let release = cx.on_release(|this, cx| {
-            let model = this.model.read(cx);
-            if model.passthrough_owner.get() == Some(this.owner_id) {
-                model.passthrough_owner.set(None);
-                if let Some(session) = model.runtime.session.as_ref() {
-                    session.disable_presentation_passthrough();
+            let owner_id = this.owner_id;
+            this.model.update(cx, |model, _| {
+                if model.passthrough_owner.get() == Some(owner_id) {
+                    model.passthrough_owner.set(None);
+                    if let Some(session) = model.runtime.session.as_ref() {
+                        session.disable_presentation_passthrough();
+                    }
                 }
-            }
+                // Otherwise scenes for a viewless page are never acknowledged:
+                // the receive path only self-acknowledges when no owner exists.
+                if model.presentation_owner == Some(owner_id) {
+                    model.presentation_owner = None;
+                    model.runtime.painted_scene_id = None;
+                }
+            });
         });
         model.update(cx, |model, cx| {
             model.claim_presentation(owner_id, page_id, cx)
