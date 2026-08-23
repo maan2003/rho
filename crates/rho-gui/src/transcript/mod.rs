@@ -500,15 +500,10 @@ impl TranscriptModel {
             .position(|turn| turn.start_block >= start)
             .unwrap_or(self.buffers.len());
         let removed = self.buffers.split_off(first_removed);
-        for turn in removed {
-            let path = transcript_path(turn.start_block);
-            self.multi_buffer.update(cx, |multi_buffer, cx| {
-                multi_buffer.remove_excerpts(path.clone(), cx)
-            });
-            self.document_multi_buffer.update(cx, |multi_buffer, cx| {
-                multi_buffer.remove_excerpts(path, cx)
-            });
-        }
+        let removed_buffers = removed
+            .into_iter()
+            .map(|turn| (transcript_path(turn.start_block), turn.buffer))
+            .collect::<Vec<_>>();
 
         let mut chunks: Vec<(usize, bool, Vec<RenderedBlock>)> = Vec::new();
         for (offset, rendered) in rendered_blocks.into_iter().enumerate() {
@@ -580,7 +575,7 @@ impl TranscriptModel {
             .rev()
             .map(|turn| turn.buffer.clone())
             .collect::<Vec<_>>();
-        self.reset_rebuilt_excerpts(first_removed, old_last_composed, cx);
+        self.reset_rebuilt_excerpts(first_removed, old_last_composed, removed_buffers, cx);
         Self::warm_syntax(new_buffers, cx);
     }
 
@@ -592,6 +587,7 @@ impl TranscriptModel {
         &mut self,
         first_rebuilt: usize,
         old_last_composed: Option<usize>,
+        removed_buffers: Vec<(PathKey, Entity<Buffer>)>,
         cx: &mut Context<V>,
     ) {
         let new_last_composed = self
@@ -634,27 +630,45 @@ impl TranscriptModel {
                 )
             })
             .collect::<Vec<_>>();
+        let rebuilt_paths = affected
+            .iter()
+            .map(|(path, ..)| path.clone())
+            .collect::<HashSet<_>>();
+        let removed_buffers = removed_buffers
+            .into_iter()
+            .filter(|(path, _)| !rebuilt_paths.contains(path))
+            .collect::<Vec<_>>();
         self.multi_buffer.update(cx, |multi_buffer, cx| {
-            for (path, buffer, end, _) in &affected {
-                multi_buffer.set_excerpts_for_path(
-                    path.clone(),
-                    buffer.clone(),
-                    [Point::zero()..*end],
-                    0,
-                    cx,
-                );
-            }
+            multi_buffer.set_excerpts_for_paths(
+                affected
+                    .iter()
+                    .map(|(path, buffer, end, _)| {
+                        (path.clone(), buffer.clone(), vec![Point::zero()..*end])
+                    })
+                    .chain(
+                        removed_buffers
+                            .iter()
+                            .map(|(path, buffer)| (path.clone(), buffer.clone(), Vec::new())),
+                    ),
+                0,
+                cx,
+            );
         });
         self.document_multi_buffer.update(cx, |multi_buffer, cx| {
-            for (path, buffer, _, end) in &affected {
-                multi_buffer.set_excerpts_for_path(
-                    path.clone(),
-                    buffer.clone(),
-                    [Point::zero()..*end],
-                    0,
-                    cx,
-                );
-            }
+            multi_buffer.set_excerpts_for_paths(
+                affected
+                    .iter()
+                    .map(|(path, buffer, _, end)| {
+                        (path.clone(), buffer.clone(), vec![Point::zero()..*end])
+                    })
+                    .chain(
+                        removed_buffers
+                            .iter()
+                            .map(|(path, buffer)| (path.clone(), buffer.clone(), Vec::new())),
+                    ),
+                0,
+                cx,
+            );
         });
         if new_document_tail.is_some() || new_last_composed.is_none() {
             self.document_tail = new_document_tail;

@@ -81,11 +81,13 @@ pub struct AgentRegistry {
     tag_agents: TagAgents,
     announced_hosts: BTreeMap<AgentId, HostId>,
     active: ActivePane,
+    deal_count_revision: u64,
 }
 
 impl AgentRegistry {
     pub fn attach_host(&mut self, host: HostId, name: String) {
         self.hosts.entry(host).or_default().name = name;
+        self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
     }
 
     pub fn detach_host(&mut self, host: HostId) {
@@ -114,6 +116,7 @@ impl AgentRegistry {
             self.active = ActivePane::Draft;
         }
         self.rebuild(None);
+        self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
     }
 
     pub fn host_name(&self, host: HostId) -> &str {
@@ -167,6 +170,7 @@ impl AgentRegistry {
         snapshot.agent_counter = agent_counter;
         snapshot.agents = agents;
         self.rebuild(Some(host));
+        self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
     }
 
     pub fn set_data(&mut self, agents: Vec<UiAgentSummary>) {
@@ -278,12 +282,20 @@ impl AgentRegistry {
 
     pub fn set_attention(&mut self, agent_id: AgentId, attention: rho_ui_proto::UiAttention) {
         self.pending_verdicts.remove(&agent_id);
+        let changed = self.attention(agent_id) != attention;
         self.attention.insert(agent_id, attention);
+        if changed {
+            self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
+        }
     }
     pub fn expect_attention(&mut self, agent_id: AgentId, attention: rho_ui_proto::UiAttention) {
         self.pending_verdicts
             .insert(agent_id, (attention, rho_core::UnixMs(now_ms())));
+        let changed = self.attention(agent_id) != attention;
         self.attention.insert(agent_id, attention);
+        if changed {
+            self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
+        }
     }
     pub fn set_activity(&mut self, agent_id: AgentId, activity: String) {
         self.activities.insert(agent_id, activity);
@@ -491,13 +503,22 @@ impl AgentRegistry {
     }
 
     pub fn mark_known(&mut self, agent_id: AgentId) {
-        self.agents.entry(agent_id).or_insert(AgentLife::Known);
+        if let std::collections::btree_map::Entry::Vacant(entry) = self.agents.entry(agent_id) {
+            entry.insert(AgentLife::Known);
+            self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
+        }
     }
     pub fn mark_live(&mut self, agent_id: AgentId) -> bool {
-        self.agents.insert(agent_id, AgentLife::Live) != Some(AgentLife::Live)
+        let previous = self.agents.insert(agent_id, AgentLife::Live);
+        if previous.is_none() {
+            self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
+        }
+        previous != Some(AgentLife::Live)
     }
     pub fn mark_not_live(&mut self, agent_id: AgentId) {
-        self.agents.insert(agent_id, AgentLife::Known);
+        if self.agents.insert(agent_id, AgentLife::Known).is_none() {
+            self.deal_count_revision = self.deal_count_revision.wrapping_add(1);
+        }
     }
     pub fn active_pane(&self) -> ActivePane {
         self.active
@@ -553,5 +574,44 @@ impl AgentRegistry {
     }
     pub fn known_agents(&self) -> impl Iterator<Item = &AgentId> {
         self.agents.keys()
+    }
+
+    /// Changes only when inputs that can affect the Desk deal count change.
+    /// Activity text and last-active timestamps affect presentation/order, not
+    /// the number of cards, so streaming those fields leaves this stable.
+    pub fn deal_count_revision(&self) -> u64 {
+        self.deal_count_revision
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rho_ui_proto::{AgentIdDomain, UiAttention, UiTurnReport};
+
+    use super::*;
+
+    #[test]
+    fn deal_count_revision_ignores_presentation_only_updates() {
+        let agent_id = AgentId::from_counter(1, &AgentIdDomain(0)).unwrap();
+        let mut registry = AgentRegistry::default();
+
+        registry.mark_known(agent_id);
+        let known_revision = registry.deal_count_revision();
+        registry.set_activity(agent_id, "writing tests".to_owned());
+        registry.touch_agent(agent_id);
+        registry.set_turn_report(
+            agent_id,
+            UiTurnReport {
+                needs_you: true,
+                summary: "finished".to_owned(),
+            },
+        );
+        assert_eq!(registry.deal_count_revision(), known_revision);
+
+        registry.set_attention(agent_id, UiAttention::Pending);
+        let pending_revision = registry.deal_count_revision();
+        assert_ne!(pending_revision, known_revision);
+        registry.set_attention(agent_id, UiAttention::Pending);
+        assert_eq!(registry.deal_count_revision(), pending_revision);
     }
 }

@@ -1,12 +1,13 @@
 //! Benchmarks the pure per-frame dashboard pass: parsing the desk
 //! document, generating the listing, and comparing it against the
-//! previous pass. `refresh_dashboard` pays this on every render, so it
-//! must stay far under a frame budget.
+//! previous pass. Streaming registry events can trigger this work before a
+//! frame, so it must stay far under the frame budget.
 
 use std::collections::HashMap;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use rho_core::UnixMs;
+use rho_gui::dashboard::assemble_deal_queue;
 use rho_gui::dashboard::bench_support::{Pass, generate_pass};
 use rho_gui::registry::{AgentRegistry, HostId};
 use rho_ui_proto::desk::parse;
@@ -78,7 +79,7 @@ fn build_fixture(heading_count: usize) -> Fixture {
 
 fn desk_sync_benchmarks(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("desk per-frame pass");
-    for heading_count in [10usize, 50, 150] {
+    for heading_count in [10usize, 150, 500, 1_000] {
         let fixture = build_fixture(heading_count);
         let previous = generate_pass(&fixture.registry, &fixture.documents, &fixture.filed);
 
@@ -104,6 +105,16 @@ fn desk_sync_benchmarks(criterion: &mut Criterion) {
                     let pass: Pass =
                         generate_pass(&fixture.registry, &fixture.documents, &fixture.filed);
                     assert!(pass.matches(previous));
+                })
+            },
+        );
+        group.bench_with_input(
+            BenchmarkId::new("deal-queue", heading_count),
+            &fixture,
+            |bench, fixture| {
+                let now = chrono::NaiveDateTime::default();
+                bench.iter(|| {
+                    assemble_deal_queue(&fixture.documents, &fixture.registry, now, 0).len()
                 })
             },
         );

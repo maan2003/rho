@@ -270,6 +270,8 @@ pub struct Dashboard {
     raw_mode: bool,
     deal: Option<DealSession>,
     queue_depth: usize,
+    queue_depth_revision: Option<u64>,
+    queue_depth_minute: Option<i64>,
     /// Portal occurrences whose complete runtime subtree is visible.
     /// This is transient display state and is never written to Desk.
     expanded_portals: HashSet<AgentOccurrence>,
@@ -354,6 +356,8 @@ impl Dashboard {
             raw_mode: false,
             deal: None,
             queue_depth: 0,
+            queue_depth_revision: None,
+            queue_depth_minute: None,
             expanded_portals: HashSet::new(),
             pending_cursor: None,
             pending_doc_cursor: None,
@@ -912,8 +916,22 @@ impl Dashboard {
             .filter_map(|host| self.source_text(*host, cx).map(|text| (*host, text)))
             .collect::<Vec<_>>();
         let filed = self.resolve_bindings(registry, &documents);
-        self.queue_depth =
-            assemble_deal_queue(&documents, registry, chrono::Local::now().naive_local(), 0).len();
+        let documents_changed = self
+            .last_synced
+            .as_ref()
+            .is_none_or(|(previous, ..)| previous != &documents);
+        let deal_revision = registry.deal_count_revision();
+        let now = chrono::Local::now();
+        let minute = now.timestamp() / 60;
+        if documents_changed
+            || self.queue_depth_revision != Some(deal_revision)
+            || self.queue_depth_minute != Some(minute)
+        {
+            self.queue_depth =
+                assemble_deal_queue(&documents, registry, now.naive_local(), 0).len();
+            self.queue_depth_revision = Some(deal_revision);
+            self.queue_depth_minute = Some(minute);
+        }
         #[cfg(feature = "native")]
         let (filed_pages, referenced_pages) = Self::resolve_page_bindings(&documents);
         self.archived_agents = archived_roots(&documents, &filed);
@@ -2834,7 +2852,7 @@ fn sorted_agents(
     agents: impl IntoIterator<Item = AgentId>,
 ) -> Vec<AgentId> {
     let mut agents = agents.into_iter().collect::<Vec<_>>();
-    agents.sort_by_key(|agent_id| {
+    agents.sort_by_cached_key(|agent_id| {
         (
             Reverse(registry.attention(*agent_id)),
             Reverse(registry.agent_last_active(*agent_id).unwrap_or_default()),
@@ -3569,7 +3587,7 @@ pub fn assemble_deal_queue(
     let mut visible_agents = HashSet::new();
     let mut claimed_topics = HashSet::new();
     let mut candidate_agents = registry.known_agents().copied().collect::<Vec<_>>();
-    candidate_agents.sort_by_key(|agent_id| {
+    candidate_agents.sort_by_cached_key(|agent_id| {
         let needs_you = registry.attention(*agent_id) == UiAttention::NeedsInput
             || registry
                 .agent_turn_report(*agent_id)

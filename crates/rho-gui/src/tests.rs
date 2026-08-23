@@ -1590,6 +1590,76 @@ fn suffix_rebuild_does_not_rewrap_settled_user_rows(cx: &mut TestAppContext) {
     );
 }
 
+#[gpui::test]
+fn whole_transcript_rebuild_batches_multibuffer_events(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let blocks = (0..100)
+        .map(|index| {
+            if index % 2 == 0 {
+                user(&format!("user turn {index}"))
+            } else {
+                assistant(
+                    &format!("assistant turn {index}"),
+                    Some(UiMessagePhase::FinalAnswer),
+                )
+            }
+        })
+        .collect::<Vec<_>>();
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(blocks, Vec::new())),
+    );
+
+    let editor = active_editor(&workspace, cx);
+    let events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    workspace
+        .update(cx, |_, _, cx| {
+            let buffer = editor.read(cx).buffer().clone();
+            let events = events.clone();
+            cx.subscribe(&buffer, move |_, _, event, _| {
+                events.lock().unwrap().push(event.clone());
+            })
+            .detach();
+        })
+        .expect("subscribe to transcript multibuffer");
+
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(
+            vec![
+                user("replacement"),
+                assistant("done", Some(UiMessagePhase::FinalAnswer)),
+            ],
+            Vec::new(),
+        )),
+    );
+
+    let events = events.lock().unwrap();
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, multi_buffer::Event::BufferRangesUpdated { .. })),
+        "transcript rebuild emitted per-buffer range events: {events:#?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, multi_buffer::Event::BufferRangesUpdatedBatch { .. }))
+    );
+    assert!(
+        events
+            .iter()
+            .filter(|event| matches!(event, multi_buffer::Event::Edited { .. }))
+            .count()
+            <= 2,
+        "transcript rebuild emitted too many edit events: {events:#?}"
+    );
+}
+
 fn assert_incremental_wrap(
     traces: &[editor::display_map::WrapSyncTrace],
     width_changes: &[(Option<gpui::Pixels>, Option<gpui::Pixels>)],
