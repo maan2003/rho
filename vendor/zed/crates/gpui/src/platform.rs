@@ -824,6 +824,11 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// platform gestures. Intended for latency-sensitive, canvas-rendered controls
     /// such as an on-screen keyboard. Platforms without touch may ignore this.
     fn set_direct_touch_region(&mut self, _bounds: Option<Bounds<Pixels>>) {}
+    /// Temporarily installs the platform serial that initiated a synthesized
+    /// compatibility click. Paired with end_touch_serial.
+    fn begin_touch_serial(&self, _serial: Option<u32>) {}
+    /// Restores input serial state after a synthesized compatibility click.
+    fn end_touch_serial(&self) {}
 
     fn bounds(&self) -> Bounds<Pixels>;
     fn is_maximized(&self) -> bool;

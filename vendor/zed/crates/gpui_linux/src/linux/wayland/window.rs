@@ -1580,6 +1580,14 @@ impl rwh::HasDisplayHandle for WaylandWindow {
 }
 
 impl PlatformWindow for WaylandWindow {
+    fn begin_touch_serial(&self, serial: Option<u32>) {
+        self.borrow().client.begin_touch_serial(serial);
+    }
+
+    fn end_touch_serial(&self) {
+        self.borrow().client.end_touch_serial();
+    }
+
     fn create_linux_wayland_passthrough(
         &self,
         events: Box<dyn Fn(gpui::LinuxWaylandPassthroughEvent) + Send + Sync>,

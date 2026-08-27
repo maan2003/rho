@@ -3,7 +3,7 @@ use crate::{
     Window, point, seal::Sealed,
 };
 use smallvec::SmallVec;
-use std::{any::Any, fmt::Debug, ops::Deref, path::PathBuf};
+use std::{any::Any, fmt::Debug, ops::Deref, path::PathBuf, time::Duration};
 
 /// An event from a platform input source.
 pub trait InputEvent: Sealed + 'static {
@@ -202,10 +202,13 @@ pub struct TouchId(pub u64);
 /// A raw touch event from the platform.
 ///
 ///
-/// Dispatch contract (core implementation pending): a touch is hit-tested
-/// once, at [`TouchPhase::Started`], occlusion-aware; all subsequent events
-/// for the same [`TouchId`] are delivered to the elements under the starting
-/// position, even after the touch moves outside them.
+/// A touch is hit-tested once, at [`TouchPhase::Started`], and implicitly
+/// captured by that element path. Subsequent events for the same [`TouchId`]
+/// use the captured path even after the contact moves outside it. Touch
+/// listeners run in capture and bubble phases. Stopping propagation or
+/// preventing the default claims the touch and suppresses framework gestures.
+/// Unclaimed touches retain browser-like defaults: tap compatibility clicks,
+/// scrolling pans with momentum, long-press secondary clicks, and pinch.
 #[derive(Clone, Debug, Default)]
 pub struct TouchEvent {
     /// Which touch this event belongs to.
@@ -216,6 +219,10 @@ pub struct TouchEvent {
     pub position: Point<Pixels>,
     /// Normalized touch force in `0.0..=1.0`, if the hardware reports it.
     pub force: Option<f32>,
+    /// Monotonic platform timestamp for gesture recognition.
+    pub timestamp: Duration,
+    /// Platform activation serial associated with the touch start, when available.
+    pub serial: Option<u32>,
 }
 
 impl Sealed for TouchEvent {}

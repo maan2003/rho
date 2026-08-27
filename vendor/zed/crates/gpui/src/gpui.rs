@@ -56,6 +56,7 @@ mod taffy;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test;
 mod text_system;
+mod touch_gestures;
 mod util;
 mod view;
 mod window;

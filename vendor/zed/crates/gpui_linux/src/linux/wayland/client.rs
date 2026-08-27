@@ -14,7 +14,7 @@ use calloop::{
     timer::{TimeoutAction, Timer},
 };
 use calloop_wayland_source::WaylandSource;
-use collections::HashMap;
+use collections::{HashMap, HashSet};
 use filedescriptor::Pipe;
 use gpui_util::ResultExt as _;
 use http_client::Url;
@@ -34,7 +34,7 @@ use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle, delegate_noop,
     protocol::{
         wl_buffer, wl_compositor, wl_keyboard, wl_pointer, wl_registry, wl_seat, wl_shm,
-        wl_shm_pool, wl_surface,
+        wl_shm_pool, wl_surface, wl_touch,
     },
 };
 use wayland_protocols::wp::color_management::v1::client::{
@@ -105,7 +105,8 @@ use gpui::{
     Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
     MouseUpEvent, NavigationDirection, Pixels, PlatformDisplay, PlatformInput,
     PlatformKeyboardLayout, PlatformWindow, Point, ScrollDelta, ScrollWheelEvent, SharedString,
-    Size, TouchPhase, WindowButtonLayout, WindowKind, WindowParams, point, profiler, px, size,
+    Size, TouchEvent, TouchId, TouchPhase, WindowButtonLayout, WindowKind, WindowParams, point,
+    profiler, px, size,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
@@ -336,8 +337,15 @@ pub(crate) struct WaylandClientState {
     pub compositor_gpu: Option<CompositorGpuHint>,
     wl_seat: wl_seat::WlSeat, // TODO: Multi seat support
     wl_pointer: Option<wl_pointer::WlPointer>,
+    wl_touch: Option<wl_touch::WlTouch>,
     pinch_gesture: Option<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1>,
     pinch_scale: f32,
+    touch_points: HashMap<i32, ActiveTouch>,
+    pending_touch_events: Vec<PendingTouchEvent>,
+    next_touch_sequence: u64,
+    touch_timestamp: Option<u32>,
+    touch_timestamp_epoch: u64,
+    synthetic_touch_serials: Vec<Option<crate::linux::wayland::serial::SerialSnapshot>>,
     wl_keyboard: Option<wl_keyboard::WlKeyboard>,
     cursor_shape_device: Option<wp_cursor_shape_device_v1::WpCursorShapeDeviceV1>,
     data_device: Option<wl_data_device::WlDataDevice>,
@@ -401,6 +409,33 @@ pub struct DragState {
     position: Point<Pixels>,
 }
 
+#[derive(Clone)]
+struct ActiveTouch {
+    surface: ObjectId,
+    position: Point<Pixels>,
+    serial: u32,
+    sequence: u64,
+    delivered: bool,
+}
+
+enum PendingTouchEvent {
+    Down {
+        id: i32,
+        touch: ActiveTouch,
+        time: Duration,
+    },
+    Motion {
+        id: i32,
+        touch: ActiveTouch,
+        time: Duration,
+    },
+    Up {
+        id: i32,
+        touch: ActiveTouch,
+        time: Duration,
+    },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DataSourceKind {
     Clipboard,
@@ -449,6 +484,17 @@ pub(crate) enum PendingActivation {
 }
 
 impl WaylandClientState {
+    fn touch_time(&mut self, time: u32) -> Duration {
+        if let Some(previous) = self.touch_timestamp
+            && time < previous
+            && previous.wrapping_sub(time) > i32::MAX as u32
+        {
+            self.touch_timestamp_epoch += 1_u64 << 32;
+        }
+        self.touch_timestamp = Some(time);
+        Duration::from_millis(self.touch_timestamp_epoch + u64::from(time))
+    }
+
     fn consume_startup_activation_token(&mut self, surface: &wl_surface::WlSurface) {
         let Some(startup_activation_token) = self.startup_activation_token.take() else {
             return;
@@ -474,6 +520,25 @@ impl WaylandClientStatePtr {
 
     pub fn get_serial(&self, kind: SerialKind) -> Serial {
         self.0.upgrade().unwrap().borrow().serial_tracker.get(kind)
+    }
+
+    pub fn begin_touch_serial(&self, serial: Option<u32>) {
+        let client = self.get_client();
+        let mut state = client.borrow_mut();
+        let snapshot = serial.map(|serial| {
+            state
+                .serial_tracker
+                .update_scoped(SerialKind::MousePress, serial)
+        });
+        state.synthetic_touch_serials.push(snapshot);
+    }
+
+    pub fn end_touch_serial(&self) {
+        let client = self.get_client();
+        let mut state = client.borrow_mut();
+        if let Some(Some(snapshot)) = state.synthetic_touch_serials.pop() {
+            state.serial_tracker.restore(snapshot);
+        }
     }
 
     pub fn start_external_drag(
@@ -608,6 +673,17 @@ impl WaylandClientStatePtr {
         let client = self.get_client();
         let mut state = client.borrow_mut();
         let closed_window = state.windows.remove(surface_id).unwrap();
+        state
+            .touch_points
+            .retain(|_, touch| &touch.surface != surface_id);
+        state.pending_touch_events.retain(|event| {
+            let touch = match event {
+                PendingTouchEvent::Down { touch, .. }
+                | PendingTouchEvent::Motion { touch, .. }
+                | PendingTouchEvent::Up { touch, .. } => touch,
+            };
+            &touch.surface != surface_id
+        });
         if let Some(window) = state.mouse_focused_window.take()
             && !window.ptr_eq(&closed_window)
         {
@@ -883,9 +959,16 @@ impl WaylandClient {
             compositor_gpu,
             wl_seat: seat,
             wl_pointer: None,
+            wl_touch: None,
             wl_keyboard: None,
             pinch_gesture: None,
             pinch_scale: 1.0,
+            touch_points: HashMap::default(),
+            pending_touch_events: Vec::new(),
+            next_touch_sequence: 0,
+            touch_timestamp: None,
+            touch_timestamp_epoch: 0,
+            synthetic_touch_serials: Vec::new(),
             cursor_shape_device: None,
             data_device,
             primary_selection,
@@ -1373,11 +1456,15 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
                 version,
             } => match &interface[..] {
                 "wl_seat" => {
+                    let cancelled = cancel_touch_points(&mut state);
                     if let Some(wl_pointer) = state.wl_pointer.take() {
                         wl_pointer.release();
                     }
                     if let Some(wl_keyboard) = state.wl_keyboard.take() {
                         wl_keyboard.release();
+                    }
+                    if let Some(wl_touch) = state.wl_touch.take() {
+                        wl_touch.release();
                     }
                     state.wl_seat.release();
                     state.wl_seat = registry.bind::<wl_seat::WlSeat, _, _>(
@@ -1386,6 +1473,11 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
                         qh,
                         (),
                     );
+                    drop(state);
+                    for (window, event) in cancelled {
+                        window.handle_input(PlatformInput::Touch(event));
+                    }
+                    return;
                 }
                 "wl_output" => {
                     let output = registry.bind::<wl_output::WlOutput, _, _>(
@@ -1551,6 +1643,87 @@ pub(crate) fn get_window(
     surface_id: &ObjectId,
 ) -> Option<WaylandWindowStatePtr> {
     state.windows.get(surface_id).cloned()
+}
+
+fn touch_event(id: i32, touch: &ActiveTouch, phase: TouchPhase, timestamp: Duration) -> TouchEvent {
+    TouchEvent {
+        id: TouchId(u64::from(id as u32)),
+        phase,
+        position: touch.position,
+        force: None,
+        timestamp,
+        serial: Some(touch.serial),
+    }
+}
+
+fn process_touch_frame(
+    state: &mut RefMut<WaylandClientState>,
+) -> Vec<(WaylandWindowStatePtr, TouchEvent)> {
+    let pending = std::mem::take(&mut state.pending_touch_events);
+    let mut events = Vec::with_capacity(pending.len());
+    for pending in pending {
+        let (id, touch, event) = match pending {
+            PendingTouchEvent::Down { id, touch, time } => {
+                if let Some(active) = state.touch_points.get_mut(&id)
+                    && active.sequence == touch.sequence
+                {
+                    active.delivered = true;
+                }
+                let event = touch_event(id, &touch, TouchPhase::Started, time);
+                (id, touch, event)
+            }
+            PendingTouchEvent::Motion { id, touch, time } => {
+                let event = touch_event(id, &touch, TouchPhase::Moved, time);
+                (id, touch, event)
+            }
+            PendingTouchEvent::Up { id, touch, time } => {
+                let event = touch_event(id, &touch, TouchPhase::Ended, time);
+                (id, touch, event)
+            }
+        };
+        let _ = id;
+        if let Some(window) = state.windows.get(&touch.surface).cloned() {
+            events.push((window, event));
+        }
+    }
+    events
+}
+
+fn cancel_touch_points(
+    state: &mut RefMut<WaylandClientState>,
+) -> Vec<(WaylandWindowStatePtr, TouchEvent)> {
+    let timestamp = Duration::from_millis(
+        state.touch_timestamp_epoch + u64::from(state.touch_timestamp.unwrap_or_default()),
+    );
+    let mut cancelled_sequences = HashSet::default();
+    let mut cancelled = Vec::new();
+    for (id, touch) in &state.touch_points {
+        if touch.delivered {
+            cancelled.push((*id, touch.clone()));
+            cancelled_sequences.insert(touch.sequence);
+        }
+    }
+    for event in &state.pending_touch_events {
+        if let PendingTouchEvent::Up { id, touch, .. } = event
+            && touch.delivered
+            && cancelled_sequences.insert(touch.sequence)
+        {
+            cancelled.push((*id, touch.clone()));
+        }
+    }
+    state.pending_touch_events.clear();
+    state.touch_points.clear();
+    cancelled
+        .into_iter()
+        .filter_map(|(id, touch)| {
+            state.windows.get(&touch.surface).cloned().map(|window| {
+                (
+                    window,
+                    touch_event(id, &touch, TouchPhase::Cancelled, timestamp),
+                )
+            })
+        })
+        .collect()
 }
 
 impl Dispatch<wl_surface::WlSurface, ()> for WaylandClientStatePtr {
@@ -1833,6 +2006,19 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
                 }
 
                 state.wl_pointer = Some(pointer);
+            }
+            if capabilities.contains(wl_seat::Capability::Touch) {
+                if state.wl_touch.is_none() {
+                    state.wl_touch = Some(seat.get_touch(qh, ()));
+                }
+            } else if let Some(touch) = state.wl_touch.take() {
+                touch.release();
+                let cancelled = cancel_touch_points(&mut state);
+                drop(state);
+                for (window, event) in cancelled {
+                    window.handle_input(PlatformInput::Touch(event));
+                }
+                return;
             }
         }
     }
@@ -2600,6 +2786,84 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                     for input in inputs {
                         window.handle_input(input);
                     }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_touch::WlTouch, ()> for WaylandClientStatePtr {
+    fn event(
+        this: &mut Self,
+        _: &wl_touch::WlTouch,
+        event: wl_touch::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let client = this.get_client();
+        let mut state = client.borrow_mut();
+        match event {
+            wl_touch::Event::Down {
+                serial,
+                time,
+                surface,
+                id,
+                x,
+                y,
+            } => {
+                let surface = surface.id();
+                if !state.windows.contains_key(&surface) {
+                    return;
+                }
+                let time = state.touch_time(time);
+                let sequence = state.next_touch_sequence;
+                state.next_touch_sequence = sequence.wrapping_add(1);
+                let touch = ActiveTouch {
+                    surface,
+                    position: point(px(x as f32), px(y as f32)),
+                    serial,
+                    sequence,
+                    delivered: false,
+                };
+                state.touch_points.insert(id, touch.clone());
+                state
+                    .pending_touch_events
+                    .push(PendingTouchEvent::Down { id, touch, time });
+            }
+            wl_touch::Event::Motion { time, id, x, y } => {
+                let time = state.touch_time(time);
+                let Some(touch) = state.touch_points.get_mut(&id) else {
+                    return;
+                };
+                touch.position = point(px(x as f32), px(y as f32));
+                let touch = touch.clone();
+                state
+                    .pending_touch_events
+                    .push(PendingTouchEvent::Motion { id, touch, time });
+            }
+            wl_touch::Event::Up { time, id, .. } => {
+                let time = state.touch_time(time);
+                let Some(touch) = state.touch_points.remove(&id) else {
+                    return;
+                };
+                state
+                    .pending_touch_events
+                    .push(PendingTouchEvent::Up { id, touch, time });
+            }
+            wl_touch::Event::Frame => {
+                let events = process_touch_frame(&mut state);
+                drop(state);
+                for (window, event) in events {
+                    window.handle_input(PlatformInput::Touch(event));
+                }
+            }
+            wl_touch::Event::Cancel => {
+                let events = cancel_touch_points(&mut state);
+                drop(state);
+                for (window, event) in events {
+                    window.handle_input(PlatformInput::Touch(event));
                 }
             }
             _ => {}

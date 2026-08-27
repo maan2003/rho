@@ -24,7 +24,7 @@ use crate::{
     MouseClickEvent, MouseDownEvent, MouseExitEvent, MouseMoveEvent, MousePressureEvent,
     MouseUpEvent, OngoingScroll, Overflow, ParentElement, PhysicalKeyEvent, PinchEvent, Pixels,
     Point, Render, ScrollWheelEvent, SharedString, Size, Style, StyleRefinement, Styled, Task,
-    TooltipId, Visibility, Window, WindowControlArea, point, px, size,
+    TooltipId, TouchEvent, Visibility, Window, WindowControlArea, point, px, size,
 };
 use collections::HashMap;
 use gpui_util::ResultExt;
@@ -381,6 +381,29 @@ impl Interactivity {
             .push(Box::new(move |event, phase, hitbox, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
                     (listener)(event, window, cx);
+                }
+            }));
+    }
+
+    /// Bind a callback to raw touch events on this element.
+    pub fn on_touch(&mut self, listener: impl Fn(&TouchEvent, &mut Window, &mut App) + 'static) {
+        self.touch_listeners
+            .push(Box::new(move |event, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Bubble && hitbox.is_hovered(window) {
+                    listener(event, window, cx);
+                }
+            }));
+    }
+
+    /// Bind a raw touch callback during the capture phase.
+    pub fn capture_touch(
+        &mut self,
+        listener: impl Fn(&TouchEvent, &mut Window, &mut App) + 'static,
+    ) {
+        self.touch_listeners
+            .push(Box::new(move |event, phase, hitbox, window, cx| {
+                if phase == DispatchPhase::Capture && hitbox.is_hovered(window) {
+                    listener(event, window, cx);
                 }
             }));
     }
@@ -1056,6 +1079,21 @@ pub trait InteractiveElement: Sized {
         self
     }
 
+    /// Bind a callback to raw touch events on this element.
+    fn on_touch(mut self, listener: impl Fn(&TouchEvent, &mut Window, &mut App) + 'static) -> Self {
+        self.interactivity().on_touch(listener);
+        self
+    }
+
+    /// Bind a raw touch callback during the capture phase.
+    fn capture_touch(
+        mut self,
+        listener: impl Fn(&TouchEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.interactivity().capture_touch(listener);
+        self
+    }
+
     /// Bind the given callback to pinch gesture events during the capture phase.
     /// The fluent API equivalent to [`Interactivity::capture_pinch`].
     ///
@@ -1718,6 +1756,8 @@ pub(crate) type ScrollWheelListener =
 
 pub(crate) type PinchListener =
     Box<dyn Fn(&PinchEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
+pub(crate) type TouchListener =
+    Box<dyn Fn(&TouchEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
 
 pub(crate) type LinuxPointerAxisListener =
     Box<dyn Fn(&LinuxPointerAxisEvent, DispatchPhase, &Hitbox, &mut Window, &mut App) + 'static>;
@@ -2138,6 +2178,7 @@ pub struct Interactivity {
     pub(crate) mouse_exit_listeners: Vec<MouseExitListener>,
     pub(crate) scroll_wheel_listeners: Vec<ScrollWheelListener>,
     pub(crate) pinch_listeners: Vec<PinchListener>,
+    pub(crate) touch_listeners: Vec<TouchListener>,
     pub(crate) linux_pointer_axis_listeners: Vec<LinuxPointerAxisListener>,
     pub(crate) linux_pinch_listeners: Vec<LinuxPinchListener>,
     pub(crate) key_down_listeners: Vec<KeyDownListener>,
@@ -2386,6 +2427,7 @@ impl Interactivity {
             || !self.click_listeners.is_empty()
             || !self.aux_click_listeners.is_empty()
             || !self.scroll_wheel_listeners.is_empty()
+            || !self.touch_listeners.is_empty()
             || self.has_pinch_listeners()
             || self.drag_listener.is_some()
             || !self.drop_listeners.is_empty()
@@ -2788,6 +2830,13 @@ impl Interactivity {
         for listener in self.pinch_listeners.drain(..) {
             let hitbox = hitbox.clone();
             window.on_mouse_event(move |event: &PinchEvent, phase, window, cx| {
+                listener(event, phase, &hitbox, window, cx);
+            })
+        }
+
+        for listener in self.touch_listeners.drain(..) {
+            let hitbox = hitbox.clone();
+            window.on_touch_event(hitbox.id, move |event: &TouchEvent, phase, window, cx| {
                 listener(event, phase, &hitbox, window, cx);
             })
         }
