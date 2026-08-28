@@ -64,6 +64,27 @@ impl Transient {
         self.title
     }
 
+    #[cfg(feature = "native")]
+    pub(crate) fn phone_rows(&self) -> Vec<(String, String, Option<String>)> {
+        self.items
+            .iter()
+            .map(|item| {
+                (
+                    display_key(item.key),
+                    item.description.clone(),
+                    item.value.clone(),
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "native")]
+    pub(crate) fn action_at(&self, index: usize) -> Option<(TransientRun, bool)> {
+        self.items
+            .get(index)
+            .map(|item| (item.run.clone(), item.stay))
+    }
+
     fn push(
         mut self,
         key: &'static str,

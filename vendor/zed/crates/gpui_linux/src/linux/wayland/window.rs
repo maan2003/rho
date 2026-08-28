@@ -1018,7 +1018,7 @@ impl WaylandWindowStatePtr {
             .input_handler
             .as_mut()
             .map(|input_handler| input_handler.query_accepts_text_input())
-            .unwrap_or(true);
+            .unwrap_or(false);
         drop(state);
         if Some(ime_enabled) == client.ime_enabled() {
             return;

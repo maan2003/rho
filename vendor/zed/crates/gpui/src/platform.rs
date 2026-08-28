@@ -814,6 +814,7 @@ pub enum TextInputStateChange {
 pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     /// Create a below-parent Wayland child surface. Non-Wayland platforms do
     /// not expose this compositor fast path.
+    #[cfg(target_os = "linux")]
     fn create_linux_wayland_passthrough(
         &self,
         _events: Box<dyn Fn(crate::LinuxWaylandPassthroughEvent) + Send + Sync>,

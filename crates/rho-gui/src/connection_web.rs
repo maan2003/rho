@@ -403,9 +403,11 @@ fn handle_host_message(
         ServerMessage::AgentAttention {
             agent_id,
             attention,
+            facts,
         } => Some(ConnEvent::AgentAttention {
             agent_id: *agent_id,
             attention: attention.clone(),
+            facts: facts.clone(),
         }),
         ServerMessage::AgentTurnReport { agent_id, report } => Some(ConnEvent::AgentTurnReport {
             agent_id: *agent_id,

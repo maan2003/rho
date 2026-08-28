@@ -187,6 +187,7 @@ impl Workspace {
             surfaces: HashMap::new(),
             active_context: ContextId::Draft,
             dashboard,
+            deal_help_visible: false,
             desk_sync: crate::desk_view::DeskSync::default(),
             desk_edit_subscriptions: HashMap::new(),
             dashboard_preview: None,

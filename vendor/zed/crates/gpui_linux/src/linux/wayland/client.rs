@@ -119,6 +119,32 @@ const MIN_KEYCODE: u32 = 8;
 const UNKNOWN_KEYBOARD_LAYOUT_NAME: SharedString = SharedString::new_static("unknown");
 const XDG_ACTIVATION_TOKEN_ENV_VAR: &str = "XDG_ACTIVATION_TOKEN";
 
+#[derive(Default)]
+struct ImeState {
+    desired_enabled: Option<bool>,
+    surface_entered: bool,
+}
+
+impl ImeState {
+    fn set_desired_enabled(&mut self, enabled: bool) -> bool {
+        self.desired_enabled = Some(enabled);
+        self.surface_entered
+    }
+
+    fn enter_surface(&mut self) -> bool {
+        self.surface_entered = true;
+        self.desired_enabled == Some(true)
+    }
+
+    fn leave_surface(&mut self) {
+        self.surface_entered = false;
+    }
+
+    fn requests_allowed(&self) -> bool {
+        self.surface_entered
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ImeCursorRectangle {
     x: i32,
@@ -400,7 +426,7 @@ pub(crate) struct WaylandClientState {
     startup_activation_token: Option<String>,
     event_loop: Option<EventLoop<'static, WaylandClientStatePtr>>,
     pub common: LinuxCommon,
-    ime_enabled: Option<bool>,
+    ime_state: ImeState,
 }
 
 pub struct DragState {
@@ -589,7 +615,9 @@ impl WaylandClientStatePtr {
     pub fn enable_ime(&self) {
         let client = self.get_client();
         let mut state = client.borrow_mut();
-        state.ime_enabled = Some(true);
+        if !state.ime_state.set_desired_enabled(true) {
+            return;
+        }
         state.last_ime_cursor_rectangle = None;
         let Some(text_input) = state.text_input.take() else {
             return;
@@ -615,7 +643,9 @@ impl WaylandClientStatePtr {
     pub fn disable_ime(&self) {
         let client = self.get_client();
         let mut state = client.borrow_mut();
-        state.ime_enabled = Some(false);
+        if !state.ime_state.set_desired_enabled(false) {
+            return;
+        }
         state.composing = false;
         if let Some(text_input) = &state.text_input {
             text_input.disable();
@@ -625,13 +655,13 @@ impl WaylandClientStatePtr {
 
     pub fn ime_enabled(&self) -> Option<bool> {
         let client = self.get_client();
-        client.borrow().ime_enabled
+        client.borrow().ime_state.desired_enabled
     }
 
     pub fn update_ime_position(&self, bounds: Bounds<Pixels>) {
         let client = self.get_client();
         let mut state = client.borrow_mut();
-        if state.pre_edit_text.is_some() {
+        if !state.ime_state.requests_allowed() || state.pre_edit_text.is_some() {
             return;
         }
         let Some(text_input) = state.text_input.clone() else {
@@ -1040,7 +1070,7 @@ impl WaylandClient {
             pending_activation: None,
             startup_activation_token,
             event_loop: Some(event_loop),
-            ime_enabled: None,
+            ime_state: ImeState::default(),
         }));
 
         event_queue
@@ -1968,6 +1998,7 @@ impl Dispatch<wl_seat::WlSeat, ()> for WaylandClientStatePtr {
                     text_input.destroy();
                     state.ime_pre_edit = None;
                     state.composing = false;
+                    state.ime_state.leave_surface();
                 }
 
                 state.text_input = state
@@ -2277,12 +2308,20 @@ impl Dispatch<zwp_text_input_v3::ZwpTextInputV3, ()> for WaylandClientStatePtr {
         let mut state = client.borrow_mut();
         match event {
             zwp_text_input_v3::Event::Enter { .. } => {
+                let should_enable = state.ime_state.enter_surface();
                 drop(state);
-                this.enable_ime();
+                if should_enable {
+                    this.enable_ime();
+                }
             }
             zwp_text_input_v3::Event::Leave { .. } => {
-                drop(state);
-                this.disable_ime();
+                state.ime_state.leave_surface();
+                state.last_ime_cursor_rectangle = None;
+                state.composing = false;
+                state.ime_pre_edit = None;
+                // `leave` has already cleared the current surface; v3 says
+                // the compositor must ignore requests until the next enter.
+                // Retain the desired state and re-apply it from `Enter`.
             }
             zwp_text_input_v3::Event::CommitString { text } => {
                 state.composing = false;
@@ -3456,6 +3495,29 @@ mod tests {
 
     fn ime_cursor_bounds(x: f32) -> Bounds<Pixels> {
         Bounds::new(point(px(x), px(20.25)), size(px(1.0), px(18.75)))
+    }
+
+    #[test]
+    fn ime_state_defers_requests_until_surface_enter() {
+        let mut state = ImeState::default();
+
+        assert!(!state.set_desired_enabled(true));
+        assert!(state.enter_surface());
+
+        state.leave_surface();
+        assert_eq!(state.desired_enabled, Some(true));
+        assert!(!state.requests_allowed());
+        assert!(state.enter_surface());
+        assert!(state.requests_allowed());
+    }
+
+    #[test]
+    fn ime_state_does_not_enable_noneditable_surface() {
+        let mut state = ImeState::default();
+
+        assert!(!state.set_desired_enabled(false));
+        assert!(!state.enter_surface());
+        assert!(state.set_desired_enabled(false));
     }
 
     #[test]

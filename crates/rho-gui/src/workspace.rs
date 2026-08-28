@@ -11,6 +11,9 @@
 //! travels down — and for the few places where a daemon-side *name* (a
 //! repository path, a short agent label) is only unique within one machine.
 
+#[cfg(feature = "native")]
+#[path = "workspace_phone.rs"]
+mod phone;
 #[cfg(all(target_family = "wasm", not(feature = "native")))]
 #[path = "workspace_web.rs"]
 mod web;
@@ -120,6 +123,7 @@ enum SurfaceView {
 }
 
 impl SurfaceView {
+    #[cfg(feature = "native")]
     fn telemetry_kind(&self) -> crate::telemetry::SurfaceKind {
         use crate::telemetry::SurfaceKind;
         match self {
@@ -411,6 +415,8 @@ pub struct Workspace {
     _universal_argument_subscription: gpui::Subscription,
     #[cfg(all(target_family = "wasm", not(feature = "native")))]
     web: web::WebUi,
+    #[cfg(feature = "native")]
+    phone: phone::PhoneUi,
 }
 
 /// Target-independent application state transitions. Transport adapters feed
@@ -836,6 +842,7 @@ impl Workspace {
             _event_task: event_task,
             _dashboard_subscription: dashboard_subscription,
             _universal_argument_subscription: universal_argument_subscription,
+            phone: phone::PhoneUi::new(),
         };
         for spec in specs {
             this.attach_host(spec, cx);
@@ -1013,6 +1020,8 @@ impl Workspace {
         };
         self.contexts.retain(|context, _| keep(context));
         self.surfaces.retain(|context, _| keep(context));
+        #[cfg(feature = "native")]
+        self.phone.retain_contexts(keep);
         if !self.contexts.contains_key(&self.active_context) {
             self.active_context = ContextId::Draft;
         }
@@ -3286,6 +3295,8 @@ impl Workspace {
         for surfaces in self.surfaces.values_mut() {
             surfaces.retain(|surface| surface.key != SurfaceKey::Transcript(agent_id));
         }
+        #[cfg(feature = "native")]
+        self.phone.remove_key(&SurfaceKey::Transcript(agent_id));
         self.pending_syncs.remove(&agent_id);
         self.models.remove(&agent_id);
     }
@@ -3986,6 +3997,10 @@ impl Workspace {
             return;
         }
         list.retain(|surface| surface.key != key);
+        #[cfg(feature = "native")]
+        if self.phone.enabled {
+            self.phone.remove(self.active_context, &key);
+        }
         let fallback = list
             .iter()
             .rev()
@@ -4052,6 +4067,10 @@ impl Workspace {
         match list.iter_mut().find(|s| **s == surface) {
             Some(existing) => *existing = surface.clone(),
             None => list.push(surface.clone()),
+        }
+        #[cfg(feature = "native")]
+        if self.phone.enabled {
+            self.phone.show(self.active_context, surface.key.clone());
         }
         let tree = match self.contexts.entry(self.active_context) {
             Entry::Vacant(entry) => {
@@ -4988,6 +5007,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        #[cfg(feature = "native")]
+        if self.phone.enabled {
+            return;
+        }
         let focused = self.active_tree().focused().surface.clone();
         let sibling = self.duplicate_surface(focused, window, cx);
         self.active_tree_mut().split(axis, sibling);
@@ -5050,6 +5073,19 @@ impl Workspace {
         self.finish_overlay_focus(window, cx);
         on_submit(self, input, window, cx);
         cx.notify();
+    }
+
+    #[cfg(feature = "native")]
+    pub(crate) fn phone_choose_minibuffer(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(minibuffer) = &mut self.minibuffer {
+            minibuffer.select(index);
+        }
+        self.minibuffer_confirm(window, cx);
     }
 
     fn minibuffer_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -6770,22 +6806,25 @@ impl Workspace {
         // Modal overlays borrow keyboard focus; the frame stays in the mode
         // recorded beneath the overlay for its whole replacement chain.
         let home = self.dashboard_mode(window, cx);
-        let focused_surface = if home {
-            crate::telemetry::SurfaceKind::Dashboard
-        } else {
-            self.active_tree().focused().surface.view.telemetry_kind()
-        };
-        let visible_surfaces = if home {
-            focused_surface.bit()
-        } else {
-            self.active_tree()
-                .panes()
-                .into_iter()
-                .fold(0, |flags, pane| {
-                    flags | pane.surface.view.telemetry_kind().bit()
-                })
-        };
-        crate::telemetry::record_surfaces(focused_surface, visible_surfaces);
+        #[cfg(feature = "native")]
+        {
+            let focused_surface = if home {
+                crate::telemetry::SurfaceKind::Dashboard
+            } else {
+                self.active_tree().focused().surface.view.telemetry_kind()
+            };
+            let visible_surfaces = if home {
+                focused_surface.bit()
+            } else {
+                self.active_tree()
+                    .panes()
+                    .into_iter()
+                    .fold(0, |flags, pane| {
+                        flags | pane.surface.view.telemetry_kind().bit()
+                    })
+            };
+            crate::telemetry::record_surfaces(focused_surface, visible_surfaces);
+        }
         let iris = false;
         self.sync_diff_visibility(!home, cx);
         #[cfg(feature = "native")]
@@ -7322,8 +7361,10 @@ impl Render for Workspace {
         let editor = self.active_editor(cx);
         let text_style = editor.update(cx, |editor, cx| editor.style(cx).text.clone());
         let connection_status = self.render_connection_status(&text_style, cx);
+        let phone = self.phone_mode(window, cx);
         div()
             .id("rho-gui")
+            .relative()
             .size_full()
             .flex()
             .flex_col()
@@ -7631,10 +7672,14 @@ impl Render for Workspace {
                 this.cycle_draft_group(window, cx);
             }))
             .on_action(cx.listener(|this, _: &PaneSplitRight, window, cx| {
-                this.split_pane(SplitAxis::Row, window, cx);
+                if !this.phone.enabled {
+                    this.split_pane(SplitAxis::Row, window, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &PaneSplitDown, window, cx| {
-                this.split_pane(SplitAxis::Column, window, cx);
+                if !this.phone.enabled {
+                    this.split_pane(SplitAxis::Column, window, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &PaneClose, window, cx| {
                 this.close_pane(window, cx);
@@ -7643,7 +7688,11 @@ impl Render for Workspace {
                 this.focus_pane_by_delta(1, window, cx);
             }))
             .on_action(cx.listener(|this, _: &PaneBack, window, cx| {
-                this.pane_back(window, cx);
+                if this.phone.enabled {
+                    this.phone_back(window, cx);
+                } else {
+                    this.pane_back(window, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &RailFocus, window, cx| {
                 this.focus_rail(window, cx);
@@ -7687,11 +7736,15 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &GitApprovalDeny, window, cx| {
                 this.finish_git_approval(GitApprovalDecision::Deny, window, cx);
             }))
-            .child(self.render_panes(window, &text_style, cx))
-            .child(
-                bottom_strip(&text_style, cx)
-                    .child(div().px_2().child(self.mode_indicator.clone())),
-            )
+            .child(if phone {
+                self.render_phone_body(&text_style, cx)
+            } else {
+                self.render_panes(window, &text_style, cx)
+            })
+            .children((!phone).then(|| {
+                bottom_strip(&text_style, cx).child(div().px_2().child(self.mode_indicator.clone()))
+            }))
+            .children(phone.then(|| self.render_phone_bar(cx)))
             .children(
                 match (
                     &self.pending_git_approval,
@@ -7749,16 +7802,24 @@ impl Render for Workspace {
                                 .into_any_element(),
                         )
                     }
-                    (None, Some(minibuffer), _, _, _, _) => {
-                        Some(minibuffer.render(&text_style, cx))
+                    (None, Some(minibuffer), _, _, _, _) => Some(if phone {
+                        minibuffer.render_phone(&text_style, cx)
+                    } else {
+                        minibuffer.render(&text_style, cx)
+                    }),
+                    (None, None, Some(transient), _, _, _) => {
+                        if phone {
+                            self.render_phone_transient_sheet(&text_style, cx)
+                        } else {
+                            Some(
+                                div()
+                                    .track_focus(&self.transient_focus)
+                                    .on_key_down(cx.listener(Self::transient_key))
+                                    .child(transient.render(&text_style, cx))
+                                    .into_any_element(),
+                            )
+                        }
                     }
-                    (None, None, Some(transient), _, _, _) => Some(
-                        div()
-                            .track_focus(&self.transient_focus)
-                            .on_key_down(cx.listener(Self::transient_key))
-                            .child(transient.render(&text_style, cx))
-                            .into_any_element(),
-                    ),
                     (None, None, None, true, _, _) => Some(
                         bottom_strip(&text_style, cx)
                             .child(

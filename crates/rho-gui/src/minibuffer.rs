@@ -203,6 +203,14 @@ impl Minibuffer {
         self.selection_moved = true;
     }
 
+    #[cfg(feature = "native")]
+    pub fn select(&mut self, index: usize) {
+        if index < self.candidates.len() {
+            self.selected = index;
+            self.selection_moved = true;
+        }
+    }
+
     /// Enter accepts the highlighted candidate, emacs `completing-read`
     /// style: it replaces the last token before submission whenever the
     /// user has typed something or explicitly moved the selection. A bare
@@ -283,6 +291,66 @@ impl Minibuffer {
                     .flex_row()
                     .items_center()
                     .px_2()
+                    .child(div().child(self.prompt.clone()))
+                    .child(div().flex_grow(1.0).child(self.editor.clone())),
+            )
+            .children(rows)
+            .into_any_element()
+    }
+
+    #[cfg(feature = "native")]
+    pub(crate) fn render_phone(
+        &self,
+        text_style: &gpui::TextStyle,
+        cx: &Context<Workspace>,
+    ) -> AnyElement {
+        let colors = cx.theme().colors();
+        let window_start = self
+            .selected
+            .saturating_sub(VISIBLE_CANDIDATES.saturating_sub(1));
+        let rows = self
+            .candidates
+            .iter()
+            .enumerate()
+            .skip(window_start)
+            .take(VISIBLE_CANDIDATES)
+            .map(|(index, candidate)| {
+                let mut row = div()
+                    .id(("phone-minibuffer-candidate", index))
+                    .cursor_pointer()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .w_full()
+                    .min_h(px(48.))
+                    .px_3()
+                    .child(div().child(candidate.value.clone()));
+                if !candidate.description.is_empty() {
+                    row = row.child(
+                        div()
+                            .text_color(colors.text_muted)
+                            .child(candidate.description.clone()),
+                    );
+                }
+                if index == self.selected {
+                    row = row.bg(colors.element_selected);
+                }
+                row.on_click(cx.listener(move |workspace, _, window, cx| {
+                    workspace.phone_choose_minibuffer(index, window, cx);
+                }))
+            });
+        bottom_strip(text_style, cx)
+            .absolute()
+            .left_0()
+            .right_0()
+            .bottom(px(48.))
+            .key_context("RhoMinibuffer")
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .min_h(px(48.))
+                    .px_3()
                     .child(div().child(self.prompt.clone()))
                     .child(div().flex_grow(1.0).child(self.editor.clone())),
             )
