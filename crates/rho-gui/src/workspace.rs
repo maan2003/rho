@@ -351,7 +351,6 @@ pub struct Workspace {
     #[cfg(feature = "native")]
     mode_indicator: Entity<vim::ModeIndicator>,
     /// Compact Helix-style key guide shown on deal entry and `?`.
-    deal_help_visible: bool,
     /// Canonical per-host CRDT Desk buffers shared by dashboard and source
     /// views.
     desk_sync: DeskSync,
@@ -816,7 +815,6 @@ impl Workspace {
             active_context: ContextId::Draft,
             dashboard,
             mode_indicator,
-            deal_help_visible: false,
             desk_sync: DeskSync::default(),
             desk_edit_subscriptions: HashMap::new(),
             dashboard_preview: None,
@@ -5400,14 +5398,12 @@ impl Workspace {
         window.focus(&self.dashboard.focus_handle(cx), cx);
         if self.dashboard.deal_mode() {
             self.dashboard.exit_deal_mode(cx);
-            self.deal_help_visible = false;
             if let Ok(action) = cx.build_action("vim::ExitDealMode", None) {
                 window.dispatch_action(action, cx);
             }
         } else {
             let now = chrono::Local::now().fixed_offset();
             self.dashboard.enter_deal_mode(&self.registry, now, cx);
-            self.deal_help_visible = self.dashboard.deal_mode();
             if self.dashboard.deal_mode()
                 && let Ok(action) = cx.build_action("vim::EnterDealMode", None)
             {
@@ -5419,7 +5415,6 @@ impl Workspace {
     }
 
     fn finish_dashboard_deal_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.deal_help_visible = false;
         if !self.dashboard.deal_mode()
             && let Ok(action) = cx.build_action("vim::ExitDealMode", None)
         {
@@ -6536,16 +6531,13 @@ impl Workspace {
             .pl(px(24.))
             .pr(px(24.))
             .child(self.render_dashboard_header(text_style, cx));
-        let mut dashboard = div()
+        let dashboard = div()
             .id("dashboard-rail")
             .flex_grow(1.0)
             .min_h_0()
             .relative()
             .overflow_hidden()
             .child(self.dashboard.editor().clone());
-        if self.dashboard.deal_mode() && self.deal_help_visible {
-            dashboard = dashboard.child(self.render_deal_help(cx));
-        }
         let hint = div()
             .flex_none()
             .pt(px(4.))
@@ -6561,61 +6553,6 @@ impl Workspace {
             .capture_any_mouse_up(cx.listener(Self::dashboard_pointer_up));
         let container = container.child(dashboard);
         container.child(hint).into_any_element()
-    }
-
-    fn render_deal_help(&self, cx: &Context<Self>) -> gpui::AnyElement {
-        let colors = cx.theme().colors();
-        let row = |keys: &'static str, meaning: &'static str| {
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .w(px(96.))
-                        .px_1()
-                        .whitespace_nowrap()
-                        .rounded_sm()
-                        .bg(colors.element_selected)
-                        .text_color(colors.text_accent)
-                        .child(keys),
-                )
-                .child(
-                    div()
-                        .whitespace_nowrap()
-                        .text_color(colors.text_muted)
-                        .child(meaning),
-                )
-        };
-        div()
-            .absolute()
-            .top_3()
-            .right_3()
-            .w(px(288.))
-            .p_3()
-            .border_1()
-            .border_color(colors.border_variant)
-            .rounded_md()
-            .shadow_md()
-            .bg(colors.element_background)
-            .text_color(colors.text)
-            .flex()
-            .flex_col()
-            .gap_2()
-            .child(
-                div()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .text_color(colors.text_accent)
-                    .child("Deal"),
-            )
-            .child(row("n / N", "next / previous card"))
-            .child(row("d / x", "done / discard"))
-            .child(row("[count] s", "snooze days"))
-            .child(row("t", "todo"))
-            .child(row("r / i", "reply / insert"))
-            .child(row("R", "redeal"))
-            .child(row("q / Esc", "exit"))
-            .into_any_element()
     }
 
     /// The dashboard-only two-line masthead.
@@ -7505,7 +7442,6 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &DashboardDealPrevious, window, cx| {
                 vim::take_count(cx);
                 if this.dashboard.previous_deal(cx) {
-                    this.deal_help_visible = false;
                     this.refresh_dashboard(window, cx);
                 }
             }))
@@ -7554,7 +7490,6 @@ impl Render for Workspace {
                 this.dashboard.discard_deal_session(cx);
                 let now = chrono::Local::now().fixed_offset();
                 this.dashboard.enter_deal_mode(&this.registry, now, cx);
-                this.deal_help_visible = true;
                 this.refresh_dashboard(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardDealInsert, window, cx| {
@@ -7562,7 +7497,6 @@ impl Render for Workspace {
                 if !this.dashboard.prepare_deal_insert(cx) || !this.dashboard.exit_deal_mode(cx) {
                     return;
                 }
-                this.deal_help_visible = false;
                 this.refresh_dashboard(window, cx);
                 if let Ok(action) = cx.build_action("vim::DealInsert", None) {
                     window.dispatch_action(action, cx);
@@ -7579,7 +7513,6 @@ impl Render for Workspace {
                 if !this.dashboard.exit_deal_mode(cx) {
                     return;
                 }
-                this.deal_help_visible = false;
                 if let Ok(action) = cx.build_action("vim::ExitDealMode", None) {
                     window.dispatch_action(action, cx);
                 }

@@ -58,6 +58,36 @@ fn shared_modal_init_preserves_bundled_helix_default(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn phone_entry_disables_modal_editing_app_wide(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    cx.update(|cx| {
+        assert!(
+            vim_mode_setting::HelixModeSetting::get_global(cx).0,
+            "desktop default is Helix on"
+        );
+    });
+
+    cx.simulate_window_resize(
+        (*workspace).into(),
+        gpui::size(gpui::px(400.), gpui::px(800.)),
+    );
+    cx.update_window((*workspace).into(), |_, window, cx| {
+        window.simulate_next_frame(cx);
+    })
+    .expect("draw phone frame");
+    cx.run_until_parked();
+
+    cx.update(|cx| {
+        assert!(
+            !vim_mode_setting::HelixModeSetting::get_global(cx).0,
+            "entering phone mode must strip Helix app-wide"
+        );
+        assert!(!vim_mode_setting::VimModeSetting::get_global(cx).0);
+    });
+}
+
+#[gpui::test]
 fn touch_editing_strips_vim_from_live_editors(cx: &mut TestAppContext) {
     cx.update(|cx| {
         assets::Assets.load_test_fonts(cx);

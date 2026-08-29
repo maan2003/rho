@@ -76,13 +76,14 @@ pub(super) struct PhoneModeChange {
     exited: bool,
 }
 
-const PHONE_FONT_SCALE: f32 = 1.25;
+const PHONE_FONT_SCALE: f32 = 1.4;
 
 /// Touch is a plain-editor world: no Vim, no Helix, every editor accepts
 /// text directly. Applied on phone-mode entry and reverted on exit so a
 /// desktop window narrowed for a moment does not lose Helix. Live editors
 /// pick the change up through the vim crate's SettingsStore observer.
 pub(crate) fn set_touch_modal_editing(enabled: bool, cx: &mut gpui::App) {
+    tracing::info!(helix = enabled, "touch modal editing toggle");
     let settings = cx.global_mut::<settings::SettingsStore>();
     settings.override_global(vim_mode_setting::VimModeSetting(false));
     settings.override_global(vim_mode_setting::HelixModeSetting(enabled));
@@ -191,6 +192,12 @@ impl Workspace {
             return;
         }
 
+        if self.phone.stack.is_empty() && self.dashboard.deal_mode() {
+            self.toggle_dashboard_deal(window, cx);
+            // The toggle focuses the desk editor; browse keeps the OSK down.
+            self.phone_set_dashboard_browsing(true, window, cx);
+            return;
+        }
         if self.phone.stack.is_empty() && self.dashboard.raw_mode() {
             self.phone_set_dashboard_browsing(true, window, cx);
             return;
