@@ -16,6 +16,9 @@ use rho_gui::*;
 use settings::{RegisterSetting, Settings, SettingsContent, SettingsStore};
 use tracing_subscriber::EnvFilter;
 
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[derive(Parser)]
 #[command(
     name = "rho-gui",

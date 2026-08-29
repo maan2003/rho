@@ -118,6 +118,10 @@ vim_mode_setting = { path = "../../vendor/zed/crates/vim_mode_setting" }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"] }
+# unprefixed_malloc routes C-library allocations (freetype, fontconfig,
+# drivers) through jemalloc too; profiling stays inert until MALLOC_CONF
+# turns it on.
+tikv-jemallocator = { version = "0.6", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
 
 [dev-dependencies]
 backtrace = "0.3"

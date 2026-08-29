@@ -12,3 +12,8 @@ codegen-backend = "llvm"
 
 [build]
 rustflags = ["--cfg", "tokio_unstable", "-Cforce-frame-pointers=yes"]
+
+# Everything but fortify: _FORTIFY_SOURCE is a hard error in jemalloc's
+# -O0 -Werror configure probes on debug builds. Ignored off-nix.
+[env]
+NIX_HARDENING_ENABLE = { value = "bindnow format pic pie relro stackprotector strictoverflow", force = true }
