@@ -4767,6 +4767,15 @@ impl Workspace {
     }
 
     fn active_surface_focus(&self, cx: &App) -> gpui::FocusHandle {
+        #[cfg(feature = "native")]
+        if self.phone.enabled
+            && matches!(
+                self.active_tree().focused().surface.view,
+                SurfaceView::Transcript { .. }
+            )
+        {
+            return self.phone.dashboard_focus.clone();
+        }
         match &self.active_tree().focused().surface.view {
             SurfaceView::Draft { editor, .. } => editor.focus_handle(cx),
             SurfaceView::Transcript { editor, .. } => editor.focus_handle(cx),

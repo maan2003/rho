@@ -5,8 +5,8 @@
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, Context, FocusHandle, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point,
-    Window, div, px,
+    AnyElement, Context, FocusHandle, Focusable as _, MouseButton, MouseDownEvent, MouseUpEvent,
+    Pixels, Point, Window, div, px,
 };
 use theme::ActiveTheme as _;
 
@@ -21,7 +21,7 @@ pub(super) struct PhoneUi {
     forced: bool,
     stack: Vec<(ContextId, SurfaceKey)>,
     dashboard_press: Option<(Point<Pixels>, Option<crate::dashboard::RowTarget>)>,
-    dashboard_focus: FocusHandle,
+    pub(super) dashboard_focus: FocusHandle,
 }
 
 impl PhoneUi {
@@ -160,6 +160,30 @@ impl Workspace {
         }
         cx.defer_in(window, move |this, window, cx| {
             this.phone_dashboard_activate_tapped_row(target, window, cx);
+        });
+    }
+
+    fn phone_surface_pointer_down(
+        &mut self,
+        _: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Let the editor place its cursor first, then only enable text input
+        // when that cursor landed in the editable prompt tail.
+        cx.defer_in(window, |this, window, cx| {
+            let Some(surface) = this.phone_surface() else {
+                return;
+            };
+            let super::SurfaceView::Transcript { model, editor } = &surface.view else {
+                return;
+            };
+            let focus = if model.read(cx).selection_in_prompt(editor, cx) {
+                editor.focus_handle(cx)
+            } else {
+                this.phone.dashboard_focus.clone()
+            };
+            window.focus(&focus, cx);
         });
     }
 
@@ -361,6 +385,7 @@ impl Workspace {
                 .min_h_0()
                 .w_full()
                 .overflow_hidden()
+                .capture_any_mouse_down(cx.listener(Self::phone_surface_pointer_down))
                 .child(self.render_surface(&surface))
                 .into_any_element()
         } else {

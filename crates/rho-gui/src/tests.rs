@@ -461,6 +461,73 @@ fn phone_desk_agent_tap_opens_the_agent_surface(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn phone_transcript_waits_for_a_tap_to_focus_the_reply_editor(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    cx.simulate_window_resize(*workspace, size(px(500.), px(800.)));
+    cx.update_window(*workspace, |_, window, cx| {
+        window.simulate_next_frame(cx);
+    })
+    .expect("paint phone Desk");
+    cx.run_until_parked();
+
+    let agent_id = agent(1);
+    feed_frame(
+        &workspace,
+        cx,
+        agent_id,
+        snapshot_frame(state(vec![user("read this first")], Vec::new())),
+    );
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |_, window, cx| {
+            assert!(
+                !editor.read(cx).focus_handle(cx).is_focused(window),
+                "opening a phone transcript must not focus its reply editor"
+            );
+        })
+        .expect("inspect initial transcript focus");
+
+    let reply_position = editor.read_with(cx, |editor, _| {
+        let bounds = *editor.last_bounds().expect("painted reply editor bounds");
+        gpui::point(bounds.center().x, bounds.bottom() - px(48.))
+    });
+    cx.update_window(*workspace, |_, window, cx| {
+        window.dispatch_event(
+            MouseDownEvent {
+                position: reply_position,
+                modifiers: Modifiers::none(),
+                button: MouseButton::Left,
+                click_count: 1,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+            cx,
+        );
+        window.dispatch_event(
+            MouseUpEvent {
+                position: reply_position,
+                modifiers: Modifiers::none(),
+                button: MouseButton::Left,
+                click_count: 1,
+            }
+            .to_platform_input(),
+            cx,
+        );
+    })
+    .expect("tap reply editor");
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |_, window, cx| {
+            assert!(
+                editor.read(cx).focus_handle(cx).is_focused(window),
+                "tapping the reply line must focus its editor"
+            );
+        })
+        .expect("inspect tapped transcript focus");
+}
+
+#[gpui::test]
 fn phone_desk_bound_heading_tap_opens_the_agent(cx: &mut TestAppContext) {
     use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
     use rho_ui_proto::{
