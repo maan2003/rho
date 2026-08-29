@@ -592,15 +592,36 @@ fn has_custom_block(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext
 
 #[gpui::test]
 fn dashboard_masthead_is_a_scrolling_editor_block(cx: &mut TestAppContext) {
+    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
+
     let workspace = test_workspace(cx);
+    let desk_text = "* Active\nintro\n** Project\nproject body\n";
+    let mut source =
+        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
+    let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text)]));
 
     workspace
         .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskSnapshot {
+                    snapshot: DeskSnapshot {
+                        text: source.snapshot().text(),
+                        operations: vec![operation],
+                        transactions: Vec::new(),
+                        replicas: Vec::new(),
+                    },
+                    replica_id: 42,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
             let editor = workspace.dashboard_editor();
             editor.update(cx, |editor, cx| {
                 let snapshot = editor.snapshot(window, cx);
                 let mastheads = snapshot
-                    .blocks_in_range(DisplayRow(0)..DisplayRow(4))
+                    .blocks_in_range(DisplayRow(0)..snapshot.max_point().row() + 1)
                     .filter_map(|(row, block)| match block {
                         Block::Custom(block) => Some((row, block)),
                         _ => None,
@@ -617,6 +638,7 @@ fn dashboard_masthead_is_a_scrolling_editor_block(cx: &mut TestAppContext) {
                     mastheads[0].1.style(),
                     editor::display_map::BlockStyle::Flex
                 );
+                assert_eq!(editor.scroll_position(cx).y, 0.);
             });
         })
         .expect("inspect dashboard masthead block");

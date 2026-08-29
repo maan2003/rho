@@ -1247,16 +1247,20 @@ impl BlockMap {
                     .iter()
                     .filter_map(|block| {
                         let placement = block.placement.to_wrap_row(wrap_snapshot)?;
-                        if !matches!(placement, BlockPlacement::Replace(_))
-                            && wrap_snapshot.intersects_fold(Point::new(
-                                block
-                                    .placement
-                                    .start()
-                                    .to_point(wrap_snapshot.buffer_snapshot())
-                                    .row,
-                                0,
-                            ))
-                        {
+                        // A block above the permanent buffer-start anchor is
+                        // outside every fold, including one that begins later
+                        // on the first row.
+                        if !matches!(
+                            block.placement,
+                            BlockPlacement::Above(Anchor::Min) | BlockPlacement::Replace(_)
+                        ) && wrap_snapshot.intersects_fold(Point::new(
+                            block
+                                .placement
+                                .start()
+                                .to_point(wrap_snapshot.buffer_snapshot())
+                                .row,
+                            0,
+                        )) {
                             return None;
                         }
                         if let BlockPlacement::Above(row) = placement

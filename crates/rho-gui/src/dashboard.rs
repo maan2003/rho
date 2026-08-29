@@ -41,6 +41,8 @@ const DASHBOARD_KEY_BASE: usize = usize::MAX - 200;
 /// Inlay id space for reply-draft placeholders, clear of the lamp ids.
 const PLACEHOLDER_ID_BASE: usize = 1_000_000;
 
+const MASTHEAD_ROWS: u32 = 3;
+
 /// Title a quick-spawned heading carries until the agent's generated
 /// summary replaces it.
 const PLACEHOLDER_TITLE: &str = "…";
@@ -348,7 +350,7 @@ impl Dashboard {
             editor.insert_blocks(
                 [editor::display_map::BlockProperties {
                     placement: editor::display_map::BlockPlacement::Above(Anchor::Min),
-                    height: Some(3),
+                    height: Some(MASTHEAD_ROWS),
                     style: editor::display_map::BlockStyle::Flex,
                     render: Arc::new(move |block_context| {
                         let text_style = block_context.editor_style.text.clone();
@@ -1677,7 +1679,9 @@ impl Dashboard {
                     }
                     count
                 });
-            Autoscroll::top_relative((ancestors + 2) as f64)
+            // Scroll anchors resolve in buffer space, so account for the
+            // masthead block's display rows when requesting visible context.
+            Autoscroll::top_relative((ancestors + 2 + MASTHEAD_ROWS as usize) as f64)
         });
         self.select_buffer_anchor(anchor, autoscroll, window, cx);
     }
