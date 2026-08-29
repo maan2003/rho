@@ -5,7 +5,8 @@
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, Context, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point, Window, div, px,
+    AnyElement, Context, FocusHandle, MouseButton, MouseDownEvent, MouseUpEvent, Pixels, Point,
+    Window, div, px,
 };
 use theme::ActiveTheme as _;
 
@@ -20,10 +21,11 @@ pub(super) struct PhoneUi {
     forced: bool,
     stack: Vec<(ContextId, SurfaceKey)>,
     dashboard_press: Option<Point<Pixels>>,
+    dashboard_focus: FocusHandle,
 }
 
 impl PhoneUi {
-    pub(super) fn new() -> Self {
+    pub(super) fn new(cx: &mut gpui::App) -> Self {
         let forced = std::env::var("RHO_PHONE").is_ok_and(|value| value == "1");
         Self {
             // The first render activates the projection. This keeps native
@@ -34,6 +36,7 @@ impl PhoneUi {
             forced,
             stack: Vec::new(),
             dashboard_press: None,
+            dashboard_focus: cx.focus_handle(),
         }
     }
 
@@ -76,15 +79,11 @@ pub(super) struct PhoneModeChange {
 const PHONE_FONT_SCALE: f32 = 1.25;
 
 impl Workspace {
-    pub(super) fn phone_mode(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
+    pub(super) fn phone_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let change = self.phone.update_mode(window);
         if change.entered {
             self.phone.stack.clear();
-            window.focus(&self.dashboard.focus_handle(cx), cx);
+            self.phone_set_dashboard_browsing(true, window, cx);
             // Deferred: adjusting fonts notifies observers, which must not
             // reenter the draw that detected the transition.
             cx.defer(|cx| {
@@ -93,6 +92,10 @@ impl Workspace {
             });
         }
         if change.exited {
+            self.dashboard
+                .editor()
+                .update(cx, |editor, _| editor.set_read_only(false));
+            window.focus(&self.dashboard.focus_handle(cx), cx);
             cx.defer(|cx| {
                 theme_settings::reset_buffer_font_size(cx);
                 theme_settings::reset_ui_font_size(cx);
@@ -104,10 +107,14 @@ impl Workspace {
     pub(super) fn phone_dashboard_pointer_down(
         &mut self,
         event: &MouseDownEvent,
-        _: &mut Window,
-        _: &mut Context<Self>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
     ) {
         self.phone.dashboard_press = (event.button == MouseButton::Left).then_some(event.position);
+        if !self.dashboard.raw_mode() {
+            let focus = self.phone.dashboard_focus.clone();
+            cx.defer_in(window, move |_, window, cx| window.focus(&focus, cx));
+        }
     }
 
     pub(super) fn phone_dashboard_pointer_up(
@@ -126,31 +133,22 @@ impl Workspace {
             return;
         }
         cx.defer_in(window, |this, window, cx| {
-            this.phone_dashboard_open_clicked_agent(window, cx);
+            this.phone_dashboard_activate_tapped_row(window, cx);
         });
     }
 
-    fn phone_dashboard_open_clicked_agent(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn phone_dashboard_activate_tapped_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use crate::dashboard::RowTarget;
         match self.dashboard.cursor_target(&self.registry, cx) {
             Some(RowTarget::Agent { agent_id, .. }) | Some(RowTarget::Reply(agent_id)) => {
                 self.open_agent(agent_id, window, cx);
             }
             Some(RowTarget::Topic {
-                host,
-                offset,
-                first_attention,
+                on_heading_line: true,
                 ..
             }) => {
-                if let Some(agent_id) = first_attention
-                    .or_else(|| self.dashboard.first_agent_for_topic((host, offset)))
-                {
-                    self.open_agent(agent_id, window, cx);
-                }
+                self.dashboard.toggle_subagents(cx);
+                self.refresh_dashboard(window, cx);
             }
             Some(RowTarget::Page(id)) => self.open_browser_page(id, window, cx),
             _ => {}
@@ -181,6 +179,11 @@ impl Workspace {
             return;
         }
 
+        if self.phone.stack.is_empty() && self.dashboard.raw_mode() {
+            self.phone_set_dashboard_browsing(true, window, cx);
+            return;
+        }
+
         self.phone.stack.pop();
         let next = loop {
             let Some((context, key)) = self.phone.stack.last().cloned() else {
@@ -197,7 +200,7 @@ impl Workspace {
             self.phone.stack.pop();
         };
         let Some((context, key)) = next else {
-            window.focus(&self.dashboard.focus_handle(cx), cx);
+            self.phone_set_dashboard_browsing(true, window, cx);
             cx.notify();
             return;
         };
@@ -232,16 +235,21 @@ impl Workspace {
                 .child(self.render_surface(&surface))
                 .into_any_element()
         } else {
+            let browsing = !self.dashboard.raw_mode();
             div()
                 .id("phone-dashboard")
                 .flex_1()
                 .min_h_0()
                 .w_full()
                 .overflow_hidden()
+                .track_focus(&self.phone.dashboard_focus)
                 // The editor consumes bubble-phase pointer events. Capture the
                 // gesture around it, then inspect its updated cursor.
-                .capture_any_mouse_down(cx.listener(Self::phone_dashboard_pointer_down))
-                .capture_any_mouse_up(cx.listener(Self::phone_dashboard_pointer_up))
+                .when(browsing, |dashboard| {
+                    dashboard
+                        .capture_any_mouse_down(cx.listener(Self::phone_dashboard_pointer_down))
+                        .capture_any_mouse_up(cx.listener(Self::phone_dashboard_pointer_up))
+                })
                 .child(self.render_rail(false, text_style, cx))
                 .into_any_element()
         }
@@ -277,7 +285,12 @@ impl Workspace {
             )
             .child(
                 item("phone-menu", "menu").on_click(cx.listener(|this, _, window, cx| {
-                    this.open_transient(crate::transient::root_menu(), window, cx);
+                    let menu = if this.phone.stack.is_empty() {
+                        crate::transient::phone_desk_menu(this.dashboard.raw_mode())
+                    } else {
+                        crate::transient::root_menu()
+                    };
+                    this.open_transient(menu, window, cx);
                 })),
             )
             .child(
@@ -291,11 +304,51 @@ impl Workspace {
     fn phone_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.minibuffer.is_some() {
             self.minibuffer_confirm(window, cx);
-        } else if self.phone.stack.is_empty() {
+        } else if self.phone.stack.is_empty() && self.dashboard.raw_mode() {
             self.dashboard_submit(window, cx);
-        } else {
+        } else if !self.phone.stack.is_empty() {
             self.submit_prompt(&crate::SubmitPrompt, window, cx);
         }
+    }
+
+    pub(crate) fn phone_cycle_dashboard_folds(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dashboard.cycle_global_folds(cx);
+        self.refresh_dashboard(window, cx);
+    }
+
+    pub(crate) fn phone_toggle_dashboard_editing(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let browsing = self.dashboard.raw_mode();
+        self.phone_set_dashboard_browsing(browsing, window, cx);
+    }
+
+    fn phone_set_dashboard_browsing(
+        &mut self,
+        browsing: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.dashboard.raw_mode() == browsing {
+            self.dashboard.toggle_raw_mode(cx);
+            self.refresh_dashboard(window, cx);
+        }
+        self.dashboard
+            .editor()
+            .update(cx, |editor, _| editor.set_read_only(browsing));
+        let focus = if browsing {
+            self.phone.dashboard_focus.clone()
+        } else {
+            self.dashboard.focus_handle(cx)
+        };
+        window.focus(&focus, cx);
+        cx.notify();
     }
 
     fn phone_transient_action(
@@ -470,13 +523,20 @@ impl Workspace {
 mod tests {
     use super::*;
 
-    #[test]
-    fn showing_an_existing_surface_brings_it_to_top_without_duplicates() {
-        let mut phone = PhoneUi::new();
-        phone.show(ContextId::Draft, SurfaceKey::Draft);
-        phone.show(ContextId::Draft, SurfaceKey::Draft);
+    #[gpui::test]
+    fn showing_an_existing_surface_brings_it_to_top_without_duplicates(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(|cx| {
+            let mut phone = PhoneUi::new(cx);
+            phone.show(ContextId::Draft, SurfaceKey::Draft);
+            phone.show(ContextId::Draft, SurfaceKey::Draft);
 
-        assert_eq!(phone.stack.len(), 1);
-        assert_eq!(phone.stack.last(), Some(&(ContextId::Draft, SurfaceKey::Draft)));
+            assert_eq!(phone.stack.len(), 1);
+            assert_eq!(
+                phone.stack.last(),
+                Some(&(ContextId::Draft, SurfaceKey::Draft))
+            );
+        });
     }
 }

@@ -842,7 +842,7 @@ impl Workspace {
             _event_task: event_task,
             _dashboard_subscription: dashboard_subscription,
             _universal_argument_subscription: universal_argument_subscription,
-            phone: phone::PhoneUi::new(),
+            phone: phone::PhoneUi::new(cx),
         };
         for spec in specs {
             this.attach_host(spec, cx);

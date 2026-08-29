@@ -704,6 +704,28 @@ pub fn root_menu() -> Transient {
         .item("q", "quit", |_, _, cx| cx.quit())
 }
 
+#[cfg(feature = "native")]
+pub fn phone_desk_menu(raw_mode: bool) -> Transient {
+    Transient::new("Desk")
+        .item("f", "Cycle folds", |workspace, window, cx| {
+            workspace.phone_cycle_dashboard_folds(window, cx);
+        })
+        .item(
+            "e",
+            if raw_mode {
+                "Done editing"
+            } else {
+                "Edit desk"
+            },
+            |workspace, window, cx| {
+                workspace.phone_toggle_dashboard_editing(window, cx);
+            },
+        )
+        .item("n", "New agent", |workspace, window, cx| {
+            workspace.enter_draft(None, window, cx);
+        })
+}
+
 fn browser_menu() -> Transient {
     Transient::new("browser").item("n", "new page", |workspace, window, cx| {
         workspace.cmd_browser(window, cx);
@@ -1716,6 +1738,20 @@ fn snooze_menu() -> Transient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "native")]
+    #[test]
+    fn phone_desk_menu_switches_editing_label() {
+        let browse = phone_desk_menu(false).phone_rows();
+        assert_eq!(
+            browse
+                .iter()
+                .map(|(_, description, _)| description.as_str())
+                .collect::<Vec<_>>(),
+            ["Cycle folds", "Edit desk", "New agent"]
+        );
+        assert_eq!(phone_desk_menu(true).phone_rows()[1].1, "Done editing");
+    }
 
     #[test]
     fn leader_keeps_usage_under_status_and_u_is_a_prefix() {

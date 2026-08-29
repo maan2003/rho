@@ -420,6 +420,10 @@ impl Dashboard {
         self.editor.read(cx).focus_handle(cx)
     }
 
+    pub fn raw_mode(&self) -> bool {
+        self.raw_mode
+    }
+
     #[cfg(feature = "native")]
     pub fn page_ids(&self) -> HashSet<rho_browser::PageId> {
         self.referenced_pages.clone()
