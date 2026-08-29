@@ -8496,35 +8496,51 @@ impl Element for EditorElement {
                         extended_right,
                     };
 
-                    snapshot = self.editor.update(cx, |editor, cx| {
-                        editor.last_bounds = Some(bounds);
-                        editor.gutter_dimensions = gutter_dimensions;
-                        editor.set_visible_line_count(
-                            (bounds.size.height / line_height) as f64,
-                            window,
-                            cx,
-                        );
-                        editor.set_visible_column_count(f64::from(editor_width / em_advance));
-
-                        if matches!(
-                            editor.mode,
-                            EditorMode::AutoHeight { .. } | EditorMode::Minimap { .. }
-                        ) {
-                            snapshot
-                        } else {
-                            let wrap_width = calculate_wrap_width(
-                                editor.soft_wrap_mode(cx),
-                                editor_width,
-                                em_layout_width,
+                    let (new_snapshot, defer_paint_until_rewrapped) =
+                        self.editor.update(cx, |editor, cx| {
+                            let is_initial_layout = editor.last_bounds.is_none();
+                            editor.last_bounds = Some(bounds);
+                            editor.gutter_dimensions = gutter_dimensions;
+                            editor.set_visible_line_count(
+                                (bounds.size.height / line_height) as f64,
+                                window,
+                                cx,
                             );
+                            editor.set_visible_column_count(f64::from(editor_width / em_advance));
 
-                            if editor.set_wrap_width(wrap_width, cx) {
-                                editor.snapshot(window, cx)
+                            if matches!(
+                                editor.mode,
+                                EditorMode::AutoHeight { .. } | EditorMode::Minimap { .. }
+                            ) {
+                                (snapshot, false)
                             } else {
-                                snapshot
+                                let wrap_width = calculate_wrap_width(
+                                    editor.soft_wrap_mode(cx),
+                                    editor_width,
+                                    em_layout_width,
+                                );
+
+                                if editor.defer_paint_until_initial_wrap
+                                    && !editor.display_map.read(cx).is_rewrapping(cx)
+                                {
+                                    editor.defer_paint_until_initial_wrap = false;
+                                }
+                                let snapshot = if editor.set_wrap_width(wrap_width, cx) {
+                                    editor.snapshot(window, cx)
+                                } else {
+                                    snapshot
+                                };
+                                let is_rewrapping =
+                                    editor.display_map.read(cx).is_rewrapping(cx);
+                                if is_initial_layout && is_rewrapping {
+                                    editor.defer_paint_until_initial_wrap = true;
+                                } else if !is_rewrapping {
+                                    editor.defer_paint_until_initial_wrap = false;
+                                }
+                                (snapshot, editor.defer_paint_until_initial_wrap)
                             }
-                        }
-                    });
+                        });
+                    snapshot = new_snapshot;
 
                     let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
                     let gutter_hitbox = window.insert_hitbox(
@@ -9937,6 +9953,7 @@ impl Element for EditorElement {
 
                     EditorLayout {
                         mode,
+                        defer_paint_until_rewrapped,
                         position_map,
                         visible_display_row_range: start_row..end_row,
                         wrap_guides,
@@ -10041,6 +10058,16 @@ impl Element for EditorElement {
             window.with_text_style(Some(text_style), |window| {
                 window.with_content_mask(Some(ContentMask { bounds }), |window| {
                     self.paint_mouse_listeners(layout, window, cx);
+
+                    // A newly laid-out editor can still have a wrap snapshot for its old width
+                    // after the bounded synchronous wait in WrapMap. Painting that snapshot makes
+                    // the text visibly reflow when the background rewrap finishes. Leave the
+                    // initial content blank instead; the wrap task notifies this editor when the
+                    // target-width snapshot is ready.
+                    if layout.defer_paint_until_rewrapped {
+                        self.paint_background(layout, window, cx);
+                        return;
+                    }
 
                     // Mask the editor behind sticky scroll headers. Important
                     // for transparent backgrounds.
@@ -10182,6 +10209,7 @@ impl IntoElement for EditorElement {
 
 pub struct EditorLayout {
     position_map: Rc<PositionMap>,
+    defer_paint_until_rewrapped: bool,
     hitbox: Hitbox,
     gutter_hitbox: Hitbox,
     content_origin: gpui::Point<Pixels>,
@@ -11587,6 +11615,54 @@ mod tests {
                 "Soft wrapped editor should have no horizontal scrolling!"
             );
         }
+    }
+
+    #[gpui::test]
+    async fn test_initial_paint_waits_for_large_soft_wrap(cx: &mut TestAppContext) {
+        init_test(cx, |_| {});
+        let window = cx.add_window(|window, cx| {
+            let text = "a long transcript line that needs to wrap at the editor width\n"
+                .repeat(20_000);
+            let buffer = MultiBuffer::build_simple(&text, cx);
+            let mut editor = Editor::new(EditorMode::full(), buffer, None, window, cx);
+            editor.set_soft_wrap_mode(language_settings::SoftWrap::EditorWidth, cx);
+            editor
+        });
+        let cx = &mut VisualTestContext::from_window(*window, cx);
+        let editor = window.root(cx).unwrap();
+        let style = cx.update(|_, cx| editor.update(cx, |editor, cx| editor.style(cx).clone()));
+
+        let (_, initial_state) = cx.draw(
+            Default::default(),
+            size(px(180.), px(500.)),
+            |_, _| EditorElement::new(&editor, style.clone()),
+        );
+        assert!(
+            initial_state.defer_paint_until_rewrapped,
+            "the initial frame must not paint the stale unwrapped snapshot"
+        );
+
+        let (_, second_pending_state) = cx.draw(
+            Default::default(),
+            size(px(180.), px(500.)),
+            |_, _| EditorElement::new(&editor, style.clone()),
+        );
+        assert!(
+            second_pending_state.defer_paint_until_rewrapped,
+            "redraws must remain blank until the initial rewrap finishes"
+        );
+
+        cx.run_until_parked();
+        let (_, resized_state) = cx.draw(
+            Default::default(),
+            size(px(220.), px(500.)),
+            |_, _| EditorElement::new(&editor, style),
+        );
+        assert!(
+            !resized_state.defer_paint_until_rewrapped,
+            "a later resize rewrap must not inherit initial-paint suppression"
+        );
+        assert!(resized_state.position_map.snapshot.max_point().row().0 > 20_000);
     }
 
     #[gpui::test]

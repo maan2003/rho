@@ -163,8 +163,7 @@ impl WrapMap {
         (handle, snapshot)
     }
 
-    #[cfg(test)]
-    pub fn is_rewrapping(&self) -> bool {
+    pub(crate) fn is_rewrapping(&self) -> bool {
         self.background_task.is_some()
     }
 

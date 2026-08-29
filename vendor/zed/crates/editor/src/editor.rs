@@ -1233,6 +1233,7 @@ pub struct Editor {
         >,
     >,
     last_bounds: Option<Bounds<Pixels>>,
+    defer_paint_until_initial_wrap: bool,
     last_position_map: Option<Rc<PositionMap>>,
     /// The right margin (vertical scrollbar + minimap width) the editor was
     /// last laid out with, updated on every prepaint.
@@ -2648,6 +2649,7 @@ impl Editor {
             gutter_hovered: false,
             pixel_position_of_newest_cursor: None,
             last_bounds: None,
+            defer_paint_until_initial_wrap: false,
             last_position_map: None,
             last_right_margin: Pixels::ZERO,
             last_horizontal_scrollbar_visible: false,
