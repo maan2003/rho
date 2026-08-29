@@ -6529,8 +6529,7 @@ impl Workspace {
                 gpui::relative(1.0)
             })
             .pl(px(24.))
-            .pr(px(24.))
-            .child(self.render_dashboard_header(text_style, cx));
+            .pr(px(24.));
         let dashboard = div()
             .id("dashboard-rail")
             .flex_grow(1.0)
@@ -6556,10 +6555,11 @@ impl Workspace {
     }
 
     /// The dashboard-only two-line masthead.
-    fn render_dashboard_header(
+    pub(crate) fn render_dashboard_header(
         &self,
         text_style: &gpui::TextStyle,
-        cx: &Context<Self>,
+        line_height: gpui::Pixels,
+        cx: &App,
     ) -> gpui::AnyElement {
         let colors = cx.theme().colors();
         let now = now_ms() as f64 / 1_000.0;
@@ -6607,8 +6607,8 @@ impl Workspace {
         }
         div()
             .w_full()
-            .h(px(60.))
-            .pb(px(20.))
+            .h(3. * line_height)
+            .pb(line_height)
             .flex()
             .items_center()
             .gap(px(10.))

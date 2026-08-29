@@ -13,10 +13,12 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
+use std::sync::Arc;
 
 use editor::scroll::Autoscroll;
 use editor::{
-    Editor, EditorMode, HighlightKey, Inlay, RowHighlightOptions, SelectionEffects, SizingBehavior,
+    Anchor, Editor, EditorMode, HighlightKey, Inlay, RowHighlightOptions, SelectionEffects,
+    SizingBehavior,
 };
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, Focusable as _, HighlightStyle, WeakEntity, Window};
@@ -340,6 +342,32 @@ impl Dashboard {
             // it is the whole point.
             editor.set_mouse_click_selection_enabled(true, cx);
             editor
+        });
+        let workspace = cx.entity().downgrade();
+        editor.update(cx, |editor, cx| {
+            editor.insert_blocks(
+                [editor::display_map::BlockProperties {
+                    placement: editor::display_map::BlockPlacement::Above(Anchor::Min),
+                    height: Some(3),
+                    style: editor::display_map::BlockStyle::Flex,
+                    render: Arc::new(move |block_context| {
+                        let text_style = block_context.editor_style.text.clone();
+                        workspace.upgrade().map_or_else(
+                            || gpui::Empty.into_any_element(),
+                            |workspace| {
+                                workspace.read(block_context).render_dashboard_header(
+                                    &text_style,
+                                    block_context.line_height,
+                                    block_context,
+                                )
+                            },
+                        )
+                    }),
+                    priority: 0,
+                }],
+                None,
+                cx,
+            );
         });
         Self {
             multi_buffer,

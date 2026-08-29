@@ -71,10 +71,7 @@ fn phone_entry_disables_modal_editing_app_wide(cx: &mut TestAppContext) {
         );
     });
 
-    cx.simulate_window_resize(
-        *workspace,
-        gpui::size(gpui::px(400.), gpui::px(800.)),
-    );
+    cx.simulate_window_resize(*workspace, gpui::size(gpui::px(400.), gpui::px(800.)));
     cx.update_window(*workspace, |_, window, cx| {
         window.simulate_next_frame(cx);
     })
@@ -591,6 +588,38 @@ fn has_custom_block(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext
             })
         })
         .expect("inspect custom blocks")
+}
+
+#[gpui::test]
+fn dashboard_masthead_is_a_scrolling_editor_block(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let editor = workspace.dashboard_editor();
+            editor.update(cx, |editor, cx| {
+                let snapshot = editor.snapshot(window, cx);
+                let mastheads = snapshot
+                    .blocks_in_range(DisplayRow(0)..DisplayRow(4))
+                    .filter_map(|(row, block)| match block {
+                        Block::Custom(block) => Some((row, block)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(mastheads.len(), 1);
+                assert_eq!(mastheads[0].0, DisplayRow(0));
+                assert_eq!(
+                    mastheads[0].1.placement,
+                    editor::display_map::BlockPlacement::Above(editor::Anchor::Min)
+                );
+                assert_eq!(mastheads[0].1.height, Some(3));
+                assert_eq!(
+                    mastheads[0].1.style(),
+                    editor::display_map::BlockStyle::Flex
+                );
+            });
+        })
+        .expect("inspect dashboard masthead block");
 }
 
 fn excerpt_boundary_count(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) -> usize {
