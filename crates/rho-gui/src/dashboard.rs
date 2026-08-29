@@ -2417,6 +2417,16 @@ impl Dashboard {
         true
     }
 
+    #[cfg(test)]
+    pub fn topic_folded_for_test(&self, host: HostId, offset: usize, cx: &App) -> bool {
+        let Some(text) = self.source_text(host, cx) else {
+            return false;
+        };
+        self.collapsed_ranges(&[(host, text)], cx)
+            .into_iter()
+            .any(|(_, owner, _)| owner == offset)
+    }
+
     /// `g t`: toggles the transient runtime tree for the staffed heading
     /// under the cursor, or closes the occurrence containing a portal row.
     pub fn toggle_agent_tree(&mut self, cx: &mut Context<Workspace>) -> bool {

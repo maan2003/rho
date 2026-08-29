@@ -333,7 +333,7 @@ fn phone_desk_agent_tap_opens_the_agent_surface(cx: &mut TestAppContext) {
         labels: Vec::new(),
     };
     let desk_text = format!(
-        "* Prelude\nbody shifts the filed row\n* Filed :eng-{}:\n",
+        "* Prelude\nbody shifts the filed row\n* Filed :eng-{}:\n* Tail\n",
         root_id.encoded()
     );
     let filed_offset = desk_text.find("* Filed").unwrap();
@@ -377,6 +377,7 @@ fn phone_desk_agent_tap_opens_the_agent_surface(cx: &mut TestAppContext) {
                 cx,
             );
             workspace.sync_dashboard(window, cx);
+            workspace.phone_ensure_topic_expanded_for_test(HostId::default(), 0, window, cx);
             workspace.phone_expand_filed_agent_for_test(
                 HostId::default(),
                 filed_offset,

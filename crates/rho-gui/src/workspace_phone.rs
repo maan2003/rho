@@ -20,7 +20,7 @@ pub(super) struct PhoneUi {
     pub(super) enabled: bool,
     forced: bool,
     stack: Vec<(ContextId, SurfaceKey)>,
-    dashboard_press: Option<Point<Pixels>>,
+    dashboard_press: Option<(Point<Pixels>, Option<crate::dashboard::RowTarget>)>,
     dashboard_focus: FocusHandle,
 }
 
@@ -123,7 +123,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.phone.dashboard_press = (event.button == MouseButton::Left).then_some(event.position);
+        self.phone.dashboard_press = (event.button == MouseButton::Left).then(|| {
+            (
+                event.position,
+                self.dashboard
+                    .target_at_window_position(event.position, &self.registry, cx),
+            )
+        });
         if !self.dashboard.raw_mode() {
             let focus = self.phone.dashboard_focus.clone();
             cx.defer_in(window, move |_, window, cx| window.focus(&focus, cx));
@@ -136,7 +142,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(start) = self.phone.dashboard_press.take() else {
+        let Some((start, target)) = self.phone.dashboard_press.take() else {
             return;
         };
         if event.button != MouseButton::Left
@@ -145,23 +151,19 @@ impl Workspace {
         {
             return;
         }
-        let position = event.position;
         cx.defer_in(window, move |this, window, cx| {
-            this.phone_dashboard_activate_tapped_row(position, window, cx);
+            this.phone_dashboard_activate_tapped_row(target, window, cx);
         });
     }
 
     fn phone_dashboard_activate_tapped_row(
         &mut self,
-        position: Point<Pixels>,
+        target: Option<crate::dashboard::RowTarget>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         use crate::dashboard::RowTarget;
-        match self
-            .dashboard
-            .target_at_window_position(position, &self.registry, cx)
-        {
+        match target {
             Some(RowTarget::Agent { agent_id, .. }) | Some(RowTarget::Reply(agent_id)) => {
                 self.open_agent(agent_id, window, cx);
             }
@@ -215,6 +217,20 @@ impl Workspace {
         self.dashboard.sync(&self.registry, window, cx);
         assert!(self.dashboard.toggle_agent_tree(cx));
         self.refresh_dashboard(window, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn phone_ensure_topic_expanded_for_test(
+        &mut self,
+        host: crate::registry::HostId,
+        offset: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.dashboard.topic_folded_for_test(host, offset, cx) {
+            assert!(self.dashboard.toggle_topic(host, offset, cx));
+            self.refresh_dashboard(window, cx);
+        }
     }
 
     #[cfg(test)]
