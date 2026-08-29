@@ -221,11 +221,13 @@ impl Workspace {
     pub(crate) fn phone_reconcile_filed_selection_for_test(
         &mut self,
         host: crate::registry::HostId,
-        offset: usize,
+        selection_offset: usize,
+        fold_offset: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.dashboard.cursor_to_doc(host, offset, cx);
+        self.dashboard.cursor_to_doc(host, selection_offset, cx);
+        assert!(self.dashboard.toggle_topic(host, fold_offset, cx));
         self.refresh_dashboard(window, cx);
     }
 

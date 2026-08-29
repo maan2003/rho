@@ -11597,17 +11597,24 @@ impl Editor {
     }
 
     /// Resolves a window-space pixel position against the editor's most
-    /// recently painted text layout without changing its selections.
-    pub fn display_point_for_window_position(
+    /// recently painted layout without changing its selections. The display
+    /// point and buffer location are both decoded with that retained snapshot,
+    /// so callers never combine stale geometry with the current display map.
+    pub fn buffer_location_for_window_position(
         &self,
         position: gpui::Point<Pixels>,
-    ) -> Option<DisplayPoint> {
+        bias: Bias,
+    ) -> Option<(Anchor, BufferId, usize)> {
         let position_map = self.last_position_map.as_ref()?;
-        position_map
-            .text_hitbox
-            .bounds
-            .contains(&position)
-            .then(|| position_map.point_for_position(position).nearest_valid)
+        if !position_map.text_hitbox.bounds.contains(&position) {
+            return None;
+        }
+        let display_point = position_map.point_for_position(position).nearest_valid;
+        let snapshot = &position_map.snapshot;
+        let anchor = snapshot.display_point_to_anchor(display_point, bias);
+        let point = display_point.to_point(snapshot);
+        let (buffer, offset) = snapshot.buffer_snapshot().point_to_buffer_offset(point)?;
+        Some((anchor, buffer.remote_id(), offset.0))
     }
 
     /// Returns the window-space pixel position of a visible display point.

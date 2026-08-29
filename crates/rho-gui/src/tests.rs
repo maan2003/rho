@@ -332,7 +332,11 @@ fn phone_desk_agent_tap_opens_the_agent_surface(cx: &mut TestAppContext) {
         turn_report: None,
         labels: Vec::new(),
     };
-    let desk_text = format!("* Filed :eng-{}:\n", root_id.encoded());
+    let desk_text = format!(
+        "* Prelude\nbody shifts the filed row\n* Filed :eng-{}:\n",
+        root_id.encoded()
+    );
+    let filed_offset = desk_text.find("* Filed").unwrap();
     let mut source =
         text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
     let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text.as_str())]));
@@ -373,7 +377,12 @@ fn phone_desk_agent_tap_opens_the_agent_surface(cx: &mut TestAppContext) {
                 cx,
             );
             workspace.sync_dashboard(window, cx);
-            workspace.phone_expand_filed_agent_for_test(HostId::default(), 0, window, cx);
+            workspace.phone_expand_filed_agent_for_test(
+                HostId::default(),
+                filed_offset,
+                window,
+                cx,
+            );
         })
         .expect("file agent in Desk");
     feed_frame(
@@ -416,9 +425,16 @@ fn phone_desk_agent_tap_opens_the_agent_surface(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, window, cx| {
             // A filed portal is spliced at a document boundary. Reconciliation
-            // may restore the selection to that owning heading between the
-            // press and release; activation must still use the tapped pixels.
-            workspace.phone_reconcile_filed_selection_for_test(HostId::default(), 0, window, cx);
+            // may restore the selection to that owning heading and change the
+            // display rows between press and release. Activation must decode
+            // the tapped pixels with the snapshot that painted them.
+            workspace.phone_reconcile_filed_selection_for_test(
+                HostId::default(),
+                filed_offset,
+                0,
+                window,
+                cx,
+            );
         })
         .expect("reconcile filed row selection");
     cx.update_window((*workspace).into(), |_, window, cx| {

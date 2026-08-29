@@ -1731,15 +1731,10 @@ impl Dashboard {
         registry: &AgentRegistry,
         cx: &mut Context<Workspace>,
     ) -> Option<RowTarget> {
-        let place = self.editor.update(cx, |editor, cx| {
-            let display_point = editor.display_point_for_window_position(position)?;
-            let snapshot = editor.display_snapshot(cx);
-            let anchor = snapshot.display_point_to_anchor(display_point, Bias::Left);
-            let point = display_point.to_point(&snapshot);
-            let buffer_snapshot = snapshot.buffer_snapshot();
-            let (buffer, offset) = buffer_snapshot.point_to_buffer_offset(point)?;
-            Some((anchor, buffer.remote_id(), offset.0))
-        })?;
+        let place = self
+            .editor
+            .read(cx)
+            .buffer_location_for_window_position(position, Bias::Left)?;
         let place = self.place_for_anchor(place.0, place.1, place.2, cx)?;
         self.target_for_place(place, registry, cx)
     }
