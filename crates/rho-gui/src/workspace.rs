@@ -6530,8 +6530,9 @@ impl Workspace {
             } else {
                 gpui::relative(1.0)
             })
-            .pl(px(24.))
-            .pr(px(24.));
+            // The desktop gutter wastes too much of a phone's width.
+            .pl(px(if self.phone.enabled { 6. } else { 24. }))
+            .pr(px(if self.phone.enabled { 6. } else { 24. }));
         let dashboard = div()
             .id("dashboard-rail")
             .flex_grow(1.0)
