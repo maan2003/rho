@@ -37,10 +37,14 @@ impl PhoneUi {
         }
     }
 
-    pub(super) fn update_mode(&mut self, window: &Window) -> (bool, bool) {
+    pub(super) fn update_mode(&mut self, window: &Window) -> PhoneModeChange {
         let was_enabled = self.enabled;
         self.enabled = self.forced || window.viewport_size().width <= PHONE_MAX_WIDTH;
-        (self.enabled, self.enabled && !was_enabled)
+        PhoneModeChange {
+            enabled: self.enabled,
+            entered: self.enabled && !was_enabled,
+            exited: was_enabled && !self.enabled,
+        }
     }
 
     pub(super) fn show(&mut self, context: ContextId, key: SurfaceKey) {
@@ -63,18 +67,50 @@ impl PhoneUi {
     }
 }
 
+pub(super) struct PhoneModeChange {
+    pub(super) enabled: bool,
+    entered: bool,
+    exited: bool,
+}
+
+/// Touch keyboards deliver text through the IME commit path, so modal
+/// editing has nothing to key off; the phone runs plain insert-only
+/// editors. Restored on exit so a desktop window narrowed for a moment
+/// does not lose Helix.
+fn set_modal_editing(enabled: bool, cx: &mut gpui::App) {
+    let settings = cx.global_mut::<settings::SettingsStore>();
+    settings.override_global(vim_mode_setting::VimModeSetting(false));
+    settings.override_global(vim_mode_setting::HelixModeSetting(enabled));
+}
+
+const PHONE_FONT_SCALE: f32 = 1.25;
+
 impl Workspace {
     pub(super) fn phone_mode(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let (enabled, entered) = self.phone.update_mode(window);
-        if entered {
+        let change = self.phone.update_mode(window);
+        if change.entered {
             self.phone.stack.clear();
             window.focus(&self.dashboard.focus_handle(cx), cx);
+            // Deferred: adjusting fonts and settings notifies observers,
+            // which must not reenter the draw that detected the transition.
+            cx.defer(|cx| {
+                theme_settings::adjust_buffer_font_size(cx, |size| size * PHONE_FONT_SCALE);
+                theme_settings::adjust_ui_font_size(cx, |size| size * PHONE_FONT_SCALE);
+                set_modal_editing(false, cx);
+            });
         }
-        enabled
+        if change.exited {
+            cx.defer(|cx| {
+                theme_settings::reset_buffer_font_size(cx);
+                theme_settings::reset_ui_font_size(cx);
+                set_modal_editing(true, cx);
+            });
+        }
+        change.enabled
     }
 
     pub(super) fn phone_dashboard_pointer_down(
