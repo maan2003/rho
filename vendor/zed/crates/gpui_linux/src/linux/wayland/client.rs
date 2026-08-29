@@ -2136,6 +2136,13 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
             } => {
                 let focused_window = state.keyboard_focused_window.clone();
 
+                // Compositors can deliver modifiers before any keymap when
+                // keyboards hotplug (observed on phoc with a YubiKey OTP
+                // keyboard present); there is no state to update yet.
+                if state.keymap_state.is_none() {
+                    log::warn!("ignoring wl_keyboard modifiers event before keymap");
+                    return;
+                }
                 let keymap_state = state.keymap_state.as_mut().unwrap();
                 let old_layout =
                     keymap_state.serialize_layout(xkbcommon::xkb::STATE_LAYOUT_EFFECTIVE);
@@ -2181,7 +2188,10 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 focused_window.handle_input(physical);
                 state = client.borrow_mut();
 
-                let keymap_state = state.keymap_state.as_ref().unwrap();
+                let Some(keymap_state) = state.keymap_state.as_ref() else {
+                    log::warn!("ignoring wl_keyboard key event before keymap");
+                    return;
+                };
                 let keycode = Keycode::from(key + MIN_KEYCODE);
                 let keysym = keymap_state.key_get_one_sym(keycode);
 
