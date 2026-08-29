@@ -175,7 +175,12 @@ pub fn record_extension_frame_stats(stats: ExtensionFrameStats) {
 
 /// Returns a non-destructive copy of the bounded extension frame-stats ring.
 pub fn snapshot_extension_frame_stats() -> Vec<ExtensionFrameStats> {
-    EXTENSION_FRAME_STATS.lock().unwrap().iter().copied().collect()
+    EXTENSION_FRAME_STATS
+        .lock()
+        .unwrap()
+        .iter()
+        .copied()
+        .collect()
 }
 
 #[derive(Clone, Debug)]
@@ -1944,13 +1949,19 @@ impl<K: BrowserPageKey> XdgShellHandler for State<K> {
     // instead: replying before the client's initial commit would make this
     // the initial configure, with no size and no Activated state.
     fn maximize_request(&mut self, surface: ToplevelSurface) {
-        if self.surface_windows.contains_key(&surface.wl_surface().id()) {
+        if self
+            .surface_windows
+            .contains_key(&surface.wl_surface().id())
+        {
             let _ = surface.send_configure();
         }
     }
 
     fn unmaximize_request(&mut self, surface: ToplevelSurface) {
-        if self.surface_windows.contains_key(&surface.wl_surface().id()) {
+        if self
+            .surface_windows
+            .contains_key(&surface.wl_surface().id())
+        {
             let _ = surface.send_configure();
         }
     }
@@ -3509,13 +3520,7 @@ fn send_frame_callbacks(
         .collect::<Vec<_>>();
     for scene_id in completed {
         let callbacks = window.dma_frame_callbacks.remove(&scene_id).unwrap();
-        record_browser_timing(
-            kind,
-            scene_id,
-            0,
-            Some(commit_id),
-            None,
-        );
+        record_browser_timing(kind, scene_id, 0, Some(commit_id), None);
         for callback in callbacks {
             callback.done(time);
         }

@@ -3662,11 +3662,7 @@ fn heading_tags_file_agents_and_conceal_in_display(cx: &mut TestAppContext) {
         .expect("read dashboard");
     assert_eq!(
         buffer_text,
-        format!(
-            "* One :eng-{}:\nbody\n* Two\n\nUnfiled · 1\n  · drifter  eng-{}",
-            agent(1).encoded(),
-            &agent(2).encoded()[..4],
-        ),
+        format!("* One :eng-{}:\nbody\n* Two\n", agent(1).encoded()),
         "tagged agent should file under its heading, tag intact in the buffer"
     );
 
@@ -3951,6 +3947,7 @@ fn tab_cycles_folds_on_a_staffed_heading(cx: &mut TestAppContext) {
                 cx,
             );
             workspace.sync_dashboard(window, cx);
+            workspace.dashboard_cycle_fold_for_test(HostId::default(), 0, window, cx);
             let focus_handle = workspace.dashboard_editor().read(cx).focus_handle(cx);
             window.focus(&focus_handle, cx);
             workspace.dashboard_editor().update(cx, |editor, cx| {
@@ -4158,6 +4155,9 @@ fn collapsed_subtree_folds_in_the_display_and_survives_edits(cx: &mut TestAppCon
                 cx,
             );
             workspace.sync_dashboard(window, cx);
+            // Startup visibility is CHILDREN for this tree; open it so this
+            // test can exercise the complete expanded → folded cycle.
+            workspace.dashboard_cycle_fold_for_test(HostId::default(), 0, window, cx);
         })
         .expect("update workspace");
     cx.run_until_parked();
@@ -4238,6 +4238,88 @@ fn collapsed_subtree_folds_in_the_display_and_survives_edits(cx: &mut TestAppCon
 }
 
 #[gpui::test]
+fn desk_seeds_two_level_and_archive_folds_only_once(cx: &mut TestAppContext) {
+    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
+
+    let desk_text = "* Active\nintro\n** Project\nproject body\n*** Detail\ndetail body\n* Archive :archive:\narchived body\n** Old\nold body\n";
+    let archive_offset = desk_text.find("* Archive").unwrap();
+    let mut source =
+        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
+    let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text)]));
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskSnapshot {
+                    snapshot: DeskSnapshot {
+                        text: source.snapshot().text(),
+                        operations: vec![operation],
+                        transactions: Vec::new(),
+                        replicas: Vec::new(),
+                    },
+                    replica_id: 42,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+        })
+        .expect("seed initial Desk folds");
+    cx.run_until_parked();
+
+    let display = |cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |workspace, _, cx| {
+                workspace
+                    .dashboard_editor()
+                    .update(cx, |editor, cx| editor.display_text(cx))
+            })
+            .expect("read Desk display")
+    };
+    let initial = display(cx);
+    assert!(initial.contains("Active"), "initial: {initial:?}");
+    assert!(initial.contains("Project"), "initial: {initial:?}");
+    assert!(initial.contains("Archive"), "initial: {initial:?}");
+    assert!(!initial.contains("intro"), "initial: {initial:?}");
+    assert!(!initial.contains("project body"), "initial: {initial:?}");
+    assert!(!initial.contains("Detail"), "initial: {initial:?}");
+    assert!(
+        !initial.contains("Old"),
+        "archive must start folded: {initial:?}"
+    );
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            // FOLDED → CHILDREN → fully open.
+            workspace.dashboard_cycle_fold_for_test(HostId::default(), archive_offset, window, cx);
+            workspace.dashboard_cycle_fold_for_test(HostId::default(), archive_offset, window, cx);
+        })
+        .expect("open archive zone");
+    cx.run_until_parked();
+    assert!(display(cx).contains("old body"), "archive should be open");
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let buffer = workspace
+                .desk_buffer_for_test(HostId::default())
+                .expect("Desk buffer");
+            let end = buffer.read(cx).len();
+            buffer.update(cx, |buffer, cx| {
+                buffer.edit([(end..end, "* Later\n")], None, cx);
+            });
+            workspace.sync_dashboard(window, cx);
+        })
+        .expect("sync a later Desk edit");
+    cx.run_until_parked();
+    let resynced = display(cx);
+    assert!(
+        resynced.contains("old body"),
+        "a later sync must not re-fold an archive the user opened: {resynced:?}"
+    );
+}
+
+#[gpui::test]
 fn vim_treats_a_collapsed_subtree_as_one_line(cx: &mut TestAppContext) {
     use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
 
@@ -4264,6 +4346,9 @@ fn vim_treats_a_collapsed_subtree_as_one_line(cx: &mut TestAppContext) {
                 cx,
             );
             workspace.sync_dashboard(window, cx);
+            // Startup folds the level-one body. Open it before testing the
+            // editor behavior of an explicitly collapsed subtree.
+            workspace.dashboard_cycle_fold_for_test(HostId::default(), 0, window, cx);
             workspace.dashboard_cycle_fold_for_test(HostId::default(), 0, window, cx);
 
             let editor = workspace.dashboard_editor();
@@ -4367,7 +4452,7 @@ fn vim_treats_a_collapsed_subtree_as_one_line(cx: &mut TestAppContext) {
 }
 
 /// The home view: bound agents stay in compact heading hints until `g t`
-/// projects their runtime tree; unbound roots live in the Unfiled tail.
+/// projects their runtime tree; unbound roots do not appear on the Desk.
 #[gpui::test]
 fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
     use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
@@ -4438,6 +4523,7 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
                 cx,
             );
             workspace.sync_dashboard(window, cx);
+            workspace.dashboard_cycle_fold_for_test(HostId::default(), 0, window, cx);
             let focus_handle = workspace.dashboard_editor().read(cx).focus_handle(cx);
             window.focus(&focus_handle, cx);
             workspace.dashboard_editor().update(cx, |editor, cx| {
@@ -4461,11 +4547,7 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
     // The tagged agent starts as only a compact heading hint.
     assert_eq!(
         dashboard_text(&workspace, cx),
-        format!(
-            "* One :eng-{}:\nbody\n* Two\n\nUnfiled · 1\n  · drifter  eng-{}",
-            agent(1).encoded(),
-            &agent(2).encoded()[..4],
-        )
+        format!("* One :eng-{}:\nbody\n* Two\n", agent(1).encoded())
     );
     let hints = workspace
         .update(cx, |workspace, _, cx| {
@@ -4479,10 +4561,9 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
     assert_eq!(
         dashboard_text(&workspace, cx),
         format!(
-            "* One :eng-{}:\n  · planner  eng-{}\nbody\n* Two\n\nUnfiled · 1\n  · drifter  eng-{}",
+            "* One :eng-{}:\n  · planner  eng-{}\nbody\n* Two\n",
             agent(1).encoded(),
             &agent(1).encoded()[..4],
-            &agent(2).encoded()[..4],
         ),
         "g t should explicitly project the runtime tree"
     );
@@ -4497,11 +4578,7 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(
         dashboard_text(&workspace, cx),
-        format!(
-            "* One :eng-{}:\nbody\n* Two\n\nUnfiled · 1\n  · drifter  eng-{}",
-            agent(1).encoded(),
-            &agent(2).encoded()[..4],
-        ),
+        format!("* One :eng-{}:\nbody\n* Two\n", agent(1).encoded()),
         "a second g t should return to the compact hint-only view"
     );
     let hints = workspace
@@ -4511,8 +4588,8 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
         .expect("read collapsed hints");
     assert_eq!(hints, 1, "closing the portal restores its compact hint");
 
-    // Deleting the tag from the text is the unbind: rows rearrange and
-    // both agents fall back to Unfiled.
+    // Deleting the tag from the text is the unbind: neither agent remains
+    // visible on the Desk.
     workspace
         .update(cx, |workspace, window, cx| {
             let buffer = workspace.desk_buffer_for_test(HostId::default()).unwrap();
@@ -4525,14 +4602,7 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
         })
         .expect("update workspace");
     cx.run_until_parked();
-    assert_eq!(
-        dashboard_text(&workspace, cx),
-        format!(
-            "* One\nbody\n* Two\n\nUnfiled · 2\n  · drifter  eng-{}\n  · planner  eng-{}",
-            &agent(2).encoded()[..4],
-            &agent(1).encoded()[..4],
-        )
-    );
+    assert_eq!(dashboard_text(&workspace, cx), "* One\nbody\n* Two\n");
 }
 
 /// Insert-mode enter in desk document text is a newline — the submit
@@ -5363,6 +5433,12 @@ fn desk_deal_scrolls_a_deep_heading_below_its_sticky_ancestors(cx: &mut TestAppC
             );
             workspace.sync_dashboard(window, cx);
             window.focus(&workspace.dashboard_editor().read(cx).focus_handle(cx), cx);
+        })
+        .unwrap();
+    cx.update(|cx| cx.refresh_windows());
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
             workspace.toggle_dashboard_deal(window, cx);
         })
         .unwrap();
@@ -5466,6 +5542,12 @@ fn desk_deal_reply_draft_is_writable_while_desk_source_stays_read_only(cx: &mut 
             );
             workspace.sync_dashboard(window, cx);
             window.focus(&workspace.dashboard_editor().read(cx).focus_handle(cx), cx);
+        })
+        .unwrap();
+    cx.update(|cx| cx.refresh_windows());
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
             workspace.toggle_dashboard_deal(window, cx);
         })
         .unwrap();
@@ -6145,6 +6227,7 @@ fn hjkl_travel_never_opens_a_fold(cx: &mut TestAppContext) {
                 cx,
             );
             workspace.sync_dashboard(window, cx);
+            workspace.dashboard_cycle_fold_for_test(HostId::default(), 0, window, cx);
             let focus_handle = workspace.dashboard_editor().read(cx).focus_handle(cx);
             window.focus(&focus_handle, cx);
             workspace.dashboard_editor().update(cx, |editor, cx| {
@@ -6261,6 +6344,7 @@ fn helix_append_on_a_folded_heading_lands_at_the_title(cx: &mut TestAppContext) 
                 cx,
             );
             workspace.sync_dashboard(window, cx);
+            workspace.dashboard_cycle_fold_for_test(HostId::default(), 0, window, cx);
             let focus_handle = workspace.dashboard_editor().read(cx).focus_handle(cx);
             window.focus(&focus_handle, cx);
             workspace.dashboard_editor().update(cx, |editor, cx| {

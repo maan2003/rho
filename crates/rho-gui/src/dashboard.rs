@@ -124,7 +124,6 @@ struct DealSession {
 }
 
 struct ListingVisibility<'a> {
-    collapsed_unfiled: &'a HashSet<HostId>,
     expanded_portals: &'a HashSet<AgentOccurrence>,
     raw: bool,
 }
@@ -146,11 +145,8 @@ enum LineKey {
         agent_id: AgentId,
         occurrence: AgentOccurrence,
     },
-    Unfiled(HostId),
     Reply(AgentId),
     NewDraft(Option<(HostId, usize)>),
-    /// An empty line separating listing regions.
-    Spacer(HostId),
 }
 
 /// One place an agent's shared runtime row is projected. The occurrence is
@@ -160,10 +156,6 @@ enum AgentOccurrence {
     Filed {
         host: HostId,
         heading: u64,
-        portal: AgentId,
-    },
-    Unfiled {
-        host: HostId,
         portal: AgentId,
     },
 }
@@ -279,10 +271,11 @@ pub struct Dashboard {
     /// operations — cycling, archiving — like org recomputes on cycle;
     /// a range whose start no longer sits on a heading line is dropped.
     collapsed: HashMap<HostId, Vec<(text::Anchor, text::Anchor)>>,
+    /// Hosts whose initial Desk visibility has already been seeded.
+    /// User-opened folds must survive every later document sync.
+    seeded_folds: HashSet<HostId>,
     /// Next S-TAB target in org's OVERVIEW → CONTENTS → SHOW ALL cycle.
     global_cycle: u8,
-    /// Hosts whose Unfiled tail is folded behind its header.
-    collapsed_unfiled: HashSet<HostId>,
     /// Shows only literal editable Desk source, with no generated UI.
     raw_mode: bool,
     deal_active: bool,
@@ -369,8 +362,8 @@ impl Dashboard {
             reply_subscriptions: HashMap::new(),
             new_draft: None,
             collapsed: HashMap::new(),
+            seeded_folds: HashSet::new(),
             global_cycle: 0,
-            collapsed_unfiled: HashSet::new(),
             raw_mode: false,
             deal_active: false,
             deal: None,
@@ -446,6 +439,21 @@ impl Dashboard {
         source: WeakEntity<Buffer>,
         cx: &mut Context<Workspace>,
     ) {
+        let replacement_fold_ranges = self
+            .hosts
+            .get(&host)
+            .and_then(WeakEntity::upgrade)
+            .zip(source.upgrade())
+            .filter(|(old, new)| old.read(cx).remote_id() != new.read(cx).remote_id())
+            .and_then(|(old, _)| {
+                let snapshot = old.read(cx).text_snapshot();
+                self.collapsed.get(&host).map(|pairs| {
+                    pairs
+                        .iter()
+                        .map(|(start, end)| start.to_offset(&snapshot)..end.to_offset(&snapshot))
+                        .collect::<Vec<_>>()
+                })
+            });
         if let Some(source) = source.upgrade() {
             if self.deal_active {
                 source.update(cx, |buffer, cx| buffer.set_capability(Capability::Read, cx));
@@ -471,6 +479,17 @@ impl Dashboard {
             }
         }
         self.hosts.insert(host, source);
+        if let Some(ranges) = replacement_fold_ranges {
+            let max = self.source_text(host, cx).map_or(0, |text| text.len());
+            let ranges = ranges
+                .into_iter()
+                .map(|range| range.start.min(max)..range.end.min(max))
+                .collect::<Vec<_>>();
+            // Anchors belong to a concrete buffer. A reconnect may replace
+            // that buffer, so carry the user's fold set across by offset.
+            self.collapsed.remove(&host);
+            self.store_fold_ranges(host, &ranges, cx);
+        }
     }
 
     fn source_text(&self, host: HostId, cx: &App) -> Option<String> {
@@ -608,18 +627,9 @@ impl Dashboard {
         }
         if self.deal_active
             && let Some(card) = self.current_deal_card()
+            && let Some(offset) = card.heading_offset
         {
-            if let Some(offset) = card.heading_offset {
-                self.pending_doc_cursor = Some((card.host, offset));
-            } else if let Some(agent_id) = card.agent_id {
-                self.pending_cursor = Some(LineKey::Agent {
-                    agent_id,
-                    occurrence: AgentOccurrence::Unfiled {
-                        host: card.host,
-                        portal: agent_id,
-                    },
-                });
-            }
+            self.pending_doc_cursor = Some((card.host, offset));
         }
         self.last_synced = None;
     }
@@ -653,18 +663,10 @@ impl Dashboard {
             return true;
         }
         self.refresh_current_deal_offset(cx);
-        if let Some(card) = self.current_deal_card() {
-            if let Some(offset) = card.heading_offset {
-                self.pending_doc_cursor = Some((card.host, offset));
-            } else if let Some(agent_id) = card.agent_id {
-                self.pending_cursor = Some(LineKey::Agent {
-                    agent_id,
-                    occurrence: AgentOccurrence::Unfiled {
-                        host: card.host,
-                        portal: agent_id,
-                    },
-                });
-            }
+        if let Some(card) = self.current_deal_card()
+            && let Some(offset) = card.heading_offset
+        {
+            self.pending_doc_cursor = Some((card.host, offset));
         }
         self.last_synced = None;
         true
@@ -1228,6 +1230,11 @@ impl Dashboard {
             self.buffers.remove(&LineKey::NewDraft(topic));
         }
 
+        for (host, text) in &documents {
+            if self.seeded_folds.insert(*host) {
+                self.store_fold_ranges(*host, &initial_fold_ranges(text), cx);
+            }
+        }
         let draft_topic = self.new_draft.as_ref().map(|(topic, _, _)| *topic);
         let collapsed = self.collapsed_ranges(&documents, cx);
         let fold_ranges = if self.raw_mode || self.deal_active {
@@ -1235,13 +1242,16 @@ impl Dashboard {
         } else {
             self.effective_fold_ranges(&documents, &collapsed, cx)
         };
+        let folds_changed = self
+            .last_synced
+            .as_ref()
+            .is_none_or(|(_, _, _, _, previous, _)| previous != &fold_ranges);
         let segments = generate(
             registry,
             &documents,
             &filed,
             &fold_ranges,
             ListingVisibility {
-                collapsed_unfiled: &self.collapsed_unfiled,
                 expanded_portals: &self.expanded_portals,
                 raw: self.raw_mode,
             },
@@ -1546,12 +1556,24 @@ impl Dashboard {
         });
 
         self.apply_highlights(&segments, &documents, cx);
-        self.apply_reply_chrome(registry, cx);
+        // Reconcile structural folds before adding display inlays. A single
+        // transition can both restore startup folds (leaving Deal) and splice
+        // a reply row; inlays must observe the resulting wrap map.
+        self.apply_subtree_folds(&fold_ranges, cx);
+        self.apply_reply_chrome(registry, !folds_changed || fold_ranges.is_empty(), cx);
         self.apply_heading_chrome(&decorations, &fold_ranges, cx);
         self.apply_tag_conceals(&conceals, cx);
-        self.apply_subtree_folds(&fold_ranges, cx);
         self.apply_sticky_headings(&documents, &segments, cx);
         self.apply_deal_highlight(&documents, &segments, cx);
+        if self.deal_active
+            && let Some((host, offset)) = pending_doc
+        {
+            // Entering Deal clears presentation folds. Reapply its cursor
+            // scroll after the display map has observed that transition;
+            // scrolling against the previous folded map targets the wrong
+            // visual row for a deep card.
+            self.move_cursor_to_doc(host, offset, window, cx);
+        }
         self.nudge_caret_off_folds(window, cx);
         self.last_synced = Some((
             documents,
@@ -2268,13 +2290,6 @@ impl Dashboard {
     /// Org-style visibility cycling on the heading under the cursor.
     pub fn toggle_subagents(&mut self, cx: &mut Context<Workspace>) -> bool {
         let cursor_place = self.cursor_place(cx);
-        if let Some(CursorPlace::Row(LineKey::Unfiled(host))) = cursor_place.clone() {
-            if !self.collapsed_unfiled.remove(&host) {
-                self.collapsed_unfiled.insert(host);
-            }
-            cx.notify();
-            return true;
-        }
         let Some((host, offset)) = self.cursor_topic(cx) else {
             return false;
         };
@@ -2393,14 +2408,6 @@ impl Dashboard {
         }
         cx.notify();
         true
-    }
-
-    /// Whether the cursor sits on a host's Unfiled header row.
-    pub fn cursor_on_unfiled_header(&self, cx: &mut Context<Workspace>) -> bool {
-        matches!(
-            self.cursor_place(cx),
-            Some(CursorPlace::Row(LineKey::Unfiled(_)))
-        )
     }
 
     pub fn heading_candidates(
@@ -2675,7 +2682,12 @@ impl Dashboard {
 
     /// Reply-draft chrome: an accent gutter stripe plus a placeholder
     /// inlay naming the addressee while the draft is empty.
-    fn apply_reply_chrome(&mut self, registry: &AgentRegistry, cx: &mut Context<Workspace>) {
+    fn apply_reply_chrome(
+        &mut self,
+        registry: &AgentRegistry,
+        show_placeholders: bool,
+        cx: &mut Context<Workspace>,
+    ) {
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
         let to_remove = std::mem::take(&mut self.placeholder_ids);
         let mut inlays = Vec::new();
@@ -2726,7 +2738,7 @@ impl Dashboard {
             // Draft text wears the user-message accent, same as typed
             // prompts everywhere else in rho.
             draft_text_ranges.push(start..end);
-            if buffer.is_empty() {
+            if buffer.is_empty() && show_placeholders {
                 // Right-biased like the transcript's prompt placeholder, so
                 // the cursor renders before the hint, not after it.
                 let Some(position) = snapshot.anchor_in_excerpt(buffer_snapshot.anchor_after(0))
@@ -3677,6 +3689,33 @@ fn body_fold_range(text: &str, headings: &[DeskHeading], index: usize) -> Option
     (end > heading.heading_range.end).then_some(heading.heading_range.end..end)
 }
 
+/// Initial Desk visibility: level-one and level-two heading lines remain
+/// visible, while level-one bodies, level-two subtrees, and archive zones are
+/// folded. This is seeded once per host; it is not a policy reapplied on sync.
+fn initial_fold_ranges(text: &str) -> Vec<Range<usize>> {
+    let headings = parse(text);
+    let mut ranges = Vec::new();
+    for (index, heading) in headings.iter().enumerate() {
+        let range = match heading.depth {
+            1 => body_fold_range(text, &headings, index),
+            2 => subtree_fold_range(text, heading),
+            _ => None,
+        };
+        if let Some(range) = range
+            && !ranges.contains(&range)
+        {
+            ranges.push(range);
+        }
+        if heading.tags.iter().any(|tag| tag == ARCHIVE_TAG)
+            && let Some(range) = subtree_fold_range(text, heading)
+            && !ranges.contains(&range)
+        {
+            ranges.push(range);
+        }
+    }
+    ranges
+}
+
 /// One step of org's TAB cycle for the heading at `offset`: FOLDED →
 /// CHILDREN (the body and every child's subtree hidden, so only the
 /// child heading lines show) → SUBTREE (everything visible) → FOLDED.
@@ -4275,7 +4314,6 @@ fn generate(
     let mut emitted_replies = HashSet::new();
     let empty = Vec::new();
     let ListingVisibility {
-        collapsed_unfiled,
         expanded_portals,
         raw,
     } = visibility;
@@ -4441,75 +4479,6 @@ fn generate(
         }
     }
 
-    let filed_roots = filed
-        .values()
-        .flatten()
-        .map(|agent_id| root_agent(registry, *agent_id))
-        .collect::<HashSet<AgentId>>();
-    for (host, _) in documents {
-        let unfiled = sorted_agents(
-            registry,
-            registry
-                .known_agents()
-                .copied()
-                .filter(|agent_id| registry.host_of_agent(*agent_id) == Some(*host))
-                .filter(|agent_id| registry.agent_parent(*agent_id).is_none())
-                .filter(|agent_id| !registry.agent_hidden(*agent_id))
-                .filter(|agent_id| !filed_roots.contains(agent_id)),
-        );
-        if unfiled.is_empty() {
-            continue;
-        }
-        let folded = collapsed_unfiled.contains(host);
-        segments.push(Segment::Line(Line::new(
-            LineKey::Spacer(*host),
-            RowTarget::None,
-        )));
-        let mut header = Line::new(LineKey::Unfiled(*host), RowTarget::None);
-        header.span(Some(DashClass::Heading), |line| {
-            line.push_str("Unfiled");
-            if multiple_hosts {
-                line.push_str(" · ");
-                line.push_str(registry.host_name(*host));
-            }
-        });
-        header.span(Some(DashClass::Muted), |line| {
-            line.push_str(&format!(" · {}", unfiled.len()));
-        });
-        if folded {
-            // The fold indicator turns into a lamp when something
-            // folded away wants attention.
-            let loudest = unfiled
-                .iter()
-                .map(|agent_id| registry.attention(*agent_id))
-                .max()
-                .unwrap_or(UiAttention::Quiet);
-            header.span(Some(DashClass::Muted), |line| {
-                if loudest > UiAttention::Quiet {
-                    line.push(' ');
-                    line.push_str(attention_glyph(loudest));
-                } else {
-                    line.push_str(" …");
-                }
-            });
-        }
-        segments.push(Segment::Line(header));
-        if !folded {
-            push_agent_portals(
-                &mut segments,
-                &mut emitted_replies,
-                &unfiled,
-                &|portal| AgentOccurrence::Unfiled {
-                    host: *host,
-                    portal,
-                },
-                None,
-                true,
-                true,
-            );
-        }
-    }
-
     // Replies whose rows are folded away, and the unanchored new-agent
     // draft, park above the new-agent line so they are never lost.
     for agent_id in replies {
@@ -4560,7 +4529,6 @@ pub mod bench_support {
             filed,
             &[],
             ListingVisibility {
-                collapsed_unfiled: &HashSet::new(),
                 expanded_portals: &HashSet::new(),
                 raw: false,
             },
@@ -4940,7 +4908,6 @@ mod tests {
             &filed,
             &[],
             ListingVisibility {
-                collapsed_unfiled: &HashSet::new(),
                 expanded_portals: &HashSet::new(),
                 raw: false,
             },
@@ -4965,7 +4932,6 @@ mod tests {
             &filed,
             &[],
             ListingVisibility {
-                collapsed_unfiled: &HashSet::new(),
                 expanded_portals: &expanded,
                 raw: false,
             },
@@ -4988,7 +4954,6 @@ mod tests {
             &filed,
             &[],
             ListingVisibility {
-                collapsed_unfiled: &HashSet::new(),
                 expanded_portals: &HashSet::new(),
                 raw: false,
             },
@@ -5034,7 +4999,6 @@ mod tests {
             &filed,
             &[],
             ListingVisibility {
-                collapsed_unfiled: &HashSet::new(),
                 expanded_portals: &HashSet::new(),
                 raw: false,
             },
@@ -5075,7 +5039,6 @@ mod tests {
             &filed,
             &[],
             ListingVisibility {
-                collapsed_unfiled: &HashSet::new(),
                 expanded_portals: &expanded,
                 raw: false,
             },
@@ -5105,7 +5068,6 @@ mod tests {
             &filed,
             &[],
             ListingVisibility {
-                collapsed_unfiled: &HashSet::new(),
                 expanded_portals: &expanded,
                 raw: false,
             },
@@ -5152,7 +5114,6 @@ mod tests {
             &HashMap::new(),
             &[],
             ListingVisibility {
-                collapsed_unfiled: &HashSet::new(),
                 expanded_portals: &HashSet::new(),
                 raw: false,
             },
@@ -5183,7 +5144,6 @@ mod tests {
             &filed,
             &collapsed,
             ListingVisibility {
-                collapsed_unfiled: &HashSet::new(),
                 expanded_portals: &expanded,
                 raw: false,
             },
@@ -5211,7 +5171,6 @@ mod tests {
             &filed,
             &collapsed,
             ListingVisibility {
-                collapsed_unfiled: &HashSet::new(),
                 expanded_portals: &HashSet::new(),
                 raw: false,
             },
@@ -5406,7 +5365,6 @@ mod tests {
             &HashMap::new(),
             &[],
             ListingVisibility {
-                collapsed_unfiled: &HashSet::new(),
                 expanded_portals: &HashSet::new(),
                 raw: false,
             },
@@ -5424,104 +5382,28 @@ mod tests {
     }
 
     #[test]
-    fn unfiled_portals_are_collapsed_by_default_and_expand_their_full_tree() {
-        let root = agent(1, None, UiAttention::Quiet, 1);
-        let child = agent(2, Some(root.agent_id), UiAttention::Pending, 2);
-        let (registry, host) = registry(vec![root.clone(), child.clone()]);
+    fn unfiled_agents_do_not_render() {
+        let root = agent(1, None, UiAttention::NeedsInput, 1);
+        let (registry, host) = registry(vec![root]);
         let segments = generate(
             &registry,
-            &[(host, String::new())],
+            &[(host, "* Topic\n".to_owned())],
             &HashMap::new(),
             &[],
             ListingVisibility {
-                collapsed_unfiled: &HashSet::new(),
                 expanded_portals: &HashSet::new(),
                 raw: false,
             },
             &[],
             None,
         );
-        let agents = segments
-            .iter()
-            .filter_map(|segment| match segment {
-                Segment::Line(line) if matches!(line.key, LineKey::Agent { .. }) => Some(line),
-                _ => None,
+        assert!(segments.iter().all(|segment| !matches!(
+            segment,
+            Segment::Line(Line {
+                key: LineKey::Agent { .. },
+                ..
             })
-            .collect::<Vec<_>>();
-        assert_eq!(agents.len(), 1);
-        assert!(matches!(
-            agents[0].key,
-            LineKey::Agent { agent_id, .. } if agent_id == root.agent_id
-        ));
-
-        let mut expanded = HashSet::new();
-        expanded.insert(AgentOccurrence::Unfiled {
-            host,
-            portal: root.agent_id,
-        });
-        let segments = generate(
-            &registry,
-            &[(host, String::new())],
-            &HashMap::new(),
-            &[],
-            ListingVisibility {
-                collapsed_unfiled: &HashSet::new(),
-                expanded_portals: &expanded,
-                raw: false,
-            },
-            &[],
-            None,
-        );
-        let agents = segments
-            .iter()
-            .filter_map(|segment| match segment {
-                Segment::Line(line) if matches!(line.key, LineKey::Agent { .. }) => Some(line),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(agents.len(), 2);
-        assert!(matches!(
-            agents[1].key,
-            LineKey::Agent { agent_id, .. } if agent_id == child.agent_id
-        ));
-        assert!(!agents[1].text.contains("└─"));
-        assert!(agents[1].text.starts_with("    "));
-    }
-
-    #[test]
-    fn unfiled_tail_folds_behind_its_header() {
-        let root = agent(1, None, UiAttention::Quiet, 1);
-        let (registry, host) = registry(vec![root.clone()]);
-        let mut collapsed_unfiled = HashSet::new();
-        collapsed_unfiled.insert(host);
-        let segments = generate(
-            &registry,
-            &[(host, String::new())],
-            &HashMap::new(),
-            &[],
-            ListingVisibility {
-                collapsed_unfiled: &collapsed_unfiled,
-                expanded_portals: &HashSet::new(),
-                raw: false,
-            },
-            &[],
-            None,
-        );
-        assert!(
-            !segments.iter().any(|segment| matches!(
-                segment,
-                Segment::Line(line) if matches!(line.key, LineKey::Agent { .. })
-            )),
-            "folded Unfiled hides its rows"
-        );
-        let header = segments
-            .iter()
-            .find_map(|segment| match segment {
-                Segment::Line(line) if line.key == LineKey::Unfiled(host) => Some(line),
-                _ => None,
-            })
-            .expect("header row remains");
-        assert!(header.text.contains("· 1"));
+        )));
     }
 
     #[test]

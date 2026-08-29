@@ -16,11 +16,11 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use gpui::{App, AppContext as _, BorrowAppContext as _, Entity, Global, Task};
-use rho_browser_wayland::{BrowserRenderConfig, DmaBufConfig};
 pub use native_host::{
     ExtensionCommandStats, TabStateEvent, snapshot_extension_command_stats,
     snapshot_tab_state_events,
 };
+use rho_browser_wayland::{BrowserRenderConfig, DmaBufConfig};
 pub use rho_browser_wayland::{
     BrowserTiming, BrowserTimingKind, ExtensionFrameStats, record_browser_timing,
     snapshot_browser_timings, snapshot_extension_frame_stats,

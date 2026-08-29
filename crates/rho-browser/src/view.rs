@@ -84,7 +84,9 @@ impl BrowserDmaBuf {
 enum HandoffPhase {
     Requested,
     Focusing,
-    AwaitingFrame { barrier: u64 },
+    AwaitingFrame {
+        barrier: u64,
+    },
     Ready,
     /// The extension rejected the focus request (for example an unknown page
     /// id). Holding the failed handoff keeps repaints from re-claiming and

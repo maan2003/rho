@@ -302,10 +302,7 @@ static EXTENSION_COMMAND_STATS: Mutex<VecDeque<ExtensionCommandStats>> =
     Mutex::new(VecDeque::new());
 
 fn record_extension_command(method: &str, at: Instant, handler_us: Option<u32>, ok: bool) {
-    let round_trip_us = at
-        .elapsed()
-        .as_micros()
-        .min(u128::from(u32::MAX)) as u32;
+    let round_trip_us = at.elapsed().as_micros().min(u128::from(u32::MAX)) as u32;
     let mut ring = EXTENSION_COMMAND_STATS.lock().unwrap();
     if ring.len() >= MAX_EXTENSION_COMMAND_STATS {
         ring.pop_front();
@@ -321,7 +318,12 @@ fn record_extension_command(method: &str, at: Instant, handler_us: Option<u32>, 
 
 /// Returns a non-destructive copy of the bounded bridge command-stats ring.
 pub fn snapshot_extension_command_stats() -> Vec<ExtensionCommandStats> {
-    EXTENSION_COMMAND_STATS.lock().unwrap().iter().cloned().collect()
+    EXTENSION_COMMAND_STATS
+        .lock()
+        .unwrap()
+        .iter()
+        .cloned()
+        .collect()
 }
 
 /// Tab lifecycle report from the extension: activation, page visibility as

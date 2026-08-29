@@ -55,8 +55,8 @@ impl BrowserRuntime {
 
         // PATH stays in sync with the deployed profile, unlike a store path
         // baked into the session environment at login.
-        let browser = std::env::var_os("RHO_CUSTOM_BRAVE_BIN")
-            .unwrap_or_else(|| "rho-brave-origin".into());
+        let browser =
+            std::env::var_os("RHO_CUSTOM_BRAVE_BIN").unwrap_or_else(|| "rho-brave-origin".into());
         let mut command = Command::new(browser);
         // The Nix Brave wrapper supplies the first two, but Chromium honors
         // only the final --disable-features argument.
