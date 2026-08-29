@@ -57,6 +57,39 @@ fn shared_modal_init_preserves_bundled_helix_default(cx: &mut TestAppContext) {
     });
 }
 
+#[gpui::test]
+fn touch_editing_strips_vim_from_live_editors(cx: &mut TestAppContext) {
+    cx.update(|cx| {
+        assets::Assets.load_test_fonts(cx);
+        let store = SettingsStore::new(cx, crate::rho_assets::RHO_DEFAULT_SETTINGS);
+        cx.set_global(store);
+        theme_settings::init(theme::LoadThemes::JustBase, cx);
+        editor::init(cx);
+        crate::init_vim_mode(cx).expect("initialize Vim mode");
+    });
+    // Only full-mode editors opt into modal editing; single-line inputs
+    // never had it.
+    let editor = cx.add_window(|window, cx| {
+        let editor = Editor::multi_line(window, cx);
+        window.focus(&editor.focus_handle(cx), cx);
+        editor
+    });
+    let text = |cx: &mut TestAppContext| {
+        editor
+            .update(cx, |editor, _, cx| editor.text(cx))
+            .expect("read editor text")
+    };
+
+    // Helix normal mode consumes these as complete commands, not text.
+    cx.simulate_keystrokes(*editor, "w b x");
+    assert_eq!(text(cx), "", "modal editing should start active");
+
+    cx.update(|cx| crate::workspace::set_touch_modal_editing(false, cx));
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*editor, "x y z");
+    assert_eq!(text(cx), "xyz", "touch editors must accept text directly");
+}
+
 fn bind_test_keymaps(cx: &mut App) {
     let default_key_bindings =
         settings::KeymapFile::load_asset_allow_partial_failure(settings::DEFAULT_KEYMAP_PATH, cx)

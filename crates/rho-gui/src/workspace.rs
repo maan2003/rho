@@ -14,6 +14,8 @@
 #[cfg(feature = "native")]
 #[path = "workspace_phone.rs"]
 mod phone;
+#[cfg(all(test, feature = "native"))]
+pub(crate) use phone::set_touch_modal_editing;
 #[cfg(all(target_family = "wasm", not(feature = "native")))]
 #[path = "workspace_web.rs"]
 mod web;

@@ -78,17 +78,28 @@ pub(super) struct PhoneModeChange {
 
 const PHONE_FONT_SCALE: f32 = 1.25;
 
+/// Touch is a plain-editor world: no Vim, no Helix, every editor accepts
+/// text directly. Applied on phone-mode entry and reverted on exit so a
+/// desktop window narrowed for a moment does not lose Helix. Live editors
+/// pick the change up through the vim crate's SettingsStore observer.
+pub(crate) fn set_touch_modal_editing(enabled: bool, cx: &mut gpui::App) {
+    let settings = cx.global_mut::<settings::SettingsStore>();
+    settings.override_global(vim_mode_setting::VimModeSetting(false));
+    settings.override_global(vim_mode_setting::HelixModeSetting(enabled));
+}
+
 impl Workspace {
     pub(super) fn phone_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let change = self.phone.update_mode(window);
         if change.entered {
             self.phone.stack.clear();
             self.phone_set_dashboard_browsing(true, window, cx);
-            // Deferred: adjusting fonts notifies observers, which must not
-            // reenter the draw that detected the transition.
+            // Deferred: adjusting fonts and settings notifies observers,
+            // which must not reenter the draw that detected the transition.
             cx.defer(|cx| {
                 theme_settings::adjust_buffer_font_size(cx, |size| size * PHONE_FONT_SCALE);
                 theme_settings::adjust_ui_font_size(cx, |size| size * PHONE_FONT_SCALE);
+                set_touch_modal_editing(false, cx);
             });
         }
         if change.exited {
@@ -99,6 +110,7 @@ impl Workspace {
             cx.defer(|cx| {
                 theme_settings::reset_buffer_font_size(cx);
                 theme_settings::reset_ui_font_size(cx);
+                set_touch_modal_editing(true, cx);
             });
         }
         change.enabled
