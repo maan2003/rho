@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Launcher icon: the desk-header rho glyph (vendor/zed/assets/icons/rho.svg)
+     on a rounded square in the Rho OKSolar P3 palette. Installed as
+     share/icons/hicolor/scalable/apps/rho-gui.svg, matching the rho-gui
+     desktop entry and Wayland app_id. -->
+<svg width="512" height="512" viewBox="0 0 512 512" version="1.1" xmlns="http://www.w3.org/2000/svg">
+ <rect width="512" height="512" rx="120" fill="#171f18"/>
+ <g transform="translate(26 -24.6) scale(1.15)">
+  <path fill="#afa851" d="m151.73 371.75h-31.684q6.8557-21.308 6.8557-64.479v-104.5q0-44.283 25.014-65.591 25.013-21.308 55.215-21.308 32.795 0 52.806 22.605 20.01 22.419 20.01 58.921 0 39.836-24.828 69.111-24.828 29.275-56.697 29.275-21.493 0-40.948-13.711v24.272q0 38.725-5.7423 65.406zm5.7425-132.66q0 22.419 11.858 34.278 11.858 11.673 30.202 11.673 21.678 0 36.13-18.529 14.637-18.714 14.637-49.286 0-38.725-19.826-61.329-19.825-22.605-44.098-22.605-16.49 0-22.79 10.376-6.1147 10.191-6.1147 33.351z"/>
+ </g>
+</svg>

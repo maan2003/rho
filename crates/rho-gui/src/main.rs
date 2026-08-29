@@ -250,7 +250,13 @@ fn run() -> Result<()> {
             rho_browser::init(&client_state_dir, cx);
             cx.activate(true);
 
-            if let Err(error) = cx.open_window(WindowOptions::default(), move |window, cx| {
+            // Wayland compositors resolve the launcher icon by matching this
+            // app_id against rho-gui.desktop.
+            let window_options = WindowOptions {
+                app_id: Some("rho-gui".to_owned()),
+                ..Default::default()
+            };
+            if let Err(error) = cx.open_window(window_options, move |window, cx| {
                 cx.new(|cx| Workspace::new(specs.clone(), window, cx))
             }) {
                 eprintln!("rho-gui: failed to open window: {error:#}");
