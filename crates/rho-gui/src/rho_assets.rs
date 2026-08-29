@@ -60,3 +60,24 @@ impl RhoAssets {
         cx.text_system().add_fonts(fonts)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oled_theme_is_embedded_and_valid() {
+        let path = "themes/rho-oled/rho-oled.json";
+        assert!(
+            RhoAssets
+                .list("themes/")
+                .unwrap()
+                .iter()
+                .any(|item| item == path)
+        );
+
+        let registry = theme::ThemeRegistry::new(Box::new(RhoAssets));
+        theme_settings::load_bundled_themes(&registry);
+        registry.get("Rho OLED").expect("registered OLED theme");
+    }
+}
