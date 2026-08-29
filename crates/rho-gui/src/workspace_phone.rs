@@ -170,11 +170,23 @@ impl Workspace {
             Some(RowTarget::Topic {
                 host,
                 offset,
+                first_attention,
                 on_heading_line: true,
-                ..
+                on_bullet,
             }) => {
-                self.dashboard.toggle_topic(host, offset, cx);
-                self.refresh_dashboard(window, cx);
+                // A heading bound to an agent is the agent on the phone:
+                // tapping its line opens the loudest one. The bullet stays
+                // a fold toggle so bound topics with children remain
+                // collapsible.
+                let bound_agent = first_attention
+                    .or_else(|| self.dashboard.first_agent_for_topic((host, offset)));
+                match bound_agent {
+                    Some(agent_id) if !on_bullet => self.open_agent(agent_id, window, cx),
+                    _ => {
+                        self.dashboard.toggle_topic(host, offset, cx);
+                        self.refresh_dashboard(window, cx);
+                    }
+                }
             }
             Some(RowTarget::Page(id)) => self.open_browser_page(id, window, cx),
             _ => {}
@@ -203,6 +215,18 @@ impl Workspace {
     ) -> Option<Point<Pixels>> {
         self.dashboard
             .agent_window_position_for_test(agent_id, window, cx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn phone_doc_position_for_test(
+        &mut self,
+        host: crate::registry::HostId,
+        offset: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Point<Pixels>> {
+        self.dashboard
+            .doc_window_position_for_test(host, offset, window, cx)
     }
 
     #[cfg(test)]

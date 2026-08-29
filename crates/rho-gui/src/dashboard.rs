@@ -185,6 +185,9 @@ pub enum RowTarget {
         /// somewhere in its subtree. Verbs that share keys with vim text
         /// editing (`r`, folding on bare enter) require the line.
         on_heading_line: bool,
+        /// Whether the position falls on the leading stars, before the
+        /// title. Phone taps there fold instead of opening the agent.
+        on_bullet: bool,
     },
     Agent {
         agent_id: AgentId,
@@ -1829,9 +1832,29 @@ impl Dashboard {
                     offset: start,
                     first_attention,
                     on_heading_line: offset <= heading.heading_range.end,
+                    on_bullet: offset < heading.title_range.start,
                 })
             }
         }
+    }
+
+    #[cfg(test)]
+    pub fn doc_window_position_for_test(
+        &mut self,
+        host: HostId,
+        offset: usize,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Option<gpui::Point<gpui::Pixels>> {
+        self.move_cursor_to_doc(host, offset, window, cx);
+        self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            let display_point = editor
+                .selections
+                .newest_display(&snapshot.display_snapshot)
+                .head();
+            editor.window_position_for_display_point(display_point, &snapshot, window, cx)
+        })
     }
 
     #[cfg(test)]

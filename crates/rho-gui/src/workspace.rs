@@ -5922,6 +5922,7 @@ impl Workspace {
                 offset,
                 first_attention,
                 on_heading_line,
+                ..
             }) => {
                 if let Some(agent_id) =
                     first_attention.or_else(|| self.dashboard.first_agent_for_topic((host, offset)))
@@ -6027,6 +6028,7 @@ impl Workspace {
                 offset,
                 first_attention,
                 on_heading_line: true,
+                ..
             }) => {
                 match first_attention
                     .or_else(|| self.dashboard.first_agent_for_topic((host, offset)))
@@ -7846,6 +7848,7 @@ mod tests {
                 offset: 0,
                 first_attention: None,
                 on_heading_line: true,
+                on_bullet: false,
             })
         ));
         assert!(!desk_heading_without_agent(

@@ -460,6 +460,149 @@ fn phone_desk_agent_tap_opens_the_agent_surface(cx: &mut TestAppContext) {
         .expect("inspect phone stack");
 }
 
+#[gpui::test]
+fn phone_desk_bound_heading_tap_opens_the_agent(cx: &mut TestAppContext) {
+    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
+    use rho_ui_proto::{
+        AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
+    };
+
+    let workspace = test_workspace(cx);
+    cx.simulate_window_resize(*workspace, size(px(500.), px(800.)));
+    cx.run_until_parked();
+
+    let root_id = agent(1);
+    let desk_text = format!("* Task :eng-{}:\n", root_id.encoded());
+    let mut source =
+        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
+    let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text.as_str())]));
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Ready {
+                    agents: vec![UiAgentSummary {
+                        agent_id: root_id,
+                        parent_agent: None,
+                        display_name: Some("bound root".to_owned()),
+                        created_at: UnixMs(1),
+                        updated_at: UnixMs(1),
+                        role: AgentRole::default(),
+                        workspace: WorkspaceInfo::UserCheckout {
+                            repo: "/tmp".into(),
+                        },
+                        attention: UiAttention::Quiet,
+                        last_active: UnixMs(1),
+                        facts: Default::default(),
+                        hidden: false,
+                        disposition: AgentDisposition::Pending,
+                        last_user_message_text: String::new(),
+                        activity: None,
+                        turn_report: None,
+                        labels: Vec::new(),
+                    }],
+                    iris_agent: None,
+                    projects: Vec::new(),
+                    auth: AuthState {
+                        namespaces: Vec::new(),
+                        disabled_namespaces: Vec::new(),
+                        active_namespace: None,
+                    },
+                    machine_seed: 0,
+                    agent_counter: 100,
+                },
+                window,
+                cx,
+            );
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskSnapshot {
+                    snapshot: DeskSnapshot {
+                        text: source.snapshot().text(),
+                        operations: vec![operation],
+                        transactions: Vec::new(),
+                        replicas: Vec::new(),
+                    },
+                    replica_id: 42,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+        })
+        .expect("bind agent in Desk");
+    cx.update_window(*workspace, |_, window, cx| {
+        window.simulate_next_frame(cx);
+    })
+    .expect("paint phone Desk");
+
+    let tap = |cx: &mut TestAppContext, position| {
+        cx.update_window(*workspace, |_, window, cx| {
+            window.dispatch_event(
+                MouseDownEvent {
+                    position,
+                    modifiers: Modifiers::none(),
+                    button: MouseButton::Left,
+                    click_count: 1,
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.dispatch_event(
+                MouseUpEvent {
+                    position,
+                    modifiers: Modifiers::none(),
+                    button: MouseButton::Left,
+                    click_count: 1,
+                }
+                .to_platform_input(),
+                cx,
+            );
+        })
+        .expect("dispatch tap");
+        cx.run_until_parked();
+    };
+
+    // A tap on the leading bullet folds; the agent stays closed.
+    let bullet = workspace
+        .update(cx, |workspace, window, cx| {
+            workspace
+                .phone_doc_position_for_test(HostId::default(), 0, window, cx)
+                .expect("bullet position")
+        })
+        .expect("locate bullet");
+    tap(cx, bullet);
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                !workspace.phone_has_surface_for_test(&crate::pane::SurfaceKey::Transcript(root_id))
+            );
+        })
+        .expect("inspect stack after bullet tap");
+
+    // A tap on the title of a bound heading opens the agent.
+    cx.update_window(*workspace, |_, window, cx| {
+        window.simulate_next_frame(cx);
+    })
+    .expect("repaint after fold toggle");
+    let title = workspace
+        .update(cx, |workspace, window, cx| {
+            workspace
+                .phone_doc_position_for_test(HostId::default(), 4, window, cx)
+                .expect("title position")
+        })
+        .expect("locate title");
+    tap(cx, title);
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                workspace.phone_has_surface_for_test(&crate::pane::SurfaceKey::Transcript(root_id))
+            );
+        })
+        .expect("inspect stack after title tap");
+}
+
 fn active_editor(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) -> Entity<Editor> {
     workspace
         .update(cx, |workspace, _, cx| workspace.active_editor(cx))
