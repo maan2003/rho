@@ -2999,16 +2999,17 @@ impl Dashboard {
                 .take_while(|character| *character == ' ')
                 .count()
                 + 1;
-            let class = if self.phone_browse_mode
-                && HEADING_STARS.contains(&placeholder_text.trim())
+            let is_phone_bullet =
+                self.phone_browse_mode && HEADING_STARS.contains(&placeholder_text.trim());
+            let bound_agent = is_phone_bullet
                 && self
                     .heading_agents
                     .get(&(*host, range.start))
-                    .is_some_and(|agents| !agents.is_empty())
-            {
-                DashClass::for_agent_depth(depth)
+                    .is_some_and(|agents| !agents.is_empty());
+            let (class, opacity) = if is_phone_bullet {
+                phone_bullet_style(depth, bound_agent)
             } else {
-                DashClass::for_depth(depth)
+                (DashClass::for_depth(depth), 1.0)
             };
             creases.push(editor::display_map::Crease::simple(
                 start..end,
@@ -3022,7 +3023,7 @@ impl Dashboard {
                         let buffer_font = theme_settings::ThemeSettings::get_global(cx)
                             .buffer_font
                             .clone();
-                        let color = class.style(cx).color.unwrap_or_default();
+                        let color = class.style(cx).color.unwrap_or_default().opacity(opacity);
                         gpui::div()
                             .font(buffer_font)
                             .text_color(color)
@@ -3221,10 +3222,6 @@ enum DashClass {
     Heading2,
     Heading3,
     Heading4,
-    AgentHeading,
-    AgentHeading2,
-    AgentHeading3,
-    AgentHeading4,
     TodoHeading,
     StaffedHeading,
     Working,
@@ -3233,16 +3230,12 @@ enum DashClass {
 }
 
 impl DashClass {
-    const ALL: [DashClass; 14] = [
+    const ALL: [DashClass; 10] = [
         DashClass::Muted,
         DashClass::Heading,
         DashClass::Heading2,
         DashClass::Heading3,
         DashClass::Heading4,
-        DashClass::AgentHeading,
-        DashClass::AgentHeading2,
-        DashClass::AgentHeading3,
-        DashClass::AgentHeading4,
         DashClass::TodoHeading,
         DashClass::StaffedHeading,
         DashClass::Working,
@@ -3260,15 +3253,6 @@ impl DashClass {
         }
     }
 
-    fn for_agent_depth(depth: usize) -> DashClass {
-        match depth.saturating_sub(1) % 4 {
-            0 => DashClass::AgentHeading,
-            1 => DashClass::AgentHeading2,
-            2 => DashClass::AgentHeading3,
-            _ => DashClass::AgentHeading4,
-        }
-    }
-
     fn key(self) -> HighlightKey {
         let slot = match self {
             DashClass::Muted => 0,
@@ -3276,10 +3260,6 @@ impl DashClass {
             DashClass::Heading2 => 2,
             DashClass::Heading3 => 3,
             DashClass::Heading4 => 4,
-            DashClass::AgentHeading => 10,
-            DashClass::AgentHeading2 => 11,
-            DashClass::AgentHeading3 => 12,
-            DashClass::AgentHeading4 => 13,
             DashClass::TodoHeading => 5,
             DashClass::StaffedHeading => 6,
             DashClass::Working => 7,
@@ -3302,10 +3282,6 @@ impl DashClass {
             DashClass::Heading2 => colors.terminal_ansi_bright_green,
             DashClass::Heading3 => colors.terminal_ansi_magenta,
             DashClass::Heading4 => colors.terminal_ansi_green,
-            DashClass::AgentHeading => colors.terminal_ansi_bright_cyan,
-            DashClass::AgentHeading2 => colors.terminal_ansi_bright_yellow,
-            DashClass::AgentHeading3 => colors.terminal_ansi_cyan,
-            DashClass::AgentHeading4 => colors.terminal_ansi_yellow,
             DashClass::TodoHeading => colors.terminal_ansi_red,
             DashClass::StaffedHeading => colors.terminal_ansi_cyan,
             DashClass::Working => colors.terminal_ansi_cyan,
@@ -3527,6 +3503,16 @@ fn agent_tree_lines(
 /// the level colors do. Fold state lives in the chevron the collapsed
 /// body's placeholder draws at the end of the heading line.
 const HEADING_STARS: [&str; 4] = ["◉", "○", "✸", "✿"];
+
+/// Phone browse bullets keep each level's established hue. Bound headings
+/// use it at full strength; plain headings recede just enough to distinguish
+/// the binding without introducing another attention-grabbing hue.
+fn phone_bullet_style(depth: usize, bound_agent: bool) -> (DashClass, f32) {
+    (
+        DashClass::for_depth(depth),
+        if bound_agent { 1.0 } else { 0.72 },
+    )
+}
 
 /// The heading-line conceals: the star token and its separating space
 /// render as an org-modern bullet (indented one column per level, same
@@ -5687,21 +5673,12 @@ mod tests {
         // Level five wraps back around to the level-one color.
         assert_eq!(class_of("Five"), DashClass::Heading);
 
-        let ordinary = [
-            DashClass::Heading,
-            DashClass::Heading2,
-            DashClass::Heading3,
-            DashClass::Heading4,
-        ];
-        let agents = [
-            DashClass::AgentHeading,
-            DashClass::AgentHeading2,
-            DashClass::AgentHeading3,
-            DashClass::AgentHeading4,
-        ];
-        for (index, agent) in agents.iter().copied().enumerate() {
-            assert_ne!(agent, ordinary[index]);
-            assert!(agents.iter().skip(index + 1).all(|other| *other != agent));
+        for depth in 1..=4 {
+            let (plain_class, plain_opacity) = phone_bullet_style(depth, false);
+            let (agent_class, agent_opacity) = phone_bullet_style(depth, true);
+            assert_eq!(plain_class, DashClass::for_depth(depth));
+            assert_eq!(agent_class, plain_class, "agent keeps the level hue");
+            assert!(agent_opacity > plain_opacity, "agent variant is subtle");
         }
     }
 }

@@ -3067,6 +3067,104 @@ fn total_cost_shows_in_status_chips(cx: &mut TestAppContext) {
     );
 }
 
+#[gpui::test]
+fn phone_status_omits_workspace_id_but_keeps_other_chips(cx: &mut TestAppContext) {
+    use rho_ui_proto::{
+        AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceId,
+        WorkspaceIdDomain, WorkspaceInfo,
+    };
+
+    let workspace = test_workspace(cx);
+    let agent_id = agent(1);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Ready {
+                    agents: vec![UiAgentSummary {
+                        agent_id,
+                        parent_agent: None,
+                        display_name: Some("worker".to_owned()),
+                        created_at: UnixMs(1),
+                        updated_at: UnixMs(1),
+                        role: AgentRole::default(),
+                        workspace: WorkspaceInfo::Workspace {
+                            repo: "/tmp/rho".into(),
+                            id: WorkspaceId::from_counter(1, &WorkspaceIdDomain(0)).unwrap(),
+                        },
+                        attention: UiAttention::Quiet,
+                        last_active: UnixMs(1),
+                        facts: Default::default(),
+                        hidden: false,
+                        disposition: AgentDisposition::Pending,
+                        last_user_message_text: String::new(),
+                        activity: None,
+                        turn_report: None,
+                        labels: Vec::new(),
+                    }],
+                    iris_agent: None,
+                    projects: Vec::new(),
+                    auth: AuthState {
+                        namespaces: Vec::new(),
+                        disabled_namespaces: Vec::new(),
+                        active_namespace: None,
+                    },
+                    machine_seed: 0,
+                    agent_counter: 100,
+                },
+                window,
+                cx,
+            );
+        })
+        .expect("register managed-workspace agent");
+    feed_frame(
+        &workspace,
+        cx,
+        agent_id,
+        AgentRemoteFrame::Snapshot(UiAgentState {
+            blocks: vec![user("go")],
+            status: UiAgentStatus::Idle,
+            context_used: Some(62_300),
+            usage: rho_ui_proto::remote::UiAgentUsage {
+                provider: "fable".to_owned(),
+                total: rho_ui_proto::AgentUsageBucket {
+                    input_tokens: 1_000_000,
+                    ..Default::default()
+                },
+            },
+        }),
+    );
+
+    let status = |cx: &mut TestAppContext| {
+        workspace
+            .update(cx, |workspace, _, cx| {
+                workspace
+                    .active_agent_model()
+                    .expect("agent view")
+                    .read(cx)
+                    .status_span_text()
+            })
+            .expect("read status")
+    };
+    assert!(status(cx).contains("ws-"), "desktop keeps workspace id");
+
+    cx.simulate_window_resize(*workspace, size(px(500.), px(800.)));
+    cx.run_until_parked();
+    let phone = status(cx);
+    assert!(!phone.contains("ws-"), "phone status: {phone:?}");
+    assert!(phone.contains("rho"), "phone keeps project: {phone:?}");
+    assert!(phone.contains("eng"), "phone keeps role: {phone:?}");
+    assert!(phone.contains("62k"), "phone keeps tokens: {phone:?}");
+    assert!(phone.contains('$'), "phone keeps cost: {phone:?}");
+
+    cx.simulate_window_resize(*workspace, size(px(1200.), px(800.)));
+    cx.run_until_parked();
+    assert!(
+        status(cx).contains("ws-"),
+        "desktop restores workspace id after leaving phone mode"
+    );
+}
+
 /// The view can exist before any frame arrives (agent selected first, load
 /// completes later): the chip must appear when the snapshot lands.
 #[gpui::test]

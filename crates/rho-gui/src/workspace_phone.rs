@@ -95,6 +95,7 @@ impl Workspace {
         if change.entered {
             self.phone.stack.clear();
             self.phone_set_dashboard_browsing(true, window, cx);
+            self.update_statuses(cx);
             // Deferred: adjusting fonts and settings notifies observers,
             // which must not reenter the draw that detected the transition.
             cx.defer(|cx| {
@@ -104,6 +105,7 @@ impl Workspace {
             });
         }
         if change.exited {
+            self.update_statuses(cx);
             if self.dashboard.set_phone_browse_mode(false) {
                 cx.defer_in(window, |this, window, cx| {
                     this.refresh_dashboard(window, cx)

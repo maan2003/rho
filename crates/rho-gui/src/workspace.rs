@@ -4449,7 +4449,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let directory_label = self.working_directory_label(agent_id);
-        let workspace_label = self.registry.workspace_id_label(*agent_id);
+        let workspace_label = if self.phone.enabled {
+            None
+        } else {
+            self.registry.workspace_id_label(*agent_id)
+        };
         let usage_label = self.store.get(agent_id).map(|state| {
             let usage = &state.usage.total;
             format!(
