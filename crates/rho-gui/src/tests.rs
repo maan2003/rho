@@ -72,10 +72,10 @@ fn phone_entry_disables_modal_editing_app_wide(cx: &mut TestAppContext) {
     });
 
     cx.simulate_window_resize(
-        (*workspace).into(),
+        *workspace,
         gpui::size(gpui::px(400.), gpui::px(800.)),
     );
-    cx.update_window((*workspace).into(), |_, window, cx| {
+    cx.update_window(*workspace, |_, window, cx| {
         window.simulate_next_frame(cx);
     })
     .expect("draw phone frame");
@@ -307,7 +307,7 @@ fn phone_desk_agent_tap_opens_the_agent_surface(cx: &mut TestAppContext) {
     };
 
     let workspace = test_workspace(cx);
-    cx.simulate_window_resize((*workspace).into(), size(px(500.), px(800.)));
+    cx.simulate_window_resize(*workspace, size(px(500.), px(800.)));
     cx.run_until_parked();
 
     let root_id = agent(1);
@@ -397,7 +397,7 @@ fn phone_desk_agent_tap_opens_the_agent_surface(cx: &mut TestAppContext) {
             workspace.phone_back_for_test(window, cx);
         })
         .expect("return to phone Desk");
-    cx.update_window((*workspace).into(), |_, window, cx| {
+    cx.update_window(*workspace, |_, window, cx| {
         window.simulate_next_frame(cx);
     })
     .expect("paint phone Desk");
@@ -409,7 +409,7 @@ fn phone_desk_agent_tap_opens_the_agent_surface(cx: &mut TestAppContext) {
                 .expect("visible agent row")
         })
         .expect("locate agent row");
-    cx.update_window((*workspace).into(), |_, window, cx| {
+    cx.update_window(*workspace, |_, window, cx| {
         window.dispatch_event(
             MouseDownEvent {
                 position,
@@ -438,7 +438,7 @@ fn phone_desk_agent_tap_opens_the_agent_surface(cx: &mut TestAppContext) {
             );
         })
         .expect("reconcile filed row selection");
-    cx.update_window((*workspace).into(), |_, window, cx| {
+    cx.update_window(*workspace, |_, window, cx| {
         window.dispatch_event(
             MouseUpEvent {
                 position,
