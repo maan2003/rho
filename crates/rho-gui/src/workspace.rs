@@ -37,6 +37,7 @@ use rho_core::ContentPart;
 use rho_ui_proto::{
     AdvisorIntelligence, AgentId, AgentRole, ClientMessage, EngineerIntelligence, MessageDelivery,
 };
+use settings::Settings as _;
 use theme::ActiveTheme as _;
 
 use crate::agent_view::AgentModel;
@@ -744,6 +745,21 @@ impl Workspace {
                 }
             }
         });
+
+        // Settings recomputes (language registration installing semantic
+        // token rules, a settings file reload) rebuild every setting global
+        // from file contents, silently dropping `override_global` values.
+        // Phone mode depends on its modal-editing override staying in force,
+        // so re-assert it whenever the store changes underneath us.
+        cx.observe_global::<settings::SettingsStore>(|this, cx| {
+            if this.phone.enabled
+                && (vim_mode_setting::VimModeSetting::get_global(cx).0
+                    || vim_mode_setting::HelixModeSetting::get_global(cx).0)
+            {
+                phone::set_touch_modal_editing(false, cx);
+            }
+        })
+        .detach();
 
         let dashboard = crate::dashboard::Dashboard::new(window, cx);
         let iris_buffer = cx.new(|cx| {

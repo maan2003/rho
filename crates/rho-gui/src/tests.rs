@@ -638,6 +638,40 @@ fn phone_desk_bound_heading_tap_opens_the_agent(cx: &mut TestAppContext) {
         .expect("inspect stack after title tap");
 }
 
+#[gpui::test]
+fn phone_modal_override_survives_settings_recompute(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    cx.simulate_window_resize(*workspace, size(px(500.), px(800.)));
+    cx.update_window(*workspace, |_, window, cx| {
+        window.simulate_next_frame(cx);
+    })
+    .expect("paint phone Desk");
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert!(
+            !vim_mode_setting::HelixModeSetting::get_global(cx).0,
+            "phone entry disables modal editing"
+        );
+    });
+
+    // Anything that recomputes settings — a language registering semantic
+    // token rules, a settings file reload — rebuilds the globals from file
+    // contents and drops `override_global` values.
+    cx.update(|cx| {
+        use gpui::UpdateGlobal as _;
+        SettingsStore::update_global(cx, |store, cx| {
+            let _ = store.set_user_settings("{}", cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert!(
+            !vim_mode_setting::HelixModeSetting::get_global(cx).0,
+            "a settings recompute must not re-enable modal editing while phone mode is active"
+        );
+    });
+}
+
 fn active_editor(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) -> Entity<Editor> {
     workspace
         .update(cx, |workspace, _, cx| workspace.active_editor(cx))
