@@ -285,6 +285,9 @@ pub struct Dashboard {
     global_cycle: u8,
     /// Shows only literal editable Desk source, with no generated UI.
     raw_mode: bool,
+    /// Phone-only composed Desk presentation: bound-agent chips collapse
+    /// into colored heading bullets while desktop chrome stays unchanged.
+    phone_browse_mode: bool,
     deal_active: bool,
     deal: Option<DealSession>,
     queue_depth: DealQueueDepth,
@@ -398,6 +401,7 @@ impl Dashboard {
             seeded_folds: HashSet::new(),
             global_cycle: 0,
             raw_mode: false,
+            phone_browse_mode: false,
             deal_active: false,
             deal: None,
             queue_depth: DealQueueDepth::default(),
@@ -448,6 +452,15 @@ impl Dashboard {
 
     pub fn raw_mode(&self) -> bool {
         self.raw_mode
+    }
+
+    pub fn set_phone_browse_mode(&mut self, enabled: bool) -> bool {
+        if self.phone_browse_mode == enabled {
+            return false;
+        }
+        self.phone_browse_mode = enabled;
+        self.last_synced = None;
+        true
     }
 
     #[cfg(feature = "native")]
@@ -1303,6 +1316,7 @@ impl Dashboard {
                 &filed,
                 &self.expanded_portals,
                 &fold_ranges,
+                !self.phone_browse_mode,
             )
         };
         #[cfg(feature = "native")]
@@ -2980,13 +2994,22 @@ impl Dashboard {
             // but draws nothing, so no visible gap invites the eye in.
             let glyph: Option<gpui::SharedString> =
                 (!placeholder_text.trim().is_empty()).then(|| placeholder_text.clone().into());
-            let class = DashClass::for_depth(
-                placeholder_text
-                    .chars()
-                    .take_while(|character| *character == ' ')
-                    .count()
-                    + 1,
-            );
+            let depth = placeholder_text
+                .chars()
+                .take_while(|character| *character == ' ')
+                .count()
+                + 1;
+            let class = if self.phone_browse_mode
+                && HEADING_STARS.contains(&placeholder_text.trim())
+                && self
+                    .heading_agents
+                    .get(&(*host, range.start))
+                    .is_some_and(|agents| !agents.is_empty())
+            {
+                DashClass::for_agent_depth(depth)
+            } else {
+                DashClass::for_depth(depth)
+            };
             creases.push(editor::display_map::Crease::simple(
                 start..end,
                 editor::FoldPlaceholder {
@@ -3198,6 +3221,10 @@ enum DashClass {
     Heading2,
     Heading3,
     Heading4,
+    AgentHeading,
+    AgentHeading2,
+    AgentHeading3,
+    AgentHeading4,
     TodoHeading,
     StaffedHeading,
     Working,
@@ -3206,12 +3233,16 @@ enum DashClass {
 }
 
 impl DashClass {
-    const ALL: [DashClass; 10] = [
+    const ALL: [DashClass; 14] = [
         DashClass::Muted,
         DashClass::Heading,
         DashClass::Heading2,
         DashClass::Heading3,
         DashClass::Heading4,
+        DashClass::AgentHeading,
+        DashClass::AgentHeading2,
+        DashClass::AgentHeading3,
+        DashClass::AgentHeading4,
         DashClass::TodoHeading,
         DashClass::StaffedHeading,
         DashClass::Working,
@@ -3229,6 +3260,15 @@ impl DashClass {
         }
     }
 
+    fn for_agent_depth(depth: usize) -> DashClass {
+        match depth.saturating_sub(1) % 4 {
+            0 => DashClass::AgentHeading,
+            1 => DashClass::AgentHeading2,
+            2 => DashClass::AgentHeading3,
+            _ => DashClass::AgentHeading4,
+        }
+    }
+
     fn key(self) -> HighlightKey {
         let slot = match self {
             DashClass::Muted => 0,
@@ -3236,6 +3276,10 @@ impl DashClass {
             DashClass::Heading2 => 2,
             DashClass::Heading3 => 3,
             DashClass::Heading4 => 4,
+            DashClass::AgentHeading => 10,
+            DashClass::AgentHeading2 => 11,
+            DashClass::AgentHeading3 => 12,
+            DashClass::AgentHeading4 => 13,
             DashClass::TodoHeading => 5,
             DashClass::StaffedHeading => 6,
             DashClass::Working => 7,
@@ -3258,6 +3302,10 @@ impl DashClass {
             DashClass::Heading2 => colors.terminal_ansi_bright_green,
             DashClass::Heading3 => colors.terminal_ansi_magenta,
             DashClass::Heading4 => colors.terminal_ansi_green,
+            DashClass::AgentHeading => colors.terminal_ansi_bright_cyan,
+            DashClass::AgentHeading2 => colors.terminal_ansi_bright_yellow,
+            DashClass::AgentHeading3 => colors.terminal_ansi_cyan,
+            DashClass::AgentHeading4 => colors.terminal_ansi_yellow,
             DashClass::TodoHeading => colors.terminal_ansi_red,
             DashClass::StaffedHeading => colors.terminal_ansi_cyan,
             DashClass::Working => colors.terminal_ansi_cyan,
@@ -3577,6 +3625,7 @@ fn heading_decorations(
     filed: &HashMap<(HostId, usize), Vec<AgentId>>,
     expanded_portals: &HashSet<AgentOccurrence>,
     fold_ranges: &[(HostId, Range<usize>)],
+    show_agent_markers: bool,
 ) -> Vec<(HostId, usize, String)> {
     let empty = Vec::new();
     let mut decorations = Vec::new();
@@ -3615,7 +3664,7 @@ fn heading_decorations(
                 label.push_str("  ");
                 label.push_str(&mark);
             }
-            for agent_id in agents {
+            for agent_id in agents.iter().filter(|_| show_agent_markers) {
                 // Archived agents read as quiet no matter what they want.
                 let attention = if archived {
                     UiAttention::Quiet
@@ -5133,12 +5182,25 @@ mod tests {
             &filed,
             &HashSet::new(),
             &[],
+            true,
         );
         assert_eq!(decorations.len(), 1);
         let (_, offset, label) = &decorations[0];
         assert_eq!(*offset, "* One".len());
         assert!(label.starts_with("  ? "), "label: {label:?}");
         assert_eq!(label.matches(" eng-").count(), 2, "label: {label:?}");
+        assert!(
+            heading_decorations(
+                &registry,
+                &[(host, text)],
+                &filed,
+                &HashSet::new(),
+                &[],
+                false,
+            )
+            .is_empty(),
+            "phone browse mode omits the complete agent marker group"
+        );
     }
 
     #[test]
@@ -5506,7 +5568,8 @@ mod tests {
         filed.insert((host, text.find("** Old").unwrap()), vec![loud.agent_id]);
         let documents = [(host, text.clone())];
         assert!(archived_roots(&documents, &filed).contains(&loud.agent_id));
-        let decorations = heading_decorations(&registry, &documents, &filed, &HashSet::new(), &[]);
+        let decorations =
+            heading_decorations(&registry, &documents, &filed, &HashSet::new(), &[], true);
         let (_, _, label) = &decorations[0];
         assert!(
             label.starts_with("  · ") && !label.contains('—'),
@@ -5623,5 +5686,22 @@ mod tests {
         assert_eq!(class_of("Four"), DashClass::Heading4);
         // Level five wraps back around to the level-one color.
         assert_eq!(class_of("Five"), DashClass::Heading);
+
+        let ordinary = [
+            DashClass::Heading,
+            DashClass::Heading2,
+            DashClass::Heading3,
+            DashClass::Heading4,
+        ];
+        let agents = [
+            DashClass::AgentHeading,
+            DashClass::AgentHeading2,
+            DashClass::AgentHeading3,
+            DashClass::AgentHeading4,
+        ];
+        for (index, agent) in agents.iter().copied().enumerate() {
+            assert_ne!(agent, ordinary[index]);
+            assert!(agents.iter().skip(index + 1).all(|other| *other != agent));
+        }
     }
 }

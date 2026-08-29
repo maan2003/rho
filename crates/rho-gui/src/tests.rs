@@ -472,7 +472,7 @@ fn phone_desk_bound_heading_tap_opens_the_agent(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     let root_id = agent(1);
-    let desk_text = format!("* Task :eng-{}:\n", root_id.encoded());
+    let desk_text = format!("* Task :eng-{}:\nbody\n", root_id.encoded());
     let mut source =
         text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
     let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text.as_str())]));
@@ -536,6 +536,40 @@ fn phone_desk_bound_heading_tap_opens_the_agent(cx: &mut TestAppContext) {
     })
     .expect("paint phone Desk");
 
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let editor = workspace.dashboard_editor();
+            let browse = editor.update(cx, |editor, cx| editor.display_text(cx));
+            assert!(!browse.contains(":eng-"), "browse display: {browse:?}");
+            assert_eq!(
+                editor.read(cx).eol_hints().len(),
+                1,
+                "the folded chevron remains, but the agent chip is gone"
+            );
+        })
+        .expect("inspect phone browse rendering");
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.phone_toggle_dashboard_editing(window, cx);
+        })
+        .expect("open raw Desk mode");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let editor = workspace.dashboard_editor();
+            let raw = editor.update(cx, |editor, cx| editor.display_text(cx));
+            assert!(raw.contains(":eng-"), "raw display: {raw:?}");
+            assert_eq!(editor.read(cx).eol_hints().len(), 0);
+        })
+        .expect("inspect raw Desk rendering");
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.phone_toggle_dashboard_editing(window, cx);
+        })
+        .expect("return to phone browse mode");
+    cx.run_until_parked();
+
     let tap = |cx: &mut TestAppContext, position| {
         cx.update_window(*workspace, |_, window, cx| {
             window.dispatch_event(
@@ -576,7 +610,8 @@ fn phone_desk_bound_heading_tap_opens_the_agent(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, _, _| {
             assert!(
-                !workspace.phone_has_surface_for_test(&crate::pane::SurfaceKey::Transcript(root_id))
+                !workspace
+                    .phone_has_surface_for_test(&crate::pane::SurfaceKey::Transcript(root_id))
             );
         })
         .expect("inspect stack after bullet tap");

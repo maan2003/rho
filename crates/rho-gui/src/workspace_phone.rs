@@ -104,6 +104,11 @@ impl Workspace {
             });
         }
         if change.exited {
+            if self.dashboard.set_phone_browse_mode(false) {
+                cx.defer_in(window, |this, window, cx| {
+                    this.refresh_dashboard(window, cx)
+                });
+            }
             self.dashboard
                 .editor()
                 .update(cx, |editor, _| editor.set_read_only(false));
@@ -457,9 +462,14 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let presentation_changed = self.dashboard.set_phone_browse_mode(browsing);
         if self.dashboard.raw_mode() == browsing {
             self.dashboard.toggle_raw_mode(cx);
             self.refresh_dashboard(window, cx);
+        } else if presentation_changed {
+            cx.defer_in(window, |this, window, cx| {
+                this.refresh_dashboard(window, cx)
+            });
         }
         self.dashboard
             .editor()
