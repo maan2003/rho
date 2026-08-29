@@ -11596,6 +11596,33 @@ impl Editor {
         Some(gpui::Point::new(source_x, source_y))
     }
 
+    /// Resolves a window-space pixel position against the editor's most
+    /// recently painted text layout without changing its selections.
+    pub fn display_point_for_window_position(
+        &self,
+        position: gpui::Point<Pixels>,
+    ) -> Option<DisplayPoint> {
+        let position_map = self.last_position_map.as_ref()?;
+        position_map
+            .text_hitbox
+            .bounds
+            .contains(&position)
+            .then(|| position_map.point_for_position(position).nearest_valid)
+    }
+
+    /// Returns the window-space pixel position of a visible display point.
+    pub fn window_position_for_display_point(
+        &mut self,
+        source: DisplayPoint,
+        editor_snapshot: &EditorSnapshot,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Option<gpui::Point<Pixels>> {
+        let origin = self.last_position_map.as_ref()?.text_hitbox.bounds.origin;
+        self.display_to_pixel_point(source, editor_snapshot, window, cx)
+            .map(|position| origin + position)
+    }
+
     pub fn register_addon<T: Addon>(&mut self, instance: T) {
         if self.mode.is_minimap() {
             return;

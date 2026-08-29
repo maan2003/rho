@@ -145,27 +145,88 @@ impl Workspace {
         {
             return;
         }
-        cx.defer_in(window, |this, window, cx| {
-            this.phone_dashboard_activate_tapped_row(window, cx);
+        let position = event.position;
+        cx.defer_in(window, move |this, window, cx| {
+            this.phone_dashboard_activate_tapped_row(position, window, cx);
         });
     }
 
-    fn phone_dashboard_activate_tapped_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn phone_dashboard_activate_tapped_row(
+        &mut self,
+        position: Point<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         use crate::dashboard::RowTarget;
-        match self.dashboard.cursor_target(&self.registry, cx) {
+        match self
+            .dashboard
+            .target_at_window_position(position, &self.registry, cx)
+        {
             Some(RowTarget::Agent { agent_id, .. }) | Some(RowTarget::Reply(agent_id)) => {
                 self.open_agent(agent_id, window, cx);
             }
             Some(RowTarget::Topic {
+                host,
+                offset,
                 on_heading_line: true,
                 ..
             }) => {
-                self.dashboard.toggle_subagents(cx);
+                self.dashboard.toggle_topic(host, offset, cx);
                 self.refresh_dashboard(window, cx);
             }
             Some(RowTarget::Page(id)) => self.open_browser_page(id, window, cx),
             _ => {}
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn phone_has_surface_for_test(&self, key: &SurfaceKey) -> bool {
+        self.phone
+            .stack
+            .iter()
+            .any(|(_, candidate)| candidate == key)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn phone_back_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.phone_back(window, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn phone_agent_position_for_test(
+        &self,
+        agent_id: rho_ui_proto::AgentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<Point<Pixels>> {
+        self.dashboard
+            .agent_window_position_for_test(agent_id, window, cx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn phone_expand_filed_agent_for_test(
+        &mut self,
+        host: crate::registry::HostId,
+        offset: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dashboard.cursor_to_doc(host, offset, cx);
+        self.dashboard.sync(&self.registry, window, cx);
+        assert!(self.dashboard.toggle_agent_tree(cx));
+        self.refresh_dashboard(window, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn phone_reconcile_filed_selection_for_test(
+        &mut self,
+        host: crate::registry::HostId,
+        offset: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dashboard.cursor_to_doc(host, offset, cx);
+        self.refresh_dashboard(window, cx);
     }
 
     fn phone_surface(&self) -> Option<Surface> {

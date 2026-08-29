@@ -2,7 +2,10 @@
 
 use editor::Editor;
 use editor::display_map::{Block, DisplayRow};
-use gpui::{App, AppContext as _, Entity, Focusable as _, TestAppContext, WindowHandle};
+use gpui::{
+    App, AppContext as _, Entity, Focusable as _, InputEvent as _, Modifiers, MouseButton,
+    MouseDownEvent, MouseUpEvent, TestAppContext, WindowHandle, px, size,
+};
 use rho_core::UnixMs;
 use rho_ui_proto::AgentId;
 use rho_ui_proto::remote::{
@@ -294,6 +297,153 @@ fn feed_frames(
     })
     .expect("flush queued frames");
     cx.run_until_parked();
+}
+
+#[gpui::test]
+fn phone_desk_agent_tap_opens_the_agent_surface(cx: &mut TestAppContext) {
+    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
+    use rho_ui_proto::{
+        AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
+    };
+
+    let workspace = test_workspace(cx);
+    cx.simulate_window_resize((*workspace).into(), size(px(500.), px(800.)));
+    cx.run_until_parked();
+
+    let root_id = agent(1);
+    let agent_id = agent(2);
+    let summary = |agent_id, parent_agent, name: &str| UiAgentSummary {
+        agent_id,
+        parent_agent,
+        display_name: Some(name.to_owned()),
+        created_at: UnixMs(1),
+        updated_at: UnixMs(1),
+        role: AgentRole::default(),
+        workspace: WorkspaceInfo::UserCheckout {
+            repo: "/tmp".into(),
+        },
+        attention: UiAttention::Quiet,
+        last_active: UnixMs(1),
+        facts: Default::default(),
+        hidden: false,
+        disposition: AgentDisposition::Pending,
+        last_user_message_text: String::new(),
+        activity: None,
+        turn_report: None,
+        labels: Vec::new(),
+    };
+    let desk_text = format!("* Filed :eng-{}:\n", root_id.encoded());
+    let mut source =
+        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
+    let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text.as_str())]));
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Ready {
+                    agents: vec![
+                        summary(root_id, None, "filed root"),
+                        summary(agent_id, Some(root_id), "filed child"),
+                    ],
+                    iris_agent: None,
+                    projects: Vec::new(),
+                    auth: AuthState {
+                        namespaces: Vec::new(),
+                        disabled_namespaces: Vec::new(),
+                        active_namespace: None,
+                    },
+                    machine_seed: 0,
+                    agent_counter: 100,
+                },
+                window,
+                cx,
+            );
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskSnapshot {
+                    snapshot: DeskSnapshot {
+                        text: source.snapshot().text(),
+                        operations: vec![operation],
+                        transactions: Vec::new(),
+                        replicas: Vec::new(),
+                    },
+                    replica_id: 42,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+            workspace.phone_expand_filed_agent_for_test(HostId::default(), 0, window, cx);
+        })
+        .expect("file agent in Desk");
+    feed_frame(
+        &workspace,
+        cx,
+        agent_id,
+        snapshot_frame(state(vec![user("phone row")], Vec::new())),
+    );
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.phone_back_for_test(window, cx);
+        })
+        .expect("return to phone Desk");
+    cx.update_window((*workspace).into(), |_, window, cx| {
+        window.simulate_next_frame(cx);
+    })
+    .expect("paint phone Desk");
+
+    let position = workspace
+        .update(cx, |workspace, window, cx| {
+            workspace
+                .phone_agent_position_for_test(agent_id, window, cx)
+                .expect("visible agent row")
+        })
+        .expect("locate agent row");
+    cx.update_window((*workspace).into(), |_, window, cx| {
+        window.dispatch_event(
+            MouseDownEvent {
+                position,
+                modifiers: Modifiers::none(),
+                button: MouseButton::Left,
+                click_count: 1,
+                first_mouse: false,
+            }
+            .to_platform_input(),
+            cx,
+        );
+    })
+    .expect("dispatch pointer down");
+    workspace
+        .update(cx, |workspace, window, cx| {
+            // A filed portal is spliced at a document boundary. Reconciliation
+            // may restore the selection to that owning heading between the
+            // press and release; activation must still use the tapped pixels.
+            workspace.phone_reconcile_filed_selection_for_test(HostId::default(), 0, window, cx);
+        })
+        .expect("reconcile filed row selection");
+    cx.update_window((*workspace).into(), |_, window, cx| {
+        window.dispatch_event(
+            MouseUpEvent {
+                position,
+                modifiers: Modifiers::none(),
+                button: MouseButton::Left,
+                click_count: 1,
+            }
+            .to_platform_input(),
+            cx,
+        );
+    })
+    .expect("dispatch pointer up");
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                workspace
+                    .phone_has_surface_for_test(&crate::pane::SurfaceKey::Transcript(agent_id))
+            );
+        })
+        .expect("inspect phone stack");
 }
 
 fn active_editor(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) -> Entity<Editor> {

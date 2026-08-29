@@ -26,7 +26,7 @@ use multi_buffer::{MultiBuffer, ToOffset as _};
 use rho_ui_proto::desk::temporal::{is_overdue_deadline, priority, property_line};
 use rho_ui_proto::desk::{DeskHeading, DeskHeadingState, TemporalMark, TemporalMarkKind, parse};
 use rho_ui_proto::{AgentId, UiAttention};
-use text::{BufferId, ToOffset as _};
+use text::{Bias, BufferId, ToOffset as _};
 use theme::ActiveTheme as _;
 
 use crate::registry::{AgentRegistry, HostId};
@@ -1686,6 +1686,16 @@ impl Dashboard {
                 .point_to_buffer_offset(head)
                 .map(|(buffer, offset)| (anchor, buffer.remote_id(), offset.0))
         })?;
+        self.place_for_anchor(anchor, buffer_id, offset, cx)
+    }
+
+    fn place_for_anchor(
+        &self,
+        anchor: multi_buffer::Anchor,
+        buffer_id: BufferId,
+        offset: usize,
+        cx: &App,
+    ) -> Option<CursorPlace> {
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
         if let multi_buffer::Anchor::Excerpt(anchor) = anchor {
             let path = snapshot.path_for_anchor(anchor);
@@ -1713,6 +1723,27 @@ impl Dashboard {
             .map(|(key, _)| CursorPlace::Row(key.clone()))
     }
 
+    /// The row at a window-space position, resolved from the editor's painted
+    /// layout without focusing it or moving its selection.
+    pub fn target_at_window_position(
+        &self,
+        position: gpui::Point<gpui::Pixels>,
+        registry: &AgentRegistry,
+        cx: &mut Context<Workspace>,
+    ) -> Option<RowTarget> {
+        let place = self.editor.update(cx, |editor, cx| {
+            let display_point = editor.display_point_for_window_position(position)?;
+            let snapshot = editor.display_snapshot(cx);
+            let anchor = snapshot.display_point_to_anchor(display_point, Bias::Left);
+            let point = display_point.to_point(&snapshot);
+            let buffer_snapshot = snapshot.buffer_snapshot();
+            let (buffer, offset) = buffer_snapshot.point_to_buffer_offset(point)?;
+            Some((anchor, buffer.remote_id(), offset.0))
+        })?;
+        let place = self.place_for_anchor(place.0, place.1, place.2, cx)?;
+        self.target_for_place(place, registry, cx)
+    }
+
     /// The heading whose *line* the cursor is on, if any.
     fn cursor_heading_line(&self, cx: &mut Context<Workspace>) -> Option<(HostId, usize)> {
         let Some(CursorPlace::Doc(host, offset)) = self.cursor_place(cx) else {
@@ -1733,7 +1764,17 @@ impl Dashboard {
         registry: &AgentRegistry,
         cx: &mut Context<Workspace>,
     ) -> Option<RowTarget> {
-        match self.cursor_place(cx)? {
+        let place = self.cursor_place(cx)?;
+        self.target_for_place(place, registry, cx)
+    }
+
+    fn target_for_place(
+        &self,
+        place: CursorPlace,
+        registry: &AgentRegistry,
+        cx: &App,
+    ) -> Option<RowTarget> {
+        match place {
             CursorPlace::Row(key) => self.targets.get(&key).cloned(),
             CursorPlace::Doc(host, offset) => {
                 let text = self.source_text(host, cx)?;
@@ -1764,6 +1805,37 @@ impl Dashboard {
                 })
             }
         }
+    }
+
+    #[cfg(test)]
+    pub fn agent_window_position_for_test(
+        &self,
+        agent_id: AgentId,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) -> Option<gpui::Point<gpui::Pixels>> {
+        use editor::display_map::ToDisplayPoint as _;
+
+        let key = self.order.iter().find(|key| {
+            matches!(key, LineKey::Agent { agent_id: candidate, .. } if *candidate == agent_id)
+        })?;
+        let path = self
+            .element_keys
+            .get(key)
+            .and_then(|id| self.composition.path_for_row(*id))?;
+        let anchor = self.multi_buffer.read(cx).location_for_path(&path, cx)?;
+        self.editor.update(cx, |editor, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            let mut display_point = anchor.to_display_point(&snapshot);
+            display_point = editor::DisplayPoint::new(
+                display_point.row(),
+                snapshot.line_len(display_point.row()) / 2,
+            );
+            let mut position =
+                editor.window_position_for_display_point(display_point, &snapshot, window, cx)?;
+            position.x = window.viewport_size().width / 2.;
+            Some(position)
+        })
     }
 
     /// The heading that owns the cursor position: the containing heading
@@ -2317,6 +2389,33 @@ impl Dashboard {
             .into_iter()
             .map(|(_, owner, range)| (owner, range))
             .collect();
+        let next = cycle_folds(&text, &headings, offset, &current);
+        self.store_fold_ranges(host, &next, cx);
+        cx.notify();
+        true
+    }
+
+    pub fn toggle_topic(
+        &mut self,
+        host: HostId,
+        offset: usize,
+        cx: &mut Context<Workspace>,
+    ) -> bool {
+        let Some(text) = self.source_text(host, cx) else {
+            return false;
+        };
+        let headings = parse(&text);
+        if !headings
+            .iter()
+            .any(|heading| heading.heading_range.start == offset)
+        {
+            return false;
+        }
+        let current = self
+            .collapsed_ranges(&[(host, text.clone())], cx)
+            .into_iter()
+            .map(|(_, owner, range)| (owner, range))
+            .collect::<Vec<_>>();
         let next = cycle_folds(&text, &headings, offset, &current);
         self.store_fold_ranges(host, &next, cx);
         cx.notify();
