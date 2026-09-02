@@ -116,9 +116,10 @@ Each deal is a fresh pull: score all eligible items, exclude the surface
 already displayed, and show the single top card above the queue floor. There
 is no retained queue session. Pulling again, stepping back, opening the
 overview, or closing without an explicit verdict skips the dealt card. Skip is
-a 15-minute cooldown, not rejection: Desk cards receive a replaceable
-`:skip: YYYY-MM-DD HH:MM` mark, agent and inbox cooldowns stay in memory, and
-the card returns afterward with its normal score untouched. The dealer never
+a 15-minute cooldown, not rejection: it lives in memory only, keyed by the
+card's identity plus a fingerprint of why it was dealt, so a reply or a
+changed mark voids it at once, and the card returns afterward with its normal
+score untouched. Nothing is written to the desk for a skip. The dealer never
 interrupts: urgency shows as signals (lamp, chime), never as the screen
 changing on its own.
 
