@@ -377,10 +377,12 @@
               # Linux AArch64 kernels commonly use either 4 KiB or 16 KiB
               # pages. jemalloc accepts system pages no larger than its
               # build-time page size, so 16 KiB supports both variants.
+              # Elsewhere 4 KiB is jemalloc's own default; it is spelled out
+              # because env refuses a null.
               env.JEMALLOC_SYS_WITH_LG_PAGE =
                 if pkgs.stdenv.hostPlatform.isLinux && pkgs.stdenv.hostPlatform.isAarch64
                 then "14"
-                else null;
+                else "12";
               postPatch = ''
                 # Brush denies warnings, but the root lockfile can select a
                 # newer Clap which deprecates attributes used by Brush.
