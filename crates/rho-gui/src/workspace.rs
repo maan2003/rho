@@ -9081,7 +9081,17 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &DashboardDealTodo, window, cx| {
                 let count = vim::take_count(cx).unwrap_or(7) as u32;
                 let today = chrono::Local::now().date_naive();
-                if this.dashboard.write_deal_todo(count, today, cx) {
+                let handled = this.dashboard.write_deal_todo(count, today, cx);
+                if handled {
+                    this.echo(
+                        &format!("todo: {}d", count.max(1)),
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
+                } else {
+                    this.echo("todo: nothing under the deal", StyleClass::SystemInfo, cx);
+                }
+                if handled {
                     this.dashboard.record_deal_verdict_as(
                         crate::dashboard::DealerVerdict::Done,
                         chrono::Local::now().fixed_offset(),
