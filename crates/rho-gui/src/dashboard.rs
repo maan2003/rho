@@ -1091,7 +1091,7 @@ impl Dashboard {
         count: u32,
         today: chrono::NaiveDate,
         cx: &mut Context<Workspace>,
-    ) -> bool {
+    ) -> Result<(), &'static str> {
         let days = count.max(1);
         self.write_deal_property(
             TemporalMarkKind::Defer,
@@ -1146,7 +1146,7 @@ impl Dashboard {
         count: u32,
         today: chrono::NaiveDate,
         cx: &mut Context<Workspace>,
-    ) -> bool {
+    ) -> Result<(), &'static str> {
         self.write_deal_property(
             TemporalMarkKind::Todo,
             today.and_time(chrono::NaiveTime::MIN),
@@ -1159,7 +1159,7 @@ impl Dashboard {
         &mut self,
         today: chrono::NaiveDate,
         cx: &mut Context<Workspace>,
-    ) -> bool {
+    ) -> Result<(), &'static str> {
         self.write_deal_property(
             TemporalMarkKind::Done,
             today.and_time(chrono::NaiveTime::MIN),
@@ -1172,7 +1172,7 @@ impl Dashboard {
         &mut self,
         today: chrono::NaiveDate,
         cx: &mut Context<Workspace>,
-    ) -> bool {
+    ) -> Result<(), &'static str> {
         self.write_deal_property(
             TemporalMarkKind::Discarded,
             today.and_time(chrono::NaiveTime::MIN),
@@ -1187,23 +1187,25 @@ impl Dashboard {
         at: chrono::NaiveDateTime,
         pace_days: Option<u32>,
         cx: &mut Context<Workspace>,
-    ) -> bool {
+    ) -> Result<(), &'static str> {
         if !self.deal_accepts_verdict() {
-            return false;
+            return Err("nothing under the deal: the deal is no longer active");
         }
         if !self.refresh_current_deal_offset(cx) {
-            return false;
+            return Err("nothing under the deal: the desk heading moved or disappeared");
         }
         let Some(card) = self.current_deal_card().cloned() else {
-            return false;
+            return Err("nothing under the deal: the deal card disappeared");
         };
         // Agent and page cards carry the heading they sit under, so a verdict
         // on them is a mark on that heading: no daemon disposition, and the
         // same mark the dealer already gates on.
         let Some(offset) = card.heading_offset else {
-            return false;
+            return Err("nothing under the deal: this card has no desk heading");
         };
         self.set_heading_property(card.host, offset, kind, at, pace_days, cx)
+            .then_some(())
+            .ok_or("nothing under the deal: the desk heading is unavailable")
     }
 
     fn set_heading_property(
@@ -4426,11 +4428,15 @@ fn heading_property_edits(
             },
         )
     }];
-    if kind == TemporalMarkKind::Defer {
+    if matches!(kind, TemporalMarkKind::Defer | TemporalMarkKind::Todo) {
         edits.extend(heading.properties.iter().filter_map(|property| {
-            let verdict_family = ["defer", "reminder"]
-                .iter()
-                .any(|key| property.key.eq_ignore_ascii_case(key));
+            let verdict_family = if kind == TemporalMarkKind::Todo {
+                ["deadline", "todo", "defer", "reminder"].as_slice()
+            } else {
+                ["defer", "reminder"].as_slice()
+            }
+            .iter()
+            .any(|key| property.key.eq_ignore_ascii_case(key));
             if !verdict_family
                 || existing.is_some_and(|target| target.line_range == property.line_range)
             {
@@ -4865,6 +4871,11 @@ fn assemble_dealer_queue_with_context(
         let Some(row) = rows_by_topic.get(&topic).copied().filter(|row| !row.gated) else {
             continue;
         };
+        if row.heading.temporal_marks.iter().any(|mark| {
+            mark.kind == TemporalMarkKind::Todo && priority(mark, desk_now) <= DEAL_QUEUE_FLOOR
+        }) {
+            continue;
+        }
         let wait_days = reply_wait_days(ended, now);
         considered.insert(DealCardIdentity::Agent(agent.agent_id));
         let (reply_priority, label) = if agent.facts.needs_you_hint {

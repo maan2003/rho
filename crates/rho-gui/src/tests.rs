@@ -6283,6 +6283,252 @@ fn f16_closes_the_dealt_surface_and_deals_another_card(cx: &mut TestAppContext) 
         .unwrap();
 }
 
+fn assert_deal_verdict_marks_heading(
+    cx: &mut TestAppContext,
+    wanted: fn(crate::dashboard::DealCardKind) -> bool,
+    key: &str,
+    property: &str,
+    pace: Option<&str>,
+) {
+    let (workspace, agent_id, _) = mixed_deal_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(workspace.seek_deal_card_for_test(wanted, window, cx));
+        })
+        .unwrap();
+    cx.update(|cx| cx.refresh_windows());
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.focus_dealt_surface_for_test(window, cx)
+        })
+        .unwrap();
+    cx.update_window(*workspace, |_, window, cx| {
+        let action = cx.build_action("vim::EnterDealMode", None).unwrap();
+        window.dispatch_action(action, cx);
+    })
+    .unwrap();
+    let dealt_identity = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.current_deal_card_for_test().unwrap().0
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, key);
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let text = workspace
+                .desk_buffer_for_test(HostId::default())
+                .unwrap()
+                .read(cx)
+                .text();
+            let agent_heading = format!("* Agent card :eng-{}:", agent_id.encoded());
+            let (heading_name, body) = if wanted(crate::dashboard::DealCardKind::Agent) {
+                (agent_heading.as_str(), "agent body")
+            } else {
+                ("* Desk card", "desk body")
+            };
+            let heading = text.find(heading_name).expect("dealt heading survives");
+            let after_heading = &text[heading..];
+            let mark = after_heading
+                .find(property)
+                .unwrap_or_else(|| panic!("{key} writes {property} on the dealt heading: {text}"));
+            assert!(
+                mark < after_heading.find(body).unwrap(),
+                "the mark belongs on the heading's property line: {text}"
+            );
+            if let Some(pace) = pace {
+                let line = after_heading[mark..].lines().next().unwrap();
+                assert!(line.ends_with(pace), "wrong pace in {line:?}");
+            }
+            if wanted(crate::dashboard::DealCardKind::Agent) {
+                assert!(
+                    !workspace.history_contains_agent_for_test(agent_id),
+                    "an agent verdict closes its transcript history entry"
+                );
+            }
+        })
+        .unwrap();
+    workspace
+        .update(cx, |workspace, _, _| {
+            if let Some((next, _)) = workspace.current_deal_card_for_test() {
+                assert_ne!(next, dealt_identity, "a verdict re-dealt the closed card");
+            }
+        })
+        .unwrap();
+    if wanted(crate::dashboard::DealCardKind::Agent) {
+        if workspace
+            .update(cx, |workspace, _, _| {
+                workspace.dashboard_deal_mode_for_test()
+            })
+            .unwrap()
+        {
+            cx.simulate_keystrokes(*workspace, "q");
+            cx.run_until_parked();
+        }
+        cx.simulate_keystrokes(*workspace, "space k");
+        cx.run_until_parked();
+        workspace
+            .update(cx, |workspace, _, _| {
+                assert!(!workspace.history_contains_agent_for_test(agent_id));
+                assert!(
+                    !workspace.agent_surface_visible_for_test(agent_id),
+                    "Space K must not return to a transcript closed by a verdict"
+                );
+            })
+            .unwrap();
+    }
+}
+
+macro_rules! deal_verdict_test {
+    ($name:ident, $pattern:pat, $key:literal, $property:literal, $pace:expr) => {
+        #[gpui::test]
+        fn $name(cx: &mut TestAppContext) {
+            assert_deal_verdict_marks_heading(
+                cx,
+                |kind| matches!(kind, $pattern),
+                $key,
+                $property,
+                $pace,
+            );
+        }
+    };
+}
+
+deal_verdict_test!(
+    deal_done_on_agent_card_marks_its_heading_done,
+    crate::dashboard::DealCardKind::Agent,
+    "d",
+    ":done:",
+    None
+);
+deal_verdict_test!(
+    deal_discard_on_agent_card_marks_its_heading_discarded,
+    crate::dashboard::DealCardKind::Agent,
+    "x",
+    ":discarded:",
+    None
+);
+deal_verdict_test!(
+    deal_snooze_on_agent_card_marks_its_heading_deferred_one_day,
+    crate::dashboard::DealCardKind::Agent,
+    "s",
+    ":defer:",
+    Some(" 1d")
+);
+deal_verdict_test!(
+    deal_todo_on_agent_card_marks_its_heading_todo_seven_days,
+    crate::dashboard::DealCardKind::Agent,
+    "t",
+    ":todo:",
+    Some(" 7d")
+);
+deal_verdict_test!(
+    deal_done_on_desk_card_marks_its_heading_done,
+    crate::dashboard::DealCardKind::Desk,
+    "d",
+    ":done:",
+    None
+);
+deal_verdict_test!(
+    deal_discard_on_desk_card_marks_its_heading_discarded,
+    crate::dashboard::DealCardKind::Desk,
+    "x",
+    ":discarded:",
+    None
+);
+deal_verdict_test!(
+    deal_snooze_on_desk_card_marks_its_heading_deferred_one_day,
+    crate::dashboard::DealCardKind::Desk,
+    "s",
+    ":defer:",
+    Some(" 1d")
+);
+deal_verdict_test!(
+    deal_todo_on_desk_card_marks_its_heading_todo_seven_days,
+    crate::dashboard::DealCardKind::Desk,
+    "t",
+    ":todo:",
+    Some(" 7d")
+);
+
+#[gpui::test]
+fn deal_verdict_mid_history_steps_to_the_newer_surface(cx: &mut TestAppContext) {
+    let (workspace, agent_id, _) = mixed_deal_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(workspace.seek_deal_card_for_test(
+                |kind| matches!(kind, crate::dashboard::DealCardKind::Agent),
+                window,
+                cx,
+            ));
+            workspace.focus_dealt_surface_for_test(window, cx);
+        })
+        .unwrap();
+    cx.update_window(*workspace, |_, window, cx| {
+        let action = cx.build_action("vim::EnterDealMode", None).unwrap();
+        window.dispatch_action(action, cx);
+    })
+    .unwrap();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            workspace.append_newer_history_for_test("newer", cx)
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "d");
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(workspace.current_surface_name_for_test(), "inbox newer");
+            assert!(!workspace.dashboard_deal_mode_for_test());
+            assert!(!workspace.history_contains_agent_for_test(agent_id));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn deal_verdict_at_history_end_deals_a_fresh_card(cx: &mut TestAppContext) {
+    let (workspace, _, _) = mixed_deal_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(workspace.seek_deal_card_for_test(
+                |kind| matches!(kind, crate::dashboard::DealCardKind::Agent),
+                window,
+                cx,
+            ));
+            workspace.focus_dealt_surface_for_test(window, cx);
+        })
+        .unwrap();
+    cx.update_window(*workspace, |_, window, cx| {
+        let action = cx.build_action("vim::EnterDealMode", None).unwrap();
+        window.dispatch_action(action, cx);
+    })
+    .unwrap();
+    let before = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.current_deal_card_for_test().unwrap().0
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "d");
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            let after = workspace
+                .current_deal_card_for_test()
+                .expect("a verdict at history end should deal another card")
+                .0;
+            assert_ne!(after, before);
+            assert!(workspace.dashboard_deal_mode_for_test());
+        })
+        .unwrap();
+}
+
 #[gpui::test]
 fn deal_agent_insert_targets_the_composer(cx: &mut TestAppContext) {
     let (workspace, agent_id, _) = mixed_deal_workspace(cx);
@@ -6784,6 +7030,46 @@ deal_q_exit_test!(
     crate::dashboard::DealCardKind::Agent
 );
 deal_q_exit_test!(q_exits_inbox_deal, crate::dashboard::DealCardKind::Inbox(_));
+
+#[gpui::test]
+fn q_closes_agent_surface_and_space_k_cannot_return_to_it(cx: &mut TestAppContext) {
+    let (workspace, agent_id, _) = mixed_deal_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(workspace.seek_deal_card_for_test(
+                |kind| matches!(kind, crate::dashboard::DealCardKind::Agent),
+                window,
+                cx,
+            ));
+            workspace.focus_dealt_surface_for_test(window, cx);
+        })
+        .unwrap();
+    cx.update_window(*workspace, |_, window, cx| {
+        let action = cx.build_action("vim::EnterDealMode", None).unwrap();
+        window.dispatch_action(action, cx);
+    })
+    .unwrap();
+    cx.simulate_keystrokes(*workspace, "q");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(!workspace.history_contains_agent_for_test(agent_id));
+            assert!(!workspace.agent_surface_visible_for_test(agent_id));
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "space k");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(!workspace.history_contains_agent_for_test(agent_id));
+            assert!(
+                !workspace.agent_surface_visible_for_test(agent_id),
+                "Space K must not return to a transcript explicitly closed with q"
+            );
+        })
+        .unwrap();
+}
 
 #[gpui::test]
 fn quick_spawn_send_relocates_the_cursor(cx: &mut TestAppContext) {

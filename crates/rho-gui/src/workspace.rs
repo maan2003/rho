@@ -452,6 +452,7 @@ pub struct Workspace {
     deal_session_open: bool,
     deal_current_interacted: bool,
     deal_view: Option<DealView>,
+    deal_focus_pending: bool,
     deal_hints_visible: bool,
     deal_controls_visible: bool,
     agent_last_interaction: HashMap<AgentId, i64>,
@@ -1044,6 +1045,7 @@ impl Workspace {
             deal_session_open: false,
             deal_current_interacted: false,
             deal_view: None,
+            deal_focus_pending: false,
             deal_hints_visible: false,
             deal_controls_visible: false,
             agent_last_interaction: HashMap::new(),
@@ -5879,6 +5881,28 @@ impl Workspace {
     }
 
     #[cfg(test)]
+    pub(crate) fn history_contains_agent_for_test(&self, agent_id: AgentId) -> bool {
+        self.surface_history
+            .iter()
+            .any(|warm| warm.surface.key == SurfaceKey::Transcript(agent_id))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn agent_surface_visible_for_test(&self, agent_id: AgentId) -> bool {
+        !self.overview_open && self.active_pane().surface.key == SurfaceKey::Transcript(agent_id)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn append_newer_history_for_test(&mut self, name: &str, cx: &mut Context<Self>) {
+        let surface = Self::wrap_surface(
+            SurfaceKey::Inbox(name.to_owned()),
+            SurfaceView::Inbox(self.active_editor(cx)),
+        );
+        self.append_history(surface, crate::journal::HistoryAppendMethod::Overview, cx);
+        self.history_cursor = self.history_cursor.saturating_sub(1);
+    }
+
+    #[cfg(test)]
     pub(crate) fn show_current_history_for_test(
         &mut self,
         method: crate::journal::SurfaceShowMethod,
@@ -6014,13 +6038,7 @@ impl Workspace {
                         return;
                     }
                 }
-                crate::dashboard::DealCardKind::Inbox(_) => {
-                    self.deal_view = Some(DealView::Inbox {
-                        identity: card.identity.clone(),
-                        kind: card.kind,
-                        editor: self.dashboard.editor().clone(),
-                    });
-                }
+                crate::dashboard::DealCardKind::Inbox(_) => {}
                 crate::dashboard::DealCardKind::Desk => {}
             }
         }
@@ -6029,6 +6047,9 @@ impl Workspace {
                 editor.focus_handle(cx)
             }
             Some(DealView::Surface { surface, .. }) => match &surface.view {
+                SurfaceView::DeskHeading(editor) | SurfaceView::Inbox(editor) => {
+                    editor.focus_handle(cx)
+                }
                 SurfaceView::Transcript { editor, .. } => editor.focus_handle(cx),
                 #[cfg(feature = "native")]
                 SurfaceView::Browser(view) => view.read(cx).focus_handle(cx),
@@ -6767,7 +6788,7 @@ impl Workspace {
 
     pub(crate) fn cmd_close_and_deal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_current_surface(window, cx);
-        self.deal_next(window, cx);
+        self.cmd_surface_forward_or_deal(window, cx);
     }
 
     pub(crate) fn cmd_toggle_raw_desk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -6898,9 +6919,21 @@ impl Workspace {
                 .current_deal_card()
                 .map(|card| Self::journal_card_identity(&card.identity)),
         });
-        if let Ok(action) = cx.build_action("vim::EnterDealMode", None) {
+        let editor = match &self.active_pane().surface.view {
+            SurfaceView::DeskHeading(editor) | SurfaceView::Inbox(editor) => Some(editor.clone()),
+            SurfaceView::Transcript { editor, .. } => Some(editor.clone()),
+            _ => None,
+        };
+        if let Some(editor) = editor {
+            // Surface promotion happens before the new editor is mounted in
+            // GPUI's action dispatch tree, so enter the owned Vim instance
+            // directly instead of dispatching EnterDealMode to the old focus.
+            vim::enter_deal_mode(&editor, window, cx);
+        } else if let Ok(action) = cx.build_action("vim::EnterDealMode", None) {
             window.dispatch_action(action, cx);
         }
+        self.deal_focus_pending = true;
+        cx.notify();
     }
 
     fn deal_next(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -6979,6 +7012,13 @@ impl Workspace {
             }
         }
         self.refresh_dashboard(window, cx);
+    }
+
+    fn finish_deal_verdict(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.dashboard.end_deal(cx);
+        self.close_current_surface(window, cx);
+        self.finish_dashboard_deal_action(window, cx);
+        self.cmd_surface_forward_or_deal(window, cx);
     }
 
     fn defer_deal_edit(
@@ -8309,6 +8349,27 @@ impl Workspace {
             }
         }
 
+        if std::mem::take(&mut self.deal_focus_pending) {
+            cx.defer_in(window, |this, window, cx| {
+                if !this.dashboard.deal_mode() {
+                    return;
+                }
+                this.focus_active_surface(window, cx);
+                let editor = match &this.active_pane().surface.view {
+                    SurfaceView::DeskHeading(editor) | SurfaceView::Inbox(editor) => {
+                        Some(editor.clone())
+                    }
+                    SurfaceView::Transcript { editor, .. } => Some(editor.clone()),
+                    _ => None,
+                };
+                if let Some(editor) = editor {
+                    vim::enter_deal_mode(&editor, window, cx);
+                } else if let Ok(action) = cx.build_action("vim::EnterDealMode", None) {
+                    window.dispatch_action(action, cx);
+                }
+            });
+        }
+
         match self.deal_view.as_ref() {
             Some(DealView::Desk { editor, .. }) => div()
                 .size_full()
@@ -9273,12 +9334,21 @@ impl Render for Workspace {
                 let card = this.dashboard.current_deal_card().cloned();
                 let today = chrono::Local::now().date_naive();
                 let now = chrono::Local::now().fixed_offset();
-                let handled = match card.as_ref().map(|card| card.kind) {
-                    Some(
-                        crate::dashboard::DealCardKind::Desk
-                        | crate::dashboard::DealCardKind::Agent,
-                    ) => this.dashboard.write_deal_done(today, cx),
-                    Some(crate::dashboard::DealCardKind::Inbox(_)) => {
+                let result = match card.as_ref() {
+                    Some(card)
+                        if card.heading_offset.is_some()
+                            || matches!(
+                                card.kind,
+                                crate::dashboard::DealCardKind::Desk
+                                    | crate::dashboard::DealCardKind::Agent
+                            ) =>
+                    {
+                        this.dashboard.write_deal_done(today, cx)
+                    }
+                    Some(crate::dashboard::DealCard {
+                        kind: crate::dashboard::DealCardKind::Inbox(_),
+                        ..
+                    }) => {
                         let Some(crate::dashboard::DealCardIdentity::Inbox(id)) =
                             card.as_ref().map(|card| &card.identity)
                         else {
@@ -9289,15 +9359,21 @@ impl Render for Workspace {
                                 &crate::inbox::InboxId(id.clone()),
                                 crate::inbox::Verdict::Discarded,
                             )
-                            .is_ok()
+                            .map(|_| ())
+                            .map_err(|_| "nothing under the deal: the inbox item is unavailable")
                     }
-                    None => false,
+                    _ => Err("nothing under the deal: the deal card disappeared"),
                 };
+                let handled = result.is_ok();
                 if handled {
                     this.dashboard
                         .record_deal_verdict_as(crate::dashboard::DealerVerdict::Done, now);
-                    this.dashboard.end_deal(cx);
-                    this.finish_dashboard_deal_action(window, cx);
+                    this.finish_deal_verdict(window, cx);
+                }
+                if let Err(reason) = result {
+                    this.echo(&format!("done: {reason}"), StyleClass::SystemInfo, cx);
+                } else {
+                    this.echo("done", StyleClass::SystemInfo, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &DashboardDealDiscard, window, cx| {
@@ -9305,12 +9381,21 @@ impl Render for Workspace {
                 let card = this.dashboard.current_deal_card().cloned();
                 let today = chrono::Local::now().date_naive();
                 let now = chrono::Local::now().fixed_offset();
-                let handled = match card.as_ref().map(|card| card.kind) {
-                    Some(
-                        crate::dashboard::DealCardKind::Desk
-                        | crate::dashboard::DealCardKind::Agent,
-                    ) => this.dashboard.write_deal_discarded(today, cx),
-                    Some(crate::dashboard::DealCardKind::Inbox(_)) => {
+                let result = match card.as_ref() {
+                    Some(card)
+                        if card.heading_offset.is_some()
+                            || matches!(
+                                card.kind,
+                                crate::dashboard::DealCardKind::Desk
+                                    | crate::dashboard::DealCardKind::Agent
+                            ) =>
+                    {
+                        this.dashboard.write_deal_discarded(today, cx)
+                    }
+                    Some(crate::dashboard::DealCard {
+                        kind: crate::dashboard::DealCardKind::Inbox(_),
+                        ..
+                    }) => {
                         let Some(crate::dashboard::DealCardIdentity::Inbox(id)) =
                             card.as_ref().map(|card| &card.identity)
                         else {
@@ -9321,15 +9406,21 @@ impl Render for Workspace {
                                 &crate::inbox::InboxId(id.clone()),
                                 crate::inbox::Verdict::Discarded,
                             )
-                            .is_ok()
+                            .map(|_| ())
+                            .map_err(|_| "nothing under the deal: the inbox item is unavailable")
                     }
-                    None => false,
+                    _ => Err("nothing under the deal: the deal card disappeared"),
                 };
+                let handled = result.is_ok();
                 if handled {
                     this.dashboard
                         .record_deal_verdict_as(crate::dashboard::DealerVerdict::Dismiss, now);
-                    this.dashboard.end_deal(cx);
-                    this.finish_dashboard_deal_action(window, cx);
+                    this.finish_deal_verdict(window, cx);
+                }
+                if let Err(reason) = result {
+                    this.echo(&format!("discard: {reason}"), StyleClass::SystemInfo, cx);
+                } else {
+                    this.echo("discard", StyleClass::SystemInfo, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &DashboardDealSnooze, window, cx| {
@@ -9337,12 +9428,21 @@ impl Render for Workspace {
                 let today = chrono::Local::now().date_naive();
                 let now = chrono::Local::now().fixed_offset();
                 let card = this.dashboard.current_deal_card().cloned();
-                let handled = match card.as_ref().map(|card| card.kind) {
-                    Some(
-                        crate::dashboard::DealCardKind::Desk
-                        | crate::dashboard::DealCardKind::Agent,
-                    ) => this.dashboard.write_deal_snooze(count, today, cx),
-                    Some(crate::dashboard::DealCardKind::Inbox(_)) => {
+                let result = match card.as_ref() {
+                    Some(card)
+                        if card.heading_offset.is_some()
+                            || matches!(
+                                card.kind,
+                                crate::dashboard::DealCardKind::Desk
+                                    | crate::dashboard::DealCardKind::Agent
+                            ) =>
+                    {
+                        this.dashboard.write_deal_snooze(count, today, cx)
+                    }
+                    Some(crate::dashboard::DealCard {
+                        kind: crate::dashboard::DealCardKind::Inbox(_),
+                        ..
+                    }) => {
                         let Some(crate::dashboard::DealCardIdentity::Inbox(id)) =
                             card.as_ref().map(|card| &card.identity)
                         else {
@@ -9353,23 +9453,28 @@ impl Render for Workspace {
                                 &crate::inbox::InboxId(id.clone()),
                                 (now + chrono::Duration::days(i64::from(count))).timestamp_millis(),
                             )
-                            .unwrap_or(false)
+                            .map_err(|_| "nothing under the deal: the inbox item is unavailable")
+                            .and_then(|changed| {
+                                changed
+                                    .then_some(())
+                                    .ok_or("nothing under the deal: the inbox item is unavailable")
+                            })
                     }
-                    _ => false,
+                    _ => Err("nothing under the deal: the deal card disappeared"),
                 };
-                // A verdict's success looks exactly like a key that did
-                // nothing; say what the press did, or that it did not.
-                if handled {
-                    let days = count.max(1);
-                    this.echo(&format!("snooze: {days}d"), StyleClass::SystemInfo, cx);
-                } else {
-                    this.echo("snooze: nothing under the deal", StyleClass::SystemInfo, cx);
-                }
+                let handled = result.is_ok();
                 if handled {
                     this.dashboard
                         .record_deal_verdict_as(crate::dashboard::DealerVerdict::Defer, now);
-                    this.dashboard.end_deal(cx);
-                    this.finish_dashboard_deal_action(window, cx);
+                    this.finish_deal_verdict(window, cx);
+                }
+                // A verdict's success looks exactly like a key that did
+                // nothing; say what the press did, or that it did not.
+                if let Err(reason) = result {
+                    this.echo(&format!("snooze: {reason}"), StyleClass::SystemInfo, cx);
+                } else {
+                    let days = count.max(1);
+                    this.echo(&format!("snooze: {days}d"), StyleClass::SystemInfo, cx);
                 }
             }))
             .on_action(
@@ -9395,23 +9500,23 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &DashboardDealTodo, window, cx| {
                 let count = vim::take_count(cx).unwrap_or(7) as u32;
                 let today = chrono::Local::now().date_naive();
-                let handled = this.dashboard.write_deal_todo(count, today, cx);
-                if handled {
-                    this.echo(
-                        &format!("todo: {}d", count.max(1)),
-                        StyleClass::SystemInfo,
-                        cx,
-                    );
-                } else {
-                    this.echo("todo: nothing under the deal", StyleClass::SystemInfo, cx);
-                }
+                let result = this.dashboard.write_deal_todo(count, today, cx);
+                let handled = result.is_ok();
                 if handled {
                     this.dashboard.record_deal_verdict_as(
                         crate::dashboard::DealerVerdict::Done,
                         chrono::Local::now().fixed_offset(),
                     );
-                    this.dashboard.end_deal(cx);
-                    this.finish_dashboard_deal_action(window, cx);
+                    this.finish_deal_verdict(window, cx);
+                }
+                if let Err(reason) = result {
+                    this.echo(&format!("todo: {reason}"), StyleClass::SystemInfo, cx);
+                } else {
+                    this.echo(
+                        &format!("todo: {}d", count.max(1)),
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
                 }
             }))
             .on_action(cx.listener(|this, _: &DashboardDealRefresh, window, cx| {

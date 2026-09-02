@@ -586,6 +586,31 @@ impl Render for Vim {
     }
 }
 
+/// Enters mode for an application-owned Deal surface without relying
+/// on focus-chain action routing during a surface promotion.
+pub fn enter_deal_mode(editor: &Entity<Editor>, window: &mut Window, cx: &mut App) -> bool {
+    let Some(addon) = editor.read(cx).addon::<VimAddon>().cloned() else {
+        return false;
+    };
+    addon.entity.update(cx, |vim, cx| {
+        let mode = if HelixModeSetting::get_global(cx).0 {
+            Mode::HelixDeal
+        } else {
+            Mode::Deal
+        };
+        vim.update_editor(cx, |_, editor, cx| {
+            editor.change_selections(Default::default(), window, cx, |selections| {
+                selections.move_with(&mut |_, selection| {
+                    selection.collapse_to(selection.head(), SelectionGoal::None);
+                });
+            });
+        });
+        vim.allow_deal_transition = true;
+        vim.switch_mode(mode, true, window, cx);
+    });
+    true
+}
+
 /// Enters insert mode for an application-owned Deal surface without relying
 /// on focus-chain action routing during a surface promotion.
 pub fn enter_deal_insert_mode(editor: &Entity<Editor>, window: &mut Window, cx: &mut App) -> bool {
