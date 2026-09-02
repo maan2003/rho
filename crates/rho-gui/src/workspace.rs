@@ -5502,6 +5502,30 @@ impl Workspace {
     }
 
     #[cfg(test)]
+    pub(crate) fn configure_evicted_transcript_mru_for_test(
+        &mut self,
+        agent_id: AgentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dashboard.end_deal(cx);
+        self.end_deal_session();
+        self.deal_view = None;
+        let transcript = self.make_surface(SurfaceKey::Transcript(agent_id), window, cx);
+        self.display_surface(transcript, cx);
+        let draft = self.make_surface(SurfaceKey::Draft, window, cx);
+        self.display_surface(draft, cx);
+        self.subscriptions
+            .mark_unloaded(agent_id, rho_ui_proto::AgentUnloadReason::Idle);
+        self.release_agent_view_cache(agent_id, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn agent_subscribed_for_test(&self, agent_id: AgentId) -> bool {
+        self.subscriptions.contains(agent_id)
+    }
+
+    #[cfg(test)]
     pub(crate) fn current_deal_card_for_test(
         &self,
     ) -> Option<(

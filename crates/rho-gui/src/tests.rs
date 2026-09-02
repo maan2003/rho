@@ -6205,6 +6205,24 @@ fn f21_steps_through_three_surfaces(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn f21_resubscribes_an_evicted_transcript(cx: &mut TestAppContext) {
+    let (workspace, agent_id, _) = mixed_deal_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.configure_evicted_transcript_mru_for_test(agent_id, window, cx);
+            assert!(!workspace.agent_subscribed_for_test(agent_id));
+            workspace.step_surface_back_for_test(window, cx);
+            assert!(
+                workspace
+                    .current_surface_name_for_test()
+                    .starts_with("mixed hand agent")
+            );
+            assert!(workspace.agent_subscribed_for_test(agent_id));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn q_closes_current_surface_and_reveals_previous(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
     let workspace = test_workspace(cx);
