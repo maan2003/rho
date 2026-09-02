@@ -37,6 +37,14 @@ pub fn token_start(text_before_cursor: &str) -> usize {
         .unwrap_or(0)
 }
 
+pub fn completion_start(text_before_cursor: &str, whole_input: bool) -> usize {
+    if whole_input {
+        0
+    } else {
+        token_start(text_before_cursor)
+    }
+}
+
 /// How long an echoed message stays visible.
 pub const ECHO_DURATION: std::time::Duration = std::time::Duration::from_secs(2);
 /// Long messages (`:help`) are capped in the echo area; the transcript
@@ -132,6 +140,8 @@ pub struct Minibuffer {
     /// The user moved the selection since the last edit, making the
     /// highlighted candidate an explicit choice even on empty input.
     selection_moved: bool,
+    complete_whole_input: bool,
+    completed_selection: Option<(Candidate, usize)>,
     _edits: Subscription,
 }
 
@@ -179,6 +189,8 @@ impl Minibuffer {
             candidates: Vec::new(),
             selected: 0,
             selection_moved: false,
+            complete_whole_input: false,
+            completed_selection: None,
             _edits: edits,
         }
     }
@@ -192,8 +204,23 @@ impl Minibuffer {
     pub fn refresh(&mut self, workspace: &Workspace, cx: &App) {
         let input = self.input(cx);
         self.candidates = (self.complete)(workspace, &input, cx);
-        self.selected = 0;
-        self.selection_moved = false;
+        if let Some((candidate, occurrence)) = self.completed_selection.clone()
+            && input == candidate.value
+            && let Some(index) = self
+                .candidates
+                .iter()
+                .enumerate()
+                .filter(|(_, other)| **other == candidate)
+                .nth(occurrence)
+                .map(|(index, _)| index)
+        {
+            self.selected = index;
+            self.selection_moved = true;
+        } else {
+            self.completed_selection = None;
+            self.selected = 0;
+            self.selection_moved = false;
+        }
     }
 
     pub fn select_by_delta(&mut self, delta: isize) {
@@ -218,20 +245,25 @@ impl Minibuffer {
     /// user has typed something or explicitly moved the selection. A bare
     /// enter on an untouched minibuffer still submits the empty input.
     pub fn accept_selected(&mut self, window: &mut Window, cx: &mut App) {
-        if !self.input(cx).trim().is_empty() || self.selection_moved {
+        if self.accepts_selected(cx) {
             self.complete_selected(window, cx);
         }
+    }
+
+    pub fn accepts_selected(&self, cx: &App) -> bool {
+        !self.input(cx).trim().is_empty() || self.selection_moved
     }
 
     /// Tab: replaces the last whitespace-delimited token of the input with
     /// the selected candidate.
     pub fn complete_selected(&mut self, window: &mut Window, cx: &mut App) {
-        let Some(candidate) = self.candidates.get(self.selected).cloned() else {
+        let Some((candidate, occurrence)) = self.selected_candidate() else {
             return;
         };
+        self.completed_selection = Some((candidate.clone(), occurrence));
         self.editor.update(cx, |editor, cx| {
             let text = editor.text(cx);
-            let start = token_start(&text);
+            let start = completion_start(&text, self.complete_whole_input);
             let new_text = format!("{}{}", &text[..start], candidate.value);
             let end = multi_buffer::MultiBufferOffset(new_text.len());
             editor.set_text(new_text, window, cx);
@@ -239,6 +271,19 @@ impl Minibuffer {
                 selections.select_ranges([end..end]);
             });
         });
+    }
+
+    pub fn set_complete_whole_input(&mut self) {
+        self.complete_whole_input = true;
+    }
+
+    pub fn selected_candidate(&self) -> Option<(Candidate, usize)> {
+        let candidate = self.candidates.get(self.selected)?.clone();
+        let occurrence = self.candidates[..self.selected]
+            .iter()
+            .filter(|other| *other == &candidate)
+            .count();
+        Some((candidate, occurrence))
     }
 
     /// Consumes the minibuffer into its input and handler; the caller

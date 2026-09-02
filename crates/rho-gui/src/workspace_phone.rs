@@ -195,31 +195,25 @@ impl Workspace {
     ) {
         use crate::dashboard::RowTarget;
         match target {
-            Some(RowTarget::Agent { agent_id, .. }) | Some(RowTarget::Reply(agent_id)) => {
-                self.open_agent(agent_id, window, cx);
-            }
-            Some(RowTarget::Topic {
+            Some(RowTarget::TreeAgent { agent_id, .. }) => self.open_agent(agent_id, window, cx),
+            Some(RowTarget::TreeTopic {
                 host,
-                offset,
+                node_id,
                 first_attention,
-                on_heading_line: true,
-                on_bullet,
-            }) => {
-                // A heading bound to an agent is the agent on the phone:
-                // tapping its line opens the loudest one. The bullet stays
-                // a fold toggle so bound topics with children remain
-                // collapsible.
-                let bound_agent = first_attention
-                    .or_else(|| self.dashboard.first_agent_for_topic((host, offset)));
-                match bound_agent {
-                    Some(agent_id) if !on_bullet => self.open_agent(agent_id, window, cx),
-                    _ => {
-                        self.dashboard.toggle_topic(host, offset, cx);
-                        self.refresh_dashboard(window, cx);
-                    }
+                ..
+            }) => match first_attention
+                .or_else(|| self.dashboard.first_tree_agent_for_topic((host, node_id)))
+            {
+                Some(agent_id) => self.open_agent(agent_id, window, cx),
+                None => {
+                    self.dashboard.move_to_tree_node_when_ready(host, node_id);
+                    self.dashboard.toggle_subagents(cx);
+                    self.refresh_dashboard(window, cx);
                 }
+            },
+            Some(RowTarget::TreePage { page_id, .. }) => {
+                self.open_browser_page(page_id, window, cx)
             }
-            Some(RowTarget::Page(id)) => self.open_browser_page(id, window, cx),
             _ => {}
         }
     }
@@ -235,71 +229,6 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn phone_back_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.phone_back(window, cx);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn phone_agent_position_for_test(
-        &self,
-        agent_id: rho_ui_proto::AgentId,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<Point<Pixels>> {
-        self.dashboard
-            .agent_window_position_for_test(agent_id, window, cx)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn phone_doc_position_for_test(
-        &mut self,
-        host: crate::registry::HostId,
-        offset: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<Point<Pixels>> {
-        self.dashboard
-            .doc_window_position_for_test(host, offset, window, cx)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn phone_expand_filed_agent_for_test(
-        &mut self,
-        host: crate::registry::HostId,
-        offset: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.dashboard.cursor_to_doc(host, offset, cx);
-        self.dashboard.sync(&self.registry, &self.inbox, window, cx);
-        assert!(self.dashboard.toggle_agent_tree(cx));
-        self.refresh_dashboard(window, cx);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn phone_ensure_topic_expanded_for_test(
-        &mut self,
-        host: crate::registry::HostId,
-        offset: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.dashboard.topic_folded_for_test(host, offset, cx) {
-            assert!(self.dashboard.toggle_topic(host, offset, cx));
-            self.refresh_dashboard(window, cx);
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn phone_reconcile_filed_selection_for_test(
-        &mut self,
-        host: crate::registry::HostId,
-        selection_offset: usize,
-        fold_offset: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.dashboard.cursor_to_doc(host, selection_offset, cx);
-        assert!(self.dashboard.toggle_topic(host, fold_offset, cx));
-        self.refresh_dashboard(window, cx);
     }
 
     fn phone_surface(&self) -> Option<Surface> {

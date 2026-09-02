@@ -8530,8 +8530,7 @@ impl Element for EditorElement {
                                 } else {
                                     snapshot
                                 };
-                                let is_rewrapping =
-                                    editor.display_map.read(cx).is_rewrapping(cx);
+                                let is_rewrapping = editor.display_map.read(cx).is_rewrapping(cx);
                                 if is_initial_layout && is_rewrapping {
                                     editor.defer_paint_until_initial_wrap = true;
                                 } else if !is_rewrapping {
@@ -11621,8 +11620,8 @@ mod tests {
     async fn test_initial_paint_waits_for_large_soft_wrap(cx: &mut TestAppContext) {
         init_test(cx, |_| {});
         let window = cx.add_window(|window, cx| {
-            let text = "a long transcript line that needs to wrap at the editor width\n"
-                .repeat(20_000);
+            let text =
+                "a long transcript line that needs to wrap at the editor width\n".repeat(20_000);
             let buffer = MultiBuffer::build_simple(&text, cx);
             let mut editor = Editor::new(EditorMode::full(), buffer, None, window, cx);
             editor.set_soft_wrap_mode(language_settings::SoftWrap::EditorWidth, cx);
@@ -11632,32 +11631,27 @@ mod tests {
         let editor = window.root(cx).unwrap();
         let style = cx.update(|_, cx| editor.update(cx, |editor, cx| editor.style(cx).clone()));
 
-        let (_, initial_state) = cx.draw(
-            Default::default(),
-            size(px(180.), px(500.)),
-            |_, _| EditorElement::new(&editor, style.clone()),
-        );
+        let (_, initial_state) = cx.draw(Default::default(), size(px(180.), px(500.)), |_, _| {
+            EditorElement::new(&editor, style.clone())
+        });
         assert!(
             initial_state.defer_paint_until_rewrapped,
             "the initial frame must not paint the stale unwrapped snapshot"
         );
 
-        let (_, second_pending_state) = cx.draw(
-            Default::default(),
-            size(px(180.), px(500.)),
-            |_, _| EditorElement::new(&editor, style.clone()),
-        );
+        let (_, second_pending_state) =
+            cx.draw(Default::default(), size(px(180.), px(500.)), |_, _| {
+                EditorElement::new(&editor, style.clone())
+            });
         assert!(
             second_pending_state.defer_paint_until_rewrapped,
             "redraws must remain blank until the initial rewrap finishes"
         );
 
         cx.run_until_parked();
-        let (_, resized_state) = cx.draw(
-            Default::default(),
-            size(px(220.), px(500.)),
-            |_, _| EditorElement::new(&editor, style),
-        );
+        let (_, resized_state) = cx.draw(Default::default(), size(px(220.), px(500.)), |_, _| {
+            EditorElement::new(&editor, style)
+        });
         assert!(
             !resized_state.defer_paint_until_rewrapped,
             "a later resize rewrap must not inherit initial-paint suppression"

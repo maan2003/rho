@@ -97,6 +97,28 @@ impl Workspace {
 
         let workspace = cx.entity().downgrade();
         let draft_model = cx.new(|cx| crate::draft_view::DraftModel::new(workspace, cx));
+        let messages_buffer = cx.new(|cx| {
+            let mut buffer = language::Buffer::local("", cx);
+            buffer.set_capability(language::Capability::Read, cx);
+            buffer
+        });
+        let messages_multi_buffer =
+            cx.new(|cx| multi_buffer::MultiBuffer::singleton(messages_buffer.clone(), cx));
+        let messages_editor = cx.new(|cx| {
+            let mut editor = editor::Editor::new(
+                editor::EditorMode::Full {
+                    scale_ui_elements_with_buffer_font_size: true,
+                    show_active_line_background: false,
+                    sizing_behavior: editor::SizingBehavior::ExcludeOverscrollMargin,
+                },
+                messages_multi_buffer,
+                window,
+                cx,
+            );
+            crate::editor_config::configure(&mut editor, window, cx);
+            editor.set_read_only(true);
+            editor
+        });
         let event_task = cx.spawn(async move |this, cx| {
             let mut events = events;
             while let Some(event) = events.next().await {
@@ -158,6 +180,21 @@ impl Workspace {
                 cx.notify();
             }
         });
+        let dealer_signal_task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(60))
+                    .await;
+                if this
+                    .update(cx, |this, cx| this.invalidate_dealer_signals(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let window_activation_subscription =
+            cx.observe_window_activation(window, |_this, _window, _cx| {});
 
         let mut this = Self {
             hosts,
@@ -171,10 +208,19 @@ impl Workspace {
             pending_frames: Vec::new(),
             frame_flush_scheduled: false,
             draft_model,
+            message_log: Default::default(),
+            messages_buffer,
+            messages_editor,
+            messages_styles: Vec::new(),
+            messages_line_lengths: Default::default(),
+            messages_applied_classes: Default::default(),
+            message_evictions_since_rebase: 0,
+            message_rebase_scheduled: false,
             workdirs: Vec::new(),
             new_agent_draft: None,
             awaiting_draft_agent: None,
             ready_hosts: Default::default(),
+            replay_hosts: Default::default(),
             quota_summaries: HashMap::new(),
             quota_history: HashMap::new(),
             quota_history_days: 7,
@@ -186,13 +232,50 @@ impl Workspace {
             contexts: HashMap::new(),
             surfaces: HashMap::new(),
             active_context: ContextId::Draft,
+            surface_history: Vec::new(),
+            history_cursor: 0,
+            overview_open: true,
+            navigation_skips: HashMap::new(),
+            last_shift_tap: None,
+            shell_touches: HashMap::new(),
+            shell_touch_was_multi: false,
+            shell_touch_committed: false,
+            deal_gesture_active: false,
+            deal_session_open: false,
+            deal_current_interacted: false,
+            deal_view: None,
+            deal_focus_pending: false,
             dashboard,
-            deal_help_visible: false,
-            desk_sync: crate::desk_view::DeskSync::default(),
-            desk_edit_subscriptions: HashMap::new(),
+            deal_hints_visible: false,
+            deal_controls_visible: false,
+            agent_last_interaction: HashMap::new(),
+            dealer_signal_eval_scheduled: false,
+            _dealer_signal_task: dealer_signal_task,
+            lamp_on: false,
+            dealer_signals_initialized: false,
+            chime_above_threshold: false,
+            desk_tree_sync: crate::desk_view::DeskTreeSync::default(),
+            pending_heading_recognition: None,
+            pending_heading_undo: None,
+            desk_batch_editing: false,
+            desk_batch_text: Vec::new(),
+            pending_desk_batch_intents: Default::default(),
+            desk_text_retargets: Default::default(),
+            pending_tree_verdicts: Default::default(),
+            desk_semantic_clipboard: None,
+            desk_semantic_paste_target: None,
+            desk_semantic_undo: Default::default(),
+            pending_semantic_batches: Default::default(),
+            pending_semantic_group: None,
             dashboard_preview: None,
+            browser_metadata_subscription: None,
             iris_preview,
             iris_agents: HashMap::new(),
+            inbox: crate::inbox::InboxStore::memory(),
+            pending_inbox_item: None,
+            pending_filing_destinations: Vec::new(),
+            pending_filing_selected: None,
+            scroll_journal_task: None,
             minibuffer: None,
             transient: None,
             transient_stack: Vec::new(),
@@ -209,6 +292,7 @@ impl Workspace {
             _event_task: event_task,
             _dashboard_subscription: dashboard_subscription,
             _universal_argument_subscription: universal_argument_subscription,
+            _window_activation_subscription: window_activation_subscription,
             web: WebUi {
                 authorizations,
                 target_error,
@@ -218,7 +302,7 @@ impl Workspace {
             },
         };
         let draft = this.make_surface(SurfaceKey::Draft, window, cx);
-        this.display_surface(draft);
+        this.display_surface(draft, cx);
         this.seed_draft(false, window, cx);
         window.focus(&this.dashboard.focus_handle(cx), cx);
         this
@@ -272,7 +356,7 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = self.active_editor(cx);
         let text_style = editor.update(cx, |editor, cx| editor.style(cx).text.clone());
-        let connection_status = self.render_connection_status(&text_style, cx);
+        let connection_status: Option<gpui::AnyElement> = None;
         let narrow = window.viewport_size().width < px(700.);
         let phone = coarse_pointer() && narrow;
         let home = self.dashboard_mode(window, cx);
@@ -299,7 +383,7 @@ impl Render for Workspace {
                     .child(self.dashboard.editor().clone())
                     .into_any_element()
             } else {
-                let surface = self.active_tree().focused().surface.clone();
+                let surface = self.active_pane().surface.clone();
                 div()
                     .size_full()
                     .overflow_hidden()

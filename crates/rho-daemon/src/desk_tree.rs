@@ -5,11 +5,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use redb::TableDefinition;
 use rho_db::{RhoDb, Sen, SenValue};
 use rho_desk::{
-    BatchOpRecord, BatchOperation, Binding, BindingKind, Document, NodeId, NodeKind, NodeOwner,
-    OperationBatch, OrderKey, PageId, Replica, ReplicaAuthor, Snapshot, TemporalKind, TemporalMark,
-    TextOpRecord, TextOperation, TextTransaction, TreeClock, TreeOpRecord, TreeOperation,
+    BatchOpRecord, BatchOperation, Binding, Document, NodeId, NodeKind, NodeOwner, OperationBatch,
+    OrderKey, Replica, ReplicaAuthor, Snapshot, TextOpRecord, TextOperation, TextTransaction,
+    TreeClock, TreeOpRecord, TreeOperation,
 };
-use rho_ui_proto::desk::{DeskHeading, DeskSnapshot, TemporalMark as OldTemporalMark, parse};
 use senax_encoder::{Decode, Encode};
 use text::{BufferId, ReplicaId};
 
@@ -27,6 +26,10 @@ struct PersistentState {
     snapshot: Snapshot,
     next_sequence: u64,
     next_replica_id: u16,
+    #[senax(default)]
+    next_machine_counter: u64,
+    #[senax(default)]
+    next_machine_clock: u32,
 }
 
 #[derive(Clone)]
@@ -64,67 +67,102 @@ impl From<String> for BatchApplyError {
 }
 
 impl DeskTreeStore {
+    pub fn validate_machine_parent(&self, parent: NodeId) -> Result<(), String> {
+        let document = Document::from_snapshot(self.snapshot())?;
+        let Some(node) = document
+            .materialize()
+            .into_iter()
+            .find(|node| node.id == parent)
+        else {
+            return Err("Desk binding parent no longer exists".into());
+        };
+        if node.kind != NodeKind::Heading || node.owner != NodeOwner::User {
+            return Err("Desk machine rows must be filed under a user heading".into());
+        }
+        Ok(())
+    }
+
     pub async fn new(
         db: RhoDb,
-        old: &DeskSnapshot,
+        old_org_for_test: Option<&str>,
         resolve_agent: impl Fn(&str) -> Option<rho_core::AgentId>,
     ) -> Result<Self, String> {
         let mut write = db.write().await;
         write.open_table(TREE_OPS);
         write.open_table(TEXT_OPS);
         write.open_table(BATCH_OPS);
-        let imported = import_org(&old.document_text()?, &resolve_agent);
-        if write.open_table(STATE).get(&()).is_none() {
+        let imported = crate::desk_org_migration::import(&mut write, &resolve_agent)?;
+        let native_logs_exist = write.open_table(TREE_OPS).iter().next().is_some()
+            || write.open_table(TEXT_OPS).iter().next().is_some()
+            || write.open_table(BATCH_OPS).iter().next().is_some();
+        let migration_completed = crate::desk_org_migration::already_completed(&mut write);
+        let state_exists = write.open_table(STATE).get(&()).is_some();
+        if migration_completed && !state_exists {
+            return Err("Desk migration is marked complete but native state is missing".into());
+        }
+        if !migration_completed && native_logs_exist {
+            return Err(
+                "Desk org migration marker is missing after native tree edits; refusing to overwrite native state"
+                    .into(),
+            );
+        }
+        let imported = imported.or_else(|| {
+            old_org_for_test.map(|text| crate::desk_org_migration::import_org(text, &resolve_agent))
+        });
+        if !state_exists {
+            let imported = imported.clone().unwrap_or_default();
             write.open_table(STATE).insert(
                 &(),
                 SenValue::owned(PersistentState {
-                    snapshot: imported,
+                    snapshot: imported.clone(),
                     next_sequence: 1,
                     next_replica_id: ReplicaId::FIRST_COLLAB_ID.as_u16(),
+                    next_machine_counter: imported
+                        .nodes
+                        .iter()
+                        .filter(|node| node.id.replica_id == ReplicaId::REMOTE_SERVER.as_u16())
+                        .map(|node| node.id.counter)
+                        .max()
+                        .unwrap_or(0),
+                    next_machine_clock: imported
+                        .version
+                        .iter()
+                        .filter(|clock| clock.replica_id == ReplicaId::REMOTE_SERVER.as_u16())
+                        .map(|clock| clock.value)
+                        .max()
+                        .unwrap_or(0),
                 }),
             );
-        } else if write.open_table(TREE_OPS).iter().next().is_none()
-            && write.open_table(TEXT_OPS).iter().next().is_none()
-            && write.open_table(BATCH_OPS).iter().next().is_none()
+        } else if !crate::desk_org_migration::already_completed(&mut write)
+            && let Some(imported) = imported
         {
-            // Phase 1 is a shadow behind the legacy editor. Re-import on
-            // startup until the first native tree operation so cutover sees
-            // every legacy edit and also repairs earlier importer revisions.
             let mut state = load_state(&mut write);
             let replicas = std::mem::take(&mut state.snapshot.replicas);
             state.snapshot = imported;
             merge_replicas(&mut state.snapshot.replicas, replicas);
+            state.next_machine_counter = state
+                .snapshot
+                .nodes
+                .iter()
+                .filter(|node| node.id.replica_id == ReplicaId::REMOTE_SERVER.as_u16())
+                .map(|node| node.id.counter)
+                .max()
+                .unwrap_or(0);
+            state.next_machine_clock = state
+                .snapshot
+                .version
+                .iter()
+                .filter(|clock| clock.replica_id == ReplicaId::REMOTE_SERVER.as_u16())
+                .map(|clock| clock.value)
+                .max()
+                .unwrap_or(0);
             save_state(&mut write, &state);
+        }
+        if !crate::desk_org_migration::already_completed(&mut write) {
+            crate::desk_org_migration::finish(&mut write);
         }
         write.commit();
         Ok(Self { db })
-    }
-
-    /// Keeps the shadow tree aligned with the visible legacy Desk until the
-    /// tree receives its first native operation. Phase 2 then cuts over to
-    /// this last complete import rather than the text present at Phase-1 boot.
-    pub async fn refresh_legacy_import(
-        &self,
-        old: &DeskSnapshot,
-        resolve_agent: impl Fn(&str) -> Option<rho_core::AgentId>,
-    ) -> Result<Option<Snapshot>, String> {
-        let text = old.document_text()?;
-        let mut write = self.db.write().await;
-        if write.open_table(TREE_OPS).iter().next().is_some()
-            || write.open_table(TEXT_OPS).iter().next().is_some()
-            || write.open_table(BATCH_OPS).iter().next().is_some()
-        {
-            return Ok(None);
-        }
-        let mut state = load_state(&mut write);
-        let replicas = std::mem::take(&mut state.snapshot.replicas);
-        state.snapshot = import_org(&text, resolve_agent);
-        merge_replicas(&mut state.snapshot.replicas, replicas);
-        state.snapshot.sequence = take_sequence(&mut state)?;
-        let replacement = state.snapshot.clone();
-        save_state(&mut write, &state);
-        write.commit();
-        Ok(Some(replacement))
     }
 
     pub fn snapshot(&self) -> Snapshot {
@@ -195,6 +233,128 @@ impl DeskTreeStore {
         save_state(&mut write, &state);
         write.commit();
         Ok(record)
+    }
+
+    /// Creates the machine-owned row for a runtime binding under a user
+    /// heading. Repeating the same request is idempotent.
+    pub async fn bind_machine(
+        &self,
+        parent: NodeId,
+        binding: Binding,
+    ) -> Result<Option<BatchOpRecord>, String> {
+        let mut write = self.db.write().await;
+        let mut state = load_state(&mut write);
+        let mut document = materialize(&mut write, &state)?;
+        let nodes = document.materialize();
+        let parent_node = nodes
+            .iter()
+            .find(|node| node.id == parent)
+            .ok_or("Desk binding parent no longer exists")?;
+        if parent_node.kind != NodeKind::Heading || parent_node.owner != NodeOwner::User {
+            return Err("Desk machine rows must be filed under a user heading".into());
+        }
+        if nodes.iter().any(|node| {
+            node.parent == Some(parent)
+                && node.owner == NodeOwner::Machine
+                && node.bindings.values().any(|value| value == &binding)
+        }) {
+            return Ok(None);
+        }
+        let replica_id = ReplicaId::REMOTE_SERVER.as_u16();
+        state.next_machine_counter = state
+            .next_machine_counter
+            .checked_add(1)
+            .ok_or("Desk machine node id exhausted")?;
+        let node_id = NodeId {
+            replica_id,
+            counter: state.next_machine_counter,
+        };
+        let last = nodes
+            .iter()
+            .filter(|node| node.parent == Some(parent))
+            .max_by_key(|node| &node.order);
+        let order = OrderKey::between(last.map(|node| &node.order), None);
+        let kind = match &binding {
+            Binding::Agent(_) => NodeKind::Agent,
+            Binding::Page(_) => NodeKind::Page,
+            Binding::File(_) => NodeKind::File,
+        };
+        let id = take_machine_clock(&mut state)?;
+        let operations = vec![
+            BatchOperation::Tree(TreeOperation::Create {
+                timestamp: take_machine_clock(&mut state)?,
+                node_id,
+                kind,
+                owner: NodeOwner::Machine,
+                parent: Some(parent),
+                order,
+            }),
+            BatchOperation::Tree(TreeOperation::SetBinding {
+                timestamp: take_machine_clock(&mut state)?,
+                node_id,
+                kind: binding.kind(),
+                value: Some(binding),
+            }),
+        ];
+        let record = persist_machine_batch(&mut write, &mut state, &mut document, id, operations)?;
+        write.commit();
+        Ok(Some(record))
+    }
+
+    /// Removes every machine row carrying this runtime binding.
+    pub async fn unbind_machine(&self, binding: Binding) -> Result<Option<BatchOpRecord>, String> {
+        let mut write = self.db.write().await;
+        let mut state = load_state(&mut write);
+        let mut document = materialize(&mut write, &state)?;
+        let node_ids = document
+            .materialize()
+            .into_iter()
+            .filter(|node| {
+                node.owner == NodeOwner::Machine
+                    && node.bindings.values().any(|value| value == &binding)
+            })
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        if node_ids.is_empty() {
+            return Ok(None);
+        }
+        let id = take_machine_clock(&mut state)?;
+        let operation = BatchOperation::Tree(TreeOperation::Delete {
+            timestamp: take_machine_clock(&mut state)?,
+            node_ids,
+        });
+        let record =
+            persist_machine_batch(&mut write, &mut state, &mut document, id, vec![operation])?;
+        write.commit();
+        Ok(Some(record))
+    }
+
+    /// Removes one specific machine-owned row. Page clients use the row id
+    /// rather than the page binding so closing one filing cannot remove a
+    /// second filing of the same runtime page.
+    pub async fn unbind_machine_node(
+        &self,
+        node_id: NodeId,
+    ) -> Result<Option<BatchOpRecord>, String> {
+        let mut write = self.db.write().await;
+        let mut state = load_state(&mut write);
+        let mut document = materialize(&mut write, &state)?;
+        let nodes = document.materialize();
+        let Some(node) = nodes.iter().find(|node| node.id == node_id) else {
+            return Ok(None);
+        };
+        if node.owner != NodeOwner::Machine || node.kind != NodeKind::Page {
+            return Err("Desk page unbind must target a machine-owned page row".into());
+        }
+        let id = take_machine_clock(&mut state)?;
+        let operation = BatchOperation::Tree(TreeOperation::Delete {
+            timestamp: take_machine_clock(&mut state)?,
+            node_ids: vec![node_id],
+        });
+        let record =
+            persist_machine_batch(&mut write, &mut state, &mut document, id, vec![operation])?;
+        write.commit();
+        Ok(Some(record))
     }
 
     pub async fn apply_text(
@@ -365,6 +525,7 @@ impl DeskTreeStore {
                 ));
             }
         }
+        let machine_moves = derive_machine_relocations(&mut write, &materialized, &batch)?;
         for operation in &batch.operations {
             match operation {
                 BatchOperation::Tree(operation) => {
@@ -416,11 +577,28 @@ impl DeskTreeStore {
                 }
             }
         }
+        let mut daemon_tree_operations = Vec::with_capacity(machine_moves.len());
+        for (node_id, parent, order) in machine_moves {
+            let machine_timestamp = take_machine_clock(&mut state)?;
+            let operation = TreeOperation::Move {
+                timestamp: machine_timestamp,
+                node_id,
+                parent,
+                order,
+            };
+            if !document.apply(operation.clone())? {
+                return Err(BatchApplyError::Invalid(
+                    "duplicate Desk machine relocation timestamp".into(),
+                ));
+            }
+            daemon_tree_operations.push(operation);
+        }
         let sequence = take_sequence(&mut state)?;
         let record = BatchOpRecord {
             sequence,
             timestamp_ms: rho_core::UnixMs::now().0,
             batch,
+            daemon_tree_operations,
         };
         write
             .open_table(BATCH_OPS)
@@ -457,6 +635,54 @@ fn merge_replicas(target: &mut Vec<Replica>, replicas: impl IntoIterator<Item = 
     }
 }
 
+fn take_machine_clock(state: &mut PersistentState) -> Result<TreeClock, String> {
+    state.next_machine_clock = state
+        .next_machine_clock
+        .checked_add(1)
+        .ok_or("Desk machine clock exhausted")?;
+    Ok(TreeClock {
+        value: state.next_machine_clock,
+        replica_id: ReplicaId::REMOTE_SERVER.as_u16(),
+    })
+}
+
+fn persist_machine_batch(
+    write: &mut rho_db::WriteTxn,
+    state: &mut PersistentState,
+    document: &mut Document,
+    id: TreeClock,
+    operations: Vec<BatchOperation>,
+) -> Result<BatchOpRecord, String> {
+    for operation in &operations {
+        let BatchOperation::Tree(operation) = operation else {
+            return Err("Desk machine batch cannot edit user text".into());
+        };
+        if operation.timestamp().replica_id != ReplicaId::REMOTE_SERVER.as_u16() {
+            return Err("Desk machine operation used a non-machine replica".into());
+        }
+        if !document.apply(operation.clone())? {
+            return Err("duplicate Desk machine operation timestamp".into());
+        }
+    }
+    let sequence = take_sequence(state)?;
+    let record = BatchOpRecord {
+        sequence,
+        timestamp_ms: rho_core::UnixMs::now().0,
+        batch: OperationBatch {
+            id,
+            expected: Vec::new(),
+            operations,
+            machine_relocation: None,
+        },
+        daemon_tree_operations: Vec::new(),
+    };
+    write
+        .open_table(BATCH_OPS)
+        .insert(&sequence, SenValue::borrowed(&record));
+    save_state(write, state);
+    Ok(record)
+}
+
 fn authorize_user_tree_operation(
     document: &Document,
     operation: &TreeOperation,
@@ -484,6 +710,213 @@ fn authorize_user_tree_operation(
     } else {
         Ok(())
     }
+}
+
+fn derive_machine_relocations(
+    write: &mut rho_db::WriteTxn,
+    materialized: &BTreeMap<NodeId, rho_desk::MaterializedNode>,
+    batch: &OperationBatch,
+) -> Result<Vec<(NodeId, Option<NodeId>, OrderKey)>, BatchApplyError> {
+    let deleted = batch
+        .operations
+        .iter()
+        .filter_map(|operation| match operation {
+            BatchOperation::Tree(TreeOperation::Delete { node_ids, .. }) => Some(node_ids),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let evacuated = materialized
+        .values()
+        .filter(|node| {
+            node.owner == NodeOwner::Machine
+                && node.parent.is_some_and(|parent| deleted.contains(&parent))
+        })
+        .collect::<Vec<_>>();
+    match &batch.machine_relocation {
+        None if evacuated.is_empty() => Ok(Vec::new()),
+        None => Err(BatchApplyError::Unauthorized(
+            "deleting this heading requires machine-row evacuation".into(),
+        )),
+        Some(rho_desk::MachineRelocationIntent::EvacuateDeletedChildren) => {
+            let expected = batch
+                .expected
+                .iter()
+                .map(|expected| expected.node_id)
+                .collect::<BTreeSet<_>>();
+            if evacuated.iter().any(|node| !expected.contains(&node.id)) {
+                return Err(BatchApplyError::Invalid(
+                    "Desk evacuation is missing a machine-row precondition".into(),
+                ));
+            }
+            Ok(evacuated
+                .into_iter()
+                .map(|node| {
+                    let mut destination = node.parent;
+                    while destination.is_some_and(|parent| deleted.contains(&parent)) {
+                        destination = destination.and_then(|parent| {
+                            materialized.get(&parent).and_then(|node| node.parent)
+                        });
+                    }
+                    (node.id, destination, node.order.clone())
+                })
+                .collect())
+        }
+        Some(rho_desk::MachineRelocationIntent::Restore {
+            delete_batch_id,
+            replacements,
+        }) => {
+            derive_machine_restoration(write, materialized, batch, *delete_batch_id, replacements)
+        }
+    }
+}
+
+fn derive_machine_restoration(
+    write: &mut rho_db::WriteTxn,
+    materialized: &BTreeMap<NodeId, rho_desk::MaterializedNode>,
+    batch: &OperationBatch,
+    delete_batch_id: TreeClock,
+    replacements: &[rho_desk::NodeReplacement],
+) -> Result<Vec<(NodeId, Option<NodeId>, OrderKey)>, BatchApplyError> {
+    let records = write
+        .open_table(BATCH_OPS)
+        .iter()
+        .map(|(sequence, record)| (sequence.value(), record.value().into_owned()))
+        .collect::<Vec<_>>();
+    let (delete_sequence, source) = records
+        .iter()
+        .find(|(_, record)| record.batch.id == delete_batch_id)
+        .ok_or_else(|| {
+            BatchApplyError::Unauthorized(
+                "Desk machine restore references an unknown delete".into(),
+            )
+        })?;
+    if source.batch.machine_relocation
+        != Some(rho_desk::MachineRelocationIntent::EvacuateDeletedChildren)
+    {
+        return Err(BatchApplyError::Unauthorized(
+            "Desk machine restore source was not an evacuation".into(),
+        ));
+    }
+    let deleted = source
+        .batch
+        .operations
+        .iter()
+        .filter_map(|operation| match operation {
+            BatchOperation::Tree(TreeOperation::Delete { node_ids, .. }) => Some(node_ids),
+            _ => None,
+        })
+        .flatten()
+        .copied()
+        .collect::<BTreeSet<_>>();
+    let replacement_map = replacements
+        .iter()
+        .map(|replacement| (replacement.deleted, replacement.replacement))
+        .collect::<BTreeMap<_, _>>();
+    let replacement_ids = replacements
+        .iter()
+        .map(|replacement| replacement.replacement)
+        .collect::<BTreeSet<_>>();
+    if replacements.len() > 4096
+        || replacement_map.len() != replacements.len()
+        || replacement_ids.len() != replacements.len()
+        || replacement_map.len() != deleted.len()
+        || replacement_map.keys().copied().collect::<BTreeSet<_>>() != deleted
+    {
+        return Err(BatchApplyError::Unauthorized(
+            "Desk machine restore replacements do not cover the deleted subtree".into(),
+        ));
+    }
+    let creates = batch
+        .operations
+        .iter()
+        .filter_map(|operation| match operation {
+            BatchOperation::Tree(TreeOperation::Create {
+                node_id,
+                kind,
+                owner,
+                parent,
+                order,
+                ..
+            }) => Some((*node_id, (*kind, *owner, *parent, order))),
+            _ => None,
+        })
+        .collect::<BTreeMap<_, _>>();
+    for expected in source
+        .batch
+        .expected
+        .iter()
+        .filter(|expected| deleted.contains(&expected.node_id))
+    {
+        let replacement = replacement_map[&expected.node_id];
+        let translated_parent = expected
+            .parent
+            .map(|parent| replacement_map.get(&parent).copied().unwrap_or(parent));
+        if !matches!(creates.get(&replacement),
+            Some((kind, NodeOwner::User, parent, order))
+                if *kind == expected.kind
+                    && *parent == translated_parent
+                    && **order == expected.order)
+        {
+            return Err(BatchApplyError::Unauthorized(
+                "Desk machine restore replacement does not match the deleted node".into(),
+            ));
+        }
+    }
+    let mut moves = Vec::new();
+    let expected = batch
+        .expected
+        .iter()
+        .map(|expected| expected.node_id)
+        .collect::<BTreeSet<_>>();
+    for operation in &source.daemon_tree_operations {
+        let TreeOperation::Move {
+            node_id,
+            parent: evacuated_parent,
+            order,
+            ..
+        } = operation
+        else {
+            continue;
+        };
+        let original_parent = source
+            .batch
+            .expected
+            .iter()
+            .find(|expected| expected.node_id == *node_id)
+            .and_then(|expected| expected.parent)
+            .ok_or_else(|| BatchApplyError::Invalid("evacuation lost original parent".into()))?;
+        let current = materialized.get(node_id).ok_or_else(|| {
+            BatchApplyError::Conflict("evacuated machine row no longer exists".into())
+        })?;
+        if !expected.contains(node_id) {
+            return Err(BatchApplyError::Invalid(
+                "Desk restoration is missing a machine-row precondition".into(),
+            ));
+        }
+        let moved_later = records.iter().any(|(sequence, record)| {
+            sequence > delete_sequence
+                && record.daemon_tree_operations.iter().any(|operation| {
+                    matches!(operation, TreeOperation::Move { node_id: later, .. } if later == node_id)
+                })
+        });
+        if current.owner != NodeOwner::Machine
+            || current.parent != *evacuated_parent
+            || current.order != *order
+            || moved_later
+        {
+            return Err(BatchApplyError::Conflict(
+                "evacuated machine row changed after deletion".into(),
+            ));
+        }
+        moves.push((
+            *node_id,
+            Some(replacement_map[&original_parent]),
+            order.clone(),
+        ));
+    }
+    Ok(moves)
 }
 
 fn load_state(write: &mut rho_db::WriteTxn) -> PersistentState {
@@ -579,314 +1012,23 @@ fn replay(
                         }
                     }
                 }
+                for operation in record.daemon_tree_operations {
+                    document.apply(operation)?;
+                }
             }
         }
     }
     Ok(())
 }
 
-fn import_org(text: &str, resolve_agent: impl Fn(&str) -> Option<rho_core::AgentId>) -> Snapshot {
-    let headings = parse(text);
-    let mut document = Document::default();
-    let server = ReplicaId::REMOTE_SERVER.as_u16();
-    document.add_replica(Replica {
-        replica_id: server,
-        author: ReplicaAuthor::Machine,
-    });
-    let mut counter = 0u64;
-    let mut clock = 0u32;
-    let mut next_id = || {
-        counter += 1;
-        NodeId {
-            replica_id: server,
-            counter,
-        }
-    };
-    let mut next_clock = || {
-        clock += 1;
-        TreeClock {
-            value: clock,
-            replica_id: server,
-        }
-    };
-    let mut heading_ids = Vec::new();
-    let mut sibling_counts: BTreeMap<Option<NodeId>, u16> = BTreeMap::new();
-
-    let mut create = |document: &mut Document,
-                      id: NodeId,
-                      kind: NodeKind,
-                      owner: NodeOwner,
-                      parent: Option<NodeId>,
-                      text: &str,
-                      next_clock: &mut dyn FnMut() -> TreeClock| {
-        let sibling = sibling_counts.entry(parent).or_default();
-        *sibling = sibling.saturating_add(1);
-        document
-            .apply(TreeOperation::Create {
-                timestamp: next_clock(),
-                node_id: id,
-                kind,
-                owner,
-                parent,
-                order: OrderKey(vec![sibling.saturating_mul(1024)]),
-            })
-            .unwrap();
-        if !text.is_empty() {
-            let mut buffer = text::Buffer::new(
-                ReplicaId::new(server),
-                BufferId::new(id.counter).unwrap(),
-                "",
-            );
-            let operation = TextOperation::from_text(&buffer.edit([(0..0, text)]));
-            document.apply_text(id, operation, None).unwrap();
-        }
-    };
-
-    if let Some(first) = headings.first() {
-        if first.heading_range.start > 0 {
-            let id = next_id();
-            create(
-                &mut document,
-                id,
-                NodeKind::Prose,
-                NodeOwner::User,
-                None,
-                &text[..first.heading_range.start],
-                &mut next_clock,
-            );
-        }
-    } else if !text.is_empty() {
-        let id = next_id();
-        create(
-            &mut document,
-            id,
-            NodeKind::Prose,
-            NodeOwner::User,
-            None,
-            text,
-            &mut next_clock,
-        );
-    }
-
-    for (index, heading) in headings.iter().enumerate() {
-        let id = next_id();
-        let parent = heading.parent.map(|parent| heading_ids[parent]);
-        let title = if let Some(state) = heading.state_range.as_ref().and(heading.state) {
-            format!("{} {}", state.keyword(), heading.title)
-        } else {
-            heading.title.clone()
-        };
-        create(
-            &mut document,
-            id,
-            NodeKind::Heading,
-            NodeOwner::User,
-            parent,
-            &title,
-            &mut next_clock,
-        );
-        heading_ids.push(id);
-        let machine_children =
-            import_heading_meta(&mut document, id, heading, &resolve_agent, &mut next_clock);
-        for (kind, binding) in machine_children {
-            let child_id = next_id();
-            create(
-                &mut document,
-                child_id,
-                kind,
-                NodeOwner::Machine,
-                Some(id),
-                "",
-                &mut next_clock,
-            );
-            document
-                .apply(TreeOperation::SetBinding {
-                    timestamp: next_clock(),
-                    node_id: child_id,
-                    kind: binding.kind(),
-                    value: Some(binding),
-                })
-                .unwrap();
-        }
-        let body_end = headings
-            .get(index + 1)
-            .map_or(text.len(), |next| next.heading_range.start);
-        let body = strip_imported_properties(
-            &text[heading.body_range.start..body_end],
-            heading,
-            heading.body_range.start,
-            &resolve_agent,
-        );
-        if !body.is_empty() {
-            let prose_id = next_id();
-            create(
-                &mut document,
-                prose_id,
-                NodeKind::Prose,
-                NodeOwner::User,
-                Some(id),
-                &body,
-                &mut next_clock,
-            );
-        }
-    }
-    document.snapshot()
-}
-
-fn import_heading_meta(
-    document: &mut Document,
-    id: NodeId,
-    heading: &DeskHeading,
-    resolve_agent: &impl Fn(&str) -> Option<rho_core::AgentId>,
-    next_clock: &mut impl FnMut() -> TreeClock,
-) -> Vec<(NodeKind, Binding)> {
-    let mut machine_children = Vec::new();
-    for mark in &heading.temporal_marks {
-        let (kind, value) = convert_mark(mark);
-        document
-            .apply(TreeOperation::SetTemporal {
-                timestamp: next_clock(),
-                node_id: id,
-                kind,
-                value: Some(value),
-            })
-            .unwrap();
-    }
-    for tag in &heading.tags {
-        if let Some(agent) = resolve_agent(tag) {
-            machine_children.push((NodeKind::Agent, Binding::Agent(agent)));
-        } else if let Some(page) = tag
-            .strip_prefix("web-")
-            .and_then(|uuid| uuid::Uuid::parse_str(uuid).ok())
-        {
-            machine_children.push((NodeKind::Page, Binding::Page(PageId(*page.as_bytes()))));
-        } else {
-            document
-                .apply(TreeOperation::SetTag {
-                    timestamp: next_clock(),
-                    node_id: id,
-                    tag: tag.clone(),
-                    present: true,
-                })
-                .unwrap();
-        }
-    }
-    if let Some(agent) = heading.agent_value.as_deref().and_then(resolve_agent) {
-        machine_children.push((NodeKind::Agent, Binding::Agent(agent)));
-    } else if let Some(value) = heading.agent_value.as_deref() {
-        tracing::warn!(
-            value,
-            "dropping malformed Desk agent property during tree import"
-        );
-    }
-    if let Some(project) = &heading.project {
-        document
-            .apply(TreeOperation::SetBinding {
-                timestamp: next_clock(),
-                node_id: id,
-                kind: BindingKind::File,
-                value: Some(Binding::File(project.into())),
-            })
-            .unwrap();
-    }
-    machine_children
-}
-
-fn convert_mark(mark: &OldTemporalMark) -> (TemporalKind, TemporalMark) {
-    use rho_ui_proto::desk::TemporalMarkKind as Old;
-    let kind = match mark.kind {
-        Old::Todo => TemporalKind::Todo,
-        Old::Deadline => TemporalKind::Deadline,
-        Old::Defer => TemporalKind::Defer,
-        Old::Reminder => TemporalKind::Reminder,
-        Old::Done => TemporalKind::Done,
-        Old::Discarded => TemporalKind::Discarded,
-    };
-    let date = mark.at.date();
-    let time = mark.at.time();
-    (
-        kind,
-        TemporalMark {
-            year: chrono::Datelike::year(&date),
-            month: chrono::Datelike::month(&date) as u8,
-            day: chrono::Datelike::day(&date) as u8,
-            minute_of_day: (!mark.date_only).then(|| {
-                chrono::Timelike::hour(&time) as u16 * 60 + chrono::Timelike::minute(&time) as u16
-            }),
-            pace_days: mark.pace_days,
-        },
-    )
-}
-
-fn strip_imported_properties(
-    body: &str,
-    heading: &DeskHeading,
-    base: usize,
-    resolve_agent: &impl Fn(&str) -> Option<rho_core::AgentId>,
-) -> String {
-    let mut seen_temporal = std::collections::BTreeSet::new();
-    let mut seen_agent = false;
-    let mut seen_project = false;
-    let mut ranges = heading
-        .properties
-        .iter()
-        .filter(|property| {
-            if let Some(kind) =
-                rho_ui_proto::desk::TemporalMarkKind::from_property_key(&property.key)
-            {
-                let first = seen_temporal.insert(kind);
-                return first
-                    && rho_ui_proto::desk::TemporalMark::parse(kind, &property.value).is_some();
-            }
-            if property.key.eq_ignore_ascii_case("agent") {
-                let first = !seen_agent;
-                seen_agent = true;
-                return first && resolve_agent(&property.value).is_some();
-            }
-            if property.key.eq_ignore_ascii_case("project") {
-                let first = !seen_project;
-                seen_project = true;
-                return first;
-            }
-            false
-        })
-        .filter_map(|property| {
-            property.line_range.start.checked_sub(base).map(|start| {
-                let mut end = property.line_range.end.saturating_sub(base).min(body.len());
-                if body.as_bytes().get(end) == Some(&b'\n') {
-                    end += 1;
-                }
-                start.min(body.len())..end
-            })
-        })
-        .collect::<Vec<_>>();
-    ranges.sort_by_key(|range| range.start);
-    let mut out = String::new();
-    let mut cursor = 0;
-    for range in ranges {
-        if range.start >= cursor {
-            out.push_str(&body[cursor..range.start]);
-            cursor = range.end.max(cursor);
-        }
-    }
-    out.push_str(&body[cursor..]);
-    out
-}
-
 #[cfg(test)]
 mod tests {
+    use rho_desk::{BindingKind, TemporalKind};
+
     use super::*;
 
-    fn legacy_snapshot(text: &str) -> DeskSnapshot {
-        let replica = ReplicaId::REMOTE_SERVER;
-        let mut buffer = text::Buffer::new(replica, BufferId::new(1).unwrap(), "");
-        let operation = rho_ui_proto::desk::DeskOperation::from_text(&buffer.edit([(0..0, text)]));
-        DeskSnapshot {
-            text: String::new(),
-            operations: vec![operation],
-            transactions: Vec::new(),
-            replicas: Vec::new(),
-        }
+    fn legacy_snapshot(text: &str) -> String {
+        text.to_owned()
     }
 
     fn expectation(document: &Document, node_id: NodeId) -> rho_desk::NodeExpectation {
@@ -907,7 +1049,7 @@ mod tests {
 
     #[test]
     fn imports_headings_prose_marks_and_tags() {
-        let snapshot = import_org(
+        let snapshot = crate::desk_org_migration::import_org(
             "preamble\n* TODO Work :keep:\n:todo: 2026-03-01 2d\nbody\n** Child\nchild body\n",
             |_| None,
         );
@@ -940,7 +1082,7 @@ mod tests {
         let text = format!(
             "* Work :eng-one:web-{page}:eng-two:web-not-a-uuid:\n:agent: broken\n:todo: not-a-date\n"
         );
-        let snapshot = import_org(&text, |tag| match tag {
+        let snapshot = crate::desk_org_migration::import_org(&text, |tag| match tag {
             "eng-one" => Some(first),
             "eng-two" => Some(second),
             _ => None,
@@ -976,8 +1118,8 @@ mod tests {
     async fn persists_tree_and_per_node_text_operations() {
         let directory = tempfile::tempdir().unwrap();
         let db = RhoDb::open(directory.path().join("desk-tree.redb"));
-        let old = DeskSnapshot::default();
-        let store = DeskTreeStore::new(db.clone(), &old, |_| None)
+        let old = String::new();
+        let store = DeskTreeStore::new(db.clone(), Some(&old), |_| None)
             .await
             .unwrap();
         let replica = store.allocate_replica(ReplicaAuthor::User).await.unwrap();
@@ -1015,7 +1157,7 @@ mod tests {
             .await
             .unwrap();
 
-        let reopened = DeskTreeStore::new(db, &old, |_| None).await.unwrap();
+        let reopened = DeskTreeStore::new(db, Some(&old), |_| None).await.unwrap();
         let document = Document::from_snapshot(reopened.snapshot()).unwrap();
         assert_eq!(document.materialize().len(), 0);
         assert_eq!(
@@ -1027,12 +1169,236 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_delete_relocates_machine_row_and_undo_restores_parent() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = RhoDb::open(directory.path().join("desk-relocation.redb"));
+        let store = DeskTreeStore::new(db, Some(&String::new()), |_| None)
+            .await
+            .unwrap();
+        let replica = store.allocate_replica(ReplicaAuthor::User).await.unwrap();
+        let heading = NodeId {
+            replica_id: replica,
+            counter: 1,
+        };
+        store
+            .apply_tree(TreeOperation::Create {
+                timestamp: TreeClock {
+                    value: 1,
+                    replica_id: replica,
+                },
+                node_id: heading,
+                kind: NodeKind::Heading,
+                owner: NodeOwner::User,
+                parent: None,
+                order: OrderKey(vec![100]),
+            })
+            .await
+            .unwrap();
+        let second_heading = NodeId {
+            replica_id: replica,
+            counter: 2,
+        };
+        store
+            .apply_tree(TreeOperation::Create {
+                timestamp: TreeClock {
+                    value: 2,
+                    replica_id: replica,
+                },
+                node_id: second_heading,
+                kind: NodeKind::Heading,
+                owner: NodeOwner::User,
+                parent: None,
+                order: OrderKey(vec![100]),
+            })
+            .await
+            .unwrap();
+        let agent = rho_core::AgentId::from_counter(1, &rho_core::AgentIdDomain(7)).unwrap();
+        let machine_record = store
+            .bind_machine(heading, Binding::Agent(agent))
+            .await
+            .unwrap()
+            .unwrap();
+        let machine = machine_record
+            .batch
+            .operations
+            .iter()
+            .find_map(|operation| match operation {
+                BatchOperation::Tree(TreeOperation::Create { node_id, .. }) => Some(*node_id),
+                _ => None,
+            })
+            .unwrap();
+        let before = Document::from_snapshot(store.snapshot()).unwrap();
+        let delete_id = TreeClock {
+            value: 3,
+            replica_id: replica,
+        };
+        let without_intent = store
+            .apply_batch(OperationBatch {
+                id: delete_id,
+                expected: vec![
+                    expectation(&before, heading),
+                    expectation(&before, second_heading),
+                    expectation(&before, machine),
+                ],
+                operations: vec![BatchOperation::Tree(TreeOperation::Delete {
+                    timestamp: TreeClock {
+                        value: 4,
+                        replica_id: replica,
+                    },
+                    node_ids: vec![heading, second_heading],
+                })],
+                machine_relocation: None,
+            })
+            .await;
+        assert!(matches!(
+            without_intent,
+            Err(BatchApplyError::Unauthorized(_))
+        ));
+        let delete = store
+            .apply_batch(OperationBatch {
+                id: delete_id,
+                expected: vec![
+                    expectation(&before, heading),
+                    expectation(&before, second_heading),
+                    expectation(&before, machine),
+                ],
+                operations: vec![BatchOperation::Tree(TreeOperation::Delete {
+                    timestamp: TreeClock {
+                        value: 4,
+                        replica_id: replica,
+                    },
+                    node_ids: vec![heading, second_heading],
+                })],
+                machine_relocation: Some(
+                    rho_desk::MachineRelocationIntent::EvacuateDeletedChildren,
+                ),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            delete.daemon_tree_operations[0],
+            TreeOperation::Move { .. }
+        ));
+        let moved = Document::from_snapshot(store.snapshot()).unwrap();
+        assert_eq!(
+            moved
+                .materialize()
+                .into_iter()
+                .find(|node| node.id == machine)
+                .unwrap()
+                .parent,
+            None
+        );
+
+        let restored = NodeId {
+            replica_id: replica,
+            counter: 3,
+        };
+        let duplicate_restore = store
+            .apply_batch(OperationBatch {
+                id: TreeClock {
+                    value: 5,
+                    replica_id: replica,
+                },
+                expected: vec![expectation(&moved, machine)],
+                operations: vec![BatchOperation::Tree(TreeOperation::Create {
+                    timestamp: TreeClock {
+                        value: 6,
+                        replica_id: replica,
+                    },
+                    node_id: restored,
+                    kind: NodeKind::Heading,
+                    owner: NodeOwner::User,
+                    parent: None,
+                    order: OrderKey(vec![100]),
+                })],
+                machine_relocation: Some(rho_desk::MachineRelocationIntent::Restore {
+                    delete_batch_id: delete_id,
+                    replacements: vec![
+                        rho_desk::NodeReplacement {
+                            deleted: heading,
+                            replacement: restored,
+                        },
+                        rho_desk::NodeReplacement {
+                            deleted: second_heading,
+                            replacement: restored,
+                        },
+                    ],
+                }),
+            })
+            .await;
+        assert!(matches!(
+            duplicate_restore,
+            Err(BatchApplyError::Unauthorized(_))
+        ));
+        let second_restored = NodeId {
+            replica_id: replica,
+            counter: 4,
+        };
+        store
+            .apply_batch(OperationBatch {
+                id: TreeClock {
+                    value: 7,
+                    replica_id: replica,
+                },
+                expected: vec![expectation(&moved, machine)],
+                operations: vec![
+                    BatchOperation::Tree(TreeOperation::Create {
+                        timestamp: TreeClock {
+                            value: 8,
+                            replica_id: replica,
+                        },
+                        node_id: restored,
+                        kind: NodeKind::Heading,
+                        owner: NodeOwner::User,
+                        parent: None,
+                        order: OrderKey(vec![100]),
+                    }),
+                    BatchOperation::Tree(TreeOperation::Create {
+                        timestamp: TreeClock {
+                            value: 9,
+                            replica_id: replica,
+                        },
+                        node_id: second_restored,
+                        kind: NodeKind::Heading,
+                        owner: NodeOwner::User,
+                        parent: None,
+                        order: OrderKey(vec![100]),
+                    }),
+                ],
+                machine_relocation: Some(rho_desk::MachineRelocationIntent::Restore {
+                    delete_batch_id: delete_id,
+                    replacements: vec![
+                        rho_desk::NodeReplacement {
+                            deleted: heading,
+                            replacement: restored,
+                        },
+                        rho_desk::NodeReplacement {
+                            deleted: second_heading,
+                            replacement: second_restored,
+                        },
+                    ],
+                }),
+            })
+            .await
+            .unwrap();
+        let final_document = Document::from_snapshot(store.snapshot()).unwrap();
+        assert_eq!(
+            final_document
+                .materialize()
+                .into_iter()
+                .find(|node| node.id == machine)
+                .unwrap()
+                .parent,
+            Some(restored)
+        );
+    }
+
+    #[tokio::test]
     async fn batch_rejects_stale_text_versions_without_partial_tree_changes() {
         let directory = tempfile::tempdir().unwrap();
         let db = RhoDb::open(directory.path().join("desk-tree.redb"));
-        let store = DeskTreeStore::new(db, &DeskSnapshot::default(), |_| None)
-            .await
-            .unwrap();
+        let store = DeskTreeStore::new(db, Some(""), |_| None).await.unwrap();
         let replica = store.allocate_replica(ReplicaAuthor::User).await.unwrap();
         let node_id = NodeId {
             replica_id: replica,
@@ -1074,6 +1440,7 @@ mod tests {
                     },
                     node_ids: vec![node_id],
                 })],
+                machine_relocation: None,
             })
             .await;
         assert_eq!(
@@ -1123,6 +1490,7 @@ mod tests {
                         transaction: None,
                     },
                 ],
+                machine_relocation: None,
             })
             .await;
         assert!(matches!(late_failure, Err(BatchApplyError::Invalid(_))));
@@ -1148,6 +1516,7 @@ mod tests {
                 },
                 node_ids: vec![node_id],
             })],
+            machine_relocation: None,
         };
         let record = store.apply_batch(batch.clone()).await.unwrap();
         assert_eq!(record.sequence, 4);
@@ -1167,6 +1536,7 @@ mod tests {
                         },
                         node_ids: vec![node_id],
                     })],
+                    machine_relocation: None,
                 })
                 .await
                 .unwrap_err(),
@@ -1184,9 +1554,7 @@ mod tests {
     async fn overlapping_deletes_authorize_against_tombstoned_ownership() {
         let directory = tempfile::tempdir().unwrap();
         let db = RhoDb::open(directory.path().join("desk-tree.redb"));
-        let store = DeskTreeStore::new(db, &DeskSnapshot::default(), |_| None)
-            .await
-            .unwrap();
+        let store = DeskTreeStore::new(db, Some(""), |_| None).await.unwrap();
         let replica = store.allocate_replica(ReplicaAuthor::User).await.unwrap();
         let ids = [1, 2].map(|counter| NodeId {
             replica_id: replica,
@@ -1238,80 +1606,92 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn startup_failure_does_not_mark_import_complete() {
+    async fn machine_bindings_are_idempotent_and_removed_with_the_runtime() {
         let directory = tempfile::tempdir().unwrap();
         let db = RhoDb::open(directory.path().join("desk-tree.redb"));
-        let invalid = DeskSnapshot {
-            operations: vec![rho_ui_proto::desk::DeskOperation::Edit {
-                timestamp: rho_ui_proto::desk::DeskClock {
-                    replica_id: 1,
-                    value: 1,
-                },
-                version: Vec::new(),
-                ranges: vec![(0, 0)],
-                new_text: Vec::new(),
-            }],
-            ..DeskSnapshot::default()
-        };
-        assert!(
-            DeskTreeStore::new(db.clone(), &invalid, |_| None)
-                .await
-                .is_err()
-        );
-        assert!(
-            DeskTreeStore::new(db, &legacy_snapshot("* recovered\n"), |_| None)
-                .await
-                .is_ok()
-        );
-    }
-
-    #[tokio::test]
-    async fn legacy_shadow_reimports_until_first_native_operation() {
-        let directory = tempfile::tempdir().unwrap();
-        let db = RhoDb::open(directory.path().join("desk-tree.redb"));
-        let store = DeskTreeStore::new(db, &legacy_snapshot("* first\n"), |_| None)
+        let store = DeskTreeStore::new(db, Some(&legacy_snapshot("* parent\n")), |_| None)
             .await
             .unwrap();
-        assert!(
-            store
-                .refresh_legacy_import(&legacy_snapshot("* second\n"), |_| None)
-                .await
-                .unwrap()
-                .is_some()
-        );
-        let document = Document::from_snapshot(store.snapshot()).unwrap();
-        let heading = document.materialize()[0].id;
-        assert_eq!(
-            document
-                .text(heading, 9, BufferId::new(9).unwrap())
-                .unwrap(),
-            "second"
+        let parent = Document::from_snapshot(store.snapshot())
+            .unwrap()
+            .materialize()[0]
+            .id;
+        let binding = Binding::Agent(
+            rho_core::AgentId::from_counter(11, &rho_core::AgentIdDomain(7)).unwrap(),
         );
 
-        let replica = store.allocate_replica(ReplicaAuthor::User).await.unwrap();
-        store
-            .apply_tree(TreeOperation::Create {
-                timestamp: TreeClock {
-                    value: 1,
-                    replica_id: replica,
-                },
-                node_id: NodeId {
-                    replica_id: replica,
-                    counter: 1,
-                },
-                kind: NodeKind::Prose,
-                owner: NodeOwner::User,
-                parent: None,
-                order: OrderKey(vec![100]),
-            })
+        let record = store
+            .bind_machine(parent, binding.clone())
             .await
+            .unwrap()
             .unwrap();
+        assert_eq!(record.batch.operations.len(), 2);
+        assert!(matches!(
+            (&record.batch.operations[0], &record.batch.operations[1]),
+            (
+                BatchOperation::Tree(TreeOperation::Create { .. }),
+                BatchOperation::Tree(TreeOperation::SetBinding { .. })
+            )
+        ));
         assert!(
             store
-                .refresh_legacy_import(&legacy_snapshot("* third\n"), |_| None)
+                .bind_machine(parent, binding.clone())
                 .await
                 .unwrap()
                 .is_none()
         );
+        let bound = Document::from_snapshot(store.snapshot()).unwrap();
+        let rows = bound.materialize();
+        assert!(rows.iter().any(|node| {
+            node.parent == Some(parent)
+                && node.owner == NodeOwner::Machine
+                && node.bindings.get(&BindingKind::Agent) == Some(&binding)
+        }));
+
+        assert!(store.unbind_machine(binding).await.unwrap().is_some());
+        let unbound = Document::from_snapshot(store.snapshot()).unwrap();
+        assert_eq!(unbound.materialize().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn page_unbind_removes_only_the_addressed_machine_row() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = RhoDb::open(directory.path().join("desk-tree.redb"));
+        let store = DeskTreeStore::new(db, Some(&legacy_snapshot("* first\n* second\n")), |_| None)
+            .await
+            .unwrap();
+        let headings = Document::from_snapshot(store.snapshot())
+            .unwrap()
+            .materialize()
+            .into_iter()
+            .map(|node| node.id)
+            .collect::<Vec<_>>();
+        let binding = Binding::Page(rho_desk::PageId([7; 16]));
+        store
+            .bind_machine(headings[0], binding.clone())
+            .await
+            .unwrap();
+        store
+            .bind_machine(headings[1], binding.clone())
+            .await
+            .unwrap();
+        let rows = Document::from_snapshot(store.snapshot())
+            .unwrap()
+            .materialize();
+        let first_page = rows
+            .iter()
+            .find(|node| node.parent == Some(headings[0]) && node.kind == NodeKind::Page)
+            .unwrap()
+            .id;
+
+        store.unbind_machine_node(first_page).await.unwrap();
+        let remaining = Document::from_snapshot(store.snapshot())
+            .unwrap()
+            .materialize();
+        assert!(!remaining.iter().any(|node| node.id == first_page));
+        assert!(remaining.iter().any(|node| {
+            node.parent == Some(headings[1])
+                && node.bindings.get(&BindingKind::Page) == Some(&binding)
+        }));
     }
 }

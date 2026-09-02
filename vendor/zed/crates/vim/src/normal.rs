@@ -406,6 +406,27 @@ impl Vim {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let semantic = match (&motion, &operator) {
+            (Motion::CurrentLine, Some(Operator::Delete)) => {
+                Some(editor::SemanticRowAction::Delete)
+            }
+            (Motion::CurrentLine, Some(Operator::Yank)) => Some(editor::SemanticRowAction::Yank),
+            (Motion::CurrentLine, Some(Operator::Indent)) => {
+                Some(editor::SemanticRowAction::Indent { outdent: false })
+            }
+            (Motion::CurrentLine, Some(Operator::Outdent)) => {
+                Some(editor::SemanticRowAction::Indent { outdent: true })
+            }
+            _ => None,
+        };
+        if let Some(action) = semantic
+            && self.update_editor(cx, |_, editor, cx| {
+                editor.dispatch_semantic_row_action(action, cx)
+            }) == Some(true)
+        {
+            self.stop_recording(cx);
+            return;
+        }
         match operator {
             None => self.move_cursor(motion, times, window, cx),
             Some(Operator::Change) => self.change_motion(motion, times, forced_motion, window, cx),
@@ -759,6 +780,12 @@ impl Vim {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.update_editor(cx, |_, editor, cx| {
+            editor.dispatch_semantic_row_action(editor::SemanticRowAction::Open { above: true }, cx)
+        }) == Some(true)
+        {
+            return;
+        }
         self.start_recording(cx);
         self.switch_mode(Mode::Insert, false, window, cx);
         self.update_editor(cx, |_, editor, cx| {
@@ -820,6 +847,13 @@ impl Vim {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.update_editor(cx, |_, editor, cx| {
+            editor
+                .dispatch_semantic_row_action(editor::SemanticRowAction::Open { above: false }, cx)
+        }) == Some(true)
+        {
+            return;
+        }
         self.start_recording(cx);
         self.switch_mode(Mode::Insert, false, window, cx);
         self.update_editor(cx, |_, editor, cx| {

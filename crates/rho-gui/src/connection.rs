@@ -74,18 +74,25 @@ impl EventSink {
 }
 
 pub enum ConnEvent {
-    DeskSnapshot {
-        snapshot: rho_ui_proto::desk::DeskSnapshot,
-        replica_id: u16,
-    },
-    DeskTextApplied(rho_ui_proto::desk::DeskTextOpRecord),
     DeskTreeSnapshot {
         snapshot: rho_desk::Snapshot,
         replica_id: u16,
     },
+    #[cfg(test)]
     DeskTreeReplaced(rho_desk::Snapshot),
     DeskTreeApplied(rho_desk::TreeOpRecord),
     DeskNodeTextApplied(rho_desk::TextOpRecord),
+    DeskTreeBatchApplied(rho_desk::BatchOpRecord),
+    DeskTreeBatchRejected {
+        id: rho_desk::TreeClock,
+        retryable: bool,
+        reason: String,
+        snapshot: rho_desk::Snapshot,
+    },
+    DeskPageBindingResult {
+        request_id: u64,
+        error: Option<String>,
+    },
     DeskTreeResyncRequired,
     Ready {
         agents: Vec<UiAgentSummary>,
@@ -1025,9 +1032,7 @@ fn replay_safe(message: &ClientMessage) -> bool {
         message,
         ClientMessage::Ping
             | ClientMessage::Subscribe
-            | ClientMessage::DeskSubscribe
             | ClientMessage::DeskTreeSubscribe
-            | ClientMessage::DeskGet
             | ClientMessage::SubscribeAgent { .. }
             | ClientMessage::AgentStreamFocus { .. }
             | ClientMessage::GitTransportRegister
@@ -1133,7 +1138,7 @@ async fn run(
     }
 
     write_frame(&mut stream, &ClientMessage::ChatGptUsage).await?;
-    write_frame(&mut stream, &ClientMessage::DeskSubscribe).await?;
+    write_frame(&mut stream, &ClientMessage::DeskTreeSubscribe).await?;
 
     write_frame(&mut stream, &ClientMessage::GitTransportRegister).await?;
 
@@ -1213,14 +1218,6 @@ async fn run(
             },
         };
         let event = match message {
-            ServerMessage::DeskSnapshot {
-                snapshot,
-                replica_id,
-            } => Some(ConnEvent::DeskSnapshot {
-                snapshot,
-                replica_id,
-            }),
-            ServerMessage::DeskTextApplied { record } => Some(ConnEvent::DeskTextApplied(record)),
             ServerMessage::DeskTreeSnapshot {
                 snapshot,
                 replica_id,
@@ -1228,20 +1225,32 @@ async fn run(
                 snapshot,
                 replica_id,
             }),
-            ServerMessage::DeskTreeReplaced { snapshot } => {
-                Some(ConnEvent::DeskTreeReplaced(snapshot))
-            }
             ServerMessage::DeskTreeApplied { record } => Some(ConnEvent::DeskTreeApplied(record)),
             ServerMessage::DeskNodeTextApplied { record } => {
                 Some(ConnEvent::DeskNodeTextApplied(record))
             }
             // Phase-1 clients re-snapshot after an atomic batch; Phase 2
             // applies the record directly without exposing partial state.
-            ServerMessage::DeskTreeBatchApplied { .. } => Some(ConnEvent::DeskTreeResyncRequired),
-            ServerMessage::DeskTreeBatchRejected { .. } => Some(ConnEvent::DeskTreeResyncRequired),
+            ServerMessage::DeskTreeBatchApplied { record } => {
+                Some(ConnEvent::DeskTreeBatchApplied(record))
+            }
+            ServerMessage::DeskTreeBatchRejected {
+                id,
+                retryable,
+                reason,
+                snapshot,
+            } => Some(ConnEvent::DeskTreeBatchRejected {
+                id,
+                retryable,
+                reason,
+                snapshot,
+            }),
+            ServerMessage::DeskPageBindingResult { request_id, error } => {
+                Some(ConnEvent::DeskPageBindingResult { request_id, error })
+            }
             ServerMessage::DeskTreeResyncRequired => Some(ConnEvent::DeskTreeResyncRequired),
-            // A `DeskGet` reply; the GUI subscribes and never sends one.
-            ServerMessage::DeskDocument { .. } => None,
+            // Read-only CLI reply; the GUI subscribes instead.
+            ServerMessage::DeskTreeDocument { .. } => None,
             ServerMessage::Ready {
                 agents,
                 iris_agent,

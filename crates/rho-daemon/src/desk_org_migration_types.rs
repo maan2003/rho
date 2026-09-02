@@ -1,27 +1,27 @@
 //! Wire vocabulary and forgiving parser for the daemon-owned Desk document.
+#![allow(dead_code)]
 
 use std::ops::Range;
 use std::sync::Arc;
 
 use clock::{Global, Lamport, ReplicaId};
+use rho_core::AgentId;
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use text::{Buffer, BufferId, EditOperation, FullOffset, Operation, UndoOperation};
 
-use crate::AgentId;
-
-#[path = "desk_temporal.rs"]
+#[path = "desk_org_migration_temporal.rs"]
 pub mod temporal;
 pub use temporal::{TemporalMark, TemporalMarkKind};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum DeskHeadingState {
+pub enum ImportedHeadingState {
     Todo,
     Done,
     Discarded,
     Staffed,
 }
 
-impl DeskHeadingState {
+impl ImportedHeadingState {
     pub fn keyword(self) -> &'static str {
         match self {
             Self::Todo => "TODO",
@@ -43,9 +43,9 @@ pub struct DeskProperty {
 
 /// A heading derived from Desk text. All ranges are UTF-8 byte ranges.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct DeskHeading {
+pub struct ImportedHeading {
     pub depth: usize,
-    pub state: Option<DeskHeadingState>,
+    pub state: Option<ImportedHeadingState>,
     /// Successfully parsed dated properties, in document order. Each kind
     /// appears at most once; the first property with that key owns it.
     pub temporal_marks: Vec<TemporalMark>,
@@ -74,7 +74,7 @@ pub struct DeskHeading {
 
 /// Parse an org-like Desk document. This deliberately has no error result:
 /// incomplete edits and malformed markup remain ordinary body text.
-pub fn parse(text: &str) -> Vec<DeskHeading> {
+pub fn import_headings(text: &str) -> Vec<ImportedHeading> {
     #[derive(Debug)]
     struct Line<'a> {
         start: usize,
@@ -106,7 +106,7 @@ pub fn parse(text: &str) -> Vec<DeskHeading> {
         });
     }
 
-    let mut headings = Vec::<DeskHeading>::new();
+    let mut headings = Vec::<ImportedHeading>::new();
     let mut heading_lines = Vec::new();
     let mut stack: Vec<(usize, usize)> = Vec::new();
     for (line_index, line) in lines.iter().enumerate() {
@@ -134,7 +134,7 @@ pub fn parse(text: &str) -> Vec<DeskHeading> {
         }
         let parent = stack.last().map(|(_, index)| *index);
         let index = headings.len();
-        headings.push(DeskHeading {
+        headings.push(ImportedHeading {
             depth,
             state,
             temporal_marks: Vec::new(),
@@ -171,7 +171,7 @@ pub fn parse(text: &str) -> Vec<DeskHeading> {
             .skip(line_index + 1)
             .take_while(|line| line.start < end)
         {
-            let Some((key, value, value_start)) = parse_property_line(line.text) else {
+            let Some((key, value, value_start)) = import_mark_line(line.text) else {
                 continue;
             };
             let property = DeskProperty {
@@ -186,8 +186,8 @@ pub fn parse(text: &str) -> Vec<DeskHeading> {
             {
                 if property_state.is_none() {
                     property_state = match kind {
-                        TemporalMarkKind::Done => Some(DeskHeadingState::Done),
-                        TemporalMarkKind::Discarded => Some(DeskHeadingState::Discarded),
+                        TemporalMarkKind::Done => Some(ImportedHeadingState::Done),
+                        TemporalMarkKind::Discarded => Some(ImportedHeadingState::Discarded),
                         TemporalMarkKind::Deadline
                         | TemporalMarkKind::Todo
                         | TemporalMarkKind::Defer
@@ -238,12 +238,12 @@ pub fn parse(text: &str) -> Vec<DeskHeading> {
 /// title. The keyword reads from the end of the line (`* Ship it DONE`);
 /// the leading position (`* DONE Ship it`) is still accepted so older
 /// documents and org-style habits keep parsing.
-fn parse_state(content: &str) -> (Option<(DeskHeadingState, Range<usize>)>, &str) {
-    const STATES: [(&str, DeskHeadingState); 4] = [
-        ("TODO", DeskHeadingState::Todo),
-        ("DONE", DeskHeadingState::Done),
-        ("DISCARDED", DeskHeadingState::Discarded),
-        ("STAFFED", DeskHeadingState::Staffed),
+fn parse_state(content: &str) -> (Option<(ImportedHeadingState, Range<usize>)>, &str) {
+    const STATES: [(&str, ImportedHeadingState); 4] = [
+        ("TODO", ImportedHeadingState::Todo),
+        ("DONE", ImportedHeadingState::Done),
+        ("DISCARDED", ImportedHeadingState::Discarded),
+        ("STAFFED", ImportedHeadingState::Staffed),
     ];
     for (keyword, state) in STATES {
         if let Some(rest) = content.strip_prefix(keyword)
@@ -299,7 +299,7 @@ fn parse_tags(content: &str) -> (ParsedTags, &str) {
     )
 }
 
-fn parse_property_line(line: &str) -> Option<(&str, &str, usize)> {
+fn import_mark_line(line: &str) -> Option<(&str, &str, usize)> {
     let leading = line.len() - line.trim_start().len();
     let rest = &line[leading..];
     let rest = rest.strip_prefix(':')?;
@@ -341,7 +341,7 @@ impl From<DeskClock> for Lamport {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum DeskOperation {
+pub enum ImportedTextOperation {
     Edit {
         timestamp: DeskClock,
         version: Vec<DeskClock>,
@@ -355,7 +355,7 @@ pub enum DeskOperation {
     },
 }
 
-impl DeskOperation {
+impl ImportedTextOperation {
     pub fn timestamp(&self) -> DeskClock {
         match self {
             Self::Edit { timestamp, .. } | Self::Undo { timestamp, .. } => *timestamp,
@@ -499,27 +499,27 @@ pub struct DeskReplica {
 pub struct DeskTextOpRecord {
     pub sequence: u64,
     pub timestamp_ms: u64,
-    pub operation: DeskOperation,
+    pub operation: ImportedTextOperation,
     pub transaction: Option<DeskTransaction>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack, Default)]
-pub struct DeskSnapshot {
+pub struct ImportedOrgSnapshot {
     /// Materialized document at snapshot time. Operation history accompanies
     /// it so clients can continue the native CRDT clock without rebasing.
     pub text: String,
-    pub operations: Vec<DeskOperation>,
+    pub operations: Vec<ImportedTextOperation>,
     pub transactions: Vec<DeskTransaction>,
     pub replicas: Vec<DeskReplica>,
 }
 
-impl DeskSnapshot {
+impl ImportedOrgSnapshot {
     pub fn buffer(&self, replica_id: u16) -> Result<Buffer, String> {
         let mut buffer = Buffer::new(ReplicaId::new(replica_id), BufferId::new(1).unwrap(), "");
         buffer.apply_ops(
             self.operations
                 .iter()
-                .map(DeskOperation::to_text)
+                .map(ImportedTextOperation::to_text)
                 .collect::<Result<Vec<_>, _>>()?,
         );
         if buffer.has_deferred_ops() {
@@ -548,12 +548,15 @@ mod tests {
     #[test]
     fn state_keyword_reads_from_the_line_end() {
         let text = "* Ship it DONE\n* STAFFED Crewed\n* mark TODO list\n";
-        let headings = super::parse(text);
-        assert_eq!(headings[0].state, Some(super::DeskHeadingState::Done));
+        let headings = super::import_headings(text);
+        assert_eq!(headings[0].state, Some(super::ImportedHeadingState::Done));
         assert_eq!(headings[0].title, "Ship it");
         assert_eq!(&text[headings[0].state_range.clone().unwrap()], "DONE");
         // Leading keywords keep parsing for older documents.
-        assert_eq!(headings[1].state, Some(super::DeskHeadingState::Staffed));
+        assert_eq!(
+            headings[1].state,
+            Some(super::ImportedHeadingState::Staffed)
+        );
         assert_eq!(headings[1].title, "Crewed");
         // A keyword in the middle of a title is just a word.
         assert_eq!(headings[2].state, None);
@@ -565,9 +568,9 @@ mod tests {
     #[test]
     fn tags_conceal_at_the_line_end_and_mid_title_colons_stay_words() {
         let text = "* Fix parser DONE :eng-x7y2:\n* Meet at 12:30\n* Crewed :eng-a1:eng-b2:\n* :lonely:\n* Odd :a::b:\n";
-        let headings = parse(text);
+        let headings = import_headings(text);
         assert_eq!(headings[0].tags, vec!["eng-x7y2"]);
-        assert_eq!(headings[0].state, Some(DeskHeadingState::Done));
+        assert_eq!(headings[0].state, Some(ImportedHeadingState::Done));
         assert_eq!(headings[0].title, "Fix parser");
         assert_eq!(&text[headings[0].tags_range.clone().unwrap()], ":eng-x7y2:");
         assert_eq!(&text[headings[0].state_range.clone().unwrap()], "DONE");
@@ -591,7 +594,7 @@ mod tests {
         // shallower heading, it stays outside so the visual gap survives
         // folding. The same rule repeats at the parent's own boundary.
         let text = "* One\n** A\nbody\n\n** B\nstuff\n\n\n* Two\n";
-        let headings = parse(text);
+        let headings = import_headings(text);
         let (one, a, b, _two) = (&headings[0], &headings[1], &headings[2], &headings[3]);
         assert_eq!(&text[a.subtree_range.clone()], "** A\nbody\n\n");
         assert_eq!(&text[b.subtree_range.clone()], "** B\nstuff\n");
@@ -600,14 +603,14 @@ mod tests {
             "* One\n** A\nbody\n\n** B\nstuff\n\n\n"
         );
         // At the end of the document the gap also stays out.
-        let headings = parse("* Last\nbody\n\n\n");
+        let headings = import_headings("* Last\nbody\n\n\n");
         assert_eq!(headings[0].subtree_range, 0.."* Last\nbody\n".len());
     }
 
     #[test]
     fn parser_is_forgiving_and_derives_parents() {
         let text = "orphan\n*bad\n* \n*** TODO deep\n:owner: anyone\nbody\n** DONE sibling\n  :broken property\n";
-        let headings = parse(text);
+        let headings = import_headings(text);
         assert_eq!(headings.len(), 3);
         assert_eq!(
             (
@@ -619,7 +622,7 @@ mod tests {
         );
         assert_eq!(
             (headings[1].depth, headings[1].state, headings[1].parent),
-            (3, Some(DeskHeadingState::Todo), Some(0))
+            (3, Some(ImportedHeadingState::Todo), Some(0))
         );
         assert_eq!(headings[2].parent, Some(0));
         assert_eq!(&headings[1].properties[0].key, "owner");
@@ -637,7 +640,7 @@ mod tests {
             agent.encoded(),
             agent.encoded()
         );
-        let headings = parse(&text);
+        let headings = import_headings(&text);
         assert_eq!(headings[0].project.as_deref(), Some("/src/root"));
         assert_eq!(headings[0].properties[1].key, "unknown");
         assert_eq!(
@@ -661,7 +664,7 @@ mod tests {
     #[test]
     fn first_agent_property_under_a_heading_wins_even_when_unknown() {
         let agent = AgentId::from_counter(2, &rho_core::AgentIdDomain(1)).unwrap();
-        let headings = parse(&format!(
+        let headings = import_headings(&format!(
             "* task\n:agent: not-an-agent\n:agent: {}\n",
             agent.encoded()
         ));
@@ -673,9 +676,9 @@ mod tests {
         use chrono::{NaiveDate, NaiveTime};
 
         let text = "* legacy TODO\n:ToDo: 2026-08-23 12:30 9d\n:todo: 2026-09-01\n:DEADLINE: not-a-date\n:deadline: 2026-08-30\n:reminder: 2026-08-30\n";
-        let headings = parse(text);
+        let headings = import_headings(text);
         let heading = &headings[0];
-        assert_eq!(heading.state, Some(DeskHeadingState::Todo));
+        assert_eq!(heading.state, Some(ImportedHeadingState::Todo));
         assert_eq!(heading.temporal_marks.len(), 2);
         assert_eq!(heading.temporal_marks[0].kind, TemporalMarkKind::Todo);
         assert_eq!(heading.temporal_marks[0].pace_days, 9);
@@ -696,11 +699,11 @@ mod tests {
 
     #[test]
     fn terminal_properties_override_legacy_keywords_in_document_order() {
-        let headings = parse(
+        let headings = import_headings(
             "* old DONE\n:discarded: 2026-08-24\n:done: 2026-08-25\n* old DISCARDED\n:done: 2026-08-26\n",
         );
-        assert_eq!(headings[0].state, Some(DeskHeadingState::Discarded));
-        assert_eq!(headings[1].state, Some(DeskHeadingState::Done));
+        assert_eq!(headings[0].state, Some(ImportedHeadingState::Discarded));
+        assert_eq!(headings[1].state, Some(ImportedHeadingState::Done));
         assert_eq!(headings[0].title, "old");
         assert!(
             headings[0].state_range.is_some(),

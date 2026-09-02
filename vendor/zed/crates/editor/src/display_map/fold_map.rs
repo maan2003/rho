@@ -267,14 +267,6 @@ impl FoldMapWriter<'_> {
             }
 
             let fold_range = buffer.anchor_after(range.start)..buffer.anchor_before(range.end);
-            // For now, ignore any ranges that span an excerpt boundary.
-            if buffer
-                .anchor_range_to_buffer_anchor_range(fold_range.clone())
-                .is_none()
-            {
-                continue;
-            }
-
             folds.push(Fold {
                 id: FoldId(post_inc(&mut self.0.next_fold_id.0)),
                 range: FoldRange(fold_range),
@@ -358,12 +350,7 @@ impl FoldMapWriter<'_> {
                 continue;
             }
             let anchors = buffer.anchor_after(range.start)..buffer.anchor_before(range.end);
-            if buffer
-                .anchor_range_to_buffer_anchor_range(anchors.clone())
-                .is_some()
-            {
-                desired.push((range, FoldRange(anchors), placeholder, elision_policy));
-            }
+            desired.push((range, FoldRange(anchors), placeholder, elision_policy));
         }
 
         let mut existing_by_range: HashMap<_, Vec<Fold>> = HashMap::default();
@@ -2252,6 +2239,39 @@ mod tests {
         writer.unfold_intersecting(Some(Point::new(0, 4)..Point::new(0, 4)), true);
         let (snapshot6, _) = map.read(inlay_snapshot, vec![]);
         assert_eq!(snapshot6.text(), "123aaaaa\nbbbbbb\nccc123456eee");
+    }
+
+    #[gpui::test]
+    fn test_fold_spanning_excerpt_boundaries(cx: &mut gpui::App) {
+        init_test(cx);
+        let buffer = MultiBuffer::build_multi(
+            [
+                ("parent\n", vec![Point::new(0, 0)..Point::new(1, 0)]),
+                ("child\n", vec![Point::new(0, 0)..Point::new(1, 0)]),
+            ],
+            cx,
+        );
+        let subscription = buffer.update(cx, |buffer, _| buffer.subscribe());
+        let buffer_snapshot = buffer.read(cx).snapshot(cx);
+        assert_eq!(buffer_snapshot.text(), "parent\nchild\n");
+        let (mut inlay_map, inlay_snapshot) = InlayMap::new(buffer_snapshot);
+        let mut map = FoldMap::new(inlay_snapshot.clone()).0;
+
+        let (mut writer, _, _) = map.write(inlay_snapshot, vec![]);
+        let (snapshot, _) = writer.fold(vec![(
+            Point::new(0, 6)..Point::new(2, 0),
+            FoldPlaceholder::test(),
+        )]);
+        assert_eq!(snapshot.text(), "parent⋯");
+
+        let buffer_snapshot = buffer.update(cx, |buffer, cx| {
+            buffer.edit([(Point::new(1, 0)..Point::new(1, 0), "new ")], None, cx);
+            buffer.snapshot(cx)
+        });
+        let (inlay_snapshot, inlay_edits) =
+            inlay_map.sync(buffer_snapshot, subscription.consume().into_inner());
+        let (snapshot, _) = map.read(inlay_snapshot, inlay_edits);
+        assert_eq!(snapshot.text(), "parent⋯");
     }
 
     #[gpui::test]

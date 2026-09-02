@@ -31,7 +31,8 @@ use tokio::sync::{Mutex, Mutex as TokioMutex, OwnedMutexGuard, broadcast, mpsc, 
 
 mod agent_ui;
 pub mod debug;
-pub mod desk;
+mod desk_org_migration;
+mod desk_org_migration_types;
 mod desk_tree;
 mod iris;
 mod realtime;
@@ -986,7 +987,6 @@ impl GitTransportBroker {
 struct AgentRegistry {
     pool: Arc<AgentPool>,
     db: RhoDb,
-    desk: desk::DeskStore,
     desk_tree: desk_tree::DeskTreeStore,
     visualizations: rho_visualizations::VisualizationStore,
     inference: Inference,
@@ -1038,16 +1038,14 @@ impl AgentRegistry {
         let pr_monitor =
             rho_pr_monitor::PrMonitor::new(pool.clone(), db.clone(), octo_socket).await?;
         let visualizations = rho_visualizations::VisualizationStore::new(db.clone()).await;
-        let desk = desk::DeskStore::new(db.clone()).await;
-        let desk_tree = desk_tree::DeskTreeStore::new(db.clone(), &desk.snapshot(), |handle| {
-            desk::resolve_agent_handle(&db, handle)
+        let desk_tree = desk_tree::DeskTreeStore::new(db.clone(), None, |handle| {
+            desk_org_migration::resolve_agent_handle(&db, handle)
         })
         .await
         .map_err(anyhow::Error::msg)?;
         let registry = Self {
             pool,
             db,
-            desk,
             desk_tree,
             visualizations,
             inference,
@@ -2518,27 +2516,6 @@ async fn handle_message(
             let _ = outgoing_tx.send(ServerMessage::Pong);
             Ok(Refresh::None)
         }
-        ClientMessage::DeskSubscribe => {
-            let replica_id = agents
-                .desk
-                .allocate_replica(rho_ui_proto::desk::DeskReplicaAuthor::User)
-                .await
-                .map_err(anyhow::Error::msg)?;
-            let _ = outgoing_tx.send(ServerMessage::DeskSnapshot {
-                snapshot: agents.desk.snapshot(),
-                replica_id,
-            });
-            let tree_replica_id = agents
-                .desk_tree
-                .allocate_replica(rho_desk::ReplicaAuthor::User)
-                .await
-                .map_err(anyhow::Error::msg)?;
-            let _ = outgoing_tx.send(ServerMessage::DeskTreeSnapshot {
-                snapshot: agents.desk_tree.snapshot(),
-                replica_id: tree_replica_id,
-            });
-            Ok(Refresh::None)
-        }
         ClientMessage::DeskTreeSubscribe => {
             let replica_id = agents
                 .desk_tree
@@ -2551,69 +2528,10 @@ async fn handle_message(
             });
             Ok(Refresh::None)
         }
-        ClientMessage::DeskGet => {
-            let text = agents
-                .desk
-                .snapshot()
-                .document_text()
-                .map_err(anyhow::Error::msg)?;
-            let _ = outgoing_tx.send(ServerMessage::DeskDocument { text });
-            Ok(Refresh::None)
-        }
-        ClientMessage::DeskSubscribeAgent { agent_id } => {
-            if !agents
-                .db
-                .read()
-                .list_agents()
-                .into_iter()
-                .any(|(id, _)| id == agent_id)
-            {
-                anyhow::bail!("Desk subscribe references an unknown agent");
-            }
-            let replica_id = agents
-                .desk
-                .allocate_replica(rho_ui_proto::desk::DeskReplicaAuthor::Agent(agent_id))
-                .await
-                .map_err(anyhow::Error::msg)?;
-            let _ = outgoing_tx.send(ServerMessage::DeskSnapshot {
-                snapshot: agents.desk.snapshot(),
-                replica_id,
-            });
-            let tree_replica_id = agents
-                .desk_tree
-                .allocate_replica(rho_desk::ReplicaAuthor::Agent(agent_id))
-                .await
-                .map_err(anyhow::Error::msg)?;
-            let _ = outgoing_tx.send(ServerMessage::DeskTreeSnapshot {
+        ClientMessage::DeskTreeGet => {
+            let _ = outgoing_tx.send(ServerMessage::DeskTreeDocument {
                 snapshot: agents.desk_tree.snapshot(),
-                replica_id: tree_replica_id,
             });
-            Ok(Refresh::None)
-        }
-        ClientMessage::DeskTextApply {
-            operation,
-            transaction,
-        } => {
-            let record = agents
-                .desk
-                .apply_text(operation, transaction)
-                .await
-                .map_err(anyhow::Error::msg)?;
-            let tree_replacement = agents
-                .desk_tree
-                .refresh_legacy_import(&agents.desk.snapshot(), |handle| {
-                    desk::resolve_agent_handle(&agents.db, handle)
-                })
-                .await
-                .map_err(anyhow::Error::msg)?;
-            let _ = agents
-                .events
-                .send(ServerMessage::DeskTextApplied { record });
-            if let Some(snapshot) = tree_replacement {
-                let _ = agents
-                    .events
-                    .send(ServerMessage::DeskTreeReplaced { snapshot });
-            }
             Ok(Refresh::None)
         }
         ClientMessage::DeskTreeApply { operation } => {
@@ -2660,6 +2578,42 @@ async fn handle_message(
                     });
                 }
             }
+            Ok(Refresh::None)
+        }
+        ClientMessage::DeskPageBind {
+            request_id,
+            parent,
+            page_id,
+        } => {
+            let result = agents
+                .desk_tree
+                .bind_machine(parent, rho_desk::Binding::Page(page_id))
+                .await;
+            if let Ok(Some(record)) = &result {
+                let _ = agents.events.send(ServerMessage::DeskTreeBatchApplied {
+                    record: record.clone(),
+                });
+            }
+            let _ = outgoing_tx.send(ServerMessage::DeskPageBindingResult {
+                request_id,
+                error: result.err(),
+            });
+            Ok(Refresh::None)
+        }
+        ClientMessage::DeskPageUnbind {
+            request_id,
+            node_id,
+        } => {
+            let result = agents.desk_tree.unbind_machine_node(node_id).await;
+            if let Ok(Some(record)) = &result {
+                let _ = agents.events.send(ServerMessage::DeskTreeBatchApplied {
+                    record: record.clone(),
+                });
+            }
+            let _ = outgoing_tx.send(ServerMessage::DeskPageBindingResult {
+                request_id,
+                error: result.err(),
+            });
             Ok(Refresh::None)
         }
         ClientMessage::RecordVisualization { mime_type, content } => {
@@ -2894,37 +2848,37 @@ async fn handle_message(
             role,
             start,
             mut content,
-            desk_anchor,
+            desk_parent,
         } => {
+            if let Some(parent) = desk_parent {
+                agents
+                    .desk_tree
+                    .validate_machine_parent(parent)
+                    .map_err(anyhow::Error::msg)?;
+            }
             if let Some(content) = content.as_mut() {
                 prepare_image_content(content).await?;
             }
             // Subscription and the AgentCreated announcement ride the pool's
             // creation broadcast (all connections, including this one).
             let (agent_id, agent) = agents.create(role, start).await?;
+            if let Some(parent) = desk_parent {
+                if let Some(record) = agents
+                    .desk_tree
+                    .bind_machine(parent, rho_desk::Binding::Agent(agent_id))
+                    .await
+                    .map_err(anyhow::Error::msg)?
+                {
+                    let _ = agents
+                        .events
+                        .send(ServerMessage::DeskTreeBatchApplied { record });
+                }
+            }
             if let Some(content) = content {
                 // The agent is fresh, so the lanes are equivalent here.
                 agent
                     .send_user_content_accepted(content, MessageDelivery::NextRequest, None)
                     .await?;
-            }
-            if let Some(anchor) = desk_anchor {
-                // Desk presentation must not delay the agent's first turn.
-                // A dead anchor leaves the fresh agent unfiled.
-                let agents = Arc::clone(agents);
-                tokio::spawn(async move {
-                    match agents.desk.tag_new_agent(agent_id, anchor).await {
-                        Ok(Some(record)) => {
-                            let _ = agents
-                                .events
-                                .send(ServerMessage::DeskTextApplied { record });
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            tracing::warn!(%error, "tagging a new agent's Desk heading failed")
-                        }
-                    }
-                });
             }
             Ok(Refresh::Ready)
         }
@@ -3103,6 +3057,18 @@ async fn handle_message(
             disposition,
         } => {
             agents.set_disposition(agent_id, disposition).await;
+            if disposition == AgentDisposition::Hidden {
+                if let Some(record) = agents
+                    .desk_tree
+                    .unbind_machine(rho_desk::Binding::Agent(agent_id))
+                    .await
+                    .map_err(anyhow::Error::msg)?
+                {
+                    let _ = agents
+                        .events
+                        .send(ServerMessage::DeskTreeBatchApplied { record });
+                }
+            }
             // Hidden changes what the rail folds, which clients read off
             // summaries; attention alone travels on its own broadcast.
             if disposition == AgentDisposition::Hidden {

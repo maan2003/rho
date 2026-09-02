@@ -126,27 +126,18 @@ than by running a supervisor, extension protocol, or daemon process graph.
   `dirs::state_dir()/rho/gui-telemetry`; it applies no automatic retention.
   This path is independent of the opt-in Dial9 CPU sampler and preserves the
   existing `--cpu-profile` export.
-  The Desk is migrating to one daemon-owned movable tree per host, with stable
-  node ids and one Zed text CRDT per node. During the first migration phase the
-  daemon durably imports and synchronizes that tree alongside the existing
-  text document while clients retain the existing presentation; the native
-  composed editor becomes authoritative in the following phase. Its
-  org-like headings derive structure rather than receiving structural RPCs.
-  Visible agent-handle tags at the end of heading lines are the filing source
-  of truth; `:project:` properties inherit down the heading tree. Every
-  resolvable tag occurrence is an independent portal onto the exact named
-  agent, so one agent may appear in several places. The normal presentation is
-  a compact end-of-line hint; `g t` opens the complete runtime subtree as
-  transient, per-occurrence display state. GUI clients retain one hidden CRDT source buffer per host
-  and project shared read-only agent runtime buffers through occurrence-specific
-  multibuffer rows, interleaved with writable prose and draft buffers.
-  `space e` switches the Desk to a raw-source projection containing only those
-  editable CRDT buffers, with all generated rows, hints, folds, and conceals
-  removed until the user toggles the composed view back on.
+  The Desk is one daemon-owned movable tree per host, with stable node ids and
+  one Zed text CRDT per node. Headings and prose are user-owned nodes; agent,
+  page, and runtime file rows are machine-owned nodes with typed bindings.
+  Metadata such as todo/defer/done marks is typed tree state. GUI clients
+  compose the node buffers into the familiar outline, project shared read-only
+  runtime buffers beside their machine rows, and submit structural/text
+  changes as atomic semantic batches. Org-looking output from `rho desk cat`
+  and `rho desk checkout` is presentation only and is never parsed.
   `rho-gui` supplies its context strip, theme mapping, and focus/show policy,
   while GPUI web owns only the immediate pointer-down routing region.
   Native web pages are client-local first-class resources owned by `rho-browser`.
-  They use extension-generated UUID `PageId`s written in full as Desk tags.
+  They use extension-generated UUID `PageId`s stored in typed Desk page nodes.
   One embedded MV3 extension owns the durable page registry inside the ordinary
   persistent Brave Origin profile. Rho launches the Brave executable selected by
   the environment but does not own browser policy or profile preferences. The
@@ -159,11 +150,10 @@ than by running a supervisor, extension protocol, or daemon process graph.
   `rhoPrivate.tabs` API attaches the UUID to browser-owned tab data. Session
   restore persists that value in `SessionTab.extra_data`; runtime tab IDs are
   never persisted and no tab groups encode Rho state.
-  The current set of `:web-<uuid>:` Desk tags is authoritative. After the
+  The current set of typed Desk page bindings is authoritative. After the
   browser starts and whenever that set changes, the GUI schedules extension
-  pages that no Desk document references for collection after a ten-minute
-  grace period; restoring a tag during ordinary cut/paste or text movement
-  cancels that collection.
+  pages that no Desk tree references for collection after a ten-minute grace
+  period; restoring a binding cancels that collection.
   Rho sends only direct create/focus/close requests and does not mirror or
   receive an eager registry.
   All pages share one normal Brave window and one private Smithay compositor

@@ -215,6 +215,11 @@ impl Vim {
 
     fn search(&mut self, action: &Search, window: &mut Window, cx: &mut Context<Self>) {
         let Some(pane) = self.pane(window, cx) else {
+            self.update_editor(cx, |_, _, cx| {
+                cx.emit(editor::EditorEvent::SearchRequested {
+                    backwards: action.backwards,
+                });
+            });
             return;
         };
         let direction = if action.backwards {

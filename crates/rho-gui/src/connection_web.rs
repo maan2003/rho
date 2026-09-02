@@ -59,18 +59,23 @@ pub struct HostEvent {
 }
 
 pub enum ConnEvent {
-    DeskSnapshot {
-        snapshot: rho_ui_proto::desk::DeskSnapshot,
-        replica_id: u16,
-    },
-    DeskTextApplied(rho_ui_proto::desk::DeskTextOpRecord),
     DeskTreeSnapshot {
         snapshot: rho_desk::Snapshot,
         replica_id: u16,
     },
-    DeskTreeReplaced(rho_desk::Snapshot),
     DeskTreeApplied(rho_desk::TreeOpRecord),
     DeskNodeTextApplied(rho_desk::TextOpRecord),
+    DeskTreeBatchApplied(rho_desk::BatchOpRecord),
+    DeskTreeBatchRejected {
+        id: rho_desk::TreeClock,
+        retryable: bool,
+        reason: String,
+        snapshot: rho_desk::Snapshot,
+    },
+    DeskPageBindingResult {
+        request_id: u64,
+        error: Option<String>,
+    },
     DeskTreeResyncRequired,
     Ready {
         agents: Vec<UiAgentSummary>,
@@ -437,16 +442,6 @@ fn handle_host_message(
             Some(ConnEvent::AgentCostDistribution(series.clone()))
         }
         ServerMessage::Error { message } => Some(ConnEvent::ServerError(message.clone())),
-        ServerMessage::DeskSnapshot {
-            snapshot,
-            replica_id,
-        } => Some(ConnEvent::DeskSnapshot {
-            snapshot: snapshot.clone(),
-            replica_id: *replica_id,
-        }),
-        ServerMessage::DeskTextApplied { record } => {
-            Some(ConnEvent::DeskTextApplied(record.clone()))
-        }
         ServerMessage::DeskTreeSnapshot {
             snapshot,
             replica_id,
@@ -454,17 +449,33 @@ fn handle_host_message(
             snapshot: snapshot.clone(),
             replica_id: *replica_id,
         }),
-        ServerMessage::DeskTreeReplaced { snapshot } => {
-            Some(ConnEvent::DeskTreeReplaced(snapshot.clone()))
-        }
         ServerMessage::DeskTreeApplied { record } => {
             Some(ConnEvent::DeskTreeApplied(record.clone()))
         }
         ServerMessage::DeskNodeTextApplied { record } => {
             Some(ConnEvent::DeskNodeTextApplied(record.clone()))
         }
-        ServerMessage::DeskTreeBatchApplied { .. } => Some(ConnEvent::DeskTreeResyncRequired),
-        ServerMessage::DeskTreeBatchRejected { .. } => Some(ConnEvent::DeskTreeResyncRequired),
+        ServerMessage::DeskTreeBatchApplied { record } => {
+            Some(ConnEvent::DeskTreeBatchApplied(record.clone()))
+        }
+        ServerMessage::DeskTreeBatchRejected {
+            id,
+            retryable,
+            reason,
+            snapshot,
+        } => Some(ConnEvent::DeskTreeBatchRejected {
+            id: *id,
+            retryable: *retryable,
+            reason: reason.clone(),
+            snapshot: snapshot.clone(),
+        }),
+        ServerMessage::DeskPageBindingResult { request_id, error } => {
+            Some(ConnEvent::DeskPageBindingResult {
+                request_id: *request_id,
+                error: error.clone(),
+            })
+        }
+        ServerMessage::DeskTreeDocument { .. } => None,
         ServerMessage::DeskTreeResyncRequired => Some(ConnEvent::DeskTreeResyncRequired),
         _ => None,
     };
@@ -1149,7 +1160,7 @@ async fn run(
     let mut send = rho_rpc::Writer::new(send);
     let mut recv = rho_rpc::Reader::new(recv);
     rho_ui_proto::write_frame(&mut send, &ClientMessage::Subscribe).await?;
-    rho_ui_proto::write_frame(&mut send, &ClientMessage::DeskSubscribe).await?;
+    rho_ui_proto::write_frame(&mut send, &ClientMessage::DeskTreeSubscribe).await?;
     let ready: ServerMessage = rho_ui_proto::read_frame(&mut recv)
         .await
         .map_err(|error| anyhow::anyhow!("read daemon ready message: {error}"))?;

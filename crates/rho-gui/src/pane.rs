@@ -11,9 +11,9 @@ use crate::registry::HostId;
 pub enum SurfaceKey {
     Draft,
     Messages,
-    DeskHeading {
+    DeskNode {
         host: HostId,
-        heading_offset: usize,
+        node_id: rho_desk::NodeId,
     },
     Inbox(String),
     Transcript(AgentId),

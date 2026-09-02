@@ -63,10 +63,7 @@ impl MultiBuffer {
         let snapshot = self.snapshot(cx);
         let excerpt = snapshot.excerpts_for_path(path).next()?;
         let path_key_index = PathKeyIndex(snapshot.path_keys.get_index_of(path)? as u64);
-        Some(Anchor::in_buffer(
-            path_key_index,
-            excerpt.context.start,
-        ))
+        Some(Anchor::in_buffer(path_key_index, excerpt.context.start))
     }
 
     pub fn set_excerpts_for_buffer(
@@ -859,7 +856,10 @@ impl MultiBuffer {
 
     pub fn remove_excerpts_for_buffer(&mut self, buffer: BufferId, cx: &mut Context<Self>) {
         let snapshot = self.sync_mut(cx);
-        let paths = snapshot.paths_for_buffer(buffer).cloned().collect::<Vec<_>>();
+        let paths = snapshot
+            .paths_for_buffer(buffer)
+            .cloned()
+            .collect::<Vec<_>>();
         for path in paths {
             self.remove_excerpts(path, cx);
         }

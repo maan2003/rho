@@ -20,7 +20,7 @@ pub(crate) use phone::set_touch_modal_editing;
 #[path = "workspace_web.rs"]
 mod web;
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 #[cfg(feature = "native")]
 use std::path::PathBuf;
 use std::time::Duration;
@@ -49,7 +49,7 @@ use crate::chime::Chime;
 #[cfg(feature = "native")]
 use crate::connection::GitApprovalDecision;
 use crate::connection::{AgentFrameAllocation, ConnEvent, Connection, HostEvent};
-use crate::desk_view::DeskSync;
+use crate::desk_view::DeskTreeSync;
 use crate::draft_view::DraftModel;
 use crate::hosts::{HostStatus, Hosts};
 use crate::inbox::{
@@ -68,19 +68,22 @@ use crate::style::StyleClass;
 use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
     AgentDone, AgentHide, AgentNew, AgentNext, AgentPrevious, BrowserExit, DashboardArchive,
-    DashboardBack, DashboardCycleGlobal, DashboardDealAppend, DashboardDealDiscard,
-    DashboardDealDone, DashboardDealExit, DashboardDealFile, DashboardDealInsert,
-    DashboardDealNext, DashboardDealOpenLine, DashboardDealRefresh, DashboardDealReply,
-    DashboardDealRoomSnooze, DashboardDealSnooze, DashboardDealTodo, DashboardDeleteEmpty,
-    DashboardDemote, DashboardGoto, DashboardHeadingAbove, DashboardHeadingBelow, DashboardJump,
-    DashboardNewAgent, DashboardNow, DashboardPromote, DashboardRenameTopic, DashboardReply,
-    DashboardStaff, DashboardSubmit, DashboardToggleAgentTree, DashboardToggleSubagents,
-    DashboardUndo, DealCloseAndNext, DealOpen, GitApprovalAllow, GitApprovalDeny, InboxCapture,
-    MessagesOpen, MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext,
-    MinibufferPrevious, OverviewToggle, PastePrompt, RailFocus, RailOpen, RoleCycle,
-    RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit,
-    SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, UploadGuiTelemetry, VoiceToggle,
-    ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
+    DashboardBack, DashboardCancelDraft, DashboardCycleGlobal, DashboardDealAppend,
+    DashboardDealDiscard, DashboardDealDone, DashboardDealExit, DashboardDealFile,
+    DashboardDealInsert, DashboardDealNext, DashboardDealOpenLine, DashboardDealRefresh,
+    DashboardDealReply, DashboardDealRoomSnooze, DashboardDealSnooze, DashboardDealTodo,
+    DashboardDeleteEmpty, DashboardDeleteRow, DashboardDemote, DashboardGoto,
+    DashboardHeadingAbove, DashboardHeadingBelow, DashboardJump, DashboardMoveSubtreeDown,
+    DashboardMoveSubtreeUp, DashboardNewAgent, DashboardNewChild, DashboardNewSibling,
+    DashboardNow, DashboardPasteRow, DashboardPasteRowBefore, DashboardPromote,
+    DashboardRenameTopic, DashboardReply, DashboardStaff, DashboardSubmit,
+    DashboardToggleAgentTree, DashboardToggleSubagents, DashboardUndo, DashboardYankRow,
+    DealCloseAndNext, DealOpen, GitApprovalAllow, GitApprovalDeny, InboxCapture, MessagesOpen,
+    MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious,
+    OverviewToggle, PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof,
+    ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit, SubmitPrompt, SurfaceBack,
+    SurfaceClose, TaskBoard, UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder, ZulipNextUnread,
+    ZulipOpenRow,
 };
 
 pub(crate) const MESSAGE_LOG_CAP: usize = 4096;
@@ -183,13 +186,19 @@ struct PendingGitApproval {
     response: tokio::sync::oneshot::Sender<GitApprovalDecision>,
 }
 
+#[cfg(feature = "native")]
+struct PendingPageFiling {
+    inbox_id: InboxId,
+    heading: String,
+}
+
 #[derive(Clone)]
 enum SurfaceView {
     Draft {
         editor: Entity<editor::Editor>,
     },
     Messages(Entity<editor::Editor>),
-    DeskHeading(Entity<editor::Editor>),
+    DeskNode(Entity<editor::Editor>),
     Inbox(Entity<editor::Editor>),
     Transcript {
         model: Entity<AgentModel>,
@@ -218,7 +227,7 @@ impl SurfaceView {
         match self {
             Self::Draft { .. } => SurfaceKind::Draft,
             Self::Messages(_) => SurfaceKind::Messages,
-            Self::DeskHeading(_) | Self::Inbox(_) => SurfaceKind::Dashboard,
+            Self::DeskNode(_) | Self::Inbox(_) => SurfaceKind::Dashboard,
             Self::Transcript { .. } => SurfaceKind::Transcript,
             Self::File(_) => SurfaceKind::File,
             Self::Shell { .. } => SurfaceKind::Shell,
@@ -341,31 +350,86 @@ struct HostProject {
     project: rho_ui_proto::UiProject,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DeskProjectResolution {
-    Use(usize),
-    Choose,
-    Missing,
+#[derive(Clone)]
+enum PendingDeskBatchIntent {
+    Recognize {
+        node_id: rho_desk::NodeId,
+        input: ClientMessage,
+        anchor: text::Anchor,
+        focus_after: bool,
+        created: rho_desk::NodeId,
+        focus_abandoned: bool,
+    },
+    SplitHeading {
+        node_id: rho_desk::NodeId,
+        input: ClientMessage,
+        anchor: text::Anchor,
+        created: rho_desk::NodeId,
+    },
+    DeleteEmpty {
+        node_id: rho_desk::NodeId,
+    },
 }
 
-fn resolve_desk_project(property: Option<&str>, projects: &[HostProject]) -> DeskProjectResolution {
-    if let Some(property) = property {
-        return projects
-            .iter()
-            .position(|candidate| {
-                candidate.project.name == property || candidate.project.path == property
-            })
-            .map_or(DeskProjectResolution::Missing, DeskProjectResolution::Use);
-    }
-    match projects.len() {
-        0 => DeskProjectResolution::Missing,
-        1 => DeskProjectResolution::Use(0),
-        _ => DeskProjectResolution::Choose,
-    }
+#[derive(Clone)]
+struct PendingTreeVerdict {
+    verdict: crate::dashboard::DealerVerdict,
+    echo: String,
 }
 
-fn updated_desk_brief(brief: &str) -> String {
-    format!("Updated brief from the Desk:\n\n{brief}")
+enum DeskSemanticUndo {
+    DeleteCreated {
+        host: HostId,
+        root: rho_desk::NodeId,
+    },
+    RestoreDeleted {
+        host: HostId,
+        subtree: crate::desk_view::DeskSubtree,
+    },
+    StructureMove {
+        host: HostId,
+        node_id: rho_desk::NodeId,
+        parent: Option<rho_desk::NodeId>,
+        order: rho_desk::OrderKey,
+    },
+    RestoreDeletedEmpty {
+        host: HostId,
+        undo: crate::desk_view::DeskDeleteEmptyUndo,
+    },
+    MergeSplit {
+        host: HostId,
+        heading: rho_desk::NodeId,
+        prose: rho_desk::NodeId,
+    },
+}
+
+fn temporal_verdict_values(
+    kind: rho_desk::TemporalKind,
+    mark: rho_desk::TemporalMark,
+) -> Vec<(rho_desk::TemporalKind, Option<rho_desk::TemporalMark>)> {
+    match kind {
+        rho_desk::TemporalKind::Todo => vec![
+            (rho_desk::TemporalKind::Deadline, None),
+            (rho_desk::TemporalKind::Defer, None),
+            (rho_desk::TemporalKind::Reminder, None),
+            (rho_desk::TemporalKind::Todo, Some(mark)),
+        ],
+        rho_desk::TemporalKind::Defer => vec![
+            (rho_desk::TemporalKind::Reminder, None),
+            (rho_desk::TemporalKind::Defer, Some(mark)),
+        ],
+        rho_desk::TemporalKind::Done => vec![
+            (rho_desk::TemporalKind::Discarded, None),
+            (rho_desk::TemporalKind::Done, Some(mark)),
+        ],
+        rho_desk::TemporalKind::Discarded => vec![
+            (rho_desk::TemporalKind::Done, None),
+            (rho_desk::TemporalKind::Discarded, Some(mark)),
+        ],
+        rho_desk::TemporalKind::Deadline | rho_desk::TemporalKind::Reminder => {
+            vec![(kind, Some(mark))]
+        }
+    }
 }
 
 pub struct Workspace {
@@ -473,9 +537,27 @@ pub struct Workspace {
     /// Compact Helix-style key guide shown on deal entry and `?`.
     /// Canonical per-host CRDT Desk buffers shared by dashboard and source
     /// views.
-    desk_sync: DeskSync,
-    /// Reconciles the dashboard when a desk buffer changes, per host.
-    desk_edit_subscriptions: HashMap<HostId, gpui::Subscription>,
+    desk_tree_sync: DeskTreeSync,
+    /// Set by `InputHandled` and consumed by the following buffer edit. The
+    /// editor announces input before mutating its buffer, while heading
+    /// recognition must run immediately after that mutation so subsequent
+    /// typing lands in the newly-created node buffer.
+    pending_heading_recognition: Option<(bool, HostId, rho_desk::NodeId, usize)>,
+    pending_heading_undo: Option<clock::Lamport>,
+    desk_batch_editing: bool,
+    desk_batch_text: Vec<ClientMessage>,
+    pending_desk_batch_intents: BTreeMap<(HostId, rho_desk::TreeClock), PendingDeskBatchIntent>,
+    /// Late editor events can still originate from a row replaced by an
+    /// accepted recognition batch. Node ids are never reused, so retaining
+    /// this redirect safely carries those edits to the replacement buffer.
+    desk_text_retargets: BTreeMap<(HostId, rho_desk::NodeId), rho_desk::NodeId>,
+    pending_tree_verdicts: BTreeMap<(HostId, rho_desk::TreeClock), PendingTreeVerdict>,
+    desk_semantic_clipboard: Option<crate::desk_view::DeskSubtree>,
+    /// One-shot recovery for `p` while Vim still holds the removed excerpt.
+    desk_semantic_paste_target: Option<(HostId, rho_desk::NodeId)>,
+    desk_semantic_undo: BTreeMap<clock::Lamport, DeskSemanticUndo>,
+    pending_semantic_batches: BTreeMap<(HostId, rho_desk::TreeClock), clock::Lamport>,
+    pending_semantic_group: Option<clock::Lamport>,
     /// Agent shown beside the dashboard cursor. Kept separate from the
     /// focused task so cursor previews do not rebuild or reorder the rail.
     dashboard_preview: Option<AgentId>,
@@ -503,6 +585,12 @@ pub struct Workspace {
     /// Desk CRDT buffer until an explicit filing verdict.
     inbox: InboxStore,
     pending_inbox_item: Option<InboxId>,
+    pending_filing_destinations: Vec<(String, String, HostId, rho_desk::NodeId)>,
+    pending_filing_selected: Option<(HostId, rho_desk::NodeId)>,
+    #[cfg(feature = "native")]
+    next_page_binding_request_id: u64,
+    #[cfg(feature = "native")]
+    pending_page_filings: BTreeMap<(HostId, u64), PendingPageFiling>,
     scroll_journal_task: Option<Task<()>>,
     /// The completing-read strip at the bottom of the window, when open.
     minibuffer: Option<Minibuffer>,
@@ -781,12 +869,12 @@ struct NewAgentDraft {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NewAgentIntent {
-    Staff((HostId, usize)),
+    Staff((HostId, rho_desk::NodeId)),
     QuickSpawn,
 }
 
 impl NewAgentIntent {
-    fn topic(self) -> Option<(HostId, usize)> {
+    fn topic(self) -> Option<(HostId, rho_desk::NodeId)> {
         match self {
             Self::Staff(topic) => Some(topic),
             Self::QuickSpawn => None,
@@ -925,17 +1013,108 @@ impl Workspace {
         let dashboard_subscription = cx.subscribe_in(
             dashboard.editor(),
             window,
-            |this, _, event: &editor::EditorEvent, window, cx| {
-                if matches!(
-                    event,
-                    editor::EditorEvent::SelectionsChanged { local: true }
-                ) {
+            |this, _, event: &editor::EditorEvent, window, cx| match event {
+                editor::EditorEvent::InputHandled { text, .. } if text.as_ref() == " " => {
+                    if let Some((host, node_id, offset)) =
+                        this.dashboard.tree_node_cursor_offset(cx)
+                    {
+                        this.pending_heading_recognition = Some((false, host, node_id, offset + 1));
+                        this.desk_batch_text.clear();
+                        this.desk_batch_editing = true;
+                    }
+                }
+                editor::EditorEvent::InputHandled { text, .. } if text.contains('\n') => {
+                    if let Some((host, node_id, offset)) =
+                        this.dashboard.tree_node_cursor_offset(cx)
+                    {
+                        if this
+                            .desk_tree_sync
+                            .tree_node(host, node_id)
+                            .is_some_and(|node| node.kind == rho_desk::NodeKind::Heading)
+                        {
+                            let transaction_id = this.dashboard.push_external_undo_transaction(cx);
+                            this.pending_heading_undo = Some(transaction_id);
+                        }
+                        let newline = text.find('\n').unwrap_or(0);
+                        this.pending_heading_recognition =
+                            Some((true, host, node_id, offset + newline));
+                        this.desk_batch_text.clear();
+                        this.desk_batch_editing = true;
+                    }
+                }
+                editor::EditorEvent::BuffersEdited { buffer_ids } => {
+                    if let Some((focus_after, mut host, mut node_id, line_end)) =
+                        this.pending_heading_recognition.take()
+                    {
+                        if let Some((edited_host, edited_node)) = this
+                            .desk_tree_sync
+                            .tree_node_for_buffers(buffer_ids, focus_after, cx)
+                        {
+                            host = edited_host;
+                            node_id = edited_node;
+                        }
+                        // Replacing the editor composition from inside its
+                        // BuffersEdited dispatch can leave the next queued
+                        // keystroke attached to the row we just deleted.
+                        // Reconcile at the end of this GPUI update instead,
+                        // before another platform input event is dispatched.
+                        cx.defer_in(window, move |this, window, cx| {
+                            this.recognize_desk_heading_after_edit(
+                                focus_after,
+                                host,
+                                node_id,
+                                line_end,
+                                window,
+                                cx,
+                            );
+                        });
+                    }
+                }
+                editor::EditorEvent::SemanticRowAction { buffer_id, action } => {
+                    this.handle_desk_semantic_row_action(*buffer_id, *action, window, cx);
+                }
+                editor::EditorEvent::Edited { .. } => {
+                    if let Some(transaction_id) = this.pending_semantic_group.take() {
+                        this.dashboard.group_until_transaction(transaction_id, cx);
+                    }
+                }
+                editor::EditorEvent::TransactionUndone { transaction_id } => {
+                    this.undo_desk_semantic_action(*transaction_id, window, cx);
+                }
+                editor::EditorEvent::SearchRequested { backwards } => {
+                    this.prompt_dashboard_search(*backwards, window, cx);
+                }
+                editor::EditorEvent::SelectionsChanged { local: true } => {
+                    let cursor = this.dashboard.tree_node_cursor_offset(cx);
+                    for ((host, _), intent) in &mut this.pending_desk_batch_intents {
+                        if let PendingDeskBatchIntent::Recognize {
+                            created,
+                            focus_abandoned,
+                            ..
+                        } = intent
+                            && !cursor.is_some_and(|(cursor_host, node_id, _)| {
+                                cursor_host == *host && node_id == *created
+                            })
+                        {
+                            *focus_abandoned = true;
+                        }
+                    }
                     this.refresh_dashboard(window, cx);
                     this.dashboard_cursor_moved(window, cx);
                 }
+                _ => {}
             },
         );
         let universal_argument_subscription = cx.observe_keystrokes(|this, event, window, cx| {
+            if this.desk_semantic_paste_target.is_some()
+                && !event.keystroke.key.eq_ignore_ascii_case("p")
+                && !matches!(
+                    event.keystroke.key.as_str(),
+                    "shift" | "control" | "alt" | "platform" | "function"
+                )
+            {
+                this.desk_semantic_paste_target = None;
+            }
             if this.dashboard.deal_mode()
                 && !matches!(
                     event.keystroke.key.as_str(),
@@ -1060,8 +1239,19 @@ impl Workspace {
             chime_above_threshold: false,
             dashboard,
             mode_indicator,
-            desk_sync: DeskSync::default(),
-            desk_edit_subscriptions: HashMap::new(),
+            desk_tree_sync: DeskTreeSync::default(),
+            pending_heading_recognition: None,
+            pending_heading_undo: None,
+            desk_batch_editing: false,
+            desk_batch_text: Vec::new(),
+            pending_desk_batch_intents: BTreeMap::new(),
+            desk_text_retargets: BTreeMap::new(),
+            pending_tree_verdicts: BTreeMap::new(),
+            desk_semantic_clipboard: None,
+            desk_semantic_paste_target: None,
+            desk_semantic_undo: BTreeMap::new(),
+            pending_semantic_batches: BTreeMap::new(),
+            pending_semantic_group: None,
             dashboard_preview: None,
             dashboard_web_preview: None,
             browser_pages: HashSet::new(),
@@ -1081,6 +1271,10 @@ impl Workspace {
                 })
             },
             pending_inbox_item: None,
+            pending_filing_destinations: Vec::new(),
+            pending_filing_selected: None,
+            next_page_binding_request_id: 1,
+            pending_page_filings: BTreeMap::new(),
             scroll_journal_task: None,
             minibuffer: None,
             transient: None,
@@ -1163,7 +1357,6 @@ impl Workspace {
         self.workdirs.retain(|workdir| workdir.host != host);
         self.remote_projects.retain(|(owner, _), _| *owner != host);
         self.registry.detach_host(host);
-        self.desk_edit_subscriptions.remove(&host);
         self.refresh_dashboard(window, cx);
         for agent_id in departed {
             self.subscriptions.forget(agent_id);
@@ -1213,14 +1406,6 @@ impl Workspace {
         if let Some(connection) = self.hosts.connection(host) {
             connection.send(message);
         }
-    }
-
-    pub(crate) fn mark_desk_text_local(
-        &mut self,
-        host: HostId,
-        clock: rho_ui_proto::desk::DeskClock,
-    ) {
-        self.desk_sync.mark_local(host, clock);
     }
 
     /// Whether the daemon behind an agent is answering. Acting on an agent
@@ -1322,6 +1507,20 @@ impl Workspace {
     }
 
     fn close_current_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dashboard.is_focused(window, cx)
+            && matches!(
+                self.dashboard.cursor_target(&self.registry, cx),
+                Some(
+                    crate::dashboard::RowTarget::NewDraft
+                        | crate::dashboard::RowTarget::NewTreeDraft(_)
+                )
+            )
+            && self.dashboard.discard_new_draft(cx)
+        {
+            self.forget_discarded_draft(cx);
+            self.refresh_dashboard(window, cx);
+            return;
+        }
         if self.overview_open {
             return;
         }
@@ -1341,7 +1540,10 @@ impl Workspace {
             dealt_untouched,
         });
         let Some(removed) = removed else {
-            if let Some(previous) = self.surface_history.get(self.history_cursor).cloned() {
+            if key == SurfaceKey::Draft {
+                self.history_cursor = self.surface_history.len();
+                self.open_overview(window, cx);
+            } else if let Some(previous) = self.surface_history.get(self.history_cursor).cloned() {
                 self.show_warm_surface(
                     previous,
                     crate::journal::SurfaceShowMethod::Mru,
@@ -1366,6 +1568,33 @@ impl Workspace {
         } else {
             self.history_cursor = self.surface_history.len();
             self.open_overview(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn forget_discarded_draft(&mut self, cx: &mut Context<Self>) {
+        self.new_agent_draft = None;
+        let key = SurfaceKey::Draft;
+        self.navigation_skips.remove(&key);
+        crate::journal::record(crate::journal::Event::SurfaceClosed {
+            surface: Self::journal_surface(&key),
+            dealt_untouched: false,
+        });
+        if let Some(index) = self
+            .surface_history
+            .iter()
+            .position(|warm| warm.surface.key == key)
+        {
+            self.surface_history.remove(index);
+            if index < self.history_cursor {
+                self.history_cursor -= 1;
+            } else if index == self.history_cursor {
+                self.history_cursor = self.surface_history.len();
+            }
+            crate::journal::record(crate::journal::Event::HistoryRemoved {
+                identity: Self::journal_surface(&key),
+                method: crate::journal::HistoryRemoveMethod::Close,
+            });
         }
         cx.notify();
     }
@@ -1530,16 +1759,24 @@ impl Workspace {
         identity: &crate::dashboard::DealCardIdentity,
     ) -> crate::journal::DealerCardIdentity {
         match identity {
-            crate::dashboard::DealCardIdentity::Desk {
+            crate::dashboard::DealCardIdentity::Tree { host, node_id } => {
+                crate::journal::DealerCardIdentity::DeskNode {
+                    host: host.0,
+                    node_id: (*node_id).into(),
+                }
+            }
+            crate::dashboard::DealCardIdentity::TreeAgent {
                 host,
-                heading_offset,
-            } => crate::journal::DealerCardIdentity::Desk {
-                host: host.to_string(),
-                heading_offset: *heading_offset,
+                node_id,
+                agent_id,
+            } => crate::journal::DealerCardIdentity::AgentNode {
+                host: host.0,
+                node_id: (*node_id).into(),
+                agent_id: agent_id.into(),
             },
             crate::dashboard::DealCardIdentity::Agent(agent_id) => {
                 crate::journal::DealerCardIdentity::Agent {
-                    agent_id: agent_id.encoded(),
+                    agent_id: agent_id.into(),
                 }
             }
             crate::dashboard::DealCardIdentity::Inbox(id) => {
@@ -1574,15 +1811,6 @@ impl Workspace {
         candidates.cards.retain(|card| {
             if let Some(current) = self.dashboard.current_deal_card() {
                 return card.identity != current.identity;
-            }
-            if self.overview_open {
-                return !matches!(
-                    (&card.identity, self.dashboard.cursor_topic(cx)),
-                    (
-                        crate::dashboard::DealCardIdentity::Desk { host, heading_offset },
-                        Some((cursor_host, cursor_offset))
-                    ) if *host == cursor_host && *heading_offset == cursor_offset
-                );
             }
             match &self.active_pane().surface.key {
                 SurfaceKey::Transcript(agent_id) => {
@@ -1838,57 +2066,149 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         match event {
-            ConnEvent::DeskSnapshot {
-                snapshot,
-                replica_id,
-            } => {
-                let buffer = self
-                    .desk_sync
-                    .apply_snapshot(host, snapshot, replica_id, cx);
-                self.dashboard.set_source(host, buffer.downgrade(), cx);
-                // Structure follows the text: any edit to the desk buffer
-                // (vim in the excerpts, or a CRDT op from another client)
-                // re-parses and reconciles.
-                self.desk_edit_subscriptions.insert(
-                    host,
-                    cx.subscribe_in(
-                        &buffer,
-                        window,
-                        |this, _, event: &language::BufferEvent, window, cx| {
-                            if matches!(event, language::BufferEvent::Edited { .. }) {
-                                this.refresh_dashboard(window, cx);
-                            }
-                        },
-                    ),
-                );
-            }
-            ConnEvent::DeskTextApplied(record) => {
-                self.desk_sync.apply_text(host, record, cx);
-            }
             ConnEvent::DeskTreeSnapshot {
                 snapshot,
                 replica_id,
             } => {
                 if self
-                    .desk_sync
+                    .desk_tree_sync
                     .apply_tree_snapshot(host, snapshot, replica_id, cx)
                 {
                     self.send_to_host(host, ClientMessage::DeskTreeSubscribe);
                 }
+                self.sync_tree_dashboard(host, window, cx);
             }
             ConnEvent::DeskTreeApplied(record) => {
-                if self.desk_sync.apply_tree(host, record, cx) {
+                if self.desk_tree_sync.apply_tree(host, record, cx) {
                     self.send_to_host(host, ClientMessage::DeskTreeSubscribe);
                 }
+                self.sync_tree_dashboard(host, window, cx);
             }
+            #[cfg(test)]
             ConnEvent::DeskTreeReplaced(snapshot) => {
-                if self.desk_sync.replace_tree_snapshot(host, snapshot, cx) {
-                    self.send_to_host(host, ClientMessage::DeskTreeSubscribe);
-                }
+                self.desk_tree_sync
+                    .replace_tree_snapshot(host, snapshot, cx);
+                self.sync_tree_dashboard(host, window, cx);
             }
             ConnEvent::DeskNodeTextApplied(record) => {
-                if self.desk_sync.apply_node_text(host, record, cx) {
+                if self.desk_tree_sync.apply_node_text(host, record, cx) {
                     self.send_to_host(host, ClientMessage::DeskTreeSubscribe);
+                }
+                self.sync_tree_dashboard(host, window, cx);
+            }
+            ConnEvent::DeskTreeBatchApplied(record) => {
+                self.pending_semantic_batches
+                    .remove(&(host, record.batch.id));
+                let verdict = self.pending_tree_verdicts.remove(&(host, record.batch.id));
+                let recognition_focus = self
+                    .pending_desk_batch_intents
+                    .remove(&(host, record.batch.id))
+                    .and_then(|intent| match intent {
+                        PendingDeskBatchIntent::Recognize {
+                            created,
+                            focus_abandoned: false,
+                            ..
+                        } if self.dashboard.is_focused(window, cx) => {
+                            let offset = self
+                                .dashboard
+                                .tree_node_cursor_offset(cx)
+                                .filter(|(cursor_host, cursor_node, _)| {
+                                    *cursor_host == host && *cursor_node == created
+                                })
+                                .map_or(0, |(_, _, offset)| offset);
+                            Some((created, offset))
+                        }
+                        _ => None,
+                    });
+                if self.desk_tree_sync.apply_batch(host, record, cx) {
+                    self.send_to_host(host, ClientMessage::DeskTreeSubscribe);
+                }
+                self.sync_tree_dashboard(host, window, cx);
+                if let Some((focus, offset)) = recognition_focus {
+                    let cursor_after_sync = self.dashboard.tree_node_cursor_offset(cx);
+                    cx.on_next_frame(window, move |this, window, cx| {
+                        if !this.dashboard.is_focused(window, cx)
+                            || this.dashboard.tree_node_cursor_offset(cx) != cursor_after_sync
+                        {
+                            return;
+                        }
+                        this.dashboard
+                            .move_to_tree_position_when_ready(host, focus, offset);
+                        this.sync_tree_dashboard(host, window, cx);
+                    });
+                    cx.notify();
+                }
+                if let Some(verdict) = verdict {
+                    self.dashboard.record_deal_verdict_as(
+                        verdict.verdict,
+                        chrono::Local::now().fixed_offset(),
+                    );
+                    self.echo(&verdict.echo, StyleClass::SystemInfo, cx);
+                    self.finish_deal_verdict(window, cx);
+                }
+            }
+            ConnEvent::DeskTreeBatchRejected {
+                id,
+                retryable,
+                reason,
+                snapshot,
+            } => {
+                self.pending_tree_verdicts.remove(&(host, id));
+                let semantic_can_retry =
+                    retryable && self.pending_desk_batch_intents.contains_key(&(host, id));
+                if !semantic_can_retry
+                    && let Some(transaction_id) = self.pending_semantic_batches.remove(&(host, id))
+                {
+                    self.discard_desk_semantic_transaction(transaction_id, cx);
+                }
+                self.retry_desk_batch(host, id, retryable, snapshot, window, cx);
+                self.sync_tree_dashboard(host, window, cx);
+                if !retryable {
+                    self.notice_on(None, &reason, StyleClass::SystemInfo, cx);
+                }
+            }
+            ConnEvent::DeskPageBindingResult { request_id, error } => {
+                #[cfg(feature = "native")]
+                if let Some(pending) = self.pending_page_filings.remove(&(host, request_id)) {
+                    match error {
+                        None => {
+                            if let Err(error) =
+                                self.inbox.verdict(&pending.inbox_id, Verdict::Filed)
+                            {
+                                tracing::error!(%error, "retiring filed inbox page");
+                                self.notice_on(
+                                    None,
+                                    "filed, but inbox persistence failed",
+                                    StyleClass::SystemInfo,
+                                    cx,
+                                );
+                            } else {
+                                crate::journal::record(crate::journal::Event::InboxVerdict {
+                                    inbox_id: pending.inbox_id.0.clone(),
+                                    verdict: crate::journal::InboxVerdict::File {
+                                        heading: pending.heading.clone(),
+                                    },
+                                });
+                                if self.pending_inbox_item.as_ref() == Some(&pending.inbox_id) {
+                                    self.pending_inbox_item = None;
+                                }
+                                self.refresh_dashboard(window, cx);
+                                self.echo(
+                                    &format!("filed under {}", pending.heading),
+                                    StyleClass::SystemInfo,
+                                    cx,
+                                );
+                            }
+                        }
+                        Some(reason) => {
+                            self.notice_on(
+                                None,
+                                &format!("file: {reason}"),
+                                StyleClass::SystemInfo,
+                                cx,
+                            );
+                        }
+                    }
                 }
             }
             ConnEvent::DeskTreeResyncRequired => {
@@ -2823,7 +3143,7 @@ impl Workspace {
                 role,
                 start,
                 content: Some(content),
-                desk_anchor: None,
+                desk_parent: None,
             },
         );
     }
@@ -3276,22 +3596,32 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if desk_heading_without_agent(
-            self.dashboard.is_focused(window, cx),
-            self.dashboard.cursor_target(&self.registry, cx),
-        ) {
-            self.dashboard.set_cursor_heading_property(
-                if hide {
-                    rho_ui_proto::desk::TemporalMarkKind::Discarded
-                } else {
-                    rho_ui_proto::desk::TemporalMarkKind::Done
-                },
-                chrono::Local::now()
-                    .date_naive()
-                    .and_time(chrono::NaiveTime::MIN),
-                None,
-                cx,
-            );
+        if self.dashboard.is_focused(window, cx)
+            && let Some(crate::dashboard::RowTarget::TreeTopic { host, node_id, .. }) =
+                self.dashboard.cursor_target(&self.registry, cx)
+        {
+            let today = chrono::Local::now().date_naive();
+            let mark = rho_desk::TemporalMark {
+                year: chrono::Datelike::year(&today),
+                month: chrono::Datelike::month(&today) as u8,
+                day: chrono::Datelike::day(&today) as u8,
+                minute_of_day: None,
+                pace_days: 0,
+            };
+            let kind = if hide {
+                rho_desk::TemporalKind::Discarded
+            } else {
+                rho_desk::TemporalKind::Done
+            };
+            if let Some((batch, messages)) = self.desk_tree_sync.prepare_temporal_batch(
+                host,
+                node_id,
+                temporal_verdict_values(kind, mark),
+            ) {
+                self.desk_tree_sync.apply_optimistic(host, &messages, cx);
+                self.sync_tree_dashboard(host, window, cx);
+                self.send_to_host(host, ClientMessage::DeskTreeBatchApply { batch });
+            }
             return;
         }
         if !self.require_connected(cx) {
@@ -3586,9 +3916,9 @@ impl Workspace {
         let context = self.capture_context(window, cx);
         let source = self.dashboard.capture_position(cx).map_or(
             SourceReference::None,
-            |(host, offset, _)| SourceReference::DeskPosition {
-                host: host.to_string(),
-                offset,
+            |(host, node_id, _)| SourceReference::DeskNode {
+                host: host.0,
+                node_id: node_id.into(),
             },
         );
         self.open_prompt(
@@ -3719,14 +4049,24 @@ impl Workspace {
         if self.pending_inbox_item.is_none() {
             return;
         }
+        self.pending_filing_destinations = self.dashboard.heading_destination_candidates(cx);
+        self.pending_filing_selected = None;
         self.open_prompt(
             "file under:",
-            std::rc::Rc::new(|workspace, needle, cx| {
+            std::rc::Rc::new(|workspace, needle, _cx| {
+                let needle = needle.to_lowercase();
                 workspace
-                    .dashboard
-                    .heading_candidates(&workspace.registry, needle, cx)
+                    .pending_filing_destinations
+                    .iter()
+                    .filter(|(value, description, _, _)| {
+                        value.to_lowercase().contains(&needle)
+                            || description.to_lowercase().contains(&needle)
+                    })
+                    .map(|(value, description, _, _)| crate::minibuffer::Candidate {
+                        value: value.clone(),
+                        description: description.clone(),
+                    })
                     .into_iter()
-                    .map(|(value, description)| crate::minibuffer::Candidate { value, description })
                     .collect()
             }),
             std::rc::Rc::new(|workspace, heading, window, cx| {
@@ -3735,6 +4075,9 @@ impl Workspace {
             window,
             cx,
         );
+        if let Some(minibuffer) = &mut self.minibuffer {
+            minibuffer.set_complete_whole_input();
+        }
     }
 
     /// Dealer-facing filing handoff. Destination completion and the eventual
@@ -3760,10 +4103,21 @@ impl Workspace {
         let Some(item) = self.inbox.get(&id).cloned() else {
             return;
         };
-        let filed = match &item.source {
-            SourceReference::Page { id } => self.file_inbox_page(heading, id, cx),
-            _ => self.dashboard.append_child_heading(heading, &item.text, cx),
-        };
+        if let SourceReference::Page { id: page_id } = &item.source {
+            let target = self.pending_filing_selected.take();
+            if !self.file_inbox_page(target, heading, page_id, &id, cx) {
+                self.notice_on(None, "file: heading not found", StyleClass::SystemInfo, cx);
+            }
+            // A page filing is not retired until the daemon acknowledges the
+            // machine-owned binding. The result event completes this flow.
+            return;
+        }
+        let filed = self
+            .pending_filing_selected
+            .take()
+            .is_some_and(|(host, parent)| {
+                self.append_tree_heading(host, parent, true, false, &item.text, window, cx)
+            });
         if !filed {
             self.notice_on(None, "file: heading not found", StyleClass::SystemInfo, cx);
             return;
@@ -3794,12 +4148,49 @@ impl Workspace {
     }
 
     #[cfg(feature = "native")]
-    fn file_inbox_page(&mut self, heading: &str, id: &str, cx: &mut Context<Self>) -> bool {
-        self.dashboard.tag_heading_with_page(heading, id, cx)
+    fn file_inbox_page(
+        &mut self,
+        target: Option<(HostId, rho_desk::NodeId)>,
+        heading: &str,
+        id: &str,
+        inbox_id: &InboxId,
+        _cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((host, parent)) = target else {
+            return false;
+        };
+        let Ok(page) = id.parse::<rho_browser::PageId>() else {
+            return false;
+        };
+        let request_id = self.next_page_binding_request_id;
+        self.next_page_binding_request_id = self.next_page_binding_request_id.wrapping_add(1);
+        self.pending_page_filings.insert(
+            (host, request_id),
+            PendingPageFiling {
+                inbox_id: inbox_id.clone(),
+                heading: heading.to_owned(),
+            },
+        );
+        self.send_to_host(
+            host,
+            ClientMessage::DeskPageBind {
+                request_id,
+                parent,
+                page_id: rho_desk::PageId(*page.0.as_bytes()),
+            },
+        );
+        true
     }
 
     #[cfg(not(feature = "native"))]
-    fn file_inbox_page(&mut self, _heading: &str, _id: &str, _cx: &mut Context<Self>) -> bool {
+    fn file_inbox_page(
+        &mut self,
+        _target: Option<(HostId, rho_desk::NodeId)>,
+        _heading: &str,
+        _id: &str,
+        _inbox_id: &InboxId,
+        _cx: &mut Context<Self>,
+    ) -> bool {
         false
     }
 
@@ -4249,7 +4640,7 @@ impl Workspace {
 
     pub fn open_agent(&mut self, agent_id: AgentId, window: &mut Window, cx: &mut Context<Self>) {
         crate::journal::record(crate::journal::Event::AgentOpened {
-            agent_id: agent_id.encoded(),
+            agent_id: agent_id.into(),
         });
         if self.agent_online(agent_id) && !self.subscriptions.contains(agent_id) {
             self.subscribe_agent(agent_id, cx);
@@ -4266,41 +4657,39 @@ impl Workspace {
     /// to the open agent, so a chord from the dashboard still lands.
     pub(crate) fn subject(&self, window: &Window, cx: &mut Context<Self>) -> Subject {
         use crate::dashboard::RowTarget;
-
-        let row = if self.dashboard.focus_handle(cx).is_focused(window) {
-            self.dashboard.cursor_target(&self.registry, cx)
-        } else {
-            None
-        };
+        let row = self
+            .dashboard
+            .focus_handle(cx)
+            .is_focused(window)
+            .then(|| self.dashboard.cursor_target(&self.registry, cx))
+            .flatten();
         let subject = match row {
-            Some(RowTarget::Agent { agent_id, .. }) => Some(Subject {
+            Some(RowTarget::TreeAgent { agent_id, .. }) => Some(Subject {
                 agent: Some(agent_id),
                 agents: self.registry.agent_subtree(agent_id),
             }),
-            // Anywhere in a staffed heading's subtree, chords act on its
-            // top agent.
-            Some(RowTarget::Topic {
+            Some(RowTarget::TreeTopic {
                 host,
-                offset,
+                node_id,
                 first_attention,
                 ..
             }) => first_attention
-                .or_else(|| self.dashboard.first_agent_for_topic((host, offset)))
+                .or_else(|| self.dashboard.first_tree_agent_for_topic((host, node_id)))
                 .map(|agent_id| Subject {
                     agent: Some(agent_id),
                     agents: self.registry.agent_subtree(agent_id),
                 }),
             _ => None,
         };
-        subject
-            .or_else(|| {
-                let agent_id = self.registry.selected_agent().copied()?;
-                Some(Subject {
+        subject.unwrap_or_else(|| {
+            self.registry
+                .selected_agent()
+                .copied()
+                .map_or_else(Subject::default, |agent_id| Subject {
                     agent: Some(agent_id),
                     agents: self.registry.agent_subtree(agent_id),
                 })
-            })
-            .unwrap_or_default()
+        })
     }
 
     /// The subject's agent, or a `{verb}: no agent in focus` notice.
@@ -4823,6 +5212,21 @@ impl Workspace {
     }
 
     #[cfg(test)]
+    pub(crate) fn echo_text_for_test(&self) -> Option<&str> {
+        self.echo.as_ref().map(|echo| echo.text())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn desk_snapshot_for_test(&self, host: HostId) -> rho_desk::Snapshot {
+        self.desk_tree_sync.snapshot_for_test(host).unwrap()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn semantic_undo_count_for_test(&self) -> usize {
+        self.desk_semantic_undo.len()
+    }
+
+    #[cfg(test)]
     pub(crate) fn messages_following(&self, cx: &App) -> bool {
         self.messages_editor.read(cx).has_active_autoscroll_pin()
     }
@@ -4947,30 +5351,24 @@ impl Workspace {
         }
         let target = self.dashboard.cursor_target(&self.registry, cx);
         #[cfg(feature = "native")]
-        if let Some(RowTarget::Page(id)) = &target {
-            self.preview_browser_page(*id, window, cx);
+        if let Some(RowTarget::TreePage { page_id, .. }) = target {
+            self.preview_browser_page(page_id, window, cx);
             return;
         }
-        // A reply draft sits inside its agent's heading region, so it keeps
-        // that agent on screen while the reply is typed.
         let agent = match target {
-            Some(RowTarget::Agent { agent_id, .. }) | Some(RowTarget::Reply(agent_id)) => {
-                Some(agent_id)
-            }
-            // Anywhere else in a staffed heading's subtree previews its top
-            // agent. Portal rows are handled by the arm above.
-            Some(RowTarget::Topic {
+            Some(RowTarget::TreeAgent { agent_id, .. }) => Some(agent_id),
+            Some(RowTarget::TreeTopic {
                 host,
-                offset,
+                node_id,
                 first_attention,
                 ..
-            }) => first_attention.or_else(|| self.dashboard.first_agent_for_topic((host, offset))),
-            Some(RowTarget::NewDraft(Some(topic))) => self.dashboard.first_agent_for_topic(topic),
+            }) => first_attention
+                .or_else(|| self.dashboard.first_tree_agent_for_topic((host, node_id))),
             _ => None,
         };
         match agent {
             Some(agent_id) if self.dashboard_preview != Some(agent_id) => {
-                self.preview_agent(agent_id, window, cx);
+                self.preview_agent(agent_id, window, cx)
             }
             Some(_) => {}
             None => self.clear_dashboard_preview(cx),
@@ -5010,7 +5408,7 @@ impl Workspace {
         match key {
             SurfaceKey::Draft => "draft".to_owned(),
             SurfaceKey::Messages => "messages".to_owned(),
-            SurfaceKey::DeskHeading { heading_offset, .. } => format!("desk {heading_offset}"),
+            SurfaceKey::DeskNode { .. } => "desk".to_owned(),
             SurfaceKey::Inbox(id) => format!("inbox {id}"),
             SurfaceKey::Transcript(agent_id) => self.registry.agent_display_label(*agent_id),
             SurfaceKey::File { path, .. } => path.to_string(),
@@ -5038,7 +5436,7 @@ impl Workspace {
         match key {
             SurfaceKey::Draft => "compose",
             SurfaceKey::Messages => "messages",
-            SurfaceKey::DeskHeading { .. } => "desk heading",
+            SurfaceKey::DeskNode { .. } => "desk heading",
             SurfaceKey::Inbox(_) => "inbox",
             SurfaceKey::Transcript(_) => "transcript",
             SurfaceKey::File { .. } => "file",
@@ -5205,32 +5603,29 @@ impl Workspace {
         match key {
             SurfaceKey::Draft => SurfaceIdentity::Draft,
             SurfaceKey::Messages => SurfaceIdentity::Messages,
-            SurfaceKey::DeskHeading {
-                host,
-                heading_offset,
-            } => SurfaceIdentity::DeskHeading {
-                host: host.to_string(),
-                heading_offset: *heading_offset,
+            SurfaceKey::DeskNode { host, node_id } => SurfaceIdentity::DeskNode {
+                host: host.0,
+                node_id: (*node_id).into(),
             },
             SurfaceKey::Inbox(id) => SurfaceIdentity::Inbox { id: id.clone() },
             SurfaceKey::Transcript(agent_id) => SurfaceIdentity::Transcript {
-                agent_id: agent_id.encoded(),
+                agent_id: agent_id.into(),
             },
             SurfaceKey::File { agent_id, path } => SurfaceIdentity::File {
-                agent_id: agent_id.encoded(),
+                agent_id: agent_id.into(),
                 path: path.to_string(),
             },
             SurfaceKey::Shell(agent_id) => SurfaceIdentity::Shell {
-                agent_id: agent_id.encoded(),
+                agent_id: agent_id.into(),
             },
             SurfaceKey::Diff { agent_id } => SurfaceIdentity::Diff {
-                agent_id: agent_id.encoded(),
+                agent_id: agent_id.into(),
             },
             SurfaceKey::Terminal {
                 agent_id,
                 terminal_id,
             } => SurfaceIdentity::Terminal {
-                agent_id: agent_id.encoded(),
+                agent_id: agent_id.into(),
                 terminal_id: *terminal_id,
             },
             #[cfg(feature = "native")]
@@ -5286,7 +5681,7 @@ impl Workspace {
             let position = match &pane.surface.view {
                 SurfaceView::Draft { editor, .. }
                 | SurfaceView::Messages(editor)
-                | SurfaceView::DeskHeading(editor)
+                | SurfaceView::DeskNode(editor)
                 | SurfaceView::Inbox(editor)
                 | SurfaceView::Transcript { editor, .. }
                 | SurfaceView::Shell { editor, .. } => {
@@ -5790,6 +6185,74 @@ impl Workspace {
     }
 
     #[cfg(test)]
+    pub(crate) fn tree_cursor_for_test(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<(HostId, rho_desk::NodeId, usize)> {
+        self.dashboard.tree_node_cursor_offset(cx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn clone_pending_desk_intent_for_test(
+        &mut self,
+        host: HostId,
+        from: rho_desk::TreeClock,
+        to: rho_desk::TreeClock,
+    ) {
+        let intent = self.pending_desk_batch_intents[&(host, from)].clone();
+        self.pending_desk_batch_intents.insert((host, to), intent);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tree_buffer_for_test(
+        &self,
+        host: HostId,
+        node_id: rho_desk::NodeId,
+    ) -> Option<Entity<language::Buffer>> {
+        self.desk_tree_sync
+            .tree_source(host)?
+            .1
+            .get(&node_id)
+            .cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tree_nodes_for_test(
+        &self,
+        host: HostId,
+        cx: &App,
+    ) -> Vec<(
+        rho_desk::NodeId,
+        rho_desk::NodeKind,
+        Option<rho_desk::NodeId>,
+        String,
+    )> {
+        self.desk_tree_sync
+            .tree_source(host)
+            .into_iter()
+            .flat_map(|(nodes, buffers)| {
+                nodes.into_iter().filter_map(move |node| {
+                    let text = buffers.get(&node.id)?.read(cx).text();
+                    Some((node.id, node.kind, node.parent, text))
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn focus_tree_node_for_test(
+        &mut self,
+        host: HostId,
+        node_id: rho_desk::NodeId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.dashboard.move_to_tree_node_when_ready(host, node_id);
+        self.refresh_dashboard(window, cx);
+        window.focus(&self.dashboard.focus_handle(cx), cx);
+    }
+
+    #[cfg(test)]
     pub(crate) fn sync_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_dashboard(window, cx);
     }
@@ -5800,8 +6263,8 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn configured_draft_topic_for_test(&self) -> Option<(HostId, usize)> {
-        self.dashboard.new_draft_topic()
+    pub(crate) fn dashboard_has_new_draft_for_test(&self) -> bool {
+        self.dashboard.has_new_draft_for_test()
     }
 
     #[cfg(test)]
@@ -5833,27 +6296,6 @@ impl Workspace {
             .connection(host)
             .map(Connection::take_sent_for_test)
             .unwrap_or_default()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn desk_buffer_for_test(&self, host: HostId) -> Option<Entity<language::Buffer>> {
-        self.desk_sync.buffer(host)
-    }
-
-    /// One TAB-cycle step on the heading at `offset`, cursor included,
-    /// with the fold state applied to the display.
-    #[cfg(test)]
-    pub(crate) fn dashboard_cycle_fold_for_test(
-        &mut self,
-        host: HostId,
-        offset: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.dashboard.cursor_to_doc(host, offset, cx);
-        self.dashboard.sync(&self.registry, &self.inbox, window, cx);
-        self.dashboard.toggle_subagents(cx);
-        self.dashboard.sync(&self.registry, &self.inbox, window, cx);
     }
 
     #[cfg(test)]
@@ -6115,7 +6557,7 @@ impl Workspace {
                 editor.focus_handle(cx)
             }
             Some(DealView::Surface { surface, .. }) => match &surface.view {
-                SurfaceView::DeskHeading(editor) | SurfaceView::Inbox(editor) => {
+                SurfaceView::DeskNode(editor) | SurfaceView::Inbox(editor) => {
                     editor.focus_handle(cx)
                 }
                 SurfaceView::Transcript { editor, .. } => editor.focus_handle(cx),
@@ -6133,64 +6575,513 @@ impl Workspace {
         self.dashboard.deal_highlight_active_for_test(cx)
     }
 
-    #[cfg(test)]
-    pub(crate) fn dashboard_deal_topic_for_test(&self) -> Option<(HostId, usize, &str)> {
-        self.dashboard.current_deal_topic_for_test()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn dashboard_reply_text_for_test(
-        &self,
-        agent_id: rho_ui_proto::AgentId,
-        cx: &App,
-    ) -> Option<String> {
-        self.dashboard.reply_text_for_test(agent_id, cx)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn dashboard_cursor_topic_for_test(
-        &self,
-        cx: &mut Context<Self>,
-    ) -> Option<(HostId, usize)> {
-        self.dashboard.cursor_topic(cx)
-    }
-
-    /// The desk half of a quick spawn, without the daemon round-trip:
-    /// appends the placeholder heading and writes the tag the daemon
-    /// would, binding `agent_id` there. Returns the heading offset.
-    #[cfg(test)]
-    pub(crate) fn quick_spawn_heading_for_test(
-        &mut self,
-        host: HostId,
-        agent_id: rho_ui_proto::AgentId,
-        cx: &mut Context<Self>,
-    ) -> Option<usize> {
-        let offset = self.dashboard.append_placeholder_heading(host, cx)?;
-        let buffer = self.desk_sync.buffer(host)?;
-        buffer.update(cx, |buffer, cx| {
-            let line_end = offset
-                + buffer
-                    .text_for_range(offset..buffer.len())
-                    .collect::<String>()
-                    .find('\n')
-                    .unwrap_or(buffer.len() - offset);
-            let tag = format!(" :eng-{}:", agent_id.encoded());
-            buffer.edit([(line_end..line_end, tag)], None, cx);
-        });
-        Some(offset)
-    }
-
     /// Reconciles the dashboard against the current world. Event-driven,
     /// with no flag to remember: the daemon funnel (`handle_event`),
     /// desk buffer edit subscriptions, draft edit subscriptions, the
     /// editor selection subscription, and the verbs each call this at
     /// their source. The reconcile is idempotent and cheap, so calling
     /// it from several funnels is fine.
+    fn sync_tree_dashboard(&mut self, host: HostId, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((nodes, buffers)) = self.desk_tree_sync.tree_source(host) {
+            self.dashboard.set_tree_source(host, nodes, buffers, cx);
+            self.refresh_dashboard(window, cx);
+        }
+    }
+
+    pub(crate) fn send_desk_node_text(
+        &mut self,
+        host: HostId,
+        node_id: rho_desk::NodeId,
+        operation: rho_desk::TextOperation,
+        transaction: rho_desk::TextTransaction,
+        visible_edit: Option<(std::ops::Range<usize>, String)>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.desk_batch_editing {
+            self.desk_batch_text.push(ClientMessage::DeskNodeTextApply {
+                node_id,
+                operation,
+                transaction: Some(transaction),
+            });
+            return;
+        }
+        if self.desk_tree_sync.tree_node(host, node_id).is_none()
+            && let Some(replacement) = self.desk_text_retargets.get(&(host, node_id)).copied()
+            && let Some(visible_edit) = visible_edit.as_ref()
+            && self
+                .desk_tree_sync
+                .replay_text_edit(host, replacement, visible_edit, cx)
+        {
+            return;
+        }
+        if let rho_desk::TextOperation::Edit {
+            ranges, new_text, ..
+        } = &operation
+            && let Some((index, newline)) = new_text
+                .iter()
+                .enumerate()
+                .find_map(|(index, text)| text.find('\n').map(|newline| (index, newline)))
+        {
+            let offset = ranges
+                .get(index)
+                .map_or(newline, |range| range.0 as usize + newline);
+            self.pending_heading_recognition = Some((true, host, node_id, offset));
+            self.desk_batch_text.clear();
+            self.desk_batch_editing = true;
+            self.desk_batch_text.push(ClientMessage::DeskNodeTextApply {
+                node_id,
+                operation,
+                transaction: Some(transaction),
+            });
+            return;
+        }
+        self.desk_tree_sync.record_pending_batch_text(
+            host,
+            node_id,
+            operation.clone(),
+            Some(transaction.clone()),
+        );
+        self.send_to_host(
+            host,
+            ClientMessage::DeskNodeTextApply {
+                node_id,
+                operation,
+                transaction: Some(transaction),
+            },
+        );
+    }
+
+    fn recognize_desk_heading_after_edit(
+        &mut self,
+        focus_after: bool,
+        host: HostId,
+        node_id: rho_desk::NodeId,
+        line_end: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let heading_undo = self.pending_heading_undo.take();
+        let input = self.desk_batch_text.first().cloned();
+        // Recognition stays attached to the inserted space before `line_end`;
+        // splitting stays attached to the inserted newline on its right.
+        let marker_anchor =
+            self.desk_tree_sync
+                .tree_anchor_at(host, node_id, line_end, text::Bias::Left, cx);
+        let newline_anchor =
+            self.desk_tree_sync
+                .tree_anchor_at(host, node_id, line_end, text::Bias::Right, cx);
+        let recognized =
+            self.desk_tree_sync
+                .recognize_heading(host, node_id, line_end, focus_after, cx);
+        let split_undo = recognized.is_none() && focus_after;
+        let (outcome, intent) = if recognized.is_some() {
+            let created = recognized.as_ref().unwrap().1;
+            (
+                recognized,
+                input
+                    .zip(marker_anchor)
+                    .map(|(input, anchor)| PendingDeskBatchIntent::Recognize {
+                        node_id,
+                        input,
+                        anchor,
+                        focus_after,
+                        created,
+                        focus_abandoned: false,
+                    }),
+            )
+        } else {
+            let split = focus_after
+                .then(|| {
+                    self.desk_tree_sync
+                        .split_heading_on_newline(host, node_id, line_end, cx)
+                })
+                .flatten();
+            let created = split.as_ref().map(|outcome| outcome.1).unwrap_or(node_id);
+            (
+                split,
+                input.zip(newline_anchor).map(|(input, anchor)| {
+                    PendingDeskBatchIntent::SplitHeading {
+                        node_id,
+                        input,
+                        anchor,
+                        created,
+                    }
+                }),
+            )
+        };
+        let Some((mut messages, focus, expected)) = outcome else {
+            self.desk_batch_editing = false;
+            if let Some(transaction_id) = heading_undo {
+                self.dashboard.group_until_transaction(transaction_id, cx);
+            }
+            for message in std::mem::take(&mut self.desk_batch_text) {
+                self.send_to_host(host, message);
+            }
+            return;
+        };
+        // Capture source expectations before the optimistic delete removes
+        // the row from materialization. Cleanup and follow-on edits are added
+        // to this same pending batch after their buffer events arrive.
+        let Some(mut batch) =
+            self.desk_tree_sync
+                .operation_batch(host, expected, messages.clone(), None)
+        else {
+            self.desk_batch_editing = false;
+            return;
+        };
+        // Install the replacement composition before returning to the input
+        // loop. Follow-on keystrokes must target the created row, never the
+        // source node this same batch deletes.
+        self.desk_tree_sync.apply_optimistic(host, &messages, cx);
+        for message in &messages {
+            if let ClientMessage::DeskTreeApply { operation } = message
+                && matches!(operation, rho_desk::TreeOperation::Delete { .. })
+            {
+                self.desk_tree_sync.apply_optimistic_delete(host, operation);
+            }
+        }
+        self.dashboard.move_to_tree_node_when_ready(host, focus);
+        if messages.iter().any(|message| {
+            matches!(
+                message,
+                ClientMessage::DeskTreeApply {
+                    operation: rho_desk::TreeOperation::Delete { node_ids, .. }
+                } if node_ids.contains(&node_id)
+            )
+        }) {
+            self.desk_text_retargets.insert((host, node_id), focus);
+        }
+        self.sync_tree_dashboard(host, window, cx);
+        let heading_undo = heading_undo
+            .or_else(|| split_undo.then(|| self.dashboard.push_external_undo_transaction(cx)));
+        if let Some(transaction_id) = heading_undo {
+            self.desk_semantic_undo.insert(
+                transaction_id,
+                DeskSemanticUndo::MergeSplit {
+                    host,
+                    heading: node_id,
+                    prose: focus,
+                },
+            );
+        }
+        // Buffer subscriptions are delivered after the edit that strips the
+        // marker/newline returns. Keep capture mode active until those
+        // programmatic cleanup operations have reached `send_desk_node_text`;
+        // otherwise they escape as a standalone edit to the node this batch
+        // deletes.
+        cx.defer_in(window, move |this, _window, _cx| {
+            this.desk_batch_editing = false;
+            let mut captured = std::mem::take(&mut this.desk_batch_text);
+            let created = intent.as_ref().and_then(|intent| match intent {
+                PendingDeskBatchIntent::Recognize { created, .. }
+                | PendingDeskBatchIntent::SplitHeading { created, .. } => Some(*created),
+                PendingDeskBatchIntent::DeleteEmpty { .. } => None,
+            });
+            let mut dependent = Vec::new();
+            captured.retain(|message| {
+                let targets_created = matches!(
+                    message,
+                    ClientMessage::DeskNodeTextApply { node_id, .. }
+                        if Some(*node_id) == created
+                );
+                if targets_created {
+                    dependent.push(message.clone());
+                }
+                !targets_created
+            });
+            captured.append(&mut messages);
+            captured.append(&mut dependent);
+            let messages = captured;
+            if let Some(transaction_id) = heading_undo {
+                this.dashboard.group_until_transaction(transaction_id, _cx);
+            }
+            batch.operations = messages
+                .iter()
+                .filter_map(|message| match message {
+                    ClientMessage::DeskTreeApply { operation } => {
+                        Some(rho_desk::BatchOperation::Tree(operation.clone()))
+                    }
+                    ClientMessage::DeskNodeTextApply {
+                        node_id,
+                        operation,
+                        transaction,
+                    } => Some(rho_desk::BatchOperation::Text {
+                        node_id: *node_id,
+                        operation: operation.clone(),
+                        transaction: transaction.clone(),
+                    }),
+                    _ => None,
+                })
+                .collect();
+            this.desk_tree_sync.update_pending_batch(host, &batch);
+            if let Some(intent) = intent {
+                this.pending_desk_batch_intents
+                    .insert((host, batch.id), intent);
+            }
+            if let Some(transaction_id) = heading_undo {
+                this.pending_semantic_batches
+                    .insert((host, batch.id), transaction_id);
+            }
+            this.send_to_host(host, ClientMessage::DeskTreeBatchApply { batch });
+        });
+    }
+
+    fn retry_desk_batch(
+        &mut self,
+        host: HostId,
+        id: rho_desk::TreeClock,
+        retryable: bool,
+        snapshot: rho_desk::Snapshot,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let intent = self.pending_desk_batch_intents.remove(&(host, id));
+        let semantic_transaction = self.pending_semantic_batches.remove(&(host, id));
+        let cursor_before = self
+            .dashboard
+            .tree_node_cursor_offset(cx)
+            .filter(|(cursor_host, _, _)| *cursor_host == host)
+            .map(|(_, node_id, offset)| (node_id, offset));
+        let dependent = self
+            .desk_tree_sync
+            .reset_rejected_batch(host, id, snapshot, cx);
+        let Some(intent) = intent.filter(|_| retryable) else {
+            if let Some(transaction_id) = semantic_transaction {
+                self.discard_desk_semantic_transaction(transaction_id, cx);
+            }
+            return;
+        };
+        self.desk_batch_text.clear();
+        self.desk_batch_editing = true;
+        let (prepared, next_intent, old_created, delete_node, focus_offset) = match intent {
+            PendingDeskBatchIntent::Recognize {
+                node_id,
+                input,
+                anchor,
+                focus_after,
+                created,
+                focus_abandoned,
+            } => {
+                self.desk_tree_sync
+                    .apply_optimistic(host, std::slice::from_ref(&input), cx);
+                self.desk_batch_text.push(input.clone());
+                let line_end = self
+                    .desk_tree_sync
+                    .resolve_tree_anchor(host, node_id, anchor, cx);
+                let prepared = line_end.and_then(|line_end| {
+                    self.desk_tree_sync
+                        .recognize_heading(host, node_id, line_end, focus_after, cx)
+                });
+                (
+                    prepared,
+                    Some((node_id, input, anchor, focus_after, false, focus_abandoned)),
+                    Some(created),
+                    None,
+                    None,
+                )
+            }
+            PendingDeskBatchIntent::SplitHeading {
+                node_id,
+                input,
+                anchor,
+                created,
+            } => {
+                self.desk_tree_sync
+                    .apply_optimistic(host, std::slice::from_ref(&input), cx);
+                self.desk_batch_text.push(input.clone());
+                let line_end = self
+                    .desk_tree_sync
+                    .resolve_tree_anchor(host, node_id, anchor, cx);
+                let prepared = line_end.and_then(|line_end| {
+                    self.desk_tree_sync
+                        .split_heading_on_newline(host, node_id, line_end, cx)
+                });
+                (
+                    prepared,
+                    Some((node_id, input, anchor, true, true, false)),
+                    Some(created),
+                    None,
+                    None,
+                )
+            }
+            PendingDeskBatchIntent::DeleteEmpty { node_id } => {
+                let mut focus_offset = None;
+                let prepared = self
+                    .desk_tree_sync
+                    .prepare_delete_empty(host, node_id, cx)
+                    .map(|(messages, focus, expected, _)| {
+                        focus_offset = focus.map(|(_, offset)| offset);
+                        (
+                            messages,
+                            focus.map(|(node, _)| node).unwrap_or(node_id),
+                            expected,
+                        )
+                    });
+                (prepared, None, None, Some(node_id), focus_offset)
+            }
+        };
+        cx.defer_in(window, move |this, window, cx| {
+            this.finish_retry_desk_batch(
+                host,
+                id,
+                prepared,
+                next_intent,
+                old_created,
+                delete_node,
+                focus_offset,
+                cursor_before,
+                dependent,
+                semantic_transaction,
+                window,
+                cx,
+            );
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_retry_desk_batch(
+        &mut self,
+        host: HostId,
+        id: rho_desk::TreeClock,
+        prepared: Option<(Vec<ClientMessage>, rho_desk::NodeId, Vec<rho_desk::NodeId>)>,
+        next_intent: Option<(
+            rho_desk::NodeId,
+            ClientMessage,
+            text::Anchor,
+            bool,
+            bool,
+            bool,
+        )>,
+        old_created: Option<rho_desk::NodeId>,
+        delete_node: Option<rho_desk::NodeId>,
+        focus_offset: Option<usize>,
+        cursor_before: Option<(rho_desk::NodeId, usize)>,
+        mut dependent: Vec<rho_desk::BatchOperation>,
+        semantic_transaction: Option<clock::Lamport>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.desk_batch_editing = false;
+        let Some((mut messages, focus, expected)) = prepared else {
+            self.desk_batch_text.clear();
+            if let Some(transaction_id) = semantic_transaction {
+                self.discard_desk_semantic_transaction(transaction_id, cx);
+            }
+            return;
+        };
+        let mut captured = std::mem::take(&mut self.desk_batch_text);
+        captured.append(&mut messages);
+        let mut batch =
+            match self
+                .desk_tree_sync
+                .operation_batch(host, expected, captured.clone(), Some(id))
+            {
+                Some(batch) => batch,
+                None => {
+                    if let Some(transaction_id) = semantic_transaction {
+                        self.discard_desk_semantic_transaction(transaction_id, cx);
+                    }
+                    return;
+                }
+            };
+        if let Some(old_created) = old_created {
+            for operation in &mut dependent {
+                if let rho_desk::BatchOperation::Text { node_id, .. } = operation
+                    && *node_id == old_created
+                {
+                    *node_id = focus;
+                }
+            }
+            if let Some(transaction_id) = semantic_transaction
+                && let Some(DeskSemanticUndo::MergeSplit { prose, .. }) =
+                    self.desk_semantic_undo.get_mut(&transaction_id)
+                && *prose == old_created
+            {
+                *prose = focus;
+            }
+        }
+        batch.operations.extend(dependent.clone());
+        self.desk_tree_sync.update_pending_batch(host, &batch);
+        self.desk_tree_sync
+            .keep_pending_batch_text(host, id, dependent.clone());
+        let dependent_messages = dependent.into_iter().map(|operation| match operation {
+            rho_desk::BatchOperation::Tree(operation) => ClientMessage::DeskTreeApply { operation },
+            rho_desk::BatchOperation::Text {
+                node_id,
+                operation,
+                transaction,
+            } => ClientMessage::DeskNodeTextApply {
+                node_id,
+                operation,
+                transaction,
+            },
+        });
+        captured.extend(dependent_messages);
+        self.desk_tree_sync.apply_optimistic(host, &captured, cx);
+        let cursor_after = cursor_before.map(|(node_id, offset)| {
+            if old_created == Some(node_id) {
+                (focus, offset)
+            } else if delete_node == Some(node_id) {
+                (focus, focus_offset.unwrap_or(offset))
+            } else {
+                (node_id, offset)
+            }
+        });
+        if let Some((node_id, offset)) = cursor_after {
+            self.dashboard
+                .move_to_tree_position_when_ready(host, node_id, offset);
+        }
+        self.sync_tree_dashboard(host, window, cx);
+        let new_intent = match next_intent {
+            Some((node_id, input, anchor, focus_after, false, focus_abandoned)) => {
+                PendingDeskBatchIntent::Recognize {
+                    node_id,
+                    input,
+                    anchor,
+                    focus_after,
+                    created: focus,
+                    focus_abandoned,
+                }
+            }
+            Some((node_id, input, anchor, _, true, _)) => PendingDeskBatchIntent::SplitHeading {
+                node_id,
+                input,
+                anchor,
+                created: focus,
+            },
+            None => PendingDeskBatchIntent::DeleteEmpty {
+                node_id: delete_node.unwrap_or(focus),
+            },
+        };
+        // As on the initial attempt, install the intent only after selection
+        // events from the optimistic recomposition have drained. Otherwise
+        // that programmatic cursor movement can look like the user abandoned
+        // the recreated heading before its retry is even sent.
+        cx.defer_in(window, move |this, _window, _cx| {
+            this.pending_desk_batch_intents
+                .insert((host, id), new_intent);
+            if let Some(transaction_id) = semantic_transaction {
+                this.pending_semantic_batches
+                    .insert((host, id), transaction_id);
+            }
+            this.send_to_host(host, ClientMessage::DeskTreeBatchApply { batch });
+        });
+    }
+
+    fn discard_desk_semantic_transaction(
+        &mut self,
+        transaction_id: clock::Lamport,
+        cx: &mut Context<Self>,
+    ) {
+        self.desk_semantic_undo.remove(&transaction_id);
+        self.dashboard
+            .forget_external_undo_transaction(transaction_id, cx);
+    }
+
     pub(crate) fn refresh_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Err(error) = self.inbox.refresh_deferred(now_ms() as i64) {
             tracing::warn!(%error, "waking deferred inbox items");
         }
-        self.dashboard.autofill_titles(&self.registry, cx);
         self.dashboard.sync(&self.registry, &self.inbox, window, cx);
         #[cfg(feature = "native")]
         {
@@ -6290,7 +7181,7 @@ impl Workspace {
         match &self.active_pane().surface.view {
             SurfaceView::Draft { editor, .. } => editor.clone(),
             SurfaceView::Messages(editor) => editor.clone(),
-            SurfaceView::DeskHeading(editor) | SurfaceView::Inbox(editor) => editor.clone(),
+            SurfaceView::DeskNode(editor) | SurfaceView::Inbox(editor) => editor.clone(),
             SurfaceView::Transcript { editor, .. } => editor.clone(),
             SurfaceView::File(view) => view.read(cx).editor().clone(),
             SurfaceView::Shell { editor, .. } => editor.clone(),
@@ -6343,9 +7234,7 @@ impl Workspace {
         match &self.active_pane().surface.view {
             SurfaceView::Draft { editor, .. } => editor.focus_handle(cx),
             SurfaceView::Messages(editor) => editor.focus_handle(cx),
-            SurfaceView::DeskHeading(editor) | SurfaceView::Inbox(editor) => {
-                editor.focus_handle(cx)
-            }
+            SurfaceView::DeskNode(editor) | SurfaceView::Inbox(editor) => editor.focus_handle(cx),
             SurfaceView::Transcript { editor, .. } => editor.focus_handle(cx),
             SurfaceView::File(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::Shell { editor, .. } => editor.focus_handle(cx),
@@ -6372,7 +7261,7 @@ impl Workspace {
             | SurfaceKey::Terminal { agent_id, .. } => Some(*agent_id),
             SurfaceKey::Draft
             | SurfaceKey::Messages
-            | SurfaceKey::DeskHeading { .. }
+            | SurfaceKey::DeskNode { .. }
             | SurfaceKey::Inbox(_)
             | SurfaceKey::ZulipInbox
             | SurfaceKey::ZulipNarrow { .. } => None,
@@ -6412,7 +7301,7 @@ impl Workspace {
                 SurfaceView::Draft { editor }
             }
             SurfaceKey::Messages => SurfaceView::Messages(self.messages_editor.clone()),
-            SurfaceKey::DeskHeading { .. } | SurfaceKey::Inbox(_) => {
+            SurfaceKey::DeskNode { .. } | SurfaceKey::Inbox(_) => {
                 unreachable!("deal surfaces are created while dealing")
             }
             SurfaceKey::Transcript(agent_id) => {
@@ -6481,7 +7370,7 @@ impl Workspace {
                 None
             }
             // Files and chat keep whatever agent context was current.
-            SurfaceKey::DeskHeading { .. }
+            SurfaceKey::DeskNode { .. }
             | SurfaceKey::Messages
             | SurfaceKey::Inbox(_)
             | SurfaceKey::File { .. }
@@ -6510,8 +7399,20 @@ impl Workspace {
         let Some(mut minibuffer) = self.minibuffer.take() else {
             return;
         };
-        minibuffer.accept_selected(window, cx);
         let prompt = minibuffer.prompt().to_owned();
+        self.pending_filing_selected = None;
+        if prompt == "file under:"
+            && let Some((candidate, occurrence)) = minibuffer.selected_candidate()
+        {
+            self.pending_filing_selected = resolve_filing_destination(
+                &self.pending_filing_destinations,
+                &candidate,
+                occurrence,
+            );
+            minibuffer.complete_selected(window, cx);
+        } else {
+            minibuffer.accept_selected(window, cx);
+        }
         let (input, on_submit) = minibuffer.into_submission(cx);
         crate::journal::record(crate::journal::Event::MinibufferSubmitted {
             prompt,
@@ -6902,22 +7803,29 @@ impl Workspace {
         self.deal_current_interacted = false;
         self.deal_view = None;
         let surface = match &card.identity {
-            crate::dashboard::DealCardIdentity::Desk {
-                host,
-                heading_offset,
-            } => {
-                self.dashboard.cursor_to_doc(*host, *heading_offset, cx);
+            crate::dashboard::DealCardIdentity::Tree { host, node_id } => {
+                self.dashboard.move_to_tree_node_when_ready(*host, *node_id);
                 Self::wrap_surface(
-                    SurfaceKey::DeskHeading {
+                    SurfaceKey::DeskNode {
                         host: *host,
-                        heading_offset: *heading_offset,
+                        node_id: *node_id,
                     },
-                    SurfaceView::DeskHeading(self.dashboard.editor().clone()),
+                    SurfaceView::DeskNode(self.dashboard.editor().clone()),
                 )
+            }
+            crate::dashboard::DealCardIdentity::TreeAgent { agent_id, .. } => {
+                crate::journal::record(crate::journal::Event::AgentOpened {
+                    agent_id: agent_id.into(),
+                });
+                self.registry.select_agent(*agent_id);
+                self.active_context = self.context_for_agent(*agent_id);
+                self.hosts
+                    .focus_agent(self.host_of(*agent_id).map(|host| (host, *agent_id)));
+                self.make_surface(SurfaceKey::Transcript(*agent_id), window, cx)
             }
             crate::dashboard::DealCardIdentity::Agent(agent_id) => {
                 crate::journal::record(crate::journal::Event::AgentOpened {
-                    agent_id: agent_id.encoded(),
+                    agent_id: agent_id.into(),
                 });
                 self.registry.select_agent(*agent_id);
                 self.active_context = self.context_for_agent(*agent_id);
@@ -6960,7 +7868,31 @@ impl Workspace {
                     buffer
                 });
                 let editor = cx.new(|cx| {
-                    let mut editor = editor::Editor::for_buffer(buffer, None, window, cx);
+                    let multi_buffer =
+                        cx.new(|cx| multi_buffer::MultiBuffer::singleton(buffer, cx));
+                    #[cfg(feature = "native")]
+                    let mut editor = editor::Editor::new(
+                        editor::EditorMode::Full {
+                            scale_ui_elements_with_buffer_font_size: true,
+                            show_active_line_background: false,
+                            sizing_behavior: editor::SizingBehavior::ExcludeOverscrollMargin,
+                        },
+                        multi_buffer,
+                        None,
+                        window,
+                        cx,
+                    );
+                    #[cfg(not(feature = "native"))]
+                    let mut editor = editor::Editor::new(
+                        editor::EditorMode::Full {
+                            scale_ui_elements_with_buffer_font_size: true,
+                            show_active_line_background: false,
+                            sizing_behavior: editor::SizingBehavior::ExcludeOverscrollMargin,
+                        },
+                        multi_buffer,
+                        window,
+                        cx,
+                    );
                     crate::editor_config::configure(&mut editor, window, cx);
                     editor.set_read_only(true);
                     editor
@@ -6988,7 +7920,7 @@ impl Workspace {
                 .map(|card| Self::journal_card_identity(&card.identity)),
         });
         let editor = match &self.active_pane().surface.view {
-            SurfaceView::DeskHeading(editor) | SurfaceView::Inbox(editor) => Some(editor.clone()),
+            SurfaceView::DeskNode(editor) | SurfaceView::Inbox(editor) => Some(editor.clone()),
             SurfaceView::Transcript { editor, .. } => Some(editor.clone()),
             _ => None,
         };
@@ -7038,13 +7970,6 @@ impl Workspace {
             SurfaceKey::Transcript(agent_id) => {
                 Some(crate::dashboard::DealCardIdentity::Agent(*agent_id))
             }
-            SurfaceKey::DeskHeading {
-                host,
-                heading_offset,
-            } => Some(crate::dashboard::DealCardIdentity::Desk {
-                host: *host,
-                heading_offset: *heading_offset,
-            }),
             SurfaceKey::Inbox(id) => Some(crate::dashboard::DealCardIdentity::Inbox(id.clone())),
             _ => self
                 .dashboard
@@ -7092,6 +8017,78 @@ impl Workspace {
         self.cmd_surface_forward_or_deal(window, cx);
     }
 
+    fn submit_tree_verdict(
+        &mut self,
+        target_node: Option<rho_desk::NodeId>,
+        kind: rho_desk::TemporalKind,
+        at: chrono::NaiveDateTime,
+        pace_days: u32,
+        verdict: crate::dashboard::DealerVerdict,
+        echo: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(card) = self.dashboard.current_deal_card().cloned() else {
+            return false;
+        };
+        let Some(node_id) = target_node.or(card.topic_node_id) else {
+            return false;
+        };
+        let mark = rho_desk::TemporalMark {
+            year: chrono::Datelike::year(&at.date()),
+            month: chrono::Datelike::month(&at.date()) as u8,
+            day: chrono::Datelike::day(&at.date()) as u8,
+            minute_of_day: (at.time() != chrono::NaiveTime::MIN).then(|| {
+                chrono::Timelike::hour(&at.time()) as u16 * 60
+                    + chrono::Timelike::minute(&at.time()) as u16
+            }),
+            pace_days,
+        };
+        let values = temporal_verdict_values(kind, mark);
+        let Some((batch, messages)) = self
+            .desk_tree_sync
+            .prepare_temporal_batch(card.host, node_id, values)
+        else {
+            return false;
+        };
+        self.pending_tree_verdicts
+            .insert((card.host, batch.id), PendingTreeVerdict { verdict, echo });
+        self.desk_tree_sync
+            .apply_optimistic(card.host, &messages, cx);
+        self.sync_tree_dashboard(card.host, window, cx);
+        self.send_to_host(card.host, ClientMessage::DeskTreeBatchApply { batch });
+        true
+    }
+
+    fn set_node_temporal(
+        &mut self,
+        host: HostId,
+        node_id: rho_desk::NodeId,
+        kind: rho_desk::TemporalKind,
+        at: chrono::NaiveDateTime,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let mark = rho_desk::TemporalMark {
+            year: chrono::Datelike::year(&at.date()),
+            month: chrono::Datelike::month(&at.date()) as u8,
+            day: chrono::Datelike::day(&at.date()) as u8,
+            minute_of_day: None,
+            pace_days: 0,
+        };
+        let Some((batch, messages)) = self.desk_tree_sync.prepare_temporal_batch(
+            host,
+            node_id,
+            temporal_verdict_values(kind, mark),
+        ) else {
+            return false;
+        };
+        self.desk_tree_sync.apply_optimistic(host, &messages, cx);
+        self.sync_tree_dashboard(host, window, cx);
+        self.send_to_host(host, ClientMessage::DeskTreeBatchApply { batch });
+        true
+    }
+
     fn defer_deal_edit(
         &mut self,
         action_name: &'static str,
@@ -7124,6 +8121,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(topic) = self.dashboard.tree_node_at_cursor(cx) {
+            self.begin_new_agent_configuration(NewAgentIntent::Staff(topic), window, cx);
+            return;
+        }
         let Some(topic) = self.dashboard.cursor_topic(cx) else {
             self.notice_on(
                 None,
@@ -7151,10 +8152,17 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let workdir = match intent {
-            NewAgentIntent::Staff(topic) => self.workdir_for_desk_topic(topic, cx),
+            NewAgentIntent::Staff((host, node_id)) => self
+                .desk_tree_sync
+                .tree_node(host, node_id)
+                .and_then(|node| node.bindings.get(&rho_desk::BindingKind::File).cloned())
+                .and_then(|binding| match binding {
+                    rho_desk::Binding::File(path) => Some(HostPath { host, path }),
+                    _ => None,
+                }),
             NewAgentIntent::QuickSpawn => {
                 let row_workdir = match self.dashboard.cursor_target(&self.registry, cx) {
-                    Some(crate::dashboard::RowTarget::Agent { agent_id, .. }) => {
+                    Some(crate::dashboard::RowTarget::TreeAgent { agent_id, .. }) => {
                         self.agent_workdir(agent_id)
                     }
                     _ => self
@@ -7196,25 +8204,26 @@ impl Workspace {
 
     fn workdir_for_desk_topic(
         &self,
-        topic: (HostId, usize),
-        cx: &mut Context<Self>,
+        topic: (HostId, rho_desk::NodeId),
+        _cx: &mut Context<Self>,
     ) -> Option<HostPath> {
-        let (host, _, _, project) = self.dashboard.staffing_target_for(topic, cx).ok()?;
-        let candidates = self
-            .workdirs
-            .iter()
-            .filter(|workdir| workdir.host == host)
-            .collect::<Vec<_>>();
-        let workdir = match project {
-            Some(project) => candidates.iter().find(|workdir| {
-                workdir.project.name == project || workdir.project.path.as_str() == project
-            })?,
-            None if candidates.len() == 1 => candidates[0],
-            None => return None,
-        };
-        Some(HostPath {
+        let (host, node_id) = topic;
+        if let Some(rho_desk::Binding::File(path)) = self
+            .desk_tree_sync
+            .tree_node(host, node_id)?
+            .bindings
+            .get(&rho_desk::BindingKind::File)
+        {
+            return Some(HostPath {
+                host,
+                path: path.clone(),
+            });
+        }
+        let mut candidates = self.workdirs.iter().filter(|workdir| workdir.host == host);
+        let only = candidates.next()?;
+        candidates.next().is_none().then(|| HostPath {
             host,
-            path: workdir.project.path.clone(),
+            path: only.project.path.clone(),
         })
     }
 
@@ -7521,7 +8530,10 @@ impl Workspace {
         let Some(intent) = self.new_agent_draft.as_ref().map(|draft| draft.intent) else {
             return;
         };
-        self.dashboard.open_new_draft(intent.topic(), window, cx);
+        match intent {
+            NewAgentIntent::Staff(topic) => self.dashboard.open_new_tree_draft(topic, window, cx),
+            _ => self.dashboard.open_new_draft(intent.topic(), window, cx),
+        }
         self.dashboard_focus_draft(window, cx);
     }
 
@@ -7550,54 +8562,28 @@ impl Workspace {
 
     fn submit_configured_agent(
         &mut self,
-        topic: Option<(HostId, usize)>,
+        topic: Option<(HostId, rho_desk::NodeId)>,
         body: String,
         host: HostId,
         start: rho_ui_proto::StartMode,
         role: AgentRole,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) {
-        let desk_anchor = match topic {
-            Some((topic_host, offset)) => {
-                debug_assert_eq!(host, topic_host);
-                let repo = match &start {
-                    rho_ui_proto::StartMode::NewOn { repo, .. }
-                    | rho_ui_proto::StartMode::Sandbox { repo, .. }
-                    | rho_ui_proto::StartMode::Join(rho_ui_proto::JoinTarget::User { repo }) => {
-                        repo.as_path()
-                    }
-                    rho_ui_proto::StartMode::Join(rho_ui_proto::JoinTarget::Workspace(info)) => {
-                        info.repo()
-                    }
-                };
-                if let Some(project) = self.workdirs.iter().find(|candidate| {
-                    candidate.host == host && candidate.project.path.as_path() == repo
-                }) {
-                    self.dashboard.set_heading_project(
-                        topic_host,
-                        offset,
-                        &project.project.name,
-                        cx,
-                    );
-                }
-                self.dashboard.cursor_to_doc(topic_host, offset, cx);
-                self.desk_sync.anchor_at(topic_host, offset, cx)
-            }
-            None => self
-                .dashboard
-                .append_placeholder_heading(host, cx)
-                .and_then(|offset| {
-                    self.dashboard.cursor_to_doc(host, offset, cx);
-                    self.desk_sync.anchor_at(host, offset, cx)
-                }),
-        };
+        let desk_parent = self
+            .new_agent_draft
+            .as_ref()
+            .and_then(|draft| match draft.intent {
+                NewAgentIntent::Staff((topic_host, node_id)) if topic_host == host => Some(node_id),
+                _ => None,
+            });
+        let _ = topic;
         self.send_to_host(
             host,
             ClientMessage::NewAgent {
                 role,
                 start,
                 content: Some(vec![ContentPart::Text { text: body }]),
-                desk_anchor,
+                desk_parent,
             },
         );
         self.new_agent_draft = None;
@@ -7607,74 +8593,59 @@ impl Workspace {
     fn dashboard_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use crate::dashboard::RowTarget;
         match self.dashboard.cursor_target(&self.registry, cx) {
-            Some(RowTarget::Agent { agent_id, .. }) => self.open_agent(agent_id, window, cx),
+            Some(RowTarget::TreeAgent { agent_id, .. }) => self.open_agent(agent_id, window, cx),
             #[cfg(feature = "native")]
-            Some(RowTarget::Page(id)) => self.open_browser_page(id, window, cx),
-            // A staffed heading opens its top agent full-frame — loudest
-            // first, quiet agents still reachable. An unstaffed heading opens
-            // its first-message draft rather than a blank composer.
-            Some(RowTarget::Topic {
-                host,
-                offset,
-                first_attention,
-                on_heading_line,
-                ..
-            }) => {
-                if let Some(agent_id) =
-                    first_attention.or_else(|| self.dashboard.first_agent_for_topic((host, offset)))
-                {
-                    self.open_agent(agent_id, window, cx);
-                } else if on_heading_line {
-                    self.dashboard
-                        .open_new_draft(Some((host, offset)), window, cx);
-                    self.dashboard_focus_draft(window, cx);
-                } else {
-                    cx.propagate();
-                }
+            Some(RowTarget::TreePage { page_id, .. }) => {
+                self.open_browser_page(page_id, window, cx)
             }
-            Some(RowTarget::Reply(agent_id)) => {
+            Some(RowTarget::TreeTopic {
+                host,
+                node_id,
+                first_attention,
+                ..
+            }) => match first_attention
+                .or_else(|| self.dashboard.first_tree_agent_for_topic((host, node_id)))
+            {
+                Some(agent_id) => self.open_agent(agent_id, window, cx),
+                None => {
+                    self.dashboard
+                        .open_new_tree_draft((host, node_id), window, cx);
+                    self.dashboard_focus_draft(window, cx);
+                }
+            },
+            Some(RowTarget::NewTreeDraft((topic_host, node_id))) => {
                 if !self.require_connected(cx) {
                     return;
                 }
-                if let Some(text) = self.dashboard.take_reply(agent_id, cx) {
-                    self.handle_submit(agent_id, vec![ContentPart::Text { text }], cx);
-                }
-                self.dashboard.cursor_to_agent(agent_id, cx);
+                let Some(body) = self.dashboard.take_new_draft(cx) else {
+                    return;
+                };
+                let (host, start, role) = match self.configured_agent_launch() {
+                    Ok(v) => v,
+                    Err(message) => {
+                        self.notice_on(None, &message, StyleClass::SystemInfo, cx);
+                        return;
+                    }
+                };
+                self.submit_configured_agent(
+                    Some((topic_host, node_id)),
+                    body,
+                    host,
+                    start,
+                    role,
+                    cx,
+                );
                 self.refresh_dashboard(window, cx);
             }
-            Some(RowTarget::NewDraft(topic)) => {
+            Some(RowTarget::NewDraft) => {
                 if !self.require_connected(cx) {
-                    return;
-                }
-                let configured = self
-                    .new_agent_draft
-                    .as_ref()
-                    .is_some_and(|draft| draft.intent.topic() == topic);
-                if configured {
-                    let (host, start, role) = match self.configured_agent_launch() {
-                        Ok(launch) => launch,
-                        Err(message) => {
-                            self.notice_on(None, &message, StyleClass::SystemInfo, cx);
-                            return;
-                        }
-                    };
-                    if let Some(body) = self.dashboard.take_new_draft(cx) {
-                        self.submit_configured_agent(topic, body, host, start, role, cx);
-                    }
-                    self.refresh_dashboard(window, cx);
                     return;
                 }
                 if let Some(body) = self.dashboard.take_new_draft(cx) {
-                    if topic.is_some() {
-                        self.staff_dashboard_node_with_brief(topic, Some(body), window, cx);
-                    } else {
-                        self.spawn_unfiled_dashboard_agent(body, window, cx);
-                    }
+                    self.spawn_unfiled_dashboard_agent(body, window, cx);
                 }
-                self.refresh_dashboard(window, cx);
             }
-            // Document text keeps vim's own enter.
-            _ => cx.propagate(),
+            _ => {}
         }
     }
 
@@ -7693,57 +8664,65 @@ impl Workspace {
     /// would fall through to the transcript prompt's `RhoGui > Editor`
     /// SubmitPrompt binding, which swallows the key.
     fn dashboard_submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        use crate::dashboard::RowTarget;
-        match self.dashboard.cursor_target(&self.registry, cx) {
-            Some(RowTarget::Reply(_)) | Some(RowTarget::NewDraft(_)) => {
-                self.dashboard_open(window, cx);
-                if let Ok(action) = cx.build_action("vim::NormalBefore", None) {
-                    window.dispatch_action(action, cx);
-                }
+        if matches!(
+            self.dashboard.cursor_target(&self.registry, cx),
+            Some(
+                crate::dashboard::RowTarget::NewDraft
+                    | crate::dashboard::RowTarget::NewTreeDraft(_)
+            )
+        ) {
+            self.dashboard_open(window, cx);
+            if let Ok(action) = cx.build_action("vim::NormalBefore", None) {
+                window.dispatch_action(action, cx);
             }
-            _ => {
-                if let Ok(action) = cx.build_action("editor::Newline", None) {
-                    window.dispatch_action(action, cx);
-                }
-            }
+        } else {
+            cx.propagate();
         }
     }
 
     fn dashboard_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.new_agent_draft = None;
         match self.dashboard.cursor_target(&self.registry, cx) {
-            Some(crate::dashboard::RowTarget::Agent { agent_id, .. })
-            | Some(crate::dashboard::RowTarget::Reply(agent_id)) => {
-                self.dashboard.open_reply(agent_id, window, cx);
-                self.dashboard_focus_draft(window, cx);
+            Some(crate::dashboard::RowTarget::TreeAgent { agent_id, .. }) => {
+                self.open_agent(agent_id, window, cx)
             }
-            // On a heading line, `r` is the one talking verb: a reply to
-            // the heading's top agent when it's staffed, a first-message
-            // draft (which spawns an agent on send) when it isn't.
-            Some(crate::dashboard::RowTarget::Topic {
+            Some(crate::dashboard::RowTarget::TreeTopic {
                 host,
-                offset,
+                node_id,
                 first_attention,
-                on_heading_line: true,
                 ..
-            }) => {
-                match first_attention
-                    .or_else(|| self.dashboard.first_agent_for_topic((host, offset)))
-                {
-                    Some(agent_id) => self.dashboard.open_reply(agent_id, window, cx),
-                    None => self
-                        .dashboard
-                        .open_new_draft(Some((host, offset)), window, cx),
+            }) => match first_attention
+                .or_else(|| self.dashboard.first_tree_agent_for_topic((host, node_id)))
+            {
+                Some(agent_id) => self.open_agent(agent_id, window, cx),
+                None => {
+                    self.dashboard
+                        .open_new_tree_draft((host, node_id), window, cx);
+                    self.dashboard_focus_draft(window, cx);
                 }
-                self.dashboard_focus_draft(window, cx);
-            }
-            // Document text keeps vim's own `r`.
+            },
             _ => cx.propagate(),
         }
     }
 
     fn dashboard_enter_insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Ok(action) = cx.build_action("vim::InsertBefore", None) {
+            window.dispatch_action(action, cx);
+        }
+    }
+
+    fn dashboard_open_native_line(
+        &mut self,
+        above: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let action = if above {
+            "vim::InsertLineAbove"
+        } else {
+            "vim::InsertLineBelow"
+        };
+        if let Ok(action) = cx.build_action(action, None) {
             window.dispatch_action(action, cx);
         }
     }
@@ -7846,15 +8825,7 @@ impl Workspace {
     /// the agent's generated summary once one exists. Hosts without a
     /// desk fall back to an unfiled spawn.
     fn quick_spawn_on(&mut self, workdir: HostProject, body: String, cx: &mut Context<Self>) {
-        let host = workdir.host;
-        let Some(offset) = self.dashboard.append_placeholder_heading(host, cx) else {
-            self.spawn_unfiled_agent_on(workdir, body, cx);
-            return;
-        };
-        // The draft row the send came from is about to vanish; the new
-        // heading is where the cursor belongs.
-        self.dashboard.cursor_to_doc(host, offset, cx);
-        self.spawn_dashboard_agent(host, offset, body, workdir, cx);
+        self.spawn_unfiled_agent_on(workdir, body, cx);
     }
 
     fn spawn_unfiled_agent_on(
@@ -7881,7 +8852,7 @@ impl Workspace {
                 },
                 content: (!body.trim().is_empty())
                     .then_some(vec![ContentPart::Text { text: body }]),
-                desk_anchor: None,
+                desk_parent: None,
             },
         );
     }
@@ -7895,16 +8866,17 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let _ = above;
         let on_submit = std::rc::Rc::new(
-            |workspace: &mut Workspace,
-             input: String,
-             _window: &mut Window,
-             cx: &mut Context<Workspace>| {
+            move |workspace: &mut Workspace,
+                  input: String,
+                  _window: &mut Window,
+                  cx: &mut Context<Workspace>| {
                 let title = input.trim();
                 if !title.is_empty() {
-                    workspace.dashboard.append_topic(title, cx);
-                    workspace.refresh_dashboard(_window, cx);
+                    if let Some((host, relative)) = workspace.dashboard.tree_node_at_cursor(cx) {
+                        workspace
+                            .append_tree_heading(host, relative, false, above, title, _window, cx);
+                    }
                 }
             },
         );
@@ -7938,198 +8910,405 @@ impl Workspace {
         self.dashboard_focus_draft(window, cx);
     }
 
-    fn staff_dashboard_node_with_brief(
+    fn dashboard_new_heading(&mut self, child: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((host, node_id)) = self.dashboard.tree_node_at_cursor(cx) else {
+            return;
+        };
+        if let Some(operation) = self
+            .desk_tree_sync
+            .prepare_new_heading(host, node_id, child, false)
+        {
+            if let rho_desk::TreeOperation::Create { node_id, .. } = &operation {
+                self.dashboard.move_to_tree_node_when_ready(host, *node_id);
+                let transaction_id = self.dashboard.push_external_undo_transaction(cx);
+                self.desk_semantic_undo.insert(
+                    transaction_id,
+                    DeskSemanticUndo::DeleteCreated {
+                        host,
+                        root: *node_id,
+                    },
+                );
+                self.pending_semantic_group = Some(transaction_id);
+            }
+            let message = ClientMessage::DeskTreeApply { operation };
+            self.desk_tree_sync
+                .apply_optimistic(host, std::slice::from_ref(&message), cx);
+            self.sync_tree_dashboard(host, window, cx);
+            self.send_to_host(host, message);
+            // The structural shortcut is the equivalent of Vim's `o`: the
+            // new row is ready for text immediately, rather than consuming
+            // the first title characters as normal-mode commands.
+            self.dashboard_enter_insert(window, cx);
+        }
+    }
+
+    fn apply_desk_semantic_batch(
         &mut self,
-        topic: Option<(HostId, usize)>,
-        brief: Option<String>,
+        host: HostId,
+        batch: rho_desk::OperationBatch,
+        messages: Vec<ClientMessage>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(topic) = topic else {
-            self.notice_on(None, "staff: choose a topic", StyleClass::SystemInfo, cx);
-            return;
-        };
-        let (host, heading_offset, mut text, project) =
-            match self.dashboard.staffing_target_for(topic, cx) {
-                Ok(target) => target,
-                Err(message) => {
-                    self.notice_on(None, message, StyleClass::SystemInfo, cx);
-                    return;
-                }
-            };
-        if let Some(brief) = brief {
-            text = brief;
-        }
-        if let Some(crate::dashboard::RowTarget::Agent { agent_id, .. }) =
-            self.dashboard.cursor_target(&self.registry, cx)
-            && matches!(
-                self.registry.agent_disposition(agent_id),
-                Some(
-                    rho_ui_proto::AgentDisposition::Pending
-                        | rho_ui_proto::AgentDisposition::Snoozed { .. }
-                )
-            )
-        {
-            self.send_to_host(
-                host,
-                ClientMessage::SendUserMessage {
-                    agent_id,
-                    content: vec![ContentPart::Text {
-                        text: updated_desk_brief(&text),
-                    }],
-                    delivery: rho_ui_proto::MessageDelivery::NextRequest,
-                },
-            );
-            self.registry.touch_agent(agent_id);
-            self.mark_agent_prompt_sent(agent_id, cx);
-            self.notice_on(
-                Some(&agent_id),
-                &format!(
-                    "updated brief sent to {}",
-                    self.registry.agent_id_label(agent_id)
-                ),
-                StyleClass::SystemInfo,
-                cx,
-            );
-            return;
-        }
-
-        let projects = self
-            .workdirs
-            .iter()
-            .filter(|workdir| workdir.host == host)
-            .cloned()
-            .collect::<Vec<_>>();
-        match resolve_desk_project(project.as_deref(), &projects) {
-            DeskProjectResolution::Use(index) => {
-                self.spawn_dashboard_agent(host, heading_offset, text, projects[index].clone(), cx)
-            }
-            DeskProjectResolution::Missing => self.notice_on(
-                None,
-                project
-                    .as_deref()
-                    .map_or(
-                        "staff: this host has no registered projects".to_owned(),
-                        |project| format!("staff: no project `{project}` on this host"),
-                    )
-                    .as_str(),
-                StyleClass::SystemInfo,
-                cx,
-            ),
-            DeskProjectResolution::Choose => {
-                let complete =
-                    std::rc::Rc::new(move |workspace: &Workspace, input: &str, _: &gpui::App| {
-                        let needle = input.trim().to_lowercase();
-                        workspace
-                            .workdirs
-                            .iter()
-                            .filter(|candidate| candidate.host == host)
-                            .filter(|candidate| {
-                                candidate.project.name.to_lowercase().contains(&needle)
-                                    || candidate
-                                        .project
-                                        .path
-                                        .as_str()
-                                        .to_lowercase()
-                                        .contains(&needle)
-                            })
-                            .map(|candidate| crate::commands::Candidate {
-                                value: candidate.project.name.clone(),
-                                description: candidate.project.path.to_string(),
-                            })
-                            .collect()
-                    });
-                let on_submit = std::rc::Rc::new(
-                    move |workspace: &mut Workspace,
-                          input: String,
-                          _window: &mut Window,
-                          cx: &mut Context<Workspace>| {
-                        let input = input.trim();
-                        let Some(workdir) = workspace
-                            .workdirs
-                            .iter()
-                            .find(|candidate| {
-                                candidate.host == host
-                                    && (candidate.project.name == input
-                                        || candidate.project.path == input)
-                            })
-                            .cloned()
-                        else {
-                            workspace.notice_on(
-                                None,
-                                "staff: choose a listed project",
-                                StyleClass::SystemInfo,
-                                cx,
-                            );
-                            return;
-                        };
-                        workspace.dashboard.set_heading_project(
-                            host,
-                            heading_offset,
-                            &workdir.project.name,
-                            cx,
-                        );
-                        workspace.spawn_dashboard_agent(
-                            host,
-                            heading_offset,
-                            text.clone(),
-                            workdir,
-                            cx,
-                        );
-                    },
-                );
-                self.open_prompt("Desk project:", complete, on_submit, window, cx);
+        self.desk_tree_sync.apply_optimistic(host, &messages, cx);
+        for message in &messages {
+            if let ClientMessage::DeskTreeApply { operation } = message
+                && matches!(operation, rho_desk::TreeOperation::Delete { .. })
+            {
+                self.desk_tree_sync.apply_optimistic_delete(host, operation);
             }
         }
+        self.sync_tree_dashboard(host, window, cx);
+        self.send_to_host(host, ClientMessage::DeskTreeBatchApply { batch });
     }
 
-    fn spawn_dashboard_agent(
+    fn paste_desk_semantic_subtree(
         &mut self,
         host: HostId,
-        heading_offset: usize,
-        text: String,
-        workdir: HostProject,
+        node_id: rho_desk::NodeId,
+        before: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let role_text = self.draft_model.read(cx).role_text(cx).trim().to_owned();
-        let role = match parse_agent_role(&role_text) {
-            Ok(role) => role,
-            Err(message) => {
-                self.notice_on(None, &message, StyleClass::SystemInfo, cx);
+        let Some(subtree) = self.desk_semantic_clipboard.clone() else {
+            return;
+        };
+        let Some((batch, messages, root)) = self
+            .desk_tree_sync
+            .prepare_paste_subtree(host, node_id, before, &subtree)
+        else {
+            return;
+        };
+        self.dashboard.move_to_tree_node_when_ready(host, root);
+        let batch_id = batch.id;
+        self.apply_desk_semantic_batch(host, batch, messages, window, cx);
+        cx.on_next_frame(window, move |this, window, cx| {
+            this.dashboard.move_to_tree_node_when_ready(host, root);
+            this.sync_tree_dashboard(host, window, cx);
+        });
+        cx.notify();
+        let transaction_id = self.dashboard.push_external_undo_transaction(cx);
+        self.desk_semantic_undo.insert(
+            transaction_id,
+            DeskSemanticUndo::DeleteCreated { host, root },
+        );
+        self.pending_semantic_batches
+            .insert((host, batch_id), transaction_id);
+    }
+
+    fn handle_desk_semantic_row_action(
+        &mut self,
+        buffer_id: text::BufferId,
+        action: editor::SemanticRowAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((host, node_id)) = self.dashboard.tree_node_for_buffer(buffer_id, cx) else {
+            return;
+        };
+        match action {
+            editor::SemanticRowAction::Yank => {
+                self.desk_semantic_clipboard =
+                    self.desk_tree_sync.capture_subtree(host, node_id, cx);
+            }
+            editor::SemanticRowAction::Delete => {
+                let Some((batch, messages, subtree, focus)) = self
+                    .desk_tree_sync
+                    .prepare_delete_subtree(host, node_id, cx)
+                else {
+                    return;
+                };
+                let relocation_notice = subtree.relocation_notice();
+                self.desk_semantic_clipboard = Some(subtree.clone());
+                self.desk_semantic_paste_target = focus.map(|focus| (host, focus));
+                let batch_id = batch.id;
+                self.apply_desk_semantic_batch(host, batch, messages, window, cx);
+                if let Some(focus) = focus {
+                    // Vim finishes its linewise delete after emitting the
+                    // semantic action and can overwrite a synchronous cursor
+                    // move with an anchor into the removed excerpt. Re-aim at
+                    // the surviving sibling after that dispatch completes.
+                    cx.on_next_frame(window, move |this, window, cx| {
+                        this.dashboard.move_to_tree_node_when_ready(host, focus);
+                        this.sync_tree_dashboard(host, window, cx);
+                        if let Ok(action) = cx.build_action("vim::NormalBefore", None) {
+                            window.dispatch_action(action, cx);
+                        }
+                    });
+                    cx.notify();
+                }
+                let transaction_id = self.dashboard.push_external_undo_transaction(cx);
+                self.desk_semantic_undo.insert(
+                    transaction_id,
+                    DeskSemanticUndo::RestoreDeleted { host, subtree },
+                );
+                self.pending_semantic_batches
+                    .insert((host, batch_id), transaction_id);
+                if let Some(notice) = relocation_notice {
+                    self.echo(&notice, StyleClass::SystemInfo, cx);
+                }
+            }
+            editor::SemanticRowAction::Paste { before } => {
+                self.desk_semantic_paste_target = None;
+                self.paste_desk_semantic_subtree(host, node_id, before, window, cx);
+            }
+            editor::SemanticRowAction::Open { above } => {
+                let Some(prepared) = self
+                    .desk_tree_sync
+                    .prepare_open_prose(host, node_id, above, cx)
+                else {
+                    return;
+                };
+                match prepared {
+                    crate::desk_view::PreparedOpenProse::Existing {
+                        node_id,
+                        offset,
+                        open_above,
+                    } => {
+                        self.dashboard
+                            .move_to_tree_position_when_ready(host, node_id, offset);
+                        self.sync_tree_dashboard(host, window, cx);
+                        self.dashboard_open_native_line(open_above, window, cx);
+                    }
+                    crate::desk_view::PreparedOpenProse::Created {
+                        batch,
+                        messages,
+                        node_id,
+                    } => {
+                        let batch_id = batch.id;
+                        self.dashboard.move_to_tree_node_when_ready(host, node_id);
+                        self.apply_desk_semantic_batch(host, batch, messages, window, cx);
+                        let transaction_id = self.dashboard.push_external_undo_transaction(cx);
+                        self.desk_semantic_undo.insert(
+                            transaction_id,
+                            DeskSemanticUndo::DeleteCreated {
+                                host,
+                                root: node_id,
+                            },
+                        );
+                        self.pending_semantic_batches
+                            .insert((host, batch_id), transaction_id);
+                        self.pending_semantic_group = Some(transaction_id);
+                        self.dashboard_enter_insert(window, cx);
+                    }
+                }
+            }
+            editor::SemanticRowAction::Indent { outdent } => {
+                let demote = !outdent;
+                let Some(original) = self.desk_tree_sync.tree_node(host, node_id) else {
+                    return;
+                };
+                let Some(operation) = self
+                    .desk_tree_sync
+                    .prepare_structure_move(host, node_id, demote)
+                else {
+                    return;
+                };
+                let message = ClientMessage::DeskTreeApply { operation };
+                self.desk_tree_sync
+                    .apply_optimistic(host, std::slice::from_ref(&message), cx);
+                self.sync_tree_dashboard(host, window, cx);
+                self.send_to_host(host, message);
+                let transaction_id = self.dashboard.push_external_undo_transaction(cx);
+                self.desk_semantic_undo.insert(
+                    transaction_id,
+                    DeskSemanticUndo::StructureMove {
+                        host,
+                        node_id,
+                        parent: original.parent,
+                        order: original.order,
+                    },
+                );
+            }
+        }
+    }
+
+    fn undo_desk_semantic_action(
+        &mut self,
+        transaction_id: clock::Lamport,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(undo) = self.desk_semantic_undo.remove(&transaction_id) else {
+            return;
+        };
+        match undo {
+            DeskSemanticUndo::DeleteCreated { host, root } => {
+                let Some((batch, messages, _, _)) =
+                    self.desk_tree_sync.prepare_delete_subtree(host, root, cx)
+                else {
+                    return;
+                };
+                self.apply_desk_semantic_batch(host, batch, messages, window, cx);
+            }
+            DeskSemanticUndo::RestoreDeleted { host, subtree } => {
+                let Some((batch, messages, root)) =
+                    self.desk_tree_sync.prepare_restore_subtree(host, &subtree)
+                else {
+                    return;
+                };
+                self.dashboard.move_to_tree_node_when_ready(host, root);
+                self.apply_desk_semantic_batch(host, batch, messages, window, cx);
+            }
+            DeskSemanticUndo::StructureMove {
+                host,
+                node_id,
+                parent,
+                order,
+            } => {
+                let Some((batch, messages)) = self
+                    .desk_tree_sync
+                    .prepare_move_to(host, node_id, parent, order)
+                else {
+                    return;
+                };
+                self.apply_desk_semantic_batch(host, batch, messages, window, cx);
+            }
+            DeskSemanticUndo::RestoreDeletedEmpty { host, undo } => {
+                self.desk_batch_editing = true;
+                self.desk_batch_text.clear();
+                let prepared = self
+                    .desk_tree_sync
+                    .prepare_restore_deleted_empty(host, &undo, cx);
+                self.desk_batch_editing = false;
+                let Some((mut messages, root, expected)) = prepared else {
+                    self.desk_batch_text.clear();
+                    return;
+                };
+                let mut captured = std::mem::take(&mut self.desk_batch_text);
+                captured.append(&mut messages);
+                let Some(batch) =
+                    self.desk_tree_sync
+                        .operation_batch(host, expected, captured.clone(), None)
+                else {
+                    return;
+                };
+                self.dashboard.move_to_tree_node_when_ready(host, root);
+                self.apply_desk_semantic_batch(host, batch, captured, window, cx);
+            }
+            DeskSemanticUndo::MergeSplit {
+                host,
+                heading,
+                prose,
+            } => {
+                self.desk_batch_editing = true;
+                self.desk_batch_text.clear();
+                let prepared = self
+                    .desk_tree_sync
+                    .prepare_merge_split(host, heading, prose, cx);
+                self.desk_batch_editing = false;
+                let Some((mut messages, expected)) = prepared else {
+                    self.desk_batch_text.clear();
+                    return;
+                };
+                let mut captured = std::mem::take(&mut self.desk_batch_text);
+                captured.append(&mut messages);
+                let Some(batch) =
+                    self.desk_tree_sync
+                        .operation_batch(host, expected, captured.clone(), None)
+                else {
+                    return;
+                };
+                self.dashboard.move_to_tree_node_when_ready(host, heading);
+                self.apply_desk_semantic_batch(host, batch, captured, window, cx);
+            }
+        }
+    }
+
+    fn append_tree_heading(
+        &mut self,
+        host: HostId,
+        relative: rho_desk::NodeId,
+        child: bool,
+        above: bool,
+        title: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(operation) = self
+            .desk_tree_sync
+            .prepare_new_heading(host, relative, child, above)
+        else {
+            return false;
+        };
+        let rho_desk::TreeOperation::Create { node_id, .. } = &operation else {
+            return false;
+        };
+        let node_id = *node_id;
+        let message = ClientMessage::DeskTreeApply { operation };
+        self.dashboard.move_to_tree_node_when_ready(host, node_id);
+        self.desk_tree_sync
+            .apply_optimistic(host, std::slice::from_ref(&message), cx);
+        self.sync_tree_dashboard(host, window, cx);
+        self.send_to_host(host, message);
+        self.dashboard.rename_cursor_topic(title, cx)
+    }
+
+    fn dashboard_reorder(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((host, node_id)) = self.dashboard.tree_node_at_cursor(cx) else {
+            return;
+        };
+        if let Some(operation) = self.desk_tree_sync.prepare_reorder(host, node_id, down) {
+            let message = ClientMessage::DeskTreeApply { operation };
+            self.desk_tree_sync
+                .apply_optimistic(host, std::slice::from_ref(&message), cx);
+            self.sync_tree_dashboard(host, window, cx);
+            self.send_to_host(host, message);
+        }
+    }
+
+    fn dashboard_delete_empty(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some((host, node_id)) = self.dashboard.tree_node_at_cursor(cx) {
+            self.desk_batch_editing = true;
+            self.desk_batch_text.clear();
+            let prepared = self.desk_tree_sync.prepare_delete_empty(host, node_id, cx);
+            self.desk_batch_editing = false;
+            if let Some((mut messages, focus, expected, undo)) = prepared {
+                let mut captured = std::mem::take(&mut self.desk_batch_text);
+                captured.append(&mut messages);
+                let messages = captured;
+                let Some(batch) =
+                    self.desk_tree_sync
+                        .operation_batch(host, expected, messages.clone(), None)
+                else {
+                    return;
+                };
+                self.pending_desk_batch_intents.insert(
+                    (host, batch.id),
+                    PendingDeskBatchIntent::DeleteEmpty { node_id },
+                );
+                if let Some((focus, offset)) = focus {
+                    self.dashboard
+                        .move_to_tree_position_when_ready(host, focus, offset);
+                }
+                self.desk_tree_sync.apply_optimistic(host, &messages, cx);
+                for message in &messages {
+                    if let ClientMessage::DeskTreeApply { operation } = message
+                        && matches!(operation, rho_desk::TreeOperation::Delete { .. })
+                    {
+                        self.desk_tree_sync.apply_optimistic_delete(host, operation);
+                    }
+                }
+                self.sync_tree_dashboard(host, window, cx);
+                let batch_id = batch.id;
+                self.send_to_host(host, ClientMessage::DeskTreeBatchApply { batch });
+                let transaction_id = self.dashboard.push_external_undo_transaction(cx);
+                self.desk_semantic_undo.insert(
+                    transaction_id,
+                    DeskSemanticUndo::RestoreDeletedEmpty { host, undo },
+                );
+                self.pending_semantic_batches
+                    .insert((host, batch_id), transaction_id);
                 return;
             }
-        };
-        self.send_to_host(
-            host,
-            ClientMessage::NewAgent {
-                role,
-                start: rho_ui_proto::StartMode::NewOn {
-                    repo: workdir.project.path,
-                    revset: crate::draft_view::AUTO_BASE_REVSET.to_owned(),
-                },
-                content: (!text.trim().is_empty()).then_some(vec![ContentPart::Text { text }]),
-                desk_anchor: self.desk_sync.anchor_at(host, heading_offset, cx),
-            },
-        );
-    }
-
-    fn dashboard_structure_move(
-        &mut self,
-        direction: crate::dashboard::StructureDirection,
-        cx: &mut Context<Self>,
-    ) {
-        self.dashboard.structure_move(direction, cx);
-    }
-
-    fn dashboard_delete_empty(&mut self, cx: &mut Context<Self>) {
-        if !self.dashboard.delete_empty(cx) {
-            self.notice_on(
-                None,
-                "delete: heading is not empty",
-                StyleClass::SystemInfo,
-                cx,
-            );
+            self.desk_batch_text.clear();
         }
+        self.notice_on(
+            None,
+            "delete: heading is not empty",
+            StyleClass::SystemInfo,
+            cx,
+        );
     }
 
     fn dashboard_undo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -8186,6 +9365,54 @@ impl Workspace {
         self.open_prompt("Desk heading:", complete, on_submit, window, cx);
     }
 
+    fn prompt_dashboard_search(
+        &mut self,
+        backwards: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let on_submit = std::rc::Rc::new(
+            move |workspace: &mut Workspace,
+                  input: String,
+                  window: &mut Window,
+                  cx: &mut Context<Workspace>| {
+                let query = input.trim();
+                if query.is_empty() {
+                    return;
+                }
+                let editor = workspace.dashboard.editor().clone();
+                let text = editor.read(cx).text(cx);
+                let found = if backwards {
+                    text.rfind(query)
+                } else {
+                    text.find(query)
+                };
+                if let Some(start) = found {
+                    editor.update(cx, |editor, cx| {
+                        editor.change_selections(Default::default(), window, cx, |selections| {
+                            selections.select_ranges([editor::MultiBufferOffset(start)
+                                ..editor::MultiBufferOffset(start + query.len())]);
+                        });
+                    });
+                    window.focus(&editor.read(cx).focus_handle(cx), cx);
+                } else {
+                    workspace.notice_on(None, "search: no match", StyleClass::SystemInfo, cx);
+                }
+            },
+        );
+        self.open_prompt(
+            if backwards {
+                "search backward:"
+            } else {
+                "search:"
+            },
+            std::rc::Rc::new(|_, _, _| Vec::new()),
+            on_submit,
+            window,
+            cx,
+        );
+    }
+
     fn prompt_dashboard_rename_topic(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let on_submit = std::rc::Rc::new(
             |workspace: &mut Workspace,
@@ -8228,6 +9455,10 @@ impl Workspace {
             .line_height(text_style.line_height)
             .text_color(text_style.color)
             .key_context("RhoDashboard");
+        #[cfg(feature = "native")]
+        let compact_dashboard = self.phone.enabled;
+        #[cfg(not(feature = "native"))]
+        let compact_dashboard = true;
         let container = container
             // The dashboard owns the preview card's reclaimed horizontal
             // space, rather than leaving a blank wrapper beside the card.
@@ -8237,8 +9468,8 @@ impl Workspace {
                 gpui::relative(1.0)
             })
             // The desktop gutter wastes too much of a phone's width.
-            .pl(px(if self.phone.enabled { 6. } else { 24. }))
-            .pr(px(if self.phone.enabled { 6. } else { 24. }));
+            .pl(px(if compact_dashboard { 6. } else { 24. }))
+            .pr(px(if compact_dashboard { 6. } else { 24. }));
         let dashboard = div()
             .id("dashboard-rail")
             .flex_grow(1.0)
@@ -8370,7 +9601,31 @@ impl Workspace {
                         buffer
                     });
                     let editor = cx.new(|cx| {
-                        let mut editor = editor::Editor::for_buffer(buffer, None, window, cx);
+                        let multi_buffer =
+                            cx.new(|cx| multi_buffer::MultiBuffer::singleton(buffer, cx));
+                        #[cfg(feature = "native")]
+                        let mut editor = editor::Editor::new(
+                            editor::EditorMode::Full {
+                                scale_ui_elements_with_buffer_font_size: true,
+                                show_active_line_background: false,
+                                sizing_behavior: editor::SizingBehavior::ExcludeOverscrollMargin,
+                            },
+                            multi_buffer,
+                            None,
+                            window,
+                            cx,
+                        );
+                        #[cfg(not(feature = "native"))]
+                        let mut editor = editor::Editor::new(
+                            editor::EditorMode::Full {
+                                scale_ui_elements_with_buffer_font_size: true,
+                                show_active_line_background: false,
+                                sizing_behavior: editor::SizingBehavior::ExcludeOverscrollMargin,
+                            },
+                            multi_buffer,
+                            window,
+                            cx,
+                        );
                         crate::editor_config::configure(&mut editor, window, cx);
                         editor.set_read_only(true);
                         editor
@@ -8427,7 +9682,7 @@ impl Workspace {
                 }
                 this.focus_active_surface(window, cx);
                 let editor = match &this.active_pane().surface.view {
-                    SurfaceView::DeskHeading(editor) | SurfaceView::Inbox(editor) => {
+                    SurfaceView::DeskNode(editor) | SurfaceView::Inbox(editor) => {
                         Some(editor.clone())
                     }
                     SurfaceView::Transcript { editor, .. } => Some(editor.clone()),
@@ -8468,6 +9723,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let path = match &card.inbox_source {
+            #[cfg(feature = "native")]
             Some(crate::dashboard::DealerInboxSource::Page(page)) => {
                 let leaf = rho_browser::live_page_name(*page).unwrap_or_else(|| "page".to_owned());
                 format!("{} / {leaf}", card.breadcrumb.replace(" › ", " / "))
@@ -8633,11 +9889,14 @@ impl Workspace {
     fn render_status_right(&self, cx: &App) -> gpui::AnyElement {
         let colors = cx.theme().colors();
         let status = cx.theme().status();
+        #[cfg(feature = "native")]
         let mode = self
             .mode_indicator
             .read(cx)
             .plain_mode(cx)
             .unwrap_or_else(|| "normal".to_owned());
+        #[cfg(not(feature = "native"))]
+        let mode = "normal".to_owned();
         let mode_color = if self.dashboard.deal_mode() {
             colors.terminal_ansi_bright_magenta
         } else if mode.contains("insert") {
@@ -8721,7 +9980,7 @@ impl Workspace {
                 .unwrap_or_else(|| "desk".to_owned());
             if matches!(
                 self.dashboard.cursor_target(&self.registry, cx),
-                Some(crate::dashboard::RowTarget::NewDraft(_))
+                Some(crate::dashboard::RowTarget::NewTreeDraft(_))
             ) {
                 format!("{path} / new agent")
             } else {
@@ -8934,7 +10193,7 @@ impl Workspace {
                 .overflow_hidden()
                 .child(editor.clone())
                 .into_any_element(),
-            SurfaceView::DeskHeading(editor) | SurfaceView::Inbox(editor) => div()
+            SurfaceView::DeskNode(editor) | SurfaceView::Inbox(editor) => div()
                 .size_full()
                 .overflow_hidden()
                 .child(editor.clone())
@@ -9076,11 +10335,18 @@ impl Workspace {
     }
 }
 
-fn desk_heading_without_agent(
-    dashboard_focused: bool,
-    target: Option<crate::dashboard::RowTarget>,
-) -> bool {
-    dashboard_focused && matches!(target, Some(crate::dashboard::RowTarget::Topic { .. }))
+pub(crate) fn resolve_filing_destination(
+    destinations: &[(String, String, HostId, rho_desk::NodeId)],
+    candidate: &crate::minibuffer::Candidate,
+    occurrence: usize,
+) -> Option<(HostId, rho_desk::NodeId)> {
+    destinations
+        .iter()
+        .filter(|(value, description, _, _)| {
+            *value == candidate.value && *description == candidate.description
+        })
+        .nth(occurrence)
+        .map(|(_, _, host, node_id)| (*host, *node_id))
 }
 
 fn parse_agent_role(text: &str) -> Result<AgentRole, String> {
@@ -9361,6 +10627,24 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &DashboardSubmit, window, cx| {
                 this.dashboard_submit(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &DashboardCancelDraft, window, cx| {
+                if matches!(
+                    this.dashboard.cursor_target(&this.registry, cx),
+                    Some(
+                        crate::dashboard::RowTarget::NewDraft
+                            | crate::dashboard::RowTarget::NewTreeDraft(_)
+                    )
+                ) && this.dashboard.discard_new_draft(cx)
+                {
+                    this.forget_discarded_draft(cx);
+                    this.refresh_dashboard(window, cx);
+                    if let Ok(action) = cx.build_action("vim::NormalBefore", None) {
+                        window.dispatch_action(action, cx);
+                    }
+                } else {
+                    cx.propagate();
+                }
+            }))
             .on_action(cx.listener(|this, _: &DashboardNewAgent, window, cx| {
                 if this.take_universal_argument() {
                     this.configure_dashboard_quick_spawn(window, cx);
@@ -9405,16 +10689,37 @@ impl Render for Workspace {
                 let card = this.dashboard.current_deal_card().cloned();
                 let today = chrono::Local::now().date_naive();
                 let now = chrono::Local::now().fixed_offset();
+                if card
+                    .as_ref()
+                    .is_some_and(|card| card.topic_node_id.is_some())
+                {
+                    if !this.submit_tree_verdict(
+                        None,
+                        rho_desk::TemporalKind::Done,
+                        today.and_time(chrono::NaiveTime::MIN),
+                        0,
+                        crate::dashboard::DealerVerdict::Done,
+                        "done".to_owned(),
+                        window,
+                        cx,
+                    ) {
+                        this.echo(
+                            "done: Desk heading is unavailable",
+                            StyleClass::SystemInfo,
+                            cx,
+                        );
+                    }
+                    return;
+                }
                 let result = match card.as_ref() {
                     Some(card)
-                        if card.heading_offset.is_some()
-                            || matches!(
-                                card.kind,
-                                crate::dashboard::DealCardKind::Desk
-                                    | crate::dashboard::DealCardKind::Agent
-                            ) =>
+                        if matches!(
+                            card.kind,
+                            crate::dashboard::DealCardKind::Desk
+                                | crate::dashboard::DealCardKind::Agent
+                        ) =>
                     {
-                        this.dashboard.write_deal_done(today, cx)
+                        Err("the dealt runtime agent has no Desk node")
                     }
                     Some(crate::dashboard::DealCard {
                         kind: crate::dashboard::DealCardKind::Inbox(_),
@@ -9452,16 +10757,37 @@ impl Render for Workspace {
                 let card = this.dashboard.current_deal_card().cloned();
                 let today = chrono::Local::now().date_naive();
                 let now = chrono::Local::now().fixed_offset();
+                if card
+                    .as_ref()
+                    .is_some_and(|card| card.topic_node_id.is_some())
+                {
+                    if !this.submit_tree_verdict(
+                        None,
+                        rho_desk::TemporalKind::Discarded,
+                        today.and_time(chrono::NaiveTime::MIN),
+                        0,
+                        crate::dashboard::DealerVerdict::Dismiss,
+                        "discard".to_owned(),
+                        window,
+                        cx,
+                    ) {
+                        this.echo(
+                            "discard: Desk heading is unavailable",
+                            StyleClass::SystemInfo,
+                            cx,
+                        );
+                    }
+                    return;
+                }
                 let result = match card.as_ref() {
                     Some(card)
-                        if card.heading_offset.is_some()
-                            || matches!(
-                                card.kind,
-                                crate::dashboard::DealCardKind::Desk
-                                    | crate::dashboard::DealCardKind::Agent
-                            ) =>
+                        if matches!(
+                            card.kind,
+                            crate::dashboard::DealCardKind::Desk
+                                | crate::dashboard::DealCardKind::Agent
+                        ) =>
                     {
-                        this.dashboard.write_deal_discarded(today, cx)
+                        Err("the dealt runtime agent has no Desk node")
                     }
                     Some(crate::dashboard::DealCard {
                         kind: crate::dashboard::DealCardKind::Inbox(_),
@@ -9499,16 +10825,39 @@ impl Render for Workspace {
                 let today = chrono::Local::now().date_naive();
                 let now = chrono::Local::now().fixed_offset();
                 let card = this.dashboard.current_deal_card().cloned();
+                if card
+                    .as_ref()
+                    .is_some_and(|card| card.topic_node_id.is_some())
+                {
+                    let days = count.max(1);
+                    if !this.submit_tree_verdict(
+                        None,
+                        rho_desk::TemporalKind::Defer,
+                        (today + chrono::Duration::days(i64::from(days)))
+                            .and_time(chrono::NaiveTime::MIN),
+                        days,
+                        crate::dashboard::DealerVerdict::Defer,
+                        format!("snooze: {days}d"),
+                        window,
+                        cx,
+                    ) {
+                        this.echo(
+                            "snooze: Desk heading is unavailable",
+                            StyleClass::SystemInfo,
+                            cx,
+                        );
+                    }
+                    return;
+                }
                 let result = match card.as_ref() {
                     Some(card)
-                        if card.heading_offset.is_some()
-                            || matches!(
-                                card.kind,
-                                crate::dashboard::DealCardKind::Desk
-                                    | crate::dashboard::DealCardKind::Agent
-                            ) =>
+                        if matches!(
+                            card.kind,
+                            crate::dashboard::DealCardKind::Desk
+                                | crate::dashboard::DealCardKind::Agent
+                        ) =>
                     {
-                        this.dashboard.write_deal_snooze(count, today, cx)
+                        Err("the dealt runtime agent has no Desk node")
                     }
                     Some(crate::dashboard::DealCard {
                         kind: crate::dashboard::DealCardKind::Inbox(_),
@@ -9552,26 +10901,57 @@ impl Render for Workspace {
                 cx.listener(|this, _: &DashboardDealRoomSnooze, window, cx| {
                     let count = vim::take_count(cx).unwrap_or(1) as u32;
                     let today = chrono::Local::now().date_naive();
-                    let now = chrono::Local::now().fixed_offset();
-                    if let Some((room, until, identity)) =
-                        this.dashboard.write_deal_room_snooze(count, today, cx)
-                    {
-                        this.dashboard
-                            .record_deal_verdict_as(crate::dashboard::DealerVerdict::Defer, now);
-                        crate::journal::record(crate::journal::Event::DeskHeadingDeferred {
-                            heading: room,
-                            until: until.format("%Y-%m-%dT%H:%M:%S").to_string(),
-                            card: Self::journal_card_identity(&identity),
-                        });
-                        this.dashboard.end_deal(cx);
-                        this.finish_dashboard_deal_action(window, cx);
+                    if let Some((_host, room_node)) = this.dashboard.current_tree_room_node() {
+                        let days = count.max(1);
+                        if !this.submit_tree_verdict(
+                            Some(room_node),
+                            rho_desk::TemporalKind::Defer,
+                            (today + chrono::Duration::days(i64::from(days)))
+                                .and_time(chrono::NaiveTime::MIN),
+                            days,
+                            crate::dashboard::DealerVerdict::Defer,
+                            format!("room snooze: {days}d"),
+                            window,
+                            cx,
+                        ) {
+                            this.echo(
+                                "room snooze: Desk room is unavailable",
+                                StyleClass::SystemInfo,
+                                cx,
+                            );
+                        }
+                        return;
                     }
                 }),
             )
             .on_action(cx.listener(|this, _: &DashboardDealTodo, window, cx| {
                 let count = vim::take_count(cx).unwrap_or(7) as u32;
                 let today = chrono::Local::now().date_naive();
-                let result = this.dashboard.write_deal_todo(count, today, cx);
+                if this
+                    .dashboard
+                    .current_deal_card()
+                    .is_some_and(|card| card.topic_node_id.is_some())
+                {
+                    let days = count.max(1);
+                    if !this.submit_tree_verdict(
+                        None,
+                        rho_desk::TemporalKind::Todo,
+                        today.and_time(chrono::NaiveTime::MIN),
+                        days,
+                        crate::dashboard::DealerVerdict::Done,
+                        format!("todo: {days}d"),
+                        window,
+                        cx,
+                    ) {
+                        this.echo(
+                            "todo: Desk heading is unavailable",
+                            StyleClass::SystemInfo,
+                            cx,
+                        );
+                    }
+                    return;
+                }
+                let result: Result<(), &'static str> = Err("the dealt item has no Desk node");
                 let handled = result.is_ok();
                 if handled {
                     this.dashboard.record_deal_verdict_as(
@@ -9733,16 +11113,6 @@ impl Render for Workspace {
                 if let Ok(action) = cx.build_action("vim::ExitDealMode", None) {
                     window.dispatch_action(action, cx);
                 }
-                if let crate::dashboard::DealCardIdentity::Desk {
-                    host,
-                    heading_offset,
-                } = card.identity
-                {
-                    this.dashboard
-                        .open_new_draft(Some((host, heading_offset)), window, cx);
-                    this.dashboard_focus_draft(window, cx);
-                    return;
-                }
                 #[cfg(feature = "native")]
                 if let Some(crate::dashboard::DealerInboxSource::Page(page)) = card.inbox_source {
                     this.open_browser_page(page, window, cx);
@@ -9788,15 +11158,30 @@ impl Render for Workspace {
                     cx.propagate();
                     return;
                 }
-                if this.dashboard.archive_cursor_heading(cx) {
-                    this.refresh_dashboard(window, cx);
-                } else {
+                let archived =
+                    this.dashboard
+                        .tree_node_at_cursor(cx)
+                        .is_some_and(|(host, node_id)| {
+                            this.set_node_temporal(
+                                host,
+                                node_id,
+                                rho_desk::TemporalKind::Discarded,
+                                chrono::Local::now()
+                                    .date_naive()
+                                    .and_time(chrono::NaiveTime::MIN),
+                                window,
+                                cx,
+                            )
+                        });
+                if !archived {
                     this.notice_on(
                         None,
-                        "archive: already archived",
+                        "archive: heading unavailable",
                         StyleClass::SystemInfo,
                         cx,
                     );
+                } else {
+                    this.notice_on(None, "archived", StyleClass::SystemInfo, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &DashboardDemote, window, cx| {
@@ -9804,22 +11189,100 @@ impl Render for Workspace {
                     cx.propagate();
                     return;
                 }
-                this.dashboard_structure_move(crate::dashboard::StructureDirection::Demote, cx);
+                this.dashboard.dispatch_semantic_row_action(
+                    editor::SemanticRowAction::Indent { outdent: false },
+                    cx,
+                );
             }))
             .on_action(cx.listener(|this, _: &DashboardPromote, window, cx| {
                 if !this.dashboard_verb_applies(window, cx) {
                     cx.propagate();
                     return;
                 }
-                this.dashboard_structure_move(crate::dashboard::StructureDirection::Promote, cx);
+                this.dashboard.dispatch_semantic_row_action(
+                    editor::SemanticRowAction::Indent { outdent: true },
+                    cx,
+                );
             }))
+            .on_action(cx.listener(|this, _: &DashboardNewSibling, window, cx| {
+                if !this.dashboard_verb_applies(window, cx) {
+                    cx.propagate();
+                    return;
+                }
+                this.dashboard_new_heading(false, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DashboardNewChild, window, cx| {
+                if !this.dashboard_verb_applies(window, cx) {
+                    cx.propagate();
+                    return;
+                }
+                this.dashboard_new_heading(true, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DashboardMoveSubtreeUp, window, cx| {
+                if !this.dashboard_verb_applies(window, cx) {
+                    cx.propagate();
+                    return;
+                }
+                this.dashboard_reorder(false, window, cx);
+            }))
+            .on_action(
+                cx.listener(|this, _: &DashboardMoveSubtreeDown, window, cx| {
+                    if !this.dashboard_verb_applies(window, cx) {
+                        cx.propagate();
+                        return;
+                    }
+                    this.dashboard_reorder(true, window, cx);
+                }),
+            )
             .on_action(cx.listener(|this, _: &DashboardDeleteEmpty, window, cx| {
                 if !this.dashboard_verb_applies(window, cx) {
                     cx.propagate();
                     return;
                 }
-                this.dashboard_delete_empty(cx);
+                this.dashboard_delete_empty(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &DashboardDeleteRow, _, cx| {
+                if !this
+                    .dashboard
+                    .dispatch_semantic_row_action(editor::SemanticRowAction::Delete, cx)
+                {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &DashboardYankRow, _, cx| {
+                if !this
+                    .dashboard
+                    .dispatch_semantic_row_action(editor::SemanticRowAction::Yank, cx)
+                {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &DashboardPasteRow, window, cx| {
+                if !this.dashboard.dispatch_semantic_row_action(
+                    editor::SemanticRowAction::Paste { before: false },
+                    cx,
+                ) {
+                    if let Some((host, node_id)) = this.desk_semantic_paste_target.take() {
+                        this.paste_desk_semantic_subtree(host, node_id, false, window, cx);
+                    } else {
+                        cx.propagate();
+                    }
+                }
+            }))
+            .on_action(
+                cx.listener(|this, _: &DashboardPasteRowBefore, window, cx| {
+                    if !this.dashboard.dispatch_semantic_row_action(
+                        editor::SemanticRowAction::Paste { before: true },
+                        cx,
+                    ) {
+                        if let Some((host, node_id)) = this.desk_semantic_paste_target.take() {
+                            this.paste_desk_semantic_subtree(host, node_id, true, window, cx);
+                        } else {
+                            cx.propagate();
+                        }
+                    }
+                }),
+            )
             .on_action(cx.listener(|this, _: &DashboardUndo, window, cx| {
                 this.dashboard_undo(window, cx);
             }))
@@ -10048,71 +11511,32 @@ mod tests {
     }
 
     #[test]
-    fn unbound_desk_heading_is_a_local_disposition_target() {
-        use crate::dashboard::RowTarget;
+    fn tree_verdicts_replace_conflicting_temporal_family_members_atomically() {
+        use rho_desk::TemporalKind::{Defer, Discarded, Done, Reminder, Todo};
 
-        assert!(desk_heading_without_agent(
-            true,
-            Some(RowTarget::Topic {
-                host: HostId::default(),
-                offset: 0,
-                first_attention: None,
-                on_heading_line: true,
-                on_bullet: false,
-            })
-        ));
-        assert!(!desk_heading_without_agent(
-            true,
-            Some(RowTarget::Agent {
-                agent_id: AgentId::from_counter(1, &rho_ui_proto::AgentIdDomain(0)).unwrap(),
-                topic: None,
-            })
-        ));
-        assert!(!desk_heading_without_agent(false, Some(RowTarget::None)));
-        assert!(!desk_heading_without_agent(true, None));
-    }
-
-    fn project(name: &str, path: &str) -> HostProject {
-        HostProject {
-            host: HostId(1),
-            project: rho_ui_proto::UiProject {
-                name: name.into(),
-                path: path.into(),
-                description: String::new(),
-            },
-        }
-    }
-
-    #[test]
-    fn desk_project_resolution_prefers_property_then_single_then_picker() {
-        let projects = vec![project("rho", "/src/rho"), project("zed", "/src/zed")];
+        let mark = rho_desk::TemporalMark {
+            year: 2026,
+            month: 3,
+            day: 18,
+            minute_of_day: None,
+            pace_days: 7,
+        };
         assert_eq!(
-            resolve_desk_project(Some("zed"), &projects),
-            DeskProjectResolution::Use(1)
+            temporal_verdict_values(Done, mark),
+            vec![(Discarded, None), (Done, Some(mark))]
         );
         assert_eq!(
-            resolve_desk_project(Some("/src/rho"), &projects),
-            DeskProjectResolution::Use(0)
+            temporal_verdict_values(Discarded, mark),
+            vec![(Done, None), (Discarded, Some(mark))]
         );
         assert_eq!(
-            resolve_desk_project(None, &projects),
-            DeskProjectResolution::Choose
+            temporal_verdict_values(Defer, mark),
+            vec![(Reminder, None), (Defer, Some(mark))]
         );
         assert_eq!(
-            resolve_desk_project(None, &projects[..1]),
-            DeskProjectResolution::Use(0)
+            temporal_verdict_values(Todo, mark).last(),
+            Some(&(Todo, Some(mark)))
         );
-        assert_eq!(
-            resolve_desk_project(Some("missing"), &projects),
-            DeskProjectResolution::Missing
-        );
-    }
-
-    #[test]
-    fn desk_reply_identifies_the_message_as_a_brief_update() {
-        assert_eq!(
-            updated_desk_brief("root\n\nchild"),
-            "Updated brief from the Desk:\n\nroot\n\nchild"
-        );
+        assert_eq!(temporal_verdict_values(Todo, mark).len(), 4);
     }
 }

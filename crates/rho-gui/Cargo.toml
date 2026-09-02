@@ -123,6 +123,7 @@ tree-sitter = "0.26"
 tree-sitter-md = { git = "https://github.com/tree-sitter-grammars/tree-sitter-markdown", rev = "9a23c1a96c0513d8fc6520972beedd419a973539" }
 org-element = { version = "0.1.0", default-features = false }
 ui = { path = "../../vendor/zed/crates/ui" }
+uuid.workspace = true
 util = { path = "../../vendor/zed/crates/util", optional = true }
 vim = { path = "../../vendor/zed/crates/vim", default-features = false }
 vim_mode_setting = { path = "../../vendor/zed/crates/vim_mode_setting" }
@@ -158,8 +159,3 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = ["Crypto", "Location", "MediaQueryList", "Navigator", "Storage", "Window", "console"] }
 zeroize = "1"
-
-[[bench]]
-name = "desk_sync"
-harness = false
-required-features = ["bench-support"]

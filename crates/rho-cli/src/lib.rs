@@ -206,7 +206,7 @@ enum CliCommand {
     },
     Daemon(DaemonArgs),
     Debug(DebugArgs),
-    /// Read and edit the Desk document through checkout/apply files.
+    /// Read the native Desk tree as an org-looking shell/editor view.
     Desk(desk::DeskArgs),
     Iroh(IrohArgs),
     Land(LandArgs),

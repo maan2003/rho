@@ -19,7 +19,7 @@ use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 
 #[cfg(not(target_family = "wasm"))]
 pub mod client;
-pub mod desk;
+#[doc(hidden)]
 pub use rho_desk as desk_tree;
 pub mod realtime;
 pub mod remote;
@@ -128,23 +128,10 @@ pub fn socket_path() -> anyhow::Result<std::path::PathBuf> {
 pub enum ClientMessage {
     Ping,
     Subscribe,
-    /// Subscribes to the daemon-owned Desk snapshot and live operation stream.
-    DeskSubscribe,
     /// Refreshes only the structured Desk stream after sequence loss.
     DeskTreeSubscribe,
-    /// Fetches the current Desk document text without allocating a replica.
-    DeskGet,
-    /// Subscribes like `DeskSubscribe`, but attributes the allocated replica
-    /// to an agent, so its edits are distinguishable in the CRDT history.
-    DeskSubscribeAgent {
-        agent_id: AgentId,
-    },
-    /// Appends an ordinary Zed text-buffer operation. The operation's
-    /// replica id must match the id assigned by `DeskSnapshot`.
-    DeskTextApply {
-        operation: desk::DeskOperation,
-        transaction: Option<desk::DeskTransaction>,
-    },
+    /// Fetches the native Desk tree without allocating a replica.
+    DeskTreeGet,
     DeskTreeApply {
         operation: desk_tree::TreeOperation,
     },
@@ -156,15 +143,24 @@ pub enum ClientMessage {
     DeskTreeBatchApply {
         batch: desk_tree::OperationBatch,
     },
+    DeskPageBind {
+        request_id: u64,
+        parent: desk_tree::NodeId,
+        page_id: desk_tree::PageId,
+    },
+    DeskPageUnbind {
+        request_id: u64,
+        node_id: desk_tree::NodeId,
+    },
     NewAgent {
         role: AgentRole,
         /// Where the agent's working copy starts (including which repo, for
         /// the modes that need one).
         start: StartMode,
         content: Option<Vec<ContentPart>>,
-        /// When present, tag the Desk heading containing this anchor with
-        /// the newly allocated agent's handle.
-        desk_anchor: Option<desk::DeskAnchor>,
+        /// User heading under which the daemon creates the agent's
+        /// machine-owned Desk row.
+        desk_parent: Option<desk_tree::NodeId>,
     },
     SubscribeAgent {
         agent_id: AgentId,
@@ -598,22 +594,9 @@ pub struct LandLeaseHolder {
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub enum ServerMessage {
     Pong,
-    DeskSnapshot {
-        snapshot: desk::DeskSnapshot,
-        /// Zed replica id assigned to this user connection. Replica ids make
-        /// body-operation attribution intrinsic to the CRDT history.
-        replica_id: u16,
-    },
-    DeskTextApplied {
-        record: desk::DeskTextOpRecord,
-    },
     DeskTreeSnapshot {
         snapshot: desk_tree::Snapshot,
         replica_id: u16,
-    },
-    /// Phase-1 shadow import replacement; clients retain their tree replica.
-    DeskTreeReplaced {
-        snapshot: desk_tree::Snapshot,
     },
     DeskTreeApplied {
         record: desk_tree::TreeOpRecord,
@@ -630,11 +613,14 @@ pub enum ServerMessage {
         reason: String,
         snapshot: desk_tree::Snapshot,
     },
+    DeskPageBindingResult {
+        request_id: u64,
+        error: Option<String>,
+    },
     /// The daemon's broadcast receiver lagged; request a new tree snapshot.
     DeskTreeResyncRequired,
-    /// Reply to `DeskGet`: the materialized document, without a subscription.
-    DeskDocument {
-        text: String,
+    DeskTreeDocument {
+        snapshot: desk_tree::Snapshot,
     },
     Ready {
         agents: Vec<UiAgentSummary>,
@@ -1361,6 +1347,7 @@ mod tests {
                 },
                 expected: Vec::new(),
                 operations: vec![desk_tree::BatchOperation::Tree(operation)],
+                machine_relocation: None,
             },
         };
         let bytes = senax_encoder::pack(&message).unwrap();

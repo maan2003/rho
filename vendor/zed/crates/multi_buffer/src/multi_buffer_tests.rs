@@ -6464,10 +6464,7 @@ fn test_multiple_paths_per_buffer(cx: &mut App) {
     multibuffer.update(cx, |multibuffer, cx| {
         multibuffer.edit([(Point::new(3, 0)..Point::new(3, 1), "")], None, cx)
     });
-    assert_eq!(
-        doc.read(cx).text(),
-        "Xaaa\nbbb\nccc\nddd\nZeee\nfff"
-    );
+    assert_eq!(doc.read(cx).text(), "Xaaa\nbbb\nccc\nddd\nZeee\nfff");
     let snapshot = multibuffer.update(cx, |multibuffer, cx| multibuffer.snapshot(cx));
     assert_eq!(
         snapshot.text(),

@@ -6,6 +6,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use camino::Utf8PathBuf;
+use chrono::{Datelike as _, Timelike as _};
 use clock::{Global, Lamport, ReplicaId};
 use rho_core::AgentId;
 use senax_encoder::{Decode, Encode, Pack, Unpack};
@@ -104,6 +105,142 @@ pub struct TemporalMark {
     pub day: u8,
     pub minute_of_day: Option<u16>,
     pub pace_days: u32,
+}
+
+impl TemporalMark {
+    pub fn at(self) -> Option<chrono::NaiveDateTime> {
+        chrono::NaiveDate::from_ymd_opt(self.year, self.month.into(), self.day.into()).and_then(
+            |date| {
+                chrono::NaiveTime::from_num_seconds_from_midnight_opt(
+                    u32::from(self.minute_of_day.unwrap_or(0)) * 60,
+                    0,
+                )
+                .map(|time| date.and_time(time))
+            },
+        )
+    }
+}
+
+pub fn temporal_priority(
+    kind: TemporalKind,
+    mark: TemporalMark,
+    now: chrono::NaiveDateTime,
+) -> f64 {
+    let Some(at) = mark.at() else {
+        return f64::NEG_INFINITY;
+    };
+    let elapsed = if mark.minute_of_day.is_none() {
+        now.date().signed_duration_since(at.date()).num_days() as f64
+    } else {
+        now.signed_duration_since(at).num_seconds() as f64 / 86_400.0
+    };
+    let pace = f64::from(mark.pace_days);
+    match kind {
+        TemporalKind::Deadline if elapsed < -pace => f64::NEG_INFINITY,
+        TemporalKind::Deadline if elapsed <= 0.0 => elapsed / pace.max(1.0),
+        TemporalKind::Deadline => 1_000_000.0 + elapsed,
+        TemporalKind::Todo => elapsed - pace,
+        TemporalKind::Defer if elapsed < 0.0 => f64::NEG_INFINITY,
+        TemporalKind::Defer => elapsed,
+        TemporalKind::Reminder if elapsed < 0.0 => f64::NEG_INFINITY,
+        TemporalKind::Reminder => -elapsed / pace.max(1.0),
+        TemporalKind::Done | TemporalKind::Discarded => f64::NEG_INFINITY,
+    }
+}
+
+/// Renders a snapshot as a human-readable, org-looking tree. This is a
+/// presentation format only: no runtime path parses it back into Desk state.
+pub fn render_org(snapshot: Snapshot) -> Result<String, String> {
+    let document = Document::from_snapshot(snapshot)?;
+    let nodes = document.materialize();
+    let by_id = nodes
+        .iter()
+        .map(|node| (node.id, node))
+        .collect::<BTreeMap<_, _>>();
+    let mut output = String::new();
+    for node in &nodes {
+        let text = document.text(
+            node.id,
+            ReplicaId::REMOTE_SERVER.as_u16(),
+            BufferId::new(1).unwrap(),
+        )?;
+        match node.kind {
+            NodeKind::Heading => {
+                let depth = std::iter::successors(node.parent, |parent| {
+                    by_id.get(parent).and_then(|node| node.parent)
+                })
+                .filter(|parent| {
+                    by_id
+                        .get(parent)
+                        .is_some_and(|node| node.kind == NodeKind::Heading)
+                })
+                .count()
+                    + 1;
+                output.push_str(&"*".repeat(depth));
+                output.push(' ');
+                output.push_str(text.trim());
+                if !node.tags.is_empty() {
+                    output.push(' ');
+                    output.push(':');
+                    output.push_str(&node.tags.iter().cloned().collect::<Vec<_>>().join(":"));
+                    output.push(':');
+                }
+                output.push('\n');
+                for (kind, mark) in &node.temporal {
+                    output.push_str(&format!(
+                        ":{}: {:04}-{:02}-{:02}",
+                        temporal_name(*kind),
+                        mark.year,
+                        mark.month,
+                        mark.day
+                    ));
+                    if let Some(minute) = mark.minute_of_day {
+                        output.push_str(&format!(" {:02}:{:02}", minute / 60, minute % 60));
+                    }
+                    if mark.pace_days != 0 {
+                        output.push_str(&format!(" {}d", mark.pace_days));
+                    }
+                    output.push('\n');
+                }
+            }
+            NodeKind::Prose => {
+                output.push_str(&text);
+                if !text.ends_with('\n') {
+                    output.push('\n');
+                }
+            }
+            NodeKind::Agent => output.push_str("- agent\n"),
+            NodeKind::Page => output.push_str("- page\n"),
+            NodeKind::File => {
+                output.push_str("- file");
+                if let Some(Binding::File(path)) = node.bindings.get(&BindingKind::File) {
+                    output.push(' ');
+                    output.push_str(path.as_str());
+                }
+                output.push('\n');
+            }
+            NodeKind::Draft => {
+                output.push_str("- draft");
+                if !text.trim().is_empty() {
+                    output.push(' ');
+                    output.push_str(text.trim());
+                }
+                output.push('\n');
+            }
+        }
+    }
+    Ok(output)
+}
+
+fn temporal_name(kind: TemporalKind) -> &'static str {
+    match kind {
+        TemporalKind::Todo => "todo",
+        TemporalKind::Deadline => "deadline",
+        TemporalKind::Defer => "defer",
+        TemporalKind::Reminder => "reminder",
+        TemporalKind::Done => "done",
+        TemporalKind::Discarded => "discarded",
+    }
 }
 
 #[derive(
@@ -349,6 +486,21 @@ pub enum BatchOperation {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct NodeReplacement {
+    pub deleted: NodeId,
+    pub replacement: NodeId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum MachineRelocationIntent {
+    EvacuateDeletedChildren,
+    Restore {
+        delete_batch_id: TreeClock,
+        replacements: Vec<NodeReplacement>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct NodeExpectation {
     pub node_id: NodeId,
     pub kind: NodeKind,
@@ -365,6 +517,8 @@ pub struct OperationBatch {
     pub id: TreeClock,
     pub expected: Vec<NodeExpectation>,
     pub operations: Vec<BatchOperation>,
+    #[senax(default)]
+    pub machine_relocation: Option<MachineRelocationIntent>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -372,6 +526,8 @@ pub struct BatchOpRecord {
     pub sequence: u64,
     pub timestamp_ms: u64,
     pub batch: OperationBatch,
+    #[senax(default)]
+    pub daemon_tree_operations: Vec<TreeOperation>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -543,9 +699,15 @@ impl Document {
                     return Err("delete references an unknown Desk node".into());
                 }
             }
-            TreeOperation::SetTemporal { node_id, .. } => {
+            TreeOperation::SetTemporal { node_id, value, .. } => {
                 if !self.nodes.contains_key(node_id) {
                     return Err("metadata references an unknown Desk node".into());
+                }
+                if value.is_some_and(|mark| {
+                    mark.at().is_none()
+                        || mark.minute_of_day.is_some_and(|minute| minute >= 24 * 60)
+                }) {
+                    return Err("invalid Desk temporal mark".into());
                 }
             }
             TreeOperation::SetBinding {
@@ -900,6 +1062,20 @@ fn find_cycle(parents: &BTreeMap<NodeId, Option<NodeId>>) -> Option<Vec<NodeId>>
     None
 }
 
+pub fn todo_priority(at: chrono::NaiveDateTime, pace_days: u32, now: chrono::NaiveDateTime) -> f64 {
+    temporal_priority(
+        TemporalKind::Todo,
+        TemporalMark {
+            year: at.date().year(),
+            month: at.date().month() as u8,
+            day: at.date().day() as u8,
+            minute_of_day: Some((at.time().num_seconds_from_midnight() / 60) as u16),
+            pace_days,
+        },
+        now,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1069,5 +1245,43 @@ mod tests {
         });
         let legacy = Document::from_snapshot(snapshot).unwrap();
         assert_eq!(legacy.materialize()[0].parent, None);
+    }
+
+    #[test]
+    fn org_renderer_is_read_only_human_output_without_runtime_ids() {
+        let mut doc = Document::default();
+        doc.apply(create(clock(1, 1), id(1), None, 10)).unwrap();
+        doc.apply(create(clock(2, 1), id(2), Some(id(1)), 10))
+            .unwrap();
+        for (node_id, title) in [(id(1), "Room"), (id(2), "Task")] {
+            let mut buffer = Buffer::new(
+                ReplicaId::new(1),
+                BufferId::new(node_id.counter).unwrap(),
+                "",
+            );
+            doc.apply_text(
+                node_id,
+                TextOperation::from_text(&buffer.edit([(0..0, title)])),
+                None,
+            )
+            .unwrap();
+        }
+        doc.apply(TreeOperation::SetTemporal {
+            timestamp: clock(3, 1),
+            node_id: id(2),
+            kind: TemporalKind::Todo,
+            value: Some(TemporalMark {
+                year: 2026,
+                month: 3,
+                day: 18,
+                minute_of_day: None,
+                pace_days: 7,
+            }),
+        })
+        .unwrap();
+
+        let rendered = render_org(doc.snapshot()).unwrap();
+        assert_eq!(rendered, "* Room\n** Task\n:todo: 2026-03-18 7d\n");
+        assert!(!rendered.contains("replica"));
     }
 }

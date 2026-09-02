@@ -28,7 +28,7 @@ pub const FILE_NAME: &str = "action-journal.redb";
 const LOCK_FILE_NAME: &str = "action-journal.lock";
 
 #[cfg(feature = "native")]
-const EVENTS: TableDefinition<u64, Sen<Entry>> = TableDefinition::new("gui_action_journal_v1");
+const EVENTS: TableDefinition<u64, Sen<Entry>> = TableDefinition::new("gui_action_journal_v3");
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(
@@ -41,6 +41,49 @@ pub struct Entry {
     pub event: Event,
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "native",
+    derive(senax_encoder::Encode, senax_encoder::Decode)
+)]
+pub struct NodeIdentity {
+    pub replica_id: u16,
+    pub counter: u64,
+}
+
+impl From<rho_desk::NodeId> for NodeIdentity {
+    fn from(id: rho_desk::NodeId) -> Self {
+        Self {
+            replica_id: id.replica_id,
+            counter: id.counter,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "native",
+    derive(senax_encoder::Encode, senax_encoder::Decode)
+)]
+pub struct AgentIdentity(pub String);
+
+impl From<rho_ui_proto::AgentId> for AgentIdentity {
+    fn from(id: rho_ui_proto::AgentId) -> Self {
+        Self(id.encoded())
+    }
+}
+
+impl From<&rho_ui_proto::AgentId> for AgentIdentity {
+    fn from(id: &rho_ui_proto::AgentId) -> Self {
+        Self(id.encoded())
+    }
+}
+impl From<&str> for AgentIdentity {
+    fn from(id: &str) -> Self {
+        Self(id.to_owned())
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(
     feature = "native",
@@ -48,9 +91,21 @@ pub struct Entry {
 )]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DealerCardIdentity {
-    Desk { host: String, heading_offset: usize },
-    Agent { agent_id: String },
-    Inbox { id: String },
+    DeskNode {
+        host: u32,
+        node_id: NodeIdentity,
+    },
+    AgentNode {
+        host: u32,
+        node_id: NodeIdentity,
+        agent_id: AgentIdentity,
+    },
+    Agent {
+        agent_id: AgentIdentity,
+    },
+    Inbox {
+        id: String,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -101,16 +156,37 @@ pub enum DealerVerdict {
 pub enum SurfaceIdentity {
     Draft,
     Messages,
-    DeskHeading { host: String, heading_offset: usize },
-    Inbox { id: String },
-    Transcript { agent_id: String },
-    File { agent_id: String, path: String },
-    Shell { agent_id: String },
-    Diff { agent_id: String },
-    Terminal { agent_id: String, terminal_id: u64 },
-    Browser { page_id: String },
+    DeskNode {
+        host: u32,
+        node_id: NodeIdentity,
+    },
+    Inbox {
+        id: String,
+    },
+    Transcript {
+        agent_id: AgentIdentity,
+    },
+    File {
+        agent_id: AgentIdentity,
+        path: String,
+    },
+    Shell {
+        agent_id: AgentIdentity,
+    },
+    Diff {
+        agent_id: AgentIdentity,
+    },
+    Terminal {
+        agent_id: AgentIdentity,
+        terminal_id: u64,
+    },
+    Browser {
+        page_id: String,
+    },
     ZulipInbox,
-    ZulipNarrow { label: String },
+    ZulipNarrow {
+        label: String,
+    },
     Dashboard,
 }
 
@@ -289,14 +365,9 @@ pub enum Event {
         surface: SurfaceIdentity,
         dealt_untouched: bool,
     },
-    DeskHeadingDeferred {
-        heading: String,
-        until: String,
-        card: DealerCardIdentity,
-    },
     OverviewOpened,
     AgentOpened {
-        agent_id: String,
+        agent_id: AgentIdentity,
     },
     AgentSelected {
         agent_id: Option<String>,
@@ -363,7 +434,6 @@ impl Event {
             Self::HistoryRemoved { .. } => "history_removed",
             Self::DealMode { .. } => "deal_mode",
             Self::SurfaceClosed { .. } => "surface_closed",
-            Self::DeskHeadingDeferred { .. } => "desk_heading_deferred",
             Self::OverviewOpened => "overview_opened",
             Self::AgentOpened { .. } => "agent_opened",
             Self::AgentSelected { .. } => "agent_selected",
@@ -404,6 +474,7 @@ impl Journal {
         let runtime = tokio::runtime::Builder::new_current_thread().build()?;
         runtime.block_on(async {
             let mut write = db.write().await;
+            write.delete_table("gui_action_journal_v1");
             write.open_table(EVENTS);
             write.commit();
         });
@@ -702,7 +773,7 @@ mod tests {
     fn surface_close_records_whether_a_deal_was_untouched() {
         let event = Event::SurfaceClosed {
             surface: SurfaceIdentity::Transcript {
-                agent_id: "eng-a".into(),
+                agent_id: AgentIdentity("agent-a".into()),
             },
             dealt_untouched: true,
         };
@@ -713,7 +784,7 @@ mod tests {
     #[test]
     fn history_events_round_trip_direction_position_and_methods() {
         let surface = SurfaceIdentity::Transcript {
-            agent_id: "eng-a".into(),
+            agent_id: AgentIdentity("agent-a".into()),
         };
         for event in [
             Event::HistoryStepped {
@@ -746,15 +817,9 @@ mod tests {
             skip_until: None,
             occurred_at: "2026-09-01T20:00:00+00:00".into(),
             time_to_verdict_ms: 4200,
-            considered_not_dealt: vec![
-                DealerCardIdentity::Agent {
-                    agent_id: "agent-a".into(),
-                },
-                DealerCardIdentity::Desk {
-                    host: "local".into(),
-                    heading_offset: 12,
-                },
-            ],
+            considered_not_dealt: vec![DealerCardIdentity::Agent {
+                agent_id: "agent-a".into(),
+            }],
         };
         let encoded = serde_json::to_string(&event).unwrap();
         assert_eq!(serde_json::from_str::<Event>(&encoded).unwrap(), event);

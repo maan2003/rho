@@ -1,4 +1,5 @@
 //! Dated Desk marks and their howm-style priority curves.
+#![allow(dead_code)]
 
 use chrono::{NaiveDate, NaiveDateTime, NaiveTime};
 
@@ -145,7 +146,11 @@ pub fn is_overdue_deadline(mark: &TemporalMark, now: NaiveDateTime) -> bool {
 }
 
 /// Render one visible Desk property line. Midnight is kept date-only.
-pub fn property_line(kind: TemporalMarkKind, at: NaiveDateTime, pace_days: Option<u32>) -> String {
+pub fn import_mark_line(
+    kind: TemporalMarkKind,
+    at: NaiveDateTime,
+    pace_days: Option<u32>,
+) -> String {
     let at = if at.time() == NaiveTime::MIN {
         at.format("%Y-%m-%d").to_string()
     } else {
@@ -264,7 +269,7 @@ mod tests {
         assert_eq!(parsed.pace_days, 9);
         assert!(!parsed.date_only);
         assert_eq!(
-            property_line(TemporalMarkKind::Done, at(10), None),
+            import_mark_line(TemporalMarkKind::Done, at(10), None),
             ":done: 2026-08-10\n"
         );
     }

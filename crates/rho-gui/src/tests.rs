@@ -334,175 +334,6 @@ fn feed_frames(
 }
 
 #[gpui::test]
-fn phone_desk_agent_tap_opens_the_agent_surface(cx: &mut TestAppContext) {
-    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
-    use rho_ui_proto::{
-        AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
-    };
-
-    let workspace = test_workspace(cx);
-    cx.simulate_window_resize(*workspace, size(px(500.), px(800.)));
-    cx.run_until_parked();
-
-    let root_id = agent(1);
-    let agent_id = agent(2);
-    let summary = |agent_id, parent_agent, name: &str| UiAgentSummary {
-        agent_id,
-        parent_agent,
-        display_name: Some(name.to_owned()),
-        created_at: UnixMs(1),
-        updated_at: UnixMs(1),
-        role: AgentRole::default(),
-        workspace: WorkspaceInfo::UserCheckout {
-            repo: "/tmp".into(),
-        },
-        attention: UiAttention::Quiet,
-        last_active: UnixMs(1),
-        facts: rho_ui_proto::UiAgentFacts {
-            turn_running: false,
-            last_turn_ended: Some(UnixMs(1)),
-            last_user_message_at: UnixMs(0),
-            needs_you_hint: true,
-        },
-        hidden: false,
-        disposition: AgentDisposition::Pending,
-        last_user_message_text: String::new(),
-        activity: None,
-        turn_report: None,
-        labels: Vec::new(),
-    };
-    let desk_text = format!(
-        "* Prelude\nbody shifts the filed row\n* Filed :eng-{}:\n* Tail\n",
-        root_id.encoded()
-    );
-    let filed_offset = desk_text.find("* Filed").unwrap();
-    let mut source =
-        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
-    let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text.as_str())]));
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::Ready {
-                    agents: vec![
-                        summary(root_id, None, "filed root"),
-                        summary(agent_id, Some(root_id), "filed child"),
-                    ],
-                    iris_agent: None,
-                    projects: Vec::new(),
-                    auth: AuthState {
-                        namespaces: Vec::new(),
-                        disabled_namespaces: Vec::new(),
-                        active_namespace: None,
-                    },
-                    machine_seed: 0,
-                    agent_counter: 100,
-                },
-                window,
-                cx,
-            );
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskSnapshot {
-                    snapshot: DeskSnapshot {
-                        text: source.snapshot().text(),
-                        operations: vec![operation],
-                        transactions: Vec::new(),
-                        replicas: Vec::new(),
-                    },
-                    replica_id: 42,
-                },
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
-            workspace.phone_ensure_topic_expanded_for_test(HostId::default(), 0, window, cx);
-            workspace.phone_expand_filed_agent_for_test(
-                HostId::default(),
-                filed_offset,
-                window,
-                cx,
-            );
-        })
-        .expect("file agent in Desk");
-    feed_frame(
-        &workspace,
-        cx,
-        agent_id,
-        snapshot_frame(state(vec![user("phone row")], Vec::new())),
-    );
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.phone_back_for_test(window, cx);
-        })
-        .expect("return to phone Desk");
-    cx.update_window(*workspace, |_, window, cx| {
-        window.simulate_next_frame(cx);
-    })
-    .expect("paint phone Desk");
-
-    let position = workspace
-        .update(cx, |workspace, window, cx| {
-            workspace
-                .phone_agent_position_for_test(agent_id, window, cx)
-                .expect("visible agent row")
-        })
-        .expect("locate agent row");
-    cx.update_window(*workspace, |_, window, cx| {
-        window.dispatch_event(
-            MouseDownEvent {
-                position,
-                modifiers: Modifiers::none(),
-                button: MouseButton::Left,
-                click_count: 1,
-                first_mouse: false,
-            }
-            .to_platform_input(),
-            cx,
-        );
-    })
-    .expect("dispatch pointer down");
-    workspace
-        .update(cx, |workspace, window, cx| {
-            // A filed portal is spliced at a document boundary. Reconciliation
-            // may restore the selection to that owning heading and change the
-            // display rows between press and release. Activation must decode
-            // the tapped pixels with the snapshot that painted them.
-            workspace.phone_reconcile_filed_selection_for_test(
-                HostId::default(),
-                filed_offset,
-                0,
-                window,
-                cx,
-            );
-        })
-        .expect("reconcile filed row selection");
-    cx.update_window(*workspace, |_, window, cx| {
-        window.dispatch_event(
-            MouseUpEvent {
-                position,
-                modifiers: Modifiers::none(),
-                button: MouseButton::Left,
-                click_count: 1,
-            }
-            .to_platform_input(),
-            cx,
-        );
-    })
-    .expect("dispatch pointer up");
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(
-                workspace
-                    .phone_has_surface_for_test(&crate::pane::SurfaceKey::Transcript(agent_id))
-            );
-        })
-        .expect("inspect phone stack");
-}
-
-#[gpui::test]
 fn phone_transcript_waits_for_a_tap_to_focus_the_reply_editor(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     cx.simulate_window_resize(*workspace, size(px(500.), px(800.)));
@@ -567,184 +398,6 @@ fn phone_transcript_waits_for_a_tap_to_focus_the_reply_editor(cx: &mut TestAppCo
             );
         })
         .expect("inspect tapped transcript focus");
-}
-
-#[gpui::test]
-fn phone_desk_bound_heading_tap_opens_the_agent(cx: &mut TestAppContext) {
-    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
-    use rho_ui_proto::{
-        AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
-    };
-
-    let workspace = test_workspace(cx);
-    cx.simulate_window_resize(*workspace, size(px(500.), px(800.)));
-    cx.run_until_parked();
-
-    let root_id = agent(1);
-    let desk_text = format!("* Task :eng-{}:\nbody\n", root_id.encoded());
-    let mut source =
-        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
-    let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text.as_str())]));
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::Ready {
-                    agents: vec![UiAgentSummary {
-                        agent_id: root_id,
-                        parent_agent: None,
-                        display_name: Some("bound root".to_owned()),
-                        created_at: UnixMs(1),
-                        updated_at: UnixMs(1),
-                        role: AgentRole::default(),
-                        workspace: WorkspaceInfo::UserCheckout {
-                            repo: "/tmp".into(),
-                        },
-                        attention: UiAttention::Quiet,
-                        last_active: UnixMs(1),
-                        facts: Default::default(),
-                        hidden: false,
-                        disposition: AgentDisposition::Pending,
-                        last_user_message_text: String::new(),
-                        activity: None,
-                        turn_report: None,
-                        labels: Vec::new(),
-                    }],
-                    iris_agent: None,
-                    projects: Vec::new(),
-                    auth: AuthState {
-                        namespaces: Vec::new(),
-                        disabled_namespaces: Vec::new(),
-                        active_namespace: None,
-                    },
-                    machine_seed: 0,
-                    agent_counter: 100,
-                },
-                window,
-                cx,
-            );
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskSnapshot {
-                    snapshot: DeskSnapshot {
-                        text: source.snapshot().text(),
-                        operations: vec![operation],
-                        transactions: Vec::new(),
-                        replicas: Vec::new(),
-                    },
-                    replica_id: 42,
-                },
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
-        })
-        .expect("bind agent in Desk");
-    cx.update_window(*workspace, |_, window, cx| {
-        window.simulate_next_frame(cx);
-    })
-    .expect("paint phone Desk");
-
-    workspace
-        .update(cx, |workspace, _, cx| {
-            let editor = workspace.dashboard_editor();
-            let browse = editor.update(cx, |editor, cx| editor.display_text(cx));
-            assert!(!browse.contains(":eng-"), "browse display: {browse:?}");
-            assert_eq!(
-                editor.read(cx).eol_hints().len(),
-                1,
-                "the folded chevron remains, but the agent chip is gone"
-            );
-        })
-        .expect("inspect phone browse rendering");
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.phone_toggle_dashboard_editing(window, cx);
-        })
-        .expect("open raw Desk mode");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            let editor = workspace.dashboard_editor();
-            let raw = editor.update(cx, |editor, cx| editor.display_text(cx));
-            assert!(raw.contains(":eng-"), "raw display: {raw:?}");
-            assert_eq!(editor.read(cx).eol_hints().len(), 0);
-        })
-        .expect("inspect raw Desk rendering");
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.phone_toggle_dashboard_editing(window, cx);
-        })
-        .expect("return to phone browse mode");
-    cx.run_until_parked();
-
-    let tap = |cx: &mut TestAppContext, position| {
-        cx.update_window(*workspace, |_, window, cx| {
-            window.dispatch_event(
-                MouseDownEvent {
-                    position,
-                    modifiers: Modifiers::none(),
-                    button: MouseButton::Left,
-                    click_count: 1,
-                    first_mouse: false,
-                }
-                .to_platform_input(),
-                cx,
-            );
-            window.dispatch_event(
-                MouseUpEvent {
-                    position,
-                    modifiers: Modifiers::none(),
-                    button: MouseButton::Left,
-                    click_count: 1,
-                }
-                .to_platform_input(),
-                cx,
-            );
-        })
-        .expect("dispatch tap");
-        cx.run_until_parked();
-    };
-
-    // A tap on the leading bullet folds; the agent stays closed.
-    let bullet = workspace
-        .update(cx, |workspace, window, cx| {
-            workspace
-                .phone_doc_position_for_test(HostId::default(), 0, window, cx)
-                .expect("bullet position")
-        })
-        .expect("locate bullet");
-    tap(cx, bullet);
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(
-                !workspace
-                    .phone_has_surface_for_test(&crate::pane::SurfaceKey::Transcript(root_id))
-            );
-        })
-        .expect("inspect stack after bullet tap");
-
-    // A tap on the title of a bound heading opens the agent.
-    cx.update_window(*workspace, |_, window, cx| {
-        window.simulate_next_frame(cx);
-    })
-    .expect("repaint after fold toggle");
-    let title = workspace
-        .update(cx, |workspace, window, cx| {
-            workspace
-                .phone_doc_position_for_test(HostId::default(), 4, window, cx)
-                .expect("title position")
-        })
-        .expect("locate title");
-    tap(cx, title);
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(
-                workspace.phone_has_surface_for_test(&crate::pane::SurfaceKey::Transcript(root_id))
-            );
-        })
-        .expect("inspect stack after title tap");
 }
 
 #[gpui::test]
@@ -3623,108 +3276,147 @@ fn terminal_escape_chord_parses() {
     }
 }
 
+#[test]
+fn filing_completion_keeps_duplicate_heading_identity() {
+    assert_eq!(
+        crate::minibuffer::completion_start("Project Al", true),
+        0,
+        "filing completion replaces the whole partial title"
+    );
+    let first = rho_desk::NodeId {
+        replica_id: 7,
+        counter: 1,
+    };
+    let second = rho_desk::NodeId {
+        replica_id: 7,
+        counter: 2,
+    };
+    let destinations = vec![
+        (
+            "Project Alpha".into(),
+            "Work / Project Alpha".into(),
+            HostId(3),
+            first,
+        ),
+        (
+            "Project Alpha".into(),
+            "Work / Project Alpha".into(),
+            HostId(3),
+            second,
+        ),
+    ];
+    let candidate = crate::minibuffer::Candidate {
+        value: "Project Alpha".into(),
+        description: "Work / Project Alpha".into(),
+    };
+    assert_eq!(
+        crate::workspace::resolve_filing_destination(&destinations, &candidate, 1),
+        Some((HostId(3), second))
+    );
+    assert!(!candidate.value.contains("7:2"));
+    assert!(!candidate.description.contains("7:2"));
+}
+
 #[gpui::test]
-fn overview_enter_opens_bound_agent_in_its_room(cx: &mut TestAppContext) {
-    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
-    use rho_ui_proto::{
-        AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
+fn deal_file_bare_enter_uses_the_offered_heading_completion(cx: &mut TestAppContext) {
+    use rho_desk::{
+        Document, NodeId, NodeKind, NodeOwner, OrderKey, Replica, ReplicaAuthor, TextOperation,
+        TreeClock, TreeOperation,
     };
 
+    let mut document = Document::default();
+    document.add_replica(Replica {
+        replica_id: 1,
+        author: ReplicaAuthor::Machine,
+    });
+    let destination = NodeId {
+        replica_id: 1,
+        counter: 1,
+    };
+    document
+        .apply(TreeOperation::Create {
+            timestamp: TreeClock {
+                value: 1,
+                replica_id: 1,
+            },
+            node_id: destination,
+            kind: NodeKind::Heading,
+            owner: NodeOwner::User,
+            parent: None,
+            order: OrderKey(vec![100]),
+        })
+        .unwrap();
+    let mut title = text::Buffer::new(text::ReplicaId::new(1), text::BufferId::new(1).unwrap(), "");
+    document
+        .apply_text(
+            destination,
+            TextOperation::from_text(&title.edit([(0..0, "Verdict agent")])),
+            None,
+        )
+        .unwrap();
+
+    cx.update(bind_test_keymaps);
     let workspace = test_workspace(cx);
-    let agent_id = agent(1);
-    let desk_text = format!(
-        "* Work
-** Task :eng-{}:
-",
-        agent_id.encoded()
-    );
-    let mut source =
-        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
-    let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text.as_str())]));
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(
                 HostId::default(),
-                ConnEvent::Ready {
-                    agents: vec![UiAgentSummary {
-                        agent_id,
-                        parent_agent: None,
-                        display_name: Some("daily agent".into()),
-                        created_at: UnixMs(1),
-                        updated_at: UnixMs(1),
-                        role: AgentRole::default(),
-                        workspace: WorkspaceInfo::UserCheckout {
-                            repo: "/tmp".into(),
-                        },
-                        attention: UiAttention::Quiet,
-                        last_active: UnixMs(1),
-                        facts: Default::default(),
-                        hidden: false,
-                        disposition: AgentDisposition::Pending,
-                        last_user_message_text: String::new(),
-                        activity: None,
-                        turn_report: None,
-                        labels: Vec::new(),
-                    }],
-                    iris_agent: None,
-                    projects: Vec::new(),
-                    auth: AuthState {
-                        namespaces: Vec::new(),
-                        disabled_namespaces: Vec::new(),
-                        active_namespace: None,
-                    },
-                    machine_seed: 0,
-                    agent_counter: 100,
-                },
-                window,
-                cx,
-            );
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskSnapshot {
-                    snapshot: DeskSnapshot {
-                        text: source.snapshot().text(),
-                        operations: vec![operation],
-                        transactions: Vec::new(),
-                        replicas: Vec::new(),
-                    },
+                ConnEvent::DeskTreeSnapshot {
+                    snapshot: document.snapshot(),
                     replica_id: 42,
                 },
                 window,
                 cx,
             );
-            workspace.sync_dashboard(window, cx);
-            workspace.focus_rail(window, cx);
-            let offset = desk_text.find("** Task").unwrap();
-            workspace.dashboard_editor().update(cx, |editor, cx| {
-                editor.change_selections(Default::default(), window, cx, |selections| {
-                    let offset = editor::MultiBufferOffset(offset);
-                    selections.select_ranges([offset..offset]);
-                });
+            let id = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
+                kind: crate::inbox::InboxKind::Capture,
+                text: "Inbox QA item".into(),
+                source: crate::inbox::SourceReference::None,
+                context: crate::inbox::CapturedContext::default(),
+                waiting_on: None,
             });
+            workspace.age_inbox_for_test(&id, 0);
+            workspace.open_deal_mode(window, cx);
         })
         .unwrap();
     cx.run_until_parked();
-
-    cx.update_window(*workspace, |_, window, cx| {
-        window.dispatch_action(Box::new(crate::RailOpen), cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-
     workspace
-        .update(cx, |workspace, window, cx| {
-            assert!(!workspace.is_dashboard_mode(window, cx));
-            assert!(workspace.active_agent_model().is_some());
-            assert!(
-                workspace
-                    .surface_history_for_test()
-                    .0
-                    .last()
-                    .is_some_and(|name| name.starts_with("daily agent"))
-            );
+        .update(cx, |workspace, _, _| {
+            assert!(matches!(
+                workspace.current_deal_card_for_test(),
+                Some((
+                    crate::dashboard::DealCardIdentity::Inbox(_),
+                    crate::dashboard::DealCardKind::Inbox(_)
+                ))
+            ));
+            workspace.take_host_messages_for_test(HostId::default());
         })
         .unwrap();
+
+    cx.dispatch_action(*workspace, crate::DashboardDealFile);
+    cx.run_until_parked();
+    // The completion is visibly selected but untouched, exactly as in the
+    // dealer flow: bare Enter must accept it rather than submit an empty name.
+    cx.dispatch_action(*workspace, crate::MinibufferConfirm);
+    cx.run_until_parked();
+    let messages = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.take_host_messages_for_test(HostId::default())
+        })
+        .unwrap();
+    assert!(messages.iter().any(|message| matches!(
+        message,
+        rho_ui_proto::ClientMessage::DeskTreeApply {
+            operation: TreeOperation::Create {
+                parent: Some(parent),
+                ..
+            }
+        } if *parent == destination
+    )));
+    assert!(messages.iter().any(|message| matches!(
+        message,
+        rho_ui_proto::ClientMessage::DeskNodeTextApply { .. }
+    )));
 }
 
 #[gpui::test]
@@ -4643,1697 +4335,889 @@ fn streaming_markdown_parses_the_edited_turn_without_revisiting_history(cx: &mut
     );
 }
 
-/// A `:eng-…:` tag written in the heading line itself is a binding: the
-/// agent files under that heading with no daemon anchor at all, the raw
-/// tag stays in the buffer (so line-wise copy carries it), and the
-/// display conceals it behind the pretty decoration.
 #[gpui::test]
-fn heading_tags_file_agents_and_conceal_in_display(cx: &mut TestAppContext) {
-    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
-    use rho_ui_proto::{
-        AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
+fn tree_desk_composes_one_native_buffer_per_node(cx: &mut TestAppContext) {
+    use rho_desk::{
+        Document, NodeId, NodeKind, NodeOwner, OrderKey, Replica, ReplicaAuthor, TextOperation,
+        TreeClock, TreeOperation,
     };
 
-    let summary = |id: u64, name: &str| UiAgentSummary {
-        agent_id: agent(id),
-        parent_agent: None,
-        display_name: Some(name.to_owned()),
-        created_at: UnixMs(id),
-        updated_at: UnixMs(id),
-        role: AgentRole::default(),
-        workspace: WorkspaceInfo::UserCheckout {
-            repo: "/tmp".into(),
-        },
-        attention: UiAttention::Quiet,
-        last_active: UnixMs(id),
-        facts: Default::default(),
-        hidden: false,
-        disposition: AgentDisposition::Pending,
-        last_user_message_text: String::new(),
-        activity: None,
-        turn_report: None,
-        labels: Vec::new(),
+    let mut document = Document::default();
+    document.add_replica(Replica {
+        replica_id: 1,
+        author: ReplicaAuthor::Machine,
+    });
+    let heading = NodeId {
+        replica_id: 1,
+        counter: 1,
     };
-
-    let desk_text = format!("* One :eng-{}:\nbody\n* Two\n", agent(1).encoded());
-    let mut source =
-        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
-    let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text.as_str())]));
-    let desk_snapshot = DeskSnapshot {
-        text: source.snapshot().text(),
-        operations: vec![operation],
-        transactions: Vec::new(),
-        replicas: Vec::new(),
+    let prose = NodeId {
+        replica_id: 1,
+        counter: 2,
     };
-
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::Ready {
-                    agents: vec![summary(1, "planner"), summary(2, "drifter")],
-                    iris_agent: None,
-                    projects: Vec::new(),
-                    auth: AuthState {
-                        disabled_namespaces: Vec::new(),
-                        active_namespace: None,
-                        namespaces: Vec::new(),
-                    },
-                    machine_seed: 0,
-                    agent_counter: 100,
-                },
-                window,
-                cx,
-            );
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskSnapshot {
-                    snapshot: desk_snapshot,
-                    replica_id: 42,
-                },
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
-            let focus_handle = workspace.dashboard_editor().read(cx).focus_handle(cx);
-            window.focus(&focus_handle, cx);
-            workspace.dashboard_editor().update(cx, |editor, cx| {
-                editor.change_selections(Default::default(), window, cx, |selections| {
-                    let offset = editor::MultiBufferOffset(2);
-                    selections.select_ranges([offset..offset]);
-                });
-            });
-        })
-        .expect("update workspace");
-    cx.run_until_parked();
-
-    let buffer_text = workspace
-        .update(cx, |workspace, _, cx| {
-            let editor = workspace.dashboard_editor();
-            editor.read(cx).buffer().read(cx).snapshot(cx).text()
-        })
-        .expect("read dashboard");
-    assert_eq!(
-        buffer_text,
-        format!("* One :eng-{}:\nbody\n* Two\n", agent(1).encoded()),
-        "tagged agent should file under its heading, tag intact in the buffer"
-    );
-
-    let display = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .dashboard_editor()
-                .update(cx, |editor, cx| editor.display_text(cx))
-        })
-        .expect("read display text");
-    assert!(
-        !display.contains(":eng-"),
-        "raw tag should be concealed: {display:?}"
-    );
-    assert!(
-        display.contains("◉ One"),
-        "the bullet and title stay visible: {display:?}"
-    );
-    // The chip is an end-of-line hint: painted after the line, outside
-    // text flow, so it never appears in display text.
-    let hints = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace.dashboard_editor().read(cx).eol_hints().len()
-        })
-        .expect("read hints");
-    assert_eq!(
-        hints, 1,
-        "the folded chevron remains without an agent-id chip"
-    );
-
-    cx.simulate_keystrokes(*workspace, "escape space e");
-    cx.run_until_parked();
-    let raw_buffer = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .dashboard_editor()
-                .read(cx)
-                .buffer()
-                .read(cx)
-                .snapshot(cx)
-                .text()
-        })
-        .expect("read raw dashboard");
-    assert_eq!(raw_buffer, desk_text, "raw mode contains only Desk source");
-    let raw_display = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .dashboard_editor()
-                .update(cx, |editor, cx| editor.display_text(cx))
-        })
-        .expect("read raw display");
-    assert!(
-        raw_display.contains("* One :eng-"),
-        "raw display: {raw_display:?}"
-    );
-    let hints = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace.dashboard_editor().read(cx).eol_hints().len()
-        })
-        .expect("read raw hints");
-    assert_eq!(hints, 0, "raw mode has no generated hints");
-
-    cx.simulate_keystrokes(*workspace, "i x escape");
-    cx.run_until_parked();
-    let edited_source = workspace
-        .update(cx, |workspace, _, cx| {
-            let buffer = workspace.desk_buffer_for_test(HostId::default()).unwrap();
-            buffer.read(cx).text()
-        })
-        .expect("read edited Desk source");
-    assert!(
-        edited_source.starts_with("* xOne :eng-"),
-        "raw Desk should be directly editable: {edited_source:?}"
-    );
-
-    cx.simulate_keystrokes(*workspace, "space e");
-    cx.run_until_parked();
-    let composed_display = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .dashboard_editor()
-                .update(cx, |editor, cx| editor.display_text(cx))
-        })
-        .expect("read restored composed display");
-    assert!(composed_display.contains("xOne"));
-    assert!(!composed_display.contains(":eng-"));
-}
-
-/// The preview pane follows the cursor: a staffed heading (or its body)
-/// shows its agent, and moving onto an unstaffed heading hides the
-/// preview instead of retaining the last agent.
-#[gpui::test]
-fn preview_clears_when_the_cursor_leaves_a_staffed_heading(cx: &mut TestAppContext) {
-    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
-    use rho_ui_proto::{
-        AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
+    let agent_row = NodeId {
+        replica_id: 1,
+        counter: 3,
     };
-
-    let summary = |id: u64, name: &str| UiAgentSummary {
-        agent_id: agent(id),
-        parent_agent: None,
-        display_name: Some(name.to_owned()),
-        created_at: UnixMs(id),
-        updated_at: UnixMs(id),
-        role: AgentRole::default(),
-        workspace: WorkspaceInfo::UserCheckout {
-            repo: "/tmp".into(),
-        },
-        attention: UiAttention::Quiet,
-        last_active: UnixMs(id),
-        facts: Default::default(),
-        hidden: false,
-        disposition: AgentDisposition::Pending,
-        last_user_message_text: String::new(),
-        activity: None,
-        turn_report: None,
-        labels: Vec::new(),
-    };
-
-    let desk_text = format!("* One :eng-{}:\nbody\n* Two\n", agent(1).encoded());
-    let mut source =
-        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
-    let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text.as_str())]));
-    let desk_snapshot = DeskSnapshot {
-        text: source.snapshot().text(),
-        operations: vec![operation],
-        transactions: Vec::new(),
-        replicas: Vec::new(),
-    };
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::Ready {
-                    agents: vec![summary(1, "planner")],
-                    iris_agent: None,
-                    projects: Vec::new(),
-                    auth: AuthState {
-                        namespaces: Vec::new(),
-                        disabled_namespaces: Vec::new(),
-                        active_namespace: None,
-                    },
-                    machine_seed: 0,
-                    agent_counter: 100,
-                },
-                window,
-                cx,
-            );
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskSnapshot {
-                    snapshot: desk_snapshot,
-                    replica_id: 42,
-                },
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
-            let focus_handle = workspace.dashboard_editor().read(cx).focus_handle(cx);
-            window.focus(&focus_handle, cx);
-        })
-        .expect("update workspace");
-    cx.update(|cx| cx.refresh_windows());
-    cx.run_until_parked();
-
-    let select =
-        |workspace: &gpui::WindowHandle<Workspace>, cx: &mut TestAppContext, offset: usize| {
-            workspace
-                .update(cx, |workspace, window, cx| {
-                    let source = workspace.desk_buffer_for_test(HostId::default()).unwrap();
-                    let source_anchor = source.read(cx).anchor_after(offset);
-                    workspace.dashboard_editor().update(cx, |editor, cx| {
-                        let anchor = editor
-                            .buffer()
-                            .read(cx)
-                            .snapshot(cx)
-                            .anchor_in_excerpt(source_anchor)
-                            .expect("Desk offset is visible");
-                        editor.change_selections(Default::default(), window, cx, |selections| {
-                            selections.select_anchor_ranges([anchor..anchor]);
-                        });
-                    });
-                })
-                .expect("move dashboard cursor");
-            cx.run_until_parked();
-        };
-    let preview = |workspace: &gpui::WindowHandle<Workspace>, cx: &mut TestAppContext| {
-        workspace
-            .update(cx, |workspace, _, _| workspace.dashboard_preview_agent())
-            .expect("read preview")
-    };
-
-    // Inside the staffed heading's body.
-    select(&workspace, cx, desk_text.find("body").expect("body") + 2);
-    assert_eq!(
-        preview(&workspace, cx),
-        Some(agent(1)),
-        "staffed heading's body should preview its agent"
-    );
-
-    // On the unstaffed heading below.
-    select(&workspace, cx, desk_text.find("* Two").expect("Two") + 2);
-    assert_eq!(
-        preview(&workspace, cx),
-        None,
-        "unstaffed heading should hide the preview"
-    );
-}
-
-/// TAB on a staffed heading cycles its fold like any other: the tag
-/// conceal (an adjacent zero-width fold ending exactly where the
-/// subtree fold starts) must not eat the cycle.
-#[gpui::test]
-fn tab_cycles_folds_on_a_staffed_heading(cx: &mut TestAppContext) {
-    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
-    use rho_ui_proto::{
-        AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
-    };
-
-    let summary = UiAgentSummary {
-        agent_id: agent(1),
-        parent_agent: None,
-        display_name: Some("planner".to_owned()),
-        created_at: UnixMs(1),
-        updated_at: UnixMs(1),
-        role: AgentRole::default(),
-        workspace: WorkspaceInfo::UserCheckout {
-            repo: "/tmp".into(),
-        },
-        attention: UiAttention::Quiet,
-        last_active: UnixMs(1),
-        facts: Default::default(),
-        hidden: false,
-        disposition: AgentDisposition::Pending,
-        last_user_message_text: String::new(),
-        activity: None,
-        turn_report: None,
-        labels: Vec::new(),
-    };
-
-    let desk_text = format!(
-        "* One :eng-{}:\nbody\n** Kid\nkid stuff\n* Two\n",
-        agent(1).encoded()
-    );
-    let mut source =
-        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
-    let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text.as_str())]));
-    let desk_snapshot = DeskSnapshot {
-        text: source.snapshot().text(),
-        operations: vec![operation],
-        transactions: Vec::new(),
-        replicas: Vec::new(),
-    };
-
-    let workspace = test_workspace(cx);
-    cx.update(bind_test_keymaps);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::Ready {
-                    agents: vec![summary],
-                    iris_agent: None,
-                    projects: Vec::new(),
-                    auth: AuthState {
-                        namespaces: Vec::new(),
-                        disabled_namespaces: Vec::new(),
-                        active_namespace: None,
-                    },
-                    machine_seed: 0,
-                    agent_counter: 100,
-                },
-                window,
-                cx,
-            );
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskSnapshot {
-                    snapshot: desk_snapshot,
-                    replica_id: 42,
-                },
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
-            workspace.dashboard_cycle_fold_for_test(HostId::default(), 0, window, cx);
-            let focus_handle = workspace.dashboard_editor().read(cx).focus_handle(cx);
-            window.focus(&focus_handle, cx);
-            workspace.dashboard_editor().update(cx, |editor, cx| {
-                editor.change_selections(Default::default(), window, cx, |selections| {
-                    let offset = editor::MultiBufferOffset(2);
-                    selections.select_ranges([offset..offset]);
-                });
-            });
-        })
-        .expect("update workspace");
-    cx.update(|cx| cx.refresh_windows());
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "escape");
-    cx.run_until_parked();
-
-    let display = |cx: &mut TestAppContext| {
-        workspace
-            .update(cx, |workspace, _, cx| {
-                workspace
-                    .dashboard_editor()
-                    .update(cx, |editor, cx| editor.display_text(cx))
-            })
-            .expect("read display text")
-    };
-
-    cx.simulate_keystrokes(*workspace, "tab");
-    cx.run_until_parked();
-    let folded = display(cx);
-    assert!(!folded.contains("body"), "folded: {folded:?}");
-    assert!(!folded.contains("Kid"), "folded: {folded:?}");
-    assert!(folded.contains('…'), "folded: {folded:?}");
-
-    cx.simulate_keystrokes(*workspace, "tab");
-    cx.run_until_parked();
-    let children = display(cx);
-    assert!(!children.contains("body"), "children: {children:?}");
-    assert!(children.contains("Kid"), "children: {children:?}");
-    assert!(!children.contains("kid stuff"), "children: {children:?}");
-
-    cx.simulate_keystrokes(*workspace, "tab");
-    cx.run_until_parked();
-    let expanded = display(cx);
-    assert!(expanded.contains("kid stuff"), "expanded: {expanded:?}");
-
-    // The footer advertises `Tab fold`, not `Tab fold only while the
-    // caret is on the title`. A body position still belongs to this
-    // heading and must cycle the same subtree.
-    let body_offset = desk_text.find("body").expect("body offset") + 1;
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.dashboard_editor().update(cx, |editor, cx| {
-                editor.change_selections(Default::default(), window, cx, |selections| {
-                    let offset = editor::MultiBufferOffset(body_offset);
-                    selections.select_ranges([offset..offset]);
-                });
-            });
-        })
-        .expect("move caret into heading body");
-    cx.simulate_keystrokes(*workspace, "tab");
-    cx.run_until_parked();
-    let folded_from_body = display(cx);
-    assert!(
-        !folded_from_body.contains("body"),
-        "folded: {folded_from_body:?}"
-    );
-    assert!(
-        !folded_from_body.contains("Kid"),
-        "folded: {folded_from_body:?}"
-    );
-
-    // Restore the expanded state for the append assertion below.
-    cx.simulate_keystrokes(*workspace, "tab tab");
-    cx.run_until_parked();
-
-    // `A` on the heading: the position past the concealed tag is not
-    // restable, so append lands at the visible title end and the typed
-    // text stays ahead of the binding.
-    cx.simulate_keystrokes(*workspace, "escape shift-a");
-    cx.simulate_keystrokes(*workspace, "space m o r e");
-    cx.run_until_parked();
-    let text = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .dashboard_editor()
-                .read(cx)
-                .buffer()
-                .read(cx)
-                .snapshot(cx)
-                .text()
-        })
-        .expect("read dashboard");
-    assert!(
-        text.starts_with("* One more :eng-"),
-        "append must stay ahead of the tag: {text:?}"
-    );
-}
-
-/// Org's S-TAB: OVERVIEW folds every top-level subtree, CONTENTS shows
-/// every heading line and nothing else, SHOW ALL opens the document.
-#[gpui::test]
-fn shift_tab_cycles_overview_contents_show_all(cx: &mut TestAppContext) {
-    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
-
-    let desk_text = "* One\nbody\n** Kid\nkid stuff\n* Two\ntwo body\n";
-    let mut source =
-        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
-    let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text)]));
-    let workspace = test_workspace(cx);
-    cx.update(bind_test_keymaps);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskSnapshot {
-                    snapshot: DeskSnapshot {
-                        text: source.snapshot().text(),
-                        operations: vec![operation],
-                        transactions: Vec::new(),
-                        replicas: Vec::new(),
-                    },
-                    replica_id: 42,
-                },
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
-            let focus_handle = workspace.dashboard_editor().read(cx).focus_handle(cx);
-            window.focus(&focus_handle, cx);
-            workspace.dashboard_editor().update(cx, |editor, cx| {
-                editor.change_selections(Default::default(), window, cx, |selections| {
-                    let offset = editor::MultiBufferOffset(2);
-                    selections.select_ranges([offset..offset]);
-                });
-            });
-        })
-        .expect("set up dashboard");
-    cx.update(|cx| cx.refresh_windows());
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "escape");
-    cx.run_until_parked();
-
-    let display = |cx: &mut TestAppContext| {
-        workspace
-            .update(cx, |workspace, _, cx| {
-                workspace
-                    .dashboard_editor()
-                    .update(cx, |editor, cx| editor.display_text(cx))
-            })
-            .expect("read display text")
-    };
-
-    cx.simulate_keystrokes(*workspace, "shift-tab");
-    cx.run_until_parked();
-    let overview = display(cx);
-    assert!(!overview.contains("body"), "overview: {overview:?}");
-    assert!(!overview.contains("Kid"), "overview: {overview:?}");
-    assert!(overview.contains("One"), "overview: {overview:?}");
-    assert!(overview.contains("Two"), "overview: {overview:?}");
-
-    cx.simulate_keystrokes(*workspace, "shift-tab");
-    cx.run_until_parked();
-    let contents = display(cx);
-    assert!(contents.contains("One"), "contents: {contents:?}");
-    assert!(contents.contains("Kid"), "contents: {contents:?}");
-    assert!(contents.contains("Two"), "contents: {contents:?}");
-    assert!(!contents.contains("body"), "contents: {contents:?}");
-    assert!(!contents.contains("kid stuff"), "contents: {contents:?}");
-
-    cx.simulate_keystrokes(*workspace, "shift-tab");
-    cx.run_until_parked();
-    let all = display(cx);
-    assert!(all.contains("body"), "show all: {all:?}");
-    assert!(all.contains("kid stuff"), "show all: {all:?}");
-    assert!(all.contains("two body"), "show all: {all:?}");
-}
-
-/// Collapse is a display fold over the subtree: TAB cycles folded →
-/// children → expanded, the buffer keeps the text throughout, and the
-/// fold is anchored — edits above it must not pop it open.
-#[gpui::test]
-fn collapsed_subtree_folds_in_the_display_and_survives_edits(cx: &mut TestAppContext) {
-    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
-
-    let desk_text = "* One\nbody\n** Kid\nkid stuff\n* Two\n";
-    let mut source =
-        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
-    let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text)]));
-    let desk_snapshot = DeskSnapshot {
-        text: source.snapshot().text(),
-        operations: vec![operation],
-        transactions: Vec::new(),
-        replicas: Vec::new(),
-    };
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskSnapshot {
-                    snapshot: desk_snapshot,
-                    replica_id: 42,
-                },
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
-            // Startup visibility is CHILDREN for this tree; open it so this
-            // test can exercise the complete expanded → folded cycle.
-            workspace.dashboard_cycle_fold_for_test(HostId::default(), 0, window, cx);
-        })
-        .expect("update workspace");
-    cx.run_until_parked();
-
-    let display = |cx: &mut TestAppContext| {
-        workspace
-            .update(cx, |workspace, _, cx| {
-                workspace
-                    .dashboard_editor()
-                    .update(cx, |editor, cx| editor.display_text(cx))
-            })
-            .expect("read display text")
-    };
-    let cycle = |cx: &mut TestAppContext| {
-        workspace
-            .update(cx, |workspace, window, cx| {
-                workspace.dashboard_cycle_fold_for_test(HostId::default(), 0, window, cx);
-            })
-            .expect("cycle fold");
-        cx.run_until_parked();
-    };
-
-    // Expanded → folded: the whole subtree hides behind the heading.
-    cycle(cx);
-    let folded = display(cx);
-    assert!(!folded.contains("body"), "folded: {folded:?}");
-    assert!(!folded.contains("Kid"), "folded: {folded:?}");
-    assert!(folded.contains("One"), "folded: {folded:?}");
-    assert!(folded.contains("Two"), "folded: {folded:?}");
-    assert!(folded.contains('…'), "folded: {folded:?}");
-    // The star prefix conceals behind an org-modern bullet on folded
-    // and expanded headings alike; the chevron placeholder carries the
-    // fold state.
-    assert!(folded.contains("◉ One"), "folded: {folded:?}");
-    assert!(folded.contains("◉ Two"), "folded: {folded:?}");
-
-    // Folded → children, org's CHILDREN state: only the child heading
-    // line joins the parent — the body and the child's subtree stay
-    // hidden.
-    cycle(cx);
-    let children = display(cx);
-    assert!(!children.contains("body"), "children: {children:?}");
-    assert!(children.contains("Kid"), "children: {children:?}");
-    assert!(!children.contains("kid stuff"), "children: {children:?}");
-
-    // The fold is anchored: an edit above it shifts every offset and
-    // the child must stay folded.
-    workspace
-        .update(cx, |workspace, window, cx| {
-            let buffer = workspace
-                .desk_buffer_for_test(HostId::default())
-                .expect("desk buffer");
-            buffer.update(cx, |buffer, cx| {
-                buffer.edit([(0..0, "* Zero\nzero body\n")], None, cx);
-            });
-            workspace.sync_dashboard(window, cx);
-        })
-        .expect("edit above fold");
-    cx.run_until_parked();
-    let shifted = display(cx);
-    assert!(shifted.contains("zero body"), "shifted: {shifted:?}");
-    assert!(shifted.contains("Kid"), "shifted: {shifted:?}");
-    assert!(
-        !shifted.contains("kid stuff"),
-        "edit above the fold must not pop it open: {shifted:?}"
-    );
-
-    // Children → fully expanded, from the shifted offset.
-    let offset = "* Zero\nzero body\n".len();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.dashboard_cycle_fold_for_test(HostId::default(), offset, window, cx);
-        })
-        .expect("cycle fold");
-    cx.run_until_parked();
-    let expanded = display(cx);
-    assert!(expanded.contains("kid stuff"), "expanded: {expanded:?}");
-}
-
-#[gpui::test]
-fn desk_seeds_two_level_and_archive_folds_only_once(cx: &mut TestAppContext) {
-    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
-
-    let desk_text = "* Active\nintro\n** Project\nproject body\n*** Detail\ndetail body\n* Archive :archive:\narchived body\n** Old\nold body\n";
-    let archive_offset = desk_text.find("* Archive").unwrap();
-    let mut source =
-        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
-    let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text)]));
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskSnapshot {
-                    snapshot: DeskSnapshot {
-                        text: source.snapshot().text(),
-                        operations: vec![operation],
-                        transactions: Vec::new(),
-                        replicas: Vec::new(),
-                    },
-                    replica_id: 42,
-                },
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
-        })
-        .expect("seed initial Desk folds");
-    cx.run_until_parked();
-
-    let display = |cx: &mut TestAppContext| {
-        workspace
-            .update(cx, |workspace, _, cx| {
-                workspace
-                    .dashboard_editor()
-                    .update(cx, |editor, cx| editor.display_text(cx))
-            })
-            .expect("read Desk display")
-    };
-    let initial = display(cx);
-    assert!(initial.contains("Active"), "initial: {initial:?}");
-    assert!(initial.contains("Project"), "initial: {initial:?}");
-    assert!(initial.contains("Archive"), "initial: {initial:?}");
-    assert!(!initial.contains("intro"), "initial: {initial:?}");
-    assert!(!initial.contains("project body"), "initial: {initial:?}");
-    assert!(!initial.contains("Detail"), "initial: {initial:?}");
-    assert!(
-        !initial.contains("Old"),
-        "archive must start folded: {initial:?}"
-    );
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            // FOLDED → CHILDREN → fully open.
-            workspace.dashboard_cycle_fold_for_test(HostId::default(), archive_offset, window, cx);
-            workspace.dashboard_cycle_fold_for_test(HostId::default(), archive_offset, window, cx);
-        })
-        .expect("open archive zone");
-    cx.run_until_parked();
-    assert!(display(cx).contains("old body"), "archive should be open");
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            let buffer = workspace
-                .desk_buffer_for_test(HostId::default())
-                .expect("Desk buffer");
-            let end = buffer.read(cx).len();
-            buffer.update(cx, |buffer, cx| {
-                buffer.edit([(end..end, "* Later\n")], None, cx);
-            });
-            workspace.sync_dashboard(window, cx);
-        })
-        .expect("sync a later Desk edit");
-    cx.run_until_parked();
-    let resynced = display(cx);
-    assert!(
-        resynced.contains("old body"),
-        "a later sync must not re-fold an archive the user opened: {resynced:?}"
-    );
-}
-
-#[gpui::test]
-fn vim_treats_a_collapsed_subtree_as_one_line(cx: &mut TestAppContext) {
-    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
-
-    let desk_text = "* One\nbody\n* Two\n";
-    let mut source =
-        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
-    let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text)]));
-    let workspace = test_workspace(cx);
-    cx.update(bind_test_keymaps);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskSnapshot {
-                    snapshot: DeskSnapshot {
-                        text: source.snapshot().text(),
-                        operations: vec![operation],
-                        transactions: Vec::new(),
-                        replicas: Vec::new(),
-                    },
-                    replica_id: 42,
-                },
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
-            // Startup folds the level-one body. Open it before testing the
-            // editor behavior of an explicitly collapsed subtree.
-            workspace.dashboard_cycle_fold_for_test(HostId::default(), 0, window, cx);
-            workspace.dashboard_cycle_fold_for_test(HostId::default(), 0, window, cx);
-
-            let editor = workspace.dashboard_editor();
-            window.focus(&editor.read(cx).focus_handle(cx), cx);
-            editor.update(cx, |editor, cx| {
-                editor.change_selections(Default::default(), window, cx, |selections| {
-                    let offset = editor::MultiBufferOffset(0);
-                    selections.select_ranges([offset..offset]);
-                });
-            });
-        })
-        .expect("set up folded dashboard");
-    cx.update(|cx| cx.refresh_windows());
-    cx.run_until_parked();
-
-    cx.simulate_keystrokes(*workspace, "escape o x escape");
-    cx.run_until_parked();
-    let text = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .dashboard_editor()
-                .read(cx)
-                .buffer()
-                .read(cx)
-                .snapshot(cx)
-                .text()
-        })
-        .expect("read dashboard");
-    assert!(
-        text.starts_with("* One\nbody\nx\n* Two\n"),
-        "o should insert after the collapsed subtree: {text:?}"
-    );
-    // The reparsed subtree claims the new line, but a fold never
-    // captures the cursor: with the cursor still on it, the typed line
-    // stays visible below the fold.
-    let display = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .dashboard_editor()
-                .update(cx, |editor, cx| editor.display_text(cx))
-        })
-        .expect("read display text");
-    assert!(
-        display.contains("\nx"),
-        "the line under the cursor must stay visible: {display:?}"
-    );
-    assert!(
-        !display.contains("body"),
-        "the rest of the subtree stays folded: {display:?}"
-    );
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.dashboard_editor().update(cx, |editor, cx| {
-                editor.change_selections(Default::default(), window, cx, |selections| {
-                    let offset = editor::MultiBufferOffset(0);
-                    selections.select_ranges([offset..offset]);
-                });
-            });
-            workspace.sync_dashboard(window, cx);
-        })
-        .expect("move cursor to folded heading");
-    cx.run_until_parked();
-    // The fold is persistent org-style state, rear-nonsticky at its
-    // end: the typed line stays outside it and visible even after the
-    // cursor leaves, until the heading is cycled again.
-    let display = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .dashboard_editor()
-                .update(cx, |editor, cx| editor.display_text(cx))
-        })
-        .expect("read display text");
-    assert!(
-        display.contains("\nx"),
-        "the typed line stays visible off-cursor: {display:?}"
-    );
-    assert!(
-        !display.contains("body"),
-        "the original subtree stays folded: {display:?}"
-    );
-    cx.simulate_keystrokes(*workspace, "escape x d");
-    cx.run_until_parked();
-    let text = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .dashboard_editor()
-                .read(cx)
-                .buffer()
-                .read(cx)
-                .snapshot(cx)
-                .text()
-        })
-        .expect("read dashboard");
-    // The typed line sits outside the fold, so the fold-merged line is
-    // heading plus original body — deletion takes exactly that.
-    assert!(
-        text.starts_with("x\n* Two\n"),
-        "helix line deletion should remove the folded subtree only: {text:?}"
-    );
-}
-
-/// The home view: bound agents stay in compact heading hints until `g t`
-/// projects their runtime tree; unbound roots do not appear on the Desk.
-#[gpui::test]
-fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
-    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
-    use rho_ui_proto::{
-        AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
-    };
-
-    let summary = |id: u64, name: &str| UiAgentSummary {
-        agent_id: agent(id),
-        parent_agent: None,
-        display_name: Some(name.to_owned()),
-        created_at: UnixMs(id),
-        updated_at: UnixMs(id),
-        role: AgentRole::default(),
-        workspace: WorkspaceInfo::UserCheckout {
-            repo: "/tmp".into(),
-        },
-        attention: UiAttention::Quiet,
-        last_active: UnixMs(id),
-        facts: Default::default(),
-        hidden: false,
-        disposition: AgentDisposition::Pending,
-        last_user_message_text: String::new(),
-        activity: None,
-        turn_report: None,
-        labels: Vec::new(),
-    };
-
-    let mut source =
-        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
-    let desk_text = format!("* One :eng-{}:\nbody\n* Two\n", agent(1).encoded());
-    let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text.as_str())]));
-    let desk_snapshot = DeskSnapshot {
-        text: source.snapshot().text(),
-        operations: vec![operation],
-        transactions: Vec::new(),
-        replicas: Vec::new(),
-    };
-
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::Ready {
-                    agents: vec![summary(1, "planner"), summary(2, "drifter")],
-                    iris_agent: None,
-                    projects: Vec::new(),
-                    auth: AuthState {
-                        disabled_namespaces: Vec::new(),
-                        active_namespace: None,
-                        namespaces: Vec::new(),
-                    },
-                    machine_seed: 0,
-                    agent_counter: 100,
-                },
-                window,
-                cx,
-            );
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskSnapshot {
-                    snapshot: desk_snapshot,
-                    replica_id: 42,
-                },
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
-            workspace.dashboard_cycle_fold_for_test(HostId::default(), 0, window, cx);
-            let focus_handle = workspace.dashboard_editor().read(cx).focus_handle(cx);
-            window.focus(&focus_handle, cx);
-            workspace.dashboard_editor().update(cx, |editor, cx| {
-                editor.change_selections(Default::default(), window, cx, |selections| {
-                    let offset = editor::MultiBufferOffset(2);
-                    selections.select_ranges([offset..offset]);
-                });
-            });
-        })
-        .expect("update workspace");
-    cx.run_until_parked();
-
-    let dashboard_text = |workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext| {
-        workspace
-            .update(cx, |workspace, _, cx| {
-                let editor = workspace.dashboard_editor();
-                editor.read(cx).buffer().read(cx).snapshot(cx).text()
-            })
-            .expect("read dashboard")
-    };
-    // The tagged agent starts as only a compact heading hint.
-    assert_eq!(
-        dashboard_text(&workspace, cx),
-        format!("* One :eng-{}:\nbody\n* Two\n", agent(1).encoded())
-    );
-    let hints = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace.dashboard_editor().read(cx).eol_hints().len()
-        })
-        .expect("read hints");
-    assert_eq!(hints, 0, "agent ids never render as heading inlays");
-
-    cx.simulate_keystrokes(*workspace, "escape g t");
-    cx.run_until_parked();
-    assert_eq!(
-        dashboard_text(&workspace, cx),
-        format!(
-            "* One :eng-{}:\n  · planner  eng-{}\nbody\n* Two\n",
-            agent(1).encoded(),
-            &agent(1).encoded()[..4],
+    for (clock, id, kind, owner, parent) in [
+        (1, heading, NodeKind::Heading, NodeOwner::User, None),
+        (2, prose, NodeKind::Prose, NodeOwner::User, Some(heading)),
+        (
+            3,
+            agent_row,
+            NodeKind::Agent,
+            NodeOwner::Machine,
+            Some(heading),
         ),
-        "g t should explicitly project the runtime tree"
-    );
-    let hints = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace.dashboard_editor().read(cx).eol_hints().len()
-        })
-        .expect("read expanded hints");
-    assert_eq!(hints, 0, "the open portal replaces its compact hint");
-
-    cx.simulate_keystrokes(*workspace, "g t");
-    cx.run_until_parked();
-    assert_eq!(
-        dashboard_text(&workspace, cx),
-        format!("* One :eng-{}:\nbody\n* Two\n", agent(1).encoded()),
-        "a second g t should return to the compact hint-only view"
-    );
-    let hints = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace.dashboard_editor().read(cx).eol_hints().len()
-        })
-        .expect("read collapsed hints");
-    assert_eq!(hints, 0, "closing the portal does not restore an id inlay");
-
-    // Deleting the tag from the text is the unbind: neither agent remains
-    // visible on the Desk.
-    workspace
-        .update(cx, |workspace, window, cx| {
-            let buffer = workspace.desk_buffer_for_test(HostId::default()).unwrap();
-            buffer.update(cx, |buffer, cx| {
-                let tag_start = "* One".len();
-                let tag_end = desk_text.find('\n').unwrap();
-                buffer.edit([(tag_start..tag_end, "")], None, cx);
-            });
-            workspace.sync_dashboard(window, cx);
-        })
-        .expect("update workspace");
-    cx.run_until_parked();
-    assert_eq!(dashboard_text(&workspace, cx), "* One\nbody\n* Two\n");
-}
-
-/// Insert-mode enter in desk document text is a newline — the submit
-/// binding only means "send" inside draft rows.
-#[gpui::test]
-fn insert_mode_enter_stays_a_newline_in_desk_text(cx: &mut TestAppContext) {
-    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
-
-    let mut source =
-        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
-    let operation = DeskOperation::from_text(&source.edit([(0..0, "* One\nbody\n* Two\n")]));
-    let desk_snapshot = DeskSnapshot {
-        text: source.snapshot().text(),
-        operations: vec![operation],
-        transactions: Vec::new(),
-        replicas: Vec::new(),
-    };
-
-    let workspace = test_workspace(cx);
-    cx.update(bind_test_keymaps);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::Ready {
-                    agents: Vec::new(),
-                    iris_agent: None,
-                    projects: Vec::new(),
-                    auth: rho_ui_proto::AuthState {
-                        disabled_namespaces: Vec::new(),
-                        active_namespace: None,
-                        namespaces: Vec::new(),
-                    },
-                    machine_seed: 0,
-                    agent_counter: 100,
+    ] {
+        document
+            .apply(TreeOperation::Create {
+                timestamp: TreeClock {
+                    value: clock,
+                    replica_id: 1,
                 },
-                window,
-                cx,
-            );
+                node_id: id,
+                kind,
+                owner,
+                parent,
+                order: OrderKey(vec![100]),
+            })
+            .unwrap();
+    }
+    for (clock, id, kind) in [
+        (4, heading, rho_desk::TemporalKind::Todo),
+        (5, prose, rho_desk::TemporalKind::Deadline),
+    ] {
+        document
+            .apply(TreeOperation::SetTemporal {
+                timestamp: TreeClock {
+                    value: clock,
+                    replica_id: 1,
+                },
+                node_id: id,
+                kind,
+                value: Some(rho_desk::TemporalMark {
+                    year: 2026,
+                    month: 3,
+                    day: 1,
+                    minute_of_day: None,
+                    pace_days: 1,
+                }),
+            })
+            .unwrap();
+    }
+    for (id, value) in [(heading, "Parent"), (prose, "body\n"), (agent_row, "agent")] {
+        let mut buffer = text::Buffer::new(
+            text::ReplicaId::new(1),
+            text::BufferId::new(id.counter).unwrap(),
+            "",
+        );
+        document
+            .apply_text(
+                id,
+                TextOperation::from_text(&buffer.edit([(0..0, value)])),
+                None,
+            )
+            .unwrap();
+    }
+
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
             workspace.handle_event(
                 HostId::default(),
-                ConnEvent::DeskSnapshot {
-                    snapshot: desk_snapshot,
+                ConnEvent::DeskTreeSnapshot {
+                    snapshot: document.snapshot(),
                     replica_id: 42,
                 },
                 window,
                 cx,
             );
-            workspace.sync_dashboard(window, cx);
         })
-        .expect("update workspace");
+        .unwrap();
     cx.run_until_parked();
-
+    let text = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .dashboard_editor()
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .text()
+        })
+        .unwrap();
+    assert_eq!(text, "Parent\nbody\n\nagent");
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(workspace.dashboard_editor().read(cx).eol_hints().len(), 2);
+        })
+        .unwrap();
     workspace
         .update(cx, |workspace, window, cx| {
             let editor = workspace.dashboard_editor();
-            let focus_handle = editor.read(cx).focus_handle(cx);
-            window.focus(&focus_handle, cx);
             editor.update(cx, |editor, cx| {
                 editor.change_selections(Default::default(), window, cx, |selections| {
-                    // End of "body" in "* One\nbody\n".
-                    let offset = editor::MultiBufferOffset(10);
+                    let offset = editor::MultiBufferOffset(3);
                     selections.select_ranges([offset..offset]);
                 });
             });
-        })
-        .expect("focus dashboard");
-    cx.update(|cx| cx.refresh_windows());
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "escape");
-    cx.simulate_keystrokes(*workspace, "i");
-    cx.simulate_keystrokes(*workspace, "enter");
-    cx.simulate_keystrokes(*workspace, "x");
-    cx.run_until_parked();
-
-    let text = workspace
-        .update(cx, |workspace, _, cx| {
-            let editor = workspace.dashboard_editor();
-            editor.read(cx).buffer().read(cx).snapshot(cx).text()
-        })
-        .expect("read dashboard");
-    assert!(
-        text.contains("body\nx\n"),
-        "enter should insert a newline before typed text: {text:?}"
-    );
-}
-
-/// Verdict verbs record their date as ordinary Desk properties. Composed
-/// mode conceals those source lines; raw mode exposes them unchanged.
-#[gpui::test]
-fn desk_verdict_keys_write_dated_properties(cx: &mut TestAppContext) {
-    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
-
-    let mut source =
-        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
-    let operation = DeskOperation::from_text(&source.edit([(0..0, "* One TODO\n* Two DONE\n")]));
-    let snapshot = DeskSnapshot {
-        text: source.snapshot().text(),
-        operations: vec![operation],
-        transactions: Vec::new(),
-        replicas: Vec::new(),
-    };
-    let workspace = test_workspace(cx);
-    cx.update(|cx| {
-        bind_test_keymaps(cx);
-        // Hide normally lives in the agent transient, whose root entry is
-        // absent when a heading has no agent. Bind the existing action so
-        // this test still drives the real keystroke/action/verb path.
-        cx.bind_keys([gpui::KeyBinding::new(
-            "ctrl-shift-x",
-            crate::AgentHide,
-            Some("RhoGui > Editor"),
-        )]);
-    });
-    workspace
-        .update(cx, |workspace, window, cx| {
+            let mut replacement = document.snapshot();
+            replacement.sequence = 1;
             workspace.handle_event(
                 HostId::default(),
-                ConnEvent::DeskSnapshot {
-                    snapshot,
-                    replica_id: 42,
-                },
+                ConnEvent::DeskTreeReplaced(replacement),
                 window,
                 cx,
             );
-            workspace.sync_dashboard(window, cx);
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "i X escape");
+    cx.run_until_parked();
+    let after_replacement = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .dashboard_editor()
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .text()
+        })
+        .unwrap();
+    assert!(
+        after_replacement.starts_with("ParXent"),
+        "replacement cursor moved: {after_replacement:?}"
+    );
+    workspace
+        .update(cx, |workspace, window, cx| {
             let editor = workspace.dashboard_editor();
             window.focus(&editor.read(cx).focus_handle(cx), cx);
             editor.update(cx, |editor, cx| {
                 editor.change_selections(Default::default(), window, cx, |selections| {
-                    selections.select_ranges([
-                        editor::MultiBufferOffset(2)..editor::MultiBufferOffset(2)
-                    ]);
+                    let offset = editor::MultiBufferOffset(0);
+                    selections.select_ranges([offset..offset]);
                 });
             });
         })
-        .expect("set up Desk");
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "escape tab");
     cx.run_until_parked();
-
-    cx.simulate_keystrokes(*workspace, "escape ctrl-shift-d");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.sync_dashboard(window, cx);
-            let second = workspace
-                .desk_buffer_for_test(HostId::default())
-                .unwrap()
-                .read(cx)
-                .text()
-                .find("* Two")
-                .unwrap()
-                + 2;
-            workspace.dashboard_editor().update(cx, |editor, cx| {
-                editor.change_selections(Default::default(), window, cx, |selections| {
-                    let second = editor::MultiBufferOffset(second);
-                    selections.select_ranges([second..second]);
-                });
-            });
-        })
-        .expect("select second heading");
-    cx.simulate_keystrokes(*workspace, "ctrl-shift-x");
-    cx.run_until_parked();
-
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let raw = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .desk_buffer_for_test(HostId::default())
-                .unwrap()
-                .read(cx)
-                .text()
-        })
-        .expect("read Desk source");
-    assert!(
-        raw.contains(&format!("* One TODO\n:done: {today}\n")),
-        "{raw:?}"
-    );
-    assert!(
-        raw.contains(&format!("* Two DONE\n:discarded: {today}\n")),
-        "{raw:?}"
-    );
-    let display = workspace
+    let folded = workspace
         .update(cx, |workspace, _, cx| {
             workspace
                 .dashboard_editor()
                 .update(cx, |editor, cx| editor.display_text(cx))
         })
-        .expect("read composed Desk");
-    assert!(!display.contains(":done:"), "{display:?}");
-    assert!(!display.contains(":discarded:"), "{display:?}");
+        .unwrap();
+    assert!(folded.contains("ParXent"), "folded display: {folded:?}");
+    assert!(!folded.contains("body"), "folded display: {folded:?}");
+
+    // Marker recognition runs between the space and the next keystroke: the
+    // remaining title input must land in the optimistically-created heading
+    // buffer, not in the prose buffer that contained the marker.
+    cx.simulate_keystrokes(*workspace, "tab");
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let editor = workspace.dashboard_editor();
+            editor.update(cx, |editor, cx| {
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    let offset = editor::MultiBufferOffset("ParXent\n".len());
+                    selections.select_ranges([offset..offset]);
+                });
+            });
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "i * space F a s t escape");
+    cx.run_until_parked();
+    let recognized = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .dashboard_editor()
+                .read(cx)
+                .buffer()
+                .read(cx)
+                .snapshot(cx)
+                .text()
+        })
+        .unwrap();
+    assert!(recognized.contains("Fastbody"), "tree text: {recognized:?}");
+    assert!(!recognized.contains("* "), "tree text: {recognized:?}");
+
+    // Vim search is hosted by the composed editor even without a Zed pane;
+    // its query must never become document input.
+    let before_search = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .tree_nodes_for_test(HostId::default(), cx)
+                .to_vec()
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "/ F a s t enter");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace.tree_nodes_for_test(HostId::default(), cx),
+                before_search.as_slice()
+            );
+        })
+        .unwrap();
+
+    // A composed heading is a semantic row: dd removes its node/subtree and
+    // an immediate p pastes the captured subtree relative to the surviving
+    // row selected after deletion. Undoing paste and delete restores it too.
+    cx.simulate_keystrokes(*workspace, "d d");
+    cx.run_until_parked();
+    assert!(!display_text(&workspace, cx).contains("Fastbody"));
+    cx.simulate_keystrokes(*workspace, "p");
+    cx.run_until_parked();
+    let pasted_display = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .dashboard_editor()
+                .update(cx, |editor, cx| editor.display_text(cx))
+        })
+        .unwrap();
+    assert_eq!(
+        pasted_display.matches("Fastbody").count(),
+        1,
+        "paste left a stale composed row: {pasted_display:?}"
+    );
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let pasted = workspace
+                .tree_nodes_for_test(HostId::default(), cx)
+                .iter()
+                .find_map(|(node_id, kind, _, text)| {
+                    (*kind == rho_desk::NodeKind::Heading && text == "Fastbody").then_some(*node_id)
+                })
+                .expect("pasted heading");
+            assert_eq!(
+                workspace
+                    .tree_cursor_for_test(cx)
+                    .map(|(_, node_id, _)| node_id),
+                Some(pasted),
+                "paste must focus the restored subtree root"
+            );
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "u");
+    cx.run_until_parked();
+    assert!(!display_text(&workspace, cx).contains("Fastbody"));
+    cx.simulate_keystrokes(*workspace, "u");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert!(
+                workspace
+                    .tree_nodes_for_test(HostId::default(), cx)
+                    .iter()
+                    .any(|(_, kind, _, text)| *kind == rho_desk::NodeKind::Heading
+                        && text == "Fastbody")
+            );
+        })
+        .unwrap();
+    let restored = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .tree_nodes_for_test(HostId::default(), cx)
+                .iter()
+                .find(|(_, kind, _, text)| {
+                    *kind == rho_desk::NodeKind::Heading && text == "Fastbody"
+                })
+                .unwrap()
+                .0
+        })
+        .unwrap();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.focus_tree_node_for_test(HostId::default(), restored, window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // Enter in a heading is one semantic split: it creates a prose child,
+    // and one `u` removes that child while restoring the original title.
+    let prose_children_before_split = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .tree_nodes_for_test(HostId::default(), cx)
+                .iter()
+                .filter(|(_, kind, parent, _)| {
+                    *kind == rho_desk::NodeKind::Prose && *parent == Some(restored)
+                })
+                .count()
+        })
+        .unwrap();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace
+                .dashboard_editor()
+                .update(cx, |editor, cx| editor.handle_input("\n", window, cx));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let nodes = workspace.tree_nodes_for_test(HostId::default(), cx);
+            assert_eq!(
+                nodes
+                    .iter()
+                    .filter(|(_, kind, parent, _)| *kind == rho_desk::NodeKind::Prose
+                        && *parent == Some(restored))
+                    .count(),
+                prose_children_before_split + 1,
+                "split nodes: {nodes:?}"
+            );
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "u");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let nodes = workspace.tree_nodes_for_test(HostId::default(), cx);
+            assert!(nodes.iter().any(
+                |(_, kind, _, text)| *kind == rho_desk::NodeKind::Heading && text == "Fastbody"
+            ));
+            assert_eq!(
+                nodes
+                    .iter()
+                    .filter(|(_, kind, parent, _)| *kind == rho_desk::NodeKind::Prose
+                        && *parent == Some(restored))
+                    .count(),
+                prose_children_before_split
+            );
+            workspace.focus_tree_node_for_test(HostId::default(), restored, window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // Backspace on an empty structural row merges it away. Its inverse must
+    // recreate an empty heading even though tombstoned CRDT ids cannot be
+    // reused.
+    let headings_before_merge = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .tree_nodes_for_test(HostId::default(), cx)
+                .iter()
+                .filter(|(_, kind, _, _)| *kind == rho_desk::NodeKind::Heading)
+                .count()
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "alt-enter escape backspace");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace
+                    .tree_nodes_for_test(HostId::default(), cx)
+                    .iter()
+                    .filter(|(_, kind, _, _)| *kind == rho_desk::NodeKind::Heading)
+                    .count(),
+                headings_before_merge
+            );
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "u");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace
+                    .tree_nodes_for_test(HostId::default(), cx)
+                    .iter()
+                    .filter(|(_, kind, _, _)| *kind == rho_desk::NodeKind::Heading)
+                    .count(),
+                headings_before_merge + 1
+            );
+        })
+        .unwrap();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.focus_tree_node_for_test(HostId::default(), restored, window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "alt-enter n e w escape");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert!(workspace
+                .tree_nodes_for_test(HostId::default(), cx)
+                .iter()
+                .any(|(_, kind, _, text)|
+                    *kind == rho_desk::NodeKind::Heading && text == "new"));
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "u");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert!(!workspace
+                .tree_nodes_for_test(HostId::default(), cx)
+                .iter()
+                .any(|(_, kind, _, text)|
+                    *kind == rho_desk::NodeKind::Heading && text == "new"));
+        })
+        .unwrap();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.focus_tree_node_for_test(HostId::default(), restored, window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "shift-o a b o v e escape");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let nodes = workspace.tree_nodes_for_test(HostId::default(), cx);
+            assert!(nodes.iter().any(|(_, kind, _, text)|
+                *kind == rho_desk::NodeKind::Prose && text == "above"));
+            assert!(nodes.iter().any(
+                |(_, kind, _, text)| *kind == rho_desk::NodeKind::Heading && text == "Fastbody"
+            ));
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "u");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(!workspace
+                .tree_nodes_for_test(HostId::default(), cx)
+                .iter()
+                .any(|(_, kind, _, text)|
+                    *kind == rho_desk::NodeKind::Prose && text == "above"));
+            workspace.focus_tree_node_for_test(HostId::default(), restored, window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "y y p");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace
+                    .tree_nodes_for_test(HostId::default(), cx)
+                    .iter()
+                    .filter(|(_, kind, _, text)| {
+                        *kind == rho_desk::NodeKind::Heading && text == "Fastbody"
+                    })
+                    .count(),
+                2
+            );
+        })
+        .unwrap();
+    let before_agent_flow = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .tree_nodes_for_test(HostId::default(), cx)
+                .to_vec()
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "shift-r c");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert!(workspace.dashboard_has_new_draft_for_test());
+            assert_eq!(
+                workspace.tree_nodes_for_test(HostId::default(), cx),
+                before_agent_flow.as_slice()
+            );
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "q");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert!(!workspace.dashboard_has_new_draft_for_test());
+            assert!(!workspace.has_new_agent_configuration_for_test());
+            assert!(
+                workspace
+                    .tree_nodes_for_test(HostId::default(), cx)
+                    .iter()
+                    .all(|(_, _, _, text)| text != "q")
+            );
+        })
+        .unwrap();
+
+    // Deleting a user heading never tombstones its machine-owned agent row.
+    // The same batch reparents the row, tells the user, and undo moves it
+    // beneath the fresh restored heading id after daemon acceptance (covered
+    // by the daemon's constrained-relocation test).
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.focus_tree_node_for_test(HostId::default(), heading, window, cx);
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "escape d d");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let nodes = workspace.tree_nodes_for_test(HostId::default(), cx);
+            assert!(
+                nodes.iter().any(|(id, kind, parent, _)| *id == agent_row
+                    && *kind == NodeKind::Agent
+                    && parent.is_none()),
+                "post-delete nodes: {nodes:?}"
+            );
+            assert_eq!(
+                workspace.echo_text_for_test(),
+                Some("moved 1 agent rows to root")
+            );
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "u");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let nodes = workspace.tree_nodes_for_test(HostId::default(), cx);
+            assert!(
+                nodes
+                    .iter()
+                    .any(|(_, kind, _, text)| *kind == NodeKind::Heading && text == "ParXent")
+            );
+            assert!(nodes.iter().any(|(id, kind, parent, _)| *id == agent_row
+                && *kind == NodeKind::Agent
+                && parent.is_none()));
+        })
+        .unwrap();
+
+    // If a retryable split conflict cannot be replayed against the fresh
+    // snapshot, its external undo entry is discarded instead of poisoning
+    // the next ordinary `u`.
+    let (before_failed_retry, undo_count) = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.take_host_messages_for_test(HostId::default());
+            (
+                workspace.desk_snapshot_for_test(HostId::default()),
+                workspace.semantic_undo_count_for_test(),
+            )
+        })
+        .unwrap();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace
+                .dashboard_editor()
+                .update(cx, |editor, cx| editor.handle_input("\n", window, cx));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let rejected_id = workspace
+        .update(cx, |workspace, _, _| {
+            workspace
+                .take_host_messages_for_test(HostId::default())
+                .into_iter()
+                .find_map(|message| match message {
+                    rho_ui_proto::ClientMessage::DeskTreeBatchApply { batch } => Some(batch.id),
+                    _ => None,
+                })
+                .expect("split batch")
+        })
+        .unwrap();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskTreeBatchRejected {
+                    id: rejected_id,
+                    retryable: true,
+                    reason: "test conflict".into(),
+                    snapshot: before_failed_retry,
+                },
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(workspace.semantic_undo_count_for_test(), undo_count);
+        })
+        .unwrap();
 }
 
 #[gpui::test]
-fn desk_deal_verdict_advances_to_empty_and_exit_restores_document(cx: &mut TestAppContext) {
-    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
-
-    let original = "* Finished\n:done: 2026-01-01\n* One\n:todo: 2000-01-01 1d";
-    let mut source =
-        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
-    let operation = DeskOperation::from_text(&source.edit([(0..0, original)]));
-    let snapshot = DeskSnapshot {
-        text: source.snapshot().text(),
-        operations: vec![operation],
-        transactions: Vec::new(),
-        replicas: Vec::new(),
+fn delayed_title_after_o_heading_recognition_targets_the_replacement(cx: &mut TestAppContext) {
+    use rho_desk::{
+        BatchOpRecord, BatchOperation, Document, NodeId, NodeKind, NodeOwner, OrderKey, Replica,
+        ReplicaAuthor, TextOperation, TreeClock, TreeOperation,
     };
+
+    let mut document = Document::default();
+    document.add_replica(Replica {
+        replica_id: 1,
+        author: ReplicaAuthor::Machine,
+    });
+    let heading = NodeId {
+        replica_id: 1,
+        counter: 1,
+    };
+    document
+        .apply(TreeOperation::Create {
+            timestamp: TreeClock {
+                value: 1,
+                replica_id: 1,
+            },
+            node_id: heading,
+            kind: NodeKind::Heading,
+            owner: NodeOwner::User,
+            parent: None,
+            order: OrderKey(vec![100]),
+        })
+        .unwrap();
+    let mut title = text::Buffer::new(text::ReplicaId::new(1), text::BufferId::new(1).unwrap(), "");
+    document
+        .apply_text(
+            heading,
+            TextOperation::from_text(&title.edit([(0..0, "Parent")])),
+            None,
+        )
+        .unwrap();
+
     cx.update(bind_test_keymaps);
     let workspace = test_workspace(cx);
-    cx.update(|cx| {
-        let settings = cx.global_mut::<SettingsStore>();
-        settings.override_global(vim_mode_setting::VimModeSetting(true));
-        settings.override_global(vim_mode_setting::HelixModeSetting(false));
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskTreeSnapshot {
+                    snapshot: document.snapshot(),
+                    replica_id: 42,
+                },
+                window,
+                cx,
+            );
+            workspace.focus_tree_node_for_test(HostId::default(), heading, window, cx);
+            workspace.take_host_messages_for_test(HostId::default());
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "o");
+    cx.run_until_parked();
+    let open_batch = workspace
+        .update(cx, |workspace, _, _| {
+            workspace
+                .take_host_messages_for_test(HostId::default())
+                .into_iter()
+                .find_map(|message| match message {
+                    rho_ui_proto::ClientMessage::DeskTreeBatchApply { batch } => Some(batch),
+                    _ => None,
+                })
+                .expect("o creates a prose row")
+        })
+        .unwrap();
+    let prose = open_batch
+        .operations
+        .iter()
+        .find_map(|operation| match operation {
+            BatchOperation::Tree(TreeOperation::Create {
+                node_id,
+                kind: NodeKind::Prose,
+                ..
+            }) => Some(*node_id),
+            _ => None,
+        })
+        .unwrap();
+    let stale_source = workspace
+        .update(cx, |workspace, _, _| {
+            workspace
+                .tree_buffer_for_test(HostId::default(), prose)
+                .expect("opened prose buffer")
+        })
+        .unwrap();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskTreeBatchApplied(BatchOpRecord {
+                    sequence: 1,
+                    timestamp_ms: 1,
+                    batch: open_batch,
+                    daemon_tree_operations: Vec::new(),
+                }),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "* space");
+    cx.run_until_parked();
+    let recognition_batch = workspace
+        .update(cx, |workspace, _, _| {
+            let messages = workspace.take_host_messages_for_test(HostId::default());
+            messages
+                .iter()
+                .cloned()
+                .into_iter()
+                .find_map(|message| match message {
+                    rho_ui_proto::ClientMessage::DeskTreeBatchApply { batch } => Some(batch),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("marker recognition batch; messages: {messages:?}"))
+        })
+        .unwrap();
+    let replacement = recognition_batch
+        .operations
+        .iter()
+        .find_map(|operation| match operation {
+            BatchOperation::Tree(TreeOperation::Create {
+                node_id,
+                kind: NodeKind::Heading,
+                ..
+            }) => Some(*node_id),
+            _ => None,
+        })
+        .unwrap();
+    assert!(recognition_batch.operations.iter().any(|operation| matches!(
+        operation,
+        BatchOperation::Tree(TreeOperation::Delete { node_ids, .. }) if node_ids == &vec![prose]
+    )));
+    let mut delayed_ack = recognition_batch.clone();
+    delayed_ack.id.value += 100;
+    workspace
+        .update(cx, |workspace, _, _| {
+            workspace.clone_pending_desk_intent_for_test(
+                HostId::default(),
+                recognition_batch.id,
+                delayed_ack.id,
+            );
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "a b");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskTreeBatchApplied(BatchOpRecord {
+                    sequence: 2,
+                    timestamp_ms: 2,
+                    batch: recognition_batch,
+                    daemon_tree_operations: Vec::new(),
+                }),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace.tree_cursor_for_test(cx),
+                Some((HostId::default(), replacement, 2)),
+                "accepted recognition must preserve the replacement caret"
+            );
+        })
+        .unwrap();
+    let before_ack_edits = workspace
+        .update(cx, |workspace, _, _| {
+            workspace
+                .take_host_messages_for_test(HostId::default())
+                .into_iter()
+                .filter_map(|message| match message {
+                    rho_ui_proto::ClientMessage::DeskNodeTextApply {
+                        node_id,
+                        operation,
+                        transaction,
+                    } => Some((node_id, operation, transaction)),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+
+    let snapshot_after_recognition = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.desk_snapshot_for_test(HostId::default())
+        })
+        .unwrap();
+    // This is the later stale source-buffer event, after recognition has
+    // fully completed and daemon acceptance replaced the prose node. Editing
+    // the retained entity exercises Edited -> Operation subscription order.
+    stale_source.update(cx, |buffer, cx| {
+        buffer.edit([(0..0, "Recognized")], None, cx);
     });
     cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskSnapshot {
-                    snapshot,
-                    replica_id: 42,
-                },
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
-            window.focus(&workspace.dashboard_editor().read(cx).focus_handle(cx), cx);
-        })
-        .expect("set up Desk");
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.open_deal_mode(window, cx)
-        })
-        .expect("enter deal mode");
-    cx.run_until_parked();
-    let dealt = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .dashboard_editor()
-                .update(cx, |editor, cx| editor.display_text(cx))
-        })
-        .expect("read dealt card");
-    assert!(dealt.contains("One"), "deal did not show card: {dealt:?}");
+    let mut edits = before_ack_edits;
+    edits.extend(
+        workspace
+            .update(cx, |workspace, _, _| {
+                workspace
+                    .take_host_messages_for_test(HostId::default())
+                    .into_iter()
+                    .filter_map(|message| match message {
+                        rho_ui_proto::ClientMessage::DeskNodeTextApply {
+                            node_id,
+                            operation,
+                            transaction,
+                        } => Some((node_id, operation, transaction)),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap(),
+    );
     assert!(
-        dealt.contains("Finished"),
-        "deal narrowed the Desk: {dealt:?}"
+        !edits.is_empty(),
+        "late title produced no persisted text edit"
     );
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(workspace.dashboard_deal_highlight_for_test(cx));
-            assert_eq!(
-                workspace.dashboard_cursor_topic_for_test(cx),
-                Some((HostId::default(), original.find("* One").unwrap()))
-            );
-        })
-        .unwrap();
-    cx.simulate_keystrokes(*workspace, "d");
-    cx.run_until_parked();
-    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-    let (raw, display) = workspace
-        .update(cx, |workspace, _, cx| {
-            let raw = workspace
-                .desk_buffer_for_test(HostId::default())
+    assert!(edits.iter().all(|(node_id, ..)| *node_id == replacement));
+    let mut reconstructed = Document::from_snapshot(snapshot_after_recognition).unwrap();
+    for (node_id, operation, transaction) in edits {
+        assert!(
+            reconstructed
+                .apply_text(node_id, operation, transaction)
                 .unwrap()
-                .read(cx)
-                .text();
-            let display = workspace
-                .dashboard_editor()
-                .update(cx, |editor, cx| editor.display_text(cx));
-            (raw, display)
-        })
-        .expect("read restored Desk");
-    assert!(raw.contains(&format!(":done: {today}")), "{raw:?}");
-    assert!(display.contains("One"), "{display:?}");
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(!workspace.dashboard_deal_mode_for_test());
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn desk_deal_card_survives_boundary_inserts_and_duplicate_heading_renames(cx: &mut TestAppContext) {
-    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
-
-    let original =
-        "* Intro\n* Target\n:deadline: 2020-01-01\nbody\n* Target\n:deadline: 2020-01-02\nother\n";
-    let target = original.find("* Target").unwrap();
-    let mut source =
-        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
-    let operation = DeskOperation::from_text(&source.edit([(0..0, original)]));
-    let snapshot = DeskSnapshot {
-        text: source.snapshot().text(),
-        operations: vec![operation],
-        transactions: Vec::new(),
-        replicas: Vec::new(),
-    };
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskSnapshot {
-                    snapshot,
-                    replica_id: 42,
-                },
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
-            workspace.open_deal_mode(window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert_eq!(
-                workspace.dashboard_cursor_topic_for_test(cx),
-                Some((HostId::default(), target))
-            );
-            workspace
-                .desk_buffer_for_test(HostId::default())
-                .unwrap()
-                .update(cx, |buffer, cx| {
-                    buffer.edit([(target..target, "* New\n")], None, cx)
-                });
-            workspace.sync_dashboard(window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(workspace.dashboard_deal_highlight_for_test(cx));
-            assert_eq!(
-                workspace.dashboard_deal_topic_for_test(),
-                Some((HostId::default(), target + "* New\n".len(), "Target"))
-            );
-            assert_eq!(
-                workspace.dashboard_cursor_topic_for_test(cx),
-                Some((HostId::default(), target + "* New\n".len()))
-            );
-        })
-        .unwrap();
-
-    let shifted_target = target + "* New\n".len();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace
-                .desk_buffer_for_test(HostId::default())
-                .unwrap()
-                .update(cx, |buffer, cx| {
-                    let title = shifted_target + "* ".len();
-                    buffer.edit([(title..title + "Target".len(), "Renamed")], None, cx)
-                });
-            workspace.sync_dashboard(window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(
-                workspace.dashboard_deal_topic_for_test(),
-                Some((HostId::default(), shifted_target, "Renamed"))
-            );
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn desk_deal_scrolls_a_deep_heading_below_its_sticky_ancestors(cx: &mut TestAppContext) {
-    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
-
-    let padding = (0..50)
-        .map(|index| format!("context {index}\n"))
-        .collect::<String>();
-    let original = format!(
-        "* Root\n{padding}** Area\n*** Project\n**** Thread\n***** Target\n:deadline: 2020-01-01\n{padding}"
+        );
+    }
+    assert_eq!(
+        reconstructed
+            .text(replacement, 42, text::BufferId::new(999).unwrap(),)
+            .unwrap(),
+        "Recognizedab"
     );
-    let target_offset = original.find("***** Target").unwrap();
-    let mut source =
-        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
-    let operation = DeskOperation::from_text(&source.edit([(0..0, original.as_str())]));
-    let snapshot = DeskSnapshot {
-        text: source.snapshot().text(),
-        operations: vec![operation],
-        transactions: Vec::new(),
-        replicas: Vec::new(),
-    };
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
+
+    // An acknowledgement may arrive after the user deliberately navigates
+    // elsewhere. In that case it must not pull the cursor back to the
+    // optimistically-created replacement.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.focus_tree_node_for_test(HostId::default(), heading, window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(
                 HostId::default(),
-                ConnEvent::DeskSnapshot {
-                    snapshot,
-                    replica_id: 42,
-                },
+                ConnEvent::DeskTreeBatchApplied(BatchOpRecord {
+                    sequence: 3,
+                    timestamp_ms: 3,
+                    batch: delayed_ack,
+                    daemon_tree_operations: Vec::new(),
+                }),
                 window,
                 cx,
             );
-            workspace.sync_dashboard(window, cx);
-            window.focus(&workspace.dashboard_editor().read(cx).focus_handle(cx), cx);
-        })
-        .unwrap();
-    cx.update(|cx| cx.refresh_windows());
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.open_deal_mode(window, cx);
         })
         .unwrap();
     cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert_eq!(
-                workspace.dashboard_cursor_topic_for_test(cx),
-                Some((HostId::default(), target_offset))
-            );
-            workspace.dashboard_editor().update(cx, |editor, cx| {
-                let snapshot = editor.display_snapshot(cx);
-                let cursor_row = editor
-                    .selections
-                    .newest::<language::Point>(&snapshot)
-                    .head()
-                    .row as f64;
-                let scroll_top = editor.scroll_position(cx).y;
-                assert!(scroll_top > 0., "deep card did not scroll");
-                assert!(
-                    (cursor_row - scroll_top - 6.).abs() < 0.1,
-                    "card should leave two context rows below four sticky ancestors: cursor={cursor_row}, scroll={scroll_top}"
-                );
-            });
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn desk_deal_open_takes_agent_without_writing_desk(cx: &mut TestAppContext) {
-    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
-    use rho_ui_proto::{
-        AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
-    };
-
-    let agent_id = agent(1);
-    let summary = UiAgentSummary {
-        agent_id,
-        parent_agent: None,
-        display_name: Some("reply target".to_owned()),
-        created_at: UnixMs(1),
-        updated_at: UnixMs(1),
-        role: AgentRole::default(),
-        workspace: WorkspaceInfo::UserCheckout {
-            repo: "/tmp".into(),
-        },
-        attention: UiAttention::NeedsInput,
-        last_active: UnixMs(1),
-        facts: Default::default(),
-        hidden: false,
-        disposition: AgentDisposition::Pending,
-        last_user_message_text: String::new(),
-        activity: None,
-        turn_report: None,
-        labels: Vec::new(),
-    };
-    let original = format!(
-        "* Reply target :eng-{}:\n:todo: 2000-01-01 1d\nAgent body.\n",
-        agent_id.encoded()
-    );
-    let mut source =
-        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
-    let operation = DeskOperation::from_text(&source.edit([(0..0, original.as_str())]));
-    let snapshot = DeskSnapshot {
-        text: source.snapshot().text(),
-        operations: vec![operation],
-        transactions: Vec::new(),
-        replicas: Vec::new(),
-    };
-
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::Ready {
-                    agents: vec![summary],
-                    iris_agent: None,
-                    projects: Vec::new(),
-                    auth: AuthState {
-                        namespaces: Vec::new(),
-                        disabled_namespaces: Vec::new(),
-                        active_namespace: None,
-                    },
-                    machine_seed: 0,
-                    agent_counter: 100,
-                },
-                window,
-                cx,
-            );
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskSnapshot {
-                    snapshot,
-                    replica_id: 42,
-                },
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
-            window.focus(&workspace.dashboard_editor().read(cx).focus_handle(cx), cx);
-        })
-        .unwrap();
-    cx.update(|cx| cx.refresh_windows());
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.open_deal_mode(window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    cx.simulate_keystrokes(*workspace, "ctrl-j");
-    cx.run_until_parked();
-
     workspace
         .update(cx, |workspace, _, cx| {
             assert_eq!(
                 workspace
-                    .dashboard_reply_text_for_test(agent_id, cx)
-                    .as_deref(),
-                None
+                    .tree_cursor_for_test(cx)
+                    .map(|(_, node_id, _)| node_id),
+                Some(heading),
+                "a delayed acknowledgement stole deliberate navigation"
             );
-            assert_eq!(
-                workspace
-                    .desk_buffer_for_test(HostId::default())
-                    .unwrap()
-                    .read(cx)
-                    .text(),
-                original
-            );
-            assert!(!workspace.dashboard_deal_mode_for_test());
         })
         .unwrap();
-}
-
-fn mixed_deal_workspace(
-    cx: &mut TestAppContext,
-) -> (WindowHandle<Workspace>, AgentId, crate::inbox::InboxId) {
-    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
-    use rho_ui_proto::{
-        AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
-    };
-
-    let agent_id = agent(71);
-    let summary = UiAgentSummary {
-        agent_id,
-        parent_agent: None,
-        display_name: Some("mixed hand agent".to_owned()),
-        created_at: UnixMs(1),
-        updated_at: UnixMs(1),
-        role: AgentRole::default(),
-        workspace: WorkspaceInfo::UserCheckout {
-            repo: "/tmp".into(),
-        },
-        attention: UiAttention::NeedsInput,
-        last_active: UnixMs(1),
-        facts: rho_ui_proto::UiAgentFacts {
-            turn_running: false,
-            last_turn_ended: Some(UnixMs(1)),
-            last_user_message_at: UnixMs(0),
-            needs_you_hint: true,
-        },
-        hidden: false,
-        disposition: AgentDisposition::Pending,
-        last_user_message_text: String::new(),
-        activity: None,
-        turn_report: None,
-        labels: Vec::new(),
-    };
-    let text = format!(
-        "* Desk card\n:deadline: 2000-01-01\ndesk body\n* Agent card :eng-{}:\nagent body\n",
-        agent_id.encoded()
-    );
-    let mut source = text::Buffer::new(
-        text::ReplicaId::new(18),
-        text::BufferId::new(1).unwrap(),
-        "",
-    );
-    let operation = DeskOperation::from_text(&source.edit([(0..0, text)]));
-    let snapshot = DeskSnapshot {
-        text: source.snapshot().text(),
-        operations: vec![operation],
-        transactions: Vec::new(),
-        replicas: Vec::new(),
-    };
-
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    let inbox_id = workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::Ready {
-                    agents: vec![summary],
-                    iris_agent: None,
-                    projects: Vec::new(),
-                    auth: AuthState {
-                        namespaces: Vec::new(),
-                        disabled_namespaces: Vec::new(),
-                        active_namespace: None,
-                    },
-                    machine_seed: 0,
-                    agent_counter: 100,
-                },
-                window,
-                cx,
-            );
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskSnapshot {
-                    snapshot,
-                    replica_id: 42,
-                },
-                window,
-                cx,
-            );
-            let inbox_id = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
-                kind: crate::inbox::InboxKind::Capture,
-                text: "captured item".to_owned(),
-                source: crate::inbox::SourceReference::None,
-                context: crate::inbox::CapturedContext {
-                    host: Some(HostId::default().to_string()),
-                    room: None,
-                    focused_surface: "test".to_owned(),
-                },
-                waiting_on: None,
-            });
-            workspace.age_inbox_for_test(&inbox_id, 1);
-            workspace.sync_dashboard(window, cx);
-            window.focus(&workspace.dashboard_editor().read(cx).focus_handle(cx), cx);
-            workspace.open_deal_mode(window, cx);
-            inbox_id
-        })
-        .unwrap();
-    cx.run_until_parked();
-    (workspace, agent_id, inbox_id)
 }
 
 fn assert_rendered_deal_matches_current(
@@ -6355,477 +5239,6 @@ fn assert_rendered_deal_matches_current(
             current.1
         })
         .unwrap()
-}
-
-#[gpui::test]
-fn deal_tab_is_not_a_skip_key(cx: &mut TestAppContext) {
-    let (workspace, _, _) = mixed_deal_workspace(cx);
-    let before = assert_rendered_deal_matches_current(&workspace, cx);
-    let before_identity = workspace
-        .update(cx, |workspace, _, _| {
-            workspace.current_deal_card_for_test().unwrap().0
-        })
-        .unwrap();
-
-    cx.simulate_keystrokes(*workspace, "tab");
-    cx.run_until_parked();
-
-    let after = assert_rendered_deal_matches_current(&workspace, cx);
-    let after_identity = workspace
-        .update(cx, |workspace, _, _| {
-            workspace.current_deal_card_for_test().unwrap().0
-        })
-        .unwrap();
-    assert_eq!(after_identity, before_identity, "TAB skipped {before:?}");
-    assert_eq!(after, before);
-}
-
-#[gpui::test]
-fn f16_closes_the_dealt_surface_and_deals_another_card(cx: &mut TestAppContext) {
-    let (workspace, _, _) = mixed_deal_workspace(cx);
-    let before = workspace
-        .update(cx, |workspace, _, _| {
-            workspace.current_deal_card_for_test().unwrap().0
-        })
-        .unwrap();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            workspace.append_newer_history_for_test("newer", cx)
-        })
-        .unwrap();
-
-    cx.simulate_keystrokes(*workspace, "f16");
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, _| {
-            let after = workspace
-                .current_deal_card_for_test()
-                .expect("F16 should immediately deal another card")
-                .0;
-            assert_ne!(after, before, "F16 re-dealt the surface it just closed");
-            assert!(workspace.dashboard_deal_mode_for_test());
-            assert_ne!(
-                workspace.current_surface_name_for_test(),
-                "inbox newer",
-                "F16 is close plus a fresh deal, not history-forward"
-            );
-        })
-        .unwrap();
-}
-
-fn assert_deal_verdict_marks_heading(
-    cx: &mut TestAppContext,
-    wanted: fn(crate::dashboard::DealCardKind) -> bool,
-    key: &str,
-    property: &str,
-    pace: Option<&str>,
-) {
-    let (workspace, agent_id, _) = mixed_deal_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert!(workspace.seek_deal_card_for_test(wanted, window, cx));
-        })
-        .unwrap();
-    cx.update(|cx| cx.refresh_windows());
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.focus_dealt_surface_for_test(window, cx)
-        })
-        .unwrap();
-    cx.update_window(*workspace, |_, window, cx| {
-        let action = cx.build_action("vim::EnterDealMode", None).unwrap();
-        window.dispatch_action(action, cx);
-    })
-    .unwrap();
-    let dealt_identity = workspace
-        .update(cx, |workspace, _, _| {
-            workspace.current_deal_card_for_test().unwrap().0
-        })
-        .unwrap();
-    cx.simulate_keystrokes(*workspace, key);
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, cx| {
-            let text = workspace
-                .desk_buffer_for_test(HostId::default())
-                .unwrap()
-                .read(cx)
-                .text();
-            let agent_heading = format!("* Agent card :eng-{}:", agent_id.encoded());
-            let (heading_name, body) = if wanted(crate::dashboard::DealCardKind::Agent) {
-                (agent_heading.as_str(), "agent body")
-            } else {
-                ("* Desk card", "desk body")
-            };
-            let heading = text.find(heading_name).expect("dealt heading survives");
-            let after_heading = &text[heading..];
-            let mark = after_heading
-                .find(property)
-                .unwrap_or_else(|| panic!("{key} writes {property} on the dealt heading: {text}"));
-            assert!(
-                mark < after_heading.find(body).unwrap(),
-                "the mark belongs on the heading's property line: {text}"
-            );
-            if let Some(pace) = pace {
-                let line = after_heading[mark..].lines().next().unwrap();
-                assert!(line.ends_with(pace), "wrong pace in {line:?}");
-            }
-            if wanted(crate::dashboard::DealCardKind::Agent) {
-                assert!(
-                    !workspace.history_contains_agent_for_test(agent_id),
-                    "an agent verdict closes its transcript history entry"
-                );
-            }
-        })
-        .unwrap();
-    workspace
-        .update(cx, |workspace, _, _| {
-            if let Some((next, _)) = workspace.current_deal_card_for_test() {
-                assert_ne!(next, dealt_identity, "a verdict re-dealt the closed card");
-            }
-        })
-        .unwrap();
-    if wanted(crate::dashboard::DealCardKind::Agent) {
-        if workspace
-            .update(cx, |workspace, _, _| {
-                workspace.dashboard_deal_mode_for_test()
-            })
-            .unwrap()
-        {
-            cx.simulate_keystrokes(*workspace, "q");
-            cx.run_until_parked();
-        }
-        cx.simulate_keystrokes(*workspace, "space k");
-        cx.run_until_parked();
-        workspace
-            .update(cx, |workspace, _, _| {
-                assert!(!workspace.history_contains_agent_for_test(agent_id));
-                assert!(
-                    !workspace.agent_surface_visible_for_test(agent_id),
-                    "Space K must not return to a transcript closed by a verdict"
-                );
-            })
-            .unwrap();
-    }
-}
-
-macro_rules! deal_verdict_test {
-    ($name:ident, $pattern:pat, $key:literal, $property:literal, $pace:expr) => {
-        #[gpui::test]
-        fn $name(cx: &mut TestAppContext) {
-            assert_deal_verdict_marks_heading(
-                cx,
-                |kind| matches!(kind, $pattern),
-                $key,
-                $property,
-                $pace,
-            );
-        }
-    };
-}
-
-deal_verdict_test!(
-    deal_done_on_agent_card_marks_its_heading_done,
-    crate::dashboard::DealCardKind::Agent,
-    "d",
-    ":done:",
-    None
-);
-deal_verdict_test!(
-    deal_discard_on_agent_card_marks_its_heading_discarded,
-    crate::dashboard::DealCardKind::Agent,
-    "x",
-    ":discarded:",
-    None
-);
-deal_verdict_test!(
-    deal_snooze_on_agent_card_marks_its_heading_deferred_one_day,
-    crate::dashboard::DealCardKind::Agent,
-    "s",
-    ":defer:",
-    Some(" 1d")
-);
-deal_verdict_test!(
-    deal_todo_on_agent_card_marks_its_heading_todo_seven_days,
-    crate::dashboard::DealCardKind::Agent,
-    "t",
-    ":todo:",
-    Some(" 7d")
-);
-deal_verdict_test!(
-    deal_done_on_desk_card_marks_its_heading_done,
-    crate::dashboard::DealCardKind::Desk,
-    "d",
-    ":done:",
-    None
-);
-deal_verdict_test!(
-    deal_discard_on_desk_card_marks_its_heading_discarded,
-    crate::dashboard::DealCardKind::Desk,
-    "x",
-    ":discarded:",
-    None
-);
-deal_verdict_test!(
-    deal_snooze_on_desk_card_marks_its_heading_deferred_one_day,
-    crate::dashboard::DealCardKind::Desk,
-    "s",
-    ":defer:",
-    Some(" 1d")
-);
-deal_verdict_test!(
-    deal_todo_on_desk_card_marks_its_heading_todo_seven_days,
-    crate::dashboard::DealCardKind::Desk,
-    "t",
-    ":todo:",
-    Some(" 7d")
-);
-
-#[gpui::test]
-fn deal_verdict_mid_history_steps_to_the_newer_surface(cx: &mut TestAppContext) {
-    let (workspace, agent_id, _) = mixed_deal_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert!(workspace.seek_deal_card_for_test(
-                |kind| matches!(kind, crate::dashboard::DealCardKind::Agent),
-                window,
-                cx,
-            ));
-            workspace.focus_dealt_surface_for_test(window, cx);
-        })
-        .unwrap();
-    cx.update_window(*workspace, |_, window, cx| {
-        let action = cx.build_action("vim::EnterDealMode", None).unwrap();
-        window.dispatch_action(action, cx);
-    })
-    .unwrap();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            workspace.append_newer_history_for_test("newer", cx)
-        })
-        .unwrap();
-
-    cx.simulate_keystrokes(*workspace, "d");
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(workspace.current_surface_name_for_test(), "inbox newer");
-            assert!(!workspace.dashboard_deal_mode_for_test());
-            assert!(!workspace.history_contains_agent_for_test(agent_id));
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn deal_verdict_at_history_end_deals_a_fresh_card(cx: &mut TestAppContext) {
-    let (workspace, _, _) = mixed_deal_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert!(workspace.seek_deal_card_for_test(
-                |kind| matches!(kind, crate::dashboard::DealCardKind::Agent),
-                window,
-                cx,
-            ));
-            workspace.focus_dealt_surface_for_test(window, cx);
-        })
-        .unwrap();
-    cx.update_window(*workspace, |_, window, cx| {
-        let action = cx.build_action("vim::EnterDealMode", None).unwrap();
-        window.dispatch_action(action, cx);
-    })
-    .unwrap();
-    let before = workspace
-        .update(cx, |workspace, _, _| {
-            workspace.current_deal_card_for_test().unwrap().0
-        })
-        .unwrap();
-
-    cx.simulate_keystrokes(*workspace, "d");
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, _| {
-            let after = workspace
-                .current_deal_card_for_test()
-                .expect("a verdict at history end should deal another card")
-                .0;
-            assert_ne!(after, before);
-            assert!(workspace.dashboard_deal_mode_for_test());
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn desk_deal_insert_types_verdict_letters_instead_of_running_actions(cx: &mut TestAppContext) {
-    let (workspace, _, _) = mixed_deal_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert!(workspace.seek_deal_card_for_test(
-                |kind| matches!(kind, crate::dashboard::DealCardKind::Desk),
-                window,
-                cx,
-            ));
-        })
-        .unwrap();
-    cx.update(|cx| cx.refresh_windows());
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.focus_dealt_surface_for_test(window, cx)
-        })
-        .unwrap();
-    cx.update_window(*workspace, |_, window, cx| {
-        let action = cx.build_action("vim::EnterDealMode", None).unwrap();
-        window.dispatch_action(action, cx);
-    })
-    .unwrap();
-
-    cx.dispatch_action(*workspace, crate::DashboardDealInsert);
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "qdxstaof");
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, cx| {
-            let text = workspace
-                .desk_buffer_for_test(HostId::default())
-                .unwrap()
-                .read(cx)
-                .text();
-            assert!(
-                text.contains("qdxstaof"),
-                "deal letters should be inserted in Desk insert mode: {text}"
-            );
-            assert!(workspace.dashboard_deal_mode_for_test());
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn verdicted_transcript_reopens_outside_vim_deal(cx: &mut TestAppContext) {
-    let (workspace, agent_id, _) = mixed_deal_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert!(workspace.seek_deal_card_for_test(
-                |kind| matches!(kind, crate::dashboard::DealCardKind::Agent),
-                window,
-                cx,
-            ));
-            workspace.focus_dealt_surface_for_test(window, cx);
-        })
-        .unwrap();
-    cx.update_window(*workspace, |_, window, cx| {
-        let action = cx.build_action("vim::EnterDealMode", None).unwrap();
-        window.dispatch_action(action, cx);
-    })
-    .unwrap();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            workspace.append_newer_history_for_test("newer", cx)
-        })
-        .unwrap();
-
-    cx.simulate_keystrokes(*workspace, "d");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.reopen_agent_for_test(agent_id, window, cx);
-            assert!(workspace.agent_surface_visible_for_test(agent_id));
-            assert!(
-                !workspace.active_editor_in_deal_mode_for_test(cx),
-                "the retained transcript editor reopened in VimDeal"
-            );
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn deal_agent_insert_targets_the_composer(cx: &mut TestAppContext) {
-    let (workspace, agent_id, _) = mixed_deal_workspace(cx);
-    feed_frame(
-        &workspace,
-        cx,
-        agent_id,
-        snapshot_frame(state(vec![user("message awaiting reply")], Vec::new())),
-    );
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert!(workspace.seek_deal_card_for_test(
-                |kind| matches!(kind, crate::dashboard::DealCardKind::Agent),
-                window,
-                cx,
-            ));
-        })
-        .unwrap();
-    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.focus_dealt_surface_for_test(window, cx)
-        })
-        .unwrap();
-    cx.dispatch_action(*workspace, crate::DashboardDealInsert);
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            let model = workspace.active_agent_model().unwrap();
-            let editor = workspace.active_editor(cx);
-            assert!(model.read(cx).selection_in_prompt(&editor, cx));
-        })
-        .unwrap();
-    cx.simulate_keystrokes(*workspace, "q");
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(workspace.active_editor(cx).read(cx).text(cx).ends_with('q'));
-        })
-        .unwrap();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(!workspace.dashboard_deal_mode_for_test());
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn leaving_deal_does_not_strand_the_dashboard_in_vim_deal(cx: &mut TestAppContext) {
-    let (workspace, _, _) = mixed_deal_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert!(workspace.seek_deal_card_for_test(
-                |kind| matches!(kind, crate::dashboard::DealCardKind::Agent),
-                window,
-                cx,
-            ));
-        })
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.focus_dealt_surface_for_test(window, cx)
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    cx.simulate_keystrokes(*workspace, "q");
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "f24 enter");
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert!(!workspace.dashboard_deal_mode_for_test());
-            assert!(
-                !workspace.is_dashboard_mode(window, cx),
-                "Enter should open the selected Desk row after leaving DEAL"
-            );
-        })
-        .unwrap();
 }
 
 #[gpui::test]
@@ -6971,6 +5384,106 @@ fn deal_and_overview_append_at_the_end_and_dedupe_existing_entries(cx: &mut Test
 }
 
 #[gpui::test]
+fn q_closes_unlisted_standalone_draft_surface(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.configure_surface_history_for_test(&["previous"], window, cx);
+            workspace.select_agent(None, window, cx);
+            assert!(!workspace.overview_open_for_test());
+            assert_eq!(workspace.current_surface_name_for_test(), "draft");
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "q");
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(workspace.overview_open_for_test())
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "f24");
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                workspace.overview_open_for_test(),
+                "overview toggle resurrected the closed draft"
+            )
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn q_discards_shift_r_draft_from_surface_history(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            // Opening the standalone composer from overview records Draft in
+            // history, matching the state that exposed the human QA failure.
+            workspace.select_agent(None, window, cx);
+            assert!(
+                workspace
+                    .surface_history_for_test()
+                    .0
+                    .contains(&"draft".to_owned())
+            );
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "f24");
+    cx.simulate_keystrokes(*workspace, "shift-r");
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(workspace.dashboard_has_new_draft_for_test())
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "q");
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(workspace.overview_open_for_test());
+            assert!(!workspace.dashboard_has_new_draft_for_test());
+            assert!(
+                !workspace
+                    .surface_history_for_test()
+                    .0
+                    .contains(&"draft".to_owned()),
+                "discarded draft remained in surface history"
+            );
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "f24");
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                workspace.overview_open_for_test(),
+                "history reopened the discarded Shift-R draft"
+            )
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn discarding_shift_r_draft_preserves_non_draft_history_cursor(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.configure_surface_history_for_test(&["current"], window, cx);
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "f24 shift-r q f24");
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(!workspace.overview_open_for_test());
+            assert_eq!(workspace.current_surface_name_for_test(), "inbox current");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn q_mid_list_removes_current_and_keeps_newer_entries_forward(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
     let workspace = test_workspace(cx);
@@ -7015,62 +5528,6 @@ fn typing_does_not_reorder_history(cx: &mut TestAppContext) {
                     1
                 )
             );
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn forwarding_back_to_a_dealt_surface_voids_its_navigation_skip(cx: &mut TestAppContext) {
-    let (workspace, _, _) = mixed_deal_workspace(cx);
-    let identity = workspace
-        .update(cx, |workspace, _, _| {
-            workspace.current_deal_card_for_test().unwrap().0
-        })
-        .unwrap();
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.step_surface_back_for_test(window, cx);
-            assert!(workspace.deal_skip_exists_for_test(&identity));
-            assert!(workspace.step_surface_forward_for_test(window, cx));
-            assert!(!workspace.deal_skip_exists_for_test(&identity));
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn forward_at_the_front_pulls_a_fresh_deal(cx: &mut TestAppContext) {
-    let (workspace, _, _) = mixed_deal_workspace(cx);
-    let before = workspace
-        .update(cx, |workspace, _, _| {
-            workspace.current_deal_card_for_test().unwrap().0
-        })
-        .unwrap();
-
-    cx.simulate_keystrokes(*workspace, "f20");
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert_ne!(workspace.current_deal_card_for_test().unwrap().0, before);
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn f21_resubscribes_an_evicted_transcript(cx: &mut TestAppContext) {
-    let (workspace, agent_id, _) = mixed_deal_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.configure_evicted_transcript_history_for_test(agent_id, window, cx);
-            assert!(!workspace.agent_subscribed_for_test(agent_id));
-            workspace.step_surface_back_for_test(window, cx);
-            assert!(
-                workspace
-                    .current_surface_name_for_test()
-                    .starts_with("mixed hand agent")
-            );
-            assert!(workspace.agent_subscribed_for_test(agent_id));
         })
         .unwrap();
 }
@@ -7142,883 +5599,4 @@ fn q_on_overview_is_a_no_op(cx: &mut TestAppContext) {
             assert_eq!(workspace.current_surface_name_for_test(), before);
         })
         .unwrap();
-}
-
-fn assert_escape_keeps_deal_with_focus(
-    cx: &mut TestAppContext,
-    key: &str,
-    wanted: fn(crate::dashboard::DealCardKind) -> bool,
-) {
-    let (workspace, _, _) = mixed_deal_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert!(workspace.seek_deal_card_for_test(wanted, window, cx));
-        })
-        .unwrap();
-    cx.run_until_parked();
-    let kind = assert_rendered_deal_matches_current(&workspace, cx);
-    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.focus_dealt_surface_for_test(window, cx)
-        })
-        .unwrap();
-    cx.run_until_parked();
-    cx.update_window(*workspace, |_, window, cx| {
-        let action = cx.build_action("vim::EnterDealMode", None).unwrap();
-        window.dispatch_action(action, cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, key);
-    cx.run_until_parked();
-    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
-        .unwrap();
-    cx.run_until_parked();
-    assert!(
-        workspace
-            .update(cx, |workspace, _, _| workspace
-                .dashboard_deal_mode_for_test())
-            .unwrap(),
-        "{key} left deal mode for {kind:?} with focus in its dealt surface"
-    );
-    return;
-}
-
-macro_rules! deal_escape_test {
-    ($name:ident, $key:literal, $pattern:pat) => {
-        #[gpui::test]
-        fn $name(cx: &mut TestAppContext) {
-            assert_escape_keeps_deal_with_focus(cx, $key, |kind| matches!(kind, $pattern));
-        }
-    };
-}
-
-macro_rules! deal_q_exit_test {
-    ($name:ident, $pattern:pat) => {
-        #[gpui::test]
-        fn $name(cx: &mut TestAppContext) {
-            let (workspace, _, _) = mixed_deal_workspace(cx);
-            workspace
-                .update(cx, |workspace, window, cx| {
-                    assert!(workspace.seek_deal_card_for_test(
-                        |kind| matches!(kind, $pattern),
-                        window,
-                        cx
-                    ));
-                    workspace.focus_dealt_surface_for_test(window, cx);
-                })
-                .unwrap();
-            cx.run_until_parked();
-            cx.simulate_keystrokes(*workspace, "q");
-            cx.run_until_parked();
-            assert!(
-                !workspace
-                    .update(cx, |workspace, _, _| workspace
-                        .dashboard_deal_mode_for_test())
-                    .unwrap()
-            );
-        }
-    };
-}
-
-deal_escape_test!(
-    escape_keeps_desk_deal,
-    "escape",
-    crate::dashboard::DealCardKind::Desk
-);
-deal_escape_test!(
-    escape_keeps_agent_deal_with_transcript_focused,
-    "escape",
-    crate::dashboard::DealCardKind::Agent
-);
-deal_escape_test!(
-    escape_keeps_inbox_deal,
-    "escape",
-    crate::dashboard::DealCardKind::Inbox(_)
-);
-deal_q_exit_test!(q_exits_desk_deal, crate::dashboard::DealCardKind::Desk);
-deal_q_exit_test!(
-    q_exits_agent_deal_with_transcript_focused,
-    crate::dashboard::DealCardKind::Agent
-);
-deal_q_exit_test!(q_exits_inbox_deal, crate::dashboard::DealCardKind::Inbox(_));
-
-#[gpui::test]
-fn q_closes_agent_surface_and_space_k_cannot_return_to_it(cx: &mut TestAppContext) {
-    let (workspace, agent_id, _) = mixed_deal_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert!(workspace.seek_deal_card_for_test(
-                |kind| matches!(kind, crate::dashboard::DealCardKind::Agent),
-                window,
-                cx,
-            ));
-            workspace.focus_dealt_surface_for_test(window, cx);
-        })
-        .unwrap();
-    cx.update_window(*workspace, |_, window, cx| {
-        let action = cx.build_action("vim::EnterDealMode", None).unwrap();
-        window.dispatch_action(action, cx);
-    })
-    .unwrap();
-    cx.simulate_keystrokes(*workspace, "q");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(!workspace.history_contains_agent_for_test(agent_id));
-            assert!(!workspace.agent_surface_visible_for_test(agent_id));
-        })
-        .unwrap();
-
-    cx.simulate_keystrokes(*workspace, "space k");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(!workspace.history_contains_agent_for_test(agent_id));
-            assert!(
-                !workspace.agent_surface_visible_for_test(agent_id),
-                "Space K must not return to a transcript explicitly closed with q"
-            );
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn quick_spawn_send_relocates_the_cursor(cx: &mut TestAppContext) {
-    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
-
-    let mut source =
-        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
-    let operation = DeskOperation::from_text(&source.edit([(0..0, "* One\nbody\n")]));
-    let desk_snapshot = DeskSnapshot {
-        text: source.snapshot().text(),
-        operations: vec![operation],
-        transactions: Vec::new(),
-        replicas: Vec::new(),
-    };
-
-    let workspace = test_workspace(cx);
-    cx.update(bind_test_keymaps);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::Ready {
-                    agents: Vec::new(),
-                    iris_agent: None,
-                    projects: vec![rho_ui_proto::UiProject {
-                        path: "/tmp/repo".into(),
-                        name: "repo".to_owned(),
-                        description: String::new(),
-                    }],
-                    auth: rho_ui_proto::AuthState {
-                        disabled_namespaces: Vec::new(),
-                        active_namespace: None,
-                        namespaces: Vec::new(),
-                    },
-                    machine_seed: 0,
-                    agent_counter: 100,
-                },
-                window,
-                cx,
-            );
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskSnapshot {
-                    snapshot: desk_snapshot,
-                    replica_id: 42,
-                },
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
-            let editor = workspace.dashboard_editor();
-            let focus_handle = editor.read(cx).focus_handle(cx);
-            window.focus(&focus_handle, cx);
-        })
-        .expect("set up workspace");
-    cx.update(|cx| cx.refresh_windows());
-    cx.run_until_parked();
-
-    cx.simulate_keystrokes(*workspace, "escape");
-    cx.simulate_keystrokes(*workspace, "shift-r");
-    cx.simulate_keystrokes(*workspace, "h i");
-    // Enter sends: spawns the agent, writes the placeholder heading, and
-    // must not leave the cursor on the removed draft row.
-    workspace
-        .update(cx, |workspace, _, _| {
-            workspace.force_host_online(HostId::default());
-        })
-        .expect("force online");
-    cx.simulate_keystrokes(*workspace, "enter");
-    cx.run_until_parked();
-
-    let (text, cursor) = workspace
-        .update(cx, |workspace, _, cx| {
-            let editor = workspace.dashboard_editor();
-            let text = editor.read(cx).buffer().read(cx).snapshot(cx).text();
-            let cursor = editor.update(cx, |editor, cx| {
-                let snapshot = editor.display_snapshot(cx);
-                editor
-                    .selections
-                    .newest::<editor::MultiBufferOffset>(&snapshot)
-                    .head()
-            });
-            (text, cursor)
-        })
-        .expect("read dashboard");
-    assert!(
-        text.contains("* …"),
-        "quick spawn should write the placeholder heading: {text:?}"
-    );
-    // The star token is concealed chrome, so the caret rests past it on
-    // the title.
-    assert_eq!(
-        cursor.0,
-        text.find("* …").expect("placeholder present") + 2,
-        "cursor should land on the new heading's title: {text:?}"
-    );
-
-    // `space u` closes the leader transient and arms a one-shot prefix.
-    cx.simulate_keystrokes(*workspace, "escape space u");
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(workspace.has_universal_argument_for_test());
-            assert!(!workspace.has_transient_for_test());
-        })
-        .expect("inspect universal argument");
-
-    // Its `R` variant takes the configured path. Change the role, compose,
-    // and submit; it should finish through the same quick-spawn placement
-    // behavior as bare `R`.
-    cx.simulate_keystrokes(*workspace, "shift-r");
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(!workspace.has_universal_argument_for_test());
-            assert!(workspace.has_new_agent_configuration_for_test());
-        })
-        .expect("inspect configured quick spawn");
-    cx.simulate_keystrokes(*workspace, "r c");
-    cx.simulate_keystrokes(*workspace, "configured");
-    cx.simulate_keystrokes(*workspace, "enter");
-    cx.run_until_parked();
-    let text = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .dashboard_editor()
-                .read(cx)
-                .buffer()
-                .read(cx)
-                .snapshot(cx)
-                .text()
-        })
-        .expect("read configured quick spawn");
-    assert_eq!(
-        text.matches("* …").count(),
-        2,
-        "configured quick spawn should add its own placeholder heading: {text:?}"
-    );
-
-    // The lowercase modified command scopes the same options transient to
-    // the heading under point instead of creating another heading.
-    cx.simulate_keystrokes(*workspace, "escape space u r r c");
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(workspace.configured_draft_topic_for_test().is_some());
-            assert!(workspace.has_new_agent_configuration_for_test());
-        })
-        .expect("inspect configured staffing draft");
-    cx.simulate_keystrokes(*workspace, "staff here");
-    cx.simulate_keystrokes(*workspace, "enter");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(!workspace.has_new_agent_configuration_for_test());
-            let text = workspace
-                .dashboard_editor()
-                .read(cx)
-                .buffer()
-                .read(cx)
-                .snapshot(cx)
-                .text();
-            assert_eq!(
-                text.matches("* …").count(),
-                2,
-                "configured staffing should bind to the existing heading: {text:?}"
-            );
-        })
-        .expect("inspect configured staffing send");
-
-    // Unsupported keys clear the prefix instead of leaving it sticky.
-    cx.simulate_keystrokes(*workspace, "escape space u j");
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(!workspace.has_universal_argument_for_test());
-            assert!(!workspace.has_transient_for_test());
-        })
-        .expect("inspect cleared universal argument");
-}
-
-/// Quick spawn (`shift-r`) writes a `* …` placeholder heading and binds
-/// the agent there; once the agent's generated summary lands, the title
-/// fills itself in — but a heading the user has renamed is left alone.
-#[gpui::test]
-fn quick_spawn_placeholder_takes_the_generated_title(cx: &mut TestAppContext) {
-    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
-    use rho_ui_proto::{
-        AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
-    };
-
-    let summary = |name: Option<&str>| UiAgentSummary {
-        agent_id: agent(1),
-        parent_agent: None,
-        display_name: name.map(str::to_owned),
-        created_at: UnixMs(1),
-        updated_at: UnixMs(1),
-        role: AgentRole::default(),
-        workspace: WorkspaceInfo::UserCheckout {
-            repo: "/tmp".into(),
-        },
-        attention: UiAttention::Quiet,
-        last_active: UnixMs(1),
-        facts: Default::default(),
-        hidden: false,
-        disposition: AgentDisposition::Pending,
-        last_user_message_text: String::new(),
-        activity: None,
-        turn_report: None,
-        labels: Vec::new(),
-    };
-    let ready = |agents: Vec<UiAgentSummary>| ConnEvent::Ready {
-        agents,
-        iris_agent: None,
-        projects: Vec::new(),
-        auth: AuthState {
-            disabled_namespaces: Vec::new(),
-            active_namespace: None,
-            namespaces: Vec::new(),
-        },
-        machine_seed: 0,
-        agent_counter: 100,
-    };
-
-    let mut source =
-        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
-    let operation = DeskOperation::from_text(&source.edit([(0..0, "* One\nbody\n")]));
-    let desk_snapshot = DeskSnapshot {
-        text: source.snapshot().text(),
-        operations: vec![operation],
-        transactions: Vec::new(),
-        replicas: Vec::new(),
-    };
-
-    let workspace = test_workspace(cx);
-    // The agent exists but has no generated summary yet when it spawns.
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), ready(vec![summary(None)]), window, cx);
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskSnapshot {
-                    snapshot: desk_snapshot,
-                    replica_id: 42,
-                },
-                window,
-                cx,
-            );
-            let offset = workspace
-                .quick_spawn_heading_for_test(HostId::default(), agent(1), cx)
-                .expect("desk is present");
-            assert_eq!(offset, "* One\nbody\n".len());
-            workspace.sync_dashboard(window, cx);
-        })
-        .expect("update workspace");
-    cx.run_until_parked();
-
-    let desk_text = |workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext| {
-        workspace
-            .update(cx, |workspace, _, cx| {
-                let editor = workspace.dashboard_editor();
-                editor.read(cx).buffer().read(cx).snapshot(cx).text()
-            })
-            .expect("read dashboard")
-    };
-    assert!(
-        desk_text(&workspace, cx).contains("* …"),
-        "placeholder heading missing: {:?}",
-        desk_text(&workspace, cx)
-    );
-
-    // The generated summary arrives: the placeholder becomes the title.
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ready(vec![summary(Some("fix the parser"))]),
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
-        })
-        .expect("update workspace");
-    cx.run_until_parked();
-    let text = desk_text(&workspace, cx);
-    assert!(
-        text.contains("* fix the parser") && !text.contains('…'),
-        "title did not fill in: {text:?}"
-    );
-
-    // Another summary refresh must not clobber the now-real title.
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ready(vec![summary(Some("a newer summary"))]),
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
-        })
-        .expect("update workspace");
-    cx.run_until_parked();
-    assert!(
-        desk_text(&workspace, cx).contains("* fix the parser"),
-        "settled title was clobbered: {:?}",
-        desk_text(&workspace, cx)
-    );
-}
-
-/// The daemon retags a heading by inserting the tag at the very spot
-/// the caret occupies after typing the title. That edit arrives as a
-/// CRDT operation and moves the caret by anchor resolution, outside
-/// `change_selections` and its caret-rest constraint — so the sync that
-/// conceals the new tag must also nudge the caret off the conceal.
-#[gpui::test]
-fn daemon_retag_keeps_the_caret_at_the_title_end(cx: &mut TestAppContext) {
-    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot, DeskTextOpRecord};
-    use rho_ui_proto::{
-        AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
-    };
-
-    let summary = UiAgentSummary {
-        agent_id: agent(1),
-        parent_agent: None,
-        display_name: Some("planner".to_owned()),
-        created_at: UnixMs(1),
-        updated_at: UnixMs(1),
-        role: AgentRole::default(),
-        workspace: WorkspaceInfo::UserCheckout {
-            repo: "/tmp".into(),
-        },
-        attention: UiAttention::Quiet,
-        last_active: UnixMs(1),
-        facts: Default::default(),
-        hidden: false,
-        disposition: AgentDisposition::Pending,
-        last_user_message_text: String::new(),
-        activity: None,
-        turn_report: None,
-        labels: Vec::new(),
-    };
-
-    let mut source =
-        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
-    let operation = DeskOperation::from_text(&source.edit([(0..0, "* One\nbody\n* Two\n")]));
-    let desk_snapshot = DeskSnapshot {
-        text: source.snapshot().text(),
-        operations: vec![operation],
-        transactions: Vec::new(),
-        replicas: Vec::new(),
-    };
-
-    let workspace = test_workspace(cx);
-    cx.update(bind_test_keymaps);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::Ready {
-                    agents: vec![summary],
-                    iris_agent: None,
-                    projects: Vec::new(),
-                    auth: AuthState {
-                        namespaces: Vec::new(),
-                        disabled_namespaces: Vec::new(),
-                        active_namespace: None,
-                    },
-                    machine_seed: 0,
-                    agent_counter: 100,
-                },
-                window,
-                cx,
-            );
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskSnapshot {
-                    snapshot: desk_snapshot,
-                    replica_id: 42,
-                },
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
-            let focus_handle = workspace.dashboard_editor().read(cx).focus_handle(cx);
-            window.focus(&focus_handle, cx);
-            workspace.dashboard_editor().update(cx, |editor, cx| {
-                editor.change_selections(Default::default(), window, cx, |selections| {
-                    let offset = editor::MultiBufferOffset(5);
-                    selections.select_ranges([offset..offset]);
-                });
-            });
-        })
-        .expect("update workspace");
-    cx.update(|cx| cx.refresh_windows());
-    cx.run_until_parked();
-
-    let caret = |cx: &mut TestAppContext| {
-        workspace
-            .update(cx, |workspace, _, cx| {
-                workspace.dashboard_editor().update(cx, |editor, cx| {
-                    let snapshot = editor.display_snapshot(cx);
-                    editor
-                        .selections
-                        .newest::<editor::MultiBufferOffset>(&snapshot)
-                        .head()
-                        .0
-                })
-            })
-            .expect("read caret")
-    };
-    assert_eq!(caret(cx), 5, "caret starts at the title end");
-
-    let tag_edit = format!(" :eng-{}:", agent(1).encoded());
-    let operation = DeskOperation::from_text(&source.edit([(5..5, tag_edit.as_str())]));
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskTextApplied(DeskTextOpRecord {
-                    sequence: 2,
-                    timestamp_ms: 2,
-                    operation,
-                    transaction: None,
-                }),
-                window,
-                cx,
-            );
-        })
-        .expect("apply retag");
-    cx.update(|cx| cx.refresh_windows());
-    cx.run_until_parked();
-
-    let display = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .dashboard_editor()
-                .update(cx, |editor, cx| editor.display_text(cx))
-        })
-        .expect("read display text");
-    assert!(
-        !display.contains(":eng-"),
-        "tag should be concealed: {display:?}"
-    );
-    assert_eq!(
-        caret(cx),
-        5,
-        "the caret must not strand past the concealed tag"
-    );
-
-    // Any anchor-resolution path can strand the caret inside the
-    // conceal; the next sync heals it.
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.dashboard_editor().update(cx, |editor, cx| {
-                let snapshot = editor.display_snapshot(cx);
-                editor.selections.change_with(&snapshot, |selections| {
-                    let line_end = editor::MultiBufferOffset(5 + tag_edit.len());
-                    selections.select_ranges([line_end..line_end]);
-                });
-            });
-            workspace.sync_dashboard(window, cx);
-        })
-        .expect("strand caret");
-    cx.update(|cx| cx.refresh_windows());
-    cx.run_until_parked();
-    assert_eq!(
-        caret(cx),
-        5,
-        "sync must nudge a stranded caret off the conceal"
-    );
-}
-
-/// Cursor motion must never open a fold: the clamp that lifts a fold
-/// when the caret lands inside it exists for genuine jumps (`o`,
-/// searches), and hjkl travel around a folded heading must not trip it.
-#[gpui::test]
-fn hjkl_travel_never_opens_a_fold(cx: &mut TestAppContext) {
-    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
-    use rho_ui_proto::{
-        AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
-    };
-
-    let summary = UiAgentSummary {
-        agent_id: agent(1),
-        parent_agent: None,
-        display_name: Some("planner".to_owned()),
-        created_at: UnixMs(1),
-        updated_at: UnixMs(1),
-        role: AgentRole::default(),
-        workspace: WorkspaceInfo::UserCheckout {
-            repo: "/tmp".into(),
-        },
-        attention: UiAttention::Quiet,
-        last_active: UnixMs(1),
-        facts: Default::default(),
-        hidden: false,
-        disposition: AgentDisposition::Pending,
-        last_user_message_text: String::new(),
-        activity: None,
-        turn_report: None,
-        labels: Vec::new(),
-    };
-
-    let desk_text = format!(
-        "* One :eng-{}:\none body\n** Kid\nkid stuff\n* Two\ntwo tail\n",
-        agent(1).encoded()
-    );
-    let mut source =
-        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
-    let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text.as_str())]));
-    let desk_snapshot = DeskSnapshot {
-        text: source.snapshot().text(),
-        operations: vec![operation],
-        transactions: Vec::new(),
-        replicas: Vec::new(),
-    };
-
-    let workspace = test_workspace(cx);
-    cx.update(bind_test_keymaps);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::Ready {
-                    agents: vec![summary],
-                    iris_agent: None,
-                    projects: Vec::new(),
-                    auth: AuthState {
-                        namespaces: Vec::new(),
-                        disabled_namespaces: Vec::new(),
-                        active_namespace: None,
-                    },
-                    machine_seed: 0,
-                    agent_counter: 100,
-                },
-                window,
-                cx,
-            );
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskSnapshot {
-                    snapshot: desk_snapshot,
-                    replica_id: 42,
-                },
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
-            workspace.dashboard_cycle_fold_for_test(HostId::default(), 0, window, cx);
-            let focus_handle = workspace.dashboard_editor().read(cx).focus_handle(cx);
-            window.focus(&focus_handle, cx);
-            workspace.dashboard_editor().update(cx, |editor, cx| {
-                editor.change_selections(Default::default(), window, cx, |selections| {
-                    let offset = editor::MultiBufferOffset(2);
-                    selections.select_ranges([offset..offset]);
-                });
-            });
-        })
-        .expect("update workspace");
-    cx.update(|cx| cx.refresh_windows());
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "escape tab");
-    cx.run_until_parked();
-
-    let folded_body_hidden = |cx: &mut TestAppContext| {
-        let display = workspace
-            .update(cx, |workspace, _, cx| {
-                workspace
-                    .dashboard_editor()
-                    .update(cx, |editor, cx| editor.display_text(cx))
-            })
-            .expect("read display text");
-        !display.contains("one body") && !display.contains("kid stuff")
-    };
-    assert!(folded_body_hidden(cx), "tab folds the subtree");
-
-    for step in [
-        "j", "k", "$", "l", "l", "h", "j", "j", "k", "k", "0", "$", "j", "$", "k", "e", "e", "b",
-        "w", "g g", "shift-g", "k",
-    ] {
-        cx.simulate_keystrokes(*workspace, step);
-        cx.run_until_parked();
-        assert!(
-            folded_body_hidden(cx),
-            "motion {step:?} must not open the fold"
-        );
-    }
-}
-
-/// End-of-line commands stop at the logical line end — in front of the
-/// concealed tag and the collapsed subtree — and helix's one-column
-/// cursor can never sit on that chrome either.
-#[gpui::test]
-fn helix_append_on_a_folded_heading_lands_at_the_title(cx: &mut TestAppContext) {
-    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
-    use rho_ui_proto::{
-        AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
-    };
-
-    let summary = UiAgentSummary {
-        agent_id: agent(1),
-        parent_agent: None,
-        display_name: Some("planner".to_owned()),
-        created_at: UnixMs(1),
-        updated_at: UnixMs(1),
-        role: AgentRole::default(),
-        workspace: WorkspaceInfo::UserCheckout {
-            repo: "/tmp".into(),
-        },
-        attention: UiAttention::Quiet,
-        last_active: UnixMs(1),
-        facts: Default::default(),
-        hidden: false,
-        disposition: AgentDisposition::Pending,
-        last_user_message_text: String::new(),
-        activity: None,
-        turn_report: None,
-        labels: Vec::new(),
-    };
-
-    let desk_text = format!(
-        "* One :eng-{}:\none body\n** Kid\nkid stuff\n* Two\n",
-        agent(1).encoded()
-    );
-    let mut source =
-        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
-    let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text.as_str())]));
-    let desk_snapshot = DeskSnapshot {
-        text: source.snapshot().text(),
-        operations: vec![operation],
-        transactions: Vec::new(),
-        replicas: Vec::new(),
-    };
-
-    let workspace = test_workspace(cx);
-    cx.update(bind_test_keymaps);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::Ready {
-                    agents: vec![summary],
-                    iris_agent: None,
-                    projects: Vec::new(),
-                    auth: AuthState {
-                        namespaces: Vec::new(),
-                        disabled_namespaces: Vec::new(),
-                        active_namespace: None,
-                    },
-                    machine_seed: 0,
-                    agent_counter: 100,
-                },
-                window,
-                cx,
-            );
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskSnapshot {
-                    snapshot: desk_snapshot,
-                    replica_id: 42,
-                },
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
-            workspace.dashboard_cycle_fold_for_test(HostId::default(), 0, window, cx);
-            let focus_handle = workspace.dashboard_editor().read(cx).focus_handle(cx);
-            window.focus(&focus_handle, cx);
-            workspace.dashboard_editor().update(cx, |editor, cx| {
-                editor.change_selections(Default::default(), window, cx, |selections| {
-                    let offset = editor::MultiBufferOffset(2);
-                    selections.select_ranges([offset..offset]);
-                });
-            });
-        })
-        .expect("update workspace");
-    cx.update(|cx| cx.refresh_windows());
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "escape tab");
-    cx.run_until_parked();
-
-    let cursor = |cx: &mut TestAppContext| {
-        workspace
-            .update(cx, |workspace, _, cx| {
-                workspace.dashboard_editor().update(cx, |editor, cx| {
-                    let snapshot = editor.display_snapshot(cx);
-                    let selection = editor
-                        .selections
-                        .newest::<editor::MultiBufferOffset>(&snapshot);
-                    (selection.start.0, selection.end.0)
-                })
-            })
-            .expect("read cursor")
-    };
-
-    // `$` rests the cursor on the title's last character. `l` steps to
-    // the logical line end — the append position, rendered as a
-    // line-end block — and no further: the concealed tag, the chip,
-    // and the chevron are not cursor positions.
-    cx.simulate_keystrokes(*workspace, "$");
-    cx.run_until_parked();
-    assert_eq!(cursor(cx), (4, 4), "$ rests on the title's last character");
-    cx.simulate_keystrokes(*workspace, "l");
-    cx.run_until_parked();
-    assert_eq!(cursor(cx), (5, 5), "l stops at the logical line end");
-    cx.simulate_keystrokes(*workspace, "l");
-    cx.run_until_parked();
-    assert_eq!(cursor(cx), (5, 5), "the cursor never enters line chrome");
-
-    // Append lands ahead of the tag, and the subtree stays folded.
-    cx.simulate_keystrokes(*workspace, "shift-a");
-    cx.simulate_keystrokes(*workspace, "space m o r e");
-    cx.run_until_parked();
-    let text = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .dashboard_editor()
-                .read(cx)
-                .buffer()
-                .read(cx)
-                .snapshot(cx)
-                .text()
-        })
-        .expect("read dashboard");
-    assert!(
-        text.starts_with("* One more :eng-"),
-        "append must stay ahead of the tag: {text:?}"
-    );
-    let display = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .dashboard_editor()
-                .update(cx, |editor, cx| editor.display_text(cx))
-        })
-        .expect("read display text");
-    assert!(
-        !display.contains("one body") && !display.contains("kid stuff"),
-        "the subtree stays folded through the append: {display:?}"
-    );
 }

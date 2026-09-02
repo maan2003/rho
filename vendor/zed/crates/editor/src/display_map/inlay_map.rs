@@ -2208,8 +2208,7 @@ mod tests {
             for end in start..=snapshot.len().0.0 {
                 let actual = snapshot
                     .chunks(
-                        InlayOffset(MultiBufferOffset(start))
-                            ..InlayOffset(MultiBufferOffset(end)),
+                        InlayOffset(MultiBufferOffset(start))..InlayOffset(MultiBufferOffset(end)),
                         LanguageAwareStyling {
                             tree_sitter: false,
                             diagnostics: false,

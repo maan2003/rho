@@ -691,9 +691,7 @@ impl WebWindowInner {
                 key_char,
             };
 
-            let result = this.dispatch_input(PlatformInput::KeyUp(KeyUpEvent {
-                keystroke,
-            }));
+            let result = this.dispatch_input(PlatformInput::KeyUp(KeyUpEvent { keystroke }));
             if let Some(result) = result {
                 if !result.propagate {
                     event.prevent_default();

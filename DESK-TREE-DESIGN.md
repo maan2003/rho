@@ -76,6 +76,31 @@ offsets and heading titles are never identities.
 above is not a small bug; it is the dealer lying. Stable ids are also what
 make the journal analyzable: the same node across weeks is the same node.
 
+### Composed rows preserve editor semantics
+
+The editor may render a tree node as a whole-buffer row, but it must expose
+that row as semantic content rather than an accidental one-line text buffer.
+Linewise vim actions (`dd`, `yy`, `p`, `o`/`O`, `>>`/`<<`) are offered to the
+embedding view with the row's opaque buffer identity. The view applies one
+structural transaction and registers its inverse in the editor's ordinary
+undo order; prose rows continue through native text editing unchanged.
+The editor entry is retained only after the daemon accepts the matching Desk
+batch. Undo restores complete user-node state (placement, text, temporal
+marks, tags, and bindings). Machine-owned descendants are never tombstoned by
+a user delete: the same batch reparents their top-level rows to the nearest
+surviving ancestor, and undo moves them beneath the restored user row. The
+client supplies only a batch-level evacuation/restore intent; the daemon
+derives the complete machine-row set and emits machine-authored moves after
+validating the user-node deletion or bijective restoration.
+External entries are consumed on undo rather than left as unsupported redo
+entries.
+
+**Why:** display inlays and excerpt boundaries must not change what a day of
+vim feels like. If the editor treats a heading as characters, deleting or
+pasting a line destroys its title while leaving the node behind. A semantic
+row hook keeps modal behavior generic in the editor, node identity private to
+Desk, and one `u` equal to one user action.
+
 ### Ownership replaces "the system never writes"
 
 The old rule was structural in spirit and impossible in practice. It becomes:
@@ -132,13 +157,14 @@ offline. Changing the primitive must not change who is responsible for it.
 
 The existing org text is imported once: headings become heading nodes with
 marks from property lines and bindings from tags, everything else becomes
-prose nodes. The migration runs on the first start that finds a text desk,
-records that it ran, and is never consulted again; it lives in one module
-named as a migration so it can be deleted outright later. After it, the org
-document itself is gone from the daemon, along with the parser, the tag
-handling, the property lines, the text wire messages, and the offset
-identities. No frozen copy is kept and no code path reads org text. The
-`rho desk cat` rendering is for human eyes only; nothing parses it back.
+prose nodes. The migration runs on the first start that finds a text desk; the
+tree snapshot and completion marker are committed atomically, the legacy
+tables are deleted, and the migration is never consulted again. It lives in
+one module named as a migration so it can be deleted outright later. After
+it, the org document itself is gone from the daemon, along with the parser,
+tag handling, property lines, text wire messages, and offset identities. No
+frozen copy is kept and no code path reads org text. The `rho desk cat`
+rendering is for human eyes only; nothing parses it back.
 
 **Why:** rho has one user and the desk is small. Carrying two truths for a
 transition period is how the current state came about.

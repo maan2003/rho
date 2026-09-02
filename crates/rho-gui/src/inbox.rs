@@ -19,7 +19,7 @@ use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "native")]
 const ITEMS: TableDefinition<Sen<String>, Sen<InboxItem>> =
-    TableDefinition::new("rho_gui_inbox_items_v1");
+    TableDefinition::new("rho_gui_inbox_items_v2");
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -42,9 +42,25 @@ pub enum InboxKind {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SourceReference {
     Page { id: String },
-    DeskPosition { host: String, offset: usize },
+    DeskNode { host: u32, node_id: NodeIdentity },
     External { source: String, reference: String },
     None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "native", derive(Encode, Decode))]
+pub struct NodeIdentity {
+    pub replica_id: u16,
+    pub counter: u64,
+}
+
+impl From<rho_desk::NodeId> for NodeIdentity {
+    fn from(id: rho_desk::NodeId) -> Self {
+        Self {
+            replica_id: id.replica_id,
+            counter: id.counter,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -282,29 +298,34 @@ impl InboxStore {
 
     fn save(&self) -> anyhow::Result<()> {
         #[cfg(not(feature = "native"))]
-        return Ok(());
-        #[cfg(feature = "native")]
-        let Some(db) = &self.db else {
+        {
             return Ok(());
-        };
+        }
         #[cfg(feature = "native")]
-        futures::executor::block_on(async {
-            let mut write = db.write().await;
-            let mut table = write.open_table(ITEMS);
-            let old_keys = table
-                .iter()
-                .map(|(key, _)| key.value().into_owned())
-                .collect::<Vec<_>>();
-            for key in old_keys {
-                table.remove(SenValue::owned(key));
-            }
-            for item in &self.items {
-                table.insert(SenValue::borrowed(&item.id.0), SenValue::borrowed(item));
-            }
-            drop(table);
-            write.commit();
-        });
-        Ok(())
+        {
+            #[cfg(feature = "native")]
+            let Some(db) = &self.db else {
+                return Ok(());
+            };
+            #[cfg(feature = "native")]
+            futures::executor::block_on(async {
+                let mut write = db.write().await;
+                let mut table = write.open_table(ITEMS);
+                let old_keys = table
+                    .iter()
+                    .map(|(key, _)| key.value().into_owned())
+                    .collect::<Vec<_>>();
+                for key in old_keys {
+                    table.remove(SenValue::owned(key));
+                }
+                for item in &self.items {
+                    table.insert(SenValue::borrowed(&item.id.0), SenValue::borrowed(item));
+                }
+                drop(table);
+                write.commit();
+            });
+            Ok(())
+        }
     }
 }
 

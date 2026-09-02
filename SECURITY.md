@@ -88,8 +88,9 @@ AI APIs.
   before persistence. Mixed structural/text batches validate exact source
   node state and canonical text versions, then persist as one idempotent log
   record; a failed precondition consumes no sequence or partial operation.
-  The initial org import runs locally against the previous
-  Desk snapshot and sends no content elsewhere.
+  A one-time, locally recorded migration may read the retired org snapshot,
+  installs the native tree and migration marker atomically, deletes the old
+  tables, and sends no content elsewhere. Runtime code never reads org text.
 - Opt-in GUI and daemon Dial9 profiles contain thread names, function symbols,
   local source paths, precise activity timing, and frontend marker metadata.
   GUI editor markers include numeric edit counts, affected row ranges, map row
