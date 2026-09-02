@@ -997,7 +997,8 @@ impl AgentRegistry {
         let desk_tree = desk_tree::DeskTreeStore::new(db.clone(), &desk.snapshot(), |handle| {
             desk::resolve_agent_handle(&db, handle)
         })
-        .await;
+        .await
+        .map_err(anyhow::Error::msg)?;
         let registry = Self {
             pool,
             db,
@@ -1703,7 +1704,14 @@ where
                         break;
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    if events_tx
+                        .send(ServerMessage::DeskTreeResyncRequired)
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
                 Err(broadcast::error::RecvError::Closed) => break,
             }
         }
@@ -2486,6 +2494,18 @@ async fn handle_message(
             });
             Ok(Refresh::None)
         }
+        ClientMessage::DeskTreeSubscribe => {
+            let replica_id = agents
+                .desk_tree
+                .allocate_replica(rho_desk::ReplicaAuthor::User)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            let _ = outgoing_tx.send(ServerMessage::DeskTreeSnapshot {
+                snapshot: agents.desk_tree.snapshot(),
+                replica_id,
+            });
+            Ok(Refresh::None)
+        }
         ClientMessage::DeskGet => {
             let text = agents
                 .desk
@@ -2534,9 +2554,21 @@ async fn handle_message(
                 .apply_text(operation, transaction)
                 .await
                 .map_err(anyhow::Error::msg)?;
+            let tree_replacement = agents
+                .desk_tree
+                .refresh_legacy_import(&agents.desk.snapshot(), |handle| {
+                    desk::resolve_agent_handle(&agents.db, handle)
+                })
+                .await
+                .map_err(anyhow::Error::msg)?;
             let _ = agents
                 .events
                 .send(ServerMessage::DeskTextApplied { record });
+            if let Some(snapshot) = tree_replacement {
+                let _ = agents
+                    .events
+                    .send(ServerMessage::DeskTreeReplaced { snapshot });
+            }
             Ok(Refresh::None)
         }
         ClientMessage::DeskTreeApply { operation } => {

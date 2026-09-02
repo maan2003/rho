@@ -1,4 +1,4 @@
-//! Direct browser iroh connection to the daemon's `rho/ui/3` protocol.
+//! Direct browser iroh connection to the daemon's `rho/ui/4` protocol.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -68,8 +68,10 @@ pub enum ConnEvent {
         snapshot: rho_desk::Snapshot,
         replica_id: u16,
     },
+    DeskTreeReplaced(rho_desk::Snapshot),
     DeskTreeApplied(rho_desk::TreeOpRecord),
     DeskNodeTextApplied(rho_desk::TextOpRecord),
+    DeskTreeResyncRequired,
     Ready {
         agents: Vec<UiAgentSummary>,
         iris_agent: Option<AgentId>,
@@ -450,12 +452,16 @@ fn handle_host_message(
             snapshot: snapshot.clone(),
             replica_id: *replica_id,
         }),
+        ServerMessage::DeskTreeReplaced { snapshot } => {
+            Some(ConnEvent::DeskTreeReplaced(snapshot.clone()))
+        }
         ServerMessage::DeskTreeApplied { record } => {
             Some(ConnEvent::DeskTreeApplied(record.clone()))
         }
         ServerMessage::DeskNodeTextApplied { record } => {
             Some(ConnEvent::DeskNodeTextApplied(record.clone()))
         }
+        ServerMessage::DeskTreeResyncRequired => Some(ConnEvent::DeskTreeResyncRequired),
         _ => None,
     };
     if let Some(event) = event {

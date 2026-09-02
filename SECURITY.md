@@ -369,9 +369,9 @@ AI APIs.
   denial-of-service boundary. The daemon's iroh secret key lives in the local
   rho database.
   The auth stream remains raw so unauthenticated input cannot invoke a
-  decompressor. All later application directions use ALPN `rho/ui/3` and one
+  decompressor. All later application directions use ALPN `rho/ui/4` and one
   streaming zstd frame with a 128 KiB maximum decoder window. Local Unix peers
-  must first exchange the fixed, ten-second-bounded `RHO-STREAM-3` preface.
+  must first exchange the fixed, ten-second-bounded `RHO-STREAM-4` preface.
   Senax frame limits are enforced on declared decompressed lengths before
   allocating payloads; compression is not an authorization or integrity
   boundary.

@@ -27,7 +27,7 @@ pub const ZSTD_WINDOW_LOG: u32 = 17;
 /// Fast, general-purpose compression for latency-sensitive application data.
 pub const ZSTD_LEVEL: i32 = 3;
 #[cfg(unix)]
-const UNIX_PREFACE: &[u8; 12] = b"RHO-STREAM-3";
+const UNIX_PREFACE: &[u8; 12] = b"RHO-STREAM-4";
 #[cfg(unix)]
 const PREFACE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);

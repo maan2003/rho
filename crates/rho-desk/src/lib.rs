@@ -388,6 +388,10 @@ pub struct Snapshot {
     pub texts: Vec<NodeTextSnapshot>,
     pub version: Vec<TreeClock>,
     pub replicas: Vec<Replica>,
+    /// Last operation sequence included by the daemon. Plain in-memory
+    /// documents leave this at zero.
+    #[senax(default)]
+    pub sequence: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -442,11 +446,17 @@ impl Document {
             texts: self.texts.values().cloned().collect(),
             version: self.seen.iter().copied().collect(),
             replicas: self.replicas.clone(),
+            sequence: 0,
         }
     }
 
     pub fn contains_operation(&self, timestamp: TreeClock) -> bool {
         self.seen.contains(&timestamp)
+    }
+
+    /// Returns ownership from the durable node record, including tombstones.
+    pub fn owner(&self, node_id: NodeId) -> Option<NodeOwner> {
+        self.nodes.get(&node_id).map(|node| node.owner)
     }
 
     pub fn apply(&mut self, operation: TreeOperation) -> Result<bool, String> {
@@ -455,18 +465,34 @@ impl Document {
             return Ok(false);
         }
         match &operation {
-            TreeOperation::Create { node_id, order, .. } => {
+            TreeOperation::Create {
+                node_id,
+                parent,
+                order,
+                ..
+            } => {
                 if node_id.replica_id != timestamp.replica_id {
                     return Err("Desk node id was allocated by another replica".into());
                 }
                 if self.nodes.contains_key(node_id) {
                     return Err("duplicate Desk node id".into());
                 }
+                if *parent == Some(*node_id) {
+                    return Err("Desk node cannot parent itself".into());
+                }
                 validate_order(order)?;
             }
-            TreeOperation::Move { node_id, order, .. } => {
+            TreeOperation::Move {
+                node_id,
+                parent,
+                order,
+                ..
+            } => {
                 if !self.nodes.contains_key(node_id) {
                     return Err("move references an unknown Desk node".into());
+                }
+                if *parent == Some(*node_id) {
+                    return Err("Desk node cannot parent itself".into());
                 }
                 validate_order(order)?;
             }
@@ -497,6 +523,22 @@ impl Document {
                 }
                 if !self.nodes.contains_key(node_id) {
                     return Err("binding references an unknown Desk node".into());
+                }
+                let node = &self.nodes[node_id];
+                let allowed = match kind {
+                    BindingKind::Agent => {
+                        node.kind == NodeKind::Agent && node.owner == NodeOwner::Machine
+                    }
+                    BindingKind::Page => {
+                        node.kind == NodeKind::Page && node.owner == NodeOwner::Machine
+                    }
+                    BindingKind::File => {
+                        node.kind == NodeKind::File
+                            || (node.kind == NodeKind::Heading && node.owner == NodeOwner::User)
+                    }
+                };
+                if !allowed {
+                    return Err("Desk binding is not valid for this node kind and owner".into());
                 }
             }
             TreeOperation::SetTag { node_id, tag, .. } => {
@@ -678,8 +720,7 @@ impl Document {
                         *id,
                         placements
                             .get(indexes[id])
-                            .and_then(|placement| placement.parent)
-                            .filter(|parent| *parent != *id),
+                            .and_then(|placement| placement.parent),
                     )
                 })
                 .collect();
@@ -953,5 +994,29 @@ mod tests {
         assert!(!doc.contains_operation(timestamp));
         doc.apply(create(timestamp, id(1), None, 10)).unwrap();
         assert_eq!(doc.materialize().len(), 1);
+    }
+
+    #[test]
+    fn self_parent_is_rejected_and_legacy_snapshot_falls_back_to_root() {
+        let mut doc = Document::default();
+        doc.apply(create(clock(1, 1), id(1), None, 10)).unwrap();
+        assert!(
+            doc.apply(TreeOperation::Move {
+                timestamp: clock(2, 1),
+                node_id: id(1),
+                parent: Some(id(1)),
+                order: OrderKey(vec![10]),
+            })
+            .is_err()
+        );
+
+        let mut snapshot = doc.snapshot();
+        snapshot.nodes[0].placements.push(Placement {
+            timestamp: clock(3, 1),
+            parent: Some(id(1)),
+            order: OrderKey(vec![10]),
+        });
+        let legacy = Document::from_snapshot(snapshot).unwrap();
+        assert_eq!(legacy.materialize()[0].parent, None);
     }
 }

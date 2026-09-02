@@ -38,9 +38,9 @@ pub const AGENT_COST_WINDOW_DAYS: u64 = 7;
 /// Maximum encoded GUI performance snapshot accepted by the daemon.
 pub const MAX_GUI_TELEMETRY_BYTES: usize = 8 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the daemon.
-pub const IROH_ALPN: &[u8] = b"rho/ui/3";
+pub const IROH_ALPN: &[u8] = b"rho/ui/4";
 #[cfg(not(target_family = "wasm"))]
-const PROTOCOL_LOG_MAGIC: &[u8; 4] = b"RUP2";
+const PROTOCOL_LOG_MAGIC: &[u8; 4] = b"RUP3";
 
 /// Fixed per-user daemon socket used by normal CLI and Git helper clients.
 #[cfg(not(target_family = "wasm"))]
@@ -58,6 +58,8 @@ pub enum ClientMessage {
     Subscribe,
     /// Subscribes to the daemon-owned Desk snapshot and live operation stream.
     DeskSubscribe,
+    /// Refreshes only the structured Desk stream after sequence loss.
+    DeskTreeSubscribe,
     /// Fetches the current Desk document text without allocating a replica.
     DeskGet,
     /// Subscribes like `DeskSubscribe`, but attributes the allocated replica
@@ -534,12 +536,18 @@ pub enum ServerMessage {
         snapshot: desk_tree::Snapshot,
         replica_id: u16,
     },
+    /// Phase-1 shadow import replacement; clients retain their tree replica.
+    DeskTreeReplaced {
+        snapshot: desk_tree::Snapshot,
+    },
     DeskTreeApplied {
         record: desk_tree::TreeOpRecord,
     },
     DeskNodeTextApplied {
         record: desk_tree::TextOpRecord,
     },
+    /// The daemon's broadcast receiver lagged; request a new tree snapshot.
+    DeskTreeResyncRequired,
     /// Reply to `DeskGet`: the materialized document, without a subscription.
     DeskDocument {
         text: String,
@@ -1211,6 +1219,12 @@ mod tests {
         let mut payload = &recorded_frame[4..];
         let message: ClientMessage = senax_encoder::unpack(&mut payload).unwrap();
         assert_eq!(message, ClientMessage::Ping);
+    }
+
+    #[test]
+    fn protocol_log_rejects_previous_wire_epoch() {
+        let mut old = &b"RUP2"[..];
+        assert!(read_protocol_log_record(&mut old).is_err());
     }
 
     #[test]

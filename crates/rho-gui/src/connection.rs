@@ -67,8 +67,10 @@ pub enum ConnEvent {
         snapshot: rho_desk::Snapshot,
         replica_id: u16,
     },
+    DeskTreeReplaced(rho_desk::Snapshot),
     DeskTreeApplied(rho_desk::TreeOpRecord),
     DeskNodeTextApplied(rho_desk::TextOpRecord),
+    DeskTreeResyncRequired,
     Ready {
         agents: Vec<UiAgentSummary>,
         iris_agent: Option<AgentId>,
@@ -1023,10 +1025,14 @@ async fn run(
                 snapshot,
                 replica_id,
             }),
+            ServerMessage::DeskTreeReplaced { snapshot } => {
+                Some(ConnEvent::DeskTreeReplaced(snapshot))
+            }
             ServerMessage::DeskTreeApplied { record } => Some(ConnEvent::DeskTreeApplied(record)),
             ServerMessage::DeskNodeTextApplied { record } => {
                 Some(ConnEvent::DeskNodeTextApplied(record))
             }
+            ServerMessage::DeskTreeResyncRequired => Some(ConnEvent::DeskTreeResyncRequired),
             // A `DeskGet` reply; the GUI subscribes and never sends one.
             ServerMessage::DeskDocument { .. } => None,
             ServerMessage::Ready {

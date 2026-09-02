@@ -1802,14 +1802,31 @@ impl Workspace {
             ConnEvent::DeskTreeSnapshot {
                 snapshot,
                 replica_id,
-            } => self
-                .desk_sync
-                .apply_tree_snapshot(host, snapshot, replica_id, cx),
+            } => {
+                if self
+                    .desk_sync
+                    .apply_tree_snapshot(host, snapshot, replica_id, cx)
+                {
+                    self.send_to_host(host, ClientMessage::DeskTreeSubscribe);
+                }
+            }
             ConnEvent::DeskTreeApplied(record) => {
-                self.desk_sync.apply_tree(host, record);
+                if self.desk_sync.apply_tree(host, record, cx) {
+                    self.send_to_host(host, ClientMessage::DeskTreeSubscribe);
+                }
+            }
+            ConnEvent::DeskTreeReplaced(snapshot) => {
+                if self.desk_sync.replace_tree_snapshot(host, snapshot, cx) {
+                    self.send_to_host(host, ClientMessage::DeskTreeSubscribe);
+                }
             }
             ConnEvent::DeskNodeTextApplied(record) => {
-                self.desk_sync.apply_node_text(host, record, cx);
+                if self.desk_sync.apply_node_text(host, record, cx) {
+                    self.send_to_host(host, ClientMessage::DeskTreeSubscribe);
+                }
+            }
+            ConnEvent::DeskTreeResyncRequired => {
+                self.send_to_host(host, ClientMessage::DeskTreeSubscribe);
             }
             ConnEvent::Ready {
                 agents,
