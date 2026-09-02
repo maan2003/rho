@@ -43,6 +43,10 @@ fn sequence_has_gap(current: u64, incoming: u64) -> bool {
     incoming > current.saturating_add(1)
 }
 
+fn snapshot_is_stale(current: u64, incoming: u64) -> bool {
+    incoming < current
+}
+
 /// Workspace-owned source of truth for every attached host's Desk document.
 pub struct DeskSync {
     hosts: BTreeMap<HostId, HostDesk>,
@@ -74,6 +78,13 @@ impl DeskSync {
         replica_id: u16,
         cx: &mut Context<Workspace>,
     ) -> bool {
+        if self
+            .tree_hosts
+            .get(&host)
+            .is_some_and(|desk| snapshot_is_stale(desk.sequence, snapshot.sequence))
+        {
+            return false;
+        }
         if let Some(replacement) = self.pending_replacements.remove(&host)
             && replacement.sequence > snapshot.sequence
         {
@@ -399,7 +410,7 @@ fn make_tree_buffer(
 
 #[cfg(test)]
 mod tests {
-    use super::sequence_has_gap;
+    use super::{sequence_has_gap, snapshot_is_stale};
 
     #[test]
     fn tree_sequence_accepts_duplicates_and_next_but_detects_loss() {
@@ -407,5 +418,12 @@ mod tests {
         assert!(!sequence_has_gap(7, 8));
         assert!(sequence_has_gap(7, 9));
         assert!(!sequence_has_gap(u64::MAX, u64::MAX));
+    }
+
+    #[test]
+    fn tree_snapshot_never_regresses_live_state() {
+        assert!(snapshot_is_stale(11, 10));
+        assert!(!snapshot_is_stale(11, 11));
+        assert!(!snapshot_is_stale(11, 12));
     }
 }
