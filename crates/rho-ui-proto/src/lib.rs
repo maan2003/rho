@@ -20,6 +20,7 @@ use senax_encoder::{Decode, Encode, Pack, Packer, Unpack, Unpacker};
 #[cfg(not(target_family = "wasm"))]
 pub mod client;
 pub mod desk;
+pub use rho_desk as desk_tree;
 pub mod realtime;
 pub mod remote;
 #[cfg(not(target_family = "wasm"))]
@@ -69,6 +70,14 @@ pub enum ClientMessage {
     DeskTextApply {
         operation: desk::DeskOperation,
         transaction: Option<desk::DeskTransaction>,
+    },
+    DeskTreeApply {
+        operation: desk_tree::TreeOperation,
+    },
+    DeskNodeTextApply {
+        node_id: desk_tree::NodeId,
+        operation: desk_tree::TextOperation,
+        transaction: Option<desk_tree::TextTransaction>,
     },
     NewAgent {
         role: AgentRole,
@@ -520,6 +529,16 @@ pub enum ServerMessage {
     },
     DeskTextApplied {
         record: desk::DeskTextOpRecord,
+    },
+    DeskTreeSnapshot {
+        snapshot: desk_tree::Snapshot,
+        replica_id: u16,
+    },
+    DeskTreeApplied {
+        record: desk_tree::TreeOpRecord,
+    },
+    DeskNodeTextApplied {
+        record: desk_tree::TextOpRecord,
     },
     /// Reply to `DeskGet`: the materialized document, without a subscription.
     DeskDocument {
@@ -1192,6 +1211,38 @@ mod tests {
         let mut payload = &recorded_frame[4..];
         let message: ClientMessage = senax_encoder::unpack(&mut payload).unwrap();
         assert_eq!(message, ClientMessage::Ping);
+    }
+
+    #[test]
+    fn desk_tree_messages_round_trip() {
+        let operation = desk_tree::TreeOperation::Create {
+            timestamp: desk_tree::TreeClock {
+                value: 7,
+                replica_id: 4,
+            },
+            node_id: desk_tree::NodeId {
+                replica_id: 4,
+                counter: 9,
+            },
+            kind: desk_tree::NodeKind::Heading,
+            owner: desk_tree::NodeOwner::User,
+            parent: None,
+            order: desk_tree::OrderKey(vec![100]),
+        };
+        let message = ClientMessage::DeskTreeApply { operation };
+        let bytes = senax_encoder::pack(&message).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded: ClientMessage = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(decoded, message);
+
+        let response = ServerMessage::DeskTreeSnapshot {
+            snapshot: desk_tree::Snapshot::default(),
+            replica_id: 4,
+        };
+        let bytes = senax_encoder::pack(&response).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded: ServerMessage = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(decoded, response);
     }
 
     #[test]

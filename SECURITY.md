@@ -79,6 +79,14 @@ AI APIs.
   transaction; the journal is
   never uploaded, analyzed, or used to adapt behavior automatically, and has no
   automatic retention, so users control it like other sensitive local state.
+- The daemon's structured Desk store accepts tree operations only from an
+  allocated user replica and node-text operations only from allocated user or
+  agent replicas. Client operations cannot create or structurally edit
+  machine-owned nodes, and machine-node text is read-only. Individual node
+  text retains the Desk's 4 MiB bounds; delete batches, text edit ranges,
+  transactions, tags, and fractional-order depth are independently capped
+  before persistence. The initial org import runs locally against the previous
+  Desk snapshot and sends no content elsewhere.
 - Opt-in GUI and daemon Dial9 profiles contain thread names, function symbols,
   local source paths, precise activity timing, and frontend marker metadata.
   GUI editor markers include numeric edit counts, affected row ranges, map row

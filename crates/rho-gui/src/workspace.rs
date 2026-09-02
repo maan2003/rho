@@ -1791,6 +1791,18 @@ impl Workspace {
             ConnEvent::DeskTextApplied(record) => {
                 self.desk_sync.apply_text(host, record, cx);
             }
+            ConnEvent::DeskTreeSnapshot {
+                snapshot,
+                replica_id,
+            } => self
+                .desk_sync
+                .apply_tree_snapshot(host, snapshot, replica_id, cx),
+            ConnEvent::DeskTreeApplied(record) => {
+                self.desk_sync.apply_tree(host, record);
+            }
+            ConnEvent::DeskNodeTextApplied(record) => {
+                self.desk_sync.apply_node_text(host, record, cx);
+            }
             ConnEvent::Ready {
                 agents,
                 iris_agent,

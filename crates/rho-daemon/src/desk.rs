@@ -387,7 +387,7 @@ fn retag_edits(
     edits
 }
 
-fn resolve_agent_handle(db: &RhoDb, handle: &str) -> Option<rho_ui_proto::AgentId> {
+pub(super) fn resolve_agent_handle(db: &RhoDb, handle: &str) -> Option<rho_ui_proto::AgentId> {
     let (role_prefix, encoded) = handle.trim().split_once('-')?;
     let read = db.read();
     let domain = rho_core::AgentIdDomain(read.machine_seed());

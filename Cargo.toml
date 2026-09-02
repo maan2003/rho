@@ -15,6 +15,7 @@ members = [
   "crates/rho-context-config",
   "crates/rho-core",
   "crates/rho-daemon",
+  "crates/rho-desk",
   "crates/rho-db",
   "crates/rho-shell",
   "crates/rho-shell-proto",
@@ -115,6 +116,7 @@ rho-code-mode = { path = "crates/rho-code-mode" }
 rho-context-config = { path = "crates/rho-context-config" }
 rho-core = { path = "crates/rho-core" }
 rho-daemon = { path = "crates/rho-daemon" }
+rho-desk = { path = "crates/rho-desk" }
 rho-db = { path = "crates/rho-db" }
 rho-shell-proto = { path = "crates/rho-shell-proto" }
 rho-inference = { path = "crates/rho-inference" }

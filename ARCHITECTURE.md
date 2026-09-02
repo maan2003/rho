@@ -126,7 +126,11 @@ than by running a supervisor, extension protocol, or daemon process graph.
   `dirs::state_dir()/rho/gui-telemetry`; it applies no automatic retention.
   This path is independent of the opt-in Dial9 CPU sampler and preserves the
   existing `--cpu-profile` export.
-  The Desk is one daemon-owned Zed CRDT text document per attached host. Its
+  The Desk is migrating to one daemon-owned movable tree per host, with stable
+  node ids and one Zed text CRDT per node. During the first migration phase the
+  daemon durably imports and synchronizes that tree alongside the existing
+  text document while clients retain the existing presentation; the native
+  composed editor becomes authoritative in the following phase. Its
   org-like headings derive structure rather than receiving structural RPCs.
   Visible agent-handle tags at the end of heading lines are the filing source
   of truth; `:project:` properties inherit down the heading tree. Every

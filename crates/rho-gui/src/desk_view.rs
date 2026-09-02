@@ -17,11 +17,18 @@ struct HostDesk {
     _subscription: gpui::Subscription,
 }
 
+struct HostTreeDesk {
+    document: rho_desk::Document,
+    buffers: BTreeMap<rho_desk::NodeId, Entity<Buffer>>,
+    _subscriptions: Vec<gpui::Subscription>,
+}
+
 /// Workspace-owned source of truth for every attached host's Desk document.
 pub struct DeskSync {
     hosts: BTreeMap<HostId, HostDesk>,
     known_ops: HashSet<(HostId, DeskClock)>,
     next_buffer_id: u64,
+    tree_hosts: BTreeMap<HostId, HostTreeDesk>,
 }
 
 impl Default for DeskSync {
@@ -30,11 +37,118 @@ impl Default for DeskSync {
             hosts: BTreeMap::new(),
             known_ops: HashSet::new(),
             next_buffer_id: 1,
+            tree_hosts: BTreeMap::new(),
         }
     }
 }
 
 impl DeskSync {
+    pub fn apply_tree_snapshot(
+        &mut self,
+        host: HostId,
+        snapshot: rho_desk::Snapshot,
+        replica_id: u16,
+        cx: &mut Context<Workspace>,
+    ) {
+        let Ok(document) = rho_desk::Document::from_snapshot(snapshot.clone()) else {
+            return;
+        };
+        let owners = document
+            .materialize()
+            .into_iter()
+            .map(|node| (node.id, node.owner))
+            .collect::<BTreeMap<_, _>>();
+        let mut buffers = BTreeMap::new();
+        let mut subscriptions = Vec::new();
+        for text in snapshot.texts {
+            let buffer_id = BufferId::new(self.next_buffer_id).expect("nonzero GUI buffer id");
+            self.next_buffer_id += 1;
+            let operations = text.operations.clone();
+            let capability = if owners.get(&text.node_id) == Some(&rho_desk::NodeOwner::User) {
+                Capability::ReadWrite
+            } else {
+                Capability::ReadOnly
+            };
+            let buffer = cx.new(|cx| {
+                let mut buffer =
+                    Buffer::remote(buffer_id, ReplicaId::new(replica_id), capability, "");
+                buffer.apply_ops(
+                    operations
+                        .iter()
+                        .filter_map(|operation| operation.to_text().ok())
+                        .map(language::Operation::Buffer)
+                        .collect::<Vec<_>>(),
+                    cx,
+                );
+                buffer
+            });
+            let node_id = text.node_id;
+            subscriptions.push(cx.subscribe(&buffer, move |workspace, _, event, _| {
+                let BufferEvent::Operation {
+                    operation: language::Operation::Buffer(operation),
+                    is_local: true,
+                } = event
+                else {
+                    return;
+                };
+                let operation = rho_desk::TextOperation::from_text(operation);
+                let timestamp = operation.timestamp();
+                workspace.send_to_host(
+                    host,
+                    ClientMessage::DeskNodeTextApply {
+                        node_id,
+                        operation,
+                        transaction: Some(rho_desk::TextTransaction {
+                            id: timestamp,
+                            edit_ids: vec![timestamp],
+                        }),
+                    },
+                );
+            }));
+            buffers.insert(node_id, buffer);
+        }
+        self.tree_hosts.insert(
+            host,
+            HostTreeDesk {
+                document,
+                buffers,
+                _subscriptions: subscriptions,
+            },
+        );
+    }
+
+    pub fn apply_tree(&mut self, host: HostId, record: rho_desk::TreeOpRecord) {
+        if let Some(desk) = self.tree_hosts.get_mut(&host) {
+            let _ = desk.document.apply(record.operation);
+        }
+    }
+
+    pub fn apply_node_text(
+        &mut self,
+        host: HostId,
+        record: rho_desk::TextOpRecord,
+        cx: &mut Context<Workspace>,
+    ) {
+        let Some(desk) = self.tree_hosts.get_mut(&host) else {
+            return;
+        };
+        if !desk
+            .document
+            .apply_text(record.node_id, record.operation.clone(), record.transaction)
+            .unwrap_or(false)
+        {
+            return;
+        }
+        if let (Some(buffer), Ok(operation)) = (
+            desk.buffers.get(&record.node_id),
+            record.operation.to_text(),
+        ) {
+            buffer.update(cx, |buffer, cx| {
+                buffer.apply_ops([language::Operation::Buffer(operation)], cx)
+            });
+        }
+    }
+
     pub fn apply_snapshot(
         &mut self,
         host: HostId,

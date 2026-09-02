@@ -13793,6 +13793,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "camino",
+ "chrono",
  "clap",
  "dirs",
  "futures 0.3.33",
@@ -13811,6 +13812,7 @@ dependencies = [
  "rho-claude-usage",
  "rho-core",
  "rho-db",
+ "rho-desk",
  "rho-image",
  "rho-inference",
  "rho-iroh-auth",
@@ -13846,6 +13848,19 @@ dependencies = [
  "senax-encoder",
  "tempfile",
  "tokio",
+]
+
+[[package]]
+name = "rho-desk"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "camino",
+ "clock",
+ "rand 0.8.7",
+ "rho-core",
+ "senax-encoder",
+ "text",
 ]
 
 [[package]]
@@ -13894,6 +13909,7 @@ dependencies = [
  "rho-browser",
  "rho-core",
  "rho-db",
+ "rho-desk",
  "rho-iroh-auth",
  "rho-profiling",
  "rho-registry",
@@ -14150,6 +14166,7 @@ dependencies = [
  "dirs",
  "futures 0.3.33",
  "rho-core",
+ "rho-desk",
  "rho-rpc",
  "rho-shell-proto",
  "rho-workspaces-types",

@@ -16,6 +16,7 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 clock.workspace = true
 futures.workspace = true
 rho-core.workspace = true
+rho-desk.workspace = true
 rho-rpc.workspace = true
 rho-shell-proto.workspace = true
 rho-workspaces-types.workspace = true

@@ -89,6 +89,7 @@ release_channel = { path = "../../vendor/zed/crates/release_channel", optional =
 redb = { workspace = true, optional = true }
 rho-db = { workspace = true, optional = true }
 rho-core.workspace = true
+rho-desk.workspace = true
 rho-browser = { workspace = true, optional = true }
 rho-iroh-auth = { workspace = true, optional = true }
 rho-profiling = { workspace = true, optional = true }

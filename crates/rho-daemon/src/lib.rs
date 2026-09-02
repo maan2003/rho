@@ -31,6 +31,7 @@ use tokio::sync::{Mutex, Mutex as TokioMutex, OwnedMutexGuard, broadcast, mpsc, 
 mod agent_ui;
 pub mod debug;
 pub mod desk;
+mod desk_tree;
 mod iris;
 mod realtime;
 mod secret_store;
@@ -943,6 +944,7 @@ struct AgentRegistry {
     pool: Arc<AgentPool>,
     db: RhoDb,
     desk: desk::DeskStore,
+    desk_tree: desk_tree::DeskTreeStore,
     visualizations: rho_visualizations::VisualizationStore,
     inference: Inference,
     /// The database's machine seed, announced in `Ready` so clients can
@@ -992,10 +994,15 @@ impl AgentRegistry {
         let pr_monitor = rho_pr_monitor::PrMonitor::new(pool.clone(), db.clone()).await?;
         let visualizations = rho_visualizations::VisualizationStore::new(db.clone()).await;
         let desk = desk::DeskStore::new(db.clone()).await;
+        let desk_tree = desk_tree::DeskTreeStore::new(db.clone(), &desk.snapshot(), |handle| {
+            desk::resolve_agent_handle(&db, handle)
+        })
+        .await;
         let registry = Self {
             pool,
             db,
             desk,
+            desk_tree,
             visualizations,
             inference,
             machine_seed,
@@ -2468,6 +2475,15 @@ async fn handle_message(
                 snapshot: agents.desk.snapshot(),
                 replica_id,
             });
+            let tree_replica_id = agents
+                .desk_tree
+                .allocate_replica(rho_desk::ReplicaAuthor::User)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            let _ = outgoing_tx.send(ServerMessage::DeskTreeSnapshot {
+                snapshot: agents.desk_tree.snapshot(),
+                replica_id: tree_replica_id,
+            });
             Ok(Refresh::None)
         }
         ClientMessage::DeskGet => {
@@ -2498,6 +2514,15 @@ async fn handle_message(
                 snapshot: agents.desk.snapshot(),
                 replica_id,
             });
+            let tree_replica_id = agents
+                .desk_tree
+                .allocate_replica(rho_desk::ReplicaAuthor::Agent(agent_id))
+                .await
+                .map_err(anyhow::Error::msg)?;
+            let _ = outgoing_tx.send(ServerMessage::DeskTreeSnapshot {
+                snapshot: agents.desk_tree.snapshot(),
+                replica_id: tree_replica_id,
+            });
             Ok(Refresh::None)
         }
         ClientMessage::DeskTextApply {
@@ -2512,6 +2537,32 @@ async fn handle_message(
             let _ = agents
                 .events
                 .send(ServerMessage::DeskTextApplied { record });
+            Ok(Refresh::None)
+        }
+        ClientMessage::DeskTreeApply { operation } => {
+            let record = agents
+                .desk_tree
+                .apply_tree(operation)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            let _ = agents
+                .events
+                .send(ServerMessage::DeskTreeApplied { record });
+            Ok(Refresh::None)
+        }
+        ClientMessage::DeskNodeTextApply {
+            node_id,
+            operation,
+            transaction,
+        } => {
+            let record = agents
+                .desk_tree
+                .apply_text(node_id, operation, transaction)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            let _ = agents
+                .events
+                .send(ServerMessage::DeskNodeTextApplied { record });
             Ok(Refresh::None)
         }
         ClientMessage::RecordVisualization { mime_type, content } => {

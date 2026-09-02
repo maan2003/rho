@@ -1,0 +1,19 @@
+[package]
+name = "rho-desk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+readme.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+bytes.workspace = true
+camino.workspace = true
+clock.workspace = true
+rho-core.workspace = true
+senax-encoder.workspace = true
+text.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
