@@ -42,13 +42,81 @@ pub const IROH_ALPN: &[u8] = b"rho/ui/5";
 #[cfg(not(target_family = "wasm"))]
 const PROTOCOL_LOG_MAGIC: &[u8; 4] = b"RUP4";
 
-/// Fixed per-user daemon socket used by normal CLI and Git helper clients.
+#[cfg(not(target_family = "wasm"))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimePaths {
+    socket: std::path::PathBuf,
+    directory: std::path::PathBuf,
+}
+
+#[cfg(not(target_family = "wasm"))]
+impl RuntimePaths {
+    pub const SOCKET_ENV: &'static str = "RHO_SOCKET_PATH";
+
+    pub fn new(socket: Option<impl Into<std::path::PathBuf>>) -> anyhow::Result<Self> {
+        let socket = match socket {
+            Some(socket) => {
+                let socket = socket.into();
+                if socket.is_absolute() {
+                    socket
+                } else {
+                    std::env::current_dir()
+                        .context("resolve current directory for relative socket path")?
+                        .join(socket)
+                }
+            }
+            None => {
+                let base = dirs::runtime_dir()
+                    .ok_or_else(|| anyhow::anyhow!("runtime directory not available"))?;
+                base.join("rho").join("rho.sock")
+            }
+        };
+        let directory = socket
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .to_owned();
+        Ok(Self { socket, directory })
+    }
+
+    pub fn from_env() -> anyhow::Result<Self> {
+        Self::new(std::env::var_os(Self::SOCKET_ENV).map(std::path::PathBuf::from))
+    }
+
+    pub fn resolve(socket: Option<impl Into<std::path::PathBuf>>) -> anyhow::Result<Self> {
+        match socket {
+            Some(socket) => Self::new(Some(socket)),
+            None => Self::from_env(),
+        }
+    }
+
+    pub fn socket(&self) -> &std::path::Path {
+        &self.socket
+    }
+
+    pub fn directory(&self) -> &std::path::Path {
+        &self.directory
+    }
+
+    pub fn octo_socket(&self) -> std::path::PathBuf {
+        self.directory.join("octo.sock")
+    }
+
+    pub fn browser_socket(&self) -> std::path::PathBuf {
+        self.directory.join("rho-browser.sock")
+    }
+
+    pub fn pr_logs(&self) -> std::path::PathBuf {
+        self.directory.join("pr-logs")
+    }
+}
+
+/// Fixed per-user daemon socket used by normal clients.
 #[cfg(not(target_family = "wasm"))]
 pub fn socket_path() -> anyhow::Result<std::path::PathBuf> {
-    let base = dirs::runtime_dir()
-        .or_else(dirs::state_dir)
-        .ok_or_else(|| anyhow::anyhow!("runtime directory not available"))?;
-    Ok(base.join("rho").join("rho.sock"))
+    Ok(RuntimePaths::new(None::<std::path::PathBuf>)?
+        .socket()
+        .to_owned())
 }
 
 /// Message sent from a UI client to the rho daemon.
@@ -1213,6 +1281,20 @@ fn read_protocol_log_record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_runtime_paths_share_an_absolute_directory() {
+        let paths = RuntimePaths::new(Some("qa/rho.sock")).unwrap();
+
+        assert!(paths.socket().is_absolute());
+        assert_eq!(paths.socket().parent(), Some(paths.directory()));
+        assert_eq!(paths.octo_socket(), paths.directory().join("octo.sock"));
+        assert_eq!(
+            paths.browser_socket(),
+            paths.directory().join("rho-browser.sock")
+        );
+        assert_eq!(paths.pr_logs(), paths.directory().join("pr-logs"));
+    }
 
     #[test]
     fn protocol_log_records_full_length_prefixed_frame() {

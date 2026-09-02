@@ -213,9 +213,9 @@ than by running a supervisor, extension protocol, or daemon process graph.
   browser-level unload can be distinguished from a website player reset.
   The compositor binds the sole unbound XDG top-level directly to the sole
   browser session; no activation token or multi-window routing participates.
-  Extension native messaging reaches `rho-gui` through a tiny stdio
-  relay and a mode-0600 Unix socket under `XDG_RUNTIME_DIR`; no TCP listener,
-  CDP, remote debugging, or arbitrary website injection participates.
+  Extension native messaging reaches `rho-gui` through a tiny stdio relay and
+  a mode-0600 Unix socket beside the selected local daemon socket; no TCP
+  listener, CDP, remote debugging, or arbitrary website injection participates.
   Browser content defaults to composition in GPUI/WGPU from an atomic Wayland
   surface-tree scene. `RHO_BROWSER_PASSTHROUGH=1` enables the guarded fast path:
   a single full-rect, untransformed DMA-BUF scene is attached directly to a
@@ -458,8 +458,8 @@ workflow-bearing Engineer/PM variants carry `AgentWorkflow`. The
 without changing the visible role label or model binding.
 
 `octo-server` is the daemon's authenticated GitHub API and constrained Git
-HTTP component. Rho runs it
-in-process on the fixed per-user Octo Unix socket. The user- and agent-facing
+HTTP component. Rho runs it in-process on an Octo Unix socket beside the
+daemon socket. The user- and agent-facing
 PR client is `rho pr` over the normal daemon socket. The daemon owns platform
 secret installation and fd-store resume, so Octo receives the GitHub token
 only through a RAM-only callback into the sealed platform secret store.

@@ -18,12 +18,7 @@ const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
-pub fn socket_path() -> Result<PathBuf> {
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .context("XDG_RUNTIME_DIR is not available for the browser socket")?;
-    Ok(runtime.join("rho-browser.sock"))
-}
+pub const SOCKET_PATH_ENV: &str = "RHO_BROWSER_SOCKET_PATH";
 
 pub fn is_invocation(arguments: &[String]) -> bool {
     arguments
@@ -35,7 +30,10 @@ pub fn is_invocation(arguments: &[String]) -> bool {
 /// messaging framing on stdio; the host relays the same bounded frames over
 /// Rho's private Unix socket.
 pub fn run() -> Result<()> {
-    let mut socket = UnixStream::connect(socket_path()?).context("connect Rho browser socket")?;
+    let socket_path = std::env::var_os(SOCKET_PATH_ENV)
+        .map(PathBuf::from)
+        .context("RHO_BROWSER_SOCKET_PATH is not set")?;
+    let mut socket = UnixStream::connect(socket_path).context("connect Rho browser socket")?;
     let mut to_socket = socket.try_clone()?;
     let _input = thread::spawn(move || -> Result<()> {
         let mut stdin = io::stdin().lock();

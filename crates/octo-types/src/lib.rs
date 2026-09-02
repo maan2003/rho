@@ -143,19 +143,6 @@ pub fn valid_ssh_repository(host: &str, value: &str) -> bool {
         && components.next().is_none()
 }
 
-/// Socket shared by Octo API clients, the HTTP Git helper, and Rho daemon.
-pub fn socket_path() -> std::io::Result<std::path::PathBuf> {
-    dirs::runtime_dir()
-        .or_else(dirs::state_dir)
-        .map(|base| base.join("rho").join("octo.sock"))
-        .ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "neither runtime nor state directory is available",
-            )
-        })
-}
-
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CiStatusResponse {
     pub pr: PrInfo,

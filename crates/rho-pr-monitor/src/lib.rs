@@ -43,11 +43,15 @@ pub struct PrMonitor {
 }
 
 impl PrMonitor {
-    pub async fn new(pool: Arc<AgentPool>, db: RhoDb) -> anyhow::Result<Arc<Self>> {
+    pub async fn new(
+        pool: Arc<AgentPool>,
+        db: RhoDb,
+        octo_socket: std::path::PathBuf,
+    ) -> anyhow::Result<Arc<Self>> {
         let monitor = Arc::new(Self {
             pool,
             db,
-            octo: OctoClient::new()?,
+            octo: OctoClient::new(octo_socket)?,
         });
         Ok(monitor)
     }

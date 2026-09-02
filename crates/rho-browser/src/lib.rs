@@ -34,15 +34,17 @@ pub use view::{
 
 pub struct WebState {
     state_dir: std::path::PathBuf,
+    socket_path: std::path::PathBuf,
     runtime: Option<Arc<BrowserRuntime>>,
     model: Option<Entity<PageModel>>,
 }
 
 impl Global for WebState {}
 
-pub fn init(state_dir: &Path, cx: &mut App) {
+pub fn init(state_dir: &Path, socket_path: std::path::PathBuf, cx: &mut App) {
     cx.set_global(WebState {
         state_dir: state_dir.to_owned(),
+        socket_path,
         runtime: None,
         model: None,
     });
@@ -78,7 +80,8 @@ fn runtime(cx: &mut App) -> Result<Arc<BrowserRuntime>> {
         }
     };
     let state_dir = cx.global::<WebState>().state_dir.clone();
-    let (runtime, session) = BrowserRuntime::launch(&state_dir, render)?;
+    let socket_path = cx.global::<WebState>().socket_path.clone();
+    let (runtime, session) = BrowserRuntime::launch(&state_dir, &socket_path, render)?;
     let runtime = Arc::new(runtime);
     let model = cx.new(|cx| PageModel::new(runtime.clone(), session, cx));
     cx.update_global::<WebState, _>(|web, _| {

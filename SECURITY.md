@@ -178,8 +178,8 @@ AI APIs.
   but no URLs, titles, pixels, or page content. Brave native messaging starts a
   copy of the
   `rho-gui` executable in bounded stdio-relay mode; it connects to the existing
-  GUI through `$XDG_RUNTIME_DIR/rho-browser.sock`, whose filesystem mode is
-  0600. The socket is a same-user trust boundary and uses no additional
+  GUI through a mode-0600 relay socket beside the selected local daemon
+  socket. The socket is a same-user trust boundary and uses no additional
   authentication. No TCP listener, CDP/remote debugging, or arbitrary injected
   website script participates. The compositor binds only an
   exactly-one-pending-window/exactly-one-unbound-top-level pair; no activation
@@ -251,7 +251,8 @@ AI APIs.
   and stashes/reclaims it via the systemd fd store (`FDSTORE=1`/`$LISTEN_FDS`),
   so the token never touches disk and survives daemon restarts but not reboots.
   Token values must not appear in logs or errors.
-- The embedded Octo server listens only on its fixed per-user Unix socket and
+- The embedded Octo server listens only on a Unix socket beside the daemon
+  socket and
   uses the sealed platform secret store as its GitHub API and constrained Git
   HTTP token source. It has no token argv/env/file/admin import path in Rho.
   Token-backed fetches are limited to standard GitHub remotes; receive-pack

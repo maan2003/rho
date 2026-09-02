@@ -11,7 +11,7 @@ use anyhow::{Context as _, Result, bail};
 use rho_browser_wayland::{BrowserCompositor, BrowserRenderConfig, BrowserSession};
 use serde_json::json;
 
-use crate::native_host::{Bridge, socket_path, write_installation};
+use crate::native_host::{Bridge, SOCKET_PATH_ENV, write_installation};
 use crate::store::{PageId, PageRecord, validate_launch_url};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -30,6 +30,7 @@ pub(crate) struct BrowserRuntime {
 impl BrowserRuntime {
     pub(crate) fn launch(
         state_dir: &Path,
+        socket_path: &Path,
         render: BrowserRenderConfig,
     ) -> Result<(Self, BrowserSession<BrowserWindow>)> {
         let brave_config = dirs::config_dir().context("resolve user config directory")?;
@@ -48,7 +49,7 @@ impl BrowserRuntime {
 
         let executable = std::env::current_exe().context("resolve rho-gui executable")?;
         write_installation(&brave_config, &extension, &executable)?;
-        let bridge = Bridge::bind(socket_path()?)?;
+        let bridge = Bridge::bind(socket_path.to_owned())?;
         let software_shm = matches!(render, BrowserRenderConfig::SoftwareShmQa);
         let compositor = BrowserCompositor::launch(render)?;
         let session = compositor.open(BrowserWindow, (1280, 720))?;
@@ -64,6 +65,7 @@ impl BrowserRuntime {
         command
             .env("WAYLAND_DISPLAY", compositor.socket_name())
             .env("XDG_SESSION_TYPE", "wayland")
+            .env(SOCKET_PATH_ENV, socket_path)
             .env_remove("DISPLAY")
             .stdin(Stdio::null())
             .stdout(Stdio::null())

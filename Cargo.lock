@@ -10780,7 +10780,6 @@ dependencies = [
 name = "octo-types"
 version = "0.1.0"
 dependencies = [
- "dirs",
  "serde",
 ]
 

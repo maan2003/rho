@@ -52,10 +52,9 @@ struct CheckoutBase {
 }
 
 pub(crate) async fn run(args: DeskArgs) -> Result<()> {
-    let socket_path = match args.socket_path {
-        Some(path) => path,
-        None => rho_daemon::default_socket_path()?,
-    };
+    let socket_path = rho_ui_proto::RuntimePaths::resolve(args.socket_path)?
+        .socket()
+        .to_owned();
     match args.command {
         DeskCommand::Cat => cat(&socket_path).await,
         DeskCommand::Checkout { file, agent } => checkout(&socket_path, &file, agent).await,

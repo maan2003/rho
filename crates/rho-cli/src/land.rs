@@ -122,10 +122,9 @@ impl LandLease {
         agent_id: Option<AgentId>,
         socket_path: Option<&Path>,
     ) -> Result<Self> {
-        let socket_path = match socket_path {
-            Some(path) => path.to_owned(),
-            None => rho_daemon::default_socket_path()?,
-        };
+        let socket_path = rho_ui_proto::RuntimePaths::resolve(socket_path.map(Path::to_owned))?
+            .socket()
+            .to_owned();
         let mut client = connect_or_start_daemon(&socket_path).await?;
         eprintln!("queued for land lease");
         client

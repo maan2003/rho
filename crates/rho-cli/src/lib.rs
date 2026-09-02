@@ -9,8 +9,8 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use rho_daemon::DaemonArgs;
 use rho_daemon::debug::DebugArgs;
-use rho_daemon::{DaemonArgs, default_socket_path};
 use rho_inference::{AuthArgs, run_auth_cli};
 use rho_ui_proto::client::Client as UiClient;
 
@@ -30,6 +30,18 @@ pub fn main() -> Result<()> {
     // SAFETY: top of main, single-threaded, resetting to default handling.
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     let args = Args::parse_or_exit(std::env::args().skip(1));
+    if let Command::Land(land) = &args.command
+        && let Some(socket_path) = &land.socket_path
+    {
+        let socket_path = rho_ui_proto::RuntimePaths::new(Some(socket_path))?
+            .socket()
+            .to_owned();
+        // SAFETY: no runtime or other thread exists; jj may invoke
+        // git-remote-octo, which must follow this CLI's daemon.
+        unsafe {
+            std::env::set_var(rho_ui_proto::RuntimePaths::SOCKET_ENV, socket_path);
+        }
+    }
     if let Command::Daemon(mut daemon_args) = args.command {
         // SAFETY: top of main, before the runtime — no threads exist yet and
         // nothing has captured pre-namespace state.
@@ -91,10 +103,9 @@ async fn run_iroh(args: IrohArgs) -> Result<()> {
             rho_ui_proto::ClientMessage::IrohRevoke { endpoint_id }
         }
     };
-    let socket_path = match args.socket_path {
-        Some(path) => path,
-        None => default_socket_path()?,
-    };
+    let socket_path = rho_ui_proto::RuntimePaths::resolve(args.socket_path)?
+        .socket()
+        .to_owned();
     let mut client = UiClient::connect(&socket_path).await?;
     client.send(&request).await?;
     loop {

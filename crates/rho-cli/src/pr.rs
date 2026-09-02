@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use anyhow::{Context as _, bail};
 use rho_ui_proto::{ClientMessage, PrCommand, ServerMessage};
 
-use crate::{PrArgs, PrCliCommand, connect_or_start_daemon, default_socket_path};
+use crate::{PrArgs, PrCliCommand, connect_or_start_daemon};
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -29,7 +29,10 @@ pub(crate) async fn run(args: PrArgs) -> anyhow::Result<()> {
         _ => None,
     };
     let command = command(args.command)?;
-    let socket_path = args.socket_path.unwrap_or(default_socket_path()?);
+    let socket_path = rho_ui_proto::RuntimePaths::resolve(args.socket_path)?
+        .socket()
+        .to_owned();
+    let runtime_paths = rho_ui_proto::RuntimePaths::new(Some(socket_path.clone()))?;
     let mut daemon = connect_or_start_daemon(&socket_path).await?;
     loop {
         let request_id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
@@ -58,6 +61,7 @@ pub(crate) async fn run(args: PrArgs) -> anyhow::Result<()> {
                     extract_logs(
                         &data,
                         response_run_id.context("binary response for non-log command")?,
+                        &runtime_paths,
                     )?;
                 }
                 if let Some(interval) = watch_interval {
@@ -139,7 +143,9 @@ fn checks_pending(output: &str) -> anyhow::Result<bool> {
 
 async fn init(args: PrArgs) -> anyhow::Result<()> {
     let token = prompt_token("GitHub token (ghp_/github_pat_/...): ")?;
-    let socket_path = args.socket_path.unwrap_or(default_socket_path()?);
+    let socket_path = rho_ui_proto::RuntimePaths::resolve(args.socket_path)?
+        .socket()
+        .to_owned();
     let mut daemon = connect_or_start_daemon(&socket_path).await?;
     daemon
         .send(&ClientMessage::PlatformSecretsSet {
@@ -225,14 +231,16 @@ fn resolve_default_base_branch() -> anyhow::Result<String> {
     Ok(bookmark)
 }
 
-fn extract_logs(bytes: &[u8], run_id: u64) -> anyhow::Result<()> {
+fn extract_logs(
+    bytes: &[u8],
+    run_id: u64,
+    runtime_paths: &rho_ui_proto::RuntimePaths,
+) -> anyhow::Result<()> {
     const MAX_FILES: usize = 1_000;
     const MAX_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
     const MAX_EXTRACTED_BYTES: u64 = 128 * 1024 * 1024;
 
-    let base = dirs::runtime_dir()
-        .unwrap_or_else(std::env::temp_dir)
-        .join("rho/pr-logs");
+    let base = runtime_paths.pr_logs();
     let path = base.join(run_id.to_string());
     if path.exists() {
         std::fs::remove_dir_all(&path)?;

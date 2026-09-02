@@ -221,6 +221,15 @@ fn run() -> Result<()> {
         })
         .transpose()?;
     let specs = host_specs(&args)?;
+    let local_socket = specs.iter().find_map(|spec| match &spec.target {
+        AttachTarget::Unix(socket) => Some(socket),
+        AttachTarget::Iroh { .. } => None,
+    });
+    let browser_socket = match local_socket {
+        Some(socket) => rho_ui_proto::RuntimePaths::new(Some(socket.clone()))?,
+        None => rho_ui_proto::RuntimePaths::new(None::<PathBuf>)?,
+    }
+    .browser_socket();
     rho_gui::journal::init(&client_state_dir).context("initialize client action journal")?;
     rho_gui::telemetry::enable();
     if profiler.is_none()
@@ -291,7 +300,7 @@ fn run() -> Result<()> {
 
             quit_on_termination_signal(cx);
 
-            rho_browser::init(&client_state_dir, cx);
+            rho_browser::init(&client_state_dir, browser_socket.clone(), cx);
             cx.activate(true);
 
             // Wayland compositors resolve the launcher icon by matching this

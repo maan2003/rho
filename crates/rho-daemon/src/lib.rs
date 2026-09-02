@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::num::NonZeroU16;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -204,16 +204,29 @@ impl PlatformSecrets {
     }
 }
 
+fn socket_is_live(socket_path: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(socket_path).is_ok()
+}
+
+fn prepare_socket_path(socket_path: &Path, name: &str) -> anyhow::Result<()> {
+    if socket_is_live(socket_path) {
+        anyhow::bail!(
+            "refusing to start: {name} socket {} is already served by a live listener",
+            socket_path.display()
+        );
+    }
+    match std::fs::remove_file(socket_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("remove stale {name} socket {}", socket_path.display())),
+    }
+}
+
 fn spawn_octo_server(
-    socket_path: &std::path::Path,
+    listener: tokio::net::UnixListener,
     secrets: PlatformSecrets,
 ) -> anyhow::Result<()> {
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent).context("create octo socket directory")?;
-    }
-    let _ = std::fs::remove_file(socket_path);
-    let listener = tokio::net::UnixListener::bind(socket_path)
-        .with_context(|| format!("bind octo socket {}", socket_path.display()))?;
     let github_api_url = url::Url::parse("https://api.github.com")?;
     let token_provider: octo_server::TokenProvider =
         Arc::new(move || secrets.get("GITHUB_TOKEN").context("reading GITHUB_TOKEN"));
@@ -224,6 +237,23 @@ fn spawn_octo_server(
         }
     });
     Ok(())
+}
+
+fn start_runtime_sockets(
+    socket_path: Option<PathBuf>,
+    secrets: PlatformSecrets,
+) -> anyhow::Result<(rho_ui_proto::RuntimePaths, Server)> {
+    let paths = rho_ui_proto::RuntimePaths::new(socket_path)?;
+    std::fs::create_dir_all(paths.directory()).context("create runtime directory")?;
+    let octo_socket = paths.octo_socket();
+    prepare_socket_path(paths.socket(), "rho daemon")?;
+    prepare_socket_path(&octo_socket, "octo")?;
+    let octo_listener = tokio::net::UnixListener::bind(&octo_socket)
+        .with_context(|| format!("bind octo socket {}", octo_socket.display()))?;
+    let listener = tokio::net::UnixListener::bind(paths.socket())
+        .with_context(|| format!("bind rho daemon socket {}", paths.socket().display()))?;
+    spawn_octo_server(octo_listener, secrets)?;
+    Ok((paths, Server::from_listener(listener)))
 }
 
 /// Re-exported so daemon entry points can set up the user+mount namespace
@@ -298,32 +328,24 @@ impl DaemonProfiler {
 }
 
 pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
+    let platform_secrets = PlatformSecrets::from_fd_store();
+    let (runtime_paths, server) =
+        start_runtime_sockets(args.socket_path, platform_secrets.clone())?;
+
     // The daemon's own cwd must never matter: agents each carry their own
     // working directory. Park the process somewhere empty and read-only so
     // any code still depending on process cwd fails loudly.
     let _ = std::env::set_current_dir("/var/empty").or_else(|_| std::env::set_current_dir("/"));
 
-    let default_socket_path = default_socket_path()?;
-    let socket_path = args
-        .socket_path
-        .unwrap_or_else(|| default_socket_path.clone());
-    if let Some(parent) = socket_path.parent() {
-        std::fs::create_dir_all(parent).context("create socket directory")?;
-    }
-    let _ = std::fs::remove_file(&socket_path);
-    let server = Server::bind(&socket_path).context("bind rho daemon socket")?;
-    let platform_secrets = PlatformSecrets::from_fd_store();
-    // Octo's fixed socket belongs to the default daemon. Test and other
-    // alternate-socket daemons must not unlink it out from under that daemon.
-    if socket_path == default_socket_path {
-        let octo_socket_path = octo_types::socket_path()?;
-        spawn_octo_server(&octo_socket_path, platform_secrets.clone())?;
-    }
     let mut user_environment = login_environment()?;
     if let Some(path) = EMBEDDED_DIRENV_PATH_BEFORE {
         user_environment.push(("RHO_DIRENV_PATH_BEFORE".into(), path.into()));
     }
     user_environment.push((FIND_DENY_ROOTS_ENV.into(), find_deny_roots()));
+    user_environment.push((
+        rho_ui_proto::RuntimePaths::SOCKET_ENV.into(),
+        runtime_paths.socket().as_os_str().to_owned(),
+    ));
     configure_octo_git_transport(&mut user_environment)?;
     let user_environment = rho_workspaces::UserEnvironment::new(user_environment);
 
@@ -357,6 +379,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             path_overrides,
             user_environment,
             platform_secrets,
+            runtime_paths.octo_socket(),
         )
         .await?,
     );
@@ -982,6 +1005,7 @@ impl AgentRegistry {
         path_overrides: PathOverrides,
         user_environment: rho_workspaces::UserEnvironment,
         platform_secrets: PlatformSecrets,
+        octo_socket: PathBuf,
     ) -> anyhow::Result<Self> {
         let pool = AgentPool::new(
             db.clone(),
@@ -991,7 +1015,8 @@ impl AgentRegistry {
         )
         .await;
         let machine_seed = db.read().machine_seed();
-        let pr_monitor = rho_pr_monitor::PrMonitor::new(pool.clone(), db.clone()).await?;
+        let pr_monitor =
+            rho_pr_monitor::PrMonitor::new(pool.clone(), db.clone(), octo_socket).await?;
         let visualizations = rho_visualizations::VisualizationStore::new(db.clone()).await;
         let desk = desk::DeskStore::new(db.clone()).await;
         let desk_tree = desk_tree::DeskTreeStore::new(db.clone(), &desk.snapshot(), |handle| {
@@ -4077,11 +4102,79 @@ mod tests {
 
     use super::{
         AgentUsageModel, GitProviderClaim, GitTransportBroker, MAX_IMAGE_BASE64_BYTES,
-        MAX_INPUT_IMAGES, claude_quota_history, configure_octo_git_transport,
+        MAX_INPUT_IMAGES, PlatformSecrets, claude_quota_history, configure_octo_git_transport,
         hourly_global_usage_series, merge_hourly_agent_cost_bucket, persist_gui_telemetry,
         prepare_image_content, quota_burn, quota_summaries, rewind_destination_materialized,
-        rewind_source_prefix, validate_image_content,
+        rewind_source_prefix, start_runtime_sockets, validate_image_content,
     };
+
+    #[tokio::test]
+    async fn explicit_socket_keeps_runtime_files_beside_it() {
+        let runtime = tempfile::tempdir().unwrap();
+        let (paths, server) = start_runtime_sockets(
+            Some(runtime.path().join("qa/rho.sock")),
+            PlatformSecrets::default(),
+        )
+        .unwrap();
+
+        assert!(paths.socket().exists());
+        assert!(paths.octo_socket().exists());
+        assert!(!paths.browser_socket().exists());
+        assert!(!paths.pr_logs().exists());
+        assert_eq!(
+            std::fs::read_dir(runtime.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            [std::ffi::OsString::from("qa")]
+        );
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn live_socket_refuses_replacement() {
+        let runtime = tempfile::tempdir().unwrap();
+        let paths = rho_ui_proto::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
+        let live = std::os::unix::net::UnixListener::bind(paths.socket()).unwrap();
+
+        let error = match start_runtime_sockets(
+            Some(paths.socket().to_owned()),
+            PlatformSecrets::default(),
+        ) {
+            Ok(_) => panic!("daemon replaced a live socket"),
+            Err(error) => error,
+        };
+
+        assert!(
+            format!("{error:#}").contains("already served by a live listener"),
+            "{error:#}"
+        );
+        assert!(std::os::unix::net::UnixStream::connect(paths.socket()).is_ok());
+        drop(live);
+    }
+
+    #[tokio::test]
+    async fn live_octo_socket_refuses_daemon_start() {
+        let runtime = tempfile::tempdir().unwrap();
+        let paths = rho_ui_proto::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
+        let live = std::os::unix::net::UnixListener::bind(paths.octo_socket()).unwrap();
+
+        let error = match start_runtime_sockets(
+            Some(paths.socket().to_owned()),
+            PlatformSecrets::default(),
+        ) {
+            Ok(_) => panic!("daemon replaced a live octo socket"),
+            Err(error) => error,
+        };
+
+        assert!(
+            format!("{error:#}").contains("already served by a live listener"),
+            "{error:#}"
+        );
+        assert!(!paths.socket().exists());
+        assert!(std::os::unix::net::UnixStream::connect(paths.octo_socket()).is_ok());
+        drop(live);
+    }
 
     fn assistant_message(uuid: uuid::Uuid, timestamp: &str) -> rho_claude::SessionMessage {
         rho_claude::SessionMessage {

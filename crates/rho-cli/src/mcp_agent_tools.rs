@@ -15,10 +15,9 @@ pub(crate) async fn run(args: McpAgentToolsArgs) -> anyhow::Result<()> {
         .agent_id
         .or_else(|| std::env::var("RHO_MCP_AGENT_ID").ok())
         .ok_or_else(|| anyhow::anyhow!("missing --agent-id or RHO_MCP_AGENT_ID"))?;
-    let socket_path = match args.socket_path {
-        Some(path) => path,
-        None => rho_daemon::default_socket_path()?,
-    };
+    let socket_path = rho_ui_proto::RuntimePaths::resolve(args.socket_path)?
+        .socket()
+        .to_owned();
     let mut daemon = connect_or_start_daemon(&socket_path).await?;
     daemon.send(&ClientMessage::Subscribe).await?;
     let ready = loop {
