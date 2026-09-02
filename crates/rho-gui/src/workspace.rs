@@ -7947,11 +7947,13 @@ impl Workspace {
             .h(px(26.))
             .w_full()
             .px_2()
+            .border_t_1()
+            .border_color(cx.theme().colors().border_variant.opacity(0.6))
             .flex()
             .flex_row()
             .items_center()
             .gap_3()
-            .bg(cx.theme().colors().element_selected)
+            .bg(cx.theme().colors().editor_background)
             .text_color(cx.theme().colors().text)
             .font_family(text_style.font_family.clone())
             .text_size(text_style.font_size)
@@ -8096,7 +8098,7 @@ impl Workspace {
             .read(cx)
             .plain_mode(cx)
             .unwrap_or_else(|| "normal".to_owned());
-        let mode_bg = if self.dashboard.deal_mode() {
+        let mode_color = if self.dashboard.deal_mode() {
             colors.terminal_ansi_bright_magenta
         } else if mode.contains("insert") {
             status.warning
@@ -8104,39 +8106,58 @@ impl Workspace {
             colors.terminal_ansi_bright_cyan
         };
         let quota = self.merged_quota_summaries();
+        let now = now_ms() as f64 / 1_000.0;
         div()
             .flex()
             .flex_row()
             .items_center()
             .gap_3()
-            .children(quota.into_iter().map(|summary| {
-                let color = if summary.remaining_percent == 0 {
-                    status.error
-                } else if summary.remaining_percent <= 10 {
-                    status.warning
-                } else {
-                    colors.text_muted
+            .children(quota.into_iter().enumerate().flat_map(|(index, summary)| {
+                let color = match summary.remaining_percent {
+                    0 => status.error,
+                    1..=10 => status.warning,
+                    _ if summary.model == "gpt" => colors.terminal_ansi_cyan,
+                    _ if summary.model == "opus" || summary.model == "fable" => {
+                        gpui::rgb(0xd97757).into()
+                    }
+                    _ => colors.text_muted,
                 };
-                div()
-                    .text_color(color)
-                    .child(format!("{} {}%", summary.model, summary.remaining_percent))
+                let reset = summary
+                    .reset_at_unix
+                    .map(|reset| reset as f64 - now)
+                    .filter(|seconds| *seconds > 0.0)
+                    .map(|seconds| format!(" {:.1}d", seconds / 86_400.0))
+                    .unwrap_or_default();
+                let separator = (index > 0).then(|| {
+                    div()
+                        .text_color(colors.text_muted)
+                        .child("·")
+                        .into_any_element()
+                });
+                separator.into_iter().chain(std::iter::once(
+                    div()
+                        .text_color(color)
+                        .child(format!(
+                            "{} {}%{reset}",
+                            summary.model, summary.remaining_percent
+                        ))
+                        .into_any_element(),
+                ))
             }))
             .children(
                 self.abnormal_connection_text()
                     .map(|connection| div().text_color(status.error).child(connection)),
             )
-            .children(
-                self.lamp_on
-                    .then(|| div().text_color(status.error).child("●")),
-            )
+            .children(self.lamp_on.then(|| {
+                div()
+                    .flex_none()
+                    .size(px(7.))
+                    .rounded_full()
+                    .bg(status.error)
+            }))
             .child(
                 div()
-                    .h_full()
-                    .px_2()
-                    .flex()
-                    .items_center()
-                    .bg(mode_bg)
-                    .text_color(colors.editor_background)
+                    .text_color(mode_color)
                     .child(if self.dashboard.deal_mode() {
                         "deal".to_owned()
                     } else {
@@ -8203,11 +8224,13 @@ impl Workspace {
             .h(px(26.))
             .w_full()
             .px_2()
+            .border_t_1()
+            .border_color(cx.theme().colors().border_variant.opacity(0.6))
             .flex()
             .flex_row()
             .items_center()
             .justify_between()
-            .bg(cx.theme().colors().status_bar_background)
+            .bg(cx.theme().colors().editor_background)
             .text_color(cx.theme().colors().text)
             .font_family(text_style.font_family.clone())
             .text_size(text_style.font_size)
