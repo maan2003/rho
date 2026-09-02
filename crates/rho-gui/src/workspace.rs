@@ -5893,6 +5893,21 @@ impl Workspace {
     }
 
     #[cfg(test)]
+    pub(crate) fn reopen_agent_for_test(
+        &mut self,
+        agent_id: AgentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.select_agent_inner(Some(agent_id), true, window, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_editor_in_deal_mode_for_test(&self, cx: &App) -> bool {
+        vim::editor_in_deal_mode(&self.active_editor(cx), cx)
+    }
+
+    #[cfg(test)]
     pub(crate) fn append_newer_history_for_test(&mut self, name: &str, cx: &mut Context<Self>) {
         let surface = Self::wrap_surface(
             SurfaceKey::Inbox(name.to_owned()),
@@ -6788,7 +6803,7 @@ impl Workspace {
 
     pub(crate) fn cmd_close_and_deal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_current_surface(window, cx);
-        self.cmd_surface_forward_or_deal(window, cx);
+        self.deal_next(window, cx);
     }
 
     pub(crate) fn cmd_toggle_raw_desk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -7016,8 +7031,11 @@ impl Workspace {
 
     fn finish_deal_verdict(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dashboard.end_deal(cx);
-        self.close_current_surface(window, cx);
+        // Exit the dealt editor while it is still focused. GPUI captures the
+        // focus target when dispatching, so doing this after close would send
+        // ExitDealMode to the replacement surface instead.
         self.finish_dashboard_deal_action(window, cx);
+        self.close_current_surface(window, cx);
         self.cmd_surface_forward_or_deal(window, cx);
     }
 

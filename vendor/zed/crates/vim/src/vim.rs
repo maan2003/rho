@@ -611,6 +611,14 @@ pub fn enter_deal_mode(editor: &Entity<Editor>, window: &mut Window, cx: &mut Ap
     true
 }
 
+/// Returns whether an application-owned editor is still in a Deal mode.
+pub fn editor_in_deal_mode(editor: &Entity<Editor>, cx: &App) -> bool {
+    editor
+        .read(cx)
+        .addon::<VimAddon>()
+        .is_some_and(|addon| matches!(addon.entity.read(cx).mode, Mode::Deal | Mode::HelixDeal))
+}
+
 /// Enters insert mode for an application-owned Deal surface without relying
 /// on focus-chain action routing during a surface promotion.
 pub fn enter_deal_insert_mode(editor: &Entity<Editor>, window: &mut Window, cx: &mut App) -> bool {

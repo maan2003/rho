@@ -4649,6 +4649,7 @@ struct DealHeading {
     breadcrumb: String,
     agents: Vec<AgentId>,
     gated: bool,
+    agent_gated: bool,
 }
 
 #[derive(Clone)]
@@ -4762,6 +4763,11 @@ fn assemble_dealer_queue_with_context(
             }
             let deferred = locally_deferred || room_deferred;
             let gated = archived || terminal || deferred;
+            let agent_gated = gated
+                || heading.temporal_marks.iter().any(|mark| {
+                    mark.kind == TemporalMarkKind::Todo
+                        && priority(mark, desk_now) <= DEAL_QUEUE_FLOOR
+                });
             let agents = heading
                 .tags
                 .iter()
@@ -4776,9 +4782,9 @@ fn assemble_dealer_queue_with_context(
                             let current_gated = heading_rows.iter().any(|row: &DealHeading| {
                                 row.host == current.0
                                     && row.heading.heading_range.start == current.1
-                                    && row.gated
+                                    && row.agent_gated
                             });
-                            if current_gated && !gated {
+                            if current_gated && !agent_gated {
                                 *current = candidate;
                             }
                         })
@@ -4792,6 +4798,7 @@ fn assemble_dealer_queue_with_context(
                 breadcrumb: heading_breadcrumb(&headings, index),
                 agents,
                 gated,
+                agent_gated,
             });
             order += 1;
         }
@@ -4868,14 +4875,13 @@ fn assemble_dealer_queue_with_context(
         let Some(topic) = agent_topics.get(&agent.agent_id).copied() else {
             continue;
         };
-        let Some(row) = rows_by_topic.get(&topic).copied().filter(|row| !row.gated) else {
+        let Some(row) = rows_by_topic
+            .get(&topic)
+            .copied()
+            .filter(|row| !row.agent_gated)
+        else {
             continue;
         };
-        if row.heading.temporal_marks.iter().any(|mark| {
-            mark.kind == TemporalMarkKind::Todo && priority(mark, desk_now) <= DEAL_QUEUE_FLOOR
-        }) {
-            continue;
-        }
         let wait_days = reply_wait_days(ended, now);
         considered.insert(DealCardIdentity::Agent(agent.agent_id));
         let (reply_priority, label) = if agent.facts.needs_you_hint {
@@ -5965,6 +5971,36 @@ mod tests {
             ]
             .contains(&card.breadcrumb.as_str())
         }));
+    }
+
+    #[test]
+    fn agent_uses_a_live_portal_regardless_of_sleeping_portal_order() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc()
+            .fixed_offset();
+        let mut facts = agent(1, None, UiAttention::NeedsInput, 0);
+        facts.facts.last_turn_ended = Some(UnixMs(
+            (now.timestamp_millis() - chrono::Duration::minutes(1).num_milliseconds()) as u64,
+        ));
+        facts.facts.last_user_message_at = UnixMs(0);
+        let agent_id = facts.agent_id;
+        let tag = agent_id.encoded();
+        let (registry, host) = registry(vec![facts]);
+        let sleeping = format!("* Sleeping :eng-{tag}:\n:todo: 2026-08-30 7d\n");
+        let live = format!("* Live :eng-{tag}:\n");
+
+        for text in [format!("{sleeping}{live}"), format!("{live}{sleeping}")] {
+            let queue = assemble_deal_queue(&[(host, text)], &deal_agent_facts(&registry), now);
+            let card = queue
+                .cards
+                .iter()
+                .find(|card| card.identity == DealCardIdentity::Agent(agent_id))
+                .expect("the live portal should offer the agent");
+            assert_eq!(card.breadcrumb, "Live");
+        }
     }
 
     #[test]

@@ -133,6 +133,42 @@ fn bind_test_keymaps(cx: &mut App) {
     crate::bind_rho_key_overrides(cx);
 }
 
+#[cfg(feature = "native")]
+#[gpui::test]
+fn native_page_deal_context_routes_verdict_keys(cx: &mut TestAppContext) {
+    use gpui::{KeyContext, Keystroke};
+
+    cx.update(bind_test_keymaps);
+    cx.update(|cx| {
+        let keymap = cx.key_bindings();
+        let keymap = keymap.borrow();
+        let contexts = [
+            KeyContext::parse("RhoGuiDeal").unwrap(),
+            KeyContext::parse("RhoBrowser").unwrap(),
+        ];
+        macro_rules! assert_route {
+            ($key:literal, $action:expr) => {{
+                let (bindings, pending) =
+                    keymap.bindings_for_input(&[Keystroke::parse($key).unwrap()], &contexts);
+                assert!(!pending);
+                assert!(
+                    bindings
+                        .first()
+                        .is_some_and(|binding| binding.action().partial_eq(&$action)),
+                    "{} did not route to {} in a dealt browser page: {bindings:?}",
+                    $key,
+                    gpui::Action::name(&$action),
+                );
+            }};
+        }
+        assert_route!("q", crate::SurfaceClose);
+        assert_route!("d", crate::DashboardDealDone);
+        assert_route!("x", crate::DashboardDealDiscard);
+        assert_route!("s", crate::DashboardDealSnooze);
+        assert_route!("t", crate::DashboardDealTodo);
+    });
+}
+
 fn test_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace> {
     cx.update(init_test_app);
     let target = AttachTarget::Unix(std::env::temp_dir().join("rho-gui-test-nonexistent.sock"));
@@ -6267,6 +6303,11 @@ fn f16_closes_the_dealt_surface_and_deals_another_card(cx: &mut TestAppContext) 
             workspace.current_deal_card_for_test().unwrap().0
         })
         .unwrap();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            workspace.append_newer_history_for_test("newer", cx)
+        })
+        .unwrap();
 
     cx.simulate_keystrokes(*workspace, "f16");
     cx.run_until_parked();
@@ -6279,6 +6320,11 @@ fn f16_closes_the_dealt_surface_and_deals_another_card(cx: &mut TestAppContext) 
                 .0;
             assert_ne!(after, before, "F16 re-dealt the surface it just closed");
             assert!(workspace.dashboard_deal_mode_for_test());
+            assert_ne!(
+                workspace.current_surface_name_for_test(),
+                "inbox newer",
+                "F16 is close plus a fresh deal, not history-forward"
+            );
         })
         .unwrap();
 }
@@ -6525,6 +6571,90 @@ fn deal_verdict_at_history_end_deals_a_fresh_card(cx: &mut TestAppContext) {
                 .0;
             assert_ne!(after, before);
             assert!(workspace.dashboard_deal_mode_for_test());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn desk_deal_insert_types_verdict_letters_instead_of_running_actions(cx: &mut TestAppContext) {
+    let (workspace, _, _) = mixed_deal_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(workspace.seek_deal_card_for_test(
+                |kind| matches!(kind, crate::dashboard::DealCardKind::Desk),
+                window,
+                cx,
+            ));
+        })
+        .unwrap();
+    cx.update(|cx| cx.refresh_windows());
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.focus_dealt_surface_for_test(window, cx)
+        })
+        .unwrap();
+    cx.update_window(*workspace, |_, window, cx| {
+        let action = cx.build_action("vim::EnterDealMode", None).unwrap();
+        window.dispatch_action(action, cx);
+    })
+    .unwrap();
+
+    cx.dispatch_action(*workspace, crate::DashboardDealInsert);
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "qdxstaof");
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let text = workspace
+                .desk_buffer_for_test(HostId::default())
+                .unwrap()
+                .read(cx)
+                .text();
+            assert!(
+                text.contains("qdxstaof"),
+                "deal letters should be inserted in Desk insert mode: {text}"
+            );
+            assert!(workspace.dashboard_deal_mode_for_test());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn verdicted_transcript_reopens_outside_vim_deal(cx: &mut TestAppContext) {
+    let (workspace, agent_id, _) = mixed_deal_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(workspace.seek_deal_card_for_test(
+                |kind| matches!(kind, crate::dashboard::DealCardKind::Agent),
+                window,
+                cx,
+            ));
+            workspace.focus_dealt_surface_for_test(window, cx);
+        })
+        .unwrap();
+    cx.update_window(*workspace, |_, window, cx| {
+        let action = cx.build_action("vim::EnterDealMode", None).unwrap();
+        window.dispatch_action(action, cx);
+    })
+    .unwrap();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            workspace.append_newer_history_for_test("newer", cx)
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "d");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.reopen_agent_for_test(agent_id, window, cx);
+            assert!(workspace.agent_surface_visible_for_test(agent_id));
+            assert!(
+                !workspace.active_editor_in_deal_mode_for_test(cx),
+                "the retained transcript editor reopened in VimDeal"
+            );
         })
         .unwrap();
 }
