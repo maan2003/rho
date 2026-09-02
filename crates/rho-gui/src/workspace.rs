@@ -34,7 +34,7 @@ use futures::channel::mpsc::UnboundedReceiver;
 use gpui::prelude::*;
 use gpui::{
     App, ClipboardEntry, Context, Entity, Focusable as _, Point, Task, TouchEvent, TouchId,
-    TouchPhase, Window, div, px, svg,
+    TouchPhase, Window, div, px,
 };
 use rho_core::ContentPart;
 use rho_ui_proto::{
@@ -110,6 +110,30 @@ struct ShellTouchContact {
 pub struct Surface {
     key: SurfaceKey,
     view: SurfaceView,
+}
+
+enum DealView {
+    Surface {
+        identity: crate::dashboard::DealCardIdentity,
+        surface: Surface,
+    },
+    Inbox {
+        identity: crate::dashboard::DealCardIdentity,
+        editor: Entity<editor::Editor>,
+    },
+}
+
+impl DealView {
+    fn matches(&self, identity: &crate::dashboard::DealCardIdentity) -> bool {
+        match self {
+            Self::Surface {
+                identity: current, ..
+            }
+            | Self::Inbox {
+                identity: current, ..
+            } => current == identity,
+        }
+    }
 }
 
 #[cfg(feature = "native")]
@@ -378,6 +402,9 @@ pub struct Workspace {
     shell_touch_committed: bool,
     horizontal_strip_gesture_active: bool,
     deal_session_open: bool,
+    deal_view: Option<DealView>,
+    deal_hints_visible: bool,
+    deal_controls_visible: bool,
     agent_last_interaction: HashMap<AgentId, i64>,
     dealer_signal_eval_scheduled: bool,
     _dealer_signal_task: Task<()>,
@@ -919,6 +946,9 @@ impl Workspace {
             shell_touch_committed: false,
             horizontal_strip_gesture_active: false,
             deal_session_open: false,
+            deal_view: None,
+            deal_hints_visible: false,
+            deal_controls_visible: false,
             agent_last_interaction: HashMap::new(),
             dealer_signal_eval_scheduled: false,
             _dealer_signal_task: dealer_signal_task,
@@ -1331,12 +1361,7 @@ impl Workspace {
                     let contact = self.shell_touches.get(&event.id).expect("touch exists");
                     let dx = (contact.position.x - contact.start.x).as_f32();
                     let dy = (contact.position.y - contact.start.y).as_f32();
-                    if self.dashboard.deal_mode()
-                        && -dy >= SHELL_SWIPE_DISTANCE.as_f32()
-                        && -dy >= dx.abs() * 1.25
-                    {
-                        Some(Box::new(DashboardDealNext) as Box<dyn gpui::Action>)
-                    } else if !self.dashboard.deal_mode()
+                    if !self.dashboard.deal_mode()
                         && dx.abs() >= SHELL_SWIPE_DISTANCE.as_f32()
                         && dx.abs() >= dy.abs() * 1.25
                     {
@@ -1376,56 +1401,6 @@ impl Workspace {
                 }
             }
         }
-    }
-
-    fn render_deal_touch_controls(&self, cx: &App) -> Option<gpui::AnyElement> {
-        self.dashboard.deal_mode().then(|| {
-            let colors = cx.theme().colors();
-            let button = |id: &'static str, label: &'static str, action: Box<dyn gpui::Action>| {
-                div()
-                    .id(id)
-                    .h(px(44.))
-                    .min_w(px(72.))
-                    .px(px(12.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .rounded_md()
-                    .bg(colors.element_background)
-                    .border_1()
-                    .border_color(colors.border)
-                    .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
-                    .child(label)
-            };
-            div()
-                .absolute()
-                .inset_0()
-                .child(div().absolute().top(px(36.)).right(px(18.)).child(button(
-                    "close",
-                    "close",
-                    Box::new(DashboardDealExit),
-                )))
-                .child(
-                    div()
-                        .absolute()
-                        .bottom(px(36.))
-                        .left_0()
-                        .right_0()
-                        .flex()
-                        .flex_row()
-                        .flex_wrap()
-                        .justify_center()
-                        .px(px(8.))
-                        .gap(px(8.))
-                        .child(button("skip", "skip", Box::new(DashboardDealNext)))
-                        .child(button("done", "done", Box::new(DashboardDealDone)))
-                        .child(button("dismiss", "dismiss", Box::new(DashboardDealDiscard)))
-                        .child(button("defer", "defer", Box::new(DashboardDealSnooze)))
-                        .child(button("open", "open", Box::new(DashboardDealReply)))
-                        .child(button("file", "file", Box::new(DashboardDealInsert))),
-                )
-                .into_any_element()
-        })
     }
 
     fn dismiss_mru_overlay(&mut self, cx: &mut Context<Self>) {
@@ -6200,6 +6175,9 @@ impl Workspace {
             return;
         }
         self.dismiss_mru_overlay(cx);
+        self.deal_view = None;
+        self.deal_hints_visible = false;
+        self.deal_controls_visible = false;
         window.focus(&self.dashboard.focus_handle(cx), cx);
         let now = chrono::Local::now().fixed_offset();
         if let Err(error) = self.inbox.refresh_deferred(now.timestamp_millis()) {
@@ -6266,6 +6244,9 @@ impl Workspace {
     }
 
     fn finish_dashboard_deal_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.deal_view = None;
+        self.deal_hints_visible = false;
+        self.deal_controls_visible = false;
         if !self.dashboard.deal_mode()
             && let Ok(action) = cx.build_action("vim::ExitDealMode", None)
         {
@@ -7375,6 +7356,7 @@ impl Workspace {
         text_style: &gpui::TextStyle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let _ = &cx;
         let container = div()
             .h_full()
             .flex_none()
@@ -7405,150 +7387,13 @@ impl Workspace {
             .relative()
             .overflow_hidden()
             .child(self.dashboard.editor().clone());
-        let hint = div()
-            .flex_none()
-            .pt(px(4.))
-            .pb(px(2.))
-            .text_size(text_style.font_size)
-            .text_color(cx.theme().colors().text_muted)
-            .child(self.dashboard.hint(cx));
         #[cfg(all(target_family = "wasm", not(feature = "native")))]
         let dashboard = dashboard
             // The editor consumes bubble-phase mouse events. Capture the
             // press/release around it, then open after its cursor has moved.
             .capture_any_mouse_down(cx.listener(Self::dashboard_pointer_down))
             .capture_any_mouse_up(cx.listener(Self::dashboard_pointer_up));
-        let container = container.child(dashboard);
-        container.child(hint).into_any_element()
-    }
-
-    /// The dashboard-only two-line masthead.
-    pub(crate) fn render_dashboard_header(
-        &self,
-        text_style: &gpui::TextStyle,
-        line_height: gpui::Pixels,
-        cx: &App,
-    ) -> gpui::AnyElement {
-        let colors = cx.theme().colors();
-        let now = now_ms() as f64 / 1_000.0;
-        let mut stats = div().flex().items_center().gap(px(6.));
-        let format_reset = |reset_at_unix: Option<i64>| {
-            reset_at_unix
-                .map(|reset| reset as f64 - now)
-                .filter(|seconds| *seconds > 0.0)
-                .map(|seconds| format!(" {:.1}d", seconds / 86_400.0))
-                .unwrap_or_default()
-        };
-        let summaries = self.merged_quota_summaries();
-        let gpt = summaries
-            .iter()
-            .filter(|summary| summary.model == "gpt")
-            .collect::<Vec<_>>();
-        for summary in &gpt {
-            stats = stats.child(
-                div()
-                    .text_color(colors.terminal_ansi_cyan)
-                    .child(format!("{}%", summary.remaining_percent)),
-            );
-        }
-        let opus = summaries.iter().find(|summary| summary.model == "opus");
-        let fable = summaries.iter().find(|summary| summary.model == "fable");
-        if opus.is_some() || fable.is_some() {
-            if !gpt.is_empty() {
-                stats = stats.child(div().text_color(text_style.color.opacity(0.55)).child("·"));
-            }
-            let mut claude = String::new();
-            if let Some(opus) = opus {
-                claude.push_str(&format!("{}%", opus.remaining_percent));
-            }
-            if let Some(fable) = fable {
-                if !claude.is_empty() {
-                    claude.push(' ');
-                }
-                claude.push_str(&format!("{}%", fable.remaining_percent));
-            }
-            let reset = opus
-                .and_then(|summary| summary.reset_at_unix)
-                .or_else(|| fable.and_then(|summary| summary.reset_at_unix));
-            claude.push_str(&format_reset(reset));
-            stats = stats.child(div().text_color(gpui::rgb(0xd97757)).child(claude));
-        }
-        div()
-            .w_full()
-            .h(3. * line_height)
-            .pb(line_height)
-            .flex()
-            .items_center()
-            .gap(px(10.))
-            .child(
-                div().w(px(40.)).h_full().p(px(4.)).pt(px(6.)).child(
-                    svg()
-                        .path("icons/rho.svg")
-                        .size_full()
-                        .text_color(colors.text_accent),
-                ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .child(div().font_weight(gpui::FontWeight::BOLD).child("rho"))
-                    .child(
-                        div()
-                            .text_color(text_style.color.opacity(0.75))
-                            .child(stats),
-                    ),
-            )
-            .into_any_element()
-    }
-
-    /// The preview sheet's bottom bar: the previewed agent's name and the
-    /// status chips (working directory, workspace, role, context used) —
-    /// left-aligned, real chrome on the sheet rather than a prompt row in
-    /// the transcript. A quiet modeline, not a header.
-    fn render_preview_bar(
-        &self,
-        text_style: &gpui::TextStyle,
-        cx: &Context<Self>,
-    ) -> Option<gpui::AnyElement> {
-        let agent_id = self.dashboard_preview?;
-        let spans = self
-            .models
-            .get(&agent_id)
-            .map(|model| model.read(cx).status_spans().to_vec())
-            .unwrap_or_default();
-        if spans.is_empty() {
-            return None;
-        }
-        Some(
-            div()
-                .flex_none()
-                .flex()
-                .flex_row()
-                .justify_end()
-                .items_baseline()
-                .gap(px(12.))
-                .px(px(12.))
-                .py(px(5.))
-                .font_family(text_style.font_family.clone())
-                .text_size(text_style.font_size)
-                .line_height(text_style.line_height)
-                .text_color(text_style.color)
-                .children(
-                    spans
-                        .into_iter()
-                        .filter(|(text, _)| !text.trim().is_empty())
-                        .map(|(text, style)| {
-                            let mut chip =
-                                div().text_color(style.color.unwrap_or(text_style.color));
-                            if let Some(weight) = style.font_weight {
-                                chip = chip.font_weight(weight);
-                            }
-                            chip.child(text)
-                        }),
-                )
-                .into_any_element(),
-        )
+        container.child(dashboard).into_any_element()
     }
 
     /// The Iris document or selected agent preview editor.
@@ -7601,6 +7446,324 @@ impl Workspace {
             })
     }
 
+    fn deal_body(
+        &mut self,
+        card: &crate::dashboard::DealCard,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        if matches!(card.kind, crate::dashboard::DealCardKind::Desk) {
+            return div()
+                .size_full()
+                .key_context("RhoDashboard")
+                .overflow_hidden()
+                .child(self.dashboard.editor().clone())
+                .into_any_element();
+        }
+
+        if self
+            .deal_view
+            .as_ref()
+            .is_none_or(|view| !view.matches(&card.identity))
+        {
+            let view = if let Some(agent_id) = card.agent_id {
+                Some(DealView::Surface {
+                    identity: card.identity.clone(),
+                    surface: self.make_surface(SurfaceKey::Transcript(agent_id), window, cx),
+                })
+            } else {
+                #[cfg(feature = "native")]
+                let page = match &card.inbox_source {
+                    Some(crate::dashboard::DealerInboxSource::Page(id)) => {
+                        rho_browser::open_page(*id, cx).map(|model| {
+                            let view = cx.new(|cx| rho_browser::PageView::new(model, *id, cx));
+                            DealView::Surface {
+                                identity: card.identity.clone(),
+                                surface: Self::wrap_surface(
+                                    SurfaceKey::Browser(*id),
+                                    SurfaceView::Browser(view),
+                                ),
+                            }
+                        })
+                    }
+                    _ => None,
+                };
+                #[cfg(not(feature = "native"))]
+                let page = None;
+                page.or_else(|| {
+                    let crate::dashboard::DealCardIdentity::Inbox(id) = &card.identity else {
+                        return None;
+                    };
+                    let item = self.inbox.get(&InboxId(id.clone()))?;
+                    let mut text = item.text.clone();
+                    let context = [
+                        item.context
+                            .room
+                            .as_deref()
+                            .map(|value| format!("room: {value}")),
+                        item.context
+                            .host
+                            .as_deref()
+                            .map(|value| format!("host: {value}")),
+                        (!item.context.focused_surface.is_empty())
+                            .then(|| format!("surface: {}", item.context.focused_surface)),
+                    ]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>();
+                    if !context.is_empty() {
+                        text.push_str(
+                            "
+
+",
+                        );
+                        text.push_str(&context.join(
+                            "
+",
+                        ));
+                    }
+                    let buffer = cx.new(|cx| {
+                        let mut buffer = language::Buffer::local(text, cx);
+                        buffer.set_capability(language::Capability::Read, cx);
+                        buffer
+                    });
+                    let editor = cx.new(|cx| {
+                        let mut editor = editor::Editor::for_buffer(buffer, None, window, cx);
+                        crate::editor_config::configure(&mut editor, window, cx);
+                        editor.set_read_only(true);
+                        editor
+                    });
+                    Some(DealView::Inbox {
+                        identity: card.identity.clone(),
+                        editor,
+                    })
+                })
+            };
+            self.deal_view = view;
+        }
+
+        match self.deal_view.as_ref() {
+            Some(DealView::Surface { surface, .. }) => self.render_surface(surface),
+            Some(DealView::Inbox { editor, .. }) => div()
+                .size_full()
+                .overflow_hidden()
+                .child(editor.clone())
+                .into_any_element(),
+            None => div().size_full().into_any_element(),
+        }
+    }
+
+    fn render_deal_why(
+        &self,
+        card: &crate::dashboard::DealCard,
+        text_style: &gpui::TextStyle,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let path = match card.kind {
+            crate::dashboard::DealCardKind::Inbox(_) => {
+                let words = card
+                    .breadcrumb
+                    .split_whitespace()
+                    .take(6)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let suffix = (card.breadcrumb.split_whitespace().count() > 6)
+                    .then_some("…")
+                    .unwrap_or("");
+                format!("inbox / {words}{suffix}")
+            }
+            _ => card.breadcrumb.replace(" › ", " / "),
+        };
+        let why = format!("{}  {}", Self::truncate_outline_path(&path), card.label);
+        let line = div()
+            .id("rho-status-line")
+            .h(px(26.))
+            .w_full()
+            .px_2()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .bg(cx.theme().colors().element_background)
+            .text_color(cx.theme().colors().text)
+            .font_family(text_style.font_family.clone())
+            .text_size(text_style.font_size)
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.deal_controls_visible = !this.deal_controls_visible;
+                    cx.notify();
+                }),
+            )
+            .child(why);
+        let right = self.status_right_text(cx);
+        if self.deal_hints_visible {
+            return line
+                .child("· n skip · N previous · d done · x dismiss · s defer · S defer room · t todo · r open · i file · q exit")
+                .child(div().flex_1())
+                .child(right)
+                .into_any_element();
+        }
+        if self.deal_controls_visible {
+            return line
+                .child(
+                    div()
+                        .id("deal-touch-skip")
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(DashboardDealNext), cx)
+                        })
+                        .child("skip"),
+                )
+                .child(
+                    div()
+                        .id("deal-touch-done")
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(DashboardDealDone), cx)
+                        })
+                        .child("done"),
+                )
+                .child(
+                    div()
+                        .id("deal-touch-defer")
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(DashboardDealSnooze), cx)
+                        })
+                        .child("defer"),
+                )
+                .child(
+                    div()
+                        .id("deal-touch-dismiss")
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(DashboardDealDiscard), cx)
+                        })
+                        .child("dismiss"),
+                )
+                .child(
+                    div()
+                        .id("deal-touch-close")
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(Box::new(DashboardDealExit), cx)
+                        })
+                        .child("close"),
+                )
+                .child(div().flex_1())
+                .child(right)
+                .into_any_element();
+        }
+        line.child(div().flex_1()).child(right).into_any_element()
+    }
+
+    fn truncate_outline_path(path: &str) -> String {
+        const MAX_CHARS: usize = 80;
+        if path.chars().count() <= MAX_CHARS {
+            return path.to_owned();
+        }
+        let parts = path.split(" / ").collect::<Vec<_>>();
+        if parts.len() < 3 {
+            return path.chars().take(MAX_CHARS - 1).collect::<String>() + "…";
+        }
+        format!("{} / … / {}", parts[0], parts[parts.len() - 1])
+    }
+
+    fn quota_status_text(&self) -> String {
+        self.merged_quota_summaries()
+            .into_iter()
+            .map(|summary| format!("{} {}%", summary.model, summary.remaining_percent))
+            .collect::<Vec<_>>()
+            .join("  ")
+    }
+
+    fn abnormal_connection_text(&self) -> Option<String> {
+        let (name, status) = self.hosts.worst_status()?;
+        let subject = (self.hosts.len() > 1).then(|| format!("{name} "));
+        match status {
+            HostStatus::Connecting => Some(format!(
+                "{}connecting",
+                subject.as_deref().unwrap_or_default()
+            )),
+            HostStatus::Recovering(_) => Some(format!(
+                "{}reconnecting",
+                subject.as_deref().unwrap_or_default()
+            )),
+            HostStatus::Disconnected(_) => Some(format!(
+                "{}disconnected",
+                subject.as_deref().unwrap_or_default()
+            )),
+            HostStatus::Online => None,
+        }
+    }
+
+    fn status_right_text(&self, cx: &App) -> String {
+        let mut parts = Vec::new();
+        let quota = self.quota_status_text();
+        if !quota.is_empty() {
+            parts.push(quota);
+        }
+        if let Some(connection) = self.abnormal_connection_text() {
+            parts.push(connection);
+        }
+        parts.push(
+            self.mode_indicator
+                .read(cx)
+                .plain_mode(cx)
+                .unwrap_or_else(|| "normal".to_owned()),
+        );
+        if self.lamp_on {
+            parts.push("●".to_owned());
+        }
+        parts.join("  ")
+    }
+
+    fn render_status_line(
+        &mut self,
+        text_style: &gpui::TextStyle,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        if self.dashboard.deal_mode()
+            && let Some(card) = self.dashboard.current_deal_card()
+        {
+            return self.render_deal_why(card, text_style, cx);
+        }
+        let path = if self.overview_open {
+            self.dashboard
+                .cursor_breadcrumb(cx)
+                .unwrap_or_else(|| "desk".to_owned())
+        } else {
+            match &self.active_pane().surface.key {
+                SurfaceKey::Transcript(agent_id) => {
+                    let leaf = self.registry.agent_display_label(*agent_id);
+                    self.dashboard
+                        .breadcrumb_for_agent(*agent_id, cx)
+                        .map_or(leaf.clone(), |path| format!("{path} / {leaf}"))
+                }
+                #[cfg(feature = "native")]
+                SurfaceKey::Browser(page) => self
+                    .dashboard
+                    .breadcrumb_for_page(*page, cx)
+                    .map_or_else(|| "page".to_owned(), |path| format!("{path} / page")),
+                key => self.surface_name(key),
+            }
+        };
+        let left = Self::truncate_outline_path(&path);
+        let right = self.status_right_text(cx);
+        div()
+            .id("rho-status-line")
+            .h(px(26.))
+            .w_full()
+            .px_2()
+            .flex()
+            .flex_row()
+            .items_center()
+            .justify_between()
+            .bg(cx.theme().colors().element_background)
+            .text_color(cx.theme().colors().text)
+            .font_family(text_style.font_family.clone())
+            .text_size(text_style.font_size)
+            .child(left)
+            .child(right)
+            .into_any_element()
+    }
+
     fn render_workspace(
         &mut self,
         window: &mut Window,
@@ -7608,51 +7771,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         if self.dashboard.deal_mode()
-            && let Some(card) = self.dashboard.current_deal_card()
+            && let Some(card) = self.dashboard.current_deal_card().cloned()
         {
-            let kind = match card.kind {
-                crate::dashboard::DealCardKind::Desk => "Desk reminder",
-                crate::dashboard::DealCardKind::Agent => "Agent",
-                crate::dashboard::DealCardKind::Inbox(crate::dashboard::DealerInboxKind::Ping) => {
-                    "Ping"
-                }
-                crate::dashboard::DealCardKind::Inbox(
-                    crate::dashboard::DealerInboxKind::Obligation,
-                ) => "Obligation",
-                crate::dashboard::DealCardKind::Inbox(
-                    crate::dashboard::DealerInboxKind::Capture,
-                ) => "Capture",
-            };
-            let card = div()
-                .absolute()
-                .inset_0()
-                .bg(cx.theme().colors().editor_background)
-                .flex()
-                .flex_col()
-                .justify_center()
-                .items_center()
-                .gap(px(18.))
-                .px(px(80.))
-                .child(div().text_color(cx.theme().colors().text_muted).child(kind))
-                .child(div().text_size(px(26.)).child(card.breadcrumb.clone()))
-                .child(div().text_size(px(18.)).child(card.label.clone()))
-                .child(
-                    div()
-                        .pt(px(18.))
-                        .text_color(cx.theme().colors().text_muted)
-                        .child("n skip · r open · d done · s defer · S defer room · Esc leave"),
-                );
-            return div()
-                .relative()
-                .size_full()
-                .child(
-                    div()
-                        .size_full()
-                        .key_context("RhoDashboard")
-                        .child(self.dashboard.editor().clone()),
-                )
-                .child(card)
-                .into_any_element();
+            return self.deal_body(&card, window, cx);
         }
         if let Some(overlay) = &self.mru_overlay {
             let colors = cx.theme().colors();
@@ -7731,9 +7852,6 @@ impl Workspace {
             (text_style.font_size.to_pixels(window.rem_size()) * 0.85).into();
         preview_text_style.line_height =
             (text_style.line_height_in_pixels(window.rem_size()) * 0.85).into();
-        let preview_bar = (home && !iris)
-            .then(|| self.render_preview_bar(&preview_text_style, cx))
-            .flatten();
         let preview = home
             .then(|| self.selected_preview(iris, window, cx))
             .flatten();
@@ -7767,33 +7885,14 @@ impl Workspace {
                                 .min_h_0()
                                 .overflow_hidden()
                                 .children(preview),
-                        )
-                        .children(preview_bar),
+                        ),
                 )
             } else {
-                let room_name = self
-                    .current_room
-                    .as_ref()
-                    .and_then(|room| self.room_names.get(room))
-                    .cloned()
-                    .unwrap_or_default();
                 element
                     .h_full()
                     .relative()
                     .overflow_hidden()
                     .child(self.render_surface(&self.active_pane().surface))
-                    .child(
-                        div()
-                            .absolute()
-                            .top(px(8.))
-                            .left(px(10.))
-                            .px(px(7.))
-                            .py(px(3.))
-                            .rounded_sm()
-                            .bg(cx.theme().colors().editor_background.opacity(0.82))
-                            .text_color(cx.theme().colors().text_muted)
-                            .child(room_name),
-                    )
             }
         });
         div()
@@ -7918,49 +8017,6 @@ impl Workspace {
         for (agent_id, view) in &self.models {
             self.refresh_view_status(agent_id, view, cx);
         }
-    }
-
-    /// The bottom strip's connection notice. With several hosts attached the
-    /// unhealthiest one speaks, named — a daemon being down says nothing
-    /// about the others, and a nameless "disconnected" would imply it did.
-    fn render_connection_status(
-        &self,
-        text_style: &gpui::TextStyle,
-        cx: &Context<Self>,
-    ) -> Option<gpui::AnyElement> {
-        let (name, status) = self.hosts.worst_status()?;
-        let subject = match self.hosts.len() > 1 {
-            true => format!("{name} · "),
-            false => String::new(),
-        };
-        let (text, class) = match status {
-            HostStatus::Connecting => (
-                format!("{subject}connecting to rho daemon…"),
-                StyleClass::SystemInfo,
-            ),
-            HostStatus::Recovering(elapsed) => {
-                let seconds = elapsed.as_secs();
-                let elapsed = if seconds < 60 {
-                    format!("{seconds}s")
-                } else {
-                    format!("{}m {:02}s", seconds / 60, seconds % 60)
-                };
-                (
-                    format!("{subject}connection interrupted · recovering · {elapsed}"),
-                    StyleClass::SystemImportant,
-                )
-            }
-            HostStatus::Disconnected(reason) => (
-                format!("{subject}disconnected from rho daemon · {reason}"),
-                StyleClass::Disconnect,
-            ),
-            HostStatus::Online => return None,
-        };
-        let mut strip = bottom_strip(text_style, cx);
-        if let Some(color) = class.resolve(cx).color {
-            strip = strip.text_color(color);
-        }
-        Some(strip.child(div().px_2().child(text)).into_any_element())
     }
 
     #[cfg(test)]
@@ -8224,9 +8280,7 @@ impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = self.active_editor(cx);
         let text_style = editor.update(cx, |editor, cx| editor.style(cx).text.clone());
-        let connection_status = self.render_connection_status(&text_style, cx);
         let phone = self.phone_mode(window, cx);
-        let deal_touch_controls = self.render_deal_touch_controls(cx);
         div()
             .id("rho-gui")
             .relative()
@@ -8238,6 +8292,19 @@ impl Render for Workspace {
             .key_context("RhoGui")
             .capture_key_down(
                 cx.listener(|this, event: &gpui::KeyDownEvent, _window, cx| {
+                    if this.dashboard.deal_mode() {
+                        this.deal_controls_visible = false;
+                        if event.keystroke.key == "?" {
+                            this.deal_hints_visible = !this.deal_hints_visible;
+                            cx.notify();
+                            cx.stop_propagation();
+                            return;
+                        }
+                        if this.deal_hints_visible {
+                            this.deal_hints_visible = false;
+                            cx.notify();
+                        }
+                    }
                     if event.keystroke.key != "k" || !event.keystroke.modifiers.control {
                         this.dismiss_mru_overlay(cx);
                     }
@@ -8404,6 +8471,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &DashboardDealPrevious, window, cx| {
                 vim::take_count(cx);
                 if this.dashboard.previous_deal(cx) {
+                    this.deal_view = None;
+                    this.deal_hints_visible = false;
+                    this.deal_controls_visible = false;
                     this.journal_deal_card_presented();
                     this.refresh_dashboard(window, cx);
                 }
@@ -8578,6 +8648,9 @@ impl Render for Workspace {
                     .current_room
                     .as_ref()
                     .and_then(|room| Some((room.host, this.room_names.get(room)?.as_str())));
+                this.deal_view = None;
+                this.deal_hints_visible = false;
+                this.deal_controls_visible = false;
                 this.dashboard.enter_deal_mode_in_room(
                     &this.registry,
                     &this.inbox,
@@ -8786,36 +8859,29 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &GitApprovalDeny, window, cx| {
                 this.finish_git_approval(GitApprovalDecision::Deny, window, cx);
             }))
-            .child(if phone {
-                self.render_phone_body(&text_style, cx)
-            } else {
-                self.render_workspace(window, &text_style, cx)
-            })
-            .children((!phone).then(|| {
-                bottom_strip(&text_style, cx).child(div().px_2().child(self.mode_indicator.clone()))
-            }))
-            .children(phone.then(|| self.render_phone_bar(cx)))
-            .children(deal_touch_controls)
-            .children(self.lamp_on.then(|| {
+            .child(
                 div()
-                    .absolute()
-                    .top(px(6.))
-                    .right(px(6.))
-                    .w(px(18.))
-                    .h(px(18.))
-                    .rounded_sm()
-                    .bg(cx.theme().colors().text_accent.opacity(0.16))
-            }))
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .flex()
+                    .flex_col()
+                    .child(if phone {
+                        self.render_phone_body(&text_style, cx)
+                    } else {
+                        self.render_workspace(window, &text_style, cx)
+                    }),
+            )
+            .child(self.render_status_line(&text_style, cx))
             .children(
                 match (
                     &self.pending_git_approval,
                     &self.minibuffer,
                     &self.transient,
                     self.universal_argument,
-                    connection_status,
                     &self.echo,
                 ) {
-                    (Some(pending), _, _, _, _, _) => {
+                    (Some(pending), _, _, _, _) => {
                         let colors = cx.theme().colors();
                         let focused = self.git_approval_focus.is_focused(window);
                         let mut deny = div().flex().flex_row().px_1().child("n deny");
@@ -8863,12 +8929,12 @@ impl Render for Workspace {
                                 .into_any_element(),
                         )
                     }
-                    (None, Some(minibuffer), _, _, _, _) => Some(if phone {
+                    (None, Some(minibuffer), _, _, _) => Some(if phone {
                         minibuffer.render_phone(&text_style, cx)
                     } else {
                         minibuffer.render(&text_style, cx)
                     }),
-                    (None, None, Some(transient), _, _, _) => {
+                    (None, None, Some(transient), _, _) => {
                         if phone {
                             self.render_phone_transient_sheet(&text_style, cx)
                         } else {
@@ -8881,7 +8947,7 @@ impl Render for Workspace {
                             )
                         }
                     }
-                    (None, None, None, true, _, _) => Some(
+                    (None, None, None, true, _) => Some(
                         bottom_strip(&text_style, cx)
                             .child(
                                 div()
@@ -8892,11 +8958,8 @@ impl Render for Workspace {
                             .child(div().px_2().child("universal argument"))
                             .into_any_element(),
                     ),
-                    (None, None, None, false, Some(status), _) => Some(status),
-                    (None, None, None, false, None, Some(echo)) => {
-                        Some(echo.render(&text_style, cx))
-                    }
-                    (None, None, None, false, None, None) => None,
+                    (None, None, None, false, Some(echo)) => Some(echo.render(&text_style, cx)),
+                    (None, None, None, false, None) => None,
                 },
             )
     }

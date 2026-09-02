@@ -63,6 +63,11 @@ impl ModeIndicator {
         self.vim.as_ref().and_then(|vim| vim.upgrade())
     }
 
+    /// Plain current-mode text for clients that render their own mode line.
+    pub fn plain_mode(&self, cx: &App) -> Option<String> {
+        Some(self.vim()?.read(cx).mode.to_string().to_lowercase())
+    }
+
     fn current_operators_description(&self, vim: Entity<Vim>, cx: &mut Context<Self>) -> String {
         let recording = Vim::globals(cx)
             .recording_register

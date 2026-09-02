@@ -13,13 +13,11 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
-use std::sync::Arc;
 use std::time::Instant;
 
 use editor::scroll::Autoscroll;
 use editor::{
-    Anchor, Editor, EditorMode, HighlightKey, Inlay, RowHighlightOptions, SelectionEffects,
-    SizingBehavior,
+    Editor, EditorMode, HighlightKey, Inlay, RowHighlightOptions, SelectionEffects, SizingBehavior,
 };
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, Focusable as _, HighlightStyle, WeakEntity, Window};
@@ -41,8 +39,6 @@ const DASHBOARD_KEY_BASE: usize = usize::MAX - 200;
 
 /// Inlay id space for reply-draft placeholders, clear of the lamp ids.
 const PLACEHOLDER_ID_BASE: usize = 1_000_000;
-
-const MASTHEAD_ROWS: u32 = 3;
 
 /// Title a quick-spawned heading carries until the agent's generated
 /// summary replaces it.
@@ -459,6 +455,45 @@ impl Dashboard {
         self.room_for_heading(host, offset, cx)
     }
 
+    pub fn breadcrumb_for_heading(&self, host: HostId, offset: usize, cx: &App) -> Option<String> {
+        let text = self.source_text(host, cx)?;
+        let headings = parse(&text);
+        let index = headings
+            .iter()
+            .position(|heading| heading.heading_range.start == offset)
+            .or_else(|| {
+                headings
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(_, heading)| heading.heading_range.start <= offset)
+                    .map(|(index, _)| index)
+            })?;
+        Some(heading_breadcrumb(&headings, index).replace(" › ", " / "))
+    }
+
+    pub fn cursor_breadcrumb(&self, cx: &mut Context<Workspace>) -> Option<String> {
+        let (host, offset) = self.cursor_topic(cx)?;
+        self.breadcrumb_for_heading(host, offset, cx)
+    }
+
+    pub fn breadcrumb_for_agent(&self, agent_id: AgentId, cx: &App) -> Option<String> {
+        let topic = self
+            .heading_agents
+            .iter()
+            .find_map(|(topic, agents)| agents.contains(&agent_id).then_some(*topic))?;
+        self.breadcrumb_for_heading(topic.0, topic.1, cx)
+    }
+
+    #[cfg(feature = "native")]
+    pub fn breadcrumb_for_page(&self, page_id: rho_browser::PageId, cx: &App) -> Option<String> {
+        let topic = self
+            .heading_pages
+            .iter()
+            .find_map(|(topic, page)| (*page == page_id).then_some(*topic))?;
+        self.breadcrumb_for_heading(topic.0, topic.1, cx)
+    }
+
     pub fn room_for_agent(&self, agent_id: AgentId, cx: &App) -> Option<DeskRoom> {
         let topic = self
             .heading_agents
@@ -513,32 +548,6 @@ impl Dashboard {
             // it is the whole point.
             editor.set_mouse_click_selection_enabled(true, cx);
             editor
-        });
-        let workspace = cx.entity().downgrade();
-        editor.update(cx, |editor, cx| {
-            editor.insert_blocks(
-                [editor::display_map::BlockProperties {
-                    placement: editor::display_map::BlockPlacement::Above(Anchor::Min),
-                    height: Some(MASTHEAD_ROWS),
-                    style: editor::display_map::BlockStyle::Flex,
-                    render: Arc::new(move |block_context| {
-                        let text_style = block_context.editor_style.text.clone();
-                        workspace.upgrade().map_or_else(
-                            || gpui::Empty.into_any_element(),
-                            |workspace| {
-                                workspace.read(block_context).render_dashboard_header(
-                                    &text_style,
-                                    block_context.line_height,
-                                    block_context,
-                                )
-                            },
-                        )
-                    }),
-                    priority: 0,
-                }],
-                None,
-                cx,
-            );
         });
         Self {
             multi_buffer,
@@ -1632,9 +1641,8 @@ impl Dashboard {
             &self.replies,
             draft_topic,
         );
-        // Staffed headings wear their agents as end-of-line inlays, not
-        // rows, so the decoration strings join the fingerprint: attention
-        // changes must not vanish into the early-out.
+        // Agent ids are implementation details. Staffed headings use the same
+        // quiet outline treatment on every form factor, with no id inlays.
         let mut decorations = if self.raw_mode {
             Vec::new()
         } else {
@@ -1644,7 +1652,7 @@ impl Dashboard {
                 &filed,
                 &self.expanded_portals,
                 &fold_ranges,
-                !self.phone_browse_mode,
+                false,
             )
         };
         #[cfg(feature = "native")]
@@ -2026,7 +2034,7 @@ impl Dashboard {
                 });
             // Scroll anchors resolve in buffer space, so account for the
             // masthead block's display rows when requesting visible context.
-            Autoscroll::top_relative((ancestors + 2 + MASTHEAD_ROWS as usize) as f64)
+            Autoscroll::top_relative((ancestors + 2) as f64)
         });
         self.select_buffer_anchor(anchor, autoscroll, window, cx);
     }

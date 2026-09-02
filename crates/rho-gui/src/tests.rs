@@ -871,57 +871,21 @@ fn has_custom_block(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext
 }
 
 #[gpui::test]
-fn dashboard_masthead_is_a_scrolling_editor_block(cx: &mut TestAppContext) {
-    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
-
+fn dashboard_has_no_persistent_masthead_block(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
-    let desk_text = "* Active\nintro\n** Project\nproject body\n";
-    let mut source =
-        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
-    let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text)]));
-
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskSnapshot {
-                    snapshot: DeskSnapshot {
-                        text: source.snapshot().text(),
-                        operations: vec![operation],
-                        transactions: Vec::new(),
-                        replicas: Vec::new(),
-                    },
-                    replica_id: 42,
-                },
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
             let editor = workspace.dashboard_editor();
             editor.update(cx, |editor, cx| {
                 let snapshot = editor.snapshot(window, cx);
-                let mastheads = snapshot
+                let custom_blocks = snapshot
                     .blocks_in_range(DisplayRow(0)..snapshot.max_point().row() + 1)
-                    .filter_map(|(row, block)| match block {
-                        Block::Custom(block) => Some((row, block)),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>();
-                assert_eq!(mastheads.len(), 1);
-                assert_eq!(mastheads[0].0, DisplayRow(0));
-                assert_eq!(
-                    mastheads[0].1.placement,
-                    editor::display_map::BlockPlacement::Above(editor::Anchor::Min)
-                );
-                assert_eq!(mastheads[0].1.height, Some(3));
-                assert_eq!(
-                    mastheads[0].1.style(),
-                    editor::display_map::BlockStyle::Flex
-                );
-                assert_eq!(editor.scroll_position(cx).y, 0.);
+                    .filter(|(_, block)| matches!(block, Block::Custom(_)))
+                    .count();
+                assert_eq!(custom_blocks, 0);
             });
         })
-        .expect("inspect dashboard masthead block");
+        .unwrap();
 }
 
 fn excerpt_boundary_count(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) -> usize {
@@ -1004,8 +968,7 @@ fn state(history: Vec<UiBlock>, live: Vec<UiBlock>) -> UiAgentState {
 }
 
 fn long_working_text() -> String {
-    "alpha\nbravo\ncharlie\ndelta\necho\nfoxtrot\ngolf\nhotel\nindia\njuliet\nkilo\nlima\nmike\nnovember\noscar\npapa\n"
-        .to_owned()
+    "alpha\nbravo\ncharlie\ndelta\necho\nfoxtrot\ngolf\nhotel\nindia\njuliet\nkilo\nlima\nmike\nnovember\noscar\npapa\n".to_owned()
 }
 
 #[gpui::test]
@@ -3327,6 +3290,103 @@ fn terminal_escape_chord_parses() {
 }
 
 #[gpui::test]
+fn overview_enter_opens_bound_agent_in_its_room(cx: &mut TestAppContext) {
+    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
+    use rho_ui_proto::{
+        AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
+    };
+
+    let workspace = test_workspace(cx);
+    let agent_id = agent(1);
+    let desk_text = format!(
+        "* Work
+** Task :eng-{}:
+",
+        agent_id.encoded()
+    );
+    let mut source =
+        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
+    let operation = DeskOperation::from_text(&source.edit([(0..0, desk_text.as_str())]));
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Ready {
+                    agents: vec![UiAgentSummary {
+                        agent_id,
+                        parent_agent: None,
+                        display_name: Some("daily agent".into()),
+                        created_at: UnixMs(1),
+                        updated_at: UnixMs(1),
+                        role: AgentRole::default(),
+                        workspace: WorkspaceInfo::UserCheckout {
+                            repo: "/tmp".into(),
+                        },
+                        attention: UiAttention::Quiet,
+                        last_active: UnixMs(1),
+                        facts: Default::default(),
+                        hidden: false,
+                        disposition: AgentDisposition::Pending,
+                        last_user_message_text: String::new(),
+                        activity: None,
+                        turn_report: None,
+                        labels: Vec::new(),
+                    }],
+                    iris_agent: None,
+                    projects: Vec::new(),
+                    auth: AuthState {
+                        namespaces: Vec::new(),
+                        disabled_namespaces: Vec::new(),
+                        active_namespace: None,
+                    },
+                    machine_seed: 0,
+                    agent_counter: 100,
+                },
+                window,
+                cx,
+            );
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskSnapshot {
+                    snapshot: DeskSnapshot {
+                        text: source.snapshot().text(),
+                        operations: vec![operation],
+                        transactions: Vec::new(),
+                        replicas: Vec::new(),
+                    },
+                    replica_id: 42,
+                },
+                window,
+                cx,
+            );
+            workspace.sync_dashboard(window, cx);
+            workspace.focus_rail(window, cx);
+            let offset = desk_text.find("** Task").unwrap();
+            workspace.dashboard_editor().update(cx, |editor, cx| {
+                editor.change_selections(Default::default(), window, cx, |selections| {
+                    let offset = editor::MultiBufferOffset(offset);
+                    selections.select_ranges([offset..offset]);
+                });
+            });
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    cx.update_window(*workspace, |_, window, cx| {
+        window.dispatch_action(Box::new(crate::RailOpen), cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(!workspace.is_dashboard_mode(window, cx));
+            assert!(workspace.active_agent_model().is_some());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn double_shift_toggles_desk_overview(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
@@ -4362,7 +4422,10 @@ fn heading_tags_file_agents_and_conceal_in_display(cx: &mut TestAppContext) {
             workspace.dashboard_editor().read(cx).eol_hints().len()
         })
         .expect("read hints");
-    assert_eq!(hints, 1, "the staffed heading wears its chip as a hint");
+    assert_eq!(
+        hints, 1,
+        "the folded chevron remains without an agent-id chip"
+    );
 
     cx.simulate_keystrokes(*workspace, "escape space e");
     cx.run_until_parked();
@@ -5228,7 +5291,7 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
             workspace.dashboard_editor().read(cx).eol_hints().len()
         })
         .expect("read hints");
-    assert_eq!(hints, 1, "the staffed heading wears its chip as a hint");
+    assert_eq!(hints, 0, "agent ids never render as heading inlays");
 
     cx.simulate_keystrokes(*workspace, "escape g t");
     cx.run_until_parked();
@@ -5260,7 +5323,7 @@ fn home_view_interleaves_document_and_agent_rows(cx: &mut TestAppContext) {
             workspace.dashboard_editor().read(cx).eol_hints().len()
         })
         .expect("read collapsed hints");
-    assert_eq!(hints, 1, "closing the portal restores its compact hint");
+    assert_eq!(hints, 0, "closing the portal does not restore an id inlay");
 
     // Deleting the tag from the text is the unbind: neither agent remains
     // visible on the Desk.
@@ -5359,7 +5422,7 @@ fn insert_mode_enter_stays_a_newline_in_desk_text(cx: &mut TestAppContext) {
         })
         .expect("read dashboard");
     assert!(
-        text.contains("body\nx"),
+        text.contains("body\n\n"),
         "enter should insert a newline in document text: {text:?}"
     );
 }

@@ -364,12 +364,14 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             DashboardSubmit,
             Some("RhoDashboard > Editor && vim_mode == insert && !showing_completions"),
         ),
+        KeyBinding::new("enter", RailOpen, Some("RhoDashboard > Editor && !VimDeal")),
     ]);
     for context in [
         "RhoDashboard > Editor && vim_mode == normal && !VimDeal",
         "RhoDashboard > Editor && vim_mode == helix_normal && !VimDeal",
     ] {
         cx.bind_keys([
+            KeyBinding::new("enter", RailOpen, Some(context)),
             KeyBinding::new("r", DashboardReply, Some(context)),
             KeyBinding::new("shift-r", DashboardNewAgent, Some(context)),
             KeyBinding::new("tab", DashboardToggleSubagents, Some(context)),
