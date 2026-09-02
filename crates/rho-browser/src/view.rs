@@ -134,6 +134,11 @@ pub fn snapshot_handoff_events() -> Vec<HandoffEvent> {
     HANDOFF_EVENTS.lock().unwrap().iter().cloned().collect()
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct PageMetadataChanged;
+
+impl gpui::EventEmitter<PageMetadataChanged> for BrowserModel {}
+
 /// The singleton live Chrome surface shared by every logical page view.
 pub struct BrowserModel {
     browser: Arc<BrowserRuntime>,
@@ -147,6 +152,7 @@ pub struct BrowserModel {
     passthrough_owner: Rc<Cell<Option<EntityId>>>,
     runtime: RuntimePageState,
     _events_task: Task<()>,
+    _metadata_task: Task<()>,
 }
 
 impl BrowserModel {
@@ -418,6 +424,28 @@ impl BrowserModel {
                 }
             }
         });
+        let mut metadata_revision = crate::native_host::page_metadata_revision();
+        let metadata_task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(500))
+                    .await;
+                let revision = crate::native_host::page_metadata_revision();
+                if revision == metadata_revision {
+                    continue;
+                }
+                metadata_revision = revision;
+                if this
+                    .update(cx, |_, cx| {
+                        cx.emit(PageMetadataChanged);
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         Self {
             browser,
             handoff: None,
@@ -443,6 +471,7 @@ impl BrowserModel {
                 cursor: BrowserCursor::Arrow,
             },
             _events_task: events_task,
+            _metadata_task: metadata_task,
         }
     }
 

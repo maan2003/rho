@@ -17,7 +17,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use gpui::{App, AppContext as _, BorrowAppContext as _, Entity, Global, Task};
 pub use native_host::{
-    ExtensionCommandStats, TabStateEvent, snapshot_extension_command_stats,
+    ExtensionCommandStats, PageMetadata, TabStateEvent, snapshot_extension_command_stats,
     snapshot_tab_state_events,
 };
 use rho_browser_wayland::{BrowserRenderConfig, DmaBufConfig};
@@ -28,7 +28,8 @@ pub use rho_browser_wayland::{
 use runtime::BrowserRuntime;
 pub use store::{PageId, PageRecord};
 pub use view::{
-    BrowserModel as PageModel, BrowserView as PageView, HandoffEvent, snapshot_handoff_events,
+    BrowserModel as PageModel, BrowserView as PageView, HandoffEvent, PageMetadataChanged,
+    snapshot_handoff_events,
 };
 
 pub struct WebState {
@@ -148,6 +149,25 @@ pub fn page_handle(id: PageId, _cx: &App) -> String {
     id.to_string()
 }
 
+pub fn live_page_name(id: PageId) -> Option<String> {
+    let metadata = native_host::page_metadata(&id.to_string())?;
+    let title = metadata
+        .title
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(80)
+        .collect::<String>();
+    if !title.is_empty() {
+        return Some(title);
+    }
+    url::Url::parse(&metadata.url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+}
+
 pub fn page_name(page: &PageRecord) -> String {
     let host = url::Url::parse(&page.launch_url)
         .ok()
@@ -163,5 +183,36 @@ pub fn page_name(page: &PageRecord) -> String {
     match characters.next() {
         Some(first) => first.to_uppercase().chain(characters).collect(),
         None => "Web page".to_owned(),
+    }
+}
+
+#[cfg(test)]
+mod page_name_tests {
+    use serde_json::json;
+
+    use super::*;
+
+    #[test]
+    fn live_name_prefers_title_then_url_host() {
+        let titled: PageId = "web-00000000-0000-4000-8000-000000000101".parse().unwrap();
+        native_host::record_page_metadata(&json!({
+            "event": "page-metadata",
+            "page_id": titled.to_string(),
+            "title": "Live title",
+            "url": "https://fallback.example/path",
+        }));
+        assert_eq!(live_page_name(titled).as_deref(), Some("Live title"));
+
+        let untitled: PageId = "web-00000000-0000-4000-8000-000000000102".parse().unwrap();
+        native_host::record_page_metadata(&json!({
+            "event": "page-metadata",
+            "page_id": untitled.to_string(),
+            "title": "",
+            "url": "https://fallback.example/path",
+        }));
+        assert_eq!(
+            live_page_name(untitled).as_deref(),
+            Some("fallback.example")
+        );
     }
 }

@@ -29,6 +29,23 @@ async function removePageId(tabId) {
   await chrome.rhoPrivate.tabs.removeId(tabId);
 }
 
+function removePageMetadata(pageId) {
+  if (!port || !pageId) return;
+  try { port.postMessage({ event: "page-metadata-removed", page_id: pageId }); } catch (_) {}
+}
+
+function reportPageMetadata(tab, pageId = tabPages.get(tab?.id)) {
+  if (!port || !pageId) return;
+  try {
+    port.postMessage({
+      event: "page-metadata",
+      page_id: pageId,
+      title: tab?.title || "",
+      url: tab?.url || "",
+    });
+  } catch (_) {}
+}
+
 function reportTabState(state, tab, pageId = tabPages.get(tab?.id), reason = "") {
   if (!port || !pageId) return;
   try {
@@ -61,6 +78,7 @@ async function rememberPage(id, tab, createdAt = Date.now(), launchUrl = tab.url
   pageTabs.set(id, tab.id);
   tabPages.set(tab.id, id);
   reportTabState("registered", tab, id);
+  reportPageMetadata(tab, id);
   const key = pageKey(id);
   const old = (await chrome.storage.local.get(key))[key];
   await chrome.storage.local.set({
@@ -220,6 +238,7 @@ async function closePage(id) {
   const record = (await chrome.storage.local.get(key))[key];
   await chrome.storage.local.set({ [key]: { ...record, closing: true } });
   await removePageId(tab.id);
+  removePageMetadata(id);
   pageTabs.delete(id);
   tabPages.delete(tab.id);
   await chrome.tabs.remove(tab.id);
@@ -297,6 +316,7 @@ chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
   const id = tabPages.get(tabId);
   if (!id) return;
   reportTabState("removed", { id: tabId }, id, "tab-removed");
+  removePageMetadata(id);
   tabPages.delete(tabId);
   pageTabs.delete(id);
   chrome.storage.local.remove(pageKey(id));
@@ -318,6 +338,9 @@ chrome.tabs.onReplaced.addListener((addedTabId, removedTabId) => {
 chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   const id = tabPages.get(tabId);
   if (!id) return;
+  if (Object.hasOwn(changeInfo, "title") || Object.hasOwn(changeInfo, "url")) {
+    reportPageMetadata(tab, id);
+  }
   const lifecycle = ["discarded", "frozen", "status"]
     .filter((field) => Object.hasOwn(changeInfo, field));
   if (lifecycle.length > 0) {

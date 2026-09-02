@@ -4,7 +4,7 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, Condvar, LazyLock, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use std::{fs, thread};
 
@@ -241,6 +241,9 @@ fn read_responses(
         let Ok(message) = serde_json::from_slice::<Value>(&frame) else {
             continue;
         };
+        if record_page_metadata(&message) {
+            continue;
+        }
         if log_tab_state(&message) {
             continue;
         }
@@ -324,6 +327,62 @@ pub fn snapshot_extension_command_stats() -> Vec<ExtensionCommandStats> {
         .iter()
         .cloned()
         .collect()
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PageMetadata {
+    pub title: String,
+    pub url: String,
+}
+
+static PAGE_METADATA: LazyLock<Mutex<HashMap<String, PageMetadata>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static PAGE_METADATA_REVISION: AtomicU64 = AtomicU64::new(0);
+
+pub fn page_metadata(page_id: &str) -> Option<PageMetadata> {
+    PAGE_METADATA.lock().unwrap().get(page_id).cloned()
+}
+
+pub fn page_metadata_revision() -> u64 {
+    PAGE_METADATA_REVISION.load(Ordering::Acquire)
+}
+
+pub(crate) fn record_page_metadata(message: &Value) -> bool {
+    if message.get("event").and_then(Value::as_str) == Some("page-metadata-removed") {
+        if let Some(page_id) = message
+            .get("page_id")
+            .and_then(Value::as_str)
+            .filter(|value| value.len() <= 64)
+        {
+            PAGE_METADATA.lock().unwrap().remove(page_id);
+            PAGE_METADATA_REVISION.fetch_add(1, Ordering::Release);
+        }
+        return true;
+    }
+    if message.get("event").and_then(Value::as_str) != Some("page-metadata") {
+        return false;
+    }
+    let bounded = |field: &str, max: usize| {
+        message
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| value.len() <= max)
+            .unwrap_or("")
+            .to_owned()
+    };
+    let page_id = bounded("page_id", 64);
+    if page_id.is_empty() {
+        return true;
+    }
+    PAGE_METADATA.lock().unwrap().insert(
+        page_id,
+        PageMetadata {
+            title: bounded("title", 1024),
+            url: bounded("url", 4096),
+        },
+    );
+    PAGE_METADATA_REVISION.fetch_add(1, Ordering::Release);
+    true
 }
 
 /// Tab lifecycle report from the extension: activation, page visibility as
@@ -511,6 +570,41 @@ mod tests {
             "rho-gui".into(),
             "chrome-extension://other/".into()
         ]));
+    }
+
+    #[test]
+    fn page_metadata_events_are_bounded_and_replace_by_page() {
+        assert!(record_page_metadata(&json!({
+            "event": "page-metadata",
+            "page_id": "web-a",
+            "title": "First",
+            "url": "https://example.com/one",
+        })));
+        assert!(record_page_metadata(&json!({
+            "event": "page-metadata",
+            "page_id": "web-a",
+            "title": "Second",
+            "url": "https://example.com/two",
+        })));
+        assert_eq!(
+            page_metadata("web-a"),
+            Some(PageMetadata {
+                title: "Second".into(),
+                url: "https://example.com/two".into(),
+            })
+        );
+        assert!(record_page_metadata(&json!({
+            "event": "page-metadata",
+            "page_id": "web-too-long",
+            "title": "x".repeat(1025),
+            "url": "https://example.com",
+        })));
+        assert_eq!(page_metadata("web-too-long").unwrap().title, "");
+        assert!(record_page_metadata(&json!({
+            "event": "page-metadata-removed",
+            "page_id": "web-a",
+        })));
+        assert_eq!(page_metadata("web-a"), None);
     }
 
     #[test]

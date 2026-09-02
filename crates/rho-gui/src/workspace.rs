@@ -431,6 +431,7 @@ pub struct Workspace {
     /// Browser resources referenced by the last reconciled Desk documents.
     #[cfg(feature = "native")]
     browser_pages: HashSet<rho_browser::PageId>,
+    browser_metadata_subscription: Option<gpui::Subscription>,
     /// Unreferenced browser pages waiting out the Desk edit grace period.
     #[cfg(feature = "native")]
     browser_page_gc: HashMap<rho_browser::PageId, Task<()>>,
@@ -961,6 +962,7 @@ impl Workspace {
             dashboard_preview: None,
             dashboard_web_preview: None,
             browser_pages: HashSet::new(),
+            browser_metadata_subscription: None,
             browser_page_gc: HashMap::new(),
             iris_preview,
             iris_agents: HashMap::new(),
@@ -3322,6 +3324,7 @@ impl Workspace {
             return;
         };
         self.scan_browser_pages_for_gc(cx);
+        self.observe_browser_metadata(&model, cx);
         let view = cx.new(|cx| rho_browser::PageView::new(model, id, cx));
         let surface = Self::wrap_surface(SurfaceKey::Browser(id), SurfaceView::Browser(view));
         self.display_surface(surface);
@@ -3365,6 +3368,21 @@ impl Workspace {
             StyleClass::SystemInfo,
             cx,
         );
+    }
+
+    #[cfg(feature = "native")]
+    fn observe_browser_metadata(
+        &mut self,
+        model: &Entity<rho_browser::PageModel>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.browser_metadata_subscription.is_none() {
+            self.browser_metadata_subscription = Some(
+                cx.subscribe(model, |_, _, _: &rho_browser::PageMetadataChanged, cx| {
+                    cx.notify()
+                }),
+            );
+        }
     }
 
     #[cfg(feature = "native")]
@@ -4518,6 +4536,7 @@ impl Workspace {
             return;
         };
         self.scan_browser_pages_for_gc(cx);
+        self.observe_browser_metadata(&model, cx);
         let view = cx.new(|cx| rho_browser::PageView::new(model, id, cx));
         self.dashboard_preview = None;
         self.hosts.focus_agent(None);
@@ -7476,6 +7495,7 @@ impl Workspace {
                 let page = match &card.inbox_source {
                     Some(crate::dashboard::DealerInboxSource::Page(id)) => {
                         rho_browser::open_page(*id, cx).map(|model| {
+                            self.observe_browser_metadata(&model, cx);
                             let view = cx.new(|cx| rho_browser::PageView::new(model, *id, cx));
                             DealView::Surface {
                                 identity: card.identity.clone(),
@@ -7559,20 +7579,26 @@ impl Workspace {
         text_style: &gpui::TextStyle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let path = match card.kind {
-            crate::dashboard::DealCardKind::Inbox(_) => {
-                let words = card
-                    .breadcrumb
-                    .split_whitespace()
-                    .take(6)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                let suffix = (card.breadcrumb.split_whitespace().count() > 6)
-                    .then_some("…")
-                    .unwrap_or("");
-                format!("inbox / {words}{suffix}")
+        let path = match &card.inbox_source {
+            Some(crate::dashboard::DealerInboxSource::Page(page)) => {
+                let leaf = rho_browser::live_page_name(*page).unwrap_or_else(|| "page".to_owned());
+                format!("{} / {leaf}", card.breadcrumb.replace(" › ", " / "))
             }
-            _ => card.breadcrumb.replace(" › ", " / "),
+            _ => match card.kind {
+                crate::dashboard::DealCardKind::Inbox(_) => {
+                    let words = card
+                        .breadcrumb
+                        .split_whitespace()
+                        .take(6)
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let suffix = (card.breadcrumb.split_whitespace().count() > 6)
+                        .then_some("…")
+                        .unwrap_or("");
+                    format!("inbox / {words}{suffix}")
+                }
+                _ => card.breadcrumb.replace(" › ", " / "),
+            },
         };
         let why = format!("{}  {}", Self::truncate_outline_path(&path), card.label);
         let line = div()
@@ -7737,10 +7763,13 @@ impl Workspace {
                         .map_or(leaf.clone(), |path| format!("{path} / {leaf}"))
                 }
                 #[cfg(feature = "native")]
-                SurfaceKey::Browser(page) => self
-                    .dashboard
-                    .breadcrumb_for_page(*page, cx)
-                    .map_or_else(|| "page".to_owned(), |path| format!("{path} / page")),
+                SurfaceKey::Browser(page) => {
+                    let leaf =
+                        rho_browser::live_page_name(*page).unwrap_or_else(|| "page".to_owned());
+                    self.dashboard
+                        .breadcrumb_for_page(*page, cx)
+                        .map_or(leaf.clone(), |path| format!("{path} / {leaf}"))
+                }
                 key => self.surface_name(key),
             }
         };
