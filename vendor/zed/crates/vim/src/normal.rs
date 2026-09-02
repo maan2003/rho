@@ -656,7 +656,12 @@ impl Vim {
         });
     }
 
-    fn insert_after(&mut self, _: &InsertAfter, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn insert_after(
+        &mut self,
+        _: &InsertAfter,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.start_recording(cx);
         self.prepare_for_insert(window, cx);
         self.switch_mode(Mode::Insert, false, window, cx);
@@ -809,7 +814,7 @@ impl Vim {
         });
     }
 
-    fn insert_line_below(
+    pub(crate) fn insert_line_below(
         &mut self,
         _: &InsertLineBelow,
         window: &mut Window,

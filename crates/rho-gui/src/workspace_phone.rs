@@ -327,7 +327,7 @@ impl Workspace {
         }
 
         if self.phone.stack.is_empty() && self.dashboard.deal_mode() {
-            self.toggle_dashboard_deal(window, cx);
+            self.open_deal_mode(window, cx);
             // The toggle focuses the desk editor; browse keeps the OSK down.
             self.phone_set_dashboard_browsing(true, window, cx);
             return;

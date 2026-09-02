@@ -49,6 +49,8 @@ impl Vim {
         self.stop_recording_immediately(action.boxed_clone(), cx);
         if count <= 1 || Vim::globals(cx).dot_replaying {
             self.create_mark("^".into(), window, cx);
+            let deal_mode =
+                matches!(self.last_mode, Mode::Deal | Mode::HelixDeal).then_some(self.last_mode);
 
             if HelixModeSetting::get_global(cx).0 {
                 // Restore the pre-append selections only if nothing happened in
@@ -78,7 +80,7 @@ impl Vim {
                         }
                     }
                 });
-                self.switch_mode(Mode::HelixNormal, false, window, cx);
+                self.switch_mode(deal_mode.unwrap_or(Mode::HelixNormal), false, window, cx);
                 return;
             }
 
@@ -93,7 +95,7 @@ impl Vim {
                 });
             });
 
-            self.switch_mode(Mode::Normal, false, window, cx);
+            self.switch_mode(deal_mode.unwrap_or(Mode::Normal), false, window, cx);
             return;
         }
 

@@ -194,6 +194,10 @@ actions!(
         ExitDealMode,
         /// Starts inserting at the current deal heading.
         DealInsert,
+        /// Starts inserting after the cursor while preserving DEAL on escape.
+        DealAppend,
+        /// Opens a line below while preserving DEAL on escape.
+        DealOpenLine,
         /// Clears any pending operators.
         ClearOperators,
         /// Clears the exchange register.
@@ -708,7 +712,11 @@ impl Vim {
 
         vim.update(cx, |_, cx| {
             Vim::action(editor, cx, |vim, _: &SwitchToNormalMode, window, cx| {
-                vim.switch_mode(Mode::Normal, false, window, cx)
+                let mode = match vim.last_mode {
+                    Mode::Deal | Mode::HelixDeal if vim.mode == Mode::Insert => vim.last_mode,
+                    _ => Mode::Normal,
+                };
+                vim.switch_mode(mode, false, window, cx)
             });
 
             Vim::action(editor, cx, |vim, _: &SwitchToInsertMode, window, cx| {
@@ -788,6 +796,20 @@ impl Vim {
                 }
                 vim.allow_deal_transition = true;
                 vim.switch_mode(Mode::Insert, false, window, cx)
+            });
+            Vim::action(editor, cx, |vim, _: &DealAppend, window, cx| {
+                if !matches!(vim.mode, Mode::Deal | Mode::HelixDeal) {
+                    return;
+                }
+                vim.allow_deal_transition = true;
+                vim.insert_after(&crate::normal::InsertAfter, window, cx);
+            });
+            Vim::action(editor, cx, |vim, _: &DealOpenLine, window, cx| {
+                if !matches!(vim.mode, Mode::Deal | Mode::HelixDeal) {
+                    return;
+                }
+                vim.allow_deal_transition = true;
+                vim.insert_line_below(&crate::normal::InsertLineBelow, window, cx);
             });
             Vim::action(editor, cx, |_, _: &PushForcedMotion, _, cx| {
                 Vim::globals(cx).forced_motion = true;
@@ -1582,7 +1604,7 @@ impl Vim {
             Mode::Replace => "replace",
             Mode::HelixNormal => "helix_normal",
             Mode::HelixSelect => "helix_select",
-            Mode::Deal | Mode::HelixDeal => "deal",
+            Mode::Deal | Mode::HelixDeal => "normal",
         }
         .to_string();
 

@@ -86,6 +86,9 @@ actions!(
         DashboardDealReply,
         DashboardDealRefresh,
         DashboardDealInsert,
+        DashboardDealAppend,
+        DashboardDealOpenLine,
+        DashboardDealFile,
         RoleCycle,
         RoleCycleGroup,
         TaskBoard,
@@ -193,6 +196,7 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         KeyBinding::new("ctrl-right", RoomStripRight, Some("RhoGui > Editor")),
         KeyBinding::new("ctrl-k", RoomBack, Some("RhoGui > Editor")),
         KeyBinding::new("ctrl-j", DealOpen, Some("RhoGui > Editor")),
+        KeyBinding::new("f20", DealOpen, Some("RhoGui > Editor")),
         KeyBinding::new("ctrl-shift-backspace", StripRemove, Some("RhoGui > Editor")),
         // Attention triage: jump to the most urgent agent, clear the current
         // one. The bundled zed keymaps don't know these actions, so they are
@@ -390,45 +394,23 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             KeyBinding::new("g r", DashboardRenameTopic, Some(context)),
         ]);
     }
-    let context = "RhoDashboard > Editor && VimDeal && vim_mode == deal";
-    cx.bind_keys([
-        KeyBinding::new("q", DashboardDealExit, Some(context)),
-        KeyBinding::new("escape", DashboardDealExit, Some(context)),
-        KeyBinding::new("n", DashboardDealNext, Some(context)),
-        KeyBinding::new("shift-n", DashboardDealPrevious, Some(context)),
-        KeyBinding::new("d", DashboardDealDone, Some(context)),
-        KeyBinding::new("x", DashboardDealDiscard, Some(context)),
-        KeyBinding::new("s", DashboardDealSnooze, Some(context)),
-        KeyBinding::new("t", DashboardDealTodo, Some(context)),
-        KeyBinding::new("r", DashboardDealReply, Some(context)),
-        KeyBinding::new("shift-r", DashboardDealRefresh, Some(context)),
-        KeyBinding::new("i", DashboardDealInsert, Some(context)),
-        KeyBinding::new("shift-s", DashboardDealRoomSnooze, Some(context)),
-    ]);
     for context in [
-        "RhoGuiDeal",
-        "RhoGuiDeal > Editor",
-        "RhoGuiDeal > Editor && vim_mode == normal",
-        "RhoGuiDeal > Editor && vim_mode == helix_normal",
-        "RhoGuiDeal > Editor && vim_mode == deal",
-        "Editor && VimDeal && vim_mode == deal",
-        "Editor && VimDeal && vim_mode == helix_deal",
-        "Editor && vim_mode == deal",
-        "Editor && vim_mode == helix_deal",
+        "RhoGui > Editor && VimDeal && vim_operator == none",
+        "RhoGui > RhoDashboard > Editor && VimDeal && vim_operator == none",
+        "RhoDashboard > Editor && VimDeal && vim_operator == none",
     ] {
         cx.bind_keys([
             KeyBinding::new("q", DashboardDealExit, Some(context)),
-            KeyBinding::new("escape", DashboardDealExit, Some(context)),
-            KeyBinding::new("n", DashboardDealNext, Some(context)),
-            KeyBinding::new("shift-n", DashboardDealPrevious, Some(context)),
+            KeyBinding::new("tab", DashboardDealNext, Some(context)),
             KeyBinding::new("d", DashboardDealDone, Some(context)),
             KeyBinding::new("x", DashboardDealDiscard, Some(context)),
             KeyBinding::new("s", DashboardDealSnooze, Some(context)),
             KeyBinding::new("shift-s", DashboardDealRoomSnooze, Some(context)),
             KeyBinding::new("t", DashboardDealTodo, Some(context)),
-            KeyBinding::new("r", DashboardDealReply, Some(context)),
-            KeyBinding::new("shift-r", DashboardDealRefresh, Some(context)),
             KeyBinding::new("i", DashboardDealInsert, Some(context)),
+            KeyBinding::new("a", DashboardDealAppend, Some(context)),
+            KeyBinding::new("o", DashboardDealOpenLine, Some(context)),
+            KeyBinding::new("f", DashboardDealFile, Some(context)),
         ]);
     }
 }

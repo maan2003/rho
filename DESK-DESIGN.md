@@ -161,8 +161,8 @@ returns on their own anyway — it is not responsible for keeping you engaged.
 Between rooms, one vertical timeline: up steps backward through
 recently-used rooms (the stack visible while stepping), down opens the
 dealer. Dealing is not room switching: taking a card in the current room
-just loads it into the strip, and only a distant card moves you. Leaving
-the deal without a verdict costs nothing — peeking at the hand is free.
+just loads it into the strip, and only a distant card moves you. Skipping
+is one key and costs nothing but the honest record of a skip.
 The desk itself is a separate overview key — like the windows key — that
 zooms out to the map, landing on the current room's heading.
 
@@ -256,10 +256,14 @@ all-agents list anywhere else on screen.
 **The deal is full-screen.** A deal is one decision. The card takes the
 whole screen — content preview, the "why" in plain inputs, verdict keys —
 so there is no half-attention split between the card and the room behind
-it. Skip is instant, so the takeover is always short. Leaving without a
-verdict costs nothing: peeking at the hand is free, and only what was shown
-is journaled. The dashboard as a destination dies: the deal is a moment,
-not a place.
+it. A freshly dealt surface is in a vim mode of its own, DEAL, which is
+normal mode plus a few verdict letters — motions, search, scrolling all
+work, and there is nothing to switch in or out of. Accept is the default:
+staying on the card, typing into it, or moving on to the next deal all take
+it. Skip is its own explicit key. A shown card is provisional until you
+leave it: skipping leaves no trace but the skip itself, no strip entry, no
+room switch. The dashboard as a destination dies: the deal is a moment, not
+a place.
 
 **Signals push dirtiness, never changes.** No event gets its own signal:
 things only mark the dealer's hand dirty, and the signals are derived from

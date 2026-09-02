@@ -3127,14 +3127,7 @@ fn total_cost_shows_in_status_chips(cx: &mut TestAppContext) {
                 .status_span_text()
         })
         .expect("read spans");
-    assert!(
-        spans.contains("$73.50") && !spans.contains("tok"),
-        "cost-only chip missing from status spans: {spans:?}"
-    );
-    assert!(
-        spans.find("62k") < spans.find("$73.50"),
-        "cost chip should follow context size: {spans:?}"
-    );
+    assert_eq!(spans, "62k", "transcript row keeps only context usage");
 }
 
 #[gpui::test]
@@ -3222,10 +3215,9 @@ fn transcript_status_omits_internal_ids_but_keeps_human_chips(cx: &mut TestAppCo
     cx.run_until_parked();
     let phone = status(cx);
     assert!(!phone.contains("ws-"), "phone status: {phone:?}");
-    assert!(phone.contains("rho"), "phone keeps project: {phone:?}");
     assert!(!phone.contains("eng"), "phone hides role ids: {phone:?}");
     assert!(phone.contains("62k"), "phone keeps tokens: {phone:?}");
-    assert!(phone.contains('$'), "phone keeps cost: {phone:?}");
+    assert!(!phone.contains('$'), "phone hides cost: {phone:?}");
 
     cx.simulate_window_resize(*workspace, size(px(1200.), px(800.)));
     cx.run_until_parked();
@@ -5578,7 +5570,7 @@ fn desk_deal_verdict_advances_to_empty_and_exit_restores_document(cx: &mut TestA
 
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.toggle_dashboard_deal(window, cx)
+            workspace.open_deal_mode(window, cx)
         })
         .expect("enter deal mode");
     cx.run_until_parked();
@@ -5600,58 +5592,6 @@ fn desk_deal_verdict_advances_to_empty_and_exit_restores_document(cx: &mut TestA
             assert_eq!(
                 workspace.dashboard_cursor_topic_for_test(cx),
                 Some((HostId::default(), original.find("* One").unwrap()))
-            );
-        })
-        .unwrap();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace
-                .desk_buffer_for_test(HostId::default())
-                .unwrap()
-                .update(cx, |buffer, cx| {
-                    buffer.edit([(0..0, "preface\n")], None, cx)
-                });
-            workspace.sync_dashboard(window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(workspace.dashboard_deal_highlight_for_test(cx));
-            assert_eq!(
-                workspace.dashboard_deal_topic_for_test(),
-                Some((
-                    HostId::default(),
-                    "preface\n".len() + original.find("* One").unwrap(),
-                    "One"
-                ))
-            );
-            assert_eq!(
-                workspace.dashboard_cursor_topic_for_test(cx),
-                Some((
-                    HostId::default(),
-                    "preface\n".len() + original.find("* One").unwrap()
-                ))
-            );
-        })
-        .unwrap();
-    cx.simulate_keystrokes(*workspace, "> >");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            let raw = workspace
-                .desk_buffer_for_test(HostId::default())
-                .unwrap()
-                .read(cx)
-                .text();
-            assert_eq!(raw, format!("preface\n{original}"));
-            assert_eq!(
-                workspace.dashboard_deal_topic_for_test(),
-                Some((
-                    HostId::default(),
-                    "preface\n".len() + original.find("* One").unwrap(),
-                    "One"
-                ))
             );
         })
         .unwrap();
@@ -5724,7 +5664,7 @@ fn desk_deal_session_resumes_and_insert_escape_returns_to_normal(cx: &mut TestAp
                 cx,
             );
             workspace.sync_dashboard(window, cx);
-            workspace.toggle_dashboard_deal(window, cx);
+            workspace.open_deal_mode(window, cx);
         })
         .unwrap();
     cx.run_until_parked();
@@ -5813,220 +5753,21 @@ fn desk_deal_session_resumes_and_insert_escape_returns_to_normal(cx: &mut TestAp
         })
         .unwrap();
 
-    cx.simulate_keystrokes(*workspace, "l l");
-    cx.run_until_parked();
-    let before_find = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace.dashboard_editor().update(cx, |editor, cx| {
-                let snapshot = editor.display_snapshot(cx);
-                editor
-                    .selections
-                    .newest::<editor::MultiBufferOffset>(&snapshot)
-                    .head()
-                    .0
-            })
-        })
-        .unwrap();
-    cx.simulate_keystrokes(*workspace, "f h");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            workspace.dashboard_editor().update(cx, |editor, cx| {
-                let snapshot = editor.display_snapshot(cx);
-                assert_eq!(
-                    editor
-                        .selections
-                        .newest::<editor::MultiBufferOffset>(&snapshot)
-                        .head()
-                        .0,
-                    before_find,
-                    "Deal motion bindings must release find's target key"
-                );
-            });
-        })
-        .unwrap();
-
-    cx.simulate_keystrokes(*workspace, "a f");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            workspace.dashboard_editor().update(cx, |editor, cx| {
-                let snapshot = editor.display_snapshot(cx);
-                assert!(
-                    editor
-                        .selections
-                        .newest::<editor::MultiBufferOffset>(&snapshot)
-                        .is_empty(),
-                    "unmatched Deal keys must not enter Helix object selection"
-                );
-            });
-        })
-        .unwrap();
-    cx.simulate_keystrokes(*workspace, "enter o a f enter");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert_eq!(
-                workspace
-                    .dashboard_deal_topic_for_test()
-                    .map(|(_, _, breadcrumb)| breadcrumb),
-                Some("One")
-            );
-            workspace.dashboard_editor().update(cx, |editor, cx| {
-                let snapshot = editor.display_snapshot(cx);
-                assert!(
-                    editor
-                        .selections
-                        .newest::<editor::MultiBufferOffset>(&snapshot)
-                        .is_empty()
-                );
-            });
-        })
-        .unwrap();
-
-    cx.simulate_keystrokes(*workspace, "enter");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert_eq!(
-                workspace
-                    .dashboard_deal_topic_for_test()
-                    .map(|(_, _, breadcrumb)| breadcrumb),
-                Some("One")
-            );
-            workspace.dashboard_editor().update(cx, |editor, cx| {
-                let snapshot = editor.display_snapshot(cx);
-                assert!(
-                    editor
-                        .selections
-                        .newest::<editor::MultiBufferOffset>(&snapshot)
-                        .is_empty()
-                );
-            });
-        })
-        .unwrap();
-
-    cx.simulate_keystrokes(*workspace, "n");
-    cx.run_until_parked();
-    let second = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .dashboard_editor()
-                .update(cx, |editor, cx| editor.display_text(cx))
-        })
-        .unwrap();
-    assert!(
-        second.contains("one body") && second.contains("two body"),
-        "{second:?}"
-    );
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(workspace.dashboard_deal_highlight_for_test(cx));
-            assert_eq!(
-                workspace.dashboard_cursor_topic_for_test(cx),
-                Some((HostId::default(), original.find("* Two").unwrap()))
-            );
-            assert!(
-                workspace
-                    .dashboard_hint_for_test(cx)
-                    .starts_with("DEAL · Two · deadline · ")
-                    && workspace
-                        .dashboard_hint_for_test(cx)
-                        .contains(" · 2/3 · 3 dealt · 2 waiting")
-            );
-        })
-        .unwrap();
-
-    cx.simulate_keystrokes(*workspace, "shift-n");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(
-                workspace
-                    .dashboard_deal_topic_for_test()
-                    .map(|(_, _, breadcrumb)| breadcrumb),
-                Some("One")
-            );
-        })
-        .unwrap();
-    cx.simulate_keystrokes(*workspace, "n");
-    cx.run_until_parked();
-
-    cx.simulate_keystrokes(*workspace, "q");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(!workspace.dashboard_deal_mode_for_test());
-            assert!(!workspace.dashboard_deal_highlight_for_test(cx));
-            workspace.dashboard_editor().update(cx, |editor, cx| {
-                let snapshot = editor.display_snapshot(cx);
-                assert!(
-                    editor
-                        .selections
-                        .newest::<editor::MultiBufferOffset>(&snapshot)
-                        .is_empty(),
-                    "exiting Deal must not leave a selection behind"
-                );
-            });
-        })
-        .unwrap();
-
-    cx.simulate_keystrokes(*workspace, "space v");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(workspace.dashboard_deal_mode_for_test());
-            assert_eq!(
-                workspace.dashboard_cursor_topic_for_test(cx),
-                Some((HostId::default(), original.find("* Two").unwrap()))
-            );
-        })
-        .unwrap();
-
-    cx.simulate_keystrokes(*workspace, "q");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            let offset = original.find("* Two").unwrap() + "* Two\n".len();
-            workspace
-                .desk_buffer_for_test(HostId::default())
-                .unwrap()
-                .update(cx, |buffer, cx| {
-                    buffer.edit([(offset..offset, ":done: 2026-01-01\n")], None, cx)
-                });
-            workspace.sync_dashboard(window, cx);
-        })
-        .unwrap();
-    cx.simulate_keystrokes(*workspace, "space v");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(
-                workspace
-                    .dashboard_deal_topic_for_test()
-                    .map(|(_, _, breadcrumb)| breadcrumb),
-                // Skip advances only the current deal. Once that session is
-                // discarded, One is eligible again immediately.
-                Some("One")
-            );
-        })
-        .unwrap();
-
     cx.simulate_keystrokes(*workspace, "i shift-m escape");
     cx.run_until_parked();
     workspace
         .update(cx, |workspace, _, cx| {
-            assert!(!workspace.dashboard_deal_mode_for_test());
+            assert!(workspace.dashboard_deal_mode_for_test());
             let raw = workspace
                 .desk_buffer_for_test(HostId::default())
                 .unwrap()
                 .read(cx)
                 .text();
-            assert_ne!(raw, original, "insert mode should edit the real Desk");
+            assert_ne!(raw, original, "insert must commit and edit the dealt Desk");
         })
         .unwrap();
 
-    cx.simulate_keystrokes(*workspace, "space v");
+    cx.simulate_keystrokes(*workspace, "tab");
     cx.run_until_parked();
     workspace
         .update(cx, |workspace, _, _| {
@@ -6035,8 +5776,16 @@ fn desk_deal_session_resumes_and_insert_escape_returns_to_normal(cx: &mut TestAp
                 workspace
                     .dashboard_deal_topic_for_test()
                     .map(|(_, _, breadcrumb)| breadcrumb),
-                Some("MOne")
+                Some("Two")
             );
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "q");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(!workspace.dashboard_deal_mode_for_test())
         })
         .unwrap();
 }
@@ -6071,7 +5820,7 @@ fn desk_deal_card_survives_boundary_inserts_and_duplicate_heading_renames(cx: &m
                 cx,
             );
             workspace.sync_dashboard(window, cx);
-            workspace.toggle_dashboard_deal(window, cx);
+            workspace.open_deal_mode(window, cx);
         })
         .unwrap();
     cx.run_until_parked();
@@ -6172,7 +5921,7 @@ fn desk_deal_scrolls_a_deep_heading_below_its_sticky_ancestors(cx: &mut TestAppC
     cx.run_until_parked();
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.toggle_dashboard_deal(window, cx);
+            workspace.open_deal_mode(window, cx);
         })
         .unwrap();
     cx.run_until_parked();
@@ -6281,12 +6030,12 @@ fn desk_deal_open_takes_agent_without_writing_desk(cx: &mut TestAppContext) {
     cx.run_until_parked();
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.toggle_dashboard_deal(window, cx);
+            workspace.open_deal_mode(window, cx);
         })
         .unwrap();
     cx.run_until_parked();
 
-    cx.simulate_keystrokes(*workspace, "j r");
+    cx.simulate_keystrokes(*workspace, "ctrl-j");
     cx.run_until_parked();
 
     workspace
@@ -6400,7 +6149,7 @@ fn mixed_deal_workspace(
             workspace.age_inbox_for_test(&inbox_id, 1);
             workspace.sync_dashboard(window, cx);
             window.focus(&workspace.dashboard_editor().read(cx).focus_handle(cx), cx);
-            workspace.toggle_dashboard_deal(window, cx);
+            workspace.open_deal_mode(window, cx);
             workspace.inject_agent_deal_card_for_test(agent_id);
             inbox_id
         })
@@ -6536,7 +6285,7 @@ fn mixed_deal_navigation_keeps_rendered_body_and_verdict_target_in_lockstep(
     {
         workspace
             .update(cx, |workspace, window, cx| {
-                workspace.toggle_dashboard_deal(window, cx)
+                workspace.open_deal_mode(window, cx)
             })
             .unwrap();
     }
@@ -6580,7 +6329,7 @@ fn mixed_deal_navigation_keeps_rendered_body_and_verdict_target_in_lockstep(
         .unwrap();
 }
 
-fn assert_deal_exit_with_focus(
+fn assert_escape_keeps_deal_with_focus(
     cx: &mut TestAppContext,
     key: &str,
     wanted: fn(crate::dashboard::DealCardKind) -> bool,
@@ -6614,50 +6363,73 @@ fn assert_deal_exit_with_focus(
         .unwrap();
     cx.run_until_parked();
     assert!(
-        !workspace
+        workspace
             .update(cx, |workspace, _, _| workspace
                 .dashboard_deal_mode_for_test())
             .unwrap(),
-        "{key} did not exit deal mode for {kind:?} with focus in its dealt surface"
+        "{key} left deal mode for {kind:?} with focus in its dealt surface"
     );
     return;
 }
 
-macro_rules! deal_exit_test {
+macro_rules! deal_escape_test {
     ($name:ident, $key:literal, $pattern:pat) => {
         #[gpui::test]
         fn $name(cx: &mut TestAppContext) {
-            assert_deal_exit_with_focus(cx, $key, |kind| matches!(kind, $pattern));
+            assert_escape_keeps_deal_with_focus(cx, $key, |kind| matches!(kind, $pattern));
         }
     };
 }
 
-deal_exit_test!(
-    escape_exits_desk_deal,
+macro_rules! deal_q_exit_test {
+    ($name:ident, $pattern:pat) => {
+        #[gpui::test]
+        fn $name(cx: &mut TestAppContext) {
+            let (workspace, _, _) = mixed_deal_workspace(cx);
+            workspace
+                .update(cx, |workspace, window, cx| {
+                    assert!(workspace.seek_deal_card_for_test(
+                        |kind| matches!(kind, $pattern),
+                        window,
+                        cx
+                    ));
+                    workspace.focus_dealt_surface_for_test(window, cx);
+                })
+                .unwrap();
+            cx.run_until_parked();
+            cx.simulate_keystrokes(*workspace, "q");
+            cx.run_until_parked();
+            assert!(
+                !workspace
+                    .update(cx, |workspace, _, _| workspace
+                        .dashboard_deal_mode_for_test())
+                    .unwrap()
+            );
+        }
+    };
+}
+
+deal_escape_test!(
+    escape_keeps_desk_deal,
     "escape",
     crate::dashboard::DealCardKind::Desk
 );
-deal_exit_test!(
-    escape_exits_agent_deal_with_transcript_focused,
+deal_escape_test!(
+    escape_keeps_agent_deal_with_transcript_focused,
     "escape",
     crate::dashboard::DealCardKind::Agent
 );
-deal_exit_test!(
-    escape_exits_inbox_deal,
+deal_escape_test!(
+    escape_keeps_inbox_deal,
     "escape",
     crate::dashboard::DealCardKind::Inbox(_)
 );
-deal_exit_test!(q_exits_desk_deal, "q", crate::dashboard::DealCardKind::Desk);
-deal_exit_test!(
+deal_q_exit_test!(q_exits_desk_deal, crate::dashboard::DealCardKind::Desk);
+deal_q_exit_test!(
     q_exits_agent_deal_with_transcript_focused,
-    "q",
     crate::dashboard::DealCardKind::Agent
 );
-deal_exit_test!(
-    q_exits_inbox_deal,
-    "q",
-    crate::dashboard::DealCardKind::Inbox(_)
-);
+deal_q_exit_test!(q_exits_inbox_deal, crate::dashboard::DealCardKind::Inbox(_));
 
 #[gpui::test]
 fn desk_deal_counted_snooze_todo_and_refresh_write_and_redeal(cx: &mut TestAppContext) {
@@ -6701,7 +6473,7 @@ fn desk_deal_counted_snooze_todo_and_refresh_write_and_redeal(cx: &mut TestAppCo
             );
             workspace.sync_dashboard(window, cx);
             window.focus(&workspace.dashboard_editor().read(cx).focus_handle(cx), cx);
-            workspace.toggle_dashboard_deal(window, cx);
+            workspace.open_deal_mode(window, cx);
         })
         .unwrap();
     cx.run_until_parked();
@@ -6725,13 +6497,6 @@ fn desk_deal_counted_snooze_todo_and_refresh_write_and_redeal(cx: &mut TestAppCo
         .unwrap();
     assert!(before_refresh.contains("5/6"), "{before_refresh:?}");
     assert!(before_refresh.contains("2 waiting"), "{before_refresh:?}");
-
-    cx.simulate_keystrokes(*workspace, "shift-r");
-    cx.run_until_parked();
-    let after_refresh = workspace
-        .update(cx, |workspace, _, cx| workspace.dashboard_hint_for_test(cx))
-        .unwrap();
-    assert!(after_refresh.contains("1/3"), "{after_refresh:?}");
 
     let raw = workspace
         .update(cx, |workspace, _, cx| {

@@ -1241,6 +1241,33 @@ impl Dashboard {
         true
     }
 
+    /// A taken Desk card remains visually dealt, but its source becomes the
+    /// one writable target until the next card is presented.
+    pub fn prepare_taken_deal_edit(&mut self, cx: &mut Context<Workspace>) -> bool {
+        if !self.prepare_deal_insert(cx) {
+            return false;
+        }
+        let Some(host) = self.current_deal_card().map(|card| card.host) else {
+            return false;
+        };
+        let Some(source) = self.hosts.get(&host).and_then(WeakEntity::upgrade) else {
+            return false;
+        };
+        source.update(cx, |buffer, cx| {
+            buffer.set_capability(Capability::ReadWrite, cx)
+        });
+        true
+    }
+
+    pub fn relock_deal_sources(&mut self, cx: &mut Context<Workspace>) {
+        if !self.deal_active {
+            return;
+        }
+        for source in self.hosts.values().filter_map(WeakEntity::upgrade) {
+            source.update(cx, |buffer, cx| buffer.set_capability(Capability::Read, cx));
+        }
+    }
+
     pub fn write_deal_snooze(
         &mut self,
         count: u32,
@@ -4641,6 +4668,7 @@ pub struct DealAgentFacts {
     pub tag: String,
     pub heading: String,
     pub facts: rho_ui_proto::UiAgentFacts,
+    pub attention: rho_ui_proto::UiAttention,
 }
 
 fn deal_agent_facts(registry: &AgentRegistry) -> Vec<DealAgentFacts> {
@@ -4668,6 +4696,7 @@ fn deal_agent_facts(registry: &AgentRegistry) -> Vec<DealAgentFacts> {
                     .trim()
                     .to_owned(),
                 facts: registry.agent_facts(*agent_id),
+                attention: registry.attention(*agent_id),
             })
         })
         .collect()
@@ -4697,8 +4726,11 @@ fn mark_elapsed_days(mark: &TemporalMark, now: chrono::NaiveDateTime) -> f64 {
 }
 
 fn age_label(days: f64) -> String {
-    if days < 1.0 {
-        format!("{}h", (days.max(0.0) * 24.0).floor() as u64)
+    let hours = days.max(0.0) * 24.0;
+    if hours < 1.0 {
+        format!("{}m", (hours * 60.0).floor().max(1.0) as u64)
+    } else if days < 1.0 {
+        format!("{}h", hours.floor() as u64)
     } else {
         format!("{}d", days.floor() as u64)
     }
@@ -5030,10 +5062,18 @@ fn assemble_dealer_queue_in_room(
         let (reply_priority, label) = if agent.facts.needs_you_hint {
             (
                 blocked_reply_priority(wait_days),
-                format!("blocked · {}", age_label(wait_days)),
+                format!("waiting on reply · {}", age_label(wait_days)),
             )
         } else {
-            (fyi_reply_priority(wait_days), "fyi".to_owned())
+            let state = if agent.attention == rho_ui_proto::UiAttention::NeedsInput {
+                "errored"
+            } else {
+                "finished"
+            };
+            (
+                fyi_reply_priority(wait_days),
+                format!("{state} · {} ago", age_label(wait_days)),
+            )
         };
         let recency_bonus = agent_interactions.get(&agent.agent_id).map_or(0.0, |last| {
             let elapsed = (now.timestamp_millis() - *last).clamp(0, AGENT_RECENCY_WINDOW_MS);
@@ -5114,19 +5154,19 @@ fn assemble_dealer_queue_in_room(
             .and_then(|context| context.split(" / ").next());
         let adjusted_score = score + room_name.map_or(0.0, |room| room_bonus(item.host, room));
         let mut reason = match (&item.kind, &item.waiting_on) {
-            (DealerInboxKind::Ping, Some(who)) => {
-                format!("ping · {} · {who} waiting", age_label(age_days))
-            }
+            (DealerInboxKind::Ping, Some(_)) => format!("ping · {}", age_label(age_days)),
             (DealerInboxKind::Ping, None) => format!("ping · {}", age_label(age_days)),
-            (DealerInboxKind::Obligation, _) => format!("obligation · {} old", age_label(age_days)),
+            (DealerInboxKind::Obligation, _) => {
+                format!("obligation · {}", age_label(age_days))
+            }
             (DealerInboxKind::Capture, _) if item.resurfacing_count > 0 => {
                 format!(
-                    "capture · {} old · seen {}×",
+                    "capture · {} · seen {}×",
                     age_label(age_days),
                     item.resurfacing_count
                 )
             }
-            (DealerInboxKind::Capture, _) => format!("capture · {} old", age_label(age_days)),
+            (DealerInboxKind::Capture, _) => format!("capture · {}", age_label(age_days)),
         };
         if let Some(context) = item
             .context
@@ -5582,7 +5622,7 @@ mod tests {
             &blocked.agent_id.encoded()[..4]
         );
         let queue = assemble_deal_queue(&[(host, text)], &deal_agent_facts(&reg), now);
-        assert_eq!(queue.cards[0].label, "blocked · 0h");
+        assert_eq!(queue.cards[0].label, "waiting on reply · 1m");
         assert_eq!(queue.cards[0].priority, 1.0);
         assert_eq!(queue.cards[1].label, "todo · ripe 1d");
         assert_eq!(queue.cards[1].priority, 1.0);
@@ -5598,7 +5638,7 @@ mod tests {
         let queue = assemble_deal_queue(&[(host, text)], &deal_agent_facts(&reg), now);
         assert_eq!(queue.cards[0].label, "todo · ripe 3d");
         assert_eq!(queue.cards[0].priority, 3.0);
-        assert_eq!(queue.cards[1].label, "blocked · 2h");
+        assert_eq!(queue.cards[1].label, "waiting on reply · 2h");
         assert_eq!(queue.cards[1].priority, 2.0);
     }
 
@@ -5743,7 +5783,11 @@ mod tests {
             &fyi.agent_id.encoded()[..4]
         );
         let queue = assemble_deal_queue(&[(host, text.clone())], &deal_agent_facts(&reg), now);
-        let fyi_card = queue.cards.iter().find(|card| card.label == "fyi").unwrap();
+        let fyi_card = queue
+            .cards
+            .iter()
+            .find(|card| card.label.starts_with("finished · "))
+            .unwrap();
         let reminder = queue
             .cards
             .iter()
@@ -5751,7 +5795,7 @@ mod tests {
             .unwrap();
         assert_eq!(fyi_card.priority, 0.0);
         assert_eq!(reminder.priority, 0.0);
-        assert_eq!(queue.cards[0].label, "fyi");
+        assert_eq!(queue.cards[0].label, "finished · 1m ago");
         assert_eq!(
             queue
                 .cards
@@ -5846,12 +5890,12 @@ mod tests {
         let queue = assemble_dealer_queue(&[], &[], &inbox, now);
         assert_eq!(queue.cards.len(), 2);
         assert_eq!(queue.cards[0].breadcrumb, "Reply to Ada");
-        assert_eq!(queue.cards[0].label, "ping · 2d · Ada waiting · from work");
+        assert_eq!(queue.cards[0].label, "ping · 2d · from work");
         assert_eq!(
             queue.cards[0].kind,
             DealCardKind::Inbox(DealerInboxKind::Ping)
         );
-        assert_eq!(queue.cards[1].label, "capture · 2d old · seen 2×");
+        assert_eq!(queue.cards[1].label, "capture · 2d · seen 2×");
     }
 
     #[test]
@@ -5940,7 +5984,7 @@ mod tests {
         );
         item.deferred_until = Some(now - chrono::Duration::hours(6));
         let queue = assemble_dealer_queue(&[], &[], &[item], now);
-        assert_eq!(queue.cards[0].label, "obligation · 30d old");
+        assert_eq!(queue.cards[0].label, "obligation · 30d");
     }
 
     #[test]
