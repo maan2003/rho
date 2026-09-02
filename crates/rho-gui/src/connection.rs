@@ -924,7 +924,7 @@ async fn supervise(
             Arc::clone(&commands),
             Arc::clone(&pending_command),
             &dialer,
-            &shell_requests,
+            Arc::clone(&shell_requests),
             &mut connected,
         )
         .await;
@@ -959,6 +959,8 @@ async fn run_control_writer<W>(
     commands: Arc<tokio::sync::Mutex<futures_mpsc::UnboundedReceiver<ClientMessage>>>,
     pending_command: Arc<Mutex<Option<ClientMessage>>>,
     attempted_shell_requests: Arc<Mutex<HashSet<u64>>>,
+    events: Option<EventSink>,
+    shell_requests: Option<Arc<Mutex<ShellControlRequests>>>,
 ) -> anyhow::Result<()>
 where
     W: tokio::io::AsyncWrite + Unpin,
@@ -981,12 +983,74 @@ where
                 }
             }
         };
-        write_frame(&mut writer, &message).await?;
+        if let Err(error) = validate_control_message(&message) {
+            pending_command.lock().unwrap().take();
+            let reason = format!("command rejected before sending: {error:#}");
+            if let Some(request_id) = shell_request_id(&message)
+                && let Some(requests) = &shell_requests
+                && let Some(response) = requests.lock().unwrap().pending.remove(&request_id)
+            {
+                let _ = response.send(ShellControlReply::Failed(reason.clone()));
+            }
+            if let Some(events) = &events {
+                let _ = events.unbounded_send(ConnEvent::ServerError(reason));
+            }
+            continue;
+        }
+        if let Err(error) = write_frame(&mut writer, &message).await {
+            if !replay_safe(&message) {
+                pending_command.lock().unwrap().take();
+                let reason = format!("command outcome unknown after disconnect: {error:#}");
+                if let Some(request_id) = shell_request_id(&message)
+                    && let Some(requests) = &shell_requests
+                    && let Some(response) = requests.lock().unwrap().pending.remove(&request_id)
+                {
+                    let _ = response.send(ShellControlReply::Failed(reason.clone()));
+                }
+                if let Some(events) = &events {
+                    let _ = events.unbounded_send(ConnEvent::ServerError(reason));
+                }
+            }
+            return Err(error);
+        }
         pending_command.lock().unwrap().take();
         if let Some(request_id) = shell_request_id(&message) {
             attempted_shell_requests.lock().unwrap().insert(request_id);
         }
     }
+}
+
+fn replay_safe(message: &ClientMessage) -> bool {
+    matches!(
+        message,
+        ClientMessage::Ping
+            | ClientMessage::Subscribe
+            | ClientMessage::DeskSubscribe
+            | ClientMessage::DeskTreeSubscribe
+            | ClientMessage::DeskGet
+            | ClientMessage::SubscribeAgent { .. }
+            | ClientMessage::AgentStreamFocus { .. }
+            | ClientMessage::GitTransportRegister
+            | ClientMessage::ShellList { .. }
+            | ClientMessage::ChatGptUsage
+            | ClientMessage::QuotaHistory
+            | ClientMessage::AgentUsage { .. }
+            | ClientMessage::GlobalUsage { .. }
+            | ClientMessage::AgentCostDistribution { .. }
+            | ClientMessage::SubscribeAgents { .. }
+            | ClientMessage::UnsubscribeAgents { .. }
+    )
+}
+
+fn validate_control_message(message: &ClientMessage) -> anyhow::Result<()> {
+    let payload = senax_encoder::pack(message).context("pack protocol frame")?;
+    anyhow::ensure!(
+        payload.len() <= rho_ui_proto::MAX_FRAME_LEN,
+        "protocol frame length {} exceeds {}",
+        payload.len(),
+        rho_ui_proto::MAX_FRAME_LEN
+    );
+    Ok(())
 }
 
 fn fail_attempted_shell_requests(
@@ -1014,7 +1078,7 @@ async fn run(
     commands: Arc<tokio::sync::Mutex<futures_mpsc::UnboundedReceiver<ClientMessage>>>,
     pending_command: Arc<Mutex<Option<ClientMessage>>>,
     dialer: &Mutex<Option<ChannelDialer>>,
-    shell_requests: &Mutex<ShellControlRequests>,
+    shell_requests: Arc<Mutex<ShellControlRequests>>,
     connected: &mut bool,
 ) -> anyhow::Result<()> {
     let (mut stream, agent_connection, _endpoint) = match target {
@@ -1076,7 +1140,11 @@ async fn run(
     let health_connection = agent_connection.clone();
     let agent_stream_task = agent_connection.map(|connection| {
         let events = events.clone();
-        tokio::spawn(run_agent_streams(connection, events))
+        let (shutdown, requested) = tokio::sync::oneshot::channel();
+        (
+            shutdown,
+            tokio::spawn(run_agent_streams(connection, events, requested)),
+        )
     });
     let git_transport_limit = Arc::new(tokio::sync::Semaphore::new(1));
     let git_requests = Arc::new(Mutex::new(
@@ -1123,6 +1191,8 @@ async fn run(
         commands,
         pending_command,
         Arc::clone(&attempted_shell_requests),
+        Some(events.clone()),
+        Some(Arc::clone(&shell_requests)),
     ));
     let mut writer_finished = false;
     let mut git_provider_tasks = tokio::task::JoinSet::new();
@@ -1347,8 +1417,8 @@ async fn run(
         task.abort();
         let _ = task.await;
     }
-    if let Some(task) = agent_stream_task {
-        task.abort();
+    if let Some((shutdown, task)) = agent_stream_task {
+        let _ = shutdown.send(());
         let _ = task.await;
     }
     abort_tasks(&mut git_provider_tasks).await;
@@ -1356,7 +1426,7 @@ async fn run(
         .as_ref()
         .map(|error| format!("daemon connection lost: {error:#}"))
         .unwrap_or_else(|| "daemon connection closed".to_owned());
-    fail_attempted_shell_requests(shell_requests, &attempted_shell_requests, &failure);
+    fail_attempted_shell_requests(&shell_requests, &attempted_shell_requests, &failure);
     git_requests.lock().unwrap().clear();
     match read_error {
         Some(error) => Err(error),
@@ -1680,7 +1750,11 @@ fn display_field(value: &str) -> String {
         .collect()
 }
 
-async fn run_agent_streams(connection: iroh::endpoint::Connection, events: EventSink) {
+async fn run_agent_streams(
+    connection: iroh::endpoint::Connection,
+    events: EventSink,
+    mut shutdown: tokio::sync::oneshot::Receiver<()>,
+) {
     const AGENT_FRAME_ALLOCATION_BUDGET: usize = 128 * 1024 * 1024;
     let mut streams = tokio::task::JoinSet::new();
     let allocation_budget = Arc::new(AgentFrameAllocationBudget::new(
@@ -1691,6 +1765,7 @@ async fn run_agent_streams(connection: iroh::endpoint::Connection, events: Event
     ));
     loop {
         tokio::select! {
+            _ = &mut shutdown => break,
             accepted = connection.accept_uni() => {
                 let Ok(recv) = accepted else { break };
                 let mut recv = rho_rpc::Reader::new(recv);
@@ -1772,6 +1847,7 @@ async fn run_agent_streams(connection: iroh::endpoint::Connection, events: Event
             }
         }
     }
+    abort_tasks(&mut streams).await;
 }
 
 async fn read_agent_stream_message(
@@ -1962,6 +2038,8 @@ mod tests {
                     Arc::new(tokio::sync::Mutex::new(commands_rx)),
                     Arc::new(Mutex::new(None)),
                     Arc::new(Mutex::new(HashSet::new())),
+                    None,
+                    None,
                 )
                 .await;
                 assert!(result.is_err());
@@ -1988,6 +2066,8 @@ mod tests {
                         Arc::clone(&commands),
                         Arc::clone(&pending),
                         Arc::clone(&attempted),
+                        None,
+                        None,
                     )
                     .await
                     .is_err()
@@ -1998,11 +2078,77 @@ mod tests {
                 ));
 
                 let (writer, mut reader) = tokio::io::duplex(1024);
-                let replay = tokio::spawn(run_control_writer(writer, commands, pending, attempted));
+                let replay = tokio::spawn(run_control_writer(
+                    writer, commands, pending, attempted, None, None,
+                ));
                 let message: ClientMessage = read_frame(&mut reader).await.unwrap();
                 assert!(matches!(message, ClientMessage::Ping));
                 replay.abort();
                 let _ = replay.await;
+            });
+    }
+
+    #[test]
+    fn permanently_invalid_command_does_not_poison_the_queue() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (commands_tx, commands_rx) = futures::channel::mpsc::unbounded();
+                commands_tx
+                    .unbounded_send(ClientMessage::ViewConfigSet {
+                        data: vec![0; rho_ui_proto::MAX_FRAME_LEN + 1],
+                    })
+                    .unwrap();
+                commands_tx.unbounded_send(ClientMessage::Ping).unwrap();
+                let (writer, mut reader) = tokio::io::duplex(1024);
+                let task = tokio::spawn(run_control_writer(
+                    writer,
+                    Arc::new(tokio::sync::Mutex::new(commands_rx)),
+                    Arc::new(Mutex::new(None)),
+                    Arc::new(Mutex::new(HashSet::new())),
+                    None,
+                    None,
+                ));
+
+                let message: ClientMessage = read_frame(&mut reader).await.unwrap();
+                assert!(matches!(message, ClientMessage::Ping));
+                task.abort();
+                let _ = task.await;
+            });
+    }
+
+    #[test]
+    fn ambiguous_non_idempotent_write_is_not_replayed() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (commands_tx, commands_rx) = futures::channel::mpsc::unbounded();
+                commands_tx
+                    .unbounded_send(ClientMessage::ShellStart {
+                        request_id: 1,
+                        agent: "test".to_owned(),
+                    })
+                    .unwrap();
+                let pending = Arc::new(Mutex::new(None));
+                let (writer, peer) = tokio::io::duplex(64);
+                drop(peer);
+                assert!(
+                    run_control_writer(
+                        writer,
+                        Arc::new(tokio::sync::Mutex::new(commands_rx)),
+                        Arc::clone(&pending),
+                        Arc::new(Mutex::new(HashSet::new())),
+                        None,
+                        None,
+                    )
+                    .await
+                    .is_err()
+                );
+                assert!(pending.lock().unwrap().is_none());
             });
     }
 
@@ -2026,7 +2172,7 @@ mod tests {
     }
 
     #[test]
-    fn session_teardown_aborts_and_awaits_provider_tasks() {
+    fn session_teardown_aborts_and_awaits_child_tasks() {
         tokio::runtime::Builder::new_current_thread()
             .enable_time()
             .build()
