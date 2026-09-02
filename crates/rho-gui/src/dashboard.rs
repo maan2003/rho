@@ -1019,6 +1019,15 @@ impl Dashboard {
         true
     }
 
+    pub fn clear_skip(&mut self, identity: &DealCardIdentity) -> bool {
+        self.skipped.remove(identity).is_some()
+    }
+
+    #[cfg(test)]
+    pub fn has_skip_for_test(&self, identity: &DealCardIdentity) -> bool {
+        self.skipped.contains_key(identity)
+    }
+
     pub fn current_deal_card(&self) -> Option<&DealCard> {
         Some(&self.deal.as_ref()?.card)
     }

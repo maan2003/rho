@@ -3379,6 +3379,13 @@ fn overview_enter_opens_bound_agent_in_its_room(cx: &mut TestAppContext) {
         .update(cx, |workspace, window, cx| {
             assert!(!workspace.is_dashboard_mode(window, cx));
             assert!(workspace.active_agent_model().is_some());
+            assert!(
+                workspace
+                    .surface_history_for_test()
+                    .0
+                    .last()
+                    .is_some_and(|name| name.starts_with("daily agent"))
+            );
         })
         .unwrap();
 }
@@ -6181,7 +6188,7 @@ fn f21_steps_through_three_surfaces(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.configure_surface_mru_for_test(&["one", "two", "three"], window, cx);
+            workspace.configure_surface_history_for_test(&["one", "two", "three"], window, cx);
         })
         .unwrap();
 
@@ -6205,11 +6212,180 @@ fn f21_steps_through_three_surfaces(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn history_back_twice_then_forward_once_lands_on_the_middle_entry(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.configure_surface_history_for_test(&["one", "two", "three"], window, cx);
+            workspace.step_surface_back_for_test(window, cx);
+            workspace.step_surface_back_for_test(window, cx);
+            assert!(workspace.step_surface_forward_for_test(window, cx));
+            assert_eq!(workspace.current_surface_name_for_test(), "inbox two");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn history_forward_entries_do_not_reappear_as_backward_duplicates(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.configure_surface_history_for_test(&["one", "two", "three"], window, cx);
+            workspace.step_surface_back_for_test(window, cx);
+            workspace.step_surface_back_for_test(window, cx);
+            workspace.step_surface_forward_for_test(window, cx);
+            workspace.step_surface_back_for_test(window, cx);
+            assert_eq!(workspace.current_surface_name_for_test(), "inbox three");
+            assert_eq!(
+                workspace.surface_history_for_test(),
+                (
+                    vec!["inbox three".into(), "inbox two".into(), "inbox one".into()],
+                    0
+                )
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn ordinary_open_of_recorded_surface_moves_the_history_cursor_without_reordering(
+    cx: &mut TestAppContext,
+) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.configure_surface_history_for_test(&["one", "two", "three"], window, cx);
+            workspace.open_history_index_for_test(0, cx);
+            assert_eq!(workspace.current_surface_name_for_test(), "inbox three");
+            assert_eq!(workspace.surface_history_for_test().1, 0);
+            assert!(workspace.step_surface_forward_for_test(window, cx));
+            assert_eq!(workspace.current_surface_name_for_test(), "inbox two");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn deal_and_overview_append_at_the_end_and_dedupe_existing_entries(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.configure_surface_history_for_test(&["one", "two", "three"], window, cx);
+            workspace.step_surface_back_for_test(window, cx);
+            workspace.show_current_history_for_test(crate::journal::SurfaceShowMethod::Deal, cx);
+            assert_eq!(
+                workspace.surface_history_for_test(),
+                (
+                    vec!["inbox three".into(), "inbox one".into(), "inbox two".into()],
+                    2
+                )
+            );
+
+            workspace
+                .show_current_history_for_test(crate::journal::SurfaceShowMethod::Overview, cx);
+            assert_eq!(
+                workspace.surface_history_for_test(),
+                (
+                    vec!["inbox three".into(), "inbox one".into(), "inbox two".into()],
+                    2
+                )
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn q_mid_list_removes_current_and_keeps_newer_entries_forward(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.configure_surface_history_for_test(&["one", "two", "three"], window, cx);
+            workspace.step_surface_back_for_test(window, cx);
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "q");
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert_eq!(workspace.current_surface_name_for_test(), "inbox three");
+            assert!(workspace.step_surface_forward_for_test(window, cx));
+            assert_eq!(workspace.current_surface_name_for_test(), "inbox one");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn typing_does_not_reorder_history(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.configure_surface_history_for_test(&["one", "two", "three"], window, cx);
+            workspace.step_surface_back_for_test(window, cx);
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "i x escape");
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(
+                workspace.surface_history_for_test(),
+                (
+                    vec!["inbox three".into(), "inbox two".into(), "inbox one".into()],
+                    1
+                )
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn forwarding_back_to_a_dealt_surface_voids_its_navigation_skip(cx: &mut TestAppContext) {
+    let (workspace, _, _) = mixed_deal_workspace(cx);
+    let identity = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.current_deal_card_for_test().unwrap().0
+        })
+        .unwrap();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.step_surface_back_for_test(window, cx);
+            assert!(workspace.deal_skip_exists_for_test(&identity));
+            assert!(workspace.step_surface_forward_for_test(window, cx));
+            assert!(!workspace.deal_skip_exists_for_test(&identity));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn forward_at_the_front_pulls_a_fresh_deal(cx: &mut TestAppContext) {
+    let (workspace, _, _) = mixed_deal_workspace(cx);
+    let before = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.current_deal_card_for_test().unwrap().0
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "f20");
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_ne!(workspace.current_deal_card_for_test().unwrap().0, before);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn f21_resubscribes_an_evicted_transcript(cx: &mut TestAppContext) {
     let (workspace, agent_id, _) = mixed_deal_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.configure_evicted_transcript_mru_for_test(agent_id, window, cx);
+            workspace.configure_evicted_transcript_history_for_test(agent_id, window, cx);
             assert!(!workspace.agent_subscribed_for_test(agent_id));
             workspace.step_surface_back_for_test(window, cx);
             assert!(
@@ -6228,7 +6404,7 @@ fn q_closes_current_surface_and_reveals_previous(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.configure_surface_mru_for_test(&["current", "previous"], window, cx);
+            workspace.configure_surface_history_for_test(&["current", "previous"], window, cx);
         })
         .unwrap();
 
@@ -6248,7 +6424,7 @@ fn q_on_last_surface_lands_on_overview(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.configure_surface_mru_for_test(&["only"], window, cx);
+            workspace.configure_surface_history_for_test(&["only"], window, cx);
         })
         .unwrap();
 
@@ -6257,6 +6433,16 @@ fn q_on_last_surface_lands_on_overview(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, _, _| {
             assert!(workspace.overview_open_for_test())
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "f24");
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                workspace.overview_open_for_test(),
+                "overview toggle resurrected a closed surface"
+            )
         })
         .unwrap();
 }

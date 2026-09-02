@@ -656,8 +656,14 @@ pub fn root_menu() -> Transient {
         .item("b", "switch buffer…", |workspace, window, cx| {
             workspace.open_buffer_picker(window, cx);
         })
-        .item("k", "close buffer", |workspace, window, cx| {
-            workspace.close_surface(None, window, cx);
+        .item("k", "surface back", |workspace, window, cx| {
+            workspace.cmd_surface_back(window, cx);
+        })
+        .item("j", "surface forward · deal", |workspace, window, cx| {
+            workspace.cmd_surface_forward_or_deal(window, cx);
+        })
+        .item("shift-j", "close · deal", |workspace, window, cx| {
+            workspace.cmd_close_and_deal(window, cx);
         })
         .item("f", "open file…", |workspace, window, cx| {
             workspace.prompt_open_file(window, cx);

@@ -155,6 +155,39 @@ pub enum SurfaceShowMethod {
     derive(senax_encoder::Encode, senax_encoder::Decode)
 )]
 #[serde(rename_all = "snake_case")]
+pub enum HistoryDirection {
+    Back,
+    Forward,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "native",
+    derive(senax_encoder::Encode, senax_encoder::Decode)
+)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryAppendMethod {
+    Deal,
+    Overview,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "native",
+    derive(senax_encoder::Encode, senax_encoder::Decode)
+)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryRemoveMethod {
+    Close,
+    Dedupe,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "native",
+    derive(senax_encoder::Encode, senax_encoder::Decode)
+)]
+#[serde(rename_all = "snake_case")]
 pub enum DealModeAction {
     Enter,
     Interacted,
@@ -232,10 +265,18 @@ pub enum Event {
         surface: SurfaceIdentity,
         method: SurfaceShowMethod,
     },
-    MruStepped {
-        from: SurfaceIdentity,
-        to: SurfaceIdentity,
-        depth: usize,
+    HistoryStepped {
+        direction: HistoryDirection,
+        position: usize,
+        len: usize,
+    },
+    HistoryAppended {
+        identity: SurfaceIdentity,
+        method: HistoryAppendMethod,
+    },
+    HistoryRemoved {
+        identity: SurfaceIdentity,
+        method: HistoryRemoveMethod,
     },
     DealMode {
         action: DealModeAction,
@@ -314,7 +355,9 @@ impl Event {
             Self::LampTransition { .. } => "lamp_transition",
             Self::ChimeRing { .. } => "chime_ring",
             Self::SurfaceShown { .. } => "surface_shown",
-            Self::MruStepped { .. } => "mru_stepped",
+            Self::HistoryStepped { .. } => "history_stepped",
+            Self::HistoryAppended { .. } => "history_appended",
+            Self::HistoryRemoved { .. } => "history_removed",
             Self::DealMode { .. } => "deal_mode",
             Self::SurfaceClosed { .. } => "surface_closed",
             Self::DeskHeadingDeferred { .. } => "desk_heading_deferred",
@@ -662,6 +705,31 @@ mod tests {
         };
         let encoded = serde_json::to_string(&event).unwrap();
         assert_eq!(serde_json::from_str::<Event>(&encoded).unwrap(), event);
+    }
+
+    #[test]
+    fn history_events_round_trip_direction_position_and_methods() {
+        let surface = SurfaceIdentity::Transcript {
+            agent_id: "eng-a".into(),
+        };
+        for event in [
+            Event::HistoryStepped {
+                direction: HistoryDirection::Back,
+                position: 3,
+                len: 7,
+            },
+            Event::HistoryAppended {
+                identity: surface.clone(),
+                method: HistoryAppendMethod::Deal,
+            },
+            Event::HistoryRemoved {
+                identity: surface,
+                method: HistoryRemoveMethod::Dedupe,
+            },
+        ] {
+            let encoded = serde_json::to_string(&event).unwrap();
+            assert_eq!(serde_json::from_str::<Event>(&encoded).unwrap(), event);
+        }
     }
 
     #[test]

@@ -155,14 +155,16 @@ returns on their own anyway — it is not responsible for keeping you engaged.
 
 ### Navigation: one surface timeline and an overview key
 
-There is one vertical timeline over surfaces: agent transcripts, browser pages,
-desk-heading surfaces, terminals, and the other things currently in hand. Up
-steps backward through recently used surfaces; repeat presses within a short
-window step deeper. Nothing is overlaid: every step shows the real surface.
-Down deals the next card, makes its surface current, and puts it at the front of
-the same timeline. Closing drops the current surface and reveals the previous
-one, or the overview when the timeline is empty. The desk itself remains a
-separate overview key — like the windows key — that zooms out to the map.
+There is one history of surfaces the dealer handed you or you opened from the
+overview: agent transcripts, browser pages, desk-heading surfaces, terminals,
+and the other things currently in hand. Up moves toward older entries. Down
+moves toward newer entries when there is forward history; only at the newest
+entry does Down deal. A deal or overview open appends at the end; if that
+surface is already present, its older entry is removed first. Typing, verdicts,
+scrolling, normal-mode cursor movement, and merely opening the overview do not
+change the history. Closing removes the current entry and reveals the previous
+older one, or the overview when none exists. The desk remains a separate
+overview key — like the windows key — that zooms out to the map.
 
 **Why:** most switching is going back to something recent, and that must be a
 reflex, not a search. The vertical axis is time: past above, future below. The
@@ -211,18 +213,20 @@ the document and open things from it. In the new shape you live on one surface
 timeline and things arrive. Two layers:
 
 **Ground: the current surface.** One agent transcript, browser page,
-desk-heading surface, terminal, or other surface fills the frame. Showing or
-dealing a surface moves it to the front of one global MRU. Closing it reveals
-the previous surface, and an empty timeline lands on the overview. Rooms and
+desk-heading surface, terminal, or other surface fills the frame. Closing a
+history entry reveals the previous older surface, and no older entry lands on
+the overview. Rooms and
 horizontal strips were tried and removed for now because their grouping and
 second axis were too confusing; they may return only as a different, clearer
 concept. There is no horizontal axis.
 
-**The timeline.** One vertical axis, keyboard-driven for now: one key steps
-backward through recently used surfaces, with repeat presses inside a short
-window stepping deeper. Nothing is overlaid and what you see is always the real
-surface. The other key deals the next card. Dealing is global and item-level:
-one queue, and every dealt card becomes the current surface immediately.
+**The timeline.** One chronological list and one cursor, keyboard-driven for
+now: one key steps toward older entries and the other steps toward newer ones.
+At the end, forward deals instead. Nothing is overlaid and what you see is
+always the real surface. Only a deal or choosing a surface from the overview
+appends to history. Re-dealing or reopening an existing entry moves it to the
+end without duplication. Dealing is global and item-level: one queue, and every
+dealt card becomes the current surface immediately.
 
 **The overview.** The desk map is the current rail view kept as it is — the
 desk buffer with live agent rows, attaching, editing, filing all work the same.

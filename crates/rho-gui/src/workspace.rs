@@ -89,12 +89,6 @@ struct WarmSurface {
     surface: Surface,
 }
 
-struct MruSession {
-    origin: WarmSurface,
-    candidates: Vec<WarmSurface>,
-    index: usize,
-}
-
 const SHELL_SWIPE_DISTANCE: gpui::Pixels = px(64.);
 
 struct ShellTouchContact {
@@ -410,12 +404,11 @@ pub struct Workspace {
     surfaces: HashMap<ContextId, Vec<Surface>>,
     /// Always present in `contexts` (the draft context never closes).
     active_context: ContextId,
-    /// Warm surfaces grouped by their Desk room. This is deliberately an
-    /// ephemeral cache: the Desk and underlying resources remain canonical.
-    surface_mru: Vec<WarmSurface>,
+    /// Chronological history of surfaces dealt or opened from the overview.
+    surface_history: Vec<WarmSurface>,
+    history_cursor: usize,
     overview_open: bool,
-    mru_session: Option<MruSession>,
-    mru_session_task: Option<Task<()>>,
+    navigation_skips: HashMap<SurfaceKey, crate::dashboard::DealCardIdentity>,
     last_shift_tap: Option<std::time::Instant>,
     shell_touches: HashMap<TouchId, ShellTouchContact>,
     shell_touch_was_multi: bool,
@@ -929,17 +922,6 @@ impl Workspace {
                 }
             } else {
                 this.last_shift_tap = None;
-                let stepping_back = event
-                    .action
-                    .as_ref()
-                    .is_some_and(|action| action.as_any().is::<SurfaceBack>())
-                    || cx
-                        .all_bindings_for_input(std::slice::from_ref(&event.keystroke))
-                        .iter()
-                        .any(|binding| binding.action().as_any().is::<SurfaceBack>());
-                if !stepping_back {
-                    this.finish_mru_session(cx);
-                }
             }
             if this.universal_argument
                 && !matches!(
@@ -991,10 +973,10 @@ impl Workspace {
             contexts: HashMap::new(),
             surfaces: HashMap::new(),
             active_context: ContextId::Draft,
-            surface_mru: Vec::new(),
+            surface_history: Vec::new(),
+            history_cursor: 0,
             overview_open: true,
-            mru_session: None,
-            mru_session_task: None,
+            navigation_skips: HashMap::new(),
             last_shift_tap: None,
             shell_touches: HashMap::new(),
             shell_touch_was_multi: false,
@@ -1214,16 +1196,33 @@ impl Workspace {
             .expect("active context has a pane")
     }
 
-    fn touch_surface(&mut self, surface: &Surface) {
-        self.surface_mru
-            .retain(|warm| warm.surface.key != surface.key);
-        self.surface_mru.insert(
-            0,
-            WarmSurface {
-                context: self.active_context,
-                surface: surface.clone(),
-            },
-        );
+    fn append_history(
+        &mut self,
+        surface: Surface,
+        method: crate::journal::HistoryAppendMethod,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(index) = self
+            .surface_history
+            .iter()
+            .position(|warm| warm.surface.key == surface.key)
+        {
+            let removed = self.surface_history.remove(index);
+            crate::journal::record(crate::journal::Event::HistoryRemoved {
+                identity: Self::journal_surface(&removed.surface.key),
+                method: crate::journal::HistoryRemoveMethod::Dedupe,
+            });
+        }
+        self.surface_history.push(WarmSurface {
+            context: self.active_context,
+            surface: surface.clone(),
+        });
+        self.history_cursor = self.surface_history.len() - 1;
+        crate::journal::record(crate::journal::Event::HistoryAppended {
+            identity: Self::journal_surface(&surface.key),
+            method,
+        });
+        cx.notify();
     }
 
     fn show_warm_surface(
@@ -1240,6 +1239,11 @@ impl Workspace {
             warm.surface = self.make_surface(SurfaceKey::Transcript(agent_id), window, cx);
         }
         self.ensure_surface_subscription(&warm.surface.key, cx);
+        if self.history_cursor < self.surface_history.len()
+            && self.surface_history[self.history_cursor].surface.key == warm.surface.key
+        {
+            self.surface_history[self.history_cursor] = warm.clone();
+        }
         self.active_context = warm.context;
         self.active_pane_mut().show(warm.surface.clone());
         self.overview_open = false;
@@ -1255,21 +1259,46 @@ impl Workspace {
         if self.overview_open {
             return;
         }
-        self.finish_mru_session(cx);
         let was_dealing = self.dashboard.deal_mode();
         let dealt_untouched = was_dealing && !self.deal_current_interacted;
         if was_dealing {
             self.skip_and_end_deal(window, cx);
         }
         let key = self.active_pane().surface.key.clone();
-        self.surface_mru.retain(|warm| warm.surface.key != key);
+        let removed = self
+            .surface_history
+            .iter()
+            .position(|warm| warm.surface.key == key);
+        self.navigation_skips.remove(&key);
         crate::journal::record(crate::journal::Event::SurfaceClosed {
             surface: Self::journal_surface(&key),
             dealt_untouched,
         });
-        if let Some(previous) = self.surface_mru.first().cloned() {
+        let Some(removed) = removed else {
+            if let Some(previous) = self.surface_history.get(self.history_cursor).cloned() {
+                self.show_warm_surface(
+                    previous,
+                    crate::journal::SurfaceShowMethod::Mru,
+                    window,
+                    cx,
+                );
+            } else {
+                self.open_overview(window, cx);
+            }
+            cx.notify();
+            return;
+        };
+        self.surface_history.remove(removed);
+        crate::journal::record(crate::journal::Event::HistoryRemoved {
+            identity: Self::journal_surface(&key),
+            method: crate::journal::HistoryRemoveMethod::Close,
+        });
+        if removed > 0 {
+            self.history_cursor = removed - 1;
+            let previous = self.surface_history[self.history_cursor].clone();
             self.show_warm_surface(previous, crate::journal::SurfaceShowMethod::Mru, window, cx);
         } else {
+            self.history_cursor = self.surface_history.len();
             self.open_overview(window, cx);
         }
         cx.notify();
@@ -1280,7 +1309,6 @@ impl Workspace {
             self.skip_and_end_deal(window, cx);
         }
         self.overview_open = true;
-        self.finish_mru_session(cx);
         self.refresh_dashboard(window, cx);
         window.focus(&self.dashboard.focus_handle(cx), cx);
         crate::journal::record(crate::journal::Event::OverviewOpened);
@@ -1289,6 +1317,9 @@ impl Workspace {
 
     fn toggle_overview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.overview_open {
+            if self.history_cursor >= self.surface_history.len() {
+                return;
+            }
             self.overview_open = false;
             self.focus_active_surface(window, cx);
             cx.notify();
@@ -1378,78 +1409,55 @@ impl Workspace {
         }
     }
 
-    fn finish_mru_session(&mut self, cx: &mut Context<Self>) {
-        let Some(session) = self.mru_session.take() else {
-            return;
-        };
-        self.mru_session_task = None;
-        let current = session.candidates[session.index].surface.key.clone();
-        let mut mru = session.candidates[..session.index]
-            .iter()
-            .rev()
-            .cloned()
-            .collect::<Vec<_>>();
-        mru.push(session.origin);
-        mru.extend(session.candidates.into_iter().skip(session.index + 1));
-        mru.retain(|warm| warm.surface.key != current);
-        if let Some(shown) = self
-            .contexts
-            .get(&self.active_context)
-            .map(|pane| pane.surface.clone())
-        {
-            mru.insert(
-                0,
-                WarmSurface {
-                    context: self.active_context,
-                    surface: shown,
-                },
-            );
-        }
-        self.surface_mru = mru;
-        cx.notify();
-    }
-
     fn step_surface_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.overview_open || self.dashboard.deal_mode() {
+        if self.overview_open || self.history_cursor == 0 {
             return;
         }
-        if self.mru_session.is_none() {
-            if self.surface_mru.len() < 2 {
-                return;
-            }
-            self.mru_session = Some(MruSession {
-                origin: self.surface_mru[0].clone(),
-                candidates: self.surface_mru[1..].to_vec(),
-                index: 0,
-            });
-        } else if let Some(session) = &mut self.mru_session {
-            if session.index + 1 >= session.candidates.len() {
-                return;
-            }
-            session.index += 1;
+        if self.dashboard.deal_mode()
+            && let Some(card) = self.dashboard.current_deal_card().cloned()
+        {
+            let key = self.active_pane().surface.key.clone();
+            self.navigation_skips.insert(key, card.identity.clone());
+            self.skip_and_end_deal(window, cx);
         }
-        let session = self.mru_session.as_ref().expect("MRU session exists");
-        let target = session.candidates[session.index].clone();
-        let from = self.active_pane().surface.key.clone();
-        let depth = session.index + 1;
+        self.history_cursor -= 1;
+        let target = self.surface_history[self.history_cursor].clone();
         self.show_warm_surface(
             target.clone(),
             crate::journal::SurfaceShowMethod::Mru,
             window,
             cx,
         );
-        crate::journal::record(crate::journal::Event::MruStepped {
-            from: Self::journal_surface(&from),
-            to: Self::journal_surface(&target.surface.key),
-            depth,
+        crate::journal::record(crate::journal::Event::HistoryStepped {
+            direction: crate::journal::HistoryDirection::Back,
+            position: self.history_cursor + 1,
+            len: self.surface_history.len(),
         });
-        self.mru_session_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(1_200))
-                .await;
-            let _ = this.update(cx, |this, cx| this.finish_mru_session(cx));
-        }));
         cx.notify();
+    }
+
+    fn step_surface_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.overview_open || self.history_cursor + 1 >= self.surface_history.len() {
+            return false;
+        }
+        self.history_cursor += 1;
+        let target = self.surface_history[self.history_cursor].clone();
+        if let Some(identity) = self.navigation_skips.remove(&target.surface.key) {
+            self.dashboard.clear_skip(&identity);
+        }
+        self.show_warm_surface(
+            target.clone(),
+            crate::journal::SurfaceShowMethod::Mru,
+            window,
+            cx,
+        );
+        crate::journal::record(crate::journal::Event::HistoryStepped {
+            direction: crate::journal::HistoryDirection::Forward,
+            position: self.history_cursor + 1,
+            len: self.surface_history.len(),
+        });
+        cx.notify();
+        true
     }
 
     fn journal_card_identity(
@@ -4470,7 +4478,6 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.overview_open = false;
         self.select_agent_inner(agent_id, true, window, cx);
     }
 
@@ -5003,7 +5010,26 @@ impl Workspace {
             }
         };
         self.overview_open = false;
-        self.touch_surface(&shown);
+        match method {
+            crate::journal::SurfaceShowMethod::Deal => {
+                self.append_history(shown.clone(), crate::journal::HistoryAppendMethod::Deal, cx)
+            }
+            crate::journal::SurfaceShowMethod::Overview => self.append_history(
+                shown.clone(),
+                crate::journal::HistoryAppendMethod::Overview,
+                cx,
+            ),
+            crate::journal::SurfaceShowMethod::Open => {
+                if let Some(index) = self
+                    .surface_history
+                    .iter()
+                    .position(|warm| warm.surface.key == shown.key)
+                {
+                    self.history_cursor = index;
+                }
+            }
+            crate::journal::SurfaceShowMethod::Mru => {}
+        }
         crate::journal::record(crate::journal::Event::SurfaceShown {
             surface: Self::journal_surface(&shown.key),
             method,
@@ -5469,15 +5495,16 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn configure_surface_mru_for_test(
+    pub(crate) fn configure_surface_history_for_test(
         &mut self,
         names: &[&str],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let editor = self.active_editor(cx);
-        self.surface_mru = names
+        self.surface_history = names
             .iter()
+            .rev()
             .map(|name| WarmSurface {
                 context: self.active_context,
                 surface: Self::wrap_surface(
@@ -5486,8 +5513,9 @@ impl Workspace {
                 ),
             })
             .collect();
-        if let Some(current) = self.surface_mru.first().cloned() {
-            self.active_pane_mut().show(current.surface);
+        self.history_cursor = self.surface_history.len().saturating_sub(1);
+        if let Some(current) = self.surface_history.last().cloned() {
+            self.active_pane_mut().show(current.surface.clone());
             self.overview_open = false;
             self.focus_active_surface(window, cx);
             cx.notify();
@@ -5514,7 +5542,51 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn configure_evicted_transcript_mru_for_test(
+    pub(crate) fn step_surface_forward_for_test(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.step_surface_forward(window, cx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn surface_history_for_test(&self) -> (Vec<String>, usize) {
+        (
+            self.surface_history
+                .iter()
+                .map(|warm| self.surface_name(&warm.surface.key))
+                .collect(),
+            self.history_cursor,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn show_current_history_for_test(
+        &mut self,
+        method: crate::journal::SurfaceShowMethod,
+        cx: &mut Context<Self>,
+    ) {
+        let surface = self.active_pane().surface.clone();
+        self.display_surface_with_method(surface, method, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn open_history_index_for_test(&mut self, index: usize, cx: &mut Context<Self>) {
+        let surface = self.surface_history[index].surface.clone();
+        self.display_surface_with_method(surface, crate::journal::SurfaceShowMethod::Open, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn deal_skip_exists_for_test(
+        &self,
+        identity: &crate::dashboard::DealCardIdentity,
+    ) -> bool {
+        self.dashboard.has_skip_for_test(identity)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn configure_evicted_transcript_history_for_test(
         &mut self,
         agent_id: AgentId,
         window: &mut Window,
@@ -5524,9 +5596,13 @@ impl Workspace {
         self.end_deal_session();
         self.deal_view = None;
         let transcript = self.make_surface(SurfaceKey::Transcript(agent_id), window, cx);
-        self.display_surface(transcript, cx);
+        self.display_surface_with_method(
+            transcript,
+            crate::journal::SurfaceShowMethod::Overview,
+            cx,
+        );
         let draft = self.make_surface(SurfaceKey::Draft, window, cx);
-        self.display_surface(draft, cx);
+        self.display_surface_with_method(draft, crate::journal::SurfaceShowMethod::Overview, cx);
         self.subscriptions
             .mark_unloaded(agent_id, rho_ui_proto::AgentUnloadReason::Idle);
         self.release_agent_view_cache(agent_id, cx);
@@ -6353,6 +6429,25 @@ impl Workspace {
         self.open_overview(window, cx);
     }
 
+    pub(crate) fn cmd_surface_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.step_surface_back(window, cx);
+    }
+
+    pub(crate) fn cmd_surface_forward_or_deal(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.step_surface_forward(window, cx) {
+            self.deal_next(window, cx);
+        }
+    }
+
+    pub(crate) fn cmd_close_and_deal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_current_surface(window, cx);
+        self.deal_next(window, cx);
+    }
+
     pub(crate) fn cmd_toggle_raw_desk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dashboard.toggle_raw_mode(cx);
         crate::journal::record(crate::journal::Event::DeskRawModeToggled {
@@ -6362,7 +6457,6 @@ impl Workspace {
     }
 
     pub(crate) fn open_deal_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.finish_mru_session(cx);
         self.deal_next(window, cx);
         cx.notify();
     }
@@ -8709,13 +8803,12 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::submit_prompt))
             .on_action(cx.listener(Self::paste_prompt))
             .on_action(cx.listener(|this, _: &SurfaceBack, window, cx| {
-                if this.dashboard.deal_mode() {
-                    this.skip_and_end_deal(window, cx);
-                }
                 this.step_surface_back(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DealOpen, window, cx| {
-                this.deal_next(window, cx);
+                if !this.step_surface_forward(window, cx) {
+                    this.deal_next(window, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &DealCloseAndNext, window, cx| {
                 this.close_current_surface(window, cx);
