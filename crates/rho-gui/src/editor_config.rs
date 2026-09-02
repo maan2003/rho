@@ -31,7 +31,7 @@ pub fn configure(editor: &mut Editor, window: &mut Window, cx: &mut Context<Edit
 }
 
 /// Chrome and typography for the compact dashboard preview. Its text is
-/// deliberately 85% the size of a full editor without affecting pane
+/// deliberately 85% the size of a full editor without affecting viewport
 /// editors.
 pub fn configure_preview(editor: &mut Editor, window: &mut Window, cx: &mut Context<Editor>) {
     configure(editor, window, cx);

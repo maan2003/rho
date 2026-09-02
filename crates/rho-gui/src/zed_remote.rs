@@ -736,7 +736,6 @@ fn encode_buffer(text: String, line_ending: text::LineEnding, bom: bool) -> Vec<
 pub struct FileView {
     remote: RemoteProject,
     editor: Entity<editor::Editor>,
-    buffer: Entity<Buffer>,
 }
 
 impl FileView {
@@ -759,19 +758,11 @@ impl FileView {
             crate::editor_config::configure_file(&mut editor, window, cx);
             editor
         });
-        Self {
-            remote,
-            editor,
-            buffer,
-        }
+        Self { remote, editor }
     }
 
     pub fn editor(&self) -> &Entity<editor::Editor> {
         &self.editor
-    }
-
-    pub fn shared_content(&self) -> (RemoteProject, Entity<Buffer>) {
-        (self.remote.clone(), self.buffer.clone())
     }
 
     fn save(&mut self, _: &crate::FileSave, window: &mut Window, cx: &mut Context<Self>) {

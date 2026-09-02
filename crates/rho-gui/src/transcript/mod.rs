@@ -11,7 +11,7 @@
 //! all anchor-based data. Any number of editors attach; after each sync
 //! the model reconciles every attachment — highlights and gutters are
 //! reapplied for changed classes, inlays and display elisions diffed
-//! against the desired state — so every pane over the transcript stays
+//! against the desired state — so every view over the transcript stays
 //! correct without owning any of it.
 //!
 //! Highlights are bucketed per [`StyleClass`] into two editor highlight keys

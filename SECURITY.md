@@ -72,6 +72,13 @@ AI APIs.
   `dirs::state_dir()/rho/gui-telemetry` (normally
   `~/.local/state/rho/gui-telemetry`). There is no automatic upload, expiry, or
   deletion; users control retention of these local diagnostic files.
+- The native GUI keeps a client-only append-only action journal under the rho
+  state directory. It may contain agent/page identities, Desk locations,
+  minibuffer prompts and input, navigation, and dealer decisions with precise
+  timestamps. A dedicated local writer commits each event in its own redb
+  transaction; the journal is
+  never uploaded, analyzed, or used to adapt behavior automatically, and has no
+  automatic retention, so users control it like other sensitive local state.
 - Opt-in GUI and daemon Dial9 profiles contain thread names, function symbols,
   local source paths, precise activity timing, and frontend marker metadata.
   GUI editor markers include numeric edit counts, affected row ranges, map row

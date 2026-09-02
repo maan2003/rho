@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use gpui::{App, AppContext as _, WindowOptions};
 use rho_gui::rho_assets::RhoAssets;
 use rho_gui::workspace::{AttachTarget, HostSpec, Workspace};
@@ -39,6 +39,27 @@ struct Args {
     /// Write a Dial9 CPU/frame trace on exit (requires a frame-pointer build).
     #[arg(long, value_name = "FILE")]
     cpu_profile: Option<PathBuf>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Read the client-only action journal.
+    Journal {
+        #[command(subcommand)]
+        command: JournalCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum JournalCommand {
+    /// Print faithful JSONL records after the GUI has exited.
+    Dump {
+        #[arg(long)]
+        kind: Option<String>,
+    },
 }
 
 #[derive(RegisterSetting)]
@@ -166,12 +187,20 @@ fn default_client_state_dir() -> Result<PathBuf> {
 }
 
 fn run() -> Result<()> {
+    let args = Args::parse();
+    let client_state_dir = default_client_state_dir()?;
+    if let Some(Command::Journal {
+        command: JournalCommand::Dump { kind },
+    }) = args.command.as_ref()
+    {
+        let stdout = std::io::stdout();
+        return rho_gui::journal::dump(&client_state_dir, kind.as_deref(), stdout.lock());
+    }
     if rustls::crypto::CryptoProvider::get_default().is_none() {
         rustls::crypto::aws_lc_rs::default_provider()
             .install_default()
             .map_err(|_| anyhow::anyhow!("failed to install the AWS-LC rustls crypto provider"))?;
     }
-    let args = Args::parse();
     let profiler = args
         .cpu_profile
         .clone()
@@ -192,7 +221,7 @@ fn run() -> Result<()> {
         })
         .transpose()?;
     let specs = host_specs(&args)?;
-    let client_state_dir = default_client_state_dir()?;
+    rho_gui::journal::init(&client_state_dir).context("initialize client action journal")?;
     rho_gui::telemetry::enable();
     if profiler.is_none()
         && let Err(error) = rho_gui::telemetry::enable_passive_cpu_profile()
@@ -203,6 +232,17 @@ fn run() -> Result<()> {
     gpui_platform::application()
         .with_assets(RhoAssets)
         .run(move |cx: &mut App| {
+            const USER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+            cx.on_user_idle(USER_IDLE_TIMEOUT, move |event| match event {
+                gpui::UserIdleEvent::Idle => {
+                    rho_gui::journal::record(rho_gui::journal::Event::UserIdle {
+                        timeout_s: USER_IDLE_TIMEOUT.as_secs(),
+                    });
+                }
+                gpui::UserIdleEvent::Resumed => {
+                    rho_gui::journal::record(rho_gui::journal::Event::UserResumed);
+                }
+            });
             let mut profiler = profiler;
             if let Some(profiler) = &mut profiler {
                 // Window drawing and this application callback share GPUI's
@@ -238,6 +278,7 @@ fn run() -> Result<()> {
                     finish_profiling(profiler);
                 }
                 rho_gui::telemetry::shutdown_passive_cpu_profile();
+                rho_gui::journal::flush();
                 std::future::ready(())
             })
             .detach();

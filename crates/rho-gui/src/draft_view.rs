@@ -7,10 +7,10 @@
 //! boundary separates field from body, so there is no scaffold text to
 //! parse: submission just reads the two writable buffers.
 //!
-//! The model is the buffer role; each pane showing the draft builds its own
-//! editor over the shared multibuffer via [`DraftModel::build_editor`].
+//! The model is the buffer role; the draft surface builds an editor over the
+//! shared multibuffer via [`DraftModel::build_editor`].
 //! Cursor-dependent operations (field cycling, focusing the body) act on a
-//! specific pane's editor, passed by the caller — the cursor belongs to the
+//! specific editor, passed by the caller — the cursor belongs to the
 //! window, not the buffer.
 
 use std::ops::Range;
@@ -83,7 +83,7 @@ pub struct DraftModel {
     attachments: Vec<ContentPart>,
     attachment_blocks: Vec<(WeakEntity<Editor>, CustomBlockId)>,
     suppress_draft_activation: bool,
-    /// Editors currently displaying the draft, weakly held: panes own
+    /// Editors currently displaying the draft, weakly held: surfaces own
     /// their editors; the model reconciles whoever is still alive.
     editors: Vec<WeakEntity<Editor>>,
     _subscriptions: Vec<Subscription>,
@@ -166,7 +166,7 @@ impl DraftModel {
         }
     }
 
-    /// Builds a pane's editor over the shared multibuffer — own cursor and
+    /// Builds an editor over the shared multibuffer — own cursor and
     /// scroll — fully caught up with the model, cursor at the body end.
     pub fn build_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<Editor> {
         let workspace = self.workspace.clone();
@@ -416,7 +416,7 @@ impl DraftModel {
         self.select_range(editor, range, window, cx);
     }
 
-    /// Puts the pane's cursor at the end of the message body.
+    /// Puts the viewport's cursor at the end of the message body.
     pub fn focus_body(
         &mut self,
         editor: &Entity<Editor>,

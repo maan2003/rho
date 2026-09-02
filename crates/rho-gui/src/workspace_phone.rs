@@ -1,7 +1,7 @@
 //! Native narrow-screen projection for the canonical workspace.
 //!
 //! Phone mode keeps the existing surfaces alive in the workspace registry, but
-//! replaces pane-tree presentation with one surface and a Desk-rooted stack.
+//! replaces desktop presentation with one surface and a Desk-rooted stack.
 
 use gpui::prelude::*;
 use gpui::{
@@ -269,7 +269,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.dashboard.cursor_to_doc(host, offset, cx);
-        self.dashboard.sync(&self.registry, window, cx);
+        self.dashboard.sync(&self.registry, &self.inbox, window, cx);
         assert!(self.dashboard.toggle_agent_tree(cx));
         self.refresh_dashboard(window, cx);
     }
@@ -364,8 +364,8 @@ impl Workspace {
             .and_then(|surfaces| surfaces.iter().find(|surface| surface.key == key))
             .cloned()
         {
-            if let Some(tree) = self.contexts.get_mut(&context) {
-                tree.focused_mut().show(surface);
+            if let Some(pane) = self.contexts.get_mut(&context) {
+                pane.show(surface);
             }
             self.sync_selection_to_focus(cx);
             self.focus_active_surface(window, cx);

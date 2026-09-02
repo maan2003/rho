@@ -32,7 +32,10 @@ use camino::Utf8PathBuf;
 use futures::StreamExt as _;
 use futures::channel::mpsc::UnboundedReceiver;
 use gpui::prelude::*;
-use gpui::{App, ClipboardEntry, Context, Entity, Focusable as _, Task, Window, div, px, svg};
+use gpui::{
+    App, ClipboardEntry, Context, Entity, Focusable as _, Point, Task, TouchEvent, TouchId,
+    TouchPhase, Window, div, px, svg,
+};
 use rho_core::ContentPart;
 use rho_ui_proto::{
     AdvisorIntelligence, AgentId, AgentRole, ClientMessage, EngineerIntelligence, MessageDelivery,
@@ -49,8 +52,11 @@ use crate::connection::{AgentFrameAllocation, ConnEvent, Connection, HostEvent};
 use crate::desk_view::DeskSync;
 use crate::draft_view::DraftModel;
 use crate::hosts::{HostStatus, Hosts};
+use crate::inbox::{
+    CapturedContext, InboxDraft, InboxId, InboxKind, InboxStore, SourceReference, Verdict,
+};
 use crate::minibuffer::{ECHO_DURATION, Echo, Minibuffer, bottom_strip};
-use crate::pane::{PaneTree, SplitAxis, SurfaceKey};
+use crate::pane::{Pane, SurfaceKey};
 use crate::registry::session::{
     AgentSubscriptions, INITIAL_AGENT_SUBSCRIPTIONS, recent_agent_roots,
 };
@@ -62,33 +68,48 @@ use crate::{
     AgentDone, AgentHide, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, BrowserExit,
     DashboardArchive, DashboardBack, DashboardCycleGlobal, DashboardDealDiscard, DashboardDealDone,
     DashboardDealExit, DashboardDealInsert, DashboardDealNext, DashboardDealPrevious,
-    DashboardDealRefresh, DashboardDealReply, DashboardDealSnooze, DashboardDealTodo,
-    DashboardDeleteEmpty, DashboardDemote, DashboardGoto, DashboardHeadingAbove,
+    DashboardDealRefresh, DashboardDealReply, DashboardDealRoomSnooze, DashboardDealSnooze,
+    DashboardDealTodo, DashboardDeleteEmpty, DashboardDemote, DashboardGoto, DashboardHeadingAbove,
     DashboardHeadingBelow, DashboardJump, DashboardNewAgent, DashboardNow, DashboardPromote,
     DashboardRenameTopic, DashboardReply, DashboardStaff, DashboardSubmit,
-    DashboardToggleAgentTree, DashboardToggleSubagents, DashboardUndo, GitApprovalAllow,
-    GitApprovalDeny, MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext,
-    MinibufferPrevious, PaneBack, PaneClose, PaneFocusNext, PaneSplitDown, PaneSplitRight,
-    PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt,
-    ShellPagerAll, ShellPagerMore, ShellPagerQuit, SubmitPrompt, TaskBoard, UploadGuiTelemetry,
-    VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow, ZulipQuit,
+    DashboardToggleAgentTree, DashboardToggleSubagents, DashboardUndo, DealOpen, GitApprovalAllow,
+    GitApprovalDeny, InboxCapture, MinibufferCancel, MinibufferComplete, MinibufferConfirm,
+    MinibufferNext, MinibufferPrevious, OverviewToggle, PastePrompt, RailFocus, RailOpen,
+    RoleCycle, RoleCycleGroup, RoomBack, RoomStripLeft, RoomStripRight, ShellEof, ShellInterrupt,
+    ShellPagerAll, ShellPagerMore, ShellPagerQuit, StripRemove, SubmitPrompt, TaskBoard,
+    UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow, ZulipQuit,
 };
 
-/// What a pane shows: stable identity plus the live view. Surfaces live
-/// in their context's surface list for the context's lifetime; panes hold
-/// clones of the same view handles, so display is cheap and the view (and
-/// any remote channel behind it) releases when the context closes.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct RoomId {
+    host: HostId,
+    heading_offset: usize,
+}
+
+#[derive(Clone)]
+struct WarmSurface {
+    context: ContextId,
+    surface: Surface,
+}
+
+struct MruOverlay {
+    origin: RoomId,
+    room_candidates: Vec<RoomId>,
+    room_index: usize,
+}
+
+const SHELL_SWIPE_DISTANCE: gpui::Pixels = px(64.);
+
+struct ShellTouchContact {
+    start: Point<gpui::Pixels>,
+    position: Point<gpui::Pixels>,
+}
+
+/// Stable surface identity plus its live view.
 #[derive(Clone)]
 pub struct Surface {
     key: SurfaceKey,
     view: SurfaceView,
-    /// The view's editor entity: the identity focus-follow reports, since
-    /// two panes can show the same key through different editors.
-    editor_id: Option<gpui::EntityId>,
-    /// Focus-in observer: gpui focus arriving inside the surface's editor
-    /// (mouse click, vim motion) pulls pane focus along. Shared by all
-    /// pane clones of the surface, dropped with the last one.
-    _focus_follow: Option<std::rc::Rc<gpui::Subscription>>,
 }
 
 #[cfg(feature = "native")]
@@ -101,13 +122,11 @@ struct PendingGitApproval {
 #[derive(Clone)]
 enum SurfaceView {
     Draft {
-        model: Entity<DraftModel>,
-        /// This pane's own editor over the model's multibuffer.
         editor: Entity<editor::Editor>,
     },
     Transcript {
         model: Entity<AgentModel>,
-        /// This pane's own editor over the model's multibuffer.
+        /// The editor over the model's multibuffer.
         editor: Entity<editor::Editor>,
     },
     File(Entity<FileView>),
@@ -159,7 +178,7 @@ enum ContextId {
     Draft,
     Agent(AgentId),
     /// Zulip's own window arrangement: entering it from the dashboard
-    /// leaves the agent panes exactly as they were, and leaving it comes
+    /// leaves the agent surface exactly as it was, and leaving it comes
     /// back to them.
     Zulip,
 }
@@ -333,18 +352,37 @@ pub struct Workspace {
     /// Attention chime output; lazily opened on the first play.
     #[cfg(feature = "native")]
     chime: Chime,
-    /// Per-context split trees of viewports over surfaces. The rail is
-    /// ambient chrome beside the active tree, not a pane in it.
-    contexts: HashMap<ContextId, PaneTree<Surface>>,
+    /// Each context retains one viewport over its surfaces.
+    contexts: HashMap<ContextId, Pane<Surface>>,
     /// Per-context surface list, the emacs buffer list: every surface
     /// opened in a context lives here for the context's lifetime,
-    /// regardless of what its panes currently display. Panes are
-    /// viewports over this list — covering or closing one never loses a
-    /// file or terminal; the views (and any workspace file channel behind them)
-    /// release when the context itself closes.
+    /// regardless of what its viewport currently displays. Covering one never
+    /// loses a file or terminal; the views (and any workspace file channel
+    /// behind them) release when the context itself closes.
     surfaces: HashMap<ContextId, Vec<Surface>>,
     /// Always present in `contexts` (the draft context never closes).
     active_context: ContextId,
+    /// Warm surfaces grouped by their Desk room. This is deliberately an
+    /// ephemeral cache: the Desk and underlying resources remain canonical.
+    room_strips: HashMap<RoomId, Vec<WarmSurface>>,
+    room_names: HashMap<RoomId, String>,
+    current_room: Option<RoomId>,
+    room_mru: Vec<RoomId>,
+    overview_open: bool,
+    mru_overlay: Option<MruOverlay>,
+    mru_overlay_task: Option<Task<()>>,
+    room_focus: HashMap<RoomId, SurfaceKey>,
+    last_shift_tap: Option<std::time::Instant>,
+    shell_touches: HashMap<TouchId, ShellTouchContact>,
+    shell_touch_was_multi: bool,
+    shell_touch_committed: bool,
+    horizontal_strip_gesture_active: bool,
+    deal_session_open: bool,
+    agent_last_interaction: HashMap<AgentId, i64>,
+    dealer_signal_eval_scheduled: bool,
+    _dealer_signal_task: Task<()>,
+    lamp_on: bool,
+    chime_above_threshold: bool,
     /// The dashboard: the rail as a real editor buffer, ambient chrome
     /// beside the active tree.
     dashboard: crate::dashboard::Dashboard,
@@ -379,6 +417,11 @@ pub struct Workspace {
     /// opened. Chat costs nothing until asked for.
     #[cfg(feature = "native")]
     zulip: Option<Entity<rho_zulip::session::Session>>,
+    /// Machine-owned arrivals. This store is client-local and never enters a
+    /// Desk CRDT buffer until an explicit filing verdict.
+    inbox: InboxStore,
+    pending_inbox_item: Option<InboxId>,
+    scroll_journal_task: Option<Task<()>>,
     /// The completing-read strip at the bottom of the window, when open.
     minibuffer: Option<Minibuffer>,
     /// An open transient menu in the bottom strip; captures the keyboard
@@ -415,6 +458,7 @@ pub struct Workspace {
     _event_task: Task<()>,
     _dashboard_subscription: gpui::Subscription,
     _universal_argument_subscription: gpui::Subscription,
+    _window_activation_subscription: gpui::Subscription,
     #[cfg(all(target_family = "wasm", not(feature = "native")))]
     web: web::WebUi,
     #[cfg(feature = "native")]
@@ -465,20 +509,12 @@ impl Workspace {
         self.registry.mark_known(agent_id);
     }
 
-    fn apply_attention(
-        &mut self,
-        agent_id: AgentId,
-        attention: rho_ui_proto::UiAttention,
-    ) -> rho_ui_proto::UiAttention {
-        let before = self.registry.attention(agent_id);
+    fn apply_attention(&mut self, agent_id: AgentId, attention: rho_ui_proto::UiAttention) {
         self.registry.set_attention(agent_id, attention);
-        before
     }
 
-    fn apply_turn_report(&mut self, agent_id: AgentId, report: rho_ui_proto::UiTurnReport) -> bool {
-        let needs_you = report.needs_you;
+    fn apply_turn_report(&mut self, agent_id: AgentId, report: rho_ui_proto::UiTurnReport) {
         self.registry.set_turn_report(agent_id, report);
-        needs_you
     }
 
     fn apply_ready(
@@ -745,6 +781,19 @@ impl Workspace {
                 }
             }
         });
+        let dealer_signal_task = cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_secs(60))
+                    .await;
+                if this
+                    .update(cx, |this, cx| this.invalidate_dealer_signals(cx))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
 
         // Settings recomputes (language registration installing semantic
         // token rules, a settings file reload) rebuild every setting global
@@ -774,7 +823,7 @@ impl Workspace {
             editor
         });
         // The preview follows the dashboard cursor: any local selection
-        // change while the dashboard is focused re-aims the panes.
+        // change while the dashboard is focused re-aims the surface.
         let dashboard_subscription = cx.subscribe_in(
             dashboard.editor(),
             window,
@@ -788,7 +837,28 @@ impl Workspace {
                 }
             },
         );
-        let universal_argument_subscription = cx.observe_keystrokes(|this, event, _, cx| {
+        let universal_argument_subscription = cx.observe_keystrokes(|this, event, window, cx| {
+            if event.keystroke.key == "shift"
+                && !event.keystroke.modifiers.control
+                && !event.keystroke.modifiers.alt
+                && !event.keystroke.modifiers.platform
+            {
+                let now = std::time::Instant::now();
+                if this
+                    .last_shift_tap
+                    .is_some_and(|last| now.duration_since(last) <= Duration::from_millis(300))
+                {
+                    this.last_shift_tap = None;
+                    this.toggle_overview(window, cx);
+                } else {
+                    this.last_shift_tap = Some(now);
+                }
+            } else {
+                this.last_shift_tap = None;
+                if event.keystroke.key != "k" || !event.keystroke.modifiers.control {
+                    this.dismiss_mru_overlay(cx);
+                }
+            }
             if this.universal_argument
                 && !matches!(
                     event.keystroke.key.as_str(),
@@ -801,6 +871,12 @@ impl Workspace {
                 cx.notify();
             }
         });
+        let window_activation_subscription =
+            cx.observe_window_activation(window, |_this, window, _cx| {
+                crate::journal::record(crate::journal::Event::WindowFocusChanged {
+                    focused: window.is_window_active(),
+                });
+            });
         let mut this = Self {
             hosts,
             subscriptions: AgentSubscriptions::default(),
@@ -829,6 +905,25 @@ impl Workspace {
             contexts: HashMap::new(),
             surfaces: HashMap::new(),
             active_context: ContextId::Draft,
+            room_strips: HashMap::new(),
+            room_names: HashMap::new(),
+            current_room: None,
+            room_mru: Vec::new(),
+            overview_open: true,
+            mru_overlay: None,
+            mru_overlay_task: None,
+            room_focus: HashMap::new(),
+            last_shift_tap: None,
+            shell_touches: HashMap::new(),
+            shell_touch_was_multi: false,
+            shell_touch_committed: false,
+            horizontal_strip_gesture_active: false,
+            deal_session_open: false,
+            agent_last_interaction: HashMap::new(),
+            dealer_signal_eval_scheduled: false,
+            _dealer_signal_task: dealer_signal_task,
+            lamp_on: false,
+            chime_above_threshold: false,
             dashboard,
             mode_indicator,
             desk_sync: DeskSync::default(),
@@ -840,6 +935,18 @@ impl Workspace {
             iris_preview,
             iris_agents: HashMap::new(),
             zulip: None,
+            // Tests build many concurrent workspaces; they must never open
+            // (or pollute) the user's real inbox database.
+            inbox: if cfg!(test) {
+                InboxStore::memory()
+            } else {
+                InboxStore::open_default().unwrap_or_else(|error| {
+                    tracing::warn!(%error, "opening client inbox; using memory-only store");
+                    InboxStore::memory()
+                })
+            },
+            pending_inbox_item: None,
+            scroll_journal_task: None,
             minibuffer: None,
             transient: None,
             transient_stack: Vec::new(),
@@ -858,6 +965,7 @@ impl Workspace {
             _event_task: event_task,
             _dashboard_subscription: dashboard_subscription,
             _universal_argument_subscription: universal_argument_subscription,
+            _window_activation_subscription: window_activation_subscription,
             phone: phone::PhoneUi::new(cx),
         };
         for spec in specs {
@@ -1005,23 +1113,505 @@ impl Workspace {
         }
     }
 
-    fn active_tree(&self) -> &PaneTree<Surface> {
+    fn active_pane(&self) -> &Pane<Surface> {
         self.contexts
             .get(&self.active_context)
-            .expect("active context has a tree")
+            .expect("active context has a pane")
     }
 
-    fn active_tree_mut(&mut self) -> &mut PaneTree<Surface> {
+    fn active_pane_mut(&mut self) -> &mut Pane<Surface> {
         self.contexts
             .get_mut(&self.active_context)
-            .expect("active context has a tree")
+            .expect("active context has a pane")
+    }
+
+    fn remember_room(
+        &mut self,
+        room: crate::dashboard::DeskRoom,
+        method: crate::journal::RoomSwitchMethod,
+        cx: &mut Context<Self>,
+    ) {
+        let id = RoomId {
+            host: room.host,
+            heading_offset: room.heading_offset,
+        };
+        self.room_names.insert(id.clone(), room.name.clone());
+        if self.current_room.as_ref() != Some(&id) {
+            self.room_mru.retain(|candidate| candidate != &id);
+            if let Some(previous) = self.current_room.replace(id.clone()) {
+                self.room_mru.retain(|candidate| candidate != &previous);
+                self.room_mru.insert(0, previous);
+            }
+            crate::journal::record(crate::journal::Event::RoomSwitched {
+                room: room.name,
+                method,
+            });
+        }
+        self.overview_open = false;
+        self.invalidate_dealer_signals(cx);
+    }
+
+    fn room_for_agent(&self, agent_id: AgentId, cx: &App) -> Option<crate::dashboard::DeskRoom> {
+        self.dashboard.room_for_agent(agent_id, cx)
+    }
+
+    fn touch_room_surface(&mut self, surface: &Surface) {
+        let Some(room) = self.current_room.clone() else {
+            return;
+        };
+        let strip = self.room_strips.entry(room.clone()).or_default();
+        if let Some(warm) = strip
+            .iter_mut()
+            .find(|warm| warm.surface.key == surface.key)
+        {
+            warm.surface = surface.clone();
+            warm.context = self.active_context;
+        } else {
+            strip.push(WarmSurface {
+                context: self.active_context,
+                surface: surface.clone(),
+            });
+        }
+        self.room_focus.insert(room, surface.key.clone());
+    }
+
+    fn slide_room_strip(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overview_open || self.dashboard.deal_mode() {
+            return;
+        }
+        let Some(room) = self.current_room.clone() else {
+            return;
+        };
+        let current_key = self.active_pane().surface.key.clone();
+        let Some(strip) = self.room_strips.get_mut(&room) else {
+            return;
+        };
+        if strip.len() < 2 {
+            return;
+        }
+        let current = strip
+            .iter()
+            .position(|warm| warm.surface.key == current_key)
+            .unwrap_or(0);
+        let next = current.saturating_add_signed(delta).min(strip.len() - 1);
+        if next == current {
+            return;
+        }
+        let warm = strip[next].clone();
+        self.active_context = warm.context;
+        self.display_surface(warm.surface.clone());
+        self.sync_selection_to_focus(cx);
+        self.focus_active_surface(window, cx);
+        crate::journal::record(crate::journal::Event::StripSlid {
+            room: self.room_names.get(&room).cloned().unwrap_or_default(),
+            direction: if delta < 0 {
+                crate::journal::StripDirection::Left
+            } else {
+                crate::journal::StripDirection::Right
+            },
+            surface: Self::journal_surface(&warm.surface.key),
+        });
+        cx.notify();
+    }
+
+    fn remove_from_room_strip(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overview_open || self.dashboard.deal_mode() {
+            return;
+        }
+        let Some(room) = self.current_room.clone() else {
+            return;
+        };
+        let key = self.active_pane().surface.key.clone();
+        let Some(strip) = self.room_strips.get_mut(&room) else {
+            return;
+        };
+        let Some(index) = strip.iter().position(|warm| warm.surface.key == key) else {
+            return;
+        };
+        strip.remove(index);
+        crate::journal::record(crate::journal::Event::StripRemoved {
+            room: self.room_names.get(&room).cloned().unwrap_or_default(),
+            surface: Self::journal_surface(&key),
+        });
+        if let Some(warm) = strip.get(index.saturating_sub(1)).cloned() {
+            self.active_context = warm.context;
+            self.display_surface(warm.surface);
+            self.focus_active_surface(window, cx);
+        } else {
+            self.room_focus.remove(&room);
+        }
+        cx.notify();
+    }
+
+    fn open_overview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(room) = self.current_room.as_ref() {
+            self.dashboard
+                .cursor_to_doc(room.host, room.heading_offset, cx);
+        }
+        self.overview_open = true;
+        self.dismiss_mru_overlay(cx);
+        self.refresh_dashboard(window, cx);
+        window.focus(&self.dashboard.focus_handle(cx), cx);
+        crate::journal::record(crate::journal::Event::OverviewOpened {
+            room: self
+                .current_room
+                .as_ref()
+                .and_then(|room| self.room_names.get(room))
+                .cloned(),
+        });
+        cx.notify();
+    }
+
+    fn toggle_overview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overview_open {
+            self.overview_open = false;
+            self.focus_active_surface(window, cx);
+            cx.notify();
+        } else {
+            self.open_overview(window, cx);
+        }
+    }
+
+    fn shell_touch(&mut self, event: &TouchEvent, window: &mut Window, cx: &mut Context<Self>) {
+        match event.phase {
+            TouchPhase::Started => {
+                self.shell_touches.insert(
+                    event.id,
+                    ShellTouchContact {
+                        start: event.position,
+                        position: event.position,
+                    },
+                );
+                if self.shell_touches.len() > 1 {
+                    self.shell_touch_was_multi = true;
+                    window.prevent_default();
+                    cx.stop_propagation();
+                }
+            }
+            TouchPhase::Moved => {
+                let Some(contact) = self.shell_touches.get_mut(&event.id) else {
+                    return;
+                };
+                contact.position = event.position;
+
+                let action = if !self.shell_touch_committed && self.shell_touch_was_multi {
+                    let contacts = self.shell_touches.values().take(2).collect::<Vec<_>>();
+                    (contacts.len() == 2)
+                        .then(|| {
+                            let dx = contacts
+                                .iter()
+                                .map(|contact| (contact.position.x - contact.start.x).as_f32())
+                                .sum::<f32>()
+                                / 2.;
+                            let dy = contacts
+                                .iter()
+                                .map(|contact| (contact.position.y - contact.start.y).as_f32())
+                                .sum::<f32>()
+                                / 2.;
+                            if dy.abs() >= SHELL_SWIPE_DISTANCE.as_f32()
+                                && dy.abs() >= dx.abs() * 1.25
+                            {
+                                if dy > 0. {
+                                    Some(if self.dashboard.deal_mode() {
+                                        Box::new(DashboardDealExit) as Box<dyn gpui::Action>
+                                    } else {
+                                        Box::new(DealOpen) as Box<dyn gpui::Action>
+                                    })
+                                } else if !self.dashboard.deal_mode() {
+                                    Some(Box::new(OverviewToggle) as Box<dyn gpui::Action>)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        })
+                        .flatten()
+                } else if !self.shell_touch_committed && !self.shell_touch_was_multi {
+                    let contact = self.shell_touches.get(&event.id).expect("touch exists");
+                    let dx = (contact.position.x - contact.start.x).as_f32();
+                    let dy = (contact.position.y - contact.start.y).as_f32();
+                    if self.dashboard.deal_mode()
+                        && -dy >= SHELL_SWIPE_DISTANCE.as_f32()
+                        && -dy >= dx.abs() * 1.25
+                    {
+                        Some(Box::new(DashboardDealNext) as Box<dyn gpui::Action>)
+                    } else if !self.dashboard.deal_mode()
+                        && dx.abs() >= SHELL_SWIPE_DISTANCE.as_f32()
+                        && dx.abs() >= dy.abs() * 1.25
+                    {
+                        Some(if dx < 0. {
+                            Box::new(RoomStripLeft) as Box<dyn gpui::Action>
+                        } else {
+                            Box::new(RoomStripRight) as Box<dyn gpui::Action>
+                        })
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(action) = action {
+                    self.shell_touch_committed = true;
+                    window.dispatch_action(action, cx);
+                }
+                if self.shell_touch_committed || self.shell_touch_was_multi {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                }
+            }
+            TouchPhase::Ended | TouchPhase::Cancelled => {
+                if !self.shell_touches.contains_key(&event.id) {
+                    return;
+                }
+                if self.shell_touch_committed || self.shell_touch_was_multi {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                }
+                self.shell_touches.remove(&event.id);
+                if self.shell_touches.is_empty() {
+                    self.shell_touch_was_multi = false;
+                    self.shell_touch_committed = false;
+                }
+            }
+        }
+    }
+
+    fn render_deal_touch_controls(&self, cx: &App) -> Option<gpui::AnyElement> {
+        self.dashboard.deal_mode().then(|| {
+            let colors = cx.theme().colors();
+            let button = |id: &'static str, label: &'static str, action: Box<dyn gpui::Action>| {
+                div()
+                    .id(id)
+                    .h(px(44.))
+                    .min_w(px(72.))
+                    .px(px(12.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_md()
+                    .bg(colors.element_background)
+                    .border_1()
+                    .border_color(colors.border)
+                    .on_click(move |_, window, cx| window.dispatch_action(action.boxed_clone(), cx))
+                    .child(label)
+            };
+            div()
+                .absolute()
+                .inset_0()
+                .child(div().absolute().top(px(36.)).right(px(18.)).child(button(
+                    "close",
+                    "close",
+                    Box::new(DashboardDealExit),
+                )))
+                .child(
+                    div()
+                        .absolute()
+                        .bottom(px(36.))
+                        .left_0()
+                        .right_0()
+                        .flex()
+                        .flex_row()
+                        .flex_wrap()
+                        .justify_center()
+                        .px(px(8.))
+                        .gap(px(8.))
+                        .child(button("skip", "skip", Box::new(DashboardDealNext)))
+                        .child(button("done", "done", Box::new(DashboardDealDone)))
+                        .child(button("dismiss", "dismiss", Box::new(DashboardDealDiscard)))
+                        .child(button("defer", "defer", Box::new(DashboardDealSnooze)))
+                        .child(button("open", "open", Box::new(DashboardDealReply)))
+                        .child(button("file", "file", Box::new(DashboardDealInsert))),
+                )
+                .into_any_element()
+        })
+    }
+
+    fn dismiss_mru_overlay(&mut self, cx: &mut Context<Self>) {
+        let Some(overlay) = self.mru_overlay.take() else {
+            return;
+        };
+        self.mru_overlay_task = None;
+        let Some(current) = self.current_room.clone() else {
+            return;
+        };
+        let mut mru = overlay.room_candidates[..overlay.room_index]
+            .iter()
+            .rev()
+            .cloned()
+            .collect::<Vec<_>>();
+        mru.push(overlay.origin);
+        mru.extend(
+            overlay
+                .room_candidates
+                .into_iter()
+                .skip(overlay.room_index + 1),
+        );
+        mru.retain(|room| room != &current);
+        self.room_mru = mru;
+        cx.notify();
+    }
+
+    fn step_room_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(origin) = self.current_room.clone() else {
+            return;
+        };
+        if self.mru_overlay.is_none() {
+            if self.room_mru.is_empty() {
+                return;
+            }
+            self.mru_overlay = Some(MruOverlay {
+                origin,
+                room_candidates: self.room_mru.clone(),
+                room_index: 0,
+            });
+        } else if let Some(overlay) = &mut self.mru_overlay {
+            if overlay.room_index + 1 >= overlay.room_candidates.len() {
+                return;
+            }
+            overlay.room_index += 1;
+        }
+        let overlay = self.mru_overlay.as_ref().expect("MRU overlay exists");
+        let target = overlay.room_candidates[overlay.room_index].clone();
+        let depth = overlay.room_index + 1;
+        let from = self
+            .current_room
+            .replace(target.clone())
+            .expect("room exists");
+        self.overview_open = false;
+        if let Some(key) = self.room_focus.get(&target)
+            && let Some(warm) = self
+                .room_strips
+                .get(&target)
+                .and_then(|strip| strip.iter().find(|warm| &warm.surface.key == key))
+                .cloned()
+        {
+            self.active_context = warm.context;
+            self.display_surface(warm.surface);
+            self.focus_active_surface(window, cx);
+        }
+        crate::journal::record(crate::journal::Event::MruStepped {
+            from_room: self.room_names.get(&from).cloned().unwrap_or_default(),
+            to_room: self.room_names.get(&target).cloned().unwrap_or_default(),
+            depth,
+        });
+        crate::journal::record(crate::journal::Event::RoomSwitched {
+            room: self.room_names.get(&target).cloned().unwrap_or_default(),
+            method: crate::journal::RoomSwitchMethod::Mru,
+        });
+        self.invalidate_dealer_signals(cx);
+        self.mru_overlay_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(700))
+                .await;
+            let _ = this.update(cx, |this, cx| this.dismiss_mru_overlay(cx));
+        }));
+        cx.notify();
+    }
+
+    fn journal_card_identity(
+        identity: &crate::dashboard::DealCardIdentity,
+    ) -> crate::journal::DealerCardIdentity {
+        match identity {
+            crate::dashboard::DealCardIdentity::Desk {
+                host,
+                heading_offset,
+            } => crate::journal::DealerCardIdentity::Desk {
+                host: host.to_string(),
+                heading_offset: *heading_offset,
+            },
+            crate::dashboard::DealCardIdentity::Agent(agent_id) => {
+                crate::journal::DealerCardIdentity::Agent {
+                    agent_id: agent_id.encoded(),
+                }
+            }
+            crate::dashboard::DealCardIdentity::Inbox(id) => {
+                crate::journal::DealerCardIdentity::Inbox { id: id.clone() }
+            }
+        }
+    }
+
+    fn invalidate_dealer_signals(&mut self, cx: &mut Context<Self>) {
+        if self.dealer_signal_eval_scheduled {
+            return;
+        }
+        self.dealer_signal_eval_scheduled = true;
+        cx.spawn(async move |this, cx| {
+            let _ = this.update(cx, |this, cx| {
+                this.dealer_signal_eval_scheduled = false;
+                this.evaluate_dealer_signals(cx);
+            });
+        })
+        .detach();
+    }
+
+    fn evaluate_dealer_signals(&mut self, cx: &mut Context<Self>) {
+        let now = chrono::Local::now().fixed_offset();
+        let current_room = self
+            .current_room
+            .as_ref()
+            .and_then(|room| Some((room.host, self.room_names.get(room)?.as_str())));
+        let hand = self.dashboard.dealer_hand(
+            &self.registry,
+            &self.inbox,
+            now,
+            current_room,
+            &self.agent_last_interaction,
+            cx,
+        );
+        let top = hand.cards.first();
+        let max_priority = top.map(|card| card.priority);
+        let card = top.map(|card| Self::journal_card_identity(&card.identity));
+        let lamp_on =
+            max_priority.is_some_and(|priority| priority >= crate::dashboard::LAMP_THRESHOLD);
+        if lamp_on != self.lamp_on {
+            self.lamp_on = lamp_on;
+            crate::journal::record(crate::journal::Event::LampTransition {
+                state: if lamp_on {
+                    crate::journal::SignalState::On
+                } else {
+                    crate::journal::SignalState::Off
+                },
+                hand_max_priority: max_priority,
+                card: card.clone(),
+            });
+            cx.notify();
+        }
+        let chime_above =
+            max_priority.is_some_and(|priority| priority >= crate::dashboard::CHIME_THRESHOLD);
+        if chime_above && !self.chime_above_threshold {
+            if let (Some(priority), Some(card)) = (max_priority, card) {
+                #[cfg(feature = "native")]
+                if !cfg!(test) {
+                    self.chime.play();
+                }
+                crate::journal::record(crate::journal::Event::ChimeRing {
+                    hand_max_priority: priority,
+                    card,
+                });
+            }
+        }
+        self.chime_above_threshold = chime_above;
+    }
+
+    fn mark_agent_prompt_sent(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
+        let sent_at = now_ms();
+        let mut facts = self.registry.agent_facts(agent_id);
+        // Optimistically retire the completed card. The user's own reply must
+        // never become the action that chimes back at them while daemon state
+        // is making its round trip.
+        facts.last_user_message_at = rho_core::UnixMs(sent_at);
+        self.registry.set_agent_facts(agent_id, facts);
+        self.agent_last_interaction.insert(agent_id, sent_at as i64);
+        self.invalidate_dealer_signals(cx);
     }
 
     fn context_for_agent(&self, agent_id: AgentId) -> ContextId {
         ContextId::Agent(agent_id)
     }
 
-    /// Drops trees for tasks that no longer exist; their views (and any
+    /// Drops contexts for tasks that no longer exist; their views (and any
     /// workspace file channels behind them) release with them.
     fn prune_contexts(&mut self) {
         let live = self
@@ -1337,44 +1927,16 @@ impl Workspace {
                 facts,
             } => {
                 self.registry.set_agent_facts(agent_id, facts);
-                // Chime on the rising edge into the user's court only when
-                // the agent is blocked or a needs-you report is already in
-                // hand (snooze expiry resurfacing a classified turn); a
-                // plain turn end waits for its report, which decides between
-                // a needs-you chime and a silent FYI. Never for the agent
-                // already on screen, whose turn end the user is watching.
-                let before = self.apply_attention(agent_id, attention);
-                let needs_you = attention >= rho_ui_proto::UiAttention::NeedsInput
-                    || self
-                        .registry
-                        .agent_turn_report(agent_id)
-                        .is_some_and(|report| report.needs_you);
-                if attention >= rho_ui_proto::UiAttention::Pending
-                    && before < rho_ui_proto::UiAttention::Pending
-                    && needs_you
-                    && self.registry.selected_agent() != Some(&agent_id)
-                    && !self.dashboard.agent_archived(&self.registry, agent_id)
-                {
-                    #[cfg(feature = "native")]
-                    self.chime.play();
-                }
+                self.apply_attention(agent_id, attention);
+                self.invalidate_dealer_signals(cx);
                 cx.notify();
             }
             ConnEvent::AgentTurnReport { agent_id, report } => {
                 let mut facts = self.registry.agent_facts(agent_id);
                 facts.needs_you_hint = report.needs_you;
                 self.registry.set_agent_facts(agent_id, facts);
-                // The attention gate keeps snoozed agents silent: their
-                // reports arrive while attention is Quiet and surface only
-                // at snooze expiry.
-                let needs_you = self.apply_turn_report(agent_id, report);
-                if needs_you
-                    && self.registry.attention(agent_id) >= rho_ui_proto::UiAttention::Pending
-                    && self.registry.selected_agent() != Some(&agent_id)
-                {
-                    #[cfg(feature = "native")]
-                    self.chime.play();
-                }
+                self.apply_turn_report(agent_id, report);
+                self.invalidate_dealer_signals(cx);
                 cx.notify();
             }
             ConnEvent::ChatGptUsage {
@@ -1725,15 +2287,12 @@ impl Workspace {
     }
 
     fn submit_prompt(&mut self, _: &SubmitPrompt, window: &mut Window, cx: &mut Context<Self>) {
-        if let SurfaceView::Shell { model, .. } = &self.active_tree().focused().surface.view {
+        if let SurfaceView::Shell { model, .. } = &self.active_pane().surface.view {
             model.clone().update(cx, |model, cx| model.submit(cx));
             return;
         }
         #[cfg(feature = "native")]
-        if matches!(
-            self.active_tree().focused().surface.view,
-            SurfaceView::ZulipNarrow(_)
-        ) {
+        if matches!(self.active_pane().surface.view, SurfaceView::ZulipNarrow(_)) {
             self.zulip_submit(cx);
             return;
         }
@@ -1752,7 +2311,7 @@ impl Workspace {
     }
 
     fn shell_interrupt(&mut self, _: &ShellInterrupt, _: &mut Window, cx: &mut Context<Self>) {
-        if let SurfaceView::Shell { model, .. } = &self.active_tree().focused().surface.view {
+        if let SurfaceView::Shell { model, .. } = &self.active_pane().surface.view {
             model.clone().update(cx, |model, _| model.interrupt());
         }
     }
@@ -1961,7 +2520,7 @@ impl Workspace {
                 let hooks = Self::zulip_hooks();
                 let view =
                     cx.new(|cx| rho_zulip::ui::NarrowView::new(session, narrow, hooks, window, cx));
-                Self::wrap_surface(key, SurfaceView::ZulipNarrow(view), window, cx)
+                Self::wrap_surface(key, SurfaceView::ZulipNarrow(view))
             }
         };
         self.display_surface(surface);
@@ -1972,7 +2531,7 @@ impl Workspace {
     /// Marks the conversation on screen read, if one is.
     #[cfg(feature = "native")]
     fn leave_zulip_narrow(&mut self, cx: &mut Context<Self>) {
-        if let SurfaceView::ZulipNarrow(view) = &self.active_tree().focused().surface.view {
+        if let SurfaceView::ZulipNarrow(view) = &self.active_pane().surface.view {
             view.clone().update(cx, |view, cx| view.mark_read(cx));
         }
     }
@@ -1981,7 +2540,7 @@ impl Workspace {
     /// cursor.
     #[cfg(feature = "native")]
     fn zulip_open_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let SurfaceView::ZulipInbox(view) = &self.active_tree().focused().surface.view else {
+        let SurfaceView::ZulipInbox(view) = &self.active_pane().surface.view else {
             return;
         };
         let Some(narrow) = view.clone().update(cx, |view, cx| view.cursor_narrow(cx)) else {
@@ -1998,7 +2557,7 @@ impl Workspace {
         let Some(session) = self.zulip.clone() else {
             return;
         };
-        let current = match &self.active_tree().focused().surface.view {
+        let current = match &self.active_pane().surface.view {
             SurfaceView::ZulipNarrow(view) => Some(view.read(cx).narrow().clone()),
             _ => None,
         };
@@ -2024,7 +2583,7 @@ impl Workspace {
     /// `P`: page further back in the conversation on screen.
     #[cfg(feature = "native")]
     fn zulip_load_older(&mut self, cx: &mut Context<Self>) {
-        if let SurfaceView::ZulipNarrow(view) = &self.active_tree().focused().surface.view {
+        if let SurfaceView::ZulipNarrow(view) = &self.active_pane().surface.view {
             view.clone().update(cx, |view, cx| view.load_older(cx));
         }
     }
@@ -2032,13 +2591,13 @@ impl Workspace {
     /// `enter` in a Zulip conversation: send the composed message.
     #[cfg(feature = "native")]
     fn zulip_submit(&mut self, cx: &mut Context<Self>) {
-        if let SurfaceView::ZulipNarrow(view) = &self.active_tree().focused().surface.view {
+        if let SurfaceView::ZulipNarrow(view) = &self.active_pane().surface.view {
             view.clone().update(cx, |view, cx| view.submit(cx));
         }
     }
 
     fn shell_eof(&mut self, _: &ShellEof, _: &mut Window, cx: &mut Context<Self>) {
-        if let SurfaceView::Shell { model, .. } = &self.active_tree().focused().surface.view {
+        if let SurfaceView::Shell { model, .. } = &self.active_pane().surface.view {
             model.clone().update(cx, |model, cx| model.eof(cx));
         }
     }
@@ -2048,7 +2607,7 @@ impl Workspace {
         action: rho_ui_proto::shell::PagerAction,
         cx: &mut Context<Self>,
     ) {
-        if let SurfaceView::Shell { model, .. } = &self.active_tree().focused().surface.view {
+        if let SurfaceView::Shell { model, .. } = &self.active_pane().surface.view {
             model.update(cx, |model, _| model.pager_action(action));
         }
     }
@@ -2079,6 +2638,7 @@ impl Workspace {
         // Engagement bump: keeps display-time staleness correct between
         // topic refreshes (the daemon persists the same timestamp).
         self.registry.touch_agent(agent_id);
+        self.mark_agent_prompt_sent(agent_id, cx);
         cx.notify();
     }
 
@@ -2159,7 +2719,7 @@ impl Workspace {
         };
         let dashboard_mode = self.dashboard_mode(window, cx);
         let pane_prompt = matches!(
-            self.active_tree().focused().surface.view,
+            self.active_pane().surface.view,
             SurfaceView::Draft { .. } | SurfaceView::Transcript { .. }
         );
         let images = item
@@ -2196,7 +2756,7 @@ impl Workspace {
                     continue;
                 }
             };
-            let added = match &self.active_tree().focused().surface.view {
+            let added = match &self.active_pane().surface.view {
                 SurfaceView::Draft { .. } => {
                     self.draft_model.update(cx, |model, cx| {
                         model.add_image(media_type.to_owned(), image.bytes.clone(), cx)
@@ -2226,7 +2786,7 @@ impl Workspace {
         let cleared = if self.dashboard_mode(window, cx) {
             false
         } else {
-            match &self.active_tree().focused().surface.view {
+            match &self.active_pane().surface.view {
                 SurfaceView::Draft { .. } => self
                     .draft_model
                     .update(cx, |model, cx| model.clear_attachments(cx)),
@@ -2770,6 +3330,17 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(room) = self.dashboard.room_for_page(id, cx) {
+            self.remember_room(
+                room,
+                if self.overview_open {
+                    crate::journal::RoomSwitchMethod::Overview
+                } else {
+                    crate::journal::RoomSwitchMethod::Open
+                },
+                cx,
+            );
+        }
         let Some(model) = rho_browser::open_page(id, cx) else {
             let message = format!("browser page not found: {id}");
             self.notice_on(None, &message, StyleClass::SystemInfo, cx);
@@ -2777,12 +3348,7 @@ impl Workspace {
         };
         self.scan_browser_pages_for_gc(cx);
         let view = cx.new(|cx| rho_browser::PageView::new(model, id, cx));
-        let surface = Self::wrap_surface(
-            SurfaceKey::Browser(id),
-            SurfaceView::Browser(view),
-            window,
-            cx,
-        );
+        let surface = Self::wrap_surface(SurfaceKey::Browser(id), SurfaceView::Browser(view));
         self.display_surface(surface);
         self.focus_active_surface(window, cx);
         cx.notify();
@@ -2790,19 +3356,10 @@ impl Workspace {
 
     #[cfg(feature = "native")]
     pub fn cmd_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dashboard.cursor_topic(cx).is_none() {
-            self.notice_on(
-                None,
-                "new web: choose a Desk heading",
-                StyleClass::SystemInfo,
-                cx,
-            );
-            return;
-        }
         let on_submit = std::rc::Rc::new(
             |workspace: &mut Workspace,
              input: String,
-             _window: &mut Window,
+             window: &mut Window,
              cx: &mut Context<Workspace>| {
                 let input = input.trim();
                 if input.is_empty() {
@@ -2813,7 +3370,7 @@ impl Workspace {
                 } else {
                     format!("https://{input}")
                 };
-                workspace.create_browser_page(url, cx);
+                workspace.create_browser_page(url, window, cx);
             },
         );
         self.open_prompt(
@@ -2836,7 +3393,8 @@ impl Workspace {
     }
 
     #[cfg(feature = "native")]
-    fn create_browser_page(&mut self, url: String, cx: &mut Context<Self>) {
+    fn create_browser_page(&mut self, url: String, window: &Window, cx: &mut Context<Self>) {
+        let context = self.capture_context(window, cx);
         let create = rho_browser::create_page(url, cx);
         cx.spawn(async move |this, cx| {
             let record = create.await;
@@ -2851,23 +3409,270 @@ impl Workspace {
                     }
                 };
                 let id = record.id;
-                let tag = id.to_string();
-                if !this.dashboard.tag_cursor_heading_with_page(&tag, cx) {
-                    rho_browser::close_page(id, cx).detach();
-                    this.notice_on(
-                        None,
-                        "new web: heading disappeared",
-                        StyleClass::SystemInfo,
-                        cx,
-                    );
-                    return;
-                }
-                this.refresh_dashboard(window, cx);
+                let inbox_id = match this.inbox.append(InboxDraft {
+                    kind: InboxKind::Capture,
+                    text: record.launch_url,
+                    source: SourceReference::Page { id: id.to_string() },
+                    context,
+                    waiting_on: None,
+                }) {
+                    Ok(inbox_id) => inbox_id,
+                    Err(error) => {
+                        tracing::error!(%error, "persisting new browser page in inbox");
+                        rho_browser::close_page(id, cx).detach();
+                        this.notice_on(
+                            None,
+                            "new web: could not save inbox item",
+                            StyleClass::SystemInfo,
+                            cx,
+                        );
+                        return;
+                    }
+                };
+                crate::journal::record(crate::journal::Event::Capture {
+                    inbox_id: inbox_id.0,
+                    method: crate::journal::CaptureMethod::TabBirth,
+                });
+                this.invalidate_dealer_signals(cx);
                 this.preview_browser_page(id, window, cx);
                 this.focus_rail(window, cx);
+                this.notice_on(None, "captured in inbox", StyleClass::SystemInfo, cx);
             });
         })
         .detach();
+    }
+
+    fn capture_context(&self, window: &Window, cx: &mut Context<Self>) -> CapturedContext {
+        let position = self.dashboard.capture_position(cx);
+        let host = position.as_ref().map(|(host, ..)| host.to_string());
+        let room = position.map(|(_, _, room)| room);
+        let focused_surface = if self.dashboard.is_focused(window, cx) {
+            "Desk".to_owned()
+        } else {
+            self.surface_name(&self.active_pane().surface.key)
+        };
+        CapturedContext {
+            host,
+            room,
+            focused_surface,
+        }
+    }
+
+    pub(crate) fn cmd_capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let context = self.capture_context(window, cx);
+        let source = self.dashboard.capture_position(cx).map_or(
+            SourceReference::None,
+            |(host, offset, _)| SourceReference::DeskPosition {
+                host: host.to_string(),
+                offset,
+            },
+        );
+        self.open_prompt(
+            "capture:",
+            std::rc::Rc::new(|_, _, _| Vec::new()),
+            std::rc::Rc::new(move |workspace, input, _, cx| {
+                let text = input.trim();
+                if text.is_empty() {
+                    return;
+                }
+                match workspace.inbox.append(InboxDraft {
+                    kind: InboxKind::Capture,
+                    text: text.to_owned(),
+                    source: source.clone(),
+                    context: context.clone(),
+                    waiting_on: None,
+                }) {
+                    Ok(id) => {
+                        crate::journal::record(crate::journal::Event::Capture {
+                            inbox_id: id.0,
+                            method: crate::journal::CaptureMethod::Keyboard,
+                        });
+                        workspace.invalidate_dealer_signals(cx);
+                        workspace.notice_on(None, "captured", StyleClass::SystemInfo, cx)
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "persisting inbox capture");
+                        workspace.notice_on(None, "capture failed", StyleClass::SystemInfo, cx);
+                    }
+                }
+            }),
+            window,
+            cx,
+        );
+    }
+
+    /// Opens the machine-owned inbox as a completing list. Selecting a row
+    /// opens a two-key membrane: `f` files, `d` discards.
+    pub(crate) fn open_inbox(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        if let Err(error) = self.inbox.refresh_deferred(now_ms) {
+            tracing::warn!(%error, "resurfacing deferred inbox items");
+        }
+        self.invalidate_dealer_signals(cx);
+        if self.inbox.pending_items(now_ms).next().is_none() {
+            self.notice_on(None, "inbox empty", StyleClass::SystemInfo, cx);
+            self.drop_transient();
+            return;
+        }
+        self.open_prompt(
+            "inbox:",
+            std::rc::Rc::new(|workspace, needle, _| {
+                let needle = needle.to_lowercase();
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                workspace
+                    .inbox
+                    .pending_items(now_ms)
+                    .filter(|item| item.text.to_lowercase().contains(&needle))
+                    .map(|item| crate::minibuffer::Candidate {
+                        value: item.text.clone(),
+                        description: format!(
+                            "{:?} · {}",
+                            item.kind,
+                            item.context.room.as_deref().unwrap_or("no room")
+                        ),
+                    })
+                    .collect()
+            }),
+            std::rc::Rc::new(|workspace, input, window, cx| {
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let Some(item) = workspace
+                    .inbox
+                    .pending_items(now_ms)
+                    .find(|item| item.text == input)
+                    .cloned()
+                else {
+                    workspace.notice_on(None, "inbox: choose an item", StyleClass::SystemInfo, cx);
+                    return;
+                };
+                workspace.pending_inbox_item = Some(item.id);
+                workspace.open_transient(crate::transient::inbox_item_menu(), window, cx);
+            }),
+            window,
+            cx,
+        );
+    }
+
+    pub(crate) fn discard_inbox_item(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.pending_inbox_item.take() else {
+            return;
+        };
+        match self.inbox.verdict(&id, Verdict::Discarded) {
+            Ok(_) => {
+                crate::journal::record(crate::journal::Event::InboxVerdict {
+                    inbox_id: id.0,
+                    verdict: crate::journal::InboxVerdict::Discard,
+                });
+                self.notice_on(None, "discarded", StyleClass::SystemInfo, cx);
+                self.invalidate_dealer_signals(cx);
+            }
+            Err(error) => tracing::error!(%error, "discarding inbox item"),
+        }
+        self.drop_transient();
+        #[cfg(feature = "native")]
+        self.scan_browser_pages_for_gc(cx);
+    }
+
+    pub(crate) fn defer_inbox_item(&mut self, cx: &mut Context<Self>) {
+        let Some(id) = self.pending_inbox_item.take() else {
+            return;
+        };
+        let until_ms = (chrono::Utc::now() + chrono::Duration::days(1)).timestamp_millis();
+        match self.inbox.verdict(&id, Verdict::Deferred { until_ms }) {
+            Ok(_) => {
+                crate::journal::record(crate::journal::Event::InboxVerdict {
+                    inbox_id: id.0,
+                    verdict: crate::journal::InboxVerdict::Defer { until_ms },
+                });
+                self.notice_on(None, "deferred one day", StyleClass::SystemInfo, cx);
+                self.invalidate_dealer_signals(cx);
+            }
+            Err(error) => tracing::error!(%error, "deferring inbox item"),
+        }
+        self.drop_transient();
+    }
+
+    pub(crate) fn prompt_file_inbox_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.pending_inbox_item.is_none() {
+            return;
+        }
+        self.open_prompt(
+            "file under:",
+            std::rc::Rc::new(|workspace, needle, cx| {
+                workspace
+                    .dashboard
+                    .heading_candidates(&workspace.registry, needle, cx)
+                    .into_iter()
+                    .map(|(value, description)| crate::minibuffer::Candidate { value, description })
+                    .collect()
+            }),
+            std::rc::Rc::new(|workspace, heading, window, cx| {
+                workspace.file_inbox_item(&heading, window, cx)
+            }),
+            window,
+            cx,
+        );
+    }
+
+    /// Dealer-facing filing handoff. Destination completion and the eventual
+    /// Desk edit remain owned by the inbox filing membrane.
+    pub fn begin_inbox_filing(
+        &mut self,
+        id: &InboxId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Result<(), String> {
+        if self.inbox.get(id).is_none() {
+            return Err(format!("inbox item {} no longer exists", id.0));
+        }
+        self.pending_inbox_item = Some(id.clone());
+        self.prompt_file_inbox_item(window, cx);
+        Ok(())
+    }
+
+    fn file_inbox_item(&mut self, heading: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(id) = self.pending_inbox_item.clone() else {
+            return;
+        };
+        let Some(item) = self.inbox.get(&id).cloned() else {
+            return;
+        };
+        let filed = match &item.source {
+            SourceReference::Page { id } => self.file_inbox_page(heading, id, cx),
+            _ => self.dashboard.append_child_heading(heading, &item.text, cx),
+        };
+        if !filed {
+            self.notice_on(None, "file: heading not found", StyleClass::SystemInfo, cx);
+            return;
+        }
+        if let Err(error) = self.inbox.verdict(&id, Verdict::Filed) {
+            tracing::error!(%error, "retiring filed inbox item");
+            self.notice_on(
+                None,
+                "filed, but inbox persistence failed",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        }
+        crate::journal::record(crate::journal::Event::InboxVerdict {
+            inbox_id: id.0.clone(),
+            verdict: crate::journal::InboxVerdict::File {
+                heading: heading.to_owned(),
+            },
+        });
+        self.pending_inbox_item = None;
+        self.refresh_dashboard(window, cx);
+        self.notice_on(None, "filed", StyleClass::SystemInfo, cx);
+    }
+
+    #[cfg(feature = "native")]
+    fn file_inbox_page(&mut self, heading: &str, id: &str, cx: &mut Context<Self>) -> bool {
+        self.dashboard.tag_heading_with_page(heading, id, cx)
+    }
+
+    #[cfg(not(feature = "native"))]
+    fn file_inbox_page(&mut self, _heading: &str, _id: &str, _cx: &mut Context<Self>) -> bool {
+        false
     }
 
     pub(crate) fn cmd_diff(&mut self, window: &Window, cx: &mut Context<Self>) {
@@ -3287,23 +4092,20 @@ impl Workspace {
     }
 
     /// Applies the subscription LRU's eviction to client-side editor state.
-    /// Pane-visible transcripts stay pinned; dashboard previews, pane history,
+    /// Visible transcripts stay pinned; dashboard previews, viewport history,
     /// and hidden transcript surfaces are cache and can be rebuilt lazily.
     fn release_agent_view_cache(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
         if let Some(model) = self.models.get(&agent_id).cloned() {
             model.update(cx, |model, _| model.clear_preview_editor());
         }
 
-        for tree in self.contexts.values_mut() {
-            tree.for_each_pane_mut(&mut |pane| {
-                pane.purge_history(|surface| surface.key == SurfaceKey::Transcript(agent_id));
-            });
+        for pane in self.contexts.values_mut() {
+            pane.purge_history(|surface| surface.key == SurfaceKey::Transcript(agent_id));
         }
-        let shown = self.contexts.values().any(|tree| {
-            tree.panes()
-                .iter()
-                .any(|pane| pane.surface.key == SurfaceKey::Transcript(agent_id))
-        });
+        let shown = self
+            .contexts
+            .values()
+            .any(|pane| pane.surface.key == SurfaceKey::Transcript(agent_id));
         if shown {
             return;
         }
@@ -3318,6 +4120,20 @@ impl Workspace {
     }
 
     pub fn open_agent(&mut self, agent_id: AgentId, window: &mut Window, cx: &mut Context<Self>) {
+        crate::journal::record(crate::journal::Event::AgentOpened {
+            agent_id: agent_id.encoded(),
+        });
+        if let Some(room) = self.room_for_agent(agent_id, cx) {
+            self.remember_room(
+                room,
+                if self.overview_open {
+                    crate::journal::RoomSwitchMethod::Overview
+                } else {
+                    crate::journal::RoomSwitchMethod::Open
+                },
+                cx,
+            );
+        }
         if self.agent_online(agent_id) && !self.subscriptions.contains(agent_id) {
             self.subscribe_agent(agent_id, cx);
         }
@@ -3433,6 +4249,7 @@ impl Workspace {
                     .expect_attention(agent_id, rho_ui_proto::UiAttention::Quiet);
             }
         }
+        self.invalidate_dealer_signals(cx);
         cx.notify();
         true
     }
@@ -3682,6 +4499,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.overview_open = false;
         self.select_agent_inner(agent_id, true, window, cx);
     }
 
@@ -3744,6 +4562,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        crate::journal::record(crate::journal::Event::AgentSelected {
+            agent_id: agent_id.map(|id| id.encoded()),
+        });
         if self.connected()
             && let Some(agent_id) = agent_id
         {
@@ -3784,7 +4605,7 @@ impl Workspace {
     /// The dashboard cursor moved: preview the row it landed on, and hide
     /// the preview when the cursor leaves every staffed region. Only
     /// while the dashboard owns the keyboard — programmatic cursor
-    /// restoration and unfocused syncs never drive the panes.
+    /// restoration and unfocused syncs never drive the visible surface.
     fn dashboard_cursor_moved(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use crate::dashboard::RowTarget;
         if !self.dashboard.focus_handle(cx).is_focused(window) {
@@ -3842,7 +4663,7 @@ impl Workspace {
     }
 
     /// The active context's surface with the given key, whether or not
-    /// any pane currently displays it.
+    /// the viewport currently displays it.
     fn find_surface(&self, pred: impl Fn(&Surface) -> bool) -> Option<&Surface> {
         self.surfaces
             .get(&self.active_context)?
@@ -3928,8 +4749,7 @@ impl Workspace {
         matches.next().is_none().then_some(first)
     }
 
-    /// Shows the named surface in the focused pane (or focuses a pane
-    /// already showing it).
+    /// Shows the named surface in the context's viewport.
     fn switch_buffer(&mut self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(surface) = self.surface_named(name).cloned() else {
             self.notice_on(
@@ -3975,8 +4795,8 @@ impl Workspace {
         self.open_prompt("buffer:", complete, on_submit, window, cx);
     }
 
-    /// Removes a surface from the context. Panes showing it fall back to
-    /// their own history, then to the list's most recent conversation
+    /// Removes a surface from the context. The viewport falls back to its
+    /// history, then to the list's most recent conversation
     /// surface. Dropping a terminal's last view detaches its wire client
     /// (the daemon keeps the pty; reopening the terminal reattaches).
     pub(crate) fn close_surface(
@@ -3998,7 +4818,7 @@ impl Workspace {
                     return;
                 }
             },
-            None => self.active_tree().focused().surface.key.clone(),
+            None => self.active_pane().surface.key.clone(),
         };
         let Some(list) = self.surfaces.get_mut(&self.active_context) else {
             return;
@@ -4025,40 +4845,10 @@ impl Workspace {
             .cloned()
             .expect("list retains at least one surface");
 
-        // Replace the closed surface everywhere it is shown, preferring
-        // each pane's own history; only the first history-less pane may
-        // take the list's surface directly (a view renders in one pane).
-        let mut orphaned = Vec::new();
-        self.active_tree_mut().for_each_pane_mut(&mut |pane| {
-            pane.purge_history(|surface| surface.key == key);
-            if pane.surface.key == key {
-                orphaned.push(pane.id);
-            }
-        });
-        // A view renders in one pane: the list's surface may go to one
-        // orphan (and only when no pane shows it already), the rest get
-        // fresh views.
-        let mut fallback_used = self
-            .active_tree()
-            .pane_showing(|s| s.key == fallback.key)
-            .is_some();
-        for pane_id in orphaned {
-            let went_back = self
-                .active_tree_mut()
-                .pane_mut(pane_id)
-                .is_some_and(|pane| pane.back());
-            if went_back {
-                continue;
-            }
-            let replacement = if fallback_used {
-                self.duplicate_surface(fallback.clone(), window, cx)
-            } else {
-                fallback_used = true;
-                fallback.clone()
-            };
-            if let Some(pane) = self.active_tree_mut().pane_mut(pane_id) {
-                pane.surface = replacement;
-            }
+        let pane = self.active_pane_mut();
+        pane.purge_history(|surface| surface.key == key);
+        if pane.surface.key == key && !pane.back() {
+            pane.surface = fallback;
         }
         self.sync_selection_to_focus(cx);
         self.focus_active_surface(window, cx);
@@ -4070,13 +4860,127 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Emacs `display-buffer`: the one place pane choice happens. The
+    fn journal_surface(key: &SurfaceKey) -> crate::journal::SurfaceIdentity {
+        use crate::journal::SurfaceIdentity;
+        match key {
+            SurfaceKey::Draft => SurfaceIdentity::Draft,
+            SurfaceKey::Transcript(agent_id) => SurfaceIdentity::Transcript {
+                agent_id: agent_id.encoded(),
+            },
+            SurfaceKey::File { agent_id, path } => SurfaceIdentity::File {
+                agent_id: agent_id.encoded(),
+                path: path.to_string(),
+            },
+            SurfaceKey::Shell(agent_id) => SurfaceIdentity::Shell {
+                agent_id: agent_id.encoded(),
+            },
+            SurfaceKey::Diff { agent_id } => SurfaceIdentity::Diff {
+                agent_id: agent_id.encoded(),
+            },
+            SurfaceKey::Terminal {
+                agent_id,
+                terminal_id,
+            } => SurfaceIdentity::Terminal {
+                agent_id: agent_id.encoded(),
+                terminal_id: *terminal_id,
+            },
+            #[cfg(feature = "native")]
+            SurfaceKey::Browser(page_id) => SurfaceIdentity::Browser {
+                page_id: page_id.to_string(),
+            },
+            SurfaceKey::ZulipInbox => SurfaceIdentity::ZulipInbox,
+            SurfaceKey::ZulipNarrow { label } => SurfaceIdentity::ZulipNarrow {
+                label: label.clone(),
+            },
+        }
+    }
+
+    fn journal_scroll(
+        &mut self,
+        event: &gpui::ScrollWheelEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if matches!(
+            event.touch_phase,
+            gpui::TouchPhase::Ended | gpui::TouchPhase::Cancelled
+        ) {
+            self.horizontal_strip_gesture_active = false;
+        } else if event.delta.precise() && !self.horizontal_strip_gesture_active {
+            // Focused children consume horizontal motion while they can
+            // scroll it. Only their edge spill bubbles to this strip seam.
+            let delta = event.delta.pixel_delta(px(20.));
+            if delta.x.abs() > delta.y.abs() && delta.x.abs() >= px(12.) {
+                self.horizontal_strip_gesture_active = true;
+                self.slide_room_strip(if delta.x > px(0.) { -1 } else { 1 }, window, cx);
+            }
+        }
+        self.journal_scroll_burst(window, cx);
+    }
+
+    fn journal_linux_scroll(
+        &mut self,
+        _: &gpui::LinuxPointerAxisEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.journal_scroll_burst(window, cx);
+    }
+
+    fn journal_scroll_burst(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let (surface, rough_position) = if self.dashboard_mode(window, cx) {
+            let editor = self.dashboard.editor().clone();
+            (
+                crate::journal::SurfaceIdentity::Dashboard,
+                editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64),
+            )
+        } else {
+            let pane = self.active_pane();
+            let position = match &pane.surface.view {
+                SurfaceView::Draft { editor, .. }
+                | SurfaceView::Transcript { editor, .. }
+                | SurfaceView::Shell { editor, .. } => {
+                    editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
+                }
+                SurfaceView::File(view) => {
+                    let editor = view.read(cx).editor().clone();
+                    editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
+                }
+                SurfaceView::Diff(view) => {
+                    let editor = view.read(cx).editor().clone();
+                    editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
+                }
+                SurfaceView::Terminal(view) => view.read(cx).scroll_offset() as i64,
+                #[cfg(feature = "native")]
+                SurfaceView::Browser(_) => 0,
+                #[cfg(feature = "native")]
+                SurfaceView::ZulipInbox(view) => {
+                    let editor = view.read(cx).editor().clone();
+                    editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
+                }
+                #[cfg(feature = "native")]
+                SurfaceView::ZulipNarrow(view) => {
+                    let editor = view.read(cx).editor().clone();
+                    editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
+                }
+            };
+            (Self::journal_surface(&pane.surface.key), position)
+        };
+        self.scroll_journal_task = Some(cx.spawn(async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(350))
+                .await;
+            crate::journal::record(crate::journal::Event::Scroll {
+                surface,
+                rough_position,
+            });
+        }));
+    }
+
+    /// Emacs `display-buffer`: the one place surface display happens. The
     /// surface joins the context's surface list first, so it stays alive
-    /// however panes shuffle afterwards. A pane already showing it wins
-    /// (the arrangement stays intact and no view is shown twice);
-    /// otherwise the focused pane shows it — never any other split, so
-    /// switching agents only ever changes the pane you're in. Founds the
-    /// context's tree on its first visit.
+    /// while hidden. The context's single viewport shows it, and is founded
+    /// on the context's first visit.
     fn display_surface(&mut self, surface: Surface) {
         use std::collections::hash_map::Entry;
         let list = self.surfaces.entry(self.active_context).or_default();
@@ -4088,21 +4992,25 @@ impl Workspace {
         if self.phone.enabled {
             self.phone.show(self.active_context, surface.key.clone());
         }
-        let tree = match self.contexts.entry(self.active_context) {
+        let shown = match self.contexts.entry(self.active_context) {
             Entry::Vacant(entry) => {
-                entry.insert(PaneTree::new(surface));
-                return;
+                entry.insert(Pane::new(surface.clone()));
+                surface
             }
-            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Occupied(entry) => {
+                let pane = entry.into_mut();
+                pane.show(surface);
+                pane.surface.clone()
+            }
         };
-        if let Some(pane) = tree.pane_showing(|s| s.key == surface.key) {
-            tree.focus(pane);
-        }
-        tree.focused_mut().show(surface);
+        self.touch_room_surface(&shown);
+        crate::journal::record(crate::journal::Event::SurfaceDisplayed {
+            surface: Self::journal_surface(&shown.key),
+        });
     }
 
     /// `:open`: reuses the agent workspace's remote buffer registry and shows
-    /// the file surface in the main pane.
+    /// the file surface in the context's viewport.
     fn open_file_surface(
         &mut self,
         agent_id: AgentId,
@@ -4160,7 +5068,7 @@ impl Workspace {
                 Ok((project, buffer)) => {
                     let _ = this.update_in(cx, |this, window, cx| {
                         let view = cx.new(|cx| FileView::new(project, buffer, window, cx));
-                        let surface = Self::wrap_surface(key, SurfaceView::File(view), window, cx);
+                        let surface = Self::wrap_surface(key, SurfaceView::File(view));
                         this.display_surface(surface);
                         this.focus_active_surface(window, cx);
                         cx.notify();
@@ -4201,12 +5109,7 @@ impl Workspace {
                     let _ = this.update_in(cx, |this, window, cx| {
                         let model = cx.new(|cx| crate::shell_view::ShellModel::new(channel, cx));
                         let editor = model.update(cx, |model, cx| model.build_editor(window, cx));
-                        let surface = Self::wrap_surface(
-                            key,
-                            SurfaceView::Shell { model, editor },
-                            window,
-                            cx,
-                        );
+                        let surface = Self::wrap_surface(key, SurfaceView::Shell { model, editor });
                         this.display_surface(surface);
                         this.focus_active_surface(window, cx);
                         cx.notify();
@@ -4337,7 +5240,7 @@ impl Workspace {
                             )
                         });
                         let view = cx.new(|cx| crate::diff_view::DiffView::new(model, window, cx));
-                        let surface = Self::wrap_surface(key, SurfaceView::Diff(view), window, cx);
+                        let surface = Self::wrap_surface(key, SurfaceView::Diff(view));
                         this.display_surface(surface);
                         this.focus_active_surface(window, cx);
                         cx.notify();
@@ -4388,8 +5291,7 @@ impl Workspace {
                         let model =
                             cx.new(|cx| crate::terminal_view::TerminalModel::new(channel, cx));
                         let view = cx.new(|cx| crate::terminal_view::TerminalView::new(model, cx));
-                        let surface =
-                            Self::wrap_surface(key, SurfaceView::Terminal(view), window, cx);
+                        let surface = Self::wrap_surface(key, SurfaceView::Terminal(view));
                         this.display_surface(surface);
                         this.focus_active_surface(window, cx);
                         cx.notify();
@@ -4560,9 +5462,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.dashboard.cursor_to_doc(host, offset, cx);
-        self.dashboard.sync(&self.registry, window, cx);
+        self.dashboard.sync(&self.registry, &self.inbox, window, cx);
         self.dashboard.toggle_subagents(cx);
-        self.dashboard.sync(&self.registry, window, cx);
+        self.dashboard.sync(&self.registry, &self.inbox, window, cx);
     }
 
     #[cfg(test)]
@@ -4634,8 +5536,11 @@ impl Workspace {
     /// their source. The reconcile is idempotent and cheap, so calling
     /// it from several funnels is fine.
     pub(crate) fn refresh_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Err(error) = self.inbox.refresh_deferred(now_ms() as i64) {
+            tracing::warn!(%error, "waking deferred inbox items");
+        }
         self.dashboard.autofill_titles(&self.registry, cx);
-        self.dashboard.sync(&self.registry, window, cx);
+        self.dashboard.sync(&self.registry, &self.inbox, window, cx);
         #[cfg(feature = "native")]
         {
             let pages = self.dashboard.page_ids();
@@ -4655,6 +5560,7 @@ impl Workspace {
                 self.scan_browser_pages_for_gc(cx);
             }
         }
+        self.invalidate_dealer_signals(cx);
     }
 
     #[cfg(feature = "native")]
@@ -4666,9 +5572,8 @@ impl Workspace {
             let pages = list.await;
             let _ = this.update(cx, |this, cx| match pages {
                 Ok(pages) => {
-                    let retained = this.dashboard.page_ids();
                     for page in pages {
-                        if retained.contains(&page.id) {
+                        if this.browser_page_retained(page.id) {
                             this.browser_page_gc.remove(&page.id);
                         } else {
                             this.schedule_browser_page_gc(page.id, cx);
@@ -4684,14 +5589,14 @@ impl Workspace {
     #[cfg(feature = "native")]
     fn schedule_browser_page_gc(&mut self, page: rho_browser::PageId, cx: &mut Context<Self>) {
         const GRACE: Duration = Duration::from_secs(10 * 60);
-        if self.browser_page_gc.contains_key(&page) || self.dashboard.page_ids().contains(&page) {
+        if self.browser_page_gc.contains_key(&page) || self.browser_page_retained(page) {
             return;
         }
         let gc = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(GRACE).await;
             let _ = this.update(cx, |this, cx| {
                 this.browser_page_gc.remove(&page);
-                if this.dashboard.page_ids().contains(&page) {
+                if this.browser_page_retained(page) {
                     return;
                 }
                 tracing::info!(page_id = %page, "closing unreferenced browser page after grace period");
@@ -4701,6 +5606,14 @@ impl Workspace {
             });
         });
         self.browser_page_gc.insert(page, gc);
+    }
+
+    #[cfg(feature = "native")]
+    fn browser_page_retained(&self, page: rho_browser::PageId) -> bool {
+        self.dashboard.page_ids().contains(&page)
+            || self.inbox.items().iter().any(|item| {
+                matches!(&item.source, SourceReference::Page { id } if id == &page.to_string())
+            })
     }
 
     #[cfg(test)]
@@ -4720,11 +5633,10 @@ impl Workspace {
             .cloned()
     }
 
-    /// The editor the user is typing into: the focused pane's own editor
-    /// (each transcript pane has one). Terminal panes have no editor; the
-    /// draft's stands in for text-style queries.
+    /// The editor the user is typing into. Terminal surfaces have no editor;
+    /// the draft's stands in for text-style queries.
     pub(crate) fn active_editor(&self, cx: &gpui::App) -> Entity<editor::Editor> {
-        match &self.active_tree().focused().surface.view {
+        match &self.active_pane().surface.view {
             SurfaceView::Draft { editor, .. } => editor.clone(),
             SurfaceView::Transcript { editor, .. } => editor.clone(),
             SurfaceView::File(view) => view.read(cx).editor().clone(),
@@ -4744,10 +5656,9 @@ impl Workspace {
         }
     }
 
-    /// The focused pane's draft editor, when the focused pane shows the
-    /// draft — cursor-dependent draft operations act on it.
+    /// The draft editor, when the active viewport shows the draft.
     fn focused_draft_editor(&self) -> Option<Entity<editor::Editor>> {
-        match &self.active_tree().focused().surface.view {
+        match &self.active_pane().surface.view {
             SurfaceView::Draft { editor, .. } => Some(editor.clone()),
             _ => None,
         }
@@ -4755,7 +5666,7 @@ impl Workspace {
 
     /// Some draft editor, from the draft context's surface list (founded at
     /// startup, never pruned). Used only where any editor serves, e.g. text
-    /// style for chrome while a terminal pane is focused.
+    /// style for chrome while a terminal surface is focused.
     fn any_draft_editor(&self) -> Option<Entity<editor::Editor>> {
         self.surfaces
             .get(&ContextId::Draft)?
@@ -4770,13 +5681,13 @@ impl Workspace {
         #[cfg(feature = "native")]
         if self.phone.enabled
             && matches!(
-                self.active_tree().focused().surface.view,
+                self.active_pane().surface.view,
                 SurfaceView::Transcript { .. }
             )
         {
             return self.phone.dashboard_focus.clone();
         }
-        match &self.active_tree().focused().surface.view {
+        match &self.active_pane().surface.view {
             SurfaceView::Draft { editor, .. } => editor.focus_handle(cx),
             SurfaceView::Transcript { editor, .. } => editor.focus_handle(cx),
             SurfaceView::File(view) => view.read(cx).editor().focus_handle(cx),
@@ -4792,10 +5703,25 @@ impl Workspace {
         }
     }
 
-    /// Moves gpui focus to the focused pane's surface. If a modal overlay
+    /// Moves gpui focus to the active surface. If a modal overlay
     /// owns the keyboard, update where it will return instead of stealing
     /// focus from it.
     fn focus_active_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let agent_id = match &self.active_pane().surface.key {
+            SurfaceKey::Transcript(agent_id)
+            | SurfaceKey::Shell(agent_id)
+            | SurfaceKey::File { agent_id, .. }
+            | SurfaceKey::Diff { agent_id }
+            | SurfaceKey::Terminal { agent_id, .. } => Some(*agent_id),
+            SurfaceKey::Draft | SurfaceKey::ZulipInbox | SurfaceKey::ZulipNarrow { .. } => None,
+            #[cfg(feature = "native")]
+            SurfaceKey::Browser(_) => None,
+        };
+        if let Some(agent_id) = agent_id {
+            self.agent_last_interaction
+                .insert(agent_id, now_ms() as i64);
+            self.invalidate_dealer_signals(cx);
+        }
         let handle = self.active_surface_focus(cx);
         if self.has_modal_overlay() {
             self.overlay_return_focus = Some(handle);
@@ -4805,7 +5731,7 @@ impl Workspace {
     }
 
     /// The surface for `key`, reusing the live one (and its focus observer)
-    /// when some pane in the active context already shows or remembers it.
+    /// when the active context already retains it.
     /// File surfaces are created asynchronously by
     /// [`Self::open_file_surface`] instead.
     fn make_surface(
@@ -4821,7 +5747,7 @@ impl Workspace {
             SurfaceKey::Draft => {
                 let model = self.draft_model.clone();
                 let editor = model.update(cx, |model, cx| model.build_editor(window, cx));
-                SurfaceView::Draft { model, editor }
+                SurfaceView::Draft { editor }
             }
             SurfaceKey::Transcript(agent_id) => {
                 let agent_id = *agent_id;
@@ -4859,146 +5785,17 @@ impl Workspace {
                 unreachable!("conversation surfaces are created by open_zulip_narrow")
             }
         };
-        Self::wrap_surface(key, view, window, cx)
+        Self::wrap_surface(key, view)
     }
 
-    /// A surface for a new pane over the same content as `surface`: every
-    /// pane gets its own view (own cursor, scroll, folds — or for
-    /// terminals, own focus and mode) over the shared model.
-    fn duplicate_surface(
-        &mut self,
-        surface: Surface,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Surface {
-        match &surface.view {
-            SurfaceView::File(view) => {
-                let (project, buffer) = view.read(cx).shared_content();
-                let view = cx.new(|cx| FileView::new(project, buffer, window, cx));
-                Self::wrap_surface(surface.key.clone(), SurfaceView::File(view), window, cx)
-            }
-            SurfaceView::Diff(view) => {
-                let model = view.read(cx).model();
-                let view = cx.new(|cx| crate::diff_view::DiffView::new(model, window, cx));
-                Self::wrap_surface(surface.key.clone(), SurfaceView::Diff(view), window, cx)
-            }
-            SurfaceView::Transcript { model, .. } => {
-                let model = model.clone();
-                let editor = model.update(cx, |model, cx| model.build_editor(window, cx));
-                Self::wrap_surface(
-                    surface.key.clone(),
-                    SurfaceView::Transcript { model, editor },
-                    window,
-                    cx,
-                )
-            }
-            SurfaceView::Draft { model, .. } => {
-                let model = model.clone();
-                let editor = model.update(cx, |model, cx| model.build_editor(window, cx));
-                Self::wrap_surface(
-                    surface.key.clone(),
-                    SurfaceView::Draft { model, editor },
-                    window,
-                    cx,
-                )
-            }
-            SurfaceView::Shell { model, .. } => {
-                let model = model.clone();
-                let editor = model.update(cx, |model, cx| model.build_editor(window, cx));
-                Self::wrap_surface(
-                    surface.key.clone(),
-                    SurfaceView::Shell { model, editor },
-                    window,
-                    cx,
-                )
-            }
-            // Terminals share one model (one wire client) but each pane
-            // gets its own view: own focus, scroll offset, and mode. Only
-            // the focused view sizes the pty, so splits don't fight.
-            SurfaceView::Terminal(view) => {
-                let model = view.read(cx).model().clone();
-                let view = cx.new(|cx| crate::terminal_view::TerminalView::new(model, cx));
-                Self::wrap_surface(surface.key.clone(), SurfaceView::Terminal(view), window, cx)
-            }
-            #[cfg(feature = "native")]
-            SurfaceView::Browser(view) => {
-                let model = view.read(cx).model().clone();
-                let SurfaceKey::Browser(id) = surface.key else {
-                    unreachable!("browser view has browser surface key")
-                };
-                let view = cx.new(|cx| rho_browser::PageView::new(model, id, cx));
-                Self::wrap_surface(surface.key.clone(), SurfaceView::Browser(view), window, cx)
-            }
-            // Chat surfaces hold one editor over one conversation: a split
-            // shows the same view rather than a second cursor over the
-            // same messages, which no one has ever wanted.
-            #[cfg(feature = "native")]
-            SurfaceView::ZulipInbox(_) | SurfaceView::ZulipNarrow(_) => surface.clone(),
-        }
-    }
-
-    /// Wraps a view as a surface with a focus-follow observer: gpui focus
-    /// arriving inside its editor (mouse click, vim motion) moves pane
-    /// focus and the agent context along.
-    fn wrap_surface(
-        key: SurfaceKey,
-        view: SurfaceView,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Surface {
-        let (handle, editor_id) = match &view {
-            SurfaceView::Draft { editor, .. } => (editor.focus_handle(cx), editor.entity_id()),
-            SurfaceView::Transcript { editor, .. } => (editor.focus_handle(cx), editor.entity_id()),
-            SurfaceView::File(view) => {
-                let editor = view.read(cx).editor();
-                (editor.focus_handle(cx), editor.entity_id())
-            }
-            SurfaceView::Shell { editor, .. } => (editor.focus_handle(cx), editor.entity_id()),
-            SurfaceView::Diff(view) => {
-                let editor = view.read(cx).editor();
-                (editor.focus_handle(cx), editor.entity_id())
-            }
-            // Terminals have no editor; the view itself carries focus.
-            SurfaceView::Terminal(view) => (view.read(cx).focus_handle(cx), view.entity_id()),
-            #[cfg(feature = "native")]
-            SurfaceView::Browser(view) => (view.read(cx).focus_handle(cx), view.entity_id()),
-            #[cfg(feature = "native")]
-            SurfaceView::ZulipInbox(view) => {
-                let editor = view.read(cx).editor().clone();
-                (editor.focus_handle(cx), editor.entity_id())
-            }
-            #[cfg(feature = "native")]
-            SurfaceView::ZulipNarrow(view) => {
-                let editor = view.read(cx).editor().clone();
-                (editor.focus_handle(cx), editor.entity_id())
-            }
-        };
-        let focus_follow = cx.on_focus_in(&handle, window, move |this, _window, cx| {
-            this.surface_focused(editor_id, cx);
-        });
-        Surface {
-            key,
-            view,
-            editor_id: Some(editor_id),
-            _focus_follow: Some(std::rc::Rc::new(focus_follow)),
-        }
-    }
-
-    fn surface_focused(&mut self, editor_id: gpui::EntityId, cx: &mut Context<Self>) {
-        let tree = self.active_tree();
-        if tree.focused().surface.editor_id == Some(editor_id) {
-            return;
-        }
-        if let Some(id) = tree.pane_showing(|s| s.editor_id == Some(editor_id)) {
-            self.active_tree_mut().focus(id);
-            self.sync_selection_to_focus(cx);
-        }
+    fn wrap_surface(key: SurfaceKey, view: SurfaceView) -> Surface {
+        Surface { key, view }
     }
 
     /// Keeps the registry's notion of "current agent" in step with the
-    /// focused pane, so `:` commands resolve against what the user sees.
+    /// visible surface, so `:` commands resolve against what the user sees.
     fn sync_selection_to_focus(&mut self, cx: &mut Context<Self>) {
-        let selected = match self.active_tree().focused().surface.key.clone() {
+        let selected = match self.active_pane().surface.key.clone() {
             SurfaceKey::Transcript(agent_id) | SurfaceKey::Shell(agent_id) => {
                 self.registry.select_agent(agent_id);
                 Some(agent_id)
@@ -5030,59 +5827,6 @@ impl Workspace {
         cx.notify();
     }
 
-    pub(crate) fn split_pane(
-        &mut self,
-        axis: SplitAxis,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        #[cfg(feature = "native")]
-        if self.phone.enabled {
-            return;
-        }
-        let focused = self.active_tree().focused().surface.clone();
-        let sibling = self.duplicate_surface(focused, window, cx);
-        self.active_tree_mut().split(axis, sibling);
-        self.focus_active_surface(window, cx);
-        cx.notify();
-    }
-
-    pub(crate) fn close_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let closed = match self.active_tree().focused().surface.key {
-            SurfaceKey::Transcript(agent_id) => Some(agent_id),
-            _ => None,
-        };
-        self.active_tree_mut().close_focused();
-        self.sync_selection_to_focus(cx);
-        self.focus_active_surface(window, cx);
-        if let Some(agent_id) = closed
-            && !self.subscriptions.contains(agent_id)
-        {
-            self.release_agent_view_cache(agent_id, cx);
-        }
-        cx.notify();
-    }
-
-    pub(crate) fn focus_pane_by_delta(
-        &mut self,
-        delta: isize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.active_tree_mut().focus_by_delta(delta);
-        self.sync_selection_to_focus(cx);
-        self.focus_active_surface(window, cx);
-        cx.notify();
-    }
-
-    pub(crate) fn pane_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active_tree_mut().focused_mut().back() {
-            self.sync_selection_to_focus(cx);
-            self.focus_active_surface(window, cx);
-            cx.notify();
-        }
-    }
-
     /// Recomputes candidates after an edit; subscribed by [`Minibuffer`].
     pub(crate) fn refresh_minibuffer(&mut self, cx: &mut Context<Self>) {
         let Some(mut minibuffer) = self.minibuffer.take() else {
@@ -5098,7 +5842,12 @@ impl Workspace {
             return;
         };
         minibuffer.accept_selected(window, cx);
+        let prompt = minibuffer.prompt().to_owned();
         let (input, on_submit) = minibuffer.into_submission(cx);
+        crate::journal::record(crate::journal::Event::MinibufferSubmitted {
+            prompt,
+            input: input.clone(),
+        });
         self.finish_overlay_focus(window, cx);
         on_submit(self, input, window, cx);
         cx.notify();
@@ -5118,7 +5867,11 @@ impl Workspace {
     }
 
     fn minibuffer_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.minibuffer.take().is_some() {
+        if let Some(minibuffer) = self.minibuffer.take() {
+            crate::journal::record(crate::journal::Event::MinibufferCancelled {
+                prompt: minibuffer.prompt().to_owned(),
+                input: minibuffer.input(cx),
+            });
             self.finish_overlay_focus(window, cx);
             cx.notify();
         }
@@ -5148,6 +5901,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let prompt = prompt.into();
+        crate::journal::record(crate::journal::Event::MinibufferOpened {
+            prompt: prompt.to_string(),
+        });
         self.capture_overlay_focus(window, cx);
         let text_style = self
             .active_editor(cx)
@@ -5409,16 +6166,16 @@ impl Workspace {
         self.open_prompt("remove project:", complete, on_submit, window, cx);
     }
 
-    /// `space r`: the dashboard is ambient chrome, not a pane — focus jumps
-    /// to it directly and never lands on it through the pane cycle.
+    /// `space r`: focus jumps directly to the dashboard.
     pub(crate) fn focus_rail(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let handle = self.dashboard.focus_handle(cx);
-        window.focus(&handle, cx);
-        cx.notify();
+        self.open_overview(window, cx);
     }
 
     pub(crate) fn cmd_toggle_raw_desk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dashboard.toggle_raw_mode(cx);
+        crate::journal::record(crate::journal::Event::DeskRawModeToggled {
+            enabled: self.dashboard.raw_mode(),
+        });
         self.refresh_dashboard(window, cx);
     }
 
@@ -5427,12 +6184,49 @@ impl Workspace {
         window.focus(&self.dashboard.focus_handle(cx), cx);
         if self.dashboard.deal_mode() {
             self.dashboard.exit_deal_mode(cx);
+            self.end_deal_session();
             if let Ok(action) = cx.build_action("vim::ExitDealMode", None) {
                 window.dispatch_action(action, cx);
             }
         } else {
-            let now = chrono::Local::now().fixed_offset();
-            self.dashboard.enter_deal_mode(&self.registry, now, cx);
+            self.open_deal_mode(window, cx);
+        }
+        self.refresh_dashboard(window, cx);
+        cx.notify();
+    }
+
+    fn open_deal_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dashboard.deal_mode() {
+            return;
+        }
+        self.dismiss_mru_overlay(cx);
+        window.focus(&self.dashboard.focus_handle(cx), cx);
+        let now = chrono::Local::now().fixed_offset();
+        if let Err(error) = self.inbox.refresh_deferred(now.timestamp_millis()) {
+            tracing::warn!(%error, "waking deferred inbox items");
+        }
+        let current_room = self
+            .current_room
+            .as_ref()
+            .and_then(|room| Some((room.host, self.room_names.get(room)?.as_str())));
+        self.dashboard.enter_deal_mode_in_room(
+            &self.registry,
+            &self.inbox,
+            now,
+            current_room,
+            &self.agent_last_interaction,
+            cx,
+        );
+        if self.dashboard.deal_mode() {
+            self.journal_deal_card_presented();
+            crate::journal::record(crate::journal::Event::DealMode {
+                action: crate::journal::DealModeAction::Enter,
+                card: self
+                    .dashboard
+                    .current_deal_card()
+                    .map(|card| Self::journal_card_identity(&card.identity)),
+            });
+            self.deal_session_open = true;
             if self.dashboard.deal_mode()
                 && let Ok(action) = cx.build_action("vim::EnterDealMode", None)
             {
@@ -5443,11 +6237,42 @@ impl Workspace {
         cx.notify();
     }
 
+    fn journal_deal_card_presented(&self) {
+        let Some(card) = self.dashboard.current_deal_card() else {
+            return;
+        };
+        crate::journal::record(crate::journal::Event::DealCardPresented {
+            label: card.label.clone(),
+            kind: match card.kind {
+                crate::dashboard::DealCardKind::Desk => "heading",
+                crate::dashboard::DealCardKind::Agent => "agent",
+                crate::dashboard::DealCardKind::Inbox(_) => "inbox",
+            }
+            .to_owned(),
+            score: card.priority,
+            room: card.breadcrumb.split(" › ").next().unwrap_or("").to_owned(),
+            host: card.host.to_string(),
+            agent_id: card.agent_id.map(|id| id.encoded()),
+        });
+    }
+
+    fn end_deal_session(&mut self) {
+        if std::mem::take(&mut self.deal_session_open) {
+            crate::journal::record(crate::journal::Event::DealMode {
+                action: crate::journal::DealModeAction::Exit,
+                card: None,
+            });
+        }
+    }
+
     fn finish_dashboard_deal_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.dashboard.deal_mode()
             && let Ok(action) = cx.build_action("vim::ExitDealMode", None)
         {
             window.dispatch_action(action, cx);
+        }
+        if !self.dashboard.deal_mode() {
+            self.end_deal_session();
         }
         self.refresh_dashboard(window, cx);
     }
@@ -5939,6 +6764,9 @@ impl Workspace {
     /// `enter` on a bound Desk heading opens its agent.
     fn dashboard_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use crate::dashboard::RowTarget;
+        if let Some(room) = self.dashboard.cursor_room(cx) {
+            self.remember_room(room, crate::journal::RoomSwitchMethod::Overview, cx);
+        }
         match self.dashboard.cursor_target(&self.registry, cx) {
             Some(RowTarget::Agent { agent_id, .. }) => self.open_agent(agent_id, window, cx),
             #[cfg(feature = "native")]
@@ -6312,6 +7140,8 @@ impl Workspace {
                     delivery: rho_ui_proto::MessageDelivery::NextRequest,
                 },
             );
+            self.registry.touch_agent(agent_id);
+            self.mark_agent_prompt_sent(agent_id, cx);
             self.notice_on(
                 Some(&agent_id),
                 &format!(
@@ -6497,12 +7327,18 @@ impl Workspace {
              input: String,
              window: &mut Window,
              cx: &mut Context<Workspace>| {
-                if workspace.dashboard.jump_to_heading(
+                let found = workspace.dashboard.jump_to_heading(
                     input.trim(),
                     &workspace.registry,
                     window,
                     cx,
-                ) {
+                );
+                crate::journal::record(crate::journal::Event::Find {
+                    query: input.trim().to_owned(),
+                    target: "desk_heading".to_owned(),
+                    found,
+                });
+                if found {
                     window.focus(&workspace.dashboard.focus_handle(cx), cx);
                 }
             },
@@ -6535,7 +7371,7 @@ impl Workspace {
     /// The home-mode dashboard beside the active context's preview.
     fn render_rail(
         &mut self,
-        show_panes: bool,
+        show_preview: bool,
         text_style: &gpui::TextStyle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
@@ -6554,7 +7390,7 @@ impl Workspace {
         let container = container
             // The dashboard owns the preview card's reclaimed horizontal
             // space, rather than leaving a blank wrapper beside the card.
-            .w(if show_panes {
+            .w(if show_preview {
                 gpui::relative(0.55)
             } else {
                 gpui::relative(1.0)
@@ -6765,35 +7601,111 @@ impl Workspace {
             })
     }
 
-    fn render_panes(
+    fn render_workspace(
         &mut self,
         window: &mut Window,
         text_style: &gpui::TextStyle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        if self.dashboard.deal_mode()
+            && let Some(card) = self.dashboard.current_deal_card()
+        {
+            let kind = match card.kind {
+                crate::dashboard::DealCardKind::Desk => "Desk reminder",
+                crate::dashboard::DealCardKind::Agent => "Agent",
+                crate::dashboard::DealCardKind::Inbox(crate::dashboard::DealerInboxKind::Ping) => {
+                    "Ping"
+                }
+                crate::dashboard::DealCardKind::Inbox(
+                    crate::dashboard::DealerInboxKind::Obligation,
+                ) => "Obligation",
+                crate::dashboard::DealCardKind::Inbox(
+                    crate::dashboard::DealerInboxKind::Capture,
+                ) => "Capture",
+            };
+            let card = div()
+                .absolute()
+                .inset_0()
+                .bg(cx.theme().colors().editor_background)
+                .flex()
+                .flex_col()
+                .justify_center()
+                .items_center()
+                .gap(px(18.))
+                .px(px(80.))
+                .child(div().text_color(cx.theme().colors().text_muted).child(kind))
+                .child(div().text_size(px(26.)).child(card.breadcrumb.clone()))
+                .child(div().text_size(px(18.)).child(card.label.clone()))
+                .child(
+                    div()
+                        .pt(px(18.))
+                        .text_color(cx.theme().colors().text_muted)
+                        .child("n skip · r open · d done · s defer · S defer room · Esc leave"),
+                );
+            return div()
+                .relative()
+                .size_full()
+                .child(
+                    div()
+                        .size_full()
+                        .key_context("RhoDashboard")
+                        .child(self.dashboard.editor().clone()),
+                )
+                .child(card)
+                .into_any_element();
+        }
+        if let Some(overlay) = &self.mru_overlay {
+            let colors = cx.theme().colors();
+            let stack = overlay
+                .room_candidates
+                .iter()
+                .enumerate()
+                .map(|(index, room)| {
+                    let name = self
+                        .room_names
+                        .get(room)
+                        .cloned()
+                        .unwrap_or_else(|| "room".to_owned());
+                    let row = div()
+                        .px(px(18.))
+                        .py(px(10.))
+                        .rounded_md()
+                        .text_color(if index == overlay.room_index {
+                            colors.text
+                        } else {
+                            colors.text_muted
+                        })
+                        .child(name);
+                    if index == overlay.room_index {
+                        row.bg(colors.element_selected)
+                    } else {
+                        row
+                    }
+                });
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .justify_center()
+                .items_center()
+                .gap(px(8.))
+                .children(stack)
+                .into_any_element();
+        }
         // Home mode: the dashboard owns the keyboard, so it owns the frame;
-        // the panes are its preview. With nothing selected there is
+        // the surface area is its preview. With nothing selected there is
         // nothing to preview — the dashboard takes the whole frame.
         // Modal overlays borrow keyboard focus; the frame stays in the mode
         // recorded beneath the overlay for its whole replacement chain.
-        let home = self.dashboard_mode(window, cx);
+        let home = self.overview_open;
         #[cfg(feature = "native")]
         {
             let focused_surface = if home {
                 crate::telemetry::SurfaceKind::Dashboard
             } else {
-                self.active_tree().focused().surface.view.telemetry_kind()
+                self.active_pane().surface.view.telemetry_kind()
             };
-            let visible_surfaces = if home {
-                focused_surface.bit()
-            } else {
-                self.active_tree()
-                    .panes()
-                    .into_iter()
-                    .fold(0, |flags, pane| {
-                        flags | pane.surface.view.telemetry_kind().bit()
-                    })
-            };
+            let visible_surfaces = focused_surface.bit();
             crate::telemetry::record_surfaces(focused_surface, visible_surfaces);
         }
         let iris = false;
@@ -6802,9 +7714,17 @@ impl Workspace {
         let web_preview_visible = self.dashboard_web_preview.is_some();
         #[cfg(not(feature = "native"))]
         let web_preview_visible = false;
-        let show_panes = !home || iris || self.dashboard_preview.is_some() || web_preview_visible;
-        let rail = home.then(|| self.render_rail(show_panes, text_style, cx));
-        // Same hairline the rail uses against the panes.
+        let room_surface_visible = self.current_room.as_ref().is_none_or(|room| {
+            self.room_strips
+                .get(room)
+                .is_some_and(|strip| !strip.is_empty())
+        });
+        let show_surface = (!home && room_surface_visible)
+            || iris
+            || self.dashboard_preview.is_some()
+            || web_preview_visible;
+        let rail = home.then(|| self.render_rail(show_surface, text_style, cx));
+        // Same hairline the rail uses against the preview.
         let separator_color = cx.theme().colors().border_variant.opacity(0.6);
         let mut preview_text_style = text_style.clone();
         preview_text_style.font_size =
@@ -6817,54 +7737,10 @@ impl Workspace {
         let preview = home
             .then(|| self.selected_preview(iris, window, cx))
             .flatten();
-        let mut leaf = |pane: &crate::pane::Pane<Surface>| -> gpui::AnyElement {
-            let id = pane.id;
-            let content = self.render_surface(&pane.surface);
-            // `flex: 1 1 0` — basis zero, so splits share space by pane
-            // count alone and content (a terminal's widest row) can never
-            // move a split edge.
-            div()
-                .h_full()
-                .overflow_hidden()
-                .flex_1()
-                .min_w_0()
-                .min_h_0()
-                .on_mouse_down(
-                    gpui::MouseButton::Left,
-                    cx.listener(move |this, _, window, cx| {
-                        if this.active_tree().focused_id() != id {
-                            this.active_tree_mut().focus(id);
-                            this.sync_selection_to_focus(cx);
-                            this.focus_active_surface(window, cx);
-                        }
-                    }),
-                )
-                .child(content)
-                .into_any_element()
-        };
-        let mut container = |axis: SplitAxis, children: Vec<gpui::AnyElement>| {
-            let element = div().flex().size_full().flex_1().min_h_0().min_w_0();
-            let element = match axis {
-                SplitAxis::Row => element.flex_row(),
-                SplitAxis::Column => element.flex_col(),
-            };
-            let mut separated = Vec::with_capacity(children.len() * 2);
-            for (index, child) in children.into_iter().enumerate() {
-                if index > 0 {
-                    let separator = match axis {
-                        SplitAxis::Row => div().w(px(1.)).h_full(),
-                        SplitAxis::Column => div().h(px(1.)).w_full(),
-                    };
-                    separated.push(separator.flex_none().bg(separator_color).into_any_element());
-                }
-                separated.push(child);
-            }
-            element.children(separated).into_any_element()
-        };
-        let panes = show_panes.then(|| {
+        let surface = show_surface.then(|| {
             let element = div().flex_1().min_w_0().min_h_0();
             // Home mode uses a narrow preview card with the original top
-            // inset, anchored to the bottom-right of the pane area rather
+            // inset, anchored to the bottom-right of the surface area rather
             // than competing with the dashboard for an equal split.
             // The sheet shows the agent's *document* editor: the same
             // transcript buffers composed without the prompt, ending where
@@ -6895,9 +7771,29 @@ impl Workspace {
                         .children(preview_bar),
                 )
             } else {
+                let room_name = self
+                    .current_room
+                    .as_ref()
+                    .and_then(|room| self.room_names.get(room))
+                    .cloned()
+                    .unwrap_or_default();
                 element
                     .h_full()
-                    .child(self.active_tree().layout(&mut leaf, &mut container))
+                    .relative()
+                    .overflow_hidden()
+                    .child(self.render_surface(&self.active_pane().surface))
+                    .child(
+                        div()
+                            .absolute()
+                            .top(px(8.))
+                            .left(px(10.))
+                            .px(px(7.))
+                            .py(px(3.))
+                            .rounded_sm()
+                            .bg(cx.theme().colors().editor_background.opacity(0.82))
+                            .text_color(cx.theme().colors().text_muted)
+                            .child(room_name),
+                    )
             }
         });
         div()
@@ -6907,7 +7803,7 @@ impl Workspace {
             .flex_grow(1.0)
             .min_h_0()
             .children(rail)
-            .children(panes)
+            .children(surface)
             .into_any_element()
     }
 
@@ -6920,24 +7816,21 @@ impl Workspace {
             .is_some_and(|(_, view)| view.read(cx).focus_handle(cx).is_focused(window));
         #[cfg(not(feature = "native"))]
         let browser_preview_focused = false;
-        dashboard.is_focused(window)
+        self.overview_open
+            || dashboard.is_focused(window)
             || self.overlay_return_focus.as_ref() == Some(&dashboard)
             || browser_preview_focused
     }
 
     /// Hidden surfaces stay alive as editor buffers, but they must not turn
-    /// worktree events into jj manifest traffic. Only models currently shown
-    /// in an active pane are allowed to refresh.
-    fn sync_diff_visibility(&self, panes_visible: bool, cx: &mut Context<Self>) {
-        let visible = if panes_visible {
-            self.active_tree()
-                .panes()
-                .into_iter()
-                .filter_map(|pane| match &pane.surface.view {
-                    SurfaceView::Diff(view) => Some(view.read(cx).model().entity_id()),
-                    _ => None,
-                })
-                .collect::<HashSet<_>>()
+    /// worktree events into jj manifest traffic. Only the visible diff may
+    /// refresh.
+    fn sync_diff_visibility(&self, surface_visible: bool, cx: &mut Context<Self>) {
+        let visible = if surface_visible {
+            match &self.active_pane().surface.view {
+                SurfaceView::Diff(view) => HashSet::from([view.read(cx).model().entity_id()]),
+                _ => HashSet::new(),
+            }
         } else {
             HashSet::new()
         };
@@ -7333,6 +8226,7 @@ impl Render for Workspace {
         let text_style = editor.update(cx, |editor, cx| editor.style(cx).text.clone());
         let connection_status = self.render_connection_status(&text_style, cx);
         let phone = self.phone_mode(window, cx);
+        let deal_touch_controls = self.render_deal_touch_controls(cx);
         div()
             .id("rho-gui")
             .relative()
@@ -7342,13 +8236,44 @@ impl Render for Workspace {
             .p(px(2.))
             .bg(cx.theme().colors().editor_background)
             .key_context("RhoGui")
+            .capture_key_down(
+                cx.listener(|this, event: &gpui::KeyDownEvent, _window, cx| {
+                    if event.keystroke.key != "k" || !event.keystroke.modifiers.control {
+                        this.dismiss_mru_overlay(cx);
+                    }
+                }),
+            )
+            .capture_touch(cx.listener(Self::shell_touch))
+            .on_scroll_wheel(cx.listener(Self::journal_scroll))
+            .on_linux_pointer_axis(cx.listener(Self::journal_linux_scroll))
             .on_action(cx.listener(Self::submit_prompt))
             .on_action(cx.listener(Self::paste_prompt))
+            .on_action(cx.listener(|this, _: &RoomStripLeft, window, cx| {
+                this.slide_room_strip(-1, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &RoomStripRight, window, cx| {
+                this.slide_room_strip(1, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &RoomBack, window, cx| {
+                this.step_room_back(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DealOpen, window, cx| {
+                this.open_deal_mode(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OverviewToggle, window, cx| {
+                this.toggle_overview(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &StripRemove, window, cx| {
+                this.remove_from_room_strip(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &BrowserExit, window, cx| {
                 this.focus_rail(window, cx);
             }))
             .on_action(cx.listener(Self::shell_interrupt))
             .on_action(cx.listener(Self::toggle_voice))
+            .on_action(cx.listener(|this, _: &InboxCapture, window, cx| {
+                this.cmd_capture(window, cx);
+            }))
             .on_action(cx.listener(Self::shell_eof))
             .on_action(cx.listener(|this, _: &ZulipOpenRow, window, cx| {
                 #[cfg(feature = "native")]
@@ -7458,6 +8383,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &DashboardDealExit, window, cx| {
                 vim::take_count(cx);
                 if this.dashboard.exit_deal_mode(cx) {
+                    this.end_deal_session();
                     this.finish_dashboard_deal_action(window, cx);
                 } else {
                     cx.propagate();
@@ -7465,7 +8391,11 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &DashboardDealNext, window, cx| {
                 vim::take_count(cx);
-                if this.dashboard.advance_deal(cx) {
+                if this
+                    .dashboard
+                    .skip_current_deal(chrono::Local::now().fixed_offset(), cx)
+                {
+                    this.journal_deal_card_presented();
                     this.finish_dashboard_deal_action(window, cx);
                 } else {
                     cx.propagate();
@@ -7474,42 +8404,162 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &DashboardDealPrevious, window, cx| {
                 vim::take_count(cx);
                 if this.dashboard.previous_deal(cx) {
+                    this.journal_deal_card_presented();
                     this.refresh_dashboard(window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &DashboardDealDone, window, cx| {
                 vim::take_count(cx);
+                let card = this.dashboard.current_deal_card().cloned();
                 let today = chrono::Local::now().date_naive();
-                if this.dashboard.write_deal_done(today, cx) {
-                    this.dashboard.record_deal_verdict();
+                let now = chrono::Local::now().fixed_offset();
+                let handled = match card.as_ref().map(|card| card.kind) {
+                    Some(crate::dashboard::DealCardKind::Desk) => {
+                        this.dashboard.write_deal_done(today, cx)
+                    }
+                    Some(crate::dashboard::DealCardKind::Agent) => {
+                        this.cmd_agent_done(false, window, cx);
+                        true
+                    }
+                    Some(crate::dashboard::DealCardKind::Inbox(_)) => {
+                        let Some(crate::dashboard::DealCardIdentity::Inbox(id)) =
+                            card.as_ref().map(|card| &card.identity)
+                        else {
+                            return;
+                        };
+                        this.inbox
+                            .verdict(
+                                &crate::inbox::InboxId(id.clone()),
+                                crate::inbox::Verdict::Discarded,
+                            )
+                            .is_ok()
+                    }
+                    None => false,
+                };
+                if handled {
+                    this.dashboard
+                        .record_deal_verdict_as(crate::dashboard::DealerVerdict::Done, now);
                     this.dashboard.advance_deal(cx);
+                    this.journal_deal_card_presented();
                     this.finish_dashboard_deal_action(window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &DashboardDealDiscard, window, cx| {
                 vim::take_count(cx);
+                let card = this.dashboard.current_deal_card().cloned();
                 let today = chrono::Local::now().date_naive();
-                if this.dashboard.write_deal_discarded(today, cx) {
-                    this.dashboard.record_deal_verdict();
+                let now = chrono::Local::now().fixed_offset();
+                let handled = match card.as_ref().map(|card| card.kind) {
+                    Some(crate::dashboard::DealCardKind::Desk) => {
+                        this.dashboard.write_deal_discarded(today, cx)
+                    }
+                    Some(crate::dashboard::DealCardKind::Agent) => {
+                        this.cmd_agent_done(true, window, cx);
+                        true
+                    }
+                    Some(crate::dashboard::DealCardKind::Inbox(_)) => {
+                        let Some(crate::dashboard::DealCardIdentity::Inbox(id)) =
+                            card.as_ref().map(|card| &card.identity)
+                        else {
+                            return;
+                        };
+                        this.inbox
+                            .verdict(
+                                &crate::inbox::InboxId(id.clone()),
+                                crate::inbox::Verdict::Discarded,
+                            )
+                            .is_ok()
+                    }
+                    None => false,
+                };
+                if handled {
+                    this.dashboard
+                        .record_deal_verdict_as(crate::dashboard::DealerVerdict::Dismiss, now);
                     this.dashboard.advance_deal(cx);
+                    this.journal_deal_card_presented();
                     this.finish_dashboard_deal_action(window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &DashboardDealSnooze, window, cx| {
                 let count = vim::take_count(cx).unwrap_or(1) as u32;
                 let today = chrono::Local::now().date_naive();
-                if this.dashboard.write_deal_snooze(count, today, cx) {
-                    this.dashboard.record_deal_verdict();
+                let now = chrono::Local::now().fixed_offset();
+                let card = this.dashboard.current_deal_card().cloned();
+                let handled = match card.as_ref().map(|card| card.kind) {
+                    Some(crate::dashboard::DealCardKind::Desk) => {
+                        this.dashboard.write_deal_snooze(count, today, cx)
+                    }
+                    Some(crate::dashboard::DealCardKind::Inbox(_)) => {
+                        let Some(crate::dashboard::DealCardIdentity::Inbox(id)) =
+                            card.as_ref().map(|card| &card.identity)
+                        else {
+                            return;
+                        };
+                        this.inbox
+                            .defer(
+                                &crate::inbox::InboxId(id.clone()),
+                                (now + chrono::Duration::days(i64::from(count))).timestamp_millis(),
+                            )
+                            .unwrap_or(false)
+                    }
+                    Some(crate::dashboard::DealCardKind::Agent) => {
+                        let Some(agent_id) = card.as_ref().and_then(|card| card.agent_id) else {
+                            return;
+                        };
+                        this.set_agent_disposition(
+                            vec![agent_id],
+                            "snooze",
+                            rho_ui_proto::AgentDisposition::Snoozed {
+                                until: rho_core::UnixMs(
+                                    (now + chrono::Duration::days(i64::from(count)))
+                                        .timestamp_millis()
+                                        .max(0) as u64,
+                                ),
+                            },
+                            cx,
+                        )
+                    }
+                    _ => false,
+                };
+                if handled {
+                    this.dashboard
+                        .record_deal_verdict_as(crate::dashboard::DealerVerdict::Defer, now);
                     this.dashboard.advance_deal(cx);
+                    this.journal_deal_card_presented();
                     this.finish_dashboard_deal_action(window, cx);
                 }
             }))
+            .on_action(
+                cx.listener(|this, _: &DashboardDealRoomSnooze, window, cx| {
+                    let count = vim::take_count(cx).unwrap_or(1) as u32;
+                    let today = chrono::Local::now().date_naive();
+                    let now = chrono::Local::now().fixed_offset();
+                    if let Some((room, until, identity)) =
+                        this.dashboard.write_deal_room_snooze(count, today, cx)
+                    {
+                        this.dashboard
+                            .record_deal_verdict_as(crate::dashboard::DealerVerdict::Defer, now);
+                        crate::journal::record(crate::journal::Event::RoomDeferred {
+                            room,
+                            until: until.format("%Y-%m-%dT%H:%M:%S").to_string(),
+                            card: Self::journal_card_identity(&identity),
+                        });
+                        this.dashboard.advance_deal(cx);
+                        this.journal_deal_card_presented();
+                        this.finish_dashboard_deal_action(window, cx);
+                    }
+                }),
+            )
             .on_action(cx.listener(|this, _: &DashboardDealTodo, window, cx| {
                 vim::take_count(cx);
                 let today = chrono::Local::now().date_naive();
                 if this.dashboard.write_deal_todo(today, cx) {
-                    this.dashboard.record_deal_verdict();
+                    this.dashboard.record_deal_verdict_as(
+                        crate::dashboard::DealerVerdict::Done,
+                        chrono::Local::now().fixed_offset(),
+                    );
                     this.dashboard.advance_deal(cx);
+                    this.journal_deal_card_presented();
                     this.finish_dashboard_deal_action(window, cx);
                 }
             }))
@@ -7521,14 +8571,51 @@ impl Render for Workspace {
                 }
                 this.dashboard.discard_deal_session(cx);
                 let now = chrono::Local::now().fixed_offset();
-                this.dashboard.enter_deal_mode(&this.registry, now, cx);
+                if let Err(error) = this.inbox.refresh_deferred(now.timestamp_millis()) {
+                    tracing::warn!(%error, "waking deferred inbox items");
+                }
+                let current_room = this
+                    .current_room
+                    .as_ref()
+                    .and_then(|room| Some((room.host, this.room_names.get(room)?.as_str())));
+                this.dashboard.enter_deal_mode_in_room(
+                    &this.registry,
+                    &this.inbox,
+                    now,
+                    current_room,
+                    &this.agent_last_interaction,
+                    cx,
+                );
+                this.journal_deal_card_presented();
                 this.refresh_dashboard(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardDealInsert, window, cx| {
                 vim::take_count(cx);
+                if let Some(crate::dashboard::DealCardIdentity::Inbox(id)) = this
+                    .dashboard
+                    .current_deal_card()
+                    .map(|card| card.identity.clone())
+                {
+                    let id = crate::inbox::InboxId(id);
+                    if this.inbox.get(&id).is_none() {
+                        return;
+                    }
+                    this.dashboard.record_deal_verdict_as(
+                        crate::dashboard::DealerVerdict::File,
+                        chrono::Local::now().fixed_offset(),
+                    );
+                    if let Err(error) = this.begin_inbox_filing(&id, window, cx) {
+                        this.notice_on(None, &format!("file: {error}"), StyleClass::SystemInfo, cx);
+                        return;
+                    }
+                    this.dashboard.exit_deal_mode(cx);
+                    this.finish_dashboard_deal_action(window, cx);
+                    return;
+                }
                 if !this.dashboard.prepare_deal_insert(cx) || !this.dashboard.exit_deal_mode(cx) {
                     return;
                 }
+                this.end_deal_session();
                 this.refresh_dashboard(window, cx);
                 if let Ok(action) = cx.build_action("vim::DealInsert", None) {
                     window.dispatch_action(action, cx);
@@ -7539,17 +8626,36 @@ impl Render for Workspace {
                 let Some(card) = this.dashboard.current_deal_card().cloned() else {
                     return;
                 };
-                let Some(agent_id) = card.agent_id else {
+                #[cfg(feature = "native")]
+                let opens_page = matches!(
+                    &card.inbox_source,
+                    Some(crate::dashboard::DealerInboxSource::Page(_))
+                );
+                #[cfg(not(feature = "native"))]
+                let opens_page = false;
+                if card.agent_id.is_none() && !opens_page {
                     return;
-                };
+                }
+                this.dashboard.record_deal_verdict_as(
+                    crate::dashboard::DealerVerdict::Open,
+                    chrono::Local::now().fixed_offset(),
+                );
                 if !this.dashboard.exit_deal_mode(cx) {
                     return;
                 }
+                this.end_deal_session();
                 if let Ok(action) = cx.build_action("vim::ExitDealMode", None) {
                     window.dispatch_action(action, cx);
                 }
-                this.dashboard.open_reply(agent_id, window, cx);
-                this.dashboard_focus_draft(window, cx);
+                #[cfg(feature = "native")]
+                if let Some(crate::dashboard::DealerInboxSource::Page(page)) = card.inbox_source {
+                    this.open_browser_page(page, window, cx);
+                    return;
+                }
+                if let Some(agent_id) = card.agent_id {
+                    this.open_agent(agent_id, window, cx);
+                    return;
+                }
             }))
             .on_action(
                 cx.listener(|this, _: &DashboardToggleAgentTree, window, cx| {
@@ -7638,29 +8744,6 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &RoleCycleGroup, window, cx| {
                 this.cycle_draft_group(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &PaneSplitRight, window, cx| {
-                if !this.phone.enabled {
-                    this.split_pane(SplitAxis::Row, window, cx);
-                }
-            }))
-            .on_action(cx.listener(|this, _: &PaneSplitDown, window, cx| {
-                if !this.phone.enabled {
-                    this.split_pane(SplitAxis::Column, window, cx);
-                }
-            }))
-            .on_action(cx.listener(|this, _: &PaneClose, window, cx| {
-                this.close_pane(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &PaneFocusNext, window, cx| {
-                this.focus_pane_by_delta(1, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &PaneBack, window, cx| {
-                if this.phone.enabled {
-                    this.phone_back(window, cx);
-                } else {
-                    this.pane_back(window, cx);
-                }
-            }))
             .on_action(cx.listener(|this, _: &RailFocus, window, cx| {
                 this.focus_rail(window, cx);
             }))
@@ -7706,12 +8789,23 @@ impl Render for Workspace {
             .child(if phone {
                 self.render_phone_body(&text_style, cx)
             } else {
-                self.render_panes(window, &text_style, cx)
+                self.render_workspace(window, &text_style, cx)
             })
             .children((!phone).then(|| {
                 bottom_strip(&text_style, cx).child(div().px_2().child(self.mode_indicator.clone()))
             }))
             .children(phone.then(|| self.render_phone_bar(cx)))
+            .children(deal_touch_controls)
+            .children(self.lamp_on.then(|| {
+                div()
+                    .absolute()
+                    .top(px(6.))
+                    .right(px(6.))
+                    .w(px(18.))
+                    .h(px(18.))
+                    .rounded_sm()
+                    .bg(cx.theme().colors().text_accent.opacity(0.16))
+            }))
             .children(
                 match (
                     &self.pending_git_approval,

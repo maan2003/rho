@@ -1360,11 +1360,9 @@ impl BrowserView {
                     },
                 );
             }
-            cx.stop_propagation();
             return;
         }
         if cleanup_only && !presents {
-            cx.stop_propagation();
             return;
         }
         if self.queued_input.is_some() || !presents {
@@ -1377,13 +1375,11 @@ impl BrowserView {
                     },
                 );
             }
-            cx.stop_propagation();
             return;
         }
         let model = self.model.read(cx);
         model.pointer_motion(x, y);
         model.pointer_axis(event);
-        cx.stop_propagation();
     }
 
     fn pinch(&mut self, event: &LinuxPinchEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -2135,7 +2131,10 @@ impl Render for BrowserView {
             .on_mouse_up(MouseButton::Middle, cx.listener(Self::mouse_up))
             .on_linux_pointer_axis(cx.listener(Self::pointer_axis))
             .on_linux_pinch(cx.listener(Self::pinch))
-            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+            // Bubble the coarse wheel event so the GUI action journal can
+            // record one surface-level scroll burst. Native pointer-axis
+            // forwarding above remains the page's actual scroll path.
+            .on_scroll_wheel(|_, _, _| {})
             .on_pinch(|_, _, cx| cx.stop_propagation())
             .on_physical_key(cx.listener(Self::physical_key))
             .on_key_down(cx.listener(Self::key_down))

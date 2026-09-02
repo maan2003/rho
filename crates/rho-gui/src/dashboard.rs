@@ -14,6 +14,7 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Instant;
 
 use editor::scroll::Autoscroll;
 use editor::{
@@ -70,11 +71,51 @@ type SyncSnapshot = (
 );
 type ArchiveEdits = (Vec<(Range<usize>, String)>, usize);
 
+// Dealer curve tuning. These are deliberately all in one place: rho has one
+// user, so policy changes are edits, not a configuration system.
 const DEAL_QUEUE_FLOOR: f64 = -1.0;
 const DEAL_PRIORITY_CUTOFF: usize = 8;
 const BLOCKED_REPLY_HEAD_START: f64 = 1.0;
 const BLOCKED_REPLY_SLOPE_PER_DAY: f64 = 12.0;
 const FYI_REPLY_PACE_DAYS: f64 = 3.0;
+const INBOX_OBLIGATION_PACE_DAYS: u32 = 0;
+const INBOX_CAPTURE_PACE_DAYS: u32 = 1;
+/// A quarter-day nudge keeps near-ties in the current room without
+/// competing with a genuinely urgent blocked reply (which rises 12/day).
+const CURRENT_ROOM_PRIORITY_BONUS: f64 = 0.25;
+/// Half a curve unit is enough to mark the hand visibly dirty without
+/// turning every newly-ripe reminder into persistent chrome.
+pub(crate) const LAMP_THRESHOLD: f64 = 0.5;
+/// At 1.2 curve units a blocked agent chimes after about 24 minutes
+/// unnoticed, an agent completed within about 12 minutes of interaction
+/// chimes immediately through the recency bonus, and a ping takes about
+/// 14 hours to cross. Sound therefore marks pressure, not every new card.
+pub(crate) const CHIME_THRESHOLD: f64 = 1.2;
+/// A recent agent interaction contributes 1.5 curve units. This must remain
+/// above the 1.2 chime threshold or recently-driven agents lose their instant
+/// completion chime; linear decay gives about 12 minutes of instant chime and
+/// about 40 minutes above the 0.5 lamp threshold.
+const AGENT_RECENCY_BONUS: f64 = 1.5;
+/// The engagement nudge fades linearly over one hour so it cannot become a
+/// hidden long-lived preference.
+const AGENT_RECENCY_WINDOW_MS: i64 = 60 * 60 * 1_000;
+
+pub(crate) fn dealer_policy_snapshot() -> crate::journal::DealerPolicySnapshot {
+    crate::journal::DealerPolicySnapshot {
+        queue_floor: DEAL_QUEUE_FLOOR,
+        priority_cutoff: DEAL_PRIORITY_CUTOFF,
+        blocked_reply_head_start: BLOCKED_REPLY_HEAD_START,
+        blocked_reply_slope_per_day: BLOCKED_REPLY_SLOPE_PER_DAY,
+        fyi_reply_pace_days: FYI_REPLY_PACE_DAYS,
+        inbox_obligation_pace_days: INBOX_OBLIGATION_PACE_DAYS,
+        inbox_capture_pace_days: INBOX_CAPTURE_PACE_DAYS,
+        current_room_priority_bonus: CURRENT_ROOM_PRIORITY_BONUS,
+        lamp_threshold: LAMP_THRESHOLD,
+        chime_threshold: CHIME_THRESHOLD,
+        agent_recency_bonus: AGENT_RECENCY_BONUS,
+        agent_recency_window_ms: AGENT_RECENCY_WINDOW_MS,
+    }
+}
 
 struct DealCardHighlight;
 
@@ -87,6 +128,81 @@ pub struct DealCard {
     pub agent_id: Option<AgentId>,
     pub agent_tag: Option<String>,
     pub breadcrumb: String,
+    pub room: Option<String>,
+    pub kind: DealCardKind,
+    pub identity: DealCardIdentity,
+    pub inbox_source: Option<DealerInboxSource>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct DeskRoom {
+    pub host: HostId,
+    pub heading_offset: usize,
+    pub name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum DealCardIdentity {
+    Desk { host: HostId, heading_offset: usize },
+    Agent(AgentId),
+    Inbox(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DealCardKind {
+    Desk,
+    Agent,
+    Inbox(DealerInboxKind),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DealerInboxKind {
+    Ping,
+    Obligation,
+    Capture,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DealerInboxItem {
+    pub id: String,
+    pub host: HostId,
+    pub title: String,
+    pub kind: DealerInboxKind,
+    pub captured_at: chrono::DateTime<chrono::FixedOffset>,
+    pub deferred_until: Option<chrono::DateTime<chrono::FixedOffset>>,
+    pub resurfacing_count: u32,
+    pub waiting_on: Option<String>,
+    pub source: Option<DealerInboxSource>,
+    /// Short human context such as the captured room or surface. This is
+    /// replayed verbatim; the dealer never summarizes or rewrites it.
+    pub context: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DealerInboxSource {
+    #[cfg(feature = "native")]
+    Page(rho_browser::PageId),
+    Other(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DealerVerdict {
+    Skip,
+    Done,
+    Dismiss,
+    Defer,
+    Open,
+    File,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct DealerEvent {
+    pub card: DealCardIdentity,
+    pub kind: DealCardKind,
+    pub verdict: DealerVerdict,
+    pub at: chrono::DateTime<chrono::FixedOffset>,
+    pub time_to_verdict_ms: u64,
+    pub considered_not_dealt: Vec<DealCardIdentity>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -96,17 +212,15 @@ pub struct DealQueue {
     pub total_alive: usize,
     /// Number selected by global priority.
     pub dealt_count: usize,
-    priority_topics: HashSet<(HostId, usize)>,
+    live_cards: HashSet<DealCardIdentity>,
+    considered_not_dealt: Vec<DealCardIdentity>,
 }
 
 impl DealQueue {
     /// Revalidates a persisted card without applying the current top-N cutoff
     /// or changing its established order.
     pub fn is_live(&self, card: &DealCard) -> bool {
-        let Some(offset) = card.heading_offset else {
-            return false;
-        };
-        self.priority_topics.contains(&(card.host, offset))
+        self.live_cards.contains(&card.identity)
     }
 }
 
@@ -125,6 +239,8 @@ struct DealSession {
     dealt_count: usize,
     total_alive: usize,
     resolved: Vec<bool>,
+    started_at: Instant,
+    considered_not_dealt: Vec<DealCardIdentity>,
 }
 
 struct ListingVisibility<'a> {
@@ -290,6 +406,7 @@ pub struct Dashboard {
     phone_browse_mode: bool,
     deal_active: bool,
     deal: Option<DealSession>,
+    deal_empty_success: bool,
     queue_depth: DealQueueDepth,
     queue_depth_revision: Option<u64>,
     queue_depth_minute: Option<i64>,
@@ -313,6 +430,52 @@ pub struct Dashboard {
 }
 
 impl Dashboard {
+    pub fn room_for_heading(&self, host: HostId, offset: usize, cx: &App) -> Option<DeskRoom> {
+        let text = self.source_text(host, cx)?;
+        let headings = parse(&text);
+        let mut index = headings
+            .iter()
+            .position(|heading| heading.heading_range.start == offset)
+            .or_else(|| {
+                headings
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find(|(_, heading)| heading.heading_range.start <= offset)
+                    .map(|(index, _)| index)
+            })?;
+        while let Some(parent) = headings[index].parent {
+            index = parent;
+        }
+        Some(DeskRoom {
+            host,
+            heading_offset: headings[index].heading_range.start,
+            name: headings[index].title.clone(),
+        })
+    }
+
+    pub fn cursor_room(&self, cx: &mut Context<Workspace>) -> Option<DeskRoom> {
+        let (host, offset) = self.cursor_topic(cx)?;
+        self.room_for_heading(host, offset, cx)
+    }
+
+    pub fn room_for_agent(&self, agent_id: AgentId, cx: &App) -> Option<DeskRoom> {
+        let topic = self
+            .heading_agents
+            .iter()
+            .find_map(|(topic, agents)| agents.contains(&agent_id).then_some(*topic))?;
+        self.room_for_heading(topic.0, topic.1, cx)
+    }
+
+    #[cfg(feature = "native")]
+    pub fn room_for_page(&self, page_id: rho_browser::PageId, cx: &App) -> Option<DeskRoom> {
+        let topic = self
+            .heading_pages
+            .iter()
+            .find_map(|(topic, page)| (*page == page_id).then_some(*topic))?;
+        self.room_for_heading(topic.0, topic.1, cx)
+    }
+
     pub fn new(window: &mut Window, cx: &mut Context<Workspace>) -> Self {
         let multi_buffer = cx.new(|_| {
             let mut multi_buffer = MultiBuffer::without_headers(Capability::ReadWrite);
@@ -404,6 +567,7 @@ impl Dashboard {
             phone_browse_mode: false,
             deal_active: false,
             deal: None,
+            deal_empty_success: false,
             queue_depth: DealQueueDepth::default(),
             queue_depth_revision: None,
             queue_depth_minute: None,
@@ -572,7 +736,49 @@ impl Dashboard {
     pub fn enter_deal_mode(
         &mut self,
         registry: &AgentRegistry,
+        inbox: &crate::inbox::InboxStore,
         now: chrono::DateTime<chrono::FixedOffset>,
+        cx: &mut Context<Workspace>,
+    ) {
+        self.enter_deal_mode_in_room(registry, inbox, now, None, &HashMap::new(), cx);
+    }
+
+    pub fn dealer_hand(
+        &self,
+        registry: &AgentRegistry,
+        inbox: &crate::inbox::InboxStore,
+        now: chrono::DateTime<chrono::FixedOffset>,
+        current_room: Option<(HostId, &str)>,
+        agent_interactions: &HashMap<AgentId, i64>,
+        cx: &App,
+    ) -> DealQueue {
+        let documents = self
+            .hosts
+            .keys()
+            .filter_map(|host| self.source_text(*host, cx).map(|text| (*host, text)))
+            .collect::<Vec<_>>();
+        let inbox = dealer_inbox_items(
+            inbox,
+            documents.first().map_or(HostId(0), |(host, _)| *host),
+            now.timestamp_millis(),
+        );
+        assemble_dealer_queue_in_room(
+            &documents,
+            &deal_agent_facts(registry),
+            &inbox,
+            now,
+            current_room,
+            agent_interactions,
+        )
+    }
+
+    pub fn enter_deal_mode_in_room(
+        &mut self,
+        registry: &AgentRegistry,
+        inbox: &crate::inbox::InboxStore,
+        now: chrono::DateTime<chrono::FixedOffset>,
+        current_room: Option<(HostId, &str)>,
+        agent_interactions: &HashMap<AgentId, i64>,
         cx: &mut Context<Workspace>,
     ) {
         let documents = self
@@ -580,7 +786,19 @@ impl Dashboard {
             .keys()
             .filter_map(|host| self.source_text(*host, cx).map(|text| (*host, text)))
             .collect::<Vec<_>>();
-        let queue = assemble_deal_queue(&documents, &deal_agent_facts(registry), now);
+        let inbox = dealer_inbox_items(
+            inbox,
+            documents.first().map_or(HostId(0), |(host, _)| *host),
+            now.timestamp_millis(),
+        );
+        let queue = assemble_dealer_queue_in_room(
+            &documents,
+            &deal_agent_facts(registry),
+            &inbox,
+            now,
+            current_room,
+            agent_interactions,
+        );
         if self
             .deal
             .as_ref()
@@ -656,6 +874,8 @@ impl Dashboard {
                 dealt_count: queue.dealt_count,
                 total_alive: queue.total_alive,
                 resolved: vec![false; card_count],
+                started_at: Instant::now(),
+                considered_not_dealt: queue.considered_not_dealt,
             });
         }
         self.raw_mode = false;
@@ -663,6 +883,7 @@ impl Dashboard {
             .deal
             .as_ref()
             .is_some_and(|deal| !deal.cards.is_empty());
+        self.deal_empty_success = !self.deal_active;
         for source in self.hosts.values().filter_map(WeakEntity::upgrade) {
             let capability = if self.deal_active {
                 Capability::Read
@@ -708,6 +929,7 @@ impl Dashboard {
             self.exit_deal_mode(cx);
             return true;
         }
+        deal.started_at = Instant::now();
         self.refresh_current_deal_offset(cx);
         if let Some(card) = self.current_deal_card()
             && let Some(offset) = card.heading_offset
@@ -726,6 +948,7 @@ impl Dashboard {
             return false;
         }
         deal.index -= 1;
+        deal.started_at = Instant::now();
         self.refresh_current_deal_offset(cx);
         if let Some(card) = self.current_deal_card()
             && let Some(offset) = card.heading_offset
@@ -845,18 +1068,97 @@ impl Dashboard {
                 .is_some_and(|deal| deal.index < deal.cards.len() && !deal.resolved[deal.index])
     }
 
-    pub fn record_deal_verdict(&mut self) {
-        if let Some(deal) = &mut self.deal
-            && !deal.resolved[deal.index]
-        {
-            deal.resolved[deal.index] = true;
-            deal.total_alive = deal.total_alive.saturating_sub(1);
+    pub fn record_deal_verdict_as(
+        &mut self,
+        verdict: DealerVerdict,
+        now: chrono::DateTime<chrono::FixedOffset>,
+    ) {
+        let Some(deal) = &mut self.deal else { return };
+        if deal.index >= deal.cards.len() || deal.resolved[deal.index] {
+            return;
         }
+        let card = &deal.cards[deal.index];
+        let event = DealerEvent {
+            card: card.identity.clone(),
+            kind: card.kind,
+            verdict,
+            at: now,
+            time_to_verdict_ms: deal
+                .started_at
+                .elapsed()
+                .as_millis()
+                .min(u128::from(u64::MAX)) as u64,
+            considered_not_dealt: deal.considered_not_dealt.clone(),
+        };
+        deal.resolved[deal.index] = true;
+        deal.total_alive = deal.total_alive.saturating_sub(1);
+        self.record_dealer_event(event);
+    }
+
+    fn record_dealer_event(&mut self, event: DealerEvent) {
+        fn identity(card: &DealCardIdentity) -> crate::journal::DealerCardIdentity {
+            match card {
+                DealCardIdentity::Desk {
+                    host,
+                    heading_offset,
+                } => crate::journal::DealerCardIdentity::Desk {
+                    host: host.to_string(),
+                    heading_offset: *heading_offset,
+                },
+                DealCardIdentity::Agent(agent_id) => crate::journal::DealerCardIdentity::Agent {
+                    agent_id: agent_id.encoded(),
+                },
+                DealCardIdentity::Inbox(id) => {
+                    crate::journal::DealerCardIdentity::Inbox { id: id.clone() }
+                }
+            }
+        }
+        let kind = match event.kind {
+            DealCardKind::Desk => crate::journal::DealerCardKind::Desk,
+            DealCardKind::Agent => crate::journal::DealerCardKind::Agent,
+            DealCardKind::Inbox(kind) => crate::journal::DealerCardKind::Inbox(match kind {
+                DealerInboxKind::Ping => crate::journal::DealerInboxKind::Ping,
+                DealerInboxKind::Obligation => crate::journal::DealerInboxKind::Obligation,
+                DealerInboxKind::Capture => crate::journal::DealerInboxKind::Capture,
+            }),
+        };
+        let verdict = match event.verdict {
+            DealerVerdict::Skip => crate::journal::DealerVerdict::Skip,
+            DealerVerdict::Done => crate::journal::DealerVerdict::Done,
+            DealerVerdict::Dismiss => crate::journal::DealerVerdict::Dismiss,
+            DealerVerdict::Defer => crate::journal::DealerVerdict::Defer,
+            DealerVerdict::Open => crate::journal::DealerVerdict::Open,
+            DealerVerdict::File => crate::journal::DealerVerdict::File,
+        };
+        crate::journal::record(crate::journal::Event::Dealer {
+            card: identity(&event.card),
+            kind,
+            verdict,
+            occurred_at: event.at.to_rfc3339(),
+            time_to_verdict_ms: event.time_to_verdict_ms,
+            considered_not_dealt: event.considered_not_dealt.iter().map(identity).collect(),
+        });
+    }
+
+    pub fn skip_current_deal(
+        &mut self,
+        now: chrono::DateTime<chrono::FixedOffset>,
+        cx: &mut Context<Workspace>,
+    ) -> bool {
+        if self.current_deal_card().is_none() {
+            return false;
+        }
+        self.record_deal_verdict_as(DealerVerdict::Skip, now);
+        self.advance_deal(cx)
     }
 
     pub fn current_deal_card(&self) -> Option<&DealCard> {
         let deal = self.deal.as_ref()?;
         deal.cards.get(deal.index)
+    }
+
+    pub fn current_inbox_source(&self) -> Option<&DealerInboxSource> {
+        self.current_deal_card()?.inbox_source.as_ref()
     }
 
     pub fn prepare_deal_insert(&mut self, cx: &mut Context<Workspace>) -> bool {
@@ -895,6 +1197,46 @@ impl Dashboard {
             Some(days),
             cx,
         )
+    }
+
+    pub fn write_deal_room_snooze(
+        &mut self,
+        count: u32,
+        today: chrono::NaiveDate,
+        cx: &mut Context<Workspace>,
+    ) -> Option<(String, chrono::NaiveDateTime, DealCardIdentity)> {
+        if !self.deal_accepts_verdict() {
+            return None;
+        }
+        self.refresh_current_deal_offset(cx);
+        let card = self.current_deal_card()?.clone();
+        let text = self.source_text(card.host, cx)?;
+        let headings = parse(&text);
+        let root = if let Some(offset) = card.heading_offset {
+            let mut index = headings
+                .iter()
+                .position(|heading| heading.heading_range.start == offset)?;
+            while let Some(parent) = headings[index].parent {
+                index = parent;
+            }
+            &headings[index]
+        } else {
+            let room = card.room.as_deref()?;
+            headings
+                .iter()
+                .find(|heading| heading.parent.is_none() && heading.title == room)?
+        };
+        let days = count.max(1);
+        let until = today.and_time(chrono::NaiveTime::MIN) + chrono::Duration::days(days.into());
+        self.set_heading_property(
+            card.host,
+            root.heading_range.start,
+            TemporalMarkKind::Defer,
+            until,
+            Some(days),
+            cx,
+        )
+        .then_some((root.title.clone(), until, card.identity))
     }
 
     pub fn write_deal_todo(
@@ -952,34 +1294,11 @@ impl Dashboard {
         let Some(card) = self.current_deal_card().cloned() else {
             return false;
         };
+        if card.kind != DealCardKind::Desk {
+            return false;
+        }
         let Some(offset) = card.heading_offset else {
-            let Some(text) = self.source_text(card.host, cx) else {
-                return false;
-            };
-            let line = rho_ui_proto::desk::temporal::property_line(kind, at, pace_days);
-            let separator = if text.is_empty() || text.ends_with('\n') {
-                ""
-            } else {
-                "\n"
-            };
-            let Some(agent_tag) = card.agent_tag.as_deref() else {
-                return false;
-            };
-            let addition = format!("{separator}* Agent {agent_tag} :{agent_tag}:\n{line}");
-            let offset = text.len() + separator.len();
-            self.hosts[&card.host]
-                .upgrade()
-                .unwrap()
-                .update(cx, |buffer, cx| {
-                    buffer.edit([(text.len()..text.len(), addition)], None, cx)
-                });
-            if let Some(deal) = &mut self.deal
-                && let Some(current) = deal.cards.get_mut(deal.index)
-            {
-                current.heading_offset = Some(offset);
-            }
-            self.record_deal_verdict();
-            return true;
+            return false;
         };
         self.set_heading_property(card.host, offset, kind, at, pace_days, cx)
     }
@@ -1026,7 +1345,6 @@ impl Dashboard {
                 }
             }
         }
-        self.record_deal_verdict();
         true
     }
 
@@ -1203,6 +1521,7 @@ impl Dashboard {
     pub fn sync(
         &mut self,
         registry: &AgentRegistry,
+        inbox: &crate::inbox::InboxStore,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
@@ -1226,8 +1545,17 @@ impl Dashboard {
             || self.queue_depth_revision != Some(deal_revision)
             || self.queue_depth_minute != Some(minute)
         {
-            let queue =
-                assemble_deal_queue(&documents, &deal_agent_facts(registry), now.fixed_offset());
+            let inbox = dealer_inbox_items(
+                inbox,
+                documents.first().map_or(HostId(0), |(host, _)| *host),
+                now.timestamp_millis(),
+            );
+            let queue = assemble_dealer_queue(
+                &documents,
+                &deal_agent_facts(registry),
+                &inbox,
+                now.fixed_offset(),
+            );
             self.queue_depth = DealQueueDepth {
                 dealt_count: queue.dealt_count,
                 total_alive: queue.total_alive,
@@ -1932,6 +2260,22 @@ impl Dashboard {
         }
     }
 
+    /// Capture metadata for the heading under the cursor. The room is the
+    /// top-level ancestor, not the leaf task, so capture never asks the user
+    /// to classify a thought while still preserving the surrounding scene.
+    pub fn capture_position(&self, cx: &mut Context<Workspace>) -> Option<(HostId, usize, String)> {
+        let (host, offset) = self.cursor_topic(cx)?;
+        let text = self.source_text(host, cx)?;
+        let headings = parse(&text);
+        let mut index = headings
+            .iter()
+            .position(|heading| heading.heading_range.start == offset)?;
+        while let Some(parent) = headings[index].parent {
+            index = parent;
+        }
+        Some((host, offset, headings[index].title.clone()))
+    }
+
     /// The heading's top agent (rows are sorted loudest-first), for verbs
     /// aimed at a heading line rather than a specific row.
     pub fn first_agent_for_topic(&self, topic: (HostId, usize)) -> Option<AgentId> {
@@ -1995,6 +2339,91 @@ impl Dashboard {
         });
         self.pending_doc_cursor = Some((host, offset));
         true
+    }
+
+    #[cfg(feature = "native")]
+    pub fn tag_heading_with_page(
+        &mut self,
+        title: &str,
+        tag: &str,
+        cx: &mut Context<Workspace>,
+    ) -> bool {
+        for host in self.hosts.keys().copied().collect::<Vec<_>>() {
+            let Some(text) = self.source_text(host, cx) else {
+                continue;
+            };
+            let Some(heading) = parse(&text)
+                .into_iter()
+                .find(|heading| heading.title == title)
+            else {
+                continue;
+            };
+            if heading.tags.iter().any(|candidate| candidate == tag) {
+                return true;
+            }
+            let Some(buffer) = self.hosts.get(&host).and_then(WeakEntity::upgrade) else {
+                return false;
+            };
+            buffer.update(cx, |buffer, cx| {
+                buffer.edit(
+                    [(
+                        heading.heading_range.end..heading.heading_range.end,
+                        format!(" :{tag}:"),
+                    )],
+                    None,
+                    cx,
+                )
+            });
+            self.pending_doc_cursor = Some((host, heading.heading_range.start));
+            return true;
+        }
+        false
+    }
+
+    /// Files captured text as a child heading through the same canonical
+    /// CRDT Desk buffer used by ordinary editing.
+    pub fn append_child_heading(
+        &mut self,
+        parent_title: &str,
+        captured: &str,
+        cx: &mut Context<Workspace>,
+    ) -> bool {
+        for host in self.hosts.keys().copied().collect::<Vec<_>>() {
+            let Some(text) = self.source_text(host, cx) else {
+                continue;
+            };
+            let Some(heading) = parse(&text)
+                .into_iter()
+                .find(|heading| heading.title == parent_title)
+            else {
+                continue;
+            };
+            let Some(buffer) = self.hosts.get(&host).and_then(WeakEntity::upgrade) else {
+                return false;
+            };
+            let title = captured.split_whitespace().collect::<Vec<_>>().join(" ");
+            if title.is_empty() {
+                return false;
+            }
+            let offset = heading.subtree_range.end;
+            let prefix =
+                if offset == 0 || text.as_bytes().get(offset.saturating_sub(1)) == Some(&b'\n') {
+                    ""
+                } else {
+                    "\n"
+                };
+            let stars = "*".repeat(heading.depth + 1);
+            buffer.update(cx, |buffer, cx| {
+                buffer.edit(
+                    [(offset..offset, format!("{prefix}{stars} {title}\n"))],
+                    None,
+                    cx,
+                )
+            });
+            self.pending_doc_cursor = Some((host, offset + prefix.len()));
+            return true;
+        }
+        false
     }
 
     /// Appends a `* …` heading for a quick spawn and returns its offset.
@@ -2670,6 +3099,9 @@ impl Dashboard {
             && let Some(deal) = &self.deal
         {
             return deal_hint(deal);
+        }
+        if self.deal_empty_success {
+            return "nothing needs you".to_owned();
         }
         format!(
             "{} dealt · {} waiting",
@@ -4194,6 +4626,9 @@ fn blocked_reply_priority(wait_days: f64) -> f64 {
 }
 
 fn fyi_reply_priority(wait_days: f64) -> f64 {
+    // Rising curves belong to work waiting on the user. Finished FYI work is
+    // reminder-like: visible immediately, then implicitly accepted if it has
+    // not mattered after a few days (and still reachable from the Desk).
     -wait_days / FYI_REPLY_PACE_DAYS
 }
 
@@ -4227,11 +4662,74 @@ fn temporal_label(mark: &TemporalMark, now: chrono::NaiveDateTime, mark_priority
         }
         TemporalMarkKind::Todo => "todo".to_owned(),
         TemporalMarkKind::Reminder => "reminder".to_owned(),
-        TemporalMarkKind::Defer => "defer".to_owned(),
+        TemporalMarkKind::Defer => format!("deferred · woke {}", age_label(elapsed)),
         TemporalMarkKind::Skip | TemporalMarkKind::Done | TemporalMarkKind::Discarded => {
             unreachable!("non-live marks cannot win")
         }
     }
+}
+
+fn dealer_inbox_items(
+    inbox: &crate::inbox::InboxStore,
+    default_host: HostId,
+    at_ms: i64,
+) -> Vec<DealerInboxItem> {
+    use crate::inbox::{InboxKind, SourceReference};
+
+    inbox
+        .pending_items(at_ms)
+        .map(|item| {
+            let kind = match item.kind {
+                InboxKind::Capture => DealerInboxKind::Capture,
+                InboxKind::Obligation => DealerInboxKind::Obligation,
+                InboxKind::Ping => DealerInboxKind::Ping,
+            };
+            let source = match &item.source {
+                #[cfg(feature = "native")]
+                SourceReference::Page { id } => id
+                    .parse()
+                    .map(DealerInboxSource::Page)
+                    .unwrap_or_else(|_| DealerInboxSource::Other(id.clone())),
+                #[cfg(not(feature = "native"))]
+                SourceReference::Page { id } => DealerInboxSource::Other(id.clone()),
+                SourceReference::DeskPosition { host, offset } => {
+                    DealerInboxSource::Other(format!("desk:{host}:{offset}"))
+                }
+                SourceReference::External { source, reference } => {
+                    DealerInboxSource::Other(format!("{source}:{reference}"))
+                }
+                SourceReference::None => DealerInboxSource::Other(String::new()),
+            };
+            let context = match (
+                item.context.room.as_deref(),
+                item.context.focused_surface.as_str(),
+            ) {
+                (Some(room), "") => Some(room.to_owned()),
+                (Some(room), surface) => Some(format!("{room} / {surface}")),
+                (None, "") => None,
+                (None, surface) => Some(surface.to_owned()),
+            };
+            DealerInboxItem {
+                id: item.id.0.clone(),
+                host: default_host,
+                title: item.text.clone(),
+                kind,
+                captured_at: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
+                    item.captured_at_ms,
+                )
+                .unwrap_or(chrono::DateTime::UNIX_EPOCH)
+                .fixed_offset(),
+                deferred_until: item.deferred_until_ms.and_then(|at| {
+                    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(at)
+                        .map(|at| at.fixed_offset())
+                }),
+                resurfacing_count: item.resurfacing_count,
+                waiting_on: item.waiting_on.clone(),
+                source: (!matches!(item.source, SourceReference::None)).then_some(source),
+                context,
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -4259,9 +4757,38 @@ pub fn assemble_deal_queue(
     agent_facts: &[DealAgentFacts],
     now: chrono::DateTime<chrono::FixedOffset>,
 ) -> DealQueue {
+    assemble_dealer_queue(documents, agent_facts, &[], now)
+}
+
+pub fn assemble_dealer_queue(
+    documents: &[(HostId, String)],
+    agent_facts: &[DealAgentFacts],
+    inbox: &[DealerInboxItem],
+    now: chrono::DateTime<chrono::FixedOffset>,
+) -> DealQueue {
+    assemble_dealer_queue_in_room(documents, agent_facts, inbox, now, None, &HashMap::new())
+}
+
+fn assemble_dealer_queue_in_room(
+    documents: &[(HostId, String)],
+    agent_facts: &[DealAgentFacts],
+    inbox: &[DealerInboxItem],
+    now: chrono::DateTime<chrono::FixedOffset>,
+    current_room: Option<(HostId, &str)>,
+    agent_interactions: &HashMap<AgentId, i64>,
+) -> DealQueue {
     use rho_ui_proto::desk::temporal::priority;
 
     let desk_now = now.naive_local();
+    let room_bonus = |host: HostId, room: &str| {
+        current_room
+            .is_some_and(|(current_host, current_name)| {
+                current_host == host && current_name == room
+            })
+            .then_some(CURRENT_ROOM_PRIORITY_BONUS)
+            .unwrap_or(0.0)
+    };
+    let mut considered = HashSet::new();
     let by_id = agent_facts
         .iter()
         .map(|agent| (agent.agent_id, agent))
@@ -4309,12 +4836,22 @@ pub fn assemble_deal_queue(
                     TemporalMarkKind::Done | TemporalMarkKind::Discarded
                 )
             });
-            let deferred = heading.temporal_marks.iter().any(|mark| {
+            let locally_deferred = heading.temporal_marks.iter().any(|mark| {
                 matches!(
                     mark.kind,
                     TemporalMarkKind::Defer | TemporalMarkKind::Reminder | TemporalMarkKind::Skip
                 ) && mark.at > desk_now
             });
+            let mut ancestor = heading.parent;
+            let mut room_deferred = false;
+            while let Some(parent) = ancestor {
+                room_deferred |= headings[parent]
+                    .temporal_marks
+                    .iter()
+                    .any(|mark| mark.kind == TemporalMarkKind::Defer && mark.at > desk_now);
+                ancestor = headings[parent].parent;
+            }
+            let deferred = locally_deferred || room_deferred;
             let gated = archived || terminal || deferred;
             let agents = heading
                 .tags
@@ -4374,20 +4911,34 @@ pub fn assemble_deal_queue(
     for row in heading_rows.iter().filter(|row| !row.gated) {
         let topic = (row.host, row.heading.heading_range.start);
         for mark in &row.heading.temporal_marks {
-            let mark_priority = priority(mark, desk_now);
+            let identity = DealCardIdentity::Desk {
+                host: row.host,
+                heading_offset: row.heading.heading_range.start,
+            };
+            considered.insert(identity.clone());
+            let mark_priority = if mark.kind == TemporalMarkKind::Defer {
+                // A defer is sleep-until, not a recurring reminder: zero
+                // before wake (gated above), then the same rising age curve as
+                // a newly arrived obligation.
+                mark_elapsed_days(mark, desk_now)
+            } else {
+                priority(mark, desk_now)
+            };
             if mark_priority <= DEAL_QUEUE_FLOOR {
                 continue;
             }
             let agent_id = row.agents.first().copied();
+            let adjusted_priority = mark_priority
+                + room_bonus(row.host, row.breadcrumb.split(" › ").next().unwrap_or(""));
             offer(
                 topic,
                 RankedDealCard {
-                    priority: mark_priority,
+                    priority: adjusted_priority,
                     virtual_reply: false,
                     order: row.order,
                     card: DealCard {
                         label: temporal_label(mark, desk_now, mark_priority),
-                        priority: mark_priority,
+                        priority: adjusted_priority,
                         host: row.host,
                         heading_offset: Some(row.heading.heading_range.start),
                         agent_id,
@@ -4395,6 +4946,10 @@ pub fn assemble_deal_queue(
                             .and_then(|agent| by_id.get(&agent))
                             .map(|agent| agent.tag.clone()),
                         breadcrumb: row.breadcrumb.clone(),
+                        room: row.breadcrumb.split(" › ").next().map(str::to_owned),
+                        kind: DealCardKind::Desk,
+                        identity,
+                        inbox_source: None,
                     },
                 },
             );
@@ -4415,6 +4970,7 @@ pub fn assemble_deal_queue(
             continue;
         };
         let wait_days = reply_wait_days(ended, now);
+        considered.insert(DealCardIdentity::Agent(agent.agent_id));
         let (reply_priority, label) = if agent.facts.needs_you_hint {
             (
                 blocked_reply_priority(wait_days),
@@ -4423,29 +4979,138 @@ pub fn assemble_deal_queue(
         } else {
             (fyi_reply_priority(wait_days), "fyi".to_owned())
         };
-        if reply_priority <= DEAL_QUEUE_FLOOR {
+        let recency_bonus = agent_interactions.get(&agent.agent_id).map_or(0.0, |last| {
+            let elapsed = (now.timestamp_millis() - *last).clamp(0, AGENT_RECENCY_WINDOW_MS);
+            AGENT_RECENCY_BONUS * (1.0 - elapsed as f64 / AGENT_RECENCY_WINDOW_MS as f64)
+        });
+        // Recency is part of the curve, not a display-only sort adjustment:
+        // floor, lamp, and chime decisions all see the post-bonus priority.
+        let adjusted_priority = reply_priority
+            + recency_bonus
+            + room_bonus(row.host, row.breadcrumb.split(" › ").next().unwrap_or(""));
+        if adjusted_priority <= DEAL_QUEUE_FLOOR {
             continue;
         }
         offer(
             topic,
             RankedDealCard {
-                priority: reply_priority,
+                priority: adjusted_priority,
                 virtual_reply: true,
                 order: row.order,
                 card: DealCard {
                     label,
-                    priority: reply_priority,
+                    priority: adjusted_priority,
                     host: topic.0,
                     heading_offset: Some(topic.1),
                     agent_id: Some(agent.agent_id),
                     agent_tag: Some(agent.tag.clone()),
                     breadcrumb: row.breadcrumb.clone(),
+                    room: row.breadcrumb.split(" › ").next().map(str::to_owned),
+                    kind: DealCardKind::Agent,
+                    identity: DealCardIdentity::Agent(agent.agent_id),
+                    inbox_source: None,
                 },
             },
         );
     }
 
-    let priority_topics = ranked.keys().copied().collect::<HashSet<_>>();
+    let inbox_order_start = order;
+    for (index, item) in inbox.iter().enumerate() {
+        let identity = DealCardIdentity::Inbox(item.id.clone());
+        considered.insert(identity.clone());
+        match item.deferred_until {
+            Some(until) if until > now => continue,
+            _ => {}
+        }
+        let age_days = now
+            .signed_duration_since(item.captured_at)
+            .num_seconds()
+            .max(0) as f64
+            / 86_400.0;
+        let mark = TemporalMark {
+            // Every inbox card is triage debt waiting for a filing verdict,
+            // so all of them rise as Todos. Fading belongs to filed Desk
+            // reminders and agent FYIs, never to the inbox: it drains to zero
+            // only through user verdicts.
+            kind: TemporalMarkKind::Todo,
+            at: item.captured_at.naive_local(),
+            date_only: false,
+            pace_days: match item.kind {
+                DealerInboxKind::Ping => 0,
+                DealerInboxKind::Obligation => INBOX_OBLIGATION_PACE_DAYS,
+                DealerInboxKind::Capture => INBOX_CAPTURE_PACE_DAYS,
+            },
+        };
+        let score = match item.kind {
+            // Someone waiting should overtake an equally old obligation
+            // within a day, so its todo elapsed term runs twice as fast.
+            DealerInboxKind::Ping => priority(&mark, now.naive_local()) + age_days,
+            DealerInboxKind::Obligation | DealerInboxKind::Capture => {
+                priority(&mark, now.naive_local())
+            }
+        };
+        if score <= DEAL_QUEUE_FLOOR {
+            continue;
+        }
+        let room_name = item
+            .context
+            .as_deref()
+            .and_then(|context| context.split(" / ").next());
+        let adjusted_score = score + room_name.map_or(0.0, |room| room_bonus(item.host, room));
+        let mut reason = match (&item.kind, &item.waiting_on) {
+            (DealerInboxKind::Ping, Some(who)) => {
+                format!("ping · {} · {who} waiting", age_label(age_days))
+            }
+            (DealerInboxKind::Ping, None) => format!("ping · {}", age_label(age_days)),
+            (DealerInboxKind::Obligation, _) => format!("obligation · {} old", age_label(age_days)),
+            (DealerInboxKind::Capture, _) if item.resurfacing_count > 0 => {
+                format!(
+                    "capture · {} old · seen {}×",
+                    age_label(age_days),
+                    item.resurfacing_count
+                )
+            }
+            (DealerInboxKind::Capture, _) => format!("capture · {} old", age_label(age_days)),
+        };
+        if let Some(context) = item
+            .context
+            .as_deref()
+            .filter(|context| !context.is_empty())
+        {
+            reason.push_str(" · from ");
+            reason.push_str(context);
+        }
+        // Inbox ids are unique, so a synthetic topic cannot collide with Desk
+        // offsets. The map remains only an implementation detail for choosing
+        // one winning card per identity.
+        let topic = (item.host, usize::MAX - index);
+        offer(
+            topic,
+            RankedDealCard {
+                priority: adjusted_score,
+                virtual_reply: false,
+                order: inbox_order_start + index,
+                card: DealCard {
+                    label: reason,
+                    priority: adjusted_score,
+                    host: item.host,
+                    heading_offset: None,
+                    agent_id: None,
+                    agent_tag: None,
+                    breadcrumb: item.title.clone(),
+                    room: room_name.map(str::to_owned),
+                    kind: DealCardKind::Inbox(item.kind),
+                    identity,
+                    inbox_source: item.source.clone(),
+                },
+            },
+        );
+    }
+
+    let live_cards = ranked
+        .values()
+        .map(|ranked| ranked.card.identity.clone())
+        .collect::<HashSet<_>>();
     let total_alive = ranked.len();
     let mut ranked = ranked.into_values().collect::<Vec<_>>();
     ranked.sort_by(|a, b| {
@@ -4463,13 +5128,23 @@ pub fn assemble_deal_queue(
         .take(DEAL_PRIORITY_CUTOFF)
         .map(|ranked| ranked.card)
         .collect::<Vec<_>>();
+    let dealt = cards
+        .iter()
+        .map(|card| &card.identity)
+        .collect::<HashSet<_>>();
+    let mut considered_not_dealt = considered
+        .into_iter()
+        .filter(|identity| !dealt.contains(identity))
+        .collect::<Vec<_>>();
+    considered_not_dealt.sort_by_key(|identity| format!("{identity:?}"));
     let dealt_count = cards.len();
 
     DealQueue {
         cards,
         total_alive,
         dealt_count,
-        priority_topics,
+        live_cards,
+        considered_not_dealt,
     }
 }
 
@@ -4478,7 +5153,8 @@ fn deal_hint(deal: &DealSession) -> String {
         return "Desk deal complete".to_owned();
     };
     format!(
-        "DEAL · {} · {}/{} · {} dealt · {} waiting",
+        "DEAL · {} · {} · {}/{} · {} dealt · {} waiting",
+        card.breadcrumb,
         card.label,
         deal.index + 1,
         deal.cards.len(),
@@ -4871,7 +5547,127 @@ mod tests {
     }
 
     #[test]
-    fn fyi_matches_reminder_fresh_and_dies_at_the_floor_after_three_days() {
+    fn recent_agent_interaction_bonus_fades_linearly_for_one_hour() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc()
+            .fixed_offset();
+        let mut fyi = agent(1, None, UiAttention::Quiet, 0);
+        fyi.facts = rho_ui_proto::UiAgentFacts {
+            last_turn_ended: Some(UnixMs(now.timestamp_millis() as u64)),
+            last_user_message_at: UnixMs(0),
+            needs_you_hint: false,
+            turn_running: false,
+        };
+        let agent_id = fyi.agent_id;
+        let (reg, host) = registry(vec![fyi]);
+        let text = format!(
+            "* Reply :eng-{}:
+",
+            &agent_id.encoded()[..4]
+        );
+        let facts = deal_agent_facts(&reg);
+
+        let priority_at = |elapsed: chrono::Duration| {
+            let interactions = HashMap::from([(
+                agent_id,
+                now.timestamp_millis() - elapsed.num_milliseconds(),
+            )]);
+            assemble_dealer_queue_in_room(
+                &[(host, text.clone())],
+                &facts,
+                &[],
+                now,
+                None,
+                &interactions,
+            )
+            .cards[0]
+                .priority
+        };
+
+        assert_eq!(priority_at(chrono::Duration::zero()), 1.5);
+        assert_eq!(priority_at(chrono::Duration::minutes(30)), 0.75);
+        assert_eq!(priority_at(chrono::Duration::hours(1)), 0.0);
+    }
+
+    #[test]
+    fn replying_optimistically_retires_the_completed_card_without_a_crossing() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc()
+            .fixed_offset();
+        let mut completed = agent(1, None, UiAttention::Quiet, 0);
+        completed.facts.last_turn_ended = Some(UnixMs(now.timestamp_millis() as u64));
+        completed.facts.last_user_message_at = UnixMs(now.timestamp_millis() as u64);
+        let agent_id = completed.agent_id;
+        let (reg, host) = registry(vec![completed]);
+        let text = format!(
+            "* Reply :eng-{}:
+",
+            &agent_id.encoded()[..4]
+        );
+        let interactions = HashMap::from([(agent_id, now.timestamp_millis())]);
+
+        let queue = assemble_dealer_queue_in_room(
+            &[(host, text)],
+            &deal_agent_facts(&reg),
+            &[],
+            now,
+            None,
+            &interactions,
+        );
+
+        assert!(queue.cards.is_empty());
+    }
+
+    #[test]
+    fn recency_bonus_revives_a_reply_before_the_queue_floor_is_applied() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc()
+            .fixed_offset();
+        let mut faded = agent(1, None, UiAttention::Quiet, 0);
+        faded.facts.last_turn_ended = Some(UnixMs(
+            (now - chrono::Duration::days(3)).timestamp_millis() as u64,
+        ));
+        let agent_id = faded.agent_id;
+        let (reg, host) = registry(vec![faded]);
+        let text = format!(
+            "* Reply :eng-{}:
+",
+            &agent_id.encoded()[..4]
+        );
+        let facts = deal_agent_facts(&reg);
+
+        let without_bonus = assemble_dealer_queue_in_room(
+            &[(host, text.clone())],
+            &facts,
+            &[],
+            now,
+            None,
+            &HashMap::new(),
+        );
+        let with_bonus = assemble_dealer_queue_in_room(
+            &[(host, text)],
+            &facts,
+            &[],
+            now,
+            None,
+            &HashMap::from([(agent_id, now.timestamp_millis())]),
+        );
+
+        assert!(without_bonus.cards.is_empty());
+        assert_eq!(with_bonus.cards[0].priority, LAMP_THRESHOLD);
+    }
+
+    #[test]
+    fn fyi_matches_reminder_fresh_and_fades_to_the_floor() {
         let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
             .unwrap()
             .and_hms_opt(12, 0, 0)
@@ -4945,8 +5741,150 @@ mod tests {
             agent_id: None,
             agent_tag: None,
             breadcrumb: String::new(),
+            room: None,
+            kind: DealCardKind::Desk,
+            identity: DealCardIdentity::Desk {
+                host,
+                heading_offset: "* Todo 0\n:todo: 2026-08-13 7d\n".len() * 8,
+            },
+            inbox_source: None,
         };
         assert!(queue.is_live(&ninth_ranked));
+    }
+
+    #[test]
+    fn inbox_curves_share_the_queue_and_explain_their_inputs() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc()
+            .fixed_offset();
+        let old = now - chrono::Duration::days(2);
+        let inbox = vec![
+            DealerInboxItem {
+                id: "ping".into(),
+                host: HostId(1),
+                title: "Reply to Ada".into(),
+                kind: DealerInboxKind::Ping,
+                captured_at: old,
+                deferred_until: None,
+                resurfacing_count: 0,
+                waiting_on: Some("Ada".into()),
+                source: None,
+                context: Some("work".into()),
+            },
+            DealerInboxItem {
+                id: "capture".into(),
+                host: HostId(1),
+                title: "Try a thing".into(),
+                kind: DealerInboxKind::Capture,
+                captured_at: old,
+                deferred_until: None,
+                resurfacing_count: 2,
+                waiting_on: None,
+                source: None,
+                context: None,
+            },
+        ];
+        let queue = assemble_dealer_queue(&[], &[], &inbox, now);
+        assert_eq!(queue.cards.len(), 2);
+        assert_eq!(queue.cards[0].breadcrumb, "Reply to Ada");
+        assert_eq!(queue.cards[0].label, "ping · 2d · Ada waiting · from work");
+        assert_eq!(
+            queue.cards[0].kind,
+            DealCardKind::Inbox(DealerInboxKind::Ping)
+        );
+        assert_eq!(queue.cards[1].label, "capture · 2d old · seen 2×");
+    }
+
+    #[test]
+    fn inbox_kind_first_visible_times_are_explicit() {
+        let captured = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc()
+            .fixed_offset();
+        let item = |id: &str, kind| DealerInboxItem {
+            id: id.into(),
+            host: HostId(1),
+            title: id.into(),
+            kind,
+            captured_at: captured,
+            deferred_until: None,
+            resurfacing_count: 0,
+            waiting_on: None,
+            source: None,
+            context: None,
+        };
+        let inbox = vec![
+            item("ping", DealerInboxKind::Ping),
+            item("obligation", DealerInboxKind::Obligation),
+            item("capture", DealerInboxKind::Capture),
+        ];
+
+        let fresh = assemble_dealer_queue(&[], &[], &inbox, captured);
+        assert!(fresh.cards.iter().any(|card| card.breadcrumb == "ping"));
+        assert!(
+            fresh
+                .cards
+                .iter()
+                .any(|card| card.breadcrumb == "obligation")
+        );
+        assert!(fresh.cards.iter().all(|card| card.breadcrumb != "capture"));
+
+        // Todo priority uses fractional elapsed days. A one-day pace starts
+        // exactly on the excluded -1 floor, then clears it within the hour;
+        // it does not hide the capture for a whole day.
+        let one_hour_later = captured + chrono::Duration::hours(1);
+        let after_one_hour = assemble_dealer_queue(&[], &[], &inbox, one_hour_later);
+        assert!(
+            after_one_hour
+                .cards
+                .iter()
+                .any(|card| card.breadcrumb == "capture")
+        );
+
+        let after_one_day =
+            assemble_dealer_queue(&[], &[], &inbox, captured + chrono::Duration::days(1));
+        let priorities = after_one_day
+            .cards
+            .iter()
+            .map(|card| (card.breadcrumb.as_str(), card.priority))
+            .collect::<HashMap<_, _>>();
+        assert!(priorities["ping"] > priorities["obligation"]);
+        assert!(priorities["obligation"] > priorities["capture"]);
+    }
+
+    #[test]
+    fn deferred_inbox_is_zero_until_wake_then_resumes_its_curve() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc()
+            .fixed_offset();
+        let mut item = DealerInboxItem {
+            id: "later".into(),
+            host: HostId(1),
+            title: "Read later".into(),
+            kind: DealerInboxKind::Obligation,
+            captured_at: now - chrono::Duration::days(30),
+            deferred_until: Some(now + chrono::Duration::hours(1)),
+            resurfacing_count: 0,
+            waiting_on: None,
+            source: None,
+            context: None,
+        };
+        assert!(
+            assemble_dealer_queue(&[], &[], &[item.clone()], now)
+                .cards
+                .is_empty()
+        );
+        item.deferred_until = Some(now - chrono::Duration::hours(6));
+        let queue = assemble_dealer_queue(&[], &[], &[item], now);
+        assert_eq!(queue.cards[0].label, "obligation · 30d old");
     }
 
     #[test]
@@ -5029,6 +5967,13 @@ mod tests {
                 agent_id: None,
                 agent_tag: None,
                 breadcrumb: "One".into(),
+                room: Some("One".into()),
+                kind: DealCardKind::Desk,
+                identity: DealCardIdentity::Desk {
+                    host,
+                    heading_offset: 0,
+                },
+                inbox_source: None,
             },
             DealCard {
                 label: "todo · ripe 2d".into(),
@@ -5038,6 +5983,13 @@ mod tests {
                 agent_id: None,
                 agent_tag: None,
                 breadcrumb: "Two".into(),
+                room: Some("Two".into()),
+                kind: DealCardKind::Desk,
+                identity: DealCardIdentity::Desk {
+                    host,
+                    heading_offset: 6,
+                },
+                inbox_source: None,
             },
         ];
         let deal = DealSession {
@@ -5048,10 +6000,12 @@ mod tests {
             dealt_count: 2,
             total_alive: 9,
             resolved: vec![false, false],
+            started_at: Instant::now(),
+            considered_not_dealt: Vec::new(),
         };
         assert_eq!(
             deal_hint(&deal),
-            "DEAL · todo · ripe 2d · 2/2 · 2 dealt · 9 waiting"
+            "DEAL · Two · todo · ripe 2d · 2/2 · 2 dealt · 9 waiting"
         );
     }
 
@@ -5680,5 +6634,52 @@ mod tests {
             assert_eq!(agent_class, plain_class, "agent keeps the level hue");
             assert!(agent_opacity > plain_opacity, "agent variant is subtle");
         }
+    }
+
+    #[test]
+    fn current_room_bonus_breaks_only_near_ties() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 20)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_local_timezone(chrono::FixedOffset::east_opt(0).unwrap())
+            .unwrap();
+        let host = HostId(1);
+        let text = "* elsewhere\n:todo: 2026-08-18 1d\n* here\n:todo: 2026-08-18 1d\n";
+        let queue = assemble_dealer_queue_in_room(
+            &[(host, text.to_owned())],
+            &[],
+            &[],
+            now,
+            Some((host, "here")),
+            &HashMap::new(),
+        );
+        assert_eq!(queue.cards[0].breadcrumb, "here");
+        assert_eq!(queue.cards[0].priority - queue.cards[1].priority, 0.25);
+    }
+
+    #[test]
+    fn top_level_room_defer_gates_descendant_cards() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 20)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_local_timezone(chrono::FixedOffset::east_opt(0).unwrap())
+            .unwrap();
+        let host = HostId(1);
+        let text = "* rho\n:defer: 2026-08-21 1d\n** hidden\n:todo: 2026-08-18 1d\n* work\n:todo: 2026-08-18 1d\n";
+        let queue = assemble_deal_queue(&[(host, text.to_owned())], &[], now);
+        assert!(
+            queue
+                .cards
+                .iter()
+                .all(|card| card.room.as_deref() != Some("rho"))
+        );
+        assert!(
+            queue
+                .cards
+                .iter()
+                .any(|card| card.room.as_deref() == Some("work"))
+        );
     }
 }

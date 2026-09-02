@@ -37,6 +37,9 @@ use wayland_client::{
         wl_shm_pool, wl_surface, wl_touch,
     },
 };
+use wayland_protocols::ext::idle_notify::v1::client::{
+    ext_idle_notification_v1, ext_idle_notifier_v1,
+};
 use wayland_protocols::wp::color_management::v1::client::{
     wp_color_management_surface_v1, wp_color_manager_v1, wp_image_description_creator_params_v1,
     wp_image_description_v1,
@@ -105,8 +108,8 @@ use gpui::{
     Modifiers, ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseExitEvent, MouseMoveEvent,
     MouseUpEvent, NavigationDirection, Pixels, PlatformDisplay, PlatformInput,
     PlatformKeyboardLayout, PlatformWindow, Point, ScrollDelta, ScrollWheelEvent, SharedString,
-    Size, TouchEvent, TouchId, TouchPhase, WindowButtonLayout, WindowKind, WindowParams, point,
-    profiler, px, size,
+    Size, TouchEvent, TouchId, TouchPhase, UserIdleEvent, WindowButtonLayout, WindowKind,
+    WindowParams, point, profiler, px, size,
 };
 use gpui_wgpu::{CompositorGpuHint, GpuContext};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
@@ -254,6 +257,7 @@ pub struct Globals {
     pub blur_manager: Option<org_kde_kwin_blur_manager::OrgKdeKwinBlurManager>,
     pub text_input_manager: Option<zwp_text_input_manager_v3::ZwpTextInputManagerV3>,
     pub gesture_manager: Option<zwp_pointer_gestures_v1::ZwpPointerGesturesV1>,
+    pub idle_notifier: Option<ext_idle_notifier_v1::ExtIdleNotifierV1>,
     pub dialog: Option<xdg_wm_dialog_v1::XdgWmDialogV1>,
     pub system_bell: Option<xdg_system_bell_v1::XdgSystemBellV1>,
     pub executor: ForegroundExecutor,
@@ -310,6 +314,7 @@ impl Globals {
             blur_manager: globals.bind(&qh, 1..=1, ()).ok(),
             text_input_manager: globals.bind(&qh, 1..=1, ()).ok(),
             gesture_manager: globals.bind(&qh, 1..=3, ()).ok(),
+            idle_notifier: globals.bind(&qh, 1..=1, ()).ok(),
             dialog: globals.bind(&qh, dialog_v..=dialog_v, ()).ok(),
             system_bell: globals.bind(&qh, 1..=1, ()).ok(),
             executor,
@@ -364,6 +369,7 @@ pub(crate) struct WaylandClientState {
     wl_seat: wl_seat::WlSeat, // TODO: Multi seat support
     wl_pointer: Option<wl_pointer::WlPointer>,
     wl_touch: Option<wl_touch::WlTouch>,
+    idle_notification: Option<ext_idle_notification_v1::ExtIdleNotificationV1>,
     pinch_gesture: Option<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1>,
     pinch_scale: f32,
     touch_points: HashMap<i32, ActiveTouch>,
@@ -806,6 +812,9 @@ impl Drop for WaylandClient {
         if let Some(text_input) = &state.text_input {
             text_input.destroy();
         }
+        if let Some(idle_notification) = &state.idle_notification {
+            idle_notification.destroy();
+        }
     }
 }
 
@@ -990,6 +999,7 @@ impl WaylandClient {
             wl_seat: seat,
             wl_pointer: None,
             wl_touch: None,
+            idle_notification: None,
             wl_keyboard: None,
             pinch_gesture: None,
             pinch_scale: 1.0,
@@ -1086,6 +1096,25 @@ impl WaylandClient {
 }
 
 impl LinuxClient for WaylandClient {
+    fn on_user_idle(&self, timeout: Duration, callback: Box<dyn FnMut(UserIdleEvent)>) {
+        let mut state = self.0.borrow_mut();
+        let Some(idle_notifier) = state.globals.idle_notifier.clone() else {
+            return;
+        };
+
+        if let Some(notification) = state.idle_notification.take() {
+            notification.destroy();
+        }
+        state.common.callbacks.user_idle = Some(callback);
+        let timeout_ms = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
+        state.idle_notification = Some(idle_notifier.get_idle_notification(
+            timeout_ms,
+            &state.wl_seat,
+            &state.globals.qh,
+            (),
+        ));
+    }
+
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout> {
         Box::new(self.0.borrow().keyboard_layout.clone())
     }
@@ -1534,6 +1563,7 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
 
 delegate_noop!(WaylandClientStatePtr: ignore xdg_activation_v1::XdgActivationV1);
 delegate_noop!(WaylandClientStatePtr: ignore xdg_system_bell_v1::XdgSystemBellV1);
+delegate_noop!(WaylandClientStatePtr: ignore ext_idle_notifier_v1::ExtIdleNotifierV1);
 delegate_noop!(WaylandClientStatePtr: ignore wp_color_management_surface_v1::WpColorManagementSurfaceV1);
 delegate_noop!(WaylandClientStatePtr: ignore wp_image_description_creator_params_v1::WpImageDescriptionCreatorParamsV1);
 delegate_noop!(WaylandClientStatePtr: ignore wl_compositor::WlCompositor);
@@ -1554,6 +1584,30 @@ delegate_noop!(WaylandClientStatePtr: ignore zwp_text_input_manager_v3::ZwpTextI
 delegate_noop!(WaylandClientStatePtr: ignore org_kde_kwin_blur::OrgKdeKwinBlur);
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewporter::WpViewporter);
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewport::WpViewport);
+
+impl Dispatch<ext_idle_notification_v1::ExtIdleNotificationV1, ()> for WaylandClientStatePtr {
+    fn event(
+        this: &mut Self,
+        _: &ext_idle_notification_v1::ExtIdleNotificationV1,
+        event: ext_idle_notification_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let client = this.get_client();
+        let mut state = client.borrow_mut();
+        let event = match event {
+            ext_idle_notification_v1::Event::Idled => UserIdleEvent::Idle,
+            ext_idle_notification_v1::Event::Resumed => UserIdleEvent::Resumed,
+            _ => return,
+        };
+        if let Some(mut callback) = state.common.callbacks.user_idle.take() {
+            drop(state);
+            callback(event);
+            client.borrow_mut().common.callbacks.user_idle = Some(callback);
+        }
+    }
+}
 
 impl Dispatch<wp_color_manager_v1::WpColorManagerV1, ()> for WaylandClientStatePtr {
     fn event(

@@ -2,8 +2,8 @@
 //!
 //! [`TerminalModel`] is the buffer role: it owns the wire display state
 //! ([`WireScreen`]), the input stream, and the read task — shared by every
-//! pane showing the terminal. [`TerminalView`] is the window role: one per
-//! pane, with its own focus, scrollback offset, and mode.
+//! surface showing the terminal. [`TerminalView`] is the viewport role, with
+//! its own focus, scrollback offset, and mode.
 //!
 //! Input is deliberately mode-free on the wire — keystrokes go to the
 //! daemon as structured [`TermKeystroke`]s and are encoded against the
@@ -17,8 +17,7 @@
 //! `i`/`a`/`enter` return to raw.
 //!
 //! Only the focused view's size is sent to the pty (tmux `window-size
-//! latest`): a terminal shown in differently-sized splits follows whichever
-//! pane you're typing in instead of thrashing the pty with competing sizes.
+//! latest`): only the visible, focused terminal surface sizes the pty.
 
 use std::cell::Cell;
 use std::ops::Range;
@@ -110,7 +109,7 @@ impl TerminalModel {
     }
 }
 
-/// One pane's view of a terminal: own focus, scroll offset, and mode.
+/// A terminal's viewport: focus, scroll offset, and mode.
 pub struct TerminalView {
     model: Entity<TerminalModel>,
     focus_handle: FocusHandle,
@@ -156,10 +155,6 @@ impl TerminalView {
             grid_origin_px: Rc::new(Cell::new((0.0, 0.0))),
             _model_changed: model_changed,
         }
-    }
-
-    pub fn model(&self) -> &Entity<TerminalModel> {
-        &self.model
     }
 
     fn key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
@@ -226,6 +221,10 @@ impl TerminalView {
             self.scroll_offset = offset;
             cx.notify();
         }
+    }
+
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll_offset
     }
 
     fn half_page(&self, cx: &Context<Self>) -> isize {
@@ -347,10 +346,10 @@ impl Render for TerminalView {
 
         let focused = self.focus_handle.is_focused(window);
 
-        // Size measurement happens at paint time: compare the pane bounds
+        // Size measurement happens at paint time: compare the viewport bounds
         // to the cell metrics and tell the daemon when the grid changed.
         // Only the focused view drives the pty size (tmux `window-size
-        // latest`) — competing sizes from other splits would thrash it.
+        // latest`) so hidden terminal surfaces do not resize the pty.
         let model = self.model.read(cx);
         let sent_size = model.sent_size.clone();
         let input = model.input.clone();
@@ -463,8 +462,8 @@ impl Render for TerminalView {
             .line_height(line_height)
             .child(div().absolute().size_full().child(measure))
             // The grid paints in an absolute layer: pty content is sized by
-            // the pane, never the other way around, so a wide row can only
-            // be clipped — it can't push the split.
+            // the viewport, never the other way around, so a wide row can only
+            // be clipped.
             .child(
                 div()
                     .absolute()
@@ -505,7 +504,7 @@ impl Palette<'_> {
         }
     }
 
-    /// `None` for the default background so cells inherit the pane color.
+    /// `None` for the default background so cells inherit the surface color.
     fn bg(&self, color: TermColor) -> Option<Hsla> {
         match color {
             TermColor::Background => None,

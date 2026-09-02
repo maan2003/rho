@@ -203,6 +203,10 @@ pub trait Platform: 'static {
     fn on_reopen(&self, callback: Box<dyn FnMut()>);
     fn on_system_wake(&self, callback: Box<dyn FnMut()>);
 
+    /// Registers a callback for system-wide user idle and resumed events.
+    /// Platforms without idle notification support never invoke the callback.
+    fn on_user_idle(&self, _timeout: Duration, _callback: Box<dyn FnMut(UserIdleEvent)>) {}
+
     // Mobile platform methods. On mobile the OS owns the application
     // lifecycle: apps are backgrounded, foregrounded, and killed at the
     // system's discretion, and must react rather than decide.
@@ -326,6 +330,15 @@ pub trait Platform: 'static {
     fn keyboard_layout(&self) -> Box<dyn PlatformKeyboardLayout>;
     fn keyboard_mapper(&self) -> Rc<dyn PlatformKeyboardMapper>;
     fn on_keyboard_layout_change(&self, callback: Box<dyn FnMut()>);
+}
+
+/// A system-wide user idle notification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UserIdleEvent {
+    /// The configured timeout elapsed without user activity.
+    Idle,
+    /// User activity resumed after an idle event.
+    Resumed,
 }
 
 /// A handle to a platform's display, e.g. a monitor or laptop screen.

@@ -1,10 +1,10 @@
 //! One agent model per agent: transcript projection, prompt draft, and
 //! local system notices — the buffer role. Editors are the window role:
-//! each pane showing the agent builds its own editor over the shared
+//! each surface showing the agent builds its editor over the shared
 //! multibuffer via [`AgentModel::build_editor`], with its own cursor,
 //! scroll, and folds. The model reconciles every attached editor when
 //! content or chrome changes, so the model persists for the session while
-//! editors come and go with panes.
+//! editors come and go with surfaces.
 //!
 //! The multibuffer composes the transcript's per-turn buffers, a lazy read-only
 //! system-notice region (local messages that must survive transcript
@@ -64,7 +64,7 @@ pub struct AgentModel {
     initial_load_ready: bool,
     initial_load: Option<Task<()>>,
     /// Full-multibuffer editors currently displaying this agent, weakly
-    /// held: panes own their editors; the model only reconciles whoever
+    /// held: surfaces own their editors; the model only reconciles whoever
     /// is still alive. The preview editor lives apart — prompt chrome
     /// must never reach it.
     editors: Vec<WeakEntity<Editor>>,
@@ -242,7 +242,7 @@ impl AgentModel {
         self.preview_editor = None;
     }
 
-    /// Builds a pane's editor over the shared multibuffer — own cursor,
+    /// Builds an editor over the shared multibuffer — own cursor,
     /// scroll, and folds — fully caught up with the model.
     pub fn build_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<Editor> {
         let workspace = self.workspace.clone();

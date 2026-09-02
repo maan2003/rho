@@ -2,7 +2,7 @@
 //!
 //! jj owns the persistent repository snapshot and immutable parent text. Zed
 //! owns current-side buffers, including unsaved edits and external-file
-//! conflict state. Every split observes one [`DiffModel`], so manifest
+//! conflict state. The [`DiffView`] observes one [`DiffModel`], so manifest
 //! refreshes reconcile the existing surface instead of replacing editors.
 
 use std::collections::{HashMap, HashSet};
@@ -244,7 +244,7 @@ struct DiffEntry {
     recalculate: Option<Task<()>>,
 }
 
-/// Shared state for every pane displaying the same workspace diff.
+/// Shared state for a workspace diff.
 pub struct DiffModel {
     remote: RemoteProject,
     client: DiffClient,
@@ -637,7 +637,7 @@ impl DiffModel {
     }
 }
 
-/// One pane's cursor, scroll, and folds over a shared [`DiffModel`].
+/// Cursor, scroll, and folds over a shared [`DiffModel`].
 pub struct DiffView {
     editor: Entity<editor::Editor>,
     model: Entity<DiffModel>,

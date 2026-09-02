@@ -18,6 +18,8 @@ pub mod draft_view;
 pub mod editor_config;
 pub mod highlights;
 pub mod hosts;
+pub mod inbox;
+pub mod journal;
 pub mod minibuffer;
 pub mod pane;
 pub(crate) mod realtime_client;
@@ -79,6 +81,7 @@ actions!(
         DashboardDealDone,
         DashboardDealDiscard,
         DashboardDealSnooze,
+        DashboardDealRoomSnooze,
         DashboardDealTodo,
         DashboardDealReply,
         DashboardDealRefresh,
@@ -87,11 +90,6 @@ actions!(
         RoleCycleGroup,
         TaskBoard,
         FileSave,
-        PaneSplitRight,
-        PaneSplitDown,
-        PaneClose,
-        PaneFocusNext,
-        PaneBack,
         BrowserExit,
         RailFocus,
         RailOpen,
@@ -118,8 +116,15 @@ actions!(
         ShellPagerAll,
         ShellPagerQuit,
         VoiceToggle,
+        InboxCapture,
         UploadGuiTelemetry,
         ZulipOpenRow,
+        RoomStripLeft,
+        RoomStripRight,
+        RoomBack,
+        DealOpen,
+        OverviewToggle,
+        StripRemove,
         ZulipNextUnread,
         ZulipLoadOlder,
         ZulipQuit
@@ -174,6 +179,21 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
     // vim keymap only binds the rho prompt keys for insert mode, while the
     // default keymap's Tab binding can lose to vim's normal-mode handling.
     cx.bind_keys([
+        KeyBinding::new("ctrl-left", RoomStripLeft, Some("RhoGui")),
+        KeyBinding::new("ctrl-right", RoomStripRight, Some("RhoGui")),
+        KeyBinding::new("ctrl-k", RoomBack, Some("RhoGui")),
+        KeyBinding::new("ctrl-j", DealOpen, Some("RhoGui")),
+        KeyBinding::new("f20", DealOpen, Some("RhoGui")),
+        KeyBinding::new("f21", RoomBack, Some("RhoGui")),
+        KeyBinding::new("f22", RoomStripLeft, Some("RhoGui")),
+        KeyBinding::new("f23", RoomStripRight, Some("RhoGui")),
+        KeyBinding::new("f24", OverviewToggle, Some("RhoGui")),
+        KeyBinding::new("ctrl-shift-backspace", StripRemove, Some("RhoGui")),
+        KeyBinding::new("ctrl-left", RoomStripLeft, Some("RhoGui > Editor")),
+        KeyBinding::new("ctrl-right", RoomStripRight, Some("RhoGui > Editor")),
+        KeyBinding::new("ctrl-k", RoomBack, Some("RhoGui > Editor")),
+        KeyBinding::new("ctrl-j", DealOpen, Some("RhoGui > Editor")),
+        KeyBinding::new("ctrl-shift-backspace", StripRemove, Some("RhoGui > Editor")),
         // Attention triage: jump to the most urgent agent, clear the current
         // one. The bundled zed keymaps don't know these actions, so they are
         // bound here rather than in an asset. The context must be at least as
@@ -211,6 +231,9 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             Some("RhoGui > RhoBrowser"),
         ),
         KeyBinding::new("ctrl-alt-shift-p", UploadGuiTelemetry, Some("RhoGui")),
+        // Capture is global and modal: one chord, type, enter, and focus is
+        // restored to the exact surface that owned it.
+        KeyBinding::new("ctrl-shift-i", InboxCapture, Some("RhoGui")),
         // A Comint-style shell submits complete input lines to the daemon;
         // its transcript remains an ordinary Vim-navigable editor buffer.
         KeyBinding::new(
@@ -262,8 +285,8 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         KeyBinding::new("shift-g", TerminalScrollBottom, Some("RhoTerminalNormal")),
     ]);
     // The space leader: one binding, opening the root transient at once
-    // (invisible until the reveal delay). Every chord beneath it — panes
-    // and agent verbs — is a transient item, so practiced
+    // (invisible until the reveal delay). Every chord beneath it is a
+    // transient item, so practiced
     // sequences run at full speed without the menu ever flashing. Bound for
     // normal-mode editors (vim or helix flavor — helix reports
     // `vim_mode == helix_normal`); the dashboard is an editor too, so the
@@ -378,6 +401,7 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         KeyBinding::new("r", DashboardDealReply, Some(context)),
         KeyBinding::new("shift-r", DashboardDealRefresh, Some(context)),
         KeyBinding::new("i", DashboardDealInsert, Some(context)),
+        KeyBinding::new("shift-s", DashboardDealRoomSnooze, Some(context)),
     ]);
 }
 

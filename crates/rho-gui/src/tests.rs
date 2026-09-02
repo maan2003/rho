@@ -4,7 +4,8 @@ use editor::Editor;
 use editor::display_map::{Block, DisplayRow};
 use gpui::{
     App, AppContext as _, Entity, Focusable as _, InputEvent as _, Modifiers, MouseButton,
-    MouseDownEvent, MouseUpEvent, TestAppContext, WindowHandle, px, size,
+    MouseDownEvent, MouseUpEvent, TestAppContext, TouchEvent, TouchId, TouchPhase, WindowHandle,
+    point, px, size,
 };
 use rho_core::UnixMs;
 use rho_ui_proto::AgentId;
@@ -3325,6 +3326,84 @@ fn terminal_escape_chord_parses() {
     }
 }
 
+#[gpui::test]
+fn double_shift_toggles_desk_overview(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.select_agent(None, window, cx);
+            assert!(!workspace.is_dashboard_mode(window, cx));
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "shift shift");
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(workspace.is_dashboard_mode(window, cx));
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "shift shift");
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(!workspace.is_dashboard_mode(window, cx));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn f24_alias_toggles_desk_overview(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.select_agent(None, window, cx);
+            assert!(!workspace.is_dashboard_mode(window, cx));
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "f24");
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(workspace.is_dashboard_mode(window, cx));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn two_finger_swipe_up_toggles_desk_overview(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.select_agent(None, window, cx);
+            window.simulate_next_frame(cx);
+            assert!(!workspace.is_dashboard_mode(window, cx));
+        })
+        .unwrap();
+    cx.update_window(*workspace, |_, window, cx| {
+        let touch = |id, phase, y, milliseconds| TouchEvent {
+            id: TouchId(id),
+            phase,
+            position: point(px(100.), px(y)),
+            timestamp: std::time::Duration::from_millis(milliseconds),
+            ..Default::default()
+        };
+        for event in [
+            touch(1, TouchPhase::Started, 500., 0),
+            touch(2, TouchPhase::Started, 500., 1),
+            touch(1, TouchPhase::Moved, 400., 20),
+            touch(2, TouchPhase::Moved, 400., 21),
+            touch(1, TouchPhase::Ended, 400., 30),
+            touch(2, TouchPhase::Ended, 400., 31),
+        ] {
+            window.dispatch_event(event.to_platform_input(), cx);
+        }
+    })
+    .unwrap();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(workspace.is_dashboard_mode(window, cx));
+        })
+        .unwrap();
+}
+
 /// The inline injection only runs over inline spans, so fenced code keeps
 /// punctuation that would be markup in prose.
 #[gpui::test]
@@ -5648,7 +5727,7 @@ fn desk_deal_session_resumes_and_insert_escape_returns_to_normal(cx: &mut TestAp
             assert!(
                 workspace
                     .dashboard_hint_for_test(cx)
-                    .starts_with("DEAL · deadline · ")
+                    .starts_with("DEAL · One · deadline · ")
                     && workspace
                         .dashboard_hint_for_test(cx)
                         .contains(" · 1/3 · 3 dealt · 3 waiting")
@@ -5793,10 +5872,10 @@ fn desk_deal_session_resumes_and_insert_escape_returns_to_normal(cx: &mut TestAp
             assert!(
                 workspace
                     .dashboard_hint_for_test(cx)
-                    .starts_with("DEAL · deadline · ")
+                    .starts_with("DEAL · Two · deadline · ")
                     && workspace
                         .dashboard_hint_for_test(cx)
-                        .contains(" · 2/3 · 3 dealt · 3 waiting")
+                        .contains(" · 2/3 · 3 dealt · 2 waiting")
             );
         })
         .unwrap();
@@ -5869,7 +5948,9 @@ fn desk_deal_session_resumes_and_insert_escape_returns_to_normal(cx: &mut TestAp
                 workspace
                     .dashboard_deal_topic_for_test()
                     .map(|(_, _, breadcrumb)| breadcrumb),
-                Some("Three")
+                // Skip advances only the current deal. Once that session is
+                // discarded, One is eligible again immediately.
+                Some("One")
             );
         })
         .unwrap();
@@ -5897,7 +5978,7 @@ fn desk_deal_session_resumes_and_insert_escape_returns_to_normal(cx: &mut TestAp
                 workspace
                     .dashboard_deal_topic_for_test()
                     .map(|(_, _, breadcrumb)| breadcrumb),
-                Some("MThree")
+                Some("MOne")
             );
         })
         .unwrap();
@@ -6064,7 +6145,7 @@ fn desk_deal_scrolls_a_deep_heading_below_its_sticky_ancestors(cx: &mut TestAppC
 }
 
 #[gpui::test]
-fn desk_deal_reply_draft_is_writable_while_desk_source_stays_read_only(cx: &mut TestAppContext) {
+fn desk_deal_open_takes_agent_without_writing_desk(cx: &mut TestAppContext) {
     use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
     use rho_ui_proto::{
         AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
@@ -6150,8 +6231,6 @@ fn desk_deal_reply_draft_is_writable_while_desk_source_stays_read_only(cx: &mut 
 
     cx.simulate_keystrokes(*workspace, "j r");
     cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "d r a f t");
-    cx.run_until_parked();
 
     workspace
         .update(cx, |workspace, _, cx| {
@@ -6159,7 +6238,7 @@ fn desk_deal_reply_draft_is_writable_while_desk_source_stays_read_only(cx: &mut 
                 workspace
                     .dashboard_reply_text_for_test(agent_id, cx)
                     .as_deref(),
-                Some("draft")
+                None
             );
             assert_eq!(
                 workspace
@@ -6221,8 +6300,6 @@ fn desk_deal_counted_snooze_todo_and_refresh_write_and_redeal(cx: &mut TestAppCo
         .unwrap();
     cx.run_until_parked();
 
-    cx.simulate_keystrokes(*workspace, "n shift-n");
-    cx.run_until_parked();
     workspace
         .update(cx, |workspace, _, cx| {
             assert!(workspace.dashboard_hint_for_test(cx).contains("1/6"));

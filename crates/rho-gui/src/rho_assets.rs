@@ -17,7 +17,7 @@ struct RhoEmbedded;
 /// Vendored from zed's `assets/settings/default.json` (at the pinned fork
 /// rev) with rho's chrome opinions applied: no line numbers, no gutter
 /// buttons, no scrollbars, no indent guides. Editors are bare buffers; the
-/// split tree is the chrome.
+/// surface viewport is the chrome.
 pub const RHO_DEFAULT_SETTINGS: &str = include_str!("../assets/settings/default.json");
 
 pub struct RhoAssets;

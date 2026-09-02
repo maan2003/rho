@@ -126,7 +126,7 @@ impl ShellModel {
         }
     }
 
-    /// Builds one pane-local editor over the shared transcript and draft.
+    /// Builds an editor over the shared transcript and draft.
     pub fn build_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<Editor> {
         let multi_buffer = self.multi_buffer.clone();
         let buffer_ids = [

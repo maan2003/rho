@@ -647,9 +647,6 @@ pub fn root_menu() -> Transient {
                 workspace.open_transient(agent_menu(), window, cx);
             },
         )
-        .item("w", "window…", |workspace, window, cx| {
-            workspace.open_transient(window_menu(), window, cx);
-        })
         .item("r", "rail", |workspace, window, cx| {
             workspace.focus_rail(window, cx);
         })
@@ -751,6 +748,12 @@ fn status_menu() -> Transient {
 
 fn input_menu() -> Transient {
     Transient::new("input")
+        .item("c", "capture thought", |workspace, window, cx| {
+            workspace.cmd_capture(window, cx);
+        })
+        .item("i", "inbox", |workspace, window, cx| {
+            workspace.open_inbox(window, cx);
+        })
         .item(
             "m",
             "iris microphone · mute/unmute",
@@ -803,6 +806,23 @@ pub fn usage_root_menu() -> Transient {
                 workspace.open_agent_cost_transient(30, window, cx);
             },
         )
+}
+
+pub(crate) fn inbox_item_menu() -> Transient {
+    Transient::new("inbox item")
+        .item(
+            "f",
+            "file under Desk heading…",
+            |workspace, window, cx| {
+                workspace.prompt_file_inbox_item(window, cx);
+            },
+        )
+        .item("d", "discard", |workspace, _, cx| {
+            workspace.discard_inbox_item(cx);
+        })
+        .item("s", "defer one day", |workspace, _, cx| {
+            workspace.defer_inbox_item(cx);
+        })
 }
 
 pub fn usage_menu(
@@ -1627,27 +1647,6 @@ pub fn new_agent_workspace_menu() -> Transient {
                 window,
                 cx,
             );
-        })
-}
-
-/// `space w`: pane arrangement, on vim's window letters — practiced
-/// `space w v` fingers land exactly where they always did.
-fn window_menu() -> Transient {
-    Transient::new("window")
-        .item("v", "split right", |workspace, window, cx| {
-            workspace.split_pane(crate::pane::SplitAxis::Row, window, cx);
-        })
-        .item("s", "split down", |workspace, window, cx| {
-            workspace.split_pane(crate::pane::SplitAxis::Column, window, cx);
-        })
-        .item("q", "close pane", |workspace, window, cx| {
-            workspace.close_pane(window, cx);
-        })
-        .item("w", "focus next", |workspace, window, cx| {
-            workspace.focus_pane_by_delta(1, window, cx);
-        })
-        .item("b", "back", |workspace, window, cx| {
-            workspace.pane_back(window, cx);
         })
 }
 

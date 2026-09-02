@@ -307,7 +307,7 @@ impl Render for Workspace {
                     .into_any_element()
             }
         } else {
-            self.render_panes(window, &text_style, cx)
+            self.render_workspace(window, &text_style, cx)
         };
 
         let auth_overlay = self.render_web_authorizations(cx);

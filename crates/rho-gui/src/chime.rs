@@ -1,5 +1,5 @@
-//! One-shot attention chime: the zed fork's bundled `agent_done.wav`,
-//! played when an agent enters the user's court (>= Pending).
+//! One-shot dealer-priority chime: the zed fork's bundled `agent_done.wav`,
+//! played when the derived hand maximum crosses the chime threshold upward.
 //!
 //! The output device is opened for each chime and closed after its tail.
 //! Keeping an idle CPAL stream alive makes some ALSA devices spin an output

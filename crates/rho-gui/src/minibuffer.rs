@@ -142,6 +142,10 @@ pub struct Minibuffer {
 const VISIBLE_CANDIDATES: usize = 8;
 
 impl Minibuffer {
+    pub fn prompt(&self) -> &str {
+        &self.prompt
+    }
+
     pub fn open(
         prompt: impl Into<SharedString>,
         text_style: &gpui::TextStyle,
