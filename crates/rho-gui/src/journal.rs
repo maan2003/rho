@@ -146,6 +146,7 @@ pub enum InboxVerdict {
 pub enum SurfaceShowMethod {
     Overview,
     Open,
+    Command,
     Mru,
     Deal,
 }
@@ -170,6 +171,7 @@ pub enum HistoryDirection {
 pub enum HistoryAppendMethod {
     Deal,
     Overview,
+    Command,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]

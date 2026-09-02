@@ -2926,6 +2926,130 @@ fn messages_surface_renders_in_order_and_follows_new_entries(cx: &mut TestAppCon
 }
 
 #[gpui::test]
+fn first_messages_open_joins_surface_history(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent(1),
+        snapshot_frame(state(vec![user("agent transcript")], Vec::new())),
+    );
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.notice_for_test(None, "message log", cx);
+            workspace.cmd_messages(window, cx);
+        })
+        .expect("open messages outside the overview");
+    assert!(buffer_text(&workspace, cx).contains("message log"));
+
+    cx.simulate_keystrokes(*workspace, "f21");
+    assert!(buffer_text(&workspace, cx).contains("agent transcript"));
+    cx.simulate_keystrokes(*workspace, "f20");
+    assert!(buffer_text(&workspace, cx).contains("message log"));
+}
+
+#[gpui::test]
+fn scrolled_messages_viewport_stays_put_across_append(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.seed_messages_for_test(
+                (0..200).map(|index| {
+                    (
+                        crate::style::StyleClass::SystemInfo,
+                        format!("message-{index}"),
+                    )
+                }),
+                cx,
+            );
+            workspace.cmd_messages(window, cx);
+        })
+        .expect("open a long messages buffer");
+    cx.simulate_window_resize(*workspace, size(px(800.), px(400.)));
+    cx.update_window(*workspace, |_, window, cx| {
+        let _ = window.draw(cx);
+    })
+    .expect("draw messages");
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.set_scroll_position(point(0., 0.), window, cx);
+            });
+        })
+        .expect("scroll away from the bottom");
+    cx.update_window(*workspace, |_, window, cx| {
+        let _ = window.draw(cx);
+    })
+    .expect("draw scrolled messages");
+    let before = workspace
+        .update(cx, |_, _, cx| {
+            editor.update(cx, |editor, cx| editor.scroll_position(cx).y)
+        })
+        .expect("read scroll position");
+
+    workspace
+        .update(cx, |workspace, _, cx| {
+            workspace.append_test_message(
+                "new message".to_owned(),
+                crate::style::StyleClass::SystemInfo,
+                cx,
+            );
+        })
+        .expect("append while scrolled away");
+    cx.update_window(*workspace, |_, window, cx| {
+        let _ = window.draw(cx);
+    })
+    .expect("draw appended messages");
+    let after = workspace
+        .update(cx, |_, _, cx| {
+            editor.update(cx, |editor, cx| editor.scroll_position(cx).y)
+        })
+        .expect("read scroll position");
+    assert_eq!(after, before);
+}
+
+#[gpui::test]
+fn evicting_the_last_message_of_a_class_clears_its_highlight(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.seed_messages_for_test(
+                std::iter::once((
+                    crate::style::StyleClass::SystemImportant,
+                    "important".to_owned(),
+                ))
+                .chain((1..crate::workspace::MESSAGE_LOG_CAP).map(|index| {
+                    (
+                        crate::style::StyleClass::SystemInfo,
+                        format!("ordinary-{index}"),
+                    )
+                })),
+                cx,
+            );
+            workspace.cmd_messages(window, cx);
+            workspace.append_test_message(
+                "ordinary-new".to_owned(),
+                crate::style::StyleClass::SystemInfo,
+                cx,
+            );
+        })
+        .expect("evict the important message");
+    let important_color = workspace
+        .update(cx, |_, _, cx| {
+            crate::style::StyleClass::SystemImportant.resolve(cx).color
+        })
+        .expect("resolve important color");
+    assert!(
+        styled_runs(&workspace, cx)
+            .iter()
+            .all(|(_, color)| *color != important_color),
+        "the evicted class highlight must not remain on ordinary messages"
+    );
+}
+
+#[gpui::test]
 fn message_log_cap_evicts_the_oldest_entries(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
@@ -2940,6 +3064,46 @@ fn message_log_cap_evicts_the_oldest_entries(cx: &mut TestAppContext) {
             assert_eq!(messages.last(), Some(&expected_last.as_str()));
         })
         .expect("fill message log");
+}
+
+#[gpui::test]
+fn capped_message_buffer_periodically_rebases_its_edit_history(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let original = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace.seed_messages_for_test(
+                (0..crate::workspace::MESSAGE_LOG_CAP).map(|index| {
+                    (
+                        crate::style::StyleClass::SystemInfo,
+                        format!("initial-{index}"),
+                    )
+                }),
+                cx,
+            );
+            workspace.messages_buffer_id()
+        })
+        .expect("seed capped messages");
+    workspace
+        .update(cx, |workspace, _, cx| {
+            for index in 0..crate::workspace::MESSAGE_REBASE_EVICTIONS {
+                workspace.append_test_message(
+                    format!("replacement-{index}"),
+                    crate::style::StyleClass::SystemInfo,
+                    cx,
+                );
+            }
+        })
+        .expect("append enough evictions to rebase");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_ne!(workspace.messages_buffer_id(), original);
+            assert_eq!(
+                workspace.message_log_texts().len(),
+                crate::workspace::MESSAGE_LOG_CAP
+            );
+        })
+        .expect("inspect rebased messages");
 }
 
 #[gpui::test]
