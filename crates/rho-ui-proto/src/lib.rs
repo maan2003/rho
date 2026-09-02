@@ -109,6 +109,10 @@ impl RuntimePaths {
     pub fn pr_logs(&self) -> std::path::PathBuf {
         self.directory.join("pr-logs")
     }
+
+    pub fn daemon_lock(&self) -> std::path::PathBuf {
+        self.directory.join(".rho-daemon.lock")
+    }
 }
 
 /// Fixed per-user daemon socket used by normal clients.
@@ -1294,6 +1298,10 @@ mod tests {
             paths.directory().join("rho-browser.sock")
         );
         assert_eq!(paths.pr_logs(), paths.directory().join("pr-logs"));
+        assert_eq!(
+            paths.daemon_lock(),
+            paths.directory().join(".rho-daemon.lock")
+        );
     }
 
     #[test]

@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsString;
 use std::num::NonZeroU16;
+use std::os::fd::AsRawFd as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -223,6 +224,24 @@ fn prepare_socket_path(socket_path: &Path, name: &str) -> anyhow::Result<()> {
     }
 }
 
+fn lock_runtime_directory(paths: &rho_ui_proto::RuntimePaths) -> anyhow::Result<std::fs::File> {
+    let path = paths.daemon_lock();
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("open daemon runtime lock {}", path.display()))?;
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+        anyhow::bail!(
+            "refusing to start: runtime directory {} is being initialized by another daemon",
+            paths.directory().display()
+        );
+    }
+    Ok(lock)
+}
+
 fn spawn_octo_server(
     listener: tokio::net::UnixListener,
     secrets: PlatformSecrets,
@@ -245,6 +264,7 @@ fn start_runtime_sockets(
 ) -> anyhow::Result<(rho_ui_proto::RuntimePaths, Server)> {
     let paths = rho_ui_proto::RuntimePaths::new(socket_path)?;
     std::fs::create_dir_all(paths.directory()).context("create runtime directory")?;
+    let _runtime_lock = lock_runtime_directory(&paths)?;
     let octo_socket = paths.octo_socket();
     prepare_socket_path(paths.socket(), "rho daemon")?;
     prepare_socket_path(&octo_socket, "octo")?;
@@ -4103,9 +4123,10 @@ mod tests {
     use super::{
         AgentUsageModel, GitProviderClaim, GitTransportBroker, MAX_IMAGE_BASE64_BYTES,
         MAX_INPUT_IMAGES, PlatformSecrets, claude_quota_history, configure_octo_git_transport,
-        hourly_global_usage_series, merge_hourly_agent_cost_bucket, persist_gui_telemetry,
-        prepare_image_content, quota_burn, quota_summaries, rewind_destination_materialized,
-        rewind_source_prefix, start_runtime_sockets, validate_image_content,
+        hourly_global_usage_series, lock_runtime_directory, merge_hourly_agent_cost_bucket,
+        persist_gui_telemetry, prepare_image_content, quota_burn, quota_summaries,
+        rewind_destination_materialized, rewind_source_prefix, start_runtime_sockets,
+        validate_image_content,
     };
 
     #[tokio::test]
@@ -4119,6 +4140,7 @@ mod tests {
 
         assert!(paths.socket().exists());
         assert!(paths.octo_socket().exists());
+        assert!(paths.daemon_lock().exists());
         assert!(!paths.browser_socket().exists());
         assert!(!paths.pr_logs().exists());
         assert_eq!(
@@ -4129,6 +4151,20 @@ mod tests {
             [std::ffi::OsString::from("qa")]
         );
         drop(server);
+    }
+
+    #[test]
+    fn concurrent_runtime_setup_is_refused() {
+        let runtime = tempfile::tempdir().unwrap();
+        let paths = rho_ui_proto::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
+        let _lock = lock_runtime_directory(&paths).unwrap();
+
+        let error = lock_runtime_directory(&paths).unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("being initialized by another daemon"),
+            "{error:#}"
+        );
     }
 
     #[tokio::test]
