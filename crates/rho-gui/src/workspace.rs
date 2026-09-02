@@ -921,7 +921,15 @@ impl Workspace {
                 }
             } else {
                 this.last_shift_tap = None;
-                if event.keystroke.key != "k" || !event.keystroke.modifiers.control {
+                let stepping_room_back = event
+                    .action
+                    .as_ref()
+                    .is_some_and(|action| action.as_any().is::<RoomBack>())
+                    || cx
+                        .all_bindings_for_input(std::slice::from_ref(&event.keystroke))
+                        .iter()
+                        .any(|binding| binding.action().as_any().is::<RoomBack>());
+                if !stepping_room_back {
                     this.dismiss_mru_overlay(cx);
                 }
             }
@@ -1525,7 +1533,7 @@ impl Workspace {
         self.invalidate_dealer_signals(cx);
         self.mru_overlay_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
-                .timer(Duration::from_millis(700))
+                .timer(Duration::from_millis(1_200))
                 .await;
             let _ = this.update(cx, |this, cx| this.dismiss_mru_overlay(cx));
         }));
@@ -2209,6 +2217,17 @@ impl Workspace {
             for summary in summaries {
                 if summary.model == "gpt" {
                     let Some(namespace) = &summary.auth_namespace else {
+                        match merged.iter_mut().find(|existing| {
+                            existing.model == summary.model && existing.auth_namespace.is_none()
+                        }) {
+                            Some(existing)
+                                if summary.remaining_percent < existing.remaining_percent =>
+                            {
+                                *existing = summary.clone();
+                            }
+                            Some(_) => {}
+                            None => merged.push(summary.clone()),
+                        }
                         continue;
                     };
                     let mut summary = summary.clone();
@@ -5526,6 +5545,46 @@ impl Workspace {
     }
 
     #[cfg(test)]
+    pub(crate) fn merged_quota_summaries_for_test(&self) -> Vec<rho_ui_proto::QuotaSummary> {
+        self.merged_quota_summaries()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn configure_room_mru_for_test(&mut self, names: &[&str]) {
+        let rooms = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let room = RoomId {
+                    host: HostId::default(),
+                    heading_offset: index,
+                };
+                self.room_names.insert(room.clone(), (*name).to_owned());
+                room
+            })
+            .collect::<Vec<_>>();
+        self.current_room = rooms.first().cloned();
+        self.room_mru = rooms.into_iter().skip(1).collect();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn current_room_name_for_test(&self) -> Option<&str> {
+        self.current_room
+            .as_ref()
+            .and_then(|room| self.room_names.get(room).map(String::as_str))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_room_mru_overlay_for_test(&self) -> bool {
+        self.mru_overlay.is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn step_room_back_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.step_room_back(window, cx);
+    }
+
+    #[cfg(test)]
     pub(crate) fn current_deal_card_for_test(
         &self,
     ) -> Option<(
@@ -6433,6 +6492,9 @@ impl Workspace {
             cx,
         );
         if self.dashboard.deal_mode() {
+            if let Ok(action) = cx.build_action("vim::EnterDealMode", None) {
+                window.dispatch_action(action, cx);
+            }
             self.journal_deal_card_presented();
             crate::journal::record(crate::journal::Event::DealMode {
                 action: crate::journal::DealModeAction::Enter,
@@ -6442,11 +6504,6 @@ impl Workspace {
                     .map(|card| Self::journal_card_identity(&card.identity)),
             });
             self.deal_session_open = true;
-            if self.dashboard.deal_mode()
-                && let Ok(action) = cx.build_action("vim::EnterDealMode", None)
-            {
-                window.dispatch_action(action, cx);
-            }
         }
         self.refresh_dashboard(window, cx);
         cx.notify();
@@ -6499,7 +6556,12 @@ impl Workspace {
     /// Commits the provisional card without ending the visual deal. The
     /// ordinary open paths deliberately own strip, room, MRU, and journal
     /// side effects; merely rendering a card never calls this.
-    fn take_current_deal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+    fn take_current_deal(
+        &mut self,
+        edit_agent: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if self.deal_current_taken {
             return self.dashboard.current_deal_card().is_some();
         }
@@ -6532,8 +6594,13 @@ impl Workspace {
                 }
                 if let Some(DealView::Surface { surface, .. }) = self.deal_view.as_ref() {
                     let surface = surface.clone();
+                    if edit_agent && let SurfaceView::Transcript { model, editor } = &surface.view {
+                        model.update(cx, |model, cx| model.focus_prompt(editor, window, cx));
+                        vim::enter_deal_insert_mode(editor, window, cx);
+                    }
                     self.registry.select_agent(agent_id);
                     self.active_context = self.context_for_agent(agent_id);
+                    self.overview_open = false;
                     self.display_surface(surface);
                     self.focus_active_surface(window, cx);
                     self.hosts
@@ -6566,26 +6633,26 @@ impl Workspace {
     fn stop_dealing_and_restore(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dashboard.exit_deal_mode(cx);
         self.end_deal_session();
-        self.deal_view = None;
-        self.deal_current_taken = false;
         if let Ok(action) = cx.build_action("vim::ExitDealMode", None) {
             window.dispatch_action(action, cx);
         }
+        self.deal_view = None;
+        self.deal_current_taken = false;
         self.restore_deal_origin(window, cx);
         self.refresh_dashboard(window, cx);
     }
 
     fn take_and_stop_dealing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.dashboard.deal_mode() || !self.take_current_deal(window, cx) {
+        if !self.dashboard.deal_mode() || !self.take_current_deal(false, window, cx) {
             return;
         }
         self.dashboard.exit_deal_mode(cx);
         self.end_deal_session();
         self.deal_origin = None;
-        self.deal_view = None;
         if let Ok(action) = cx.build_action("vim::ExitDealMode", None) {
             window.dispatch_action(action, cx);
         }
+        self.deal_view = None;
     }
 
     fn finish_dashboard_deal_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -6604,6 +6671,33 @@ impl Workspace {
             self.deal_current_taken = false;
         }
         self.refresh_dashboard(window, cx);
+    }
+
+    fn defer_deal_edit(
+        &mut self,
+        action_name: &'static str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        cx.defer_in(window, move |_, window, cx| {
+            if let Ok(action) = cx.build_action("vim::EnterDealMode", None) {
+                window.dispatch_action(action, cx);
+            }
+            cx.defer_in(window, move |_, window, cx| {
+                if let Ok(action) = cx.build_action(action_name, None) {
+                    window.dispatch_action(action, cx);
+                }
+            });
+        });
+    }
+
+    fn focus_taken_agent_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let SurfaceView::Transcript { model, editor } = &self.active_pane().surface.view else {
+            return;
+        };
+        let model = model.clone();
+        let editor = editor.clone();
+        model.update(cx, |model, cx| model.focus_prompt(&editor, window, cx));
     }
 
     pub(crate) fn configure_dashboard_staff(
@@ -7887,10 +7981,26 @@ impl Workspace {
                 None => None,
             };
             if let Some(focus) = focus {
-                window.focus(&focus, cx);
-                if let Ok(action) = cx.build_action("vim::EnterDealMode", None) {
-                    window.dispatch_action(action, cx);
-                }
+                let identity = card.identity.clone();
+                cx.defer_in(window, move |this, window, cx| {
+                    if !this.dashboard.deal_mode()
+                        || this
+                            .dashboard
+                            .current_deal_card()
+                            .is_none_or(|card| card.identity != identity)
+                    {
+                        return;
+                    }
+                    window.focus(&focus, cx);
+                    cx.defer_in(window, |this, window, cx| {
+                        if !this.dashboard.deal_mode() {
+                            return;
+                        }
+                        if let Ok(action) = cx.build_action("vim::EnterDealMode", None) {
+                            window.dispatch_action(action, cx);
+                        }
+                    });
+                });
             }
         }
 
@@ -8249,44 +8359,10 @@ impl Workspace {
         if self.dashboard.deal_mode()
             && let Some(card) = self.dashboard.current_deal_card().cloned()
         {
-            return self.deal_body(&card, window, cx);
-        }
-        if let Some(overlay) = &self.mru_overlay {
-            let colors = cx.theme().colors();
-            let stack = overlay
-                .room_candidates
-                .iter()
-                .enumerate()
-                .map(|(index, room)| {
-                    let name = self
-                        .room_names
-                        .get(room)
-                        .cloned()
-                        .unwrap_or_else(|| "room".to_owned());
-                    let row = div()
-                        .px(px(18.))
-                        .py(px(10.))
-                        .rounded_md()
-                        .text_color(if index == overlay.room_index {
-                            colors.text
-                        } else {
-                            colors.text_muted
-                        })
-                        .child(name);
-                    if index == overlay.room_index {
-                        row.bg(colors.element_selected)
-                    } else {
-                        row
-                    }
-                });
             return div()
                 .size_full()
-                .flex()
-                .flex_col()
-                .justify_center()
-                .items_center()
-                .gap(px(8.))
-                .children(stack)
+                .key_context("RhoGuiDeal")
+                .child(self.deal_body(&card, window, cx))
                 .into_any_element();
         }
         // Home mode: the dashboard owns the keyboard, so it owns the frame;
@@ -8392,7 +8468,6 @@ impl Workspace {
         #[cfg(not(feature = "native"))]
         let browser_preview_focused = false;
         self.overview_open
-            || dashboard.is_focused(window)
             || self.overlay_return_focus.as_ref() == Some(&dashboard)
             || browser_preview_focused
     }
@@ -8771,7 +8846,7 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &DealOpen, window, cx| {
                 if this.dashboard.deal_mode() {
-                    if !this.take_current_deal(window, cx) {
+                    if !this.take_current_deal(false, window, cx) {
                         return;
                     }
                     this.dashboard.advance_deal(cx);
@@ -9135,23 +9210,66 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &DashboardDealInsert, window, cx| {
                 vim::take_count(cx);
-                if !this.take_current_deal(window, cx) {
+                let deal_agent = this
+                    .dashboard
+                    .current_deal_card()
+                    .and_then(|card| card.agent_id);
+                let edits_agent = deal_agent.is_some();
+                if !this.take_current_deal(false, window, cx) {
                     return;
                 }
-                if matches!(
+                if let Some(agent_id) = deal_agent {
+                    this.dashboard.exit_deal_mode(cx);
+                    this.end_deal_session();
+                    this.deal_origin = None;
+                    this.deal_view = None;
+                    this.overview_open = false;
+                    this.select_agent_inner(Some(agent_id), true, window, cx);
+                    // The transcript surface is still hidden behind the
+                    // focused Desk preview until the next render. Blurring
+                    // lets that render mount the selected surface; the
+                    // deferred focus below can then enter its composer.
+                    window.blur();
+                    cx.defer_in(window, move |_this, window, cx| {
+                        cx.defer_in(window, move |this, window, cx| {
+                            let Some(surface) = this
+                                .find_surface(|surface| {
+                                    surface.key == SurfaceKey::Transcript(agent_id)
+                                })
+                                .cloned()
+                            else {
+                                return;
+                            };
+                            let SurfaceView::Transcript { model, editor } = surface.view else {
+                                return;
+                            };
+                            model.update(cx, |model, cx| model.focus_prompt(&editor, window, cx));
+                            vim::enter_deal_insert_mode(&editor, window, cx);
+                        });
+                    });
+                }
+                let edits_desk = matches!(
                     this.dashboard.current_deal_card().map(|card| card.kind),
                     Some(crate::dashboard::DealCardKind::Desk)
-                ) {
+                );
+                if edits_desk {
                     this.dashboard.prepare_taken_deal_edit(cx);
                     this.refresh_dashboard(window, cx);
                 }
-                if let Ok(action) = cx.build_action("vim::DealInsert", None) {
-                    window.dispatch_action(action, cx);
+                if !edits_agent {
+                    this.focus_taken_agent_prompt(window, cx);
+                }
+                if edits_desk {
+                    if let Ok(action) = cx.build_action("vim::DealInsert", None) {
+                        window.dispatch_action(action, cx);
+                    }
+                } else if !edits_agent {
+                    this.defer_deal_edit("vim::DealInsert", window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &DashboardDealAppend, window, cx| {
                 vim::take_count(cx);
-                if !this.take_current_deal(window, cx) {
+                if !this.take_current_deal(false, window, cx) {
                     return;
                 }
                 if matches!(
@@ -9161,13 +9279,12 @@ impl Render for Workspace {
                     this.dashboard.prepare_taken_deal_edit(cx);
                     this.refresh_dashboard(window, cx);
                 }
-                if let Ok(action) = cx.build_action("vim::DealAppend", None) {
-                    window.dispatch_action(action, cx);
-                }
+                this.focus_taken_agent_prompt(window, cx);
+                this.defer_deal_edit("vim::DealAppend", window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardDealOpenLine, window, cx| {
                 vim::take_count(cx);
-                if !this.take_current_deal(window, cx) {
+                if !this.take_current_deal(false, window, cx) {
                     return;
                 }
                 if matches!(
@@ -9177,9 +9294,8 @@ impl Render for Workspace {
                     this.dashboard.prepare_taken_deal_edit(cx);
                     this.refresh_dashboard(window, cx);
                 }
-                if let Ok(action) = cx.build_action("vim::DealOpenLine", None) {
-                    window.dispatch_action(action, cx);
-                }
+                this.focus_taken_agent_prompt(window, cx);
+                this.defer_deal_edit("vim::DealOpenLine", window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardDealFile, window, cx| {
                 vim::take_count(cx);

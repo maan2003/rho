@@ -6329,6 +6329,177 @@ fn mixed_deal_navigation_keeps_rendered_body_and_verdict_target_in_lockstep(
         .unwrap();
 }
 
+#[gpui::test]
+fn deal_tab_skips_the_rendered_card(cx: &mut TestAppContext) {
+    let (workspace, _, _) = mixed_deal_workspace(cx);
+    let before = assert_rendered_deal_matches_current(&workspace, cx);
+    let before_identity = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.current_deal_card_for_test().unwrap().0
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "tab");
+    cx.run_until_parked();
+
+    let after = assert_rendered_deal_matches_current(&workspace, cx);
+    let after_identity = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.current_deal_card_for_test().unwrap().0
+        })
+        .unwrap();
+    assert_ne!(
+        after_identity, before_identity,
+        "TAB did not skip {before:?}"
+    );
+    assert_ne!(
+        after, before,
+        "mixed hand should advance to another card kind"
+    );
+}
+
+#[gpui::test]
+fn deal_agent_insert_targets_the_composer(cx: &mut TestAppContext) {
+    let (workspace, agent_id, _) = mixed_deal_workspace(cx);
+    feed_frame(
+        &workspace,
+        cx,
+        agent_id,
+        snapshot_frame(state(vec![user("message awaiting reply")], Vec::new())),
+    );
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(workspace.seek_deal_card_for_test(
+                |kind| matches!(kind, crate::dashboard::DealCardKind::Agent),
+                window,
+                cx,
+            ));
+        })
+        .unwrap();
+    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.focus_dealt_surface_for_test(window, cx)
+        })
+        .unwrap();
+    cx.dispatch_action(*workspace, crate::DashboardDealInsert);
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let model = workspace.active_agent_model().unwrap();
+            let editor = workspace.active_editor(cx);
+            assert!(model.read(cx).selection_in_prompt(&editor, cx));
+        })
+        .unwrap();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(!workspace.dashboard_deal_mode_for_test());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn leaving_deal_does_not_strand_the_dashboard_in_vim_deal(cx: &mut TestAppContext) {
+    let (workspace, _, _) = mixed_deal_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(workspace.seek_deal_card_for_test(
+                |kind| matches!(kind, crate::dashboard::DealCardKind::Agent),
+                window,
+                cx,
+            ));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.focus_dealt_surface_for_test(window, cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes(*workspace, "q");
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "f24 enter");
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(!workspace.dashboard_deal_mode_for_test());
+            assert!(
+                !workspace.is_dashboard_mode(window, cx),
+                "Enter should open the selected Desk row after leaving DEAL"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn unnamed_legacy_gpt_quota_is_visible_to_the_status_line(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::ChatGptUsage {
+                    used_percent: 60.,
+                    reset_at_unix: 1,
+                },
+                window,
+                cx,
+            );
+            assert_eq!(
+                workspace.merged_quota_summaries_for_test(),
+                vec![rho_ui_proto::QuotaSummary {
+                    model: "gpt".to_owned(),
+                    auth_namespace: None,
+                    remaining_percent: 40,
+                    burn_10m: 0,
+                    burn_2h: 0,
+                    burn_1d: 0,
+                    burn_3d: 0,
+                    reset_at_unix: Some(1),
+                }]
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn f21_keeps_the_room_mru_stepping_window_open(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, _, _| {
+            workspace.configure_room_mru_for_test(&["one", "two", "three"]);
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "f21");
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(workspace.current_room_name_for_test(), Some("two"));
+            assert!(
+                workspace.has_room_mru_overlay_for_test(),
+                "F21 committed the MRU order before the next step"
+            );
+        })
+        .unwrap();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.step_room_back_for_test(window, cx)
+        })
+        .unwrap();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(workspace.current_room_name_for_test(), Some("three"));
+        })
+        .unwrap();
+}
+
 fn assert_escape_keeps_deal_with_focus(
     cx: &mut TestAppContext,
     key: &str,

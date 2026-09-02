@@ -395,9 +395,13 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         ]);
     }
     for context in [
+        "RhoGuiDeal",
+        "RhoGuiDeal > Editor",
         "RhoGui > Editor && VimDeal && vim_operator == none",
         "RhoGui > RhoDashboard > Editor && VimDeal && vim_operator == none",
         "RhoDashboard > Editor && VimDeal && vim_operator == none",
+        "Editor && VimDeal && vim_operator == none",
+        "VimDeal && vim_operator == none",
     ] {
         cx.bind_keys([
             KeyBinding::new("q", DashboardDealExit, Some(context)),

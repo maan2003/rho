@@ -159,7 +159,8 @@ returns on their own anyway — it is not responsible for keeping you engaged.
 ### Navigation: a timeline gesture, a strip, and an overview key
 
 Between rooms, one vertical timeline: up steps backward through
-recently-used rooms (the stack visible while stepping), down opens the
+recently-used rooms; repeat presses within a short window step deeper, with
+nothing overlaid — what you see is always the real room. Down opens the
 dealer. Dealing is not room switching: taking a card in the current room
 just loads it into the strip, and only a distant card moves you. Skipping
 is one key and costs nothing but the honest record of a skip.
@@ -169,8 +170,8 @@ zooms out to the map, landing on the current room's heading.
 **Why:** most switching is going back to something recent, and that must be
 a reflex, not a search — the original friction was exactly "finding the item
 in the desk". The vertical axis is time, not space: past above, future
-below. Blind MRU cycling (alt-tab confusion) is avoided because the scrub
-shows the stack. The desk stays the map: it is consulted deliberately, its
+below. Stepping is blind, but every step shows the real room, so you always
+see where you landed. The desk stays the map: it is consulted deliberately, its
 order is never auto-changed (auto-reordering destroys spatial memory — the
 old adaptive-menus mistake), and landing on the current heading quietly
 teaches where you are on the map.
@@ -238,9 +239,9 @@ enough to cover the side-by-side cases for now. They can come back later if
 their absence is actually felt.
 
 **The timeline.** One axis, two directions, keyboard-driven for now: one
-key steps back through recently-used rooms (the stack visible while
-stepping — stop tapping and you are simply there), the other opens the
-dealer. Dealing is global and item-level: one queue across all rooms, with
+key steps back through recently-used rooms; repeat presses within a short
+window step deeper, nothing is overlaid, and what you see is always the real
+room. The other opens the dealer. Dealing is global and item-level: one queue across all rooms, with
 the small current-room bonus from the dealer section. A card in the current
 room just loads into the strip; a distant card switches rooms. Room-level
 verdicts (defer the whole room) are given from an item card. Inbox captures

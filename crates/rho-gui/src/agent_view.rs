@@ -21,7 +21,7 @@ use editor::{
 };
 use futures::future::join_all;
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, Subscription, Task, WeakEntity, Window};
+use gpui::{App, Context, Entity, Focusable, Subscription, Task, WeakEntity, Window};
 use language::{Buffer, BufferEvent, Capability, InlayId, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use rho_core::ContentPart;
@@ -360,6 +360,32 @@ impl AgentModel {
         };
         let head = editor.read(cx).selections.newest_anchor().head();
         head.cmp(&prompt_start, &snapshot).is_ge()
+    }
+
+    /// Places this editor's cursor in the writable prompt tail. Transcript
+    /// previews can retain an older cursor when promoted from Deal mode; edit
+    /// commands must not start against the read-only conversation above it.
+    pub fn focus_prompt(
+        &self,
+        editor: &Entity<Editor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(prompt_end) = self
+            .multi_buffer
+            .read(cx)
+            .snapshot(cx)
+            .anchor_in_excerpt(self.prompt_end)
+        else {
+            return;
+        };
+        editor.update(cx, |editor, cx| {
+            editor.set_autoscroll_pin(prompt_end, AutoscrollStrategy::Bottom, cx);
+            editor.change_selections(SelectionEffects::default(), window, cx, |selections| {
+                selections.select_anchor_ranges([prompt_end..prompt_end]);
+            });
+        });
+        window.focus(&editor.focus_handle(cx), cx);
     }
 
     pub fn add_image(&mut self, media_type: String, data: Vec<u8>, cx: &mut Context<Self>) {
