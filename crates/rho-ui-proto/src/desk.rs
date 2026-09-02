@@ -191,8 +191,7 @@ pub fn parse(text: &str) -> Vec<DeskHeading> {
                         TemporalMarkKind::Deadline
                         | TemporalMarkKind::Todo
                         | TemporalMarkKind::Defer
-                        | TemporalMarkKind::Reminder
-                        | TemporalMarkKind::Skip => None,
+                        | TemporalMarkKind::Reminder => None,
                     };
                 }
                 headings[index].temporal_marks.push(mark);

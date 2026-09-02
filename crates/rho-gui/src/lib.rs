@@ -53,7 +53,6 @@ actions!(
         AgentPrevious,
         AgentNext,
         AgentNew,
-        AgentJumpAttention,
         AgentDone,
         AgentHide,
         DashboardNewAgent,
@@ -77,7 +76,6 @@ actions!(
         DashboardRenameTopic,
         DashboardDealExit,
         DashboardDealNext,
-        DashboardDealPrevious,
         DashboardDealDone,
         DashboardDealDiscard,
         DashboardDealSnooze,
@@ -122,15 +120,13 @@ actions!(
         InboxCapture,
         UploadGuiTelemetry,
         ZulipOpenRow,
-        RoomStripLeft,
-        RoomStripRight,
-        RoomBack,
+        SurfaceBack,
         DealOpen,
+        DealCloseAndNext,
         OverviewToggle,
-        StripRemove,
+        SurfaceClose,
         ZulipNextUnread,
-        ZulipLoadOlder,
-        ZulipQuit
+        ZulipLoadOlder
     ]
 );
 
@@ -182,39 +178,40 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
     // vim keymap only binds the rho prompt keys for insert mode, while the
     // default keymap's Tab binding can lose to vim's normal-mode handling.
     cx.bind_keys([
-        KeyBinding::new("ctrl-left", RoomStripLeft, Some("RhoGui")),
-        KeyBinding::new("ctrl-right", RoomStripRight, Some("RhoGui")),
-        KeyBinding::new("ctrl-k", RoomBack, Some("RhoGui")),
+        KeyBinding::new("ctrl-k", SurfaceBack, Some("RhoGui")),
         KeyBinding::new("ctrl-j", DealOpen, Some("RhoGui")),
         KeyBinding::new("f20", DealOpen, Some("RhoGui")),
-        KeyBinding::new("f21", RoomBack, Some("RhoGui")),
-        KeyBinding::new("f22", RoomStripLeft, Some("RhoGui")),
-        KeyBinding::new("f23", RoomStripRight, Some("RhoGui")),
+        KeyBinding::new("f21", SurfaceBack, Some("RhoGui")),
         KeyBinding::new("f24", OverviewToggle, Some("RhoGui")),
-        KeyBinding::new("ctrl-shift-backspace", StripRemove, Some("RhoGui")),
-        KeyBinding::new("ctrl-left", RoomStripLeft, Some("RhoGui > Editor")),
-        KeyBinding::new("ctrl-right", RoomStripRight, Some("RhoGui > Editor")),
-        KeyBinding::new("ctrl-k", RoomBack, Some("RhoGui > Editor")),
+        KeyBinding::new("ctrl-shift-backspace", SurfaceClose, Some("RhoGui")),
+        KeyBinding::new("ctrl-shift-j", DealCloseAndNext, Some("RhoGui")),
+        KeyBinding::new("f16", DealCloseAndNext, Some("RhoGui")),
+        KeyBinding::new("ctrl-k", SurfaceBack, Some("RhoGui > Editor")),
         KeyBinding::new("ctrl-j", DealOpen, Some("RhoGui > Editor")),
         KeyBinding::new("f20", DealOpen, Some("RhoGui > Editor")),
-        KeyBinding::new("ctrl-shift-backspace", StripRemove, Some("RhoGui > Editor")),
+        KeyBinding::new(
+            "ctrl-shift-backspace",
+            SurfaceClose,
+            Some("RhoGui > Editor"),
+        ),
+        KeyBinding::new("ctrl-shift-j", DealCloseAndNext, Some("RhoGui > Editor")),
+        KeyBinding::new("f16", DealCloseAndNext, Some("RhoGui > Editor")),
         // Attention triage: jump to the most urgent agent, clear the current
         // one. The bundled zed keymaps don't know these actions, so they are
         // bound here rather than in an asset. The context must be at least as
         // deep as `Editor`: the bundled keymap binds these keys under plain
         // `Editor` (JoinLines, git::Diff), and gpui prefers the deeper match,
         // so a root-level `RhoGui` binding would lose while typing.
-        KeyBinding::new("ctrl-shift-j", AgentJumpAttention, Some("RhoGui > Editor")),
         KeyBinding::new("ctrl-shift-d", AgentDone, Some("RhoGui > Editor")),
         KeyBinding::new(
             "tab",
             RoleCycle,
-            Some("RhoGui > Editor && !showing_completions"),
+            Some("RhoGui > Editor && !showing_completions && !VimDeal"),
         ),
         KeyBinding::new(
             "shift-tab",
             RoleCycleGroup,
-            Some("RhoGui > Editor && !showing_completions"),
+            Some("RhoGui > Editor && !showing_completions && !VimDeal"),
         ),
         KeyBinding::new("ctrl-s", FileSave, Some("RhoFileView")),
         KeyBinding::new("ctrl-s", FileSave, Some("RhoDiffView")),
@@ -287,6 +284,7 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         ),
         KeyBinding::new("g g", TerminalScrollTop, Some("RhoTerminalNormal")),
         KeyBinding::new("shift-g", TerminalScrollBottom, Some("RhoTerminalNormal")),
+        KeyBinding::new("q", SurfaceClose, Some("RhoTerminalNormal")),
     ]);
     // The space leader: one binding, opening the root transient at once
     // (invisible until the reveal delay). Every chord beneath it is a
@@ -300,7 +298,10 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         "RhoGui > Editor && vim_mode == normal",
         "RhoGui > Editor && vim_mode == helix_normal",
     ] {
-        cx.bind_keys([KeyBinding::new("space", RootTransient, Some(context))]);
+        cx.bind_keys([
+            KeyBinding::new("space", RootTransient, Some(context)),
+            KeyBinding::new("q", SurfaceClose, Some(context)),
+        ]);
     }
     // Minibuffer keys. The input is a single-line editor (vim skips those),
     // but enter/escape/tab still need to beat the editor's own bindings, so
@@ -336,7 +337,7 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         cx.bind_keys([
             KeyBinding::new("n", ZulipNextUnread, Some(context)),
             KeyBinding::new("shift-p", ZulipLoadOlder, Some(context)),
-            KeyBinding::new("q", ZulipQuit, Some(context)),
+            KeyBinding::new("q", SurfaceClose, Some(context)),
         ]);
     }
     cx.bind_keys([
@@ -395,8 +396,6 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         ]);
     }
     for context in [
-        "RhoGuiDeal",
-        "RhoGuiDeal > Editor",
         "RhoGui > Editor && VimDeal && vim_operator == none",
         "RhoGui > RhoDashboard > Editor && VimDeal && vim_operator == none",
         "RhoDashboard > Editor && VimDeal && vim_operator == none",
@@ -404,8 +403,7 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         "VimDeal && vim_operator == none",
     ] {
         cx.bind_keys([
-            KeyBinding::new("q", DashboardDealExit, Some(context)),
-            KeyBinding::new("tab", DashboardDealNext, Some(context)),
+            KeyBinding::new("q", SurfaceClose, Some(context)),
             KeyBinding::new("d", DashboardDealDone, Some(context)),
             KeyBinding::new("x", DashboardDealDiscard, Some(context)),
             KeyBinding::new("s", DashboardDealSnooze, Some(context)),

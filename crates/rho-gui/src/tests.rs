@@ -5419,8 +5419,8 @@ fn insert_mode_enter_stays_a_newline_in_desk_text(cx: &mut TestAppContext) {
         })
         .expect("read dashboard");
     assert!(
-        text.contains("body\n\n"),
-        "enter should insert a newline in document text: {text:?}"
+        text.contains("body\nx\n"),
+        "enter should insert a newline before typed text: {text:?}"
     );
 }
 
@@ -5616,176 +5616,6 @@ fn desk_deal_verdict_advances_to_empty_and_exit_restores_document(cx: &mut TestA
     workspace
         .update(cx, |workspace, _, _| {
             assert!(!workspace.dashboard_deal_mode_for_test());
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn desk_deal_session_resumes_and_insert_escape_returns_to_normal(cx: &mut TestAppContext) {
-    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
-
-    let original = "* One\n:deadline: 2020-01-01\none body\n* Two\n:deadline: 2020-01-02\ntwo body\n* Three\n:deadline: 2020-01-03\nthree body\n";
-    let mut source =
-        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
-    let operation = DeskOperation::from_text(&source.edit([(0..0, original)]));
-    let snapshot = DeskSnapshot {
-        text: source.snapshot().text(),
-        operations: vec![operation],
-        transactions: Vec::new(),
-        replicas: Vec::new(),
-    };
-    let replacement_snapshot = snapshot.clone();
-    let mut truncated =
-        text::Buffer::new(text::ReplicaId::new(9), text::BufferId::new(2).unwrap(), "");
-    let truncated_operation = DeskOperation::from_text(&truncated.edit([(0..0, "* One\nshort\n")]));
-    let truncated_snapshot = DeskSnapshot {
-        text: truncated.snapshot().text(),
-        operations: vec![truncated_operation],
-        transactions: Vec::new(),
-        replicas: Vec::new(),
-    };
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    cx.update(|cx| {
-        let settings = cx.global_mut::<SettingsStore>();
-        settings.override_global(vim_mode_setting::VimModeSetting(false));
-        settings.override_global(vim_mode_setting::HelixModeSetting(true));
-    });
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskSnapshot {
-                    snapshot,
-                    replica_id: 42,
-                },
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
-            workspace.open_deal_mode(window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskSnapshot {
-                    snapshot: truncated_snapshot,
-                    replica_id: 43,
-                },
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
-            assert_eq!(
-                workspace
-                    .desk_buffer_for_test(HostId::default())
-                    .unwrap()
-                    .read(cx)
-                    .capability(),
-                language::Capability::Read
-            );
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskSnapshot {
-                    snapshot: replacement_snapshot,
-                    replica_id: 44,
-                },
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    let first = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .dashboard_editor()
-                .update(cx, |editor, cx| editor.display_text(cx))
-        })
-        .unwrap();
-    assert!(first.contains("one body"), "{first:?}");
-    assert!(!first.contains(":deadline:"), "{first:?}");
-    let lines = first.lines().collect::<Vec<_>>();
-    let body_line = lines
-        .iter()
-        .position(|line| *line == "one body")
-        .expect("body line");
-    assert!(
-        body_line > 0 && lines[body_line - 1].contains("One"),
-        "concealed property row must not leave a blank spacer: {first:?}"
-    );
-    assert!(
-        first.contains("two body") && first.contains("three body"),
-        "{first:?}"
-    );
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(workspace.dashboard_deal_highlight_for_test(cx));
-            assert_eq!(
-                workspace.dashboard_cursor_topic_for_test(cx),
-                Some((HostId::default(), original.find("* One").unwrap()))
-            );
-            assert!(
-                workspace
-                    .dashboard_hint_for_test(cx)
-                    .starts_with("DEAL · One · deadline · ")
-                    && workspace
-                        .dashboard_hint_for_test(cx)
-                        .contains(" · 1/3 · 3 dealt · 3 waiting")
-            );
-            workspace.dashboard_editor().update(cx, |editor, cx| {
-                let snapshot = editor.display_snapshot(cx);
-                assert!(
-                    editor
-                        .selections
-                        .newest::<editor::MultiBufferOffset>(&snapshot)
-                        .is_empty(),
-                    "Helix Deal must use a cursor, not a selection"
-                );
-            });
-        })
-        .unwrap();
-
-    cx.simulate_keystrokes(*workspace, "i shift-m escape");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(workspace.dashboard_deal_mode_for_test());
-            let raw = workspace
-                .desk_buffer_for_test(HostId::default())
-                .unwrap()
-                .read(cx)
-                .text();
-            assert_ne!(raw, original, "insert must commit and edit the dealt Desk");
-        })
-        .unwrap();
-
-    cx.simulate_keystrokes(*workspace, "tab");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(workspace.dashboard_deal_mode_for_test());
-            assert_eq!(
-                workspace
-                    .dashboard_deal_topic_for_test()
-                    .map(|(_, _, breadcrumb)| breadcrumb),
-                Some("Two")
-            );
-        })
-        .unwrap();
-
-    cx.simulate_keystrokes(*workspace, "q");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(!workspace.dashboard_deal_mode_for_test())
         })
         .unwrap();
 }
@@ -6080,7 +5910,12 @@ fn mixed_deal_workspace(
         },
         attention: UiAttention::NeedsInput,
         last_active: UnixMs(1),
-        facts: Default::default(),
+        facts: rho_ui_proto::UiAgentFacts {
+            turn_running: false,
+            last_turn_ended: Some(UnixMs(1)),
+            last_user_message_at: UnixMs(0),
+            needs_you_hint: true,
+        },
         hidden: false,
         disposition: AgentDisposition::Pending,
         last_user_message_text: String::new(),
@@ -6150,7 +5985,6 @@ fn mixed_deal_workspace(
             workspace.sync_dashboard(window, cx);
             window.focus(&workspace.dashboard_editor().read(cx).focus_handle(cx), cx);
             workspace.open_deal_mode(window, cx);
-            workspace.inject_agent_deal_card_for_test(agent_id);
             inbox_id
         })
         .unwrap();
@@ -6179,158 +6013,8 @@ fn assert_rendered_deal_matches_current(
         .unwrap()
 }
 
-fn next_deal(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) {
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.next_deal_for_test(window, cx)
-        })
-        .unwrap();
-    cx.run_until_parked();
-}
-
-fn previous_deal(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) {
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.previous_deal_for_test(window, cx)
-        })
-        .unwrap();
-    cx.run_until_parked();
-}
-
 #[gpui::test]
-fn mixed_deal_navigation_keeps_rendered_body_and_verdict_target_in_lockstep(
-    cx: &mut TestAppContext,
-) {
-    let (workspace, _agent_id, inbox_id) = mixed_deal_workspace(cx);
-    let mut seen = Vec::new();
-    seen.push(assert_rendered_deal_matches_current(&workspace, cx));
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.snooze_deal_for_test(3, window, cx)
-        })
-        .unwrap();
-    cx.run_until_parked();
-    seen.push(assert_rendered_deal_matches_current(&workspace, cx));
-    workspace
-        .update(cx, |workspace, _, cx| {
-            let desk = workspace
-                .desk_buffer_for_test(HostId::default())
-                .unwrap()
-                .read(cx)
-                .text();
-            let wake = chrono::Local::now()
-                .date_naive()
-                .checked_add_signed(chrono::Duration::days(3))
-                .unwrap();
-            assert!(desk.contains(&format!(":defer: {wake} 3d")), "{desk:?}");
-            assert!(workspace.inbox_contains_for_test(&inbox_id));
-        })
-        .unwrap();
-
-    for _ in 0..5 {
-        next_deal(&workspace, cx);
-        if !workspace
-            .update(cx, |workspace, _, _| {
-                workspace.dashboard_deal_mode_for_test()
-            })
-            .unwrap()
-        {
-            break;
-        }
-        let next = assert_rendered_deal_matches_current(&workspace, cx);
-        seen.push(next);
-        if seen
-            .iter()
-            .any(|kind| matches!(kind, crate::dashboard::DealCardKind::Desk))
-            && seen
-                .iter()
-                .any(|kind| matches!(kind, crate::dashboard::DealCardKind::Agent))
-            && seen
-                .iter()
-                .any(|kind| matches!(kind, crate::dashboard::DealCardKind::Inbox(_)))
-        {
-            break;
-        }
-    }
-    assert!(
-        seen.iter()
-            .any(|kind| matches!(kind, crate::dashboard::DealCardKind::Desk)),
-        "{seen:?}"
-    );
-
-    // Walk back through the rendered history too. `N` used to leave the
-    // prior surface focused while moving the verdict cursor.
-    previous_deal(&workspace, cx);
-    assert_rendered_deal_matches_current(&workspace, cx);
-    previous_deal(&workspace, cx);
-    assert_rendered_deal_matches_current(&workspace, cx);
-    assert!(
-        seen.iter()
-            .any(|kind| matches!(kind, crate::dashboard::DealCardKind::Agent)),
-        "{seen:?}"
-    );
-    assert!(
-        seen.iter()
-            .any(|kind| matches!(kind, crate::dashboard::DealCardKind::Inbox(_))),
-        "{seen:?}"
-    );
-
-    // Re-deal and find the inbox card. Discard must retire only that capture,
-    // never mutate the Desk card that was previously rendered.
-    if !workspace
-        .update(cx, |workspace, _, _| {
-            workspace.dashboard_deal_mode_for_test()
-        })
-        .unwrap()
-    {
-        workspace
-            .update(cx, |workspace, window, cx| {
-                workspace.open_deal_mode(window, cx)
-            })
-            .unwrap();
-    }
-    for _ in 0..6 {
-        if matches!(
-            assert_rendered_deal_matches_current(&workspace, cx),
-            crate::dashboard::DealCardKind::Inbox(_)
-        ) {
-            break;
-        }
-        next_deal(&workspace, cx);
-    }
-    let desk_before = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .desk_buffer_for_test(HostId::default())
-                .unwrap()
-                .read(cx)
-                .text()
-        })
-        .unwrap();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.done_deal_for_test(window, cx)
-        })
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(!workspace.inbox_contains_for_test(&inbox_id));
-            assert_eq!(
-                workspace
-                    .desk_buffer_for_test(HostId::default())
-                    .unwrap()
-                    .read(cx)
-                    .text(),
-                desk_before,
-                "inbox verdict mutated the previously displayed Desk target"
-            );
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn deal_tab_skips_the_rendered_card(cx: &mut TestAppContext) {
+fn deal_tab_is_not_a_skip_key(cx: &mut TestAppContext) {
     let (workspace, _, _) = mixed_deal_workspace(cx);
     let before = assert_rendered_deal_matches_current(&workspace, cx);
     let before_identity = workspace
@@ -6348,14 +6032,32 @@ fn deal_tab_skips_the_rendered_card(cx: &mut TestAppContext) {
             workspace.current_deal_card_for_test().unwrap().0
         })
         .unwrap();
-    assert_ne!(
-        after_identity, before_identity,
-        "TAB did not skip {before:?}"
-    );
-    assert_ne!(
-        after, before,
-        "mixed hand should advance to another card kind"
-    );
+    assert_eq!(after_identity, before_identity, "TAB skipped {before:?}");
+    assert_eq!(after, before);
+}
+
+#[gpui::test]
+fn f16_closes_the_dealt_surface_and_deals_another_card(cx: &mut TestAppContext) {
+    let (workspace, _, _) = mixed_deal_workspace(cx);
+    let before = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.current_deal_card_for_test().unwrap().0
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "f16");
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            let after = workspace
+                .current_deal_card_for_test()
+                .expect("F16 should immediately deal another card")
+                .0;
+            assert_ne!(after, before, "F16 re-dealt the surface it just closed");
+            assert!(workspace.dashboard_deal_mode_for_test());
+        })
+        .unwrap();
 }
 
 #[gpui::test]
@@ -6391,6 +6093,12 @@ fn deal_agent_insert_targets_the_composer(cx: &mut TestAppContext) {
             let model = workspace.active_agent_model().unwrap();
             let editor = workspace.active_editor(cx);
             assert!(model.read(cx).selection_in_prompt(&editor, cx));
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "q");
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert!(workspace.active_editor(cx).read(cx).text(cx).ends_with('q'));
         })
         .unwrap();
     workspace
@@ -6468,34 +6176,89 @@ fn unnamed_legacy_gpt_quota_is_visible_to_the_status_line(cx: &mut TestAppContex
 }
 
 #[gpui::test]
-fn f21_keeps_the_room_mru_stepping_window_open(cx: &mut TestAppContext) {
+fn f21_steps_through_three_surfaces(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
     let workspace = test_workspace(cx);
     workspace
-        .update(cx, |workspace, _, _| {
-            workspace.configure_room_mru_for_test(&["one", "two", "three"]);
+        .update(cx, |workspace, window, cx| {
+            workspace.configure_surface_mru_for_test(&["one", "two", "three"], window, cx);
         })
         .unwrap();
 
     cx.simulate_keystrokes(*workspace, "f21");
     workspace
         .update(cx, |workspace, _, _| {
-            assert_eq!(workspace.current_room_name_for_test(), Some("two"));
-            assert!(
-                workspace.has_room_mru_overlay_for_test(),
-                "F21 committed the MRU order before the next step"
-            );
+            assert_eq!(workspace.current_surface_name_for_test(), "inbox two");
         })
         .unwrap();
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.step_room_back_for_test(window, cx)
+            workspace.step_surface_back_for_test(window, cx)
         })
         .unwrap();
 
     workspace
         .update(cx, |workspace, _, _| {
-            assert_eq!(workspace.current_room_name_for_test(), Some("three"));
+            assert_eq!(workspace.current_surface_name_for_test(), "inbox three");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn q_closes_current_surface_and_reveals_previous(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.configure_surface_mru_for_test(&["current", "previous"], window, cx);
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "q");
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(workspace.current_surface_name_for_test(), "inbox previous");
+            assert!(!workspace.overview_open_for_test());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn q_on_last_surface_lands_on_overview(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.configure_surface_mru_for_test(&["only"], window, cx);
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "q");
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(workspace.overview_open_for_test())
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn q_on_overview_is_a_no_op(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    let before = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.current_surface_name_for_test()
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "q");
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(workspace.overview_open_for_test());
+            assert_eq!(workspace.current_surface_name_for_test(), before);
         })
         .unwrap();
 }
@@ -6602,101 +6365,6 @@ deal_q_exit_test!(
 );
 deal_q_exit_test!(q_exits_inbox_deal, crate::dashboard::DealCardKind::Inbox(_));
 
-#[gpui::test]
-fn desk_deal_counted_snooze_todo_and_refresh_write_and_redeal(cx: &mut TestAppContext) {
-    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
-
-    let mut original = (1..=6)
-        .map(|day| format!("* Card {day}\n:deadline: 2020-01-{day:02}\nbody {day}\n"))
-        .collect::<String>();
-    original = original.replacen(
-        ":deadline: 2020-01-01\n",
-        ":skip: 2019-01-01\n:deadline: 2020-01-01\n",
-        1,
-    );
-    let mut source =
-        text::Buffer::new(text::ReplicaId::new(8), text::BufferId::new(1).unwrap(), "");
-    let operation = DeskOperation::from_text(&source.edit([(0..0, original)]));
-    let snapshot = DeskSnapshot {
-        text: source.snapshot().text(),
-        operations: vec![operation],
-        transactions: Vec::new(),
-        replicas: Vec::new(),
-    };
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    cx.update(|cx| {
-        let settings = cx.global_mut::<SettingsStore>();
-        settings.override_global(vim_mode_setting::VimModeSetting(true));
-        settings.override_global(vim_mode_setting::HelixModeSetting(false));
-    });
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskSnapshot {
-                    snapshot,
-                    replica_id: 42,
-                },
-                window,
-                cx,
-            );
-            workspace.sync_dashboard(window, cx);
-            window.focus(&workspace.dashboard_editor().read(cx).focus_handle(cx), cx);
-            workspace.open_deal_mode(window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(workspace.dashboard_hint_for_test(cx).contains("1/6"));
-        })
-        .unwrap();
-
-    cx.simulate_keystrokes(*workspace, "3 s");
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "4 d");
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "s");
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "t");
-    cx.run_until_parked();
-    let before_refresh = workspace
-        .update(cx, |workspace, _, cx| workspace.dashboard_hint_for_test(cx))
-        .unwrap();
-    assert!(before_refresh.contains("5/6"), "{before_refresh:?}");
-    assert!(before_refresh.contains("2 waiting"), "{before_refresh:?}");
-
-    let raw = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .desk_buffer_for_test(HostId::default())
-                .unwrap()
-                .read(cx)
-                .text()
-        })
-        .unwrap();
-    let today = chrono::Local::now().date_naive();
-    let snoozed = today.checked_add_signed(chrono::Duration::days(3)).unwrap();
-    let one_day = today.succ_opt().unwrap();
-    assert!(raw.contains(&format!(":defer: {snoozed} 3d")), "{raw:?}");
-    assert!(raw.contains(&format!(":defer: {one_day} 1d")), "{raw:?}");
-    assert!(raw.contains(&format!(":todo: {today} 7d")), "{raw:?}");
-    assert!(!raw.contains(":reminder:"), "{raw:?}");
-    assert!(!raw.contains(":skip: 2019-01-01"), "{raw:?}");
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(workspace.dashboard_deal_mode_for_test());
-        })
-        .unwrap();
-}
-
-/// Sending a quick-spawn draft removes its row out from under the
-/// cursor; the cursor must land somewhere resolvable (the new heading)
-/// before vim's NormalBefore touches the selection, or it panics on a
-/// dead excerpt anchor.
 #[gpui::test]
 fn quick_spawn_send_relocates_the_cursor(cx: &mut TestAppContext) {
     use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};

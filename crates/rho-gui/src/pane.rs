@@ -4,10 +4,17 @@
 use camino::Utf8PathBuf;
 use rho_ui_proto::AgentId;
 
+use crate::registry::HostId;
+
 /// Stable identity of a surface, independent of its live view entity.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SurfaceKey {
     Draft,
+    DeskHeading {
+        host: HostId,
+        heading_offset: usize,
+    },
+    Inbox(String),
     Transcript(AgentId),
     File {
         agent_id: AgentId,

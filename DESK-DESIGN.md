@@ -40,20 +40,13 @@ what you decided, it tells you what some process last did. A desk the system
 co-writes becomes a feed you read instead of a memory you own. This rule is
 structural: it is not "the system is careful", it is "the system cannot".
 
-### Rooms: top-level headings are categories
+### Top-level headings are stable categories
 
-Top-level headings are rooms: "rho", "work", "discord", "social". A handful
-of them, alive for months. Everything lives inside some room — agents, pages,
-files, chat conversations. Actual tasks and projects are sub-headings inside
-a room. Rooms can end: archiving a top-level heading is how a room dies
-(this already exists).
-
-**Why:** switching happens between a small number of stable contexts, not
-between dozens of tasks. Because rooms are few and long-lived, recency-based
-switching stays calm and spatial memory inside a room has time to form.
-"Everything lives in a room" keeps the model to one noun: there are rooms,
-and there are things inside rooms. Nothing is homeless — social chat just
-lives in the "social" room.
+Top-level headings such as "rho", "work", "discord", and "social" remain
+long-lived desk categories. Tasks and projects can nest beneath them, and
+archiving a top-level heading retires that category. They organize the user's
+map and scope heading-level verdicts; they are not GUI rooms or navigation
+containers. Navigation follows surface recency instead.
 
 ### The inbox is outside the desk
 
@@ -89,7 +82,7 @@ ever lost.
 
 One gesture, write the thought, back to what you were doing. No picking a
 heading, no category, no naming. The system silently attaches context: what
-was on screen, the current room, the source (page URL, transcript position,
+was on screen, the current surface, the source (page URL, transcript position,
 chat message), timestamp. Sources: reading pages, talking to agents ("note
 this down"), coworker pings (captured automatically), and voice via Iris
 when away from the keyboard.
@@ -97,17 +90,17 @@ when away from the keyboard.
 **Why:** every decision added at capture time is paid on every thought, and
 eventually you stop capturing. The brain lets go of a thought only when it
 trusts the system to bring it back (GTD). Filing happens later during
-dealing, where the attached context makes the right room obvious. The
+dealing, where the attached context makes the right heading obvious. The
 attached context also fixes the "what did I mean by this?" problem: a lazy
 note is fine at write time because the system replays the scene at read
 time.
 
 ### One lifecycle for everything
 
-Everything — a tab, an agent, a task, a whole room — is pending, active,
+Everything — a tab, an agent, a task, a desk heading — is pending, active,
 deferred, or done. Verdicts differ per kind: done on a tab is a dismissal
 and must cost nothing; done on an agent is accepting reviewed work and
-deserves friction; deferring a room ("rho sleeps until tonight") mutes
+deserves friction; deferring a top-level heading ("rho sleeps until tonight") mutes
 everything inside it.
 
 **Why:** one lifecycle means one mental model and one dealer for everything.
@@ -119,20 +112,23 @@ amount of friction differ per kind on purpose.
 
 ### The dealer: a cooperative scheduler for attention
 
-The dealer hands you the next card: an agent that finished, a ping, a
-deferred task that woke up, an inbox item to file. Skip is always free —
-one gesture, no guilt, no explanation. The dealer never interrupts: urgency
-shows as signals (lamp, chime), never as the screen changing on its own.
+Each deal is a fresh pull: score all eligible items, exclude the surface
+already displayed, and show the single top card above the queue floor. There
+is no retained queue session. Pulling again, stepping back, opening the
+overview, or closing without an explicit verdict skips the dealt card. Skip is
+a 15-minute cooldown, not rejection: Desk cards receive a replaceable
+`:skip: YYYY-MM-DD HH:MM` mark, agent and inbox cooldowns stay in memory, and
+the card returns afterward with its normal score untouched. The dealer never
+interrupts: urgency shows as signals (lamp, chime), never as the screen
+changing on its own.
 
 Ranking is by curves: every item has an urgency curve over time, and the
 kind sets the shape. Pings rise (someone is waiting, the cost of silence
 grows). Unfiled captures rise slowly (filing is a small debt). Finished
 agent results and reminders fade (pure information: ignored for a few days
 means implicitly accepted — and never deleted).
-Deadlines spike near the date. Deferred items are zero until wake time.
-Cards in the current room get a small bonus — enough to prefer staying
-put, never enough to bury something urgent in another room. Context
-switches cost, so the dealer leans against them, but only leans.
+Deadlines spike near the date. A `:defer:` mark is sleep-until-then-rising: it is absent before its wake
+time, then rises one unit per elapsed day like a newly arrived obligation.
 Dealer policy is written as properties on desk headings (`:defer:`, time
 windows), so the dealer can always answer "why this card?" by quoting the
 desk back.
@@ -156,47 +152,32 @@ it. The deal's real asset is signal-to-noise: every junk card devalues all
 future cards. The dealer can afford to say "nothing" because the human
 returns on their own anyway — it is not responsible for keeping you engaged.
 
-### Navigation: a timeline gesture, a strip, and an overview key
+### Navigation: one surface timeline and an overview key
 
-Between rooms, one vertical timeline: up steps backward through
-recently-used rooms; repeat presses within a short window step deeper, with
-nothing overlaid — what you see is always the real room. Down opens the
-dealer. Dealing is not room switching: taking a card in the current room
-just loads it into the strip, and only a distant card moves you. Skipping
-is one key and costs nothing but the honest record of a skip.
-The desk itself is a separate overview key — like the windows key — that
-zooms out to the map, landing on the current room's heading.
+There is one vertical timeline over surfaces: agent transcripts, browser pages,
+desk-heading surfaces, terminals, and the other things currently in hand. Up
+steps backward through recently used surfaces; repeat presses within a short
+window step deeper. Nothing is overlaid: every step shows the real surface.
+Down deals the next card, makes its surface current, and puts it at the front of
+the same timeline. Closing drops the current surface and reveals the previous
+one, or the overview when the timeline is empty. The desk itself remains a
+separate overview key — like the windows key — that zooms out to the map.
 
-**Why:** most switching is going back to something recent, and that must be
-a reflex, not a search — the original friction was exactly "finding the item
-in the desk". The vertical axis is time, not space: past above, future
-below. Stepping is blind, but every step shows the real room, so you always
-see where you landed. The desk stays the map: it is consulted deliberately, its
-order is never auto-changed (auto-reordering destroys spatial memory — the
-old adaptive-menus mistake), and landing on the current heading quietly
-teaches where you are on the map.
+**Why:** most switching is going back to something recent, and that must be a
+reflex, not a search. The vertical axis is time: past above, future below. The
+desk stays the stable map and is consulted deliberately; its order is never
+auto-changed.
 
-### Inside a room: the strip is a dynamic working set
-
-A room shows a horizontal strip of surfaces (niri-style): agents, pages,
-terminals, chat. The strip is *not* a static layout and *not* derived from
-the org tree. It is the live working set: taking a card from the dealer
-loads its surface into the strip, touching something loads it. Removal is
-manual — one cheap gesture. Nothing is lost on removal: the desk retains
-everything; the strip only shows what is in hand.
-
-**Why:** loading must be automatic — the brain does not file the three
-things it is juggling, they are just "in hand", so the dealer and plain
-touching fill the strip with zero ceremony. Removal is deliberate because
-dropping something from the working set is a small verdict, and a timer
-makes that verdict wrongly in both directions: it drains the thing you
-were about to come back to and keeps the thing you silently abandoned.
+Rooms and horizontal room strips were tried and removed for now. In practice
+the extra grouping and second navigation axis were more confusing than useful.
+There is no horizontal navigation axis in v1. A different room concept may
+return later if observed use gives it a clear job.
 
 ### Log everything, adapt nothing silently
 
 The journal is the whole-GUI interaction record, not a dealer log. Every
 user interaction goes through it — nothing bypasses the journal: deals
-(card, kind, curve score, room, time of day, verdict, time-to-verdict, and
+(card, kind, curve score, source context, time of day, verdict, time-to-verdict, and
 the cards considered but not dealt), inbox verdicts wherever they happen,
 captures, manual desk lookups ("find events"), opening and viewing agents,
 surface and pane switches, scrolling. Storage is free. The point is wider
@@ -225,62 +206,50 @@ exploration budget.
 ## The GUI shape (v1)
 
 The dealer world inverts the GUI. Today the desk buffer is home: you live in
-the document and open things from it. In the new shape you live in a room and
-things arrive. Three layers:
+the document and open things from it. In the new shape you live on one surface
+timeline and things arrive. Two layers:
 
-**Ground: the room strip.** The screen is the current room — a horizontal
-strip of surfaces (agents, pages, shell, zulip), one surface full-screen at a
-time. The strip slides with a normal horizontal scroll — the focused surface
-gets the gesture first, and at its edge it spills into the strip — with
-keyboard keys as fallback. It never wraps, and each room remembers which
-surface you were on. A small room name in a corner is the only chrome. No splits: one surface per strip cell. Splits are complexity
-paid on every layout decision, and sliding between full-screen cells is cheap
-enough to cover the side-by-side cases for now. They can come back later if
-their absence is actually felt.
+**Ground: the current surface.** One agent transcript, browser page,
+desk-heading surface, terminal, or other surface fills the frame. Showing or
+dealing a surface moves it to the front of one global MRU. Closing it reveals
+the previous surface, and an empty timeline lands on the overview. Rooms and
+horizontal strips were tried and removed for now because their grouping and
+second axis were too confusing; they may return only as a different, clearer
+concept. There is no horizontal axis.
 
-**The timeline.** One axis, two directions, keyboard-driven for now: one
-key steps back through recently-used rooms; repeat presses within a short
-window step deeper, nothing is overlaid, and what you see is always the real
-room. The other opens the dealer. Dealing is global and item-level: one queue across all rooms, with
-the small current-room bonus from the dealer section. A card in the current
-room just loads into the strip; a distant card switches rooms. Room-level
-verdicts (defer the whole room) are given from an item card. Inbox captures
-are ordinary cards in the same queue.
+**The timeline.** One vertical axis, keyboard-driven for now: one key steps
+backward through recently used surfaces, with repeat presses inside a short
+window stepping deeper. Nothing is overlaid and what you see is always the real
+surface. The other key deals the next card. Dealing is global and item-level:
+one queue, and every dealt card becomes the current surface immediately.
 
-**The overview.** The desk map is the current rail view kept as it is —
-the desk buffer with live agent rows, attaching, editing, filing all work
-the same. What changes is its role, not its looks: it is a place you visit
-deliberately (the overview key), not the place you live. The rail's
-aggregation of everything exists only here; there is no persistent
-all-agents list anywhere else on screen.
+**The overview.** The desk map is the current rail view kept as it is — the
+desk buffer with live agent rows, attaching, editing, filing all work the same.
+It is a place you visit deliberately, not persistent chrome.
 
-**The deal is full-screen.** A deal is one decision. The card takes the
-whole screen — content preview, the "why" in plain inputs, verdict keys —
-so there is no half-attention split between the card and the room behind
-it. A freshly dealt surface is in a vim mode of its own, DEAL, which is
-normal mode plus a few verdict letters — motions, search, scrolling all
-work, and there is nothing to switch in or out of. Accept is the default:
-staying on the card, typing into it, or moving on to the next deal all take
-it. Skip is its own explicit key. A shown card is provisional until you
-leave it: skipping leaves no trace but the skip itself, no strip entry, no
-room switch. The dashboard as a destination dies: the deal is a moment, not
-a place.
+**The deal is full-screen.** A deal is one decision. The dealt surface takes
+the whole screen with its content, plain-language reason, and verdict keys. A
+fresh surface is in DEAL, which is normal mode plus verdict letters: motions,
+search, and scrolling all work. Insert commits to the surface and Escape returns
+to DEAL on desk cards. Dealing immediately puts the surface on the timeline.
+Ctrl-J skips it for 15 minutes, leaves its surface behind, and performs a fresh
+pull. `q` skips and closes the current dealt surface. Ctrl-Shift-J combines
+skip, close, and a fresh pull.
 
 **Signals push dirtiness, never changes.** No event gets its own signal:
-things only mark the dealer's hand dirty, and the signals are derived from
-the hand's current state. Two thresholds: a quiet visual cue (a translucent
+things only mark the dealer dirty, and signals are derived from a fresh score. Two thresholds: a quiet visual cue (a translucent
 shade in a corner) at a lower bar, a chime at a higher one. The chime is
-edge-triggered — it rings once when the hand crosses the line, and again
-only after the hand has dropped back below. Signals carry no content: no
+edge-triggered — it rings once when the top score crosses the line, and again
+only after the score has dropped back below. Signals carry no content: no
 counts, no names. A count is a badge, and a badge is the checking loop.
-Pulling (opening the hand) is the only way to see what or why. Agents you
+Pulling a card is the only way to see what or why. Agents you
 recently interacted with get a fading bonus on their cards, so a completion
 from an agent you are actively driving reaches you immediately while a
 background agent's completion waits quietly — as a curve bonus, not a
 signal special-case, so dealing order agrees with the signals.
 
 **Cold start boots into the desk.** Sitting down starts at the map: orient
-first, then dive into a room or ask for a deal. This also keeps the rule
+first, then open a surface or ask for a deal. This also keeps the rule
 that the dealer never moves you anywhere on its own — including at startup.
 
 ## Deliberately deferred
@@ -288,12 +257,12 @@ that the dealer never moves you anywhere on its own — including at startup.
 These were discussed and parked on purpose. None of them block the core;
 all are additive later:
 
-- **Briefings** — an LLM summary at wake / on returning to a cold room
+- **Briefings** — an LLM summary at wake / on returning to a cold surface
   ("while you slept: two agents finished, three pings arrived").
   Generated from the logs, so it can be added any time.
-- **Agent help with filing** — an agent suggesting the room for an inbox
+- **Agent help with filing** — an agent suggesting the heading for an inbox
   item, or gardening the desk on request. Manual filing first.
-- **Rituals / sweeps** — a cross-room "drain everything" mode, morning or
+- **Rituals / sweeps** — a global "drain everything" mode, morning or
   evening shapes. Cannot be designed before living with the dealer, because
   current habits are shaped by the dealer not existing.
 - **v2 learned dealing** — see logging section for the rules it must obey.

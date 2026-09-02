@@ -100,6 +100,8 @@ pub enum DealerVerdict {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SurfaceIdentity {
     Draft,
+    DeskHeading { host: String, heading_offset: usize },
+    Inbox { id: String },
     Transcript { agent_id: String },
     File { agent_id: String, path: String },
     Shell { agent_id: String },
@@ -140,22 +142,11 @@ pub enum InboxVerdict {
     derive(senax_encoder::Encode, senax_encoder::Decode)
 )]
 #[serde(rename_all = "snake_case")]
-pub enum RoomSwitchMethod {
+pub enum SurfaceShowMethod {
     Overview,
     Open,
     Mru,
-    Dealer,
-}
-
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(
-    feature = "native",
-    derive(senax_encoder::Encode, senax_encoder::Decode)
-)]
-#[serde(rename_all = "snake_case")]
-pub enum StripDirection {
-    Left,
-    Right,
+    Deal,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -166,6 +157,7 @@ pub enum StripDirection {
 #[serde(rename_all = "snake_case")]
 pub enum DealModeAction {
     Enter,
+    Interacted,
     Exit,
 }
 
@@ -197,13 +189,12 @@ pub struct BuildIdentity {
 )]
 pub struct DealerPolicySnapshot {
     pub queue_floor: f64,
-    pub priority_cutoff: usize,
     pub blocked_reply_head_start: f64,
     pub blocked_reply_slope_per_day: f64,
     pub fyi_reply_pace_days: f64,
     pub inbox_obligation_pace_days: u32,
     pub inbox_capture_pace_days: u32,
-    pub current_room_priority_bonus: f64,
+    pub skip_cooldown_minutes: i64,
     pub lamp_threshold: f64,
     pub chime_threshold: f64,
     pub agent_recency_bonus: f64,
@@ -230,51 +221,41 @@ pub enum Event {
     UserResumed,
     LampTransition {
         state: SignalState,
-        hand_max_priority: Option<f64>,
+        top_priority: Option<f64>,
         card: Option<DealerCardIdentity>,
     },
     ChimeRing {
-        hand_max_priority: f64,
+        top_priority: f64,
         card: DealerCardIdentity,
     },
-    RoomSwitched {
-        room: String,
-        method: RoomSwitchMethod,
-    },
-    StripSlid {
-        room: String,
-        direction: StripDirection,
+    SurfaceShown {
         surface: SurfaceIdentity,
+        method: SurfaceShowMethod,
     },
     MruStepped {
-        from_room: String,
-        to_room: String,
+        from: SurfaceIdentity,
+        to: SurfaceIdentity,
         depth: usize,
     },
     DealMode {
         action: DealModeAction,
         card: Option<DealerCardIdentity>,
     },
-    StripRemoved {
-        room: String,
+    SurfaceClosed {
         surface: SurfaceIdentity,
+        dealt_untouched: bool,
     },
-    RoomDeferred {
-        room: String,
+    DeskHeadingDeferred {
+        heading: String,
         until: String,
         card: DealerCardIdentity,
     },
-    OverviewOpened {
-        room: Option<String>,
-    },
+    OverviewOpened,
     AgentOpened {
         agent_id: String,
     },
     AgentSelected {
         agent_id: Option<String>,
-    },
-    SurfaceDisplayed {
-        surface: SurfaceIdentity,
     },
     MinibufferOpened {
         prompt: String,
@@ -302,26 +283,10 @@ pub enum Event {
         card: DealerCardIdentity,
         kind: DealerCardKind,
         verdict: DealerVerdict,
+        skip_until: Option<String>,
         occurred_at: String,
         time_to_verdict_ms: u64,
         considered_not_dealt: Vec<DealerCardIdentity>,
-    },
-    DealCardPresented {
-        label: String,
-        kind: String,
-        score: f64,
-        room: String,
-        host: String,
-        agent_id: Option<String>,
-    },
-    DealVerdict {
-        label: String,
-        kind: String,
-        score: f64,
-        room: String,
-        host: String,
-        agent_id: Option<String>,
-        verdict: String,
     },
     Capture {
         inbox_id: String,
@@ -348,16 +313,14 @@ impl Event {
             Self::UserResumed => "user_resumed",
             Self::LampTransition { .. } => "lamp_transition",
             Self::ChimeRing { .. } => "chime_ring",
-            Self::RoomSwitched { .. } => "room_switched",
-            Self::StripSlid { .. } => "strip_slid",
+            Self::SurfaceShown { .. } => "surface_shown",
             Self::MruStepped { .. } => "mru_stepped",
             Self::DealMode { .. } => "deal_mode",
-            Self::StripRemoved { .. } => "strip_removed",
-            Self::RoomDeferred { .. } => "room_deferred",
-            Self::OverviewOpened { .. } => "overview_opened",
+            Self::SurfaceClosed { .. } => "surface_closed",
+            Self::DeskHeadingDeferred { .. } => "desk_heading_deferred",
+            Self::OverviewOpened => "overview_opened",
             Self::AgentOpened { .. } => "agent_opened",
             Self::AgentSelected { .. } => "agent_selected",
-            Self::SurfaceDisplayed { .. } => "surface_displayed",
             Self::MinibufferOpened { .. } => "minibuffer_opened",
             Self::MinibufferSubmitted { .. } => "minibuffer_submitted",
             Self::MinibufferCancelled { .. } => "minibuffer_cancelled",
@@ -367,8 +330,6 @@ impl Event {
             Self::Scroll { .. } => "scroll",
             Self::Find { .. } => "find",
             Self::Dealer { .. } => "dealer",
-            Self::DealCardPresented { .. } => "deal_card_presented",
-            Self::DealVerdict { .. } => "deal_verdict",
         }
     }
 }
@@ -663,18 +624,18 @@ mod tests {
     }
 
     #[test]
-    fn signal_events_round_trip_the_derived_hand() {
+    fn signal_events_round_trip_the_top_card() {
         let card = DealerCardIdentity::Agent {
             agent_id: "agent-a".into(),
         };
         for event in [
             Event::LampTransition {
                 state: SignalState::On,
-                hand_max_priority: Some(1.5),
+                top_priority: Some(1.5),
                 card: Some(card.clone()),
             },
             Event::ChimeRing {
-                hand_max_priority: 1.5,
+                top_priority: 1.5,
                 card,
             },
         ] {
@@ -692,6 +653,18 @@ mod tests {
     }
 
     #[test]
+    fn surface_close_records_whether_a_deal_was_untouched() {
+        let event = Event::SurfaceClosed {
+            surface: SurfaceIdentity::Transcript {
+                agent_id: "eng-a".into(),
+            },
+            dealt_untouched: true,
+        };
+        let encoded = serde_json::to_string(&event).unwrap();
+        assert_eq!(serde_json::from_str::<Event>(&encoded).unwrap(), event);
+    }
+
+    #[test]
     fn dealer_event_round_trips_considered_cards() {
         let event = Event::Dealer {
             card: DealerCardIdentity::Inbox {
@@ -699,6 +672,7 @@ mod tests {
             },
             kind: DealerCardKind::Inbox(DealerInboxKind::Capture),
             verdict: DealerVerdict::Defer,
+            skip_until: None,
             occurred_at: "2026-09-01T20:00:00+00:00".into(),
             time_to_verdict_ms: 4200,
             considered_not_dealt: vec![

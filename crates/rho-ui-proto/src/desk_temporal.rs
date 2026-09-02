@@ -9,7 +9,6 @@ pub enum TemporalMarkKind {
     Todo,
     Defer,
     Reminder,
-    Skip,
     Done,
     Discarded,
 }
@@ -21,7 +20,6 @@ impl TemporalMarkKind {
             Self::Todo => "todo",
             Self::Defer => "defer",
             Self::Reminder => "reminder",
-            Self::Skip => "skip",
             Self::Done => "done",
             Self::Discarded => "discarded",
         }
@@ -36,8 +34,6 @@ impl TemporalMarkKind {
             Some(Self::Defer)
         } else if key.eq_ignore_ascii_case("reminder") {
             Some(Self::Reminder)
-        } else if key.eq_ignore_ascii_case("skip") {
-            Some(Self::Skip)
         } else if key.eq_ignore_ascii_case("done") {
             Some(Self::Done)
         } else if key.eq_ignore_ascii_case("discarded") {
@@ -52,12 +48,12 @@ impl TemporalMarkKind {
             Self::Deadline | Self::Todo => 7,
             Self::Defer => 30,
             Self::Reminder => 1,
-            Self::Skip | Self::Done | Self::Discarded => 0,
+            Self::Done | Self::Discarded => 0,
         }
     }
 
     fn accepts_pace(self) -> bool {
-        !matches!(self, Self::Skip | Self::Done | Self::Discarded)
+        !matches!(self, Self::Done | Self::Discarded)
     }
 }
 
@@ -127,15 +123,11 @@ pub fn priority(mark: &TemporalMark, now: NaiveDateTime) -> f64 {
         TemporalMarkKind::Deadline if elapsed <= 0.0 => elapsed / pace,
         TemporalMarkKind::Deadline => 1_000_000.0 + elapsed,
         TemporalMarkKind::Todo => elapsed - pace,
-        TemporalMarkKind::Defer => {
-            let phase = elapsed.rem_euclid(pace);
-            -phase.min(pace - phase)
-        }
+        TemporalMarkKind::Defer if elapsed < 0.0 => f64::NEG_INFINITY,
+        TemporalMarkKind::Defer => elapsed,
         TemporalMarkKind::Reminder if elapsed < 0.0 => f64::NEG_INFINITY,
         TemporalMarkKind::Reminder => -elapsed / pace,
-        TemporalMarkKind::Skip | TemporalMarkKind::Done | TemporalMarkKind::Discarded => {
-            f64::NEG_INFINITY
-        }
+        TemporalMarkKind::Done | TemporalMarkKind::Discarded => f64::NEG_INFINITY,
     }
 }
 
@@ -210,12 +202,12 @@ mod tests {
     }
 
     #[test]
-    fn defer_is_a_permanent_triangle_wave() {
-        let mark = mark(TemporalMarkKind::Defer, 1, 10);
-        assert_eq!(priority(&mark, at(1)), 0.0);
-        assert_eq!(priority(&mark, at(6)), -5.0);
-        assert_eq!(priority(&mark, at(11)), 0.0);
-        assert_eq!(priority(&mark, at(16)), -5.0);
+    fn defer_sleeps_until_wake_then_keeps_rising() {
+        let mark = mark(TemporalMarkKind::Defer, 10, 10);
+        assert_eq!(priority(&mark, at(9)), f64::NEG_INFINITY);
+        assert_eq!(priority(&mark, at(10)), 0.0);
+        assert_eq!(priority(&mark, at(11)), 1.0);
+        assert_eq!(priority(&mark, at(20)), 10.0);
     }
 
     #[test]
@@ -260,18 +252,6 @@ mod tests {
         );
         assert_eq!(priority(&reminder, at(10) + Duration::hours(12)), 0.0);
         assert!(priority(&reminder, at(10) + Duration::hours(15)) < 0.0);
-    }
-
-    #[test]
-    fn skip_has_no_pace_and_never_surfaces_on_its_own() {
-        assert!(TemporalMark::parse(TemporalMarkKind::Skip, "2026-08-10 2d").is_none());
-        let mark = mark(TemporalMarkKind::Skip, 10, 0);
-        assert_eq!(priority(&mark, at(9)), f64::NEG_INFINITY);
-        assert_eq!(priority(&mark, at(11)), f64::NEG_INFINITY);
-        assert_eq!(
-            property_line(TemporalMarkKind::Skip, at(10), None),
-            ":skip: 2026-08-10\n"
-        );
     }
 
     #[test]

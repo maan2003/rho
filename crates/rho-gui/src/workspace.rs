@@ -67,27 +67,21 @@ use crate::style::RoleFamily;
 use crate::style::StyleClass;
 use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
-    AgentDone, AgentHide, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, BrowserExit,
-    DashboardArchive, DashboardBack, DashboardCycleGlobal, DashboardDealAppend,
-    DashboardDealDiscard, DashboardDealDone, DashboardDealExit, DashboardDealFile,
-    DashboardDealInsert, DashboardDealNext, DashboardDealOpenLine, DashboardDealPrevious,
-    DashboardDealRefresh, DashboardDealReply, DashboardDealRoomSnooze, DashboardDealSnooze,
-    DashboardDealTodo, DashboardDeleteEmpty, DashboardDemote, DashboardGoto, DashboardHeadingAbove,
-    DashboardHeadingBelow, DashboardJump, DashboardNewAgent, DashboardNow, DashboardPromote,
-    DashboardRenameTopic, DashboardReply, DashboardStaff, DashboardSubmit,
-    DashboardToggleAgentTree, DashboardToggleSubagents, DashboardUndo, DealOpen, GitApprovalAllow,
-    GitApprovalDeny, InboxCapture, MinibufferCancel, MinibufferComplete, MinibufferConfirm,
-    MinibufferNext, MinibufferPrevious, OverviewToggle, PastePrompt, RailFocus, RailOpen,
-    RoleCycle, RoleCycleGroup, RoomBack, RoomStripLeft, RoomStripRight, ShellEof, ShellInterrupt,
-    ShellPagerAll, ShellPagerMore, ShellPagerQuit, StripRemove, SubmitPrompt, TaskBoard,
-    UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow, ZulipQuit,
+    AgentDone, AgentHide, AgentNew, AgentNext, AgentPrevious, BrowserExit, DashboardArchive,
+    DashboardBack, DashboardCycleGlobal, DashboardDealAppend, DashboardDealDiscard,
+    DashboardDealDone, DashboardDealExit, DashboardDealFile, DashboardDealInsert,
+    DashboardDealNext, DashboardDealOpenLine, DashboardDealRefresh, DashboardDealReply,
+    DashboardDealRoomSnooze, DashboardDealSnooze, DashboardDealTodo, DashboardDeleteEmpty,
+    DashboardDemote, DashboardGoto, DashboardHeadingAbove, DashboardHeadingBelow, DashboardJump,
+    DashboardNewAgent, DashboardNow, DashboardPromote, DashboardRenameTopic, DashboardReply,
+    DashboardStaff, DashboardSubmit, DashboardToggleAgentTree, DashboardToggleSubagents,
+    DashboardUndo, DealCloseAndNext, DealOpen, GitApprovalAllow, GitApprovalDeny, InboxCapture,
+    MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious,
+    OverviewToggle, PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof,
+    ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit, SubmitPrompt, SurfaceBack,
+    SurfaceClose, TaskBoard, UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder, ZulipNextUnread,
+    ZulipOpenRow,
 };
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct RoomId {
-    host: HostId,
-    heading_offset: usize,
-}
 
 #[derive(Clone)]
 struct WarmSurface {
@@ -95,18 +89,10 @@ struct WarmSurface {
     surface: Surface,
 }
 
-struct MruOverlay {
-    origin: RoomId,
-    room_candidates: Vec<RoomId>,
-    room_index: usize,
-}
-
-#[derive(Clone)]
-struct DealOrigin {
-    active_context: ContextId,
-    surface: Surface,
-    current_room: Option<RoomId>,
-    overview_open: bool,
+struct MruSession {
+    origin: WarmSurface,
+    candidates: Vec<WarmSurface>,
+    index: usize,
 }
 
 const SHELL_SWIPE_DISTANCE: gpui::Pixels = px(64.);
@@ -183,6 +169,8 @@ enum SurfaceView {
     Draft {
         editor: Entity<editor::Editor>,
     },
+    DeskHeading(Entity<editor::Editor>),
+    Inbox(Entity<editor::Editor>),
     Transcript {
         model: Entity<AgentModel>,
         /// The editor over the model's multibuffer.
@@ -209,6 +197,7 @@ impl SurfaceView {
         use crate::telemetry::SurfaceKind;
         match self {
             Self::Draft { .. } => SurfaceKind::Draft,
+            Self::DeskHeading(_) | Self::Inbox(_) => SurfaceKind::Dashboard,
             Self::Transcript { .. } => SurfaceKind::Transcript,
             Self::File(_) => SurfaceKind::File,
             Self::Shell { .. } => SurfaceKind::Shell,
@@ -423,22 +412,17 @@ pub struct Workspace {
     active_context: ContextId,
     /// Warm surfaces grouped by their Desk room. This is deliberately an
     /// ephemeral cache: the Desk and underlying resources remain canonical.
-    room_strips: HashMap<RoomId, Vec<WarmSurface>>,
-    room_names: HashMap<RoomId, String>,
-    current_room: Option<RoomId>,
-    room_mru: Vec<RoomId>,
+    surface_mru: Vec<WarmSurface>,
     overview_open: bool,
-    mru_overlay: Option<MruOverlay>,
-    mru_overlay_task: Option<Task<()>>,
-    room_focus: HashMap<RoomId, SurfaceKey>,
+    mru_session: Option<MruSession>,
+    mru_session_task: Option<Task<()>>,
     last_shift_tap: Option<std::time::Instant>,
     shell_touches: HashMap<TouchId, ShellTouchContact>,
     shell_touch_was_multi: bool,
     shell_touch_committed: bool,
-    horizontal_strip_gesture_active: bool,
+    deal_gesture_active: bool,
     deal_session_open: bool,
-    deal_origin: Option<DealOrigin>,
-    deal_current_taken: bool,
+    deal_current_interacted: bool,
     deal_view: Option<DealView>,
     deal_hints_visible: bool,
     deal_controls_visible: bool,
@@ -904,6 +888,30 @@ impl Workspace {
             },
         );
         let universal_argument_subscription = cx.observe_keystrokes(|this, event, window, cx| {
+            if this.dashboard.deal_mode()
+                && !matches!(
+                    event.keystroke.key.as_str(),
+                    "shift"
+                        | "control"
+                        | "alt"
+                        | "platform"
+                        | "function"
+                        | "q"
+                        | "d"
+                        | "x"
+                        | "s"
+                        | "t"
+                        | "f"
+                        | "i"
+                        | "a"
+                        | "o"
+                        | "tab"
+                        | "f16"
+                        | "f20"
+                )
+            {
+                this.mark_deal_interacted();
+            }
             if event.keystroke.key == "shift"
                 && !event.keystroke.modifiers.control
                 && !event.keystroke.modifiers.alt
@@ -921,16 +929,16 @@ impl Workspace {
                 }
             } else {
                 this.last_shift_tap = None;
-                let stepping_room_back = event
+                let stepping_back = event
                     .action
                     .as_ref()
-                    .is_some_and(|action| action.as_any().is::<RoomBack>())
+                    .is_some_and(|action| action.as_any().is::<SurfaceBack>())
                     || cx
                         .all_bindings_for_input(std::slice::from_ref(&event.keystroke))
                         .iter()
-                        .any(|binding| binding.action().as_any().is::<RoomBack>());
-                if !stepping_room_back {
-                    this.dismiss_mru_overlay(cx);
+                        .any(|binding| binding.action().as_any().is::<SurfaceBack>());
+                if !stepping_back {
+                    this.finish_mru_session(cx);
                 }
             }
             if this.universal_argument
@@ -983,22 +991,17 @@ impl Workspace {
             contexts: HashMap::new(),
             surfaces: HashMap::new(),
             active_context: ContextId::Draft,
-            room_strips: HashMap::new(),
-            room_names: HashMap::new(),
-            current_room: None,
-            room_mru: Vec::new(),
+            surface_mru: Vec::new(),
             overview_open: true,
-            mru_overlay: None,
-            mru_overlay_task: None,
-            room_focus: HashMap::new(),
+            mru_session: None,
+            mru_session_task: None,
             last_shift_tap: None,
             shell_touches: HashMap::new(),
             shell_touch_was_multi: false,
             shell_touch_committed: false,
-            horizontal_strip_gesture_active: false,
+            deal_gesture_active: false,
             deal_session_open: false,
-            deal_origin: None,
-            deal_current_taken: false,
+            deal_current_interacted: false,
             deal_view: None,
             deal_hints_visible: false,
             deal_controls_visible: false,
@@ -1057,9 +1060,10 @@ impl Workspace {
             this.attach_host(spec, cx);
         }
         let draft = this.make_surface(SurfaceKey::Draft, window, cx);
-        this.display_surface(draft);
+        this.display_surface(draft, cx);
         this.seed_draft(false, window, cx);
         // Startup lands in home mode: the dashboard is the front door.
+        this.overview_open = true;
         let dashboard_focus = this.dashboard.focus_handle(cx);
         window.focus(&dashboard_focus, cx);
         // Seed the listing before any event arrives ("+ new agent").
@@ -1127,7 +1131,7 @@ impl Workspace {
         if !self.contexts.contains_key(&self.active_context) {
             self.active_context = ContextId::Draft;
             let draft = self.make_surface(SurfaceKey::Draft, window, cx);
-            self.display_surface(draft);
+            self.display_surface(draft, cx);
             self.focus_active_surface(window, cx);
         }
         self.refresh_draft_agent_targets(cx);
@@ -1210,140 +1214,76 @@ impl Workspace {
             .expect("active context has a pane")
     }
 
-    fn remember_room(
-        &mut self,
-        room: crate::dashboard::DeskRoom,
-        method: crate::journal::RoomSwitchMethod,
-        cx: &mut Context<Self>,
-    ) {
-        let id = RoomId {
-            host: room.host,
-            heading_offset: room.heading_offset,
-        };
-        self.room_names.insert(id.clone(), room.name.clone());
-        if self.current_room.as_ref() != Some(&id) {
-            self.room_mru.retain(|candidate| candidate != &id);
-            if let Some(previous) = self.current_room.replace(id.clone()) {
-                self.room_mru.retain(|candidate| candidate != &previous);
-                self.room_mru.insert(0, previous);
-            }
-            crate::journal::record(crate::journal::Event::RoomSwitched {
-                room: room.name,
-                method,
-            });
-        }
-        self.overview_open = false;
-        self.invalidate_dealer_signals(cx);
-    }
-
-    fn room_for_agent(&self, agent_id: AgentId, cx: &App) -> Option<crate::dashboard::DeskRoom> {
-        self.dashboard.room_for_agent(agent_id, cx)
-    }
-
-    fn touch_room_surface(&mut self, surface: &Surface) {
-        let Some(room) = self.current_room.clone() else {
-            return;
-        };
-        let strip = self.room_strips.entry(room.clone()).or_default();
-        if let Some(warm) = strip
-            .iter_mut()
-            .find(|warm| warm.surface.key == surface.key)
-        {
-            warm.surface = surface.clone();
-            warm.context = self.active_context;
-        } else {
-            strip.push(WarmSurface {
+    fn touch_surface(&mut self, surface: &Surface) {
+        self.surface_mru
+            .retain(|warm| warm.surface.key != surface.key);
+        self.surface_mru.insert(
+            0,
+            WarmSurface {
                 context: self.active_context,
                 surface: surface.clone(),
-            });
-        }
-        self.room_focus.insert(room, surface.key.clone());
+            },
+        );
     }
 
-    fn slide_room_strip(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        if self.overview_open || self.dashboard.deal_mode() {
-            return;
+    fn show_warm_surface(
+        &mut self,
+        mut warm: WarmSurface,
+        method: crate::journal::SurfaceShowMethod,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let SurfaceKey::Transcript(agent_id) = warm.surface.key
+            && !self.subscriptions.contains(agent_id)
+        {
+            self.subscribe_agent(agent_id, cx);
+            warm.surface = self.make_surface(SurfaceKey::Transcript(agent_id), window, cx);
         }
-        let Some(room) = self.current_room.clone() else {
-            return;
-        };
-        let current_key = self.active_pane().surface.key.clone();
-        let Some(strip) = self.room_strips.get_mut(&room) else {
-            return;
-        };
-        if strip.len() < 2 {
-            return;
-        }
-        let current = strip
-            .iter()
-            .position(|warm| warm.surface.key == current_key)
-            .unwrap_or(0);
-        let next = current.saturating_add_signed(delta).min(strip.len() - 1);
-        if next == current {
-            return;
-        }
-        let warm = strip[next].clone();
+        self.ensure_surface_subscription(&warm.surface.key, cx);
         self.active_context = warm.context;
-        self.display_surface(warm.surface.clone());
+        self.active_pane_mut().show(warm.surface.clone());
+        self.overview_open = false;
         self.sync_selection_to_focus(cx);
         self.focus_active_surface(window, cx);
-        crate::journal::record(crate::journal::Event::StripSlid {
-            room: self.room_names.get(&room).cloned().unwrap_or_default(),
-            direction: if delta < 0 {
-                crate::journal::StripDirection::Left
-            } else {
-                crate::journal::StripDirection::Right
-            },
+        crate::journal::record(crate::journal::Event::SurfaceShown {
             surface: Self::journal_surface(&warm.surface.key),
+            method,
         });
-        cx.notify();
     }
 
-    fn remove_from_room_strip(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.overview_open || self.dashboard.deal_mode() {
+    fn close_current_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overview_open {
             return;
         }
-        let Some(room) = self.current_room.clone() else {
-            return;
-        };
+        self.finish_mru_session(cx);
+        let was_dealing = self.dashboard.deal_mode();
+        let dealt_untouched = was_dealing && !self.deal_current_interacted;
+        if was_dealing {
+            self.skip_and_end_deal(window, cx);
+        }
         let key = self.active_pane().surface.key.clone();
-        let Some(strip) = self.room_strips.get_mut(&room) else {
-            return;
-        };
-        let Some(index) = strip.iter().position(|warm| warm.surface.key == key) else {
-            return;
-        };
-        strip.remove(index);
-        crate::journal::record(crate::journal::Event::StripRemoved {
-            room: self.room_names.get(&room).cloned().unwrap_or_default(),
+        self.surface_mru.retain(|warm| warm.surface.key != key);
+        crate::journal::record(crate::journal::Event::SurfaceClosed {
             surface: Self::journal_surface(&key),
+            dealt_untouched,
         });
-        if let Some(warm) = strip.get(index.saturating_sub(1)).cloned() {
-            self.active_context = warm.context;
-            self.display_surface(warm.surface);
-            self.focus_active_surface(window, cx);
+        if let Some(previous) = self.surface_mru.first().cloned() {
+            self.show_warm_surface(previous, crate::journal::SurfaceShowMethod::Mru, window, cx);
         } else {
-            self.room_focus.remove(&room);
+            self.open_overview(window, cx);
         }
         cx.notify();
     }
 
     fn open_overview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(room) = self.current_room.as_ref() {
-            self.dashboard
-                .cursor_to_doc(room.host, room.heading_offset, cx);
+        if self.dashboard.deal_mode() {
+            self.skip_and_end_deal(window, cx);
         }
         self.overview_open = true;
-        self.dismiss_mru_overlay(cx);
+        self.finish_mru_session(cx);
         self.refresh_dashboard(window, cx);
         window.focus(&self.dashboard.focus_handle(cx), cx);
-        crate::journal::record(crate::journal::Event::OverviewOpened {
-            room: self
-                .current_room
-                .as_ref()
-                .and_then(|room| self.room_names.get(room))
-                .cloned(),
-        });
+        crate::journal::record(crate::journal::Event::OverviewOpened);
         cx.notify();
     }
 
@@ -1397,11 +1337,7 @@ impl Workspace {
                                 && dy.abs() >= dx.abs() * 1.25
                             {
                                 if dy > 0. {
-                                    Some(if self.dashboard.deal_mode() {
-                                        Box::new(DashboardDealExit) as Box<dyn gpui::Action>
-                                    } else {
-                                        Box::new(DealOpen) as Box<dyn gpui::Action>
-                                    })
+                                    Some(Box::new(DealOpen) as Box<dyn gpui::Action>)
                                 } else if !self.dashboard.deal_mode() {
                                     Some(Box::new(OverviewToggle) as Box<dyn gpui::Action>)
                                 } else {
@@ -1412,22 +1348,6 @@ impl Workspace {
                             }
                         })
                         .flatten()
-                } else if !self.shell_touch_committed && !self.shell_touch_was_multi {
-                    let contact = self.shell_touches.get(&event.id).expect("touch exists");
-                    let dx = (contact.position.x - contact.start.x).as_f32();
-                    let dy = (contact.position.y - contact.start.y).as_f32();
-                    if !self.dashboard.deal_mode()
-                        && dx.abs() >= SHELL_SWIPE_DISTANCE.as_f32()
-                        && dx.abs() >= dy.abs() * 1.25
-                    {
-                        Some(if dx < 0. {
-                            Box::new(RoomStripLeft) as Box<dyn gpui::Action>
-                        } else {
-                            Box::new(RoomStripRight) as Box<dyn gpui::Action>
-                        })
-                    } else {
-                        None
-                    }
                 } else {
                     None
                 };
@@ -1458,84 +1378,76 @@ impl Workspace {
         }
     }
 
-    fn dismiss_mru_overlay(&mut self, cx: &mut Context<Self>) {
-        let Some(overlay) = self.mru_overlay.take() else {
+    fn finish_mru_session(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.mru_session.take() else {
             return;
         };
-        self.mru_overlay_task = None;
-        let Some(current) = self.current_room.clone() else {
-            return;
-        };
-        let mut mru = overlay.room_candidates[..overlay.room_index]
+        self.mru_session_task = None;
+        let current = session.candidates[session.index].surface.key.clone();
+        let mut mru = session.candidates[..session.index]
             .iter()
             .rev()
             .cloned()
             .collect::<Vec<_>>();
-        mru.push(overlay.origin);
-        mru.extend(
-            overlay
-                .room_candidates
-                .into_iter()
-                .skip(overlay.room_index + 1),
-        );
-        mru.retain(|room| room != &current);
-        self.room_mru = mru;
+        mru.push(session.origin);
+        mru.extend(session.candidates.into_iter().skip(session.index + 1));
+        mru.retain(|warm| warm.surface.key != current);
+        if let Some(shown) = self
+            .contexts
+            .get(&self.active_context)
+            .map(|pane| pane.surface.clone())
+        {
+            mru.insert(
+                0,
+                WarmSurface {
+                    context: self.active_context,
+                    surface: shown,
+                },
+            );
+        }
+        self.surface_mru = mru;
         cx.notify();
     }
 
-    fn step_room_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(origin) = self.current_room.clone() else {
+    fn step_surface_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.overview_open || self.dashboard.deal_mode() {
             return;
-        };
-        if self.mru_overlay.is_none() {
-            if self.room_mru.is_empty() {
+        }
+        if self.mru_session.is_none() {
+            if self.surface_mru.len() < 2 {
                 return;
             }
-            self.mru_overlay = Some(MruOverlay {
-                origin,
-                room_candidates: self.room_mru.clone(),
-                room_index: 0,
+            self.mru_session = Some(MruSession {
+                origin: self.surface_mru[0].clone(),
+                candidates: self.surface_mru[1..].to_vec(),
+                index: 0,
             });
-        } else if let Some(overlay) = &mut self.mru_overlay {
-            if overlay.room_index + 1 >= overlay.room_candidates.len() {
+        } else if let Some(session) = &mut self.mru_session {
+            if session.index + 1 >= session.candidates.len() {
                 return;
             }
-            overlay.room_index += 1;
+            session.index += 1;
         }
-        let overlay = self.mru_overlay.as_ref().expect("MRU overlay exists");
-        let target = overlay.room_candidates[overlay.room_index].clone();
-        let depth = overlay.room_index + 1;
-        let from = self
-            .current_room
-            .replace(target.clone())
-            .expect("room exists");
-        self.overview_open = false;
-        if let Some(key) = self.room_focus.get(&target)
-            && let Some(warm) = self
-                .room_strips
-                .get(&target)
-                .and_then(|strip| strip.iter().find(|warm| &warm.surface.key == key))
-                .cloned()
-        {
-            self.active_context = warm.context;
-            self.display_surface(warm.surface);
-            self.focus_active_surface(window, cx);
-        }
+        let session = self.mru_session.as_ref().expect("MRU session exists");
+        let target = session.candidates[session.index].clone();
+        let from = self.active_pane().surface.key.clone();
+        let depth = session.index + 1;
+        self.show_warm_surface(
+            target.clone(),
+            crate::journal::SurfaceShowMethod::Mru,
+            window,
+            cx,
+        );
         crate::journal::record(crate::journal::Event::MruStepped {
-            from_room: self.room_names.get(&from).cloned().unwrap_or_default(),
-            to_room: self.room_names.get(&target).cloned().unwrap_or_default(),
+            from: Self::journal_surface(&from),
+            to: Self::journal_surface(&target.surface.key),
             depth,
         });
-        crate::journal::record(crate::journal::Event::RoomSwitched {
-            room: self.room_names.get(&target).cloned().unwrap_or_default(),
-            method: crate::journal::RoomSwitchMethod::Mru,
-        });
-        self.invalidate_dealer_signals(cx);
-        self.mru_overlay_task = Some(cx.spawn(async move |this, cx| {
+        self.mru_session_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .timer(Duration::from_millis(1_200))
                 .await;
-            let _ = this.update(cx, |this, cx| this.dismiss_mru_overlay(cx));
+            let _ = this.update(cx, |this, cx| this.finish_mru_session(cx));
         }));
         cx.notify();
     }
@@ -1578,19 +1490,14 @@ impl Workspace {
 
     fn evaluate_dealer_signals(&mut self, cx: &mut Context<Self>) {
         let now = chrono::Local::now().fixed_offset();
-        let current_room = self
-            .current_room
-            .as_ref()
-            .and_then(|room| Some((room.host, self.room_names.get(room)?.as_str())));
-        let mut hand = self.dashboard.dealer_hand(
+        let mut candidates = self.dashboard.dealer_hand(
             &self.registry,
             &self.inbox,
             now,
-            current_room,
             &self.agent_last_interaction,
             cx,
         );
-        hand.cards.retain(|card| {
+        candidates.cards.retain(|card| {
             if let Some(current) = self.dashboard.current_deal_card() {
                 return card.identity != current.identity;
             }
@@ -1615,7 +1522,7 @@ impl Workspace {
                 _ => true,
             }
         });
-        let top = hand.cards.first();
+        let top = candidates.cards.first();
         let max_priority = top.map(|card| card.priority);
         let card = top.map(|card| Self::journal_card_identity(&card.identity));
         let lamp_on =
@@ -1628,7 +1535,7 @@ impl Workspace {
                 } else {
                     crate::journal::SignalState::Off
                 },
-                hand_max_priority: max_priority,
+                top_priority: max_priority,
                 card: card.clone(),
             });
             cx.notify();
@@ -1647,7 +1554,7 @@ impl Workspace {
                     self.chime.play();
                 }
                 crate::journal::record(crate::journal::Event::ChimeRing {
-                    hand_max_priority: priority,
+                    top_priority: priority,
                     card,
                 });
             }
@@ -2553,7 +2460,7 @@ impl Workspace {
         self.zulip_session(cx);
         self.active_context = ContextId::Zulip;
         let surface = self.make_surface(SurfaceKey::ZulipInbox, window, cx);
-        self.display_surface(surface);
+        self.display_surface(surface, cx);
         self.focus_active_surface(window, cx);
         cx.notify();
     }
@@ -2601,7 +2508,7 @@ impl Workspace {
                 Self::wrap_surface(key, SurfaceView::ZulipNarrow(view))
             }
         };
-        self.display_surface(surface);
+        self.display_surface(surface, cx);
         self.focus_active_surface(window, cx);
         cx.notify();
     }
@@ -2647,15 +2554,6 @@ impl Workspace {
                 self.open_zulip(window, cx);
             }
         }
-    }
-
-    /// `q`: leave Zulip for the agent world it was entered from, marking
-    /// the conversation on screen read on the way out.
-    #[cfg(feature = "native")]
-    fn zulip_quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.leave_zulip_narrow(cx);
-        let agent_id = self.registry.selected_agent().copied();
-        self.select_agent(agent_id, window, cx);
     }
 
     /// `P`: page further back in the conversation on screen.
@@ -3408,17 +3306,6 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if let Some(room) = self.dashboard.room_for_page(id, cx) {
-            self.remember_room(
-                room,
-                if self.overview_open {
-                    crate::journal::RoomSwitchMethod::Overview
-                } else {
-                    crate::journal::RoomSwitchMethod::Open
-                },
-                cx,
-            );
-        }
         let Some(model) = rho_browser::open_page(id, cx) else {
             let message = format!("browser page not found: {id}");
             self.notice_on(None, &message, StyleClass::SystemInfo, cx);
@@ -3428,7 +3315,7 @@ impl Workspace {
         self.observe_browser_metadata(&model, cx);
         let view = cx.new(|cx| rho_browser::PageView::new(model, id, cx));
         let surface = Self::wrap_surface(SurfaceKey::Browser(id), SurfaceView::Browser(view));
-        self.display_surface(surface);
+        self.display_surface(surface, cx);
         self.focus_active_surface(window, cx);
         cx.notify();
     }
@@ -4221,17 +4108,6 @@ impl Workspace {
         crate::journal::record(crate::journal::Event::AgentOpened {
             agent_id: agent_id.encoded(),
         });
-        if let Some(room) = self.room_for_agent(agent_id, cx) {
-            self.remember_room(
-                room,
-                if self.overview_open {
-                    crate::journal::RoomSwitchMethod::Overview
-                } else {
-                    crate::journal::RoomSwitchMethod::Open
-                },
-                cx,
-            );
-        }
         if self.agent_online(agent_id) && !self.subscriptions.contains(agent_id) {
             self.subscribe_agent(agent_id, cx);
         }
@@ -4350,21 +4226,6 @@ impl Workspace {
         self.invalidate_dealer_signals(cx);
         cx.notify();
         true
-    }
-
-    /// Jumps to the rail's most urgent agent (excluding the current one), so
-    /// working through a backlog is one keystroke per agent.
-    pub fn jump_to_attention(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(agent_id) = self.registry.next_attention_agent() else {
-            self.notice_on(
-                None,
-                "attention-jump: nothing is waiting on you",
-                StyleClass::SystemInfo,
-                cx,
-            );
-            return;
-        };
-        self.open_agent(agent_id, window, cx);
     }
 
     /// Tab in the draft cycles the `Workdir:` field, the start field, and
@@ -4691,7 +4552,7 @@ impl Workspace {
         };
         self.active_context = context;
         let surface = self.make_surface(key, window, cx);
-        self.display_surface(surface);
+        self.display_surface(surface, cx);
         if focus {
             self.focus_active_surface(window, cx);
         }
@@ -4774,6 +4635,8 @@ impl Workspace {
     fn surface_name(&self, key: &SurfaceKey) -> String {
         match key {
             SurfaceKey::Draft => "draft".to_owned(),
+            SurfaceKey::DeskHeading { heading_offset, .. } => format!("desk {heading_offset}"),
+            SurfaceKey::Inbox(id) => format!("inbox {id}"),
             SurfaceKey::Transcript(agent_id) => self.registry.agent_display_label(*agent_id),
             SurfaceKey::File { path, .. } => path.to_string(),
             SurfaceKey::Shell(agent_id) => {
@@ -4799,6 +4662,8 @@ impl Workspace {
     fn surface_kind(key: &SurfaceKey) -> &'static str {
         match key {
             SurfaceKey::Draft => "compose",
+            SurfaceKey::DeskHeading { .. } => "desk heading",
+            SurfaceKey::Inbox(_) => "inbox",
             SurfaceKey::Transcript(_) => "transcript",
             SurfaceKey::File { .. } => "file",
             SurfaceKey::Shell(_) => "shell",
@@ -4859,7 +4724,7 @@ impl Workspace {
             );
             return;
         };
-        self.display_surface(surface);
+        self.display_surface(surface, cx);
         self.sync_selection_to_focus(cx);
         self.focus_active_surface(window, cx);
         cx.notify();
@@ -4963,6 +4828,14 @@ impl Workspace {
         use crate::journal::SurfaceIdentity;
         match key {
             SurfaceKey::Draft => SurfaceIdentity::Draft,
+            SurfaceKey::DeskHeading {
+                host,
+                heading_offset,
+            } => SurfaceIdentity::DeskHeading {
+                host: host.to_string(),
+                heading_offset: *heading_offset,
+            },
+            SurfaceKey::Inbox(id) => SurfaceIdentity::Inbox { id: id.clone() },
             SurfaceKey::Transcript(agent_id) => SurfaceIdentity::Transcript {
                 agent_id: agent_id.encoded(),
             },
@@ -5004,17 +4877,12 @@ impl Workspace {
             event.touch_phase,
             gpui::TouchPhase::Ended | gpui::TouchPhase::Cancelled
         ) {
-            self.horizontal_strip_gesture_active = false;
-        } else if event.delta.precise() && !self.horizontal_strip_gesture_active {
-            // Focused children consume horizontal motion while they can
-            // scroll it. Only their edge spill bubbles to this strip seam.
+            self.deal_gesture_active = false;
+        } else if event.delta.precise() && !self.deal_gesture_active {
             let delta = event.delta.pixel_delta(px(20.));
             if self.dashboard.deal_mode() && delta.y > px(12.) && delta.y.abs() > delta.x.abs() {
-                self.horizontal_strip_gesture_active = true;
+                self.deal_gesture_active = true;
                 window.dispatch_action(Box::new(DealOpen), cx);
-            } else if delta.x.abs() > delta.y.abs() && delta.x.abs() >= px(12.) {
-                self.horizontal_strip_gesture_active = true;
-                self.slide_room_strip(if delta.x > px(0.) { -1 } else { 1 }, window, cx);
             }
         }
         self.journal_scroll_burst(window, cx);
@@ -5040,6 +4908,8 @@ impl Workspace {
             let pane = self.active_pane();
             let position = match &pane.surface.view {
                 SurfaceView::Draft { editor, .. }
+                | SurfaceView::DeskHeading(editor)
+                | SurfaceView::Inbox(editor)
                 | SurfaceView::Transcript { editor, .. }
                 | SurfaceView::Shell { editor, .. } => {
                     editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
@@ -5083,8 +4953,23 @@ impl Workspace {
     /// surface joins the context's surface list first, so it stays alive
     /// while hidden. The context's single viewport shows it, and is founded
     /// on the context's first visit.
-    fn display_surface(&mut self, surface: Surface) {
+    fn display_surface(&mut self, surface: Surface, cx: &mut Context<Self>) {
+        let method = if self.overview_open {
+            crate::journal::SurfaceShowMethod::Overview
+        } else {
+            crate::journal::SurfaceShowMethod::Open
+        };
+        self.display_surface_with_method(surface, method, cx);
+    }
+
+    fn display_surface_with_method(
+        &mut self,
+        surface: Surface,
+        method: crate::journal::SurfaceShowMethod,
+        cx: &mut Context<Self>,
+    ) {
         use std::collections::hash_map::Entry;
+        self.ensure_surface_subscription(&surface.key, cx);
         let list = self.surfaces.entry(self.active_context).or_default();
         match list.iter_mut().find(|s| **s == surface) {
             Some(existing) => *existing = surface.clone(),
@@ -5105,10 +4990,25 @@ impl Workspace {
                 pane.surface.clone()
             }
         };
-        self.touch_room_surface(&shown);
-        crate::journal::record(crate::journal::Event::SurfaceDisplayed {
+        self.overview_open = false;
+        self.touch_surface(&shown);
+        crate::journal::record(crate::journal::Event::SurfaceShown {
             surface: Self::journal_surface(&shown.key),
+            method,
         });
+    }
+
+    fn ensure_surface_subscription(&mut self, key: &SurfaceKey, cx: &mut Context<Self>) {
+        let agent_id = match key {
+            SurfaceKey::Transcript(agent_id) | SurfaceKey::File { agent_id, .. } => Some(*agent_id),
+            _ => None,
+        };
+        if let Some(agent_id) = agent_id
+            && self.agent_online(agent_id)
+            && !self.subscriptions.contains(agent_id)
+        {
+            self.subscribe_agent(agent_id, cx);
+        }
     }
 
     /// `:open`: reuses the agent workspace's remote buffer registry and shows
@@ -5125,7 +5025,7 @@ impl Workspace {
             path: path.clone(),
         };
         if let Some(surface) = self.find_surface(|s| s.key == key).cloned() {
-            self.display_surface(surface);
+            self.display_surface(surface, cx);
             cx.notify();
             return;
         }
@@ -5171,7 +5071,7 @@ impl Workspace {
                     let _ = this.update_in(cx, |this, window, cx| {
                         let view = cx.new(|cx| FileView::new(project, buffer, window, cx));
                         let surface = Self::wrap_surface(key, SurfaceView::File(view));
-                        this.display_surface(surface);
+                        this.display_surface(surface, cx);
                         this.focus_active_surface(window, cx);
                         cx.notify();
                     });
@@ -5196,7 +5096,7 @@ impl Workspace {
     fn open_shell_surface(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
         let key = SurfaceKey::Shell(agent_id);
         if let Some(surface) = self.find_surface(|surface| surface.key == key).cloned() {
-            self.display_surface(surface);
+            self.display_surface(surface, cx);
             cx.notify();
             return;
         }
@@ -5212,7 +5112,7 @@ impl Workspace {
                         let model = cx.new(|cx| crate::shell_view::ShellModel::new(channel, cx));
                         let editor = model.update(cx, |model, cx| model.build_editor(window, cx));
                         let surface = Self::wrap_surface(key, SurfaceView::Shell { model, editor });
-                        this.display_surface(surface);
+                        this.display_surface(surface, cx);
                         this.focus_active_surface(window, cx);
                         cx.notify();
                     });
@@ -5278,7 +5178,7 @@ impl Workspace {
                     view.model().update(cx, |model, cx| model.refresh_now(cx));
                 });
             }
-            self.display_surface(surface);
+            self.display_surface(surface, cx);
             cx.notify();
             return;
         }
@@ -5343,7 +5243,7 @@ impl Workspace {
                         });
                         let view = cx.new(|cx| crate::diff_view::DiffView::new(model, window, cx));
                         let surface = Self::wrap_surface(key, SurfaceView::Diff(view));
-                        this.display_surface(surface);
+                        this.display_surface(surface, cx);
                         this.focus_active_surface(window, cx);
                         cx.notify();
                     });
@@ -5373,7 +5273,7 @@ impl Workspace {
             )
             .cloned()
         {
-            self.display_surface(surface);
+            self.display_surface(surface, cx);
             cx.notify();
             return;
         }
@@ -5394,7 +5294,7 @@ impl Workspace {
                             cx.new(|cx| crate::terminal_view::TerminalModel::new(channel, cx));
                         let view = cx.new(|cx| crate::terminal_view::TerminalView::new(model, cx));
                         let surface = Self::wrap_surface(key, SurfaceView::Terminal(view));
-                        this.display_surface(surface);
+                        this.display_surface(surface, cx);
                         this.focus_active_surface(window, cx);
                         cx.notify();
                     });
@@ -5557,38 +5457,48 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn configure_room_mru_for_test(&mut self, names: &[&str]) {
-        let rooms = names
+    pub(crate) fn configure_surface_mru_for_test(
+        &mut self,
+        names: &[&str],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor = self.active_editor(cx);
+        self.surface_mru = names
             .iter()
-            .enumerate()
-            .map(|(index, name)| {
-                let room = RoomId {
-                    host: HostId::default(),
-                    heading_offset: index,
-                };
-                self.room_names.insert(room.clone(), (*name).to_owned());
-                room
+            .map(|name| WarmSurface {
+                context: self.active_context,
+                surface: Self::wrap_surface(
+                    SurfaceKey::Inbox((*name).to_owned()),
+                    SurfaceView::Inbox(editor.clone()),
+                ),
             })
-            .collect::<Vec<_>>();
-        self.current_room = rooms.first().cloned();
-        self.room_mru = rooms.into_iter().skip(1).collect();
+            .collect();
+        if let Some(current) = self.surface_mru.first().cloned() {
+            self.active_pane_mut().show(current.surface);
+            self.overview_open = false;
+            self.focus_active_surface(window, cx);
+            cx.notify();
+        }
     }
 
     #[cfg(test)]
-    pub(crate) fn current_room_name_for_test(&self) -> Option<&str> {
-        self.current_room
-            .as_ref()
-            .and_then(|room| self.room_names.get(room).map(String::as_str))
+    pub(crate) fn current_surface_name_for_test(&self) -> String {
+        self.surface_name(&self.active_pane().surface.key)
     }
 
     #[cfg(test)]
-    pub(crate) fn has_room_mru_overlay_for_test(&self) -> bool {
-        self.mru_overlay.is_some()
+    pub(crate) fn overview_open_for_test(&self) -> bool {
+        self.overview_open
     }
 
     #[cfg(test)]
-    pub(crate) fn step_room_back_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.step_room_back(window, cx);
+    pub(crate) fn step_surface_back_for_test(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.step_surface_back(window, cx);
     }
 
     #[cfg(test)]
@@ -5604,77 +5514,23 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn inject_agent_deal_card_for_test(&mut self, agent_id: AgentId) {
-        self.dashboard.inject_agent_deal_card_for_test(agent_id);
-    }
-
-    #[cfg(test)]
     pub(crate) fn seek_deal_card_for_test(
         &mut self,
         wanted: fn(crate::dashboard::DealCardKind) -> bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !self.dashboard.seek_deal_card_for_test(wanted) {
-            return false;
-        }
-        self.deal_view = None;
-        self.refresh_dashboard(window, cx);
-        true
-    }
-
-    #[cfg(test)]
-    pub(crate) fn next_deal_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self
-            .dashboard
-            .skip_current_deal(chrono::Local::now().fixed_offset(), cx)
-        {
-            self.finish_dashboard_deal_action(window, cx);
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn previous_deal_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dashboard.previous_deal(cx) {
-            self.deal_view = None;
-            self.refresh_dashboard(window, cx);
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn done_deal_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(card) = self.dashboard.current_deal_card().cloned() else {
-            return;
-        };
-        let handled = match card.identity {
-            crate::dashboard::DealCardIdentity::Inbox(id) => {
-                self.inbox.verdict(&InboxId(id), Verdict::Discarded).is_ok()
-            }
-            crate::dashboard::DealCardIdentity::Desk { .. } => self
+        for _ in 0..8 {
+            if self
                 .dashboard
-                .write_deal_done(chrono::Local::now().date_naive(), cx),
-            crate::dashboard::DealCardIdentity::Agent(_) => false,
-        };
-        if handled {
-            self.dashboard.advance_deal(cx);
-            self.finish_dashboard_deal_action(window, cx);
+                .current_deal_card()
+                .is_some_and(|card| wanted(card.kind))
+            {
+                return true;
+            }
+            self.deal_next(window, cx);
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn snooze_deal_for_test(
-        &mut self,
-        days: u32,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self
-            .dashboard
-            .write_deal_snooze(days, chrono::Local::now().date_naive(), cx)
-        {
-            self.dashboard.advance_deal(cx);
-            self.finish_dashboard_deal_action(window, cx);
-        }
+        false
     }
 
     #[cfg(test)]
@@ -5712,11 +5568,6 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn age_inbox_for_test(&mut self, id: &InboxId, captured_at_ms: i64) {
         self.inbox.set_captured_at_for_test(id, captured_at_ms);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn inbox_contains_for_test(&self, id: &InboxId) -> bool {
-        self.inbox.get(id).is_some()
     }
 
     #[cfg(test)]
@@ -5767,11 +5618,6 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn dashboard_deal_topic_for_test(&self) -> Option<(HostId, usize, &str)> {
         self.dashboard.current_deal_topic_for_test()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn dashboard_hint_for_test(&self, cx: &mut Context<Self>) -> String {
-        self.dashboard.hint(cx)
     }
 
     #[cfg(test)]
@@ -5925,6 +5771,7 @@ impl Workspace {
     pub(crate) fn active_editor(&self, cx: &gpui::App) -> Entity<editor::Editor> {
         match &self.active_pane().surface.view {
             SurfaceView::Draft { editor, .. } => editor.clone(),
+            SurfaceView::DeskHeading(editor) | SurfaceView::Inbox(editor) => editor.clone(),
             SurfaceView::Transcript { editor, .. } => editor.clone(),
             SurfaceView::File(view) => view.read(cx).editor().clone(),
             SurfaceView::Shell { editor, .. } => editor.clone(),
@@ -5976,6 +5823,9 @@ impl Workspace {
         }
         match &self.active_pane().surface.view {
             SurfaceView::Draft { editor, .. } => editor.focus_handle(cx),
+            SurfaceView::DeskHeading(editor) | SurfaceView::Inbox(editor) => {
+                editor.focus_handle(cx)
+            }
             SurfaceView::Transcript { editor, .. } => editor.focus_handle(cx),
             SurfaceView::File(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::Shell { editor, .. } => editor.focus_handle(cx),
@@ -6000,7 +5850,11 @@ impl Workspace {
             | SurfaceKey::File { agent_id, .. }
             | SurfaceKey::Diff { agent_id }
             | SurfaceKey::Terminal { agent_id, .. } => Some(*agent_id),
-            SurfaceKey::Draft | SurfaceKey::ZulipInbox | SurfaceKey::ZulipNarrow { .. } => None,
+            SurfaceKey::Draft
+            | SurfaceKey::DeskHeading { .. }
+            | SurfaceKey::Inbox(_)
+            | SurfaceKey::ZulipInbox
+            | SurfaceKey::ZulipNarrow { .. } => None,
             #[cfg(feature = "native")]
             SurfaceKey::Browser(_) => None,
         };
@@ -6035,6 +5889,9 @@ impl Workspace {
                 let model = self.draft_model.clone();
                 let editor = model.update(cx, |model, cx| model.build_editor(window, cx));
                 SurfaceView::Draft { editor }
+            }
+            SurfaceKey::DeskHeading { .. } | SurfaceKey::Inbox(_) => {
+                unreachable!("deal surfaces are created while dealing")
             }
             SurfaceKey::Transcript(agent_id) => {
                 let agent_id = *agent_id;
@@ -6102,9 +5959,11 @@ impl Workspace {
                 None
             }
             // Files and chat keep whatever agent context was current.
-            SurfaceKey::File { .. } | SurfaceKey::ZulipInbox | SurfaceKey::ZulipNarrow { .. } => {
-                None
-            }
+            SurfaceKey::DeskHeading { .. }
+            | SurfaceKey::Inbox(_)
+            | SurfaceKey::File { .. }
+            | SurfaceKey::ZulipInbox
+            | SurfaceKey::ZulipNarrow { .. } => None,
         };
         if self.connected()
             && let Some(agent_id) = selected
@@ -6467,72 +6326,9 @@ impl Workspace {
     }
 
     pub(crate) fn open_deal_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dashboard.deal_mode() {
-            return;
-        }
-        self.deal_origin = Some(DealOrigin {
-            active_context: self.active_context,
-            surface: self.active_pane().surface.clone(),
-            current_room: self.current_room.clone(),
-            overview_open: self.overview_open,
-        });
-        self.deal_current_taken = false;
-        self.dismiss_mru_overlay(cx);
-        self.deal_view = None;
-        self.deal_hints_visible = false;
-        self.deal_controls_visible = false;
-        window.focus(&self.dashboard.focus_handle(cx), cx);
-        let now = chrono::Local::now().fixed_offset();
-        if let Err(error) = self.inbox.refresh_deferred(now.timestamp_millis()) {
-            tracing::warn!(%error, "waking deferred inbox items");
-        }
-        let current_room = self
-            .current_room
-            .as_ref()
-            .and_then(|room| Some((room.host, self.room_names.get(room)?.as_str())));
-        self.dashboard.enter_deal_mode_in_room(
-            &self.registry,
-            &self.inbox,
-            now,
-            current_room,
-            &self.agent_last_interaction,
-            cx,
-        );
-        if self.dashboard.deal_mode() {
-            if let Ok(action) = cx.build_action("vim::EnterDealMode", None) {
-                window.dispatch_action(action, cx);
-            }
-            self.journal_deal_card_presented();
-            crate::journal::record(crate::journal::Event::DealMode {
-                action: crate::journal::DealModeAction::Enter,
-                card: self
-                    .dashboard
-                    .current_deal_card()
-                    .map(|card| Self::journal_card_identity(&card.identity)),
-            });
-            self.deal_session_open = true;
-        }
-        self.refresh_dashboard(window, cx);
+        self.finish_mru_session(cx);
+        self.deal_next(window, cx);
         cx.notify();
-    }
-
-    fn journal_deal_card_presented(&self) {
-        let Some(card) = self.dashboard.current_deal_card() else {
-            return;
-        };
-        crate::journal::record(crate::journal::Event::DealCardPresented {
-            label: card.label.clone(),
-            kind: match card.kind {
-                crate::dashboard::DealCardKind::Desk => "heading",
-                crate::dashboard::DealCardKind::Agent => "agent",
-                crate::dashboard::DealCardKind::Inbox(_) => "inbox",
-            }
-            .to_owned(),
-            score: card.priority,
-            room: card.breadcrumb.split(" › ").next().unwrap_or("").to_owned(),
-            host: card.host.to_string(),
-            agent_id: card.agent_id.map(|id| id.encoded()),
-        });
     }
 
     fn end_deal_session(&mut self) {
@@ -6544,138 +6340,191 @@ impl Workspace {
         }
     }
 
-    fn restore_deal_origin(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(origin) = self.deal_origin.take() else {
+    fn mark_deal_interacted(&mut self) {
+        if !self.dashboard.deal_mode() || self.deal_current_interacted {
             return;
-        };
-        self.active_context = origin.active_context;
-        self.active_pane_mut().show(origin.surface);
-        self.current_room = origin.current_room;
-        self.overview_open = origin.overview_open;
-        if self.overview_open {
-            window.focus(&self.dashboard.focus_handle(cx), cx);
-        } else {
-            let focus = self.active_surface_focus(cx);
-            window.focus(&focus, cx);
         }
+        self.deal_current_interacted = true;
+        crate::journal::record(crate::journal::Event::DealMode {
+            action: crate::journal::DealModeAction::Interacted,
+            card: self
+                .dashboard
+                .current_deal_card()
+                .map(|card| Self::journal_card_identity(&card.identity)),
+        });
     }
 
-    /// Commits the provisional card without ending the visual deal. The
-    /// ordinary open paths deliberately own strip, room, MRU, and journal
-    /// side effects; merely rendering a card never calls this.
-    fn take_current_deal(
-        &mut self,
-        edit_agent: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if self.deal_current_taken {
-            return self.dashboard.current_deal_card().is_some();
-        }
+    fn present_current_deal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(card) = self.dashboard.current_deal_card().cloned() else {
             return false;
         };
-        self.dashboard.record_deal_verdict_as(
-            crate::dashboard::DealerVerdict::Open,
-            chrono::Local::now().fixed_offset(),
-        );
-        self.deal_current_taken = true;
-        match card.identity {
+        self.deal_current_interacted = false;
+        self.deal_view = None;
+        let surface = match &card.identity {
             crate::dashboard::DealCardIdentity::Desk {
                 host,
                 heading_offset,
             } => {
-                if let Some(room) = self.dashboard.room_for_heading(host, heading_offset, cx) {
-                    self.remember_room(room, crate::journal::RoomSwitchMethod::Open, cx);
-                }
-                self.dashboard.cursor_to_doc(host, heading_offset, cx);
-                self.overview_open = true;
-                window.focus(&self.dashboard.focus_handle(cx), cx);
+                self.dashboard.cursor_to_doc(*host, *heading_offset, cx);
+                Self::wrap_surface(
+                    SurfaceKey::DeskHeading {
+                        host: *host,
+                        heading_offset: *heading_offset,
+                    },
+                    SurfaceView::DeskHeading(self.dashboard.editor().clone()),
+                )
             }
             crate::dashboard::DealCardIdentity::Agent(agent_id) => {
                 crate::journal::record(crate::journal::Event::AgentOpened {
                     agent_id: agent_id.encoded(),
                 });
-                if let Some(room) = self.room_for_agent(agent_id, cx) {
-                    self.remember_room(room, crate::journal::RoomSwitchMethod::Open, cx);
-                }
-                if let Some(DealView::Surface { surface, .. }) = self.deal_view.as_ref() {
-                    let surface = surface.clone();
-                    if edit_agent && let SurfaceView::Transcript { model, editor } = &surface.view {
-                        model.update(cx, |model, cx| model.focus_prompt(editor, window, cx));
-                        vim::enter_deal_insert_mode(editor, window, cx);
-                    }
-                    self.registry.select_agent(agent_id);
-                    self.active_context = self.context_for_agent(agent_id);
-                    self.overview_open = false;
-                    self.display_surface(surface);
-                    self.focus_active_surface(window, cx);
-                    self.hosts
-                        .focus_agent(self.host_of(agent_id).map(|host| (host, agent_id)));
-                }
+                self.registry.select_agent(*agent_id);
+                self.active_context = self.context_for_agent(*agent_id);
+                self.hosts
+                    .focus_agent(self.host_of(*agent_id).map(|host| (host, *agent_id)));
+                self.make_surface(SurfaceKey::Transcript(*agent_id), window, cx)
             }
-            crate::dashboard::DealCardIdentity::Inbox(_) => {
+            crate::dashboard::DealCardIdentity::Inbox(id) => {
                 #[cfg(feature = "native")]
                 if let Some(crate::dashboard::DealerInboxSource::Page(page)) = card.inbox_source {
-                    self.open_browser_page(page, window, cx);
+                    if let Some(model) = rho_browser::open_page(page, cx) {
+                        self.observe_browser_metadata(&model, cx);
+                        let view = cx.new(|cx| rho_browser::PageView::new(model, page, cx));
+                        let surface = Self::wrap_surface(
+                            SurfaceKey::Browser(page),
+                            SurfaceView::Browser(view),
+                        );
+                        self.deal_view = Some(DealView::Surface {
+                            identity: card.identity.clone(),
+                            kind: card.kind,
+                            surface: surface.clone(),
+                        });
+                        self.display_surface_with_method(
+                            surface,
+                            crate::journal::SurfaceShowMethod::Deal,
+                            cx,
+                        );
+                        self.focus_active_surface(window, cx);
+                        self.finish_presenting_deal(window, cx);
+                        return true;
+                    }
                 }
+                let text = self
+                    .inbox
+                    .get(&InboxId(id.clone()))
+                    .map_or_else(|| card.breadcrumb.clone(), |item| item.text.clone());
+                let buffer = cx.new(|cx| {
+                    let mut buffer = language::Buffer::local(text, cx);
+                    buffer.set_capability(language::Capability::Read, cx);
+                    buffer
+                });
+                let editor = cx.new(|cx| {
+                    let mut editor = editor::Editor::for_buffer(buffer, None, window, cx);
+                    crate::editor_config::configure(&mut editor, window, cx);
+                    editor.set_read_only(true);
+                    editor
+                });
+                Self::wrap_surface(SurfaceKey::Inbox(id.clone()), SurfaceView::Inbox(editor))
             }
-        }
+        };
+        self.deal_view = Some(DealView::Surface {
+            identity: card.identity.clone(),
+            kind: card.kind,
+            surface: surface.clone(),
+        });
+        self.display_surface_with_method(surface, crate::journal::SurfaceShowMethod::Deal, cx);
+        self.focus_active_surface(window, cx);
+        self.finish_presenting_deal(window, cx);
         true
     }
 
-    fn present_next_deal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.dashboard.relock_deal_sources(cx);
-        if let Ok(action) = cx.build_action("vim::ExitDealMode", None) {
+    fn finish_presenting_deal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        crate::journal::record(crate::journal::Event::DealMode {
+            action: crate::journal::DealModeAction::Enter,
+            card: self
+                .dashboard
+                .current_deal_card()
+                .map(|card| Self::journal_card_identity(&card.identity)),
+        });
+        if let Ok(action) = cx.build_action("vim::EnterDealMode", None) {
             window.dispatch_action(action, cx);
         }
-        self.deal_view = None;
-        self.deal_current_taken = false;
-        self.deal_hints_visible = false;
-        self.deal_controls_visible = false;
-        self.journal_deal_card_presented();
-        self.refresh_dashboard(window, cx);
     }
 
-    fn stop_dealing_and_restore(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.dashboard.exit_deal_mode(cx);
-        self.end_deal_session();
-        if let Ok(action) = cx.build_action("vim::ExitDealMode", None) {
-            window.dispatch_action(action, cx);
+    fn deal_next(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dashboard.deal_mode() {
+            self.skip_and_end_deal(window, cx);
         }
-        self.deal_view = None;
-        self.deal_current_taken = false;
-        self.restore_deal_origin(window, cx);
-        self.refresh_dashboard(window, cx);
+        let exclude = self.displayed_deal_identity();
+        let now = chrono::Local::now().fixed_offset();
+        if let Err(error) = self.inbox.refresh_deferred(now.timestamp_millis()) {
+            tracing::warn!(%error, "waking deferred inbox items");
+        }
+        if self
+            .dashboard
+            .pull_deal(
+                &self.registry,
+                &self.inbox,
+                now,
+                exclude.as_ref(),
+                &self.agent_last_interaction,
+                cx,
+            )
+            .is_some()
+        {
+            self.deal_session_open = true;
+            self.present_current_deal(window, cx);
+            self.refresh_dashboard(window, cx);
+        } else {
+            self.notice_on(None, "nothing needs you", StyleClass::SystemInfo, cx);
+        }
     }
 
-    fn take_and_stop_dealing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.dashboard.deal_mode() || !self.take_current_deal(false, window, cx) {
-            return;
+    fn displayed_deal_identity(&self) -> Option<crate::dashboard::DealCardIdentity> {
+        match &self.active_pane().surface.key {
+            SurfaceKey::Transcript(agent_id) => {
+                Some(crate::dashboard::DealCardIdentity::Agent(*agent_id))
+            }
+            SurfaceKey::DeskHeading {
+                host,
+                heading_offset,
+            } => Some(crate::dashboard::DealCardIdentity::Desk {
+                host: *host,
+                heading_offset: *heading_offset,
+            }),
+            SurfaceKey::Inbox(id) => Some(crate::dashboard::DealCardIdentity::Inbox(id.clone())),
+            _ => self
+                .dashboard
+                .current_deal_card()
+                .map(|card| card.identity.clone()),
         }
-        self.dashboard.exit_deal_mode(cx);
+    }
+
+    fn skip_and_end_deal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(card) = self.dashboard.current_deal_card().cloned() {
+            self.dashboard
+                .skip_card(card.identity, chrono::Local::now().fixed_offset(), cx);
+        }
+        self.dashboard.end_deal(cx);
         self.end_deal_session();
-        self.deal_origin = None;
+        self.deal_view = None;
+        self.deal_current_interacted = false;
         if let Ok(action) = cx.build_action("vim::ExitDealMode", None) {
             window.dispatch_action(action, cx);
         }
-        self.deal_view = None;
     }
 
     fn finish_dashboard_deal_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.deal_view = None;
         self.deal_hints_visible = false;
         self.deal_controls_visible = false;
-        if !self.dashboard.deal_mode()
-            && let Ok(action) = cx.build_action("vim::ExitDealMode", None)
-        {
-            window.dispatch_action(action, cx);
-        }
-        if !self.dashboard.deal_mode() {
-            self.end_deal_session();
-            self.restore_deal_origin(window, cx);
+        if self.dashboard.deal_mode() {
+            self.present_current_deal(window, cx);
         } else {
-            self.deal_current_taken = false;
+            self.end_deal_session();
+            if let Ok(action) = cx.build_action("vim::ExitDealMode", None) {
+                window.dispatch_action(action, cx);
+            }
         }
         self.refresh_dashboard(window, cx);
     }
@@ -7194,9 +7043,6 @@ impl Workspace {
     /// `enter` on a bound Desk heading opens its agent.
     fn dashboard_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         use crate::dashboard::RowTarget;
-        if let Some(room) = self.dashboard.cursor_room(cx) {
-            self.remember_room(room, crate::journal::RoomSwitchMethod::Overview, cx);
-        }
         match self.dashboard.cursor_target(&self.registry, cx) {
             Some(RowTarget::Agent { agent_id, .. }) => self.open_agent(agent_id, window, cx),
             #[cfg(feature = "native")]
@@ -8018,14 +7864,7 @@ impl Workspace {
                 .overflow_hidden()
                 .child(editor.clone())
                 .into_any_element(),
-            Some(DealView::Surface { kind, surface, .. }) => {
-                debug_assert!(matches!(
-                    kind,
-                    crate::dashboard::DealCardKind::Agent
-                        | crate::dashboard::DealCardKind::Inbox(_)
-                ));
-                self.render_surface(surface)
-            }
+            Some(DealView::Surface { surface, .. }) => self.render_surface(surface),
             Some(DealView::Inbox { kind, editor, .. }) => {
                 debug_assert!(matches!(kind, crate::dashboard::DealCardKind::Inbox(_)));
                 div()
@@ -8091,7 +7930,7 @@ impl Workspace {
         let right = self.render_status_right(cx);
         if self.deal_hints_visible {
             return line
-                .child("· Tab skip · d done · x dismiss · s defer · S defer room · t todo · f file · q skip + stop")
+                .child("· q close · d done · x dismiss · s defer · S defer heading · t todo · f file · Ctrl-J next")
                 .child(div().flex_1())
                 .child(right)
                 .into_any_element();
@@ -8100,11 +7939,11 @@ impl Workspace {
             return line
                 .child(
                     div()
-                        .id("deal-touch-skip")
+                        .id("deal-touch-close")
                         .on_click(|_, window, cx| {
-                            window.dispatch_action(Box::new(DashboardDealNext), cx)
+                            window.dispatch_action(Box::new(DashboardDealExit), cx)
                         })
-                        .child("skip"),
+                        .child("close"),
                 )
                 .child(
                     div()
@@ -8132,11 +7971,11 @@ impl Workspace {
                 )
                 .child(
                     div()
-                        .id("deal-touch-close")
+                        .id("deal-touch-next")
                         .on_click(|_, window, cx| {
-                            window.dispatch_action(Box::new(DashboardDealExit), cx)
+                            window.dispatch_action(Box::new(DashboardDealNext), cx)
                         })
-                        .child("close"),
+                        .child("next"),
                 )
                 .child(div().flex_1())
                 .child(right)
@@ -8391,15 +8230,7 @@ impl Workspace {
         let web_preview_visible = self.dashboard_web_preview.is_some();
         #[cfg(not(feature = "native"))]
         let web_preview_visible = false;
-        let room_surface_visible = self.current_room.as_ref().is_none_or(|room| {
-            self.room_strips
-                .get(room)
-                .is_some_and(|strip| !strip.is_empty())
-        });
-        let show_surface = (!home && room_surface_visible)
-            || iris
-            || self.dashboard_preview.is_some()
-            || web_preview_visible;
+        let show_surface = !home || iris || self.dashboard_preview.is_some() || web_preview_visible;
         let rail = home.then(|| self.render_rail(show_surface, text_style, cx));
         // Same hairline the rail uses against the preview.
         let separator_color = cx.theme().colors().border_variant.opacity(0.6);
@@ -8509,6 +8340,11 @@ impl Workspace {
         match &surface.view {
             SurfaceView::Draft { editor, .. } => div()
                 .id("rho-surface-draft")
+                .size_full()
+                .overflow_hidden()
+                .child(editor.clone())
+                .into_any_element(),
+            SurfaceView::DeskHeading(editor) | SurfaceView::Inbox(editor) => div()
                 .size_full()
                 .overflow_hidden()
                 .child(editor.clone())
@@ -8836,48 +8672,26 @@ impl Render for Workspace {
             .on_linux_pointer_axis(cx.listener(Self::journal_linux_scroll))
             .on_action(cx.listener(Self::submit_prompt))
             .on_action(cx.listener(Self::paste_prompt))
-            .on_action(cx.listener(|this, _: &RoomStripLeft, window, cx| {
-                this.take_and_stop_dealing(window, cx);
-                this.slide_room_strip(-1, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &RoomStripRight, window, cx| {
-                this.take_and_stop_dealing(window, cx);
-                this.slide_room_strip(1, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &RoomBack, window, cx| {
-                this.take_and_stop_dealing(window, cx);
-                this.step_room_back(window, cx);
+            .on_action(cx.listener(|this, _: &SurfaceBack, window, cx| {
+                if this.dashboard.deal_mode() {
+                    this.skip_and_end_deal(window, cx);
+                }
+                this.step_surface_back(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DealOpen, window, cx| {
-                if this.dashboard.deal_mode() {
-                    if !this.take_current_deal(false, window, cx) {
-                        return;
-                    }
-                    this.dashboard.advance_deal(cx);
-                    if this.dashboard.current_deal_card().is_some() {
-                        this.present_next_deal(window, cx);
-                    } else {
-                        this.end_deal_session();
-                        this.deal_origin = None;
-                        this.deal_view = None;
-                        if let Ok(action) = cx.build_action("vim::ExitDealMode", None) {
-                            window.dispatch_action(action, cx);
-                        }
-                        this.notice_on(None, "nothing needs you", StyleClass::SystemInfo, cx);
-                        this.refresh_dashboard(window, cx);
-                    }
-                } else {
-                    this.open_deal_mode(window, cx);
-                }
+                this.deal_next(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DealCloseAndNext, window, cx| {
+                this.close_current_surface(window, cx);
+                this.deal_next(window, cx);
             }))
             .on_action(cx.listener(|this, _: &OverviewToggle, window, cx| {
                 this.toggle_overview(window, cx);
             }))
-            .on_action(cx.listener(|this, _: &StripRemove, window, cx| {
-                this.remove_from_room_strip(window, cx);
+            .on_action(cx.listener(|this, _: &SurfaceClose, window, cx| {
+                this.close_current_surface(window, cx);
             }))
             .on_action(cx.listener(|this, _: &BrowserExit, window, cx| {
-                this.take_and_stop_dealing(window, cx);
                 this.focus_rail(window, cx);
             }))
             .on_action(cx.listener(Self::shell_interrupt))
@@ -8902,12 +8716,6 @@ impl Render for Workspace {
                 #[cfg(feature = "native")]
                 this.zulip_load_older(cx);
             }))
-            .on_action(cx.listener(|this, _: &ZulipQuit, window, cx| {
-                #[cfg(feature = "native")]
-                this.zulip_quit(window, cx);
-                #[cfg(not(feature = "native"))]
-                let _ = window;
-            }))
             .on_action(cx.listener(|this, _: &ShellPagerMore, _, cx| {
                 this.shell_pager_action(rho_ui_proto::shell::PagerAction::Continue, cx);
             }))
@@ -8925,9 +8733,6 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &AgentNew, window, cx| {
                 this.select_agent(None, window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &AgentJumpAttention, window, cx| {
-                this.jump_to_attention(window, cx);
             }))
             .on_action(cx.listener(|this, _: &AgentDone, window, cx| {
                 if this.dashboard.is_focused(window, cx)
@@ -8994,39 +8799,14 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &DashboardDealExit, window, cx| {
                 vim::take_count(cx);
                 if this.dashboard.deal_mode() {
-                    if !this.deal_current_taken {
-                        this.dashboard
-                            .skip_current_deal(chrono::Local::now().fixed_offset(), cx);
-                    }
-                    this.stop_dealing_and_restore(window, cx);
+                    this.close_current_surface(window, cx);
                 } else {
                     cx.propagate();
                 }
             }))
             .on_action(cx.listener(|this, _: &DashboardDealNext, window, cx| {
                 vim::take_count(cx);
-                if this
-                    .dashboard
-                    .skip_current_deal(chrono::Local::now().fixed_offset(), cx)
-                {
-                    if this.dashboard.current_deal_card().is_some() {
-                        this.present_next_deal(window, cx);
-                    } else {
-                        this.stop_dealing_and_restore(window, cx);
-                    }
-                } else {
-                    cx.propagate();
-                }
-            }))
-            .on_action(cx.listener(|this, _: &DashboardDealPrevious, window, cx| {
-                vim::take_count(cx);
-                if this.dashboard.previous_deal(cx) {
-                    this.deal_view = None;
-                    this.deal_hints_visible = false;
-                    this.deal_controls_visible = false;
-                    this.journal_deal_card_presented();
-                    this.refresh_dashboard(window, cx);
-                }
+                this.deal_next(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardDealDone, window, cx| {
                 vim::take_count(cx);
@@ -9059,8 +8839,7 @@ impl Render for Workspace {
                 if handled {
                     this.dashboard
                         .record_deal_verdict_as(crate::dashboard::DealerVerdict::Done, now);
-                    this.dashboard.advance_deal(cx);
-                    this.journal_deal_card_presented();
+                    this.dashboard.end_deal(cx);
                     this.finish_dashboard_deal_action(window, cx);
                 }
             }))
@@ -9095,8 +8874,7 @@ impl Render for Workspace {
                 if handled {
                     this.dashboard
                         .record_deal_verdict_as(crate::dashboard::DealerVerdict::Dismiss, now);
-                    this.dashboard.advance_deal(cx);
-                    this.journal_deal_card_presented();
+                    this.dashboard.end_deal(cx);
                     this.finish_dashboard_deal_action(window, cx);
                 }
             }))
@@ -9144,8 +8922,7 @@ impl Render for Workspace {
                 if handled {
                     this.dashboard
                         .record_deal_verdict_as(crate::dashboard::DealerVerdict::Defer, now);
-                    this.dashboard.advance_deal(cx);
-                    this.journal_deal_card_presented();
+                    this.dashboard.end_deal(cx);
                     this.finish_dashboard_deal_action(window, cx);
                 }
             }))
@@ -9159,27 +8936,25 @@ impl Render for Workspace {
                     {
                         this.dashboard
                             .record_deal_verdict_as(crate::dashboard::DealerVerdict::Defer, now);
-                        crate::journal::record(crate::journal::Event::RoomDeferred {
-                            room,
+                        crate::journal::record(crate::journal::Event::DeskHeadingDeferred {
+                            heading: room,
                             until: until.format("%Y-%m-%dT%H:%M:%S").to_string(),
                             card: Self::journal_card_identity(&identity),
                         });
-                        this.dashboard.advance_deal(cx);
-                        this.journal_deal_card_presented();
+                        this.dashboard.end_deal(cx);
                         this.finish_dashboard_deal_action(window, cx);
                     }
                 }),
             )
             .on_action(cx.listener(|this, _: &DashboardDealTodo, window, cx| {
-                vim::take_count(cx);
+                let count = vim::take_count(cx).unwrap_or(7) as u32;
                 let today = chrono::Local::now().date_naive();
-                if this.dashboard.write_deal_todo(today, cx) {
+                if this.dashboard.write_deal_todo(count, today, cx) {
                     this.dashboard.record_deal_verdict_as(
                         crate::dashboard::DealerVerdict::Done,
                         chrono::Local::now().fixed_offset(),
                     );
-                    this.dashboard.advance_deal(cx);
-                    this.journal_deal_card_presented();
+                    this.dashboard.end_deal(cx);
                     this.finish_dashboard_deal_action(window, cx);
                 }
             }))
@@ -9189,28 +8964,7 @@ impl Render for Workspace {
                     cx.propagate();
                     return;
                 }
-                this.dashboard.discard_deal_session(cx);
-                let now = chrono::Local::now().fixed_offset();
-                if let Err(error) = this.inbox.refresh_deferred(now.timestamp_millis()) {
-                    tracing::warn!(%error, "waking deferred inbox items");
-                }
-                let current_room = this
-                    .current_room
-                    .as_ref()
-                    .and_then(|room| Some((room.host, this.room_names.get(room)?.as_str())));
-                this.deal_view = None;
-                this.deal_hints_visible = false;
-                this.deal_controls_visible = false;
-                this.dashboard.enter_deal_mode_in_room(
-                    &this.registry,
-                    &this.inbox,
-                    now,
-                    current_room,
-                    &this.agent_last_interaction,
-                    cx,
-                );
-                this.journal_deal_card_presented();
-                this.refresh_dashboard(window, cx);
+                this.deal_next(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardDealInsert, window, cx| {
                 vim::take_count(cx);
@@ -9219,13 +8973,10 @@ impl Render for Workspace {
                     .current_deal_card()
                     .and_then(|card| card.agent_id);
                 let edits_agent = deal_agent.is_some();
-                if !this.take_current_deal(false, window, cx) {
-                    return;
-                }
+                this.mark_deal_interacted();
                 if let Some(agent_id) = deal_agent {
-                    this.dashboard.exit_deal_mode(cx);
+                    this.dashboard.end_deal(cx);
                     this.end_deal_session();
-                    this.deal_origin = None;
                     this.deal_view = None;
                     this.overview_open = false;
                     this.select_agent_inner(Some(agent_id), true, window, cx);
@@ -9273,9 +9024,7 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &DashboardDealAppend, window, cx| {
                 vim::take_count(cx);
-                if !this.take_current_deal(false, window, cx) {
-                    return;
-                }
+                this.mark_deal_interacted();
                 if matches!(
                     this.dashboard.current_deal_card().map(|card| card.kind),
                     Some(crate::dashboard::DealCardKind::Desk)
@@ -9288,9 +9037,7 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &DashboardDealOpenLine, window, cx| {
                 vim::take_count(cx);
-                if !this.take_current_deal(false, window, cx) {
-                    return;
-                }
+                this.mark_deal_interacted();
                 if matches!(
                     this.dashboard.current_deal_card().map(|card| card.kind),
                     Some(crate::dashboard::DealCardKind::Desk)
@@ -9320,7 +9067,7 @@ impl Render for Workspace {
                         this.notice_on(None, &format!("file: {error}"), StyleClass::SystemInfo, cx);
                         return;
                     }
-                    this.dashboard.exit_deal_mode(cx);
+                    this.dashboard.end_deal(cx);
                     this.finish_dashboard_deal_action(window, cx);
                     return;
                 }
@@ -9347,7 +9094,7 @@ impl Render for Workspace {
                     crate::dashboard::DealerVerdict::Open,
                     chrono::Local::now().fixed_offset(),
                 );
-                if !this.dashboard.exit_deal_mode(cx) {
+                if !this.dashboard.end_deal(cx) {
                     return;
                 }
                 this.end_deal_session();
@@ -9462,7 +9209,6 @@ impl Render for Workspace {
                 this.cycle_draft_group(window, cx);
             }))
             .on_action(cx.listener(|this, _: &RailFocus, window, cx| {
-                this.take_and_stop_dealing(window, cx);
                 this.focus_rail(window, cx);
             }))
             .on_action(cx.listener(|this, _: &RailOpen, window, cx| {

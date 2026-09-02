@@ -70,15 +70,12 @@ type ArchiveEdits = (Vec<(Range<usize>, String)>, usize);
 // Dealer curve tuning. These are deliberately all in one place: rho has one
 // user, so policy changes are edits, not a configuration system.
 const DEAL_QUEUE_FLOOR: f64 = -1.0;
-const DEAL_PRIORITY_CUTOFF: usize = 8;
+const SKIP_COOLDOWN_MINUTES: i64 = 15;
 const BLOCKED_REPLY_HEAD_START: f64 = 1.0;
 const BLOCKED_REPLY_SLOPE_PER_DAY: f64 = 12.0;
 const FYI_REPLY_PACE_DAYS: f64 = 3.0;
 const INBOX_OBLIGATION_PACE_DAYS: u32 = 0;
 const INBOX_CAPTURE_PACE_DAYS: u32 = 1;
-/// A quarter-day nudge keeps near-ties in the current room without
-/// competing with a genuinely urgent blocked reply (which rises 12/day).
-const CURRENT_ROOM_PRIORITY_BONUS: f64 = 0.25;
 /// Half a curve unit is enough to mark the hand visibly dirty without
 /// turning every newly-ripe reminder into persistent chrome.
 pub(crate) const LAMP_THRESHOLD: f64 = 0.5;
@@ -99,13 +96,12 @@ const AGENT_RECENCY_WINDOW_MS: i64 = 60 * 60 * 1_000;
 pub(crate) fn dealer_policy_snapshot() -> crate::journal::DealerPolicySnapshot {
     crate::journal::DealerPolicySnapshot {
         queue_floor: DEAL_QUEUE_FLOOR,
-        priority_cutoff: DEAL_PRIORITY_CUTOFF,
+        skip_cooldown_minutes: SKIP_COOLDOWN_MINUTES,
         blocked_reply_head_start: BLOCKED_REPLY_HEAD_START,
         blocked_reply_slope_per_day: BLOCKED_REPLY_SLOPE_PER_DAY,
         fyi_reply_pace_days: FYI_REPLY_PACE_DAYS,
         inbox_obligation_pace_days: INBOX_OBLIGATION_PACE_DAYS,
         inbox_capture_pace_days: INBOX_CAPTURE_PACE_DAYS,
-        current_room_priority_bonus: CURRENT_ROOM_PRIORITY_BONUS,
         lamp_threshold: LAMP_THRESHOLD,
         chime_threshold: CHIME_THRESHOLD,
         agent_recency_bonus: AGENT_RECENCY_BONUS,
@@ -199,6 +195,7 @@ pub struct DealerEvent {
     pub at: chrono::DateTime<chrono::FixedOffset>,
     pub time_to_verdict_ms: u64,
     pub considered_not_dealt: Vec<DealCardIdentity>,
+    pub skip_until: Option<chrono::DateTime<chrono::FixedOffset>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -208,16 +205,8 @@ pub struct DealQueue {
     pub total_alive: usize,
     /// Number selected by global priority.
     pub dealt_count: usize,
-    live_cards: HashSet<DealCardIdentity>,
     considered_not_dealt: Vec<DealCardIdentity>,
-}
-
-impl DealQueue {
-    /// Revalidates a persisted card without applying the current top-N cutoff
-    /// or changing its established order.
-    pub fn is_live(&self, card: &DealCard) -> bool {
-        self.live_cards.contains(&card.identity)
-    }
+    fingerprints: HashMap<DealCardIdentity, DealFingerprint>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -228,15 +217,21 @@ pub struct DealQueueDepth {
 
 #[derive(Clone, Debug)]
 struct DealSession {
-    cards: Vec<DealCard>,
-    anchors: Vec<Option<(HostId, text::Anchor)>>,
-    boundary_anchors: Vec<Option<text::Anchor>>,
-    index: usize,
-    dealt_count: usize,
-    total_alive: usize,
-    resolved: Vec<bool>,
+    card: DealCard,
+    fingerprint: DealFingerprint,
+    anchor: Option<(HostId, text::Anchor)>,
+    boundary_anchor: Option<text::Anchor>,
     started_at: Instant,
     considered_not_dealt: Vec<DealCardIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DealFingerprint(String);
+
+#[derive(Clone, Debug)]
+struct SkippedCard {
+    at: chrono::DateTime<chrono::FixedOffset>,
+    fingerprint: DealFingerprint,
 }
 
 struct ListingVisibility<'a> {
@@ -402,6 +397,7 @@ pub struct Dashboard {
     phone_browse_mode: bool,
     deal_active: bool,
     deal: Option<DealSession>,
+    skipped: HashMap<DealCardIdentity, SkippedCard>,
     deal_empty_success: bool,
     queue_depth: DealQueueDepth,
     queue_depth_revision: Option<u64>,
@@ -576,6 +572,7 @@ impl Dashboard {
             phone_browse_mode: false,
             deal_active: false,
             deal: None,
+            skipped: HashMap::new(),
             deal_empty_success: false,
             queue_depth: DealQueueDepth::default(),
             queue_depth_revision: None,
@@ -679,19 +676,16 @@ impl Dashboard {
             }
             if let Some(deal) = &mut self.deal {
                 let snapshot = source.read(cx).snapshot();
-                for (index, card) in deal.cards.iter().enumerate() {
-                    if card.host == host
-                        && let Some(offset) = card.heading_offset
-                    {
-                        let offset = offset.min(snapshot.len());
-                        deal.anchors[index] = Some((host, snapshot.anchor_before(offset)));
-                        deal.boundary_anchors[index] = Some(snapshot.anchor_after(offset));
-                    }
+                if deal.card.host == host
+                    && let Some(offset) = deal.card.heading_offset
+                {
+                    let offset = offset.min(snapshot.len());
+                    deal.anchor = Some((host, snapshot.anchor_before(offset)));
+                    deal.boundary_anchor = Some(snapshot.anchor_after(offset));
                 }
                 if self.deal_active
-                    && let Some(card) = deal.cards.get(deal.index)
-                    && card.host == host
-                    && let Some(offset) = card.heading_offset
+                    && deal.card.host == host
+                    && let Some(offset) = deal.card.heading_offset
                 {
                     self.pending_doc_cursor = Some((host, offset.min(snapshot.len())));
                 }
@@ -722,9 +716,7 @@ impl Dashboard {
     }
 
     pub fn deal_waiting(&self) -> usize {
-        self.deal
-            .as_ref()
-            .map_or(0, |deal| deal.cards.len().saturating_sub(deal.index))
+        usize::from(self.deal.is_some())
     }
 
     #[cfg(test)]
@@ -742,70 +734,11 @@ impl Dashboard {
         Some((card.host, card.heading_offset?, card.breadcrumb.as_str()))
     }
 
-    #[cfg(test)]
-    pub(crate) fn inject_agent_deal_card_for_test(&mut self, agent_id: AgentId) {
-        let deal = self.deal.as_mut().expect("active test deal");
-        if deal
-            .cards
-            .iter()
-            .any(|card| card.identity == DealCardIdentity::Agent(agent_id))
-        {
-            return;
-        }
-        let host = deal
-            .cards
-            .first()
-            .map_or(HostId::default(), |card| card.host);
-        let index = (deal.index + 1).min(deal.cards.len());
-        deal.cards.insert(
-            index,
-            DealCard {
-                label: "blocked · test".to_owned(),
-                priority: 1.0,
-                host,
-                heading_offset: None,
-                agent_id: Some(agent_id),
-                agent_tag: Some(format!("eng-{}", agent_id.encoded())),
-                breadcrumb: "Agent card".to_owned(),
-                room: None,
-                kind: DealCardKind::Agent,
-                identity: DealCardIdentity::Agent(agent_id),
-                inbox_source: None,
-            },
-        );
-        deal.anchors.insert(index, None);
-        deal.boundary_anchors.insert(index, None);
-        deal.resolved.insert(index, false);
-        deal.dealt_count += 1;
-        deal.total_alive += 1;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn seek_deal_card_for_test(&mut self, wanted: fn(DealCardKind) -> bool) -> bool {
-        let deal = self.deal.as_mut().expect("active test deal");
-        let Some(index) = deal.cards.iter().position(|card| wanted(card.kind)) else {
-            return false;
-        };
-        deal.index = index;
-        true
-    }
-
-    pub fn enter_deal_mode(
-        &mut self,
-        registry: &AgentRegistry,
-        inbox: &crate::inbox::InboxStore,
-        now: chrono::DateTime<chrono::FixedOffset>,
-        cx: &mut Context<Workspace>,
-    ) {
-        self.enter_deal_mode_in_room(registry, inbox, now, None, &HashMap::new(), cx);
-    }
-
     pub fn dealer_hand(
         &self,
         registry: &AgentRegistry,
         inbox: &crate::inbox::InboxStore,
         now: chrono::DateTime<chrono::FixedOffset>,
-        current_room: Option<(HostId, &str)>,
         agent_interactions: &HashMap<AgentId, i64>,
         cx: &App,
     ) -> DealQueue {
@@ -819,146 +752,73 @@ impl Dashboard {
             documents.first().map_or(HostId(0), |(host, _)| *host),
             now.timestamp_millis(),
         );
-        assemble_dealer_queue_in_room(
+        assemble_dealer_queue_with_context(
             &documents,
             &deal_agent_facts(registry),
             &inbox,
             now,
-            current_room,
             agent_interactions,
+            &self.skipped,
         )
     }
 
-    pub fn enter_deal_mode_in_room(
+    /// Re-evaluates the complete dealer world and presents its highest-scoring
+    /// claim. There is deliberately no retained hand: each pull sees current
+    /// Desk text, agent facts, inbox state, and cooldowns.
+    pub fn pull_deal(
         &mut self,
         registry: &AgentRegistry,
         inbox: &crate::inbox::InboxStore,
         now: chrono::DateTime<chrono::FixedOffset>,
-        current_room: Option<(HostId, &str)>,
+        exclude: Option<&DealCardIdentity>,
         agent_interactions: &HashMap<AgentId, i64>,
         cx: &mut Context<Workspace>,
-    ) {
-        let documents = self
-            .hosts
-            .keys()
-            .filter_map(|host| self.source_text(*host, cx).map(|text| (*host, text)))
-            .collect::<Vec<_>>();
-        let inbox = dealer_inbox_items(
-            inbox,
-            documents.first().map_or(HostId(0), |(host, _)| *host),
-            now.timestamp_millis(),
-        );
-        let queue = assemble_dealer_queue_in_room(
-            &documents,
-            &deal_agent_facts(registry),
-            &inbox,
-            now,
-            current_room,
-            agent_interactions,
-        );
-        if self
-            .deal
-            .as_ref()
-            .is_some_and(|deal| deal.index >= deal.cards.len())
-        {
-            self.deal = None;
-        }
-        if self.deal.is_some() {
-            let index = self.deal.as_ref().unwrap().index;
-            for card_index in index..self.deal.as_ref().unwrap().cards.len() {
-                self.refresh_deal_offset(card_index, cx);
-            }
-            let mut card_index = self.deal.as_ref().unwrap().cards.len();
-            while card_index > index {
-                card_index -= 1;
-                let live = self
-                    .deal
-                    .as_ref()
-                    .and_then(|deal| deal.cards.get(card_index))
-                    .is_some_and(|card| queue.is_live(card));
-                if !live {
-                    let deal = self.deal.as_mut().unwrap();
-                    deal.cards.remove(card_index);
-                    deal.anchors.remove(card_index);
-                    deal.boundary_anchors.remove(card_index);
-                    deal.resolved.remove(card_index);
-                }
-            }
-            if let Some(deal) = &mut self.deal {
-                let resolved_live = deal
-                    .cards
-                    .iter()
-                    .zip(&deal.resolved)
-                    .filter(|(card, resolved)| **resolved && queue.is_live(card))
-                    .count();
-                deal.total_alive = queue.total_alive.saturating_sub(resolved_live);
-            }
-            if self
-                .deal
-                .as_ref()
-                .is_some_and(|deal| deal.index >= deal.cards.len())
-            {
-                self.deal = None;
-            }
-        }
-        if self.deal.is_none() {
-            let cards = queue.cards;
-            let anchors = cards
-                .iter()
-                .map(|card| {
-                    let offset = card.heading_offset?;
-                    let source = self.hosts.get(&card.host)?.upgrade()?;
-                    Some((card.host, source.read(cx).anchor_before(offset)))
+    ) -> Option<DealCard> {
+        let hand = self.dealer_hand(registry, inbox, now, agent_interactions, cx);
+        let (card, fingerprint, considered_not_dealt) = select_deal(&hand, exclude)?;
+        let (anchor, boundary_anchor) = if let Some(offset) = card.heading_offset {
+            self.hosts
+                .get(&card.host)
+                .and_then(WeakEntity::upgrade)
+                .map(|source| {
+                    let snapshot = source.read(cx).snapshot();
+                    (
+                        Some((card.host, snapshot.anchor_before(offset))),
+                        Some(snapshot.anchor_after(offset)),
+                    )
                 })
-                .collect::<Vec<_>>();
-            // The before-biased anchor remains the card's durable identity.
-            // Its after-biased mate only disambiguates an insertion made exactly
-            // at the heading boundary.
-            let boundary_anchors = cards
-                .iter()
-                .map(|card| {
-                    let offset = card.heading_offset?;
-                    let source = self.hosts.get(&card.host)?.upgrade()?;
-                    Some(source.read(cx).anchor_after(offset))
-                })
-                .collect();
-            let card_count = cards.len();
-            self.deal = Some(DealSession {
-                cards,
-                anchors,
-                boundary_anchors,
-                index: 0,
-                dealt_count: queue.dealt_count,
-                total_alive: queue.total_alive,
-                resolved: vec![false; card_count],
-                started_at: Instant::now(),
-                considered_not_dealt: queue.considered_not_dealt,
-            });
-        }
+                .unwrap_or((None, None))
+        } else {
+            (None, None)
+        };
+        self.deal = Some(DealSession {
+            card: card.clone(),
+            fingerprint,
+            anchor,
+            boundary_anchor,
+            started_at: Instant::now(),
+            considered_not_dealt,
+        });
         self.raw_mode = false;
-        self.deal_active = self
-            .deal
-            .as_ref()
-            .is_some_and(|deal| !deal.cards.is_empty());
-        self.deal_empty_success = !self.deal_active;
+        self.deal_active = true;
+        self.deal_empty_success = false;
         for source in self.hosts.values().filter_map(WeakEntity::upgrade) {
-            let capability = if self.deal_active {
-                Capability::Read
-            } else {
-                Capability::ReadWrite
-            };
-            source.update(cx, |buffer, cx| buffer.set_capability(capability, cx));
+            source.update(cx, |buffer, cx| buffer.set_capability(Capability::Read, cx));
         }
-        if self.deal_active
-            && let Some(card) = self.current_deal_card()
-            && let Some(offset) = card.heading_offset
-        {
+        if let Some(offset) = card.heading_offset {
             self.pending_doc_cursor = Some((card.host, offset));
         }
         self.last_synced = None;
+        Some(card)
+    }
+
+    pub fn end_deal(&mut self, cx: &mut Context<Workspace>) -> bool {
+        self.deal = None;
+        self.exit_deal_mode(cx)
     }
 
     pub fn exit_deal_mode(&mut self, cx: &mut Context<Workspace>) -> bool {
+        self.deal = None;
         let exited = std::mem::take(&mut self.deal_active);
         if exited {
             for source in self.hosts.values().filter_map(WeakEntity::upgrade) {
@@ -971,87 +831,30 @@ impl Dashboard {
         exited
     }
 
-    pub fn advance_deal(&mut self, cx: &mut Context<Workspace>) -> bool {
-        if !self.deal_active {
-            return false;
-        }
-        let Some(deal) = &mut self.deal else {
-            return false;
-        };
-        if deal.index < deal.cards.len() {
-            deal.index += 1;
-        }
-        if deal.index >= deal.cards.len() {
-            self.deal = None;
-            self.exit_deal_mode(cx);
-            return true;
-        }
-        deal.started_at = Instant::now();
-        self.refresh_current_deal_offset(cx);
-        if let Some(card) = self.current_deal_card()
-            && let Some(offset) = card.heading_offset
-        {
-            self.pending_doc_cursor = Some((card.host, offset));
-        }
-        self.last_synced = None;
-        true
-    }
-
-    pub fn previous_deal(&mut self, cx: &mut Context<Workspace>) -> bool {
-        let Some(deal) = &mut self.deal else {
-            return false;
-        };
-        if !self.deal_active || deal.index == 0 {
-            return false;
-        }
-        deal.index -= 1;
-        deal.started_at = Instant::now();
-        self.refresh_current_deal_offset(cx);
-        if let Some(card) = self.current_deal_card()
-            && let Some(offset) = card.heading_offset
-        {
-            self.pending_doc_cursor = Some((card.host, offset));
-        }
-        self.last_synced = None;
-        true
-    }
-
     pub fn discard_deal_session(&mut self, cx: &mut Context<Workspace>) {
-        self.deal = None;
-        self.exit_deal_mode(cx);
+        self.end_deal(cx);
     }
 
     fn refresh_current_deal_offset(&mut self, cx: &App) -> bool {
-        let Some(index) = self.deal.as_ref().map(|deal| deal.index) else {
-            return false;
-        };
-        self.refresh_deal_offset(index, cx)
-    }
-
-    fn refresh_deal_offset(&mut self, index: usize, cx: &App) -> bool {
         let Some(deal) = &self.deal else {
             return false;
         };
-        if index >= deal.cards.len() {
-            return false;
-        }
-        let Some((host, anchor)) = deal.anchors.get(index).and_then(Clone::clone) else {
+        let Some((host, anchor)) = deal.anchor.clone() else {
             return true;
         };
-        let Some(source) = self.hosts.get(&host).and_then(|source| source.upgrade()) else {
+        let Some(source) = self.hosts.get(&host).and_then(WeakEntity::upgrade) else {
             return false;
         };
         let snapshot = source.read(cx).snapshot();
         let before_offset = anchor.to_offset(&snapshot);
         let after_offset = deal
-            .boundary_anchors
-            .get(index)
-            .and_then(Clone::clone)
+            .boundary_anchor
+            .clone()
             .map(|anchor| anchor.to_offset(&snapshot))
             .unwrap_or(before_offset);
         let text = snapshot.text();
         let headings = parse(&text);
-        let previous_breadcrumb = &deal.cards[index].breadcrumb;
+        let previous_breadcrumb = &deal.card.breadcrumb;
         let previous_leaf = previous_breadcrumb
             .rsplit(" › ")
             .next()
@@ -1101,28 +904,21 @@ impl Dashboard {
             });
         if let Some((offset, breadcrumb)) = found
             && let Some(deal) = &mut self.deal
-            && let Some(card) = deal.cards.get_mut(index)
         {
-            card.heading_offset = Some(offset);
-            card.breadcrumb = breadcrumb;
-            deal.anchors[index] = Some((host, snapshot.anchor_before(offset)));
-            deal.boundary_anchors[index] = Some(snapshot.anchor_after(offset));
+            deal.card.heading_offset = Some(offset);
+            deal.card.breadcrumb = breadcrumb;
+            deal.anchor = Some((host, snapshot.anchor_before(offset)));
+            deal.boundary_anchor = Some(snapshot.anchor_after(offset));
             return true;
         }
-        if let Some(deal) = &mut self.deal
-            && let Some(card) = deal.cards.get_mut(index)
-        {
-            card.heading_offset = None;
+        if let Some(deal) = &mut self.deal {
+            deal.card.heading_offset = None;
         }
         false
     }
 
     pub fn deal_accepts_verdict(&self) -> bool {
-        self.deal_active
-            && self
-                .deal
-                .as_ref()
-                .is_some_and(|deal| deal.index < deal.cards.len() && !deal.resolved[deal.index])
+        self.deal_active && self.deal.is_some()
     }
 
     pub fn record_deal_verdict_as(
@@ -1130,14 +926,12 @@ impl Dashboard {
         verdict: DealerVerdict,
         now: chrono::DateTime<chrono::FixedOffset>,
     ) {
-        let Some(deal) = &mut self.deal else { return };
-        if deal.index >= deal.cards.len() || deal.resolved[deal.index] {
-            return;
-        }
-        let card = &deal.cards[deal.index];
+        let Some(deal) = &self.deal else { return };
+        let skip_until = (verdict == DealerVerdict::Skip)
+            .then(|| now + chrono::Duration::minutes(SKIP_COOLDOWN_MINUTES));
         let event = DealerEvent {
-            card: card.identity.clone(),
-            kind: card.kind,
+            card: deal.card.identity.clone(),
+            kind: deal.card.kind,
             verdict,
             at: now,
             time_to_verdict_ms: deal
@@ -1146,9 +940,11 @@ impl Dashboard {
                 .as_millis()
                 .min(u128::from(u64::MAX)) as u64,
             considered_not_dealt: deal.considered_not_dealt.clone(),
+            skip_until,
         };
-        deal.resolved[deal.index] = true;
-        deal.total_alive = deal.total_alive.saturating_sub(1);
+        if verdict != DealerVerdict::Skip {
+            self.skipped.remove(&event.card);
+        }
         self.record_dealer_event(event);
     }
 
@@ -1194,24 +990,37 @@ impl Dashboard {
             occurred_at: event.at.to_rfc3339(),
             time_to_verdict_ms: event.time_to_verdict_ms,
             considered_not_dealt: event.considered_not_dealt.iter().map(identity).collect(),
+            skip_until: event.skip_until.map(|until| until.to_rfc3339()),
         });
     }
 
-    pub fn skip_current_deal(
+    pub fn skip_card(
         &mut self,
+        identity: DealCardIdentity,
         now: chrono::DateTime<chrono::FixedOffset>,
-        cx: &mut Context<Workspace>,
+        _cx: &mut Context<Workspace>,
     ) -> bool {
-        if self.current_deal_card().is_none() {
+        let Some(fingerprint) = self
+            .deal
+            .as_ref()
+            .filter(|deal| deal.card.identity == identity)
+            .map(|deal| deal.fingerprint.clone())
+        else {
             return false;
-        }
+        };
+        self.skipped.insert(
+            identity,
+            SkippedCard {
+                at: now,
+                fingerprint,
+            },
+        );
         self.record_deal_verdict_as(DealerVerdict::Skip, now);
-        self.advance_deal(cx)
+        true
     }
 
     pub fn current_deal_card(&self) -> Option<&DealCard> {
-        let deal = self.deal.as_ref()?;
-        deal.cards.get(deal.index)
+        Some(&self.deal.as_ref()?.card)
     }
 
     pub fn current_inbox_source(&self) -> Option<&DealerInboxSource> {
@@ -1325,13 +1134,14 @@ impl Dashboard {
 
     pub fn write_deal_todo(
         &mut self,
+        count: u32,
         today: chrono::NaiveDate,
         cx: &mut Context<Workspace>,
     ) -> bool {
         self.write_deal_property(
             TemporalMarkKind::Todo,
             today.and_time(chrono::NaiveTime::MIN),
-            Some(7),
+            Some(if count == 0 { 7 } else { count }),
             cx,
         )
     }
@@ -1408,27 +1218,10 @@ impl Dashboard {
         let line = rho_ui_proto::desk::temporal::property_line(kind, at, pace_days);
         let mut edits = heading_property_edits(&text, &heading, kind, line);
         edits.sort_by_key(|(range, _)| range.start);
-        let delta = edits
-            .iter()
-            .map(|edit| edit.1.len() as isize - (edit.0.end - edit.0.start) as isize)
-            .sum::<isize>();
-        let edit_start = edits[0].0.start;
         self.hosts[&host]
             .upgrade()
             .unwrap()
             .update(cx, |buffer, cx| buffer.edit(edits, None, cx));
-        if delta != 0
-            && let Some(deal) = &mut self.deal
-        {
-            for card in deal.cards.iter_mut().skip(deal.index + 1) {
-                if card.host == host
-                    && let Some(offset) = &mut card.heading_offset
-                    && *offset > edit_start
-                {
-                    *offset = offset.saturating_add_signed(delta);
-                }
-            }
-        }
         true
     }
 
@@ -3725,6 +3518,20 @@ impl Dashboard {
     }
 }
 
+fn select_deal(
+    hand: &DealQueue,
+    exclude: Option<&DealCardIdentity>,
+) -> Option<(DealCard, DealFingerprint, Vec<DealCardIdentity>)> {
+    let mut cards = hand
+        .cards
+        .iter()
+        .filter(|card| exclude.is_none_or(|excluded| card.identity != *excluded));
+    let card = cards.next()?.clone();
+    let fingerprint = hand.fingerprints.get(&card.identity)?.clone();
+    let considered_not_dealt = cards.take(5).map(|card| card.identity.clone()).collect();
+    Some((card, fingerprint, considered_not_dealt))
+}
+
 /// Gutter highlight marker type for reply drafts.
 pub struct ReplyGutter;
 
@@ -4233,7 +4040,6 @@ fn display_mark(heading: &DeskHeading, now: chrono::NaiveDateTime) -> Option<Str
         TemporalMarkKind::Todo => format!("todo {date} · {}d", mark.pace_days),
         TemporalMarkKind::Defer => format!("defer {date} · {}d", mark.pace_days),
         TemporalMarkKind::Reminder => format!("reminder {date} · {}d", mark.pace_days),
-        TemporalMarkKind::Skip => format!("skipped until {date}"),
         TemporalMarkKind::Done => format!("done {date}"),
         TemporalMarkKind::Discarded => format!("discarded {date}"),
     })
@@ -4613,7 +4419,7 @@ fn heading_property_edits(
     }];
     if kind == TemporalMarkKind::Defer {
         edits.extend(heading.properties.iter().filter_map(|property| {
-            let verdict_family = ["defer", "reminder", "skip"]
+            let verdict_family = ["defer", "reminder"]
                 .iter()
                 .any(|key| property.key.eq_ignore_ascii_case(key));
             if !verdict_family
@@ -4751,7 +4557,7 @@ fn temporal_label(mark: &TemporalMark, now: chrono::NaiveDateTime, mark_priority
         TemporalMarkKind::Todo => "todo".to_owned(),
         TemporalMarkKind::Reminder => "reminder".to_owned(),
         TemporalMarkKind::Defer => format!("deferred · woke {}", age_label(elapsed)),
-        TemporalMarkKind::Skip | TemporalMarkKind::Done | TemporalMarkKind::Discarded => {
+        TemporalMarkKind::Done | TemporalMarkKind::Discarded => {
             unreachable!("non-live marks cannot win")
         }
     }
@@ -4836,6 +4642,7 @@ struct RankedDealCard {
     virtual_reply: bool,
     order: usize,
     card: DealCard,
+    fingerprint: DealFingerprint,
 }
 
 /// Builds one deterministic deal from Desk text and per-agent facts. Every
@@ -4854,28 +4661,27 @@ pub fn assemble_dealer_queue(
     inbox: &[DealerInboxItem],
     now: chrono::DateTime<chrono::FixedOffset>,
 ) -> DealQueue {
-    assemble_dealer_queue_in_room(documents, agent_facts, inbox, now, None, &HashMap::new())
+    assemble_dealer_queue_with_context(
+        documents,
+        agent_facts,
+        inbox,
+        now,
+        &HashMap::new(),
+        &HashMap::new(),
+    )
 }
 
-fn assemble_dealer_queue_in_room(
+fn assemble_dealer_queue_with_context(
     documents: &[(HostId, String)],
     agent_facts: &[DealAgentFacts],
     inbox: &[DealerInboxItem],
     now: chrono::DateTime<chrono::FixedOffset>,
-    current_room: Option<(HostId, &str)>,
     agent_interactions: &HashMap<AgentId, i64>,
+    skipped: &HashMap<DealCardIdentity, SkippedCard>,
 ) -> DealQueue {
     use rho_ui_proto::desk::temporal::priority;
 
     let desk_now = now.naive_local();
-    let room_bonus = |host: HostId, room: &str| {
-        current_room
-            .is_some_and(|(current_host, current_name)| {
-                current_host == host && current_name == room
-            })
-            .then_some(CURRENT_ROOM_PRIORITY_BONUS)
-            .unwrap_or(0.0)
-    };
     let mut considered = HashSet::new();
     let by_id = agent_facts
         .iter()
@@ -4927,16 +4733,16 @@ fn assemble_dealer_queue_in_room(
             let locally_deferred = heading.temporal_marks.iter().any(|mark| {
                 matches!(
                     mark.kind,
-                    TemporalMarkKind::Defer | TemporalMarkKind::Reminder | TemporalMarkKind::Skip
-                ) && mark.at > desk_now
+                    TemporalMarkKind::Defer | TemporalMarkKind::Reminder
+                ) && priority(mark, desk_now) == f64::NEG_INFINITY
             });
             let mut ancestor = heading.parent;
             let mut room_deferred = false;
             while let Some(parent) = ancestor {
-                room_deferred |= headings[parent]
-                    .temporal_marks
-                    .iter()
-                    .any(|mark| mark.kind == TemporalMarkKind::Defer && mark.at > desk_now);
+                room_deferred |= headings[parent].temporal_marks.iter().any(|mark| {
+                    mark.kind == TemporalMarkKind::Defer
+                        && priority(mark, desk_now) == f64::NEG_INFINITY
+                });
                 ancestor = headings[parent].parent;
             }
             let deferred = locally_deferred || room_deferred;
@@ -5004,26 +4810,19 @@ fn assemble_dealer_queue_in_room(
                 heading_offset: row.heading.heading_range.start,
             };
             considered.insert(identity.clone());
-            let mark_priority = if mark.kind == TemporalMarkKind::Defer {
-                // A defer is sleep-until, not a recurring reminder: zero
-                // before wake (gated above), then the same rising age curve as
-                // a newly arrived obligation.
-                mark_elapsed_days(mark, desk_now)
-            } else {
-                priority(mark, desk_now)
-            };
+            let mark_priority = priority(mark, desk_now);
             if mark_priority <= DEAL_QUEUE_FLOOR {
                 continue;
             }
             let agent_id = row.agents.first().copied();
-            let adjusted_priority = mark_priority
-                + room_bonus(row.host, row.breadcrumb.split(" › ").next().unwrap_or(""));
+            let adjusted_priority = mark_priority;
             offer(
                 topic,
                 RankedDealCard {
                     priority: adjusted_priority,
                     virtual_reply: false,
                     order: row.order,
+                    fingerprint: DealFingerprint(format!("{:?}", row.heading.temporal_marks)),
                     card: DealCard {
                         label: temporal_label(mark, desk_now, mark_priority),
                         priority: adjusted_priority,
@@ -5081,9 +4880,7 @@ fn assemble_dealer_queue_in_room(
         });
         // Recency is part of the curve, not a display-only sort adjustment:
         // floor, lamp, and chime decisions all see the post-bonus priority.
-        let adjusted_priority = reply_priority
-            + recency_bonus
-            + room_bonus(row.host, row.breadcrumb.split(" › ").next().unwrap_or(""));
+        let adjusted_priority = reply_priority + recency_bonus;
         if adjusted_priority <= DEAL_QUEUE_FLOOR {
             continue;
         }
@@ -5093,6 +4890,7 @@ fn assemble_dealer_queue_in_room(
                 priority: adjusted_priority,
                 virtual_reply: true,
                 order: row.order,
+                fingerprint: DealFingerprint(format!("{:?}:{:?}", agent.facts, agent.attention)),
                 card: DealCard {
                     label,
                     priority: adjusted_priority,
@@ -5152,7 +4950,7 @@ fn assemble_dealer_queue_in_room(
             .context
             .as_deref()
             .and_then(|context| context.split(" / ").next());
-        let adjusted_score = score + room_name.map_or(0.0, |room| room_bonus(item.host, room));
+        let adjusted_score = score;
         let mut reason = match (&item.kind, &item.waiting_on) {
             (DealerInboxKind::Ping, Some(_)) => format!("ping · {}", age_label(age_days)),
             (DealerInboxKind::Ping, None) => format!("ping · {}", age_label(age_days)),
@@ -5186,6 +4984,7 @@ fn assemble_dealer_queue_in_room(
                 priority: adjusted_score,
                 virtual_reply: false,
                 order: inbox_order_start + index,
+                fingerprint: DealFingerprint(format!("{item:?}")),
                 card: DealCard {
                     label: reason,
                     priority: adjusted_score,
@@ -5203,10 +5002,12 @@ fn assemble_dealer_queue_in_room(
         );
     }
 
-    let live_cards = ranked
-        .values()
-        .map(|ranked| ranked.card.identity.clone())
-        .collect::<HashSet<_>>();
+    ranked.retain(|_, ranked| {
+        skipped.get(&ranked.card.identity).is_none_or(|skip| {
+            now >= skip.at + chrono::Duration::minutes(SKIP_COOLDOWN_MINUTES)
+                || skip.fingerprint != ranked.fingerprint
+        })
+    });
     let total_alive = ranked.len();
     let mut ranked = ranked.into_values().collect::<Vec<_>>();
     ranked.sort_by(|a, b| {
@@ -5219,44 +5020,33 @@ fn assemble_dealer_queue_in_room(
             .then_with(|| b.virtual_reply.cmp(&a.virtual_reply))
             .then_with(|| a.order.cmp(&b.order))
     });
+    let fingerprints = ranked
+        .iter()
+        .map(|ranked| (ranked.card.identity.clone(), ranked.fingerprint.clone()))
+        .collect();
     let cards = ranked
         .into_iter()
-        .take(DEAL_PRIORITY_CUTOFF)
         .map(|ranked| ranked.card)
         .collect::<Vec<_>>();
-    let dealt = cards
+    let considered_not_dealt = cards
         .iter()
-        .map(|card| &card.identity)
-        .collect::<HashSet<_>>();
-    let mut considered_not_dealt = considered
-        .into_iter()
-        .filter(|identity| !dealt.contains(identity))
-        .collect::<Vec<_>>();
-    considered_not_dealt.sort_by_key(|identity| format!("{identity:?}"));
-    let dealt_count = cards.len();
+        .skip(1)
+        .take(5)
+        .map(|card| card.identity.clone())
+        .collect();
+    let dealt_count = usize::from(!cards.is_empty());
 
     DealQueue {
         cards,
         total_alive,
         dealt_count,
-        live_cards,
         considered_not_dealt,
+        fingerprints,
     }
 }
 
 fn deal_hint(deal: &DealSession) -> String {
-    let Some(card) = deal.cards.get(deal.index) else {
-        return "Desk deal complete".to_owned();
-    };
-    format!(
-        "DEAL · {} · {} · {}/{} · {} dealt · {} waiting",
-        card.breadcrumb,
-        card.label,
-        deal.index + 1,
-        deal.cards.len(),
-        deal.dealt_count,
-        deal.total_alive,
-    )
+    format!("DEAL · {} · {}", deal.card.breadcrumb, deal.card.label)
 }
 
 /// Ends a document slice before a cut point's newline, so the synthetic
@@ -5671,13 +5461,13 @@ mod tests {
                 agent_id,
                 now.timestamp_millis() - elapsed.num_milliseconds(),
             )]);
-            assemble_dealer_queue_in_room(
+            assemble_dealer_queue_with_context(
                 &[(host, text.clone())],
                 &facts,
                 &[],
                 now,
-                None,
                 &interactions,
+                &HashMap::new(),
             )
             .cards[0]
                 .priority
@@ -5708,13 +5498,13 @@ mod tests {
         );
         let interactions = HashMap::from([(agent_id, now.timestamp_millis())]);
 
-        let queue = assemble_dealer_queue_in_room(
+        let queue = assemble_dealer_queue_with_context(
             &[(host, text)],
             &deal_agent_facts(&reg),
             &[],
             now,
-            None,
             &interactions,
+            &HashMap::new(),
         );
 
         assert!(queue.cards.is_empty());
@@ -5741,21 +5531,21 @@ mod tests {
         );
         let facts = deal_agent_facts(&reg);
 
-        let without_bonus = assemble_dealer_queue_in_room(
+        let without_bonus = assemble_dealer_queue_with_context(
             &[(host, text.clone())],
             &facts,
             &[],
             now,
-            None,
+            &HashMap::new(),
             &HashMap::new(),
         );
-        let with_bonus = assemble_dealer_queue_in_room(
+        let with_bonus = assemble_dealer_queue_with_context(
             &[(host, text)],
             &facts,
             &[],
             now,
-            None,
             &HashMap::from([(agent_id, now.timestamp_millis())]),
+            &HashMap::new(),
         );
 
         assert!(without_bonus.cards.is_empty());
@@ -5816,7 +5606,157 @@ mod tests {
     }
 
     #[test]
-    fn floor_cutoff_returns_only_the_top_eight_live_claims() {
+    fn fresh_selection_honors_exclusion_and_caps_considered_cards() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
+            .unwrap()
+            .and_time(chrono::NaiveTime::MIN)
+            .and_utc()
+            .fixed_offset();
+        let text = (0..7)
+            .map(|index| format!("* Todo {index}\n:todo: 2026-08-{:02} 1d\n", 10 + index))
+            .collect::<String>();
+        let hand = assemble_deal_queue(&[(HostId(1), text)], &[], now);
+        let first = hand.cards[0].identity.clone();
+        let (selected, _, considered) = select_deal(&hand, Some(&first)).unwrap();
+        assert_ne!(selected.identity, first);
+        assert_eq!(selected.identity, hand.cards[1].identity);
+        assert!(considered.len() <= 5);
+    }
+
+    #[test]
+    fn nothing_at_or_below_floor_is_selected() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
+            .unwrap()
+            .and_time(chrono::NaiveTime::MIN)
+            .and_utc()
+            .fixed_offset();
+        let hand = assemble_deal_queue(
+            &[(HostId(1), "* Later\n:todo: 2026-08-23 1d\n".into())],
+            &[],
+            now,
+        );
+        assert!(select_deal(&hand, None).is_none());
+    }
+
+    #[test]
+    fn skip_hides_unchanged_agent_until_expiry_but_new_event_voids_it() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc()
+            .fixed_offset();
+        let mut facts = agent(1, None, UiAttention::NeedsInput, 0);
+        facts.facts.last_turn_ended = Some(UnixMs(now.timestamp_millis() as u64));
+        facts.facts.last_user_message_at = UnixMs(0);
+        let agent_id = facts.agent_id;
+        let (reg, host) = registry(vec![facts.clone()]);
+        let document = format!("* Agent :eng-{}:\n", &agent_id.encoded()[..4]);
+        let initial = assemble_dealer_queue_with_context(
+            &[(host, document.clone())],
+            &deal_agent_facts(&reg),
+            &[],
+            now,
+            &HashMap::new(),
+            &HashMap::new(),
+        );
+        let identity = DealCardIdentity::Agent(agent_id);
+        let skip = SkippedCard {
+            at: now,
+            fingerprint: initial.fingerprints[&identity].clone(),
+        };
+        let skipped = HashMap::from([(identity.clone(), skip)]);
+        assert!(
+            assemble_dealer_queue_with_context(
+                &[(host, document.clone())],
+                &deal_agent_facts(&reg),
+                &[],
+                now + chrono::Duration::minutes(14),
+                &HashMap::new(),
+                &skipped,
+            )
+            .cards
+            .is_empty()
+        );
+
+        facts.facts.last_turn_ended = Some(UnixMs((now.timestamp_millis() + 1) as u64));
+        let (changed_registry, _) = registry(vec![facts]);
+        assert!(
+            assemble_dealer_queue_with_context(
+                &[(host, document.clone())],
+                &deal_agent_facts(&changed_registry),
+                &[],
+                now + chrono::Duration::minutes(14),
+                &HashMap::new(),
+                &skipped,
+            )
+            .cards
+            .iter()
+            .any(|card| card.identity == identity)
+        );
+        assert!(
+            assemble_dealer_queue_with_context(
+                &[(host, document)],
+                &deal_agent_facts(&reg),
+                &[],
+                now + chrono::Duration::minutes(15),
+                &HashMap::new(),
+                &skipped,
+            )
+            .cards
+            .iter()
+            .any(|card| card.identity == identity)
+        );
+    }
+
+    #[test]
+    fn changing_a_desk_marks_set_voids_its_skip() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
+            .unwrap()
+            .and_time(chrono::NaiveTime::MIN)
+            .and_utc()
+            .fixed_offset();
+        let host = HostId(1);
+        let original = "* Topic\n:todo: 2026-08-20 1d\n".to_owned();
+        let initial = assemble_deal_queue(&[(host, original.clone())], &[], now);
+        let identity = initial.cards[0].identity.clone();
+        let skipped = HashMap::from([(
+            identity.clone(),
+            SkippedCard {
+                at: now,
+                fingerprint: initial.fingerprints[&identity].clone(),
+            },
+        )]);
+        assert!(
+            assemble_dealer_queue_with_context(
+                &[(host, original)],
+                &[],
+                &[],
+                now,
+                &HashMap::new(),
+                &skipped,
+            )
+            .cards
+            .is_empty()
+        );
+        let changed = "* Topic\n:todo: 2026-08-19 1d\n".to_owned();
+        assert_eq!(
+            assemble_dealer_queue_with_context(
+                &[(host, changed)],
+                &[],
+                &[],
+                now,
+                &HashMap::new(),
+                &skipped,
+            )
+            .cards[0]
+                .identity,
+            identity
+        );
+    }
+
+    #[test]
+    fn scorer_keeps_every_claim_above_the_strict_floor() {
         let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
             .unwrap()
             .and_hms_opt(12, 0, 0)
@@ -5828,28 +5768,10 @@ mod tests {
             text.push_str(&format!("* Todo {index}\n:todo: 2026-08-13 7d\n"));
         }
         text.push_str("* At floor\n:todo: 2026-08-15 9d\n");
-        let host = HostId(1);
-        let queue = assemble_deal_queue(&[(host, text)], &[], now);
+        let queue = assemble_deal_queue(&[(HostId(1), text)], &[], now);
         assert_eq!(queue.total_alive, 10);
-        assert_eq!(queue.dealt_count, DEAL_PRIORITY_CUTOFF);
-        assert_eq!(queue.cards.len(), DEAL_PRIORITY_CUTOFF);
-        let ninth_ranked = DealCard {
-            label: "todo".into(),
-            priority: 0.0,
-            host,
-            heading_offset: Some("* Todo 0\n:todo: 2026-08-13 7d\n".len() * 8),
-            agent_id: None,
-            agent_tag: None,
-            breadcrumb: String::new(),
-            room: None,
-            kind: DealCardKind::Desk,
-            identity: DealCardIdentity::Desk {
-                host,
-                heading_offset: "* Todo 0\n:todo: 2026-08-13 7d\n".len() * 8,
-            },
-            inbox_source: None,
-        };
-        assert!(queue.is_live(&ninth_ranked));
+        assert_eq!(queue.cards.len(), 10);
+        assert_eq!(queue.dealt_count, 1);
     }
 
     #[test]
@@ -6001,9 +5923,6 @@ mod tests {
 * Reminded
 :reminder: 2026-08-24
 :deadline: 2020-01-01
-* Skipped
-:skip: 2026-08-24
-:deadline: 2020-01-01
 * Done
 :done: 2026-08-20
 :deadline: 2020-01-01
@@ -6020,7 +5939,6 @@ mod tests {
             ![
                 "Deferred",
                 "Reminded",
-                "Skipped",
                 "Done",
                 "Archive",
                 "Archive › Archived",
@@ -6051,62 +5969,39 @@ mod tests {
         assert!(result.contains(":done: 2026-08-01"));
         assert!(result.contains(":defer: 2026-08-27 4d"));
         assert!(!result.contains(":reminder:"));
-        assert!(!result.contains(":skip:"));
+        // Skip is no longer Desk vocabulary; unknown prose-like properties
+        // are not rewritten by dealer verdicts.
+        assert!(result.contains(":skip: 2026-08-26"));
         assert_eq!(result.matches(":defer:").count(), 1);
     }
 
     #[test]
-    fn deal_chrome_names_the_current_section_and_position() {
-        let host = HostId(1);
-        let cards = vec![
-            DealCard {
-                label: "reminder".into(),
-                priority: 0.0,
-                host,
-                heading_offset: Some(0),
-                agent_id: None,
-                agent_tag: None,
-                breadcrumb: "One".into(),
-                room: Some("One".into()),
-                kind: DealCardKind::Desk,
-                identity: DealCardIdentity::Desk {
-                    host,
-                    heading_offset: 0,
-                },
-                inbox_source: None,
+    fn deal_chrome_names_the_current_card() {
+        let card = DealCard {
+            label: "todo · ripe 2d".into(),
+            priority: 2.0,
+            host: HostId(1),
+            heading_offset: Some(6),
+            agent_id: None,
+            agent_tag: None,
+            breadcrumb: "Two".into(),
+            room: Some("Two".into()),
+            kind: DealCardKind::Desk,
+            identity: DealCardIdentity::Desk {
+                host: HostId(1),
+                heading_offset: 6,
             },
-            DealCard {
-                label: "todo · ripe 2d".into(),
-                priority: 2.0,
-                host,
-                heading_offset: Some(6),
-                agent_id: None,
-                agent_tag: None,
-                breadcrumb: "Two".into(),
-                room: Some("Two".into()),
-                kind: DealCardKind::Desk,
-                identity: DealCardIdentity::Desk {
-                    host,
-                    heading_offset: 6,
-                },
-                inbox_source: None,
-            },
-        ];
+            inbox_source: None,
+        };
         let deal = DealSession {
-            anchors: vec![None, None],
-            boundary_anchors: vec![None, None],
-            cards,
-            index: 1,
-            dealt_count: 2,
-            total_alive: 9,
-            resolved: vec![false, false],
+            card,
+            fingerprint: DealFingerprint(String::new()),
+            anchor: None,
+            boundary_anchor: None,
             started_at: Instant::now(),
             considered_not_dealt: Vec::new(),
         };
-        assert_eq!(
-            deal_hint(&deal),
-            "DEAL · Two · todo · ripe 2d · 2/2 · 2 dealt · 9 waiting"
-        );
+        assert_eq!(deal_hint(&deal), "DEAL · Two · todo · ripe 2d");
     }
 
     #[test]
@@ -6734,28 +6629,6 @@ mod tests {
             assert_eq!(agent_class, plain_class, "agent keeps the level hue");
             assert!(agent_opacity > plain_opacity, "agent variant is subtle");
         }
-    }
-
-    #[test]
-    fn current_room_bonus_breaks_only_near_ties() {
-        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 20)
-            .unwrap()
-            .and_hms_opt(12, 0, 0)
-            .unwrap()
-            .and_local_timezone(chrono::FixedOffset::east_opt(0).unwrap())
-            .unwrap();
-        let host = HostId(1);
-        let text = "* elsewhere\n:todo: 2026-08-18 1d\n* here\n:todo: 2026-08-18 1d\n";
-        let queue = assemble_dealer_queue_in_room(
-            &[(host, text.to_owned())],
-            &[],
-            &[],
-            now,
-            Some((host, "here")),
-            &HashMap::new(),
-        );
-        assert_eq!(queue.cards[0].breadcrumb, "here");
-        assert_eq!(queue.cards[0].priority - queue.cards[1].priority, 0.25);
     }
 
     #[test]
