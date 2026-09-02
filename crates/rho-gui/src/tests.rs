@@ -3193,10 +3193,88 @@ fn connection_recovery_is_transient_workspace_chrome(cx: &mut TestAppContext) {
             );
         })
         .expect("update connection status");
-    assert!(
-        !display_text(&workspace, cx).contains("disconnected"),
-        "connection status belongs in workspace chrome, not transcript content"
-    );
+    workspace
+        .update(cx, |workspace, _, _| {
+            let notices = workspace.message_log_texts();
+            assert!(notices.iter().any(|text| text.contains("reconnecting")));
+            assert!(notices.iter().any(|text| text.contains("connected")));
+            assert!(notices.iter().any(|text| text.contains("disconnected")));
+        })
+        .expect("inspect connection notices");
+}
+
+#[gpui::test]
+fn dropped_fake_connection_resubscribes_retained_transcript_after_reconnect(
+    cx: &mut TestAppContext,
+) {
+    use rho_ui_proto::{
+        AgentDisposition, AgentRole, AuthState, ClientMessage, UiAgentSummary, UiAttention,
+        WorkspaceInfo,
+    };
+
+    let workspace = test_workspace(cx);
+    let agent_id = agent(1);
+    let summary = || UiAgentSummary {
+        agent_id,
+        parent_agent: None,
+        display_name: Some("retained transcript".to_owned()),
+        created_at: UnixMs(1),
+        updated_at: UnixMs(1),
+        role: AgentRole::default(),
+        workspace: WorkspaceInfo::UserCheckout {
+            repo: "/tmp".into(),
+        },
+        attention: UiAttention::Quiet,
+        last_active: UnixMs(1),
+        facts: Default::default(),
+        hidden: false,
+        disposition: AgentDisposition::Pending,
+        last_user_message_text: String::new(),
+        activity: None,
+        turn_report: None,
+        labels: Vec::new(),
+    };
+    let ready = || ConnEvent::Ready {
+        agents: vec![summary()],
+        iris_agent: None,
+        projects: Vec::new(),
+        auth: AuthState {
+            namespaces: Vec::new(),
+            disabled_namespaces: Vec::new(),
+            active_namespace: None,
+        },
+        machine_seed: 0,
+        agent_counter: 2,
+    };
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), ready(), window, cx);
+            workspace.take_host_messages_for_test(HostId::default());
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Disconnected("link dropped".to_owned()),
+                window,
+                cx,
+            );
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Recovering(std::time::Duration::from_millis(500)),
+                window,
+                cx,
+            );
+            workspace.handle_event(HostId::default(), ready(), window, cx);
+
+            let messages = workspace.take_host_messages_for_test(HostId::default());
+            assert!(messages.iter().any(|message| {
+                matches!(
+                    message,
+                    ClientMessage::SubscribeAgents { agent_ids }
+                        if agent_ids == &vec![agent_id]
+                )
+            }));
+        })
+        .expect("reconnect fake daemon");
 }
 
 #[gpui::test]

@@ -1897,6 +1897,7 @@ impl Workspace {
                 machine_seed,
                 agent_counter,
             } => {
+                let reconnecting = self.ready_hosts.contains(&host);
                 let (first_ready, initial_subscriptions) =
                     self.apply_ready(host, machine_seed, agent_counter, agents, iris_agent);
                 self.prune_contexts();
@@ -1918,7 +1919,19 @@ impl Workspace {
                     // refresh it now that workdir names and topics are known.
                     self.seed_draft(false, window, cx);
                 }
-                if let Some(agent_ids) = initial_subscriptions
+                let agent_ids = if reconnecting {
+                    let retained = self
+                        .subscriptions
+                        .iter()
+                        .filter(|agent_id| self.registry.host_of_agent(*agent_id) == Some(host))
+                        .collect::<Vec<_>>();
+                    (!retained.is_empty())
+                        .then_some(retained)
+                        .or(initial_subscriptions)
+                } else {
+                    initial_subscriptions
+                };
+                if let Some(agent_ids) = agent_ids
                     && !agent_ids.is_empty()
                 {
                     self.set_initial_subscriptions(host, agent_ids, cx);
@@ -2101,11 +2114,31 @@ impl Workspace {
                 );
             }
             ConnEvent::Recovering(elapsed) => {
+                let changed = !self
+                    .hosts
+                    .get(host)
+                    .is_some_and(|entry| matches!(entry.status, HostStatus::Recovering(_)));
                 self.hosts.set_status(host, HostStatus::Recovering(elapsed));
+                if changed {
+                    let source = self.host_label(host);
+                    self.notice_on(
+                        None,
+                        &format!("[{source} reconnecting]"),
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
+                }
                 cx.notify();
             }
             ConnEvent::Recovered => {
                 self.hosts.set_status(host, HostStatus::Online);
+                let source = self.host_label(host);
+                self.notice_on(
+                    None,
+                    &format!("[{source} connected]"),
+                    StyleClass::SystemInfo,
+                    cx,
+                );
                 cx.notify();
             }
             ConnEvent::Disconnected(reason) => {
@@ -2125,9 +2158,15 @@ impl Workspace {
                 // Only detaching (`space h d`) forgets a daemon.
                 self.hosts
                     .set_status(host, HostStatus::Disconnected(reason.clone()));
-                // A later reconnect is a fresh session for this host, and
-                // earns the same warm start its first `Ready` did.
-                self.ready_hosts.remove(&host);
+                let source = self.host_label(host);
+                self.notice_on(
+                    None,
+                    &format!("[{source} disconnected: {reason}]"),
+                    StyleClass::SystemImportant,
+                    cx,
+                );
+                // Keep the ready marker so the next handshake can replay the
+                // retained session instead of treating it as first startup.
                 if self.awaiting_draft_agent == Some(host) {
                     self.awaiting_draft_agent = None;
                 }
@@ -5780,6 +5819,14 @@ impl Workspace {
     pub(crate) fn force_host_online(&mut self, host: HostId) {
         self.hosts
             .set_status(host, crate::hosts::HostStatus::Online);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_host_messages_for_test(&self, host: HostId) -> Vec<ClientMessage> {
+        self.hosts
+            .connection(host)
+            .map(Connection::take_sent_for_test)
+            .unwrap_or_default()
     }
 
     #[cfg(test)]

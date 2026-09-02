@@ -1,6 +1,6 @@
 //! Direct browser iroh connection to the daemon's `rho/ui/5` protocol.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::str::FromStr as _;
@@ -149,6 +149,8 @@ const AUTHENTICATOR_KEY: &str = "rho-gui-web-authenticator";
 const PRF_LABEL: &[u8] = b"rho webui iroh prf v1";
 const HKDF_INFO: &[u8] = b"rho webui iroh ed25519 seed v1";
 const MAX_CREDENTIAL_ID_LEN: usize = 1024;
+const INITIAL_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+const MAX_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Clone, Debug)]
 pub enum Event {
@@ -928,8 +930,10 @@ impl Connection {
                             return;
                         }
                     };
-                    let mut retry = std::time::Duration::from_secs(1);
+                    let mut retry = INITIAL_RECONNECT_DELAY;
+                    let mut reconnecting = false;
                     loop {
+                        let connected = Rc::new(Cell::new(false));
                         let _ = events.unbounded_send(Event::Phase(Phase::Connecting));
                         match run(
                             daemon,
@@ -939,6 +943,7 @@ impl Connection {
                             host_sink.clone(),
                             Arc::clone(&shell_requests),
                             Rc::clone(&dialer),
+                            Rc::clone(&connected),
                         )
                         .await
                         {
@@ -951,12 +956,18 @@ impl Connection {
                                 futures::future::pending::<()>().await;
                             }
                             Err(error) => {
+                                if connected.get() {
+                                    retry = INITIAL_RECONNECT_DELAY;
+                                    reconnecting = false;
+                                }
                                 *dialer.borrow_mut() = None;
                                 let reason = format!("{error:#}");
                                 let _ = events
                                     .unbounded_send(Event::Phase(Phase::Failed(reason.clone())));
                                 if let Some(sink) = &host_sink {
-                                    sink.send(ConnEvent::Disconnected(reason));
+                                    if !reconnecting {
+                                        sink.send(ConnEvent::Disconnected(reason));
+                                    }
                                     sink.send(ConnEvent::Recovering(retry));
                                 }
                                 conn_log(&format!(
@@ -966,7 +977,8 @@ impl Connection {
                             }
                         }
                         n0_future::time::sleep(retry).await;
-                        retry = (retry * 2).min(std::time::Duration::from_secs(30));
+                        retry = (retry * 2).min(MAX_RECONNECT_DELAY);
+                        reconnecting = true;
                     }
                 },
                 registration,
@@ -1093,6 +1105,7 @@ async fn run(
     host_sink: Option<HostSink>,
     shell_requests: Arc<Mutex<ShellControlRequests>>,
     dialer: Rc<RefCell<Option<rho_rpc::Dialer>>>,
+    connected: Rc<Cell<bool>>,
 ) -> anyhow::Result<RunOutcome> {
     conn_log(&format!("dialing daemon from endpoint {}", endpoint.id()));
     let connection = endpoint
@@ -1127,6 +1140,7 @@ async fn run(
     let mut recv = rho_rpc::Reader::new(recv);
     rho_ui_proto::write_frame(&mut send, &ClientMessage::Subscribe).await?;
     rho_ui_proto::write_frame(&mut send, &ClientMessage::DeskSubscribe).await?;
+    connected.set(true);
     let _ = events.unbounded_send(Event::Phase(Phase::Online));
     if let Some(sink) = &host_sink {
         sink.send(ConnEvent::Recovered);

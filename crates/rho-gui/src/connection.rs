@@ -20,6 +20,13 @@ use rho_ui_proto::{
 };
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+const INITIAL_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+const MAX_RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(10);
+
+fn next_reconnect_delay(delay: std::time::Duration) -> std::time::Duration {
+    (delay * 2).min(MAX_RECONNECT_DELAY)
+}
+
 use crate::registry::HostId;
 use crate::workspace::AttachTarget;
 
@@ -534,6 +541,8 @@ pub struct Connection {
     /// Dropping this aborts the IO task, tearing the connection down with the
     /// workspace.
     _io_task: Task<Result<(), gpui_tokio::JoinError>>,
+    #[cfg(test)]
+    sent: Arc<Mutex<Vec<ClientMessage>>>,
 }
 
 pub struct VisualizationArtifact {
@@ -719,7 +728,14 @@ impl Connection {
         }
     }
     pub fn send(&self, message: ClientMessage) {
+        #[cfg(test)]
+        self.sent.lock().unwrap().push(message.clone());
         let _ = self.commands.unbounded_send(message);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_sent_for_test(&self) -> Vec<ClientMessage> {
+        std::mem::take(&mut *self.sent.lock().unwrap())
     }
 
     pub fn focus_agent(&self, agent_id: Option<AgentId>) {
@@ -851,38 +867,89 @@ pub fn spawn(
     let iroh = matches!(&target, AttachTarget::Iroh { .. });
     let event_tx = EventSink { host, events };
     let (command_tx, command_rx) = futures_mpsc::unbounded();
+    let command_rx = Arc::new(tokio::sync::Mutex::new(command_rx));
     let dialer = Arc::new(Mutex::new(None));
     let shell_requests = Arc::new(Mutex::new(ShellControlRequests::default()));
-    let io_dialer = dialer.clone();
-    let io_shell_requests = Arc::clone(&shell_requests);
-    let io_task = Tokio::spawn(cx, async move {
-        if let Err(error) = run(
-            target,
-            &event_tx,
-            command_rx,
-            &io_dialer,
-            &io_shell_requests,
+    let io_task = if cfg!(test) {
+        Tokio::spawn(cx, async {})
+    } else {
+        Tokio::spawn(
+            cx,
+            supervise(
+                target,
+                event_tx,
+                command_rx,
+                dialer.clone(),
+                Arc::clone(&shell_requests),
+            ),
         )
-        .await
-        {
-            let _ = event_tx.unbounded_send(ConnEvent::Disconnected(format!("{error:#}")));
-        }
-    });
+    };
     Connection {
         commands: command_tx,
         iroh,
         dialer,
         shell_requests,
         _io_task: io_task,
+        #[cfg(test)]
+        sent: Arc::new(Mutex::new(Vec::new())),
+    }
+}
+
+async fn supervise(
+    target: AttachTarget,
+    events: EventSink,
+    commands: Arc<tokio::sync::Mutex<futures_mpsc::UnboundedReceiver<ClientMessage>>>,
+    dialer: Arc<Mutex<Option<ChannelDialer>>>,
+    shell_requests: Arc<Mutex<ShellControlRequests>>,
+) {
+    let mut delay = INITIAL_RECONNECT_DELAY;
+    let mut reconnecting = false;
+    loop {
+        let mut connected = false;
+        let result = run(
+            target.clone(),
+            &events,
+            Arc::clone(&commands),
+            &dialer,
+            &shell_requests,
+            reconnecting,
+            &mut connected,
+        )
+        .await;
+        *dialer.lock().unwrap() = None;
+        if events.events.is_closed() {
+            break;
+        }
+        if connected {
+            delay = INITIAL_RECONNECT_DELAY;
+            reconnecting = false;
+        }
+        let reason = result
+            .err()
+            .map(|error| format!("{error:#}"))
+            .unwrap_or_else(|| "daemon connection closed".to_owned());
+        if (!reconnecting
+            && events
+                .unbounded_send(ConnEvent::Disconnected(reason))
+                .is_err())
+            || events.unbounded_send(ConnEvent::Recovering(delay)).is_err()
+        {
+            break;
+        }
+        tokio::time::sleep(delay).await;
+        delay = next_reconnect_delay(delay);
+        reconnecting = true;
     }
 }
 
 async fn run(
     target: AttachTarget,
     events: &EventSink,
-    mut commands: futures_mpsc::UnboundedReceiver<ClientMessage>,
+    commands: Arc<tokio::sync::Mutex<futures_mpsc::UnboundedReceiver<ClientMessage>>>,
     dialer: &Mutex<Option<ChannelDialer>>,
     shell_requests: &Mutex<ShellControlRequests>,
+    reconnecting: bool,
+    connected: &mut bool,
 ) -> anyhow::Result<()> {
     let (mut stream, agent_connection, _endpoint) = match target {
         AttachTarget::Unix(socket_path) => {
@@ -928,6 +995,10 @@ async fn run(
         })
         .is_err()
     {
+        return Ok(());
+    }
+    *connected = true;
+    if reconnecting && events.unbounded_send(ConnEvent::Recovered).is_err() {
         return Ok(());
     }
 
@@ -986,7 +1057,7 @@ async fn run(
         usage_refresh.tick().await;
         loop {
             tokio::select! {
-                message = commands.next() => {
+                message = async { commands.lock().await.next().await } => {
                     let Some(message) = message else { break };
                     if write_frame(&mut writer, &message).await.is_err() {
                         break;
@@ -1001,12 +1072,11 @@ async fn run(
         }
     });
 
-    loop {
+    let read_error = loop {
         let message: ServerMessage = match read_frame(&mut reader).await {
             Ok(message) => message,
             Err(error) => {
-                let _ = events.unbounded_send(ConnEvent::Disconnected(error.to_string()));
-                break;
+                break Some(error);
             }
         };
         let event = match message {
@@ -1203,10 +1273,11 @@ async fn run(
         if let Some(event) = event
             && events.unbounded_send(event).is_err()
         {
-            break;
+            break None;
         }
-    }
+    };
     writer_task.abort();
+    let _ = writer_task.await;
     if let Some(task) = health_task {
         task.abort();
     }
@@ -1214,7 +1285,10 @@ async fn run(
     if let Some(task) = agent_stream_task {
         task.abort();
     }
-    Ok(())
+    match read_error {
+        Some(error) => Err(error.into()),
+        None => Ok(()),
+    }
 }
 
 async fn request_git_approval(
@@ -1782,9 +1856,20 @@ mod tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::{
-        AgentFrameAllocationBudget, copy_planned_receive_pack, display_field, git_push_prompt,
+        AgentFrameAllocationBudget, INITIAL_RECONNECT_DELAY, MAX_RECONNECT_DELAY,
+        copy_planned_receive_pack, display_field, git_push_prompt, next_reconnect_delay,
         receive_pack_refs_match, validate_git_transport_request,
     };
+
+    #[test]
+    fn reconnect_backoff_caps_at_ten_seconds() {
+        let mut delay = INITIAL_RECONNECT_DELAY;
+        for _ in 0..10 {
+            delay = next_reconnect_delay(delay);
+        }
+        assert_eq!(delay, MAX_RECONNECT_DELAY);
+        assert_eq!(next_reconnect_delay(delay), MAX_RECONNECT_DELAY);
+    }
 
     fn receive_pack_input(reference: &str, old: &str, new: &str, tail: &[u8]) -> Vec<u8> {
         let command = format!("{old} {new} {reference}\0report-status\n");
