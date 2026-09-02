@@ -18,6 +18,12 @@ those obligations live in a separate app with its own badge, so the dealer
 cannot see them and the user has to go look. The desk and the dealer exist
 so the user never has to go look.
 
+The goal is to replace the Slack app entirely, not to mirror its badge:
+reading channels and direct messages, writing in them, and following
+threads all happen in rho, in the editor, with vim keys. The dealer part
+(mentions and threads as cards) is the reason to do it; the client part is
+what makes it possible to close the other app.
+
 ## Core decisions and why
 
 ### Rho is the Slack client, on the client side, with no daemon involvement
@@ -82,17 +88,33 @@ where the user's structure lives; Slack should not write into the desk on
 its own, and a filed thread should be as much a first-class row as an
 agent.
 
-### The thread surface is a real editor
+### Channels, direct messages, and threads are all the same surface
 
-A dealt or opened thread is a surface built the way the agent transcript
-is: a read-only editor holding the rendered thread, vim motions and search
-work inside it, a composer below it. `i` focuses the composer, Enter sends
-a reply into the thread, `q` closes. It enters the deal history like every
-other surface.
+A conversation surface is built the way the agent transcript is: a
+read-only editor holding the rendered messages, vim motions and search
+work inside it, a composer below it. `i` focuses the composer, Enter sends,
+`q` closes, and it enters the deal history like every other surface. A
+channel, a direct message, a group message, and a thread are the same
+surface with a different source; opening a thread from a channel is
+opening a child surface, and Space+K returns. Older history loads as the
+user scrolls up. Reading a conversation in rho marks it read in Slack, so
+the phone and other clients agree.
 
 **Why:** the transcript view is already the closest thing rho has to a
 chat, and the point of rho is that everything is the same editor with the
-same keys.
+same keys. One surface kind with four sources is also far less code than
+four surfaces.
+
+### A conversation list is the way in
+
+A list surface shows the user's channels and direct messages, unread ones
+first with the unread count, the rest by recency; a line per conversation,
+Enter opens it, search narrows it. Unread state comes from Slack, and the
+websocket keeps it current.
+
+**Why:** the dealer only deals what the user is obliged to answer; the
+rest of Slack is browsed, and browsing needs a list. It is the one piece of
+Slack's own navigation worth keeping.
 
 ### Block Kit renders to text
 
@@ -128,8 +150,8 @@ the thread identity. No strings where an enum will do.
 
 - Automatic token and cookie extraction from the embedded browser.
 - Dialogs and modals rendered as forms in the editor.
-- Reactions, sending new messages outside a thread, search, presence,
-  browsing unread channels.
+- Reactions, emoji, file upload, message editing and deletion, presence,
+  workspace-wide search.
 - Scopes and per-heading keyword filters.
 
 ## Symptoms to watch for
@@ -143,5 +165,6 @@ the thread identity. No strings where an enum will do.
 
 A mention lands as a card within a second, a reply from the thread surface
 marks it done, a later answer brings it back, a dropped connection is
-visible and heals itself, and reading a thread in rho feels like reading a
-transcript.
+visible and heals itself, and a normal day of Slack, reading channels and
+direct messages, answering, opening threads, happens without launching the
+Slack app.
