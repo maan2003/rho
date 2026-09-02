@@ -339,6 +339,42 @@ pub struct TextOpRecord {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub enum BatchOperation {
+    Tree(TreeOperation),
+    Text {
+        node_id: NodeId,
+        operation: TextOperation,
+        transaction: Option<TextTransaction>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct NodeExpectation {
+    pub node_id: NodeId,
+    pub kind: NodeKind,
+    pub owner: NodeOwner,
+    pub parent: Option<NodeId>,
+    pub order: OrderKey,
+    pub text_version: Vec<TreeClock>,
+}
+
+/// One atomic structural/textual Desk mutation. Expected versions are exact
+/// source-node preconditions; a mismatch rejects the entire batch.
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct OperationBatch {
+    pub id: TreeClock,
+    pub expected: Vec<NodeExpectation>,
+    pub operations: Vec<BatchOperation>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct BatchOpRecord {
+    pub sequence: u64,
+    pub timestamp_ms: u64,
+    pub batch: OperationBatch,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct NodeTextSnapshot {
     pub node_id: NodeId,
     pub operations: Vec<TextOperation>,
@@ -689,6 +725,21 @@ impl Document {
             .ok_or("unknown Desk node")?
             .buffer(replica_id, buffer_id)?
             .text())
+    }
+
+    pub fn text_version(&self, node_id: NodeId) -> Result<Vec<TreeClock>, String> {
+        let buffer_id = BufferId::new(1).unwrap();
+        let buffer = self
+            .texts
+            .get(&node_id)
+            .ok_or("unknown Desk node")?
+            .buffer(ReplicaId::REMOTE_SERVER.as_u16(), buffer_id)?;
+        Ok(buffer
+            .version()
+            .iter()
+            .filter(|clock| clock.value != 0)
+            .map(Into::into)
+            .collect())
     }
 
     /// Returns live nodes in depth-first display order. Placement winners are

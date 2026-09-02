@@ -1032,6 +1032,10 @@ async fn run(
             ServerMessage::DeskNodeTextApplied { record } => {
                 Some(ConnEvent::DeskNodeTextApplied(record))
             }
+            // Phase-1 clients re-snapshot after an atomic batch; Phase 2
+            // applies the record directly without exposing partial state.
+            ServerMessage::DeskTreeBatchApplied { .. } => Some(ConnEvent::DeskTreeResyncRequired),
+            ServerMessage::DeskTreeBatchRejected { .. } => Some(ConnEvent::DeskTreeResyncRequired),
             ServerMessage::DeskTreeResyncRequired => Some(ConnEvent::DeskTreeResyncRequired),
             // A `DeskGet` reply; the GUI subscribes and never sends one.
             ServerMessage::DeskDocument { .. } => None,

@@ -85,7 +85,10 @@ AI APIs.
   machine-owned nodes, and machine-node text is read-only. Individual node
   text retains the Desk's 4 MiB bounds; delete batches, text edit ranges,
   transactions, tags, and fractional-order depth are independently capped
-  before persistence. The initial org import runs locally against the previous
+  before persistence. Mixed structural/text batches validate exact source
+  node state and canonical text versions, then persist as one idempotent log
+  record; a failed precondition consumes no sequence or partial operation.
+  The initial org import runs locally against the previous
   Desk snapshot and sends no content elsewhere.
 - Opt-in GUI and daemon Dial9 profiles contain thread names, function symbols,
   local source paths, precise activity timing, and frontend marker metadata.
@@ -369,7 +372,7 @@ AI APIs.
   denial-of-service boundary. The daemon's iroh secret key lives in the local
   rho database.
   The auth stream remains raw so unauthenticated input cannot invoke a
-  decompressor. All later application directions use ALPN `rho/ui/4` and one
+  decompressor. All later application directions use ALPN `rho/ui/5` and one
   streaming zstd frame with a 128 KiB maximum decoder window. Local Unix peers
   must first exchange the fixed, ten-second-bounded `RHO-STREAM-4` preface.
   Senax frame limits are enforced on declared decompressed lengths before

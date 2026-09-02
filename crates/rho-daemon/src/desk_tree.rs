@@ -1,13 +1,13 @@
 //! Durable daemon ownership of the structured Desk document.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use redb::TableDefinition;
 use rho_db::{RhoDb, Sen, SenValue};
 use rho_desk::{
-    Binding, BindingKind, Document, NodeId, NodeKind, NodeOwner, OrderKey, PageId, Replica,
-    ReplicaAuthor, Snapshot, TemporalKind, TemporalMark, TextOpRecord, TextOperation,
-    TextTransaction, TreeClock, TreeOpRecord, TreeOperation,
+    BatchOpRecord, BatchOperation, Binding, BindingKind, Document, NodeId, NodeKind, NodeOwner,
+    OperationBatch, OrderKey, PageId, Replica, ReplicaAuthor, Snapshot, TemporalKind, TemporalMark,
+    TextOpRecord, TextOperation, TextTransaction, TreeClock, TreeOpRecord, TreeOperation,
 };
 use rho_ui_proto::desk::{DeskHeading, DeskSnapshot, TemporalMark as OldTemporalMark, parse};
 use senax_encoder::{Decode, Encode};
@@ -19,6 +19,8 @@ const TREE_OPS: TableDefinition<u64, Sen<TreeOpRecord>> =
     TableDefinition::new("rho_desk_tree_ops_v1");
 const TEXT_OPS: TableDefinition<u64, Sen<TextOpRecord>> =
     TableDefinition::new("rho_desk_node_text_ops_v1");
+const BATCH_OPS: TableDefinition<u64, Sen<BatchOpRecord>> =
+    TableDefinition::new("rho_desk_batch_ops_v1");
 
 #[derive(Clone, Debug, Encode, Decode)]
 struct PersistentState {
@@ -32,6 +34,35 @@ pub struct DeskTreeStore {
     db: RhoDb,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum BatchApplyError {
+    Conflict(String),
+    Invalid(String),
+    Unauthorized(String),
+}
+
+impl BatchApplyError {
+    pub fn retryable(&self) -> bool {
+        matches!(self, Self::Conflict(_))
+    }
+}
+
+impl std::fmt::Display for BatchApplyError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Conflict(message) | Self::Invalid(message) | Self::Unauthorized(message) => {
+                formatter.write_str(message)
+            }
+        }
+    }
+}
+
+impl From<String> for BatchApplyError {
+    fn from(message: String) -> Self {
+        Self::Invalid(message)
+    }
+}
+
 impl DeskTreeStore {
     pub async fn new(
         db: RhoDb,
@@ -41,6 +72,7 @@ impl DeskTreeStore {
         let mut write = db.write().await;
         write.open_table(TREE_OPS);
         write.open_table(TEXT_OPS);
+        write.open_table(BATCH_OPS);
         let imported = import_org(&old.document_text()?, &resolve_agent);
         if write.open_table(STATE).get(&()).is_none() {
             write.open_table(STATE).insert(
@@ -53,6 +85,7 @@ impl DeskTreeStore {
             );
         } else if write.open_table(TREE_OPS).iter().next().is_none()
             && write.open_table(TEXT_OPS).iter().next().is_none()
+            && write.open_table(BATCH_OPS).iter().next().is_none()
         {
             // Phase 1 is a shadow behind the legacy editor. Re-import on
             // startup until the first native tree operation so cutover sees
@@ -79,6 +112,7 @@ impl DeskTreeStore {
         let mut write = self.db.write().await;
         if write.open_table(TREE_OPS).iter().next().is_some()
             || write.open_table(TEXT_OPS).iter().next().is_some()
+            || write.open_table(BATCH_OPS).iter().next().is_some()
         {
             return Ok(None);
         }
@@ -113,7 +147,12 @@ impl DeskTreeStore {
             .iter()
             .map(|(sequence, record)| (sequence.value(), record.value().into_owned()))
             .collect::<Vec<_>>();
-        replay(&mut document, tree, text).expect("stored Desk operations");
+        let batches = read
+            .open_table(BATCH_OPS)
+            .iter()
+            .map(|(sequence, record)| (sequence.value(), record.value().into_owned()))
+            .collect::<Vec<_>>();
+        replay(&mut document, tree, text, batches).expect("stored Desk operations");
         let mut snapshot = document.snapshot();
         snapshot.sequence = state.next_sequence.saturating_sub(1);
         snapshot
@@ -203,6 +242,188 @@ impl DeskTreeStore {
         };
         write
             .open_table(TEXT_OPS)
+            .insert(&sequence, SenValue::borrowed(&record));
+        save_state(&mut write, &state);
+        write.commit();
+        Ok(record)
+    }
+
+    pub async fn apply_batch(
+        &self,
+        batch: OperationBatch,
+    ) -> Result<BatchOpRecord, BatchApplyError> {
+        if batch.operations.is_empty()
+            || batch.operations.len() > 4096
+            || batch.expected.len() > 4096
+        {
+            return Err(BatchApplyError::Invalid(
+                "Desk batch operation count is invalid".into(),
+            ));
+        }
+        if !matches!(
+            self.replica_author(batch.id.replica_id),
+            Some(ReplicaAuthor::User)
+        ) {
+            return Err(BatchApplyError::Unauthorized(
+                "Desk batch id has an unassigned user replica id".into(),
+            ));
+        }
+        for operation in &batch.operations {
+            let replica = match operation {
+                BatchOperation::Tree(operation) => operation.timestamp().replica_id,
+                BatchOperation::Text { operation, .. } => operation.timestamp().replica_id,
+            };
+            if replica != batch.id.replica_id {
+                return Err(BatchApplyError::Unauthorized(
+                    "Desk batch operations must use the batch replica".into(),
+                ));
+            }
+            if !matches!(self.replica_author(replica), Some(ReplicaAuthor::User)) {
+                return Err(BatchApplyError::Unauthorized(
+                    "Desk batch has an unassigned user replica id".into(),
+                ));
+            }
+        }
+        let mut write = self.db.write().await;
+        if let Some(old) = write
+            .open_table(BATCH_OPS)
+            .iter()
+            .map(|(_, record)| record.value().into_owned())
+            .find(|record| record.batch.id == batch.id)
+        {
+            return if old.batch == batch {
+                Ok(old)
+            } else {
+                Err(BatchApplyError::Invalid(
+                    "Desk batch id was reused with different content".into(),
+                ))
+            };
+        }
+        let mut state = load_state(&mut write);
+        let mut document = materialize(&mut write, &state)?;
+        let expected_nodes = batch
+            .expected
+            .iter()
+            .map(|expected| expected.node_id)
+            .collect::<BTreeSet<_>>();
+        if expected_nodes.len() != batch.expected.len() {
+            return Err(BatchApplyError::Invalid(
+                "Desk batch has duplicate text preconditions".into(),
+            ));
+        }
+        let materialized = document
+            .materialize()
+            .into_iter()
+            .map(|node| (node.id, node))
+            .collect::<BTreeMap<_, _>>();
+        let existing = materialized.keys().copied().collect::<BTreeSet<_>>();
+        for operation in &batch.operations {
+            let targets: Vec<NodeId> = match operation {
+                BatchOperation::Text { node_id, .. } => vec![*node_id],
+                BatchOperation::Tree(TreeOperation::Create { .. }) => Vec::new(),
+                BatchOperation::Tree(TreeOperation::Delete { node_ids, .. }) => node_ids.clone(),
+                BatchOperation::Tree(
+                    TreeOperation::Move { node_id, .. }
+                    | TreeOperation::SetTemporal { node_id, .. }
+                    | TreeOperation::SetBinding { node_id, .. }
+                    | TreeOperation::SetTag { node_id, .. },
+                ) => vec![*node_id],
+            };
+            if targets
+                .iter()
+                .any(|node_id| existing.contains(node_id) && !expected_nodes.contains(node_id))
+            {
+                return Err(BatchApplyError::Invalid(
+                    "Desk batch is missing a source text version".into(),
+                ));
+            }
+        }
+        for expected in &batch.expected {
+            let Some(node) = materialized.get(&expected.node_id) else {
+                return Err(BatchApplyError::Conflict(
+                    "Desk batch source node changed".into(),
+                ));
+            };
+            let canonical = expected.text_version.iter().all(|clock| clock.value != 0)
+                && expected
+                    .text_version
+                    .windows(2)
+                    .all(|pair| pair[0].replica_id < pair[1].replica_id);
+            if !canonical {
+                return Err(BatchApplyError::Invalid(
+                    "Desk batch text version is not canonical".into(),
+                ));
+            }
+            if node.kind != expected.kind
+                || node.owner != expected.owner
+                || node.parent != expected.parent
+                || node.order != expected.order
+                || document.text_version(expected.node_id)? != expected.text_version
+            {
+                return Err(BatchApplyError::Conflict(
+                    "Desk batch source text version changed".into(),
+                ));
+            }
+        }
+        for operation in &batch.operations {
+            match operation {
+                BatchOperation::Tree(operation) => {
+                    authorize_user_tree_operation(&document, operation)
+                        .map_err(BatchApplyError::Unauthorized)?;
+                    if !document.apply(operation.clone())? {
+                        return Err(BatchApplyError::Invalid(
+                            "duplicate Desk batch tree timestamp".into(),
+                        ));
+                    }
+                }
+                BatchOperation::Text {
+                    node_id,
+                    operation,
+                    transaction,
+                } => {
+                    let node = document
+                        .materialize()
+                        .into_iter()
+                        .find(|node| node.id == *node_id)
+                        .ok_or_else(|| {
+                            BatchApplyError::Invalid(
+                                "Desk batch text references a deleted node".into(),
+                            )
+                        })?;
+                    if node.owner != NodeOwner::User {
+                        return Err(BatchApplyError::Unauthorized(
+                            "machine-owned Desk nodes are read-only".into(),
+                        ));
+                    }
+                    if !document.apply_text(*node_id, operation.clone(), transaction.clone())? {
+                        return Err(BatchApplyError::Invalid(
+                            "duplicate Desk batch text timestamp".into(),
+                        ));
+                    }
+                    if document
+                        .text(
+                            *node_id,
+                            ReplicaId::REMOTE_SERVER.as_u16(),
+                            BufferId::new(1).unwrap(),
+                        )?
+                        .len()
+                        > 4 * 1024 * 1024
+                    {
+                        return Err(BatchApplyError::Invalid(
+                            "Desk node text exceeds 4194304 bytes".into(),
+                        ));
+                    }
+                }
+            }
+        }
+        let sequence = take_sequence(&mut state)?;
+        let record = BatchOpRecord {
+            sequence,
+            timestamp_ms: rho_core::UnixMs::now().0,
+            batch,
+        };
+        write
+            .open_table(BATCH_OPS)
             .insert(&sequence, SenValue::borrowed(&record));
         save_state(&mut write, &state);
         write.commit();
@@ -300,19 +521,26 @@ fn materialize(write: &mut rho_db::WriteTxn, state: &PersistentState) -> Result<
         .iter()
         .map(|(sequence, record)| (sequence.value(), record.value().into_owned()))
         .collect::<Vec<_>>();
-    replay(&mut document, tree, text)?;
+    let batches = write
+        .open_table(BATCH_OPS)
+        .iter()
+        .map(|(sequence, record)| (sequence.value(), record.value().into_owned()))
+        .collect::<Vec<_>>();
+    replay(&mut document, tree, text, batches)?;
     Ok(document)
 }
 
 enum StoredOperation {
     Tree(TreeOpRecord),
     Text(TextOpRecord),
+    Batch(BatchOpRecord),
 }
 
 fn replay(
     document: &mut Document,
     tree: impl IntoIterator<Item = (u64, TreeOpRecord)>,
     text: impl IntoIterator<Item = (u64, TextOpRecord)>,
+    batches: impl IntoIterator<Item = (u64, BatchOpRecord)>,
 ) -> Result<(), String> {
     let mut operations = tree
         .into_iter()
@@ -320,6 +548,11 @@ fn replay(
         .chain(
             text.into_iter()
                 .map(|(sequence, record)| (sequence, StoredOperation::Text(record))),
+        )
+        .chain(
+            batches
+                .into_iter()
+                .map(|(sequence, record)| (sequence, StoredOperation::Batch(record))),
         )
         .collect::<Vec<_>>();
     operations.sort_by_key(|(sequence, _)| *sequence);
@@ -330,6 +563,22 @@ fn replay(
             }
             StoredOperation::Text(record) => {
                 document.apply_text(record.node_id, record.operation, record.transaction)?;
+            }
+            StoredOperation::Batch(record) => {
+                for operation in record.batch.operations {
+                    match operation {
+                        BatchOperation::Tree(operation) => {
+                            document.apply(operation)?;
+                        }
+                        BatchOperation::Text {
+                            node_id,
+                            operation,
+                            transaction,
+                        } => {
+                            document.apply_text(node_id, operation, transaction)?;
+                        }
+                    }
+                }
             }
         }
     }
@@ -640,6 +889,22 @@ mod tests {
         }
     }
 
+    fn expectation(document: &Document, node_id: NodeId) -> rho_desk::NodeExpectation {
+        let node = document
+            .materialize()
+            .into_iter()
+            .find(|node| node.id == node_id)
+            .unwrap();
+        rho_desk::NodeExpectation {
+            node_id,
+            kind: node.kind,
+            owner: node.owner,
+            parent: node.parent,
+            order: node.order,
+            text_version: document.text_version(node_id).unwrap(),
+        }
+    }
+
     #[test]
     fn imports_headings_prose_marks_and_tags() {
         let snapshot = import_org(
@@ -758,6 +1023,160 @@ mod tests {
                 .text(node_id, 33, BufferId::new(33).unwrap())
                 .unwrap(),
             "hello\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_rejects_stale_text_versions_without_partial_tree_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = RhoDb::open(directory.path().join("desk-tree.redb"));
+        let store = DeskTreeStore::new(db, &DeskSnapshot::default(), |_| None)
+            .await
+            .unwrap();
+        let replica = store.allocate_replica(ReplicaAuthor::User).await.unwrap();
+        let node_id = NodeId {
+            replica_id: replica,
+            counter: 1,
+        };
+        store
+            .apply_tree(TreeOperation::Create {
+                timestamp: TreeClock {
+                    value: 1,
+                    replica_id: replica,
+                },
+                node_id,
+                kind: NodeKind::Prose,
+                owner: NodeOwner::User,
+                parent: None,
+                order: OrderKey(vec![100]),
+            })
+            .await
+            .unwrap();
+        let mut buffer = text::Buffer::new(ReplicaId::new(replica), BufferId::new(1).unwrap(), "");
+        let first = TextOperation::from_text(&buffer.edit([(0..0, "before")]));
+        store.apply_text(node_id, first, None).await.unwrap();
+        let before = Document::from_snapshot(store.snapshot()).unwrap();
+        let expected = expectation(&before, node_id);
+
+        let concurrent = TextOperation::from_text(&buffer.edit([(6..6, " concurrent")]));
+        store.apply_text(node_id, concurrent, None).await.unwrap();
+        let result = store
+            .apply_batch(OperationBatch {
+                id: TreeClock {
+                    value: 10,
+                    replica_id: replica,
+                },
+                expected: vec![expected],
+                operations: vec![BatchOperation::Tree(TreeOperation::Delete {
+                    timestamp: TreeClock {
+                        value: 4,
+                        replica_id: replica,
+                    },
+                    node_ids: vec![node_id],
+                })],
+            })
+            .await;
+        assert_eq!(
+            result.unwrap_err(),
+            BatchApplyError::Conflict("Desk batch source text version changed".into())
+        );
+        let after = Document::from_snapshot(store.snapshot()).unwrap();
+        assert_eq!(after.materialize().len(), 1);
+        assert_eq!(
+            after.text(node_id, 9, BufferId::new(9).unwrap()).unwrap(),
+            "before concurrent"
+        );
+        let current = expectation(&after, node_id);
+        let created_id = NodeId {
+            replica_id: replica,
+            counter: 2,
+        };
+        let missing_id = NodeId {
+            replica_id: replica,
+            counter: 3,
+        };
+        let mut missing_buffer =
+            text::Buffer::new(ReplicaId::new(replica), BufferId::new(3).unwrap(), "");
+        let invalid_text = TextOperation::from_text(&missing_buffer.edit([(0..0, "lost")]));
+        let late_failure = store
+            .apply_batch(OperationBatch {
+                id: TreeClock {
+                    value: 12,
+                    replica_id: replica,
+                },
+                expected: vec![current.clone()],
+                operations: vec![
+                    BatchOperation::Tree(TreeOperation::Create {
+                        timestamp: TreeClock {
+                            value: 6,
+                            replica_id: replica,
+                        },
+                        node_id: created_id,
+                        kind: NodeKind::Heading,
+                        owner: NodeOwner::User,
+                        parent: None,
+                        order: OrderKey(vec![200]),
+                    }),
+                    BatchOperation::Text {
+                        node_id: missing_id,
+                        operation: invalid_text,
+                        transaction: None,
+                    },
+                ],
+            })
+            .await;
+        assert!(matches!(late_failure, Err(BatchApplyError::Invalid(_))));
+        let unchanged = store.snapshot();
+        assert_eq!(unchanged.sequence, 3);
+        assert_eq!(
+            Document::from_snapshot(unchanged)
+                .unwrap()
+                .materialize()
+                .len(),
+            1
+        );
+        let batch = OperationBatch {
+            id: TreeClock {
+                value: 11,
+                replica_id: replica,
+            },
+            expected: vec![current],
+            operations: vec![BatchOperation::Tree(TreeOperation::Delete {
+                timestamp: TreeClock {
+                    value: 5,
+                    replica_id: replica,
+                },
+                node_ids: vec![node_id],
+            })],
+        };
+        let record = store.apply_batch(batch.clone()).await.unwrap();
+        assert_eq!(record.sequence, 4);
+        assert_eq!(store.apply_batch(batch).await.unwrap().sequence, 4);
+        assert_eq!(
+            store
+                .apply_batch(OperationBatch {
+                    id: TreeClock {
+                        value: 11,
+                        replica_id: replica,
+                    },
+                    expected: Vec::new(),
+                    operations: vec![BatchOperation::Tree(TreeOperation::Delete {
+                        timestamp: TreeClock {
+                            value: 6,
+                            replica_id: replica,
+                        },
+                        node_ids: vec![node_id],
+                    })],
+                })
+                .await
+                .unwrap_err(),
+            BatchApplyError::Invalid("Desk batch id was reused with different content".into())
+        );
+        assert!(
+            Document::from_snapshot(store.snapshot())
+                .unwrap()
+                .materialize()
+                .is_empty()
         );
     }
 

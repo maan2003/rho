@@ -531,7 +531,7 @@ transitions. `rho-iroh-auth` owns the trusted-client table, temporary trust,
 and pending enrollments in `rho-db`; the daemon supplies only the application
 ALPN and retains approve/revoke command routing. Each post-authentication application direction is
 one streaming zstd frame with a 128 KiB maximum history window; Senax length
-limits apply to decompressed payloads. The iroh ALPN is `rho/ui/4` and Unix
+limits apply to decompressed payloads. The iroh ALPN is `rho/ui/5` and Unix
 peers exchange the fixed `RHO-STREAM-4` preface before compression.
 The protocol crate owns only wire types, limits, and state diffs; `rho-daemon`
 projects the richer `rho-agent` runtime state into that wire shape. Consequently UI

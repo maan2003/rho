@@ -1,4 +1,4 @@
-//! Direct browser iroh connection to the daemon's `rho/ui/4` protocol.
+//! Direct browser iroh connection to the daemon's `rho/ui/5` protocol.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -461,6 +461,8 @@ fn handle_host_message(
         ServerMessage::DeskNodeTextApplied { record } => {
             Some(ConnEvent::DeskNodeTextApplied(record.clone()))
         }
+        ServerMessage::DeskTreeBatchApplied { .. } => Some(ConnEvent::DeskTreeResyncRequired),
+        ServerMessage::DeskTreeBatchRejected { .. } => Some(ConnEvent::DeskTreeResyncRequired),
         ServerMessage::DeskTreeResyncRequired => Some(ConnEvent::DeskTreeResyncRequired),
         _ => None,
     };

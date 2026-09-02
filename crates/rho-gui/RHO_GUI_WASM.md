@@ -108,7 +108,7 @@ without JavaScript `eval`; COOP/COEP remain required for shared wasm memory.
 The canonical `Workspace` now lives in `workspace.rs` on both targets and owns
 the registry, store, subscriptions, model cache, and lifecycle transitions.
 Its browser child contains only browser transport/chrome, touch layout, and
-render state. The browser uses direct iroh (ALPN `rho/ui/4`) with the same
+render state. The browser uses direct iroh (ALPN `rho/ui/5`) with the same
 WebAuthn PRF identity/enrollment flow and feeds frames into the same workspace
 state and `AgentModel` synchronization path as native.
 

@@ -2597,6 +2597,26 @@ async fn handle_message(
                 .send(ServerMessage::DeskNodeTextApplied { record });
             Ok(Refresh::None)
         }
+        ClientMessage::DeskTreeBatchApply { batch } => {
+            let id = batch.id;
+            match agents.desk_tree.apply_batch(batch).await {
+                Ok(record) => {
+                    let _ = agents
+                        .events
+                        .send(ServerMessage::DeskTreeBatchApplied { record });
+                }
+                Err(error) => {
+                    let retryable = error.retryable();
+                    let _ = outgoing_tx.send(ServerMessage::DeskTreeBatchRejected {
+                        id,
+                        retryable,
+                        reason: error.to_string(),
+                        snapshot: agents.desk_tree.snapshot(),
+                    });
+                }
+            }
+            Ok(Refresh::None)
+        }
         ClientMessage::RecordVisualization { mime_type, content } => {
             let id = agents.visualizations.record(mime_type, content).await?;
             let _ = outgoing_tx.send(ServerMessage::VisualizationRecorded { id });

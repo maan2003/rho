@@ -38,9 +38,9 @@ pub const AGENT_COST_WINDOW_DAYS: u64 = 7;
 /// Maximum encoded GUI performance snapshot accepted by the daemon.
 pub const MAX_GUI_TELEMETRY_BYTES: usize = 8 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the daemon.
-pub const IROH_ALPN: &[u8] = b"rho/ui/4";
+pub const IROH_ALPN: &[u8] = b"rho/ui/5";
 #[cfg(not(target_family = "wasm"))]
-const PROTOCOL_LOG_MAGIC: &[u8; 4] = b"RUP3";
+const PROTOCOL_LOG_MAGIC: &[u8; 4] = b"RUP4";
 
 /// Fixed per-user daemon socket used by normal CLI and Git helper clients.
 #[cfg(not(target_family = "wasm"))]
@@ -80,6 +80,9 @@ pub enum ClientMessage {
         node_id: desk_tree::NodeId,
         operation: desk_tree::TextOperation,
         transaction: Option<desk_tree::TextTransaction>,
+    },
+    DeskTreeBatchApply {
+        batch: desk_tree::OperationBatch,
     },
     NewAgent {
         role: AgentRole,
@@ -545,6 +548,15 @@ pub enum ServerMessage {
     },
     DeskNodeTextApplied {
         record: desk_tree::TextOpRecord,
+    },
+    DeskTreeBatchApplied {
+        record: desk_tree::BatchOpRecord,
+    },
+    DeskTreeBatchRejected {
+        id: desk_tree::TreeClock,
+        retryable: bool,
+        reason: String,
+        snapshot: desk_tree::Snapshot,
     },
     /// The daemon's broadcast receiver lagged; request a new tree snapshot.
     DeskTreeResyncRequired,
@@ -1223,7 +1235,7 @@ mod tests {
 
     #[test]
     fn protocol_log_rejects_previous_wire_epoch() {
-        let mut old = &b"RUP2"[..];
+        let mut old = &b"RUP3"[..];
         assert!(read_protocol_log_record(&mut old).is_err());
     }
 
@@ -1243,7 +1255,24 @@ mod tests {
             parent: None,
             order: desk_tree::OrderKey(vec![100]),
         };
-        let message = ClientMessage::DeskTreeApply { operation };
+        let message = ClientMessage::DeskTreeApply {
+            operation: operation.clone(),
+        };
+        let bytes = senax_encoder::pack(&message).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded: ClientMessage = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(decoded, message);
+
+        let message = ClientMessage::DeskTreeBatchApply {
+            batch: desk_tree::OperationBatch {
+                id: desk_tree::TreeClock {
+                    value: 8,
+                    replica_id: 4,
+                },
+                expected: Vec::new(),
+                operations: vec![desk_tree::BatchOperation::Tree(operation)],
+            },
+        };
         let bytes = senax_encoder::pack(&message).unwrap();
         let mut slice: &[u8] = &bytes;
         let decoded: ClientMessage = senax_encoder::unpack(&mut slice).unwrap();
