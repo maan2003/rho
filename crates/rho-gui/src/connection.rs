@@ -912,7 +912,6 @@ async fn supervise(
             Arc::clone(&commands),
             &dialer,
             &shell_requests,
-            reconnecting,
             &mut connected,
         )
         .await;
@@ -948,7 +947,6 @@ async fn run(
     commands: Arc<tokio::sync::Mutex<futures_mpsc::UnboundedReceiver<ClientMessage>>>,
     dialer: &Mutex<Option<ChannelDialer>>,
     shell_requests: &Mutex<ShellControlRequests>,
-    reconnecting: bool,
     connected: &mut bool,
 ) -> anyhow::Result<()> {
     let (mut stream, agent_connection, _endpoint) = match target {
@@ -998,7 +996,7 @@ async fn run(
         return Ok(());
     }
     *connected = true;
-    if reconnecting && events.unbounded_send(ConnEvent::Recovered).is_err() {
+    if events.unbounded_send(ConnEvent::Recovered).is_err() {
         return Ok(());
     }
 
