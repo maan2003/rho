@@ -126,7 +126,8 @@ actions!(
         OverviewToggle,
         SurfaceClose,
         ZulipNextUnread,
-        ZulipLoadOlder
+        ZulipLoadOlder,
+        MessagesOpen
     ]
 );
 

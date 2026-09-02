@@ -100,6 +100,7 @@ pub enum DealerVerdict {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SurfaceIdentity {
     Draft,
+    Messages,
     DeskHeading { host: String, heading_offset: usize },
     Inbox { id: String },
     Transcript { agent_id: String },

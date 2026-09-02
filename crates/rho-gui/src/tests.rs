@@ -2859,7 +2859,7 @@ fn editing_startup_draft_prevents_first_frame_auto_selection(cx: &mut TestAppCon
 }
 
 #[gpui::test]
-fn system_notices_survive_transcript_rerenders(cx: &mut TestAppContext) {
+fn notices_append_to_messages_without_changing_the_transcript(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     feed_frame(
         &workspace,
@@ -2867,38 +2867,79 @@ fn system_notices_survive_transcript_rerenders(cx: &mut TestAppContext) {
         agent(1),
         snapshot_frame(state(vec![user("first")], Vec::new())),
     );
+    let transcript_before = buffer_text(&workspace, cx);
+    workspace
+        .update(cx, |workspace, _, cx| {
+            workspace.notice_for_test(Some(&agent(1)), "boom", cx);
+        })
+        .expect("post notice");
+    assert!(
+        workspace
+            .update(cx, |workspace, _, _| workspace
+                .message_log_texts()
+                .iter()
+                .any(|message| message.ends_with(": boom")))
+            .expect("read messages"),
+        "notice should be retained in the message log"
+    );
+    assert_eq!(buffer_text(&workspace, cx), transcript_before);
+}
+
+#[gpui::test]
+fn messages_surface_renders_in_order_and_follows_new_entries(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(
                 HostId::default(),
-                ConnEvent::ServerError("boom".to_owned()),
+                ConnEvent::ServerError("first".to_owned()),
                 window,
                 cx,
             );
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::ServerError("second".to_owned()),
+                window,
+                cx,
+            );
+            workspace.cmd_messages(window, cx);
         })
-        .expect("post notice");
-    assert!(display_text(&workspace, cx).contains("[rho daemon error: boom]"));
-
-    // A full snapshot re-render replaces the entire transcript projection;
-    // the local notice must survive.
-    feed_frame(
-        &workspace,
-        cx,
-        agent(1),
-        snapshot_frame(state(
-            vec![
-                user("first"),
-                assistant("answer", Some(UiMessagePhase::FinalAnswer)),
-            ],
-            Vec::new(),
-        )),
-    );
-    let text = display_text(&workspace, cx);
+        .expect("open messages");
+    let initial = buffer_text(&workspace, cx);
     assert!(
-        text.contains("[rho daemon error: boom]"),
-        "local notices should survive transcript re-renders: {text:?}"
+        initial.find("first").unwrap() < initial.find("second").unwrap(),
+        "messages should render oldest to newest: {initial:?}"
     );
-    assert!(text.contains("answer"));
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::ServerError("third".to_owned()),
+                window,
+                cx,
+            );
+            assert!(workspace.messages_following(cx));
+        })
+        .expect("append while messages are open");
+    assert!(buffer_text(&workspace, cx).ends_with("[rho daemon error: third]\n"));
+}
+
+#[gpui::test]
+fn message_log_cap_evicts_the_oldest_entries(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, _, _| {
+            for index in 0..=crate::workspace::MESSAGE_LOG_CAP {
+                workspace.append_test_log_entry(format!("message-{index}"));
+            }
+            let messages = workspace.message_log_texts();
+            assert_eq!(messages.len(), crate::workspace::MESSAGE_LOG_CAP);
+            assert_eq!(messages.first(), Some(&"message-1"));
+            let expected_last = format!("message-{}", crate::workspace::MESSAGE_LOG_CAP);
+            assert_eq!(messages.last(), Some(&expected_last.as_str()));
+        })
+        .expect("fill message log");
 }
 
 #[gpui::test]
@@ -3019,12 +3060,17 @@ fn submit_prompt_bubbles_from_the_editor_to_the_workspace(cx: &mut TestAppContex
 
     cx.dispatch_action(*workspace, crate::SubmitPrompt);
 
-    // Not connected, so the submission surfaces as a system notice — proving
-    // the action reached the workspace handler.
+    // Not connected, so the submission reaches the message log — proving the
+    // action reached the workspace handler without changing the draft.
     let text = display_text(&workspace, cx);
     assert!(
-        text.contains("not connected to rho-daemon"),
-        "submit should reach the workspace and report the failed send: {text:?}"
+        workspace
+            .update(cx, |workspace, _, _| workspace
+                .message_log_texts()
+                .iter()
+                .any(|message| message.contains("not connected to rho-daemon")))
+            .expect("read messages"),
+        "submit should reach the workspace and report the failed send"
     );
     // Draft submissions keep the buffer until the daemon confirms creation,
     // so a failed send never loses the message.
@@ -3038,10 +3084,16 @@ fn submit_prompt_bubbles_from_the_editor_to_the_workspace(cx: &mut TestAppContex
 fn upload_gui_telemetry_action_reports_when_no_daemon_is_connected(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     cx.dispatch_action(*workspace, crate::UploadGuiTelemetry);
-    let text = display_text(&workspace, cx);
     assert!(
-        text.contains("performance snapshot: no daemon is connected"),
-        "telemetry action should reach the workspace and fail nonfatally: {text:?}"
+        workspace
+            .update(cx, |workspace, _, _| workspace
+                .message_log_texts()
+                .iter()
+                .any(
+                    |message| message.contains("performance snapshot: no daemon is connected")
+                ))
+            .expect("read messages"),
+        "telemetry action should reach the workspace and fail nonfatally"
     );
 }
 

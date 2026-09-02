@@ -32,6 +32,7 @@ pub(crate) enum SurfaceKind {
     Browser,
     ZulipInbox,
     ZulipNarrow,
+    Messages,
 }
 
 impl SurfaceKind {
@@ -51,11 +52,12 @@ impl SurfaceKind {
             Self::Browser => "browser",
             Self::ZulipInbox => "zulip_inbox",
             Self::ZulipNarrow => "zulip_narrow",
+            Self::Messages => "messages",
         }
     }
 }
 
-const SURFACE_KINDS: [SurfaceKind; 10] = [
+const SURFACE_KINDS: [SurfaceKind; 11] = [
     SurfaceKind::Dashboard,
     SurfaceKind::Draft,
     SurfaceKind::Transcript,
@@ -66,6 +68,7 @@ const SURFACE_KINDS: [SurfaceKind; 10] = [
     SurfaceKind::Browser,
     SurfaceKind::ZulipInbox,
     SurfaceKind::ZulipNarrow,
+    SurfaceKind::Messages,
 ];
 
 #[derive(Clone, Copy)]
@@ -416,7 +419,7 @@ fn snapshot_with_cpu_profiles(cpu_profiles: &[Vec<u8>]) -> anyhow::Result<Vec<u8
         .collect();
     let bytes = serde_json::to_vec_pretty(&Snapshot {
         schema: "dev.rho.gui-performance-snapshot",
-        version: 8,
+        version: 9,
         captured_unix_ms: SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -538,7 +541,7 @@ mod tests {
         assert!(bytes.len() <= rho_ui_proto::MAX_GUI_TELEMETRY_BYTES);
         let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(value["schema"], "dev.rho.gui-performance-snapshot");
-        assert_eq!(value["version"], 8);
+        assert_eq!(value["version"], 9);
         assert_eq!(value["build"]["profile"], env!("RHO_BUILD_PROFILE"));
         assert_eq!(value["build"]["opt_level"], env!("RHO_BUILD_OPT_LEVEL"));
         assert_eq!(value["build"]["target"], env!("RHO_BUILD_TARGET"));

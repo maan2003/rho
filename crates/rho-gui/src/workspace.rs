@@ -20,7 +20,7 @@ pub(crate) use phone::set_touch_modal_editing;
 #[path = "workspace_web.rs"]
 mod web;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(feature = "native")]
 use std::path::PathBuf;
 use std::time::Duration;
@@ -76,12 +76,33 @@ use crate::{
     DashboardNewAgent, DashboardNow, DashboardPromote, DashboardRenameTopic, DashboardReply,
     DashboardStaff, DashboardSubmit, DashboardToggleAgentTree, DashboardToggleSubagents,
     DashboardUndo, DealCloseAndNext, DealOpen, GitApprovalAllow, GitApprovalDeny, InboxCapture,
-    MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious,
-    OverviewToggle, PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof,
-    ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit, SubmitPrompt, SurfaceBack,
-    SurfaceClose, TaskBoard, UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder, ZulipNextUnread,
-    ZulipOpenRow,
+    MessagesOpen, MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext,
+    MinibufferPrevious, OverviewToggle, PastePrompt, RailFocus, RailOpen, RoleCycle,
+    RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit,
+    SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, UploadGuiTelemetry, VoiceToggle,
+    ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
 };
+
+pub(crate) const MESSAGE_LOG_CAP: usize = 4096;
+
+#[derive(Clone)]
+struct MessageLogEntry {
+    timestamp: chrono::DateTime<chrono::FixedOffset>,
+    class: StyleClass,
+    text: String,
+}
+
+#[derive(Default)]
+struct MessageLog(VecDeque<MessageLogEntry>);
+
+impl MessageLog {
+    fn push(&mut self, entry: MessageLogEntry) {
+        self.0.push_back(entry);
+        if self.0.len() > MESSAGE_LOG_CAP {
+            self.0.pop_front();
+        }
+    }
+}
 
 #[derive(Clone)]
 struct WarmSurface {
@@ -163,6 +184,7 @@ enum SurfaceView {
     Draft {
         editor: Entity<editor::Editor>,
     },
+    Messages(Entity<editor::Editor>),
     DeskHeading(Entity<editor::Editor>),
     Inbox(Entity<editor::Editor>),
     Transcript {
@@ -191,6 +213,7 @@ impl SurfaceView {
         use crate::telemetry::SurfaceKind;
         match self {
             Self::Draft { .. } => SurfaceKind::Draft,
+            Self::Messages(_) => SurfaceKind::Messages,
             Self::DeskHeading(_) | Self::Inbox(_) => SurfaceKind::Dashboard,
             Self::Transcript { .. } => SurfaceKind::Transcript,
             Self::File(_) => SurfaceKind::File,
@@ -365,6 +388,10 @@ pub struct Workspace {
     pending_frames: Vec<PendingAgentFrame>,
     frame_flush_scheduled: bool,
     draft_model: Entity<DraftModel>,
+    message_log: MessageLog,
+    messages_buffer: Entity<language::Buffer>,
+    messages_editor: Entity<editor::Editor>,
+    messages_styles: Vec<(StyleClass, std::ops::Range<text::Anchor>)>,
     /// Registered workdirs from every attached daemon; selection vocabulary
     /// for new agents, and what decides which host a new agent lands on.
     workdirs: Vec<HostProject>,
@@ -809,6 +836,22 @@ impl Workspace {
         let workspace = cx.entity().downgrade();
         let mode_indicator = cx.new(|cx| vim::ModeIndicator::new(window, cx));
         let draft_model = cx.new(|cx| DraftModel::new(workspace, cx));
+        let messages_buffer = cx.new(|cx| {
+            let mut buffer = language::Buffer::local("", cx);
+            buffer.set_capability(language::Capability::Read, cx);
+            buffer
+        });
+        let messages_editor = cx.new(|cx| {
+            let mut editor = editor::Editor::for_buffer(messages_buffer.clone(), None, window, cx);
+            crate::editor_config::configure(&mut editor, window, cx);
+            editor.set_read_only(true);
+            editor.set_autoscroll_pin(
+                multi_buffer::Anchor::Max,
+                editor::scroll::AutoscrollStrategy::Bottom,
+                cx,
+            );
+            editor
+        });
         let event_task = cx.spawn(async move |this, cx| {
             let mut events: UnboundedReceiver<HostEvent> = events;
             while let Some(event) = events.next().await {
@@ -957,6 +1000,10 @@ impl Workspace {
             pending_frames: Vec::new(),
             frame_flush_scheduled: false,
             draft_model,
+            message_log: MessageLog::default(),
+            messages_buffer,
+            messages_editor,
+            messages_styles: Vec::new(),
             workdirs: Vec::new(),
             new_agent_draft: None,
             awaiting_draft_agent: None,
@@ -4453,8 +4500,8 @@ impl Workspace {
         })
     }
 
-    /// Emacs `message`: the notice lands in the transcript (the durable
-    /// log) and flashes in the echo area at the bottom of the window.
+    /// Records a notice outside the conversation and flashes it in the echo
+    /// area.
     fn notice_on(
         &mut self,
         agent_id: Option<&AgentId>,
@@ -4462,22 +4509,75 @@ impl Workspace {
         class: StyleClass,
         cx: &mut Context<Self>,
     ) {
-        let view = agent_id
-            .or_else(|| self.registry.selected_agent())
-            .and_then(|agent_id| self.models.get(agent_id))
-            .cloned();
-        match view {
-            Some(view) => view.update(cx, |view, cx| view.system_notice(text, class, cx)),
-            None => self
-                .draft_model
-                .update(cx, |view, cx| view.system_notice(text, class, cx)),
-        }
-        self.echo(text, class, cx);
+        let logged = match agent_id {
+            Some(agent_id) => format!("{}: {text}", self.registry.agent_display_label(*agent_id)),
+            None => text.to_owned(),
+        };
+        self.append_message(logged, class, cx);
+        self.show_echo(text, class, cx);
     }
 
-    /// Shows a message in the echo area; replacing a message cancels its
-    /// predecessor's dismiss timer.
+    /// Records and shows a message in the echo area.
     fn echo(&mut self, text: &str, class: StyleClass, cx: &mut Context<Self>) {
+        self.append_message(text.to_owned(), class, cx);
+        self.show_echo(text, class, cx);
+    }
+
+    fn append_message(&mut self, text: String, class: StyleClass, cx: &mut Context<Self>) {
+        self.message_log.push(MessageLogEntry {
+            timestamp: chrono::Local::now().fixed_offset(),
+            class,
+            text: text.lines().collect::<Vec<_>>().join(" "),
+        });
+        let mut rendered = String::new();
+        let mut spans = Vec::with_capacity(self.message_log.0.len());
+        for entry in &self.message_log.0 {
+            let start = rendered.len();
+            use std::fmt::Write as _;
+            let _ = writeln!(
+                rendered,
+                "{}  {}",
+                entry.timestamp.format("%H:%M"),
+                entry.text
+            );
+            spans.push((entry.class, start..rendered.len()));
+        }
+        self.messages_buffer.update(cx, |buffer, cx| {
+            let old_len = buffer.len();
+            buffer.edit([(0..old_len, rendered.as_str())], None, cx);
+            self.messages_styles = spans
+                .into_iter()
+                .map(|(class, range)| {
+                    (
+                        class,
+                        buffer.anchor_before(range.start)..buffer.anchor_before(range.end),
+                    )
+                })
+                .collect();
+        });
+
+        let multi_buffer = self.messages_editor.read(cx).buffer().clone();
+        let mut by_class: Vec<(StyleClass, Vec<std::ops::Range<text::Anchor>>)> = Vec::new();
+        for (class, range) in &self.messages_styles {
+            match by_class.iter_mut().find(|(existing, _)| existing == class) {
+                Some((_, ranges)) => ranges.push(range.clone()),
+                None => by_class.push((*class, vec![range.clone()])),
+            }
+        }
+        crate::highlights::apply_class_highlights(
+            &self.messages_editor,
+            &multi_buffer,
+            crate::style::Region::System,
+            by_class
+                .iter()
+                .map(|(class, ranges)| (*class, ranges.as_slice())),
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// Replacing a message cancels its predecessor's dismiss timer.
+    fn show_echo(&mut self, text: &str, class: StyleClass, cx: &mut Context<Self>) {
         let dismiss = cx.spawn(async move |this, cx| {
             cx.background_executor().timer(ECHO_DURATION).await;
             let _ = this.update(cx, |this, cx| {
@@ -4487,6 +4587,47 @@ impl Workspace {
         });
         self.echo = Some(Echo::new(text, class, dismiss));
         cx.notify();
+    }
+
+    pub(crate) fn cmd_messages(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let surface = self.make_surface(SurfaceKey::Messages, window, cx);
+        self.display_surface(surface, cx);
+        self.sync_selection_to_focus(cx);
+        self.focus_active_surface(window, cx);
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn message_log_texts(&self) -> Vec<&str> {
+        self.message_log
+            .0
+            .iter()
+            .map(|entry| entry.text.as_str())
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn append_test_log_entry(&mut self, text: String) {
+        self.message_log.push(MessageLogEntry {
+            timestamp: chrono::Local::now().fixed_offset(),
+            class: StyleClass::SystemInfo,
+            text,
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn notice_for_test(
+        &mut self,
+        agent_id: Option<&AgentId>,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.notice_on(agent_id, text, StyleClass::SystemInfo, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn messages_following(&self, cx: &App) -> bool {
+        self.messages_editor.read(cx).has_active_autoscroll_pin()
     }
 
     pub fn select_agent(
@@ -4671,6 +4812,7 @@ impl Workspace {
     fn surface_name(&self, key: &SurfaceKey) -> String {
         match key {
             SurfaceKey::Draft => "draft".to_owned(),
+            SurfaceKey::Messages => "messages".to_owned(),
             SurfaceKey::DeskHeading { heading_offset, .. } => format!("desk {heading_offset}"),
             SurfaceKey::Inbox(id) => format!("inbox {id}"),
             SurfaceKey::Transcript(agent_id) => self.registry.agent_display_label(*agent_id),
@@ -4698,6 +4840,7 @@ impl Workspace {
     fn surface_kind(key: &SurfaceKey) -> &'static str {
         match key {
             SurfaceKey::Draft => "compose",
+            SurfaceKey::Messages => "messages",
             SurfaceKey::DeskHeading { .. } => "desk heading",
             SurfaceKey::Inbox(_) => "inbox",
             SurfaceKey::Transcript(_) => "transcript",
@@ -4864,6 +5007,7 @@ impl Workspace {
         use crate::journal::SurfaceIdentity;
         match key {
             SurfaceKey::Draft => SurfaceIdentity::Draft,
+            SurfaceKey::Messages => SurfaceIdentity::Messages,
             SurfaceKey::DeskHeading {
                 host,
                 heading_offset,
@@ -4944,6 +5088,7 @@ impl Workspace {
             let pane = self.active_pane();
             let position = match &pane.surface.view {
                 SurfaceView::Draft { editor, .. }
+                | SurfaceView::Messages(editor)
                 | SurfaceView::DeskHeading(editor)
                 | SurfaceView::Inbox(editor)
                 | SurfaceView::Transcript { editor, .. }
@@ -5900,6 +6045,7 @@ impl Workspace {
     pub(crate) fn active_editor(&self, cx: &gpui::App) -> Entity<editor::Editor> {
         match &self.active_pane().surface.view {
             SurfaceView::Draft { editor, .. } => editor.clone(),
+            SurfaceView::Messages(editor) => editor.clone(),
             SurfaceView::DeskHeading(editor) | SurfaceView::Inbox(editor) => editor.clone(),
             SurfaceView::Transcript { editor, .. } => editor.clone(),
             SurfaceView::File(view) => view.read(cx).editor().clone(),
@@ -5952,6 +6098,7 @@ impl Workspace {
         }
         match &self.active_pane().surface.view {
             SurfaceView::Draft { editor, .. } => editor.focus_handle(cx),
+            SurfaceView::Messages(editor) => editor.focus_handle(cx),
             SurfaceView::DeskHeading(editor) | SurfaceView::Inbox(editor) => {
                 editor.focus_handle(cx)
             }
@@ -5980,6 +6127,7 @@ impl Workspace {
             | SurfaceKey::Diff { agent_id }
             | SurfaceKey::Terminal { agent_id, .. } => Some(*agent_id),
             SurfaceKey::Draft
+            | SurfaceKey::Messages
             | SurfaceKey::DeskHeading { .. }
             | SurfaceKey::Inbox(_)
             | SurfaceKey::ZulipInbox
@@ -6019,6 +6167,7 @@ impl Workspace {
                 let editor = model.update(cx, |model, cx| model.build_editor(window, cx));
                 SurfaceView::Draft { editor }
             }
+            SurfaceKey::Messages => SurfaceView::Messages(self.messages_editor.clone()),
             SurfaceKey::DeskHeading { .. } | SurfaceKey::Inbox(_) => {
                 unreachable!("deal surfaces are created while dealing")
             }
@@ -6089,6 +6238,7 @@ impl Workspace {
             }
             // Files and chat keep whatever agent context was current.
             SurfaceKey::DeskHeading { .. }
+            | SurfaceKey::Messages
             | SurfaceKey::Inbox(_)
             | SurfaceKey::File { .. }
             | SurfaceKey::ZulipInbox
@@ -8491,6 +8641,12 @@ impl Workspace {
                 .overflow_hidden()
                 .child(editor.clone())
                 .into_any_element(),
+            SurfaceView::Messages(editor) => div()
+                .id("rho-surface-messages")
+                .size_full()
+                .overflow_hidden()
+                .child(editor.clone())
+                .into_any_element(),
             SurfaceView::DeskHeading(editor) | SurfaceView::Inbox(editor) => div()
                 .size_full()
                 .overflow_hidden()
@@ -8836,6 +8992,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &SurfaceClose, window, cx| {
                 this.close_current_surface(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MessagesOpen, window, cx| {
+                this.cmd_messages(window, cx);
             }))
             .on_action(cx.listener(|this, _: &BrowserExit, window, cx| {
                 this.focus_rail(window, cx);

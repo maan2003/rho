@@ -10,6 +10,7 @@ use crate::registry::HostId;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SurfaceKey {
     Draft,
+    Messages,
     DeskHeading {
         host: HostId,
         heading_offset: usize,

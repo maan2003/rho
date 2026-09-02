@@ -357,6 +357,9 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::submit_prompt))
             .on_action(cx.listener(Self::paste_prompt))
             .on_action(cx.listener(Self::toggle_voice))
+            .on_action(cx.listener(|this, _: &crate::MessagesOpen, window, cx| {
+                this.cmd_messages(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &crate::RootTransient, window, cx| {
                 this.open_transient(crate::transient::root_menu(), window, cx);
             }))

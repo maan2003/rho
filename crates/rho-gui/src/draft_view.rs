@@ -2,10 +2,9 @@
 //! to create the agent.
 //!
 //! Entirely separate from [`crate::agent_view::AgentModel`] — there is no
-//! transcript here. The multibuffer composes three small buffers: read-only
-//! local notices, the workdir field, and the message body. The excerpt
-//! boundary separates field from body, so there is no scaffold text to
-//! parse: submission just reads the two writable buffers.
+//! transcript here. The multibuffer composes the draft fields and message body.
+//! The excerpt boundary separates field from body, so there is no scaffold text
+//! to parse: submission just reads the two writable buffers.
 //!
 //! The model is the buffer role; the draft surface builds an editor over the
 //! shared multibuffer via [`DraftModel::build_editor`].
@@ -27,8 +26,7 @@ use rho_core::ContentPart;
 
 #[cfg(feature = "native")]
 use crate::commands::WorkspaceCompletionProvider;
-use crate::highlights::apply_class_highlights;
-use crate::style::{self, PROMPT_DRAFT_HIGHLIGHT_KEY, Region, StyleClass};
+use crate::style::{self, PROMPT_DRAFT_HIGHLIGHT_KEY, StyleClass};
 use crate::workspace::Workspace;
 
 const BODY_PLACEHOLDER_INLAY_ID: usize = 0;
@@ -71,8 +69,6 @@ pub struct DraftGutter;
 pub struct DraftModel {
     workspace: WeakEntity<Workspace>,
     multi_buffer: Entity<MultiBuffer>,
-    system_buffer: Entity<Buffer>,
-    system_styles: Vec<(StyleClass, Range<text::Anchor>)>,
     workdir_buffer: Entity<Buffer>,
     role_buffer: Entity<Buffer>,
     start_buffer: Entity<Buffer>,
@@ -91,11 +87,6 @@ pub struct DraftModel {
 
 impl DraftModel {
     pub fn new(workspace: WeakEntity<Workspace>, cx: &mut Context<Self>) -> Self {
-        let system_buffer = cx.new(|cx| {
-            let mut buffer = Buffer::local("", cx);
-            buffer.set_capability(Capability::Read, cx);
-            buffer
-        });
         let workdir_buffer = cx.new(|cx| Buffer::local("", cx));
         let role_buffer = cx.new(|cx| Buffer::local(DEFAULT_ROLE, cx));
         let start_buffer = cx.new(|cx| Buffer::local(DEFAULT_START, cx));
@@ -104,11 +95,10 @@ impl DraftModel {
         let multi_buffer = cx.new(|cx| {
             let mut multi_buffer = MultiBuffer::without_headers(Capability::ReadWrite);
             for (key, buffer) in [
-                (0, &system_buffer),
-                (1, &workdir_buffer),
-                (2, &role_buffer),
-                (3, &start_buffer),
-                (4, &body_buffer),
+                (0, &workdir_buffer),
+                (1, &role_buffer),
+                (2, &start_buffer),
+                (3, &body_buffer),
             ] {
                 multi_buffer.set_excerpts_for_path(
                     PathKey::sorted(key),
@@ -149,8 +139,6 @@ impl DraftModel {
         Self {
             workspace,
             multi_buffer,
-            system_buffer,
-            system_styles: Vec::new(),
             workdir_buffer,
             role_buffer,
             start_buffer,
@@ -172,7 +160,6 @@ impl DraftModel {
         let workspace = self.workspace.clone();
         let multi_buffer = self.multi_buffer.clone();
         let buffers = [
-            &self.system_buffer,
             &self.workdir_buffer,
             &self.role_buffer,
             &self.start_buffer,
@@ -218,7 +205,6 @@ impl DraftModel {
         self.pin_autoscroll_to(&editor, cx);
         self.apply_body_chrome_to(&editor, cx);
         self.refresh_attachment_blocks(cx);
-        self.apply_system_styles_to(&editor, cx);
         self.focus_body(&editor, window, cx);
         editor
     }
@@ -424,44 +410,6 @@ impl DraftModel {
         cx: &mut Context<Self>,
     ) {
         self.select_range(editor, self.body_end..self.body_end, window, cx);
-    }
-
-    /// Appends a local system notice (connection problems, rejected
-    /// creations) above the compose form.
-    pub fn system_notice(&mut self, text: &str, class: StyleClass, cx: &mut Context<Self>) {
-        let range = self.system_buffer.update(cx, |buffer, cx| {
-            let start = buffer.len();
-            let mut line = text.to_owned();
-            if !line.ends_with('\n') {
-                line.push('\n');
-            }
-            buffer.edit([(start..start, line.as_str())], None, cx);
-            buffer.anchor_before(start)..buffer.anchor_before(start + line.len())
-        });
-        self.system_styles.push((class, range));
-        for editor in self.live_editors() {
-            self.apply_system_styles_to(&editor, cx);
-        }
-        cx.notify();
-    }
-
-    fn apply_system_styles_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
-        let mut by_class: Vec<(StyleClass, Vec<Range<text::Anchor>>)> = Vec::new();
-        for (class, range) in &self.system_styles {
-            match by_class.iter_mut().find(|(existing, _)| existing == class) {
-                Some((_, ranges)) => ranges.push(range.clone()),
-                None => by_class.push((*class, vec![range.clone()])),
-            }
-        }
-        apply_class_highlights(
-            editor,
-            &self.multi_buffer,
-            Region::System,
-            by_class
-                .iter()
-                .map(|(class, ranges)| (*class, ranges.as_slice())),
-            cx,
-        );
     }
 
     fn select_range(

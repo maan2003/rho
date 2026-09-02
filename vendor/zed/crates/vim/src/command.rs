@@ -1441,6 +1441,7 @@ impl CommandRange {
 
 fn generate_commands(_: &App) -> Vec<VimCommand> {
     vec![
+        VimCommand::str(("messages", ""), "rho_gui::MessagesOpen"),
         VimCommand::new(
             ("w", "rite"),
             VimSave {

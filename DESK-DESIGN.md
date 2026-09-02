@@ -168,6 +168,10 @@ change the history. Closing removes the current entry and reveals the previous
 older one, or the overview when none exists. The desk remains a separate
 overview key — like the windows key — that zooms out to the map.
 
+GUI notices live in the session-wide messages surface, which is opened with
+`:messages` and participates in the same surface timeline. Notices never appear
+inside an agent transcript; transcripts contain only the agent conversation.
+
 **Why:** most switching is going back to something recent, and that must be a
 reflex, not a search. The vertical axis is time: past above, future below. The
 desk stays the stable map and is consulted deliberately; its order is never

@@ -1,17 +1,15 @@
-//! One agent model per agent: transcript projection, prompt draft, and
-//! local system notices — the buffer role. Editors are the window role:
+//! One agent model per agent: transcript projection and prompt draft — the
+//! buffer role. Editors are the window role:
 //! each surface showing the agent builds its editor over the shared
 //! multibuffer via [`AgentModel::build_editor`], with its own cursor,
 //! scroll, and folds. The model reconciles every attached editor when
 //! content or chrome changes, so the model persists for the session while
 //! editors come and go with surfaces.
 //!
-//! The multibuffer composes the transcript's per-turn buffers, a lazy read-only
-//! system-notice region (local messages that must survive transcript
-//! re-renders), and the writable prompt draft.
+//! The multibuffer composes the transcript's per-turn buffers and the writable
+//! prompt draft.
 
 use std::collections::HashMap;
-use std::ops::Range;
 
 use collections::HashSet;
 use editor::display_map::CustomBlockId;
@@ -31,9 +29,8 @@ use text::{Buffer as TextBuffer, BufferId, ReplicaId};
 
 #[cfg(feature = "native")]
 use crate::commands::WorkspaceCompletionProvider;
-use crate::highlights::apply_class_highlights;
 use crate::store::FrameSummary;
-use crate::style::{self, PROMPT_DRAFT_HIGHLIGHT_KEY, Region, StyleClass};
+use crate::style::{self, PROMPT_DRAFT_HIGHLIGHT_KEY, StyleClass};
 use crate::transcript::TranscriptModel;
 use crate::workspace::Workspace;
 
@@ -44,13 +41,9 @@ pub struct PromptGutter;
 pub struct AgentModel {
     transcript: TranscriptModel,
     prompt_buffer: Entity<Buffer>,
-    system_buffer: Entity<Buffer>,
-    system_excerpt_added: bool,
-    system_styles: Vec<(StyleClass, Range<text::Anchor>)>,
     multi_buffer: Entity<MultiBuffer>,
-    /// The document multibuffer: transcript (cropped flush when the turn
-    /// is closed) plus system notices, without the prompt. The dashboard
-    /// preview reads this — a pure document that ends where the words do.
+    /// The document multibuffer is the transcript cropped flush when the turn
+    /// is closed, without the prompt. The dashboard preview reads this.
     document_multi_buffer: Entity<MultiBuffer>,
     /// The read-only editor over the document multibuffer, built lazily
     /// for the dashboard preview and kept for the model's lifetime.
@@ -77,11 +70,6 @@ impl AgentModel {
         visualization_client: crate::connection::VisualizationClient,
         cx: &mut Context<Self>,
     ) -> Self {
-        let system_buffer = cx.new(|cx| {
-            let mut buffer = Buffer::local("", cx);
-            buffer.set_capability(Capability::Read, cx);
-            buffer
-        });
         let prompt_buffer = cx.new(|cx| Buffer::local("", cx));
         let prompt_end = prompt_buffer.read(cx).anchor_after(0);
         let multi_buffer = cx.new(|cx| {
@@ -111,9 +99,6 @@ impl AgentModel {
         Self {
             transcript,
             prompt_buffer,
-            system_buffer,
-            system_excerpt_added: false,
-            system_styles: Vec::new(),
             multi_buffer,
             document_multi_buffer,
             preview_editor: None,
@@ -208,7 +193,6 @@ impl AgentModel {
             return editor.clone();
         }
         let multi_buffer = self.document_multi_buffer.clone();
-        let system_id = self.system_buffer.read(cx).remote_id();
         let editor = cx.new(|cx| {
             let mut editor = Editor::new(
                 EditorMode::Full {
@@ -224,14 +208,12 @@ impl AgentModel {
             );
             crate::editor_config::configure_preview(&mut editor, window, cx);
             editor.disable_bracket_colorization(cx);
-            editor.disable_header_for_buffer(system_id, cx);
             editor.set_read_only(true);
             editor.set_autoscroll_pin(multi_buffer::Anchor::Max, AutoscrollStrategy::Bottom, cx);
             editor
         });
         self.transcript
             .attach(&editor, crate::workspace::now_ms(), cx);
-        self.apply_system_styles_to(&editor, cx);
         self.preview_editor = Some(editor.clone());
         editor
     }
@@ -247,7 +229,6 @@ impl AgentModel {
     pub fn build_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) -> Entity<Editor> {
         let workspace = self.workspace.clone();
         let multi_buffer = self.multi_buffer.clone();
-        let system_id = self.system_buffer.read(cx).remote_id();
         let prompt_id = self.prompt_buffer.read(cx).remote_id();
         let editor = cx.new(|cx| {
             let mut editor = Editor::new(
@@ -264,7 +245,6 @@ impl AgentModel {
             );
             crate::editor_config::configure(&mut editor, window, cx);
             editor.disable_bracket_colorization(cx);
-            editor.disable_header_for_buffer(system_id, cx);
             editor.disable_header_for_buffer(prompt_id, cx);
             #[cfg(feature = "native")]
             editor.set_completion_provider(Some(WorkspaceCompletionProvider::new(
@@ -291,7 +271,6 @@ impl AgentModel {
             .attach(&editor, crate::workspace::now_ms(), cx);
         self.editors.push(editor.downgrade());
         self.apply_status_to(&editor, cx);
-        self.apply_system_styles_to(&editor, cx);
         self.apply_prompt_chrome_to(&editor, cx);
         self.refresh_attachment_blocks(cx);
         editor
@@ -401,77 +380,6 @@ impl AgentModel {
         self.update_prompt_chrome(cx);
         self.refresh_attachment_blocks(cx);
         had
-    }
-
-    /// Appends a local system notice that survives transcript re-renders.
-    pub fn system_notice(&mut self, text: &str, class: StyleClass, cx: &mut Context<Self>) {
-        let range = self.system_buffer.update(cx, |buffer, cx| {
-            let start = buffer.len();
-            let mut line = text.to_owned();
-            if !line.ends_with('\n') {
-                line.push('\n');
-            }
-            buffer.edit([(start..start, line.as_str())], None, cx);
-            buffer.anchor_before(start)..buffer.anchor_before(start + line.len())
-        });
-        self.system_styles.push((class, range));
-        let system_buffer = self.system_buffer.clone();
-        if !self.system_excerpt_added {
-            self.system_excerpt_added = true;
-            self.multi_buffer.update(cx, |multi_buffer, cx| {
-                multi_buffer.set_excerpts_for_path(
-                    PathKey::sorted(u64::MAX - 1),
-                    system_buffer.clone(),
-                    [Point::zero()..system_buffer.read(cx).max_point()],
-                    0,
-                    cx,
-                );
-            });
-        }
-        // The document's system excerpt is cropped flush (no trailing
-        // blank row) and re-set as notices accumulate.
-        let end = {
-            let buffer = system_buffer.read(cx);
-            buffer.offset_to_point(buffer.len().saturating_sub(1))
-        };
-        self.document_multi_buffer.update(cx, |multi_buffer, cx| {
-            multi_buffer.set_excerpts_for_path(
-                PathKey::sorted(u64::MAX - 1),
-                system_buffer.clone(),
-                [Point::zero()..end],
-                0,
-                cx,
-            );
-        });
-        for editor in self.live_editors() {
-            self.apply_system_styles_to(&editor, cx);
-        }
-        if let Some(editor) = self.preview_editor.clone() {
-            self.apply_system_styles_to(&editor, cx);
-        }
-        cx.notify();
-    }
-
-    fn apply_system_styles_to(&self, editor: &Entity<Editor>, cx: &mut Context<Self>) {
-        let mut by_class: Vec<(StyleClass, Vec<Range<text::Anchor>>)> = Vec::new();
-        for (class, range) in &self.system_styles {
-            match by_class.iter_mut().find(|(existing, _)| existing == class) {
-                Some((_, ranges)) => ranges.push(range.clone()),
-                None => by_class.push((*class, vec![range.clone()])),
-            }
-        }
-        // Resolve against the editor's own multibuffer: full editors and
-        // the document preview compose the system buffer differently.
-        let multi_buffer = editor.read(cx).buffer().clone();
-        apply_class_highlights(
-            editor,
-            &multi_buffer,
-            Region::System,
-            by_class
-                .iter()
-                .map(|(class, ranges)| (*class, ranges.as_slice())),
-            cx,
-        );
     }
 
     pub fn set_status(
