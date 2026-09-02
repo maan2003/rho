@@ -374,6 +374,13 @@
               env.RHO_WAYLAND_VK_DRIVER_FILES = "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.${pkgs.stdenv.hostPlatform.parsed.cpu.name}.json";
               env.LK_CUSTOM_WEBRTC = webrtcPrebuilt;
               env.RUSTY_V8_ARCHIVE = rustyV8Archive;
+              # Linux AArch64 kernels commonly use either 4 KiB or 16 KiB
+              # pages. jemalloc accepts system pages no larger than its
+              # build-time page size, so 16 KiB supports both variants.
+              env.JEMALLOC_SYS_WITH_LG_PAGE =
+                if pkgs.stdenv.hostPlatform.isLinux && pkgs.stdenv.hostPlatform.isAarch64
+                then "14"
+                else null;
               postPatch = ''
                 # Brush denies warnings, but the root lockfile can select a
                 # newer Clap which deprecates attributes used by Brush.
@@ -555,6 +562,10 @@
           RHO_WAYLAND_GRIM = "${pkgs.grim}/bin/grim";
           RHO_WAYLAND_WTYPE = "${pkgs.wtype}/bin/wtype";
           RHO_WAYLAND_VK_DRIVER_FILES = "${pkgs.mesa}/share/vulkan/icd.d/lvp_icd.${pkgs.stdenv.hostPlatform.parsed.cpu.name}.json";
+          JEMALLOC_SYS_WITH_LG_PAGE =
+            if pkgs.stdenv.hostPlatform.isLinux && pkgs.stdenv.hostPlatform.isAarch64
+            then "14"
+            else null;
           packages = [
             selfciMq
             pkgs.cargo-nextest
