@@ -8247,10 +8247,8 @@ impl Workspace {
                 separator.into_iter().chain(std::iter::once(
                     div()
                         .text_color(color)
-                        .child(format!(
-                            "{} {}%{reset}",
-                            summary.model, summary.remaining_percent
-                        ))
+                        // Colour alone names the provider; no model text.
+                        .child(format!("{}%{reset}", summary.remaining_percent))
                         .into_any_element(),
                 ))
             }))
