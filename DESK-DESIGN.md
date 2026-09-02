@@ -101,7 +101,9 @@ Everything — a tab, an agent, a task, a desk heading — is pending, active,
 deferred, or done. Verdicts differ per kind: done on a tab is a dismissal
 and must cost nothing; done on an agent is accepting reviewed work and
 deserves friction; deferring a top-level heading ("rho sleeps until tonight") mutes
-everything inside it.
+everything inside it. A verdict on a dealt agent or page card is a mark on
+the desk heading it sits under, never a daemon-side disposition: the desk
+is the one place the dealer reads, so it is the one place a verdict lives.
 
 **Why:** one lifecycle means one mental model and one dealer for everything.
 Tab hoarding is what humans do when tabs lack done/defer semantics — the tab

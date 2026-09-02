@@ -8960,13 +8960,10 @@ impl Render for Workspace {
                 let today = chrono::Local::now().date_naive();
                 let now = chrono::Local::now().fixed_offset();
                 let handled = match card.as_ref().map(|card| card.kind) {
-                    Some(crate::dashboard::DealCardKind::Desk) => {
-                        this.dashboard.write_deal_done(today, cx)
-                    }
-                    Some(crate::dashboard::DealCardKind::Agent) => {
-                        this.cmd_agent_done(false, window, cx);
-                        true
-                    }
+                    Some(
+                        crate::dashboard::DealCardKind::Desk
+                        | crate::dashboard::DealCardKind::Agent,
+                    ) => this.dashboard.write_deal_done(today, cx),
                     Some(crate::dashboard::DealCardKind::Inbox(_)) => {
                         let Some(crate::dashboard::DealCardIdentity::Inbox(id)) =
                             card.as_ref().map(|card| &card.identity)
@@ -8995,13 +8992,10 @@ impl Render for Workspace {
                 let today = chrono::Local::now().date_naive();
                 let now = chrono::Local::now().fixed_offset();
                 let handled = match card.as_ref().map(|card| card.kind) {
-                    Some(crate::dashboard::DealCardKind::Desk) => {
-                        this.dashboard.write_deal_discarded(today, cx)
-                    }
-                    Some(crate::dashboard::DealCardKind::Agent) => {
-                        this.cmd_agent_done(true, window, cx);
-                        true
-                    }
+                    Some(
+                        crate::dashboard::DealCardKind::Desk
+                        | crate::dashboard::DealCardKind::Agent,
+                    ) => this.dashboard.write_deal_discarded(today, cx),
                     Some(crate::dashboard::DealCardKind::Inbox(_)) => {
                         let Some(crate::dashboard::DealCardIdentity::Inbox(id)) =
                             card.as_ref().map(|card| &card.identity)
@@ -9030,9 +9024,10 @@ impl Render for Workspace {
                 let now = chrono::Local::now().fixed_offset();
                 let card = this.dashboard.current_deal_card().cloned();
                 let handled = match card.as_ref().map(|card| card.kind) {
-                    Some(crate::dashboard::DealCardKind::Desk) => {
-                        this.dashboard.write_deal_snooze(count, today, cx)
-                    }
+                    Some(
+                        crate::dashboard::DealCardKind::Desk
+                        | crate::dashboard::DealCardKind::Agent,
+                    ) => this.dashboard.write_deal_snooze(count, today, cx),
                     Some(crate::dashboard::DealCardKind::Inbox(_)) => {
                         let Some(crate::dashboard::DealCardIdentity::Inbox(id)) =
                             card.as_ref().map(|card| &card.identity)
@@ -9046,25 +9041,16 @@ impl Render for Workspace {
                             )
                             .unwrap_or(false)
                     }
-                    Some(crate::dashboard::DealCardKind::Agent) => {
-                        let Some(agent_id) = card.as_ref().and_then(|card| card.agent_id) else {
-                            return;
-                        };
-                        this.set_agent_disposition(
-                            vec![agent_id],
-                            "snooze",
-                            rho_ui_proto::AgentDisposition::Snoozed {
-                                until: rho_core::UnixMs(
-                                    (now + chrono::Duration::days(i64::from(count)))
-                                        .timestamp_millis()
-                                        .max(0) as u64,
-                                ),
-                            },
-                            cx,
-                        )
-                    }
                     _ => false,
                 };
+                // A verdict's success looks exactly like a key that did
+                // nothing; say what the press did, or that it did not.
+                if handled {
+                    let days = count.max(1);
+                    this.echo(&format!("snooze: {days}d"), StyleClass::SystemInfo, cx);
+                } else {
+                    this.echo("snooze: nothing under the deal", StyleClass::SystemInfo, cx);
+                }
                 if handled {
                     this.dashboard
                         .record_deal_verdict_as(crate::dashboard::DealerVerdict::Defer, now);

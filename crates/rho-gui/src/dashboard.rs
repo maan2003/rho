@@ -1197,9 +1197,9 @@ impl Dashboard {
         let Some(card) = self.current_deal_card().cloned() else {
             return false;
         };
-        if card.kind != DealCardKind::Desk {
-            return false;
-        }
+        // Agent and page cards carry the heading they sit under, so a verdict
+        // on them is a mark on that heading: no daemon disposition, and the
+        // same mark the dealer already gates on.
         let Some(offset) = card.heading_offset else {
             return false;
         };
@@ -6638,6 +6638,39 @@ mod tests {
             assert_eq!(agent_class, plain_class, "agent keeps the level hue");
             assert!(agent_opacity > plain_opacity, "agent variant is subtle");
         }
+    }
+
+    #[test]
+    fn agent_reply_card_sleeps_while_its_heading_is_deferred() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc()
+            .fixed_offset();
+        let mut blocked = agent(1, None, UiAttention::Pending, 0);
+        blocked.facts = rho_ui_proto::UiAgentFacts {
+            last_turn_ended: Some(UnixMs(now.timestamp_millis() as u64)),
+            last_user_message_at: UnixMs(0),
+            needs_you_hint: true,
+            turn_running: false,
+        };
+        let (reg, host) = registry(vec![blocked.clone()]);
+        let tag = &blocked.agent_id.encoded()[..4];
+        let snoozed = format!("* Blocked :eng-{tag}:\n:defer: 2026-08-25 2d\n");
+        let queue = assemble_deal_queue(&[(host, snoozed)], &deal_agent_facts(&reg), now);
+        assert!(
+            queue.cards.iter().all(|card| card.agent_id.is_none()),
+            "a future :defer: on the heading must hide the agent's reply card"
+        );
+        let woken = format!("* Blocked :eng-{tag}:\n:defer: 2026-08-22 1d\n");
+        let queue = assemble_deal_queue(&[(host, woken)], &deal_agent_facts(&reg), now);
+        assert!(
+            queue
+                .cards
+                .iter()
+                .any(|card| card.agent_id == Some(blocked.agent_id))
+        );
     }
 
     #[test]
