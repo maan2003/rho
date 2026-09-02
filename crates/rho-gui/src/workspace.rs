@@ -115,12 +115,18 @@ pub struct Surface {
 }
 
 enum DealView {
+    Desk {
+        identity: crate::dashboard::DealCardIdentity,
+        editor: Entity<editor::Editor>,
+    },
     Surface {
         identity: crate::dashboard::DealCardIdentity,
+        kind: crate::dashboard::DealCardKind,
         surface: Surface,
     },
     Inbox {
         identity: crate::dashboard::DealCardIdentity,
+        kind: crate::dashboard::DealCardKind,
         editor: Entity<editor::Editor>,
     },
 }
@@ -128,12 +134,30 @@ enum DealView {
 impl DealView {
     fn matches(&self, identity: &crate::dashboard::DealCardIdentity) -> bool {
         match self {
-            Self::Surface {
+            Self::Desk {
+                identity: current, ..
+            }
+            | Self::Surface {
                 identity: current, ..
             }
             | Self::Inbox {
                 identity: current, ..
             } => current == identity,
+        }
+    }
+
+    #[cfg(test)]
+    fn card(
+        &self,
+    ) -> (
+        &crate::dashboard::DealCardIdentity,
+        crate::dashboard::DealCardKind,
+    ) {
+        match self {
+            Self::Desk { identity, .. } => (identity, crate::dashboard::DealCardKind::Desk),
+            Self::Surface { identity, kind, .. } | Self::Inbox { identity, kind, .. } => {
+                (identity, *kind)
+            }
         }
     }
 }
@@ -5504,6 +5528,174 @@ impl Workspace {
     }
 
     #[cfg(test)]
+    pub(crate) fn current_deal_card_for_test(
+        &self,
+    ) -> Option<(
+        crate::dashboard::DealCardIdentity,
+        crate::dashboard::DealCardKind,
+    )> {
+        self.dashboard
+            .current_deal_card()
+            .map(|card| (card.identity.clone(), card.kind))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_agent_deal_card_for_test(&mut self, agent_id: AgentId) {
+        self.dashboard.inject_agent_deal_card_for_test(agent_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seek_deal_card_for_test(
+        &mut self,
+        wanted: fn(crate::dashboard::DealCardKind) -> bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.dashboard.seek_deal_card_for_test(wanted) {
+            return false;
+        }
+        self.deal_view = None;
+        self.refresh_dashboard(window, cx);
+        true
+    }
+
+    #[cfg(test)]
+    pub(crate) fn next_deal_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .dashboard
+            .skip_current_deal(chrono::Local::now().fixed_offset(), cx)
+        {
+            self.finish_dashboard_deal_action(window, cx);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn previous_deal_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dashboard.previous_deal(cx) {
+            self.deal_view = None;
+            self.refresh_dashboard(window, cx);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn done_deal_for_test(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(card) = self.dashboard.current_deal_card().cloned() else {
+            return;
+        };
+        let handled = match card.identity {
+            crate::dashboard::DealCardIdentity::Inbox(id) => {
+                self.inbox.verdict(&InboxId(id), Verdict::Discarded).is_ok()
+            }
+            crate::dashboard::DealCardIdentity::Desk { .. } => self
+                .dashboard
+                .write_deal_done(chrono::Local::now().date_naive(), cx),
+            crate::dashboard::DealCardIdentity::Agent(_) => false,
+        };
+        if handled {
+            self.dashboard.advance_deal(cx);
+            self.finish_dashboard_deal_action(window, cx);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn snooze_deal_for_test(
+        &mut self,
+        days: u32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .dashboard
+            .write_deal_snooze(days, chrono::Local::now().date_naive(), cx)
+        {
+            self.dashboard.advance_deal(cx);
+            self.finish_dashboard_deal_action(window, cx);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn rendered_deal_card_for_test(
+        &self,
+    ) -> Option<(
+        crate::dashboard::DealCardIdentity,
+        crate::dashboard::DealCardKind,
+    )> {
+        if let Some(view) = &self.deal_view {
+            return Some((view.card().0.clone(), view.card().1));
+        }
+        let card = self.dashboard.current_deal_card()?;
+        match card.kind {
+            crate::dashboard::DealCardKind::Desk => {}
+            crate::dashboard::DealCardKind::Agent if card.agent_id.is_some() => {}
+            crate::dashboard::DealCardKind::Inbox(_) => {
+                let crate::dashboard::DealCardIdentity::Inbox(id) = &card.identity else {
+                    return None;
+                };
+                if self.inbox.get(&InboxId(id.clone())).is_none() {
+                    return None;
+                }
+            }
+            _ => return None,
+        }
+        Some((card.identity.clone(), card.kind))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn append_inbox_for_test(&mut self, draft: InboxDraft) -> InboxId {
+        self.inbox.append(draft).expect("append test inbox item")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn age_inbox_for_test(&mut self, id: &InboxId, captured_at_ms: i64) {
+        self.inbox.set_captured_at_for_test(id, captured_at_ms);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inbox_contains_for_test(&self, id: &InboxId) -> bool {
+        self.inbox.get(id).is_some()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn focus_dealt_surface_for_test(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let card = self.dashboard.current_deal_card().cloned();
+        if let Some(card) = &card {
+            match card.kind {
+                crate::dashboard::DealCardKind::Agent => {
+                    if let Some(agent_id) = card.agent_id {
+                        self.select_agent_inner(Some(agent_id), true, window, cx);
+                        return;
+                    }
+                }
+                crate::dashboard::DealCardKind::Inbox(_) => {
+                    self.deal_view = Some(DealView::Inbox {
+                        identity: card.identity.clone(),
+                        kind: card.kind,
+                        editor: self.dashboard.editor().clone(),
+                    });
+                }
+                crate::dashboard::DealCardKind::Desk => {}
+            }
+        }
+        let focus = match self.deal_view.as_ref() {
+            Some(DealView::Desk { editor, .. }) | Some(DealView::Inbox { editor, .. }) => {
+                editor.focus_handle(cx)
+            }
+            Some(DealView::Surface { surface, .. }) => match &surface.view {
+                SurfaceView::Transcript { editor, .. } => editor.focus_handle(cx),
+                #[cfg(feature = "native")]
+                SurfaceView::Browser(view) => view.read(cx).focus_handle(cx),
+                _ => return,
+            },
+            None => self.dashboard.editor().read(cx).focus_handle(cx),
+        };
+        window.focus(&focus, cx);
+    }
+
+    #[cfg(test)]
     pub(crate) fn dashboard_deal_highlight_for_test(&self, cx: &App) -> bool {
         self.dashboard.deal_highlight_active_for_test(cx)
     }
@@ -6310,6 +6502,7 @@ impl Workspace {
         }
         if !self.dashboard.deal_mode() {
             self.end_deal_session();
+            window.focus(&self.dashboard.focus_handle(cx), cx);
         }
         self.refresh_dashboard(window, cx);
     }
@@ -7509,26 +7702,24 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        if matches!(card.kind, crate::dashboard::DealCardKind::Desk) {
-            return div()
-                .size_full()
-                .key_context("RhoDashboard")
-                .overflow_hidden()
-                .child(self.dashboard.editor().clone())
-                .into_any_element();
-        }
-
         if self
             .deal_view
             .as_ref()
             .is_none_or(|view| !view.matches(&card.identity))
         {
-            let view = if matches!(card.kind, crate::dashboard::DealCardKind::Agent)
-                && let Some(agent_id) = card.agent_id
-            {
-                Some(DealView::Surface {
+            let view = if matches!(card.kind, crate::dashboard::DealCardKind::Desk) {
+                Some(DealView::Desk {
                     identity: card.identity.clone(),
-                    surface: self.make_surface(SurfaceKey::Transcript(agent_id), window, cx),
+                    editor: self.dashboard.editor().clone(),
+                })
+            } else if matches!(card.kind, crate::dashboard::DealCardKind::Agent) {
+                card.agent_id.map(|agent_id| {
+                    let surface = self.make_surface(SurfaceKey::Transcript(agent_id), window, cx);
+                    DealView::Surface {
+                        identity: card.identity.clone(),
+                        kind: card.kind,
+                        surface,
+                    }
                 })
             } else {
                 #[cfg(feature = "native")]
@@ -7539,6 +7730,7 @@ impl Workspace {
                             let view = cx.new(|cx| rho_browser::PageView::new(model, *id, cx));
                             DealView::Surface {
                                 identity: card.identity.clone(),
+                                kind: card.kind,
                                 surface: Self::wrap_surface(
                                     SurfaceKey::Browser(*id),
                                     SurfaceView::Browser(view),
@@ -7595,6 +7787,7 @@ impl Workspace {
                     });
                     Some(DealView::Inbox {
                         identity: card.identity.clone(),
+                        kind: card.kind,
                         editor,
                     })
                 })
@@ -7603,12 +7796,28 @@ impl Workspace {
         }
 
         match self.deal_view.as_ref() {
-            Some(DealView::Surface { surface, .. }) => self.render_surface(surface),
-            Some(DealView::Inbox { editor, .. }) => div()
+            Some(DealView::Desk { editor, .. }) => div()
                 .size_full()
+                .key_context("RhoDashboard")
                 .overflow_hidden()
                 .child(editor.clone())
                 .into_any_element(),
+            Some(DealView::Surface { kind, surface, .. }) => {
+                debug_assert!(matches!(
+                    kind,
+                    crate::dashboard::DealCardKind::Agent
+                        | crate::dashboard::DealCardKind::Inbox(_)
+                ));
+                self.render_surface(surface)
+            }
+            Some(DealView::Inbox { kind, editor, .. }) => {
+                debug_assert!(matches!(kind, crate::dashboard::DealCardKind::Inbox(_)));
+                div()
+                    .size_full()
+                    .overflow_hidden()
+                    .child(editor.clone())
+                    .into_any_element()
+            }
             None => div().size_full().into_any_element(),
         }
     }
@@ -7640,7 +7849,7 @@ impl Workspace {
                 _ => card.breadcrumb.replace(" › ", " / "),
             },
         };
-        let why = format!("{}  {}", Self::truncate_outline_path(&path), card.label);
+        let path = Self::truncate_outline_path(&path);
         let line = div()
             .id("rho-status-line")
             .h(px(26.))
@@ -7650,10 +7859,11 @@ impl Workspace {
             .flex_row()
             .items_center()
             .gap_3()
-            .bg(cx.theme().colors().element_background)
+            .bg(cx.theme().colors().element_selected)
             .text_color(cx.theme().colors().text)
             .font_family(text_style.font_family.clone())
             .text_size(text_style.font_size)
+            .line_height(text_style.line_height)
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -7661,8 +7871,13 @@ impl Workspace {
                     cx.notify();
                 }),
             )
-            .child(why);
-        let right = self.status_right_text(cx);
+            .child(self.render_status_path(&path, cx))
+            .child(
+                div()
+                    .text_color(cx.theme().status().warning)
+                    .child(card.label.clone()),
+            );
+        let right = self.render_status_right(cx);
         if self.deal_hints_visible {
             return line
                 .child("· n skip · N previous · d done · x dismiss · s defer · S defer room · t todo · r open · i file · q exit")
@@ -7731,14 +7946,6 @@ impl Workspace {
         format!("{} / … / {}", parts[0], parts[parts.len() - 1])
     }
 
-    fn quota_status_text(&self) -> String {
-        self.merged_quota_summaries()
-            .into_iter()
-            .map(|summary| format!("{} {}%", summary.model, summary.remaining_percent))
-            .collect::<Vec<_>>()
-            .join("  ")
-    }
-
     fn abnormal_connection_text(&self) -> Option<String> {
         let (name, status) = self.hosts.worst_status()?;
         let subject = (self.hosts.len() > 1).then(|| format!("{name} "));
@@ -7759,25 +7966,92 @@ impl Workspace {
         }
     }
 
-    fn status_right_text(&self, cx: &App) -> String {
-        let mut parts = Vec::new();
-        let quota = self.quota_status_text();
-        if !quota.is_empty() {
-            parts.push(quota);
-        }
-        if let Some(connection) = self.abnormal_connection_text() {
-            parts.push(connection);
-        }
-        parts.push(
-            self.mode_indicator
-                .read(cx)
-                .plain_mode(cx)
-                .unwrap_or_else(|| "normal".to_owned()),
-        );
-        if self.lamp_on {
-            parts.push("●".to_owned());
-        }
-        parts.join("  ")
+    fn render_status_path(&self, path: &str, cx: &App) -> gpui::AnyElement {
+        let colors = cx.theme().colors();
+        let parts = path.split(" / ").collect::<Vec<_>>();
+        div()
+            .flex()
+            .flex_row()
+            .children(parts.into_iter().enumerate().flat_map(|(index, part)| {
+                let color = if index == 0 {
+                    colors.terminal_ansi_bright_magenta
+                } else if index + 1 == path.split(" / ").count() {
+                    colors.text
+                } else {
+                    colors.terminal_ansi_bright_green
+                };
+                let separator = (index > 0).then(|| {
+                    div()
+                        .text_color(colors.text_muted)
+                        .child(" / ")
+                        .into_any_element()
+                });
+                separator.into_iter().chain(std::iter::once(
+                    div()
+                        .text_color(color)
+                        .child(part.to_owned())
+                        .into_any_element(),
+                ))
+            }))
+            .into_any_element()
+    }
+
+    fn render_status_right(&self, cx: &App) -> gpui::AnyElement {
+        let colors = cx.theme().colors();
+        let status = cx.theme().status();
+        let mode = self
+            .mode_indicator
+            .read(cx)
+            .plain_mode(cx)
+            .unwrap_or_else(|| "normal".to_owned());
+        let mode_bg = if self.dashboard.deal_mode() {
+            colors.terminal_ansi_bright_magenta
+        } else if mode.contains("insert") {
+            status.warning
+        } else {
+            colors.terminal_ansi_bright_cyan
+        };
+        let quota = self.merged_quota_summaries();
+        div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3()
+            .children(quota.into_iter().map(|summary| {
+                let color = if summary.remaining_percent == 0 {
+                    status.error
+                } else if summary.remaining_percent <= 10 {
+                    status.warning
+                } else {
+                    colors.text_muted
+                };
+                div()
+                    .text_color(color)
+                    .child(format!("{} {}%", summary.model, summary.remaining_percent))
+            }))
+            .children(
+                self.abnormal_connection_text()
+                    .map(|connection| div().text_color(status.error).child(connection)),
+            )
+            .children(
+                self.lamp_on
+                    .then(|| div().text_color(status.error).child("●")),
+            )
+            .child(
+                div()
+                    .h_full()
+                    .px_2()
+                    .flex()
+                    .items_center()
+                    .bg(mode_bg)
+                    .text_color(colors.editor_background)
+                    .child(if self.dashboard.deal_mode() {
+                        "deal".to_owned()
+                    } else {
+                        mode
+                    }),
+            )
+            .into_any_element()
     }
 
     fn render_status_line(
@@ -7822,12 +8096,16 @@ impl Workspace {
                 key => self.surface_name(key),
             }
         };
-        let left = self
-            .echo
-            .as_ref()
-            .map(|echo| echo.text().to_owned())
-            .unwrap_or_else(|| Self::truncate_outline_path(&path));
-        let right = self.status_right_text(cx);
+        let left = self.echo.as_ref().map_or_else(
+            || self.render_status_path(&Self::truncate_outline_path(&path), cx),
+            |echo| {
+                div()
+                    .text_color(cx.theme().status().info)
+                    .child(echo.text().to_owned())
+                    .into_any_element()
+            },
+        );
+        let right = self.render_status_right(cx);
         div()
             .id("rho-status-line")
             .h(px(26.))
@@ -7837,10 +8115,11 @@ impl Workspace {
             .flex_row()
             .items_center()
             .justify_between()
-            .bg(cx.theme().colors().element_background)
+            .bg(cx.theme().colors().status_bar_background)
             .text_color(cx.theme().colors().text)
             .font_family(text_style.font_family.clone())
             .text_size(text_style.font_size)
+            .line_height(text_style.line_height)
             .child(left)
             .child(right)
             .into_any_element()
@@ -8374,26 +8653,46 @@ impl Render for Workspace {
             } else {
                 "RhoGui"
             })
-            .capture_key_down(
-                cx.listener(|this, event: &gpui::KeyDownEvent, _window, cx| {
-                    if this.dashboard.deal_mode() {
-                        this.deal_controls_visible = false;
-                        if event.keystroke.key == "?" {
-                            this.deal_hints_visible = !this.deal_hints_visible;
-                            cx.notify();
-                            cx.stop_propagation();
-                            return;
-                        }
-                        if this.deal_hints_visible {
-                            this.deal_hints_visible = false;
-                            cx.notify();
-                        }
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
+                if this.dashboard.deal_mode() {
+                    this.deal_controls_visible = false;
+                    if event.keystroke.key == "?" {
+                        this.deal_hints_visible = !this.deal_hints_visible;
+                        cx.notify();
+                        cx.stop_propagation();
+                        return;
                     }
-                    if event.keystroke.key != "k" || !event.keystroke.modifiers.control {
-                        this.dismiss_mru_overlay(cx);
+                    let action: Option<Box<dyn gpui::Action>> = match (
+                        event.keystroke.key.as_str(),
+                        event.keystroke.modifiers.shift,
+                    ) {
+                        ("escape" | "q", false) => Some(Box::new(DashboardDealExit)),
+                        ("n", false) => Some(Box::new(DashboardDealNext)),
+                        ("n", true) => Some(Box::new(DashboardDealPrevious)),
+                        ("d", false) => Some(Box::new(DashboardDealDone)),
+                        ("x", false) => Some(Box::new(DashboardDealDiscard)),
+                        ("s", false) => Some(Box::new(DashboardDealSnooze)),
+                        ("s", true) => Some(Box::new(DashboardDealRoomSnooze)),
+                        ("t", false) => Some(Box::new(DashboardDealTodo)),
+                        ("r", false) => Some(Box::new(DashboardDealReply)),
+                        ("r", true) => Some(Box::new(DashboardDealRefresh)),
+                        ("i", false) => Some(Box::new(DashboardDealInsert)),
+                        _ => None,
+                    };
+                    if let Some(action) = action {
+                        window.dispatch_action(action, cx);
+                        cx.stop_propagation();
+                        return;
                     }
-                }),
-            )
+                    if this.deal_hints_visible {
+                        this.deal_hints_visible = false;
+                        cx.notify();
+                    }
+                }
+                if event.keystroke.key != "k" || !event.keystroke.modifiers.control {
+                    this.dismiss_mru_overlay(cx);
+                }
+            }))
             .capture_touch(cx.listener(Self::shell_touch))
             .on_scroll_wheel(cx.listener(Self::journal_scroll))
             .on_linux_pointer_axis(cx.listener(Self::journal_linux_scroll))

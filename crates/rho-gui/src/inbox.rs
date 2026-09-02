@@ -100,6 +100,15 @@ pub struct InboxStore {
 }
 
 impl InboxStore {
+    #[cfg(test)]
+    pub(crate) fn set_captured_at_for_test(&mut self, id: &InboxId, captured_at_ms: i64) {
+        self.items
+            .iter_mut()
+            .find(|item| &item.id == id)
+            .expect("test inbox item")
+            .captured_at_ms = captured_at_ms;
+    }
+
     #[cfg(feature = "native")]
     pub fn open_default() -> anyhow::Result<Self> {
         let base = dirs::state_dir().context("state directory not available")?;

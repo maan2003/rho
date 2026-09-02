@@ -742,6 +742,54 @@ impl Dashboard {
         Some((card.host, card.heading_offset?, card.breadcrumb.as_str()))
     }
 
+    #[cfg(test)]
+    pub(crate) fn inject_agent_deal_card_for_test(&mut self, agent_id: AgentId) {
+        let deal = self.deal.as_mut().expect("active test deal");
+        if deal
+            .cards
+            .iter()
+            .any(|card| card.identity == DealCardIdentity::Agent(agent_id))
+        {
+            return;
+        }
+        let host = deal
+            .cards
+            .first()
+            .map_or(HostId::default(), |card| card.host);
+        let index = (deal.index + 1).min(deal.cards.len());
+        deal.cards.insert(
+            index,
+            DealCard {
+                label: "blocked · test".to_owned(),
+                priority: 1.0,
+                host,
+                heading_offset: None,
+                agent_id: Some(agent_id),
+                agent_tag: Some(format!("eng-{}", agent_id.encoded())),
+                breadcrumb: "Agent card".to_owned(),
+                room: None,
+                kind: DealCardKind::Agent,
+                identity: DealCardIdentity::Agent(agent_id),
+                inbox_source: None,
+            },
+        );
+        deal.anchors.insert(index, None);
+        deal.boundary_anchors.insert(index, None);
+        deal.resolved.insert(index, false);
+        deal.dealt_count += 1;
+        deal.total_alive += 1;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seek_deal_card_for_test(&mut self, wanted: fn(DealCardKind) -> bool) -> bool {
+        let deal = self.deal.as_mut().expect("active test deal");
+        let Some(index) = deal.cards.iter().position(|card| wanted(card.kind)) else {
+            return false;
+        };
+        deal.index = index;
+        true
+    }
+
     pub fn enter_deal_mode(
         &mut self,
         registry: &AgentRegistry,

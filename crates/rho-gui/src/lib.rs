@@ -405,21 +405,32 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         KeyBinding::new("i", DashboardDealInsert, Some(context)),
         KeyBinding::new("shift-s", DashboardDealRoomSnooze, Some(context)),
     ]);
-    let context = "RhoGuiDeal";
-    cx.bind_keys([
-        KeyBinding::new("q", DashboardDealExit, Some(context)),
-        KeyBinding::new("escape", DashboardDealExit, Some(context)),
-        KeyBinding::new("n", DashboardDealNext, Some(context)),
-        KeyBinding::new("shift-n", DashboardDealPrevious, Some(context)),
-        KeyBinding::new("d", DashboardDealDone, Some(context)),
-        KeyBinding::new("x", DashboardDealDiscard, Some(context)),
-        KeyBinding::new("s", DashboardDealSnooze, Some(context)),
-        KeyBinding::new("shift-s", DashboardDealRoomSnooze, Some(context)),
-        KeyBinding::new("t", DashboardDealTodo, Some(context)),
-        KeyBinding::new("r", DashboardDealReply, Some(context)),
-        KeyBinding::new("shift-r", DashboardDealRefresh, Some(context)),
-        KeyBinding::new("i", DashboardDealInsert, Some(context)),
-    ]);
+    for context in [
+        "RhoGuiDeal",
+        "RhoGuiDeal > Editor",
+        "RhoGuiDeal > Editor && vim_mode == normal",
+        "RhoGuiDeal > Editor && vim_mode == helix_normal",
+        "RhoGuiDeal > Editor && vim_mode == deal",
+        "Editor && VimDeal && vim_mode == deal",
+        "Editor && VimDeal && vim_mode == helix_deal",
+        "Editor && vim_mode == deal",
+        "Editor && vim_mode == helix_deal",
+    ] {
+        cx.bind_keys([
+            KeyBinding::new("q", DashboardDealExit, Some(context)),
+            KeyBinding::new("escape", DashboardDealExit, Some(context)),
+            KeyBinding::new("n", DashboardDealNext, Some(context)),
+            KeyBinding::new("shift-n", DashboardDealPrevious, Some(context)),
+            KeyBinding::new("d", DashboardDealDone, Some(context)),
+            KeyBinding::new("x", DashboardDealDiscard, Some(context)),
+            KeyBinding::new("s", DashboardDealSnooze, Some(context)),
+            KeyBinding::new("shift-s", DashboardDealRoomSnooze, Some(context)),
+            KeyBinding::new("t", DashboardDealTodo, Some(context)),
+            KeyBinding::new("r", DashboardDealReply, Some(context)),
+            KeyBinding::new("shift-r", DashboardDealRefresh, Some(context)),
+            KeyBinding::new("i", DashboardDealInsert, Some(context)),
+        ]);
+    }
 }
 
 /// Initializes the modal editor engine and the exact keymap stack shared by

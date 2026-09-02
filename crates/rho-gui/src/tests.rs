@@ -322,7 +322,12 @@ fn phone_desk_agent_tap_opens_the_agent_surface(cx: &mut TestAppContext) {
         },
         attention: UiAttention::Quiet,
         last_active: UnixMs(1),
-        facts: Default::default(),
+        facts: rho_ui_proto::UiAgentFacts {
+            turn_running: false,
+            last_turn_ended: Some(UnixMs(1)),
+            last_user_message_at: UnixMs(0),
+            needs_you_hint: true,
+        },
         hidden: false,
         disposition: AgentDisposition::Pending,
         last_user_message_text: String::new(),
@@ -6304,6 +6309,355 @@ fn desk_deal_open_takes_agent_without_writing_desk(cx: &mut TestAppContext) {
         })
         .unwrap();
 }
+
+fn mixed_deal_workspace(
+    cx: &mut TestAppContext,
+) -> (WindowHandle<Workspace>, AgentId, crate::inbox::InboxId) {
+    use rho_ui_proto::desk::{DeskOperation, DeskSnapshot};
+    use rho_ui_proto::{
+        AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceInfo,
+    };
+
+    let agent_id = agent(71);
+    let summary = UiAgentSummary {
+        agent_id,
+        parent_agent: None,
+        display_name: Some("mixed hand agent".to_owned()),
+        created_at: UnixMs(1),
+        updated_at: UnixMs(1),
+        role: AgentRole::default(),
+        workspace: WorkspaceInfo::UserCheckout {
+            repo: "/tmp".into(),
+        },
+        attention: UiAttention::NeedsInput,
+        last_active: UnixMs(1),
+        facts: Default::default(),
+        hidden: false,
+        disposition: AgentDisposition::Pending,
+        last_user_message_text: String::new(),
+        activity: None,
+        turn_report: None,
+        labels: Vec::new(),
+    };
+    let text = format!(
+        "* Desk card\n:deadline: 2000-01-01\ndesk body\n* Agent card :eng-{}:\nagent body\n",
+        agent_id.encoded()
+    );
+    let mut source = text::Buffer::new(
+        text::ReplicaId::new(18),
+        text::BufferId::new(1).unwrap(),
+        "",
+    );
+    let operation = DeskOperation::from_text(&source.edit([(0..0, text)]));
+    let snapshot = DeskSnapshot {
+        text: source.snapshot().text(),
+        operations: vec![operation],
+        transactions: Vec::new(),
+        replicas: Vec::new(),
+    };
+
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    let inbox_id = workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Ready {
+                    agents: vec![summary],
+                    iris_agent: None,
+                    projects: Vec::new(),
+                    auth: AuthState {
+                        namespaces: Vec::new(),
+                        disabled_namespaces: Vec::new(),
+                        active_namespace: None,
+                    },
+                    machine_seed: 0,
+                    agent_counter: 100,
+                },
+                window,
+                cx,
+            );
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskSnapshot {
+                    snapshot,
+                    replica_id: 42,
+                },
+                window,
+                cx,
+            );
+            let inbox_id = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
+                kind: crate::inbox::InboxKind::Capture,
+                text: "captured item".to_owned(),
+                source: crate::inbox::SourceReference::None,
+                context: crate::inbox::CapturedContext {
+                    host: Some(HostId::default().to_string()),
+                    room: None,
+                    focused_surface: "test".to_owned(),
+                },
+                waiting_on: None,
+            });
+            workspace.age_inbox_for_test(&inbox_id, 1);
+            workspace.sync_dashboard(window, cx);
+            window.focus(&workspace.dashboard_editor().read(cx).focus_handle(cx), cx);
+            workspace.toggle_dashboard_deal(window, cx);
+            workspace.inject_agent_deal_card_for_test(agent_id);
+            inbox_id
+        })
+        .unwrap();
+    cx.run_until_parked();
+    (workspace, agent_id, inbox_id)
+}
+
+fn assert_rendered_deal_matches_current(
+    workspace: &WindowHandle<Workspace>,
+    cx: &mut TestAppContext,
+) -> crate::dashboard::DealCardKind {
+    workspace
+        .update(cx, |workspace, _, _| {
+            let current = workspace
+                .current_deal_card_for_test()
+                .expect("current deal card");
+            let rendered = workspace
+                .rendered_deal_card_for_test()
+                .expect("rendered deal body");
+            assert_eq!(
+                rendered, current,
+                "rendered body diverged from verdict target"
+            );
+            current.1
+        })
+        .unwrap()
+}
+
+fn next_deal(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) {
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.next_deal_for_test(window, cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+}
+
+fn previous_deal(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) {
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.previous_deal_for_test(window, cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+}
+
+#[gpui::test]
+fn mixed_deal_navigation_keeps_rendered_body_and_verdict_target_in_lockstep(
+    cx: &mut TestAppContext,
+) {
+    let (workspace, _agent_id, inbox_id) = mixed_deal_workspace(cx);
+    let mut seen = Vec::new();
+    seen.push(assert_rendered_deal_matches_current(&workspace, cx));
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.snooze_deal_for_test(3, window, cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    seen.push(assert_rendered_deal_matches_current(&workspace, cx));
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let desk = workspace
+                .desk_buffer_for_test(HostId::default())
+                .unwrap()
+                .read(cx)
+                .text();
+            let wake = chrono::Local::now()
+                .date_naive()
+                .checked_add_signed(chrono::Duration::days(3))
+                .unwrap();
+            assert!(desk.contains(&format!(":defer: {wake} 3d")), "{desk:?}");
+            assert!(workspace.inbox_contains_for_test(&inbox_id));
+        })
+        .unwrap();
+
+    for _ in 0..5 {
+        next_deal(&workspace, cx);
+        if !workspace
+            .update(cx, |workspace, _, _| {
+                workspace.dashboard_deal_mode_for_test()
+            })
+            .unwrap()
+        {
+            break;
+        }
+        let next = assert_rendered_deal_matches_current(&workspace, cx);
+        seen.push(next);
+        if seen
+            .iter()
+            .any(|kind| matches!(kind, crate::dashboard::DealCardKind::Desk))
+            && seen
+                .iter()
+                .any(|kind| matches!(kind, crate::dashboard::DealCardKind::Agent))
+            && seen
+                .iter()
+                .any(|kind| matches!(kind, crate::dashboard::DealCardKind::Inbox(_)))
+        {
+            break;
+        }
+    }
+    assert!(
+        seen.iter()
+            .any(|kind| matches!(kind, crate::dashboard::DealCardKind::Desk)),
+        "{seen:?}"
+    );
+
+    // Walk back through the rendered history too. `N` used to leave the
+    // prior surface focused while moving the verdict cursor.
+    previous_deal(&workspace, cx);
+    assert_rendered_deal_matches_current(&workspace, cx);
+    previous_deal(&workspace, cx);
+    assert_rendered_deal_matches_current(&workspace, cx);
+    assert!(
+        seen.iter()
+            .any(|kind| matches!(kind, crate::dashboard::DealCardKind::Agent)),
+        "{seen:?}"
+    );
+    assert!(
+        seen.iter()
+            .any(|kind| matches!(kind, crate::dashboard::DealCardKind::Inbox(_))),
+        "{seen:?}"
+    );
+
+    // Re-deal and find the inbox card. Discard must retire only that capture,
+    // never mutate the Desk card that was previously rendered.
+    if !workspace
+        .update(cx, |workspace, _, _| {
+            workspace.dashboard_deal_mode_for_test()
+        })
+        .unwrap()
+    {
+        workspace
+            .update(cx, |workspace, window, cx| {
+                workspace.toggle_dashboard_deal(window, cx)
+            })
+            .unwrap();
+    }
+    for _ in 0..6 {
+        if matches!(
+            assert_rendered_deal_matches_current(&workspace, cx),
+            crate::dashboard::DealCardKind::Inbox(_)
+        ) {
+            break;
+        }
+        next_deal(&workspace, cx);
+    }
+    let desk_before = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace
+                .desk_buffer_for_test(HostId::default())
+                .unwrap()
+                .read(cx)
+                .text()
+        })
+        .unwrap();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.done_deal_for_test(window, cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert!(!workspace.inbox_contains_for_test(&inbox_id));
+            assert_eq!(
+                workspace
+                    .desk_buffer_for_test(HostId::default())
+                    .unwrap()
+                    .read(cx)
+                    .text(),
+                desk_before,
+                "inbox verdict mutated the previously displayed Desk target"
+            );
+        })
+        .unwrap();
+}
+
+fn assert_deal_exit_with_focus(
+    cx: &mut TestAppContext,
+    key: &str,
+    wanted: fn(crate::dashboard::DealCardKind) -> bool,
+) {
+    let (workspace, _, _) = mixed_deal_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(workspace.seek_deal_card_for_test(wanted, window, cx));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let kind = assert_rendered_deal_matches_current(&workspace, cx);
+    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.focus_dealt_surface_for_test(window, cx)
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.update_window(*workspace, |_, window, cx| {
+        let action = cx.build_action("vim::EnterDealMode", None).unwrap();
+        window.dispatch_action(action, cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, key);
+    cx.run_until_parked();
+    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert!(
+        !workspace
+            .update(cx, |workspace, _, _| workspace
+                .dashboard_deal_mode_for_test())
+            .unwrap(),
+        "{key} did not exit deal mode for {kind:?} with focus in its dealt surface"
+    );
+    return;
+}
+
+macro_rules! deal_exit_test {
+    ($name:ident, $key:literal, $pattern:pat) => {
+        #[gpui::test]
+        fn $name(cx: &mut TestAppContext) {
+            assert_deal_exit_with_focus(cx, $key, |kind| matches!(kind, $pattern));
+        }
+    };
+}
+
+deal_exit_test!(
+    escape_exits_desk_deal,
+    "escape",
+    crate::dashboard::DealCardKind::Desk
+);
+deal_exit_test!(
+    escape_exits_agent_deal_with_transcript_focused,
+    "escape",
+    crate::dashboard::DealCardKind::Agent
+);
+deal_exit_test!(
+    escape_exits_inbox_deal,
+    "escape",
+    crate::dashboard::DealCardKind::Inbox(_)
+);
+deal_exit_test!(q_exits_desk_deal, "q", crate::dashboard::DealCardKind::Desk);
+deal_exit_test!(
+    q_exits_agent_deal_with_transcript_focused,
+    "q",
+    crate::dashboard::DealCardKind::Agent
+);
+deal_exit_test!(
+    q_exits_inbox_deal,
+    "q",
+    crate::dashboard::DealCardKind::Inbox(_)
+);
 
 #[gpui::test]
 fn desk_deal_counted_snooze_todo_and_refresh_write_and_redeal(cx: &mut TestAppContext) {
