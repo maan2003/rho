@@ -132,8 +132,13 @@ offline. Changing the primitive must not change who is responsible for it.
 
 The existing org text is imported once: headings become heading nodes with
 marks from property lines and bindings from tags, everything else becomes
-prose nodes. After that the parser, the tag handling, the property lines,
-and the offset identities are deleted.
+prose nodes. The migration runs on the first start that finds a text desk,
+records that it ran, and is never consulted again; it lives in one module
+named as a migration so it can be deleted outright later. After it, the org
+document itself is gone from the daemon, along with the parser, the tag
+handling, the property lines, the text wire messages, and the offset
+identities. No frozen copy is kept and no code path reads org text. The
+`rho desk cat` rendering is for human eyes only; nothing parses it back.
 
 **Why:** rho has one user and the desk is small. Carrying two truths for a
 transition period is how the current state came about.
