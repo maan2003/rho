@@ -2251,6 +2251,13 @@ impl Workspace {
             }
         }
         merged.sort_by(|a, b| (&a.model, &a.auth_namespace).cmp(&(&b.model, &b.auth_namespace)));
+        // An unnamed legacy entry and a named namespace can describe the
+        // same account; showing identical numbers twice says nothing.
+        merged.dedup_by(|a, b| {
+            a.model == b.model
+                && a.remaining_percent == b.remaining_percent
+                && a.reset_at_unix == b.reset_at_unix
+        });
         merged
     }
 
@@ -8222,33 +8229,35 @@ impl Workspace {
             .flex_row()
             .items_center()
             .gap_3()
-            .children(quota.into_iter().enumerate().flat_map(|(index, summary)| {
-                // Colour is the provider's, always; the number says how low.
-                let color = match summary.model.as_str() {
-                    "gpt" => colors.terminal_ansi_cyan,
-                    "opus" | "fable" => gpui::rgb(0xd97757).into(),
-                    _ => colors.text_muted,
-                };
-                let reset = summary
-                    .reset_at_unix
-                    .map(|reset| reset as f64 - now)
-                    .filter(|seconds| *seconds > 0.0)
-                    .map(|seconds| format!(" {:.1}d", seconds / 86_400.0))
-                    .unwrap_or_default();
-                let separator = (index > 0).then(|| {
-                    div()
-                        .text_color(colors.text_muted)
-                        .child("·")
-                        .into_any_element()
-                });
-                separator.into_iter().chain(std::iter::once(
-                    div()
-                        .text_color(color)
-                        // Colour alone names the provider; no model text.
-                        .child(format!("{}%{reset}", summary.remaining_percent))
-                        .into_any_element(),
-                ))
-            }))
+            .child(div().flex().flex_row().items_center().gap_1p5().children(
+                quota.into_iter().enumerate().flat_map(|(index, summary)| {
+                    // Colour is the provider's, always; the number says how low.
+                    let color = match summary.model.as_str() {
+                        "gpt" => colors.terminal_ansi_cyan,
+                        "opus" | "fable" => gpui::rgb(0xd97757).into(),
+                        _ => colors.text_muted,
+                    };
+                    let reset = summary
+                        .reset_at_unix
+                        .map(|reset| reset as f64 - now)
+                        .filter(|seconds| *seconds > 0.0)
+                        .map(|seconds| format!(" {:.1}d", seconds / 86_400.0))
+                        .unwrap_or_default();
+                    let separator = (index > 0).then(|| {
+                        div()
+                            .text_color(colors.text_muted)
+                            .child("·")
+                            .into_any_element()
+                    });
+                    separator.into_iter().chain(std::iter::once(
+                        div()
+                            .text_color(color)
+                            // Colour alone names the provider; no model text.
+                            .child(format!("{}%{reset}", summary.remaining_percent))
+                            .into_any_element(),
+                    ))
+                }),
+            ))
             .children(
                 self.abnormal_connection_text()
                     .map(|connection| div().text_color(status.error).child(connection)),
