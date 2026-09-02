@@ -3204,7 +3204,7 @@ fn connection_recovery_is_transient_workspace_chrome(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn dropped_fake_connection_resubscribes_retained_transcript_after_reconnect(
+fn ordinary_ready_does_not_replay_but_reconnect_resubscribes_retained_transcript(
     cx: &mut TestAppContext,
 ) {
     use rho_ui_proto::{
@@ -3251,6 +3251,13 @@ fn dropped_fake_connection_resubscribes_retained_transcript_after_reconnect(
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(HostId::default(), ready(), window, cx);
             workspace.take_host_messages_for_test(HostId::default());
+            workspace.handle_event(HostId::default(), ready(), window, cx);
+            let refresh_messages = workspace.take_host_messages_for_test(HostId::default());
+            assert!(
+                !refresh_messages
+                    .iter()
+                    .any(|message| { matches!(message, ClientMessage::SubscribeAgents { .. }) })
+            );
             workspace.handle_event(
                 HostId::default(),
                 ConnEvent::Disconnected("link dropped".to_owned()),

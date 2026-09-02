@@ -27,6 +27,15 @@ fn next_reconnect_delay(delay: std::time::Duration) -> std::time::Duration {
     (delay * 2).min(MAX_RECONNECT_DELAY)
 }
 
+fn shell_request_id(message: &ClientMessage) -> Option<u64> {
+    match message {
+        ClientMessage::ShellStart { request_id, .. }
+        | ClientMessage::ShellList { request_id, .. }
+        | ClientMessage::ShellClose { request_id, .. } => Some(*request_id),
+        _ => None,
+    }
+}
+
 use crate::registry::HostId;
 use crate::workspace::AttachTarget;
 
@@ -868,6 +877,7 @@ pub fn spawn(
     let event_tx = EventSink { host, events };
     let (command_tx, command_rx) = futures_mpsc::unbounded();
     let command_rx = Arc::new(tokio::sync::Mutex::new(command_rx));
+    let pending_command = Arc::new(Mutex::new(None));
     let dialer = Arc::new(Mutex::new(None));
     let shell_requests = Arc::new(Mutex::new(ShellControlRequests::default()));
     let io_task = if cfg!(test) {
@@ -879,6 +889,7 @@ pub fn spawn(
                 target,
                 event_tx,
                 command_rx,
+                pending_command,
                 dialer.clone(),
                 Arc::clone(&shell_requests),
             ),
@@ -899,6 +910,7 @@ async fn supervise(
     target: AttachTarget,
     events: EventSink,
     commands: Arc<tokio::sync::Mutex<futures_mpsc::UnboundedReceiver<ClientMessage>>>,
+    pending_command: Arc<Mutex<Option<ClientMessage>>>,
     dialer: Arc<Mutex<Option<ChannelDialer>>>,
     shell_requests: Arc<Mutex<ShellControlRequests>>,
 ) {
@@ -910,6 +922,7 @@ async fn supervise(
             target.clone(),
             &events,
             Arc::clone(&commands),
+            Arc::clone(&pending_command),
             &dialer,
             &shell_requests,
             &mut connected,
@@ -941,10 +954,65 @@ async fn supervise(
     }
 }
 
+async fn run_control_writer<W>(
+    mut writer: W,
+    commands: Arc<tokio::sync::Mutex<futures_mpsc::UnboundedReceiver<ClientMessage>>>,
+    pending_command: Arc<Mutex<Option<ClientMessage>>>,
+    attempted_shell_requests: Arc<Mutex<HashSet<u64>>>,
+) -> anyhow::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut usage_refresh = tokio::time::interval(std::time::Duration::from_secs(10 * 60));
+    usage_refresh.tick().await;
+    loop {
+        let message = if let Some(message) = pending_command.lock().unwrap().clone() {
+            message
+        } else {
+            tokio::select! {
+                message = async { commands.lock().await.next().await } => {
+                    let Some(message) = message else { return Ok(()) };
+                    *pending_command.lock().unwrap() = Some(message.clone());
+                    message
+                }
+                _ = usage_refresh.tick() => {
+                    write_frame(&mut writer, &ClientMessage::ChatGptUsage).await?;
+                    continue;
+                }
+            }
+        };
+        write_frame(&mut writer, &message).await?;
+        pending_command.lock().unwrap().take();
+        if let Some(request_id) = shell_request_id(&message) {
+            attempted_shell_requests.lock().unwrap().insert(request_id);
+        }
+    }
+}
+
+fn fail_attempted_shell_requests(
+    shell_requests: &Mutex<ShellControlRequests>,
+    attempted: &Mutex<HashSet<u64>>,
+    reason: &str,
+) {
+    let attempted = std::mem::take(&mut *attempted.lock().unwrap());
+    let mut requests = shell_requests.lock().unwrap();
+    for request_id in attempted {
+        if let Some(response) = requests.pending.remove(&request_id) {
+            let _ = response.send(ShellControlReply::Failed(reason.to_owned()));
+        }
+    }
+}
+
+async fn abort_tasks<T: 'static>(tasks: &mut tokio::task::JoinSet<T>) {
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+}
+
 async fn run(
     target: AttachTarget,
     events: &EventSink,
     commands: Arc<tokio::sync::Mutex<futures_mpsc::UnboundedReceiver<ClientMessage>>>,
+    pending_command: Arc<Mutex<Option<ClientMessage>>>,
     dialer: &Mutex<Option<ChannelDialer>>,
     shell_requests: &Mutex<ShellControlRequests>,
     connected: &mut bool,
@@ -1015,7 +1083,7 @@ async fn run(
         HashMap::<u64, tokio::sync::watch::Sender<bool>>::new(),
     ));
 
-    let (mut reader, mut writer) = tokio::io::split(stream);
+    let (mut reader, writer) = tokio::io::split(stream);
     let health_task = health_connection.map(|connection| {
         let events = events.clone();
         tokio::spawn(async move {
@@ -1049,33 +1117,30 @@ async fn run(
             }
         })
     });
-    let writer_task = tokio::spawn(async move {
-        let mut usage_refresh = tokio::time::interval(std::time::Duration::from_secs(10 * 60));
-        // The initial request was sent above; skip the interval's immediate tick.
-        usage_refresh.tick().await;
-        loop {
-            tokio::select! {
-                message = async { commands.lock().await.next().await } => {
-                    let Some(message) = message else { break };
-                    if write_frame(&mut writer, &message).await.is_err() {
-                        break;
-                    }
-                }
-                _ = usage_refresh.tick() => {
-                    if write_frame(&mut writer, &ClientMessage::ChatGptUsage).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
+    let attempted_shell_requests = Arc::new(Mutex::new(HashSet::new()));
+    let mut writer_task = tokio::spawn(run_control_writer(
+        writer,
+        commands,
+        pending_command,
+        Arc::clone(&attempted_shell_requests),
+    ));
+    let mut writer_finished = false;
+    let mut git_provider_tasks = tokio::task::JoinSet::new();
 
     let read_error = loop {
-        let message: ServerMessage = match read_frame(&mut reader).await {
-            Ok(message) => message,
-            Err(error) => {
-                break Some(error);
+        let message: ServerMessage = tokio::select! {
+            result = &mut writer_task => {
+                writer_finished = true;
+                break Some(match result {
+                    Ok(Ok(())) => anyhow::anyhow!("daemon control writer stopped"),
+                    Ok(Err(error)) => error.context("write daemon control frame"),
+                    Err(error) => anyhow::anyhow!("daemon control writer task failed: {error}"),
+                });
             }
+            result = read_frame(&mut reader) => match result {
+                Ok(message) => message,
+                Err(error) => break Some(error.into()),
+            },
         };
         let event = match message {
             ServerMessage::DeskSnapshot {
@@ -1175,7 +1240,7 @@ async fn run(
                 let (done_tx, mut done_rx) = tokio::sync::watch::channel(false);
                 git_requests.lock().unwrap().insert(request_id, done_tx);
                 let git_requests = git_requests.clone();
-                tokio::spawn(async move {
+                git_provider_tasks.spawn(async move {
                     let result = async {
                         let _permit = tokio::select! {
                             permit = git_transport_limit.acquire_owned() => {
@@ -1274,17 +1339,27 @@ async fn run(
             break None;
         }
     };
-    writer_task.abort();
-    let _ = writer_task.await;
+    if !writer_finished {
+        writer_task.abort();
+        let _ = writer_task.await;
+    }
     if let Some(task) = health_task {
         task.abort();
+        let _ = task.await;
     }
-    shell_requests.lock().unwrap().pending.clear();
     if let Some(task) = agent_stream_task {
         task.abort();
+        let _ = task.await;
     }
+    abort_tasks(&mut git_provider_tasks).await;
+    let failure = read_error
+        .as_ref()
+        .map(|error| format!("daemon connection lost: {error:#}"))
+        .unwrap_or_else(|| "daemon connection closed".to_owned());
+    fail_attempted_shell_requests(shell_requests, &attempted_shell_requests, &failure);
+    git_requests.lock().unwrap().clear();
     match read_error {
-        Some(error) => Err(error.into()),
+        Some(error) => Err(error),
         None => Ok(()),
     }
 }
@@ -1847,16 +1922,18 @@ fn is_safe_remote_executable(value: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::collections::HashSet;
+    use std::sync::{Arc, Mutex};
 
     use octo_types::{ReceivePackCommands, RefUpdate};
-    use rho_ui_proto::{GitService, GitTransportRequest};
+    use rho_ui_proto::{ClientMessage, GitService, GitTransportRequest};
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     use super::{
         AgentFrameAllocationBudget, INITIAL_RECONNECT_DELAY, MAX_RECONNECT_DELAY,
-        copy_planned_receive_pack, display_field, git_push_prompt, next_reconnect_delay,
-        receive_pack_refs_match, validate_git_transport_request,
+        ShellControlReply, ShellControlRequests, abort_tasks, copy_planned_receive_pack,
+        display_field, fail_attempted_shell_requests, git_push_prompt, next_reconnect_delay,
+        read_frame, receive_pack_refs_match, run_control_writer, validate_git_transport_request,
     };
 
     #[test]
@@ -1867,6 +1944,114 @@ mod tests {
         }
         assert_eq!(delay, MAX_RECONNECT_DELAY);
         assert_eq!(next_reconnect_delay(delay), MAX_RECONNECT_DELAY);
+    }
+
+    #[test]
+    fn writer_failure_returns_to_the_connection_supervisor() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (writer, peer) = tokio::io::duplex(64);
+                drop(peer);
+                let (commands_tx, commands_rx) = futures::channel::mpsc::unbounded();
+                commands_tx.unbounded_send(ClientMessage::Ping).unwrap();
+                let result = run_control_writer(
+                    writer,
+                    Arc::new(tokio::sync::Mutex::new(commands_rx)),
+                    Arc::new(Mutex::new(None)),
+                    Arc::new(Mutex::new(HashSet::new())),
+                )
+                .await;
+                assert!(result.is_err());
+            });
+    }
+
+    #[test]
+    fn failed_write_replays_the_in_flight_command() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (commands_tx, commands_rx) = futures::channel::mpsc::unbounded();
+                commands_tx.unbounded_send(ClientMessage::Ping).unwrap();
+                let commands = Arc::new(tokio::sync::Mutex::new(commands_rx));
+                let pending = Arc::new(Mutex::new(None));
+                let attempted = Arc::new(Mutex::new(HashSet::new()));
+                let (failed_writer, peer) = tokio::io::duplex(64);
+                drop(peer);
+                assert!(
+                    run_control_writer(
+                        failed_writer,
+                        Arc::clone(&commands),
+                        Arc::clone(&pending),
+                        Arc::clone(&attempted),
+                    )
+                    .await
+                    .is_err()
+                );
+                assert!(matches!(
+                    pending.lock().unwrap().as_ref(),
+                    Some(ClientMessage::Ping)
+                ));
+
+                let (writer, mut reader) = tokio::io::duplex(1024);
+                let replay = tokio::spawn(run_control_writer(writer, commands, pending, attempted));
+                let message: ClientMessage = read_frame(&mut reader).await.unwrap();
+                assert!(matches!(message, ClientMessage::Ping));
+                replay.abort();
+                let _ = replay.await;
+            });
+    }
+
+    #[test]
+    fn teardown_fails_only_requests_attempted_on_the_dead_session() {
+        let mut requests = ShellControlRequests::default();
+        let (attempted_tx, attempted_rx) = tokio::sync::oneshot::channel();
+        let (queued_tx, _queued_rx) = tokio::sync::oneshot::channel();
+        requests.pending.insert(1, attempted_tx);
+        requests.pending.insert(2, queued_tx);
+        let requests = Mutex::new(requests);
+        let attempted = Mutex::new(HashSet::from([1]));
+
+        fail_attempted_shell_requests(&requests, &attempted, "lost");
+
+        assert!(matches!(
+            attempted_rx.blocking_recv().unwrap(),
+            ShellControlReply::Failed(reason) if reason == "lost"
+        ));
+        assert!(requests.lock().unwrap().pending.contains_key(&2));
+    }
+
+    #[test]
+    fn session_teardown_aborts_and_awaits_provider_tasks() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                struct Dropped(Arc<std::sync::atomic::AtomicBool>);
+                impl Drop for Dropped {
+                    fn drop(&mut self) {
+                        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+                let guard = Dropped(Arc::clone(&dropped));
+                let mut tasks = tokio::task::JoinSet::new();
+                tasks.spawn(async move {
+                    let _guard = guard;
+                    futures::future::pending::<()>().await;
+                });
+                tokio::task::yield_now().await;
+
+                abort_tasks(&mut tasks).await;
+
+                assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+                assert!(tasks.is_empty());
+            });
     }
 
     fn receive_pack_input(reference: &str, old: &str, new: &str, tail: &[u8]) -> Vec<u8> {

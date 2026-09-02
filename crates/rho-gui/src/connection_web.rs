@@ -944,6 +944,7 @@ impl Connection {
                             Arc::clone(&shell_requests),
                             Rc::clone(&dialer),
                             Rc::clone(&connected),
+                            reconnecting,
                         )
                         .await
                         {
@@ -1097,6 +1098,14 @@ enum RunOutcome {
     EnrollmentRequired,
 }
 
+fn ensure_ready(message: &ServerMessage) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        matches!(message, ServerMessage::Ready { .. }),
+        "rho daemon did not send ready message"
+    );
+    Ok(())
+}
+
 async fn run(
     daemon: EndpointId,
     endpoint: &iroh::Endpoint,
@@ -1106,6 +1115,7 @@ async fn run(
     shell_requests: Arc<Mutex<ShellControlRequests>>,
     dialer: Rc<RefCell<Option<rho_rpc::Dialer>>>,
     connected: Rc<Cell<bool>>,
+    reconnecting: bool,
 ) -> anyhow::Result<RunOutcome> {
     conn_log(&format!("dialing daemon from endpoint {}", endpoint.id()));
     let connection = endpoint
@@ -1140,9 +1150,15 @@ async fn run(
     let mut recv = rho_rpc::Reader::new(recv);
     rho_ui_proto::write_frame(&mut send, &ClientMessage::Subscribe).await?;
     rho_ui_proto::write_frame(&mut send, &ClientMessage::DeskSubscribe).await?;
+    let ready: ServerMessage = rho_ui_proto::read_frame(&mut recv)
+        .await
+        .map_err(|error| anyhow::anyhow!("read daemon ready message: {error}"))?;
+    ensure_ready(&ready)?;
+    handle_host_message(host_sink.as_ref(), &shell_requests, &ready);
+    let _ = events.unbounded_send(Event::Message(ready));
     connected.set(true);
     let _ = events.unbounded_send(Event::Phase(Phase::Online));
-    if let Some(sink) = &host_sink {
+    if reconnecting && let Some(sink) = &host_sink {
         sink.send(ConnEvent::Recovered);
     }
     let channel_connection = connection.clone();
@@ -1555,4 +1571,30 @@ fn decode_hex_vec(text: &str) -> Option<Vec<u8>> {
         bytes.push(u8::from_str_radix(chunk, 16).ok()?);
     }
     Some(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_is_not_ready_before_the_ready_handshake() {
+        assert!(ensure_ready(&ServerMessage::Pong).is_err());
+        assert!(
+            ensure_ready(&ServerMessage::Ready {
+                agents: Vec::new(),
+                iris_agent: None,
+                projects: Vec::new(),
+                auth: rho_ui_proto::AuthState {
+                    namespaces: Vec::new(),
+                    disabled_namespaces: Vec::new(),
+                    active_namespace: None,
+                },
+                view_config: Vec::new(),
+                machine_seed: 0,
+                agent_counter: 0,
+            })
+            .is_ok()
+        );
+    }
 }

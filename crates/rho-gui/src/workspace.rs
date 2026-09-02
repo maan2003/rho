@@ -415,6 +415,9 @@ pub struct Workspace {
     /// Hosts that have delivered at least one `Ready`. A host attaches
     /// blind; until it answers, its agents do not exist for this client.
     ready_hosts: HashSet<HostId>,
+    /// A routine registry refresh also sends `Ready`, so replay is armed
+    /// separately and only by an actual disconnect.
+    replay_hosts: HashSet<HostId>,
     /// Per-host quota and usage answers. The chrome merges them (the
     /// binding constraint is whichever host has least headroom); keeping
     /// them apart means one host's refresh never blanks another's.
@@ -1021,6 +1024,7 @@ impl Workspace {
             new_agent_draft: None,
             awaiting_draft_agent: None,
             ready_hosts: HashSet::new(),
+            replay_hosts: HashSet::new(),
             quota_summaries: HashMap::new(),
             quota_history: HashMap::new(),
             quota_history_days: 7,
@@ -1151,6 +1155,7 @@ impl Workspace {
         }
         self.hosts.detach(host);
         self.ready_hosts.remove(&host);
+        self.replay_hosts.remove(&host);
         self.quota_summaries.remove(&host);
         self.quota_history.remove(&host);
         self.global_usage.remove(&host);
@@ -1897,7 +1902,7 @@ impl Workspace {
                 machine_seed,
                 agent_counter,
             } => {
-                let reconnecting = self.ready_hosts.contains(&host);
+                let reconnecting = self.replay_hosts.remove(&host);
                 let (first_ready, initial_subscriptions) =
                     self.apply_ready(host, machine_seed, agent_counter, agents, iris_agent);
                 self.prune_contexts();
@@ -2158,6 +2163,7 @@ impl Workspace {
                 // Only detaching (`space h d`) forgets a daemon.
                 self.hosts
                     .set_status(host, HostStatus::Disconnected(reason.clone()));
+                self.replay_hosts.insert(host);
                 let source = self.host_label(host);
                 self.notice_on(
                     None,
