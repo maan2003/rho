@@ -8223,13 +8223,10 @@ impl Workspace {
             .items_center()
             .gap_3()
             .children(quota.into_iter().enumerate().flat_map(|(index, summary)| {
-                let color = match summary.remaining_percent {
-                    0 => status.error,
-                    1..=10 => status.warning,
-                    _ if summary.model == "gpt" => colors.terminal_ansi_cyan,
-                    _ if summary.model == "opus" || summary.model == "fable" => {
-                        gpui::rgb(0xd97757).into()
-                    }
+                // Colour is the provider's, always; the number says how low.
+                let color = match summary.model.as_str() {
+                    "gpt" => colors.terminal_ansi_cyan,
+                    "opus" | "fable" => gpui::rgb(0xd97757).into(),
                     _ => colors.text_muted,
                 };
                 let reset = summary
