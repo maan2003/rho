@@ -2157,11 +2157,6 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
             wl_keyboard::Event::Enter { surface, .. } => {
                 state.keyboard_focused_window = get_window(&mut state, &surface.id());
                 state.enter_token = Some(());
-
-                if let Some(window) = state.keyboard_focused_window.clone() {
-                    drop(state);
-                    window.set_focused(true);
-                }
             }
             wl_keyboard::Event::Leave { surface, .. } => {
                 let keyboard_focused_window = get_window(&mut state, &surface.id());
@@ -2178,7 +2173,6 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                     state.pre_edit_text.take();
                     drop(state);
                     window.handle_ime(ImeInput::DeleteText);
-                    window.set_focused(false);
                 }
             }
             wl_keyboard::Event::Modifiers {
@@ -2248,8 +2242,18 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                 };
                 let keycode = Keycode::from(key + MIN_KEYCODE);
                 let keysym = keymap_state.key_get_one_sym(keycode);
+                let is_shift = matches!(keysym, xkb::Keysym::Shift_L | xkb::Keysym::Shift_R);
 
                 match key_state {
+                    wl_keyboard::KeyState::Pressed if is_shift => {
+                        let input = PlatformInput::KeyDown(KeyDownEvent {
+                            keystroke: keystroke_from_xkb(keymap_state, state.modifiers, keycode),
+                            is_held: false,
+                            prefer_character_input: false,
+                        });
+                        drop(state);
+                        focused_window.handle_input(input);
+                    }
                     wl_keyboard::KeyState::Pressed if !keysym.is_modifier_key() => {
                         let mut keystroke =
                             keystroke_from_xkb(keymap_state, state.modifiers, keycode);
@@ -2348,6 +2352,13 @@ impl Dispatch<wl_keyboard::WlKeyboard, ()> for WaylandClientStatePtr {
                             state.repeat.current_keycode = None;
                         }
 
+                        drop(state);
+                        focused_window.handle_input(input);
+                    }
+                    wl_keyboard::KeyState::Released if is_shift => {
+                        let input = PlatformInput::KeyUp(KeyUpEvent {
+                            keystroke: keystroke_from_xkb(keymap_state, state.modifiers, keycode),
+                        });
                         drop(state);
                         focused_window.handle_input(input);
                     }

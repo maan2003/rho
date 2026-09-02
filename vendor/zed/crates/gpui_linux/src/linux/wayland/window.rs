@@ -1161,9 +1161,11 @@ impl WaylandWindowStatePtr {
                 let mut fullscreen = false;
                 let mut maximized = false;
                 let mut resizing = false;
+                let mut active = false;
 
                 for state in states {
                     match state {
+                        xdg_toplevel::State::Activated => active = true,
                         xdg_toplevel::State::Maximized => {
                             maximized = true;
                         }
@@ -1188,6 +1190,8 @@ impl WaylandWindowStatePtr {
                         }
                     }
                 }
+
+                self.set_active(active);
 
                 if fullscreen || maximized {
                     tiling = Tiling::tiled();
@@ -1498,15 +1502,21 @@ impl WaylandWindowStatePtr {
         }
     }
 
-    pub fn set_focused(&self, focus: bool) {
-        self.state.borrow_mut().active = focus;
+    pub fn set_active(&self, active: bool) {
+        let mut state = self.state.borrow_mut();
+        if state.active == active {
+            return;
+        }
+        state.active = active;
+        drop(state);
+
         let callback = self.callbacks.borrow_mut().active_status_change.take();
         if let Some(mut fun) = callback {
-            fun(focus);
+            fun(active);
             self.callbacks.borrow_mut().active_status_change = Some(fun);
         }
         if let Some(adapter) = self.state.borrow_mut().accesskit_adapter.as_mut() {
-            adapter.update_window_focus_state(focus);
+            adapter.update_window_focus_state(active);
         }
     }
 

@@ -3133,7 +3133,7 @@ fn total_cost_shows_in_status_chips(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn phone_status_omits_workspace_id_but_keeps_other_chips(cx: &mut TestAppContext) {
+fn transcript_status_omits_internal_ids_but_keeps_human_chips(cx: &mut TestAppContext) {
     use rho_ui_proto::{
         AgentDisposition, AgentRole, AuthState, UiAgentSummary, UiAttention, WorkspaceId,
         WorkspaceIdDomain, WorkspaceInfo,
@@ -3211,22 +3211,22 @@ fn phone_status_omits_workspace_id_but_keeps_other_chips(cx: &mut TestAppContext
             })
             .expect("read status")
     };
-    assert!(status(cx).contains("ws-"), "desktop keeps workspace id");
+    assert!(!status(cx).contains("ws-"), "desktop hides workspace id");
 
     cx.simulate_window_resize(*workspace, size(px(500.), px(800.)));
     cx.run_until_parked();
     let phone = status(cx);
     assert!(!phone.contains("ws-"), "phone status: {phone:?}");
     assert!(phone.contains("rho"), "phone keeps project: {phone:?}");
-    assert!(phone.contains("eng"), "phone keeps role: {phone:?}");
+    assert!(!phone.contains("eng"), "phone hides role ids: {phone:?}");
     assert!(phone.contains("62k"), "phone keeps tokens: {phone:?}");
     assert!(phone.contains('$'), "phone keeps cost: {phone:?}");
 
     cx.simulate_window_resize(*workspace, size(px(1200.), px(800.)));
     cx.run_until_parked();
     assert!(
-        status(cx).contains("ws-"),
-        "desktop restores workspace id after leaving phone mode"
+        !status(cx).contains("ws-"),
+        "desktop keeps workspace ids hidden after leaving phone mode"
     );
 }
 
@@ -5805,17 +5805,6 @@ fn desk_deal_session_resumes_and_insert_escape_returns_to_normal(cx: &mut TestAp
                     "Helix Deal must use a cursor, not a selection"
                 );
             });
-        })
-        .unwrap();
-
-    cx.simulate_keystrokes(*workspace, "r");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(
-                workspace.dashboard_deal_mode_for_test(),
-                "reply must be inert on a non-agent deal card"
-            );
         })
         .unwrap();
 

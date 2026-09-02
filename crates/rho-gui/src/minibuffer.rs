@@ -38,14 +38,13 @@ pub fn token_start(text_before_cursor: &str) -> usize {
 }
 
 /// How long an echoed message stays visible.
-pub const ECHO_DURATION: std::time::Duration = std::time::Duration::from_secs(6);
+pub const ECHO_DURATION: std::time::Duration = std::time::Duration::from_secs(2);
 /// Long messages (`:help`) are capped in the echo area; the transcript
 /// keeps the full copy.
 const ECHO_MAX_LINES: usize = 12;
 
-/// The emacs echo area: the most recent system notice, flashed in the
-/// bottom strip. The durable copy lives in the transcript log; this is
-/// the at-a-glance one. Dropping it (replacement or timer) dismisses it.
+/// The most recent system notice, temporarily substituted into the shared
+/// status line. Dropping it (replacement or timer) dismisses it.
 pub struct Echo {
     text: String,
     class: StyleClass,
@@ -54,7 +53,6 @@ pub struct Echo {
 }
 
 impl Echo {
-    #[cfg(test)]
     pub fn text(&self) -> &str {
         &self.text
     }

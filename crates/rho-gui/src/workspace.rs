@@ -37,9 +37,9 @@ use gpui::{
     TouchPhase, Window, div, px,
 };
 use rho_core::ContentPart;
-use rho_ui_proto::{
-    AdvisorIntelligence, AgentId, AgentRole, ClientMessage, EngineerIntelligence, MessageDelivery,
-};
+#[cfg(test)]
+use rho_ui_proto::AdvisorIntelligence;
+use rho_ui_proto::{AgentId, AgentRole, ClientMessage, EngineerIntelligence, MessageDelivery};
 use settings::Settings as _;
 use theme::ActiveTheme as _;
 
@@ -62,7 +62,9 @@ use crate::registry::session::{
 };
 use crate::registry::{ActivePane, AgentRegistry, HostId};
 use crate::store::{AgentStore, FrameSummary};
-use crate::style::{RoleFamily, StyleClass};
+#[cfg(test)]
+use crate::style::RoleFamily;
+use crate::style::StyleClass;
 use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
     AgentDone, AgentHide, AgentJumpAttention, AgentNew, AgentNext, AgentPrevious, BrowserExit,
@@ -409,6 +411,7 @@ pub struct Workspace {
     dealer_signal_eval_scheduled: bool,
     _dealer_signal_task: Task<()>,
     lamp_on: bool,
+    dealer_signals_initialized: bool,
     chime_above_threshold: bool,
     /// The dashboard: the rail as a real editor buffer, ambient chrome
     /// beside the active tree.
@@ -899,11 +902,15 @@ impl Workspace {
                 cx.notify();
             }
         });
+        let mut last_window_active = None;
         let window_activation_subscription =
-            cx.observe_window_activation(window, |_this, window, _cx| {
-                crate::journal::record(crate::journal::Event::WindowFocusChanged {
-                    focused: window.is_window_active(),
-                });
+            cx.observe_window_activation(window, move |_this, window, _cx| {
+                let focused = window.is_window_active();
+                if last_window_active == Some(focused) {
+                    return;
+                }
+                last_window_active = Some(focused);
+                crate::journal::record(crate::journal::Event::WindowFocusChanged { focused });
             });
         let mut this = Self {
             hosts,
@@ -954,6 +961,7 @@ impl Workspace {
             dealer_signal_eval_scheduled: false,
             _dealer_signal_task: dealer_signal_task,
             lamp_on: false,
+            dealer_signals_initialized: false,
             chime_above_threshold: false,
             dashboard,
             mode_indicator,
@@ -1529,7 +1537,7 @@ impl Workspace {
             .current_room
             .as_ref()
             .and_then(|room| Some((room.host, self.room_names.get(room)?.as_str())));
-        let hand = self.dashboard.dealer_hand(
+        let mut hand = self.dashboard.dealer_hand(
             &self.registry,
             &self.inbox,
             now,
@@ -1537,6 +1545,31 @@ impl Workspace {
             &self.agent_last_interaction,
             cx,
         );
+        hand.cards.retain(|card| {
+            if let Some(current) = self.dashboard.current_deal_card() {
+                return card.identity != current.identity;
+            }
+            if self.overview_open {
+                return !matches!(
+                    (&card.identity, self.dashboard.cursor_topic(cx)),
+                    (
+                        crate::dashboard::DealCardIdentity::Desk { host, heading_offset },
+                        Some((cursor_host, cursor_offset))
+                    ) if *host == cursor_host && *heading_offset == cursor_offset
+                );
+            }
+            match &self.active_pane().surface.key {
+                SurfaceKey::Transcript(agent_id) => {
+                    card.identity != crate::dashboard::DealCardIdentity::Agent(*agent_id)
+                }
+                #[cfg(feature = "native")]
+                SurfaceKey::Browser(page) => !matches!(
+                    card.inbox_source,
+                    Some(crate::dashboard::DealerInboxSource::Page(id)) if id == *page
+                ),
+                _ => true,
+            }
+        });
         let top = hand.cards.first();
         let max_priority = top.map(|card| card.priority);
         let card = top.map(|card| Self::journal_card_identity(&card.identity));
@@ -1557,6 +1590,11 @@ impl Workspace {
         }
         let chime_above =
             max_priority.is_some_and(|priority| priority >= crate::dashboard::CHIME_THRESHOLD);
+        if !self.dealer_signals_initialized {
+            self.dealer_signals_initialized = true;
+            self.chime_above_threshold = chime_above;
+            return;
+        }
         if chime_above && !self.chime_above_threshold {
             if let (Some(priority), Some(card)) = (max_priority, card) {
                 #[cfg(feature = "native")]
@@ -3429,7 +3467,7 @@ impl Workspace {
                 this.invalidate_dealer_signals(cx);
                 this.preview_browser_page(id, window, cx);
                 this.focus_rail(window, cx);
-                this.notice_on(None, "captured in inbox", StyleClass::SystemInfo, cx);
+                this.echo("captured", StyleClass::SystemInfo, cx);
             });
         })
         .detach();
@@ -3481,7 +3519,7 @@ impl Workspace {
                             method: crate::journal::CaptureMethod::Keyboard,
                         });
                         workspace.invalidate_dealer_signals(cx);
-                        workspace.notice_on(None, "captured", StyleClass::SystemInfo, cx)
+                        workspace.echo("captured", StyleClass::SystemInfo, cx)
                     }
                     Err(error) => {
                         tracing::error!(%error, "persisting inbox capture");
@@ -3555,7 +3593,7 @@ impl Workspace {
                     inbox_id: id.0,
                     verdict: crate::journal::InboxVerdict::Discard,
                 });
-                self.notice_on(None, "discarded", StyleClass::SystemInfo, cx);
+                self.echo("discarded", StyleClass::SystemInfo, cx);
                 self.invalidate_dealer_signals(cx);
             }
             Err(error) => tracing::error!(%error, "discarding inbox item"),
@@ -3576,7 +3614,7 @@ impl Workspace {
                     inbox_id: id.0,
                     verdict: crate::journal::InboxVerdict::Defer { until_ms },
                 });
-                self.notice_on(None, "deferred one day", StyleClass::SystemInfo, cx);
+                self.echo("deferred 1d", StyleClass::SystemInfo, cx);
                 self.invalidate_dealer_signals(cx);
             }
             Err(error) => tracing::error!(%error, "deferring inbox item"),
@@ -3655,7 +3693,11 @@ impl Workspace {
         });
         self.pending_inbox_item = None;
         self.refresh_dashboard(window, cx);
-        self.notice_on(None, "filed", StyleClass::SystemInfo, cx);
+        self.echo(
+            &format!("filed under {heading}"),
+            StyleClass::SystemInfo,
+            cx,
+        );
     }
 
     #[cfg(feature = "native")]
@@ -5361,11 +5403,9 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let directory_label = self.working_directory_label(agent_id);
-        let workspace_label = if self.phone.enabled {
-            None
-        } else {
-            self.registry.workspace_id_label(*agent_id)
-        };
+        // Daemon workspace and role identifiers are internal routing data,
+        // not useful transcript prompt chrome.
+        let workspace_label: Option<String> = None;
         let usage_label = self.store.get(agent_id).map(|state| {
             let usage = &state.usage.total;
             format!(
@@ -5373,7 +5413,6 @@ impl Workspace {
                 crate::transient::bucket_cost_usd(usage, &state.usage.provider)
             )
         });
-        let role_label = self.role_label(agent_id);
         let context_used = self
             .store
             .get(agent_id)
@@ -5383,9 +5422,7 @@ impl Workspace {
                 &directory_label,
                 workspace_label.as_deref(),
                 usage_label.as_deref(),
-                role_label
-                    .as_ref()
-                    .map(|label| (label.text.as_str(), label.family)),
+                None,
                 context_used,
                 cx,
             )
@@ -6772,8 +6809,8 @@ impl Workspace {
             #[cfg(feature = "native")]
             Some(RowTarget::Page(id)) => self.open_browser_page(id, window, cx),
             // A staffed heading opens its top agent full-frame — loudest
-            // first, quiet agents still reachable. Unstaffed headings keep
-            // enter as a fold toggle.
+            // first, quiet agents still reachable. An unstaffed heading opens
+            // its first-message draft rather than a blank composer.
             Some(RowTarget::Topic {
                 host,
                 offset,
@@ -6786,8 +6823,9 @@ impl Workspace {
                 {
                     self.open_agent(agent_id, window, cx);
                 } else if on_heading_line {
-                    self.dashboard.toggle_subagents(cx);
-                    self.refresh_dashboard(window, cx);
+                    self.dashboard
+                        .open_new_draft(Some((host, offset)), window, cx);
+                    self.dashboard_focus_draft(window, cx);
                 } else {
                     cx.propagate();
                 }
@@ -7485,7 +7523,9 @@ impl Workspace {
             .as_ref()
             .is_none_or(|view| !view.matches(&card.identity))
         {
-            let view = if let Some(agent_id) = card.agent_id {
+            let view = if matches!(card.kind, crate::dashboard::DealCardKind::Agent)
+                && let Some(agent_id) = card.agent_id
+            {
                 Some(DealView::Surface {
                     identity: card.identity.clone(),
                     surface: self.make_surface(SurfaceKey::Transcript(agent_id), window, cx),
@@ -7751,9 +7791,18 @@ impl Workspace {
             return self.render_deal_why(card, text_style, cx);
         }
         let path = if self.overview_open {
-            self.dashboard
+            let path = self
+                .dashboard
                 .cursor_breadcrumb(cx)
-                .unwrap_or_else(|| "desk".to_owned())
+                .unwrap_or_else(|| "desk".to_owned());
+            if matches!(
+                self.dashboard.cursor_target(&self.registry, cx),
+                Some(crate::dashboard::RowTarget::NewDraft(_))
+            ) {
+                format!("{path} / new agent")
+            } else {
+                path
+            }
         } else {
             match &self.active_pane().surface.key {
                 SurfaceKey::Transcript(agent_id) => {
@@ -7773,7 +7822,11 @@ impl Workspace {
                 key => self.surface_name(key),
             }
         };
-        let left = Self::truncate_outline_path(&path);
+        let left = self
+            .echo
+            .as_ref()
+            .map(|echo| echo.text().to_owned())
+            .unwrap_or_else(|| Self::truncate_outline_path(&path));
         let right = self.status_right_text(cx);
         div()
             .id("rho-status-line")
@@ -8070,10 +8123,6 @@ impl Workspace {
             .unwrap_or_else(|| directory.to_string())
     }
 
-    fn role_label(&self, agent_id: &AgentId) -> Option<RoleLabel> {
-        self.registry.agent_role(*agent_id).map(agent_role_label)
-    }
-
     pub fn live_agent_targets(&self) -> Vec<crate::commands::Candidate> {
         let mut candidates = Vec::new();
         for agent_id in self.registry.known_agents() {
@@ -8250,11 +8299,13 @@ fn cycle_agent_role_text(current: &str) -> &'static str {
     }
 }
 
+#[cfg(test)]
 struct RoleLabel {
     text: String,
     family: RoleFamily,
 }
 
+#[cfg(test)]
 fn agent_role_label(config: AgentRole) -> RoleLabel {
     match config {
         AgentRole::PM | AgentRole::WorkflowPM { .. } => RoleLabel {
@@ -8318,7 +8369,11 @@ impl Render for Workspace {
             .flex_col()
             .p(px(2.))
             .bg(cx.theme().colors().editor_background)
-            .key_context("RhoGui")
+            .key_context(if self.dashboard.deal_mode() {
+                "RhoGuiDeal"
+            } else {
+                "RhoGui"
+            })
             .capture_key_down(
                 cx.listener(|this, event: &gpui::KeyDownEvent, _window, cx| {
                     if this.dashboard.deal_mode() {
@@ -8735,7 +8790,10 @@ impl Render for Workspace {
                 );
                 #[cfg(not(feature = "native"))]
                 let opens_page = false;
-                if card.agent_id.is_none() && !opens_page {
+                if card.agent_id.is_none()
+                    && !opens_page
+                    && !matches!(card.kind, crate::dashboard::DealCardKind::Desk)
+                {
                     return;
                 }
                 this.dashboard.record_deal_verdict_as(
@@ -8748,6 +8806,16 @@ impl Render for Workspace {
                 this.end_deal_session();
                 if let Ok(action) = cx.build_action("vim::ExitDealMode", None) {
                     window.dispatch_action(action, cx);
+                }
+                if let crate::dashboard::DealCardIdentity::Desk {
+                    host,
+                    heading_offset,
+                } = card.identity
+                {
+                    this.dashboard
+                        .open_new_draft(Some((host, heading_offset)), window, cx);
+                    this.dashboard_focus_draft(window, cx);
+                    return;
                 }
                 #[cfg(feature = "native")]
                 if let Some(crate::dashboard::DealerInboxSource::Page(page)) = card.inbox_source {
@@ -8987,7 +9055,7 @@ impl Render for Workspace {
                             .child(div().px_2().child("universal argument"))
                             .into_any_element(),
                     ),
-                    (None, None, None, false, Some(echo)) => Some(echo.render(&text_style, cx)),
+                    (None, None, None, false, Some(_)) => None,
                     (None, None, None, false, None) => None,
                 },
             )

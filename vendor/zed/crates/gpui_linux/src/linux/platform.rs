@@ -1075,6 +1075,21 @@ pub(super) fn keystroke_from_xkb(
         Keysym::End => "end".to_owned(),
         Keysym::Insert => "insert".to_owned(),
 
+        Keysym::F13 => "f13".to_owned(),
+        Keysym::F14 => "f14".to_owned(),
+        Keysym::F15 => "f15".to_owned(),
+        Keysym::F16 => "f16".to_owned(),
+        Keysym::F17 => "f17".to_owned(),
+        Keysym::F18 => "f18".to_owned(),
+        Keysym::F19 => "f19".to_owned(),
+        Keysym::F20 => "f20".to_owned(),
+        Keysym::F21 => "f21".to_owned(),
+        Keysym::F22 => "f22".to_owned(),
+        Keysym::F23 => "f23".to_owned(),
+        Keysym::F24 => "f24".to_owned(),
+
+        Keysym::Shift_L | Keysym::Shift_R => "shift".to_owned(),
+
         _ => {
             let name = xkb::keysym_get_name(key_sym).to_lowercase();
             if key_sym.is_keypad_key() {
