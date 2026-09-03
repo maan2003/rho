@@ -32,8 +32,9 @@ pub enum Waiting {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Thread {
     pub reason: Reason,
-    /// The newest message in the thread. This is the verdict key: a newer
-    /// one voids a skip or a done, exactly like an agent's reply.
+    /// The newest message in the thread. The tree keys a thread node's
+    /// verdicts on it: a newer one voids a skip or a done, exactly like an
+    /// agent's reply.
     pub latest: Ts,
     pub latest_from_you: bool,
     /// First line of the newest message, for the card.
@@ -79,7 +80,7 @@ pub struct ThreadCard {
     pub waiting: Waiting,
     pub wait_days: f64,
     /// The newest message; a change here is what re-raises the card.
-    pub verdict_key: Ts,
+    pub latest: Ts,
 }
 
 /// Everything one `mark read before` touches: the conversations to mark and
@@ -635,25 +636,6 @@ impl Model {
         })
     }
 
-    /// Every thread that owes the user an answer, newest wait first.
-    pub fn obligations(&self, now_ms: i64) -> Vec<ThreadCard> {
-        let mut cards = self
-            .threads
-            .iter()
-            .filter(|(_, thread)| thread.waiting() == Waiting::OnYou)
-            .map(|(key, thread)| ThreadCard {
-                key: key.clone(),
-                conversation: self.label(&key.channel),
-                summary: thread.summary.clone(),
-                waiting: Waiting::OnYou,
-                wait_days: wait_days(thread, now_ms),
-                verdict_key: thread.latest.clone(),
-            })
-            .collect::<Vec<_>>();
-        cards.sort_by(|left, right| right.wait_days.total_cmp(&left.wait_days));
-        cards
-    }
-
     pub fn card(&self, key: &ThreadKey, now_ms: i64) -> Option<ThreadCard> {
         let thread = self.threads.get(key)?;
         Some(ThreadCard {
@@ -662,7 +644,7 @@ impl Model {
             summary: thread.summary.clone(),
             waiting: thread.waiting(),
             wait_days: wait_days(thread, now_ms),
-            verdict_key: thread.latest.clone(),
+            latest: thread.latest.clone(),
         })
     }
 }
@@ -699,6 +681,22 @@ fn mentions_in(block: &Value, self_id: &UserId) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// The cards a thread node would be raised for: what the dealer used to
+    /// ask the model for directly, now derived here because the tree is what
+    /// deals.
+    fn owed(model: &Model, now_ms: i64) -> Vec<ThreadCard> {
+        let mut cards = model
+            .tracked()
+            .into_iter()
+            .filter_map(|key| model.card(&key, now_ms))
+            .filter(|card| card.waiting == Waiting::OnYou)
+            .collect::<Vec<_>>();
+        cards.sort_by(|left, right| right.wait_days.total_cmp(&left.wait_days));
+        cards
+    }
+
     #[test]
     fn a_thread_raised_by_the_feed_gains_its_summary_when_it_is_loaded() {
         let mut model = model();
@@ -883,7 +881,7 @@ mod tests {
             Some(Change::Raised(_))
         ));
         assert_eq!(live_first.note_activity(&item, 0), None);
-        assert_eq!(live_first.obligations(0).len(), 1);
+        assert_eq!(owed(&live_first, 0).len(), 1);
     }
 
     #[test]
@@ -937,7 +935,7 @@ mod tests {
         );
         // And a repeat poll of the same feed page changes nothing either.
         assert_eq!(model.note_activity(&item, 0), None);
-        assert_eq!(model.obligations(0).len(), 1);
+        assert_eq!(owed(&model, 0).len(), 1);
     }
 
     #[test]
@@ -950,7 +948,7 @@ mod tests {
         ));
         let key = model.key(&ChannelId("D1".into()), &Ts("400".into()));
         assert_eq!(model.thread(&key).unwrap().waiting(), Waiting::OnYou);
-        assert_eq!(model.obligations(now).len(), 1);
+        assert_eq!(owed(&model, now).len(), 1);
 
         // Answering is not a verdict: the thread is still tracked, the ball
         // is theirs, and the card the dealer builds says so.
@@ -968,7 +966,7 @@ mod tests {
         );
         let card = model.card(&key, now).unwrap();
         assert_eq!(card.waiting, Waiting::OnYou);
-        assert_eq!(card.verdict_key, Ts("402".into()));
+        assert_eq!(card.latest, Ts("402".into()));
         assert_eq!(card.summary, "thanks!");
         assert_eq!(card.conversation, "@ada");
     }
@@ -982,7 +980,7 @@ mod tests {
             sent_ms,
         );
         let now = sent_ms + 2 * DAY;
-        let card = &model.obligations(now)[0];
+        let card = &owed(&model, now)[0];
         assert!((card.wait_days - 2.0).abs() < 0.01, "{}", card.wait_days);
         assert_eq!(card.waiting, Waiting::OnYou);
     }
@@ -1015,7 +1013,7 @@ mod tests {
         let key = model.key(&ChannelId("D1".into()), &Ts("600".into()));
         model.mark_read(&ChannelId("D1".into()), &Ts("600".into()));
         assert_eq!(model.thread(&key).unwrap().waiting(), Waiting::OnYou);
-        assert_eq!(model.obligations(0).len(), 1);
+        assert_eq!(owed(&model, 0).len(), 1);
     }
 
     #[test]

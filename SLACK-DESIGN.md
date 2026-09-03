@@ -129,17 +129,16 @@ websocket exists only so the lamp lights within a second.
 
 ### Slack deals straight from the session; there is no inbox in between
 
-A mention, a DM, or a reply to a thread the user is in becomes a dealer
-candidate directly from the Slack session's own store, the way an agent
-card comes from the registry. The card carries the thread identity and the
-latest message timestamp; verdicts (done, discard, snooze, todo) are kept
-client-side in the Slack store, keyed on thread plus latest timestamp, so a
-verdicted thread stays quiet until a newer message from someone else voids
-it; the user's own messages never touch the verdict. Filing (`f`)
-under a heading creates a machine-owned thread node bound to that thread;
-it updates in place and is removed when the thread has been quiet for a
-while, like agent rows. The rho inbox is not involved: nothing is copied
-into it and nothing is read back from it.
+A mention, a DM, or a reply to a thread the user is in makes the thread
+matter, and a `thread` node is created for it in the tree; the dealer
+deals the node, the way it deals an agent's. The Slack side carries no
+decisions at all: the node holds the thread's identity and its verdict
+log, and the session supplies the words, the wait, and the newest
+timestamp, read live and never stored beside the mirror. A verdict is
+keyed on the newest message, so a verdicted thread stays quiet until a
+newer message from someone else voids it; the user's own messages never
+touch the verdict. Filing (`f`) moves the node under a heading like any
+other. The rho inbox is not involved; it no longer exists.
 
 **Why:** the inbox was a redirection. Slack already keeps the truth of what
 is waiting and what has been answered; copying it into an inbox item meant
@@ -154,7 +153,8 @@ file owned by the GUI, `~/.local/state/rho/slack.redb`, owner-only: users
 and their avatar hashes, conversations and their labels, messages per
 conversation in timestamp order with reactions, edits, and deletions
 applied, thread replies under their parent, the activity cursor, per
-conversation `last_read`, and the verdict state from the section above.
+conversation `last_read`. Verdicts are not here: they are the tree's, on
+the thread node.
 Every surface renders from the mirror first and refreshes behind it: the
 list and any conversation open instantly from disk, then the session
 fetches only what is newer than the mirror's newest timestamp for that
@@ -222,8 +222,8 @@ source of truth. The beginning of history is recorded when a page returns
 **Why:** Slack's own web client does exactly this (an IndexedDB mirror, so
 boot is instant and history scrolls without a round trip). Rho's promise
 is that the UI never waits on a remote, and the GitHub design already
-takes the same shape. The mirror is also the only sane home for verdict
-state and read positions: one file, one identity per thread.
+takes the same shape. Read positions cache here too, one file and one
+identity per thread; verdicts do not, they are the tree's.
 
 ### Channels, direct messages, and threads are all the same surface
 

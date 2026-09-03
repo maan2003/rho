@@ -174,7 +174,17 @@ the moment the upgrade is confirmed.
    the daemon (the shape of `DeskPageBind`), and the dealer deals the node;
    Slack verdicts live in its log from then on (Slack checklist 2.10).
 3. Slack: the mirror's verdict table removed; anything left that still
-   deals from the mirror rather than from nodes.
+   deals from the mirror rather than from nodes. Landed 3 Sep: slice 2's
+   cutover had already moved every decision onto thread nodes, so there
+   was no verdict table left to delete and nothing dealing from the
+   mirror. What this slice removed is what was left pointing the old way:
+   `Model::obligations`, the dealer's entry point into the Slack store,
+   dead outside its own tests; `ThreadCard::verdict_key`, renamed
+   `latest`, because the newest message is a fact and the verdict keyed on
+   it is the node's; and the design's claim that the mirror is the home
+   for verdict state. A test pins the rule: a done thread is closed by its
+   node whatever Slack still says, and is still findable so a newer
+   message can rebind it.
 4. Notes: multi-line `body` on the text CRDT, the note surface, "notes for
    this" from any surface, the map over the tree; `DESK-DESIGN.md` retired
    to notes-and-filing.

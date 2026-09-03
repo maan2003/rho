@@ -201,7 +201,7 @@ fn slack_candidates(
         candidates.push(FindCandidate {
             path: format!("slack › {} › {}", card.conversation, card.summary),
             kind: "thread",
-            recency: millis(&card.verdict_key),
+            recency: millis(&card.latest),
             target: FindTarget::Slack(rho_slack::session::Source::Thread(key)),
         });
     }
@@ -421,7 +421,7 @@ mod tests {
                     summary: "release date".to_owned(),
                     waiting: Waiting::OnYou,
                     wait_days: 0.0,
-                    verdict_key: Ts::from("140.000000"),
+                    latest: Ts::from("140.000000"),
                 },
             )],
         );

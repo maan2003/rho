@@ -979,7 +979,7 @@ impl Workspace {
                             Waiting::OnThem => Some(card.conversation),
                             Waiting::OnYou => None,
                         },
-                        latest: card.verdict_key.0,
+                        latest: card.latest.0,
                     },
                 ))
             })

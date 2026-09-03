@@ -560,8 +560,7 @@ done right after the transcript primitive (2.4) and before 2.10:
 - [ ] 3.4 In a thread surface `enter` sends to the thread. "Also send to
       channel", editing, and deleting stay deferred.
 
-- [x] 3.5 Sending images. Landed 3 Sep, with a keyboard attach prompt
-      (`space s a`) added as the rig-drivable route. Original: Asked by the user on 3 Sep. A paste of image
+- [ ] 3.5 Sending images. Asked by the user on 3 Sep. A paste of image
       bytes into the composer, or a file path dropped on it, attaches the
       image: the composer shows a thumbnail chip (`image.png · 320 KB`) above
       the text, `enter` uploads and posts the text as the message with the

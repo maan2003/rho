@@ -6439,6 +6439,51 @@ fn a_thread_node_without_its_mirror_is_not_dealt(cx: &mut TestAppContext) {
         .unwrap();
 }
 
+/// Where a Slack thread's verdict lives: on the node, not beside the
+/// mirror. A thread the user is done with is closed in the tree, and the
+/// backlog command, which is the one place that acts on every thread card
+/// at once, sees only what the tree still calls open.
+#[gpui::test]
+fn a_thread_verdict_is_read_from_the_node_not_from_slack(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    let open = desk.thread_row(None, "C1", "500.0");
+    let settled = desk.thread_row(None, "C1", "600.0");
+    desk.set(
+        settled,
+        rho_desk::cells::Field::State,
+        rho_desk::cells::Value::State(rho_desk::cells::State::Done),
+    );
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            let cards = workspace.dashboard.open_thread_cards();
+            assert_eq!(
+                cards
+                    .iter()
+                    .map(|(card, _)| card.node_id)
+                    .collect::<Vec<_>>(),
+                vec![open],
+                "the done thread is closed by its node, whatever Slack still says"
+            );
+            // The closed one is still findable, which is what lets a newer
+            // message rebind and reopen it.
+            assert_eq!(
+                workspace
+                    .dashboard
+                    .thread_card_id(&crate::dashboard::ThreadRef {
+                        workspace: "acme".to_owned(),
+                        channel: "C1".to_owned(),
+                        thread_ts: "600.0".to_owned(),
+                    })
+                    .map(|card| card.node_id),
+                Some(settled)
+            );
+        })
+        .unwrap();
+}
+
 /// A verdict closes a thread; a message from them after it reopens the same
 /// node. The client's part is the rebind: an open node is left alone, a
 /// closed one is bound again and the daemon reopens it.

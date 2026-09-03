@@ -26,6 +26,17 @@ fn timings() -> Timings {
     }
 }
 
+/// The threads that owe the user an answer: what a thread node is created
+/// for. The model raises them; the tree deals them.
+fn owed(model: &Model, now_ms: i64) -> Vec<rho_slack::model::ThreadCard> {
+    model
+        .tracked()
+        .into_iter()
+        .filter_map(|key| model.card(&key, now_ms))
+        .filter(|card| card.waiting == rho_slack::model::Waiting::OnYou)
+        .collect()
+}
+
 fn client(fake: &Fake) -> Arc<Client> {
     let credentials = Credentials::parse("acme", "xoxc-test", "cookie").unwrap();
     Arc::new(Client::with_base(credentials, fake.api_base()).unwrap())
@@ -177,7 +188,7 @@ async fn the_feed_poll_dedupes_against_the_websocket() {
     )
     .unwrap();
     assert_eq!(model.note_message(&message, 0), None);
-    assert_eq!(model.obligations(0).len(), 1);
+    assert_eq!(owed(&model, 0).len(), 1);
 }
 
 #[tokio::test]
@@ -366,7 +377,7 @@ async fn the_follow_list_comes_from_slack_and_the_socket_keeps_it_current() {
             }
         }
     }
-    assert_eq!(model.obligations(0).len(), 2);
+    assert_eq!(owed(&model, 0).len(), 2);
 
     // Unfollowing on another client takes the standing claim back.
     fake.live(json!({"kind": "unsubscribe", "channel": "C1", "thread_ts": "700.0"}));
@@ -836,7 +847,7 @@ async fn ignoring_a_thread_travels_both_ways() {
     );
     assert_eq!(dropped.len(), 1);
     assert_eq!(dropped[0].channel, ChannelId("C1".into()));
-    assert_eq!(model.obligations(0).len(), 1, "only the other card is left");
+    assert_eq!(owed(&model, 0).len(), 1, "only the other card is left");
 
     // The other direction: unfollowed in another client, live.
     fake.live(json!({"kind": "unsubscribe", "channel": "C2", "thread_ts": "600.0"}));
@@ -851,7 +862,7 @@ async fn ignoring_a_thread_travels_both_ways() {
             break;
         }
     }
-    assert!(model.obligations(0).is_empty());
+    assert!(owed(&model, 0).is_empty());
 
     // Followed again in Slack: nothing comes back until somebody writes.
     fake.live(json!({"kind": "subscribe", "channel": "C2", "thread_ts": "600.0"}));
@@ -863,10 +874,7 @@ async fn ignoring_a_thread_travels_both_ways() {
             break;
         }
     }
-    assert!(
-        model.obligations(0).is_empty(),
-        "following is not an obligation"
-    );
+    assert!(owed(&model, 0).is_empty(), "following is not an obligation");
     fake.live_reply("C2", "600.0", "U1", "still there?");
     loop {
         if let Wire::Frame(WsEvent::Message(message)) = next_wire(&mut receiver).await
@@ -875,7 +883,7 @@ async fn ignoring_a_thread_travels_both_ways() {
             break;
         }
     }
-    assert_eq!(model.obligations(0).len(), 1, "the next message raises it");
+    assert_eq!(owed(&model, 0).len(), 1, "the next message raises it");
 }
 
 /// Undoing a discard is whole: `shift-u` follows the thread again in Slack,
@@ -910,7 +918,7 @@ async fn undoing_a_discard_follows_the_thread_again() {
         .unwrap(),
         0,
     );
-    assert_eq!(model.obligations(0).len(), 1);
+    assert_eq!(owed(&model, 0).len(), 1);
 
     // `x`: unfollowed in Slack, and rho keeps the thread so the undo has
     // something to bring back.
@@ -943,7 +951,7 @@ async fn undoing_a_discard_follows_the_thread_again() {
         .card(&key, 0)
         .expect("the thread is still rho's to deal");
     assert_eq!(card.summary, "any update?");
-    assert_eq!(model.obligations(0).len(), 1);
+    assert_eq!(owed(&model, 0).len(), 1);
 }
 
 #[tokio::test]
