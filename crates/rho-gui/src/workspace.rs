@@ -10468,6 +10468,22 @@ impl Workspace {
     }
 
     fn render_status_right(&self, cx: &App) -> gpui::AnyElement {
+        /// The status line's mode word: three letters, the way helix does
+        /// it, so the segment never moves when the mode changes.
+        fn mode_word(mode: &str) -> String {
+            match mode {
+                "normal" => "NOR",
+                "insert" => "INS",
+                "replace" => "REP",
+                "visual" => "VIS",
+                "visual line" => "V-LINE",
+                "visual block" => "V-BLOCK",
+                "select" => "SEL",
+                "deal" => "DEAL",
+                other => return other.to_uppercase(),
+            }
+            .to_owned()
+        }
         let colors = cx.theme().colors();
         let status = cx.theme().status();
         let mode = self
@@ -10527,9 +10543,9 @@ impl Workspace {
                 div()
                     .text_color(mode_color)
                     .child(if self.dashboard.deal_mode() {
-                        "deal".to_owned()
+                        "DEAL".to_owned()
                     } else {
-                        mode
+                        mode_word(&mode)
                     }),
             )
             .into_any_element()
