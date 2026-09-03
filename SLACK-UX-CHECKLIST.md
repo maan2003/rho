@@ -214,6 +214,19 @@ under test. If the fake cannot produce a state, extend the fake.
       creating the machine-owned desk node. Undo (eng-5pha's verdict undo
       stack) must cover this store the way it covers desk marks: add a
       variant, do not bypass it. Human-entered inbox items are out of scope.
+- [ ] 2.11 Local mirror in rho-db, decided. Today nothing is cached:
+      history is fetched on open and lives only in memory. Rho: a GUI-owned
+      redb file `~/.local/state/rho/slack.redb` (0600) holding users and
+      avatar hashes, conversations and labels, messages per conversation in
+      ts order with reactions, edits, and deletions applied, thread replies
+      under their parent, the activity cursor, per conversation
+      `last_read`, and 2.10's verdict state; 2.10's store is this file, not
+      a separate one. Every surface renders from the mirror first and
+      refreshes behind it; a conversation fetches only what is newer than
+      its cached newest ts; restart shows the mirror before the socket is
+      up; offline, everything cached is readable and sending fails loudly
+      into the composer. Screenshot: the list and a conversation open with
+      the fake stopped.
 - [ ] 2.7 Direct messages raise cards. Slack's `activity.feed` does not
       carry DMs, only mentions, reactions, and thread replies; a DM never
       reaches the inbox today. Rho: a websocket `message` in an `im` or

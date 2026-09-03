@@ -94,6 +94,27 @@ a second identity, a second lifetime, and a surface that showed a message
 body with no conversation around it. Human-entered items may want an inbox
 of their own later; Slack does not.
 
+### A local mirror in rho-db, so reading never waits on Slack
+
+Everything the client has ever fetched is kept on disk in a rho-db (redb)
+file owned by the GUI, `~/.local/state/rho/slack.redb`, owner-only: users
+and their avatar hashes, conversations and their labels, messages per
+conversation in timestamp order with reactions, edits, and deletions
+applied, thread replies under their parent, the activity cursor, per
+conversation `last_read`, and the verdict state from the section above.
+Every surface renders from the mirror first and refreshes behind it: the
+list and any conversation open instantly from disk, then the session
+fetches only what is newer than the mirror's newest timestamp for that
+conversation. A restart shows yesterday's Slack before the socket is up;
+offline, all of it is readable. Sending while offline fails loudly into
+the composer rather than queueing, for now.
+
+**Why:** Slack's own web client does exactly this (an IndexedDB mirror, so
+boot is instant and history scrolls without a round trip). Rho's promise
+is that the UI never waits on a remote, and the GitHub design already
+takes the same shape. The mirror is also the only sane home for verdict
+state and read positions: one file, one identity per thread.
+
 ### Channels, direct messages, and threads are all the same surface
 
 A conversation surface is built the way the agent transcript is: a
