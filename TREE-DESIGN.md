@@ -112,6 +112,15 @@ per message. The mirror stays the bulk store.
 - The note surface: an editor over `body`, with the node's children below.
 - One key on any surface opens or creates the note under that node.
 - Every other kind keeps its surface.
+- Find: a minibuffer over every node, matched fuzzily against its full
+  path (`nixos › poco on linux`, `#design › release date`, an agent's
+  label under its parent). Matching is subsequence with word-boundary and
+  path-segment bonuses, fzf-style, so `nixpoco` finds it; ranking by match
+  quality, then recency of use. `enter` opens the node's surface as a
+  normal open (transcript, page, conversation, note). Asked for by the
+  user on 2026-09-03 for agents first; built over the desk tree's paths
+  now, behind one function that yields `(path, target)`, and moved onto
+  `NodeId` in slice 2 without changing the prompt.
 
 ## Migration
 
