@@ -43,8 +43,9 @@ Added in the talk that followed:
   minutes), crashed, waiting on a tool permission. Comes from the system,
   outranks everything, and an agent cannot paper over it with a cheerful
   status. The two sources stay visibly apart.
-- **every status carries a one-line reason.** The word alone sends the
-  human hunting through the transcript.
+- **the reason is the turn's last line, not a separate field.** The word
+  alone would send the human hunting; the reply's own closing line is the
+  reason, at no extra tokens.
 
 ## Ranking: by what burns
 
@@ -68,15 +69,16 @@ response, as a small XML element, so declaring costs nothing and needs no
 tool round trip:
 
 ```xml
-<rho-wants kind="needs-input" blocked="false" ask="decision">
-V2 has no place for a todo's date; (b) maps it to defer_until, your call.
-</rho-wants>
+<rho-wants kind="needs-input" blocked="false" ask="decision"/>
 ```
 
 `kind` is one of `quiet`, `show`, `needs-input`, `done`; `blocked` and `ask`
-(`decision` or `act`) only on `needs-input`; the body is the reason line.
-The daemon strips the element from the transcript text, records it as a
-typed event, and sets the fields; the element never renders. One element
+(`decision` or `act`) only on `needs-input`. No body: the user's call on
+3 Sep, a reason line is tokens spent repeating what the reply already
+says. The reason shown on Home and in the deal bar is the last line of the
+turn's own text, which Home shows for a running agent anyway. The daemon
+strips the element from the transcript text, records it as a typed event,
+and sets the fields; the element never renders. One element
 per turn; the last one in a turn wins. No element means the turn's default
 (quiet while working, done when the turn ends).
 
@@ -100,9 +102,9 @@ silence. A tool would only win if the declaration needed an answer back.
 
 ## Where it lives
 
-Two fields on the agent node in the tree: `wants` (typed, with its details)
-and `reason` (one line, machine-written from the agent's own words, the one
-place machine text is the agent's text). Observed health is a separate
+One field on the agent node in the tree: `wants` (typed, with its
+details); the reason is derived from the transcript's last line, never
+stored. Observed health is a separate
 field the daemon owns. Home and the phone header read them; the dealer
 ranks by them.
 
