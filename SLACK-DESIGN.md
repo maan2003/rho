@@ -126,8 +126,10 @@ bounded fetch at ingest, the thread plus a small window of the channel
 around the parent, because that is exactly what the web client fetches
 when the user clicks the notification; rho only does it a little earlier,
 so the deal renders from the mirror with no network wait. The bound is
-one history call and one replies call per ping, never a page back, never
-a second conversation.
+two history calls (20 before the ping and 20 after, since Slack cannot
+window both sides of a ts in one call) and one replies call per ping,
+never a page back, never a second conversation. The user chose both-sided
+context over the saved request.
 
 Shape to borrow, from matrix-rust-sdk's event cache (cloned under
 `~/src/matrix-rust-sdk`, `crates/matrix-sdk-common/src/linked_chunk` and

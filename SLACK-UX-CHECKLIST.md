@@ -225,10 +225,9 @@ under test. If the fake cannot produce a state, extend the fake.
       stack) must cover this store the way it covers desk marks: add a
       variant, do not bypass it. Human-entered inbox items are out of scope.
 - [x] 2.11 Local mirror in rho-db, done (`slack.redb`, derived chunks, gap
-      records, history-begins flag, ping prefetch as one history call
-      `latest=<ping> limit=40` plus one replies call, since Slack cannot
-      window both sides of a ts in one call; the tail arrives on the
-      socket). Offline screenshots 211-*. Original text: today nothing is cached:
+      records, history-begins flag, ping prefetch is two history calls, 20 before and
+      20 after the ping, plus one replies call; the user chose both-sided
+      context over the saved request). Offline screenshots 211-*. Original text: today nothing is cached:
       history is fetched on open and lives only in memory. Rho: a GUI-owned
       redb file `~/.local/state/rho/slack.redb` (0600) holding users and
       avatar hashes, conversations and labels, messages per conversation in
