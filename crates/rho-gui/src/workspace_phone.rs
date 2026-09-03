@@ -19,6 +19,39 @@ const TARGET_HEIGHT: Pixels = px(56.);
 const FLICK_SLOP: f32 = 12.;
 const FLICK_COMMIT_VELOCITY: f32 = 900.;
 const SNAP_DURATION: std::time::Duration = std::time::Duration::from_millis(180);
+const PHONE_DEAL_HEADER_FIXED_GUTTER: Pixels = px(24.);
+
+fn phone_deal_header_text(
+    path: &str,
+    state: &str,
+    header_width: Pixels,
+    measure: impl Fn(&str) -> Pixels,
+) -> (String, String) {
+    let state_width = measure(state);
+    let path_width = (header_width - PHONE_DEAL_HEADER_FIXED_GUTTER - state_width).max(px(0.));
+    if measure(path) <= path_width {
+        return (path.to_owned(), state.to_owned());
+    }
+
+    let ellipsis = "…";
+    let mut truncated = String::new();
+    for (boundary, character) in path.char_indices() {
+        if !character.is_whitespace() {
+            continue;
+        }
+        let prefix = path[..boundary]
+            .trim_end_matches(|character: char| character.is_whitespace() || character == '/');
+        let candidate = format!("{prefix}{ellipsis}");
+        if measure(&candidate) > path_width {
+            break;
+        }
+        truncated = candidate;
+    }
+    if truncated.is_empty() && measure(ellipsis) <= path_width {
+        truncated.push_str(ellipsis);
+    }
+    (truncated, state.to_owned())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PhoneScrollEdge {
@@ -844,6 +877,31 @@ impl Workspace {
             && let Some(card) = self.dashboard.current_deal_card().cloned()
         {
             let colors = cx.theme().colors();
+            let (breadcrumb, label) = {
+                let font_size = text_style.font_size.to_pixels(window.rem_size());
+                let font = text_style.font();
+                phone_deal_header_text(
+                    &card.breadcrumb,
+                    &card.label,
+                    window.viewport_size().width,
+                    |text| {
+                        window
+                            .text_system()
+                            .shape_line(
+                                text.into(),
+                                font_size,
+                                &[gpui::TextRun {
+                                    len: text.len(),
+                                    font: font.clone(),
+                                    color: text_style.color,
+                                    ..Default::default()
+                                }],
+                                None,
+                            )
+                            .width
+                    },
+                )
+            };
             let header = div()
                 .id("phone-deal-header")
                 .flex_none()
@@ -866,16 +924,9 @@ impl Workspace {
                         .min_w_0()
                         .overflow_hidden()
                         .whitespace_nowrap()
-                        .text_ellipsis()
-                        .child(card.breadcrumb.clone()),
+                        .child(breadcrumb),
                 )
-                .child(
-                    div()
-                        .flex_none()
-                        .ml_2()
-                        .whitespace_nowrap()
-                        .child(card.label.clone()),
-                );
+                .child(div().flex_none().ml_2().whitespace_nowrap().child(label));
             let body = self.deal_body(&card, window, cx);
             let card = div()
                 .id("phone-deal-card")
@@ -1464,6 +1515,24 @@ impl Workspace {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_360px_deal_header_truncates_the_path_before_its_state() {
+        let state = "needs reply · 1.9h";
+        let measure = |text: &str| px(text.chars().count() as f32 * 8.);
+        let (path, rendered_state) = phone_deal_header_text(
+            "product strategy / deeply nested launch readiness review",
+            state,
+            px(360.),
+            measure,
+        );
+
+        assert_eq!(path, "product strategy…");
+        assert_eq!(rendered_state, state);
+        assert!(
+            measure(&path) + measure(&rendered_state) + PHONE_DEAL_HEADER_FIXED_GUTTER <= px(360.)
+        );
+    }
 
     #[gpui::test]
     fn showing_an_existing_surface_brings_it_to_top_without_duplicates(
