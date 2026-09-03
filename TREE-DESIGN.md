@@ -157,7 +157,12 @@ the moment the upgrade is confirmed.
    the desk tree, the desk view kept working over it. Replaces the
    order-key and move machinery in `rho-desk` and the daemon.
 2. Identity: `NodeId` through the dealer, undo, journal, and deal views;
-   the inbox retired; captures as root notes. Every agent gets a root
+   the inbox deleted outright (store, surface, kinds, source references,
+   journal events, the word itself), the user's call on 3 Sep; captures
+   as root notes, with a one-shot on first run that turns existing capture
+   items into root notes and is deleted with the V1 migration after the
+   upgrade; Slack inbox items are not carried, they re-derive from the
+   mirror. Every agent gets a root
    `agent` node at creation, quick-spawn included, made by the daemon.
    Pulled in from slice 3 on 3 Sep so Slack never stops being dealt: a
    `thread` node is created when a ping or a reply to the user would have
