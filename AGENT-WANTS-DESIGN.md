@@ -14,7 +14,8 @@ your call" into a message and hoping.
 ## The idea: a self-declared status, phrased as what the human should do
 
 The three, named as the agent's speech acts (settled 3 Sep after two
-renames; the user's original words in quotes):
+renames; the user's original words in quotes; the tags are `<tell-human/>`,
+`<ask-human/>`, `<answer-human/>`):
 
 - **heads-up**: "working and not blocked on the human, but I have some
   stuff to show". Unprompted news the agent judges worth a look, and a
@@ -84,11 +85,14 @@ response, as a small XML element, so declaring costs nothing and needs no
 tool round trip:
 
 ```xml
-<rho-wants kind="ask"/>
+<ask-human/>
 ```
 
-`kind` is one of `heads-up`, `ask`, `answer`, and that is the whole
-element. No body: the user's call on
+The element name is the act with the human as its object, `tell-human`,
+`ask-human`, `answer-human`, and that is the whole element: no attributes,
+no body. Named so on 3 Sep because the goal is to put the act in the
+agent's mind from the token alone; writing `<ask-human/>` is the thought
+"I am asking the human". `tell` is the doc's `heads-up`. No body: the user's call on
 3 Sep, a reason line is tokens spent repeating what the reply already
 says. The reason shown on Home and in the deal bar is the last line of the
 turn's own text, which Home shows for a running agent anyway. The daemon
@@ -108,8 +112,8 @@ safe:
 - Strip while streaming, not after the turn, so a half-typed tag never
   flickers on screen.
 - A malformed element is absent, logged, and never fails the turn.
-- The name is distinctive (`<rho-wants>` rather than `<wants>`), so it
-  cannot collide with markup an agent is talking about.
+- The names are distinctive (`<ask-human/>`, never a bare `<ask>`), so
+  they cannot collide with markup an agent is talking about.
 
 Forgetting is the weak spot and is survivable: a missing tag declares
 nothing, and the states that matter most (stalled, crashed) are observed
