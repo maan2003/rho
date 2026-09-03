@@ -151,6 +151,31 @@ under test. If the fake cannot produce a state, extend the fake.
       editor cannot place an image inline at a fixed width without breaking
       line layout, report that before working around it.
 
+Polish from the user's live screenshot of 3 Sep ("still a bit ugly"),
+done right after the transcript primitive (2.4) and before 2.10:
+
+- [ ] 1.14 The reader's own author column prints the handle (`maan2003`)
+      while everyone else gets a display name. Same resolution for the
+      reader as for everyone: the roster's display name.
+- [ ] 1.15 Rows by the longest author start their body one column right
+      of the others (padding is off by one when the name fills the
+      column). Bodies align in one column across the surface.
+- [ ] 1.16 Links print twice: `<url|text>` renders as `text <url>` and
+      `<url>` as `url <url>`. Render the text once in the link class, the
+      URL once only when there is no text; the URL stays reachable through
+      line metadata for `enter`.
+- [ ] 1.17 Unfurls are one muted line `↗ title · site` plus at most two
+      lines of description, no blank lines inside. The x.com unfurl took
+      ten lines with the whole tweet body. Collapsible later.
+- [ ] 1.18 Image preview scales to fit the text width minus the body
+      indent, capped at 24 lines high, aspect preserved; a 2048px
+      screenshot was shown at about 480px and unreadable. The file line
+      drops the type when the extension already says it: `image.png ·
+      141 KB`.
+- [ ] 1.19 Custom emoji (`:forrest_gump_wave:`) stay as the shortcode in
+      muted text until the image inlay (1.13) lands, then render inline
+      through it.
+
 ## Phase 2: unread, position, and moving around
 
 - [ ] 2.1 Unread rule. Now none. Rho: `── new ──` at `last_read`; opening a
