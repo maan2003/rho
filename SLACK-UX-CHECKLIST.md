@@ -202,8 +202,11 @@ under test. If the fake cannot produce a state, extend the fake.
 
 - [ ] 4.1 Status bar. The surface segment reads the conversation label, and
       `· thread` inside a thread. Nothing about the connection while it is
-      healthy; degraded shows the lamp and the notice (already), and the
-      word `disconnected` appears only then.
+      healthy; degraded shows the lamp and the notice (already). Found in
+      Phase 0: the `disconnected` seen in the bar is rho's own daemon
+      status, not Slack. Keep it that way, and make sure a Slack outage
+      never borrows that word: Slack's state is the lamp plus a notice
+      that names Slack.
 - [ ] 4.2 Typing indicators and presence: deferred, unchanged.
 
 ## Phase 5: one key table
