@@ -226,18 +226,40 @@ fn phone_entry_opens_the_feed_and_one_finger_flicks_to_the_next_card(cx: &mut Te
                 timestamp: std::time::Duration::from_millis(80),
                 ..Default::default()
             },
+        ] {
+            window.dispatch_event(event.to_platform_input(), cx);
+        }
+    })
+    .unwrap();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(workspace.phone_motion_for_test(), (-300., None));
+        })
+        .unwrap();
+    cx.update_window(*workspace, |_, window, cx| {
+        window.dispatch_event(
             TouchEvent {
                 id: TouchId(1),
                 phase: TouchPhase::Ended,
                 position: point(px(200.), px(300.)),
                 timestamp: std::time::Duration::from_millis(100),
                 ..Default::default()
-            },
-        ] {
-            window.dispatch_event(event.to_platform_input(), cx);
-        }
+            }
+            .to_platform_input(),
+            cx,
+        );
     })
     .unwrap();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(
+                workspace.phone_motion_for_test(),
+                (0., Some((-300., -800.)))
+            );
+        })
+        .unwrap();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(200));
     cx.run_until_parked();
 
     workspace
@@ -468,6 +490,7 @@ fn phone_blocks_navigation_while_a_tree_verdict_is_pending(cx: &mut TestAppConte
         })
         .unwrap();
     cx.dispatch_action(*workspace, crate::DashboardDealDone);
+    cx.dispatch_action(*workspace, crate::UndoVerdict);
     cx.run_until_parked();
     let verdict_batch = workspace
         .update(cx, |workspace, _, _| {
@@ -482,8 +505,8 @@ fn phone_blocks_navigation_while_a_tree_verdict_is_pending(cx: &mut TestAppConte
         })
         .unwrap();
 
-    // Neither another verdict nor an upward flick may move or mutate the card
-    // until the first verdict is acknowledged.
+    // Neither another verdict, undo, nor an upward flick may move or mutate
+    // the card until the first verdict is acknowledged.
     cx.dispatch_action(*workspace, crate::DashboardDealDone);
     cx.update_window(*workspace, |_, window, cx| {
         for event in [

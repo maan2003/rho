@@ -5,8 +5,9 @@
 
 use gpui::prelude::*;
 use gpui::{
-    AnyElement, Context, FocusHandle, Focusable as _, MouseButton, MouseDownEvent, MouseUpEvent,
-    Pixels, Point, TouchEvent, TouchId, TouchPhase, Window, div, px,
+    Animation, AnimationExt as _, AnyElement, Context, FocusHandle, Focusable as _, MouseButton,
+    MouseDownEvent, MouseUpEvent, Pixels, Point, TouchEvent, TouchId, TouchPhase, Window, div,
+    ease_out_quint, px,
 };
 use theme::ActiveTheme as _;
 
@@ -17,6 +18,7 @@ const TAP_SLOP: Pixels = px(8.);
 const TARGET_HEIGHT: Pixels = px(56.);
 const FLICK_SLOP: f32 = 12.;
 const FLICK_COMMIT_VELOCITY: f32 = 900.;
+const SNAP_DURATION: std::time::Duration = std::time::Duration::from_millis(180);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PhoneScrollEdge {
@@ -50,6 +52,13 @@ enum PhoneRoot {
 enum PhoneTransition {
     Flick(crate::dashboard::DealCard),
     Verdict(u64),
+}
+
+#[derive(Clone, Copy)]
+struct PhoneSnap {
+    generation: u64,
+    from: Pixels,
+    to: Pixels,
 }
 
 struct PhoneFlickGesture {
@@ -119,6 +128,8 @@ pub(super) struct PhoneUi {
     last_gesture: Option<String>,
     flick: Option<PhoneFlickGesture>,
     drag_offset: Pixels,
+    snap: Option<PhoneSnap>,
+    next_snap_generation: u64,
     transitions: Vec<PhoneTransition>,
     root: PhoneRoot,
     feed_surface: Option<(ContextId, SurfaceKey)>,
@@ -141,6 +152,8 @@ impl PhoneUi {
             last_gesture: None,
             flick: None,
             drag_offset: Pixels::ZERO,
+            snap: None,
+            next_snap_generation: 1,
             transitions: Vec::new(),
             root: PhoneRoot::Feed,
             feed_surface: None,
@@ -396,6 +409,16 @@ impl Workspace {
     }
 
     #[cfg(test)]
+    pub(crate) fn phone_motion_for_test(&self) -> (f32, Option<(f32, f32)>) {
+        (
+            self.phone.drag_offset.as_f32(),
+            self.phone
+                .snap
+                .map(|snap| (snap.from.as_f32(), snap.to.as_f32())),
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn phone_remember_last_verdict_for_test(&mut self) {
         let sequence = self.verdict_undo.last().unwrap().sequence;
         self.phone
@@ -584,6 +607,7 @@ impl Workspace {
         match event.phase {
             TouchPhase::Started => {
                 if self.shell_touches.len() == 1
+                    && self.phone.snap.is_none()
                     && self.phone.root == PhoneRoot::Feed
                     && self.phone.stack.is_empty()
                     && !self.phone_current_deal_has_pending_tree_verdict()
@@ -634,6 +658,7 @@ impl Workspace {
                 }
             }
             TouchPhase::Ended | TouchPhase::Cancelled => {
+                let from = self.phone.drag_offset;
                 let direction = self.phone.flick.take().and_then(|mut flick| {
                     (flick.id == event.id && event.phase == TouchPhase::Ended).then(|| {
                         flick.update(event);
@@ -644,10 +669,60 @@ impl Workspace {
                 if let Some(direction) = direction {
                     window.prevent_default();
                     cx.stop_propagation();
-                    self.commit_phone_flick(direction, window, cx);
+                    if self.dashboard.current_deal_card().is_some() {
+                        let to = match direction {
+                            crate::journal::PhoneFlickDirection::Up => {
+                                -window.viewport_size().height
+                            }
+                            crate::journal::PhoneFlickDirection::Down => {
+                                window.viewport_size().height
+                            }
+                        };
+                        self.start_phone_snap(from, to, Some(direction), window, cx);
+                    } else {
+                        self.commit_phone_flick(direction, window, cx);
+                    }
+                } else if from != Pixels::ZERO {
+                    self.start_phone_snap(from, Pixels::ZERO, None, window, cx);
                 }
             }
         }
+        cx.notify();
+    }
+
+    fn start_phone_snap(
+        &mut self,
+        from: Pixels,
+        to: Pixels,
+        direction: Option<crate::journal::PhoneFlickDirection>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let generation = self.phone.next_snap_generation;
+        self.phone.next_snap_generation = self.phone.next_snap_generation.wrapping_add(1);
+        self.phone.snap = Some(PhoneSnap {
+            generation,
+            from,
+            to,
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            cx.background_executor().timer(SNAP_DURATION).await;
+            let _ = this.update_in(cx, |this, window, cx| {
+                if this
+                    .phone
+                    .snap
+                    .is_none_or(|snap| snap.generation != generation)
+                {
+                    return;
+                }
+                this.phone.snap = None;
+                if let Some(direction) = direction {
+                    this.commit_phone_flick(direction, window, cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
         cx.notify();
     }
 
@@ -773,12 +848,11 @@ impl Workspace {
                         .child(card.label.clone()),
                 );
             let body = self.deal_body(&card, window, cx);
-            return div()
+            let card = div()
                 .id("phone-deal-card")
                 .track_focus(&self.phone.dashboard_focus)
                 .size_full()
                 .relative()
-                .top(self.phone.drag_offset)
                 .flex()
                 .flex_col()
                 .child(header)
@@ -792,8 +866,21 @@ impl Workspace {
                         .overflow_hidden()
                         .child(body),
                 )
-                .child(self.render_phone_verdict_bar(cx))
-                .into_any_element();
+                .child(self.render_phone_verdict_bar(cx));
+            return if let Some(snap) = self.phone.snap {
+                card.with_animation(
+                    ("phone-card-snap", snap.generation),
+                    Animation::new(SNAP_DURATION).with_easing(ease_out_quint()),
+                    move |card, delta| {
+                        let from = snap.from.as_f32();
+                        let to = snap.to.as_f32();
+                        card.top(px(from + (to - from) * delta))
+                    },
+                )
+                .into_any_element()
+            } else {
+                card.top(self.phone.drag_offset).into_any_element()
+            };
         }
         if self.phone.root == PhoneRoot::Feed && self.phone.stack.is_empty() {
             let colors = cx.theme().colors();
@@ -829,7 +916,7 @@ impl Workspace {
                         .items_center()
                         .justify_center()
                         .text_color(colors.text_muted)
-                        .child("nothing needs you"),
+                        .child("nothing needs attention"),
                 )
                 .child(self.render_phone_bar(cx))
                 .into_any_element();
@@ -896,6 +983,10 @@ impl Workspace {
             .any(|pending| pending.event.card == card.identity)
     }
 
+    pub(super) fn phone_snap_in_progress(&self) -> bool {
+        self.phone.snap.is_some()
+    }
+
     fn dispatch_phone_verdict(
         &mut self,
         verdict: crate::journal::PhoneVerdict,
@@ -903,7 +994,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.phone_current_deal_has_pending_tree_verdict() {
+        if self.phone.snap.is_some() || self.phone_current_deal_has_pending_tree_verdict() {
             return;
         }
         let before = self

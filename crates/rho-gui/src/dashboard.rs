@@ -1857,7 +1857,7 @@ impl Dashboard {
             return deal_hint(deal);
         }
         if self.deal_empty_success {
-            return "nothing needs you".to_owned();
+            return "nothing needs attention".to_owned();
         }
         format!(
             "{} dealt · {} waiting",

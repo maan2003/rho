@@ -8188,7 +8188,9 @@ impl Workspace {
     }
 
     fn deal_next(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.phone.enabled && self.phone_current_deal_has_pending_tree_verdict() {
+        if self.phone.enabled
+            && (self.phone_snap_in_progress() || self.phone_current_deal_has_pending_tree_verdict())
+        {
             return;
         }
         if self.dashboard.deal_mode() {
@@ -8215,7 +8217,7 @@ impl Workspace {
             self.present_current_deal(window, cx);
             self.refresh_dashboard(window, cx);
         } else {
-            self.notice_on(None, "nothing needs you", StyleClass::SystemInfo, cx);
+            self.notice_on(None, "nothing needs attention", StyleClass::SystemInfo, cx);
         }
     }
 
@@ -8353,6 +8355,11 @@ impl Workspace {
     }
 
     pub(crate) fn undo_verdict(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.phone.enabled
+            && (self.phone_snap_in_progress() || self.phone_current_deal_has_pending_tree_verdict())
+        {
+            return;
+        }
         let Some(entry) = self.verdict_undo.pop() else {
             self.echo("nothing to undo", StyleClass::SystemInfo, cx);
             return;
@@ -8448,7 +8455,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.phone.enabled && self.phone_current_deal_has_pending_tree_verdict() {
+        if self.phone.enabled
+            && (self.phone_snap_in_progress() || self.phone_current_deal_has_pending_tree_verdict())
+        {
             return false;
         }
         let Some(card) = self.dashboard.current_deal_card().cloned() else {
