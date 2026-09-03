@@ -344,14 +344,33 @@ done right after the transcript primitive (2.4) and before 2.10:
       whose newest message is older than the cutoff, one request per
       conversation, no pagination beyond what the mirror already holds;
       threads the user is in get `subscriptions.thread.mark` the same way.
-      In rho, reading is the verdict, so those obligations are discharged;
-      once thread nodes exist (slice 2) the same command writes a `done`
-      verdict on every open thread node older than the cutoff, one log
-      entry each, undone as a batch with `shift-u`. Nothing newer than the
+      In rho, reading is not a verdict (decided 3 Sep, see 2.14), so the
+      command also writes a `done` verdict on every open Slack card whose
+      latest message is older than the cutoff: in the Slack verdict store
+      today, on the thread node once slice 2 lands, one log entry each,
+      undone as a batch with `shift-u`. Nothing newer than the
       cutoff is touched, ever. Journal `SlackMarkedReadBefore { cutoff,
       conversations, threads }`. The fake counts the mark calls; the test
       asserts exactly one per old conversation and zero for newer ones.
       Screenshot the confirmation line and the list after.
+- [ ] 2.14 Verdicts are the user's keys only. Decided by the user on 3
+      Sep, recorded in SLACK-DESIGN "A Slack thread is shaped like an
+      agent" and "A Slack card outranks an agent of the same wait". Three
+      behaviours change. The user's own message no longer quiets a card
+      (`Change::Quieted` on `from_you` in `note_message`/`note_loaded`):
+      it flips the state word to `replied` and moves the card to the fyi
+      curve (0 at the reply, minus a third per day, gone under the floor
+      after 3 days), still open, still closable with `d`. `mark_read`
+      (rho reading, `channel_marked`, `im_marked`) clears unread counts
+      and nothing else; the "reading elsewhere is a verdict too" branch
+      goes. A `needs reply` card scores like a blocked agent with a 1.1
+      head start and the same 12 per day slope, replacing the pace-0 todo
+      curve plus `age_days`; a just-replied agent (recency bonus up to
+      1.5 in the first hour) still ranks above it. Tests: own reply keeps
+      the card and relabels it; a read on another client keeps the card;
+      a reply from them after `d` re-raises; a 2h-old ping outranks a
+      2h-old blocked agent but not a 10-minute-old one. Screenshot a deal
+      queue holding both.
 - [ ] 2.10 No inbox in between, decided. Today a Slack obligation is copied
       into the rho inbox (`SlackItems`, `InboxKind::Slack`,
       `SourceReference::SlackThread`) and dealt from there. Rho: the dealer

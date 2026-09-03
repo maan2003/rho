@@ -52,13 +52,37 @@ prompt is enough to use it today and keeps the first version small.
 
 Identity is (workspace, channel, thread timestamp). A thread is "waiting on
 you" when the last message is not yours, and "waiting on them" once you
-replied. Your own reply is the done verdict, automatically. A newer reply
-after any verdict brings the thread back, keyed on the latest message
-timestamp, the same way an agent reply voids a skip.
+replied. The state word and the curve follow from that; verdicts do not.
+Only the user's keys set a verdict (done, discard, snooze, todo, filed).
+The user's own reply is not a verdict: it flips the card to "replied" and
+lets its priority fall, but the card stays open until the user closes it.
+Reading is not a verdict either, in rho or on another client: it clears
+unread and nothing more. A newer message from someone else after any
+verdict brings the thread back, keyed on the latest message timestamp,
+the same way an agent reply voids a skip.
 
 **Why:** the dealer, its curves, verdict keys, deal history, and journal
 already model exactly this for agents. Slack adds no new concept; it adds
-another source of the same card.
+another source of the same card. Reading and replying used to count as
+done; the user rejected both (3 Sep): a reply is a move in a conversation,
+not the end of it, and a thread read on the phone is still owed an answer.
+Closing a thread is a decision only the user makes.
+
+### A Slack card outranks an agent of the same wait
+
+Both are someone waiting on the user. A thread that needs a reply takes
+the agent blocked curve with a higher head start: 1.1 where an agent
+starts at 1.0, rising at the same 12 per day. An agent that just replied
+keeps its recency bonus (up to 1.5 in the first hour), so it still deals
+first; past that, equal waits favour Slack. A thread the user has replied
+to takes the agent fyi curve: 0 at the reply, falling a third per day,
+under the queue floor after three days, so it is dealt only when nothing
+else is waiting and fades on its own if they never answer. A reply from
+them re-raises it as "needs reply" from a fresh start.
+
+**Why:** the user asked for Slack above agents (3 Sep), with a gap small
+enough that an agent that just spoke still leads. A coworker's wait costs
+more than an agent's, but not so much more that Slack should always win.
 
 ### Ingest: the activity feed for truth, the websocket for latency
 
@@ -69,7 +93,7 @@ things live. Only mentions, direct messages, and threads the user has
 posted in ever become cards; channel traffic never does. From the fifty
 odd websocket event types, rho handles `hello`, `reconnect_url`, `pong`,
 `message` (including thread replies), `thread`, `channel_marked` and
-`im_marked` (read elsewhere, so quiet the card).
+`im_marked` (read elsewhere, so clear the unread badge; the card stays).
 
 **Why:** the feed is a stable, paged list of exactly the things that
 matter, so a missed websocket frame is never a missed mention. The
@@ -82,7 +106,8 @@ candidate directly from the Slack session's own store, the way an agent
 card comes from the registry. The card carries the thread identity and the
 latest message timestamp; verdicts (done, discard, snooze, todo) are kept
 client-side in the Slack store, keyed on thread plus latest timestamp, so a
-verdicted thread stays quiet until a newer message voids it. Filing (`f`)
+verdicted thread stays quiet until a newer message from someone else voids
+it; the user's own messages never touch the verdict. Filing (`f`)
 under a heading creates a machine-owned thread node bound to that thread;
 it updates in place and is removed when the thread has been quiet for a
 while, like agent rows. The rho inbox is not involved: nothing is copied
@@ -182,7 +207,8 @@ channel, a direct message, a group message, and a thread are the same
 surface with a different source; opening a thread from a channel is
 opening a child surface, and Space+K returns. Older history loads as the
 user scrolls up. Reading a conversation in rho marks it read in Slack, so
-the phone and other clients agree.
+the phone and other clients agree; read state is the unread badge and
+nothing else, it never discharges a card.
 
 **Why:** the transcript view is already the closest thing rho has to a
 chat, and the point of rho is that everything is the same editor with the
@@ -248,7 +274,8 @@ the thread identity. No strings where an enum will do.
 ## What done means
 
 A mention lands as a card within a second, a reply from the thread surface
-marks it done, a later answer brings it back, a dropped connection is
+flips it to replied and drops it down the queue, `d` closes it, a later
+answer from them brings it back, a dropped connection is
 visible and heals itself, and a normal day of Slack, reading channels and
 direct messages, answering, opening threads, happens without launching the
 Slack app.
