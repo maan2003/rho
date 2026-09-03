@@ -95,7 +95,14 @@ text is 100% user-written".
 
 Card identity is `NodeId` everywhere: dealer, skips, undo, journal, deal
 views. Curves are per kind as today; `defer_until` and `deadline` are the
-tuning knobs, typed. A verdict appends to the log and sets fields:
+tuning knobs, typed. An `open` node is dealable only if `defer_until` (once
+reached) or `deadline` is set; a note with neither is a plain note and is
+never dealt. After `defer_until` the curve is `elapsed - pace_days`, which
+is today's todo curve, and today's defer curve when `pace_days` is 0. The
+old todo and defer marks both become `defer_until` (todo keeps its pace,
+defer gets 0), so every existing card ranks exactly as before; the one
+loss, accepted on 3 Sep, is the word: a woken todo and a woken defer read
+the same in the bar. There is no `todo_at` field and no `todo` tag. A verdict appends to the log and sets fields:
 `done`/`dismiss` set `state`; `defer` sets `defer_until`; `file` sets
 `parent`; `todo` creates a `note` child. Undo reads the log entry and
 restores the fields it changed. Capture is "create a note at the root";
