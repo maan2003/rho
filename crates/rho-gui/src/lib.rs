@@ -398,6 +398,14 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             SubmitPrompt,
             Some("RhoSlackConversation > Editor && vim_mode == insert"),
         ),
+        // A message with a second line is written, not sent twice: the
+        // newline is bound explicitly because the prompt's `RhoGui > Editor`
+        // SubmitPrompt binding would otherwise swallow the key.
+        KeyBinding::new(
+            "shift-enter",
+            editor::actions::Newline,
+            Some("RhoSlackConversation > Editor && vim_mode == insert"),
+        ),
     ]);
     // Deal mode reports itself as normal (plus `VimDeal`), and these
     // contexts are deeper than the deal keys', so without the exclusion a

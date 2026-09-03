@@ -408,8 +408,25 @@ impl ConversationView {
             return;
         }
         self.set_compose(String::new(), cx);
-        self.session
-            .update(cx, |session, cx| session.send(&source, text, cx));
+        let sending = self
+            .session
+            .update(cx, |session, cx| session.send(&source, text.clone(), cx));
+        cx.spawn(async move |this, cx| {
+            if sending.await.is_err() {
+                let _ = this.update(cx, |this, cx| this.restore_compose(text, cx));
+            }
+        })
+        .detach();
+    }
+
+    /// Puts a refused message back where it was typed. Whatever the reader
+    /// has written since goes under it rather than over it: text that was
+    /// typed is never dropped on the floor, and which of the two they want
+    /// is theirs to decide.
+    fn restore_compose(&mut self, text: String, cx: &mut Context<Self>) {
+        let held = self.input.read(cx).text();
+        self.set_compose(restored_compose(text, &held), cx);
+        cx.notify();
     }
 
     /// The message the cursor is on, if the transcript has one there.
@@ -1072,6 +1089,14 @@ impl ConversationView {
         {
             mark_dealt(&mut item);
         }
+        if self
+            .session
+            .read(cx)
+            .loaded(&self.source)
+            .is_some_and(|loaded| loaded.is_pending(&message.ts))
+        {
+            mark_pending(&mut item);
+        }
         self.awaiting_images
             .retain(|(waiting, _)| waiting != &message.ts);
         for (line, file) in images {
@@ -1619,6 +1644,22 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
         });
     }
     item(Row::Message(message.ts.clone()), spans, lines)
+}
+
+/// The composer after a refused send: the words that did not go out, and
+/// under them whatever the reader has typed since. Which of the two they
+/// want is theirs to decide; neither is thrown away to make room.
+fn restored_compose(refused: String, held: &str) -> String {
+    match held.trim().is_empty() {
+        true => refused,
+        false => format!("{refused}\n{held}"),
+    }
+}
+
+/// A message still on its way out: the whole line goes muted, so the reader
+/// can tell what has landed from what has not without a marker to decode.
+fn mark_pending(item: &mut Rendered) {
+    item.styles = vec![(Class::Muted, 0..item.text.trim_end_matches('\n').len())];
 }
 
 /// Tints the message a deal is about. The trailing newline is left out: it
@@ -2720,6 +2761,39 @@ mod tests {
                 .chars()
                 .all(|character| character == '\n'),
             "the tint must stop before the gap to the next message"
+        );
+    }
+
+    #[test]
+    fn a_message_on_its_way_out_reads_muted_from_end_to_end() {
+        let sending = parsed(json!({
+            "ts": "1700000000.0",
+            "user": "ME",
+            "text": "on its way",
+        }));
+        let mut item = message_item(&sending, &model(), false);
+        assert!(
+            item.styles.iter().any(|(class, _)| *class == Class::You),
+            "a landed message names its sender"
+        );
+        mark_pending(&mut item);
+        assert_eq!(
+            item.styles
+                .iter()
+                .map(|(class, range)| (*class, item.text[range.clone()].to_owned()))
+                .collect::<Vec<_>>(),
+            vec![(Class::Muted, item.text.trim_end().to_owned())],
+            "nothing about it reads as landed, not even the name"
+        );
+    }
+
+    #[test]
+    fn a_refused_message_goes_back_above_whatever_was_typed_since() {
+        assert_eq!(restored_compose("refused".into(), "   "), "refused");
+        assert_eq!(
+            restored_compose("refused".into(), "typed since"),
+            "refused\ntyped since",
+            "neither the refused message nor the new one is dropped"
         );
     }
 }

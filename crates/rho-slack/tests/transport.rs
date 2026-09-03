@@ -1114,3 +1114,44 @@ async fn a_refused_upload_fails_rather_than_posting_a_message() {
         .unwrap();
     assert!(page.messages.is_empty());
 }
+
+/// A send Slack refuses has to come back as an error, because that is what
+/// the composer keeps the reader's words on: a refusal reported as success
+/// loses the message with nothing on screen to say so.
+#[tokio::test]
+async fn a_refused_send_comes_back_as_an_error() {
+    let fake = Fake::start().await.unwrap();
+    let client = client(&fake);
+    let poke = reqwest::Client::new();
+    let refuse: serde_json::Value = poke
+        .post(fake.control_url())
+        .json(&json!({"kind": "send_fail", "fail": true}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(refuse["ok"], json!(true));
+
+    let sent = client
+        .post_message(&ChannelId("C1".into()), None, "into a refusal")
+        .await;
+    assert!(sent.is_err(), "a refused send is not a send: {sent:?}");
+
+    let _: serde_json::Value = poke
+        .post(fake.control_url())
+        .json(&json!({"kind": "send_fail", "fail": false}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        client
+            .post_message(&ChannelId("C1".into()), None, "and through")
+            .await
+            .is_ok()
+    );
+}

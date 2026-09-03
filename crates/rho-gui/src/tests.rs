@@ -6491,6 +6491,9 @@ fn deal_keys_reach_a_dealt_slack_conversation(cx: &mut TestAppContext) {
             Some("rho_gui::SlackCancelEdit")
         );
         assert_eq!(routes("enter", &composing), Some("rho_gui::SubmitPrompt"));
+        // A second line is written with shift-enter; without the binding the
+        // prompt's own `enter` would take the key and send the half message.
+        assert_eq!(routes("shift-enter", &composing), Some("editor::Newline"));
     });
 }
 

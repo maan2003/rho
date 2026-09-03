@@ -93,6 +93,11 @@ pub struct Loaded {
     /// message until it reaches the live end.
     pub behind_live: bool,
     older_cursor: Option<String>,
+    /// Messages sent from here that Slack has not confirmed yet. They sit
+    /// in `messages` like any other, shown muted until the echo replaces
+    /// them, so the reader sees what they sent without being told it
+    /// arrived before it did.
+    pending: Vec<Ts>,
     pub error: Option<String>,
     /// Bumped by every change to `messages`, so a surface knows whether what
     /// it is showing is current.
@@ -191,6 +196,40 @@ impl Loaded {
         *held = message;
         self.record(Update::Replaced(ts));
         true
+    }
+
+    /// Whether this message is still on its way out.
+    pub fn is_pending(&self, ts: &Ts) -> bool {
+        self.pending.contains(ts)
+    }
+
+    /// Shows a message the moment it is sent, under a timestamp of rho's
+    /// own. Slack's real one arrives with the echo and takes its place.
+    fn hold_local(&mut self, message: Message) {
+        self.pending.push(message.ts.clone());
+        self.insert(message);
+    }
+
+    /// The echo of something sent from here, matched to the local copy by
+    /// its text: the reply carries Slack's timestamp, never rho's, so the
+    /// words are all the two have in common.
+    fn settle_local(&mut self, message: &Message) {
+        let Some(index) = self.pending.iter().position(|ts| {
+            self.messages
+                .iter()
+                .any(|held| &held.ts == ts && held.text == message.text)
+        }) else {
+            return;
+        };
+        let ts = self.pending.remove(index);
+        self.remove(&ts);
+    }
+
+    /// Takes back a message Slack refused. The words go back to the
+    /// composer, so leaving the line on screen would show it twice.
+    fn drop_local(&mut self, ts: &Ts) {
+        self.pending.retain(|held| held != ts);
+        self.remove(ts);
     }
 
     /// An emoji on a held message. Slack sends the reaction, never the
@@ -544,6 +583,16 @@ impl Session {
     }
 
     fn receive(&mut self, message: Message, now: i64, cx: &mut Context<Self>) {
+        // The real thing takes the local copy's place, whichever arrives
+        // first: Slack echoes a sent message down the socket as well as
+        // answering the post with it.
+        if message.user.as_ref() == Some(self.model.self_id()) {
+            for source in self.sources_for(&message.channel, &message.thread_root()) {
+                if let Some(loaded) = self.loaded.get_mut(&source) {
+                    loaded.settle_local(&message);
+                }
+            }
+        }
         // The counters move for channel traffic too: the list is the whole
         // workspace, and `note_message` answers only about cards.
         self.model.note_counts(&message);
@@ -1501,27 +1550,42 @@ impl Session {
 
     /// Sends `text` where the surface points: into the thread from a thread
     /// surface, into the conversation otherwise.
-    pub fn send(&mut self, source: &Source, text: String, cx: &mut Context<Self>) {
+    /// Posts the message. The words appear at once, muted, under a local
+    /// timestamp; Slack's echo replaces that line with the real thing.
+    /// A refusal takes the line back and hands the text to the caller,
+    /// which is what keeps it out of the reader's way and in their
+    /// composer.
+    pub fn send(
+        &mut self,
+        source: &Source,
+        text: String,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
         let Some(client) = self.client.clone() else {
-            return;
+            return Task::ready(Err(anyhow::anyhow!("slack is not connected")));
         };
         if text.trim().is_empty() {
-            return;
+            return Task::ready(Ok(()));
         }
         self.pending_sends += 1;
         let channel = source.channel().clone();
         let thread_ts = source.thread_ts().cloned();
         let source = source.clone();
         let body = text.clone();
+        let local = self.hold_local(&source, &text, cx);
         let task = gpui_tokio::Tokio::spawn(cx, async move {
             client
                 .post_message(&channel, thread_ts.as_ref(), &body)
                 .await
         });
-        self._tasks.push(cx.spawn(async move |this, cx| {
+        cx.spawn(async move |this, cx| {
             let sent = match task.await {
                 Ok(sent) => sent,
                 Err(error) => Err(anyhow::anyhow!("{error}")),
+            };
+            let outcome = match &sent {
+                Ok(_) => Ok(()),
+                Err(error) => Err(anyhow::anyhow!("{error:#}")),
             };
             let _ = this.update(cx, |session, cx| {
                 session.pending_sends = session.pending_sends.saturating_sub(1);
@@ -1529,14 +1593,73 @@ impl Session {
                     Ok(ts) => session.accept_own(&source, ts, text, cx),
                     Err(error) => {
                         tracing::warn!(error = %error, "slack send failed");
-                        if let Some(loaded) = session.loaded.get_mut(&source) {
-                            loaded.error = Some(format!("{error:#}"));
+                        let error = format!("{error:#}");
+                        // The same two surfaces `hold_local` put it in: a
+                        // reply's root is the thread, a top-level message's
+                        // is the message itself.
+                        let root = source.thread_ts().cloned().unwrap_or_else(|| local.clone());
+                        for source in session.sources_for(source.channel(), &root) {
+                            if let Some(loaded) = session.loaded.get_mut(&source) {
+                                loaded.drop_local(&local);
+                            }
                         }
+                        if let Some(loaded) = session.loaded.get_mut(&source) {
+                            loaded.error = Some(error.clone());
+                        }
+                        // Said once, where the user reads what rho has to
+                        // tell them: a send that did not happen is not a
+                        // detail of the conversation surface.
+                        cx.emit(SessionEvent::Notice(format!("slack: {error}")));
                     }
                 }
                 cx.notify();
             });
-        }));
+            outcome
+        })
+    }
+
+    /// Puts the message on screen before Slack has seen it, in every open
+    /// surface it belongs to. The mirror is left alone: nothing goes on
+    /// disk that the server has not confirmed.
+    fn hold_local(&mut self, source: &Source, text: &str, cx: &mut Context<Self>) -> Ts {
+        let ts = self.local_ts(source);
+        let message = Message {
+            ts: ts.clone(),
+            thread_ts: source.thread_ts().cloned(),
+            channel: source.channel().clone(),
+            user: Some(self.model.self_id().clone()),
+            bot_name: None,
+            blocks: Vec::new(),
+            text: text.to_owned(),
+            attachments: Vec::new(),
+            files: Vec::new(),
+            subtype: None,
+            reply_count: 0,
+            latest_reply: None,
+            edited: false,
+            reactions: Vec::new(),
+        };
+        for source in self.sources_for(source.channel(), &message.thread_root()) {
+            if let Some(loaded) = self.loaded.get_mut(&source) {
+                loaded.hold_local(message.clone());
+            }
+        }
+        cx.notify();
+        ts
+    }
+
+    /// A timestamp for a message Slack has not numbered yet. The transcript
+    /// sorts on the number, so it has to be newer than anything held or the
+    /// line would appear in the middle of the conversation.
+    fn local_ts(&self, source: &Source) -> Ts {
+        let now = now_ms() as f64 / 1000.0;
+        let newest = self
+            .loaded
+            .get(source)
+            .and_then(|loaded| loaded.messages.last())
+            .map(|last| last.ts.epoch_seconds())
+            .unwrap_or_default();
+        Ts(format!("{:.6}", now.max(newest + 0.000_001)))
     }
 
     /// Sends a picture with the message. The bytes go up first, then Slack
@@ -1997,5 +2120,47 @@ mod tests {
                 Update::Replaced(ts),
             ])
         );
+    }
+
+    #[test]
+    fn a_sent_message_shows_muted_until_the_echo_takes_its_place() {
+        let mut loaded = Loaded::default();
+        loaded.insert(message("100.0", "earlier"));
+        let local = Ts("100.000001".into());
+        loaded.hold_local(Message {
+            ts: local.clone(),
+            ..message("100.000001", "on its way")
+        });
+        assert!(loaded.is_pending(&local));
+        assert_eq!(loaded.messages.last().unwrap().text, "on its way");
+
+        // Slack's echo carries its own timestamp, so the words are what
+        // match the two up.
+        loaded.settle_local(&message("101.0", "on its way"));
+        assert!(!loaded.is_pending(&local));
+        assert_eq!(loaded.messages.len(), 1, "the local copy is gone");
+        // The real one arrives by the ordinary route right after.
+        loaded.insert(message("101.0", "on its way"));
+        assert_eq!(loaded.messages.len(), 2);
+    }
+
+    #[test]
+    fn a_refused_message_leaves_no_line_behind() {
+        let mut loaded = Loaded::default();
+        let local = Ts("100.000001".into());
+        loaded.hold_local(Message {
+            ts: local.clone(),
+            ..message("100.000001", "never sent")
+        });
+        loaded.drop_local(&local);
+        assert!(!loaded.is_pending(&local));
+        assert!(loaded.messages.is_empty());
+        // An echo of something else must not take a local copy with it.
+        loaded.hold_local(Message {
+            ts: local.clone(),
+            ..message("100.000001", "mine")
+        });
+        loaded.settle_local(&message("101.0", "somebody else's"));
+        assert!(loaded.is_pending(&local));
     }
 }

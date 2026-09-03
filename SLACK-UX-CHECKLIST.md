@@ -8,10 +8,8 @@ Reconciled against main on 3 Sep. Genuinely open, in order:
   segment (the anchoring half landed); 2.5 `shift-n` next unread; 2.6 list
   row counts, time column, and the muted section; 2.7 DMs in `mpim` and
   unread DMs from `client.counts` at startup (one-to-one DMs landed).
-- 3.1 composer boundary and placeholder; 3.2 `shift-enter`, the muted
-  local echo, and keeping the text on a failed send (`enter` sends);
-  3.3 completion.
-- 5.1 the one key table, once 2.5 and 3.2 have their keys.
+- 3.1 composer boundary and placeholder; 3.3 completion.
+- 5.1 the one key table, once 2.5 has its key.
 
 4.2 stays deferred.
 
@@ -572,7 +570,16 @@ done right after the transcript primitive (2.4) and before 2.10:
       the same shape as the agent transcript's prompt: its rule and its
       marker, then the input; a muted placeholder `message #design` while
       empty. Whatever the transcript does, the Slack surface does too.
-- [ ] 3.2 Sending. `enter` in insert sends; `shift-enter` inserts a newline;
+- [x] 3.2 Sending, done 3 Sep: `shift-enter` is bound to the editor's
+      newline in the composer's own context, so it beats the prompt's
+      `enter`; `Session::send` shows the message at once under a local
+      timestamp, muted from end to end, and Slack's echo replaces that line
+      whichever way it arrives; a refusal takes the line back, puts the
+      words above whatever was typed since, and says so once in the message
+      log. Screens `32-01-shift-enter`, `32-02-muted-echo`, `32-03-landed`,
+      `32-04-refused`, taken against the fake with its new `send_delay` and
+      `send_fail` controls.
+      `enter` in insert sends; `shift-enter` inserts a newline;
       a pasted block with newlines never sends by itself. The sent message
       appears at once in the muted class until the server's echo replaces
       it. On failure the text stays in the composer and the error goes to

@@ -68,6 +68,11 @@ struct State {
     /// a QA run has to be able to look at what the reader sees while a
     /// picture is still coming.
     file_delay_ms: u64,
+    /// How long a send takes to be accepted, and whether it is accepted at
+    /// all. Both are what a QA run needs to see the states a real network
+    /// puts the composer in: a message on its way, and one refused.
+    send_delay_ms: u64,
+    send_fails: bool,
     /// Bytes that arrived through the upload URL, by the file id the
     /// upload was reserved under. Serving them back at `/files/` is what
     /// makes a sent picture the same round trip as a received one.
@@ -521,6 +526,15 @@ async fn serve_api(
             continue;
         }
         let method = path.rsplit('/').next().unwrap_or_default().to_owned();
+        // Slack is not instant either: the wait is here, before anything is
+        // stored or echoed, so the client shows a sent message the way it
+        // does when the network is slow rather than absent.
+        if method == "chat.postMessage" {
+            let delay = state.lock().unwrap().send_delay_ms;
+            if delay > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
+        }
         let response = handle(&method, &body, &state, &ws_url, &frames);
         write_json(&mut stream, &response).await?;
     }
@@ -702,6 +716,14 @@ fn apply_live(state: &mut State, frames: &broadcast::Sender<Frame>, request: &Va
         // while it is still on its way.
         "file_delay" => {
             state.file_delay_ms = request["ms"].as_u64().unwrap_or_default();
+            return json!({"ok": true});
+        }
+        "send_delay" => {
+            state.send_delay_ms = request["ms"].as_u64().unwrap_or_default();
+            return json!({"ok": true});
+        }
+        "send_fail" => {
+            state.send_fails = request["fail"].as_bool().unwrap_or(true);
             return json!({"ok": true});
         }
         kind @ ("subscribe" | "unsubscribe") => {
@@ -1149,6 +1171,9 @@ fn handle(
             json!({"ok": true, "ts": ts, "text": text})
         }
         "chat.postMessage" => {
+            if state.send_fails {
+                return json!({"ok": false, "error": "message_not_sent"});
+            }
             let payload: Value = serde_json::from_str(body).unwrap_or(Value::Null);
             let channel = payload["channel"].as_str().unwrap_or_default().to_owned();
             let thread_ts = payload["thread_ts"].as_str().map(str::to_owned);
