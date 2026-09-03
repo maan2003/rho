@@ -17,11 +17,13 @@ you have looked at it" was answered by an inbox that no longer exists.
 
 ### `n` is the verb, from anywhere
 
-`n` opens the `new` transient on every surface, the phone included:
+`space n` opens the `new` transient on every surface, the phone included:
 `a` agent, `p` page, `n` note. Nothing else creates.
 
 **Why:** one key to learn, one place to extend, and the phone root menu
-already has `n` for a new agent.
+already has `n` for a new agent. It sits under the space leader with the
+other verbs because a bare `n` in any editor is vim's next match (landed
+that way with slice 2, 3 Sep).
 
 ### The area is always asked, and context is the first answer
 
@@ -81,6 +83,13 @@ call, 3 Sep: Find finds.
 `DeskPageBind.parent` becomes optional (`None` = root) to match
 `NewAgent.desk_parent`; a note is an ordinary `DeskMutationApply`. Nothing
 else changes on the wire.
+
+## Landed, still to retire
+
+Slice 2 built the new flow beside the old one. `shift-r`, staff,
+quick-spawn with a universal argument, the `new agent` transient, and
+`browser › new page` are still bound; they go in one change after Home,
+so the desk never has two ways to make a thing for long.
 
 ## Deliberately deferred
 
