@@ -132,11 +132,11 @@ under test. If the fake cannot produce a state, extend the fake.
       `deck.pdf · pdf · 220 KB`; `enter` on it downloads to the cache and
       hands the path to `xdg-open`. `[file: …]` placeholders are a defect.
 
-- [ ] 1.13 Avatars, BLOCKED: the vendored editor's `InlayContent` is text
-      or colour only; an image inline needs either an image variant added
-      to the vendored editor or a block per message, which breaks 1.4.
-      Waiting on the user: extend the editor, or drop avatars. Original
-      spec follows. a small avatar sits before the author name on
+- [ ] 1.13 Avatars, decided by the user: inline images become a common
+      editor primitive, an image variant of `InlayContent` in the vendored
+      editor occupying a fixed number of cells at one line height
+      (eng-5pha builds it after the dealer follow-ups). Avatars then land
+      on that primitive; nothing per-Slack. Original spec follows. a small avatar sits before the author name on
       each message line in the compact layout, one line tall, a fixed width
       so the name and body columns never shift. Source: `profile.image_48`
       from `users.info` or `users.list`, keyed by user id plus
