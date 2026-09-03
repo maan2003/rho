@@ -63,7 +63,7 @@ under test. If the fake cannot produce a state, extend the fake.
 
 ## Phase 1: naming and reading
 
-- [ ] 1.1 Conversation names. Now the raw mpdm name. Slack shows the other
+- [x] 1.1 Conversation names. Now the raw mpdm name. Slack shows the other
       members' names. Rho: group DM = member display names minus self,
       joined with `, `, no `#`; DM = `@name`; channel and private channel =
       `#name`. Same label in the list, the surface title, the status bar,
@@ -71,17 +71,17 @@ under test. If the fake cannot produce a state, extend the fake.
       status segment, which today reads `inbox 1a065ab070c-2` (a raw inbox
       id, seen by the user). A raw `mpdm-`, `C0…`, or inbox id string
       anywhere is a defect.
-- [ ] 1.2 Emoji. Now `:shortcode:` literal. Rho: standard shortcodes become
+- [x] 1.2 Emoji. Now `:shortcode:` literal. Rho: standard shortcodes become
       the glyph (a shortcode table, e.g. the `emojis` crate); workspace
       custom emoji stay `:name:` in the muted class. Applies to bodies,
       reactions, and the conversation list.
-- [ ] 1.3 Names, decided: the word `you` appears nowhere. The user's own
+- [x] 1.3 Names, decided: the word `you` appears nowhere. The user's own
       messages carry the user's display name like anyone else's, and a
       mention of the user renders as `@<display name>`, the same string the
       author line uses. Self is distinguished by class only: own author name
       and mentions of self in the "you" class, everyone else in the sender
       class.
-- [ ] 1.4 Message layout, decided: compact, IRC and Discord-compact style.
+- [x] 1.4 Message layout, decided: compact, IRC and Discord-compact style.
       Time, author, and the first line of the body on one line:
       `14:27  David   Hope manifold isn't stressing you out too much`.
       Author names pad to a fixed column per conversation so bodies line
@@ -91,9 +91,9 @@ under test. If the fake cannot produce a state, extend the fake.
       (the spans already carry every class). No blank line between
       messages; day separators are the only breaks. Reaction and reply
       lines (1.6, 1.7) sit under the body, aligned to the body column.
-- [ ] 1.5 Day separators stay `── Fri 21 Aug ──`; times stay `14:27`;
+- [x] 1.5 Day separators stay `── Fri 21 Aug ──`; times stay `14:27`;
       absolute, never "today" or "2h ago".
-- [ ] 1.6 Threads isolated, decided. Now replies are interleaved with the
+- [x] 1.6 Threads isolated, decided. Now replies are interleaved with the
       channel's messages and marked `in thread`. Slack keeps replies out of
       the channel entirely; rho does the same. The channel surface shows
       only top-level messages (`thread_ts` absent or equal to `ts`) plus
@@ -103,26 +103,28 @@ under test. If the fake cannot produce a state, extend the fake.
       opens the thread surface, which is the only place replies render.
       A reply arriving over the websocket updates the parent's count line,
       never the channel body. The `in thread` marker goes away.
-- [ ] 1.7 Reactions. Now absent. Rho: one muted line under the message,
+- [x] 1.7 Reactions. Now absent. Rho: one muted line under the message,
       `👍 3 · 🎉 1`; a reaction the user added renders in the "you" class
       instead of muted, no word for it. Reading them is in scope; adding
       stays deferred.
-- [ ] 1.8 Edited and deleted. `(edited)` in the muted class after the time;
+- [x] 1.8 Edited and deleted. `(edited)` in the muted class at the end of
+      the body (landed there rather than after the time, so 1.4's fixed
+      clock column never shifts);
       a `message_deleted` frame removes the message from the buffer.
-- [ ] 1.9 mrkdwn coverage. Every construct seeded in 0.2 renders as
+- [x] 1.9 mrkdwn coverage. Every construct seeded in 0.2 renders as
       readable text: bold and italic keep Slack's markers, strike renders as
       `~text~`, inline code as backticks, code blocks fenced, quotes `> `,
       lists `- ` or `1. `, links as `label <url>`, channel links as
       `#name`, user groups as `@handle`, `<!here>` as `@here`, dates as the
       fallback text. Unknown ids never leak (already tested; keep).
-- [ ] 1.10 Bot and app messages. Author is the bot's display name; `blocks`
+- [x] 1.10 Bot and app messages. Author is the bot's display name; `blocks`
       through `render_block`; legacy `attachments` render title, pretext,
       text, and fields. Link unfurls (`is_msg_unfurl`, `is_app_unfurl`)
       collapse to one muted line `↗ title`, never the full preview.
-- [ ] 1.11 System messages, decided: shown, because Slack shows them.
+- [x] 1.11 System messages, decided: shown, because Slack shows them.
       `channel_join`, `channel_leave`, `channel_topic`, `pinned_item`
       render as one muted line `— David joined —`.
-- [ ] 1.12 Files, decided: images preview inline. An image file renders as
+- [x] 1.12 Files, decided: images preview inline. An image file renders as
       the picture itself under the message, bounded to a sane height, the
       way the agent transcript shows images (reuse that path and
       `rho-image`); fetched through the API with the session's token and
@@ -130,7 +132,11 @@ under test. If the fake cannot produce a state, extend the fake.
       `deck.pdf · pdf · 220 KB`; `enter` on it downloads to the cache and
       hands the path to `xdg-open`. `[file: …]` placeholders are a defect.
 
-- [ ] 1.13 Avatars, decided: a small avatar sits before the author name on
+- [ ] 1.13 Avatars, BLOCKED: the vendored editor's `InlayContent` is text
+      or colour only; an image inline needs either an image variant added
+      to the vendored editor or a block per message, which breaks 1.4.
+      Waiting on the user: extend the editor, or drop avatars. Original
+      spec follows. a small avatar sits before the author name on
       each message line in the compact layout, one line tall, a fixed width
       so the name and body columns never shift. Source: `profile.image_48`
       from `users.info` or `users.list`, keyed by user id plus
@@ -210,7 +216,11 @@ under test. If the fake cannot produce a state, extend the fake.
       cards come from the registry; the inbox is not written or read for
       Slack. Verdict state (done, discard, snooze until, todo) lives in the
       Slack store on disk, keyed on thread plus latest timestamp, so a
-      verdict survives a restart and a newer message voids it. Filing keeps
+      verdict survives a restart and a newer message voids it. Known defect
+      this removes: today the card's text is rendered once at ingest,
+      before the roster lands, so on a cold start a mention reads
+      `@someone` instead of the name; rendering at display time from the
+      model fixes it. Filing keeps
       creating the machine-owned desk node. Undo (eng-5pha's verdict undo
       stack) must cover this store the way it covers desk marks: add a
       variant, do not bypass it. Human-entered inbox items are out of scope.
