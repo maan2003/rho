@@ -573,7 +573,9 @@ done right after the transcript primitive (2.4) and before 2.10:
       text kept, like a failed send. Journal `SlackFileSent { conversation,
       bytes }`. Screenshot the chip and the sent result on the fake.
 
-- [ ] 3.6 Editing a sent message. Asked by the user on 3 Sep. On one of
+- [x] 3.6 Editing a sent message. Landed 3 Sep; escape on an open edit
+      cancels and leaves insert in one press (ruled 3 Sep, done with 3.5).
+      Original: Asked by the user on 3 Sep. On one of
       the reader's own messages, `e` in normal mode (the Slack conversation
       context, outside a deal) opens the composer prefilled with that
       message's text and the message tinted while the edit is open;
