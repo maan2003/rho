@@ -53,6 +53,11 @@ Added in the talk that followed:
   the daemon, push, approve) is in the reply's own words and changes no
   rank. An earlier draft had `blocked` and `for` attributes; dropped on
   3 Sep as redundant.
+- **the answer/show split is whether the human was waiting, not
+  grammar.** After a question the human waits, so the reply is an answer.
+  After a suggestion ("maybe blurhash?") the human is not waiting: agreeing
+  and queuing it declares nothing; deviating from it is a thing worth a
+  look, so show. Settled 3 Sep on exactly that example.
 - **answer is Slack's "replied".** The agent's turn ended with a result
   and the ball is with the human; its twin, a turn that ended with a
   question, is ask. The deal bar words already exist: `needs reply · 1.9h`,
