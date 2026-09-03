@@ -69,9 +69,9 @@ use crate::{
     GitApprovalAllow, GitApprovalDeny, HomeOpenRow, MessagesOpen, MinibufferCancel,
     MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious, OverviewToggle,
     PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt,
-    ShellPagerAll, ShellPagerMore, ShellPagerQuit, SlackCompose, SlackOpenRow, SlackSearch,
-    SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, UndoVerdict, UploadGuiTelemetry,
-    VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
+    ShellPagerAll, ShellPagerMore, ShellPagerQuit, SlackCompose, SlackMarkReadBefore, SlackOpenRow,
+    SlackSearch, SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, UndoVerdict,
+    UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
 };
 
 pub(crate) const MESSAGE_LOG_CAP: usize = 4096;
@@ -338,8 +338,6 @@ struct PendingTreeVerdict {
 #[derive(Clone)]
 struct VerdictUndo {
     sequence: u64,
-    card: crate::dashboard::DealCard,
-    verdict: crate::dashboard::DealerVerdict,
     verb: String,
     state: VerdictUndoState,
 }
@@ -348,9 +346,18 @@ struct VerdictUndo {
 enum VerdictUndoState {
     /// The applied verdict this undo appends `Undone { of }` against.
     DeskVerdict {
+        card: crate::dashboard::DealCard,
+        verdict: crate::dashboard::DealerVerdict,
         host: HostId,
         node: rho_desk::NodeId,
         at: rho_desk::cells::Stamp,
+    },
+    /// The done verdicts one `mark read before` wrote. It closed a backlog
+    /// in one keystroke, so it comes back in one: `shift-u` undoes every
+    /// node it touched, not the last of them.
+    MarkedReadBefore {
+        host: HostId,
+        nodes: Vec<(rho_desk::NodeId, rho_desk::cells::Stamp)>,
     },
 }
 
@@ -7359,14 +7366,10 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let VerdictUndo {
-            card,
-            verdict,
-            verb,
-            state,
-            ..
-        } = entry;
-        let _ = state;
+        let VerdictUndo { verb, state, .. } = entry;
+        let VerdictUndoState::DeskVerdict { card, verdict, .. } = state else {
+            return;
+        };
         self.dashboard.clear_skip(&card.identity);
         crate::journal::record(crate::journal::Event::VerdictUndone {
             card: Self::journal_card_identity(&card.identity),
@@ -7383,13 +7386,86 @@ impl Workspace {
         self.refresh_dashboard(window, cx);
     }
 
-    fn next_verdict_undo(
+    /// Writes a done verdict on each node and leaves one undo entry for the
+    /// lot. Unlike a dealt verdict this does not wait for the daemon's
+    /// answer before arming the undo: there is no card in front of the user
+    /// to hold, and a mutation the daemon refuses simply has no verdict
+    /// event for the undo to find, which reports itself.
+    pub(crate) fn mark_cards_done(
         &mut self,
-        card: crate::dashboard::DealCard,
-        verdict: crate::dashboard::DealerVerdict,
+        host: HostId,
+        nodes: Vec<rho_desk::NodeId>,
         verb: String,
-        state: VerdictUndoState,
-    ) -> VerdictUndo {
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> usize {
+        let mut applied = Vec::new();
+        for node in nodes {
+            let Some((writes, event)) =
+                self.desk_cells
+                    .verdict_writes(host, node, crate::desk_view::DeskVerdict::Done)
+            else {
+                continue;
+            };
+            let Some(stamp) = self.apply_desk_writes(host, writes, Some(event), window, cx) else {
+                continue;
+            };
+            applied.push((node, stamp));
+        }
+        let count = applied.len();
+        if count > 0 {
+            let undo = self.next_verdict_undo(
+                verb,
+                VerdictUndoState::MarkedReadBefore {
+                    host,
+                    nodes: applied,
+                },
+            );
+            self.restore_verdict_undo(undo);
+        }
+        count
+    }
+
+    fn undo_marked_read_before(
+        &mut self,
+        entry: VerdictUndo,
+        host: HostId,
+        nodes: Vec<(rho_desk::NodeId, rho_desk::cells::Stamp)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut undone = 0;
+        for (node, at) in nodes {
+            let Some((writes, verdict)) = self.desk_cells.undo_verdict_writes(host, node, at)
+            else {
+                continue;
+            };
+            if self
+                .apply_desk_writes(host, writes, Some(verdict), window, cx)
+                .is_some()
+            {
+                undone += 1;
+            }
+        }
+        if undone == 0 {
+            self.restore_verdict_undo(entry);
+            self.echo(
+                "undo: Desk notes are unavailable",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        }
+        crate::journal::record(crate::journal::Event::SlackMarkReadBeforeUndone { cards: undone });
+        self.echo(
+            &format!("undid {}: {undone} reopened", entry.verb),
+            StyleClass::SystemInfo,
+            cx,
+        );
+        self.refresh_dashboard(window, cx);
+    }
+
+    fn next_verdict_undo(&mut self, verb: String, state: VerdictUndoState) -> VerdictUndo {
         let sequence = self.next_verdict_undo_sequence;
         self.next_verdict_undo_sequence = self
             .next_verdict_undo_sequence
@@ -7397,8 +7473,6 @@ impl Workspace {
             .expect("verdict undo sequence overflow");
         VerdictUndo {
             sequence,
-            card,
-            verdict,
             verb,
             state,
         }
@@ -7423,7 +7497,10 @@ impl Workspace {
             return;
         };
         match entry.state.clone() {
-            VerdictUndoState::DeskVerdict { host, node, at } => {
+            VerdictUndoState::MarkedReadBefore { host, nodes } => {
+                self.undo_marked_read_before(entry, host, nodes, window, cx);
+            }
+            VerdictUndoState::DeskVerdict { host, node, at, .. } => {
                 // Undo is the log's own inverse: the daemon accepts `Undone`
                 // only while the cells still hold what the verdict wrote.
                 let Some((writes, verdict)) = self.desk_cells.undo_verdict_writes(host, node, at)
@@ -7488,10 +7565,10 @@ impl Workspace {
             return false;
         };
         let undo = self.next_verdict_undo(
-            card.clone(),
-            verdict,
             verb,
             VerdictUndoState::DeskVerdict {
+                card: card.clone(),
+                verdict,
                 host: card.host,
                 node: node_id,
                 at: stamp,
@@ -9328,6 +9405,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &SlackSearch, window, cx| {
                 this.prompt_slack_search(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &SlackMarkReadBefore, window, cx| {
+                this.prompt_slack_mark_read_before(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &FindNode, window, cx| {
                 this.open_find(window, cx);
             }))
@@ -10058,7 +10138,7 @@ pub fn now_ms() -> u64 {
 }
 
 /// `30m`, `2h`, `1d`; a bare number means minutes.
-fn parse_duration_ms(text: &str) -> Option<u64> {
+pub(crate) fn parse_duration_ms(text: &str) -> Option<u64> {
     let (digits, unit) = match text.find(|c: char| !c.is_ascii_digit()) {
         Some(at) => text.split_at(at),
         None => (text, "m"),

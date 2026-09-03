@@ -437,6 +437,18 @@ pub enum Event {
     SlackReplied {
         thread: SlackThread,
     },
+    /// The old backlog marked read in one go: the cutoff the user gave and
+    /// how much it touched. The verdicts it wrote are undone as a batch,
+    /// which is what `SlackMarkReadBeforeUndone` records; the marking
+    /// itself is Slack's state and is not reversed.
+    SlackMarkedReadBefore {
+        cutoff: String,
+        conversations: usize,
+        threads: usize,
+    },
+    SlackMarkReadBeforeUndone {
+        cards: usize,
+    },
     MinibufferOpened {
         prompt: String,
     },
@@ -524,6 +536,8 @@ impl Event {
             Self::SlackDisconnected { .. } => "slack_disconnected",
             Self::SlackThreadBound { .. } => "slack_thread_bound",
             Self::SlackReplied { .. } => "slack_replied",
+            Self::SlackMarkedReadBefore { .. } => "slack_marked_read_before",
+            Self::SlackMarkReadBeforeUndone { .. } => "slack_mark_read_before_undone",
             Self::MinibufferOpened { .. } => "minibuffer_opened",
             Self::MinibufferSubmitted { .. } => "minibuffer_submitted",
             Self::MinibufferCancelled { .. } => "minibuffer_cancelled",

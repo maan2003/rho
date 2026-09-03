@@ -415,6 +415,118 @@ impl Workspace {
 
     /// `s`: narrow the listing to what the user types. The prompt is the
     /// search, so there is nothing extra to dismiss afterwards.
+    /// `mark read before`: the backlog older than a cutoff, marked read in
+    /// Slack and closed here. The prompt shows what it would touch before
+    /// anything happens, because the action is not reversible in Slack.
+    pub(crate) fn prompt_slack_mark_read_before(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.open_prompt(
+            format!("mark read before ({DEFAULT_MARK_CUTOFF}):"),
+            std::rc::Rc::new(|workspace: &Workspace, needle: &str, cx: &gpui::App| {
+                let cutoff = mark_cutoff_text(needle);
+                match workspace.slack_mark_counts(&cutoff, cx) {
+                    Some((conversations, threads)) => vec![Candidate {
+                        value: cutoff,
+                        description: format!(
+                            "{} · {} · enter",
+                            plural(conversations, "conversation"),
+                            plural(threads, "thread")
+                        ),
+                    }],
+                    None => vec![Candidate {
+                        value: cutoff,
+                        description: "an age like 7d, or a date like 2026-08-15".to_owned(),
+                    }],
+                }
+            }),
+            std::rc::Rc::new(|workspace: &mut Workspace, input, window, cx| {
+                workspace.slack_mark_read_before(&input, window, cx);
+            }),
+            window,
+            cx,
+        );
+    }
+
+    /// What the prompt line counts: conversations and threads Slack would be
+    /// told about. `None` means the input is not a cutoff yet.
+    fn slack_mark_counts(&self, input: &str, cx: &gpui::App) -> Option<(usize, usize)> {
+        let cutoff = parse_mark_cutoff(input, chrono::Local::now())?;
+        let plan = self
+            .slack
+            .as_ref()?
+            .read(cx)
+            .model()
+            .mark_plan(cutoff.timestamp() as f64);
+        Some((plan.conversations.len(), plan.threads.len()))
+    }
+
+    pub(crate) fn slack_mark_read_before(
+        &mut self,
+        input: &str,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let text = mark_cutoff_text(input);
+        let Some(cutoff) = parse_mark_cutoff(&text, chrono::Local::now()) else {
+            self.echo(
+                &format!("mark read before: {text} is not an age or a date"),
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        let Some(session) = self.slack.clone() else {
+            self.echo("slack: no session", StyleClass::SystemInfo, cx);
+            return;
+        };
+        let before = cutoff.timestamp() as f64;
+        let plan = session.read(cx).model().mark_plan(before);
+        let conversations = plan.conversations.len();
+        let threads = plan.threads.len();
+        // Reading is not a verdict, so the cards have to be closed as well
+        // as marked: an open card older than the cutoff is exactly the
+        // backlog the user just said they are done with.
+        let host = self.hosts.primary();
+        let nodes = cards_before(
+            self.dashboard.open_thread_cards(),
+            &self.slack_thread_facts(cx),
+            host,
+            before,
+        );
+        if conversations == 0 && threads == 0 && nodes.is_empty() {
+            self.echo(
+                &format!("mark read before {text}: nothing that old"),
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        }
+        session.update(cx, |session, cx| session.mark_read_before(plan, cx));
+        let closed = match host {
+            Some(host) => {
+                self.mark_cards_done(host, nodes, "mark read before".to_owned(), window, cx)
+            }
+            None => 0,
+        };
+        crate::journal::record(crate::journal::Event::SlackMarkedReadBefore {
+            cutoff: text.clone(),
+            conversations,
+            threads,
+        });
+        self.echo(
+            &format!(
+                "marked read before {text}: {} · {} · {closed} closed",
+                plural(conversations, "conversation"),
+                plural(threads, "thread")
+            ),
+            StyleClass::SystemInfo,
+            cx,
+        );
+    }
+
     pub(crate) fn prompt_slack_search(
         &mut self,
         window: &mut gpui::Window,
@@ -604,6 +716,65 @@ impl Workspace {
     }
 }
 
+/// Which open thread cards a cutoff closes: the ones whose newest message
+/// is older than it. A card the mirror has nothing to say about is left
+/// alone, and nothing newer than the cutoff is ever in here.
+fn cards_before(
+    cards: Vec<(crate::dashboard::DealCardId, ThreadRef)>,
+    facts: &std::collections::HashMap<ThreadRef, DealerThread>,
+    host: Option<crate::registry::HostId>,
+    before: f64,
+) -> Vec<rho_desk::NodeId> {
+    cards
+        .into_iter()
+        .filter(|(card, thread)| {
+            Some(card.host) == host
+                && facts
+                    .get(thread)
+                    .is_some_and(|facts| Ts(facts.latest.clone()).epoch_seconds() < before)
+        })
+        .map(|(card, _)| card.node_id)
+        .collect()
+}
+
+/// `1 conversation`, `2 conversations`: the count line is read as a
+/// sentence, not as a table.
+fn plural(count: usize, noun: &str) -> String {
+    match count {
+        1 => format!("1 {noun}"),
+        _ => format!("{count} {noun}s"),
+    }
+}
+
+/// The age the prompt offers when the user says nothing: a week of backlog
+/// is the one the question is usually about.
+const DEFAULT_MARK_CUTOFF: &str = "7d";
+
+fn mark_cutoff_text(input: &str) -> String {
+    match input.trim() {
+        "" => DEFAULT_MARK_CUTOFF.to_owned(),
+        text => text.to_owned(),
+    }
+}
+
+/// `7d` is an age counted back from now; `2026-08-15` is a date, and the
+/// cutoff is its first moment, so the day itself is left alone.
+fn parse_mark_cutoff(
+    input: &str,
+    now: chrono::DateTime<chrono::Local>,
+) -> Option<chrono::DateTime<chrono::Local>> {
+    use chrono::TimeZone as _;
+
+    let text = input.trim();
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d") {
+        return chrono::Local
+            .from_local_datetime(&date.and_hms_opt(0, 0, 0)?)
+            .earliest();
+    }
+    let milliseconds = crate::workspace::parse_duration_ms(text)?;
+    now.checked_sub_signed(chrono::TimeDelta::try_milliseconds(milliseconds as i64)?)
+}
+
 pub(crate) fn thread_ref(key: &ThreadKey) -> ThreadRef {
     ThreadRef {
         workspace: key.workspace.0.clone(),
@@ -636,6 +807,72 @@ mod tests {
             handle: "manmeet".into(),
         }]);
         model
+    }
+
+    fn thread_ref_of(thread_ts: &str) -> ThreadRef {
+        ThreadRef {
+            workspace: "acme".to_owned(),
+            channel: "C1".to_owned(),
+            thread_ts: thread_ts.to_owned(),
+        }
+    }
+
+    fn facts(latest: &str) -> DealerThread {
+        DealerThread {
+            title: "any update?".to_owned(),
+            conversation: "#design".to_owned(),
+            raised_at: chrono::Local::now().fixed_offset(),
+            wait_days: 1.0,
+            waiting_on: None,
+            latest: latest.to_owned(),
+        }
+    }
+
+    /// The cutoff is the whole of what the command touches: a card whose
+    /// newest message is newer than it stays open, however old the card is.
+    #[test]
+    fn only_cards_older_than_the_cutoff_are_closed() {
+        let host = crate::registry::HostId::default();
+        let node = |counter| rho_desk::NodeId {
+            replica_id: 1,
+            counter,
+        };
+        let card = |node_id| crate::dashboard::DealCardId { host, node_id };
+        let cards = vec![
+            (card(node(1)), thread_ref_of("100.0")),
+            (card(node(2)), thread_ref_of("900.0")),
+            (card(node(3)), thread_ref_of("50.0")),
+        ];
+        let facts = [
+            (thread_ref_of("100.0"), facts("100.0")),
+            (thread_ref_of("900.0"), facts("900.0")),
+        ]
+        .into_iter()
+        .collect();
+
+        assert_eq!(
+            cards_before(cards, &facts, Some(host), 500.0),
+            vec![node(1)],
+            "the newer thread stays, and one the mirror has nothing on is left alone"
+        );
+    }
+
+    #[test]
+    fn a_cutoff_is_an_age_or_a_date() {
+        let now = chrono::Local::now();
+        assert_eq!(
+            mark_cutoff_text("  "),
+            "7d",
+            "nothing typed means the default"
+        );
+        let week = parse_mark_cutoff("7d", now).unwrap();
+        assert_eq!((now - week).num_days(), 7);
+        let date = parse_mark_cutoff("2026-08-15", now).unwrap();
+        assert_eq!(
+            date.format("%Y-%m-%d %H:%M").to_string(),
+            "2026-08-15 00:00"
+        );
+        assert!(parse_mark_cutoff("last tuesday", now).is_none());
     }
 
     fn message(

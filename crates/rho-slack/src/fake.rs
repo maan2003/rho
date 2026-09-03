@@ -857,6 +857,9 @@ fn handle(
             }
         }
         "emoji.list" => json!({"ok": true, "emoji": state.emoji}),
+        // Slack's own client sends this when a reader leaves a thread; it is
+        // the only way to quiet a thread's unread badge without posting.
+        "subscriptions.thread.mark" => json!({"ok": true}),
         "subscriptions.thread.getView" => json!({
             "ok": true,
             "threads": state

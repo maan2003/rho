@@ -533,6 +533,27 @@ impl Client {
         Ok(())
     }
 
+    /// Marks a thread read up to `ts`. A thread is unread on its own count,
+    /// so marking the conversation does not quiet it; this is the call
+    /// Slack's own client makes when the reader leaves the thread.
+    pub async fn mark_thread_read(
+        &self,
+        channel: &ChannelId,
+        thread_ts: &Ts,
+        ts: &Ts,
+    ) -> anyhow::Result<()> {
+        self.post_form(
+            "subscriptions.thread.mark",
+            &[
+                ("channel", channel.0.clone()),
+                ("thread_ts", thread_ts.0.clone()),
+                ("ts", ts.0.clone()),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Sends `text`. With `thread_ts` it is a reply inside that thread;
     /// without, a new message in the channel or DM.
     pub async fn post_message(

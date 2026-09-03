@@ -135,6 +135,7 @@ actions!(
         SlackOpenRow,
         SlackCompose,
         SlackSearch,
+        SlackMarkReadBefore,
         FindNode,
         MessagesOpen,
         HomeOpenRow
@@ -385,6 +386,14 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             KeyBinding::new("i", SlackCompose, Some(context)),
             KeyBinding::new("s", SlackSearch, Some(context)),
         ]);
+    }
+    // Marking the old backlog is a list-wide verb, so it lives on the list
+    // and not inside a conversation.
+    for context in [
+        "RhoSlackList > Editor && vim_mode == normal && !VimDeal",
+        "RhoSlackList > Editor && vim_mode == helix_normal && !VimDeal",
+    ] {
+        cx.bind_keys([KeyBinding::new("m", SlackMarkReadBefore, Some(context))]);
     }
     cx.bind_keys([
         KeyBinding::new(

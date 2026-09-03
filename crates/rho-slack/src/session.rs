@@ -1245,6 +1245,40 @@ impl Session {
         }));
     }
 
+    /// Marks the old backlog read: one `conversations.mark` per conversation
+    /// in the plan and one `subscriptions.thread.mark` per thread, which is
+    /// what a person clicking through the same backlog would send. The plan
+    /// is what the count line showed, so nothing newer than the cutoff can
+    /// be touched between showing it and acting.
+    pub fn mark_read_before(&mut self, plan: crate::model::MarkPlan, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        for (channel, ts) in &plan.conversations {
+            self.model.mark_read(channel, ts);
+        }
+        cx.notify();
+        let task = gpui_tokio::Tokio::spawn(cx, async move {
+            for (channel, ts) in plan.conversations {
+                if let Err(error) = client.mark_read(&channel, &ts).await {
+                    tracing::warn!(error = %error, "slack mark-read failed");
+                }
+            }
+            for (key, ts) in plan.threads {
+                if let Err(error) = client
+                    .mark_thread_read(&key.channel, &key.thread_ts, &ts)
+                    .await
+                {
+                    tracing::warn!(error = %error, "slack thread mark-read failed");
+                }
+            }
+        });
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let _ = task.await;
+            let _ = this.update(cx, |_, cx| cx.notify());
+        }));
+    }
+
     /// Sends `text` where the surface points: into the thread from a thread
     /// surface, into the conversation otherwise.
     pub fn send(&mut self, source: &Source, text: String, cx: &mut Context<Self>) {

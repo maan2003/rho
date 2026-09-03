@@ -7349,3 +7349,59 @@ fn shift_r_no_longer_writes_a_desk_draft(cx: &mut TestAppContext) {
         })
         .unwrap();
 }
+
+/// `mark read before` closes a backlog of threads in one keystroke, so it
+/// comes back in one: `shift-u` reopens every node it closed, not the last
+/// of them. Entered below the prompt, whose other half (the marking) is
+/// tested against the fake Slack server.
+#[gpui::test]
+fn marking_the_backlog_closes_every_old_card_and_undoes_as_one(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    let old = desk.thread_row(None, "C1", "100.0");
+    let older = desk.thread_row(None, "C1", "50.0");
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            let closed = workspace.mark_cards_done(
+                HostId::default(),
+                vec![old, older],
+                "mark read before".to_owned(),
+                window,
+                cx,
+            );
+            assert_eq!(closed, 2);
+            for node_id in [old, older] {
+                assert!(
+                    !workspace
+                        .dashboard
+                        .node_is_open(crate::dashboard::DealCardId {
+                            host: HostId::default(),
+                            node_id,
+                        }),
+                    "every old card is closed"
+                );
+            }
+            assert_eq!(
+                workspace.verdict_undo_count_for_test(),
+                1,
+                "one keystroke leaves one thing to undo"
+            );
+
+            workspace.undo_verdict(window, cx);
+            for node_id in [old, older] {
+                assert!(
+                    workspace
+                        .dashboard
+                        .node_is_open(crate::dashboard::DealCardId {
+                            host: HostId::default(),
+                            node_id,
+                        }),
+                    "the undo reopens the whole batch"
+                );
+            }
+            assert_eq!(workspace.verdict_undo_count_for_test(), 0);
+        })
+        .unwrap();
+}

@@ -684,3 +684,76 @@ async fn a_refused_session_names_slack_and_the_error() {
     assert!(notice.starts_with("slack: "), "the notice names Slack");
     assert!(notice.contains("fatal_error"), "and says what Slack said");
 }
+
+/// Marking the old backlog: one `conversations.mark` per old unread
+/// conversation, one `subscriptions.thread.mark` per old thread the user is
+/// in, and nothing at all for anything newer than the cutoff. The fake
+/// counts the calls, so "nothing newer is touched" is asserted rather than
+/// asserted about.
+#[tokio::test]
+async fn marking_the_backlog_touches_only_what_is_older_than_the_cutoff() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_user("U1", "ada");
+    fake.add_channel("C1", "design");
+    fake.add_channel("C2", "random");
+    fake.add_channel("C3", "quiet");
+    // Old and unread, new and unread, old and already read.
+    fake.set_count("C1", true, 1, "100.0");
+    fake.set_count("C2", true, 1, "900.0");
+    fake.set_count("C3", false, 0, "100.0");
+    fake.follow_thread("C1", "50.0");
+    fake.follow_thread("C2", "800.0");
+    let client = client(&fake);
+
+    let mut model = Model::new(rho_slack::WorkspaceName("acme".into()));
+    model.set_self(rho_slack::UserId("ME".into()));
+    model.add_users(client.users().await.unwrap());
+    model.add_conversations(client.conversations().await.unwrap());
+    model.set_counts(client.counts().await.unwrap().conversations);
+    model.set_followed(
+        client
+            .followed_threads()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|thread| (thread.channel, thread.thread_ts)),
+    );
+    for (channel, ts) in [("C1", "50.0"), ("C2", "800.0")] {
+        model.note_message(
+            &rho_slack::api::parse_message(
+                &json!({"ts": ts, "thread_ts": ts, "user": "U1", "text": "any update?"}),
+                &ChannelId(channel.into()),
+            )
+            .unwrap(),
+            0,
+        );
+    }
+
+    let plan = model.mark_plan(500.0);
+    assert_eq!(
+        plan.conversations,
+        vec![(ChannelId("C1".into()), Ts("100.0".into()))],
+        "only the old conversation with unreads is backlog"
+    );
+    assert_eq!(plan.threads.len(), 1);
+    assert_eq!(plan.threads[0].0.channel, ChannelId("C1".into()));
+
+    for (channel, ts) in &plan.conversations {
+        client.mark_read(channel, ts).await.unwrap();
+    }
+    for (key, ts) in &plan.threads {
+        client
+            .mark_thread_read(&key.channel, &key.thread_ts, ts)
+            .await
+            .unwrap();
+    }
+
+    assert_eq!(fake.marked(), vec![("C1".to_owned(), "100.0".to_owned())]);
+    assert_eq!(fake.calls("conversations.mark"), 1);
+    assert_eq!(fake.calls("subscriptions.thread.mark"), 1);
+    assert_eq!(
+        fake.fields("subscriptions.thread.mark", "thread_ts"),
+        vec![Some("50.0".to_owned())],
+        "the newer thread is left alone"
+    );
+}

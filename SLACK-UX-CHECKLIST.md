@@ -348,7 +348,7 @@ done right after the transcript primitive (2.4) and before 2.10:
       the fake must model that, and the both-sides test must run on a
       channel long enough to tell (500 messages, ping in the middle, context
       visible below the ping in the screenshot).
-- [ ] 2.13 Marking the old backlog done. Asked by the user on 3 Sep. On the
+- [x] 2.13 Marking the old backlog done. Asked by the user on 3 Sep. On the
       Slack list, a command `mark read before` opens a minibuffer taking an
       age or a date (`7d`, `2026-08-15`, default `7d`) and shows the count
       it would touch before acting (`14 conversations · 3 threads · enter`).
@@ -366,6 +366,18 @@ done right after the transcript primitive (2.4) and before 2.10:
       conversations, threads }`. The fake counts the mark calls; the test
       asserts exactly one per old conversation and zero for newer ones.
       Screenshot the confirmation line and the list after.
+      Landed 3 Sep. `m` on the Slack list (also `space shift-s m`) opens
+      `mark read before (7d):`; the line under it counts what the input
+      would touch (`1 conversation · 0 threads · enter`) and recounts as it
+      is typed. Acting sends one `conversations.mark` per old conversation
+      and one `subscriptions.thread.mark` per old followed thread, then
+      writes a done verdict on every open thread card older than the
+      cutoff; `shift-u` reopens that whole batch as one undo. Conversations
+      with nothing unread are left out of the plan: a read conversation is
+      not backlog, and marking it would spend a request to change nothing.
+      Screenshots: /tmp/rho-slack-ux/screens/{mark-prompt,mark-done}.png,
+      the count line and `marked read before 2d: 1 conversation · 0 threads
+      · 1 closed` with `#random` moved out of the unread group.
 - [x] 2.14 Verdicts are the user's keys only. Landed 3 Sep. Combined
       ping-plus-agent deal screenshot skipped: staging an agent means a
       live model call; the ordering test is the proof.

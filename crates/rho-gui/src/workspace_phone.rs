@@ -997,7 +997,10 @@ impl Workspace {
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.open_transient(crate::transient::phone_root_menu(), window, cx);
                         }))
-                        .child("deal"),
+                        // The header names what the reader is looking at,
+                        // and with the queue empty that is Home, not the
+                        // deal they have already flicked past.
+                        .child("home"),
                 )
                 .child({
                     // Home is the card after the last deal: flick past the

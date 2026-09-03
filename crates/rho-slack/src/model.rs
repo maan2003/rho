@@ -78,6 +78,15 @@ pub struct ThreadCard {
     pub verdict_key: Ts,
 }
 
+/// Everything one `mark read before` touches: the conversations to mark and
+/// the followed threads to mark, each with the message to mark up to. The
+/// count shown before acting and the calls made after are this same list.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MarkPlan {
+    pub conversations: Vec<(ChannelId, Ts)>,
+    pub threads: Vec<(ThreadKey, Ts)>,
+}
+
 /// One line of the conversation list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConversationRow {
@@ -304,6 +313,36 @@ impl Model {
                 .then_with(|| left.label.cmp(&right.label))
         });
         rows
+    }
+
+    /// What `mark read before` would touch, as a plan the caller can count
+    /// before it acts and then act on unchanged. `before` is a cutoff in
+    /// epoch seconds; nothing newer than it is ever in here.
+    ///
+    /// Conversations are the unread ones only. A conversation with nothing
+    /// unread is not backlog, and marking it would spend a request to change
+    /// nothing.
+    pub fn mark_plan(&self, before: f64) -> MarkPlan {
+        let conversations = self
+            .counts
+            .values()
+            .filter(|count| count.has_unreads || count.mention_count > 0)
+            .filter_map(|count| {
+                let latest = count.latest.clone()?;
+                (latest.epoch_seconds() < before).then_some((count.channel.clone(), latest))
+            })
+            .collect();
+        let threads = self
+            .threads
+            .iter()
+            .filter(|(key, _)| self.followed.contains(key))
+            .filter(|(_, thread)| thread.latest.epoch_seconds() < before)
+            .map(|(key, thread)| (key.clone(), thread.latest.clone()))
+            .collect();
+        MarkPlan {
+            conversations,
+            threads,
+        }
     }
 
     /// The follow list as Slack has it, from `subscriptions.thread.getView`

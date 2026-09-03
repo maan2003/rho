@@ -929,6 +929,30 @@ impl Dashboard {
         self.node_card(|node| node_thread(node).as_ref() == Some(thread))
     }
 
+    /// Every open Slack thread node, with the thread it stands for. The
+    /// backlog command needs them all at once rather than the one the
+    /// cursor is on.
+    pub fn open_thread_cards(&self) -> Vec<(DealCardId, ThreadRef)> {
+        self.tree_hosts
+            .iter()
+            .flat_map(|(host, source)| {
+                source
+                    .nodes
+                    .iter()
+                    .filter(|node| node.state == rho_desk::cells::State::Open)
+                    .filter_map(move |node| {
+                        Some((
+                            DealCardId {
+                                host: *host,
+                                node_id: node.id,
+                            },
+                            node_thread(node)?,
+                        ))
+                    })
+            })
+            .collect()
+    }
+
     /// Whether a card's node still wants attention. A node a verdict
     /// closed is not re-dealt until something reopens it.
     pub fn node_is_open(&self, card: DealCardId) -> bool {

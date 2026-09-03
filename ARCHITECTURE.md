@@ -309,12 +309,12 @@ than by running a supervisor, extension protocol, or daemon process graph.
   paths and Mesa's software Vulkan driver rather than relying on the caller's
   environment. Mixed key, text, and wait steps remain on one virtual keyboard
   so compositor enter/leave cannot race application input or modal actions.
-  Known limit (3 Sep): `wtype` never delivers a shift *modifier* through
-  Sway to gpui, only shifted characters via text mode, so bindings that
-  differ by shift (`shift-u`, `shift-f`) cannot be pressed in the
-  rig and get no screenshots. The fix is our own `zwp_virtual_keyboard`
-  client uploading a `us` keymap and sending keycodes plus modifier state,
-  about a day; queued after the Slack list, not mid-slice.
+  Chords are `+`-separated (`key:shift+s`, `key:ctrl+k`); the `-` spelling
+  the keymap uses is not a `wtype` key name and fails outright. That, not
+  the compositor, was the earlier "shift is undeliverable" limit recorded
+  here: with the right spelling a shifted binding does reach gpui, both as
+  a transient item (`space shift+s`) and as a vim key (`shift+g`), so
+  shifted bindings can be pressed in the rig and screenshotted.
 - The daemon snapshots the user's login-shell environment and passes it
   explicitly to `rho-workspaces` for daemon-owned commands. Workspace-control
   subprocesses use that environment directly; agent execution shells and
