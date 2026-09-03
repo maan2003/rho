@@ -31,9 +31,11 @@ use tokio::sync::{Mutex, Mutex as TokioMutex, OwnedMutexGuard, broadcast, mpsc, 
 
 mod agent_ui;
 pub mod debug;
+mod desk_cells;
 mod desk_org_migration;
 mod desk_org_migration_types;
 mod desk_tree;
+mod desk_tree_v1;
 mod iris;
 mod realtime;
 mod secret_store;

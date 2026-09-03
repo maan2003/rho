@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 //! Convergent movable-tree and per-node text CRDT used by the Desk.
 //!
 //! This crate owns document mechanics only. Rendering, daemon persistence,
@@ -5,14 +7,97 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
+use bytes::BytesMut;
 use camino::Utf8PathBuf;
 use chrono::{Datelike as _, Timelike as _};
 use clock::{Global, Lamport, ReplicaId};
+use redb::{TableDefinition, TypeName, Value};
 use rho_core::AgentId;
-use senax_encoder::{Decode, Encode, Pack, Unpack};
+use rho_db::{SenValue, WriteTxn};
+use senax_encoder::{Decode, Decoder, Encode, Encoder, Pack, Unpack};
 use text::{Buffer, BufferId, EditOperation, FullOffset, Operation, UndoOperation};
 
-pub mod cells;
+const STATE: TableDefinition<(), StateValue> = TableDefinition::new("rho_desk_tree_state_v1");
+const TREE_OPS: TableDefinition<u64, TreeRecordValue> =
+    TableDefinition::new("rho_desk_tree_ops_v1");
+const TEXT_OPS: TableDefinition<u64, TextRecordValue> =
+    TableDefinition::new("rho_desk_node_text_ops_v1");
+const BATCH_OPS: TableDefinition<u64, BatchRecordValue> =
+    TableDefinition::new("rho_desk_batch_ops_v1");
+
+#[derive(Clone, Debug, Encode, Decode)]
+struct PersistentState {
+    snapshot: Snapshot,
+    next_sequence: u64,
+    next_replica_id: u16,
+    #[senax(default)]
+    next_machine_counter: u64,
+    #[senax(default)]
+    next_machine_clock: u32,
+}
+
+#[derive(Debug)]
+struct StateValue;
+#[derive(Debug)]
+struct TreeRecordValue;
+#[derive(Debug)]
+struct TextRecordValue;
+#[derive(Debug)]
+struct BatchRecordValue;
+
+macro_rules! frozen_value {
+    ($marker:ty, $record:ty, $name:literal) => {
+        impl Value for $marker {
+            type SelfType<'a> = SenValue<'a, $record>;
+            type AsBytes<'a> = BytesMut;
+            fn fixed_width() -> Option<usize> {
+                None
+            }
+            fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
+            where
+                Self: 'a,
+            {
+                let mut data = data;
+                SenValue::owned(<$record>::decode(&mut data).expect("decode frozen Desk tree v1"))
+            }
+            fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
+            where
+                Self: 'b,
+            {
+                let mut bytes = BytesMut::new();
+                value
+                    .as_ref()
+                    .encode(&mut bytes)
+                    .expect("encode frozen Desk tree v1");
+                bytes
+            }
+            fn type_name() -> TypeName {
+                TypeName::new($name)
+            }
+        }
+    };
+}
+
+frozen_value!(
+    StateValue,
+    PersistentState,
+    "rho-db::Sen<rho_daemon::desk_tree::PersistentState>"
+);
+frozen_value!(
+    TreeRecordValue,
+    TreeOpRecord,
+    "rho-db::Sen<rho_desk::TreeOpRecord>"
+);
+frozen_value!(
+    TextRecordValue,
+    TextOpRecord,
+    "rho-db::Sen<rho_desk::TextOpRecord>"
+);
+frozen_value!(
+    BatchRecordValue,
+    BatchOpRecord,
+    "rho-db::Sen<rho_desk::BatchOpRecord>"
+);
 
 /// Stable identity of a Desk node. Counters are allocated independently by
 /// each replica; the replica component makes the pair globally unique.
@@ -1078,212 +1163,76 @@ pub fn todo_priority(at: chrono::NaiveDateTime, pace_days: u32, now: chrono::Nai
     )
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn clock(value: u32, replica_id: u16) -> TreeClock {
-        TreeClock { value, replica_id }
+/// Reads and replays the complete native-tree V1 epoch. This is the only
+/// runtime entry point retained for the cells-V2 migration.
+pub fn load_replayed(write: &mut WriteTxn) -> Result<Option<Snapshot>, String> {
+    let Some(state) = write
+        .open_table(STATE)
+        .get(&())
+        .map(|value| value.value().into_owned())
+    else {
+        return Ok(None);
+    };
+    let mut document = Document::from_snapshot(state.snapshot)?;
+    enum Stored {
+        Tree(TreeOpRecord),
+        Text(TextOpRecord),
+        Batch(BatchOpRecord),
     }
-    fn id(counter: u64) -> NodeId {
-        NodeId {
-            replica_id: 1,
-            counter,
-        }
-    }
-    fn create(
-        timestamp: TreeClock,
-        node_id: NodeId,
-        parent: Option<NodeId>,
-        order: u16,
-    ) -> TreeOperation {
-        TreeOperation::Create {
-            timestamp,
-            node_id,
-            kind: NodeKind::Heading,
-            owner: NodeOwner::User,
-            parent,
-            order: OrderKey(vec![order]),
-        }
-    }
-
-    #[test]
-    fn order_keys_always_fit_between_neighbors() {
-        let left = OrderKey(vec![100]);
-        let right = OrderKey(vec![101]);
-        let middle = OrderKey::between(Some(&left), Some(&right));
-        assert!(left < middle && middle < right);
-    }
-
-    #[test]
-    fn concurrent_cycle_drops_lower_priority_move() {
-        let mut doc = Document::default();
-        doc.apply(create(clock(1, 1), id(1), None, 10)).unwrap();
-        doc.apply(create(clock(2, 1), id(2), None, 20)).unwrap();
-        doc.apply(TreeOperation::Move {
-            timestamp: clock(3, 1),
-            node_id: id(1),
-            parent: Some(id(2)),
-            order: OrderKey(vec![10]),
-        })
-        .unwrap();
-        doc.apply(TreeOperation::Move {
-            timestamp: clock(4, 2),
-            node_id: id(2),
-            parent: Some(id(1)),
-            order: OrderKey(vec![10]),
-        })
-        .unwrap();
-        let nodes = doc.materialize();
-        let a = nodes.iter().find(|node| node.id == id(1)).unwrap();
-        let b = nodes.iter().find(|node| node.id == id(2)).unwrap();
-        assert_eq!(a.parent, None);
-        assert_eq!(b.parent, Some(id(1)));
-    }
-
-    #[test]
-    fn operation_order_does_not_affect_materialization() {
-        let operations = [
-            create(clock(1, 1), id(1), None, 10),
-            create(clock(2, 1), id(2), None, 20),
-            TreeOperation::Move {
-                timestamp: clock(8, 1),
-                node_id: id(1),
-                parent: Some(id(2)),
-                order: OrderKey(vec![10]),
-            },
-            TreeOperation::Move {
-                timestamp: clock(7, 2),
-                node_id: id(2),
-                parent: Some(id(1)),
-                order: OrderKey(vec![10]),
-            },
-        ];
-        let mut left = Document::default();
-        let mut right = Document::default();
-        for operation in operations.clone() {
-            left.apply(operation).unwrap();
-        }
-        for operation in operations.into_iter().rev() {
-            // Causally impossible references are queued by transport in production;
-            // create first here, then reverse only the concurrent moves.
-            if matches!(operation, TreeOperation::Create { .. }) {
-                continue;
+    let mut records = write
+        .open_table(TREE_OPS)
+        .iter()
+        .map(|(sequence, record)| (sequence.value(), Stored::Tree(record.value().into_owned())))
+        .collect::<Vec<_>>();
+    records.extend(
+        write.open_table(TEXT_OPS).iter().map(|(sequence, record)| {
+            (sequence.value(), Stored::Text(record.value().into_owned()))
+        }),
+    );
+    records.extend(
+        write
+            .open_table(BATCH_OPS)
+            .iter()
+            .map(|(sequence, record)| {
+                (sequence.value(), Stored::Batch(record.value().into_owned()))
+            }),
+    );
+    records.sort_by_key(|(sequence, _)| *sequence);
+    for (_, record) in records {
+        match record {
+            Stored::Tree(record) => {
+                document.apply(record.operation)?;
+            }
+            Stored::Text(record) => {
+                document.apply_text(record.node_id, record.operation, record.transaction)?;
+            }
+            Stored::Batch(record) => {
+                for operation in record.batch.operations {
+                    match operation {
+                        BatchOperation::Tree(operation) => {
+                            document.apply(operation)?;
+                        }
+                        BatchOperation::Text {
+                            node_id,
+                            operation,
+                            transaction,
+                        } => {
+                            document.apply_text(node_id, operation, transaction)?;
+                        }
+                    }
+                }
+                for operation in record.daemon_tree_operations {
+                    document.apply(operation)?;
+                }
             }
         }
-        right.apply(create(clock(1, 1), id(1), None, 10)).unwrap();
-        right.apply(create(clock(2, 1), id(2), None, 20)).unwrap();
-        right
-            .apply(TreeOperation::Move {
-                timestamp: clock(7, 2),
-                node_id: id(2),
-                parent: Some(id(1)),
-                order: OrderKey(vec![10]),
-            })
-            .unwrap();
-        right
-            .apply(TreeOperation::Move {
-                timestamp: clock(8, 1),
-                node_id: id(1),
-                parent: Some(id(2)),
-                order: OrderKey(vec![10]),
-            })
-            .unwrap();
-        assert_eq!(left.materialize(), right.materialize());
     }
+    Ok(Some(document.snapshot()))
+}
 
-    #[test]
-    fn delete_wins_over_moves_and_rehomes_children() {
-        let mut doc = Document::default();
-        doc.apply(create(clock(1, 1), id(1), None, 10)).unwrap();
-        doc.apply(create(clock(2, 1), id(2), Some(id(1)), 10))
-            .unwrap();
-        doc.apply(TreeOperation::Delete {
-            timestamp: clock(3, 1),
-            node_ids: vec![id(1)],
-        })
-        .unwrap();
-        assert_eq!(doc.materialize()[0].parent, None);
-        assert_eq!(doc.materialize()[0].id, id(2));
-    }
-
-    #[test]
-    fn rejected_operation_does_not_poison_its_timestamp() {
-        let mut doc = Document::default();
-        let timestamp = clock(1, 1);
-        let bad = TreeOperation::Create {
-            timestamp,
-            node_id: id(1),
-            kind: NodeKind::Heading,
-            owner: NodeOwner::User,
-            parent: None,
-            order: OrderKey(vec![0]),
-        };
-        assert!(doc.apply(bad).is_err());
-        assert!(!doc.contains_operation(timestamp));
-        doc.apply(create(timestamp, id(1), None, 10)).unwrap();
-        assert_eq!(doc.materialize().len(), 1);
-    }
-
-    #[test]
-    fn self_parent_is_rejected_and_legacy_snapshot_falls_back_to_root() {
-        let mut doc = Document::default();
-        doc.apply(create(clock(1, 1), id(1), None, 10)).unwrap();
-        assert!(
-            doc.apply(TreeOperation::Move {
-                timestamp: clock(2, 1),
-                node_id: id(1),
-                parent: Some(id(1)),
-                order: OrderKey(vec![10]),
-            })
-            .is_err()
-        );
-
-        let mut snapshot = doc.snapshot();
-        snapshot.nodes[0].placements.push(Placement {
-            timestamp: clock(3, 1),
-            parent: Some(id(1)),
-            order: OrderKey(vec![10]),
-        });
-        let legacy = Document::from_snapshot(snapshot).unwrap();
-        assert_eq!(legacy.materialize()[0].parent, None);
-    }
-
-    #[test]
-    fn org_renderer_is_read_only_human_output_without_runtime_ids() {
-        let mut doc = Document::default();
-        doc.apply(create(clock(1, 1), id(1), None, 10)).unwrap();
-        doc.apply(create(clock(2, 1), id(2), Some(id(1)), 10))
-            .unwrap();
-        for (node_id, title) in [(id(1), "Room"), (id(2), "Task")] {
-            let mut buffer = Buffer::new(
-                ReplicaId::new(1),
-                BufferId::new(node_id.counter).unwrap(),
-                "",
-            );
-            doc.apply_text(
-                node_id,
-                TextOperation::from_text(&buffer.edit([(0..0, title)])),
-                None,
-            )
-            .unwrap();
-        }
-        doc.apply(TreeOperation::SetTemporal {
-            timestamp: clock(3, 1),
-            node_id: id(2),
-            kind: TemporalKind::Todo,
-            value: Some(TemporalMark {
-                year: 2026,
-                month: 3,
-                day: 18,
-                minute_of_day: None,
-                pace_days: 7,
-            }),
-        })
-        .unwrap();
-
-        let rendered = render_org(doc.snapshot()).unwrap();
-        assert_eq!(rendered, "* Room\n** Task\n:todo: 2026-03-18 7d\n");
-        assert!(!rendered.contains("replica"));
-    }
+pub fn text_into_current(text: NodeTextSnapshot) -> Result<rho_desk::NodeTextSnapshot, String> {
+    let mut bytes = BytesMut::new();
+    text.encode(&mut bytes).map_err(|error| error.to_string())?;
+    let mut bytes = bytes.as_ref();
+    rho_desk::NodeTextSnapshot::decode(&mut bytes).map_err(|error| error.to_string())
 }
