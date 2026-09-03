@@ -242,7 +242,10 @@ It is a place you visit deliberately, not persistent chrome.
 the whole screen with its content, plain-language reason, and verdict keys. A
 fresh surface is in DEAL, which is normal mode plus verdict letters: motions,
 search, and scrolling all work. Insert commits to the surface and Escape returns
-to DEAL on desk cards. Dealing immediately puts the surface on the timeline.
+to DEAL on desk cards. Escape in DEAL itself leaves deal mode (decided by
+the user on 2026-09-03, replacing "no deliberate exit"): it is the Open
+verdict, the surface stays on the timeline in normal mode, on every
+surface kind, including ones without a vim editor. Dealing immediately puts the surface on the timeline.
 Ctrl-J skips it for 15 minutes, leaves its surface behind, and performs a fresh
 pull. `q` skips and closes the current dealt surface. Ctrl-Shift-J combines
 skip, close, and a fresh pull.
