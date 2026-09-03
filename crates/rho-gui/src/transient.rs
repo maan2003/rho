@@ -666,6 +666,9 @@ pub fn root_menu() -> Transient {
         .item("f", "open file…", |workspace, window, cx| {
             workspace.prompt_open_file(window, cx);
         })
+        .item("shift-f", "find node…", |workspace, window, cx| {
+            workspace.open_find(window, cx);
+        })
         .item("c", "start/attach shell", |workspace, window, cx| {
             workspace.cmd_shell(window, cx);
         })

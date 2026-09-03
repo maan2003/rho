@@ -69,12 +69,13 @@ use crate::{
     DashboardNow, DashboardPasteRow, DashboardPasteRowBefore, DashboardPromote,
     DashboardRenameTopic, DashboardReply, DashboardStaff, DashboardSubmit,
     DashboardToggleAgentTree, DashboardToggleSubagents, DashboardUndo, DashboardYankRow,
-    DealCloseAndNext, DealLeave, DealOpen, GitApprovalAllow, GitApprovalDeny, InboxCapture,
-    MessagesOpen, MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext,
-    MinibufferPrevious, OverviewToggle, PastePrompt, RailFocus, RailOpen, RoleCycle,
-    RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit,
-    SlackCompose, SlackOpenRow, SlackSearch, SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard,
-    UndoVerdict, UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
+    DealCloseAndNext, DealLeave, DealOpen, FindNode, GitApprovalAllow, GitApprovalDeny,
+    InboxCapture, MessagesOpen, MinibufferCancel, MinibufferComplete, MinibufferConfirm,
+    MinibufferNext, MinibufferPrevious, OverviewToggle, PastePrompt, RailFocus, RailOpen,
+    RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore,
+    ShellPagerQuit, SlackCompose, SlackOpenRow, SlackSearch, SubmitPrompt, SurfaceBack,
+    SurfaceClose, TaskBoard, UndoVerdict, UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder,
+    ZulipNextUnread, ZulipOpenRow,
 };
 
 pub(crate) const MESSAGE_LOG_CAP: usize = 4096;
@@ -465,7 +466,7 @@ pub struct Workspace {
     hosts: Hosts,
     subscriptions: AgentSubscriptions,
     store: AgentStore,
-    registry: AgentRegistry,
+    pub(crate) registry: AgentRegistry,
     models: HashMap<AgentId, Entity<AgentModel>>,
     /// Weak project cache keyed by daemon-side workspace identity, qualified
     /// by host — the same repository path on two machines is two projects.
@@ -558,7 +559,7 @@ pub struct Workspace {
     chime_above_threshold: bool,
     /// The dashboard: the rail as a real editor buffer, ambient chrome
     /// beside the active tree.
-    dashboard: crate::dashboard::Dashboard,
+    pub(crate) dashboard: crate::dashboard::Dashboard,
     /// The vendored modal engine's status item, kept visible in Rho's frame.
     mode_indicator: Entity<vim::ModeIndicator>,
     /// Compact Helix-style key guide shown on deal entry and `?`.
@@ -633,7 +634,7 @@ pub struct Workspace {
     pending_page_filings: BTreeMap<(HostId, u64), PendingPageFiling>,
     scroll_journal_task: Option<Task<()>>,
     /// The completing-read strip at the bottom of the window, when open.
-    minibuffer: Option<Minibuffer>,
+    pub(crate) minibuffer: Option<Minibuffer>,
     /// An open transient menu in the bottom strip; captures the keyboard
     /// via `transient_focus` while shown.
     transient: Option<crate::transient::Transient>,
@@ -9305,7 +9306,7 @@ impl Workspace {
     /// A freshly opened draft row only exists on screen after a sync:
     /// splice it in now so the pending cursor lands on it, then enter
     /// insert there — never on the read-only row the cursor came from.
-    fn dashboard_focus_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn dashboard_focus_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_dashboard(window, cx);
         self.dashboard_enter_insert(window, cx);
     }
@@ -11161,6 +11162,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &SlackSearch, window, cx| {
                 this.prompt_slack_search(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &FindNode, window, cx| {
+                this.open_find(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ShellPagerMore, _, cx| {
                 this.shell_pager_action(rho_ui_proto::shell::PagerAction::Continue, cx);

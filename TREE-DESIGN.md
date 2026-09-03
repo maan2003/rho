@@ -121,7 +121,11 @@ per message. The mirror stays the bulk store.
   normal open (transcript, page, conversation, note). Asked for by the
   user on 2026-09-03 for agents first; built over the desk tree's paths
   now, behind one function that yields `(path, target)`, and moved onto
-  `NodeId` in slice 2 without changing the prompt.
+  `NodeId` in slice 2 without changing the prompt. Built 3 Sep: `ctrl-shift-f`
+  anywhere (or `shift-f` on the root transient), scorer in
+  `crates/rho-gui/src/find.rs`, recency from what already records a use
+  (agent activity, conversation latest, thread verdict key) until the tree
+  carries a per-node last-opened field.
 
 ## Migration
 

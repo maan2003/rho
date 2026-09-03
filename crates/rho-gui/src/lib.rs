@@ -9,6 +9,7 @@ pub mod desk_view;
 pub(crate) mod diff_view;
 pub mod draft_view;
 pub mod editor_config;
+pub(crate) mod find;
 pub mod highlights;
 pub mod hosts;
 pub(crate) mod image_view;
@@ -135,6 +136,7 @@ actions!(
         SlackOpenRow,
         SlackCompose,
         SlackSearch,
+        FindNode,
         MessagesOpen
     ]
 );
@@ -203,6 +205,11 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         ),
         KeyBinding::new("ctrl-shift-j", DealCloseAndNext, Some("RhoGui > Editor")),
         KeyBinding::new("f16", DealCloseAndNext, Some("RhoGui > Editor")),
+        // Find, the node finder. Bound at both depths for the same reason
+        // as the keys above: the bundled keymap binds `ctrl-shift-f` to
+        // search under plain `Editor`, and gpui prefers the deeper match.
+        KeyBinding::new("ctrl-shift-f", FindNode, Some("RhoGui")),
+        KeyBinding::new("ctrl-shift-f", FindNode, Some("RhoGui > Editor")),
         // Attention triage: jump to the most urgent agent, clear the current
         // one. The bundled zed keymaps don't know these actions, so they are
         // bound here rather than in an asset. The context must be at least as

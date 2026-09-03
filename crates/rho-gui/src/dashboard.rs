@@ -2295,6 +2295,112 @@ impl Dashboard {
             .collect()
     }
 
+    /// Every tree node the finder can open, as its full path and target.
+    /// Headings carry their own breadcrumb; an agent or a page hangs its
+    /// title under its parent's.
+    pub(crate) fn find_candidates(
+        &self,
+        registry: &AgentRegistry,
+        cx: &App,
+    ) -> Vec<crate::find::FindCandidate> {
+        use crate::find::{FindCandidate, FindTarget};
+
+        let mut candidates = Vec::new();
+        for (host, source) in &self.tree_hosts {
+            let nodes = source
+                .nodes
+                .iter()
+                .map(|node| (node.id, node))
+                .collect::<HashMap<_, _>>();
+            let titles = source
+                .buffers
+                .iter()
+                .map(|(id, buffer)| (*id, buffer.read(cx).text()))
+                .collect::<HashMap<_, _>>();
+            let title_of = |node_id: rho_desk::NodeId| {
+                titles
+                    .get(&node_id)
+                    .and_then(|text| text.lines().next())
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+                    .map(str::to_owned)
+            };
+            for node in &source.nodes {
+                let breadcrumb = tree_breadcrumb(node.id, &nodes, &titles);
+                let under = |title: String| {
+                    if breadcrumb.is_empty() {
+                        title
+                    } else {
+                        format!("{breadcrumb} › {title}")
+                    }
+                };
+                let candidate = match node.kind {
+                    rho_desk::NodeKind::Heading => {
+                        if breadcrumb.is_empty() {
+                            continue;
+                        }
+                        FindCandidate {
+                            path: breadcrumb.clone(),
+                            kind: "topic",
+                            target: FindTarget::Topic {
+                                host: *host,
+                                node_id: node.id,
+                            },
+                            recency: self
+                                .tree_heading_agents
+                                .get(&(*host, node.id))
+                                .into_iter()
+                                .flatten()
+                                .filter_map(|agent_id| registry.agent_last_active(*agent_id))
+                                .map(|active| active.0 as i64)
+                                .max()
+                                .unwrap_or_default(),
+                        }
+                    }
+                    rho_desk::NodeKind::Agent => {
+                        let Some(rho_desk::Binding::Agent(agent_id)) =
+                            node.bindings.get(&rho_desk::BindingKind::Agent)
+                        else {
+                            continue;
+                        };
+                        FindCandidate {
+                            path: under(
+                                title_of(node.id)
+                                    .unwrap_or_else(|| registry.agent_human_name(*agent_id)),
+                            ),
+                            kind: "agent",
+                            target: FindTarget::Agent(*agent_id),
+                            recency: registry
+                                .agent_last_active(*agent_id)
+                                .map_or(0, |active| active.0 as i64),
+                        }
+                    }
+                    rho_desk::NodeKind::Page => {
+                        let Some(rho_desk::Binding::Page(page_id)) =
+                            node.bindings.get(&rho_desk::BindingKind::Page)
+                        else {
+                            continue;
+                        };
+                        let Some(title) = title_of(node.id) else {
+                            continue;
+                        };
+                        FindCandidate {
+                            path: under(title),
+                            kind: "page",
+                            target: FindTarget::Page(rho_browser::PageId(uuid::Uuid::from_bytes(
+                                page_id.0,
+                            ))),
+                            recency: 0,
+                        }
+                    }
+                    _ => continue,
+                };
+                candidates.push(candidate);
+            }
+        }
+        candidates
+    }
+
     pub fn heading_candidates(
         &self,
         _registry: &AgentRegistry,

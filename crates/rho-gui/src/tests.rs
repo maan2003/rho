@@ -7197,3 +7197,247 @@ fn a_verdict_ends_the_deal_even_when_the_item_went_quiet(cx: &mut TestAppContext
         })
         .unwrap();
 }
+
+/// The finder's candidate source over a real desk tree: every node arrives
+/// as its full path, and submitting one opens the surface that path names.
+#[gpui::test]
+fn find_offers_every_node_as_a_path_and_opens_the_one_chosen(cx: &mut TestAppContext) {
+    use rho_desk::{
+        Binding, BindingKind, Document, NodeId, NodeKind, NodeOwner, OrderKey, Replica,
+        ReplicaAuthor, TextOperation, TreeClock, TreeOperation,
+    };
+    use rho_ui_proto::{
+        AgentDisposition, AgentRole, AuthState, UiAgentFacts, UiAgentSummary, UiAttention,
+        WorkspaceInfo,
+    };
+
+    cx.update(bind_test_keymaps);
+    // A page node makes the dashboard look at the browser, which is a
+    // global rather than a field.
+    cx.update(|cx| {
+        let dir = std::env::temp_dir();
+        rho_browser::init(&dir, dir.join("rho-gui-test-nonexistent-browser.sock"), cx);
+    });
+    let agent_id = agent(31);
+    let page_id = rho_browser::PageId(uuid::Uuid::from_u128(7));
+    let node = |counter| NodeId {
+        replica_id: 1,
+        counter,
+    };
+    let (root, topic, row, page) = (node(1), node(2), node(3), node(4));
+
+    let mut document = Document::default();
+    document.add_replica(Replica {
+        replica_id: 1,
+        author: ReplicaAuthor::Machine,
+    });
+    for (index, (node_id, kind, owner, parent)) in [
+        (root, NodeKind::Heading, NodeOwner::User, None),
+        (topic, NodeKind::Heading, NodeOwner::User, Some(root)),
+        (row, NodeKind::Agent, NodeOwner::Machine, Some(topic)),
+        (page, NodeKind::Page, NodeOwner::Machine, Some(topic)),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        document
+            .apply(TreeOperation::Create {
+                timestamp: TreeClock {
+                    value: index as u32 + 1,
+                    replica_id: 1,
+                },
+                node_id,
+                kind,
+                owner,
+                parent,
+                order: OrderKey(vec![(index as u16 + 1) * 20]),
+            })
+            .unwrap();
+    }
+    for (index, (node_id, kind, value)) in [
+        (row, BindingKind::Agent, Binding::Agent(agent_id)),
+        (
+            page,
+            BindingKind::Page,
+            Binding::Page(rho_desk::PageId(*page_id.0.as_bytes())),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        document
+            .apply(TreeOperation::SetBinding {
+                timestamp: TreeClock {
+                    value: index as u32 + 10,
+                    replica_id: 1,
+                },
+                node_id,
+                kind,
+                value: Some(value),
+            })
+            .unwrap();
+    }
+    for (index, (node_id, title)) in [
+        (root, "nixos"),
+        (topic, "poco on linux"),
+        (row, "warm agent"),
+        (page, "release notes"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut buffer = text::Buffer::new(
+            text::ReplicaId::new(1),
+            text::BufferId::new(index as u64 + 1).unwrap(),
+            "",
+        );
+        document
+            .apply_text(
+                node_id,
+                TextOperation::from_text(&buffer.edit([(0..0, title.to_owned())])),
+                None,
+            )
+            .unwrap();
+    }
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskTreeSnapshot {
+                    snapshot: document.snapshot(),
+                    replica_id: 42,
+                },
+                window,
+                cx,
+            );
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Ready {
+                    agents: vec![UiAgentSummary {
+                        agent_id,
+                        parent_agent: None,
+                        display_name: Some("warm agent".into()),
+                        created_at: UnixMs(1),
+                        updated_at: UnixMs(1),
+                        role: AgentRole::default(),
+                        workspace: WorkspaceInfo::UserCheckout {
+                            repo: "/tmp".into(),
+                        },
+                        attention: UiAttention::Pending,
+                        last_active: UnixMs(5),
+                        facts: UiAgentFacts::default(),
+                        hidden: false,
+                        disposition: AgentDisposition::Pending,
+                        last_user_message_text: String::new(),
+                        activity: None,
+                        turn_report: None,
+                        labels: Vec::new(),
+                    }],
+                    iris_agent: None,
+                    projects: Vec::new(),
+                    auth: AuthState {
+                        namespaces: Vec::new(),
+                        disabled_namespaces: Vec::new(),
+                        active_namespace: None,
+                    },
+                    machine_seed: 0,
+                    agent_counter: 40,
+                },
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let paths = workspace
+                .find_candidates(cx)
+                .into_iter()
+                .map(|candidate| (candidate.path, candidate.kind))
+                .collect::<Vec<_>>();
+            for expected in [
+                ("nixos".to_owned(), "topic"),
+                ("nixos › poco on linux".to_owned(), "topic"),
+                ("nixos › poco on linux › warm agent".to_owned(), "agent"),
+                ("nixos › poco on linux › release notes".to_owned(), "page"),
+            ] {
+                assert!(
+                    paths.contains(&expected),
+                    "{expected:?} missing from {paths:?}"
+                );
+            }
+            // The whole point of the path: initials across segments find it.
+            assert_eq!(
+                crate::find::rank(
+                    &paths
+                        .iter()
+                        .map(|(path, _)| (path.clone(), 0))
+                        .collect::<Vec<_>>(),
+                    "nixpocowarm",
+                )
+                .first()
+                .map(|index| paths[*index].0.clone()),
+                Some("nixos › poco on linux › warm agent".to_owned())
+            );
+        })
+        .unwrap();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_find(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "n i x p o c o w a r m");
+    cx.run_until_parked();
+    cx.dispatch_action(*workspace, crate::MinibufferConfirm);
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                workspace
+                    .current_surface_name_for_test()
+                    .starts_with("warm agent"),
+                "enter on an agent's path opens that agent, not {}",
+                workspace.current_surface_name_for_test()
+            );
+        })
+        .unwrap();
+}
+
+/// The finder's chord must survive the bundled keymaps: `ctrl-shift-f` is
+/// Zed's project search and vim binds a great deal at this depth.
+#[gpui::test]
+fn the_find_chord_wins_against_the_bundled_keymaps(cx: &mut TestAppContext) {
+    use gpui::{KeyContext, Keystroke};
+
+    cx.update(bind_test_keymaps);
+    cx.update(|cx| {
+        let keymap = cx.key_bindings();
+        let keymap = keymap.borrow();
+        let routes = |key: &str, contexts: &[KeyContext]| {
+            let stroke = Keystroke::parse(key).unwrap();
+            keymap
+                .bindings_for_input(&[stroke], contexts)
+                .0
+                .first()
+                .map(|binding| binding.action().name())
+        };
+        for surface in ["RhoGuiDashboard", "RhoSlackConversation", "RhoGuiAgent"] {
+            let contexts = [
+                KeyContext::parse("RhoGui").unwrap(),
+                KeyContext::parse(surface).unwrap(),
+                KeyContext::parse("Editor VimControl vim_mode=normal vim_operator=none").unwrap(),
+            ];
+            assert_eq!(
+                routes("ctrl-shift-f", &contexts),
+                Some("rho_gui::FindNode"),
+                "find must reach the prompt from {surface}"
+            );
+        }
+    });
+}
