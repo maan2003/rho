@@ -17,19 +17,21 @@ The three, named as the agent's speech acts (settled 3 Sep after two
 renames; the user's original words in quotes):
 
 - **heads-up**: "working and not blocked on the human, but I have some
-  stuff to show". Unprompted news the agent judges worth a look. Most of a
-  primary agent's life. The human looks out of interest.
+  stuff to show". Unprompted news the agent judges worth a look, and a
+  finished task: the task was assigned, not asked, so its completion is
+  news, not an answer. Most of a primary agent's life. The human looks
+  out of interest, or when the daemon's observed idle time says the
+  finished agent has been waiting long enough.
 - **ask**: "might not be totally blocked, but the human would help
   massively". The agent needs something from the human.
-- **answer**: "the human should check its response". The human asked or
-  assigned something and this reply is the answer; without the look the
-  exchange was useless, and a finished task usually has a follow-up.
-  First `done`, then `check`: renamed because it is about the exchange,
-  not the task. An agent can be mid-work and still owe the human a look at
-  the reply it just gave, so answer nests inside working. A reply that
-  answers nothing ("ok" → "noted") is not an answer and declares nothing;
-  the agent judges that, it is never derived from what triggered the
-  turn.
+- **answer**: "the human should check its response", narrowed to a
+  question's answer: the human asked something and this reply is the
+  answer; without the look the exchange was useless. First `done`, then
+  `check`: renamed because it is about the exchange, not the task. An
+  agent can be mid-work and still owe the human a look at the reply it
+  just gave, so answer nests inside working. A reply that answers nothing
+  ("ok" → "noted") declares nothing; the agent judges that, it is never
+  derived from what triggered the turn.
 
 Added in the talk that followed:
 
@@ -59,9 +61,10 @@ Added in the talk that followed:
 
 ## Ranking: by what burns
 
-Went wrong and a blocked ask: steep. Answer: medium, the human forgets
-and the agent's context goes cold. An unblocked ask: between. Heads-up:
-flat, the human comes when interested. Nothing declared: below the cutoff. The agent
+Went wrong and a blocked ask: steep. Answer: medium, the human forgets.
+An unblocked ask: between. Heads-up: flat while the agent is working, and
+rising with the daemon's observed idle time once it stops, which is how a
+finished task climbs without a state of its own. Nothing declared: below the cutoff. The agent
 sets the state and the reason; the curve is the human's, never the agent's.
 
 ## What clears each, or the status rots
