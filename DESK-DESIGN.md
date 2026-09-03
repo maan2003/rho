@@ -136,6 +136,17 @@ Dealer policy is written as properties on desk headings (`:defer:`, time
 windows), so the dealer can always answer "why this card?" by quoting the
 desk back.
 
+Deferring takes a unit, decided with the user on 3 Sep: `s` is an operator
+in the vim sense, count first, unit after: `45sm` forty-five minutes, `3sh`
+three hours, `2sd` two days, `sw` a week, `ss` the default of one day (as
+`dd`). No prompt, because a verdict lives on single keys. `defer_until` is
+a timestamp, so the bar and Home read `deferred · 2h` with the same age
+words as everything else, and the separate agent snooze prompt goes away
+once agents are nodes. On the phone the defer target opens a bottom sheet
+of chips: `30m · 2h · tonight · tomorrow · 3d · next week` (tonight 18:00,
+tomorrow 09:00, local). Time-of-day units on the desktop (`st`, `sT`) are
+the next step once the operator exists.
+
 Below a cutoff, cards are simply not dealt. The empty state is a success:
 "nothing needs you" is a valid and good answer.
 
