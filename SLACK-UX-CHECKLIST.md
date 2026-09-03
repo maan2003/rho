@@ -383,6 +383,26 @@ done right after the transcript primitive (2.4) and before 2.10:
       message from someone else. Fake records the unfollow calls; tests
       cover both directions. Journal `SlackThreadIgnored { thread, by:
       Rho | Slack }`.
+- [ ] 2.16 A thread reply the user never saw. Reported by the user on 3
+      Sep: a reply in a thread they had posted in raised nothing, no chime,
+      no lamp, not in a manual deal. Two causes in `model.rs`, either one
+      enough. First, `participated` is in memory only, filled when rho
+      itself sees the user's message, so after a restart, or when the user
+      replied from the phone, rho does not know the thread is theirs and
+      `reason_for` calls the reply channel traffic. Second, `note_message`
+      inserts into `seen` before it decides the reason, so that live reply
+      poisons dedup and the activity feed's `thread_v2` item for the same
+      `ts`, which would have raised it, is dropped as a duplicate. Fix
+      both: `seen` records a message only once it has a reason (channel
+      traffic is never "seen"; the feed stays the truth it was designed to
+      be); participation persists in the mirror and is derived on load
+      from any mirrored message by the user with a thread root, and a feed
+      `thread_v2` item marks the thread participated. Tests: a live reply
+      in an unknown thread followed by the feed item raises exactly once;
+      a restart with the user's reply in the mirror keeps the thread
+      participated. Comes right after 2.14, since 2.14 removes the third
+      way this card could have gone quiet (a `channel_marked` from the
+      phone).
 - [ ] 2.10 No inbox in between, decided. Today a Slack obligation is copied
       into the rho inbox (`SlackItems`, `InboxKind::Slack`,
       `SourceReference::SlackThread`) and dealt from there. Rho: the dealer
