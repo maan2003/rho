@@ -144,6 +144,12 @@ nodes at the root or `thread` nodes; the Slack verdict table becomes
 verdict log entries on `thread` nodes. The old stores are read once and
 left in place until the next release.
 
+Once the user's daemon has run the migration, the migration goes: the
+frozen V1 decoder, the V1 tables and their fixture, the rollback text, and
+the migrated marker, all deleted in one change so nothing carries a
+compatibility facade (the user's standing rule, 3 Sep). Queued for 5pha
+the moment the upgrade is confirmed.
+
 ## Slices, in landing order
 
 1. Storage: cells, LWW and add-wins merge, verdict log, materializer with
