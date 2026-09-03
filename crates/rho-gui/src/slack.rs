@@ -191,6 +191,52 @@ impl Workspace {
         }
     }
 
+    /// Where a Slack card's message lives. A thread only when someone has
+    /// replied under the root: a mention in a channel with nothing under it
+    /// is a channel message, and opening a one-message "thread" for it would
+    /// hide the room it was said in.
+    pub(crate) fn slack_deal_source(
+        workspace: &str,
+        channel: &str,
+        thread_ts: &str,
+        latest_ts: &str,
+    ) -> Source {
+        if latest_ts == thread_ts {
+            return Source::Conversation(ChannelId(channel.to_owned()));
+        }
+        Source::Thread(ThreadKey {
+            workspace: WorkspaceName(workspace.to_owned()),
+            channel: ChannelId(channel.to_owned()),
+            thread_ts: Ts(thread_ts.to_owned()),
+        })
+    }
+
+    /// Opens the conversation a Slack card is about and puts the reader on
+    /// the message that raised it: the deal is the conversation, so the
+    /// surface is the ordinary one, opened the ordinary way.
+    pub(crate) fn open_slack_deal(
+        &mut self,
+        workspace: &str,
+        channel: &str,
+        thread_ts: &str,
+        latest_ts: &str,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        if self.slack_session(cx).is_none() {
+            return false;
+        }
+        let source = Self::slack_deal_source(workspace, channel, thread_ts, latest_ts);
+        self.open_slack_source(source, window, cx);
+        let SurfaceView::SlackConversation(view) = &self.active_pane().surface.view else {
+            return false;
+        };
+        let latest = Ts(latest_ts.to_owned());
+        view.clone()
+            .update(cx, |view, cx| view.reveal(latest, window, cx));
+        true
+    }
+
     /// Shows one conversation: a channel, a group, a DM, or a thread. A
     /// thread opened from a channel is a child surface, so `ctrl-k` returns
     /// to the channel it came from.
@@ -717,5 +763,22 @@ mod tests {
             1,
             "a restart must not raise the thread twice"
         );
+    }
+
+    #[test]
+    fn a_slack_deal_opens_the_thread_only_when_the_reply_is_in_one() {
+        // The card carries the message that raised it. A card whose latest
+        // message is the root is a channel message with no thread under it,
+        // so the deal opens the channel, not a thread of one.
+        assert!(matches!(
+            Workspace::slack_deal_source("acme", "C1", "500.0", "500.0"),
+            Source::Conversation(ChannelId(channel)) if channel == "C1"
+        ));
+        let Source::Thread(key) = Workspace::slack_deal_source("acme", "C1", "500.0", "700.0")
+        else {
+            panic!("a reply under a root must deal in its thread");
+        };
+        assert_eq!(key.channel.0, "C1");
+        assert_eq!(key.thread_ts.0, "500.0");
     }
 }

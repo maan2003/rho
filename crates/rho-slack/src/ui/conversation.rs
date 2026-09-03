@@ -44,6 +44,14 @@ pub struct ConversationView {
     /// that come back for those are not the reader moving, and must not buy
     /// another page.
     moved: Moved,
+    /// The message a deal is about: tinted, and the place the surface puts
+    /// the cursor when it opens. It stays for the life of the surface, so
+    /// the reader can scroll away and still find what they were dealt.
+    dealt: Option<Ts>,
+    /// Whether the dealt message has been scrolled to yet. It may not be
+    /// loaded when the deal opens; the first refresh that brings it in does
+    /// the scroll.
+    dealt_placed: bool,
     /// Messages drawn before their picture had finished downloading, by the
     /// file the message is waiting on. Nothing in the update log speaks for
     /// a download, so the surface remembers this itself.
@@ -235,6 +243,8 @@ impl ConversationView {
             revision: 0,
             fill: Fill::default(),
             moved: Moved::default(),
+            dealt: None,
+            dealt_placed: false,
             awaiting_images: Vec::new(),
             _subscriptions: subscriptions,
         };
@@ -366,6 +376,58 @@ impl ConversationView {
         });
     }
 
+    /// Shows the message a deal is about: tinted for the life of the
+    /// surface, with the cursor on it and the view centred on it. A deal is
+    /// one message to answer, and this is that message.
+    pub fn reveal(&mut self, ts: Ts, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dealt.as_ref() == Some(&ts) && self.dealt_placed {
+            return;
+        }
+        self.dealt = Some(ts.clone());
+        self.dealt_placed = false;
+        let key = Row::Message(ts);
+        let messages = self.shown_messages(cx);
+        if let Some(item) = self.item_for_key(&key, &messages, cx) {
+            self.transcript.replace(&key, item, cx);
+        }
+        self.place_dealt(window, cx);
+    }
+
+    /// Puts the cursor on the dealt message once it is in the transcript.
+    fn place_dealt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dealt_placed {
+            return;
+        }
+        let Some(ts) = self.dealt.clone() else {
+            return;
+        };
+        let Some(start) = self
+            .transcript
+            .range_of(&Row::Message(ts))
+            .map(|range| range.start)
+        else {
+            return;
+        };
+        let Some(anchor) = self
+            .multi_buffer
+            .read(cx)
+            .snapshot(cx)
+            .anchor_in_excerpt(start)
+        else {
+            return;
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.set_autoscroll_pin(anchor, AutoscrollStrategy::Center, cx);
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_anchor_ranges([anchor..anchor]);
+            });
+        });
+        // The surface moved the cursor, not the reader: that must not spend
+        // the reader's one page of history.
+        self.moved.cursor = Some(self.cursor_row(cx) as u32);
+        self.dealt_placed = true;
+    }
+
     /// Brings the transcript up to date with the session. Only the messages
     /// the session says changed are rewritten: a socket frame costs one
     /// item, a page costs one insert, and everything else keeps its anchors,
@@ -386,6 +448,9 @@ impl ConversationView {
             Some(updates) => self.apply_updates(updates, window, cx),
         }
         self.revision = revision;
+        // A deal may open on a message the tail does not hold yet: the page
+        // that brings it in is where the cursor goes.
+        self.place_dealt(window, cx);
         self.settle_images(cx);
         self.refresh_chrome(cx);
         self.keep_filling(cx);
@@ -652,6 +717,9 @@ impl ConversationView {
                 Some((line as u32, file.clone()))
             })
             .collect::<Vec<_>>();
+        if self.dealt.as_ref() == Some(&message.ts) {
+            mark_dealt(&mut item);
+        }
         self.awaiting_images
             .retain(|(waiting, _)| waiting != &message.ts);
         for (line, file) in images {
@@ -1109,6 +1177,14 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
         });
     }
     item(Row::Message(message.ts.clone()), spans, lines)
+}
+
+/// Tints the message a deal is about. The trailing newline is left out: it
+/// is the gap to the next message, and tinting it would draw an empty band
+/// under the card.
+fn mark_dealt(item: &mut Rendered) {
+    item.backgrounds
+        .push((Class::Dealt, 0..item.text.trim_end_matches('\n').len()));
 }
 
 /// The break between days, which is the only separator the transcript has.
@@ -2008,6 +2084,25 @@ mod tests {
                 .count()
                 >= 3,
             "both messages belong to the same thread"
+        );
+    }
+
+    #[test]
+    fn the_dealt_message_is_tinted_but_the_gap_under_it_is_not() {
+        let mut item = message_item(
+            &message("1700000000.0", None, "look at this"),
+            &model(),
+            false,
+        );
+        mark_dealt(&mut item);
+        let (class, range) = item.backgrounds.last().cloned().unwrap();
+        assert_eq!(class, Class::Dealt);
+        assert_eq!(&item.text[range.clone()], item.text.trim_end_matches('\n'));
+        assert!(
+            item.text[range.end..]
+                .chars()
+                .all(|character| character == '\n'),
+            "the tint must stop before the gap to the next message"
         );
     }
 }

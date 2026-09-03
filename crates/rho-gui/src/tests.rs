@@ -7104,3 +7104,96 @@ fn q_on_overview_is_a_no_op(cx: &mut TestAppContext) {
         })
         .unwrap();
 }
+
+#[gpui::test]
+fn deal_keys_reach_a_dealt_slack_conversation(cx: &mut TestAppContext) {
+    use gpui::{KeyContext, Keystroke};
+
+    cx.update(bind_test_keymaps);
+    cx.update(|cx| {
+        let keymap = cx.key_bindings();
+        let keymap = keymap.borrow();
+        let routes = |key: &str, contexts: &[KeyContext]| {
+            let stroke = Keystroke::parse(key).unwrap();
+            keymap
+                .bindings_for_input(&[stroke], contexts)
+                .0
+                .first()
+                .map(|binding| binding.action().name())
+        };
+        // A conversation puts its editor a level deeper than the deal keys'
+        // plain `Editor` context, and the bundled vim keymap binds `d` and
+        // `s` up there: without a binding at this depth the deal keys are
+        // lost on a dealt conversation.
+        let dealt = [
+            KeyContext::parse("RhoGui").unwrap(),
+            KeyContext::parse("RhoGuiDeal").unwrap(),
+            KeyContext::parse("RhoSlackConversation").unwrap(),
+            KeyContext::parse("Editor VimDeal VimControl vim_mode=normal vim_operator=none")
+                .unwrap(),
+        ];
+        assert_eq!(routes("d", &dealt), Some("rho_gui::DashboardDealDone"));
+        assert_eq!(routes("s", &dealt), Some("rho_gui::DashboardDealSnooze"));
+        assert_eq!(routes("i", &dealt), Some("rho_gui::DashboardDealInsert"));
+        assert_eq!(routes("escape", &dealt), Some("rho_gui::DealLeave"));
+
+        // Outside a deal the conversation keeps its own keys.
+        let reading = [
+            KeyContext::parse("RhoGui").unwrap(),
+            KeyContext::parse("RhoSlackConversation").unwrap(),
+            KeyContext::parse("Editor VimControl vim_mode=normal vim_operator=none").unwrap(),
+        ];
+        assert_eq!(routes("i", &reading), Some("rho_gui::SlackCompose"));
+        assert_eq!(routes("s", &reading), Some("rho_gui::SlackSearch"));
+    });
+}
+
+#[gpui::test]
+fn a_verdict_ends_the_deal_even_when_the_item_went_quiet(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    let id = workspace
+        .update(cx, |workspace, window, cx| {
+            let id = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
+                kind: crate::inbox::InboxKind::Slack,
+                text: "can you look at the deploy?".into(),
+                source: crate::inbox::SourceReference::SlackThread {
+                    workspace: "acme".into(),
+                    channel: "C1".into(),
+                    thread_ts: "500.0".into(),
+                    latest_ts: "500.0".into(),
+                },
+                context: crate::inbox::CapturedContext {
+                    host: None,
+                    room: Some("#design".into()),
+                    focused_surface: String::new(),
+                },
+                waiting_on: None,
+            });
+            workspace.age_inbox_for_test(&id, 0);
+            workspace.open_deal_mode(window, cx);
+            id
+        })
+        .unwrap();
+    cx.run_until_parked();
+    // Reading a Slack conversation retires rho's copy of the obligation
+    // while the deal is still open. The verdict must still land.
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(workspace.dashboard_deal_mode_for_test());
+            workspace.retire_inbox_for_test(&id);
+        })
+        .unwrap();
+
+    cx.dispatch_action(*workspace, crate::DashboardDealDone);
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                !workspace.dashboard_deal_mode_for_test(),
+                "a verdict on an item that went quiet still ends the deal"
+            );
+        })
+        .unwrap();
+}

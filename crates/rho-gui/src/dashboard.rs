@@ -161,6 +161,10 @@ pub enum DealerInboxSource {
         workspace: String,
         channel: String,
         thread_ts: String,
+        /// The newest message in the thread: the one the card is about, and
+        /// the one the conversation opens on. Equal to `thread_ts` when the
+        /// ping is a channel message with no replies under it.
+        latest_ts: String,
     },
     Other(String),
 }
@@ -2104,11 +2108,12 @@ fn dealer_inbox_items(
                     workspace,
                     channel,
                     thread_ts,
-                    ..
+                    latest_ts,
                 } => DealerInboxSource::SlackThread {
                     workspace: workspace.clone(),
                     channel: channel.clone(),
                     thread_ts: thread_ts.clone(),
+                    latest_ts: latest_ts.clone(),
                 },
                 SourceReference::DeskNode { .. } => DealerInboxSource::Other("desk".into()),
                 SourceReference::External { source, reference } => {
@@ -2197,15 +2202,19 @@ fn inbox_deal_queue(
         }
         let mut label = match (item.kind, &item.waiting_on) {
             (DealerInboxKind::Ping, _) => "ping".to_owned(),
-            // Shaped like the agent card: the state, then how long it has
-            // been in that state.
-            (DealerInboxKind::Slack, Some(_)) => "waiting on them".to_owned(),
-            (DealerInboxKind::Slack, None) => "waiting on you".to_owned(),
+            // The state, then how long it has been in that state. Whose turn
+            // it is is the whole of what a Slack thread's card says: the
+            // conversation is on the left of the bar already, and the words
+            // are on screen.
+            (DealerInboxKind::Slack, Some(_)) => "replied".to_owned(),
+            (DealerInboxKind::Slack, None) => "needs reply".to_owned(),
             (DealerInboxKind::Obligation, _) => "obligation".to_owned(),
             (DealerInboxKind::Capture, _) => "capture".to_owned(),
         };
         label.push_str(&format!(" · {}", age_label(age_days)));
-        if let Some(context) = item.context.as_deref().filter(|value| !value.is_empty()) {
+        if item.kind != DealerInboxKind::Slack
+            && let Some(context) = item.context.as_deref().filter(|value| !value.is_empty())
+        {
             label.push_str(" · from ");
             label.push_str(context);
         }
@@ -2503,13 +2512,14 @@ mod tests {
                 workspace: "acme".into(),
                 channel: "C1".into(),
                 thread_ts: "500.0".into(),
+                latest_ts: "500.0".into(),
             }),
             context: Some("#design".into()),
         };
 
         let queue = inbox_deal_queue(&[thread(None)], now, &HashMap::new());
         assert_eq!(queue.cards.len(), 1);
-        assert_eq!(queue.cards[0].label, "waiting on you · 2.0d · from #design");
+        assert_eq!(queue.cards[0].label, "needs reply · 2.0d");
         assert_eq!(queue.cards[0].breadcrumb, "can you look at the deploy?");
         assert_eq!(queue.cards[0].room.as_deref(), Some("#design"));
         assert_eq!(
@@ -2526,10 +2536,7 @@ mod tests {
         assert!(!queue.cards[0].label.contains("500.0"));
 
         let answered = inbox_deal_queue(&[thread(Some("#design"))], now, &HashMap::new());
-        assert_eq!(
-            answered.cards[0].label,
-            "waiting on them · 2.0d · from #design"
-        );
+        assert_eq!(answered.cards[0].label, "replied · 2.0d");
 
         // Two days of someone waiting must outrank two days of a capture,
         // the same way a blocked agent outranks an FYI.

@@ -363,11 +363,15 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             Some("RhoSlackConversation > Editor && vim_mode == insert"),
         ),
     ]);
+    // Deal mode reports itself as normal (plus `VimDeal`), and these
+    // contexts are deeper than the deal keys', so without the exclusion a
+    // dealt conversation would answer `i` with the composer and `s` with
+    // search instead of insert and snooze.
     for context in [
-        "RhoSlackList > Editor && vim_mode == normal",
-        "RhoSlackList > Editor && vim_mode == helix_normal",
-        "RhoSlackConversation > Editor && vim_mode == normal",
-        "RhoSlackConversation > Editor && vim_mode == helix_normal",
+        "RhoSlackList > Editor && vim_mode == normal && !VimDeal",
+        "RhoSlackList > Editor && vim_mode == helix_normal && !VimDeal",
+        "RhoSlackConversation > Editor && vim_mode == normal && !VimDeal",
+        "RhoSlackConversation > Editor && vim_mode == helix_normal && !VimDeal",
     ] {
         cx.bind_keys([
             KeyBinding::new("q", SurfaceClose, Some(context)),
@@ -455,11 +459,17 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             KeyBinding::new("g r", DashboardRenameTopic, Some(context)),
         ]);
     }
+    // A surface with a key context of its own puts the dealt editor deeper
+    // than `Editor`, and the bundled vim keymap binds these same keys one
+    // level up: without a binding at the surface's own depth vim wins and
+    // the deal keys do nothing there.
     for context in [
         "RhoGuiDeal > RhoBrowser",
         "RhoGui > Editor && VimDeal && vim_operator == none",
         "RhoGui > RhoDashboard > Editor && VimDeal && vim_operator == none",
         "RhoDashboard > Editor && VimDeal && vim_operator == none",
+        "RhoSlackConversation > Editor && VimDeal && vim_operator == none",
+        "RhoSlackList > Editor && VimDeal && vim_operator == none",
         "Editor && VimDeal && vim_operator == none",
         "VimDeal && vim_operator == none",
     ] {
@@ -493,6 +503,8 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         "RhoGui > Editor && VimDeal && vim_operator == none",
         "RhoGui > RhoDashboard > Editor && VimDeal && vim_operator == none",
         "RhoDashboard > Editor && VimDeal && vim_operator == none",
+        "RhoSlackConversation > Editor && VimDeal && vim_operator == none",
+        "RhoSlackList > Editor && VimDeal && vim_operator == none",
         "Editor && VimDeal && vim_operator == none",
         "VimDeal && vim_operator == none",
     ] {

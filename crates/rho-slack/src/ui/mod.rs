@@ -69,13 +69,16 @@ impl rho_transcript::Style for Class {
     /// An unfurl is a card, not a run of words: a faint tint behind the whole
     /// of it is what makes it read as one.
     fn background(self, bucket: u32, cx: &App) -> Option<(HighlightKey, gpui::Hsla)> {
-        if self != Class::Unfurl {
-            return None;
-        }
+        let colors = cx.theme().colors();
+        let tint = match self {
+            Class::Unfurl => colors.element_background,
+            Class::Dealt => colors.element_selected,
+            _ => return None,
+        };
         let key = HighlightKey::SyntaxTreeView(
             SLACK_TRANSCRIPT_KEY_BASE + (bucket as usize + 1) * Class::ALL.len() * 2 + self.slot(),
         );
-        Some((key, cx.theme().colors().element_background.into()))
+        Some((key, tint.into()))
     }
 }
 
@@ -112,10 +115,14 @@ pub enum Class {
     Bold,
     Italic,
     Struck,
+    /// The message a deal is about, tinted so the reader lands on it and can
+    /// still see it after scrolling around. It stays until the surface
+    /// closes: a deal is one thing to answer, not a flash.
+    Dealt,
 }
 
 impl Class {
-    pub const ALL: [Class; 14] = [
+    pub const ALL: [Class; 15] = [
         Class::Sender,
         Class::You,
         Class::Time,
@@ -130,6 +137,7 @@ impl Class {
         Class::Bold,
         Class::Italic,
         Class::Struck,
+        Class::Dealt,
     ];
 
     fn slot(self) -> usize {
@@ -148,6 +156,7 @@ impl Class {
             Self::Bold => 11,
             Self::Italic => 12,
             Self::Struck => 13,
+            Self::Dealt => 14,
         }
     }
 
@@ -182,6 +191,7 @@ impl Class {
             Self::Muted => (colors.text_muted, FontWeight::NORMAL),
             Self::Error => (colors.terminal_ansi_red, FontWeight::NORMAL),
             Self::Link | Self::Unfurl => (colors.link_text_hover, FontWeight::NORMAL),
+            Self::Dealt => (colors.text, FontWeight::NORMAL),
             Self::Bold | Self::Italic | Self::Struck => unreachable!("styled above"),
         };
         HighlightStyle {

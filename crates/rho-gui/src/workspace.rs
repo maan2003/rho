@@ -8087,6 +8087,26 @@ impl Workspace {
                 self.make_surface(SurfaceKey::Transcript(*agent_id), window, cx)
             }
             crate::dashboard::DealCardIdentity::Inbox(id) => {
+                // A Slack obligation is a conversation: the deal view is the
+                // conversation surface itself, opened the way `enter` opens
+                // it, with the message that raised the card on screen.
+                if let Some(crate::dashboard::DealerInboxSource::SlackThread {
+                    workspace,
+                    channel,
+                    thread_ts,
+                    latest_ts,
+                }) = card.inbox_source.clone()
+                    && self
+                        .open_slack_deal(&workspace, &channel, &thread_ts, &latest_ts, window, cx)
+                {
+                    self.deal_view = Some(DealView::Surface {
+                        identity: card.identity.clone(),
+                        kind: card.kind,
+                        surface: self.active_pane().surface.clone(),
+                    });
+                    self.finish_presenting_deal(window, cx);
+                    return true;
+                }
                 if !self.phone.enabled
                     && let Some(crate::dashboard::DealerInboxSource::Page(page)) = card.inbox_source
                 {
@@ -8160,7 +8180,14 @@ impl Workspace {
     /// The editor the current deal is being read in, when the dealt surface
     /// has one. A browser page and a picture do not.
     fn deal_editor(&self, cx: &App) -> Option<Entity<editor::Editor>> {
-        match &self.active_pane().surface.view {
+        Self::surface_editor(&self.active_pane().surface.view, cx)
+    }
+
+    /// The editor a surface is read in, if it has one. Deal mode is entered
+    /// and left on this editor directly, so every surface kind that can be
+    /// dealt must be listed here or its keyboard never enters DEAL.
+    fn surface_editor(view: &SurfaceView, cx: &App) -> Option<Entity<editor::Editor>> {
+        match view {
             SurfaceView::DeskNode(editor) | SurfaceView::Inbox(editor) => Some(editor.clone()),
             SurfaceView::Transcript { editor, .. } => Some(editor.clone()),
             SurfaceView::SlackConversation(view) => Some(view.read(cx).editor().clone()),
@@ -8314,6 +8341,31 @@ impl Workspace {
             self.leave_deal_mode(window, cx);
         }
         self.refresh_dashboard(window, cx);
+    }
+
+    /// What a verdict on an inbox card means when the item behind it is
+    /// gone. A Slack obligation goes quiet the moment its conversation is
+    /// read, which the dealt surface itself does, so the reader's verdict
+    /// lands on a card whose item has already been retired: the deal still
+    /// ends, there is simply nothing left to undo. Any other card losing
+    /// its item is a stale card, and saying so is better than pretending.
+    fn inbox_verdict_outcome<T>(
+        card: Option<&crate::dashboard::DealCard>,
+        found: Option<T>,
+    ) -> Result<Option<T>, &'static str> {
+        match found {
+            Some(found) => Ok(Some(found)),
+            None if matches!(
+                card.map(|card| card.kind),
+                Some(crate::dashboard::DealCardKind::Inbox(
+                    crate::dashboard::DealerInboxKind::Slack
+                ))
+            ) =>
+            {
+                Ok(None)
+            }
+            None => Err("nothing under the deal: the inbox item is unavailable"),
+        }
     }
 
     fn finish_deal_verdict(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -10168,10 +10220,9 @@ impl Workspace {
                 Some(DealView::Desk { editor, .. }) | Some(DealView::Inbox { editor, .. }) => {
                     Some(editor.focus_handle(cx))
                 }
-                Some(DealView::Surface { surface, .. }) => match &surface.view {
-                    SurfaceView::Transcript { editor, .. } => Some(editor.focus_handle(cx)),
-                    _ => None,
-                },
+                Some(DealView::Surface { surface, .. }) => {
+                    Self::surface_editor(&surface.view, cx).map(|editor| editor.focus_handle(cx))
+                }
                 None => None,
             };
             if let Some(focus) = focus {
@@ -10204,14 +10255,7 @@ impl Workspace {
                     return;
                 }
                 this.focus_active_surface(window, cx);
-                let editor = match &this.active_pane().surface.view {
-                    SurfaceView::DeskNode(editor) | SurfaceView::Inbox(editor) => {
-                        Some(editor.clone())
-                    }
-                    SurfaceView::Transcript { editor, .. } => Some(editor.clone()),
-                    _ => None,
-                };
-                if let Some(editor) = editor {
+                if let Some(editor) = this.deal_editor(cx) {
                     vim::enter_deal_mode(&editor, window, cx);
                 } else if let Ok(action) = cx.build_action("vim::EnterDealMode", None) {
                     window.dispatch_action(action, cx);
@@ -10249,6 +10293,20 @@ impl Workspace {
             Some(crate::dashboard::DealerInboxSource::Page(page)) => {
                 let leaf = rho_browser::live_page_name(*page).unwrap_or_else(|| "page".to_owned());
                 format!("{} / {leaf}", card.breadcrumb.replace(" › ", " / "))
+            }
+            // A Slack deal shows the conversation and nothing else: the
+            // words are on screen already, and the state segment says whose
+            // turn it is.
+            Some(crate::dashboard::DealerInboxSource::SlackThread {
+                thread_ts,
+                latest_ts,
+                ..
+            }) => {
+                let conversation = card.room.clone().unwrap_or_else(|| "slack".to_owned());
+                match latest_ts == thread_ts {
+                    true => conversation,
+                    false => format!("{conversation} / thread"),
+                }
             }
             _ => match card.kind {
                 crate::dashboard::DealCardKind::Inbox(_) => card.room.as_ref().map_or_else(
@@ -11270,15 +11328,13 @@ impl Render for Workspace {
                                 crate::inbox::Verdict::Discarded,
                             )
                             .map_err(|_| "nothing under the deal: the inbox item is unavailable")
-                            .and_then(|item| {
-                                item.ok_or("nothing under the deal: the inbox item is unavailable")
-                            })
+                            .and_then(|item| Self::inbox_verdict_outcome(card.as_ref(), item))
                     }
                     _ => Err("nothing under the deal: the deal card disappeared"),
                 };
                 let handled = result.is_ok();
                 if handled {
-                    if let (Some(card), Ok(item)) = (card.clone(), &result) {
+                    if let (Some(card), Ok(Some(item))) = (card.clone(), &result) {
                         let entry = this.next_verdict_undo(
                             card,
                             crate::dashboard::DealerVerdict::Done,
@@ -11356,15 +11412,13 @@ impl Render for Workspace {
                                 crate::inbox::Verdict::Discarded,
                             )
                             .map_err(|_| "nothing under the deal: the inbox item is unavailable")
-                            .and_then(|item| {
-                                item.ok_or("nothing under the deal: the inbox item is unavailable")
-                            })
+                            .and_then(|item| Self::inbox_verdict_outcome(card.as_ref(), item))
                     }
                     _ => Err("nothing under the deal: the deal card disappeared"),
                 };
                 let handled = result.is_ok();
                 if handled {
-                    if let (Some(card), Ok(item)) = (card.clone(), &result) {
+                    if let (Some(card), Ok(Some(item))) = (card.clone(), &result) {
                         let entry = this.next_verdict_undo(
                             card,
                             crate::dashboard::DealerVerdict::Dismiss,
@@ -11451,9 +11505,8 @@ impl Render for Workspace {
                             )
                             .map_err(|_| "nothing under the deal: the inbox item is unavailable")
                             .and_then(|changed| {
-                                changed
-                                    .then_some(())
-                                    .ok_or("nothing under the deal: the inbox item is unavailable")
+                                Self::inbox_verdict_outcome(card.as_ref(), changed.then_some(()))
+                                    .map(|_| ())
                             })
                     }
                     _ => Err("nothing under the deal: the deal card disappeared"),
@@ -11728,12 +11781,10 @@ impl Render for Workspace {
                         workspace,
                         channel,
                         thread_ts,
+                        latest_ts,
                     }) if this.phone.enabled => {
-                        let source = rho_slack::session::Source::Thread(rho_slack::ThreadKey {
-                            workspace: rho_slack::WorkspaceName(workspace),
-                            channel: rho_slack::ChannelId::from(channel.as_str()),
-                            thread_ts: rho_slack::Ts(thread_ts),
-                        });
+                        let source =
+                            Self::slack_deal_source(&workspace, &channel, &thread_ts, &latest_ts);
                         this.open_slack_source(source, window, cx);
                         if let SurfaceView::SlackConversation(view) =
                             &this.active_pane().surface.view

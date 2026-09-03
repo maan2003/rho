@@ -255,7 +255,12 @@ done right after the transcript primitive (2.4) and before 2.10:
       real-Slack case may be a dead socket, an open conversation re-syncs
       its tail on Ready, on reconnect, and on every `activity.feed` poll,
       so a dead socket degrades to the poll, never to silence.
-- [ ] 2.9 The deal is the conversation, decided. Now a dealt Slack card is
+- [x] 2.9 The deal is the conversation, done 3 Sep (`99f7eafc`): thread or
+      channel opens as the deal view, pinging message tinted with the cursor
+      on it, deal keys bound at the conversation's depth, escape to normal,
+      bar `#design  needs reply · 0m`; a verdict on a card already quieted by
+      the read cursor counts as handled (2.10 removes that gap). Original:
+      Now a dealt Slack card is
       a one-line label with nothing behind it; only Page cards open their
       surface as the deal view (`DealCardIdentity::Inbox` with
       `DealerInboxSource::Page`). Rho: dealing a Slack obligation opens the
