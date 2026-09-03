@@ -90,6 +90,23 @@ channel, or a repository, opened from that thing with one key, and the tree
 as the store that agents file into. That is a smaller design and gets its
 own pass once Home exists; until then the map stays reachable from Home.
 
+## Snooze takes a unit
+
+Decided with the user on 3 Sep (first recorded in DESK-DESIGN, which is
+retired; restated here because the dealer lives here now). The snooze key
+is an operator: `s` followed by a unit, with an optional count in front,
+vim style. `45sm` is 45 minutes, `3sh` three hours, `2sd` two days, `sw`
+one week, `ss` the default of one day. No prompt, no minibuffer; the deal
+bar echoes the resulting time. On the phone the sheet offers chips:
+`30m · 2h · tonight (18:00) · tomorrow (09:00) · 3d · next week`. The
+agent snooze prompt goes away; agents take the same operator. Snoozing
+writes `defer_until` with pace 0 (TREE-DESIGN), so the card comes back
+exactly then and rises from zero.
+
+**Why:** snoozing is done dozens of times a day and most of them are
+"not now, an hour", which a prompt makes slow and a day-granular key makes
+wrong. Count-plus-unit is already in the user's fingers from vim.
+
 ## Deliberately deferred
 
 - Editing anything from Home.
