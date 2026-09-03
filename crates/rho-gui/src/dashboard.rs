@@ -53,13 +53,15 @@ pub(crate) const LAMP_THRESHOLD: f64 = 0.5;
 /// chimes immediately through the recency bonus, and a ping takes about
 /// 14 hours to cross. Sound therefore marks pressure, not every new card.
 pub(crate) const CHIME_THRESHOLD: f64 = 1.2;
-/// A recent agent interaction contributes 1.5 curve units. This must remain
-/// above the 1.2 chime threshold or recently-driven agents lose their instant
-/// completion chime; linear decay gives about 12 minutes of instant chime and
-/// about 40 minutes above the 0.5 lamp threshold.
+/// The agent the user just spoke to (a send, or opening its surface)
+/// contributes 1.5 curve units. This must remain above the 1.2 chime
+/// threshold or recently-driven agents lose their instant completion chime;
+/// the quadratic fall below gives about 6 minutes of instant chime and about
+/// 25 minutes above the 0.5 lamp threshold.
 const AGENT_RECENCY_BONUS: f64 = 1.5;
-/// The engagement nudge fades linearly over one hour so it cannot become a
-/// hidden long-lived preference.
+/// The nudge is gone within the hour and falls steeply from the start
+/// (quadratic: 0.375 left at 30 minutes), so "just spoke to" means minutes,
+/// not a hidden hour-long preference.
 const AGENT_RECENCY_WINDOW_MS: i64 = 60 * 60 * 1_000;
 
 pub(crate) fn dealer_policy_snapshot() -> crate::journal::DealerPolicySnapshot {
@@ -553,8 +555,9 @@ impl Dashboard {
                                 agent_interactions.get(&agent_id).map_or(0.0, |last| {
                                     let elapsed = (now.timestamp_millis() - *last)
                                         .clamp(0, AGENT_RECENCY_WINDOW_MS);
-                                    AGENT_RECENCY_BONUS
-                                        * (1.0 - elapsed as f64 / AGENT_RECENCY_WINDOW_MS as f64)
+                                    let remaining =
+                                        1.0 - elapsed as f64 / AGENT_RECENCY_WINDOW_MS as f64;
+                                    AGENT_RECENCY_BONUS * remaining * remaining
                                 });
                             let priority = base_priority + recency_bonus;
                             if priority <= DEAL_QUEUE_FLOOR {
