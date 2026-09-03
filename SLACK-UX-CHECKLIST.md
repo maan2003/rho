@@ -201,6 +201,19 @@ done right after the transcript primitive (2.4) and before 2.10:
       muted small caption style used for chrome, and the thumbnail keeps
       its 12-line cap. Screenshot the same DM shape on the fake before and
       after.
+- [ ] 1.23 Images load without flicker. Seen by the user on 3 Sep: an
+      image arriving in a conversation jumps. Two causes to remove: the
+      box changes size when the bytes land, and the message item is
+      replaced wholesale on arrival. Rho: the box is sized from the file's
+      `original_w`/`original_h` at first render (12-line cap, aspect kept),
+      so nothing below it moves; until the bytes land it shows Slack's own
+      smallest thumbnail (`thumb_80`, or `thumb_64`) scaled up and blurred,
+      a blurhash without the encoding step, and a muted box if no thumb is
+      cached yet; when the full bytes land, the editor's image inlay is
+      replaced by id in place, the transcript item is not rebuilt. Test:
+      the item's range and the rows below it do not change across the
+      swap; the fake serves file bytes with a `/control` delay so the rig
+      shows the placeholder state.
 - [x] 1.20 Line layout, done with 2.4. Decided by the user: `<name>: <body>  <time>`.
       No time column on the left, no padded author column, no tab after
       the name: the name, a colon, one space, the body. The time goes on
