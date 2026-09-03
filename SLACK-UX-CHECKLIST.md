@@ -173,6 +173,16 @@ done right after the transcript primitive (2.4) and before 2.10:
       image to the window, `q` or `escape` returns to the conversation;
       no external opener for images. The file line drops the type when
       the extension already says it: `image.png · 141 KB`.
+- [ ] 1.20 Line layout, decided by the user: `<name>: <body>  <time>`.
+      No time column on the left, no padded author column, no tab after
+      the name: the name, a colon, one space, the body. The time goes on
+      the right, muted, after the body: at the end of the last line of
+      the body, separated by two spaces (assumed; the user said "right
+      side", and a true right-aligned column is not text). Continuation
+      lines of a wrapped or multi-line body indent two spaces; reaction,
+      reply-count, file and unfurl lines under a message indent the same.
+      Day rules and system lines unchanged. Replaces the column layout of
+      1.4; update its screenshot.
 - [ ] 1.19 Custom emoji (`:forrest_gump_wave:`) stay as the shortcode in
       muted text until the image inlay (1.13) lands, then render inline
       through it.
