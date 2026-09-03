@@ -486,6 +486,9 @@ pub struct Workspace {
     /// Canonical per-host CRDT Desk buffers shared by dashboard and source
     /// views.
     pub(crate) desk_cells: DeskCells,
+    /// One note surface per node the reader has opened, kept so the body's
+    /// cursor and scroll survive leaving and coming back.
+    note_views: HashMap<(HostId, rho_desk::NodeId), crate::note_view::NoteView>,
     /// Set by `InputHandled` and consumed by the following buffer edit. The
     /// editor announces input before mutating its buffer, while heading
     /// recognition must run immediately after that mutation so subsequent
@@ -1051,6 +1054,7 @@ impl Workspace {
             dashboard,
             mode_indicator,
             desk_cells: DeskCells::new(crate::desk_view::desk_device()),
+            note_views: HashMap::new(),
             pending_heading_recognition: None,
             pending_heading_undo: None,
             pending_tree_verdicts: BTreeMap::new(),
@@ -4924,7 +4928,7 @@ impl Workspace {
             SurfaceKey::Draft => "draft".to_owned(),
             SurfaceKey::Home => "home".to_owned(),
             SurfaceKey::Messages => "messages".to_owned(),
-            SurfaceKey::DeskNode { .. } => "desk".to_owned(),
+            SurfaceKey::DeskNode { .. } => "note".to_owned(),
             SurfaceKey::Transcript(agent_id) => self.registry.agent_display_label(*agent_id),
             SurfaceKey::File { path, .. } => path.to_string(),
             SurfaceKey::Shell(agent_id) => {
@@ -4958,7 +4962,7 @@ impl Workspace {
             SurfaceKey::Draft => "compose",
             SurfaceKey::Home => "home",
             SurfaceKey::Messages => "messages",
-            SurfaceKey::DeskNode { .. } => "desk heading",
+            SurfaceKey::DeskNode { .. } => "note",
             SurfaceKey::Transcript(_) => "transcript",
             SurfaceKey::File { .. } => "file",
             SurfaceKey::Shell(_) => "shell",
@@ -5863,6 +5867,24 @@ impl Workspace {
         }
     }
 
+    /// The children a note surface is showing, in order.
+    #[cfg(test)]
+    pub(crate) fn note_children_for_test(
+        &self,
+        host: HostId,
+        node_id: rho_desk::NodeId,
+    ) -> Vec<rho_desk::NodeId> {
+        self.note_views
+            .get(&(host, node_id))
+            .map(|view| view.children())
+            .unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn current_surface_key_for_test(&self) -> SurfaceKey {
+        self.active_pane().surface.key.clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn current_surface_name_for_test(&self) -> String {
         self.surface_name(&self.active_pane().surface.key)
@@ -6124,7 +6146,212 @@ impl Workspace {
         if let Some((nodes, buffers)) = self.desk_cells.tree_source(host) {
             self.dashboard.set_tree_source(host, nodes, buffers, cx);
             self.refresh_dashboard(window, cx);
+            self.sync_note_views(host, cx);
         }
+    }
+
+    /// Rebuilds every open note surface against the tree, so a child
+    /// created or renamed elsewhere shows under the note it belongs to.
+    fn sync_note_views(&mut self, host: HostId, cx: &mut Context<Self>) {
+        if self.note_views.is_empty() {
+            return;
+        }
+        let Some((nodes, buffers)) = self.desk_cells.tree_source(host) else {
+            return;
+        };
+        // A note's title is the first line of its body; a machine row's
+        // buffer already holds the title the map derived for it.
+        let titles = buffers
+            .iter()
+            .map(|(id, buffer)| {
+                (
+                    *id,
+                    crate::dashboard::note_title(&buffer.read(cx).text()).to_owned(),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        let mut views = std::mem::take(&mut self.note_views);
+        for ((view_host, _), view) in views.iter_mut() {
+            if *view_host != host {
+                continue;
+            }
+            view.sync(&nodes, &titles, cx);
+        }
+        self.note_views = views;
+    }
+
+    /// The note surface for a node, built on first open and kept after, so
+    /// the cursor and scroll survive leaving and coming back. `None` while
+    /// the node's body has not arrived from the daemon yet.
+    fn note_view_for(
+        &mut self,
+        host: HostId,
+        node_id: rho_desk::NodeId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<&crate::note_view::NoteView> {
+        let body = self.desk_cells.buffer(host, node_id)?.clone();
+        // A resync can hand out a fresh buffer for the same node; the old
+        // surface is then over text nothing writes to any more.
+        if self
+            .note_views
+            .get(&(host, node_id))
+            .is_some_and(|view| view.body() != &body)
+        {
+            self.note_views.remove(&(host, node_id));
+        }
+        if !self.note_views.contains_key(&(host, node_id)) {
+            let view = crate::note_view::NoteView::new(host, node_id, body, window, cx);
+            self.note_views.insert((host, node_id), view);
+        }
+        self.sync_note_views(host, cx);
+        self.note_views.get(&(host, node_id))
+    }
+
+    /// Opens whatever a node is: a transcript, a page, a conversation, or
+    /// the note surface. What `enter` on a row means, wherever the row is.
+    pub(crate) fn open_tree_node(
+        &mut self,
+        host: HostId,
+        node_id: rho_desk::NodeId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let card = crate::dashboard::DealCardId { host, node_id };
+        match self.dashboard.card_target(card) {
+            crate::dashboard::CardTarget::Agent(agent_id) => {
+                self.open_agent(agent_id, window, cx);
+                true
+            }
+            crate::dashboard::CardTarget::Page(page) => {
+                self.open_browser_page(page, window, cx);
+                true
+            }
+            crate::dashboard::CardTarget::Thread(thread) => {
+                self.open_slack_source(
+                    rho_slack::session::Source::Thread(crate::slack::thread_key(&thread)),
+                    window,
+                    cx,
+                );
+                true
+            }
+            crate::dashboard::CardTarget::Note | crate::dashboard::CardTarget::Missing => {
+                self.open_note(host, node_id, window, cx)
+            }
+        }
+    }
+
+    /// Opens a node's own surface: the note, with its children under it.
+    pub(crate) fn open_note(
+        &mut self,
+        host: HostId,
+        node_id: rho_desk::NodeId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.note_view_for(host, node_id, window, cx).is_none() {
+            return false;
+        }
+        let surface = self.make_surface(SurfaceKey::DeskNode { host, node_id }, window, cx);
+        self.display_surface(surface, cx);
+        self.focus_active_surface(window, cx);
+        true
+    }
+
+    /// "Notes for this": the note filed under whatever the reader is
+    /// looking at, created the first time the key is pressed. A note
+    /// surface answers with itself, so the key is idempotent there.
+    pub(crate) fn open_notes_for_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((host, node_id)) = self.surface_node() else {
+            self.notice_on(
+                None,
+                "notes: nothing here to file a note under",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        if self
+            .desk_cells
+            .node(host, node_id)
+            .is_some_and(|node| node.kind == rho_desk::cells::NodeKind::Note)
+        {
+            self.open_note(host, node_id, window, cx);
+            return;
+        }
+        let existing = self
+            .desk_cells
+            .tree_source(host)
+            .into_iter()
+            .flat_map(|(nodes, _)| nodes)
+            .find(|node| {
+                node.parent == Some(node_id) && node.kind == rho_desk::cells::NodeKind::Note
+            })
+            .map(|node| node.id);
+        if let Some(existing) = existing {
+            self.open_note(host, existing, window, cx);
+            return;
+        }
+        if !self.require_connected(cx) {
+            return;
+        }
+        let Some((created, writes)) = self.desk_cells.create_note_writes(host, Some(node_id))
+        else {
+            return;
+        };
+        if self
+            .apply_desk_writes(host, writes, None, window, cx)
+            .is_none()
+        {
+            return;
+        }
+        self.open_note(host, created, window, cx);
+    }
+
+    /// `enter` on a child row of a note surface opens that child. In the
+    /// body it is an ordinary newline, so the handler propagates.
+    fn note_open_row(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let SurfaceKey::DeskNode { host, node_id } = self.active_pane().surface.key.clone() else {
+            return false;
+        };
+        let Some(child) = self
+            .note_views
+            .get(&(host, node_id))
+            .and_then(|view| view.child_at_cursor(cx))
+        else {
+            return false;
+        };
+        self.open_tree_node(host, child, window, cx)
+    }
+
+    /// The node the current surface is about: the thing a note would be
+    /// filed under. Every kind that has a row in the tree answers.
+    fn surface_node(&self) -> Option<(HostId, rho_desk::NodeId)> {
+        let card = match &self.active_pane().surface.key {
+            SurfaceKey::DeskNode { host, node_id } => return Some((*host, *node_id)),
+            SurfaceKey::Transcript(agent_id)
+            | SurfaceKey::Shell(agent_id)
+            | SurfaceKey::Diff { agent_id }
+            | SurfaceKey::File { agent_id, .. }
+            | SurfaceKey::Terminal { agent_id, .. } => self.dashboard.agent_card_id(*agent_id),
+            SurfaceKey::Browser(page) => self.dashboard.page_card_id(*page),
+            SurfaceKey::SlackConversation(rho_slack::session::Source::Thread(key)) => self
+                .dashboard
+                .thread_card_id(&crate::slack::thread_ref(key)),
+            // A channel surface is dealt for one of its messages, and that
+            // message is what has a node. With several open in the same
+            // channel, the newest is the one the reader was sent to.
+            SurfaceKey::SlackConversation(rho_slack::session::Source::Conversation(channel)) => {
+                self.dashboard
+                    .open_thread_cards()
+                    .into_iter()
+                    .filter(|(_, thread)| thread.channel == channel.0)
+                    .max_by(|(_, left), (_, right)| left.thread_ts.cmp(&right.thread_ts))
+                    .map(|(card, _)| card)
+            }
+            _ => None,
+        }?;
+        Some((card.host, card.node_id))
     }
 
     /// A note-body edit, on its way to the daemon as a text operation.
@@ -6537,8 +6764,14 @@ impl Workspace {
                 SurfaceView::Home(cx.new(|cx| crate::home::HomeView::new(window, cx)))
             }
             SurfaceKey::Messages => SurfaceView::Messages(self.messages_editor.clone()),
-            SurfaceKey::DeskNode { .. } => {
-                unreachable!("deal surfaces are created while dealing")
+            SurfaceKey::DeskNode { host, node_id } => {
+                let (host, node_id) = (*host, *node_id);
+                match self.note_view_for(host, node_id, window, cx) {
+                    Some(view) => SurfaceView::DeskNode(view.editor().clone()),
+                    // Nothing opens a node whose body has not arrived; the
+                    // dashboard's editor keeps the surface honest if one does.
+                    None => SurfaceView::DeskNode(self.dashboard.editor().clone()),
+                }
             }
             SurfaceKey::Transcript(agent_id) => {
                 let agent_id = *agent_id;
@@ -7486,11 +7719,7 @@ impl Workspace {
         }
         if undone == 0 {
             self.restore_verdict_undo(entry);
-            self.echo(
-                "undo: Desk notes are unavailable",
-                StyleClass::SystemInfo,
-                cx,
-            );
+            self.echo("undo: notes are unavailable", StyleClass::SystemInfo, cx);
             return;
         }
         crate::journal::record(crate::journal::Event::SlackMarkReadBeforeUndone { cards: undone });
@@ -7543,13 +7772,13 @@ impl Workspace {
                 let Some((writes, verdict)) = self.desk_cells.undo_verdict_writes(host, node, at)
                 else {
                     self.restore_verdict_undo(entry);
-                    self.echo("undo: Desk note is unavailable", StyleClass::SystemInfo, cx);
+                    self.echo("undo: the note is unavailable", StyleClass::SystemInfo, cx);
                     return;
                 };
                 let Some(stamp) = self.apply_desk_writes(host, writes, Some(verdict), window, cx)
                 else {
                     self.restore_verdict_undo(entry);
-                    self.echo("undo: Desk note is unavailable", StyleClass::SystemInfo, cx);
+                    self.echo("undo: the note is unavailable", StyleClass::SystemInfo, cx);
                     return;
                 };
                 self.pending_tree_undos
@@ -7859,21 +8088,27 @@ impl Workspace {
             Some(RowTarget::TreePage { page_id, .. }) => {
                 self.open_browser_page(page_id, window, cx)
             }
+            // `enter` opens what the row is, and a note's surface is the
+            // note. Staffing one is `r`, which writes the draft.
             Some(RowTarget::TreeTopic {
                 host,
                 node_id,
                 first_attention,
                 ..
-            }) => match first_attention
-                .or_else(|| self.dashboard.first_tree_agent_for_topic((host, node_id)))
-            {
-                Some(agent_id) => self.open_agent(agent_id, window, cx),
-                None => {
-                    self.dashboard
-                        .open_new_tree_draft((host, node_id), window, cx);
-                    self.dashboard_focus_draft(window, cx);
+            }) => {
+                if !self.open_note(host, node_id, window, cx) {
+                    match first_attention
+                        .or_else(|| self.dashboard.first_tree_agent_for_topic((host, node_id)))
+                    {
+                        Some(agent_id) => self.open_agent(agent_id, window, cx),
+                        None => {
+                            self.dashboard
+                                .open_new_tree_draft((host, node_id), window, cx);
+                            self.dashboard_focus_draft(window, cx);
+                        }
+                    }
                 }
-            },
+            }
             Some(RowTarget::NewTreeDraft((topic_host, node_id))) => {
                 if !self.require_connected(cx) {
                     return;
@@ -7921,7 +8156,10 @@ impl Workspace {
                 window.dispatch_action(action, cx);
             }
         } else {
-            cx.propagate();
+            // Not propagate: the fall-through lands on the transcript
+            // prompt's SubmitPrompt binding, which eats the key and leaves
+            // the note without its newline.
+            window.dispatch_action(Box::new(editor::actions::Newline), cx);
         }
     }
 
@@ -8292,7 +8530,7 @@ impl Workspace {
                 }
             },
         );
-        self.open_prompt("Desk heading:", complete, on_submit, window, cx);
+        self.open_prompt("Note:", complete, on_submit, window, cx);
     }
 
     fn prompt_dashboard_search(
@@ -8867,7 +9105,7 @@ impl Workspace {
             let path = self
                 .dashboard
                 .cursor_breadcrumb(cx)
-                .unwrap_or_else(|| "desk".to_owned());
+                .unwrap_or_else(|| "map".to_owned());
             if matches!(
                 self.dashboard.cursor_target(&self.registry, cx),
                 Some(crate::dashboard::RowTarget::NewTreeDraft(_))
@@ -9064,6 +9302,8 @@ impl Workspace {
                 .child(editor.clone())
                 .into_any_element(),
             SurfaceView::DeskNode(editor) => div()
+                .id("rho-surface-note")
+                .key_context("RhoNote")
                 .size_full()
                 .overflow_hidden()
                 .child(editor.clone())
@@ -9598,11 +9838,7 @@ impl Render for Workspace {
                         window,
                         cx,
                     ) {
-                        this.echo(
-                            "done: Desk heading is unavailable",
-                            StyleClass::SystemInfo,
-                            cx,
-                        );
+                        this.echo("done: the note is unavailable", StyleClass::SystemInfo, cx);
                     }
                     return;
                 }
@@ -9620,7 +9856,7 @@ impl Render for Workspace {
                         cx,
                     ) {
                         this.echo(
-                            "discard: Desk heading is unavailable",
+                            "discard: the note is unavailable",
                             StyleClass::SystemInfo,
                             cx,
                         );
@@ -9651,7 +9887,7 @@ impl Render for Workspace {
                         cx,
                     ) {
                         this.echo(
-                            "snooze: Desk heading is unavailable",
+                            "snooze: the note is unavailable",
                             StyleClass::SystemInfo,
                             cx,
                         );
@@ -9679,7 +9915,7 @@ impl Render for Workspace {
                             cx,
                         ) {
                             this.echo(
-                                "room snooze: Desk room is unavailable",
+                                "room snooze: the room is unavailable",
                                 StyleClass::SystemInfo,
                                 cx,
                             );
@@ -9704,15 +9940,11 @@ impl Render for Workspace {
                         window,
                         cx,
                     ) {
-                        this.echo(
-                            "todo: Desk heading is unavailable",
-                            StyleClass::SystemInfo,
-                            cx,
-                        );
+                        this.echo("todo: the note is unavailable", StyleClass::SystemInfo, cx);
                     }
                     return;
                 }
-                let result: Result<(), &'static str> = Err("the dealt item has no Desk node");
+                let result: Result<(), &'static str> = Err("the dealt item has no node");
                 let handled = result.is_ok();
                 if handled {
                     this.dashboard.record_deal_verdict_as(
@@ -10073,6 +10305,14 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &RailFocus, window, cx| {
                 this.focus_rail(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &crate::NoteOpenRow, window, cx| {
+                if !this.note_open_row(window, cx) {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &crate::NotesForThis, window, cx| {
+                this.open_notes_for_surface(window, cx);
             }))
             .on_action(cx.listener(|this, _: &RailOpen, window, cx| {
                 this.dashboard_open(window, cx);

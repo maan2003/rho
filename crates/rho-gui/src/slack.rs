@@ -1046,7 +1046,7 @@ fn parse_mark_cutoff(
     now.checked_sub_signed(chrono::TimeDelta::try_milliseconds(milliseconds as i64)?)
 }
 
-fn thread_key(thread: &ThreadRef) -> ThreadKey {
+pub(crate) fn thread_key(thread: &ThreadRef) -> ThreadKey {
     ThreadKey {
         workspace: rho_slack::config::WorkspaceName(thread.workspace.clone()),
         channel: ChannelId(thread.channel.clone()),

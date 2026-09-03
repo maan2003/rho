@@ -6763,6 +6763,179 @@ fn the_find_chord_wins_against_the_bundled_keymaps(cx: &mut TestAppContext) {
     });
 }
 
+/// A note is one text, not one line: the body runs as long as it wants and
+/// the first line is what everything else calls it.
+#[gpui::test]
+fn a_notes_title_is_its_first_line_and_the_body_is_the_note(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let mut desk = DeskFixture::new();
+    let root = desk.note(None, "nixos");
+    desk.note(
+        Some(root),
+        "poco on linux\nthe screen is the hard part\nand the modem after it",
+    );
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let paths = workspace
+                .find_candidates(cx)
+                .into_iter()
+                .map(|candidate| candidate.path)
+                .collect::<Vec<_>>();
+            assert!(
+                paths.contains(&"nixos › poco on linux".to_owned()),
+                "the path is the first line, not the whole note: {paths:?}"
+            );
+            assert!(
+                !paths.iter().any(|path| path.contains("hard part")),
+                "the body never reaches a path: {paths:?}"
+            );
+        })
+        .unwrap();
+}
+
+/// The note surface: the body is the node's own text, and the children hang
+/// under it, so a note is read where it lives rather than on the map.
+#[gpui::test]
+fn a_note_opens_as_its_own_surface_with_its_children_under_it(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let mut desk = DeskFixture::new();
+    let topic = desk.note(None, "poco on linux\nthe screen is the hard part");
+    let first = desk.note(Some(topic), "modem firmware");
+    let second = desk.note(Some(topic), "battery calibration");
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(workspace.open_note(HostId::default(), topic, window, cx));
+            assert_eq!(
+                workspace.current_surface_key_for_test(),
+                crate::pane::SurfaceKey::DeskNode {
+                    host: HostId::default(),
+                    node_id: topic,
+                }
+            );
+            assert_eq!(
+                workspace.note_children_for_test(HostId::default(), topic),
+                vec![first, second]
+            );
+        })
+        .unwrap();
+}
+
+/// "Notes for this" from a surface that is not a note: the note is created
+/// under the thing on screen, and pressing the key again returns to it
+/// rather than making a second one.
+#[gpui::test]
+fn notes_for_this_files_a_note_under_the_surfaces_node(cx: &mut TestAppContext) {
+    use rho_ui_proto::{
+        AgentDisposition, AgentRole, AuthState, UiAgentFacts, UiAgentSummary, UiAttention,
+        WorkspaceInfo,
+    };
+
+    cx.update(bind_test_keymaps);
+    let agent_id = agent(77);
+    let mut desk = DeskFixture::new();
+    let topic = desk.note(None, "nixos");
+    let agent_node = desk.agent_row(topic, agent_id);
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Ready {
+                    agents: vec![UiAgentSummary {
+                        agent_id,
+                        parent_agent: None,
+                        display_name: Some("warm agent".into()),
+                        created_at: UnixMs(1),
+                        updated_at: UnixMs(1),
+                        role: AgentRole::default(),
+                        workspace: WorkspaceInfo::UserCheckout {
+                            repo: "/tmp".into(),
+                        },
+                        attention: UiAttention::Pending,
+                        last_active: UnixMs(5),
+                        facts: UiAgentFacts::default(),
+                        hidden: false,
+                        disposition: AgentDisposition::Pending,
+                        last_user_message_text: String::new(),
+                        activity: None,
+                        turn_report: None,
+                        labels: Vec::new(),
+                    }],
+                    iris_agent: None,
+                    projects: Vec::new(),
+                    auth: AuthState {
+                        namespaces: Vec::new(),
+                        disabled_namespaces: Vec::new(),
+                        active_namespace: None,
+                    },
+                    machine_seed: 0,
+                    agent_counter: 40,
+                },
+                window,
+                cx,
+            );
+            workspace.open_agent(agent_id, window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let created = workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_notes_for_surface(window, cx);
+            let crate::pane::SurfaceKey::DeskNode { node_id, .. } =
+                workspace.current_surface_key_for_test()
+            else {
+                panic!("notes for this opens the note surface");
+            };
+            assert_eq!(
+                workspace
+                    .desk_cells
+                    .node(HostId::default(), node_id)
+                    .and_then(|node| node.parent),
+                Some(agent_node),
+                "the note is filed under the agent on screen"
+            );
+            node_id
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_agent(agent_id, window, cx);
+            workspace.open_notes_for_surface(window, cx);
+            assert_eq!(
+                workspace.current_surface_key_for_test(),
+                crate::pane::SurfaceKey::DeskNode {
+                    host: HostId::default(),
+                    node_id: created,
+                },
+                "the second press opens the note that already exists"
+            );
+        })
+        .unwrap();
+}
+
 /// A desk as the daemon would hand it over: cells the client merges, plus a
 /// text history per note. Tests build one and send it as `DeskSynced`.
 struct DeskFixture {
@@ -7523,6 +7696,55 @@ fn a_thread_unfollowed_in_slack_closes_its_card(cx: &mut TestAppContext) {
                 0,
                 "a verdict made in another client is not this one's to undo"
             );
+        })
+        .unwrap();
+}
+
+/// A body is text: enter is a newline on the map and on the note surface
+/// alike. Both used to fall through to the transcript prompt's submit
+/// binding, which ate the key and kept every note one line long.
+#[gpui::test]
+fn enter_writes_a_newline_into_a_note_body(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let mut desk = DeskFixture::new();
+    let on_the_map = desk.note(None, "map row");
+    let note = desk.note(None, "first line");
+
+    let workspace = overview_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.focus_tree_node_for_test(HostId::default(), on_the_map, window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "i t a i l enter escape");
+    cx.run_until_parked();
+    let body = |workspace: &Workspace, node_id, cx: &gpui::App| {
+        workspace
+            .desk_cells
+            .buffer(HostId::default(), node_id)
+            .expect("the note has a body")
+            .read(cx)
+            .text()
+    };
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(body(workspace, on_the_map, cx), "tail\nmap row");
+        })
+        .unwrap();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert!(workspace.open_note(HostId::default(), note, window, cx));
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "a enter s e c o n d");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(body(workspace, note, cx), "first line\nsecond");
         })
         .unwrap();
 }

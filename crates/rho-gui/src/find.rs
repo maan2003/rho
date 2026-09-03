@@ -301,14 +301,13 @@ impl Workspace {
         match candidates[index].target.clone() {
             FindTarget::Agent(agent_id) => self.open_agent(agent_id, window, cx),
             FindTarget::Page(page_id) => self.open_browser_page(page_id, window, cx),
+            // A node opens its own surface, and a note's surface is the
+            // note: the staffed-heading shortcut belonged to the desk,
+            // where a heading had nowhere else to go.
             FindTarget::Topic { host, node_id } => {
-                match self.dashboard.first_tree_agent_for_topic((host, node_id)) {
-                    Some(agent_id) => self.open_agent(agent_id, window, cx),
-                    None => {
-                        self.dashboard
-                            .open_new_tree_draft((host, node_id), window, cx);
-                        self.dashboard_focus_draft(window, cx);
-                    }
+                if !self.open_note(host, node_id, window, cx) {
+                    self.dashboard.move_to_tree_node_when_ready(host, node_id);
+                    self.open_overview(window, cx);
                 }
             }
             FindTarget::Slack(source) => self.open_slack_source(source, window, cx),

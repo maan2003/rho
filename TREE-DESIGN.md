@@ -187,7 +187,28 @@ the moment the upgrade is confirmed.
    message can rebind it.
 4. Notes: multi-line `body` on the text CRDT, the note surface, "notes for
    this" from any surface, the map over the tree; `DESK-DESIGN.md` retired
-   to notes-and-filing.
+   to notes-and-filing. Landed 3 Sep. The body was already multi-line in
+   the store (the 4 MiB cap and the newline-free text path were there from
+   slice 1); what was missing is that everything downstream read a whole
+   body as a title, so `note_title` — the first line, trimmed — is now the
+   one place a note is named, and paths, cards, rooms, and pickers all go
+   through it. The note surface is `crates/rho-gui/src/note_view.rs`: one
+   composition whose section is the node's own body buffer and whose tail
+   is a generated row per child, so editing a note there and editing it on
+   the map are one edit on one CRDT. `enter` on a row — on the map, in the
+   finder, or on a child row of a note — opens what the row is, which for
+   a note is its surface; staffing a note with an agent stays `r`.
+   "Notes for this" is `ctrl-shift-n` (and `space shift-n`): the child note
+   of the node the surface is about, created on the first press and
+   reopened on every one after. Two keymap bugs stood in the way of a body
+   ever having a second line and were fixed here: `enter` in insert mode
+   fell through to the transcript prompt's `SubmitPrompt`, which ate the
+   key, and on the map the mode-less `RailOpen` binding outranked both, so
+   `enter` while typing opened the row instead. The map also pads the
+   second and later lines of a body to its bullet's column, so a note
+   reads as one block. No daemon change: the GUI already creates notes in
+   its own namespace, the 4 MiB cap and the text path were there from
+   slice 1, and the daemon never derived a title.
 5. Home on the tree.
 
 Each slice lands on its own with the tests of the slices before it green.

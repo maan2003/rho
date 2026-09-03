@@ -32,6 +32,9 @@ use crate::workspace::Workspace;
 const DASHBOARD_KEY_BASE: usize = usize::MAX - 200;
 
 const TREE_INLAY_ID_BASE: usize = 2_000_000;
+/// Indent inlays for the second and later lines of a note body. Far enough
+/// past the row prefixes that a long note cannot collide with them.
+const CONTINUATION_INLAY_ID_BASE: usize = 3_000_000;
 
 type DraftTopic = Option<(HostId, rho_desk::NodeId)>;
 type DraftState = (DraftTopic, Entity<Buffer>, gpui::Subscription);
@@ -413,7 +416,7 @@ impl Dashboard {
                     && source
                         .buffers
                         .get(&node.id)
-                        .is_some_and(|buffer| buffer.read(cx).text().trim() == title.trim()))
+                        .is_some_and(|buffer| note_title(&buffer.read(cx).text()) == title.trim()))
                 .then_some((*host, node.id))
             })
         })
@@ -443,7 +446,7 @@ impl Dashboard {
             let titles = source
                 .buffers
                 .iter()
-                .map(|(id, buffer)| (*id, buffer.read(cx).text()))
+                .map(|(id, buffer)| (*id, note_title(&buffer.read(cx).text()).to_owned()))
                 .collect::<HashMap<_, _>>();
             for heading in source
                 .nodes
@@ -692,7 +695,7 @@ impl Dashboard {
         let titles = source
             .buffers
             .iter()
-            .map(|(id, buffer)| (*id, buffer.read(cx).text()))
+            .map(|(id, buffer)| (*id, note_title(&buffer.read(cx).text()).to_owned()))
             .collect::<HashMap<_, _>>();
         Some(tree_breadcrumb(node_id, &nodes, &titles))
     }
@@ -713,7 +716,7 @@ impl Dashboard {
             }
             node_id = parent;
         }
-        let name = source.buffers.get(&node_id)?.read(cx).text();
+        let name = note_title(&source.buffers.get(&node_id)?.read(cx).text()).to_owned();
         Some(DeskRoom {
             host,
             node_id,
@@ -1625,9 +1628,32 @@ impl Dashboard {
                 ranges.push(start..end);
             }
             if !hidden_by_fold && !prefix.is_empty() {
+                // A body runs to as many lines as it wants, and only its
+                // first carries the bullet. The rest are padded to the same
+                // column so the note reads as one block under it.
+                let padding = " ".repeat(prefix.chars().count());
                 let inlay = Inlay::custom(TREE_INLAY_ID_BASE + index * 2, start, prefix);
                 self.tree_inlay_ids.push(inlay.id);
                 inlays.push(inlay);
+                let text = buffer_snapshot.text();
+                for (line, offset) in text
+                    .match_indices('\n')
+                    .enumerate()
+                    .map(|(line, (offset, _))| (line, offset + 1))
+                {
+                    let Some(anchor) =
+                        snapshot.anchor_in_excerpt(buffer_snapshot.anchor_after(offset))
+                    else {
+                        continue;
+                    };
+                    let inlay = Inlay::custom(
+                        CONTINUATION_INLAY_ID_BASE + index * 256 + line,
+                        anchor,
+                        padding.clone(),
+                    );
+                    self.tree_inlay_ids.push(inlay.id);
+                    inlays.push(inlay);
+                }
             }
             let mut hints = Vec::new();
             match node.state {
@@ -2335,6 +2361,13 @@ fn area_kind(kind: rho_desk::cells::NodeKind) -> &'static str {
     }
 }
 
+/// A note's title is the first line of its body. The rest of the body is
+/// the note itself: it belongs on the note's own surface, never in a path,
+/// a card, or a picker row.
+pub(crate) fn note_title(text: &str) -> &str {
+    text.lines().next().unwrap_or("").trim()
+}
+
 /// A note is the user's to write in; every other kind is the machine's row.
 fn is_note(node: &rho_desk::cells::MaterializedNode) -> bool {
     node.kind == rho_desk::cells::NodeKind::Note
@@ -2385,9 +2418,10 @@ impl Dashboard {
                     if node.kind != rho_desk::cells::NodeKind::Note {
                         return None;
                     }
-                    let title = source.buffers.get(&node.id)?.read(cx).text();
+                    let title =
+                        note_title(&source.buffers.get(&node.id)?.read(cx).text()).to_owned();
                     Some((
-                        title.trim().to_owned(),
+                        title.clone(),
                         self.breadcrumb_for_node_for_source(node.id, source, cx)?,
                         *host,
                         node.id,
@@ -2417,7 +2451,7 @@ impl Dashboard {
             let titles = source
                 .buffers
                 .iter()
-                .map(|(id, buffer)| (*id, buffer.read(cx).text()))
+                .map(|(id, buffer)| (*id, note_title(&buffer.read(cx).text()).to_owned()))
                 .collect::<HashMap<_, _>>();
             for node in &source.nodes {
                 let breadcrumb = tree_breadcrumb(node.id, &nodes, &titles);
@@ -2471,7 +2505,7 @@ impl Dashboard {
             let titles = source
                 .buffers
                 .iter()
-                .map(|(id, buffer)| (*id, buffer.read(cx).text()))
+                .map(|(id, buffer)| (*id, note_title(&buffer.read(cx).text()).to_owned()))
                 .collect::<HashMap<_, _>>();
             let title_of = |node_id: rho_desk::NodeId| {
                 titles
@@ -2566,7 +2600,8 @@ impl Dashboard {
                     .iter()
                     .filter(|node| node.kind == rho_desk::cells::NodeKind::Note)
                     .filter_map(|node| {
-                        let title = source.buffers.get(&node.id)?.read(cx).text();
+                        let title =
+                            note_title(&source.buffers.get(&node.id)?.read(cx).text()).to_owned();
                         title.to_lowercase().contains(&needle).then(|| {
                             (
                                 title.clone(),
@@ -2593,7 +2628,7 @@ impl Dashboard {
         let titles = source
             .buffers
             .iter()
-            .map(|(id, buffer)| (*id, buffer.read(cx).text()))
+            .map(|(id, buffer)| (*id, note_title(&buffer.read(cx).text()).to_owned()))
             .collect::<HashMap<_, _>>();
         Some(tree_breadcrumb(node_id, &nodes, &titles))
     }

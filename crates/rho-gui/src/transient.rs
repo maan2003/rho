@@ -629,10 +629,10 @@ pub fn root_menu() -> Transient {
         })
         // Home took the front door; the map keeps a key of its own so the
         // notes store stays one press away from it.
-        .item("o", "desk map", |workspace, window, cx| {
+        .item("o", "map", |workspace, window, cx| {
             workspace.open_overview(window, cx);
         })
-        .item("e", "Desk raw source", |workspace, window, cx| {
+        .item("e", "map raw source", |workspace, window, cx| {
             workspace.cmd_toggle_raw_desk(window, cx);
         })
         .item("b", "switch buffer…", |workspace, window, cx| {
@@ -655,6 +655,9 @@ pub fn root_menu() -> Transient {
         })
         .item("n", "new…", |workspace, window, cx| {
             workspace.open_transient(new_menu(), window, cx);
+        })
+        .item("shift-n", "notes for this", |workspace, window, cx| {
+            workspace.open_notes_for_surface(window, cx);
         })
         .item("c", "start/attach shell", |workspace, window, cx| {
             workspace.cmd_shell(window, cx);
@@ -694,7 +697,7 @@ pub fn root_menu() -> Transient {
 
 pub fn phone_root_menu() -> Transient {
     Transient::new("menu")
-        .item("d", "Desk", |workspace, window, cx| {
+        .item("d", "Map", |workspace, window, cx| {
             workspace.phone_open_desk(window, cx);
         })
         .item("s", "Slack", |workspace, window, cx| {
@@ -709,7 +712,7 @@ pub fn phone_root_menu() -> Transient {
 }
 
 pub fn phone_desk_menu(raw_mode: bool) -> Transient {
-    Transient::new("Desk")
+    Transient::new("Map")
         .item("f", "Cycle folds", |workspace, window, cx| {
             workspace.phone_cycle_dashboard_folds(window, cx);
         })
@@ -718,7 +721,7 @@ pub fn phone_desk_menu(raw_mode: bool) -> Transient {
             if raw_mode {
                 "Done editing"
             } else {
-                "Edit desk"
+                "Edit notes"
             },
             |workspace, window, cx| {
                 workspace.phone_toggle_dashboard_editing(window, cx);
@@ -1720,7 +1723,7 @@ mod tests {
                 .iter()
                 .map(|(_, description, _)| description.as_str())
                 .collect::<Vec<_>>(),
-            ["Cycle folds", "Edit desk", "New…"]
+            ["Cycle folds", "Edit notes", "New…"]
         );
         assert_eq!(phone_desk_menu(true).phone_rows()[1].1, "Done editing");
     }

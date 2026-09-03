@@ -18,6 +18,7 @@ pub mod hosts;
 pub(crate) mod image_view;
 pub mod journal;
 pub mod minibuffer;
+pub mod note_view;
 pub mod pane;
 pub(crate) mod realtime_client;
 pub mod render;
@@ -140,6 +141,8 @@ actions!(
         SlackEditLast,
         SlackCancelEdit,
         FindNode,
+        NotesForThis,
+        NoteOpenRow,
         MessagesOpen,
         HomeOpenRow
     ]
@@ -214,6 +217,10 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         // search under plain `Editor`, and gpui prefers the deeper match.
         KeyBinding::new("ctrl-shift-f", FindNode, Some("RhoGui")),
         KeyBinding::new("ctrl-shift-f", FindNode, Some("RhoGui > Editor")),
+        // Notes for whatever is on screen. The terminal keeps `ctrl-shift-n`
+        // for its own escape, which is bound deeper and so still wins there.
+        KeyBinding::new("ctrl-shift-n", NotesForThis, Some("RhoGui")),
+        KeyBinding::new("ctrl-shift-n", NotesForThis, Some("RhoGui > Editor")),
         // Attention triage: jump to the most urgent agent, clear the current
         // one. The bundled zed keymaps don't know these actions, so they are
         // bound here rather than in an asset. The context must be at least as
@@ -459,8 +466,28 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             DashboardCancelDraft,
             Some("RhoDashboard > Editor && vim_mode == insert"),
         ),
-        KeyBinding::new("enter", RailOpen, Some("RhoDashboard > Editor && !VimDeal")),
+        // Not in insert: enter is a newline in the body being typed, and
+        // this binding outranks the submit and newline ones below it.
+        KeyBinding::new(
+            "enter",
+            RailOpen,
+            Some("RhoDashboard > Editor && !VimDeal && vim_mode != insert"),
+        ),
     ]);
+    for context in [
+        "RhoNote > Editor && vim_mode == normal && !VimDeal",
+        "RhoNote > Editor && vim_mode == helix_normal && !VimDeal",
+    ] {
+        cx.bind_keys([KeyBinding::new("enter", NoteOpenRow, Some(context))]);
+    }
+    // A note body is text, so enter is a newline. Bound explicitly because
+    // the transcript prompt's `RhoGui > Editor` SubmitPrompt binding would
+    // otherwise win here and swallow the key.
+    cx.bind_keys([KeyBinding::new(
+        "enter",
+        editor::actions::Newline,
+        Some("RhoNote > Editor && vim_mode == insert"),
+    )]);
     for context in [
         "RhoDashboard > Editor && vim_mode == normal && !VimDeal",
         "RhoDashboard > Editor && vim_mode == helix_normal && !VimDeal",

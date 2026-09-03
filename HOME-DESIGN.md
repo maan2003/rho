@@ -2,8 +2,8 @@
 
 Status: decided with the user on 2026-09-03, built the same day
 (`crates/rho-gui/src/home.rs`). Changes the cold-start and overview rules
-of `DESK-DESIGN.md`; the dealer itself is untouched. As built: the desk map
-keeps a root-menu key of its own (`o desk map`); the overview key pressed on
+of `DESK-DESIGN.md`; the dealer itself is untouched. As built: the map
+keeps a root-menu key of its own (`o map`); the overview key pressed on
 Home returns to the surface the reader came from.
 
 ## The problem
@@ -69,8 +69,7 @@ deal: flick past the queue and it is what you see.
 
 ### What Home does not do
 
-- No counts leak out of it: the lamp and chime stay contentless, as in
-  `DESK-DESIGN.md`.
+- No counts leak out of it: the lamp and chime stay contentless.
 - No scrolling into the whole queue: the caps are hard, so Home cannot
   become an inbox to tidy.
 - No pronoun: the word "you" does not appear; sections are `next`,
