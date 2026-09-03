@@ -194,11 +194,26 @@ under test. If the fake cannot produce a state, extend the fake.
       Deal keys (`d`, `x`, `s`, `S`, `t`, `f`, `q`) work on that surface
       exactly as on an agent surface, and a verdict closes it and moves on.
       The card line still shows in the queue; the surface is what you look
-      at. Until 2.9 lands, the interim inbox deal surface (seen by the
+      at. Also seen by the user: `escape` on the dealt inbox surface does
+      not leave deal mode for normal mode. On the conversation surface
+      `escape` must go to normal mode exactly as on an agent transcript
+      (the `ExitDealMode` contract), and the same must hold on any deal
+      surface; find why the inbox surface swallowed it and say so. Until 2.9 lands, the interim inbox deal surface (seen by the
       user as a bare message body with nothing around it) must at least
       carry a header line `David · #design · Thu 3 Sep 10:02` above the
       text and the conversation label in the status segment; that part is
       Phase 1 work under 1.1.
+- [ ] 2.10 No inbox in between, decided. Today a Slack obligation is copied
+      into the rho inbox (`SlackItems`, `InboxKind::Slack`,
+      `SourceReference::SlackThread`) and dealt from there. Rho: the dealer
+      takes Slack candidates straight from the session's store, as agent
+      cards come from the registry; the inbox is not written or read for
+      Slack. Verdict state (done, discard, snooze until, todo) lives in the
+      Slack store on disk, keyed on thread plus latest timestamp, so a
+      verdict survives a restart and a newer message voids it. Filing keeps
+      creating the machine-owned desk node. Undo (eng-5pha's verdict undo
+      stack) must cover this store the way it covers desk marks: add a
+      variant, do not bypass it. Human-entered inbox items are out of scope.
 - [ ] 2.7 Direct messages raise cards. Slack's `activity.feed` does not
       carry DMs, only mentions, reactions, and thread replies; a DM never
       reaches the inbox today. Rho: a websocket `message` in an `im` or

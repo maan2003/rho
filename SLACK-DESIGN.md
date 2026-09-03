@@ -75,18 +75,24 @@ odd websocket event types, rho handles `hello`, `reconnect_url`, `pong`,
 matter, so a missed websocket frame is never a missed mention. The
 websocket exists only so the lamp lights within a second.
 
-### Items land in the inbox, then file into the desk
+### Slack deals straight from the session; there is no inbox in between
 
-A mention becomes an inbox obligation with a typed Slack source (workspace,
-channel, timestamp), so it rises immediately under the obligation curve.
-Filing it (`f`) under a heading creates a machine-owned thread node bound
-to that thread; it updates in place and is removed when the thread has
-been quiet for a while, like agent rows.
+A mention, a DM, or a reply to a thread the user is in becomes a dealer
+candidate directly from the Slack session's own store, the way an agent
+card comes from the registry. The card carries the thread identity and the
+latest message timestamp; verdicts (done, discard, snooze, todo) are kept
+client-side in the Slack store, keyed on thread plus latest timestamp, so a
+verdicted thread stays quiet until a newer message voids it. Filing (`f`)
+under a heading creates a machine-owned thread node bound to that thread;
+it updates in place and is removed when the thread has been quiet for a
+while, like agent rows. The rho inbox is not involved: nothing is copied
+into it and nothing is read back from it.
 
-**Why:** the inbox is where new things wait for a verdict and the desk is
-where the user's structure lives; Slack should not write into the desk on
-its own, and a filed thread should be as much a first-class row as an
-agent.
+**Why:** the inbox was a redirection. Slack already keeps the truth of what
+is waiting and what has been answered; copying it into an inbox item meant
+a second identity, a second lifetime, and a surface that showed a message
+body with no conversation around it. Human-entered items may want an inbox
+of their own later; Slack does not.
 
 ### Channels, direct messages, and threads are all the same surface
 
@@ -143,7 +149,7 @@ the thread identity. No strings where an enum will do.
 
 ## What stays the same for the human
 
-- The dealer, verdict keys, deal history, inbox, filing.
+- The dealer, verdict keys, deal history, filing.
 - The desk owns structure; Slack rows appear only where the user filed them.
 
 ## Deliberately deferred
