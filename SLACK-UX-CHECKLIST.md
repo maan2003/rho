@@ -163,9 +163,16 @@ under test. If the fake cannot produce a state, extend the fake.
 - [ ] 2.3 Following the tail. Pinned at the bottom, a new message keeps the
       view at the bottom. Scrolled up, the view does not move and the
       surface's status segment shows `3 new`; `G` clears it.
-- [ ] 2.4 Older history stays on `shift-p`; the echo reports `loaded 100
-      older` through the Messages buffer, and the cursor stays on the line
-      it was on.
+- [ ] 2.4 History fills as the reader scrolls, decided by the user: a
+      conversation or thread must feel complete. When the cursor or
+      viewport comes within a screen of a gap (the top of the loaded run,
+      or a hole left by downtime), the session fetches the page that fills
+      it, one page in flight at a time, and the cursor stays on the line
+      it was on while the lines above grow. History-begins makes the top a
+      no-op, never a request. `shift-p` stays as the explicit form; the
+      echo reports `loaded 100 older` through the Messages buffer. This is
+      still on demand under the budget rule: the web client fetches
+      exactly the same page when a user scrolls to it.
 - [ ] 2.5 Next unread conversation from inside a conversation: `shift-n`,
       the same key Zulip uses in rho. Wraps to the list when nothing is
       unread.
