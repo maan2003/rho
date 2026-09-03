@@ -1037,6 +1037,21 @@ impl Dashboard {
         Some(card)
     }
 
+    pub fn reopen_deal(&mut self, card: DealCard) {
+        if let Some(node_id) = card.topic_node_id {
+            self.pending_tree_cursor = Some((card.host, node_id, 0));
+        }
+        self.deal = Some(DealSession {
+            card,
+            fingerprint: DealFingerprint("verdict undo".to_owned()),
+            started_at: Instant::now(),
+            considered_not_dealt: Vec::new(),
+        });
+        self.raw_mode = false;
+        self.deal_active = true;
+        self.deal_empty_success = false;
+    }
+
     pub fn end_deal(&mut self, cx: &mut Context<Workspace>) -> bool {
         self.deal = None;
         self.exit_deal_mode(cx)

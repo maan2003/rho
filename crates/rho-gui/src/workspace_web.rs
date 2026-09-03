@@ -262,6 +262,8 @@ impl Workspace {
             pending_desk_batch_intents: Default::default(),
             desk_text_retargets: Default::default(),
             pending_tree_verdicts: Default::default(),
+            pending_tree_undos: Default::default(),
+            verdict_undo: Vec::new(),
             desk_semantic_clipboard: None,
             desk_semantic_paste_target: None,
             desk_semantic_undo: Default::default(),

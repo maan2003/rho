@@ -166,6 +166,42 @@ fn native_page_deal_context_routes_verdict_keys(cx: &mut TestAppContext) {
         assert_route!("x", crate::DashboardDealDiscard);
         assert_route!("s", crate::DashboardDealSnooze);
         assert_route!("t", crate::DashboardDealTodo);
+        assert_route!("shift-u", crate::UndoVerdict);
+    });
+}
+
+#[gpui::test]
+fn undo_verdict_binding_is_confined_to_deal_normal_mode(cx: &mut TestAppContext) {
+    use gpui::{KeyContext, Keystroke};
+
+    cx.update(bind_test_keymaps);
+    cx.update(|cx| {
+        let keymap = cx.key_bindings();
+        let keymap = keymap.borrow();
+        let stroke = Keystroke::parse("shift-u").unwrap();
+        let resolves = |contexts: &[KeyContext]| {
+            keymap
+                .bindings_for_input(&[stroke.clone()], contexts)
+                .0
+                .first()
+                .is_some_and(|binding| binding.action().partial_eq(&crate::UndoVerdict))
+        };
+        assert!(resolves(&[
+            KeyContext::parse("RhoGui").unwrap(),
+            KeyContext::parse("Editor VimDeal vim_mode=normal vim_operator=none").unwrap(),
+        ]));
+        assert!(resolves(&[
+            KeyContext::parse("RhoGui").unwrap(),
+            KeyContext::parse("Editor VimDeal vim_mode=helix_normal vim_operator=none").unwrap(),
+        ]));
+        assert!(!resolves(&[
+            KeyContext::parse("RhoDashboard").unwrap(),
+            KeyContext::parse("Editor VimDeal vim_mode=insert vim_operator=none").unwrap(),
+        ]));
+        assert!(!resolves(&[
+            KeyContext::parse("RhoGui").unwrap(),
+            KeyContext::parse("Editor VimDeal vim_mode=normal vim_operator=delete").unwrap(),
+        ]));
     });
 }
 
@@ -3417,6 +3453,226 @@ fn deal_file_bare_enter_uses_the_offered_heading_completion(cx: &mut TestAppCont
         message,
         rho_ui_proto::ClientMessage::DeskNodeTextApply { .. }
     )));
+}
+
+#[gpui::test]
+fn inbox_verdict_echo_names_card_and_undo_restores_it(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let id = workspace
+        .update(cx, |workspace, window, cx| {
+            let id = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
+                kind: crate::inbox::InboxKind::Capture,
+                text: "Remember the title".into(),
+                source: crate::inbox::SourceReference::None,
+                context: crate::inbox::CapturedContext::default(),
+                waiting_on: None,
+            });
+            workspace.age_inbox_for_test(&id, 0);
+            workspace.open_deal_mode(window, cx);
+            id
+        })
+        .unwrap();
+    cx.dispatch_action(*workspace, crate::DashboardDealDiscard);
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(
+                workspace.echo_text_for_test(),
+                Some("discard: Remember the title")
+            );
+            assert!(workspace.inbox_item_for_test(&id).is_none());
+            assert_eq!(workspace.verdict_undo_count_for_test(), 1);
+        })
+        .unwrap();
+
+    cx.dispatch_action(*workspace, crate::UndoVerdict);
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(workspace.inbox_item_for_test(&id).is_some());
+            assert_eq!(
+                workspace.echo_text_for_test(),
+                Some("undid discard: Remember the title")
+            );
+            assert_eq!(
+                workspace.current_deal_card_for_test().map(|card| card.0),
+                Some(crate::dashboard::DealCardIdentity::Inbox(id.0.clone()))
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn undo_verdict_with_empty_stack_echoes(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    cx.dispatch_action(*workspace, crate::UndoVerdict);
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(workspace.echo_text_for_test(), Some("nothing to undo"));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppContext) {
+    use rho_desk::{
+        BatchOpRecord, Document, NodeId, NodeKind, NodeOwner, OrderKey, Replica, ReplicaAuthor,
+        TemporalKind, TemporalMark, TextOperation, TreeClock, TreeOperation,
+    };
+
+    let mut document = Document::default();
+    document.add_replica(Replica {
+        replica_id: 1,
+        author: ReplicaAuthor::Machine,
+    });
+    let heading = NodeId {
+        replica_id: 1,
+        counter: 1,
+    };
+    document
+        .apply(TreeOperation::Create {
+            timestamp: TreeClock {
+                value: 1,
+                replica_id: 1,
+            },
+            node_id: heading,
+            kind: NodeKind::Heading,
+            owner: NodeOwner::User,
+            parent: None,
+            order: OrderKey(vec![100]),
+        })
+        .unwrap();
+    let prior = TemporalMark {
+        year: 2020,
+        month: 1,
+        day: 1,
+        minute_of_day: None,
+        pace_days: 1,
+    };
+    document
+        .apply(TreeOperation::SetTemporal {
+            timestamp: TreeClock {
+                value: 2,
+                replica_id: 1,
+            },
+            node_id: heading,
+            kind: TemporalKind::Todo,
+            value: Some(prior),
+        })
+        .unwrap();
+    let mut title = text::Buffer::new(text::ReplicaId::new(1), text::BufferId::new(1).unwrap(), "");
+    document
+        .apply_text(
+            heading,
+            TextOperation::from_text(&title.edit([(0..0, "Named card")])),
+            None,
+        )
+        .unwrap();
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskTreeSnapshot {
+                    snapshot: document.snapshot(),
+                    replica_id: 42,
+                },
+                window,
+                cx,
+            );
+            workspace.open_deal_mode(window, cx);
+            workspace.take_host_messages_for_test(HostId::default());
+        })
+        .unwrap();
+
+    macro_rules! verdict_and_undo {
+        ($action:expr, $echo:literal) => {{
+            cx.dispatch_action(*workspace, $action);
+            cx.run_until_parked();
+            let batch = workspace
+                .update(cx, |workspace, _, _| {
+                    workspace
+                        .take_host_messages_for_test(HostId::default())
+                        .into_iter()
+                        .find_map(|message| match message {
+                            rho_ui_proto::ClientMessage::DeskTreeBatchApply { batch } => {
+                                Some(batch)
+                            }
+                            _ => None,
+                        })
+                        .expect("verdict batch")
+                })
+                .unwrap();
+            workspace
+                .update(cx, |workspace, window, cx| {
+                    workspace.handle_event(
+                        HostId::default(),
+                        ConnEvent::DeskTreeBatchApplied(BatchOpRecord {
+                            sequence: 1,
+                            timestamp_ms: 1,
+                            batch,
+                            daemon_tree_operations: Vec::new(),
+                        }),
+                        window,
+                        cx,
+                    );
+                    assert_eq!(workspace.echo_text_for_test(), Some($echo));
+                })
+                .unwrap();
+            cx.dispatch_action(*workspace, crate::UndoVerdict);
+            let undo_batch = workspace
+                .update(cx, |workspace, _, _| {
+                    let node = Document::from_snapshot(
+                        workspace.desk_snapshot_for_test(HostId::default()),
+                    )
+                    .unwrap()
+                    .materialize()
+                    .into_iter()
+                    .find(|node| node.id == heading)
+                    .unwrap();
+                    assert_eq!(node.temporal.get(&TemporalKind::Todo), Some(&prior));
+                    workspace
+                        .take_host_messages_for_test(HostId::default())
+                        .into_iter()
+                        .find_map(|message| match message {
+                            rho_ui_proto::ClientMessage::DeskTreeBatchApply { batch } => {
+                                Some(batch)
+                            }
+                            _ => None,
+                        })
+                        .expect("undo batch")
+                })
+                .unwrap();
+            workspace
+                .update(cx, |workspace, window, cx| {
+                    workspace.handle_event(
+                        HostId::default(),
+                        ConnEvent::DeskTreeBatchApplied(BatchOpRecord {
+                            sequence: 2,
+                            timestamp_ms: 2,
+                            batch: undo_batch,
+                            daemon_tree_operations: Vec::new(),
+                        }),
+                        window,
+                        cx,
+                    );
+                    assert_eq!(
+                        workspace.current_deal_card_for_test().map(|card| card.0),
+                        Some(crate::dashboard::DealCardIdentity::Tree {
+                            host: HostId::default(),
+                            node_id: heading,
+                        })
+                    );
+                })
+                .unwrap();
+        }};
+    }
+
+    verdict_and_undo!(crate::DashboardDealDone, "done: Named card");
+    verdict_and_undo!(crate::DashboardDealDiscard, "discard: Named card");
+    verdict_and_undo!(crate::DashboardDealSnooze, "snooze 1d: Named card");
+    verdict_and_undo!(crate::DashboardDealTodo, "todo: Named card");
 }
 
 #[gpui::test]

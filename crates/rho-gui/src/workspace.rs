@@ -82,7 +82,7 @@ use crate::{
     MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious,
     OverviewToggle, PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof,
     ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit, SlackCompose, SlackLoadOlder,
-    SlackOpenRow, SlackSearch, SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard,
+    SlackOpenRow, SlackSearch, SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, UndoVerdict,
     UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
 };
 
@@ -385,6 +385,32 @@ enum PendingDeskBatchIntent {
 struct PendingTreeVerdict {
     verdict: crate::dashboard::DealerVerdict,
     echo: String,
+    undo: VerdictUndo,
+}
+
+#[derive(Clone)]
+struct VerdictUndo {
+    card: crate::dashboard::DealCard,
+    verdict: crate::dashboard::DealerVerdict,
+    verb: String,
+    state: VerdictUndoState,
+}
+
+#[derive(Clone)]
+enum VerdictUndoState {
+    DeskMarks {
+        host: HostId,
+        node: rho_desk::NodeId,
+        prior: Vec<(rho_desk::TemporalKind, Option<rho_desk::TemporalMark>)>,
+    },
+    Inbox {
+        id: crate::inbox::InboxId,
+        prior: crate::inbox::InboxItem,
+    },
+}
+
+struct PendingTreeUndo {
+    entry: VerdictUndo,
 }
 
 enum DeskSemanticUndo {
@@ -562,6 +588,8 @@ pub struct Workspace {
     /// this redirect safely carries those edits to the replacement buffer.
     desk_text_retargets: BTreeMap<(HostId, rho_desk::NodeId), rho_desk::NodeId>,
     pending_tree_verdicts: BTreeMap<(HostId, rho_desk::TreeClock), PendingTreeVerdict>,
+    pending_tree_undos: BTreeMap<(HostId, rho_desk::TreeClock), PendingTreeUndo>,
+    verdict_undo: Vec<VerdictUndo>,
     desk_semantic_clipboard: Option<crate::desk_view::DeskSubtree>,
     /// One-shot recovery for `p` while Vim still holds the removed excerpt.
     desk_semantic_paste_target: Option<(HostId, rho_desk::NodeId)>,
@@ -1273,6 +1301,8 @@ impl Workspace {
             pending_desk_batch_intents: BTreeMap::new(),
             desk_text_retargets: BTreeMap::new(),
             pending_tree_verdicts: BTreeMap::new(),
+            pending_tree_undos: BTreeMap::new(),
+            verdict_undo: Vec::new(),
             desk_semantic_clipboard: None,
             desk_semantic_paste_target: None,
             desk_semantic_undo: BTreeMap::new(),
@@ -2147,6 +2177,7 @@ impl Workspace {
                 self.pending_semantic_batches
                     .remove(&(host, record.batch.id));
                 let verdict = self.pending_tree_verdicts.remove(&(host, record.batch.id));
+                let undone = self.pending_tree_undos.remove(&(host, record.batch.id));
                 let recognition_focus = self
                     .pending_desk_batch_intents
                     .remove(&(host, record.batch.id))
@@ -2186,12 +2217,16 @@ impl Workspace {
                     cx.notify();
                 }
                 if let Some(verdict) = verdict {
+                    self.verdict_undo.push(verdict.undo);
                     self.dashboard.record_deal_verdict_as(
                         verdict.verdict,
                         chrono::Local::now().fixed_offset(),
                     );
-                    self.echo(&verdict.echo, StyleClass::SystemInfo, cx);
                     self.finish_deal_verdict(window, cx);
+                    self.echo(&verdict.echo, StyleClass::SystemInfo, cx);
+                }
+                if let Some(undone) = undone {
+                    self.complete_verdict_undo(undone.entry, window, cx);
                 }
             }
             ConnEvent::DeskTreeBatchRejected {
@@ -2201,6 +2236,9 @@ impl Workspace {
                 snapshot,
             } => {
                 self.pending_tree_verdicts.remove(&(host, id));
+                if let Some(undone) = self.pending_tree_undos.remove(&(host, id)) {
+                    self.verdict_undo.push(undone.entry);
+                }
                 let semantic_can_retry =
                     retryable && self.pending_desk_batch_intents.contains_key(&(host, id));
                 if !semantic_can_retry
@@ -6630,6 +6668,16 @@ impl Workspace {
     }
 
     #[cfg(test)]
+    pub(crate) fn inbox_item_for_test(&self, id: &InboxId) -> Option<crate::inbox::InboxItem> {
+        self.inbox.get(id).cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn verdict_undo_count_for_test(&self) -> usize {
+        self.verdict_undo.len()
+    }
+
+    #[cfg(test)]
     pub(crate) fn focus_dealt_surface_for_test(
         &mut self,
         window: &mut Window,
@@ -8139,6 +8187,84 @@ impl Workspace {
         self.cmd_surface_forward_or_deal(window, cx);
     }
 
+    fn journal_dealer_verdict(
+        verdict: crate::dashboard::DealerVerdict,
+    ) -> crate::journal::DealerVerdict {
+        match verdict {
+            crate::dashboard::DealerVerdict::Skip => crate::journal::DealerVerdict::Skip,
+            crate::dashboard::DealerVerdict::Done => crate::journal::DealerVerdict::Done,
+            crate::dashboard::DealerVerdict::Dismiss => crate::journal::DealerVerdict::Dismiss,
+            crate::dashboard::DealerVerdict::Defer => crate::journal::DealerVerdict::Defer,
+            crate::dashboard::DealerVerdict::Open => crate::journal::DealerVerdict::Open,
+            crate::dashboard::DealerVerdict::File => crate::journal::DealerVerdict::File,
+        }
+    }
+
+    fn complete_verdict_undo(
+        &mut self,
+        entry: VerdictUndo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let VerdictUndo {
+            card,
+            verdict,
+            verb,
+            ..
+        } = entry;
+        self.dashboard.clear_skip(&card.identity);
+        crate::journal::record(crate::journal::Event::VerdictUndone {
+            card: Self::journal_card_identity(&card.identity),
+            verdict: Self::journal_dealer_verdict(verdict),
+        });
+        self.echo(
+            &format!("undid {verb}: {}", card.breadcrumb),
+            StyleClass::SystemInfo,
+            cx,
+        );
+        self.dashboard.reopen_deal(card);
+        self.deal_session_open = true;
+        self.present_current_deal(window, cx);
+        self.refresh_dashboard(window, cx);
+    }
+
+    pub(crate) fn undo_verdict(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(entry) = self.verdict_undo.pop() else {
+            self.echo("nothing to undo", StyleClass::SystemInfo, cx);
+            return;
+        };
+        match entry.state.clone() {
+            VerdictUndoState::DeskMarks { host, node, prior } => {
+                let Some((batch, messages)) = self
+                    .desk_tree_sync
+                    .prepare_temporal_batch(host, node, prior)
+                else {
+                    self.verdict_undo.push(entry);
+                    self.echo(
+                        "undo: Desk heading is unavailable",
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
+                    return;
+                };
+                self.pending_tree_undos
+                    .insert((host, batch.id), PendingTreeUndo { entry });
+                self.desk_tree_sync.apply_optimistic(host, &messages, cx);
+                self.sync_tree_dashboard(host, window, cx);
+                self.send_to_host(host, ClientMessage::DeskTreeBatchApply { batch });
+            }
+            VerdictUndoState::Inbox { id, prior } => {
+                debug_assert_eq!(id, prior.id);
+                if let Err(error) = self.inbox.restore(prior) {
+                    self.verdict_undo.push(entry);
+                    self.echo(&format!("undo: {error}"), StyleClass::SystemInfo, cx);
+                    return;
+                }
+                self.complete_verdict_undo(entry, window, cx);
+            }
+        }
+    }
+
     fn submit_tree_verdict(
         &mut self,
         target_node: Option<rho_desk::NodeId>,
@@ -8146,7 +8272,7 @@ impl Workspace {
         at: chrono::NaiveDateTime,
         pace_days: u32,
         verdict: crate::dashboard::DealerVerdict,
-        echo: String,
+        verb: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -8167,14 +8293,38 @@ impl Workspace {
             pace_days,
         };
         let values = temporal_verdict_values(kind, mark);
+        let Some(node) = self.desk_tree_sync.tree_node(card.host, node_id) else {
+            return false;
+        };
+        let prior = values
+            .iter()
+            .map(|(kind, _)| (*kind, node.temporal.get(kind).copied()))
+            .collect();
         let Some((batch, messages)) = self
             .desk_tree_sync
             .prepare_temporal_batch(card.host, node_id, values)
         else {
             return false;
         };
-        self.pending_tree_verdicts
-            .insert((card.host, batch.id), PendingTreeVerdict { verdict, echo });
+        let echo = format!("{verb}: {}", card.breadcrumb);
+        let undo = VerdictUndo {
+            card: card.clone(),
+            verdict,
+            verb,
+            state: VerdictUndoState::DeskMarks {
+                host: card.host,
+                node: node_id,
+                prior,
+            },
+        };
+        self.pending_tree_verdicts.insert(
+            (card.host, batch.id),
+            PendingTreeVerdict {
+                verdict,
+                echo,
+                undo,
+            },
+        );
         self.desk_tree_sync
             .apply_optimistic(card.host, &messages, cx);
         self.sync_tree_dashboard(card.host, window, cx);
@@ -10866,9 +11016,19 @@ impl Render for Workspace {
                 vim::take_count(cx);
                 this.deal_next(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &UndoVerdict, window, cx| {
+                vim::take_count(cx);
+                this.undo_verdict(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &DashboardDealDone, window, cx| {
                 vim::take_count(cx);
                 let card = this.dashboard.current_deal_card().cloned();
+                let prior_inbox = card.as_ref().and_then(|card| match &card.identity {
+                    crate::dashboard::DealCardIdentity::Inbox(id) => {
+                        this.inbox.get(&crate::inbox::InboxId(id.clone())).cloned()
+                    }
+                    _ => None,
+                });
                 let today = chrono::Local::now().date_naive();
                 let now = chrono::Local::now().fixed_offset();
                 if card
@@ -10924,6 +11084,17 @@ impl Render for Workspace {
                 };
                 let handled = result.is_ok();
                 if handled {
+                    if let (Some(card), Some(item)) = (card.clone(), prior_inbox) {
+                        this.verdict_undo.push(VerdictUndo {
+                            card,
+                            verdict: crate::dashboard::DealerVerdict::Done,
+                            verb: "done".to_owned(),
+                            state: VerdictUndoState::Inbox {
+                                id: item.id.clone(),
+                                prior: item,
+                            },
+                        });
+                    }
                     this.dashboard
                         .record_deal_verdict_as(crate::dashboard::DealerVerdict::Done, now);
                     this.finish_deal_verdict(window, cx);
@@ -10931,12 +11102,22 @@ impl Render for Workspace {
                 if let Err(reason) = result {
                     this.echo(&format!("done: {reason}"), StyleClass::SystemInfo, cx);
                 } else {
-                    this.echo("done", StyleClass::SystemInfo, cx);
+                    this.echo(
+                        &format!("done: {}", card.as_ref().unwrap().breadcrumb),
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
                 }
             }))
             .on_action(cx.listener(|this, _: &DashboardDealDiscard, window, cx| {
                 vim::take_count(cx);
                 let card = this.dashboard.current_deal_card().cloned();
+                let prior_inbox = card.as_ref().and_then(|card| match &card.identity {
+                    crate::dashboard::DealCardIdentity::Inbox(id) => {
+                        this.inbox.get(&crate::inbox::InboxId(id.clone())).cloned()
+                    }
+                    _ => None,
+                });
                 let today = chrono::Local::now().date_naive();
                 let now = chrono::Local::now().fixed_offset();
                 if card
@@ -10992,6 +11173,17 @@ impl Render for Workspace {
                 };
                 let handled = result.is_ok();
                 if handled {
+                    if let (Some(card), Some(item)) = (card.clone(), prior_inbox) {
+                        this.verdict_undo.push(VerdictUndo {
+                            card,
+                            verdict: crate::dashboard::DealerVerdict::Dismiss,
+                            verb: "discard".to_owned(),
+                            state: VerdictUndoState::Inbox {
+                                id: item.id.clone(),
+                                prior: item,
+                            },
+                        });
+                    }
                     this.dashboard
                         .record_deal_verdict_as(crate::dashboard::DealerVerdict::Dismiss, now);
                     this.finish_deal_verdict(window, cx);
@@ -10999,7 +11191,11 @@ impl Render for Workspace {
                 if let Err(reason) = result {
                     this.echo(&format!("discard: {reason}"), StyleClass::SystemInfo, cx);
                 } else {
-                    this.echo("discard", StyleClass::SystemInfo, cx);
+                    this.echo(
+                        &format!("discard: {}", card.as_ref().unwrap().breadcrumb),
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
                 }
             }))
             .on_action(cx.listener(|this, _: &DashboardDealSnooze, window, cx| {
@@ -11007,6 +11203,12 @@ impl Render for Workspace {
                 let today = chrono::Local::now().date_naive();
                 let now = chrono::Local::now().fixed_offset();
                 let card = this.dashboard.current_deal_card().cloned();
+                let prior_inbox = card.as_ref().and_then(|card| match &card.identity {
+                    crate::dashboard::DealCardIdentity::Inbox(id) => {
+                        this.inbox.get(&crate::inbox::InboxId(id.clone())).cloned()
+                    }
+                    _ => None,
+                });
                 if card
                     .as_ref()
                     .is_some_and(|card| card.topic_node_id.is_some())
@@ -11019,7 +11221,7 @@ impl Render for Workspace {
                             .and_time(chrono::NaiveTime::MIN),
                         days,
                         crate::dashboard::DealerVerdict::Defer,
-                        format!("snooze: {days}d"),
+                        format!("snooze {days}d"),
                         window,
                         cx,
                     ) {
@@ -11066,6 +11268,17 @@ impl Render for Workspace {
                 };
                 let handled = result.is_ok();
                 if handled {
+                    if let (Some(card), Some(item)) = (card.clone(), prior_inbox) {
+                        this.verdict_undo.push(VerdictUndo {
+                            card,
+                            verdict: crate::dashboard::DealerVerdict::Defer,
+                            verb: format!("snooze {}d", count.max(1)),
+                            state: VerdictUndoState::Inbox {
+                                id: item.id.clone(),
+                                prior: item,
+                            },
+                        });
+                    }
                     this.dashboard
                         .record_deal_verdict_as(crate::dashboard::DealerVerdict::Defer, now);
                     this.finish_deal_verdict(window, cx);
@@ -11076,7 +11289,11 @@ impl Render for Workspace {
                     this.echo(&format!("snooze: {reason}"), StyleClass::SystemInfo, cx);
                 } else {
                     let days = count.max(1);
-                    this.echo(&format!("snooze: {days}d"), StyleClass::SystemInfo, cx);
+                    this.echo(
+                        &format!("snooze {days}d: {}", card.as_ref().unwrap().breadcrumb),
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
                 }
             }))
             .on_action(
@@ -11092,7 +11309,7 @@ impl Render for Workspace {
                                 .and_time(chrono::NaiveTime::MIN),
                             days,
                             crate::dashboard::DealerVerdict::Defer,
-                            format!("room snooze: {days}d"),
+                            format!("snooze {days}d"),
                             window,
                             cx,
                         ) {
@@ -11121,7 +11338,7 @@ impl Render for Workspace {
                         today.and_time(chrono::NaiveTime::MIN),
                         days,
                         crate::dashboard::DealerVerdict::Done,
-                        format!("todo: {days}d"),
+                        "todo".to_owned(),
                         window,
                         cx,
                     ) {

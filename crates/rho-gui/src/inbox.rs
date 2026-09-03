@@ -296,6 +296,26 @@ impl InboxStore {
         }
     }
 
+    /// Restores the exact local state removed or changed by a user verdict.
+    pub fn restore(&mut self, item: InboxItem) -> anyhow::Result<bool> {
+        let previous = self
+            .items
+            .iter()
+            .position(|candidate| candidate.id == item.id)
+            .map(|index| self.items.remove(index));
+        self.items.push(item.clone());
+        self.items.sort_by_key(|item| item.captured_at_ms);
+        if let Err(error) = self.save() {
+            self.items.retain(|candidate| candidate.id != item.id);
+            if let Some(previous) = previous {
+                self.items.push(previous);
+                self.items.sort_by_key(|item| item.captured_at_ms);
+            }
+            return Err(error);
+        }
+        Ok(true)
+    }
+
     /// Pending projection input for the dealer: deferred items cost no card
     /// allocation until their wake time, while obligations remain immortal.
     pub fn pending_items(&self, at_ms: i64) -> impl Iterator<Item = &InboxItem> {

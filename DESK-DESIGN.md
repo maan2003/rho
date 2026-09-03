@@ -247,6 +247,12 @@ Ctrl-J skips it for 15 minutes, leaves its surface behind, and performs a fresh
 pull. `q` skips and closes the current dealt surface. Ctrl-Shift-J combines
 skip, close, and a fresh pull.
 
+Verdicts remain legible and reversible for the lifetime of the GUI session.
+Each confirmation names the visible card title and is retained in Messages;
+`U` (or **undo verdict** in the transient menu) reverses verdicts in LIFO order,
+restores the card's prior Desk temporal or inbox state, and immediately deals
+that card again. The stack is session-local and has no fixed depth.
+
 **Signals push dirtiness, never changes.** No event gets its own signal:
 things only mark the dealer dirty, and signals are derived from a fresh score. Two thresholds: a quiet visual cue (a translucent
 shade in a corner) at a lower bar, a chime at a higher one. The chime is

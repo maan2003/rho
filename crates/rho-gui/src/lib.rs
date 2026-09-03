@@ -92,6 +92,7 @@ actions!(
         DashboardDealSnooze,
         DashboardDealRoomSnooze,
         DashboardDealTodo,
+        UndoVerdict,
         DashboardDealReply,
         DashboardDealRefresh,
         DashboardDealInsert,
@@ -481,6 +482,21 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             KeyBinding::new("o", DashboardDealOpenLine, Some(context)),
             KeyBinding::new("f", DashboardDealFile, Some(context)),
         ]);
+    }
+    cx.bind_keys([KeyBinding::new(
+        "shift-u",
+        UndoVerdict,
+        Some("RhoGuiDeal > RhoBrowser"),
+    )]);
+    for context in [
+        "RhoGui > Editor && VimDeal && vim_operator == none",
+        "RhoGui > RhoDashboard > Editor && VimDeal && vim_operator == none",
+        "RhoDashboard > Editor && VimDeal && vim_operator == none",
+        "Editor && VimDeal && vim_operator == none",
+        "VimDeal && vim_operator == none",
+    ] {
+        let context = format!("{context} && (vim_mode == normal || vim_mode == helix_normal)");
+        cx.bind_keys([KeyBinding::new("shift-u", UndoVerdict, Some(&context))]);
     }
 }
 

@@ -700,6 +700,9 @@ pub fn root_menu() -> Transient {
         })
         .item("u", "universal argument", |workspace, _, cx| {
             workspace.set_universal_argument(cx);
+        })
+        .item("shift-u", "undo verdict", |_, window, cx| {
+            window.dispatch_action(Box::new(crate::UndoVerdict), cx);
         });
     // Slack is a native-only client: it holds the desktop session's own
     // token and cookie, which the browser build cannot.

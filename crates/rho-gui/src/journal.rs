@@ -439,6 +439,12 @@ pub enum Event {
         time_to_verdict_ms: u64,
         considered_not_dealt: Vec<DealerCardIdentity>,
     },
+    /// A local verdict reversal. External effects initiated by the original
+    /// verdict (for example, marking a Slack thread read) are not reversed.
+    VerdictUndone {
+        card: DealerCardIdentity,
+        verdict: DealerVerdict,
+    },
     Capture {
         inbox_id: String,
         method: CaptureMethod,
@@ -486,6 +492,7 @@ impl Event {
             Self::Scroll { .. } => "scroll",
             Self::Find { .. } => "find",
             Self::Dealer { .. } => "dealer",
+            Self::VerdictUndone { .. } => "verdict_undone",
         }
     }
 }
