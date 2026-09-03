@@ -353,7 +353,10 @@ done right after the transcript primitive (2.4) and before 2.10:
       conversations, threads }`. The fake counts the mark calls; the test
       asserts exactly one per old conversation and zero for newer ones.
       Screenshot the confirmation line and the list after.
-- [ ] 2.14 Verdicts are the user's keys only. Decided by the user on 3
+- [x] 2.14 Verdicts are the user's keys only. Landed 3 Sep. Combined
+      ping-plus-agent deal screenshot skipped: staging an agent means a
+      live model call; the ordering test is the proof.
+      Original: Decided by the user on 3
       Sep, recorded in SLACK-DESIGN "A Slack thread is shaped like an
       agent" and "A Slack card outranks an agent of the same wait". Three
       behaviours change. The user's own message no longer quiets a card
