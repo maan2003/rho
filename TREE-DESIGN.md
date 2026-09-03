@@ -150,6 +150,20 @@ the migrated marker, all deleted in one change so nothing carries a
 compatibility facade (the user's standing rule, 3 Sep). Queued for 5pha
 the moment the upgrade is confirmed.
 
+Deleted 3 Sep, after confirming read-only that the live daemon had run it:
+the daemon binary the running process was started from carries the
+conversion, and `initialize` runs on every start, so a daemon that is up
+and answering has cell state and had written the marker. Gone with it:
+`desk_tree_v1.rs`, the `desk-tree-v1-real.redb` fixture (the cell tests
+now seed their own note), the `MigrationReport` and its marker table, and
+the rollback paragraph in SECURITY. A database with no cell state now
+starts empty instead of converting one. What is left of V1 is the native
+tree store itself (`desk_tree.rs`, the `DeskTree*` protocol messages, and
+`desk_org_migration*`, which only it uses): nothing writes to it, and the
+one reader is `rho desk cat`/`checkout`, the agent-facing skill, which
+still shows the pre-cutover tree. That view has to move onto cells or go,
+and it is the user's call which.
+
 ## Slices, in landing order
 
 1. Storage: cells, LWW and add-wins merge, verdict log, materializer with

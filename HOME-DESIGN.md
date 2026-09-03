@@ -114,11 +114,11 @@ so a card can come back this afternoon); days and weeks land on a date, as
 a defer always has. The bar says the time it comes back on (`snooze until
 22:54`, `snooze until Sat 5 Sep`), and the map's mark hint carries the
 clock time with it. The phone's defer button opens the chips instead of
-taking a day; the agent snooze prompt is gone. One thing left open: a
-snoozed node keeps whatever `pace_days` it had, because `Verdict::Defer`
-writes one field and both the writer and the daemon's checker read that
-shape from `rho-desk`. Zeroing the pace on a snooze is a shared change and
-a profile upgrade.
+taking a day; the agent snooze prompt is gone. The pace follows in the
+next change: `Verdict::Defer` writes `pace_days` 0 beside the wake time, so
+a snoozed todo comes back from zero rather than halfway up its old curve.
+The pair is one shape in `rho-desk`, which the writer builds and the daemon
+checks, so an entry naming only the wake time is refused.
 
 ## Deliberately deferred
 

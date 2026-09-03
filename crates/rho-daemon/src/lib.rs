@@ -35,7 +35,6 @@ mod desk_cells;
 mod desk_org_migration;
 mod desk_org_migration_types;
 mod desk_tree;
-mod desk_tree_v1;
 mod iris;
 mod realtime;
 mod secret_store;
@@ -1048,20 +1047,9 @@ impl AgentRegistry {
         })
         .await
         .map_err(anyhow::Error::msg)?;
-        let (desk_cells, migration_report, migrated_now) =
-            desk_cells::DeskCellStore::new(db.clone(), machine_seed)
-                .await
-                .map_err(anyhow::Error::msg)?;
-        if migrated_now {
-            tracing::info!(
-                warnings = migration_report.warnings.len(),
-                page_urls_awaiting_backfill = migration_report.page_urls_awaiting_backfill.len(),
-                ?migration_report.kind_counts,
-                rooted_by_chain_rule = migration_report.rooted_by_chain_rule,
-                dropped_marks = migration_report.dropped_marks,
-                "migrated Desk tree V1 to cells V2"
-            );
-        }
+        let desk_cells = desk_cells::DeskCellStore::new(db.clone(), machine_seed)
+            .await
+            .map_err(anyhow::Error::msg)?;
         let registry = Self {
             pool,
             db,

@@ -4522,6 +4522,54 @@ fn deal_file_bare_enter_files_the_dealt_node_under_the_offered_heading(cx: &mut 
         .unwrap();
 }
 
+/// A snoozed todo comes back from zero: the pace it climbed at before goes
+/// with the verdict, or the card would return already halfway up the curve.
+#[gpui::test]
+fn a_snooze_zeroes_the_pace_it_was_climbing_at(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    let dealt = desk.due_note(None, "Paced card");
+    desk.set(
+        dealt,
+        rho_desk::cells::Field::PaceDays,
+        rho_desk::cells::Value::Days(7),
+    );
+
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.open_deal_mode(window, cx);
+            workspace.take_host_messages_for_test(HostId::default());
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    cx.dispatch_action(*workspace, crate::DashboardDealSnooze);
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            let mutation =
+                take_desk_mutation(workspace, HostId::default()).expect("snooze mutation");
+            assert!(mutation.writes.iter().any(|write| write.node == dealt
+                && write.field == rho_desk::cells::Field::PaceDays
+                && write.value == rho_desk::cells::Value::Days(0)));
+            let Some((_, rho_desk::cells::VerdictEvent::Applied { changes, .. })) =
+                mutation.verdict
+            else {
+                panic!("the snooze records an applied verdict");
+            };
+            // The entry says what it put back, so an undo restores the pace.
+            let paced = changes
+                .iter()
+                .find(|change| change.field == rho_desk::cells::Field::PaceDays)
+                .expect("the pace is part of the verdict");
+            assert_eq!(paced.before, Some(rho_desk::cells::Value::Days(7)));
+            assert_eq!(paced.after, Some(rho_desk::cells::Value::Days(0)));
+        })
+        .unwrap();
+}
+
 #[gpui::test]
 fn cancelling_the_file_prompt_writes_nothing_and_keeps_the_card(cx: &mut TestAppContext) {
     let mut desk = DeskFixture::new();

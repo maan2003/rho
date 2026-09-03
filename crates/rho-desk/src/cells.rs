@@ -187,24 +187,31 @@ pub struct TodoCadence {
 /// is the value the verdict's field had, which only the writer knows;
 /// `cadence` is required for `todo`, whose changes describe the note the
 /// verdict creates rather than the node it was dealt on.
+/// The shape a verdict has to have, against the values the node carries
+/// now. `before` answers per field, since a verdict may touch more than one.
 pub fn verdict_changes(
     node: NodeId,
     verdict: &Verdict,
-    before: Option<Value>,
+    before: &dyn Fn(&Field) -> Option<Value>,
     cadence: Option<TodoCadence>,
 ) -> Result<Vec<FieldChange>, String> {
-    let one = |field: Field, after: Value| {
-        Ok(vec![FieldChange {
-            node,
-            field,
-            before: before.clone(),
-            after: Some(after),
-        }])
+    let change = |field: Field, after: Value| FieldChange {
+        before: before(&field),
+        node,
+        field,
+        after: Some(after),
     };
+    let one = |field: Field, after: Value| Ok(vec![change(field, after)]);
     match verdict {
         Verdict::Done => one(Field::State, Value::State(State::Done)),
         Verdict::Dismiss => one(Field::State, Value::State(State::Dismissed)),
-        Verdict::Defer { until } => one(Field::DeferUntil, Value::OptionalTimestamp(Some(*until))),
+        // A snooze puts the card back at zero: `elapsed - pace` is the todo
+        // curve when a pace is set and the defer curve when it is not, so a
+        // deferred todo that kept its old pace would come back climbing.
+        Verdict::Defer { until } => Ok(vec![
+            change(Field::DeferUntil, Value::OptionalTimestamp(Some(*until))),
+            change(Field::PaceDays, Value::Days(0)),
+        ]),
         Verdict::File { parent } => one(Field::Parent, Value::Parent(Some(*parent))),
         // A todo is the one verdict that writes a whole new note, so its
         // entry carries all three cells that make that note a live cadence,
@@ -223,7 +230,7 @@ pub fn verdict_changes(
                 FieldChange {
                     node,
                     field: Field::State,
-                    before: before.clone(),
+                    before: before(&Field::State),
                     after: Some(Value::State(State::Done)),
                 },
                 change(Field::Deleted, Value::Bool(true), Value::Bool(false)),

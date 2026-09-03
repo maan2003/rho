@@ -1,4 +1,4 @@
-//! Cells-V2 persistence and the one-shot native-tree V1 conversion.
+//! Cells-V2 persistence.
 
 #![allow(dead_code)]
 
@@ -19,8 +19,6 @@ const VERDICTS: TableDefinition<Sen<VerdictKey>, Sen<VerdictEvent>> =
 const TEXTS: TableDefinition<Sen<NodeId>, Sen<rho_desk::NodeTextSnapshot>> =
     TableDefinition::new("rho_desk_node_text_v2");
 const META: TableDefinition<(), Sen<CellMeta>> = TableDefinition::new("rho_desk_cell_meta_v2");
-const MIGRATED: TableDefinition<(), Sen<MigrationReport>> =
-    TableDefinition::new("rho_desk_tree_migrated_v2");
 const MUTATIONS: TableDefinition<Sen<Stamp>, Sen<CellMutation>> =
     TableDefinition::new("rho_desk_mutations_v2");
 
@@ -42,18 +40,6 @@ struct CellMeta {
     frontier: Version,
     device_node_namespaces: Vec<(DeviceId, u16)>,
     next_node_namespace: u16,
-}
-
-#[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
-pub(crate) struct MigrationReport {
-    pub(crate) warnings: Vec<String>,
-    pub(crate) page_urls_awaiting_backfill: Vec<NodeId>,
-    #[senax(default)]
-    pub(crate) kind_counts: Vec<(rho_desk::cells::NodeKind, u64)>,
-    #[senax(default)]
-    pub(crate) rooted_by_chain_rule: u64,
-    #[senax(default)]
-    pub(crate) dropped_marks: u64,
 }
 
 #[derive(Clone)]
@@ -91,16 +77,12 @@ pub(crate) enum BindPlacement {
 }
 
 impl DeskCellStore {
-    pub(crate) async fn new(
-        db: RhoDb,
-        machine_seed: u64,
-    ) -> Result<(Self, MigrationReport, bool), String> {
+    pub(crate) async fn new(db: RhoDb, machine_seed: u64) -> Result<Self, String> {
         let mut write = db.write().await;
-        let already_migrated = write.open_table(MIGRATED).get(&()).is_some();
-        let report = initialize(&mut write, machine_seed)?;
+        initialize(&mut write, machine_seed)?;
         write.open_table(MUTATIONS);
         write.commit();
-        Ok((Self { db }, report, !already_migrated))
+        Ok(Self { db })
     }
 
     pub(crate) fn sync_since(&self, known: &Version) -> Result<Snapshot, String> {
@@ -942,10 +924,12 @@ fn validate_verdict_shape(
     let expected = rho_desk::cells::verdict_changes(
         verdict_node,
         verdict,
-        changes
-            .iter()
-            .find(|change| change.node == verdict_node)
-            .and_then(|change| change.before.clone()),
+        &|field| {
+            changes
+                .iter()
+                .find(|change| change.node == verdict_node && &change.field == field)
+                .and_then(|change| change.before.clone())
+        },
         rho_desk::cells::todo_cadence(changes),
     )?;
     let mut shape = changes.to_vec();
@@ -987,52 +971,27 @@ fn user_field(field: &Field) -> bool {
     )
 }
 
-pub(crate) fn initialize(
-    write: &mut WriteTxn,
-    machine_seed: u64,
-) -> Result<MigrationReport, String> {
-    let meta_exists = write.open_table(META).get(&()).is_some();
-    let report = write
-        .open_table(MIGRATED)
-        .get(&())
-        .map(|value| value.value().into_owned());
-    match (meta_exists, report) {
-        (true, Some(report)) => {
-            upgrade_slice_1a_state(write, machine_seed)?;
-            return Ok(report);
-        }
-        (true, None) => {
-            return Err("Desk cells V2 state exists without its migration marker".into());
-        }
-        (false, Some(_)) => {
-            return Err("Desk cells V2 migration marker exists without state".into());
-        }
-        (false, None) => {}
+/// Opens the cell tables, making the empty state on a database that has
+/// none. The native-tree V1 conversion that used to run here is gone: it
+/// ran once on every daemon it was ever going to run on.
+pub(crate) fn initialize(write: &mut WriteTxn, machine_seed: u64) -> Result<(), String> {
+    if write.open_table(META).get(&()).is_some() {
+        return upgrade_slice_1a_state(write, machine_seed);
     }
-
-    let legacy = crate::desk_tree_v1::load_replayed(write)?
-        .ok_or("Desk native-tree V1 state is missing during cells migration")?;
     let daemon_device = DeviceId(*uuid::Uuid::new_v4().as_bytes());
-    let migrated = migrate_v1(legacy, daemon_device, machine_seed)?;
-    let daemon_namespace = migrated.next_node_namespace;
-    let next_node_namespace = daemon_namespace
-        .checked_add(1)
-        .ok_or("Desk node namespace exhausted during migration")?;
-    let report = migration_report(&migrated, daemon_device)?;
-    persist_snapshot(write, &migrated.snapshot, migrated.texts)?;
     write.open_table(META).insert(
         &(),
         SenValue::owned(CellMeta {
             daemon_device,
-            frontier: migrated.snapshot.version,
-            device_node_namespaces: vec![(daemon_device, daemon_namespace)],
-            next_node_namespace,
+            frontier: Version::new(),
+            device_node_namespaces: vec![(daemon_device, 1)],
+            next_node_namespace: 2,
         }),
     );
-    write
-        .open_table(MIGRATED)
-        .insert(&(), SenValue::borrowed(&report));
-    Ok(report)
+    write.open_table(CELLS);
+    write.open_table(VERDICTS);
+    write.open_table(TEXTS);
+    Ok(())
 }
 
 fn upgrade_slice_1a_state(write: &mut WriteTxn, machine_seed: u64) -> Result<(), String> {
@@ -1111,304 +1070,6 @@ fn upgrade_slice_1a_state(write: &mut WriteTxn, machine_seed: u64) -> Result<(),
         persist_accepted_mutation(write, &mut meta, &store, mutation);
     }
     Ok(())
-}
-
-struct ConvertedV1 {
-    snapshot: Snapshot,
-    texts: Vec<rho_desk::NodeTextSnapshot>,
-    warnings: Vec<String>,
-    next_node_namespace: u16,
-}
-
-fn migration_report(migrated: &ConvertedV1, device: DeviceId) -> Result<MigrationReport, String> {
-    let page_urls_awaiting_backfill =
-        migrated
-            .snapshot
-            .cells
-            .iter()
-            .filter(|cell| {
-                cell.field == Field::PageRef
-                    && !migrated.snapshot.cells.iter().any(|candidate| {
-                        candidate.node == cell.node && candidate.field == Field::Url
-                    })
-            })
-            .map(|cell| cell.node)
-            .collect();
-    let migrated_store = Store::from_snapshot(device, migrated.snapshot.clone())?;
-    let materialized = migrated_store.materialize();
-    let mut kind_counts = std::collections::BTreeMap::new();
-    let mut rooted_by_chain_rule = 0;
-    for node in &materialized {
-        *kind_counts.entry(node.kind).or_insert(0) += 1;
-        if node.parent.is_none()
-            && matches!(
-                migrated_store.value(node.id, &Field::Parent),
-                Some(rho_desk::cells::Value::Parent(Some(_)))
-            )
-        {
-            rooted_by_chain_rule += 1;
-        }
-    }
-    Ok(MigrationReport {
-        warnings: migrated.warnings.clone(),
-        page_urls_awaiting_backfill,
-        kind_counts: kind_counts.into_iter().collect(),
-        rooted_by_chain_rule,
-        dropped_marks: 0,
-    })
-}
-
-fn migrate_v1(
-    legacy: crate::desk_tree_v1::Snapshot,
-    device: DeviceId,
-    machine_seed: u64,
-) -> Result<ConvertedV1, String> {
-    use rho_desk::cells::{NodeKind, State, Store, Timestamp, TimestampPrecision, Value};
-
-    use crate::desk_tree_v1 as v1;
-    let migration_namespace = legacy
-        .nodes
-        .iter()
-        .map(|node| node.id.replica_id)
-        .chain(legacy.replicas.iter().map(|replica| replica.replica_id))
-        .max()
-        .unwrap_or(text::ReplicaId::FIRST_COLLAB_ID.as_u16().saturating_sub(1))
-        .checked_add(1)
-        .ok_or("Desk node namespace exhausted during migration")?;
-    let order = v1::Document::from_snapshot(legacy.clone())?
-        .materialize()
-        .into_iter()
-        .enumerate()
-        .map(|(index, node)| (node.id, index as i64))
-        .collect::<std::collections::BTreeMap<_, _>>();
-    let mut store = Store::new(device);
-    let mut warnings = Vec::new();
-    let mut synthetic_file_count = 0_u64;
-    for (fallback_order, old) in legacy.nodes.iter().enumerate() {
-        let id = current_id(old.id);
-        let kind = match old.kind {
-            v1::NodeKind::Agent => NodeKind::Agent,
-            v1::NodeKind::Page => NodeKind::Page,
-            v1::NodeKind::File => NodeKind::File,
-            v1::NodeKind::Heading | v1::NodeKind::Prose | v1::NodeKind::Draft => NodeKind::Note,
-        };
-        let parent = old
-            .placements
-            .iter()
-            .max_by_key(|placement| placement.timestamp)
-            .and_then(|placement| placement.parent)
-            .map(current_id);
-        store.write(id, Field::Kind, Value::Kind(kind))?;
-        store.write(id, Field::Parent, Value::Parent(parent))?;
-        store.write(
-            id,
-            Field::CreatedAt,
-            Value::Timestamp(Timestamp {
-                unix_ms: order
-                    .get(&old.id)
-                    .copied()
-                    .unwrap_or_else(|| order.len() as i64 + fallback_order as i64),
-                precision: TimestampPrecision::Millisecond,
-            }),
-        )?;
-        store.write(id, Field::Deleted, Value::Bool(old.deleted_at.is_some()))?;
-        let state = old
-            .temporal
-            .iter()
-            .filter_map(|(kind, stamp, mark)| {
-                mark.as_ref()?;
-                let value = match kind {
-                    v1::TemporalKind::Todo => State::Open,
-                    v1::TemporalKind::Done => State::Done,
-                    v1::TemporalKind::Discarded => State::Dismissed,
-                    _ => return None,
-                };
-                Some((*stamp, value))
-            })
-            .max_by_key(|(stamp, _)| *stamp)
-            .map_or(State::Open, |(_, state)| state);
-        store.write(id, Field::State, Value::State(state))?;
-        let pace = old
-            .temporal
-            .iter()
-            .filter(|(kind, _, _)| {
-                matches!(
-                    kind,
-                    v1::TemporalKind::Todo
-                        | v1::TemporalKind::Defer
-                        | v1::TemporalKind::Reminder
-                        | v1::TemporalKind::Deadline
-                )
-            })
-            .filter_map(|(kind, stamp, mark)| {
-                mark.map(|mark| {
-                    (
-                        *stamp,
-                        if *kind == v1::TemporalKind::Defer {
-                            0
-                        } else {
-                            mark.pace_days
-                        },
-                    )
-                })
-            })
-            .max_by_key(|(stamp, _)| *stamp)
-            .map_or(0, |(_, pace)| pace);
-        store.write(id, Field::PaceDays, Value::Days(pace))?;
-        let defer = old
-            .temporal
-            .iter()
-            .filter_map(|(kind, stamp, mark)| {
-                matches!(
-                    kind,
-                    v1::TemporalKind::Todo | v1::TemporalKind::Defer | v1::TemporalKind::Reminder
-                )
-                .then_some((*stamp, *kind, *mark))
-            })
-            .filter_map(|(stamp, kind, mark)| mark.map(|mark| (stamp, kind, mark)))
-            .max_by_key(|(stamp, _, _)| *stamp);
-        let defer_until = defer.map(|(_, _, mark)| timestamp(mark)).transpose()?;
-        store.write(id, Field::DeferUntil, Value::OptionalTimestamp(defer_until))?;
-        if let Some((_, source, _)) = defer {
-            if source == v1::TemporalKind::Reminder {
-                warnings.push(format!(
-                    "node {:?}: reminder converted to defer-until",
-                    old.id
-                ));
-            }
-        }
-        let deadline = old
-            .temporal
-            .iter()
-            .filter(|(kind, _, _)| *kind == v1::TemporalKind::Deadline)
-            .max_by_key(|(_, stamp, _)| *stamp)
-            .and_then(|(_, _, mark)| *mark)
-            .map(timestamp)
-            .transpose()?;
-        store.write(id, Field::Deadline, Value::OptionalTimestamp(deadline))?;
-        for (tag, _, present) in &old.tags {
-            store.write(id, Field::Tag(tag.clone()), Value::Bool(*present))?;
-        }
-        let active_bindings = old.bindings.iter().fold(
-            std::collections::BTreeMap::new(),
-            |mut latest, (kind, stamp, binding)| {
-                if latest
-                    .get(kind)
-                    .is_none_or(|(latest_stamp, _)| stamp > latest_stamp)
-                {
-                    latest.insert(*kind, (*stamp, binding));
-                }
-                latest
-            },
-        );
-        for (binding_kind, (_, binding)) in active_bindings {
-            let Some(binding) = binding else { continue };
-            if binding.kind() != binding_kind {
-                return Err(format!(
-                    "legacy node {:?} has a binding whose value does not match its kind",
-                    old.id
-                ));
-            }
-            match binding {
-                v1::Binding::Agent(agent) => {
-                    if kind != NodeKind::Agent {
-                        return Err(format!(
-                            "legacy {:?} node {:?} has an agent binding",
-                            old.kind, old.id
-                        ));
-                    }
-                    store.write(id, Field::AgentId, Value::AgentId(agent.clone()))?;
-                    store.write(id, Field::Host, Value::Host(machine_seed))?;
-                }
-                v1::Binding::Page(page) => {
-                    if kind != NodeKind::Page {
-                        return Err(format!(
-                            "legacy {:?} node {:?} has a page binding",
-                            old.kind, old.id
-                        ));
-                    }
-                    store.write(id, Field::PageRef, Value::PageRef(rho_desk::PageId(page.0)))?;
-                    warnings.push(format!(
-                        "node {:?}: page URL awaits GUI registry backfill",
-                        old.id
-                    ));
-                }
-                v1::Binding::File(path) => {
-                    if kind == NodeKind::File {
-                        store.write(id, Field::Path, Value::Path(path.clone()))?;
-                    } else if old.kind == v1::NodeKind::Heading {
-                        synthetic_file_count += 1;
-                        let file = NodeId {
-                            replica_id: migration_namespace,
-                            counter: synthetic_file_count,
-                        };
-                        let created_at = match store.value(id, &Field::CreatedAt) {
-                            Some(Value::Timestamp(value)) => *value,
-                            _ => unreachable!("migration just wrote CreatedAt"),
-                        };
-                        store.write(file, Field::Kind, Value::Kind(NodeKind::File))?;
-                        store.write(file, Field::Parent, Value::Parent(Some(id)))?;
-                        store.write(file, Field::CreatedAt, Value::Timestamp(created_at))?;
-                        store.write(file, Field::Deleted, Value::Bool(old.deleted_at.is_some()))?;
-                        store.write(file, Field::State, Value::State(State::Open))?;
-                        store.write(file, Field::DeferUntil, Value::OptionalTimestamp(None))?;
-                        store.write(file, Field::Deadline, Value::OptionalTimestamp(None))?;
-                        store.write(file, Field::PaceDays, Value::Days(0))?;
-                        store.write(file, Field::Path, Value::Path(path.clone()))?;
-                    } else {
-                        return Err(format!(
-                            "legacy {:?} node {:?} has a file binding",
-                            old.kind, old.id
-                        ));
-                    }
-                }
-            }
-        }
-    }
-    if synthetic_file_count > 0 {
-        warnings.push(format!(
-            "split {synthetic_file_count} legacy heading file bindings into File children"
-        ));
-    }
-    let texts = legacy
-        .texts
-        .into_iter()
-        .map(crate::desk_tree_v1::text_into_current)
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(ConvertedV1 {
-        snapshot: store.snapshot(),
-        texts,
-        warnings,
-        next_node_namespace: if synthetic_file_count == 0 {
-            migration_namespace
-        } else {
-            migration_namespace
-                .checked_add(1)
-                .ok_or("Desk node namespace exhausted after creating migration nodes")?
-        },
-    })
-}
-
-fn current_id(id: crate::desk_tree_v1::NodeId) -> NodeId {
-    NodeId {
-        replica_id: id.replica_id,
-        counter: id.counter,
-    }
-}
-
-fn timestamp(
-    mark: crate::desk_tree_v1::TemporalMark,
-) -> Result<rho_desk::cells::Timestamp, String> {
-    use rho_desk::cells::{Timestamp, TimestampPrecision};
-    let at = mark.at().ok_or("invalid legacy Desk temporal mark")?;
-    Ok(Timestamp {
-        unix_ms: at.and_utc().timestamp_millis(),
-        precision: if mark.minute_of_day.is_some() {
-            TimestampPrecision::Minute
-        } else {
-            TimestampPrecision::Day
-        },
-    })
 }
 
 fn read_snapshot(read: &rho_db::ReadTxn) -> Result<Snapshot, String> {
@@ -1528,188 +1189,91 @@ fn persist_snapshot(
 
 #[cfg(test)]
 mod tests {
-    use bytes::BytesMut;
-    use redb::{TableDefinition, TypeName, Value as RedbValue};
     use rho_db::RhoDb;
-    use senax_encoder::{Decoder, Encoder};
 
     use super::*;
 
-    #[derive(Clone, Debug, Encode, Decode)]
-    struct V1MigrationReport {
-        warnings: Vec<String>,
-        page_urls_awaiting_backfill: Vec<NodeId>,
-    }
-
-    #[derive(Debug)]
-    struct V1MigrationReportValue;
-
-    impl RedbValue for V1MigrationReportValue {
-        type SelfType<'a> = SenValue<'a, V1MigrationReport>;
-        type AsBytes<'a> = BytesMut;
-
-        fn fixed_width() -> Option<usize> {
-            None
-        }
-
-        fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
-        where
-            Self: 'a,
-        {
-            let mut data = data;
-            SenValue::owned(V1MigrationReport::decode(&mut data).unwrap())
-        }
-
-        fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
-        where
-            Self: 'b,
-        {
-            let mut bytes = BytesMut::new();
-            value.as_ref().encode(&mut bytes).unwrap();
-            bytes
-        }
-
-        fn type_name() -> TypeName {
-            TypeName::new("rho-db::Sen<rho_daemon::desk_cells::MigrationReport>")
-        }
-    }
-
+    /// A store with one user note at the root, which is the smallest real
+    /// state: machine rows are filed under a note, so an empty database on
+    /// its own cannot answer for one.
     async fn fixture_store() -> DeskCellStore {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("rho.redb");
-        std::fs::write(&path, include_bytes!("../testdata/desk-tree-v1-real.redb")).unwrap();
         let db = RhoDb::open(path);
         // RhoDb owns the open file after the temporary directory handle drops.
-        DeskCellStore::new(db, 42).await.unwrap().0
+        let store = DeskCellStore::new(db, 42).await.unwrap();
+        seed_note(&store, DeviceId([1; 16])).await;
+        store
     }
 
-    #[tokio::test]
-    async fn frozen_v1_fixture_migrates_once_into_v2_tables() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("rho.redb");
-        std::fs::write(&path, include_bytes!("../testdata/desk-tree-v1-real.redb")).unwrap();
-        let db = RhoDb::open(path);
-        let machine_seed = 42;
-        let first = {
-            let mut write = db.write().await;
-            let report = initialize(&mut write, machine_seed).unwrap();
-            write.commit();
-            report
+    /// Writes one complete root note the way a client does, and answers with
+    /// it. Every field a new note needs is here; the daemon rejects a
+    /// partial one.
+    async fn seed_note(store: &DeskCellStore, device: DeviceId) -> NodeId {
+        use rho_desk::cells::{
+            CellMutation, CellWrite, NodeKind, State, Timestamp, TimestampPrecision, Value,
         };
-        assert_eq!(
-            first
-                .kind_counts
-                .iter()
-                .map(|(_, count)| count)
-                .sum::<u64>(),
-            2
-        );
-        assert_eq!(first.dropped_marks, 0);
-        let read = db.read();
-        assert!(read.open_table(META).get(&()).is_some());
-        assert!(read.open_table(MIGRATED).get(&()).is_some());
-        let cells = read
-            .open_table(CELLS)
-            .iter()
-            .map(|(_, value)| value.value().into_owned())
-            .collect::<Vec<_>>();
-        assert!(cells.iter().any(|cell| {
-            cell.field == Field::Kind
-                && cell.value == rho_desk::cells::Value::Kind(rho_desk::cells::NodeKind::Note)
-        }));
-        assert!(cells.iter().any(|cell| {
-            cell.field == Field::PaceDays && cell.value == rho_desk::cells::Value::Days(3)
-        }));
-        assert_eq!(
-            cells
-                .iter()
-                .map(|cell| cell.node)
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
-            2
-        );
-        assert!(cells.iter().all(|cell| {
-            cell.field != Field::Deleted || cell.value == rho_desk::cells::Value::Bool(false)
-        }));
-        assert!(cells.iter().any(|cell| {
-            cell.field == Field::Parent
-                && matches!(cell.value, rho_desk::cells::Value::Parent(Some(_)))
-        }));
-        assert_eq!(read.open_table(TEXTS).iter().count(), 2);
-        drop(read);
-        let second = {
-            let mut write = db.write().await;
-            let report = initialize(&mut write, machine_seed).unwrap();
-            write.commit();
-            report
-        };
-        assert_eq!(second, first);
-    }
 
-    #[tokio::test]
-    async fn migration_splits_a_heading_file_binding_into_a_typed_child() {
-        use crate::desk_tree_v1 as v1;
-
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("rho.redb");
-        std::fs::write(&path, include_bytes!("../testdata/desk-tree-v1-real.redb")).unwrap();
-        let db = RhoDb::open(path);
-        let mut write = db.write().await;
-        let mut legacy = v1::load_replayed(&mut write).unwrap().unwrap();
-        drop(write);
-        let heading = legacy
-            .nodes
-            .iter_mut()
-            .find(|node| node.kind == v1::NodeKind::Heading)
-            .unwrap();
-        let heading_id = current_id(heading.id);
-        heading.bindings.push((
-            v1::BindingKind::File,
-            v1::TreeClock {
-                value: u32::MAX,
-                replica_id: heading.id.replica_id,
-            },
-            Some(v1::Binding::File(camino::Utf8PathBuf::from("rho"))),
-        ));
-        let migration_namespace = legacy
-            .nodes
-            .iter()
-            .map(|node| node.id.replica_id)
-            .chain(legacy.replicas.iter().map(|replica| replica.replica_id))
-            .max()
-            .unwrap()
-            + 1;
-
-        let converted = migrate_v1(legacy, DeviceId([4; 16]), 42).unwrap();
-        let store = Store::from_snapshot(DeviceId([4; 16]), converted.snapshot).unwrap();
-        let file_id = NodeId {
-            replica_id: migration_namespace,
+        let namespace = store.node_namespace(device).await.unwrap();
+        let node = NodeId {
+            replica_id: namespace,
             counter: 1,
         };
-        assert_eq!(
-            store.value(heading_id, &Field::Kind),
-            Some(&rho_desk::cells::Value::Kind(
-                rho_desk::cells::NodeKind::Note
-            ))
+        let write = |field, value| CellWrite { node, field, value };
+        let version = store
+            .frontier()
+            .unwrap()
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            + 1;
+        store
+            .apply_mutation(
+                device,
+                namespace,
+                CellMutation {
+                    stamp: Stamp { device, version },
+                    writes: vec![
+                        write(Field::Kind, Value::Kind(NodeKind::Note)),
+                        write(Field::Parent, Value::Parent(None)),
+                        write(Field::Deleted, Value::Bool(false)),
+                        write(
+                            Field::CreatedAt,
+                            Value::Timestamp(Timestamp {
+                                unix_ms: 1,
+                                precision: TimestampPrecision::Millisecond,
+                            }),
+                        ),
+                        write(Field::State, Value::State(State::Open)),
+                        write(Field::DeferUntil, Value::OptionalTimestamp(None)),
+                        write(Field::Deadline, Value::OptionalTimestamp(None)),
+                        write(Field::PaceDays, Value::Days(0)),
+                    ],
+                    verdict: None,
+                },
+            )
+            .await
+            .unwrap();
+        // A note without a body has no text row, and the text rules are
+        // tested against a real one.
+        let mut buffer = text::Buffer::new(
+            text::ReplicaId::new(namespace),
+            text::BufferId::new(1).unwrap(),
+            "",
         );
-        assert_eq!(
-            store.value(file_id, &Field::Parent),
-            Some(&rho_desk::cells::Value::Parent(Some(heading_id)))
-        );
-        assert_eq!(
-            store.value(file_id, &Field::Path),
-            Some(&rho_desk::cells::Value::Path(camino::Utf8PathBuf::from(
-                "rho"
-            )))
-        );
-        assert_eq!(converted.next_node_namespace, migration_namespace + 1);
+        let operation = rho_desk::TextOperation::from_text(&buffer.edit([(0..0, "seeded note")]));
+        store
+            .apply_text(namespace, node, operation, None)
+            .await
+            .unwrap();
+        node
     }
 
+    /// Slice-1a databases carry no daemon namespace and no host on an agent
+    /// node; reopening one fills both in without touching anything else.
     #[tokio::test]
-    async fn migration_report_added_fields_default_when_reopening_slice_1a_state() {
-        const OLD_MIGRATED: TableDefinition<(), V1MigrationReportValue> =
-            TableDefinition::new("rho_desk_tree_migrated_v2");
-
+    async fn reopening_slice_1a_state_fills_in_the_namespace_and_the_host() {
         let store = fixture_store().await;
         let machine_seed = 42;
         let parent = store.sync_since(&Version::new()).unwrap().cells[0].node;
@@ -1747,22 +1311,10 @@ mod tests {
             }),
             SenValue::owned(host_cell),
         );
-        write.open_table(OLD_MIGRATED).insert(
-            &(),
-            SenValue::owned(V1MigrationReport {
-                warnings: vec!["old".into()],
-                page_urls_awaiting_backfill: Vec::new(),
-            }),
-        );
         write.commit();
-        let (_, report, migrated_now) = DeskCellStore::new(store.db.clone(), machine_seed)
+        DeskCellStore::new(store.db.clone(), machine_seed)
             .await
             .unwrap();
-        assert!(!migrated_now);
-        assert_eq!(report.warnings, ["old"]);
-        assert!(report.kind_counts.is_empty());
-        assert_eq!(report.rooted_by_chain_rule, 0);
-        assert_eq!(report.dropped_marks, 0);
         let read = store.db.read();
         let upgraded = read.open_table(META).get(&()).unwrap().value().into_owned();
         assert_eq!(daemon_node_namespace(&upgraded).unwrap(), daemon_namespace);
@@ -1775,11 +1327,7 @@ mod tests {
     #[tokio::test]
     async fn mutations_are_connection_bound_idempotent_and_sync_since_frontiers() {
         use rho_desk::cells::{CellMutation, CellWrite, Value};
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("rho.redb");
-        std::fs::write(&path, include_bytes!("../testdata/desk-tree-v1-real.redb")).unwrap();
-        let db = RhoDb::open(path);
-        let (store, _, _) = DeskCellStore::new(db, 42).await.unwrap();
+        let store = fixture_store().await;
         let initial = store.sync_since(&Version::new()).unwrap();
         let node = initial.cells[0].node;
         let device = DeviceId([9; 16]);
@@ -2385,5 +1933,108 @@ mod tests {
             )
             .await;
         assert_eq!(result, Ok(()));
+    }
+    /// A snooze puts the card back at zero: the entry carries the pace with
+    /// the wake time, and one that names only the wake time is not a defer.
+    #[tokio::test]
+    async fn a_defer_verdict_zeroes_the_pace() {
+        use rho_desk::cells::{
+            CellMutation, CellWrite, FieldChange, Timestamp, TimestampPrecision, Value, Verdict,
+            VerdictEvent,
+        };
+
+        let store = fixture_store().await;
+        let device = DeviceId([13; 16]);
+        let namespace = store.node_namespace(device).await.unwrap();
+        let node = seed_note(&store, device).await;
+        let next_version =
+            |store: &DeskCellStore| store.frontier().unwrap().values().copied().max().unwrap() + 1;
+
+        // The note is a todo first, so the pace has something to zero.
+        let paced = next_version(&store);
+        store
+            .apply_mutation(
+                device,
+                namespace,
+                CellMutation {
+                    stamp: Stamp {
+                        device,
+                        version: paced,
+                    },
+                    writes: vec![CellWrite {
+                        node,
+                        field: Field::PaceDays,
+                        value: Value::Days(7),
+                    }],
+                    verdict: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let at = Timestamp {
+            unix_ms: 9,
+            precision: TimestampPrecision::Millisecond,
+        };
+        let wakes = FieldChange {
+            node,
+            field: Field::DeferUntil,
+            before: Some(Value::OptionalTimestamp(None)),
+            after: Some(Value::OptionalTimestamp(Some(at))),
+        };
+        let paced_to_zero = FieldChange {
+            node,
+            field: Field::PaceDays,
+            before: Some(Value::Days(7)),
+            after: Some(Value::Days(0)),
+        };
+        let defer = |version: u64, changes: Vec<FieldChange>| {
+            let stamp = Stamp { device, version };
+            CellMutation {
+                stamp,
+                writes: changes
+                    .iter()
+                    .map(|change| CellWrite {
+                        node: change.node,
+                        field: change.field.clone(),
+                        value: change.after.clone().unwrap(),
+                    })
+                    .collect(),
+                verdict: Some((
+                    node,
+                    VerdictEvent::Applied {
+                        verdict: Verdict::Defer { until: at },
+                        at: stamp,
+                        changes,
+                    },
+                )),
+            }
+        };
+
+        let only_the_wake_time = defer(next_version(&store), vec![wakes.clone()]);
+        assert!(
+            store
+                .apply_mutation(device, namespace, only_the_wake_time)
+                .await
+                .is_err()
+        );
+        let whole = defer(next_version(&store), vec![wakes, paced_to_zero]);
+        store
+            .apply_mutation(device, namespace, whole)
+            .await
+            .unwrap();
+
+        let materialized = Store::from_snapshot(
+            DeviceId([0; 16]),
+            store.sync_since(&Version::new()).unwrap(),
+        )
+        .unwrap()
+        .materialize();
+        let node = materialized
+            .into_iter()
+            .find(|candidate| candidate.id == node)
+            .unwrap();
+        assert_eq!(node.defer_until, Some(at));
+        assert_eq!(node.pace_days, 0);
     }
 }

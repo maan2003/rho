@@ -775,119 +775,89 @@ impl DeskCells {
     )> {
         use rho_desk::cells::{Field, Value, Verdict};
 
-        let (verdict, mut writes, change): (Verdict, Vec<rho_desk::cells::CellWrite>, _) =
-            match verdict {
-                DeskVerdict::Done | DeskVerdict::Dismiss => {
-                    let state = if matches!(verdict, DeskVerdict::Done) {
-                        rho_desk::cells::State::Done
-                    } else {
-                        rho_desk::cells::State::Dismissed
-                    };
-                    let verdict = if matches!(verdict, DeskVerdict::Done) {
-                        Verdict::Done
-                    } else {
-                        Verdict::Dismiss
-                    };
-                    (
-                        verdict,
-                        Vec::new(),
-                        (node_id, Field::State, Value::State(state)),
-                    )
-                }
-                DeskVerdict::Defer { until } => (
-                    Verdict::Defer { until },
-                    Vec::new(),
-                    (
-                        node_id,
-                        Field::DeferUntil,
-                        Value::OptionalTimestamp(Some(until)),
-                    ),
-                ),
-                DeskVerdict::File { parent } => (
-                    Verdict::File { parent },
-                    Vec::new(),
-                    (node_id, Field::Parent, Value::Parent(Some(parent))),
-                ),
-                DeskVerdict::Todo { defer_until, pace } => {
-                    let (note, mut writes) = self.create_note_writes(host, Some(node_id))?;
-                    // The creation already writes every common field, so the
-                    // cadence replaces those values rather than repeating them.
-                    for write in &mut writes {
-                        match write.field {
-                            Field::DeferUntil => {
-                                write.value = Value::OptionalTimestamp(Some(defer_until));
-                            }
-                            Field::PaceDays => write.value = Value::Days(pace),
-                            _ => {}
+        let (verdict, mut writes): (Verdict, Vec<rho_desk::cells::CellWrite>) = match verdict {
+            DeskVerdict::Done => (Verdict::Done, Vec::new()),
+            DeskVerdict::Dismiss => (Verdict::Dismiss, Vec::new()),
+            DeskVerdict::Defer { until } => (Verdict::Defer { until }, Vec::new()),
+            DeskVerdict::File { parent } => (Verdict::File { parent }, Vec::new()),
+            DeskVerdict::Todo { defer_until, pace } => {
+                let (note, mut writes) = self.create_note_writes(host, Some(node_id))?;
+                // The creation already writes every common field, so the
+                // cadence replaces those values rather than repeating them.
+                for write in &mut writes {
+                    match write.field {
+                        Field::DeferUntil => {
+                            write.value = Value::OptionalTimestamp(Some(defer_until));
                         }
+                        Field::PaceDays => write.value = Value::Days(pace),
+                        _ => {}
                     }
-                    // The entry is built by the same constructor the daemon
-                    // checks it against, so the writer and the checker cannot
-                    // drift. It also marks the dealt node done: the todo is
-                    // what handles it, and without that the dealer offers it
-                    // again the moment the note exists.
-                    let verdict = Verdict::Todo { note };
-                    let before = self
-                        .hosts
-                        .get(&host)?
-                        .view
-                        .value(node_id, &Field::State)
-                        .cloned();
-                    let changes = rho_desk::cells::verdict_changes(
-                        node_id,
-                        &verdict,
-                        before,
-                        Some(rho_desk::cells::TodoCadence {
-                            defer_until,
-                            pace_days: pace,
-                        }),
-                    )
-                    .ok()?;
-                    writes.push(rho_desk::cells::CellWrite {
-                        node: node_id,
-                        field: Field::State,
-                        value: Value::State(rho_desk::cells::State::Done),
-                    });
-                    let event = rho_desk::cells::VerdictEvent::Applied {
-                        verdict,
-                        at: rho_desk::cells::Stamp {
-                            device: self.device,
-                            version: 0,
-                        },
-                        changes,
-                    };
-                    return Some((writes, (node_id, event)));
                 }
-            };
-        let (change_node, field, after) = change;
-        let before = self
-            .hosts
-            .get(&host)?
-            .view
-            .value(change_node, &field)
-            .cloned()
-            // A note this mutation creates has no prior cell; the verdict log
-            // records its arrival as the deletion it was born out of.
-            .or_else(|| {
-                (field == Field::Deleted && change_node != node_id).then_some(Value::Bool(true))
-            });
-        if before.as_ref() == Some(&after) {
+                // The entry is built by the same constructor the daemon
+                // checks it against, so the writer and the checker cannot
+                // drift. It also marks the dealt node done: the todo is
+                // what handles it, and without that the dealer offers it
+                // again the moment the note exists.
+                let verdict = Verdict::Todo { note };
+                let view = &self.hosts.get(&host)?.view;
+                let changes = rho_desk::cells::verdict_changes(
+                    node_id,
+                    &verdict,
+                    &|field| view.value(node_id, field).cloned(),
+                    Some(rho_desk::cells::TodoCadence {
+                        defer_until,
+                        pace_days: pace,
+                    }),
+                )
+                .ok()?;
+                writes.push(rho_desk::cells::CellWrite {
+                    node: node_id,
+                    field: Field::State,
+                    value: Value::State(rho_desk::cells::State::Done),
+                });
+                let event = rho_desk::cells::VerdictEvent::Applied {
+                    verdict,
+                    at: rho_desk::cells::Stamp {
+                        device: self.device,
+                        version: 0,
+                    },
+                    changes,
+                };
+                return Some((writes, (node_id, event)));
+            }
+        };
+        // The writes come out of the same constructor the daemon checks the
+        // entry against, so a verdict that touches two fields (a snooze, which
+        // zeroes the pace as well) cannot drift between writer and checker.
+        let view = &self.hosts.get(&host)?.view;
+        let changes = rho_desk::cells::verdict_changes(
+            node_id,
+            &verdict,
+            &|field| view.value(node_id, field).cloned(),
+            None,
+        )
+        .ok()?;
+        // A verdict that changes nothing about what it is for is not one:
+        // deferring a card to the moment it already wakes leaves it alone.
+        let first = changes.first()?;
+        if first.before == first.after {
             return None;
         }
-        if !writes
-            .iter()
-            .any(|write| write.node == change_node && write.field == field)
-        {
-            writes.push(rho_desk::cells::CellWrite {
-                node: change_node,
-                field: field.clone(),
-                value: after.clone(),
-            });
-        } else if let Some(write) = writes
-            .iter_mut()
-            .find(|write| write.node == change_node && write.field == field)
-        {
-            write.value = after.clone();
+        for change in &changes {
+            let Some(after) = change.after.clone() else {
+                continue;
+            };
+            match writes
+                .iter_mut()
+                .find(|write| write.node == change.node && write.field == change.field)
+            {
+                Some(write) => write.value = after,
+                None => writes.push(rho_desk::cells::CellWrite {
+                    node: change.node,
+                    field: change.field.clone(),
+                    value: after,
+                }),
+            }
         }
         let event = rho_desk::cells::VerdictEvent::Applied {
             verdict,
@@ -895,12 +865,7 @@ impl DeskCells {
                 device: self.device,
                 version: 0,
             },
-            changes: vec![rho_desk::cells::FieldChange {
-                node: change_node,
-                field,
-                before,
-                after: Some(after),
-            }],
+            changes,
         };
         Some((writes, (node_id, event)))
     }

@@ -90,10 +90,10 @@ AI APIs.
   transactions, verdict changes, and mutation write counts have independent
   bounds before persistence. Failed validation commits no frontier, cell,
   verdict, text, or mutation-log entry.
-  The one-time native-tree V1 conversion and completion marker commit
-  atomically and send no content elsewhere. Frozen V1 tables remain untouched
-  for rollback but are not a runtime truth after cutover; rollback after V2
-  writes requires the pre-upgrade database copy.
+  The one-time native-tree V1 conversion is gone, with its marker and its
+  frozen decoder: it ran on every daemon it was ever going to run on. A
+  database that never took it has no cell state to read, and going back to
+  it means the pre-upgrade database copy.
 - Opt-in GUI and daemon Dial9 profiles contain thread names, function symbols,
   local source paths, precise activity timing, and frontend marker metadata.
   GUI editor markers include numeric edit counts, affected row ranges, map row
