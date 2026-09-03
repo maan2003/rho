@@ -220,7 +220,9 @@ done right after the transcript primitive (2.4) and before 2.10:
       `name: body`, so there is no client-side lever to make it two columns.
       It wants a minimum soft-wrap indent per editor; b8os does not touch
       the vendored editor.
-- [ ] 1.23 Images load without flicker. Seen by the user on 3 Sep: an
+- [x] 1.23 Images load without flicker. Landed 3 Sep as a fixed-size
+      block filled by Slack's thumbnail, not an inlay and not a blur filter
+      (gpui has none for images). Original: Seen by the user on 3 Sep: an
       image arriving in a conversation jumps. Two causes to remove: the
       box changes size when the bytes land, and the message item is
       replaced wholesale on arrival. Rho: the box is sized from the file's
