@@ -25,8 +25,10 @@ The user's three, in their words:
 
 Added in the talk that followed:
 
-- **quiet** is a real, declared fourth state, the default: working, nothing
-  for the human. Without it "show" is indistinguishable from "no news yet".
+- **there is no "quiet" state.** Nothing for the human is the absence of
+  an element, and whether the agent is running or idle is the daemon's
+  observation, not a declaration (the user's call on 3 Sep, over an
+  earlier draft that had quiet as a declared default).
 - **show is Slack's mention; unread is separate.** New output is a system
   fact. Show is the agent's judgement that something is worth the human's
   eyes. Keep both, like a channel with chatter versus one where the human
@@ -51,15 +53,15 @@ Added in the talk that followed:
 
 Went wrong and needs-input-blocked: steep. Done: medium, the human forgets
 and the agent's context goes cold. Needs-input-not-blocked: between. Show:
-flat, the human comes when interested. Quiet: below the cutoff. The agent
+flat, the human comes when interested. Nothing declared: below the cutoff. The agent
 sets the state and the reason; the curve is the human's, never the agent's.
 
 ## What clears each, or the status rots
 
 Show and done clear when the human opens the transcript (the read cursor,
 as in Slack). Needs input clears when the human replies or performs the
-act. Every status resets to quiet when the agent starts a new turn, so a
-stale done cannot outlive the next piece of work. An agent with a question
+act. Every status clears when the agent starts a new turn, so a stale done
+cannot outlive the next piece of work. An agent with a question
 and things to show reports the higher one, the question on top.
 
 ## How the agent declares it: a tag in the response, not a tool call
@@ -72,15 +74,16 @@ tool round trip:
 <rho-wants kind="needs-input" blocked="false" ask="decision"/>
 ```
 
-`kind` is one of `quiet`, `show`, `needs-input`, `done`; `blocked` and `ask`
+`kind` is one of `show`, `needs-input`, `done`; `blocked` and `ask`
 (`decision` or `act`) only on `needs-input`. No body: the user's call on
 3 Sep, a reason line is tokens spent repeating what the reply already
 says. The reason shown on Home and in the deal bar is the last line of the
 turn's own text, which Home shows for a running agent anyway. The daemon
 strips the element from the transcript text, records it as a typed event,
 and sets the fields; the element never renders. One element
-per turn; the last one in a turn wins. No element means the turn's default
-(quiet while working, done when the turn ends).
+per turn; the last one in a turn wins. No element means nothing declared:
+the row shows only what the daemon observes (running, idle since, stalled),
+and the human is not asked to look.
 
 Why a tag and not a tool: a tool call ends the turn and costs an inference
 step for a fact that never needs a result back. Four rules keep the tag
@@ -95,10 +98,10 @@ safe:
 - The name is distinctive (`<rho-wants>` rather than `<wants>`), so it
   cannot collide with markup an agent is talking about.
 
-Forgetting is the weak spot and is survivable: a missing tag is the turn's
-default, and the states that matter most (stalled, crashed) are observed by
-the daemon, so a forgetful agent degrades to "no self-declaration", never to
-silence. A tool would only win if the declaration needed an answer back.
+Forgetting is the weak spot and is survivable: a missing tag declares
+nothing, and the states that matter most (stalled, crashed) are observed
+by the daemon, so a forgetful agent degrades to "no self-declaration",
+never to silence. A tool would only win if the declaration needed an answer back.
 
 ## Where it lives
 
