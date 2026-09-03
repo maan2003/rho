@@ -154,12 +154,8 @@ under test. If the fake cannot produce a state, extend the fake.
 Polish from the user's live screenshot of 3 Sep ("still a bit ugly"),
 done right after the transcript primitive (2.4) and before 2.10:
 
-- [ ] 1.14 Names: the user wants the handle (`maan2003`), not the display
-      name (`Manmeet`), for the reader's own column and self-mentions.
-      Assumed until the user says otherwise: handles for everyone else
-      too, in the author column, mentions, and DM titles, so one rule
-      names everyone. If the user wants display names for others, only
-      the reader flips.
+- [x] 1.14 Not a defect: display names for everyone, and `maan2003` is
+      the user's display name. Nothing changes.
 - [ ] 1.15 Rows by the longest author start their body one column right
       of the others (padding is off by one when the name fills the
       column). Bodies align in one column across the surface.
