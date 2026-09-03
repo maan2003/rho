@@ -10483,7 +10483,6 @@ impl Workspace {
             colors.terminal_ansi_bright_cyan
         };
         let quota = self.merged_quota_summaries();
-        let now = now_ms() as f64 / 1_000.0;
         div()
             .flex()
             .flex_row()
@@ -10497,12 +10496,6 @@ impl Workspace {
                         "opus" | "fable" => gpui::rgb(0xd97757).into(),
                         _ => colors.text_muted,
                     };
-                    let reset = summary
-                        .reset_at_unix
-                        .map(|reset| reset as f64 - now)
-                        .filter(|seconds| *seconds > 0.0)
-                        .map(|seconds| format!(" {:.1}d", seconds / 86_400.0))
-                        .unwrap_or_default();
                     let separator = (index > 0).then(|| {
                         div()
                             .text_color(colors.text_muted)
@@ -10512,8 +10505,9 @@ impl Workspace {
                     separator.into_iter().chain(std::iter::once(
                         div()
                             .text_color(color)
-                            // Colour alone names the provider; no model text.
-                            .child(format!("{}%{reset}", summary.remaining_percent))
+                            // Colour alone names the provider; no model text, and
+                            // no reset time: the usage transient carries that.
+                            .child(format!("{}%", summary.remaining_percent))
                             .into_any_element(),
                     ))
                 }),

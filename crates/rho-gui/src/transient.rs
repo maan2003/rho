@@ -196,22 +196,22 @@ impl Transient {
                     format!("gpt/{name}")
                 };
                 if let Some(latest) = latest {
-                    label.push_str(&format!(" {}%", latest.remaining_percent));
-                    if let Some(seconds) = latest
-                        .reset_at_unix
-                        .map(|reset| reset - crate::workspace::now_ms() as i64 / 1_000)
-                        .filter(|seconds| *seconds > 0)
-                    {
-                        label.push_str(&format!(" · {:.1}d", seconds as f64 / 86_400.0));
-                    }
+                    label.push_str(&quota_latest_suffix(latest));
                 }
                 legend = legend.child(div().text_color(quota_auth_color(index)).child(label));
             }
-            if series.iter().any(|series| series.model == "opus") {
-                legend = legend.child(div().text_color(opus).child("opus"));
-            }
-            if series.iter().any(|series| series.model == "fable") {
-                legend = legend.child(div().text_color(fable).child("fable"));
+            for (model, color) in [("opus", opus), ("fable", fable)] {
+                let latest = series
+                    .iter()
+                    .filter(|series| series.model == model)
+                    .filter_map(|series| series.points.last())
+                    .max_by_key(|point| point.observed_at_ms);
+                if let Some(latest) = latest {
+                    let label = format!("{model}{}", quota_latest_suffix(latest));
+                    legend = legend.child(div().text_color(color).child(label));
+                } else if series.iter().any(|series| series.model == model) {
+                    legend = legend.child(div().text_color(color).child(model));
+                }
             }
             return bottom_strip(text_style, cx)
                 .child(
@@ -979,6 +979,20 @@ fn usage_chart(
 
 /// Stable visual order for the alphabetically sorted auth namespaces shown
 /// in both the dashboard masthead and the rate-limit graph.
+/// The legend is the one place the reset time lives: the status line shows
+/// the percent alone.
+fn quota_latest_suffix(latest: &rho_ui_proto::QuotaPoint) -> String {
+    let mut suffix = format!(" {}%", latest.remaining_percent);
+    if let Some(seconds) = latest
+        .reset_at_unix
+        .map(|reset| reset - crate::workspace::now_ms() as i64 / 1_000)
+        .filter(|seconds| *seconds > 0)
+    {
+        suffix.push_str(&format!(" · {:.1}d", seconds as f64 / 86_400.0));
+    }
+    suffix
+}
+
 pub(crate) fn quota_auth_color(index: usize) -> Hsla {
     const COLORS: [u32; 6] = [
         0x22d3ee, // cyan
