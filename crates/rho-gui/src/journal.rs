@@ -353,7 +353,7 @@ pub struct DealerPolicySnapshot {
     pub blocked_reply_head_start: f64,
     pub blocked_reply_slope_per_day: f64,
     pub fyi_reply_pace_days: f64,
-    pub thread_pace_days: u32,
+    pub thread_reply_head_start: f64,
     pub skip_cooldown_minutes: i64,
     pub lamp_threshold: f64,
     pub chime_threshold: f64,

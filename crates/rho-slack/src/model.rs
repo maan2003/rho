@@ -60,8 +60,9 @@ pub enum Change {
     Raised(ThreadKey),
     /// A thread already raised whose newest message changed.
     Updated(ThreadKey),
-    /// The user replied, or read it elsewhere: the obligation is discharged.
-    Quieted(ThreadKey),
+    /// The user answered. The card stays and says `replied`: verdicts are
+    /// the user's keys only, so nothing here closes it and nothing binds.
+    Replied(ThreadKey),
 }
 
 /// A dealer card's worth of a thread, with no ids and no raw timestamps.
@@ -304,23 +305,14 @@ impl Model {
     }
 
     /// Marks a conversation read locally. Called both when rho reads one and
-    /// when Slack says another client did.
-    pub fn mark_read(&mut self, channel: &ChannelId, ts: &Ts) -> Vec<Change> {
+    /// when Slack says another client did. Reading is not a verdict: this
+    /// clears the unread counts and leaves every card exactly where it was.
+    pub fn mark_read(&mut self, channel: &ChannelId, ts: &Ts) {
+        let _ = ts;
         if let Some(count) = self.counts.get_mut(channel) {
             count.has_unreads = false;
             count.mention_count = 0;
         }
-        // Reading elsewhere is a verdict too: the card goes quiet without
-        // the user having to answer it inside rho.
-        self.threads
-            .iter()
-            .filter(|(key, thread)| {
-                &key.channel == channel
-                    && thread.waiting() == Waiting::OnYou
-                    && !thread.latest.is_newer_than(ts)
-            })
-            .map(|(key, _)| Change::Quieted(key.clone()))
-            .collect()
     }
 
     /// Fills in the body of a message rho already knows about. The feed
@@ -338,7 +330,7 @@ impl Model {
         thread.latest_from_you = message.user.as_ref() == Some(&self.self_id);
         Some(match thread.waiting() {
             Waiting::OnYou => Change::Updated(key),
-            Waiting::OnThem => Change::Quieted(key),
+            Waiting::OnThem => Change::Replied(key),
         })
     }
 
@@ -533,7 +525,9 @@ impl Model {
             },
         );
         Some(match (was_waiting, from_you) {
-            (_, true) => Change::Quieted(key),
+            // Answering is not closing. The card keeps its place in the tree
+            // and drops onto the fyi curve; only the user's own `d` ends it.
+            (_, true) => Change::Replied(key),
             (Some(Waiting::OnYou), false) => Change::Updated(key),
             // Either brand new, or answered-then-answered-again: both are a
             // fresh obligation, which is what re-raises a card after a done.
@@ -787,7 +781,7 @@ mod tests {
     }
 
     #[test]
-    fn your_reply_is_the_done_verdict_and_a_later_answer_re_raises() {
+    fn your_reply_relabels_the_card_and_a_later_answer_re_raises() {
         let mut model = model();
         let now = 10 * DAY;
         assert!(matches!(
@@ -798,12 +792,14 @@ mod tests {
         assert_eq!(model.thread(&key).unwrap().waiting(), Waiting::OnYou);
         assert_eq!(model.obligations(now).len(), 1);
 
+        // Answering is not a verdict: the thread is still tracked, the ball
+        // is theirs, and the card the dealer builds says so.
         assert_eq!(
             model.note_message(&reply("D1", "401", "400", "ME", "tomorrow"), now),
-            Some(Change::Quieted(key.clone()))
+            Some(Change::Replied(key.clone()))
         );
         assert_eq!(model.thread(&key).unwrap().waiting(), Waiting::OnThem);
-        assert!(model.obligations(now).is_empty());
+        assert_eq!(model.card(&key, now).unwrap().waiting, Waiting::OnThem);
 
         // Their answer brings it back, keyed on the newer message.
         assert_eq!(
@@ -851,16 +847,15 @@ mod tests {
     }
 
     #[test]
-    fn reading_elsewhere_quiets_the_card() {
+    fn reading_elsewhere_clears_the_badge_and_keeps_the_card() {
+        // Verdicts are the user's keys only. Reading on the phone means the
+        // unread badge is stale, nothing more: the ping still owes an answer.
         let mut model = model();
         model.note_message(&message("D1", "600", "U1", "ping"), 0);
-        let quieted = model.mark_read(&ChannelId("D1".into()), &Ts("600".into()));
-        assert_eq!(
-            quieted,
-            vec![Change::Quieted(
-                model.key(&ChannelId("D1".into()), &Ts("600".into()))
-            )]
-        );
+        let key = model.key(&ChannelId("D1".into()), &Ts("600".into()));
+        model.mark_read(&ChannelId("D1".into()), &Ts("600".into()));
+        assert_eq!(model.thread(&key).unwrap().waiting(), Waiting::OnYou);
+        assert_eq!(model.obligations(0).len(), 1);
     }
 
     #[test]

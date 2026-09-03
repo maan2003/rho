@@ -982,21 +982,6 @@ fn parent_write(
     }
 }
 
-/// The eight common fields a client must write to create a note.
-fn field_change(
-    node: rho_desk::NodeId,
-    field: rho_desk::cells::Field,
-    before: rho_desk::cells::Value,
-    after: rho_desk::cells::Value,
-) -> rho_desk::cells::FieldChange {
-    rho_desk::cells::FieldChange {
-        node,
-        field,
-        before: Some(before),
-        after: Some(after),
-    }
-}
-
 /// How far an ancestry walk goes before it decides it is in a cycle.
 const MAX_ANCESTRY: usize = 256;
 

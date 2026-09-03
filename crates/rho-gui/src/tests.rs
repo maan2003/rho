@@ -6362,6 +6362,59 @@ fn a_thread_node_without_its_mirror_is_not_dealt(cx: &mut TestAppContext) {
         .unwrap();
 }
 
+/// A verdict closes a thread; a message from them after it reopens the same
+/// node. The client's part is the rebind: an open node is left alone, a
+/// closed one is bound again and the daemon reopens it.
+#[gpui::test]
+fn a_reply_after_a_verdict_rebinds_the_closed_thread(cx: &mut TestAppContext) {
+    use rho_slack::{ChannelId, Ts, WorkspaceName};
+    use rho_ui_proto::ClientMessage;
+
+    let mut desk = DeskFixture::new();
+    let thread = desk.thread_row(None, "C1", "500.0");
+    let key = rho_slack::ThreadKey {
+        workspace: WorkspaceName("acme".to_owned()),
+        channel: ChannelId("C1".to_owned()),
+        thread_ts: Ts("500.0".to_owned()),
+    };
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.take_host_messages_for_test(HostId::default());
+            workspace.bind_slack_thread(&key, cx);
+            assert!(
+                !workspace
+                    .take_host_messages_for_test(HostId::default())
+                    .iter()
+                    .any(|message| matches!(message, ClientMessage::DeskThreadBind { .. })),
+                "a thread already dealt as an open node needs no bind"
+            );
+
+            desk.set(
+                thread,
+                rho_desk::cells::Field::State,
+                rho_desk::cells::Value::State(rho_desk::cells::State::Done),
+            );
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.take_host_messages_for_test(HostId::default());
+            workspace.bind_slack_thread(&key, cx);
+            let bound = workspace
+                .take_host_messages_for_test(HostId::default())
+                .into_iter()
+                .find_map(|message| match message {
+                    ClientMessage::DeskThreadBind {
+                        channel, thread_ts, ..
+                    } => Some((channel, thread_ts)),
+                    _ => None,
+                })
+                .expect("a reply after the verdict binds the thread again");
+            assert_eq!(bound, ("C1".to_owned(), "500.0".to_owned()));
+        })
+        .unwrap();
+}
+
 /// Creation: `n` from anywhere, the area always asked with the node in
 /// context as the first answer, so Enter alone files the new thing where
 /// the reader already is.

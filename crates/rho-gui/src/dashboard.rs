@@ -43,9 +43,11 @@ const SKIP_COOLDOWN_MINUTES: i64 = 15;
 const BLOCKED_REPLY_HEAD_START: f64 = 1.0;
 const BLOCKED_REPLY_SLOPE_PER_DAY: f64 = 12.0;
 const FYI_REPLY_PACE_DAYS: f64 = 3.0;
-/// A thread is someone waiting on a reply, so it rises from the day it was
-/// raised with no pace of its own.
-const THREAD_PACE_DAYS: u32 = 0;
+/// A person waiting on a reply is a blocked agent with a name, so a thread
+/// rises on the same slope. The head start is a tenth above an agent's so a
+/// ping of the same wait comes first; an agent the user just spoke to still
+/// outranks it through the recency bonus, which is far larger.
+const THREAD_REPLY_HEAD_START: f64 = 1.1;
 /// Half a curve unit is enough to mark the hand visibly dirty without
 /// turning every newly-ripe reminder into persistent chrome.
 pub(crate) const LAMP_THRESHOLD: f64 = 0.5;
@@ -72,7 +74,7 @@ pub(crate) fn dealer_policy_snapshot() -> crate::journal::DealerPolicySnapshot {
         blocked_reply_head_start: BLOCKED_REPLY_HEAD_START,
         blocked_reply_slope_per_day: BLOCKED_REPLY_SLOPE_PER_DAY,
         fyi_reply_pace_days: FYI_REPLY_PACE_DAYS,
-        thread_pace_days: THREAD_PACE_DAYS,
+        thread_reply_head_start: THREAD_REPLY_HEAD_START,
         lamp_threshold: LAMP_THRESHOLD,
         chime_threshold: CHIME_THRESHOLD,
         agent_recency_bonus: AGENT_RECENCY_BONUS,
@@ -135,11 +137,15 @@ pub enum DealCardKind {
 /// What a Slack thread node is currently about, read live from the mirror.
 /// The tree holds the thread's identity and its verdicts; the words, the
 /// wait, and the newest message stay in Slack.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DealerThread {
     pub title: String,
     pub conversation: String,
     pub raised_at: chrono::DateTime<chrono::FixedOffset>,
+    /// How long the ball has been where it is, counted from the newest
+    /// message: the wait a `needs reply` card rises on, and the age a
+    /// `replied` card decays from.
+    pub wait_days: f64,
     /// Who the ball is with, when it is not the user.
     pub waiting_on: Option<String>,
     /// The newest message in the thread: a new one voids a skip.
@@ -2651,22 +2657,20 @@ fn thread_card_facts(
     thread: &DealerThread,
     now: chrono::DateTime<chrono::FixedOffset>,
 ) -> (String, f64) {
-    let waiting_days = now
-        .signed_duration_since(thread.raised_at)
-        .num_seconds()
-        .max(0) as f64
-        / 86_400.0;
-    let priority = rho_desk::todo_priority(
-        thread.raised_at.naive_local(),
-        THREAD_PACE_DAYS,
-        now.naive_local(),
-    ) + waiting_days;
-    let state = if thread.waiting_on.is_some() {
-        "replied"
-    } else {
-        "needs reply"
+    let _ = now;
+    let (state, priority) = match thread.waiting_on.is_some() {
+        // The user answered: the thread is theirs to carry now, so the card
+        // is a reminder that fades, not a demand that grows.
+        true => ("replied", fyi_reply_priority(thread.wait_days)),
+        false => (
+            "needs reply",
+            THREAD_REPLY_HEAD_START + BLOCKED_REPLY_SLOPE_PER_DAY * thread.wait_days,
+        ),
     };
-    (format!("{state} · {}", age_label(waiting_days)), priority)
+    (
+        format!("{state} · {}", age_label(thread.wait_days)),
+        priority,
+    )
 }
 
 #[cfg(test)]
@@ -2681,34 +2685,52 @@ mod tests {
             .unwrap()
             .and_utc()
             .fixed_offset();
-        let thread = |waiting_on: Option<&str>| DealerThread {
+        let thread = |waiting_on: Option<&str>, wait_days: f64| DealerThread {
             title: "can you look at the deploy?".into(),
             conversation: "#design".into(),
             raised_at: now - chrono::Duration::days(2),
+            wait_days,
             waiting_on: waiting_on.map(str::to_owned),
             latest: "500.0".into(),
         };
 
-        let (label, priority) = thread_card_facts(&thread(None), now);
+        let (label, priority) = thread_card_facts(&thread(None, 2.0), now);
         assert_eq!(label, "needs reply · 2.0d");
         // Nothing addressed to the machine reaches what the reader sees.
         assert!(!label.contains("C1"));
         assert!(!label.contains("500.0"));
         assert_eq!(
-            thread_card_facts(&thread(Some("#design")), now).0,
-            "replied · 2.0d"
+            priority,
+            THREAD_REPLY_HEAD_START + 2.0 * BLOCKED_REPLY_SLOPE_PER_DAY
         );
 
-        // Two days of someone waiting outranks two days of a note that is
-        // merely due, which is what puts the thread first in one queue.
-        let note = rho_desk::todo_priority(
-            (now - chrono::Duration::days(2)).naive_local(),
-            THREAD_PACE_DAYS,
-            now.naive_local(),
-        );
+        // Answering flips the word and the curve: the card fades from the
+        // reply instead of rising, and is under the floor after three days.
+        let (label, replied) = thread_card_facts(&thread(Some("#design"), 2.0), now);
+        assert_eq!(label, "replied · 2.0d");
+        assert_eq!(replied, fyi_reply_priority(2.0));
+        assert!(replied > DEAL_QUEUE_FLOOR);
+        assert!(thread_card_facts(&thread(Some("#design"), 3.5), now).1 <= DEAL_QUEUE_FLOOR);
+    }
+
+    #[test]
+    fn a_ping_outranks_a_blocked_agent_of_the_same_wait_but_not_a_fresh_one() {
+        // The user's rule: someone waiting on them comes first, unless they
+        // were talking to that agent minutes ago.
+        let wait_days = 2.0 / 24.0;
+        let ping = THREAD_REPLY_HEAD_START + BLOCKED_REPLY_SLOPE_PER_DAY * wait_days;
+        let blocked = blocked_reply_priority(wait_days);
         assert!(
-            priority > note,
-            "a waiting thread ({priority}) must outrank a due note ({note})"
+            ping > blocked,
+            "a ping ({ping}) outranks an agent ({blocked})"
+        );
+
+        let elapsed = 10 * 60 * 1_000;
+        let remaining = 1.0 - elapsed as f64 / AGENT_RECENCY_WINDOW_MS as f64;
+        let just_spoken_to = blocked + AGENT_RECENCY_BONUS * remaining * remaining;
+        assert!(
+            just_spoken_to > ping,
+            "an agent spoken to 10 minutes ago ({just_spoken_to}) still comes first"
         );
     }
 }

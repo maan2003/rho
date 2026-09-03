@@ -405,10 +405,10 @@ impl Session {
                 self.delete(&channel, &ts);
             }
             Wire::Frame(WsEvent::Marked { channel, ts }) => {
-                // Read elsewhere: Slack's own read cursor is the verdict, so
-                // the obligation is discharged here too.
-                let changes = self.model.mark_read(&channel, &ts);
-                self.announce(changes, cx);
+                // Read elsewhere. Only the badge is stale: reading is not a
+                // verdict, so every card stays exactly where it was.
+                self.model.mark_read(&channel, &ts);
+                cx.notify();
             }
             Wire::Frame(_) => {}
             Wire::Disconnected(reason) => {
@@ -1215,8 +1215,8 @@ impl Session {
         else {
             return;
         };
-        let changes = self.model.mark_read(&channel, &latest);
-        self.announce(changes, cx);
+        self.model.mark_read(&channel, &latest);
+        cx.notify();
         let task =
             gpui_tokio::Tokio::spawn(cx, async move { client.mark_read(&channel, &latest).await });
         self._tasks.push(cx.spawn(async move |this, cx| {

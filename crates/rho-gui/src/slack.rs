@@ -591,6 +591,7 @@ impl Workspace {
                         title: card.summary,
                         conversation: card.conversation.clone(),
                         raised_at,
+                        wait_days: card.wait_days,
                         waiting_on: match card.waiting {
                             Waiting::OnThem => Some(card.conversation),
                             Waiting::OnYou => None,
@@ -666,18 +667,20 @@ mod tests {
             .iter()
             .filter_map(|change| match change {
                 Change::Raised(key) | Change::Updated(key) => Some(thread_ref(key)),
-                Change::Quieted(_) => None,
+                Change::Replied(_) => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(binds.len(), 2, "a raise and an update both bind");
         assert_eq!(binds[0], binds[1], "one thread is one node");
         assert_eq!(binds[0].thread_ts, "100.0");
 
-        // Your own reply is the done verdict; nothing is bound for it.
-        let quieted = model
+        // Your own reply is not a verdict, and it binds nothing: the node
+        // already exists, and a thread you closed stays closed until they
+        // write again.
+        let replied = model
             .note_message(&message("102.0", Some("100.0"), "ME", "on it"), 0)
-            .expect("your own reply quiets");
-        assert!(matches!(quieted, Change::Quieted(_)));
+            .expect("your own reply is announced");
+        assert!(matches!(replied, Change::Replied(_)));
     }
 
     #[test]
