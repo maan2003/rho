@@ -67,8 +67,10 @@ under test. If the fake cannot produce a state, extend the fake.
       members' names. Rho: group DM = member display names minus self,
       joined with `, `, no `#`; DM = `@name`; channel and private channel =
       `#name`. Same label in the list, the surface title, the status bar,
-      the dealer card, and the filed desk heading. A raw `mpdm-` or
-      `C0…` string anywhere is a defect.
+      the dealer card, the filed desk heading, and the inbox deal surface's
+      status segment, which today reads `inbox 1a065ab070c-2` (a raw inbox
+      id, seen by the user). A raw `mpdm-`, `C0…`, or inbox id string
+      anywhere is a defect.
 - [ ] 1.2 Emoji. Now `:shortcode:` literal. Rho: standard shortcodes become
       the glyph (a shortcode table, e.g. the `emojis` crate); workspace
       custom emoji stay `:name:` in the muted class. Applies to bodies,
@@ -192,7 +194,11 @@ under test. If the fake cannot produce a state, extend the fake.
       Deal keys (`d`, `x`, `s`, `S`, `t`, `f`, `q`) work on that surface
       exactly as on an agent surface, and a verdict closes it and moves on.
       The card line still shows in the queue; the surface is what you look
-      at.
+      at. Until 2.9 lands, the interim inbox deal surface (seen by the
+      user as a bare message body with nothing around it) must at least
+      carry a header line `David · #design · Thu 3 Sep 10:02` above the
+      text and the conversation label in the status segment; that part is
+      Phase 1 work under 1.1.
 - [ ] 2.7 Direct messages raise cards. Slack's `activity.feed` does not
       carry DMs, only mentions, reactions, and thread replies; a DM never
       reaches the inbox today. Rho: a websocket `message` in an `im` or
