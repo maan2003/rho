@@ -118,6 +118,17 @@ holds. The request pattern must look like a person reading, because an
 unofficial client that bulk-pulls history is the kind Slack detects and
 bans.
 
+The budget, stated as a rule: rho's request volume must stay at or below
+what Slack's own web client makes for a power user doing the same day.
+Any fetch must correspond to something the web client would do for a user
+action. Under that rule a ping named by the activity feed may trigger one
+bounded fetch at ingest, the thread plus a small window of the channel
+around the parent, because that is exactly what the web client fetches
+when the user clicks the notification; rho only does it a little earlier,
+so the deal renders from the mirror with no network wait. The bound is
+one history call and one replies call per ping, never a page back, never
+a second conversation.
+
 Shape to borrow, from matrix-rust-sdk's event cache (cloned under
 `~/src/matrix-rust-sdk`, `crates/matrix-sdk-common/src/linked_chunk` and
 `crates/matrix-sdk/src/event_cache`): a conversation's history is a chain
