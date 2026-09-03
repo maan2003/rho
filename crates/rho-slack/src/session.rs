@@ -474,14 +474,34 @@ impl Session {
                             .map(|thread| (thread.channel, thread.thread_ts)),
                     );
                 }
+                // A DM that arrived while rho was off is in the counts and
+                // nowhere else: the feed never carries one. Raised here,
+                // once the conversations are known, because whether a
+                // channel is a DM is a fact about the roster.
+                let raised = session.model.unread_dms(now_ms());
+                for change in &raised {
+                    if let Change::Raised(key) | Change::Updated(key) = change {
+                        session.prefetch_ping(&key.clone(), cx);
+                        session.ensure_thread_loaded(&key.clone(), cx);
+                    }
+                }
                 // Anything raised before the roster landed was named
                 // "#a conversation"; now it has a name, so say so again.
+                let fresh = raised
+                    .iter()
+                    .filter_map(|change| match change {
+                        Change::Raised(key) => Some(key.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
                 let known = session
                     .model
                     .tracked()
                     .into_iter()
+                    .filter(|key| !fresh.contains(key))
                     .map(Change::Updated)
                     .chain(dropped.into_iter().map(Change::Discarded))
+                    .chain(raised)
                     .collect();
                 session.announce(known, cx);
                 cx.notify();

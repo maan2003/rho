@@ -1155,3 +1155,59 @@ async fn a_refused_send_comes_back_as_an_error() {
             .is_ok()
     );
 }
+
+/// A DM that arrived while rho was off. `activity.feed` carries mentions,
+/// thread replies and reactions and never a DM, so the only place a missed
+/// one shows up is the unread counts the roster fetch already asks for.
+#[tokio::test]
+async fn a_dm_unread_at_startup_raises_a_card() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_user("U7", "david");
+    fake.add_dm("D7", "U7");
+    fake.add_group("G7", "mpdm-david--manmeet--keith-1", &["U7", "ME"]);
+    fake.add_message(
+        "D7",
+        json!({"ts": "700.0", "user": "U7", "text": "while you were out"}),
+    );
+    fake.set_count("D7", true, 0, "700.0");
+    // The group DM Slack names `mpdm-...` is a DM too: the user was put in
+    // it by name, so what is said there is addressed to them.
+    fake.add_message(
+        "G7",
+        json!({"ts": "702.0", "user": "U7", "text": "and here as well"}),
+    );
+    fake.set_count("G7", true, 0, "702.0");
+    // A channel with a backlog is not an obligation.
+    fake.set_count("C1", true, 0, "701.0");
+
+    let client = client(&fake);
+    let mut model = Model::new(client.workspace().clone());
+    model.set_self(rho_slack::types::UserId(fake.self_id().to_owned()));
+    model.add_users(client.users().await.unwrap());
+    model.add_conversations(client.conversations().await.unwrap());
+    model.set_counts(client.counts().await.unwrap().conversations);
+
+    let raised = model.unread_dms(0);
+    let channels = raised
+        .iter()
+        .map(|change| match change {
+            Change::Raised(key) => key.channel.clone(),
+            other => panic!("an unread DM is a new card: {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        channels,
+        vec![ChannelId("D7".into()), ChannelId("G7".into())],
+        "both DMs are raised and the channel is not"
+    );
+    for change in &raised {
+        let Change::Raised(key) = change else {
+            continue;
+        };
+        assert_eq!(model.card(key, 0).unwrap().waiting, Waiting::OnYou);
+    }
+    assert!(
+        model.unread_dms(0).is_empty(),
+        "a reconnect does not raise them again"
+    );
+}

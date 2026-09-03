@@ -6,8 +6,7 @@ Reconciled against main on 3 Sep. Genuinely open, in order:
   (b) soft-wrap column waits on the vendored editor.
 - 2.1 unread rule and cursor on first unread; 2.3 the `3 new` status
   segment (the anchoring half landed); 2.5 `shift-n` next unread; 2.6 list
-  row counts, time column, and the muted section; 2.7 DMs in `mpim` and
-  unread DMs from `client.counts` at startup (one-to-one DMs landed).
+  row counts, time column, and the muted section.
 - 3.1 composer boundary and placeholder; 3.3 completion.
 - 5.1 the one key table, once 2.5 has its key.
 
@@ -558,7 +557,15 @@ done right after the transcript primitive (2.4) and before 2.10:
       counts calls per method and a test asserts that opening the list
       fetches no history. Screenshot: the list and a conversation open
       with the fake stopped.
-- [ ] 2.7 Direct messages raise cards. Slack's `activity.feed` does not
+- [x] 2.7 Direct messages raise cards, done 3 Sep: a group DM counts as a
+      DM (`Model::is_dm` takes `im` and `mpim` alike), so a message in one
+      raises the same card a one-to-one does; and `Model::unread_dms`,
+      called on the roster fetch, raises a card for every DM Slack says is
+      unread, with the ordinary dedup so the socket and the feed never
+      double it. The counts were already fetched; a raised DM is then
+      loaded once for its summary, the same two calls the feed path makes
+      for a mention. Screen `27-01-dm-card`.
+      Slack's `activity.feed` does not
       carry DMs, only mentions, reactions, and thread replies; a DM never
       reaches the inbox today. Rho: a websocket `message` in an `im` or
       `mpim` from someone else, or an unread DM in `client.counts` at

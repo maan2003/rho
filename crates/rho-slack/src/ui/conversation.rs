@@ -568,9 +568,8 @@ impl ConversationView {
             if sending.await.is_err() {
                 let _ = this.update(cx, |this, cx| {
                     this.attached = Some(file);
-                    this.set_compose(text, cx);
+                    this.restore_compose(text, cx);
                     this.refresh_chip(cx);
-                    cx.notify();
                 });
             }
         })

@@ -290,11 +290,7 @@ impl Model {
     /// `client.counts` said at connect until the next restart.
     pub fn note_counts(&mut self, message: &Message) {
         let from_you = message.user.as_ref() == Some(&self.self_id);
-        let is_dm = self
-            .conversations
-            .get(&message.channel)
-            .is_some_and(|conversation| conversation.kind == ConversationKind::DirectMessage);
-        let pings_you = is_dm || self.mentions_you(message);
+        let pings_you = self.is_dm(&message.channel) || self.mentions_you(message);
         let count = self
             .counts
             .entry(message.channel.clone())
@@ -322,6 +318,35 @@ impl Model {
         if pings_you {
             count.mention_count += 1;
         }
+    }
+
+    /// The DMs Slack says are unread, raised as the cards they would have
+    /// been had rho been running. `activity.feed` carries mentions, thread
+    /// replies and reactions but never a DM, so without this a message sent
+    /// while rho was off is in the list and nowhere else.
+    ///
+    /// Deduplication is the ordinary one: a DM the socket or the feed has
+    /// already accounted for is not raised twice.
+    pub fn unread_dms(&mut self, now_ms: i64) -> Vec<Change> {
+        let unread = self
+            .counts
+            .values()
+            .filter(|count| count.has_unreads || count.mention_count > 0)
+            .filter(|count| self.is_dm(&count.channel))
+            .filter_map(|count| {
+                Some(ActivityItem {
+                    channel: count.channel.clone(),
+                    ts: count.latest.clone()?,
+                    thread_ts: None,
+                    kind: ActivityKind::DirectMessage,
+                    unread: true,
+                })
+            })
+            .collect::<Vec<_>>();
+        unread
+            .iter()
+            .filter_map(|item| self.note_activity(item, now_ms))
+            .collect()
     }
 
     /// The conversation list: unread first with their counts, then the rest
@@ -606,17 +631,26 @@ impl Model {
         if from_you {
             return followed.then_some(Reason::Thread);
         }
-        let is_dm = self
-            .conversations
-            .get(&message.channel)
-            .is_some_and(|conversation| conversation.kind == ConversationKind::DirectMessage);
-        if is_dm {
+        if self.is_dm(&message.channel) {
             return Some(Reason::DirectMessage);
         }
         if self.mentions_you(message) {
             return Some(Reason::Mention);
         }
         followed.then_some(Reason::Thread)
+    }
+
+    /// Whether the conversation is a DM: one person or a group of them.
+    /// A group DM is a room, but it is a room the user was put in by name,
+    /// so a message in it is addressed to them the way a one-to-one is and
+    /// not the way `#design` is.
+    fn is_dm(&self, channel: &ChannelId) -> bool {
+        self.conversations.get(channel).is_some_and(|conversation| {
+            matches!(
+                conversation.kind,
+                ConversationKind::DirectMessage | ConversationKind::Group
+            )
+        })
     }
 
     fn mentions_you(&self, message: &Message) -> bool {
@@ -1202,5 +1236,55 @@ mod tests {
         assert!(!listed.unread);
         assert_eq!(listed.mention_count, 0);
         assert_eq!(listed.latest, Some(Ts("103".into())));
+    }
+
+    #[test]
+    fn a_group_dm_is_a_dm_and_a_dm_unread_at_startup_is_a_card() {
+        let mut model = model();
+        model.add_conversations([Conversation {
+            id: ChannelId("G1".into()),
+            kind: ConversationKind::Group,
+            name: "mpdm-ada--keith-1".to_owned(),
+            user: None,
+            members: vec![UserId("U1".into()), UserId("ME".into())],
+        }]);
+        // A group DM is a room the user was put in by name: a message in it
+        // is addressed to them, the way a one-to-one is.
+        let key = model.key(&ChannelId("G1".into()), &Ts("200".into()));
+        assert_eq!(
+            model.note_message(&message("G1", "200", "U1", "are you both free?"), 0),
+            Some(Change::Raised(key.clone()))
+        );
+        assert_eq!(model.thread(&key).unwrap().reason, Reason::DirectMessage);
+
+        // What Slack says is unread when rho starts: a DM that arrived while
+        // it was off, which the feed never carries.
+        model.set_counts([
+            ConversationCount {
+                channel: ChannelId("D1".into()),
+                has_unreads: true,
+                mention_count: 1,
+                latest: Some(Ts("300".into())),
+            },
+            // A channel with unreads is backlog, not an obligation.
+            ConversationCount {
+                channel: ChannelId("C1".into()),
+                has_unreads: true,
+                mention_count: 0,
+                latest: Some(Ts("301".into())),
+            },
+        ]);
+        let raised = model.unread_dms(0);
+        assert_eq!(
+            raised,
+            vec![Change::Raised(
+                model.key(&ChannelId("D1".into()), &Ts("300".into()))
+            )],
+            "the DM is raised and the channel is not"
+        );
+        assert!(
+            model.unread_dms(0).is_empty(),
+            "a second roster fetch raises nothing again"
+        );
     }
 }
