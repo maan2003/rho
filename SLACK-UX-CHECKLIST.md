@@ -46,6 +46,12 @@ Nothing else lands until this does; every screenshot below comes from it.
       plus `RHO_SLACK_API_BASE` reproduces the reference shot's conversation
       in rho. The websocket connects, so the status bar does not read
       `disconnected` in screenshots.
+- [ ] 0.7 The fake can drive live events while rho is open: the example
+      exposes a control file or endpoint the QA run can poke to push a new
+      message, a thread reply, a reaction, an edit, and a deletion over the
+      websocket into a seeded conversation on demand, plus a `--live`
+      mode that posts a scripted message every few seconds. Every Phase 2
+      live screenshot comes from this.
 - [ ] 0.6 The fake serves `emoji.list` with the custom emoji, and
       `users.info` with display names that differ from handles.
 
@@ -153,6 +159,16 @@ Nothing else lands until this does; every screenshot below comes from it.
       then the rest. Rho: `label  @2 · 5 new  14:27`; unread first, then by
       recency; muted conversations at the bottom under a rule. No
       last-message preview. Presence is deferred.
+- [ ] 2.8 Live updates, reported broken by the user in real use: an open
+      conversation does not change when new messages arrive. Rho: a
+      websocket `message` for the open conversation appends at once, with
+      2.3's tail rule; a reply updates the parent's count line and the open
+      thread surface; `reaction_added`, `reaction_removed`,
+      `message_changed`, and `message_deleted` update in place; the
+      conversation list's unread counts move without reopening it; the
+      user's own sent message shows without a refetch. Find the real cause
+      first (a dropped socket, a missed frame type, or a view that only
+      re-renders on open) and say which it was.
 - [ ] 2.7 Direct messages raise cards. Slack's `activity.feed` does not
       carry DMs, only mentions, reactions, and thread replies; a DM never
       reaches the inbox today. Rho: a websocket `message` in an `im` or
