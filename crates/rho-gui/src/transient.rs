@@ -669,6 +669,9 @@ pub fn root_menu() -> Transient {
         .item("shift-f", "find node…", |workspace, window, cx| {
             workspace.open_find(window, cx);
         })
+        .item("n", "new…", |workspace, window, cx| {
+            workspace.open_transient(new_menu(), window, cx);
+        })
         .item("c", "start/attach shell", |workspace, window, cx| {
             workspace.cmd_shell(window, cx);
         })
@@ -686,9 +689,6 @@ pub fn root_menu() -> Transient {
         })
         .item("shift-t", "new terminal", |workspace, window, cx| {
             workspace.cmd_term(true, window, cx);
-        })
-        .item("g", "browser…", |workspace, window, cx| {
-            workspace.open_transient(browser_menu(), window, cx);
         })
         .item("p", "projects…", |workspace, window, cx| {
             workspace.open_transient(projects_menu(), window, cx);
@@ -743,15 +743,26 @@ pub fn phone_desk_menu(raw_mode: bool) -> Transient {
                 workspace.phone_toggle_dashboard_editing(window, cx);
             },
         )
-        .item("n", "New agent", |workspace, window, cx| {
-            workspace.enter_draft(None, window, cx);
+        .item("n", "New…", |workspace, window, cx| {
+            workspace.open_transient(new_menu(), window, cx);
         })
 }
 
-fn browser_menu() -> Transient {
-    Transient::new("browser").item("n", "new page", |workspace, window, cx| {
-        workspace.cmd_browser(window, cx);
-    })
+/// Creation, the one verb: everything new starts here and is filed where
+/// the area picker's first row already points.
+pub fn new_menu() -> Transient {
+    use crate::create::NewKind;
+
+    Transient::new("new")
+        .item("a", "agent…", |workspace, window, cx| {
+            workspace.begin_new(NewKind::Agent, window, cx);
+        })
+        .item("p", "page…", |workspace, window, cx| {
+            workspace.begin_new(NewKind::Page, window, cx);
+        })
+        .item("n", "note…", |workspace, window, cx| {
+            workspace.begin_new(NewKind::Note, window, cx);
+        })
 }
 
 fn slack_menu() -> Transient {
@@ -783,12 +794,6 @@ fn status_menu() -> Transient {
 
 fn input_menu() -> Transient {
     Transient::new("input")
-        .item("c", "capture thought", |workspace, window, cx| {
-            workspace.cmd_capture(window, cx);
-        })
-        .item("i", "inbox", |workspace, window, cx| {
-            workspace.open_inbox(window, cx);
-        })
         .item(
             "m",
             "iris microphone · mute/unmute",
@@ -841,23 +846,6 @@ pub fn usage_root_menu() -> Transient {
                 workspace.open_agent_cost_transient(30, window, cx);
             },
         )
-}
-
-pub(crate) fn inbox_item_menu() -> Transient {
-    Transient::new("inbox item")
-        .item(
-            "f",
-            "file under Desk heading…",
-            |workspace, window, cx| {
-                workspace.prompt_file_inbox_item(window, cx);
-            },
-        )
-        .item("d", "discard", |workspace, _, cx| {
-            workspace.discard_inbox_item(cx);
-        })
-        .item("s", "defer one day", |workspace, _, cx| {
-            workspace.defer_inbox_item(cx);
-        })
 }
 
 pub fn usage_menu(
@@ -1795,7 +1783,7 @@ mod tests {
                 .iter()
                 .map(|(_, description, _)| description.as_str())
                 .collect::<Vec<_>>(),
-            ["Cycle folds", "Edit desk", "New agent"]
+            ["Cycle folds", "Edit desk", "New…"]
         );
         assert_eq!(phone_desk_menu(true).phone_rows()[1].1, "Done editing");
     }

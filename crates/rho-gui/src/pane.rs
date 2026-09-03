@@ -15,7 +15,6 @@ pub enum SurfaceKey {
         host: HostId,
         node_id: rho_desk::NodeId,
     },
-    Inbox(String),
     Transcript(AgentId),
     File {
         agent_id: AgentId,

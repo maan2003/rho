@@ -411,6 +411,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     spawn_presentation_projection(Arc::clone(&agents));
     spawn_turn_report_projection(Arc::clone(&agents));
     spawn_inference_projection(Arc::clone(&agents));
+    spawn_agent_node_projection(Arc::clone(&agents));
     let quota_environment = agents.user_environment.clone();
     spawn_claude_quota_recorder(
         rho_claude_usage::spawn_poller(
@@ -2033,6 +2034,86 @@ fn attention_level(kind: Option<&AgentStateKind>, disposition: AgentDisposition)
 /// Durable presentation changes refresh the normal snapshot for every
 /// connection. Broadcast loss is harmless because `Ready` is reconstructed
 /// from the agent cache, including after daemon restart.
+/// Every agent is a node in the tree from the moment it exists, however it
+/// was started: from the GUI, from the phone, or by another agent. A child
+/// is filed under the agent that spawned it; everything else lands at the
+/// root, and the user's chosen area moves it from there.
+fn spawn_agent_node_projection(agents: Arc<AgentRegistry>) {
+    let mut created = agents.pool.subscribe_created();
+    let agents = Arc::downgrade(&agents);
+    tokio::spawn(async move {
+        loop {
+            let created = match created.recv().await {
+                Ok(created) => created,
+                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Closed) => break,
+            };
+            let Some(agents) = agents.upgrade() else {
+                break;
+            };
+            let host = agents.machine_seed;
+            let parent = match created.parent {
+                Some(parent) => {
+                    agents
+                        .desk_cells
+                        .machine_node(&desk_cells::MachineBinding::Agent {
+                            agent_id: parent,
+                            host,
+                        })
+                }
+                None => None,
+            };
+            match agents
+                .desk_cells
+                .bind_machine(
+                    parent,
+                    desk_cells::MachineBinding::Agent {
+                        agent_id: created.agent_id,
+                        host,
+                    },
+                    desk_cells::BindPlacement::Default,
+                )
+                .await
+            {
+                Ok((_, true)) => {
+                    if let Ok(frontier) = agents.desk_cells.frontier() {
+                        let _ = agents
+                            .events
+                            .send(ServerMessage::DeskCellsAvailable { frontier });
+                    }
+                }
+                Ok((_, false)) => {}
+                Err(error) => tracing::warn!("agent node not created: {error}"),
+            }
+        }
+    });
+}
+
+/// Reply to a bind request and tell every client that new cells are waiting.
+fn announce_binding(
+    agents: &AgentRegistry,
+    outgoing_tx: &mpsc::UnboundedSender<ServerMessage>,
+    request_id: u64,
+    result: Result<(rho_desk::NodeId, bool), String>,
+) -> anyhow::Result<()> {
+    if let Ok((_, true)) = result {
+        let frontier = agents.desk_cells.frontier().map_err(anyhow::Error::msg)?;
+        let _ = agents
+            .events
+            .send(ServerMessage::DeskCellsAvailable { frontier });
+    }
+    let (node_id, error) = match result {
+        Ok((node_id, _)) => (Some(node_id), None),
+        Err(error) => (None, Some(error)),
+    };
+    let _ = outgoing_tx.send(ServerMessage::DeskBindingResult {
+        request_id,
+        node_id,
+        error,
+    });
+    Ok(())
+}
+
 fn spawn_inference_projection(agents: Arc<AgentRegistry>) {
     let mut state = agents.inference.subscribe();
     let agents = Arc::downgrade(&agents);
@@ -2684,18 +2765,35 @@ async fn handle_message(
         } => {
             let result = agents
                 .desk_cells
-                .bind_machine(parent, desk_cells::MachineBinding::Page { page_id, url })
+                .bind_machine(
+                    parent,
+                    desk_cells::MachineBinding::Page { page_id, url },
+                    desk_cells::BindPlacement::Chosen,
+                )
                 .await;
-            if matches!(result, Ok(true)) {
-                let frontier = agents.desk_cells.frontier().map_err(anyhow::Error::msg)?;
-                let _ = agents
-                    .events
-                    .send(ServerMessage::DeskCellsAvailable { frontier });
-            }
-            let _ = outgoing_tx.send(ServerMessage::DeskPageBindingResult {
-                request_id,
-                error: result.err(),
-            });
+            announce_binding(&agents, &outgoing_tx, request_id, result)?;
+            Ok(Refresh::None)
+        }
+        ClientMessage::DeskThreadBind {
+            request_id,
+            parent,
+            workspace,
+            channel,
+            thread_ts,
+        } => {
+            let result = agents
+                .desk_cells
+                .bind_machine(
+                    parent,
+                    desk_cells::MachineBinding::Thread {
+                        workspace,
+                        channel,
+                        thread_ts,
+                    },
+                    desk_cells::BindPlacement::Default,
+                )
+                .await;
+            announce_binding(&agents, &outgoing_tx, request_id, result)?;
             Ok(Refresh::None)
         }
         ClientMessage::DeskPageUnbind {
@@ -2709,8 +2807,9 @@ async fn handle_message(
                     .events
                     .send(ServerMessage::DeskCellsAvailable { frontier });
             }
-            let _ = outgoing_tx.send(ServerMessage::DeskPageBindingResult {
+            let _ = outgoing_tx.send(ServerMessage::DeskBindingResult {
                 request_id,
+                node_id: None,
                 error: result.err(),
             });
             Ok(Refresh::None)
@@ -2949,36 +3048,36 @@ async fn handle_message(
             mut content,
             desk_parent,
         } => {
-            if let Some(parent) = desk_parent {
-                agents
-                    .desk_cells
-                    .validate_machine_parent(parent)
-                    .map_err(anyhow::Error::msg)?;
-            }
+            agents
+                .desk_cells
+                .validate_machine_parent(desk_parent)
+                .map_err(anyhow::Error::msg)?;
             if let Some(content) = content.as_mut() {
                 prepare_image_content(content).await?;
             }
             // Subscription and the AgentCreated announcement ride the pool's
             // creation broadcast (all connections, including this one).
             let (agent_id, agent) = agents.create(role, start).await?;
-            if let Some(parent) = desk_parent {
-                if agents
-                    .desk_cells
-                    .bind_machine(
-                        parent,
-                        desk_cells::MachineBinding::Agent {
-                            agent_id,
-                            host: agents.machine_seed,
-                        },
-                    )
-                    .await
-                    .map_err(anyhow::Error::msg)?
-                {
-                    let frontier = agents.desk_cells.frontier().map_err(anyhow::Error::msg)?;
-                    let _ = agents
-                        .events
-                        .send(ServerMessage::DeskCellsAvailable { frontier });
-                }
+            // Creation already gives the agent a node at the root; this moves
+            // it to the area the user picked, and is a no-op when they picked
+            // the root.
+            let (_, changed) = agents
+                .desk_cells
+                .bind_machine(
+                    desk_parent,
+                    desk_cells::MachineBinding::Agent {
+                        agent_id,
+                        host: agents.machine_seed,
+                    },
+                    desk_cells::BindPlacement::Chosen,
+                )
+                .await
+                .map_err(anyhow::Error::msg)?;
+            if changed {
+                let frontier = agents.desk_cells.frontier().map_err(anyhow::Error::msg)?;
+                let _ = agents
+                    .events
+                    .send(ServerMessage::DeskCellsAvailable { frontier });
             }
             if let Some(content) = content {
                 // The agent is fresh, so the lanes are equivalent here.

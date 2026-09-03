@@ -168,6 +168,9 @@ pub(super) struct PhoneUi {
     feed_surface: Option<(ContextId, SurfaceKey)>,
     stack: Vec<(ContextId, SurfaceKey)>,
     dashboard_press: Option<(Point<Pixels>, Option<crate::dashboard::RowTarget>)>,
+    /// A card arrived while the feed sat empty. The feed is the deal, so it
+    /// has to be opened again; only a redraw has the window to do it.
+    pub(super) feed_retry: bool,
     pub(super) dashboard_focus: FocusHandle,
 }
 
@@ -192,6 +195,7 @@ impl PhoneUi {
             feed_surface: None,
             stack: Vec::new(),
             dashboard_press: None,
+            feed_retry: false,
             dashboard_focus: cx.focus_handle(),
         }
     }
@@ -303,6 +307,18 @@ impl Workspace {
                 theme_settings::adjust_ui_font_size(cx, |size| size * PHONE_FONT_SCALE);
                 set_touch_modal_editing(false, cx);
             });
+        }
+        // The queue can be empty when the phone first draws: a Slack thread
+        // becomes a node only once the mirror has synced. Without this the
+        // feed would stay on "nothing needs attention" for the rest of the
+        // session.
+        if self.phone.enabled
+            && std::mem::take(&mut self.phone.feed_retry)
+            && self.phone.root == PhoneRoot::Feed
+            && self.phone.stack.is_empty()
+            && !self.dashboard.deal_mode()
+        {
+            cx.defer_in(window, |this, window, cx| this.open_deal_mode(window, cx));
         }
         if change.exited {
             self.phone.flick = None;
@@ -587,11 +603,9 @@ impl Workspace {
 
     fn phone_deal_scroll_edge(&mut self, cx: &mut Context<Self>) -> PhoneScrollEdge {
         let editor = match self.deal_view.as_ref() {
-            Some(super::DealView::Desk { editor, .. })
-            | Some(super::DealView::Inbox { editor, .. }) => Some(editor.clone()),
+            Some(super::DealView::Desk { editor, .. }) => Some(editor.clone()),
             Some(super::DealView::Surface { surface, .. }) => match &surface.view {
                 super::SurfaceView::DeskNode(editor)
-                | super::SurfaceView::Inbox(editor)
                 | super::SurfaceView::Transcript { editor, .. } => Some(editor.clone()),
                 _ => None,
             },

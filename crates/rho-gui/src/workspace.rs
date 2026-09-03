@@ -43,9 +43,6 @@ use crate::connection::{
 use crate::desk_view::DeskCells;
 use crate::draft_view::DraftModel;
 use crate::hosts::{HostStatus, Hosts};
-use crate::inbox::{
-    CapturedContext, InboxDraft, InboxId, InboxKind, InboxStore, SourceReference, Verdict,
-};
 use crate::minibuffer::{ECHO_DURATION, Echo, Minibuffer, bottom_strip};
 use crate::pane::{Pane, SurfaceKey};
 use crate::registry::session::{
@@ -70,12 +67,11 @@ use crate::{
     DashboardRenameTopic, DashboardReply, DashboardStaff, DashboardSubmit,
     DashboardToggleAgentTree, DashboardToggleSubagents, DashboardUndo, DashboardYankRow,
     DealCloseAndNext, DealLeave, DealOpen, FindNode, GitApprovalAllow, GitApprovalDeny,
-    InboxCapture, MessagesOpen, MinibufferCancel, MinibufferComplete, MinibufferConfirm,
-    MinibufferNext, MinibufferPrevious, OverviewToggle, PastePrompt, RailFocus, RailOpen,
-    RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore,
-    ShellPagerQuit, SlackCompose, SlackOpenRow, SlackSearch, SubmitPrompt, SurfaceBack,
-    SurfaceClose, TaskBoard, UndoVerdict, UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder,
-    ZulipNextUnread, ZulipOpenRow,
+    MessagesOpen, MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext,
+    MinibufferPrevious, OverviewToggle, PastePrompt, RailFocus, RailOpen, RoleCycle,
+    RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit,
+    SlackCompose, SlackOpenRow, SlackSearch, SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard,
+    UndoVerdict, UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
 };
 
 pub(crate) const MESSAGE_LOG_CAP: usize = 4096;
@@ -125,63 +121,52 @@ pub struct Surface {
 
 enum DealView {
     Desk {
-        identity: crate::dashboard::DealCardIdentity,
+        identity: crate::dashboard::DealCardId,
         editor: Entity<editor::Editor>,
     },
     Surface {
-        identity: crate::dashboard::DealCardIdentity,
-        kind: crate::dashboard::DealCardKind,
+        identity: crate::dashboard::DealCardId,
         surface: Surface,
-    },
-    Inbox {
-        identity: crate::dashboard::DealCardIdentity,
-        kind: crate::dashboard::DealCardKind,
-        editor: Entity<editor::Editor>,
     },
 }
 
 impl DealView {
-    fn matches(&self, identity: &crate::dashboard::DealCardIdentity) -> bool {
+    fn matches(&self, identity: &crate::dashboard::DealCardId) -> bool {
         match self {
             Self::Desk {
                 identity: current, ..
             }
             | Self::Surface {
                 identity: current, ..
-            }
-            | Self::Inbox {
-                identity: current, ..
             } => current == identity,
         }
     }
 
     #[cfg(test)]
-    fn card(
-        &self,
-    ) -> (
-        &crate::dashboard::DealCardIdentity,
-        crate::dashboard::DealCardKind,
-    ) {
+    fn identity(&self) -> crate::dashboard::DealCardId {
         match self {
-            Self::Desk { identity, .. } => (identity, crate::dashboard::DealCardKind::Desk),
-            Self::Surface { identity, kind, .. } | Self::Inbox { identity, kind, .. } => {
-                (identity, *kind)
-            }
+            Self::Desk { identity, .. } | Self::Surface { identity, .. } => *identity,
         }
     }
+}
+
+/// A bind request waiting for the daemon's answer, and what the journal
+/// should say when it comes back.
+pub(crate) enum PendingBinding {
+    Created {
+        kind: crate::journal::CreatedKind,
+        method: crate::journal::CreateMethod,
+        at_root: bool,
+    },
+    SlackThread {
+        thread: crate::journal::SlackThread,
+    },
 }
 
 struct PendingGitApproval {
     request_id: u64,
     prompt: String,
     response: tokio::sync::oneshot::Sender<GitApprovalDecision>,
-}
-
-struct PendingPageFiling {
-    inbox_id: InboxId,
-    heading: String,
-    card: Option<crate::dashboard::DealCard>,
-    phone_event: Option<crate::dashboard::DealerEvent>,
 }
 
 #[derive(Clone)]
@@ -191,7 +176,6 @@ pub(crate) enum SurfaceView {
     },
     Messages(Entity<editor::Editor>),
     DeskNode(Entity<editor::Editor>),
-    Inbox(Entity<editor::Editor>),
     Transcript {
         model: Entity<AgentModel>,
         /// The editor over the model's multibuffer.
@@ -218,7 +202,7 @@ impl SurfaceView {
         match self {
             Self::Draft { .. } => SurfaceKind::Draft,
             Self::Messages(_) => SurfaceKind::Messages,
-            Self::DeskNode(_) | Self::Inbox(_) => SurfaceKind::Dashboard,
+            Self::DeskNode(_) => SurfaceKind::Dashboard,
             Self::Transcript { .. } => SurfaceKind::Transcript,
             Self::File(_) => SurfaceKind::File,
             Self::Shell { .. } => SurfaceKind::Shell,
@@ -364,16 +348,6 @@ enum VerdictUndoState {
         node: rho_desk::NodeId,
         at: rho_desk::cells::Stamp,
     },
-    Inbox {
-        id: crate::inbox::InboxId,
-        prior: crate::inbox::InboxItem,
-    },
-    Filed {
-        host: HostId,
-        node: rho_desk::NodeId,
-        prior: crate::inbox::InboxItem,
-    },
-    PageFiled,
 }
 
 struct PendingTreeUndo {
@@ -395,7 +369,7 @@ struct DeskSemanticUndo {
 }
 
 pub struct Workspace {
-    hosts: Hosts,
+    pub(crate) hosts: Hosts,
     subscriptions: AgentSubscriptions,
     store: AgentStore,
     pub(crate) registry: AgentRegistry,
@@ -471,7 +445,7 @@ pub struct Workspace {
     surface_history: Vec<WarmSurface>,
     history_cursor: usize,
     overview_open: bool,
-    navigation_skips: HashMap<SurfaceKey, crate::dashboard::DealCardIdentity>,
+    navigation_skips: HashMap<SurfaceKey, crate::dashboard::DealCardId>,
     last_shift_tap: Option<std::time::Instant>,
     shell_touches: HashMap<TouchId, ShellTouchContact>,
     shell_touch_was_multi: bool,
@@ -508,7 +482,8 @@ pub struct Workspace {
     pending_tree_undos: BTreeMap<(HostId, rho_desk::cells::Stamp), PendingTreeUndo>,
     /// Text a paste owes its new notes, held until the daemon accepts the
     /// creation those notes came from.
-    pending_desk_texts: BTreeMap<(HostId, rho_desk::cells::Stamp), Vec<(rho_desk::NodeId, String)>>,
+    pub(crate) pending_desk_texts:
+        BTreeMap<(HostId, rho_desk::cells::Stamp), Vec<(rho_desk::NodeId, String)>>,
     verdict_undo: Vec<VerdictUndo>,
     next_verdict_undo_sequence: u64,
     desk_semantic_clipboard: Option<crate::desk_view::DeskCapture>,
@@ -516,7 +491,7 @@ pub struct Workspace {
     desk_semantic_paste_target: Option<(HostId, rho_desk::NodeId)>,
     desk_semantic_undo: BTreeMap<clock::Lamport, DeskSemanticUndo>,
     pending_semantic_batches: BTreeMap<(HostId, rho_desk::cells::Stamp), clock::Lamport>,
-    pending_semantic_group: Option<clock::Lamport>,
+    pub(crate) pending_semantic_group: Option<clock::Lamport>,
     /// Agent shown beside the dashboard cursor. Kept separate from the
     /// focused task so cursor previews do not rebuild or reorder the rail.
     dashboard_preview: Option<AgentId>,
@@ -537,9 +512,6 @@ pub struct Workspace {
     /// opened. Chat costs nothing until asked for.
     zulip: Option<Entity<rho_zulip::session::Session>>,
     pub(crate) slack: Option<Entity<rho_slack::session::Session>>,
-    /// Threads rho has raised into the inbox, so a reconnect or a restart
-    /// updates the card it already made rather than making a second one.
-    pub(crate) slack_items: crate::slack::SlackItems,
     /// Set while the Slack session cannot be trusted to be current. It lights
     /// the lamp on its own, because nothing else in the queue knows.
     pub(crate) slack_degraded: Option<String>,
@@ -550,16 +522,11 @@ pub struct Workspace {
     /// One per open conversation surface, for what a conversation asks the
     /// frame to show: a picture full-window, so far.
     pub(crate) _slack_view_subscriptions: Vec<gpui::Subscription>,
-    /// Machine-owned arrivals. This store is client-local and never enters a
-    /// Desk CRDT buffer until an explicit filing verdict.
-    pub(crate) inbox: InboxStore,
-    pending_inbox_item: Option<InboxId>,
-    pending_filing_card: Option<(InboxId, crate::dashboard::DealCard)>,
-    pending_phone_filing_event: Option<crate::dashboard::DealerEvent>,
     pending_filing_destinations: Vec<(String, String, HostId, rho_desk::NodeId)>,
     pending_filing_selected: Option<(HostId, rho_desk::NodeId)>,
-    next_page_binding_request_id: u64,
-    pending_page_filings: BTreeMap<(HostId, u64), PendingPageFiling>,
+    pub(crate) next_binding_request_id: u64,
+    /// Bind requests in flight, so their answer can be journalled.
+    pub(crate) pending_bindings: BTreeMap<(HostId, u64), PendingBinding>,
     scroll_journal_task: Option<Task<()>>,
     /// The completing-read strip at the bottom of the window, when open.
     pub(crate) minibuffer: Option<Minibuffer>,
@@ -1174,28 +1141,14 @@ impl Workspace {
             iris_agents: HashMap::new(),
             zulip: None,
             slack: None,
-            slack_items: crate::slack::SlackItems::default(),
             slack_degraded: None,
             slack_labels: HashMap::new(),
             _slack_subscription: None,
             _slack_view_subscriptions: Vec::new(),
-            // Tests build many concurrent workspaces; they must never open
-            // (or pollute) the user's real inbox database.
-            inbox: if cfg!(test) {
-                InboxStore::memory()
-            } else {
-                InboxStore::open_default().unwrap_or_else(|error| {
-                    tracing::warn!(%error, "opening client inbox; using memory-only store");
-                    InboxStore::memory()
-                })
-            },
-            pending_inbox_item: None,
-            pending_filing_card: None,
-            pending_phone_filing_event: None,
             pending_filing_destinations: Vec::new(),
             pending_filing_selected: None,
-            next_page_binding_request_id: 1,
-            pending_page_filings: BTreeMap::new(),
+            next_binding_request_id: 1,
+            pending_bindings: BTreeMap::new(),
             scroll_journal_task: None,
             minibuffer: None,
             transient: None,
@@ -1687,32 +1640,11 @@ impl Workspace {
     }
 
     fn journal_card_identity(
-        identity: &crate::dashboard::DealCardIdentity,
+        identity: &crate::dashboard::DealCardId,
     ) -> crate::journal::DealerCardIdentity {
-        match identity {
-            crate::dashboard::DealCardIdentity::Tree { host, node_id } => {
-                crate::journal::DealerCardIdentity::DeskNode {
-                    host: host.0,
-                    node_id: (*node_id).into(),
-                }
-            }
-            crate::dashboard::DealCardIdentity::TreeAgent {
-                host,
-                node_id,
-                agent_id,
-            } => crate::journal::DealerCardIdentity::AgentNode {
-                host: host.0,
-                node_id: (*node_id).into(),
-                agent_id: agent_id.into(),
-            },
-            crate::dashboard::DealCardIdentity::Agent(agent_id) => {
-                crate::journal::DealerCardIdentity::Agent {
-                    agent_id: agent_id.into(),
-                }
-            }
-            crate::dashboard::DealCardIdentity::Inbox(id) => {
-                crate::journal::DealerCardIdentity::Inbox { id: id.clone() }
-            }
+        crate::journal::DealerCardIdentity {
+            host: identity.host.0,
+            node_id: identity.node_id.into(),
         }
     }
 
@@ -1732,9 +1664,10 @@ impl Workspace {
 
     fn evaluate_dealer_signals(&mut self, cx: &mut Context<Self>) {
         let now = chrono::Local::now().fixed_offset();
+        let threads = self.slack_thread_facts(cx);
         let mut candidates = self.dashboard.dealer_hand(
             &self.registry,
-            &self.inbox,
+            &threads,
             now,
             &self.agent_last_interaction,
             cx,
@@ -1745,12 +1678,11 @@ impl Workspace {
             }
             match &self.active_pane().surface.key {
                 SurfaceKey::Transcript(agent_id) => {
-                    card.identity != crate::dashboard::DealCardIdentity::Agent(*agent_id)
+                    Some(card.identity) != self.dashboard.agent_card_id(*agent_id)
                 }
-                SurfaceKey::Browser(page) => !matches!(
-                    card.inbox_source,
-                    Some(crate::dashboard::DealerInboxSource::Page(id)) if id == *page
-                ),
+                SurfaceKey::Browser(page) => {
+                    Some(card.identity) != self.dashboard.page_card_id(*page)
+                }
                 _ => true,
             }
         });
@@ -1768,6 +1700,9 @@ impl Workspace {
             self.subscribe_agent(agent_id, cx);
         }
         let top = candidates.cards.first();
+        if self.phone.enabled && top.is_some() && !self.dashboard.deal_mode() {
+            self.phone.feed_retry = true;
+        }
         let max_priority = top.map(|card| card.priority);
         let card = top.map(|card| Self::journal_card_identity(&card.identity));
         let mut lamp_on =
@@ -2024,6 +1959,7 @@ impl Workspace {
                     self.send_to_host(host, again);
                 }
                 self.sync_tree_dashboard(host, window, cx);
+                self.carry_over_captures(host, window, cx);
             }
             ConnEvent::DeskCellsAvailable { frontier } => {
                 if let Some(sync) = self.desk_cells.cells_available(host, frontier) {
@@ -2049,87 +1985,12 @@ impl Workspace {
                 self.desk_cells.text_applied(host, node_id, operation, cx);
                 self.sync_tree_dashboard(host, window, cx);
             }
-            ConnEvent::DeskPageBindingResult { request_id, error } => {
-                if let Some(pending) = self.pending_page_filings.remove(&(host, request_id)) {
-                    match error {
-                        None => match self.inbox.verdict(&pending.inbox_id, Verdict::Filed) {
-                            Ok(Some(_)) => {
-                                let submitted_card_is_current =
-                                    pending.phone_event.as_ref().is_some_and(|event| {
-                                        self.dashboard
-                                            .current_deal_card()
-                                            .is_some_and(|current| current.identity == event.card)
-                                    });
-                                let mut undo_sequence = None;
-                                if let Some(card) = pending.card {
-                                    let entry = self.next_verdict_undo(
-                                        card,
-                                        crate::dashboard::DealerVerdict::File,
-                                        "file".to_owned(),
-                                        VerdictUndoState::PageFiled,
-                                    );
-                                    undo_sequence = Some(entry.sequence);
-                                    self.restore_verdict_undo(entry);
-                                }
-                                crate::journal::record(crate::journal::Event::InboxVerdict {
-                                    inbox_id: pending.inbox_id.0.clone(),
-                                    verdict: crate::journal::InboxVerdict::File {
-                                        heading: pending.heading.clone(),
-                                    },
-                                });
-                                if self.pending_inbox_item.as_ref() == Some(&pending.inbox_id) {
-                                    self.pending_inbox_item = None;
-                                }
-                                if let Some(event) = pending.phone_event {
-                                    self.dashboard.record_dealer_event(event);
-                                    self.record_phone_verdict(
-                                        crate::journal::PhoneVerdict::File,
-                                        cx,
-                                    );
-                                    if submitted_card_is_current {
-                                        if let Some(sequence) = undo_sequence {
-                                            self.phone_completed_verdict(sequence);
-                                        }
-                                        self.restore_phone_feed(window, cx);
-                                        self.finish_deal_verdict(window, cx);
-                                    } else {
-                                        self.refresh_dashboard(window, cx);
-                                    }
-                                } else {
-                                    self.refresh_dashboard(window, cx);
-                                }
-                                self.echo(
-                                    &format!("filed under {}", pending.heading),
-                                    StyleClass::SystemInfo,
-                                    cx,
-                                );
-                            }
-                            Ok(None) => self.notice_on(
-                                None,
-                                "file: inbox item is unavailable",
-                                StyleClass::SystemInfo,
-                                cx,
-                            ),
-                            Err(error) => {
-                                tracing::error!(%error, "retiring filed inbox page");
-                                self.notice_on(
-                                    None,
-                                    "filed, but inbox persistence failed",
-                                    StyleClass::SystemInfo,
-                                    cx,
-                                );
-                            }
-                        },
-                        Some(reason) => {
-                            self.notice_on(
-                                None,
-                                &format!("file: {reason}"),
-                                StyleClass::SystemInfo,
-                                cx,
-                            );
-                        }
-                    }
-                }
+            ConnEvent::DeskBindingResult {
+                request_id,
+                node_id,
+                error,
+            } => {
+                self.complete_binding(host, request_id, node_id, error, window, cx);
             }
             ConnEvent::Ready {
                 agents,
@@ -3664,33 +3525,6 @@ impl Workspace {
         cx.notify();
     }
 
-    pub fn cmd_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let on_submit = std::rc::Rc::new(
-            |workspace: &mut Workspace,
-             input: String,
-             window: &mut Window,
-             cx: &mut Context<Workspace>| {
-                let input = input.trim();
-                if input.is_empty() {
-                    return;
-                }
-                let url = if input.contains("://") {
-                    input.to_owned()
-                } else {
-                    format!("https://{input}")
-                };
-                workspace.create_browser_page(url, window, cx);
-            },
-        );
-        self.open_prompt(
-            "new web:",
-            std::rc::Rc::new(|_, _, _| Vec::new()),
-            on_submit,
-            window,
-            cx,
-        );
-    }
-
     fn observe_browser_metadata(
         &mut self,
         model: &Entity<rho_browser::PageModel>,
@@ -3705,13 +3539,16 @@ impl Workspace {
         }
     }
 
+    /// Creates a browser page and files it as a node under `parent`
+    /// (`None` is the root), then opens it.
     pub(crate) fn create_browser_page(
         &mut self,
         url: String,
+        parent: Option<(HostId, rho_desk::NodeId)>,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
-        let context = self.capture_context(window, cx);
+        let _ = window;
         let create = rho_browser::create_page(url, cx);
         cx.spawn(async move |this, cx| {
             let record = create.await;
@@ -3726,407 +3563,107 @@ impl Workspace {
                     }
                 };
                 let id = record.id;
-                let inbox_id = match this.inbox.append(InboxDraft {
-                    kind: InboxKind::Capture,
-                    text: record.launch_url,
-                    source: SourceReference::Page { id: id.to_string() },
-                    context,
-                    waiting_on: None,
-                }) {
-                    Ok(inbox_id) => inbox_id,
-                    Err(error) => {
-                        tracing::error!(%error, "persisting new browser page in inbox");
-                        rho_browser::close_page(id, cx).detach();
-                        this.notice_on(
-                            None,
-                            "new web: could not save inbox item",
-                            StyleClass::SystemInfo,
-                            cx,
-                        );
-                        return;
-                    }
-                };
-                crate::journal::record(crate::journal::Event::Capture {
-                    inbox_id: inbox_id.0,
-                    method: crate::journal::CaptureMethod::TabBirth,
-                });
-                this.invalidate_dealer_signals(cx);
+                this.bind_page_node(
+                    id,
+                    record.launch_url,
+                    parent,
+                    crate::journal::CreateMethod::TabBirth,
+                    cx,
+                );
                 this.preview_browser_page(id, window, cx);
                 this.focus_rail(window, cx);
-                this.echo("captured", StyleClass::SystemInfo, cx);
             });
         })
         .detach();
     }
 
-    fn capture_context(&self, window: &Window, cx: &mut Context<Self>) -> CapturedContext {
-        let position = self.dashboard.capture_position(cx);
-        let host = position.as_ref().map(|(host, ..)| host.to_string());
-        let room = position.map(|(_, _, room)| room);
-        let focused_surface = if self.dashboard.is_focused(window, cx) {
-            "Desk".to_owned()
-        } else {
-            self.surface_name(&self.active_pane().surface.key)
-        };
-        CapturedContext {
-            host,
-            room,
-            focused_surface,
-        }
-    }
-
-    pub(crate) fn cmd_capture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let context = self.capture_context(window, cx);
-        let source = self.dashboard.capture_position(cx).map_or(
-            SourceReference::None,
-            |(host, node_id, _)| SourceReference::DeskNode {
-                host: host.0,
-                node_id: node_id.into(),
-            },
-        );
-        self.open_prompt(
-            "capture:",
-            std::rc::Rc::new(|_, _, _| Vec::new()),
-            std::rc::Rc::new(move |workspace, input, _, cx| {
-                let text = input.trim();
-                if text.is_empty() {
-                    return;
-                }
-                match workspace.inbox.append(InboxDraft {
-                    kind: InboxKind::Capture,
-                    text: text.to_owned(),
-                    source: source.clone(),
-                    context: context.clone(),
-                    waiting_on: None,
-                }) {
-                    Ok(id) => {
-                        crate::journal::record(crate::journal::Event::Capture {
-                            inbox_id: id.0,
-                            method: crate::journal::CaptureMethod::Keyboard,
-                        });
-                        workspace.invalidate_dealer_signals(cx);
-                        workspace.echo("captured", StyleClass::SystemInfo, cx)
-                    }
-                    Err(error) => {
-                        tracing::error!(%error, "persisting inbox capture");
-                        workspace.notice_on(None, "capture failed", StyleClass::SystemInfo, cx);
-                    }
-                }
-            }),
-            window,
-            cx,
-        );
-    }
-
-    /// Opens the machine-owned inbox as a completing list. Selecting a row
-    /// opens a two-key membrane: `f` files, `d` discards.
-    pub(crate) fn open_inbox(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let now_ms = chrono::Utc::now().timestamp_millis();
-        if let Err(error) = self.inbox.refresh_deferred(now_ms) {
-            tracing::warn!(%error, "resurfacing deferred inbox items");
-        }
-        self.invalidate_dealer_signals(cx);
-        if self.inbox.pending_items(now_ms).next().is_none() {
-            self.notice_on(None, "inbox empty", StyleClass::SystemInfo, cx);
-            self.drop_transient();
-            return;
-        }
-        self.open_prompt(
-            "inbox:",
-            std::rc::Rc::new(|workspace, needle, _| {
-                let needle = needle.to_lowercase();
-                let now_ms = chrono::Utc::now().timestamp_millis();
-                workspace
-                    .inbox
-                    .pending_items(now_ms)
-                    .filter(|item| item.text.to_lowercase().contains(&needle))
-                    .map(|item| crate::minibuffer::Candidate {
-                        value: item.text.clone(),
-                        description: format!(
-                            "{:?} · {}",
-                            item.kind,
-                            item.context.room.as_deref().unwrap_or("no room")
-                        ),
-                    })
-                    .collect()
-            }),
-            std::rc::Rc::new(|workspace, input, window, cx| {
-                let now_ms = chrono::Utc::now().timestamp_millis();
-                let Some(item) = workspace
-                    .inbox
-                    .pending_items(now_ms)
-                    .find(|item| item.text == input)
-                    .cloned()
-                else {
-                    workspace.notice_on(None, "inbox: choose an item", StyleClass::SystemInfo, cx);
-                    return;
-                };
-                workspace.pending_inbox_item = Some(item.id);
-                workspace.open_transient(crate::transient::inbox_item_menu(), window, cx);
-            }),
-            window,
-            cx,
-        );
-    }
-
-    pub(crate) fn discard_inbox_item(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.pending_inbox_item.take() else {
-            return;
-        };
-        match self.inbox.verdict(&id, Verdict::Discarded) {
-            Ok(_) => {
-                crate::journal::record(crate::journal::Event::InboxVerdict {
-                    inbox_id: id.0,
-                    verdict: crate::journal::InboxVerdict::Discard,
-                });
-                self.echo("discarded", StyleClass::SystemInfo, cx);
-                self.invalidate_dealer_signals(cx);
-            }
-            Err(error) => tracing::error!(%error, "discarding inbox item"),
-        }
-        self.drop_transient();
-        self.scan_browser_pages_for_gc(cx);
-    }
-
-    pub(crate) fn defer_inbox_item(&mut self, cx: &mut Context<Self>) {
-        let Some(id) = self.pending_inbox_item.take() else {
-            return;
-        };
-        let until_ms = (chrono::Utc::now() + chrono::Duration::days(1)).timestamp_millis();
-        match self.inbox.verdict(&id, Verdict::Deferred { until_ms }) {
-            Ok(_) => {
-                crate::journal::record(crate::journal::Event::InboxVerdict {
-                    inbox_id: id.0,
-                    verdict: crate::journal::InboxVerdict::Defer { until_ms },
-                });
-                self.echo("deferred 1d", StyleClass::SystemInfo, cx);
-                self.invalidate_dealer_signals(cx);
-            }
-            Err(error) => tracing::error!(%error, "deferring inbox item"),
-        }
-        self.drop_transient();
-    }
-
-    pub(crate) fn prompt_file_inbox_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.pending_filing_card = None;
-        if self.pending_inbox_item.is_none() {
-            return;
-        }
-        self.pending_filing_destinations = self.dashboard.heading_destination_candidates(cx);
-        self.pending_filing_selected = None;
-        self.open_prompt(
-            "file under:",
-            std::rc::Rc::new(|workspace, needle, _cx| {
-                let needle = needle.to_lowercase();
-                workspace
-                    .pending_filing_destinations
-                    .iter()
-                    .filter(|(value, description, _, _)| {
-                        value.to_lowercase().contains(&needle)
-                            || description.to_lowercase().contains(&needle)
-                    })
-                    .map(|(value, description, _, _)| crate::minibuffer::Candidate {
-                        value: value.clone(),
-                        description: description.clone(),
-                    })
-                    .into_iter()
-                    .collect()
-            }),
-            std::rc::Rc::new(|workspace, heading, window, cx| {
-                workspace.file_inbox_item(&heading, window, cx)
-            }),
-            window,
-            cx,
-        );
-        if let Some(minibuffer) = &mut self.minibuffer {
-            minibuffer.set_complete_whole_input();
-        }
-    }
-
-    /// Dealer-facing filing handoff. Destination completion and the eventual
-    /// Desk edit remain owned by the inbox filing membrane.
-    pub fn begin_inbox_filing(
+    /// Asks the daemon for the page's node. The node id comes back on
+    /// `DeskBindingResult`, which is where the journal entry is written.
+    pub(crate) fn bind_page_node(
         &mut self,
-        id: &InboxId,
-        window: &mut Window,
+        page: rho_browser::PageId,
+        url: String,
+        parent: Option<(HostId, rho_desk::NodeId)>,
+        method: crate::journal::CreateMethod,
         cx: &mut Context<Self>,
-    ) -> Result<(), String> {
-        self.pending_filing_card = None;
-        self.pending_phone_filing_event = None;
-        if self.inbox.get(id).is_none() {
-            return Err(format!("inbox item {} no longer exists", id.0));
-        }
-        self.pending_inbox_item = Some(id.clone());
-        self.prompt_file_inbox_item(window, cx);
-        Ok(())
-    }
-
-    fn file_inbox_item(&mut self, heading: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(id) = self.pending_inbox_item.clone() else {
-            self.pending_filing_card = None;
-            return;
-        };
-        let Some(item) = self.inbox.get(&id).cloned() else {
-            self.pending_filing_card = None;
-            return;
-        };
-        if let SourceReference::Page { id: page_id } = &item.source {
-            let target = self.pending_filing_selected.take();
-            let phone_event = self.pending_phone_filing_event.take();
-            let card = self
-                .pending_filing_card
-                .take()
-                .and_then(|(card_id, card)| (card_id == id).then_some(card));
-            if !self.file_inbox_page(target, heading, page_id, &id, card, phone_event, cx) {
-                self.notice_on(None, "file: heading not found", StyleClass::SystemInfo, cx);
-            }
-            // A page filing is not retired until the daemon acknowledges the
-            // machine-owned binding. The result event completes this flow.
-            return;
-        }
-        // A filed Slack thread keeps the conversation it came from: the
-        // summary alone reads as a stray sentence a week later. The tag is
-        // what makes the filed threads findable as a set.
-        let (title, tags): (String, &[&str]) = match &item.source {
-            SourceReference::SlackThread { .. } => {
-                let title = match item.context.room.as_deref() {
-                    Some(room) => format!("{room}: {}", item.text),
-                    None => item.text.clone(),
-                };
-                (title, &["slack"])
-            }
-            _ => (item.text.clone(), &[]),
-        };
-        let filed = self
-            .pending_filing_selected
-            .take()
-            .and_then(|(host, parent)| {
-                self.append_tree_heading_tagged(host, parent, true, &title, tags, window, cx)
-                    .map(|node| (host, node))
-            });
-        let Some((host, node)) = filed else {
-            self.pending_filing_card = None;
-            self.notice_on(None, "file: heading not found", StyleClass::SystemInfo, cx);
-            return;
-        };
-        let removed = match self.inbox.verdict(&id, Verdict::Filed) {
-            Ok(Some(removed)) => removed,
-            Ok(None) => {
-                self.pending_filing_card = None;
-                self.notice_on(
-                    None,
-                    "file: inbox item is unavailable",
-                    StyleClass::SystemInfo,
-                    cx,
-                );
-                return;
-            }
-            Err(error) => {
-                self.pending_filing_card = None;
-                tracing::error!(%error, "retiring filed inbox item");
-                self.notice_on(
-                    None,
-                    "filed, but inbox persistence failed",
-                    StyleClass::SystemInfo,
-                    cx,
-                );
-                return;
-            }
-        };
-        crate::journal::record(crate::journal::Event::InboxVerdict {
-            inbox_id: id.0.clone(),
-            verdict: crate::journal::InboxVerdict::File {
-                heading: heading.to_owned(),
-            },
-        });
-        self.pending_inbox_item = None;
-        let phone_event = self.pending_phone_filing_event.take();
-        let submitted_card_is_current = phone_event.as_ref().is_some_and(|event| {
-            self.dashboard
-                .current_deal_card()
-                .is_some_and(|card| card.identity == event.card)
-        });
-        let mut undo_sequence = None;
-        if let Some(card) = self
-            .pending_filing_card
-            .take()
-            .and_then(|(card_id, card)| (card_id == id).then_some(card))
-        {
-            let entry = self.next_verdict_undo(
-                card,
-                crate::dashboard::DealerVerdict::File,
-                "file".to_owned(),
-                VerdictUndoState::Filed {
-                    host,
-                    node,
-                    prior: removed,
-                },
+    ) {
+        let Some(host) = parent
+            .map(|(host, _)| host)
+            .or_else(|| self.hosts.primary())
+        else {
+            self.notice_on(
+                None,
+                "new page: no daemon is connected",
+                StyleClass::SystemInfo,
+                cx,
             );
-            undo_sequence = Some(entry.sequence);
-            self.restore_verdict_undo(entry);
-        }
-        if let Some(event) = phone_event {
-            self.dashboard.record_dealer_event(event);
-            self.record_phone_verdict(crate::journal::PhoneVerdict::File, cx);
-            if submitted_card_is_current {
-                if let Some(sequence) = undo_sequence {
-                    self.phone_completed_verdict(sequence);
-                }
-                self.restore_phone_feed(window, cx);
-                self.finish_deal_verdict(window, cx);
-            } else {
-                self.refresh_dashboard(window, cx);
-            }
-        } else {
-            self.refresh_dashboard(window, cx);
-        }
-        self.echo(
-            &format!("filed under {heading}"),
-            StyleClass::SystemInfo,
-            cx,
-        );
-    }
-
-    fn file_inbox_page(
-        &mut self,
-        target: Option<(HostId, rho_desk::NodeId)>,
-        heading: &str,
-        id: &str,
-        inbox_id: &InboxId,
-        card: Option<crate::dashboard::DealCard>,
-        phone_event: Option<crate::dashboard::DealerEvent>,
-        _cx: &mut Context<Self>,
-    ) -> bool {
-        let Some((host, parent)) = target else {
-            return false;
+            return;
         };
-        let Ok(page) = id.parse::<rho_browser::PageId>() else {
-            return false;
-        };
-        // A page filed while its browser is not running has no URL yet; the
-        // daemon backfills it rather than losing the filing.
-        let url = rho_browser::live_page_url(page).unwrap_or_default();
-        let request_id = self.next_page_binding_request_id;
-        self.next_page_binding_request_id = self.next_page_binding_request_id.wrapping_add(1);
-        self.pending_page_filings.insert(
+        let request_id = self.next_binding_request_id;
+        self.next_binding_request_id = self.next_binding_request_id.wrapping_add(1);
+        self.pending_bindings.insert(
             (host, request_id),
-            PendingPageFiling {
-                inbox_id: inbox_id.clone(),
-                heading: heading.to_owned(),
-                card,
-                phone_event,
+            PendingBinding::Created {
+                kind: crate::journal::CreatedKind::Page,
+                method,
+                at_root: parent.is_none(),
             },
         );
         self.send_to_host(
             host,
             ClientMessage::DeskPageBind {
                 request_id,
-                parent,
+                parent: parent.map(|(_, node_id)| node_id),
                 page_id: rho_desk::PageId(*page.0.as_bytes()),
                 url,
             },
         );
-        true
+    }
+
+    /// A bind request came back. Threads are bound by the machine and are
+    /// silent; a page the user asked for is journalled and echoed.
+    fn complete_binding(
+        &mut self,
+        host: HostId,
+        request_id: u64,
+        node_id: Option<rho_desk::NodeId>,
+        error: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let pending = self.pending_bindings.remove(&(host, request_id));
+        if let Some(reason) = error {
+            if pending.is_some() {
+                self.notice_on(None, &format!("new: {reason}"), StyleClass::SystemInfo, cx);
+            } else {
+                tracing::warn!(%reason, "desk binding rejected");
+            }
+            return;
+        }
+        let Some(node_id) = node_id else {
+            return;
+        };
+        match pending {
+            Some(PendingBinding::Created {
+                kind,
+                method,
+                at_root,
+            }) => crate::journal::record(crate::journal::Event::Created {
+                node_id: node_id.into(),
+                kind,
+                method,
+                at_root,
+            }),
+            Some(PendingBinding::SlackThread { thread }) => {
+                crate::journal::record(crate::journal::Event::SlackThreadBound {
+                    thread,
+                    node_id: node_id.into(),
+                })
+            }
+            None => {}
+        }
+        self.invalidate_dealer_signals(cx);
+        self.refresh_dashboard(window, cx);
     }
 
     pub(crate) fn cmd_diff(&mut self, window: &Window, cx: &mut Context<Self>) {
@@ -5320,7 +4857,6 @@ impl Workspace {
             SurfaceKey::Draft => "draft".to_owned(),
             SurfaceKey::Messages => "messages".to_owned(),
             SurfaceKey::DeskNode { .. } => "desk".to_owned(),
-            SurfaceKey::Inbox(id) => self.inbox_surface_label(id),
             SurfaceKey::Transcript(agent_id) => self.registry.agent_display_label(*agent_id),
             SurfaceKey::File { path, .. } => path.to_string(),
             SurfaceKey::Shell(agent_id) => {
@@ -5349,31 +4885,11 @@ impl Workspace {
         }
     }
 
-    /// What a dealt card is about, for the status bar. An inbox id is rho's
-    /// own bookkeeping: the person reading it wants the conversation the
-    /// card came from.
-    fn inbox_surface_label(&self, id: &str) -> String {
-        let Some(item) = self.inbox.get(&InboxId(id.to_owned())) else {
-            return "inbox".to_owned();
-        };
-        if let Some(room) = item.context.room.as_ref().filter(|room| !room.is_empty()) {
-            return room.clone();
-        }
-        match item.kind {
-            crate::inbox::InboxKind::Ping => "ping",
-            crate::inbox::InboxKind::Capture => "capture",
-            crate::inbox::InboxKind::Obligation => "obligation",
-            crate::inbox::InboxKind::Slack => "slack",
-        }
-        .to_owned()
-    }
-
     fn surface_kind(key: &SurfaceKey) -> &'static str {
         match key {
             SurfaceKey::Draft => "compose",
             SurfaceKey::Messages => "messages",
             SurfaceKey::DeskNode { .. } => "desk heading",
-            SurfaceKey::Inbox(_) => "inbox",
             SurfaceKey::Transcript(_) => "transcript",
             SurfaceKey::File { .. } => "file",
             SurfaceKey::Shell(_) => "shell",
@@ -5544,7 +5060,6 @@ impl Workspace {
                 host: host.0,
                 node_id: (*node_id).into(),
             },
-            SurfaceKey::Inbox(id) => SurfaceIdentity::Inbox { id: id.clone() },
             SurfaceKey::Transcript(agent_id) => SurfaceIdentity::Transcript {
                 agent_id: agent_id.into(),
             },
@@ -5625,7 +5140,6 @@ impl Workspace {
                 SurfaceView::Draft { editor, .. }
                 | SurfaceView::Messages(editor)
                 | SurfaceView::DeskNode(editor)
-                | SurfaceView::Inbox(editor)
                 | SurfaceView::Transcript { editor, .. }
                 | SurfaceView::Shell { editor, .. } => {
                     editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
@@ -6254,33 +5768,19 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let editor = self.active_editor(cx);
-        // Each surface gets a real inbox item, because a surface is named
-        // after what its card is about, not after its id.
+        // A surface is named after what it is about, so the test history is
+        // built from named conversations.
         self.surface_history = names
             .iter()
             .rev()
-            .map(|name| {
-                let id = self
-                    .inbox
-                    .append(crate::inbox::InboxDraft {
-                        kind: crate::inbox::InboxKind::Capture,
-                        text: (*name).to_owned(),
-                        source: crate::inbox::SourceReference::None,
-                        context: crate::inbox::CapturedContext {
-                            host: None,
-                            room: Some((*name).to_owned()),
-                            focused_surface: String::new(),
-                        },
-                        waiting_on: None,
-                    })
-                    .expect("the test inbox accepts an item");
-                WarmSurface {
-                    context: self.active_context,
-                    surface: Self::wrap_surface(
-                        SurfaceKey::Inbox(id.0),
-                        SurfaceView::Inbox(editor.clone()),
-                    ),
-                }
+            .map(|name| WarmSurface {
+                context: self.active_context,
+                surface: Self::wrap_surface(
+                    SurfaceKey::ZulipNarrow {
+                        label: (*name).to_owned(),
+                    },
+                    SurfaceView::DeskNode(editor.clone()),
+                ),
             })
             .collect();
         self.history_cursor = self.surface_history.len().saturating_sub(1);
@@ -6361,8 +5861,10 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn append_newer_history_for_test(&mut self, name: &str, cx: &mut Context<Self>) {
         let surface = Self::wrap_surface(
-            SurfaceKey::Inbox(name.to_owned()),
-            SurfaceView::Inbox(self.active_editor(cx)),
+            SurfaceKey::ZulipNarrow {
+                label: name.to_owned(),
+            },
+            SurfaceView::DeskNode(self.active_editor(cx)),
         );
         self.append_history(surface, crate::journal::HistoryAppendMethod::Overview, cx);
         self.history_cursor = self.history_cursor.saturating_sub(1);
@@ -6387,7 +5889,7 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn deal_skip_exists_for_test(
         &self,
-        identity: &crate::dashboard::DealCardIdentity,
+        identity: &crate::dashboard::DealCardId,
     ) -> bool {
         self.dashboard.has_skip_for_test(identity)
     }
@@ -6428,10 +5930,7 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn current_deal_card_for_test(
         &self,
-    ) -> Option<(
-        crate::dashboard::DealCardIdentity,
-        crate::dashboard::DealCardKind,
-    )> {
+    ) -> Option<(crate::dashboard::DealCardId, crate::dashboard::DealCardKind)> {
         self.dashboard
             .current_deal_card()
             .map(|card| (card.identity.clone(), card.kind))
@@ -6460,48 +5959,17 @@ impl Workspace {
     #[cfg(test)]
     pub(crate) fn rendered_deal_card_for_test(
         &self,
-    ) -> Option<(
-        crate::dashboard::DealCardIdentity,
-        crate::dashboard::DealCardKind,
-    )> {
-        if let Some(view) = &self.deal_view {
-            return Some((view.card().0.clone(), view.card().1));
-        }
+    ) -> Option<(crate::dashboard::DealCardId, crate::dashboard::DealCardKind)> {
         let card = self.dashboard.current_deal_card()?;
+        if let Some(view) = &self.deal_view {
+            return Some((view.identity(), card.kind));
+        }
         match card.kind {
-            crate::dashboard::DealCardKind::Desk => {}
+            crate::dashboard::DealCardKind::Desk | crate::dashboard::DealCardKind::Thread => {}
             crate::dashboard::DealCardKind::Agent if card.agent_id.is_some() => {}
-            crate::dashboard::DealCardKind::Inbox(_) => {
-                let crate::dashboard::DealCardIdentity::Inbox(id) = &card.identity else {
-                    return None;
-                };
-                if self.inbox.get(&InboxId(id.clone())).is_none() {
-                    return None;
-                }
-            }
             _ => return None,
         }
-        Some((card.identity.clone(), card.kind))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn append_inbox_for_test(&mut self, draft: InboxDraft) -> InboxId {
-        self.inbox.append(draft).expect("append test inbox item")
-    }
-
-    #[cfg(test)]
-    pub(crate) fn age_inbox_for_test(&mut self, id: &InboxId, captured_at_ms: i64) {
-        self.inbox.set_captured_at_for_test(id, captured_at_ms);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn inbox_item_for_test(&self, id: &InboxId) -> Option<crate::inbox::InboxItem> {
-        self.inbox.get(id).cloned()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn retire_inbox_for_test(&mut self, id: &InboxId) {
-        self.inbox.retire(id).expect("retire test inbox item");
+        Some((card.identity, card.kind))
     }
 
     #[cfg(test)]
@@ -6520,36 +5988,6 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn pending_filing_card_for_test(&self) -> Option<(InboxId, String)> {
-        self.pending_filing_card
-            .as_ref()
-            .map(|(id, card)| (id.clone(), card.breadcrumb.clone()))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn complete_filing_for_test(
-        &mut self,
-        host: HostId,
-        parent: rho_desk::NodeId,
-        heading: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.pending_filing_selected = Some((host, parent));
-        self.file_inbox_item(heading, window, cx);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn prepare_deal_filing_for_test(&mut self, id: InboxId) {
-        self.pending_inbox_item = Some(id.clone());
-        self.pending_filing_card = self
-            .dashboard
-            .current_deal_card()
-            .cloned()
-            .map(|card| (id, card));
-    }
-
-    #[cfg(test)]
     pub(crate) fn focus_dealt_surface_for_test(
         &mut self,
         window: &mut Window,
@@ -6564,18 +6002,13 @@ impl Workspace {
                         return;
                     }
                 }
-                crate::dashboard::DealCardKind::Inbox(_) => {}
-                crate::dashboard::DealCardKind::Desk => {}
+                crate::dashboard::DealCardKind::Desk | crate::dashboard::DealCardKind::Thread => {}
             }
         }
         let focus = match self.deal_view.as_ref() {
-            Some(DealView::Desk { editor, .. }) | Some(DealView::Inbox { editor, .. }) => {
-                editor.focus_handle(cx)
-            }
+            Some(DealView::Desk { editor, .. }) => editor.focus_handle(cx),
             Some(DealView::Surface { surface, .. }) => match &surface.view {
-                SurfaceView::DeskNode(editor) | SurfaceView::Inbox(editor) => {
-                    editor.focus_handle(cx)
-                }
+                SurfaceView::DeskNode(editor) => editor.focus_handle(cx),
                 SurfaceView::Transcript { editor, .. } => editor.focus_handle(cx),
                 SurfaceView::Browser(view) => view.read(cx).focus_handle(cx),
                 _ => return,
@@ -6596,7 +6029,12 @@ impl Workspace {
     /// editor selection subscription, and the verbs each call this at
     /// their source. The reconcile is idempotent and cheap, so calling
     /// it from several funnels is fine.
-    fn sync_tree_dashboard(&mut self, host: HostId, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn sync_tree_dashboard(
+        &mut self,
+        host: HostId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some((nodes, buffers)) = self.desk_cells.tree_source(host) {
             self.dashboard.set_tree_source(host, nodes, buffers, cx);
             self.refresh_dashboard(window, cx);
@@ -6624,7 +6062,7 @@ impl Workspace {
 
     /// Sends one mutation and remembers what its acceptance still owes:
     /// the editor's undo entry, a dealt verdict, or text for pasted notes.
-    fn apply_desk_writes(
+    pub(crate) fn apply_desk_writes(
         &mut self,
         host: HostId,
         writes: Vec<rho_desk::cells::CellWrite>,
@@ -6716,7 +6154,7 @@ impl Workspace {
 
     /// Records the editor undo entry a structure verb owns, so `u` emits the
     /// inverse writes rather than replaying text.
-    fn record_desk_semantic_undo(
+    pub(crate) fn record_desk_semantic_undo(
         &mut self,
         host: HostId,
         stamp: rho_desk::cells::Stamp,
@@ -6792,10 +6230,8 @@ impl Workspace {
     }
 
     pub(crate) fn refresh_dashboard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Err(error) = self.inbox.refresh_deferred(now_ms() as i64) {
-            tracing::warn!(%error, "waking deferred inbox items");
-        }
-        self.dashboard.sync(&self.registry, &self.inbox, window, cx);
+        let threads = self.slack_thread_facts(cx);
+        self.dashboard.sync(&self.registry, &threads, window, cx);
         {
             let pages = self.dashboard.page_ids();
             if pages != self.browser_pages {
@@ -6862,9 +6298,6 @@ impl Workspace {
 
     fn browser_page_retained(&self, page: rho_browser::PageId) -> bool {
         self.dashboard.page_ids().contains(&page)
-            || self.inbox.items().iter().any(|item| {
-                matches!(&item.source, SourceReference::Page { id } if id == &page.to_string())
-            })
     }
 
     #[cfg(test)]
@@ -6890,7 +6323,7 @@ impl Workspace {
         match &self.active_pane().surface.view {
             SurfaceView::Draft { editor, .. } => editor.clone(),
             SurfaceView::Messages(editor) => editor.clone(),
-            SurfaceView::DeskNode(editor) | SurfaceView::Inbox(editor) => editor.clone(),
+            SurfaceView::DeskNode(editor) => editor.clone(),
             SurfaceView::Transcript { editor, .. } => editor.clone(),
             SurfaceView::File(view) => view.read(cx).editor().clone(),
             SurfaceView::Shell { editor, .. } => editor.clone(),
@@ -6944,7 +6377,7 @@ impl Workspace {
         match &self.active_pane().surface.view {
             SurfaceView::Draft { editor, .. } => editor.focus_handle(cx),
             SurfaceView::Messages(editor) => editor.focus_handle(cx),
-            SurfaceView::DeskNode(editor) | SurfaceView::Inbox(editor) => editor.focus_handle(cx),
+            SurfaceView::DeskNode(editor) => editor.focus_handle(cx),
             SurfaceView::Transcript { editor, .. } => editor.focus_handle(cx),
             SurfaceView::File(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::Shell { editor, .. } => editor.focus_handle(cx),
@@ -6972,7 +6405,6 @@ impl Workspace {
             SurfaceKey::Draft
             | SurfaceKey::Messages
             | SurfaceKey::DeskNode { .. }
-            | SurfaceKey::Inbox(_)
             | SurfaceKey::ZulipInbox
             | SurfaceKey::ZulipNarrow { .. } => None,
             SurfaceKey::SlackList | SurfaceKey::SlackConversation(_) => None,
@@ -7012,7 +6444,7 @@ impl Workspace {
                 SurfaceView::Draft { editor }
             }
             SurfaceKey::Messages => SurfaceView::Messages(self.messages_editor.clone()),
-            SurfaceKey::DeskNode { .. } | SurfaceKey::Inbox(_) => {
+            SurfaceKey::DeskNode { .. } => {
                 unreachable!("deal surfaces are created while dealing")
             }
             SurfaceKey::Transcript(agent_id) => {
@@ -7034,7 +6466,7 @@ impl Workspace {
                 unreachable!("terminal surfaces are created by open_terminal_surface")
             }
             SurfaceKey::Browser(_) => {
-                unreachable!("browser surfaces are created by cmd_browser")
+                unreachable!("browser surfaces are created by create_browser_page")
             }
             SurfaceKey::ZulipInbox => {
                 let session = self.zulip_session(cx);
@@ -7093,7 +6525,6 @@ impl Workspace {
             // Files and chat keep whatever agent context was current.
             SurfaceKey::DeskNode { .. }
             | SurfaceKey::Messages
-            | SurfaceKey::Inbox(_)
             | SurfaceKey::File { .. }
             | SurfaceKey::ZulipInbox
             | SurfaceKey::ZulipNarrow { .. } => None,
@@ -7160,11 +6591,6 @@ impl Workspace {
 
     fn minibuffer_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(minibuffer) = self.minibuffer.take() {
-            self.pending_filing_card = None;
-            if minibuffer.prompt() == "file under:" {
-                self.pending_inbox_item = None;
-                self.pending_phone_filing_event = None;
-            }
             crate::journal::record(crate::journal::Event::MinibufferCancelled {
                 prompt: minibuffer.prompt().to_owned(),
                 input: minibuffer.input(cx),
@@ -7519,116 +6945,74 @@ impl Workspace {
         };
         self.deal_current_interacted = false;
         self.deal_view = None;
-        let surface = match &card.identity {
-            crate::dashboard::DealCardIdentity::Tree { host, node_id } => {
-                self.dashboard.move_to_tree_node_when_ready(*host, *node_id);
+        let host = card.identity.host;
+        let node_id = card.identity.node_id;
+        let surface = match self.dashboard.card_target(card.identity) {
+            crate::dashboard::CardTarget::Note | crate::dashboard::CardTarget::Missing => {
+                self.dashboard.move_to_tree_node_when_ready(host, node_id);
                 Self::wrap_surface(
-                    SurfaceKey::DeskNode {
-                        host: *host,
-                        node_id: *node_id,
-                    },
+                    SurfaceKey::DeskNode { host, node_id },
                     SurfaceView::DeskNode(self.dashboard.editor().clone()),
                 )
             }
-            crate::dashboard::DealCardIdentity::TreeAgent { agent_id, .. } => {
+            crate::dashboard::CardTarget::Agent(agent_id) => {
                 crate::journal::record(crate::journal::Event::AgentOpened {
                     agent_id: agent_id.into(),
                 });
-                self.registry.select_agent(*agent_id);
-                self.active_context = self.context_for_agent(*agent_id);
+                self.registry.select_agent(agent_id);
+                self.active_context = self.context_for_agent(agent_id);
                 self.hosts
-                    .focus_agent(self.host_of(*agent_id).map(|host| (host, *agent_id)));
-                self.make_surface(SurfaceKey::Transcript(*agent_id), window, cx)
+                    .focus_agent(self.host_of(agent_id).map(|host| (host, agent_id)));
+                self.make_surface(SurfaceKey::Transcript(agent_id), window, cx)
             }
-            crate::dashboard::DealCardIdentity::Agent(agent_id) => {
-                crate::journal::record(crate::journal::Event::AgentOpened {
-                    agent_id: agent_id.into(),
-                });
-                self.registry.select_agent(*agent_id);
-                self.active_context = self.context_for_agent(*agent_id);
-                self.hosts
-                    .focus_agent(self.host_of(*agent_id).map(|host| (host, *agent_id)));
-                self.make_surface(SurfaceKey::Transcript(*agent_id), window, cx)
-            }
-            crate::dashboard::DealCardIdentity::Inbox(id) => {
-                // A Slack obligation is a conversation: the deal view is the
-                // conversation surface itself, opened the way `enter` opens
-                // it, with the message that raised the card on screen.
-                if let Some(crate::dashboard::DealerInboxSource::SlackThread {
-                    workspace,
-                    channel,
-                    thread_ts,
-                    latest_ts,
-                }) = card.inbox_source.clone()
-                    && self
-                        .open_slack_deal(&workspace, &channel, &thread_ts, &latest_ts, window, cx)
-                {
+            // A thread is a conversation: the deal view is the conversation
+            // surface itself, opened the way `enter` opens it, with the
+            // message that raised the card on screen.
+            crate::dashboard::CardTarget::Thread(thread) => {
+                let latest = self
+                    .slack_thread_facts(cx)
+                    .get(&thread)
+                    .map_or_else(|| thread.thread_ts.clone(), |facts| facts.latest.clone());
+                if self.open_slack_deal(
+                    &thread.workspace,
+                    &thread.channel,
+                    &thread.thread_ts,
+                    &latest,
+                    window,
+                    cx,
+                ) {
                     self.deal_view = Some(DealView::Surface {
-                        identity: card.identity.clone(),
-                        kind: card.kind,
+                        identity: card.identity,
                         surface: self.active_pane().surface.clone(),
                     });
                     self.finish_presenting_deal(window, cx);
                     return true;
                 }
-                if !self.phone.enabled
-                    && let Some(crate::dashboard::DealerInboxSource::Page(page)) = card.inbox_source
-                {
-                    if let Some(model) = rho_browser::open_page(page, cx) {
+                self.dashboard.move_to_tree_node_when_ready(host, node_id);
+                Self::wrap_surface(
+                    SurfaceKey::DeskNode { host, node_id },
+                    SurfaceView::DeskNode(self.dashboard.editor().clone()),
+                )
+            }
+            crate::dashboard::CardTarget::Page(page) => {
+                match (self.phone.enabled, rho_browser::open_page(page, cx)) {
+                    (false, Some(model)) => {
                         self.observe_browser_metadata(&model, cx);
                         let view = cx.new(|cx| rho_browser::PageView::new(model, page, cx));
-                        let surface = Self::wrap_surface(
-                            SurfaceKey::Browser(page),
-                            SurfaceView::Browser(view),
-                        );
-                        self.deal_view = Some(DealView::Surface {
-                            identity: card.identity.clone(),
-                            kind: card.kind,
-                            surface: surface.clone(),
-                        });
-                        self.display_surface_with_method(
-                            surface,
-                            crate::journal::SurfaceShowMethod::Deal,
-                            cx,
-                        );
-                        self.focus_active_surface(window, cx);
-                        self.finish_presenting_deal(window, cx);
-                        return true;
+                        Self::wrap_surface(SurfaceKey::Browser(page), SurfaceView::Browser(view))
+                    }
+                    _ => {
+                        self.dashboard.move_to_tree_node_when_ready(host, node_id);
+                        Self::wrap_surface(
+                            SurfaceKey::DeskNode { host, node_id },
+                            SurfaceView::DeskNode(self.dashboard.editor().clone()),
+                        )
                     }
                 }
-                let text = self
-                    .inbox
-                    .get(&InboxId(id.clone()))
-                    .map_or_else(|| card.breadcrumb.clone(), |item| item.text.clone());
-                let buffer = cx.new(|cx| {
-                    let mut buffer = language::Buffer::local(text, cx);
-                    buffer.set_capability(language::Capability::Read, cx);
-                    buffer
-                });
-                let editor = cx.new(|cx| {
-                    let multi_buffer =
-                        cx.new(|cx| multi_buffer::MultiBuffer::singleton(buffer, cx));
-                    let mut editor = editor::Editor::new(
-                        editor::EditorMode::Full {
-                            scale_ui_elements_with_buffer_font_size: true,
-                            show_active_line_background: false,
-                            sizing_behavior: editor::SizingBehavior::ExcludeOverscrollMargin,
-                        },
-                        multi_buffer,
-                        None,
-                        window,
-                        cx,
-                    );
-                    crate::editor_config::configure(&mut editor, window, cx);
-                    editor.set_read_only(true);
-                    editor
-                });
-                Self::wrap_surface(SurfaceKey::Inbox(id.clone()), SurfaceView::Inbox(editor))
             }
         };
         self.deal_view = Some(DealView::Surface {
-            identity: card.identity.clone(),
-            kind: card.kind,
+            identity: card.identity,
             surface: surface.clone(),
         });
         self.display_surface_with_method(surface, crate::journal::SurfaceShowMethod::Deal, cx);
@@ -7652,7 +7036,7 @@ impl Workspace {
     /// dealt must be listed here or its keyboard never enters DEAL.
     fn surface_editor(view: &SurfaceView, cx: &App) -> Option<Entity<editor::Editor>> {
         match view {
-            SurfaceView::DeskNode(editor) | SurfaceView::Inbox(editor) => Some(editor.clone()),
+            SurfaceView::DeskNode(editor) => Some(editor.clone()),
             SurfaceView::Transcript { editor, .. } => Some(editor.clone()),
             SurfaceView::SlackConversation(view) => Some(view.read(cx).editor().clone()),
             _ => None,
@@ -7750,14 +7134,12 @@ impl Workspace {
         }
         let exclude = self.displayed_deal_identity();
         let now = chrono::Local::now().fixed_offset();
-        if let Err(error) = self.inbox.refresh_deferred(now.timestamp_millis()) {
-            tracing::warn!(%error, "waking deferred inbox items");
-        }
+        let threads = self.slack_thread_facts(cx);
         if self
             .dashboard
             .pull_deal(
                 &self.registry,
-                &self.inbox,
+                &threads,
                 now,
                 exclude.as_ref(),
                 &self.agent_last_interaction,
@@ -7773,12 +7155,9 @@ impl Workspace {
         }
     }
 
-    fn displayed_deal_identity(&self) -> Option<crate::dashboard::DealCardIdentity> {
+    fn displayed_deal_identity(&self) -> Option<crate::dashboard::DealCardId> {
         match &self.active_pane().surface.key {
-            SurfaceKey::Transcript(agent_id) => {
-                Some(crate::dashboard::DealCardIdentity::Agent(*agent_id))
-            }
-            SurfaceKey::Inbox(id) => Some(crate::dashboard::DealCardIdentity::Inbox(id.clone())),
+            SurfaceKey::Transcript(agent_id) => self.dashboard.agent_card_id(*agent_id),
             _ => self
                 .dashboard
                 .current_deal_card()
@@ -7807,28 +7186,61 @@ impl Workspace {
         self.refresh_dashboard(window, cx);
     }
 
-    /// What a verdict on an inbox card means when the item behind it is
-    /// gone. A Slack obligation goes quiet the moment its conversation is
-    /// read, which the dealt surface itself does, so the reader's verdict
-    /// lands on a card whose item has already been retired: the deal still
-    /// ends, there is simply nothing left to undo. Any other card losing
-    /// its item is a stale card, and saying so is better than pretending.
-    fn inbox_verdict_outcome<T>(
-        card: Option<&crate::dashboard::DealCard>,
-        found: Option<T>,
-    ) -> Result<Option<T>, &'static str> {
-        match found {
-            Some(found) => Ok(Some(found)),
-            None if matches!(
-                card.map(|card| card.kind),
-                Some(crate::dashboard::DealCardKind::Inbox(
-                    crate::dashboard::DealerInboxKind::Slack
-                ))
-            ) =>
-            {
-                Ok(None)
-            }
-            None => Err("nothing under the deal: the inbox item is unavailable"),
+    /// `f` on a deal: choose the note the card's node moves under. Filing is
+    /// a verdict like any other, so it goes through the tree's verdict log.
+    pub(crate) fn prompt_file_deal_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dashboard.current_deal_card().is_none() {
+            return;
+        }
+        self.pending_filing_destinations = self.dashboard.heading_destination_candidates(cx);
+        self.pending_filing_selected = None;
+        self.open_prompt(
+            "file under:",
+            std::rc::Rc::new(|workspace, needle, _cx| {
+                let needle = needle.to_lowercase();
+                workspace
+                    .pending_filing_destinations
+                    .iter()
+                    .filter(|(value, description, _, _)| {
+                        value.to_lowercase().contains(&needle)
+                            || description.to_lowercase().contains(&needle)
+                    })
+                    .map(|(value, description, _, _)| crate::minibuffer::Candidate {
+                        value: value.clone(),
+                        description: description.clone(),
+                    })
+                    .collect()
+            }),
+            std::rc::Rc::new(|workspace, heading, window, cx| {
+                let Some(parent) = workspace
+                    .pending_filing_destinations
+                    .iter()
+                    .find(|(value, ..)| *value == heading)
+                    .map(|(_, _, _, node_id)| *node_id)
+                else {
+                    workspace.notice_on(None, "file: choose a heading", StyleClass::SystemInfo, cx);
+                    return;
+                };
+                if !workspace.submit_tree_verdict(
+                    None,
+                    crate::desk_view::DeskVerdict::File { parent },
+                    crate::dashboard::DealerVerdict::File,
+                    format!("file under {heading}"),
+                    window,
+                    cx,
+                ) {
+                    workspace.echo(
+                        "file: the deal card disappeared",
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
+                }
+            }),
+            window,
+            cx,
+        );
+        if let Some(minibuffer) = &mut self.minibuffer {
+            minibuffer.set_complete_whole_input();
         }
     }
 
@@ -7868,12 +7280,7 @@ impl Workspace {
             state,
             ..
         } = entry;
-        if let VerdictUndoState::Filed { prior, .. } = state
-            && let Err(error) = self.inbox.restore(prior)
-        {
-            self.echo(&format!("undo: {error}"), StyleClass::SystemInfo, cx);
-            return;
-        }
+        let _ = state;
         self.dashboard.clear_skip(&card.identity);
         crate::journal::record(crate::journal::Event::VerdictUndone {
             card: Self::journal_card_identity(&card.identity),
@@ -7948,52 +7355,6 @@ impl Workspace {
                 self.pending_tree_undos
                     .insert((host, stamp), PendingTreeUndo { entry });
             }
-            VerdictUndoState::Inbox { id, prior } => {
-                debug_assert_eq!(id, prior.id);
-                if let Err(error) = self.inbox.restore(prior) {
-                    self.restore_verdict_undo(entry);
-                    self.echo(&format!("undo: {error}"), StyleClass::SystemInfo, cx);
-                    return;
-                }
-                self.complete_verdict_undo(entry, window, cx);
-            }
-            VerdictUndoState::Filed { host, node, .. } => {
-                let filed_leaf = self
-                    .desk_cells
-                    .node(host, node)
-                    .is_some_and(|node| node.kind == rho_desk::cells::NodeKind::Note)
-                    && !self.desk_cells.has_children(host, node);
-                if !filed_leaf {
-                    self.echo(
-                        &format!("cannot undo filing: {} was edited", entry.card.breadcrumb),
-                        StyleClass::SystemInfo,
-                        cx,
-                    );
-                    return;
-                }
-                let writes = self.desk_cells.delete_writes(node);
-                let Some(stamp) = self.apply_desk_writes(host, writes, None, window, cx) else {
-                    self.echo(
-                        &format!("cannot undo filing: {} was edited", entry.card.breadcrumb),
-                        StyleClass::SystemInfo,
-                        cx,
-                    );
-                    return;
-                };
-                self.pending_tree_undos
-                    .insert((host, stamp), PendingTreeUndo { entry });
-            }
-            VerdictUndoState::PageFiled => {
-                // A future implementation can undo the machine-owned node by
-                // adding DeskPageUnbind; no tree batch can remove it safely.
-                let title = entry.card.breadcrumb.clone();
-                self.restore_verdict_undo(entry);
-                self.echo(
-                    &format!("cannot undo page filing yet: {title}"),
-                    StyleClass::SystemInfo,
-                    cx,
-                );
-            }
         }
     }
 
@@ -8020,9 +7381,10 @@ impl Workspace {
         else {
             return false;
         };
-        let Some(node_id) = target_node.or(card.topic_node_id) else {
-            return false;
-        };
+        // The verdict lands on the card's own node: an agent card marks the
+        // agent, a thread card marks the thread. `target_node` is the room
+        // snooze, which deliberately files one level up.
+        let node_id = target_node.unwrap_or(card.identity.node_id);
         let phone_verdict = self.phone.enabled.then(|| match dealt {
             crate::desk_view::DeskVerdict::Done => crate::journal::PhoneVerdict::Done,
             crate::desk_view::DeskVerdict::Dismiss => crate::journal::PhoneVerdict::Dismiss,
@@ -8147,6 +7509,33 @@ impl Workspace {
         self.begin_new_agent_configuration(NewAgentIntent::QuickSpawn, window, cx);
     }
 
+    /// `n a` with an area chosen: the area is the agent's parent, and the
+    /// root is the quick-spawn flow's own inheritance.
+    pub(crate) fn new_agent_in_area(
+        &mut self,
+        area: Option<(HostId, rho_desk::NodeId)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let intent = match area {
+            Some(topic) => NewAgentIntent::Staff(topic),
+            None => NewAgentIntent::QuickSpawn,
+        };
+        self.begin_new_agent_configuration(intent, window, cx);
+    }
+
+    /// The workdir a new thing under an area inherits: the area's own
+    /// file, the nearest ancestor with one, then the agent that owns the
+    /// area (or the area itself when it is an agent node). The caller
+    /// falls back to the host's only workdir.
+    fn area_workdir(&self, host: HostId, node_id: rho_desk::NodeId) -> Option<HostPath> {
+        if let Some(path) = self.desk_cells.inherited_file_path(host, node_id) {
+            return Some(HostPath { host, path });
+        }
+        let agent_id = self.desk_cells.nearest_agent(host, node_id)?;
+        self.agent_workdir(agent_id)
+    }
+
     fn begin_new_agent_configuration(
         &mut self,
         intent: NewAgentIntent,
@@ -8154,10 +7543,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let workdir = match intent {
-            NewAgentIntent::Staff((host, node_id)) => self
-                .desk_cells
-                .file_path(host, node_id)
-                .map(|path| HostPath { host, path }),
+            NewAgentIntent::Staff((host, node_id)) => self.area_workdir(host, node_id),
             NewAgentIntent::QuickSpawn => {
                 let row_workdir = match self.dashboard.cursor_target(&self.registry, cx) {
                     Some(crate::dashboard::RowTarget::TreeAgent { agent_id, .. }) => {
@@ -8694,7 +8080,7 @@ impl Workspace {
         }
     }
 
-    fn dashboard_enter_insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn dashboard_enter_insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Ok(action) = cx.build_action("vim::InsertBefore", None) {
             window.dispatch_action(action, cx);
         }
@@ -9354,82 +8740,20 @@ impl Workspace {
                     let surface = self.make_surface(SurfaceKey::Transcript(agent_id), window, cx);
                     DealView::Surface {
                         identity: card.identity.clone(),
-                        kind: card.kind,
                         surface,
                     }
                 })
             } else {
-                let page = None;
-                page.or_else(|| {
-                    let crate::dashboard::DealCardIdentity::Inbox(id) = &card.identity else {
-                        return None;
-                    };
-                    let item = self.inbox.get(&InboxId(id.clone()))?;
-                    let mut text = item.text.clone();
-                    let context = [
-                        item.context
-                            .room
-                            .as_deref()
-                            .map(|value| format!("room: {value}")),
-                        item.context
-                            .host
-                            .as_deref()
-                            .map(|value| format!("host: {value}")),
-                        (!item.context.focused_surface.is_empty())
-                            .then(|| format!("surface: {}", item.context.focused_surface)),
-                    ]
-                    .into_iter()
-                    .flatten()
-                    .collect::<Vec<_>>();
-                    if !context.is_empty() {
-                        text.push_str(
-                            "
-
-",
-                        );
-                        text.push_str(&context.join(
-                            "
-",
-                        ));
-                    }
-                    let buffer = cx.new(|cx| {
-                        let mut buffer = language::Buffer::local(text, cx);
-                        buffer.set_capability(language::Capability::Read, cx);
-                        buffer
-                    });
-                    let editor = cx.new(|cx| {
-                        let multi_buffer =
-                            cx.new(|cx| multi_buffer::MultiBuffer::singleton(buffer, cx));
-                        let mut editor = editor::Editor::new(
-                            editor::EditorMode::Full {
-                                scale_ui_elements_with_buffer_font_size: true,
-                                show_active_line_background: false,
-                                sizing_behavior: editor::SizingBehavior::ExcludeOverscrollMargin,
-                            },
-                            multi_buffer,
-                            None,
-                            window,
-                            cx,
-                        );
-                        crate::editor_config::configure(&mut editor, window, cx);
-                        editor.set_read_only(true);
-                        editor
-                    });
-                    Some(DealView::Inbox {
-                        identity: card.identity.clone(),
-                        kind: card.kind,
-                        editor,
-                    })
-                })
+                // A thread deals as its conversation surface, which the deal
+                // presenter opens; nothing to build here.
+                None
             };
             self.deal_view = view;
         }
 
         if created && !self.phone.enabled {
             let focus = match self.deal_view.as_ref() {
-                Some(DealView::Desk { editor, .. }) | Some(DealView::Inbox { editor, .. }) => {
-                    Some(editor.focus_handle(cx))
-                }
+                Some(DealView::Desk { editor, .. }) => Some(editor.focus_handle(cx)),
                 Some(DealView::Surface { surface, .. }) => {
                     Self::surface_editor(&surface.view, cx).map(|editor| editor.focus_handle(cx))
                 }
@@ -9481,14 +8805,6 @@ impl Workspace {
                 .child(editor.clone())
                 .into_any_element(),
             Some(DealView::Surface { surface, .. }) => self.render_surface(surface),
-            Some(DealView::Inbox { kind, editor, .. }) => {
-                debug_assert!(matches!(kind, crate::dashboard::DealCardKind::Inbox(_)));
-                div()
-                    .size_full()
-                    .overflow_hidden()
-                    .child(editor.clone())
-                    .into_any_element()
-            }
             None => div().size_full().into_any_element(),
         }
     }
@@ -9500,33 +8816,26 @@ impl Workspace {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let path = match &card.inbox_source {
-            Some(crate::dashboard::DealerInboxSource::Page(page)) => {
-                let leaf = rho_browser::live_page_name(*page).unwrap_or_else(|| "page".to_owned());
+        let path = match self.dashboard.card_target(card.identity) {
+            crate::dashboard::CardTarget::Page(page) => {
+                let leaf = rho_browser::live_page_name(page).unwrap_or_else(|| "page".to_owned());
                 format!("{} / {leaf}", card.breadcrumb.replace(" › ", " / "))
             }
             // A Slack deal shows the conversation and nothing else: the
             // words are on screen already, and the state segment says whose
             // turn it is.
-            Some(crate::dashboard::DealerInboxSource::SlackThread {
-                thread_ts,
-                latest_ts,
-                ..
-            }) => {
+            crate::dashboard::CardTarget::Thread(thread) => {
                 let conversation = card.room.clone().unwrap_or_else(|| "slack".to_owned());
-                match latest_ts == thread_ts {
+                let latest = self
+                    .slack_thread_facts(cx)
+                    .get(&thread)
+                    .map(|facts| facts.latest.clone());
+                match latest.as_ref() == Some(&thread.thread_ts) || latest.is_none() {
                     true => conversation,
                     false => format!("{conversation} / thread"),
                 }
             }
-            _ => match card.kind {
-                crate::dashboard::DealCardKind::Inbox(_) => card.room.as_ref().map_or_else(
-                    || format!("inbox / {}", card.breadcrumb),
-                    |room| format!("{room} / {}", card.breadcrumb),
-                ),
-                crate::dashboard::DealCardKind::Agent => card.breadcrumb.replace(" › ", " / "),
-                crate::dashboard::DealCardKind::Desk => card.breadcrumb.replace(" › ", " / "),
-            },
+            _ => card.breadcrumb.replace(" › ", " / "),
         };
         let path = Self::truncate_outline_path(&path);
         let line = div()
@@ -10011,7 +9320,7 @@ impl Workspace {
                 .overflow_hidden()
                 .child(editor.clone())
                 .into_any_element(),
-            SurfaceView::DeskNode(editor) | SurfaceView::Inbox(editor) => div()
+            SurfaceView::DeskNode(editor) => div()
                 .size_full()
                 .overflow_hidden()
                 .child(editor.clone())
@@ -10389,9 +9698,6 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(Self::shell_interrupt))
             .on_action(cx.listener(Self::toggle_voice))
-            .on_action(cx.listener(|this, _: &InboxCapture, window, cx| {
-                this.cmd_capture(window, cx);
-            }))
             .on_action(cx.listener(Self::shell_eof))
             .on_action(cx.listener(|this, _: &ZulipOpenRow, window, cx| {
                 this.zulip_open_row(window, cx);
@@ -10530,12 +9836,7 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &DashboardDealDone, window, cx| {
                 vim::take_count(cx);
-                let card = this.dashboard.current_deal_card().cloned();
-                let now = chrono::Local::now().fixed_offset();
-                if card
-                    .as_ref()
-                    .is_some_and(|card| card.topic_node_id.is_some())
-                {
+                if this.dashboard.current_deal_card().is_some() {
                     if !this.submit_tree_verdict(
                         None,
                         crate::desk_view::DeskVerdict::Done,
@@ -10552,71 +9853,11 @@ impl Render for Workspace {
                     }
                     return;
                 }
-                let result = match card.as_ref() {
-                    Some(card)
-                        if matches!(
-                            card.kind,
-                            crate::dashboard::DealCardKind::Desk
-                                | crate::dashboard::DealCardKind::Agent
-                        ) =>
-                    {
-                        Err("the dealt runtime agent has no Desk node")
-                    }
-                    Some(crate::dashboard::DealCard {
-                        kind: crate::dashboard::DealCardKind::Inbox(_),
-                        ..
-                    }) => {
-                        let Some(crate::dashboard::DealCardIdentity::Inbox(id)) =
-                            card.as_ref().map(|card| &card.identity)
-                        else {
-                            return;
-                        };
-                        this.inbox
-                            .verdict(
-                                &crate::inbox::InboxId(id.clone()),
-                                crate::inbox::Verdict::Discarded,
-                            )
-                            .map_err(|_| "nothing under the deal: the inbox item is unavailable")
-                            .and_then(|item| Self::inbox_verdict_outcome(card.as_ref(), item))
-                    }
-                    _ => Err("nothing under the deal: the deal card disappeared"),
-                };
-                let handled = result.is_ok();
-                if handled {
-                    if let (Some(card), Ok(Some(item))) = (card.clone(), &result) {
-                        let entry = this.next_verdict_undo(
-                            card,
-                            crate::dashboard::DealerVerdict::Done,
-                            "done".to_owned(),
-                            VerdictUndoState::Inbox {
-                                id: item.id.clone(),
-                                prior: item.clone(),
-                            },
-                        );
-                        this.restore_verdict_undo(entry);
-                    }
-                    this.dashboard
-                        .record_deal_verdict_as(crate::dashboard::DealerVerdict::Done, now);
-                    this.finish_deal_verdict(window, cx);
-                }
-                if let Err(reason) = result {
-                    this.echo(&format!("done: {reason}"), StyleClass::SystemInfo, cx);
-                } else {
-                    this.echo(
-                        &format!("done: {}", card.as_ref().unwrap().breadcrumb),
-                        StyleClass::SystemInfo,
-                        cx,
-                    );
-                }
+                this.echo("done: nothing under the deal", StyleClass::SystemInfo, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardDealDiscard, window, cx| {
                 vim::take_count(cx);
-                let card = this.dashboard.current_deal_card().cloned();
-                let now = chrono::Local::now().fixed_offset();
-                if card
-                    .as_ref()
-                    .is_some_and(|card| card.topic_node_id.is_some())
-                {
+                if this.dashboard.current_deal_card().is_some() {
                     if !this.submit_tree_verdict(
                         None,
                         crate::desk_view::DeskVerdict::Dismiss,
@@ -10633,78 +9874,16 @@ impl Render for Workspace {
                     }
                     return;
                 }
-                let result = match card.as_ref() {
-                    Some(card)
-                        if matches!(
-                            card.kind,
-                            crate::dashboard::DealCardKind::Desk
-                                | crate::dashboard::DealCardKind::Agent
-                        ) =>
-                    {
-                        Err("the dealt runtime agent has no Desk node")
-                    }
-                    Some(crate::dashboard::DealCard {
-                        kind: crate::dashboard::DealCardKind::Inbox(_),
-                        ..
-                    }) => {
-                        let Some(crate::dashboard::DealCardIdentity::Inbox(id)) =
-                            card.as_ref().map(|card| &card.identity)
-                        else {
-                            return;
-                        };
-                        this.inbox
-                            .verdict(
-                                &crate::inbox::InboxId(id.clone()),
-                                crate::inbox::Verdict::Discarded,
-                            )
-                            .map_err(|_| "nothing under the deal: the inbox item is unavailable")
-                            .and_then(|item| Self::inbox_verdict_outcome(card.as_ref(), item))
-                    }
-                    _ => Err("nothing under the deal: the deal card disappeared"),
-                };
-                let handled = result.is_ok();
-                if handled {
-                    if let (Some(card), Ok(Some(item))) = (card.clone(), &result) {
-                        let entry = this.next_verdict_undo(
-                            card,
-                            crate::dashboard::DealerVerdict::Dismiss,
-                            "discard".to_owned(),
-                            VerdictUndoState::Inbox {
-                                id: item.id.clone(),
-                                prior: item.clone(),
-                            },
-                        );
-                        this.restore_verdict_undo(entry);
-                    }
-                    this.dashboard
-                        .record_deal_verdict_as(crate::dashboard::DealerVerdict::Dismiss, now);
-                    this.finish_deal_verdict(window, cx);
-                }
-                if let Err(reason) = result {
-                    this.echo(&format!("discard: {reason}"), StyleClass::SystemInfo, cx);
-                } else {
-                    this.echo(
-                        &format!("discard: {}", card.as_ref().unwrap().breadcrumb),
-                        StyleClass::SystemInfo,
-                        cx,
-                    );
-                }
+                this.echo(
+                    "discard: nothing under the deal",
+                    StyleClass::SystemInfo,
+                    cx,
+                );
             }))
             .on_action(cx.listener(|this, _: &DashboardDealSnooze, window, cx| {
                 let count = vim::take_count(cx).unwrap_or(1) as u32;
                 let today = chrono::Local::now().date_naive();
-                let now = chrono::Local::now().fixed_offset();
-                let card = this.dashboard.current_deal_card().cloned();
-                let prior_inbox = card.as_ref().and_then(|card| match &card.identity {
-                    crate::dashboard::DealCardIdentity::Inbox(id) => {
-                        this.inbox.get(&crate::inbox::InboxId(id.clone())).cloned()
-                    }
-                    _ => None,
-                });
-                if card
-                    .as_ref()
-                    .is_some_and(|card| card.topic_node_id.is_some())
-                {
+                if this.dashboard.current_deal_card().is_some() {
                     let days = count.max(1);
                     if !this.submit_tree_verdict(
                         None,
@@ -10726,68 +9905,7 @@ impl Render for Workspace {
                     }
                     return;
                 }
-                let result = match card.as_ref() {
-                    Some(card)
-                        if matches!(
-                            card.kind,
-                            crate::dashboard::DealCardKind::Desk
-                                | crate::dashboard::DealCardKind::Agent
-                        ) =>
-                    {
-                        Err("the dealt runtime agent has no Desk node")
-                    }
-                    Some(crate::dashboard::DealCard {
-                        kind: crate::dashboard::DealCardKind::Inbox(_),
-                        ..
-                    }) => {
-                        let Some(crate::dashboard::DealCardIdentity::Inbox(id)) =
-                            card.as_ref().map(|card| &card.identity)
-                        else {
-                            return;
-                        };
-                        this.inbox
-                            .defer(
-                                &crate::inbox::InboxId(id.clone()),
-                                (now + chrono::Duration::days(i64::from(count))).timestamp_millis(),
-                            )
-                            .map_err(|_| "nothing under the deal: the inbox item is unavailable")
-                            .and_then(|changed| {
-                                Self::inbox_verdict_outcome(card.as_ref(), changed.then_some(()))
-                                    .map(|_| ())
-                            })
-                    }
-                    _ => Err("nothing under the deal: the deal card disappeared"),
-                };
-                let handled = result.is_ok();
-                if handled {
-                    if let (Some(card), Some(item)) = (card.clone(), prior_inbox) {
-                        let entry = this.next_verdict_undo(
-                            card,
-                            crate::dashboard::DealerVerdict::Defer,
-                            format!("snooze {}d", count.max(1)),
-                            VerdictUndoState::Inbox {
-                                id: item.id.clone(),
-                                prior: item,
-                            },
-                        );
-                        this.restore_verdict_undo(entry);
-                    }
-                    this.dashboard
-                        .record_deal_verdict_as(crate::dashboard::DealerVerdict::Defer, now);
-                    this.finish_deal_verdict(window, cx);
-                }
-                // A verdict's success looks exactly like a key that did
-                // nothing; say what the press did, or that it did not.
-                if let Err(reason) = result {
-                    this.echo(&format!("snooze: {reason}"), StyleClass::SystemInfo, cx);
-                } else {
-                    let days = count.max(1);
-                    this.echo(
-                        &format!("snooze {days}d: {}", card.as_ref().unwrap().breadcrumb),
-                        StyleClass::SystemInfo,
-                        cx,
-                    );
-                }
+                this.echo("snooze: nothing under the deal", StyleClass::SystemInfo, cx);
             }))
             .on_action(
                 cx.listener(|this, _: &DashboardDealRoomSnooze, window, cx| {
@@ -10820,11 +9938,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &DashboardDealTodo, window, cx| {
                 let count = vim::take_count(cx).unwrap_or(7) as u32;
                 let today = chrono::Local::now().date_naive();
-                if this
-                    .dashboard
-                    .current_deal_card()
-                    .is_some_and(|card| card.topic_node_id.is_some())
-                {
+                if this.dashboard.current_deal_card().is_some() {
                     let days = count.max(1);
                     if !this.submit_tree_verdict(
                         None,
@@ -10956,57 +10070,17 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &DashboardDealFile, window, cx| {
                 vim::take_count(cx);
-                if let Some(crate::dashboard::DealCardIdentity::Inbox(id)) = this
-                    .dashboard
-                    .current_deal_card()
-                    .map(|card| card.identity.clone())
-                {
-                    let filing_card = this.dashboard.current_deal_card().cloned();
-                    let id = crate::inbox::InboxId(id);
-                    if this.inbox.get(&id).is_none() {
-                        return;
-                    }
-                    let phone = this.phone.enabled;
-                    let phone_event = phone
-                        .then(|| {
-                            this.dashboard.prepare_deal_verdict(
-                                crate::dashboard::DealerVerdict::File,
-                                chrono::Local::now().fixed_offset(),
-                            )
-                        })
-                        .flatten();
-                    if !phone {
-                        this.dashboard.record_deal_verdict_as(
-                            crate::dashboard::DealerVerdict::File,
-                            chrono::Local::now().fixed_offset(),
-                        );
-                    }
-                    if let Err(error) = this.begin_inbox_filing(&id, window, cx) {
-                        this.notice_on(None, &format!("file: {error}"), StyleClass::SystemInfo, cx);
-                        return;
-                    }
-                    this.pending_filing_card = filing_card.map(|card| (id, card));
-                    this.pending_phone_filing_event = phone_event;
-                    if !phone {
-                        this.dashboard.end_deal(cx);
-                        this.finish_dashboard_deal_action(window, cx);
-                    }
-                    return;
-                }
+                this.prompt_file_deal_card(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardDealReply, window, cx| {
                 vim::take_count(cx);
                 let Some(card) = this.dashboard.current_deal_card().cloned() else {
                     return;
                 };
-                let source = card.inbox_source.clone();
-                let opens_page =
-                    matches!(source, Some(crate::dashboard::DealerInboxSource::Page(_)));
-                let opens_slack = this.phone.enabled
-                    && matches!(
-                        source,
-                        Some(crate::dashboard::DealerInboxSource::SlackThread { .. })
-                    );
+                let target = this.dashboard.card_target(card.identity);
+                let opens_page = matches!(target, crate::dashboard::CardTarget::Page(_));
+                let opens_slack =
+                    this.phone.enabled && matches!(target, crate::dashboard::CardTarget::Thread(_));
                 if card.agent_id.is_none()
                     && !opens_page
                     && !opens_slack
@@ -11022,18 +10096,21 @@ impl Render for Workspace {
                     return;
                 }
                 this.leave_deal_mode(window, cx);
-                match source {
-                    Some(crate::dashboard::DealerInboxSource::Page(page)) => {
+                match target {
+                    crate::dashboard::CardTarget::Page(page) => {
                         this.open_browser_page(page, window, cx);
                     }
-                    Some(crate::dashboard::DealerInboxSource::SlackThread {
-                        workspace,
-                        channel,
-                        thread_ts,
-                        latest_ts,
-                    }) if this.phone.enabled => {
-                        let source =
-                            Self::slack_deal_source(&workspace, &channel, &thread_ts, &latest_ts);
+                    crate::dashboard::CardTarget::Thread(thread) if this.phone.enabled => {
+                        let latest = this
+                            .slack_thread_facts(cx)
+                            .get(&thread)
+                            .map_or_else(|| thread.thread_ts.clone(), |facts| facts.latest.clone());
+                        let source = Self::slack_deal_source(
+                            &thread.workspace,
+                            &thread.channel,
+                            &thread.thread_ts,
+                            &latest,
+                        );
                         this.open_slack_source(source, window, cx);
                         if let SurfaceView::SlackConversation(view) =
                             &this.active_pane().surface.view

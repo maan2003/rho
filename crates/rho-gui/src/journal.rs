@@ -88,44 +88,19 @@ impl From<&str> for AgentIdentity {
 #[derive(
     Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
 )]
+pub struct DealerCardIdentity {
+    pub host: u32,
+    pub node_id: NodeIdentity,
+}
+
+#[derive(
+    Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
+)]
 #[serde(tag = "type", rename_all = "snake_case")]
-pub enum DealerCardIdentity {
-    DeskNode {
-        host: u32,
-        node_id: NodeIdentity,
-    },
-    AgentNode {
-        host: u32,
-        node_id: NodeIdentity,
-        agent_id: AgentIdentity,
-    },
-    Agent {
-        agent_id: AgentIdentity,
-    },
-    Inbox {
-        id: String,
-    },
-}
-
-#[derive(
-    Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum DealerInboxKind {
-    Ping,
-    Obligation,
-    Capture,
-    Slack,
-}
-
-#[derive(
-    Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
-)]
-#[serde(tag = "type", content = "inbox_kind", rename_all = "snake_case")]
 pub enum DealerCardKind {
-    Desk,
+    Note,
     Agent,
-    Inbox(DealerInboxKind),
+    Thread,
 }
 
 #[derive(
@@ -188,9 +163,6 @@ pub enum SurfaceIdentity {
         host: u32,
         node_id: NodeIdentity,
     },
-    Inbox {
-        id: String,
-    },
     Transcript {
         agent_id: AgentIdentity,
     },
@@ -241,19 +213,21 @@ pub struct SlackThread {
     Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
 )]
 #[serde(rename_all = "snake_case")]
-pub enum CaptureMethod {
-    Keyboard,
+pub enum CreateMethod {
+    /// The `new` transient: the user asked for it and chose the area.
+    New,
+    /// A browser tab that was born rather than opened from a link.
     TabBirth,
 }
 
 #[derive(
     Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
 )]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum InboxVerdict {
-    Discard,
-    File { heading: String },
-    Defer { until_ms: i64 },
+#[serde(rename_all = "snake_case")]
+pub enum CreatedKind {
+    Note,
+    Page,
+    Agent,
 }
 
 #[derive(
@@ -379,8 +353,7 @@ pub struct DealerPolicySnapshot {
     pub blocked_reply_head_start: f64,
     pub blocked_reply_slope_per_day: f64,
     pub fyi_reply_pace_days: f64,
-    pub inbox_obligation_pace_days: u32,
-    pub inbox_capture_pace_days: u32,
+    pub thread_pace_days: u32,
     pub skip_cooldown_minutes: i64,
     pub lamp_threshold: f64,
     pub chime_threshold: f64,
@@ -445,8 +418,8 @@ pub enum Event {
     AgentSelected {
         agent_id: Option<String>,
     },
-    /// The Slack session came up, went away, raised a thread into the inbox,
-    /// or carried the user's own reply. The thread is named, not numbered:
+    /// The Slack session came up, went away, gave a thread a node, or
+    /// carried the user's own reply. The thread is named, not numbered:
     /// the record has to be readable a month later.
     SlackConnected {
         workspace: String,
@@ -455,9 +428,10 @@ pub enum Event {
         workspace: String,
         reason: String,
     },
-    SlackItemIngested {
+    /// A Slack thread started to matter, so it has a node in the tree.
+    SlackThreadBound {
         thread: SlackThread,
-        inbox_id: String,
+        node_id: NodeIdentity,
     },
     SlackReplied {
         thread: SlackThread,
@@ -499,13 +473,18 @@ pub enum Event {
         card: DealerCardIdentity,
         verdict: DealerVerdict,
     },
-    Capture {
-        inbox_id: String,
-        method: CaptureMethod,
+    /// A new node the user asked for, and where it was filed.
+    Created {
+        node_id: NodeIdentity,
+        kind: CreatedKind,
+        method: CreateMethod,
+        at_root: bool,
     },
-    InboxVerdict {
-        inbox_id: String,
-        verdict: InboxVerdict,
+    /// One-shot on the first run of the build that deleted the inbox: the
+    /// capture items the user had written became notes at the root.
+    CaptureCarryover {
+        notes: u32,
+        unreadable: u32,
     },
     /// One event per scroll burst. The position is a coarse vertical row or
     /// line offset; surfaces without a readable viewport report zero.
@@ -542,14 +521,14 @@ impl Event {
             Self::AgentSelected { .. } => "agent_selected",
             Self::SlackConnected { .. } => "slack_connected",
             Self::SlackDisconnected { .. } => "slack_disconnected",
-            Self::SlackItemIngested { .. } => "slack_item_ingested",
+            Self::SlackThreadBound { .. } => "slack_thread_bound",
             Self::SlackReplied { .. } => "slack_replied",
             Self::MinibufferOpened { .. } => "minibuffer_opened",
             Self::MinibufferSubmitted { .. } => "minibuffer_submitted",
             Self::MinibufferCancelled { .. } => "minibuffer_cancelled",
             Self::DeskRawModeToggled { .. } => "desk_raw_mode_toggled",
-            Self::Capture { .. } => "capture",
-            Self::InboxVerdict { .. } => "inbox_verdict",
+            Self::Created { .. } => "created",
+            Self::CaptureCarryover { .. } => "capture_carryover",
             Self::Scroll { .. } => "scroll",
             Self::Find { .. } => "find",
             Self::Dealer { .. } => "dealer",
@@ -836,8 +815,12 @@ mod tests {
 
     #[test]
     fn signal_events_round_trip_the_top_card() {
-        let card = DealerCardIdentity::Agent {
-            agent_id: "agent-a".into(),
+        let card = DealerCardIdentity {
+            host: 1,
+            node_id: NodeIdentity {
+                replica_id: 2,
+                counter: 3,
+            },
         };
         for event in [
             Event::LampTransition {
@@ -903,16 +886,24 @@ mod tests {
     #[test]
     fn dealer_event_round_trips_considered_cards() {
         let event = Event::Dealer {
-            card: DealerCardIdentity::Inbox {
-                id: "capture-1".into(),
+            card: DealerCardIdentity {
+                host: 1,
+                node_id: NodeIdentity {
+                    replica_id: 2,
+                    counter: 7,
+                },
             },
-            kind: DealerCardKind::Inbox(DealerInboxKind::Capture),
+            kind: DealerCardKind::Thread,
             verdict: DealerVerdict::Defer,
             skip_until: None,
             occurred_at: "2026-09-01T20:00:00+00:00".into(),
             time_to_verdict_ms: 4200,
-            considered_not_dealt: vec![DealerCardIdentity::Agent {
-                agent_id: "agent-a".into(),
+            considered_not_dealt: vec![DealerCardIdentity {
+                host: 1,
+                node_id: NodeIdentity {
+                    replica_id: 2,
+                    counter: 9,
+                },
             }],
         };
         let encoded = serde_json::to_string(&event).unwrap();

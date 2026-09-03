@@ -7,13 +7,11 @@
 use gpui::AppContext as _;
 use rho_slack::config::{CredentialStore, Credentials, WorkspaceName};
 use rho_slack::health::Signal;
-use rho_slack::model::{Change, Model, ThreadCard, Waiting};
+use rho_slack::model::{Change, Model, Waiting};
 use rho_slack::session::{Session, SessionEvent, Source};
 use rho_slack::types::{ChannelId, ThreadKey, Ts};
 
-use crate::inbox::{
-    CapturedContext, InboxDraft, InboxId, InboxKind, InboxStore, SourceReference, now_ms,
-};
+use crate::dashboard::{DealerThread, ThreadRef};
 use crate::minibuffer::Candidate;
 use crate::pane::SurfaceKey;
 use crate::style::StyleClass;
@@ -174,7 +172,6 @@ impl Workspace {
         let name = store.workspaces().next()?;
         let credentials = store.get(&name)?.clone();
         let session = cx.new(|cx| Session::new(credentials, cx));
-        self.slack_items.adopt(&self.inbox, &name);
         self._slack_subscription = Some(cx.subscribe(&session, |workspace, session, event, cx| {
             workspace.on_slack_event(session, event, cx);
         }));
@@ -314,7 +311,7 @@ impl Workspace {
             let view = view.clone();
             let link = view.update(cx, |view, cx| view.cursor_link(cx));
             if let Some(link) = link {
-                self.create_browser_page(link, window, cx);
+                self.create_browser_page(link, None, window, cx);
                 return;
             }
         }
@@ -467,29 +464,13 @@ impl Workspace {
                 });
             }
             SessionEvent::Changed(changes) => {
-                let now = now_ms();
                 for change in changes {
-                    let ingested = {
-                        let model = session.read(cx).model();
-                        self.slack_items.apply(&mut self.inbox, model, change, now)
-                    };
-                    match ingested {
-                        Ok(Some(id)) => {
-                            if matches!(change, rho_slack::model::Change::Raised(_)) {
-                                let thread = journal_thread_labelled(
-                                    session.read(cx).model(),
-                                    change_key(change),
-                                );
-                                crate::journal::record(crate::journal::Event::SlackItemIngested {
-                                    thread,
-                                    inbox_id: id.0.clone(),
-                                });
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(error) => {
-                            tracing::error!(%error, "slack inbox write failed");
-                        }
+                    // A thread that starts to matter becomes a node, and the
+                    // dealer deals the node. The daemon answers with the node
+                    // it already had when the thread was raised before, so a
+                    // reconnect never makes a second one.
+                    if let Change::Raised(key) | Change::Updated(key) = change {
+                        self.bind_slack_thread(key, cx);
                     }
                 }
                 self.invalidate_dealer_signals(cx);
@@ -512,12 +493,6 @@ impl Workspace {
             },
         }
         cx.notify();
-    }
-}
-
-fn change_key(change: &Change) -> &ThreadKey {
-    match change {
-        Change::Raised(key) | Change::Updated(key) | Change::Quieted(key) => key,
     }
 }
 
@@ -547,109 +522,92 @@ fn journal_thread_labelled(model: &Model, key: &ThreadKey) -> crate::journal::Sl
     }
 }
 
-/// The inbox side of a Slack session: which thread is which item.
-///
-/// The Slack session owns these items outright — it appends, updates, and
-/// retires them from the wire — so the user never files a stale obligation
-/// and never has to dismiss one they already answered.
-#[derive(Default)]
-pub(crate) struct SlackItems {
-    items: std::collections::BTreeMap<ThreadKey, InboxId>,
-}
-
-impl SlackItems {
-    /// Applies one model change to the inbox. Returns the item behind the
-    /// thread when one is now live, which is what the journal records.
-    pub(crate) fn apply(
-        &mut self,
-        store: &mut InboxStore,
-        model: &Model,
-        change: &Change,
-        now_ms: i64,
-    ) -> anyhow::Result<Option<InboxId>> {
-        match change {
-            Change::Raised(key) | Change::Updated(key) => {
-                let Some(card) = model.card(key, now_ms) else {
-                    return Ok(None);
-                };
-                let draft = draft_for(&card);
-                match self.items.get(key) {
-                    Some(id) if store.get(id).is_some() => {
-                        let id = id.clone();
-                        store.update(&id, draft)?;
-                        Ok(Some(id))
-                    }
-                    _ => {
-                        let id = store.append(draft)?;
-                        self.items.insert(key.clone(), id.clone());
-                        Ok(Some(id))
-                    }
-                }
-            }
-            Change::Quieted(key) => {
-                if let Some(id) = self.items.remove(key) {
-                    store.retire(&id)?;
-                }
-                Ok(None)
-            }
+impl Workspace {
+    /// Asks the daemon for this thread's node. Nothing is stored here: the
+    /// tree holds the thread, and the daemon's answer is idempotent.
+    pub(crate) fn bind_slack_thread(&mut self, key: &ThreadKey, cx: &mut gpui::Context<Self>) {
+        let Some(host) = self.hosts.primary() else {
+            return;
+        };
+        // A thread already dealt as an open node needs nothing; one that a
+        // verdict quieted is re-bound, and the daemon reopens it.
+        if self
+            .dashboard
+            .thread_card_id(&thread_ref(key))
+            .is_some_and(|card| self.dashboard.node_is_open(card))
+        {
+            return;
         }
-    }
-
-    /// Rebuilds the thread→item map from what the store already holds, so a
-    /// restart does not raise a second card for a thread already in the
-    /// inbox.
-    pub(crate) fn adopt(&mut self, store: &InboxStore, workspace: &WorkspaceName) {
-        for item in store.items() {
-            let SourceReference::SlackThread {
-                workspace: item_workspace,
-                channel,
-                thread_ts,
-                ..
-            } = &item.source
-            else {
-                continue;
-            };
-            if item_workspace != &workspace.0 {
-                continue;
-            }
-            self.items.insert(
-                ThreadKey {
-                    workspace: workspace.clone(),
-                    channel: ChannelId(channel.clone()),
-                    thread_ts: Ts(thread_ts.clone()),
+        let conversation = self.slack.as_ref().map_or_else(String::new, |session| {
+            session.read(cx).model().label(&key.channel)
+        });
+        let request_id = self.next_binding_request_id;
+        self.next_binding_request_id = self.next_binding_request_id.wrapping_add(1);
+        self.pending_bindings.insert(
+            (host, request_id),
+            crate::workspace::PendingBinding::SlackThread {
+                thread: crate::journal::SlackThread {
+                    workspace: key.workspace.0.clone(),
+                    conversation,
+                    thread: key.thread_ts.0.clone(),
                 },
-                item.id.clone(),
-            );
-        }
+            },
+        );
+        self.send_to_host(
+            host,
+            rho_ui_proto::ClientMessage::DeskThreadBind {
+                request_id,
+                parent: None,
+                workspace: key.workspace.0.clone(),
+                channel: key.channel.0.clone(),
+                thread_ts: key.thread_ts.0.clone(),
+            },
+        );
     }
 
-    pub(crate) fn item(&self, key: &ThreadKey) -> Option<&InboxId> {
-        self.items.get(key)
+    /// What every tracked thread is currently about. The dealer reads this
+    /// live from the mirror rather than storing any of it in the tree.
+    pub(crate) fn slack_thread_facts(
+        &self,
+        cx: &gpui::App,
+    ) -> std::collections::HashMap<ThreadRef, DealerThread> {
+        let Some(session) = self.slack.as_ref() else {
+            return std::collections::HashMap::new();
+        };
+        let now = chrono::Local::now();
+        let model = session.read(cx).model();
+        model
+            .tracked()
+            .into_iter()
+            .filter_map(|key| {
+                let card = model.card(&key, now.timestamp_millis())?;
+                let thread = model.thread(&key)?;
+                let raised_at = chrono::DateTime::from_timestamp_millis(thread.first_seen_ms)?
+                    .with_timezone(&now.timezone())
+                    .fixed_offset();
+                Some((
+                    thread_ref(&key),
+                    DealerThread {
+                        title: card.summary,
+                        conversation: card.conversation.clone(),
+                        raised_at,
+                        waiting_on: match card.waiting {
+                            Waiting::OnThem => Some(card.conversation),
+                            Waiting::OnYou => None,
+                        },
+                        latest: card.verdict_key.0,
+                    },
+                ))
+            })
+            .collect()
     }
 }
 
-fn draft_for(card: &ThreadCard) -> InboxDraft {
-    InboxDraft {
-        kind: InboxKind::Slack,
-        text: card.summary.clone(),
-        source: SourceReference::SlackThread {
-            workspace: card.key.workspace.0.clone(),
-            channel: card.key.channel.0.clone(),
-            thread_ts: card.key.thread_ts.0.clone(),
-            latest_ts: card.verdict_key.0.clone(),
-        },
-        context: CapturedContext {
-            host: None,
-            room: Some(card.conversation.clone()),
-            focused_surface: String::new(),
-        },
-        // The dealer reads this as "the ball is in their court"; a thread
-        // waiting on them is only ever an item because the user has not yet
-        // given it a verdict.
-        waiting_on: match card.waiting {
-            Waiting::OnThem => Some(card.conversation.clone()),
-            Waiting::OnYou => None,
-        },
+pub(crate) fn thread_ref(key: &ThreadKey) -> ThreadRef {
+    ThreadRef {
+        workspace: key.workspace.0.clone(),
+        channel: key.channel.0.clone(),
+        thread_ts: key.thread_ts.0.clone(),
     }
 }
 
@@ -693,76 +651,33 @@ mod tests {
     }
 
     #[test]
-    fn a_mention_becomes_an_item_and_your_reply_retires_it() {
+    fn a_mention_and_its_follow_ups_name_one_thread_to_bind() {
+        // The tree holds one node per thread, so every change the client
+        // acts on has to name the same thread: the mention that raised it
+        // and the reply that keeps it alive are one `thread` node.
         let mut model = model();
-        let mut store = InboxStore::memory();
-        let mut items = SlackItems::default();
-
-        let change = model
+        let raised = model
             .note_message(&message("100.0", None, "U1", "hey <@ME> look"), 0)
             .expect("a mention raises");
-        items.apply(&mut store, &model, &change, 0).unwrap();
-        assert_eq!(store.items().len(), 1);
-        let item = &store.items()[0];
-        assert_eq!(item.kind, InboxKind::Slack);
-        assert_eq!(item.text, "hey @Manmeet look");
-        assert_eq!(item.context.room.as_deref(), Some("#design"));
-        assert_eq!(item.waiting_on, None, "the mention waits on you");
-        assert!(matches!(
-            &item.source,
-            SourceReference::SlackThread { channel, thread_ts, latest_ts, .. }
-                if channel == "C1" && thread_ts == "100.0" && latest_ts == "100.0"
-        ));
-
-        // A later reply from them updates the same item, and moves the
-        // verdict key so a skip on the old card cannot hide the new one.
-        let change = model
+        let updated = model
             .note_message(&message("101.0", Some("100.0"), "U1", "still stuck"), 0)
             .expect("a newer reply updates");
-        items.apply(&mut store, &model, &change, 0).unwrap();
-        assert_eq!(store.items().len(), 1, "one thread is one item");
-        assert!(matches!(
-            &store.items()[0].source,
-            SourceReference::SlackThread { latest_ts, .. } if latest_ts == "101.0"
-        ));
+        let binds = [raised, updated]
+            .iter()
+            .filter_map(|change| match change {
+                Change::Raised(key) | Change::Updated(key) => Some(thread_ref(key)),
+                Change::Quieted(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(binds.len(), 2, "a raise and an update both bind");
+        assert_eq!(binds[0], binds[1], "one thread is one node");
+        assert_eq!(binds[0].thread_ts, "100.0");
 
-        let change = model
+        // Your own reply is the done verdict; nothing is bound for it.
+        let quieted = model
             .note_message(&message("102.0", Some("100.0"), "ME", "on it"), 0)
             .expect("your own reply quiets");
-        items.apply(&mut store, &model, &change, 0).unwrap();
-        assert!(
-            store.items().is_empty(),
-            "answering is the done verdict; nothing is left to file"
-        );
-    }
-
-    #[test]
-    fn a_restart_adopts_the_items_it_already_raised() {
-        let mut model = model();
-        let mut store = InboxStore::memory();
-        let mut items = SlackItems::default();
-        let change = model
-            .note_message(&message("200.0", None, "U1", "<@ME> ping"), 0)
-            .unwrap();
-        let id = items
-            .apply(&mut store, &model, &change, 0)
-            .unwrap()
-            .unwrap();
-
-        let mut adopted = SlackItems::default();
-        adopted.adopt(&store, &WorkspaceName("acme".into()));
-        let key = model.key(&ChannelId("C1".into()), &Ts("200.0".into()));
-        assert_eq!(adopted.item(&key), Some(&id));
-
-        let change = model
-            .note_message(&message("201.0", Some("200.0"), "U1", "still?"), 0)
-            .unwrap();
-        adopted.apply(&mut store, &model, &change, 0).unwrap();
-        assert_eq!(
-            store.items().len(),
-            1,
-            "a restart must not raise the thread twice"
-        );
+        assert!(matches!(quieted, Change::Quieted(_)));
     }
 
     #[test]

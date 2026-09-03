@@ -43,8 +43,9 @@ const SKIP_COOLDOWN_MINUTES: i64 = 15;
 const BLOCKED_REPLY_HEAD_START: f64 = 1.0;
 const BLOCKED_REPLY_SLOPE_PER_DAY: f64 = 12.0;
 const FYI_REPLY_PACE_DAYS: f64 = 3.0;
-const INBOX_OBLIGATION_PACE_DAYS: u32 = 0;
-const INBOX_CAPTURE_PACE_DAYS: u32 = 1;
+/// A thread is someone waiting on a reply, so it rises from the day it was
+/// raised with no pace of its own.
+const THREAD_PACE_DAYS: u32 = 0;
 /// Half a curve unit is enough to mark the hand visibly dirty without
 /// turning every newly-ripe reminder into persistent chrome.
 pub(crate) const LAMP_THRESHOLD: f64 = 0.5;
@@ -71,8 +72,7 @@ pub(crate) fn dealer_policy_snapshot() -> crate::journal::DealerPolicySnapshot {
         blocked_reply_head_start: BLOCKED_REPLY_HEAD_START,
         blocked_reply_slope_per_day: BLOCKED_REPLY_SLOPE_PER_DAY,
         fyi_reply_pace_days: FYI_REPLY_PACE_DAYS,
-        inbox_obligation_pace_days: INBOX_OBLIGATION_PACE_DAYS,
-        inbox_capture_pace_days: INBOX_CAPTURE_PACE_DAYS,
+        thread_pace_days: THREAD_PACE_DAYS,
         lamp_threshold: LAMP_THRESHOLD,
         chime_threshold: CHIME_THRESHOLD,
         agent_recency_bonus: AGENT_RECENCY_BONUS,
@@ -88,15 +88,16 @@ pub struct DealCard {
     pub label: String,
     pub priority: f64,
     pub host: HostId,
-    pub subject_node_id: Option<rho_desk::NodeId>,
-    pub topic_node_id: Option<rho_desk::NodeId>,
+    /// The note the card hangs under, which is the anchor the desk cursor
+    /// follows and the key the dealer deduplicates on. The verdict itself
+    /// lands on the card's own node, `identity`.
+    pub topic_node_id: rho_desk::NodeId,
     pub agent_id: Option<AgentId>,
     pub agent_tag: Option<String>,
     pub breadcrumb: String,
     pub room: Option<String>,
     pub kind: DealCardKind,
-    pub identity: DealCardIdentity,
-    pub inbox_source: Option<DealerInboxSource>,
+    pub identity: DealCardId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -106,69 +107,51 @@ pub struct DeskRoom {
     pub name: String,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum DealCardIdentity {
-    Tree {
-        host: HostId,
-        node_id: rho_desk::NodeId,
-    },
-    TreeAgent {
-        host: HostId,
-        node_id: rho_desk::NodeId,
-        agent_id: AgentId,
-    },
+/// What a dealt node opens as.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CardTarget {
+    Note,
     Agent(AgentId),
-    Inbox(String),
+    Page(rho_browser::PageId),
+    Thread(ThreadRef),
+    /// The node is gone, or lacks the fields its kind needs.
+    Missing,
+}
+
+/// Every card is a node in the tree, on the host that holds it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DealCardId {
+    pub host: HostId,
+    pub node_id: rho_desk::NodeId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DealCardKind {
     Desk,
     Agent,
-    Inbox(DealerInboxKind),
+    Thread,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DealerInboxKind {
-    Ping,
-    Obligation,
-    Capture,
-    /// A Slack thread waiting on the user. Machine-owned, so it carries the
-    /// thread's own wait rather than a capture age.
-    Slack,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct DealerInboxItem {
-    pub id: String,
-    pub host: HostId,
-    pub title: String,
-    pub kind: DealerInboxKind,
-    pub captured_at: chrono::DateTime<chrono::FixedOffset>,
-    pub deferred_until: Option<chrono::DateTime<chrono::FixedOffset>>,
-    pub resurfacing_count: u32,
-    pub waiting_on: Option<String>,
-    pub source: Option<DealerInboxSource>,
-    /// Short human context such as the captured room or surface. This is
-    /// replayed verbatim; the dealer never summarizes or rewrites it.
-    pub context: Option<String>,
-}
-
+/// What a Slack thread node is currently about, read live from the mirror.
+/// The tree holds the thread's identity and its verdicts; the words, the
+/// wait, and the newest message stay in Slack.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum DealerInboxSource {
-    Page(rho_browser::PageId),
-    /// Enough to reopen the conversation surface on the thread. Ids live here
-    /// because this is addressing, not display; the card shows the label.
-    SlackThread {
-        workspace: String,
-        channel: String,
-        thread_ts: String,
-        /// The newest message in the thread: the one the card is about, and
-        /// the one the conversation opens on. Equal to `thread_ts` when the
-        /// ping is a channel message with no replies under it.
-        latest_ts: String,
-    },
-    Other(String),
+pub struct DealerThread {
+    pub title: String,
+    pub conversation: String,
+    pub raised_at: chrono::DateTime<chrono::FixedOffset>,
+    /// Who the ball is with, when it is not the user.
+    pub waiting_on: Option<String>,
+    /// The newest message in the thread: a new one voids a skip.
+    pub latest: String,
+}
+
+/// A Slack thread's address, as the tree stores it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ThreadRef {
+    pub workspace: String,
+    pub channel: String,
+    pub thread_ts: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -183,12 +166,12 @@ pub enum DealerVerdict {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct DealerEvent {
-    pub card: DealCardIdentity,
+    pub card: DealCardId,
     pub kind: DealCardKind,
     pub verdict: DealerVerdict,
     pub at: chrono::DateTime<chrono::FixedOffset>,
     pub time_to_verdict_ms: u64,
-    pub considered_not_dealt: Vec<DealCardIdentity>,
+    pub considered_not_dealt: Vec<DealCardId>,
     pub skip_until: Option<chrono::DateTime<chrono::FixedOffset>>,
 }
 
@@ -199,8 +182,8 @@ pub struct DealQueue {
     pub total_alive: usize,
     /// Number selected by global priority.
     pub dealt_count: usize,
-    considered_not_dealt: Vec<DealCardIdentity>,
-    fingerprints: HashMap<DealCardIdentity, DealFingerprint>,
+    considered_not_dealt: Vec<DealCardId>,
+    fingerprints: HashMap<DealCardId, DealFingerprint>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -214,7 +197,7 @@ struct DealSession {
     card: DealCard,
     fingerprint: DealFingerprint,
     started_at: Instant,
-    considered_not_dealt: Vec<DealCardIdentity>,
+    considered_not_dealt: Vec<DealCardId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -337,7 +320,7 @@ pub struct Dashboard {
     phone_browse_mode: bool,
     deal_active: bool,
     deal: Option<DealSession>,
-    skipped: HashMap<DealCardIdentity, SkippedCard>,
+    skipped: HashMap<DealCardId, SkippedCard>,
     deal_empty_success: bool,
     queue_depth: DealQueueDepth,
     /// Portal occurrences whose complete runtime subtree is visible.
@@ -433,7 +416,7 @@ impl Dashboard {
     fn tree_dealer_queue(
         &self,
         registry: &AgentRegistry,
-        inbox: &[DealerInboxItem],
+        threads: &HashMap<ThreadRef, DealerThread>,
         now: chrono::DateTime<chrono::FixedOffset>,
         agent_interactions: &HashMap<AgentId, i64>,
         cx: &App,
@@ -486,7 +469,7 @@ impl Dashboard {
                     if priority <= DEAL_QUEUE_FLOOR {
                         continue;
                     }
-                    let identity = DealCardIdentity::Tree {
+                    let identity = DealCardId {
                         host: *host,
                         node_id: heading.id,
                     };
@@ -499,15 +482,13 @@ impl Dashboard {
                             label: desk_mark_label(mark, at, now.naive_local()),
                             priority,
                             host: *host,
-                            subject_node_id: Some(heading.id),
-                            topic_node_id: Some(heading.id),
+                            topic_node_id: heading.id,
                             agent_id: bindings.first().map(|(_, id)| *id),
                             agent_tag: None,
                             breadcrumb: breadcrumb.clone(),
                             room: room.clone(),
                             kind: DealCardKind::Desk,
                             identity,
-                            inbox_source: None,
                         },
                     });
                 }
@@ -575,19 +556,16 @@ impl Dashboard {
                                     label,
                                     priority,
                                     host: *host,
-                                    subject_node_id: Some(machine_node_id),
-                                    topic_node_id: Some(heading.id),
+                                    topic_node_id: heading.id,
                                     agent_id: Some(agent_id),
                                     agent_tag: None,
                                     breadcrumb: breadcrumb.clone(),
                                     room: room.clone(),
                                     kind: DealCardKind::Agent,
-                                    identity: DealCardIdentity::TreeAgent {
+                                    identity: DealCardId {
                                         host: *host,
                                         node_id: machine_node_id,
-                                        agent_id,
                                     },
-                                    inbox_source: None,
                                 },
                             });
                         }
@@ -595,11 +573,58 @@ impl Dashboard {
                 }
                 order += 1;
             }
+            // Slack threads that started to matter are nodes like any other,
+            // so they rank in the same queue. What the card says comes from
+            // the mirror: the tree holds the thread's identity and verdicts,
+            // never its words.
+            for node in source
+                .nodes
+                .iter()
+                .filter(|node| node.kind == rho_desk::cells::NodeKind::Thread)
+            {
+                if node.state != rho_desk::cells::State::Open
+                    || desk_deferred(node, now.naive_local())
+                {
+                    order += 1;
+                    continue;
+                }
+                let Some(thread) = node_thread(node).and_then(|key| threads.get(&key)) else {
+                    order += 1;
+                    continue;
+                };
+                let (label, priority) = thread_card_facts(&thread, now);
+                if priority <= DEAL_QUEUE_FLOOR {
+                    order += 1;
+                    continue;
+                }
+                ranked.push(RankedDealCard {
+                    priority,
+                    virtual_reply: false,
+                    order,
+                    fingerprint: DealFingerprint(thread.latest.clone()),
+                    card: DealCard {
+                        label,
+                        priority,
+                        host: *host,
+                        topic_node_id: node.id,
+                        agent_id: None,
+                        agent_tag: None,
+                        breadcrumb: thread.title.clone(),
+                        room: Some(thread.conversation.clone()),
+                        kind: DealCardKind::Thread,
+                        identity: DealCardId {
+                            host: *host,
+                            node_id: node.id,
+                        },
+                    },
+                });
+                order += 1;
+            }
         }
         // One winning card per topic; a virtual reply wins an exact tie.
         let mut by_topic = HashMap::new();
         for candidate in ranked {
-            let topic = (candidate.card.host, candidate.card.topic_node_id.unwrap());
+            let topic = (candidate.card.host, candidate.card.topic_node_id);
             by_topic
                 .entry(topic)
                 .and_modify(|old: &mut RankedDealCard| {
@@ -628,7 +653,7 @@ impl Dashboard {
                 .then_with(|| b.virtual_reply.cmp(&a.virtual_reply))
                 .then_with(|| a.order.cmp(&b.order))
         });
-        let mut queue = DealQueue {
+        let queue = DealQueue {
             total_alive: ranked.len(),
             dealt_count: usize::from(!ranked.is_empty()),
             considered_not_dealt: ranked
@@ -643,21 +668,6 @@ impl Dashboard {
                 .collect(),
             cards: ranked.into_iter().map(|ranked| ranked.card).collect(),
         };
-        let inbox_queue = inbox_deal_queue(inbox, now, &self.skipped);
-        queue.cards.extend(inbox_queue.cards);
-        queue
-            .cards
-            .sort_by(|a, b| b.priority.total_cmp(&a.priority));
-        queue.total_alive += inbox_queue.total_alive;
-        queue.dealt_count = usize::from(!queue.cards.is_empty());
-        queue.fingerprints.extend(inbox_queue.fingerprints);
-        queue.considered_not_dealt = queue
-            .cards
-            .iter()
-            .skip(1)
-            .take(5)
-            .map(|card| card.identity.clone())
-            .collect();
         queue
     }
 
@@ -876,6 +886,68 @@ impl Dashboard {
             .insert(host, TreeHostSource { nodes, buffers });
     }
 
+    /// What a card's node is, which decides the surface it opens.
+    pub fn card_target(&self, card: DealCardId) -> CardTarget {
+        let Some(node) = self
+            .tree_hosts
+            .get(&card.host)
+            .and_then(|source| source.nodes.iter().find(|node| node.id == card.node_id))
+        else {
+            return CardTarget::Missing;
+        };
+        match node.kind {
+            rho_desk::cells::NodeKind::Agent => {
+                node_agent(node).map_or(CardTarget::Missing, CardTarget::Agent)
+            }
+            rho_desk::cells::NodeKind::Page => {
+                node_page(node).map_or(CardTarget::Missing, CardTarget::Page)
+            }
+            rho_desk::cells::NodeKind::Thread => {
+                node_thread(node).map_or(CardTarget::Missing, CardTarget::Thread)
+            }
+            _ => CardTarget::Note,
+        }
+    }
+
+    /// The card a thing on screen would be dealt as, so the dealer can stay
+    /// quiet about what the user is already looking at.
+    pub fn agent_card_id(&self, agent_id: AgentId) -> Option<DealCardId> {
+        self.node_card(|node| node_agent(node) == Some(agent_id))
+    }
+
+    pub fn page_card_id(&self, page: rho_browser::PageId) -> Option<DealCardId> {
+        self.node_card(|node| node_page(node) == Some(page))
+    }
+
+    pub fn thread_card_id(&self, thread: &ThreadRef) -> Option<DealCardId> {
+        self.node_card(|node| node_thread(node).as_ref() == Some(thread))
+    }
+
+    /// Whether a card's node still wants attention. A node a verdict
+    /// closed is not re-dealt until something reopens it.
+    pub fn node_is_open(&self, card: DealCardId) -> bool {
+        self.tree_hosts
+            .get(&card.host)
+            .and_then(|source| source.nodes.iter().find(|node| node.id == card.node_id))
+            .is_some_and(|node| node.state == rho_desk::cells::State::Open)
+    }
+
+    fn node_card(
+        &self,
+        matches: impl Fn(&rho_desk::cells::MaterializedNode) -> bool,
+    ) -> Option<DealCardId> {
+        self.tree_hosts.iter().find_map(|(host, source)| {
+            source
+                .nodes
+                .iter()
+                .find(|node| matches(node))
+                .map(|node| DealCardId {
+                    host: *host,
+                    node_id: node.id,
+                })
+        })
+    }
+
     pub fn tree_node_at_cursor(
         &self,
         cx: &mut Context<Workspace>,
@@ -954,14 +1026,12 @@ impl Dashboard {
     pub fn dealer_hand(
         &self,
         registry: &AgentRegistry,
-        inbox: &crate::inbox::InboxStore,
+        threads: &HashMap<ThreadRef, DealerThread>,
         now: chrono::DateTime<chrono::FixedOffset>,
         agent_interactions: &HashMap<AgentId, i64>,
         cx: &App,
     ) -> DealQueue {
-        let host = self.tree_hosts.keys().next().copied().unwrap_or(HostId(0));
-        let inbox = dealer_inbox_items(inbox, host, now.timestamp_millis());
-        self.tree_dealer_queue(registry, &inbox, now, agent_interactions, cx)
+        self.tree_dealer_queue(registry, threads, now, agent_interactions, cx)
     }
 
     /// Re-evaluates the complete dealer world and presents its highest-scoring
@@ -970,13 +1040,13 @@ impl Dashboard {
     pub fn pull_deal(
         &mut self,
         registry: &AgentRegistry,
-        inbox: &crate::inbox::InboxStore,
+        threads: &HashMap<ThreadRef, DealerThread>,
         now: chrono::DateTime<chrono::FixedOffset>,
-        exclude: Option<&DealCardIdentity>,
+        exclude: Option<&DealCardId>,
         agent_interactions: &HashMap<AgentId, i64>,
         cx: &mut Context<Workspace>,
     ) -> Option<DealCard> {
-        let hand = self.dealer_hand(registry, inbox, now, agent_interactions, cx);
+        let hand = self.dealer_hand(registry, threads, now, agent_interactions, cx);
         let (card, fingerprint, considered_not_dealt) = select_deal(&hand, exclude)?;
         self.deal = Some(DealSession {
             card: card.clone(),
@@ -987,16 +1057,12 @@ impl Dashboard {
         self.raw_mode = false;
         self.deal_active = true;
         self.deal_empty_success = false;
-        if let Some(node_id) = card.topic_node_id {
-            self.pending_tree_cursor = Some((card.host, node_id, 0));
-        }
+        self.pending_tree_cursor = Some((card.host, card.topic_node_id, 0));
         Some(card)
     }
 
     pub fn reopen_deal(&mut self, card: DealCard) {
-        if let Some(node_id) = card.topic_node_id {
-            self.pending_tree_cursor = Some((card.host, node_id, 0));
-        }
+        self.pending_tree_cursor = Some((card.host, card.topic_node_id, 0));
         self.deal = Some(DealSession {
             card,
             fingerprint: DealFingerprint("verdict undo".to_owned()),
@@ -1065,40 +1131,16 @@ impl Dashboard {
         if verdict != DealerVerdict::Skip {
             self.skipped.remove(&event.card);
         }
-        fn identity(card: &DealCardIdentity) -> crate::journal::DealerCardIdentity {
-            match card {
-                DealCardIdentity::Tree { host, node_id } => {
-                    crate::journal::DealerCardIdentity::DeskNode {
-                        host: host.0,
-                        node_id: (*node_id).into(),
-                    }
-                }
-                DealCardIdentity::TreeAgent {
-                    host,
-                    node_id,
-                    agent_id,
-                } => crate::journal::DealerCardIdentity::AgentNode {
-                    host: host.0,
-                    node_id: (*node_id).into(),
-                    agent_id: (*agent_id).into(),
-                },
-                DealCardIdentity::Agent(agent_id) => crate::journal::DealerCardIdentity::Agent {
-                    agent_id: (*agent_id).into(),
-                },
-                DealCardIdentity::Inbox(id) => {
-                    crate::journal::DealerCardIdentity::Inbox { id: id.clone() }
-                }
+        fn identity(card: &DealCardId) -> crate::journal::DealerCardIdentity {
+            crate::journal::DealerCardIdentity {
+                host: card.host.0,
+                node_id: card.node_id.into(),
             }
         }
         let kind = match event.kind {
-            DealCardKind::Desk => crate::journal::DealerCardKind::Desk,
+            DealCardKind::Desk => crate::journal::DealerCardKind::Note,
             DealCardKind::Agent => crate::journal::DealerCardKind::Agent,
-            DealCardKind::Inbox(kind) => crate::journal::DealerCardKind::Inbox(match kind {
-                DealerInboxKind::Ping => crate::journal::DealerInboxKind::Ping,
-                DealerInboxKind::Obligation => crate::journal::DealerInboxKind::Obligation,
-                DealerInboxKind::Capture => crate::journal::DealerInboxKind::Capture,
-                DealerInboxKind::Slack => crate::journal::DealerInboxKind::Slack,
-            }),
+            DealCardKind::Thread => crate::journal::DealerCardKind::Thread,
         };
         let verdict = match event.verdict {
             DealerVerdict::Skip => crate::journal::DealerVerdict::Skip,
@@ -1121,7 +1163,7 @@ impl Dashboard {
 
     pub fn skip_card(
         &mut self,
-        identity: DealCardIdentity,
+        identity: DealCardId,
         now: chrono::DateTime<chrono::FixedOffset>,
         _cx: &mut Context<Workspace>,
     ) -> bool {
@@ -1144,12 +1186,12 @@ impl Dashboard {
         true
     }
 
-    pub fn clear_skip(&mut self, identity: &DealCardIdentity) -> bool {
+    pub fn clear_skip(&mut self, identity: &DealCardId) -> bool {
         self.skipped.remove(identity).is_some()
     }
 
     #[cfg(test)]
-    pub fn has_skip_for_test(&self, identity: &DealCardIdentity) -> bool {
+    pub fn has_skip_for_test(&self, identity: &DealCardId) -> bool {
         self.skipped.contains_key(identity)
     }
 
@@ -1160,7 +1202,7 @@ impl Dashboard {
     pub fn current_tree_room_node(&self) -> Option<(HostId, rho_desk::NodeId)> {
         let card = self.current_deal_card()?;
         let source = self.tree_hosts.get(&card.host)?;
-        let mut node_id = card.topic_node_id?;
+        let mut node_id = card.topic_node_id;
         loop {
             let node = source.nodes.iter().find(|node| node.id == node_id)?;
             let Some(parent) = node.parent else {
@@ -1172,10 +1214,6 @@ impl Dashboard {
             }
             node_id = parent;
         }
-    }
-
-    pub fn current_inbox_source(&self) -> Option<&DealerInboxSource> {
-        self.current_deal_card()?.inbox_source.as_ref()
     }
 
     /// Opens (or returns to) the inline new-agent draft. Like a reply
@@ -1246,6 +1284,7 @@ impl Dashboard {
     fn sync_tree(
         &mut self,
         registry: &AgentRegistry,
+        threads: &HashMap<ThreadRef, DealerThread>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
@@ -1280,7 +1319,7 @@ impl Dashboard {
                 if is_note(node) {
                     continue;
                 }
-                let title = derived_title(node, registry);
+                let title = derived_title(node, registry, threads);
                 crate::desk_view::write_derived_title(buffer, &title, cx);
             }
         }
@@ -1601,20 +1640,18 @@ impl Dashboard {
     pub fn sync(
         &mut self,
         registry: &AgentRegistry,
-        inbox: &crate::inbox::InboxStore,
+        threads: &HashMap<ThreadRef, DealerThread>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
         let now = chrono::Local::now();
-        let host = self.tree_hosts.keys().next().copied().unwrap_or(HostId(0));
-        let inbox = dealer_inbox_items(inbox, host, now.timestamp_millis());
         let queue =
-            self.tree_dealer_queue(registry, &inbox, now.fixed_offset(), &HashMap::new(), cx);
+            self.tree_dealer_queue(registry, threads, now.fixed_offset(), &HashMap::new(), cx);
         self.queue_depth = DealQueueDepth {
             dealt_count: queue.dealt_count,
             total_alive: queue.total_alive,
         };
-        self.sync_tree(registry, window, cx);
+        self.sync_tree(registry, threads, window, cx);
     }
 
     fn select_buffer_anchor(
@@ -1849,8 +1886,8 @@ impl Dashboard {
 
 fn select_deal(
     hand: &DealQueue,
-    exclude: Option<&DealCardIdentity>,
-) -> Option<(DealCard, DealFingerprint, Vec<DealCardIdentity>)> {
+    exclude: Option<&DealCardId>,
+) -> Option<(DealCard, DealFingerprint, Vec<DealCardId>)> {
     let mut cards = hand
         .cards
         .iter()
@@ -2098,11 +2135,24 @@ fn desk_mark_label(
 }
 
 /// The agent a machine row is bound to.
-fn node_agent(node: &rho_desk::cells::MaterializedNode) -> Option<AgentId> {
+pub(crate) fn node_agent(node: &rho_desk::cells::MaterializedNode) -> Option<AgentId> {
     match node.fields.get(&rho_desk::cells::Field::AgentId) {
         Some(rho_desk::cells::Value::AgentId(agent_id)) => Some(*agent_id),
         _ => None,
     }
+}
+
+/// The Slack thread a thread node stands for.
+pub(crate) fn node_thread(node: &rho_desk::cells::MaterializedNode) -> Option<ThreadRef> {
+    let text = |field| match node.fields.get(&field) {
+        Some(rho_desk::cells::Value::Text(value)) => Some(value.clone()),
+        _ => None,
+    };
+    Some(ThreadRef {
+        workspace: text(rho_desk::cells::Field::Workspace)?,
+        channel: text(rho_desk::cells::Field::Channel)?,
+        thread_ts: text(rho_desk::cells::Field::ThreadTs)?,
+    })
 }
 
 fn node_page(node: &rho_desk::cells::MaterializedNode) -> Option<rho_browser::PageId> {
@@ -2140,7 +2190,11 @@ fn node_path(node: &rho_desk::cells::MaterializedNode) -> Option<String> {
 
 /// What a machine row says. Agent rows carry their name in the row prefix
 /// already, so their buffer stays empty rather than repeating it.
-fn derived_title(node: &rho_desk::cells::MaterializedNode, _registry: &AgentRegistry) -> String {
+fn derived_title(
+    node: &rho_desk::cells::MaterializedNode,
+    _registry: &AgentRegistry,
+    threads: &HashMap<ThreadRef, DealerThread>,
+) -> String {
     use rho_desk::cells::{Field, NodeKind, Value};
 
     let text = |field| match node.fields.get(&field) {
@@ -2154,10 +2208,12 @@ fn derived_title(node: &rho_desk::cells::MaterializedNode, _registry: &AgentRegi
             .or_else(|| text(Field::Url))
             .unwrap_or_else(|| "page".to_owned()),
         NodeKind::File => node_path(node).unwrap_or_default(),
-        NodeKind::Thread => match (text(Field::Channel), text(Field::ThreadTs)) {
-            (Some(channel), Some(ts)) => format!("#{channel} · {ts}"),
-            (Some(channel), None) => format!("#{channel}"),
-            _ => "thread".to_owned(),
+        // The tree holds the thread's identity, which is ids and a
+        // timestamp; what it is called lives in the mirror. A thread rho
+        // has not caught up with yet says so rather than showing its keys.
+        NodeKind::Thread => match node_thread(node).and_then(|key| threads.get(&key)) {
+            Some(thread) => format!("{} · {}", thread.conversation, thread.title),
+            None => "thread".to_owned(),
         },
         NodeKind::PullRequest => match (
             text(Field::Repo),
@@ -2167,6 +2223,20 @@ fn derived_title(node: &rho_desk::cells::MaterializedNode, _registry: &AgentRegi
             (Some(repo), _) => repo,
             _ => "pull request".to_owned(),
         },
+    }
+}
+
+/// What an area row calls itself in the picker.
+fn area_kind(kind: rho_desk::cells::NodeKind) -> &'static str {
+    use rho_desk::cells::NodeKind;
+
+    match kind {
+        NodeKind::Note => "note",
+        NodeKind::Agent => "agent",
+        NodeKind::Page => "page",
+        NodeKind::Thread => "thread",
+        NodeKind::File => "file",
+        NodeKind::PullRequest => "pull request",
     }
 }
 
@@ -2195,188 +2265,13 @@ fn tree_breadcrumb(
     path.join(" › ")
 }
 
-fn dealer_inbox_items(
-    inbox: &crate::inbox::InboxStore,
-    default_host: HostId,
-    at_ms: i64,
-) -> Vec<DealerInboxItem> {
-    use crate::inbox::{InboxKind, SourceReference};
-
-    inbox
-        .pending_items(at_ms)
-        .map(|item| {
-            let kind = match item.kind {
-                InboxKind::Capture => DealerInboxKind::Capture,
-                InboxKind::Obligation => DealerInboxKind::Obligation,
-                InboxKind::Ping => DealerInboxKind::Ping,
-                InboxKind::Slack => DealerInboxKind::Slack,
-            };
-            let source = match &item.source {
-                SourceReference::Page { id } => id
-                    .parse()
-                    .map(DealerInboxSource::Page)
-                    .unwrap_or_else(|_| DealerInboxSource::Other(id.clone())),
-                SourceReference::SlackThread {
-                    workspace,
-                    channel,
-                    thread_ts,
-                    latest_ts,
-                } => DealerInboxSource::SlackThread {
-                    workspace: workspace.clone(),
-                    channel: channel.clone(),
-                    thread_ts: thread_ts.clone(),
-                    latest_ts: latest_ts.clone(),
-                },
-                SourceReference::DeskNode { .. } => DealerInboxSource::Other("desk".into()),
-                SourceReference::External { source, reference } => {
-                    DealerInboxSource::Other(format!("{source}:{reference}"))
-                }
-                SourceReference::None => DealerInboxSource::Other(String::new()),
-            };
-            let context = match (
-                item.context.room.as_deref(),
-                item.context.focused_surface.as_str(),
-            ) {
-                (Some(room), "") => Some(room.to_owned()),
-                (Some(room), surface) => Some(format!("{room} / {surface}")),
-                (None, "") => None,
-                (None, surface) => Some(surface.to_owned()),
-            };
-            DealerInboxItem {
-                id: item.id.0.clone(),
-                host: default_host,
-                title: item.text.clone(),
-                kind,
-                captured_at: chrono::DateTime::<chrono::Utc>::from_timestamp_millis(
-                    item.captured_at_ms,
-                )
-                .unwrap_or(chrono::DateTime::UNIX_EPOCH)
-                .fixed_offset(),
-                deferred_until: item.deferred_until_ms.and_then(|at| {
-                    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(at)
-                        .map(|at| at.fixed_offset())
-                }),
-                resurfacing_count: item.resurfacing_count,
-                waiting_on: item.waiting_on.clone(),
-                source: (!matches!(item.source, SourceReference::None)).then_some(source),
-                context,
-            }
-        })
-        .collect()
-}
-
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 struct RankedDealCard {
     priority: f64,
     virtual_reply: bool,
     order: usize,
     fingerprint: DealFingerprint,
     card: DealCard,
-}
-
-fn inbox_deal_queue(
-    inbox: &[DealerInboxItem],
-    now: chrono::DateTime<chrono::FixedOffset>,
-    skipped: &HashMap<DealCardIdentity, SkippedCard>,
-) -> DealQueue {
-    let mut ranked = Vec::new();
-    for (index, item) in inbox.iter().enumerate() {
-        let identity = DealCardIdentity::Inbox(item.id.clone());
-        if item.deferred_until.is_some_and(|until| until > now) {
-            continue;
-        }
-        let age_days = now
-            .signed_duration_since(item.captured_at)
-            .num_seconds()
-            .max(0) as f64
-            / 86_400.0;
-        let pace = match item.kind {
-            // A Slack thread is someone waiting on a reply, exactly like a
-            // ping, so it paces and rises the same way.
-            DealerInboxKind::Ping | DealerInboxKind::Slack | DealerInboxKind::Obligation => {
-                INBOX_OBLIGATION_PACE_DAYS
-            }
-            DealerInboxKind::Capture => INBOX_CAPTURE_PACE_DAYS,
-        };
-        let mut score =
-            rho_desk::todo_priority(item.captured_at.naive_local(), pace, now.naive_local());
-        if matches!(item.kind, DealerInboxKind::Ping | DealerInboxKind::Slack) {
-            score += age_days;
-        }
-        let fingerprint = DealFingerprint(format!("{item:?}"));
-        if score <= DEAL_QUEUE_FLOOR
-            || skipped.get(&identity).is_some_and(|skip| {
-                now < skip.at + chrono::Duration::minutes(SKIP_COOLDOWN_MINUTES)
-                    && skip.fingerprint == fingerprint
-            })
-        {
-            continue;
-        }
-        let mut label = match (item.kind, &item.waiting_on) {
-            (DealerInboxKind::Ping, _) => "ping".to_owned(),
-            // The state, then how long it has been in that state. Whose turn
-            // it is is the whole of what a Slack thread's card says: the
-            // conversation is on the left of the bar already, and the words
-            // are on screen.
-            (DealerInboxKind::Slack, Some(_)) => "replied".to_owned(),
-            (DealerInboxKind::Slack, None) => "needs reply".to_owned(),
-            (DealerInboxKind::Obligation, _) => "obligation".to_owned(),
-            (DealerInboxKind::Capture, _) => "capture".to_owned(),
-        };
-        label.push_str(&format!(" · {}", age_label(age_days)));
-        if item.kind != DealerInboxKind::Slack
-            && let Some(context) = item.context.as_deref().filter(|value| !value.is_empty())
-        {
-            label.push_str(" · from ");
-            label.push_str(context);
-        }
-        ranked.push(RankedDealCard {
-            priority: score,
-            virtual_reply: false,
-            order: index,
-            fingerprint,
-            card: DealCard {
-                label,
-                priority: score,
-                host: item.host,
-                subject_node_id: None,
-                topic_node_id: None,
-                agent_id: None,
-                agent_tag: None,
-                breadcrumb: item.title.clone(),
-                room: item
-                    .context
-                    .as_deref()
-                    .and_then(|value| value.split(" / ").next())
-                    .map(str::to_owned),
-                kind: DealCardKind::Inbox(item.kind),
-                identity,
-                inbox_source: item.source.clone(),
-            },
-        });
-    }
-    ranked.sort_by(|a, b| {
-        b.priority
-            .total_cmp(&a.priority)
-            .then_with(|| a.order.cmp(&b.order))
-    });
-    let fingerprints = ranked
-        .iter()
-        .map(|item| (item.card.identity.clone(), item.fingerprint.clone()))
-        .collect();
-    let cards = ranked.into_iter().map(|item| item.card).collect::<Vec<_>>();
-    DealQueue {
-        total_alive: cards.len(),
-        dealt_count: usize::from(!cards.is_empty()),
-        considered_not_dealt: cards
-            .iter()
-            .skip(1)
-            .take(5)
-            .map(|card| card.identity.clone())
-            .collect(),
-        cards,
-        fingerprints,
-    }
 }
 
 fn deal_hint(deal: &DealSession) -> String {
@@ -2405,6 +2300,60 @@ impl Dashboard {
                 })
             })
             .collect()
+    }
+
+    /// Every node a new thing can be filed under, as its full path. Any
+    /// kind is an area: a note under a Slack thread is notes for that
+    /// thread, an agent under a page is the engineer on it. A row with
+    /// nothing readable to type at is left out.
+    pub(crate) fn area_candidates(
+        &self,
+        registry: &AgentRegistry,
+        threads: &HashMap<ThreadRef, DealerThread>,
+        cx: &App,
+    ) -> Vec<(String, &'static str, HostId, rho_desk::NodeId)> {
+        let mut areas = Vec::new();
+        for (host, source) in &self.tree_hosts {
+            let nodes = source
+                .nodes
+                .iter()
+                .map(|node| (node.id, node))
+                .collect::<HashMap<_, _>>();
+            let titles = source
+                .buffers
+                .iter()
+                .map(|(id, buffer)| (*id, buffer.read(cx).text()))
+                .collect::<HashMap<_, _>>();
+            for node in &source.nodes {
+                let breadcrumb = tree_breadcrumb(node.id, &nodes, &titles);
+                // A note's breadcrumb already ends with the note itself;
+                // every other kind hangs its title under its parent's.
+                let path = if is_note(node) {
+                    breadcrumb
+                } else {
+                    let title = titles
+                        .get(&node.id)
+                        .and_then(|text| text.lines().next())
+                        .map(str::trim)
+                        .filter(|text| !text.is_empty())
+                        .map(str::to_owned)
+                        .or_else(|| {
+                            node_agent(node).map(|agent_id| registry.agent_human_name(agent_id))
+                        })
+                        .unwrap_or_else(|| derived_title(node, registry, threads));
+                    if breadcrumb.is_empty() {
+                        title
+                    } else {
+                        format!("{breadcrumb} › {title}")
+                    }
+                };
+                if path.trim().is_empty() {
+                    continue;
+                }
+                areas.push((path, area_kind(node.kind), *host, node.id));
+            }
+        }
+        areas
     }
 
     /// Every tree node the finder can open, as its full path and target.
@@ -2690,10 +2639,34 @@ impl Dashboard {
         true
     }
     pub fn prepare_taken_deal_edit(&mut self, _cx: &mut Context<Workspace>) -> bool {
-        self.current_deal_card()
-            .and_then(|card| card.topic_node_id)
-            .is_some()
+        self.current_deal_card().is_some()
     }
+}
+
+/// What a thread's card says and how hard it pushes. The state, then how
+/// long it has been in that state: whose turn it is is the whole of what a
+/// thread's card says. Somebody waiting outranks a note of the same age,
+/// the way a blocked agent outranks an FYI.
+fn thread_card_facts(
+    thread: &DealerThread,
+    now: chrono::DateTime<chrono::FixedOffset>,
+) -> (String, f64) {
+    let waiting_days = now
+        .signed_duration_since(thread.raised_at)
+        .num_seconds()
+        .max(0) as f64
+        / 86_400.0;
+    let priority = rho_desk::todo_priority(
+        thread.raised_at.naive_local(),
+        THREAD_PACE_DAYS,
+        now.naive_local(),
+    ) + waiting_days;
+    let state = if thread.waiting_on.is_some() {
+        "replied"
+    } else {
+        "needs reply"
+    };
+    (format!("{state} · {}", age_label(waiting_days)), priority)
 }
 
 #[cfg(test)]
@@ -2708,59 +2681,34 @@ mod tests {
             .unwrap()
             .and_utc()
             .fixed_offset();
-        let thread = |waiting_on: Option<&str>| DealerInboxItem {
-            id: "slack".into(),
-            host: HostId(1),
+        let thread = |waiting_on: Option<&str>| DealerThread {
             title: "can you look at the deploy?".into(),
-            kind: DealerInboxKind::Slack,
-            captured_at: now - chrono::Duration::days(2),
-            deferred_until: None,
-            resurfacing_count: 0,
+            conversation: "#design".into(),
+            raised_at: now - chrono::Duration::days(2),
             waiting_on: waiting_on.map(str::to_owned),
-            source: Some(DealerInboxSource::SlackThread {
-                workspace: "acme".into(),
-                channel: "C1".into(),
-                thread_ts: "500.0".into(),
-                latest_ts: "500.0".into(),
-            }),
-            context: Some("#design".into()),
+            latest: "500.0".into(),
         };
 
-        let queue = inbox_deal_queue(&[thread(None)], now, &HashMap::new());
-        assert_eq!(queue.cards.len(), 1);
-        assert_eq!(queue.cards[0].label, "needs reply · 2.0d");
-        assert_eq!(queue.cards[0].breadcrumb, "can you look at the deploy?");
-        assert_eq!(queue.cards[0].room.as_deref(), Some("#design"));
+        let (label, priority) = thread_card_facts(&thread(None), now);
+        assert_eq!(label, "needs reply · 2.0d");
+        // Nothing addressed to the machine reaches what the reader sees.
+        assert!(!label.contains("C1"));
+        assert!(!label.contains("500.0"));
         assert_eq!(
-            queue.cards[0].kind,
-            DealCardKind::Inbox(DealerInboxKind::Slack)
+            thread_card_facts(&thread(Some("#design")), now).0,
+            "replied · 2.0d"
         );
-        // The card carries enough to reopen the thread, and no ids reach the
-        // text the user reads.
-        assert!(matches!(
-            queue.cards[0].inbox_source,
-            Some(DealerInboxSource::SlackThread { .. })
-        ));
-        assert!(!queue.cards[0].label.contains("C1"));
-        assert!(!queue.cards[0].label.contains("500.0"));
 
-        let answered = inbox_deal_queue(&[thread(Some("#design"))], now, &HashMap::new());
-        assert_eq!(answered.cards[0].label, "replied · 2.0d");
-
-        // Two days of someone waiting must outrank two days of a capture,
-        // the same way a blocked agent outranks an FYI.
-        let capture = DealerInboxItem {
-            id: "capture".into(),
-            kind: DealerInboxKind::Capture,
-            waiting_on: None,
-            source: None,
-            context: None,
-            ..thread(None)
-        };
-        let mixed = inbox_deal_queue(&[capture, thread(None)], now, &HashMap::new());
-        assert_eq!(
-            mixed.cards[0].identity,
-            DealCardIdentity::Inbox("slack".into())
+        // Two days of someone waiting outranks two days of a note that is
+        // merely due, which is what puts the thread first in one queue.
+        let note = rho_desk::todo_priority(
+            (now - chrono::Duration::days(2)).naive_local(),
+            THREAD_PACE_DAYS,
+            now.naive_local(),
+        );
+        assert!(
+            priority > note,
+            "a waiting thread ({priority}) must outrank a due note ({note})"
         );
     }
 }

@@ -1,9 +1,11 @@
 //! The Rho GPUI client views and native application integration.
 
 pub mod agent_view;
+pub(crate) mod capture_carryover;
 pub(crate) mod chime;
 pub(crate) mod commands;
 pub(crate) mod connection;
+pub(crate) mod create;
 pub mod dashboard;
 pub mod desk_view;
 pub(crate) mod diff_view;
@@ -13,7 +15,6 @@ pub(crate) mod find;
 pub mod highlights;
 pub mod hosts;
 pub(crate) mod image_view;
-pub mod inbox;
 pub mod journal;
 pub mod minibuffer;
 pub mod pane;
@@ -122,7 +123,6 @@ actions!(
         ShellPagerAll,
         ShellPagerQuit,
         VoiceToggle,
-        InboxCapture,
         UploadGuiTelemetry,
         ZulipOpenRow,
         SurfaceBack,
@@ -252,7 +252,6 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         KeyBinding::new("ctrl-alt-shift-p", UploadGuiTelemetry, Some("RhoGui")),
         // Capture is global and modal: one chord, type, enter, and focus is
         // restored to the exact surface that owned it.
-        KeyBinding::new("ctrl-shift-i", InboxCapture, Some("RhoGui")),
         // A Comint-style shell submits complete input lines to the daemon;
         // its transcript remains an ordinary Vim-navigable editor buffer.
         KeyBinding::new(

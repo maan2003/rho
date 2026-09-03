@@ -226,7 +226,7 @@ impl Workspace {
         };
         let session = session.read(cx);
         let model = session.model();
-        let now = crate::inbox::now_ms();
+        let now = chrono::Utc::now().timestamp_millis();
         let threads = model
             .tracked()
             .into_iter()

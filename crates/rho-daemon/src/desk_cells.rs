@@ -74,6 +74,20 @@ pub(crate) enum MachineBinding {
     File {
         path: Utf8PathBuf,
     },
+    Thread {
+        workspace: String,
+        channel: String,
+        thread_ts: String,
+    },
+}
+
+/// Whether a bind may move a node that already exists for this binding.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BindPlacement {
+    /// The caller chose the parent, so an existing node moves there.
+    Chosen,
+    /// The parent is only a default; a node that already exists stays put.
+    Default,
 }
 
 impl DeskCellStore {
@@ -262,7 +276,10 @@ impl DeskCellStore {
         Ok(())
     }
 
-    pub(crate) fn validate_machine_parent(&self, parent: NodeId) -> Result<(), String> {
+    pub(crate) fn validate_machine_parent(&self, parent: Option<NodeId>) -> Result<(), String> {
+        let Some(parent) = parent else {
+            return Ok(());
+        };
         let read = self.db.read();
         let meta = read
             .open_table(META)
@@ -282,11 +299,26 @@ impl DeskCellStore {
         Ok(())
     }
 
+    /// The node a machine-owned thing already has, if any.
+    pub(crate) fn machine_node(&self, binding: &MachineBinding) -> Option<NodeId> {
+        let read = self.db.read();
+        let meta = read.open_table(META).get(&())?.value().into_owned();
+        let store = Store::from_snapshot(meta.daemon_device, read_snapshot(&read).ok()?).ok()?;
+        store
+            .materialize()
+            .into_iter()
+            .find(|node| binding_identity_matches(node, binding))
+            .map(|node| node.id)
+    }
+
+    /// Create the node for a machine-owned thing, or return the one it
+    /// already has. `parent` is `None` for the root.
     pub(crate) async fn bind_machine(
         &self,
-        parent: NodeId,
+        parent: Option<NodeId>,
         binding: MachineBinding,
-    ) -> Result<bool, String> {
+        placement: BindPlacement,
+    ) -> Result<(NodeId, bool), String> {
         use rho_desk::cells::{CellWrite, NodeKind, State, Timestamp, TimestampPrecision, Value};
 
         let mut write = self.db.write().await;
@@ -294,41 +326,66 @@ impl DeskCellStore {
         let snapshot = read_snapshot_from_write(&mut write)?;
         let mut store = Store::from_snapshot(meta.daemon_device, snapshot)?;
         let nodes = store.materialize();
-        let parent_node = nodes
-            .iter()
-            .find(|node| node.id == parent)
-            .ok_or("Desk binding parent no longer exists")?;
-        if parent_node.kind != NodeKind::Note {
-            return Err("Desk machine rows must be filed under a user note".into());
+        if let Some(parent) = parent {
+            let parent_node = nodes
+                .iter()
+                .find(|node| node.id == parent)
+                .ok_or("Desk binding parent no longer exists")?;
+            if parent_node.kind != NodeKind::Note {
+                return Err("Desk machine rows must be filed under a user note".into());
+            }
         }
+        // A machine thing has one node wherever it is filed, so an existing
+        // node is found by identity across the whole tree, never only under
+        // the parent this call happens to name.
         if let Some(existing) = nodes
             .iter()
-            .find(|node| node.parent == Some(parent) && binding_identity_matches(node, &binding))
+            .find(|node| binding_identity_matches(node, &binding))
         {
+            let mut writes = Vec::new();
             if let MachineBinding::Page { url, .. } = &binding
                 && existing.fields.get(&Field::Url)
                     != Some(&rho_desk::cells::Value::Text(url.clone()))
             {
                 validate_page_url(url)?;
-                let version = next_daemon_version(&meta)?;
-                let mutation = CellMutation {
-                    stamp: Stamp {
-                        device: meta.daemon_device,
-                        version,
-                    },
-                    writes: vec![CellWrite {
-                        node: existing.id,
-                        field: Field::Url,
-                        value: Value::Text(url.clone()),
-                    }],
-                    verdict: None,
-                };
-                store.apply_mutation(&mutation)?;
-                persist_accepted_mutation(&mut write, &mut meta, &store, mutation);
-                write.commit();
-                return Ok(true);
+                writes.push(CellWrite {
+                    node: existing.id,
+                    field: Field::Url,
+                    value: Value::Text(url.clone()),
+                });
             }
-            return Ok(false);
+            // New traffic supersedes the verdict that quieted a thread: the
+            // answer was to the older message, so its node opens again.
+            if matches!(binding, MachineBinding::Thread { .. }) && existing.state != State::Open {
+                writes.push(CellWrite {
+                    node: existing.id,
+                    field: Field::State,
+                    value: Value::State(State::Open),
+                });
+            }
+            if placement == BindPlacement::Chosen && existing.parent != parent {
+                writes.push(CellWrite {
+                    node: existing.id,
+                    field: Field::Parent,
+                    value: Value::Parent(parent),
+                });
+            }
+            if writes.is_empty() {
+                return Ok((existing.id, false));
+            }
+            let version = next_daemon_version(&meta)?;
+            let mutation = CellMutation {
+                stamp: Stamp {
+                    device: meta.daemon_device,
+                    version,
+                },
+                writes,
+                verdict: None,
+            };
+            store.apply_mutation(&mutation)?;
+            persist_accepted_mutation(&mut write, &mut meta, &store, mutation);
+            write.commit();
+            return Ok((existing.id, true));
         }
         let version = next_daemon_version(&meta)?;
         let namespace = daemon_node_namespace(&meta)?;
@@ -340,6 +397,7 @@ impl DeskCellStore {
             MachineBinding::Agent { .. } => NodeKind::Agent,
             MachineBinding::Page { .. } => NodeKind::Page,
             MachineBinding::File { .. } => NodeKind::File,
+            MachineBinding::Thread { .. } => NodeKind::Thread,
         };
         let now = Timestamp {
             unix_ms: i64::try_from(rho_core::UnixMs::now().0)
@@ -355,7 +413,7 @@ impl DeskCellStore {
             CellWrite {
                 node,
                 field: Field::Parent,
-                value: Value::Parent(Some(parent)),
+                value: Value::Parent(parent),
             },
             CellWrite {
                 node,
@@ -421,6 +479,27 @@ impl DeskCellStore {
                     value: Value::Path(path),
                 });
             }
+            MachineBinding::Thread {
+                workspace,
+                channel,
+                thread_ts,
+            } => {
+                writes.push(CellWrite {
+                    node,
+                    field: Field::Workspace,
+                    value: Value::Text(workspace),
+                });
+                writes.push(CellWrite {
+                    node,
+                    field: Field::Channel,
+                    value: Value::Text(channel),
+                });
+                writes.push(CellWrite {
+                    node,
+                    field: Field::ThreadTs,
+                    value: Value::Text(thread_ts),
+                });
+            }
         }
         let mutation = CellMutation {
             stamp: Stamp {
@@ -434,7 +513,7 @@ impl DeskCellStore {
         store.apply_mutation(&mutation)?;
         persist_accepted_mutation(&mut write, &mut meta, &store, mutation);
         write.commit();
-        Ok(true)
+        Ok((node, true))
     }
 
     pub(crate) async fn unbind_machine(&self, binding: &MachineBinding) -> Result<bool, String> {
@@ -677,6 +756,16 @@ fn binding_identity_matches(
             node.kind == rho_desk::cells::NodeKind::File
                 && node.fields.get(&Field::Path) == Some(&Value::Path(path.clone()))
         }
+        MachineBinding::Thread {
+            workspace,
+            channel,
+            thread_ts,
+        } => {
+            node.kind == rho_desk::cells::NodeKind::Thread
+                && node.fields.get(&Field::Workspace) == Some(&Value::Text(workspace.clone()))
+                && node.fields.get(&Field::Channel) == Some(&Value::Text(channel.clone()))
+                && node.fields.get(&Field::ThreadTs) == Some(&Value::Text(thread_ts.clone()))
+        }
     }
 }
 
@@ -847,63 +936,37 @@ fn validate_verdict_shape(
 ) -> Result<(), String> {
     use rho_desk::cells::{Value, Verdict};
 
-    let valid = match verdict {
-        Verdict::Done if changes.len() == 1 => {
-            let change = &changes[0];
-            change.node == verdict_node
-                && change.field == Field::State
-                && change.after == Some(Value::State(rho_desk::cells::State::Done))
-        }
-        Verdict::Dismiss if changes.len() == 1 => {
-            let change = &changes[0];
-            change.node == verdict_node
-                && change.field == Field::State
-                && change.after == Some(Value::State(rho_desk::cells::State::Dismissed))
-        }
-        Verdict::Defer { until } if changes.len() == 1 => {
-            let change = &changes[0];
-            change.node == verdict_node
-                && change.field == Field::DeferUntil
-                && change.after == Some(Value::OptionalTimestamp(Some(*until)))
-        }
-        Verdict::File { parent } if changes.len() == 1 => {
-            let change = &changes[0];
-            change.node == verdict_node
-                && change.field == Field::Parent
-                && change.after == Some(Value::Parent(Some(*parent)))
-        }
-        Verdict::Todo { note } => {
-            let changed = |field: &Field| changes.iter().find(|change| &change.field == field);
-            changes.len() == 3
-                && changes.iter().all(|change| change.node == *note)
-                && matches!(
-                    changed(&Field::Deleted),
-                    Some(change)
-                        if change.before == Some(Value::Bool(true))
-                            && change.after == Some(Value::Bool(false))
-                )
-                && matches!(
-                    changed(&Field::DeferUntil),
-                    Some(change)
-                        if change.before == Some(Value::OptionalTimestamp(None))
-                            && matches!(change.after, Some(Value::OptionalTimestamp(Some(_))))
-                )
-                && matches!(
-                    changed(&Field::PaceDays),
-                    Some(change)
-                        if change.before == Some(Value::Days(0))
-                            && matches!(change.after, Some(Value::Days(_)))
-                )
-                && (!applied
+    // The entry is checked against the shape rho-desk builds for this
+    // verdict, so the writer and the checker share one definition. `before`
+    // is the writer's to state; everything else has to match.
+    let expected = rho_desk::cells::verdict_changes(
+        verdict_node,
+        verdict,
+        changes
+            .iter()
+            .find(|change| change.node == verdict_node)
+            .and_then(|change| change.before.clone()),
+        rho_desk::cells::todo_cadence(changes),
+    )?;
+    let mut shape = changes.to_vec();
+    shape.sort_by(|left, right| left.field.cmp(&right.field));
+    let mut expected_shape = expected;
+    expected_shape.sort_by(|left, right| left.field.cmp(&right.field));
+    let valid = shape == expected_shape
+        && match verdict {
+            // The note a todo creates has to be created by the same mutation
+            // and filed under the node the verdict was dealt on.
+            Verdict::Todo { note } => {
+                !applied
                     || (created.contains(note)
                         && mutation.writes.iter().any(|write| {
                             write.node == *note
                                 && write.field == Field::Parent
                                 && write.value == Value::Parent(Some(verdict_node))
-                        })))
-        }
-        _ => false,
-    };
+                        }))
+            }
+            _ => true,
+        };
     if !valid {
         return Err("Desk verdict changes do not match the verdict semantics".into());
     }
@@ -1652,12 +1715,13 @@ mod tests {
         let parent = store.sync_since(&Version::new()).unwrap().cells[0].node;
         store
             .bind_machine(
-                parent,
+                Some(parent),
                 MachineBinding::Agent {
                     agent_id: AgentId::from_counter(3, &rho_core::AgentIdDomain(machine_seed))
                         .unwrap(),
                     host: machine_seed,
                 },
+                BindPlacement::Chosen,
             )
             .await
             .unwrap();
@@ -1897,6 +1961,11 @@ mod tests {
                 write.value = Value::Days(7);
             }
         }
+        todo_writes.push(CellWrite {
+            node: target,
+            field: Field::State,
+            value: Value::State(State::Done),
+        });
         let applied_stamp = Stamp {
             device,
             version: version + 1,
@@ -1914,6 +1983,12 @@ mod tests {
                             verdict: rho_desk::cells::Verdict::Todo { note },
                             at: applied_stamp,
                             changes: vec![
+                                rho_desk::cells::FieldChange {
+                                    node: target,
+                                    field: Field::State,
+                                    before: Some(Value::State(State::Open)),
+                                    after: Some(Value::State(State::Done)),
+                                },
                                 rho_desk::cells::FieldChange {
                                     node: note,
                                     field: Field::Deleted,
@@ -1964,6 +2039,11 @@ mod tests {
                             field: Field::PaceDays,
                             value: Value::Days(0),
                         },
+                        CellWrite {
+                            node: target,
+                            field: Field::State,
+                            value: Value::State(State::Open),
+                        },
                     ],
                     verdict: Some((
                         target,
@@ -1996,8 +2076,18 @@ mod tests {
             agent_id: agent_id.clone(),
             host: 42,
         };
-        assert!(store.bind_machine(parent, binding.clone()).await.unwrap());
-        assert!(!store.bind_machine(parent, binding.clone()).await.unwrap());
+        let (node, created) = store
+            .bind_machine(Some(parent), binding.clone(), BindPlacement::Chosen)
+            .await
+            .unwrap();
+        assert!(created);
+        assert_eq!(
+            store
+                .bind_machine(Some(parent), binding.clone(), BindPlacement::Chosen)
+                .await
+                .unwrap(),
+            (node, false)
+        );
         let meta = store.sync_since(&Version::new()).unwrap();
         let materialized = Store::from_snapshot(DeviceId([0; 16]), meta)
             .unwrap()
@@ -2199,5 +2289,101 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+    #[tokio::test]
+    async fn a_todo_verdict_on_a_thread_node_creates_its_note() {
+        use rho_desk::cells::{
+            CellWrite, FieldChange, NodeKind, State, Timestamp, TimestampPrecision, Value, Verdict,
+            VerdictEvent,
+        };
+
+        let store = fixture_store().await;
+        let (thread, _) = store
+            .bind_machine(
+                None,
+                MachineBinding::Thread {
+                    workspace: "acme".into(),
+                    channel: "C1".into(),
+                    thread_ts: "1.0".into(),
+                },
+                BindPlacement::Default,
+            )
+            .await
+            .unwrap();
+        let device = DeviceId([12; 16]);
+        let namespace = store.node_namespace(device).await.unwrap();
+        let version = store.frontier().unwrap().values().copied().max().unwrap() + 1;
+        let stamp = Stamp { device, version };
+        let note = NodeId {
+            replica_id: namespace,
+            counter: 4242,
+        };
+        let at = Timestamp {
+            unix_ms: 5,
+            precision: TimestampPrecision::Millisecond,
+        };
+        let write = |field, value| CellWrite {
+            node: note,
+            field,
+            value,
+        };
+        let result = store
+            .apply_mutation(
+                device,
+                namespace,
+                CellMutation {
+                    stamp,
+                    writes: vec![
+                        CellWrite {
+                            node: thread,
+                            field: Field::State,
+                            value: Value::State(State::Done),
+                        },
+                        write(Field::Kind, Value::Kind(NodeKind::Note)),
+                        write(Field::Parent, Value::Parent(Some(thread))),
+                        write(Field::Deleted, Value::Bool(false)),
+                        write(Field::CreatedAt, Value::Timestamp(at)),
+                        write(Field::State, Value::State(State::Open)),
+                        write(Field::DeferUntil, Value::OptionalTimestamp(Some(at))),
+                        write(Field::Deadline, Value::OptionalTimestamp(None)),
+                        write(Field::PaceDays, Value::Days(7)),
+                    ],
+                    verdict: Some((
+                        thread,
+                        VerdictEvent::Applied {
+                            verdict: Verdict::Todo { note },
+                            at: stamp,
+                            changes: vec![
+                                FieldChange {
+                                    node: thread,
+                                    field: Field::State,
+                                    before: Some(Value::State(State::Open)),
+                                    after: Some(Value::State(State::Done)),
+                                },
+                                FieldChange {
+                                    node: note,
+                                    field: Field::Deleted,
+                                    before: Some(Value::Bool(true)),
+                                    after: Some(Value::Bool(false)),
+                                },
+                                FieldChange {
+                                    node: note,
+                                    field: Field::DeferUntil,
+                                    before: Some(Value::OptionalTimestamp(None)),
+                                    after: Some(Value::OptionalTimestamp(Some(at))),
+                                },
+                                FieldChange {
+                                    node: note,
+                                    field: Field::PaceDays,
+                                    before: Some(Value::Days(0)),
+                                    after: Some(Value::Days(7)),
+                                },
+                            ],
+                        },
+                    )),
+                },
+            )
+            .await;
+        assert_eq!(result, Ok(()));
     }
 }

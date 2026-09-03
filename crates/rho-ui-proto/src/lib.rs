@@ -38,9 +38,9 @@ pub const AGENT_COST_WINDOW_DAYS: u64 = 7;
 /// Maximum encoded GUI performance snapshot accepted by the daemon.
 pub const MAX_GUI_TELEMETRY_BYTES: usize = 8 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the daemon.
-pub const IROH_ALPN: &[u8] = b"rho/ui/6";
+pub const IROH_ALPN: &[u8] = b"rho/ui/7";
 #[cfg(not(target_family = "wasm"))]
-const PROTOCOL_LOG_MAGIC: &[u8; 4] = b"RUP5";
+const PROTOCOL_LOG_MAGIC: &[u8; 4] = b"RUP6";
 
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -157,9 +157,20 @@ pub enum ClientMessage {
     },
     DeskPageBind {
         request_id: u64,
-        parent: desk_tree::NodeId,
+        /// `None` files the page at the root.
+        parent: Option<desk_tree::NodeId>,
         page_id: desk_tree::PageId,
         url: String,
+    },
+    /// Create the `thread` node for a Slack thread that has started to matter.
+    /// Idempotent: a second bind of the same thread reuses its node.
+    DeskThreadBind {
+        request_id: u64,
+        /// `None` files the thread at the root.
+        parent: Option<desk_tree::NodeId>,
+        workspace: String,
+        channel: String,
+        thread_ts: String,
     },
     DeskPageUnbind {
         request_id: u64,
@@ -647,8 +658,11 @@ pub enum ServerMessage {
         reason: String,
         snapshot: desk_tree::Snapshot,
     },
-    DeskPageBindingResult {
+    /// Result of `DeskPageBind`, `DeskPageUnbind`, or `DeskThreadBind`.
+    DeskBindingResult {
         request_id: u64,
+        /// The bound node, when the request created or found one.
+        node_id: Option<desk_tree::NodeId>,
         error: Option<String>,
     },
     /// The daemon's broadcast receiver lagged; request a new tree snapshot.
@@ -1345,7 +1359,7 @@ mod tests {
 
     #[test]
     fn protocol_log_rejects_previous_wire_epoch() {
-        let mut old = &b"RUP4"[..];
+        let mut old = &b"RUP5"[..];
         assert!(read_protocol_log_record(&mut old).is_err());
     }
 

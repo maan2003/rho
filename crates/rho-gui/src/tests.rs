@@ -183,21 +183,18 @@ fn phone_entry_disables_modal_editing_app_wide(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn phone_entry_opens_the_feed_and_one_finger_flicks_to_the_next_card(cx: &mut TestAppContext) {
+    // Two notes that want attention: what the feed deals are nodes.
+    let mut desk = DeskFixture::new();
+    desk.due_note(None, "First phone card");
+    desk.due_note(None, "Second phone card");
+
     let workspace = test_workspace(cx);
     workspace
-        .update(cx, |workspace, _, _| {
-            for text in ["First phone card", "Second phone card"] {
-                let id = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
-                    kind: crate::inbox::InboxKind::Capture,
-                    text: text.into(),
-                    source: crate::inbox::SourceReference::None,
-                    context: crate::inbox::CapturedContext::default(),
-                    waiting_on: None,
-                });
-                workspace.age_inbox_for_test(&id, 0);
-            }
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
         })
         .unwrap();
+    cx.run_until_parked();
 
     cx.simulate_window_resize(*workspace, gpui::size(gpui::px(400.), gpui::px(800.)));
     cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
@@ -275,22 +272,53 @@ fn phone_entry_opens_the_feed_and_one_finger_flicks_to_the_next_card(cx: &mut Te
 }
 
 #[gpui::test]
-fn leaving_phone_mode_cancels_a_delayed_flick_commit(cx: &mut TestAppContext) {
+fn the_phone_feed_opens_when_the_first_card_arrives_after_it_did(cx: &mut TestAppContext) {
+    // A Slack thread becomes a node only once the mirror has synced, so the
+    // phone's first draw can find an empty queue. The feed is the deal: it
+    // has to open itself when the card lands.
     let workspace = test_workspace(cx);
+    cx.simulate_window_resize(*workspace, size(px(400.), px(800.)));
+    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
     workspace
         .update(cx, |workspace, _, _| {
-            for text in ["First resize card", "Second resize card"] {
-                let id = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
-                    kind: crate::inbox::InboxKind::Capture,
-                    text: text.into(),
-                    source: crate::inbox::SourceReference::None,
-                    context: crate::inbox::CapturedContext::default(),
-                    waiting_on: None,
-                });
-                workspace.age_inbox_for_test(&id, 0);
-            }
+            assert!(workspace.current_deal_card_for_test().is_none());
         })
         .unwrap();
+
+    let mut desk = DeskFixture::new();
+    desk.due_note(None, "Arrived after the feed");
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(workspace.current_deal_card_for_test().is_some());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn leaving_phone_mode_cancels_a_delayed_flick_commit(cx: &mut TestAppContext) {
+    // Two notes that want attention: what the feed deals are nodes.
+    let mut desk = DeskFixture::new();
+    desk.due_note(None, "First resize card");
+    desk.due_note(None, "Second resize card");
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
     cx.simulate_window_resize(*workspace, size(px(400.), px(800.)));
     cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
         .unwrap();
@@ -319,20 +347,21 @@ fn leaving_phone_mode_cancels_a_delayed_flick_commit(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn cancelling_phone_file_keeps_the_current_feed_card(cx: &mut TestAppContext) {
+    // The feed deals nodes: one note that wants attention.
+    let mut desk = DeskFixture::new();
+    let node_id = desk.due_note(None, "Keep this phone card");
+
     let workspace = test_workspace(cx);
-    let id = workspace
-        .update(cx, |workspace, _, _| {
-            let id = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
-                kind: crate::inbox::InboxKind::Capture,
-                text: "Keep this phone card".into(),
-                source: crate::inbox::SourceReference::None,
-                context: crate::inbox::CapturedContext::default(),
-                waiting_on: None,
-            });
-            workspace.age_inbox_for_test(&id, 0);
-            id
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
         })
         .unwrap();
+    cx.run_until_parked();
+    let id = crate::dashboard::DealCardId {
+        host: HostId::default(),
+        node_id,
+    };
     cx.simulate_window_resize(*workspace, gpui::size(gpui::px(400.), gpui::px(800.)));
     cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
         .unwrap();
@@ -345,30 +374,28 @@ fn cancelling_phone_file_keeps_the_current_feed_card(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, _, _| {
             assert!(workspace.phone_feed_for_test());
-            assert_eq!(
-                workspace.current_deal_card_for_test().unwrap().0,
-                crate::dashboard::DealCardIdentity::Inbox(id.0)
-            );
+            assert_eq!(workspace.current_deal_card_for_test().unwrap().0, id);
         })
         .unwrap();
 }
 
 #[gpui::test]
 fn phone_back_from_a_surface_reveals_the_hidden_feed_card(cx: &mut TestAppContext) {
+    // The feed deals nodes: one note that wants attention.
+    let mut desk = DeskFixture::new();
+    let node_id = desk.due_note(None, "Feed stays put");
+
     let workspace = test_workspace(cx);
-    let expected = workspace
-        .update(cx, |workspace, _, _| {
-            let id = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
-                kind: crate::inbox::InboxKind::Capture,
-                text: "Feed stays put".into(),
-                source: crate::inbox::SourceReference::None,
-                context: crate::inbox::CapturedContext::default(),
-                waiting_on: None,
-            });
-            workspace.age_inbox_for_test(&id, 0);
-            crate::dashboard::DealCardIdentity::Inbox(id.0)
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
         })
         .unwrap();
+    cx.run_until_parked();
+    let expected = crate::dashboard::DealCardId {
+        host: HostId::default(),
+        node_id,
+    };
     cx.simulate_window_resize(*workspace, gpui::size(gpui::px(400.), gpui::px(800.)));
     cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
         .unwrap();
@@ -388,25 +415,41 @@ fn phone_back_from_a_surface_reveals_the_hidden_feed_card(cx: &mut TestAppContex
 #[gpui::test]
 fn phone_empty_feed_flick_down_undoes_the_last_verdict(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
+    // The feed deals nodes: one note that wants attention.
+    let mut desk = DeskFixture::new();
+    let node_id = desk.due_note(None, "Last phone card");
+
     let workspace = test_workspace(cx);
-    let expected = workspace
-        .update(cx, |workspace, _, _| {
-            let id = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
-                kind: crate::inbox::InboxKind::Capture,
-                text: "Last phone card".into(),
-                source: crate::inbox::SourceReference::None,
-                context: crate::inbox::CapturedContext::default(),
-                waiting_on: None,
-            });
-            workspace.age_inbox_for_test(&id, 0);
-            crate::dashboard::DealCardIdentity::Inbox(id.0)
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
         })
         .unwrap();
+    cx.run_until_parked();
+    let expected = crate::dashboard::DealCardId {
+        host: HostId::default(),
+        node_id,
+    };
     cx.simulate_window_resize(*workspace, gpui::size(gpui::px(400.), gpui::px(800.)));
     cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
         .unwrap();
     cx.run_until_parked();
     cx.dispatch_action(*workspace, crate::DashboardDealDone);
+    cx.run_until_parked();
+    // A tree verdict lands when the daemon accepts it.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let stamp = take_desk_mutation(workspace, HostId::default())
+                .expect("verdict mutation")
+                .stamp;
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskMutationAccepted { stamp },
+                window,
+                cx,
+            );
+        })
+        .unwrap();
     cx.run_until_parked();
     workspace
         .update(cx, |workspace, _, _| {
@@ -443,6 +486,22 @@ fn phone_empty_feed_flick_down_undoes_the_last_verdict(cx: &mut TestAppContext) 
         }
     })
     .unwrap();
+    cx.run_until_parked();
+    // The undo is a mutation like any other: the card comes back when the
+    // daemon has taken it.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let stamp = take_desk_mutation(workspace, HostId::default())
+                .expect("undo mutation")
+                .stamp;
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskMutationAccepted { stamp },
+                window,
+                cx,
+            );
+        })
+        .unwrap();
     cx.run_until_parked();
     workspace
         .update(cx, |workspace, _, _| {
@@ -797,8 +856,14 @@ fn a_todo_verdict_logs_every_cell_that_makes_the_new_note_a_cadence(cx: &mut Tes
             let rho_desk::cells::Verdict::Todo { note: created } = verdict else {
                 panic!("the entry is not a todo");
             };
-            assert_eq!(changes.len(), 3);
-            assert!(changes.iter().all(|change| change.node == created));
+            assert_eq!(changes.len(), 4);
+            assert!(
+                changes
+                    .iter()
+                    .filter(|change| change.node == created)
+                    .count()
+                    == 3
+            );
             let change = |field: Field| {
                 changes
                     .iter()
@@ -817,6 +882,17 @@ fn a_todo_verdict_logs_every_cell_that_makes_the_new_note_a_cadence(cx: &mut Tes
             let pace = change(Field::PaceDays);
             assert_eq!(pace.before, Some(Value::Days(0)));
             assert!(matches!(pace.after, Some(Value::Days(_))));
+            // The dealt node is handled by the todo: without this the dealer
+            // offers the same card again the moment the note exists.
+            let state = change(Field::State);
+            assert_eq!(state.node, note);
+            assert_eq!(
+                state.after,
+                Some(Value::State(rho_desk::cells::State::Done))
+            );
+            assert!(mutation.writes.iter().any(|write| write.node == note
+                && write.field == Field::State
+                && write.value == Value::State(rho_desk::cells::State::Done)));
             // The daemon also requires the note to be parented on the heading.
             assert!(mutation.writes.iter().any(|write| write.node == created
                 && write.field == Field::Parent
@@ -944,19 +1020,14 @@ fn escape_leaves_deal_mode_on_every_dealt_surface(cx: &mut TestAppContext) {
 #[gpui::test]
 fn escape_ends_the_deal_and_leaves_the_surface_where_it_is(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
+    let mut desk = DeskFixture::new();
+    desk.due_note(None, "Deal QA note");
+    desk.due_note(None, "Deal QA second note");
+
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            for text in ["Inbox QA item", "Inbox QA second item"] {
-                let id = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
-                    kind: crate::inbox::InboxKind::Capture,
-                    text: text.into(),
-                    source: crate::inbox::SourceReference::None,
-                    context: crate::inbox::CapturedContext::default(),
-                    waiting_on: None,
-                });
-                workspace.age_inbox_for_test(&id, 0);
-            }
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
             workspace.open_deal_mode(window, cx);
         })
         .unwrap();
@@ -3850,14 +3921,6 @@ fn dealer_recompute_keeps_only_top_three_agent_cards_warm(cx: &mut TestAppContex
             for agent_id in ids.into_iter().skip(1) {
                 workspace.forget_agent_subscription_for_test(agent_id);
             }
-            let inbox = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
-                kind: crate::inbox::InboxKind::Capture,
-                text: "not a transcript".into(),
-                source: crate::inbox::SourceReference::None,
-                context: crate::inbox::CapturedContext::default(),
-                waiting_on: None,
-            });
-            workspace.age_inbox_for_test(&inbox, 0);
             workspace.invalidate_dealer_signals(cx);
         })
         .unwrap();
@@ -4286,74 +4349,49 @@ fn filing_completion_keeps_duplicate_heading_identity() {
 }
 
 #[gpui::test]
-fn deal_file_bare_enter_uses_the_offered_heading_completion(cx: &mut TestAppContext) {
+fn deal_file_bare_enter_files_the_dealt_node_under_the_offered_heading(cx: &mut TestAppContext) {
+    // Filing is a verdict on the card's own node: one `Parent` write, and
+    // an undo that puts the node back where it was.
     let mut desk = DeskFixture::new();
     let destination = desk.note(None, "Verdict agent");
+    let dealt = desk.due_note(None, "Deal QA note");
 
     cx.update(bind_test_keymaps);
     let workspace = test_workspace(cx);
-    let inbox_id = workspace
+    workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(HostId::default(), desk.synced(), window, cx);
-            let id = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
-                kind: crate::inbox::InboxKind::Capture,
-                text: "Inbox QA item".into(),
-                source: crate::inbox::SourceReference::None,
-                context: crate::inbox::CapturedContext::default(),
-                waiting_on: None,
-            });
-            workspace.age_inbox_for_test(&id, 0);
             workspace.open_deal_mode(window, cx);
-            id
+            workspace.take_host_messages_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
     workspace
         .update(cx, |workspace, _, _| {
-            assert!(matches!(
-                workspace.current_deal_card_for_test(),
-                Some((
-                    crate::dashboard::DealCardIdentity::Inbox(_),
-                    crate::dashboard::DealCardKind::Inbox(_)
-                ))
-            ));
-            workspace.take_host_messages_for_test(HostId::default());
+            assert_eq!(
+                workspace.current_deal_card_for_test().map(|card| card.0),
+                Some(crate::dashboard::DealCardId {
+                    host: HostId::default(),
+                    node_id: dealt,
+                })
+            );
         })
         .unwrap();
 
     cx.dispatch_action(*workspace, crate::DashboardDealFile);
     cx.run_until_parked();
     // The completion is visibly selected but untouched, exactly as in the
-    // dealer flow: bare Enter must accept it rather than submit an empty name.
+    // dealer flow: bare Enter accepts it rather than submitting an empty name.
     cx.dispatch_action(*workspace, crate::MinibufferConfirm);
     cx.run_until_parked();
-    // Filing creates the note first; its title arrives as text once the
-    // daemon has accepted that creation.
-    let (created, stamp) = workspace
+    let stamp = workspace
         .update(cx, |workspace, _, _| {
-            let messages = workspace.take_host_messages_for_test(HostId::default());
-            let mutation = messages
-                .iter()
-                .find_map(|message| match message {
-                    rho_ui_proto::ClientMessage::DeskMutationApply { mutation } => Some(mutation),
-                    _ => None,
-                })
-                .expect("filing mutation");
-            let created = mutation
-                .writes
-                .iter()
-                .find_map(|write| {
-                    (write.field == rho_desk::cells::Field::Parent
-                        && write.value == rho_desk::cells::Value::Parent(Some(destination)))
-                    .then_some(write.node)
-                })
-                .expect("note filed under the offered heading");
-            // The title follows the creation on the same ordered connection.
-            assert!(messages.iter().any(|message| matches!(
-                message,
-                rho_ui_proto::ClientMessage::DeskTextApply { node_id, .. } if *node_id == created
-            )));
-            (created, mutation.stamp)
+            let mutation =
+                take_desk_mutation(workspace, HostId::default()).expect("filing mutation");
+            assert!(mutation.writes.iter().any(|write| write.node == dealt
+                && write.field == rho_desk::cells::Field::Parent
+                && write.value == rho_desk::cells::Value::Parent(Some(destination))));
+            mutation.stamp
         })
         .unwrap();
     workspace
@@ -4365,322 +4403,59 @@ fn deal_file_bare_enter_uses_the_offered_heading_completion(cx: &mut TestAppCont
                 cx,
             );
             assert_eq!(workspace.verdict_undo_count_for_test(), 1);
-            assert!(workspace.inbox_item_for_test(&inbox_id).is_none());
+            assert_eq!(
+                workspace.echo_text_for_test(),
+                Some("file under Verdict agent: Deal QA note")
+            );
         })
         .unwrap();
+
     cx.dispatch_action(*workspace, crate::UndoVerdict);
-    let undo_stamp = workspace
+    workspace
         .update(cx, |workspace, _, _| {
             let mutation =
                 take_desk_mutation(workspace, HostId::default()).expect("filing undo mutation");
-            assert!(mutation.writes.iter().any(|write| write.node == created
-                && write.field == rho_desk::cells::Field::Deleted
-                && write.value == rho_desk::cells::Value::Bool(true)));
-            mutation.stamp
+            assert!(mutation.writes.iter().any(|write| write.node == dealt
+                && write.field == rho_desk::cells::Field::Parent
+                && write.value == rho_desk::cells::Value::Parent(None)));
         })
         .unwrap();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskMutationAccepted { stamp: undo_stamp },
-                window,
-                cx,
-            );
-            assert!(workspace.inbox_item_for_test(&inbox_id).is_some());
-            assert_eq!(
-                workspace.echo_text_for_test(),
-                Some("undid file: Inbox QA item")
-            );
-            assert_eq!(
-                workspace.current_deal_card_for_test().map(|card| card.0),
-                Some(crate::dashboard::DealCardIdentity::Inbox(
-                    inbox_id.0.clone()
-                ))
-            );
-            assert_eq!(
-                workspace.rendered_deal_card_for_test(),
-                workspace.current_deal_card_for_test()
-            );
-            assert!(workspace.dashboard_deal_mode_for_test());
-        })
-        .unwrap();
+}
 
-    // Filing again, then giving the filed note a child: the undo no longer
-    // owns a bare leaf, so it refuses rather than deleting someone's work.
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.prepare_deal_filing_for_test(inbox_id.clone());
-            workspace.complete_filing_for_test(
-                HostId::default(),
-                destination,
-                "Verdict agent",
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    cx.run_until_parked();
-    let (second_created, second_stamp) = workspace
-        .update(cx, |workspace, _, _| {
-            let mutation =
-                take_desk_mutation(workspace, HostId::default()).expect("second filing mutation");
-            let created = mutation
-                .writes
-                .iter()
-                .find_map(|write| {
-                    (write.field == rho_desk::cells::Field::Parent
-                        && write.value == rho_desk::cells::Value::Parent(Some(destination)))
-                    .then_some(write.node)
-                })
-                .expect("second note filed under the offered heading");
-            (created, mutation.stamp)
-        })
-        .unwrap();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskMutationAccepted {
-                    stamp: second_stamp,
-                },
-                window,
-                cx,
-            );
-            assert_eq!(workspace.verdict_undo_count_for_test(), 1);
-        })
-        .unwrap();
-    let child_note = desk.new_node(rho_desk::cells::NodeKind::Note, Some(second_created));
+#[gpui::test]
+fn cancelling_the_file_prompt_writes_nothing_and_keeps_the_card(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    desk.note(None, "Somewhere to file");
+    let dealt = desk.due_note(None, "First filing");
+
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(HostId::default(), desk.synced(), window, cx);
-            workspace.undo_verdict(window, cx);
-            assert_eq!(
-                workspace.echo_text_for_test(),
-                Some("cannot undo filing: Inbox QA item was edited")
-            );
-            assert_eq!(workspace.verdict_undo_count_for_test(), 0);
-            assert!(
-                workspace
-                    .take_host_messages_for_test(HostId::default())
-                    .iter()
-                    .all(|message| !matches!(
-                        message,
-                        rho_ui_proto::ClientMessage::DeskMutationApply { .. }
-                    ))
-            );
-            let nodes = workspace.desk_cells_snapshot_for_test(HostId::default());
-            assert!(nodes.iter().any(|node| node.id == second_created));
-            assert!(nodes.iter().any(|node| node.id == child_note));
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn cancelled_filing_cannot_leak_its_card_into_the_next_item(cx: &mut TestAppContext) {
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    let (first, second) = workspace
-        .update(cx, |workspace, window, cx| {
-            let first = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
-                kind: crate::inbox::InboxKind::Capture,
-                text: "First filing".into(),
-                source: crate::inbox::SourceReference::None,
-                context: crate::inbox::CapturedContext::default(),
-                waiting_on: None,
-            });
-            let second = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
-                kind: crate::inbox::InboxKind::Capture,
-                text: "Second filing".into(),
-                source: crate::inbox::SourceReference::None,
-                context: crate::inbox::CapturedContext::default(),
-                waiting_on: None,
-            });
-            workspace.age_inbox_for_test(&first, 0);
             workspace.open_deal_mode(window, cx);
-            (first, second)
+            workspace.take_host_messages_for_test(HostId::default());
         })
         .unwrap();
+    cx.run_until_parked();
 
     cx.dispatch_action(*workspace, crate::DashboardDealFile);
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(
-                workspace.pending_filing_card_for_test(),
-                Some((first.clone(), "First filing".into()))
-            );
-        })
-        .unwrap();
     cx.dispatch_action(*workspace, crate::MinibufferCancel);
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(workspace.pending_filing_card_for_test(), None);
-            workspace.prepare_deal_filing_for_test(second);
-            assert_eq!(workspace.pending_filing_card_for_test(), None);
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn page_filing_undo_stays_on_the_stack_until_unbind_exists(cx: &mut TestAppContext) {
-    let workspace = test_workspace(cx);
-    let inbox_id = workspace
-        .update(cx, |workspace, window, cx| {
-            let page_id = uuid::Uuid::new_v4();
-            let id = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
-                kind: crate::inbox::InboxKind::Capture,
-                text: "Filed research page".into(),
-                source: crate::inbox::SourceReference::Page {
-                    id: page_id.to_string(),
-                },
-                context: crate::inbox::CapturedContext::default(),
-                waiting_on: None,
-            });
-            workspace.reopen_deal_for_test(crate::dashboard::DealCard {
-                label: "Filed research page".into(),
-                priority: 1.0,
-                host: HostId::default(),
-                subject_node_id: None,
-                topic_node_id: None,
-                agent_id: None,
-                agent_tag: None,
-                breadcrumb: "Filed research page".into(),
-                room: None,
-                kind: crate::dashboard::DealCardKind::Inbox(
-                    crate::dashboard::DealerInboxKind::Capture,
-                ),
-                identity: crate::dashboard::DealCardIdentity::Inbox(id.0.clone()),
-                inbox_source: Some(crate::dashboard::DealerInboxSource::Page(
-                    rho_browser::PageId(page_id),
-                )),
-            });
-            workspace.prepare_deal_filing_for_test(id.clone());
-            workspace.complete_filing_for_test(
-                HostId::default(),
-                rho_desk::NodeId {
-                    replica_id: 1,
-                    counter: 1,
-                },
-                "Research",
-                window,
-                cx,
-            );
-            id
-        })
-        .unwrap();
-    let request_id = workspace
-        .update(cx, |workspace, _, _| {
-            workspace
-                .take_host_messages_for_test(HostId::default())
-                .into_iter()
-                .find_map(|message| match message {
-                    rho_ui_proto::ClientMessage::DeskPageBind { request_id, .. } => {
-                        Some(request_id)
-                    }
-                    _ => None,
-                })
-                .expect("page binding request")
-        })
-        .unwrap();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskPageBindingResult {
-                    request_id,
-                    error: None,
-                },
-                window,
-                cx,
-            );
-            assert!(workspace.inbox_item_for_test(&inbox_id).is_none());
-            assert_eq!(workspace.verdict_undo_count_for_test(), 1);
-
-            workspace.undo_verdict(window, cx);
-
-            assert_eq!(
-                workspace.echo_text_for_test(),
-                Some("cannot undo page filing yet: Filed research page")
-            );
-            assert_eq!(workspace.verdict_undo_count_for_test(), 1);
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn inbox_verdict_echo_names_card_and_undo_restores_it(cx: &mut TestAppContext) {
-    let workspace = test_workspace(cx);
-    let id = workspace
-        .update(cx, |workspace, window, cx| {
-            let id = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
-                kind: crate::inbox::InboxKind::Capture,
-                text: "Remember the title".into(),
-                source: crate::inbox::SourceReference::None,
-                context: crate::inbox::CapturedContext::default(),
-                waiting_on: None,
-            });
-            workspace.age_inbox_for_test(&id, 0);
-            workspace.open_deal_mode(window, cx);
-            id
-        })
-        .unwrap();
-    cx.dispatch_action(*workspace, crate::DashboardDealDiscard);
     cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(
-                workspace.echo_text_for_test(),
-                Some("discard: Remember the title")
-            );
-            assert!(workspace.inbox_item_for_test(&id).is_none());
-            assert_eq!(workspace.verdict_undo_count_for_test(), 1);
-        })
-        .unwrap();
 
-    cx.dispatch_action(*workspace, crate::UndoVerdict);
-    cx.run_until_parked();
     workspace
         .update(cx, |workspace, _, _| {
-            assert!(workspace.inbox_item_for_test(&id).is_some());
-            assert_eq!(
-                workspace.echo_text_for_test(),
-                Some("undid discard: Remember the title")
+            assert!(
+                take_desk_mutation(workspace, HostId::default()).is_none(),
+                "a cancelled prompt files nothing"
             );
             assert_eq!(
                 workspace.current_deal_card_for_test().map(|card| card.0),
-                Some(crate::dashboard::DealCardIdentity::Inbox(id.0.clone()))
-            );
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn missing_inbox_item_is_not_a_successful_verdict(cx: &mut TestAppContext) {
-    let workspace = test_workspace(cx);
-    let id = workspace
-        .update(cx, |workspace, window, cx| {
-            let id = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
-                kind: crate::inbox::InboxKind::Capture,
-                text: "Retired elsewhere".into(),
-                source: crate::inbox::SourceReference::None,
-                context: crate::inbox::CapturedContext::default(),
-                waiting_on: None,
-            });
-            workspace.age_inbox_for_test(&id, 0);
-            workspace.open_deal_mode(window, cx);
-            workspace.retire_inbox_for_test(&id);
-            id
-        })
-        .unwrap();
-
-    cx.dispatch_action(*workspace, crate::DashboardDealDone);
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(workspace.inbox_item_for_test(&id).is_none());
-            assert_eq!(workspace.verdict_undo_count_for_test(), 0);
-            assert_eq!(
-                workspace.echo_text_for_test(),
-                Some("done: nothing under the deal: the inbox item is unavailable")
+                Some(crate::dashboard::DealCardId {
+                    host: HostId::default(),
+                    node_id: dealt,
+                }),
+                "the card the reader was looking at is still the one dealt"
             );
         })
         .unwrap();
@@ -4784,7 +4559,7 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
                     );
                     assert_eq!(
                         workspace.current_deal_card_for_test().map(|card| card.0),
-                        Some(crate::dashboard::DealCardIdentity::Tree {
+                        Some(crate::dashboard::DealCardId {
                             host: HostId::default(),
                             node_id: note,
                         })
@@ -4817,11 +4592,15 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
     workspace
         .update(cx, |workspace, window, cx| {
             let mut replacement = workspace.current_deal_card_value_for_test().unwrap();
-            replacement.identity = crate::dashboard::DealCardIdentity::Inbox("replacement".into());
-            replacement.kind =
-                crate::dashboard::DealCardKind::Inbox(crate::dashboard::DealerInboxKind::Capture);
-            replacement.topic_node_id = None;
-            replacement.subject_node_id = None;
+            let other = rho_desk::NodeId {
+                replica_id: 1,
+                counter: 999,
+            };
+            replacement.identity = crate::dashboard::DealCardId {
+                host: HostId::default(),
+                node_id: other,
+            };
+            replacement.topic_node_id = other;
             replacement.agent_id = None;
             workspace.reopen_deal_for_test(replacement);
             workspace.handle_event(
@@ -4832,9 +4611,10 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
             );
             assert_eq!(
                 workspace.current_deal_card_for_test().map(|card| card.0),
-                Some(crate::dashboard::DealCardIdentity::Inbox(
-                    "replacement".into()
-                ))
+                Some(crate::dashboard::DealCardId {
+                    host: HostId::default(),
+                    node_id: other,
+                })
             );
             assert_eq!(workspace.echo_text_for_test(), Some("done: Named card"));
         })
@@ -6496,50 +6276,148 @@ fn deal_keys_reach_a_dealt_slack_conversation(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn a_verdict_ends_the_deal_even_when_the_item_went_quiet(cx: &mut TestAppContext) {
+fn a_verdict_ends_the_deal_even_when_the_node_went_quiet(cx: &mut TestAppContext) {
+    // Reading a Slack conversation elsewhere quiets the thread while the
+    // deal is still open: its node loses the facts the card was drawn from.
+    // The verdict must still land and still end the deal.
+    let mut desk = DeskFixture::new();
+    let dealt = desk.due_note(None, "can you look at the deploy?");
+
     cx.update(bind_test_keymaps);
     let workspace = test_workspace(cx);
-    let id = workspace
+    workspace
         .update(cx, |workspace, window, cx| {
-            let id = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
-                kind: crate::inbox::InboxKind::Slack,
-                text: "can you look at the deploy?".into(),
-                source: crate::inbox::SourceReference::SlackThread {
-                    workspace: "acme".into(),
-                    channel: "C1".into(),
-                    thread_ts: "500.0".into(),
-                    latest_ts: "500.0".into(),
-                },
-                context: crate::inbox::CapturedContext {
-                    host: None,
-                    room: Some("#design".into()),
-                    focused_surface: String::new(),
-                },
-                waiting_on: None,
-            });
-            workspace.age_inbox_for_test(&id, 0);
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
             workspace.open_deal_mode(window, cx);
-            id
         })
         .unwrap();
     cx.run_until_parked();
-    // Reading a Slack conversation retires rho's copy of the obligation
-    // while the deal is still open. The verdict must still land.
     workspace
-        .update(cx, |workspace, _, _| {
+        .update(cx, |workspace, window, cx| {
             assert!(workspace.dashboard_deal_mode_for_test());
-            workspace.retire_inbox_for_test(&id);
+            desk.set(
+                dealt,
+                rho_desk::cells::Field::DeferUntil,
+                rho_desk::cells::Value::OptionalTimestamp(None),
+            );
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
         })
         .unwrap();
 
     cx.dispatch_action(*workspace, crate::DashboardDealDone);
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let stamp = take_desk_mutation(workspace, HostId::default())
+                .expect("verdict mutation")
+                .stamp;
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskMutationAccepted { stamp },
+                window,
+                cx,
+            );
+        })
+        .unwrap();
     cx.run_until_parked();
 
     workspace
         .update(cx, |workspace, _, _| {
             assert!(
                 !workspace.dashboard_deal_mode_for_test(),
-                "a verdict on an item that went quiet still ends the deal"
+                "a verdict on a card that went quiet still ends the deal"
+            );
+        })
+        .unwrap();
+}
+
+/// A `thread` node is the thread's identity and its verdicts; what the
+/// card says comes from the Slack mirror. With nothing in the mirror there
+/// is nothing to say, so the node is not dealt as a blank card.
+#[gpui::test]
+fn a_thread_node_without_its_mirror_is_not_dealt(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    let dealable = desk.due_note(None, "a note that does want attention");
+    desk.thread_row(None, "C1", "500.0");
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.open_deal_mode(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(
+                workspace.current_deal_card_for_test().map(|card| card.0),
+                Some(crate::dashboard::DealCardId {
+                    host: HostId::default(),
+                    node_id: dealable,
+                }),
+                "the only card is the one with something to say"
+            );
+        })
+        .unwrap();
+}
+
+/// Creation: `n` from anywhere, the area always asked with the node in
+/// context as the first answer, so Enter alone files the new thing where
+/// the reader already is.
+#[gpui::test]
+fn new_note_files_itself_under_the_area_the_cursor_is_on(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let mut desk = DeskFixture::new();
+    let elsewhere = desk.note(None, "elsewhere");
+    let context = desk.note(None, "the area in view");
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.focus_tree_node_for_test(HostId::default(), context, window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let areas = workspace
+                .dashboard
+                .area_candidates(&workspace.registry, &Default::default(), cx)
+                .into_iter()
+                .map(|(path, kind, _, _)| (path, kind))
+                .collect::<Vec<_>>();
+            assert!(areas.contains(&("the area in view".to_owned(), "note")));
+            assert!(areas.contains(&("elsewhere".to_owned(), "note")));
+            workspace.take_host_messages_for_test(HostId::default());
+        })
+        .unwrap();
+
+    // `space n n`, then bare Enter on the offered context row.
+    cx.simulate_keystrokes(*workspace, "space n n");
+    cx.run_until_parked();
+    cx.dispatch_action(*workspace, crate::MinibufferConfirm);
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            let mutation =
+                take_desk_mutation(workspace, HostId::default()).expect("new note mutation");
+            assert!(
+                mutation
+                    .writes
+                    .iter()
+                    .any(|write| write.field == rho_desk::cells::Field::Parent
+                        && write.value == rho_desk::cells::Value::Parent(Some(context))),
+                "Enter on the first row files the note where the cursor is"
+            );
+            assert!(
+                !mutation
+                    .writes
+                    .iter()
+                    .any(|write| write.value == rho_desk::cells::Value::Parent(Some(elsewhere))),
+                "no other area is written to"
             );
         })
         .unwrap();
@@ -6748,6 +6626,41 @@ impl DeskFixture {
                 operations: vec![operation],
                 transactions: Vec::new(),
             });
+        }
+        node_id
+    }
+
+    /// A note the dealer will deal. A plain note is never dealt, so the
+    /// mark that makes it want attention is part of the seed.
+    fn due_note(&mut self, parent: Option<rho_desk::NodeId>, text: &str) -> rho_desk::NodeId {
+        let node_id = self.note(parent, text);
+        self.set(
+            node_id,
+            rho_desk::cells::Field::DeferUntil,
+            rho_desk::cells::Value::OptionalTimestamp(Some(rho_desk::cells::Timestamp {
+                unix_ms: 1_600_000_000_000,
+                precision: rho_desk::cells::TimestampPrecision::Day,
+            })),
+        );
+        node_id
+    }
+
+    /// A machine thread row, as the daemon writes it after a thread bind.
+    fn thread_row(
+        &mut self,
+        parent: Option<rho_desk::NodeId>,
+        channel: &str,
+        thread_ts: &str,
+    ) -> rho_desk::NodeId {
+        use rho_desk::cells::{Field, Value};
+
+        let node_id = self.new_node(rho_desk::cells::NodeKind::Thread, parent);
+        for (field, value) in [
+            (Field::Workspace, Value::Text("acme".to_owned())),
+            (Field::Channel, Value::Text(channel.to_owned())),
+            (Field::ThreadTs, Value::Text(thread_ts.to_owned())),
+        ] {
+            self.set(node_id, field, value);
         }
         node_id
     }

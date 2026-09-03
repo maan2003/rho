@@ -67,6 +67,8 @@ pub struct AgentPool {
 pub struct AgentCreated {
     pub agent_id: AgentId,
     pub agent: RunningAgent,
+    /// The agent that spawned this one, when another agent did.
+    pub parent: Option<AgentId>,
 }
 
 pub type ActivationObserver = dyn Fn(AgentId, RunningAgent) -> BoxFuture<'static, ()> + Send + Sync;
@@ -499,6 +501,7 @@ impl AgentPool {
             let _ = self.created.send(AgentCreated {
                 agent_id,
                 agent: agent.clone(),
+                parent,
             });
         }
         Ok((agent_id, agent))

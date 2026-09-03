@@ -94,8 +94,9 @@ pub enum ConnEvent {
         operation: rho_desk::TextOperation,
     },
     DeskResyncRequired,
-    DeskPageBindingResult {
+    DeskBindingResult {
         request_id: u64,
+        node_id: Option<rho_desk::NodeId>,
         error: Option<String>,
     },
     Ready {
@@ -1252,9 +1253,15 @@ async fn run(
             | ServerMessage::DeskTreeBatchApplied { .. }
             | ServerMessage::DeskTreeBatchRejected { .. }
             | ServerMessage::DeskTreeResyncRequired => None,
-            ServerMessage::DeskPageBindingResult { request_id, error } => {
-                Some(ConnEvent::DeskPageBindingResult { request_id, error })
-            }
+            ServerMessage::DeskBindingResult {
+                request_id,
+                node_id,
+                error,
+            } => Some(ConnEvent::DeskBindingResult {
+                request_id,
+                node_id,
+                error,
+            }),
             // Read-only CLI reply; the GUI subscribes instead.
             ServerMessage::DeskTreeDocument { .. } => None,
             ServerMessage::Ready {

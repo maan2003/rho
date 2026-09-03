@@ -627,6 +627,47 @@ impl DeskCells {
         crate::dashboard::node_file_path(&nodes, node_id)
     }
 
+    /// The workdir a new thing filed under `node_id` inherits: the node's
+    /// own file, else the nearest ancestor with one. A cycle is shown at
+    /// the root rather than repaired, so the walk stops at the depth no
+    /// real tree reaches.
+    pub fn inherited_file_path(
+        &self,
+        host: HostId,
+        node_id: rho_desk::NodeId,
+    ) -> Option<camino::Utf8PathBuf> {
+        let nodes = self.hosts.get(&host)?.view.materialize();
+        let mut cursor = Some(node_id);
+        for _ in 0..MAX_ANCESTRY {
+            let id = cursor?;
+            if let Some(path) = crate::dashboard::node_file_path(&nodes, id) {
+                return Some(path);
+            }
+            cursor = nodes.iter().find(|node| node.id == id)?.parent;
+        }
+        None
+    }
+
+    /// The agent that owns an area: the node itself when it is an agent
+    /// node, else the nearest ancestor that is one.
+    pub fn nearest_agent(
+        &self,
+        host: HostId,
+        node_id: rho_desk::NodeId,
+    ) -> Option<rho_core::AgentId> {
+        let nodes = self.hosts.get(&host)?.view.materialize();
+        let mut cursor = Some(node_id);
+        for _ in 0..MAX_ANCESTRY {
+            let id = cursor?;
+            let node = nodes.iter().find(|node| node.id == id)?;
+            if let Some(agent_id) = crate::dashboard::node_agent(node) {
+                return Some(agent_id);
+            }
+            cursor = node.parent;
+        }
+        None
+    }
+
     /// Every live note in the subtree, parents first, with its text.
     pub fn capture(
         &self,
@@ -780,23 +821,35 @@ impl DeskCells {
                             _ => {}
                         }
                     }
-                    // A todo is the one verdict that writes a whole new note, so
-                    // its log entry carries all three cells that make the note a
-                    // live cadence, against the values a node that never existed
-                    // is read as having. One of them is not enough: the daemon
-                    // checks the entry against exactly this shape.
-                    let changes = vec![
-                        field_change(note, Field::Deleted, Value::Bool(true), Value::Bool(false)),
-                        field_change(
-                            note,
-                            Field::DeferUntil,
-                            Value::OptionalTimestamp(None),
-                            Value::OptionalTimestamp(Some(defer_until)),
-                        ),
-                        field_change(note, Field::PaceDays, Value::Days(0), Value::Days(pace)),
-                    ];
+                    // The entry is built by the same constructor the daemon
+                    // checks it against, so the writer and the checker cannot
+                    // drift. It also marks the dealt node done: the todo is
+                    // what handles it, and without that the dealer offers it
+                    // again the moment the note exists.
+                    let verdict = Verdict::Todo { note };
+                    let before = self
+                        .hosts
+                        .get(&host)?
+                        .view
+                        .value(node_id, &Field::State)
+                        .cloned();
+                    let changes = rho_desk::cells::verdict_changes(
+                        node_id,
+                        &verdict,
+                        before,
+                        Some(rho_desk::cells::TodoCadence {
+                            defer_until,
+                            pace_days: pace,
+                        }),
+                    )
+                    .ok()?;
+                    writes.push(rho_desk::cells::CellWrite {
+                        node: node_id,
+                        field: Field::State,
+                        value: Value::State(rho_desk::cells::State::Done),
+                    });
                     let event = rho_desk::cells::VerdictEvent::Applied {
-                        verdict: Verdict::Todo { note },
+                        verdict,
                         at: rho_desk::cells::Stamp {
                             device: self.device,
                             version: 0,
@@ -943,6 +996,9 @@ fn field_change(
         after: Some(after),
     }
 }
+
+/// How far an ancestry walk goes before it decides it is in a cycle.
+const MAX_ANCESTRY: usize = 256;
 
 fn create_note_writes(
     node_id: rho_desk::NodeId,

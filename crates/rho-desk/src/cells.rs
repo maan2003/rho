@@ -173,6 +173,95 @@ pub struct FieldChange {
     pub after: Option<Value>,
 }
 
+/// The cadence a `todo` verdict gives the note it creates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TodoCadence {
+    pub defer_until: Timestamp,
+    pub pace_days: u32,
+}
+
+/// The field changes a verdict records in its log entry.
+///
+/// One definition for both sides: the GUI logs exactly this, and the daemon
+/// checks a submitted entry against it, so the two can never drift. `before`
+/// is the value the verdict's field had, which only the writer knows;
+/// `cadence` is required for `todo`, whose changes describe the note the
+/// verdict creates rather than the node it was dealt on.
+pub fn verdict_changes(
+    node: NodeId,
+    verdict: &Verdict,
+    before: Option<Value>,
+    cadence: Option<TodoCadence>,
+) -> Result<Vec<FieldChange>, String> {
+    let one = |field: Field, after: Value| {
+        Ok(vec![FieldChange {
+            node,
+            field,
+            before: before.clone(),
+            after: Some(after),
+        }])
+    };
+    match verdict {
+        Verdict::Done => one(Field::State, Value::State(State::Done)),
+        Verdict::Dismiss => one(Field::State, Value::State(State::Dismissed)),
+        Verdict::Defer { until } => one(Field::DeferUntil, Value::OptionalTimestamp(Some(*until))),
+        Verdict::File { parent } => one(Field::Parent, Value::Parent(Some(*parent))),
+        // A todo is the one verdict that writes a whole new note, so its
+        // entry carries all three cells that make that note a live cadence,
+        // against the values a node that never existed reads as having. The
+        // node it was dealt on is handled by the same act: without that the
+        // dealer offers it again the moment the todo is written.
+        Verdict::Todo { note } => {
+            let cadence = cadence.ok_or("a todo verdict needs its cadence")?;
+            let change = |field: Field, before: Value, after: Value| FieldChange {
+                node: *note,
+                field,
+                before: Some(before),
+                after: Some(after),
+            };
+            Ok(vec![
+                FieldChange {
+                    node,
+                    field: Field::State,
+                    before: before.clone(),
+                    after: Some(Value::State(State::Done)),
+                },
+                change(Field::Deleted, Value::Bool(true), Value::Bool(false)),
+                change(
+                    Field::DeferUntil,
+                    Value::OptionalTimestamp(None),
+                    Value::OptionalTimestamp(Some(cadence.defer_until)),
+                ),
+                change(
+                    Field::PaceDays,
+                    Value::Days(0),
+                    Value::Days(cadence.pace_days),
+                ),
+            ])
+        }
+    }
+}
+
+/// The cadence a submitted `todo` entry claims, read back out of its changes.
+pub fn todo_cadence(changes: &[FieldChange]) -> Option<TodoCadence> {
+    let after = |field: Field| {
+        changes
+            .iter()
+            .find(|change| change.field == field)
+            .and_then(|change| change.after.clone())
+    };
+    let Some(Value::OptionalTimestamp(Some(defer_until))) = after(Field::DeferUntil) else {
+        return None;
+    };
+    let Some(Value::Days(pace_days)) = after(Field::PaceDays) else {
+        return None;
+    };
+    Some(TodoCadence {
+        defer_until,
+        pace_days,
+    })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum VerdictEvent {
     Applied {
