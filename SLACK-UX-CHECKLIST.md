@@ -179,6 +179,20 @@ under test. If the fake cannot produce a state, extend the fake.
       real-Slack case may be a dead socket, an open conversation re-syncs
       its tail on Ready, on reconnect, and on every `activity.feed` poll,
       so a dead socket degrades to the poll, never to silence.
+- [ ] 2.9 The deal is the conversation, decided. Now a dealt Slack card is
+      a one-line label with nothing behind it; only Page cards open their
+      surface as the deal view (`DealCardIdentity::Inbox` with
+      `DealerInboxSource::Page`). Rho: dealing a Slack obligation opens the
+      conversation surface as the deal view the way an agent card opens
+      its transcript: the thread surface when the ping is in a thread, the
+      channel or DM otherwise, scrolled so the pinging message is in view
+      with the cursor on it and the message itself in a highlight class
+      that stays until the surface closes. Enough history above it to
+      read what led to it (the surface's normal tail, `shift-p` for more).
+      Deal keys (`d`, `x`, `s`, `S`, `t`, `f`, `q`) work on that surface
+      exactly as on an agent surface, and a verdict closes it and moves on.
+      The card line still shows in the queue; the surface is what you look
+      at.
 - [ ] 2.7 Direct messages raise cards. Slack's `activity.feed` does not
       carry DMs, only mentions, reactions, and thread replies; a DM never
       reaches the inbox today. Rho: a websocket `message` in an `im` or
