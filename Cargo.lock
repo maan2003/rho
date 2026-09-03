@@ -13915,6 +13915,7 @@ dependencies = [
  "rho-registry",
  "rho-rpc",
  "rho-rtc",
+ "rho-slack",
  "rho-touch-keyboard",
  "rho-ui-proto",
  "rho-zulip",
@@ -14124,6 +14125,33 @@ dependencies = [
  "bytes",
  "senax-encoder",
  "tokio",
+]
+
+[[package]]
+name = "rho-slack"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "dirs",
+ "editor",
+ "futures 0.3.33",
+ "gpui",
+ "gpui_tokio",
+ "language",
+ "multi_buffer",
+ "reqwest 0.12.28",
+ "rho-slack",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "text",
+ "theme",
+ "tokio",
+ "tokio-tungstenite",
+ "tracing",
+ "ui",
 ]
 
 [[package]]

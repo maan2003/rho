@@ -118,6 +118,7 @@ pub enum DealerInboxKind {
     Ping,
     Obligation,
     Capture,
+    Slack,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -187,7 +188,25 @@ pub enum SurfaceIdentity {
     ZulipNarrow {
         label: String,
     },
+    SlackList,
+    SlackConversation {
+        thread: SlackThread,
+    },
     Dashboard,
+}
+
+/// A Slack thread as the journal names it: the workspace and conversation a
+/// person would recognise, plus the thread's own key so two threads in one
+/// conversation stay distinct.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(
+    feature = "native",
+    derive(senax_encoder::Encode, senax_encoder::Decode)
+)]
+pub struct SlackThread {
+    pub workspace: String,
+    pub conversation: String,
+    pub thread: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
@@ -372,6 +391,23 @@ pub enum Event {
     AgentSelected {
         agent_id: Option<String>,
     },
+    /// The Slack session came up, went away, raised a thread into the inbox,
+    /// or carried the user's own reply. The thread is named, not numbered:
+    /// the record has to be readable a month later.
+    SlackConnected {
+        workspace: String,
+    },
+    SlackDisconnected {
+        workspace: String,
+        reason: String,
+    },
+    SlackItemIngested {
+        thread: SlackThread,
+        inbox_id: String,
+    },
+    SlackReplied {
+        thread: SlackThread,
+    },
     MinibufferOpened {
         prompt: String,
     },
@@ -437,6 +473,10 @@ impl Event {
             Self::OverviewOpened => "overview_opened",
             Self::AgentOpened { .. } => "agent_opened",
             Self::AgentSelected { .. } => "agent_selected",
+            Self::SlackConnected { .. } => "slack_connected",
+            Self::SlackDisconnected { .. } => "slack_disconnected",
+            Self::SlackItemIngested { .. } => "slack_item_ingested",
+            Self::SlackReplied { .. } => "slack_replied",
             Self::MinibufferOpened { .. } => "minibuffer_opened",
             Self::MinibufferSubmitted { .. } => "minibuffer_submitted",
             Self::MinibufferCancelled { .. } => "minibuffer_cancelled",

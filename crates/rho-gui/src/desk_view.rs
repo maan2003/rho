@@ -1084,6 +1084,27 @@ impl DeskTreeSync {
         Some(new_heading_operation(desk, parent, order)?)
     }
 
+    /// A tag on a node rho just created. Filing a Slack thread uses this so
+    /// the filed threads are findable as a set rather than as loose headings.
+    pub fn prepare_set_tag(
+        &mut self,
+        host: HostId,
+        node_id: rho_desk::NodeId,
+        tag: &str,
+    ) -> Option<rho_desk::TreeOperation> {
+        let desk = self.tree_hosts.get_mut(&host)?;
+        desk.next_tree_clock = desk.next_tree_clock.checked_add(1)?;
+        Some(rho_desk::TreeOperation::SetTag {
+            timestamp: rho_desk::TreeClock {
+                value: desk.next_tree_clock,
+                replica_id: desk.replica_id,
+            },
+            node_id,
+            tag: tag.to_owned(),
+            present: true,
+        })
+    }
+
     pub fn prepare_reorder(
         &mut self,
         host: HostId,

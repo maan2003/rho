@@ -131,6 +131,9 @@ pub enum DealerInboxKind {
     Ping,
     Obligation,
     Capture,
+    /// A Slack thread waiting on the user. Machine-owned, so it carries the
+    /// thread's own wait rather than a capture age.
+    Slack,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -153,6 +156,13 @@ pub struct DealerInboxItem {
 pub enum DealerInboxSource {
     #[cfg(feature = "native")]
     Page(rho_browser::PageId),
+    /// Enough to reopen the conversation surface on the thread. Ids live here
+    /// because this is addressing, not display; the card shows the label.
+    SlackThread {
+        workspace: String,
+        channel: String,
+        thread_ts: String,
+    },
     Other(String),
 }
 
@@ -1105,6 +1115,7 @@ impl Dashboard {
                 DealerInboxKind::Ping => crate::journal::DealerInboxKind::Ping,
                 DealerInboxKind::Obligation => crate::journal::DealerInboxKind::Obligation,
                 DealerInboxKind::Capture => crate::journal::DealerInboxKind::Capture,
+                DealerInboxKind::Slack => crate::journal::DealerInboxKind::Slack,
             }),
         };
         let verdict = match event.verdict {
@@ -2085,6 +2096,7 @@ fn dealer_inbox_items(
                 InboxKind::Capture => DealerInboxKind::Capture,
                 InboxKind::Obligation => DealerInboxKind::Obligation,
                 InboxKind::Ping => DealerInboxKind::Ping,
+                InboxKind::Slack => DealerInboxKind::Slack,
             };
             let source = match &item.source {
                 #[cfg(feature = "native")]
@@ -2094,6 +2106,16 @@ fn dealer_inbox_items(
                     .unwrap_or_else(|_| DealerInboxSource::Other(id.clone())),
                 #[cfg(not(feature = "native"))]
                 SourceReference::Page { id } => DealerInboxSource::Other(id.clone()),
+                SourceReference::SlackThread {
+                    workspace,
+                    channel,
+                    thread_ts,
+                    ..
+                } => DealerInboxSource::SlackThread {
+                    workspace: workspace.clone(),
+                    channel: channel.clone(),
+                    thread_ts: thread_ts.clone(),
+                },
                 SourceReference::DeskNode { .. } => DealerInboxSource::Other("desk".into()),
                 SourceReference::External { source, reference } => {
                     DealerInboxSource::Other(format!("{source}:{reference}"))
@@ -2158,12 +2180,16 @@ fn inbox_deal_queue(
             .max(0) as f64
             / 86_400.0;
         let pace = match item.kind {
-            DealerInboxKind::Ping | DealerInboxKind::Obligation => INBOX_OBLIGATION_PACE_DAYS,
+            // A Slack thread is someone waiting on a reply, exactly like a
+            // ping, so it paces and rises the same way.
+            DealerInboxKind::Ping | DealerInboxKind::Slack | DealerInboxKind::Obligation => {
+                INBOX_OBLIGATION_PACE_DAYS
+            }
             DealerInboxKind::Capture => INBOX_CAPTURE_PACE_DAYS,
         };
         let mut score =
             rho_desk::todo_priority(item.captured_at.naive_local(), pace, now.naive_local());
-        if item.kind == DealerInboxKind::Ping {
+        if matches!(item.kind, DealerInboxKind::Ping | DealerInboxKind::Slack) {
             score += age_days;
         }
         let fingerprint = DealFingerprint(format!("{item:?}"));
@@ -2175,12 +2201,15 @@ fn inbox_deal_queue(
         {
             continue;
         }
-        let mut label = match item.kind {
-            DealerInboxKind::Ping => "ping",
-            DealerInboxKind::Obligation => "obligation",
-            DealerInboxKind::Capture => "capture",
-        }
-        .to_owned();
+        let mut label = match (item.kind, &item.waiting_on) {
+            (DealerInboxKind::Ping, _) => "ping".to_owned(),
+            // Shaped like the agent card: the state, then how long it has
+            // been in that state.
+            (DealerInboxKind::Slack, Some(_)) => "waiting on them".to_owned(),
+            (DealerInboxKind::Slack, None) => "waiting on you".to_owned(),
+            (DealerInboxKind::Obligation, _) => "obligation".to_owned(),
+            (DealerInboxKind::Capture, _) => "capture".to_owned(),
+        };
         label.push_str(&format!(" · {}", age_label(age_days)));
         if let Some(context) = item.context.as_deref().filter(|value| !value.is_empty()) {
             label.push_str(" · from ");
@@ -2452,5 +2481,76 @@ impl Dashboard {
         self.current_deal_card()
             .and_then(|card| card.topic_node_id)
             .is_some()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_slack_thread_deals_like_an_agent_waiting_on_a_reply() {
+        let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap()
+            .and_utc()
+            .fixed_offset();
+        let thread = |waiting_on: Option<&str>| DealerInboxItem {
+            id: "slack".into(),
+            host: HostId(1),
+            title: "can you look at the deploy?".into(),
+            kind: DealerInboxKind::Slack,
+            captured_at: now - chrono::Duration::days(2),
+            deferred_until: None,
+            resurfacing_count: 0,
+            waiting_on: waiting_on.map(str::to_owned),
+            source: Some(DealerInboxSource::SlackThread {
+                workspace: "acme".into(),
+                channel: "C1".into(),
+                thread_ts: "500.0".into(),
+            }),
+            context: Some("#design".into()),
+        };
+
+        let queue = inbox_deal_queue(&[thread(None)], now, &HashMap::new());
+        assert_eq!(queue.cards.len(), 1);
+        assert_eq!(queue.cards[0].label, "waiting on you · 2.0d · from #design");
+        assert_eq!(queue.cards[0].breadcrumb, "can you look at the deploy?");
+        assert_eq!(queue.cards[0].room.as_deref(), Some("#design"));
+        assert_eq!(
+            queue.cards[0].kind,
+            DealCardKind::Inbox(DealerInboxKind::Slack)
+        );
+        // The card carries enough to reopen the thread, and no ids reach the
+        // text the user reads.
+        assert!(matches!(
+            queue.cards[0].inbox_source,
+            Some(DealerInboxSource::SlackThread { .. })
+        ));
+        assert!(!queue.cards[0].label.contains("C1"));
+        assert!(!queue.cards[0].label.contains("500.0"));
+
+        let answered = inbox_deal_queue(&[thread(Some("#design"))], now, &HashMap::new());
+        assert_eq!(
+            answered.cards[0].label,
+            "waiting on them · 2.0d · from #design"
+        );
+
+        // Two days of someone waiting must outrank two days of a capture,
+        // the same way a blocked agent outranks an FYI.
+        let capture = DealerInboxItem {
+            id: "capture".into(),
+            kind: DealerInboxKind::Capture,
+            waiting_on: None,
+            source: None,
+            context: None,
+            ..thread(None)
+        };
+        let mixed = inbox_deal_queue(&[capture, thread(None)], now, &HashMap::new());
+        assert_eq!(
+            mixed.cards[0].identity,
+            DealCardIdentity::Inbox("slack".into())
+        );
     }
 }

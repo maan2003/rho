@@ -35,15 +35,35 @@ pub enum InboxKind {
     Ping,
     Capture,
     Obligation,
+    /// A Slack thread that owes the user an answer. Machine-owned: the Slack
+    /// session appends, updates, and retires these without a user verdict.
+    Slack,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "native", derive(Encode, Decode))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SourceReference {
-    Page { id: String },
-    DeskNode { host: u32, node_id: NodeIdentity },
-    External { source: String, reference: String },
+    Page {
+        id: String,
+    },
+    /// A Slack thread. `latest_ts` is the verdict key rather than part of the
+    /// thread's identity: a newer reply changes it, which voids a skip and
+    /// re-raises the card exactly as an agent's reply does.
+    SlackThread {
+        workspace: String,
+        channel: String,
+        thread_ts: String,
+        latest_ts: String,
+    },
+    DeskNode {
+        host: u32,
+        node_id: NodeIdentity,
+    },
+    External {
+        source: String,
+        reference: String,
+    },
     None,
 }
 
@@ -329,7 +349,7 @@ impl InboxStore {
     }
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
 

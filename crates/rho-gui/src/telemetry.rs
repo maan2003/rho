@@ -32,6 +32,8 @@ pub(crate) enum SurfaceKind {
     Browser,
     ZulipInbox,
     ZulipNarrow,
+    SlackList,
+    SlackConversation,
     Messages,
 }
 
@@ -52,12 +54,14 @@ impl SurfaceKind {
             Self::Browser => "browser",
             Self::ZulipInbox => "zulip_inbox",
             Self::ZulipNarrow => "zulip_narrow",
+            Self::SlackList => "slack_list",
+            Self::SlackConversation => "slack_conversation",
             Self::Messages => "messages",
         }
     }
 }
 
-const SURFACE_KINDS: [SurfaceKind; 11] = [
+const SURFACE_KINDS: [SurfaceKind; 13] = [
     SurfaceKind::Dashboard,
     SurfaceKind::Draft,
     SurfaceKind::Transcript,
@@ -68,6 +72,8 @@ const SURFACE_KINDS: [SurfaceKind; 11] = [
     SurfaceKind::Browser,
     SurfaceKind::ZulipInbox,
     SurfaceKind::ZulipNarrow,
+    SurfaceKind::SlackList,
+    SurfaceKind::SlackConversation,
     SurfaceKind::Messages,
 ];
 

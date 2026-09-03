@@ -35,6 +35,12 @@ pub enum SurfaceKey {
     ZulipNarrow {
         label: String,
     },
+    #[cfg(feature = "native")]
+    SlackList,
+    /// One Slack conversation. The source is the identity: two threads in
+    /// the same channel are two surfaces, and their labels are not unique.
+    #[cfg(feature = "native")]
+    SlackConversation(rho_slack::session::Source),
 }
 
 impl SurfaceKey {

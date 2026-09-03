@@ -1,0 +1,72 @@
+# A self-contained Slack client: wire protocol, client-side model, and the
+# GPUI surface that displays a thread. The `ui` feature carries the view, so
+# the protocol half stays free of Zed dependencies.
+[package]
+edition.workspace = true
+license = "GPL-3.0-or-later"
+name = "rho-slack"
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[features]
+default = ["ui"]
+ui = [
+  "dep:chrono",
+  "dep:editor",
+  "dep:gpui",
+  "dep:gpui_tokio",
+  "dep:language",
+  "dep:multi_buffer",
+  "dep:text",
+  "dep:theme",
+  "dep:ui",
+  # The client is native-only: it talks to slack.com with the desktop
+  # session's own token and cookie, which a browser build cannot hold.
+  "editor/native",
+]
+# An in-process Slack stand-in: the web API endpoints rho calls plus the
+# websocket. Used by the transport tests and by the isolated GUI QA run.
+fake = []
+
+[dependencies]
+anyhow.workspace = true
+chrono = { version = "0.4", default-features = false, features = [
+  "clock",
+  "std",
+], optional = true }
+dirs.workspace = true
+futures.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = [
+  "io-util",
+  "macros",
+  "net",
+  "rt",
+  "sync",
+  "time",
+] }
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+
+editor = { path = "../../vendor/zed/crates/editor", default-features = false, optional = true }
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, optional = true }
+gpui_tokio = { path = "../../vendor/zed/crates/gpui_tokio", optional = true }
+language = { path = "../../vendor/zed/crates/language", optional = true }
+multi_buffer = { path = "../../vendor/zed/crates/multi_buffer", optional = true }
+text = { path = "../../vendor/zed/crates/text", optional = true }
+theme = { path = "../../vendor/zed/crates/theme", optional = true }
+ui = { path = "../../vendor/zed/crates/ui", optional = true }
+
+[[example]]
+name = "fake_slack"
+required-features = ["fake"]
+
+[dev-dependencies]
+rho-slack = { path = ".", features = ["fake"] }
+tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

@@ -28,6 +28,8 @@ pub mod rho_assets;
 #[cfg(all(test, feature = "native"))]
 mod sampler;
 pub(crate) mod shell_view;
+#[cfg(feature = "native")]
+pub mod slack;
 pub mod style;
 #[cfg(feature = "native")]
 #[doc(hidden)]
@@ -136,6 +138,10 @@ actions!(
         SurfaceClose,
         ZulipNextUnread,
         ZulipLoadOlder,
+        SlackOpenRow,
+        SlackCompose,
+        SlackLoadOlder,
+        SlackSearch,
         MessagesOpen
     ]
 );
@@ -350,6 +356,43 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             KeyBinding::new("q", SurfaceClose, Some(context)),
         ]);
     }
+    // Slack reads the same way: `enter` opens the row or the thread the
+    // cursor is on, `i` goes to the composer and `enter` there sends, `q`
+    // closes, and `ctrl-k` (the surface-back key everywhere else) walks out
+    // of a thread back to the channel it was opened from.
+    cx.bind_keys([
+        KeyBinding::new("enter", SlackOpenRow, Some("RhoSlackList > Editor")),
+        KeyBinding::new(
+            "enter",
+            SubmitPrompt,
+            Some("RhoSlackConversation > Editor && vim_mode == insert"),
+        ),
+    ]);
+    for context in [
+        "RhoSlackList > Editor && vim_mode == normal",
+        "RhoSlackList > Editor && vim_mode == helix_normal",
+        "RhoSlackConversation > Editor && vim_mode == normal",
+        "RhoSlackConversation > Editor && vim_mode == helix_normal",
+    ] {
+        cx.bind_keys([
+            KeyBinding::new("q", SurfaceClose, Some(context)),
+            KeyBinding::new("i", SlackCompose, Some(context)),
+            KeyBinding::new("shift-p", SlackLoadOlder, Some(context)),
+            KeyBinding::new("s", SlackSearch, Some(context)),
+        ]);
+    }
+    cx.bind_keys([
+        KeyBinding::new(
+            "enter",
+            SlackOpenRow,
+            Some("RhoSlackConversation > Editor && vim_mode == normal"),
+        ),
+        KeyBinding::new(
+            "enter",
+            SlackOpenRow,
+            Some("RhoSlackConversation > Editor && vim_mode == helix_normal"),
+        ),
+    ]);
     cx.bind_keys([
         KeyBinding::new("shift-y", GitApprovalAllow, Some("RhoGitApproval")),
         KeyBinding::new("n", GitApprovalDeny, Some("RhoGitApproval")),

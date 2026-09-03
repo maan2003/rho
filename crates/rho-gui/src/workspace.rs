@@ -81,9 +81,9 @@ use crate::{
     DealCloseAndNext, DealOpen, GitApprovalAllow, GitApprovalDeny, InboxCapture, MessagesOpen,
     MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious,
     OverviewToggle, PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof,
-    ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit, SubmitPrompt, SurfaceBack,
-    SurfaceClose, TaskBoard, UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder, ZulipNextUnread,
-    ZulipOpenRow,
+    ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit, SlackCompose, SlackLoadOlder,
+    SlackOpenRow, SlackSearch, SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard,
+    UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
 };
 
 pub(crate) const MESSAGE_LOG_CAP: usize = 4096;
@@ -127,8 +127,8 @@ struct ShellTouchContact {
 /// Stable surface identity plus its live view.
 #[derive(Clone)]
 pub struct Surface {
-    key: SurfaceKey,
-    view: SurfaceView,
+    pub(crate) key: SurfaceKey,
+    pub(crate) view: SurfaceView,
 }
 
 enum DealView {
@@ -193,7 +193,7 @@ struct PendingPageFiling {
 }
 
 #[derive(Clone)]
-enum SurfaceView {
+pub(crate) enum SurfaceView {
     Draft {
         editor: Entity<editor::Editor>,
     },
@@ -218,6 +218,10 @@ enum SurfaceView {
     ZulipInbox(Entity<rho_zulip::ui::InboxView>),
     #[cfg(feature = "native")]
     ZulipNarrow(Entity<rho_zulip::ui::NarrowView>),
+    #[cfg(feature = "native")]
+    SlackList(Entity<rho_slack::ui::ListView>),
+    #[cfg(feature = "native")]
+    SlackConversation(Entity<rho_slack::ui::ConversationView>),
 }
 
 impl SurfaceView {
@@ -239,6 +243,10 @@ impl SurfaceView {
             Self::ZulipInbox(_) => SurfaceKind::ZulipInbox,
             #[cfg(feature = "native")]
             Self::ZulipNarrow(_) => SurfaceKind::ZulipNarrow,
+            #[cfg(feature = "native")]
+            Self::SlackList(_) => SurfaceKind::SlackList,
+            #[cfg(feature = "native")]
+            Self::SlackConversation(_) => SurfaceKind::SlackConversation,
         }
     }
 }
@@ -252,13 +260,15 @@ impl PartialEq for Surface {
 /// Which task's window arrangement fills the window. The draft composer
 /// has its own context.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-enum ContextId {
+pub(crate) enum ContextId {
     Draft,
     Agent(AgentId),
     /// Zulip's own window arrangement: entering it from the dashboard
     /// leaves the agent surface exactly as it was, and leaving it comes
     /// back to them.
     Zulip,
+    /// Slack's own arrangement, on the same terms as Zulip's.
+    Slack,
 }
 
 /// How to reach the daemon. Deliberately holds no client-local paths: the
@@ -505,7 +515,7 @@ pub struct Workspace {
     /// behind them) release when the context itself closes.
     surfaces: HashMap<ContextId, Vec<Surface>>,
     /// Always present in `contexts` (the draft context never closes).
-    active_context: ContextId,
+    pub(crate) active_context: ContextId,
     /// Chronological history of surfaces dealt or opened from the overview.
     surface_history: Vec<WarmSurface>,
     history_cursor: usize,
@@ -581,9 +591,25 @@ pub struct Workspace {
     /// opened. Chat costs nothing until asked for.
     #[cfg(feature = "native")]
     zulip: Option<Entity<rho_zulip::session::Session>>,
+    #[cfg(feature = "native")]
+    pub(crate) slack: Option<Entity<rho_slack::session::Session>>,
+    /// Threads rho has raised into the inbox, so a reconnect or a restart
+    /// updates the card it already made rather than making a second one.
+    #[cfg(feature = "native")]
+    pub(crate) slack_items: crate::slack::SlackItems,
+    /// Set while the Slack session cannot be trusted to be current. It lights
+    /// the lamp on its own, because nothing else in the queue knows.
+    #[cfg(feature = "native")]
+    pub(crate) slack_degraded: Option<String>,
+    /// A readable name per open conversation, so naming a surface never has
+    /// to reach into the session.
+    #[cfg(feature = "native")]
+    pub(crate) slack_labels: HashMap<rho_slack::session::Source, String>,
+    #[cfg(feature = "native")]
+    pub(crate) _slack_subscription: Option<gpui::Subscription>,
     /// Machine-owned arrivals. This store is client-local and never enters a
     /// Desk CRDT buffer until an explicit filing verdict.
-    inbox: InboxStore,
+    pub(crate) inbox: InboxStore,
     pending_inbox_item: Option<InboxId>,
     pending_filing_destinations: Vec<(String, String, HostId, rho_desk::NodeId)>,
     pending_filing_selected: Option<(HostId, rho_desk::NodeId)>,
@@ -1260,6 +1286,16 @@ impl Workspace {
             iris_preview,
             iris_agents: HashMap::new(),
             zulip: None,
+            #[cfg(feature = "native")]
+            slack: None,
+            #[cfg(feature = "native")]
+            slack_items: crate::slack::SlackItems::default(),
+            #[cfg(feature = "native")]
+            slack_degraded: None,
+            #[cfg(feature = "native")]
+            slack_labels: HashMap::new(),
+            #[cfg(feature = "native")]
+            _slack_subscription: None,
             // Tests build many concurrent workspaces; they must never open
             // (or pollute) the user's real inbox database.
             inbox: if cfg!(test) {
@@ -1309,6 +1345,11 @@ impl Workspace {
         window.focus(&dashboard_focus, cx);
         // Seed the listing before any event arrives ("+ new agent").
         this.refresh_dashboard(window, cx);
+        // Slack runs from startup, not from the first time the surface is
+        // opened: a mention has to become a card whether or not anyone is
+        // looking at Slack.
+        #[cfg(feature = "native")]
+        this.slack_session(cx);
         this
     }
 
@@ -1435,13 +1476,13 @@ impl Workspace {
         }
     }
 
-    fn active_pane(&self) -> &Pane<Surface> {
+    pub(crate) fn active_pane(&self) -> &Pane<Surface> {
         self.contexts
             .get(&self.active_context)
             .expect("active context has a pane")
     }
 
-    fn active_pane_mut(&mut self) -> &mut Pane<Surface> {
+    pub(crate) fn active_pane_mut(&mut self) -> &mut Pane<Surface> {
         self.contexts
             .get_mut(&self.active_context)
             .expect("active context has a pane")
@@ -1785,7 +1826,7 @@ impl Workspace {
         }
     }
 
-    fn invalidate_dealer_signals(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn invalidate_dealer_signals(&mut self, cx: &mut Context<Self>) {
         if self.dealer_signal_eval_scheduled {
             return;
         }
@@ -1827,8 +1868,14 @@ impl Workspace {
         let top = candidates.cards.first();
         let max_priority = top.map(|card| card.priority);
         let card = top.map(|card| Self::journal_card_identity(&card.identity));
-        let lamp_on =
+        let mut lamp_on =
             max_priority.is_some_and(|priority| priority >= crate::dashboard::LAMP_THRESHOLD);
+        // A Slack session that has lost touch is worth the lamp on its own:
+        // the queue cannot rank a mention nobody has received yet.
+        #[cfg(feature = "native")]
+        {
+            lamp_on = lamp_on || self.slack_degraded.is_some();
+        }
         if lamp_on != self.lamp_on {
             self.lamp_on = lamp_on;
             crate::journal::record(crate::journal::Event::LampTransition {
@@ -1891,7 +1938,7 @@ impl Workspace {
         let keep = |context: &ContextId| match context {
             ContextId::Draft => true,
             ContextId::Agent(agent_id) => live.contains(agent_id),
-            ContextId::Zulip => true,
+            ContextId::Zulip | ContextId::Slack => true,
         };
         self.contexts.retain(|context, _| keep(context));
         self.surfaces.retain(|context, _| keep(context));
@@ -2742,6 +2789,14 @@ impl Workspace {
         #[cfg(feature = "native")]
         if matches!(self.active_pane().surface.view, SurfaceView::ZulipNarrow(_)) {
             self.zulip_submit(cx);
+            return;
+        }
+        #[cfg(feature = "native")]
+        if matches!(
+            self.active_pane().surface.view,
+            SurfaceView::SlackConversation(_)
+        ) {
+            self.slack_submit(cx);
             return;
         }
         match self.registry.selected_agent().copied() {
@@ -4112,11 +4167,24 @@ impl Workspace {
             // machine-owned binding. The result event completes this flow.
             return;
         }
+        // A filed Slack thread keeps the conversation it came from: the
+        // summary alone reads as a stray sentence a week later. The tag is
+        // what makes the filed threads findable as a set.
+        let (title, tags): (String, &[&str]) = match &item.source {
+            SourceReference::SlackThread { .. } => {
+                let title = match item.context.room.as_deref() {
+                    Some(room) => format!("{room}: {}", item.text),
+                    None => item.text.clone(),
+                };
+                (title, &["slack"])
+            }
+            _ => (item.text.clone(), &[]),
+        };
         let filed = self
             .pending_filing_selected
             .take()
             .is_some_and(|(host, parent)| {
-                self.append_tree_heading(host, parent, true, false, &item.text, window, cx)
+                self.append_tree_heading_tagged(host, parent, true, false, &title, tags, window, cx)
             });
         if !filed {
             self.notice_on(None, "file: heading not found", StyleClass::SystemInfo, cx);
@@ -4950,7 +5018,7 @@ impl Workspace {
 
     /// Records a notice outside the conversation and flashes it in the echo
     /// area.
-    fn notice_on(
+    pub(crate) fn notice_on(
         &mut self,
         agent_id: Option<&AgentId>,
         text: &str,
@@ -4966,7 +5034,7 @@ impl Workspace {
     }
 
     /// Records and shows a message in the echo area.
-    fn echo(&mut self, text: &str, class: StyleClass, cx: &mut Context<Self>) {
+    pub(crate) fn echo(&mut self, text: &str, class: StyleClass, cx: &mut Context<Self>) {
         self.append_message(text.to_owned(), class, cx);
         self.show_echo(text, class, cx);
     }
@@ -5396,7 +5464,7 @@ impl Workspace {
 
     /// The active context's surface with the given key, whether or not
     /// the viewport currently displays it.
-    fn find_surface(&self, pred: impl Fn(&Surface) -> bool) -> Option<&Surface> {
+    pub(crate) fn find_surface(&self, pred: impl Fn(&Surface) -> bool) -> Option<&Surface> {
         self.surfaces
             .get(&self.active_context)?
             .iter()
@@ -5429,6 +5497,14 @@ impl Workspace {
             SurfaceKey::Browser(browser) => browser.to_string(),
             SurfaceKey::ZulipInbox => "zulip".to_owned(),
             SurfaceKey::ZulipNarrow { label } => label.clone(),
+            #[cfg(feature = "native")]
+            SurfaceKey::SlackList => "slack".to_owned(),
+            #[cfg(feature = "native")]
+            SurfaceKey::SlackConversation(source) => self
+                .slack_labels
+                .get(source)
+                .cloned()
+                .unwrap_or_else(|| "slack".to_owned()),
         }
     }
 
@@ -5447,6 +5523,10 @@ impl Workspace {
             SurfaceKey::Browser(_) => "browser",
             SurfaceKey::ZulipInbox => "zulip inbox",
             SurfaceKey::ZulipNarrow { .. } => "zulip",
+            #[cfg(feature = "native")]
+            SurfaceKey::SlackList => "slack list",
+            #[cfg(feature = "native")]
+            SurfaceKey::SlackConversation(_) => "slack",
         }
     }
 
@@ -5636,6 +5716,12 @@ impl Workspace {
             SurfaceKey::ZulipNarrow { label } => SurfaceIdentity::ZulipNarrow {
                 label: label.clone(),
             },
+            #[cfg(feature = "native")]
+            SurfaceKey::SlackList => SurfaceIdentity::SlackList,
+            #[cfg(feature = "native")]
+            SurfaceKey::SlackConversation(source) => SurfaceIdentity::SlackConversation {
+                thread: crate::slack::journal_thread(source),
+            },
         }
     }
 
@@ -5708,6 +5794,16 @@ impl Workspace {
                     let editor = view.read(cx).editor().clone();
                     editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
                 }
+                #[cfg(feature = "native")]
+                SurfaceView::SlackList(view) => {
+                    let editor = view.read(cx).editor().clone();
+                    editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
+                }
+                #[cfg(feature = "native")]
+                SurfaceView::SlackConversation(view) => {
+                    let editor = view.read(cx).editor().clone();
+                    editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
+                }
             };
             (Self::journal_surface(&pane.surface.key), position)
         };
@@ -5726,7 +5822,7 @@ impl Workspace {
     /// surface joins the context's surface list first, so it stays alive
     /// while hidden. The context's single viewport shows it, and is founded
     /// on the context's first visit.
-    fn display_surface(&mut self, surface: Surface, cx: &mut Context<Self>) {
+    pub(crate) fn display_surface(&mut self, surface: Surface, cx: &mut Context<Self>) {
         let method = if self.overview_open {
             crate::journal::SurfaceShowMethod::Overview
         } else {
@@ -5735,7 +5831,7 @@ impl Workspace {
         self.display_surface_with_method(surface, method, cx);
     }
 
-    fn display_surface_with_method(
+    pub(crate) fn display_surface_with_method(
         &mut self,
         surface: Surface,
         method: crate::journal::SurfaceShowMethod,
@@ -7197,6 +7293,10 @@ impl Workspace {
             SurfaceView::ZulipInbox(view) => view.read(cx).editor().clone(),
             #[cfg(feature = "native")]
             SurfaceView::ZulipNarrow(view) => view.read(cx).editor().clone(),
+            #[cfg(feature = "native")]
+            SurfaceView::SlackList(view) => view.read(cx).editor().clone(),
+            #[cfg(feature = "native")]
+            SurfaceView::SlackConversation(view) => view.read(cx).editor().clone(),
         }
     }
 
@@ -7246,13 +7346,17 @@ impl Workspace {
             SurfaceView::ZulipInbox(view) => view.read(cx).editor().focus_handle(cx),
             #[cfg(feature = "native")]
             SurfaceView::ZulipNarrow(view) => view.read(cx).editor().focus_handle(cx),
+            #[cfg(feature = "native")]
+            SurfaceView::SlackList(view) => view.read(cx).editor().focus_handle(cx),
+            #[cfg(feature = "native")]
+            SurfaceView::SlackConversation(view) => view.read(cx).editor().focus_handle(cx),
         }
     }
 
     /// Moves gpui focus to the active surface. If a modal overlay
     /// owns the keyboard, update where it will return instead of stealing
     /// focus from it.
-    fn focus_active_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn focus_active_surface(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let agent_id = match &self.active_pane().surface.key {
             SurfaceKey::Transcript(agent_id)
             | SurfaceKey::Shell(agent_id)
@@ -7265,6 +7369,8 @@ impl Workspace {
             | SurfaceKey::Inbox(_)
             | SurfaceKey::ZulipInbox
             | SurfaceKey::ZulipNarrow { .. } => None,
+            #[cfg(feature = "native")]
+            SurfaceKey::SlackList | SurfaceKey::SlackConversation(_) => None,
             #[cfg(feature = "native")]
             SurfaceKey::Browser(_) => None,
         };
@@ -7285,7 +7391,7 @@ impl Workspace {
     /// when the active context already retains it.
     /// File surfaces are created asynchronously by
     /// [`Self::open_file_surface`] instead.
-    fn make_surface(
+    pub(crate) fn make_surface(
         &mut self,
         key: SurfaceKey,
         window: &mut Window,
@@ -7339,11 +7445,25 @@ impl Workspace {
             SurfaceKey::ZulipNarrow { .. } => {
                 unreachable!("conversation surfaces are created by open_zulip_narrow")
             }
+            #[cfg(feature = "native")]
+            SurfaceKey::SlackList => {
+                let session = self
+                    .slack_session(cx)
+                    .expect("the slack list is only opened once a session exists");
+                let hooks = Self::slack_hooks();
+                SurfaceView::SlackList(
+                    cx.new(|cx| rho_slack::ui::ListView::new(session, hooks, window, cx)),
+                )
+            }
+            #[cfg(feature = "native")]
+            SurfaceKey::SlackConversation(_) => {
+                unreachable!("slack conversations are created by open_slack_source")
+            }
         };
         Self::wrap_surface(key, view)
     }
 
-    fn wrap_surface(key: SurfaceKey, view: SurfaceView) -> Surface {
+    pub(crate) fn wrap_surface(key: SurfaceKey, view: SurfaceView) -> Surface {
         Surface { key, view }
     }
 
@@ -7376,6 +7496,8 @@ impl Workspace {
             | SurfaceKey::File { .. }
             | SurfaceKey::ZulipInbox
             | SurfaceKey::ZulipNarrow { .. } => None,
+            #[cfg(feature = "native")]
+            SurfaceKey::SlackList | SurfaceKey::SlackConversation(_) => None,
         };
         if self.connected()
             && let Some(agent_id) = selected
@@ -9225,6 +9347,20 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.append_tree_heading_tagged(host, relative, child, above, title, &[], window, cx)
+    }
+
+    fn append_tree_heading_tagged(
+        &mut self,
+        host: HostId,
+        relative: rho_desk::NodeId,
+        child: bool,
+        above: bool,
+        title: &str,
+        tags: &[&str],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some(operation) = self
             .desk_tree_sync
             .prepare_new_heading(host, relative, child, above)
@@ -9241,6 +9377,16 @@ impl Workspace {
             .apply_optimistic(host, std::slice::from_ref(&message), cx);
         self.sync_tree_dashboard(host, window, cx);
         self.send_to_host(host, message);
+        for tag in tags {
+            let Some(operation) = self.desk_tree_sync.prepare_set_tag(host, node_id, tag) else {
+                continue;
+            };
+            let message = ClientMessage::DeskTreeApply { operation };
+            self.desk_tree_sync
+                .apply_optimistic(host, std::slice::from_ref(&message), cx);
+            self.send_to_host(host, message);
+        }
+        self.sync_tree_dashboard(host, window, cx);
         self.dashboard.rename_cursor_topic(title, cx)
     }
 
@@ -10224,6 +10370,20 @@ impl Workspace {
                 .overflow_hidden()
                 .child(view.clone())
                 .into_any_element(),
+            #[cfg(feature = "native")]
+            SurfaceView::SlackList(view) => div()
+                .id("rho-surface-slack-list")
+                .size_full()
+                .overflow_hidden()
+                .child(view.clone())
+                .into_any_element(),
+            #[cfg(feature = "native")]
+            SurfaceView::SlackConversation(view) => div()
+                .id("rho-surface-slack-conversation")
+                .size_full()
+                .overflow_hidden()
+                .child(view.clone())
+                .into_any_element(),
             SurfaceView::Shell { editor, .. } => div()
                 .id("rho-surface-shell")
                 .key_context("RhoShell")
@@ -10573,6 +10733,28 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &ZulipLoadOlder, _, cx| {
                 #[cfg(feature = "native")]
                 this.zulip_load_older(cx);
+            }))
+            .on_action(cx.listener(|this, _: &SlackOpenRow, window, cx| {
+                #[cfg(feature = "native")]
+                this.slack_open_row(window, cx);
+                #[cfg(not(feature = "native"))]
+                let _ = window;
+            }))
+            .on_action(cx.listener(|this, _: &SlackCompose, window, cx| {
+                #[cfg(feature = "native")]
+                this.slack_compose(window, cx);
+                #[cfg(not(feature = "native"))]
+                let _ = window;
+            }))
+            .on_action(cx.listener(|this, _: &SlackLoadOlder, _, cx| {
+                #[cfg(feature = "native")]
+                this.slack_load_older(cx);
+            }))
+            .on_action(cx.listener(|this, _: &SlackSearch, window, cx| {
+                #[cfg(feature = "native")]
+                this.prompt_slack_search(window, cx);
+                #[cfg(not(feature = "native"))]
+                let _ = window;
             }))
             .on_action(cx.listener(|this, _: &ShellPagerMore, _, cx| {
                 this.shell_pager_action(rho_ui_proto::shell::PagerAction::Continue, cx);

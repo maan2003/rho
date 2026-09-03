@@ -625,7 +625,7 @@ fn display_key(spec: &str) -> String {
 /// `space` — the root menu: every leader chord lives here (or one level
 /// down), so the whole vocabulary is discoverable by pausing.
 pub fn root_menu() -> Transient {
-    Transient::new("rho")
+    let menu = Transient::new("rho")
         .item("i", "input…", |workspace, window, cx| {
             workspace.open_transient(input_menu(), window, cx);
         })
@@ -700,8 +700,14 @@ pub fn root_menu() -> Transient {
         })
         .item("u", "universal argument", |workspace, _, cx| {
             workspace.set_universal_argument(cx);
-        })
-        .item("q", "quit", |_, _, cx| cx.quit())
+        });
+    // Slack is a native-only client: it holds the desktop session's own
+    // token and cookie, which the browser build cannot.
+    #[cfg(feature = "native")]
+    let menu = menu.item("shift-s", "slack…", |workspace, window, cx| {
+        workspace.open_transient(slack_menu(), window, cx);
+    });
+    menu.item("q", "quit", |_, _, cx| cx.quit())
 }
 
 #[cfg(feature = "native")]
@@ -730,6 +736,17 @@ fn browser_menu() -> Transient {
     Transient::new("browser").item("n", "new page", |workspace, window, cx| {
         workspace.cmd_browser(window, cx);
     })
+}
+
+#[cfg(feature = "native")]
+fn slack_menu() -> Transient {
+    Transient::new("slack")
+        .item("o", "conversations", |workspace, window, cx| {
+            workspace.open_slack(window, cx);
+        })
+        .item("r", "register workspace…", |workspace, window, cx| {
+            workspace.prompt_slack_register(window, cx);
+        })
 }
 
 fn status_menu() -> Transient {
