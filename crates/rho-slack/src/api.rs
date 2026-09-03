@@ -758,6 +758,13 @@ pub fn parse_message(value: &Value, fallback_channel: &ChannelId) -> Option<Mess
                     filetype: string(&file["filetype"]).unwrap_or_default(),
                     size: file["size"].as_u64().unwrap_or(0),
                     url: string(&file["url_private"]).unwrap_or_default(),
+                    original_w: file["original_w"].as_u64().unwrap_or(0) as u32,
+                    original_h: file["original_h"].as_u64().unwrap_or(0) as u32,
+                    // The smallest Slack offers: it is a placeholder, so the
+                    // fewest bytes that carry the picture's colours win.
+                    thumb_url: string(&file["thumb_64"])
+                        .or_else(|| string(&file["thumb_80"]))
+                        .unwrap_or_default(),
                 })
             })
             .collect(),

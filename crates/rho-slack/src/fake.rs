@@ -64,6 +64,10 @@ struct State {
     /// The form fields of every call to each method, in order, so a test can
     /// assert what rho asked for and not merely that it asked.
     forms: BTreeMap<String, Vec<BTreeMap<String, String>>>,
+    /// How long the bytes of a file take to arrive. Slack is not instant and
+    /// a QA run has to be able to look at what the reader sees while a
+    /// picture is still coming.
+    file_delay_ms: u64,
 }
 
 pub struct Fake {
@@ -470,6 +474,13 @@ async fn serve_api(
         // serves them because that is how Slack does it, on the same host
         // and behind the same credentials.
         if let Some(bytes) = binary_route(&path) {
+            let delay = match path.starts_with("/files/") {
+                true => state.lock().unwrap().file_delay_ms,
+                false => 0,
+            };
+            if delay > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
             let head = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
                 bytes.len()
@@ -510,6 +521,12 @@ async fn write_json(stream: &mut TcpStream, response: &Value) -> anyhow::Result<
 /// colours so a screenshot shows that the right picture reached the right
 /// author.
 fn binary_route(path: &str) -> Option<&'static [u8]> {
+    if path.starts_with("/thumbs/") {
+        // Slack's smallest thumbnail: the placeholder, so it is tiny on
+        // purpose and blurs when the box blows it up.
+        static THUMB: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        return Some(THUMB.get_or_init(|| preview_png(64, 40)).as_slice());
+    }
     if path.starts_with("/files/") {
         // A file is what a preview is judged on, so it is big enough to
         // look at rather than a 16-pixel square.
@@ -651,6 +668,12 @@ fn apply_live(state: &mut State, frames: &broadcast::Sender<Frame>, request: &Va
         }
         // Following and unfollowing, the way any Slack client does it: the
         // list the next connect reads and the live frame move together.
+        // How slowly a picture arrives, so a QA run can look at the box
+        // while it is still on its way.
+        "file_delay" => {
+            state.file_delay_ms = request["ms"].as_u64().unwrap_or_default();
+            return json!({"ok": true});
+        }
         kind @ ("subscribe" | "unsubscribe") => {
             let thread_ts = field("thread_ts");
             let entry = (channel.clone(), thread_ts.clone());

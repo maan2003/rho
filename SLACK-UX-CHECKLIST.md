@@ -233,6 +233,23 @@ done right after the transcript primitive (2.4) and before 2.10:
       the item's range and the rows below it do not change across the
       swap; the fake serves file bytes with a `/control` delay so the rig
       shows the placeholder state.
+      Landed 3 Sep. The box is a block sized from `original_w`/`original_h`
+      (aspect kept, 12-line cap) and the picture inside it is drawn at a
+      size spelled out from the same numbers: the editor resizes a block to
+      whatever its element measured, so a thumbnail left to be its own tiny
+      self shrank the box and moved every row under it. `thumb_64` (or
+      `thumb_80`) is fetched alongside the picture and blown up to fill the
+      box meanwhile — the upscale is the blur, gpui has no blur filter — and
+      a muted box of the same size stands there until even that has landed.
+      The arrival rewrites no item: the block reads the file cache when it
+      draws, so `settle_images` only asks for a redraw, where it used to
+      replace the message. Rig with a 12s `/control` file delay: the two
+      screenshots (screens/74-placeholder.png, 75-arrived.png) differ only
+      in rows 568..1071, the picture's own box; every row above and below is
+      pixel-identical, which is the no-jump rule measured rather than
+      described. Tests cover the sizing and that the boxes an item asks for
+      do not depend on the cache; rho-slack has no gpui harness, so the
+      before/after layout itself is the rig's to prove.
 - [x] 1.24 A stale new-agent draft is the only way out of a conversation.
       Seen by b8os in the rig on 3 Sep: `ctrl-k` out of a Slack conversation
       surfaced a leftover "draft" compose buffer as the only buffer, with no

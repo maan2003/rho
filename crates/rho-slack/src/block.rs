@@ -899,6 +899,9 @@ mod tests {
                 filetype: "text".to_owned(),
                 size: 2048,
                 url: "https://files.example/trace.txt".to_owned(),
+                original_w: 0,
+                original_h: 0,
+                thumb_url: String::new(),
             }],
             &Roster,
         );

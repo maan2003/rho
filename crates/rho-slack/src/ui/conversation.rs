@@ -22,7 +22,7 @@ use theme::ActiveTheme as _;
 
 use crate::model::Model;
 use crate::session::{Session, Source, Update};
-use crate::types::{FileSummary, Message, ThreadKey, Ts};
+use crate::types::{CELL_ASPECT, FileSummary, IMAGE_COLUMNS, Message, ThreadKey, Ts};
 use crate::ui::{Class, Hooks, Span, clock_time, crosses_day, day_label, lay_out};
 
 pub struct ConversationView {
@@ -532,28 +532,24 @@ impl ConversationView {
     }
 
     /// A picture whose bytes were still arriving when its message was
-    /// drawn. The download changes nothing about the message, so no update
-    /// speaks for it: the surface re-renders that one message itself once
-    /// the file is on disk.
+    /// drawn. The download changes nothing about the message and nothing
+    /// about its box, which was already the picture's size: the block reads
+    /// the cache when it draws, so all this owes the reader is a redraw.
+    /// Rewriting the item would move every row under it for one frame.
     fn settle_images(&mut self, cx: &mut Context<Self>) {
-        let ready = {
+        let arrived = {
             let session = self.session.read(cx);
             self.awaiting_images
                 .iter()
-                .filter(|(_, id)| session.cached_file(id).is_some_and(|path| path.exists()))
-                .map(|(ts, _)| ts.clone())
-                .collect::<Vec<_>>()
+                .any(|(_, id)| session.cached_file(id).is_some_and(|path| path.exists()))
         };
-        if ready.is_empty() {
+        if !arrived {
             return;
         }
-        let messages = self.shown_messages(cx);
-        for ts in ready {
-            let key = Row::Message(ts);
-            if let Some(item) = self.item_for_key(&key, &messages, cx) {
-                self.transcript.replace(&key, item, cx);
-            }
-        }
+        let session = self.session.read(cx);
+        self.awaiting_images
+            .retain(|(_, id)| !session.cached_file(id).is_some_and(|path| path.exists()));
+        cx.notify();
     }
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
@@ -814,14 +810,9 @@ impl ConversationView {
             let session = self.session.read(cx);
             message_item(message, session.model(), in_thread)
         };
-        let images = item
-            .lines
-            .iter()
-            .enumerate()
-            .filter_map(|(line, meta)| {
-                let file = meta.file.as_ref().filter(|file| file.is_image())?;
-                Some((line as u32, file.clone()))
-            })
+        let images = image_boxes(&item)
+            .into_iter()
+            .map(|(line, file)| (line, file.clone()))
             .collect::<Vec<_>>();
         if self.dealt.as_ref() == Some(&message.ts) {
             mark_dealt(&mut item);
@@ -829,17 +820,27 @@ impl ConversationView {
         self.awaiting_images
             .retain(|(waiting, _)| waiting != &message.ts);
         for (line, file) in images {
-            let path = self.session.update(cx, |session, cx| {
+            let ready = self.session.update(cx, |session, cx| {
+                // The thumbnail is asked for alongside the picture: it is
+                // what stands in the box until the picture lands.
+                if let Some(thumb) = file.thumbnail() {
+                    session.cache_file(&thumb, cx);
+                }
                 session.cache_file(&file, cx);
-                session.cached_file(&file.id).map(std::path::Path::to_owned)
+                session
+                    .cached_file(&file.id)
+                    .is_some_and(|path| path.exists())
             });
-            let Some(path) = path.filter(|path| path.exists()) else {
+            if !ready {
                 self.awaiting_images
                     .push((message.ts.clone(), file.id.clone()));
-                continue;
-            };
-            item.blocks
-                .push(image_block(line, path, file, cx.entity().downgrade()));
+            }
+            item.blocks.push(image_block(
+                line,
+                file,
+                self.session.downgrade(),
+                cx.entity().downgrade(),
+            ));
         }
         item
     }
@@ -1144,27 +1145,96 @@ fn day_before(
     held(&Row::Message(before.ts.clone())).then(|| before.ts.epoch_seconds() as i64)
 }
 
+/// The pictures a message hangs under itself: which line each sits on, and
+/// which file it is. What is cached is not an input, which is the whole of
+/// the no-jump rule — the same boxes, of the same height, are asked for
+/// whether the bytes have arrived or not.
+fn image_boxes(item: &Rendered) -> Vec<(u32, &FileSummary)> {
+    item.lines
+        .iter()
+        .enumerate()
+        .filter_map(|(line, meta)| {
+            let file = meta.file.as_ref().filter(|file| file.is_image())?;
+            Some((line as u32, file))
+        })
+        .collect()
+}
+
+/// How big the picture is drawn inside its box: its own shape, scaled to
+/// fill the box the rows were measured for. The thumbnail standing in for
+/// it is drawn at exactly the same size, so the swap changes the pixels and
+/// nothing else — no row moves, on any screen or at any font size.
+fn drawn_size(
+    file: &FileSummary,
+    box_width: gpui::Pixels,
+    box_height: gpui::Pixels,
+) -> (gpui::Pixels, gpui::Pixels) {
+    let (width, height) = (file.original_w as f32, file.original_h as f32);
+    if width <= 0.0 || height <= 0.0 {
+        return (box_width, box_height);
+    }
+    let scale = (f32::from(box_width) / width).min(f32::from(box_height) / height);
+    (gpui::px(width * scale), gpui::px(height * scale))
+}
+
 /// A picture under the line that names it, indented to the body column.
 /// Clicking it asks for the full-size view, the same thing `enter` on the
 /// file line asks for.
+///
+/// The box exists from the first draw, sized from what Slack says the
+/// picture measures, and holds its size for the picture's whole journey:
+/// Slack's smallest thumbnail blown up to fill it, then the picture itself.
+/// Nothing under it moves, and the arrival costs no item — the block reads
+/// the cache each time it draws, so the surface only asks for a redraw.
 fn image_block(
     line: u32,
-    path: std::path::PathBuf,
     file: FileSummary,
+    session: gpui::WeakEntity<Session>,
     view: gpui::WeakEntity<ConversationView>,
 ) -> BlockSpec {
+    let rows = file.image_rows();
     BlockSpec {
         line,
-        height: IMAGE_ROWS,
+        height: rows,
         render: std::sync::Arc::new(move |cx| {
             let (file, view) = (file.clone(), view.clone());
+            let cached = |id: &str| {
+                session
+                    .read_with(cx, |session, _| {
+                        session.cached_file(id).map(std::path::Path::to_owned)
+                    })
+                    .ok()
+                    .flatten()
+                    .filter(|path| path.exists())
+            };
+            let thumb = file.thumbnail();
+            let picture =
+                cached(&file.id).or_else(|| thumb.as_ref().and_then(|thumb| cached(&thumb.id)));
             // The spacer is real text in the transcript's own font, which is
             // the only way to land the picture exactly under the body column
             // whatever font the reader has set.
             let style = cx.editor_style.text.clone();
+            let box_height = cx.line_height * rows as f32;
+            let box_width = cx.line_height * (IMAGE_COLUMNS as f32 * CELL_ASPECT);
+            // The picture's own size inside the box, spelled out rather than
+            // left to the element: the editor measures a block and resizes
+            // it to what it drew, so a thumbnail allowed to be its own tiny
+            // self would shrink the box and move every row under it.
+            let (width, height) = drawn_size(&file, box_width, box_height);
+            let inside = match picture {
+                Some(path) => gpui::img(path).w(width).h(height).into_any_element(),
+                // Nothing cached yet, not even the thumbnail: an empty box
+                // of the right size, which still holds the rows below it.
+                None => div()
+                    .w(width)
+                    .h(height)
+                    .bg(cx.app.theme().colors().element_background)
+                    .into_any_element(),
+            };
             div()
                 .flex()
                 .items_start()
+                .h(box_height)
                 .font_family(style.font_family.clone())
                 .text_size(style.font_size)
                 .child(" ".repeat(BODY_INDENT))
@@ -1176,20 +1246,13 @@ fn image_block(
                             let file = file.clone();
                             let _ = view.update(cx, |_, cx| cx.emit(Event::OpenFile(file)));
                         })
-                        .child(
-                            gpui::img(path.clone())
-                                .max_h(cx.line_height * IMAGE_ROWS as f32)
-                                .max_w_full(),
-                        ),
+                        .child(inside),
                 )
                 .into_any_element()
         }),
         priority: 0,
     }
 }
-
-/// How many lines tall an inline image preview is allowed to be.
-const IMAGE_ROWS: u32 = 12;
 
 /// One message as an item: `name: body  time`.
 ///
@@ -2267,6 +2330,36 @@ mod tests {
             text.lines().any(|line| line.trim() == "image.png · 220 KB"),
             "the file line carries no time of its own: {text}"
         );
+    }
+
+    #[test]
+    fn a_pictures_box_is_asked_for_before_its_bytes_arrive() {
+        let with_file = parsed(json!({
+            "ts": "1700000000.0",
+            "user": "U1",
+            "text": "here is the mock",
+            "files": [{
+                "id": "F1",
+                "name": "image.png",
+                "title": "image.png",
+                "filetype": "png",
+                "size": 225_280,
+                "url_private": "https://files.example.com/image.png",
+                "original_w": 1200,
+                "original_h": 200,
+            }],
+        }));
+        let item = message_item(&with_file, &model(), false);
+        let boxes = image_boxes(&item);
+        assert_eq!(boxes.len(), 1, "one box, under the line that names it");
+        let (line, file) = boxes[0];
+        assert_eq!(
+            item.text.lines().nth(line as usize).map(str::trim),
+            Some("image.png · 220 KB")
+        );
+        // Nothing here consulted the cache, which is why the arrival of the
+        // bytes cannot change the height and cannot move the rows below.
+        assert_eq!(file.image_rows(), 4);
     }
 
     #[test]

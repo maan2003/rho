@@ -606,6 +606,14 @@ struct StoredFile {
     filetype: String,
     size: u64,
     url: String,
+    // Written since the picture's box learned to size itself; a row from
+    // before that decodes without them and gets the capped box.
+    #[senax(default)]
+    original_w: u32,
+    #[senax(default)]
+    original_h: u32,
+    #[senax(default)]
+    thumb_url: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
@@ -652,6 +660,9 @@ impl From<&Message> for StoredMessage {
                     filetype: file.filetype.clone(),
                     size: file.size,
                     url: file.url.clone(),
+                    original_w: file.original_w,
+                    original_h: file.original_h,
+                    thumb_url: file.thumb_url.clone(),
                 })
                 .collect(),
             subtype: message.subtype.clone(),
@@ -708,6 +719,9 @@ impl From<&StoredMessage> for Message {
                     filetype: file.filetype.clone(),
                     size: file.size,
                     url: file.url.clone(),
+                    original_w: file.original_w,
+                    original_h: file.original_h,
+                    thumb_url: file.thumb_url.clone(),
                 })
                 .collect(),
             subtype: stored.subtype.clone(),

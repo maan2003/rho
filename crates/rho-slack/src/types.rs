@@ -220,6 +220,15 @@ pub struct FileSummary {
     /// Where the bytes live. Reaching them needs the session's own token and
     /// cookie, like everything else here.
     pub url: String,
+    /// The picture's own size, as Slack measured it. The box is drawn from
+    /// this before any bytes arrive: a box that grows when they land pushes
+    /// everything under it down the screen.
+    pub original_w: u32,
+    pub original_h: u32,
+    /// Slack's smallest thumbnail. Blown up to fill the box it stands in for
+    /// the picture while the real bytes are on their way: a blurhash with no
+    /// encoding step, since the upscale is the blur.
+    pub thumb_url: String,
 }
 
 impl FileSummary {
@@ -242,6 +251,34 @@ impl FileSummary {
         parts.join(" · ")
     }
 
+    /// The thumbnail as a file of its own, so it is fetched and cached by
+    /// the one path that fetches and caches everything else.
+    pub fn thumbnail(&self) -> Option<Self> {
+        (!self.thumb_url.is_empty()).then(|| Self {
+            id: format!("{}#thumb", self.id),
+            title: format!("thumb-{}", self.title),
+            size: 0,
+            url: self.thumb_url.clone(),
+            thumb_url: String::new(),
+            ..self.clone()
+        })
+    }
+
+    /// How many rows the picture's box takes: its own shape, capped at
+    /// [`IMAGE_ROWS`]. A picture Slack never measured gets the cap, which is
+    /// the box it would have had anyway.
+    pub fn image_rows(&self) -> u32 {
+        let (width, height) = (self.original_w, self.original_h);
+        if width == 0 || height == 0 {
+            return IMAGE_ROWS;
+        }
+        // The box is at most IMAGE_COLUMNS wide, and a monospace cell is
+        // about half as wide as it is tall, so a picture that wide is this
+        // many rows deep.
+        let rows = IMAGE_COLUMNS as f32 * CELL_ASPECT * height as f32 / width as f32;
+        (rows.ceil() as u32).clamp(1, IMAGE_ROWS)
+    }
+
     pub fn is_image(&self) -> bool {
         matches!(
             self.filetype.as_str(),
@@ -250,6 +287,16 @@ impl FileSummary {
     }
 }
 
+/// How many lines tall an inline picture is allowed to be.
+pub const IMAGE_ROWS: u32 = 12;
+
+/// How wide, in columns. Together with the cap this is the box a picture is
+/// fitted into, whatever its own size.
+pub const IMAGE_COLUMNS: u32 = 48;
+
+/// A monospace cell's width over its height, near enough for sizing a box.
+pub const CELL_ASPECT: f32 = 0.5;
+
 fn human_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
@@ -257,5 +304,52 @@ fn human_size(bytes: u64) -> String {
         bytes if bytes >= MB => format!("{:.1} MB", bytes as f64 / MB as f64),
         bytes if bytes >= KB => format!("{} KB", bytes / KB),
         bytes => format!("{bytes} B"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn picture(width: u32, height: u32) -> FileSummary {
+        FileSummary {
+            id: "F1".to_owned(),
+            title: "image.png".to_owned(),
+            filetype: "png".to_owned(),
+            size: 225_280,
+            url: "https://files.example/image.png".to_owned(),
+            original_w: width,
+            original_h: height,
+            thumb_url: "https://files.example/thumb.png".to_owned(),
+        }
+    }
+
+    #[test]
+    fn a_pictures_box_is_its_own_shape_capped_at_twelve_rows() {
+        // A tall picture takes the cap; a wide one takes what it needs, so
+        // the box is never a hole the picture does not fill.
+        assert_eq!(picture(400, 1200).image_rows(), IMAGE_ROWS);
+        assert_eq!(picture(320, 200).image_rows(), IMAGE_ROWS);
+        assert_eq!(picture(1200, 200).image_rows(), 4);
+        assert_eq!(picture(2400, 100).image_rows(), 1);
+        // Slack did not say, so the box is the cap it would have had.
+        assert_eq!(picture(0, 0).image_rows(), IMAGE_ROWS);
+    }
+
+    #[test]
+    fn a_thumbnail_is_a_file_of_its_own() {
+        let thumb = picture(320, 200).thumbnail().expect("a thumbnail");
+        assert_eq!(thumb.id, "F1#thumb");
+        assert_eq!(thumb.url, "https://files.example/thumb.png");
+        // The box it stands in is the picture's, not its own tiny size.
+        assert_eq!(thumb.image_rows(), picture(320, 200).image_rows());
+        assert!(
+            FileSummary {
+                thumb_url: String::new(),
+                ..picture(320, 200)
+            }
+            .thumbnail()
+            .is_none()
+        );
     }
 }

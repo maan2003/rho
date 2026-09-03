@@ -101,6 +101,10 @@ fn seed_reference_group(fake: &Fake, at: &dyn Fn(i64, i64, i64) -> String) {
         "{}/files/image.png",
         fake.api_base().trim_end_matches("/api")
     );
+    let thumb = format!(
+        "{}/thumbs/image.png",
+        fake.api_base().trim_end_matches("/api")
+    );
     let say = |ts: String, user: &str, text: &str| {
         fake.add_message(GROUP, json!({"ts": ts, "user": user, "text": text}))
     };
@@ -213,6 +217,12 @@ fn seed_reference_group(fake: &Fake, at: &dyn Fn(i64, i64, i64) -> String) {
                 "filetype": "png",
                 "size": 225_280,
                 "url_private": files.clone(),
+                // What Slack says about a picture before its bytes arrive:
+                // the size the box is drawn from, and the thumbnail that
+                // stands in it meanwhile.
+                "original_w": 320,
+                "original_h": 200,
+                "thumb_64": thumb.clone(),
             }],
         }),
     );
