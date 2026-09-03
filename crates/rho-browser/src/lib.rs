@@ -171,6 +171,10 @@ pub fn live_page_name(id: PageId) -> Option<String> {
         .and_then(|url| url.host_str().map(str::to_owned))
 }
 
+pub fn live_page_url(id: PageId) -> Option<String> {
+    native_host::page_metadata(&id.to_string()).map(|metadata| metadata.url)
+}
+
 pub fn page_name(page: &PageRecord) -> String {
     let host = url::Url::parse(&page.launch_url)
         .ok()

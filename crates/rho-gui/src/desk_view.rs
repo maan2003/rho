@@ -3,2035 +3,1014 @@ use std::collections::{BTreeMap, BTreeSet};
 use gpui::{AppContext as _, Context, Entity};
 use language::{Buffer, BufferEvent, Capability};
 use rho_ui_proto::ClientMessage;
-use text::{BufferId, ReplicaId, ToOffset as _};
+use text::{BufferId, ReplicaId};
 
 use crate::registry::HostId;
 use crate::workspace::Workspace;
 
-struct HostTreeDesk {
-    document: rho_desk::Document,
+struct HostDeskCells {
+    /// What the daemon has told us. A rejected mutation falls back to this.
+    confirmed: rho_desk::cells::Store,
+    /// What the reader sees: `confirmed` plus every mutation still in
+    /// flight, so a keypress shows before the round trip finishes.
+    view: rho_desk::cells::Store,
+    /// Mutations sent and not yet visible in `confirmed`, oldest first.
+    pending: Vec<rho_desk::cells::CellMutation>,
     buffers: BTreeMap<rho_desk::NodeId, Entity<Buffer>>,
     _subscriptions: Vec<gpui::Subscription>,
-    sequence: u64,
-    replica_id: u16,
-    next_tree_clock: u32,
+    /// The node and text replica namespace the daemon assigned this
+    /// connection. Every node this GUI creates lives in it.
+    namespace: u16,
     next_node_counter: u64,
+    /// A `DeskSync` is in flight; the daemon answers exactly one.
+    syncing: bool,
+    /// The newest frontier poked while a sync was in flight. A poke that
+    /// races its response must not be dropped, so it is answered after.
+    poked: Option<rho_desk::cells::Version>,
 }
 
-enum PendingTreeEvent {
-    Tree(rho_desk::TreeOpRecord),
-    Text(rho_desk::TextOpRecord),
-}
+impl HostDeskCells {
+    /// The stamp a new mutation carries: past everything this GUI has
+    /// observed, so it beats its own earlier writes and cannot jump more
+    /// than one past the daemon's global maximum.
+    fn next_stamp(&self, device: rho_desk::cells::DeviceId) -> rho_desk::cells::Stamp {
+        let version = self
+            .view
+            .version()
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .saturating_add(1);
+        rho_desk::cells::Stamp { device, version }
+    }
 
-impl PendingTreeEvent {
-    fn sequence(&self) -> u64 {
-        match self {
-            Self::Tree(record) => record.sequence,
-            Self::Text(record) => record.sequence,
+    /// Replays the unconfirmed writes over the confirmed cells. Used when a
+    /// rejection drops one from the middle of the queue.
+    fn rebuild_view(&mut self, device: rho_desk::cells::DeviceId) {
+        let mut view = rho_desk::cells::Store::new(device);
+        // The confirmed store is this GUI's own merge; it cannot fail to
+        // merge into an empty store of the same device.
+        let _ = view.merge(self.confirmed.snapshot());
+        for mutation in &self.pending {
+            if let Err(error) = view.apply_mutation(mutation) {
+                tracing::warn!(%error, "dropping an unreplayable Desk mutation");
+            }
         }
+        self.view = view;
+    }
+
+    /// Forgets the mutations the daemon has now told us about, which is what
+    /// keeps the replay queue from growing for the life of the process.
+    fn prune_pending(&mut self) {
+        let confirmed = self.confirmed.version().clone();
+        self.pending.retain(|mutation| {
+            confirmed.get(&mutation.stamp.device).copied().unwrap_or(0) < mutation.stamp.version
+        });
     }
 }
 
-fn sequence_has_gap(current: u64, incoming: u64) -> bool {
-    incoming > current.saturating_add(1)
+/// Whether `frontier` covers every device version in `poke`.
+fn covers(frontier: &rho_desk::cells::Version, poke: &rho_desk::cells::Version) -> bool {
+    poke.iter()
+        .all(|(device, version)| frontier.get(device).copied().unwrap_or(0) >= *version)
 }
 
-fn snapshot_is_stale(current: u64, incoming: u64) -> bool {
-    incoming < current
-}
-
-/// Workspace-owned source of truth for every attached host's Desk document.
-pub struct DeskTreeSync {
+/// Workspace-owned Desk state for every attached host, on the cell protocol.
+pub struct DeskCells {
+    device: rho_desk::cells::DeviceId,
     next_buffer_id: u64,
-    tree_hosts: BTreeMap<HostId, HostTreeDesk>,
-    pending_tree: BTreeMap<HostId, BTreeMap<u64, PendingTreeEvent>>,
-    pending_replacements: BTreeMap<HostId, rho_desk::Snapshot>,
-    pending_batches: BTreeMap<(HostId, rho_desk::TreeClock), rho_desk::OperationBatch>,
-    pending_batch_text: BTreeMap<(HostId, rho_desk::TreeClock), Vec<rho_desk::BatchOperation>>,
+    hosts: BTreeMap<HostId, HostDeskCells>,
 }
 
-#[derive(Clone)]
-pub struct DeskSubtree {
-    nodes: Vec<(rho_desk::MaterializedNode, String)>,
-    relocated_machine_rows: Vec<RelocatedMachineRow>,
-    relocation_destination: String,
-}
-
-#[derive(Clone)]
-struct RelocatedMachineRow {
-    node_id: rho_desk::NodeId,
-    destination: Option<rho_desk::NodeId>,
-    source_batch: Option<rho_desk::TreeClock>,
-}
-
-impl DeskSubtree {
-    pub fn relocation_notice(&self) -> Option<String> {
-        (!self.relocated_machine_rows.is_empty()).then(|| {
-            format!(
-                "moved {} agent rows to {}",
-                self.relocated_machine_rows.len(),
-                self.relocation_destination
-            )
-        })
-    }
-}
-
-#[derive(Clone)]
-pub struct DeskDeleteEmptyUndo {
-    heading: rho_desk::MaterializedNode,
-    deleted_right: Option<(rho_desk::MaterializedNode, String)>,
-    previous_text: Option<(rho_desk::NodeId, String)>,
-    moved_child: Option<rho_desk::NodeId>,
-}
-
-pub enum PreparedOpenProse {
-    Existing {
-        node_id: rho_desk::NodeId,
-        offset: usize,
-        open_above: bool,
-    },
-    Created {
-        batch: rho_desk::OperationBatch,
-        messages: Vec<ClientMessage>,
-        node_id: rho_desk::NodeId,
-    },
-}
-
-impl Default for DeskTreeSync {
-    fn default() -> Self {
+impl DeskCells {
+    pub fn new(device: rho_desk::cells::DeviceId) -> Self {
         Self {
+            device,
             next_buffer_id: 1,
-            tree_hosts: BTreeMap::new(),
-            pending_tree: BTreeMap::new(),
-            pending_replacements: BTreeMap::new(),
-            pending_batches: BTreeMap::new(),
-            pending_batch_text: BTreeMap::new(),
+            hosts: BTreeMap::new(),
         }
+    }
+
+    pub fn device(&self) -> rho_desk::cells::DeviceId {
+        self.device
+    }
+
+    /// The handshake, sent on connect and after every poke. `known` is what
+    /// this GUI already holds, so the daemon answers with the difference.
+    pub fn sync(&mut self, host: HostId) -> ClientMessage {
+        let known = match self.hosts.get_mut(&host) {
+            Some(desk) => {
+                desk.syncing = true;
+                desk.confirmed.version().clone()
+            }
+            None => rho_desk::cells::Version::new(),
+        };
+        ClientMessage::DeskSync {
+            device: self.device,
+            known,
+        }
+    }
+
+    /// The daemon's answer. Returns a further `DeskSync` when a poke
+    /// arrived while this one was in flight and the answer does not already
+    /// cover it.
+    pub fn synced(
+        &mut self,
+        host: HostId,
+        namespace: u16,
+        delta: rho_desk::cells::Snapshot,
+        texts: Vec<rho_desk::NodeTextSnapshot>,
+        cx: &mut Context<Workspace>,
+    ) -> Option<ClientMessage> {
+        let frontier = delta.version.clone();
+        let existing = self.hosts.contains_key(&host);
+        if !existing {
+            self.hosts.insert(
+                host,
+                HostDeskCells {
+                    confirmed: rho_desk::cells::Store::new(self.device),
+                    view: rho_desk::cells::Store::new(self.device),
+                    pending: Vec::new(),
+                    buffers: BTreeMap::new(),
+                    _subscriptions: Vec::new(),
+                    namespace,
+                    next_node_counter: 0,
+                    syncing: false,
+                    poked: None,
+                },
+            );
+        }
+        {
+            let desk = self.hosts.get_mut(&host)?;
+            desk.namespace = namespace;
+            desk.syncing = false;
+            if let Err(error) = desk.confirmed.merge(delta.clone()) {
+                tracing::error!(%error, "Desk cell delta did not merge");
+                return None;
+            }
+            if let Err(error) = desk.view.merge(delta) {
+                tracing::error!(%error, "Desk cell delta did not merge into the view");
+            }
+            desk.prune_pending();
+            desk.rebuild_view(self.device);
+            desk.next_node_counter = desk
+                .view
+                .materialize()
+                .iter()
+                .filter(|node| node.id.replica_id == namespace)
+                .map(|node| node.id.counter)
+                .max()
+                .unwrap_or(0)
+                .max(desk.next_node_counter);
+        }
+        self.merge_texts(host, texts, cx);
+        self.reconcile_buffers(host, cx);
+        let desk = self.hosts.get_mut(&host)?;
+        match desk.poked.take() {
+            // The answer already carries everything the poke announced.
+            Some(poke) if covers(&frontier, &poke) => None,
+            Some(_) => Some(self.sync(host)),
+            None => None,
+        }
+    }
+
+    /// `DeskCellsAvailable`: a poke, not a delta. One handshake is in flight
+    /// at a time; a poke that arrives during one is answered after it.
+    pub fn cells_available(
+        &mut self,
+        host: HostId,
+        frontier: rho_desk::cells::Version,
+    ) -> Option<ClientMessage> {
+        let desk = self.hosts.get_mut(&host)?;
+        if covers(desk.confirmed.version(), &frontier) {
+            return None;
+        }
+        if desk.syncing {
+            desk.poked = Some(frontier);
+            return None;
+        }
+        Some(self.sync(host))
+    }
+
+    /// The daemon lost our place in its event stream: start over.
+    pub fn resync_required(&mut self, host: HostId) -> ClientMessage {
+        if let Some(desk) = self.hosts.get_mut(&host) {
+            desk.syncing = false;
+            desk.poked = None;
+        }
+        self.sync(host)
+    }
+
+    pub fn mutation_accepted(&mut self, host: HostId, stamp: rho_desk::cells::Stamp) {
+        // Nothing to do but note it: the cells are already in the view and
+        // the poke that follows brings them into `confirmed`.
+        let _ = (host, stamp);
+    }
+
+    /// A rejected mutation never happened. The view falls back to the last
+    /// merged cells, which is what the reader must see.
+    pub fn mutation_rejected(
+        &mut self,
+        host: HostId,
+        stamp: rho_desk::cells::Stamp,
+        cx: &mut Context<Workspace>,
+    ) {
+        let device = self.device;
+        let Some(desk) = self.hosts.get_mut(&host) else {
+            return;
+        };
+        desk.pending.retain(|mutation| mutation.stamp != stamp);
+        desk.rebuild_view(device);
+        self.reconcile_buffers(host, cx);
     }
 }
 
-impl DeskTreeSync {
-    #[cfg(test)]
-    pub fn snapshot_for_test(&self, host: HostId) -> Option<rho_desk::Snapshot> {
-        Some(self.tree_hosts.get(&host)?.document.snapshot())
-    }
-
-    pub fn prepare_merge_split(
+impl DeskCells {
+    /// Merges the handshake's text histories. A snapshot never replaces a
+    /// newer operation that arrived on its own: the two are queued
+    /// independently, so the merge is by operation, not by replacement.
+    fn merge_texts(
         &mut self,
         host: HostId,
-        heading: rho_desk::NodeId,
-        prose: rho_desk::NodeId,
+        texts: Vec<rho_desk::NodeTextSnapshot>,
         cx: &mut Context<Workspace>,
-    ) -> Option<(Vec<ClientMessage>, Vec<rho_desk::NodeId>)> {
-        let desk = self.tree_hosts.get_mut(&host)?;
-        let nodes = desk.document.materialize();
-        nodes
-            .iter()
-            .find(|node| node.id == heading && node.kind == rho_desk::NodeKind::Heading)?;
-        nodes.iter().find(|node| {
-            node.id == prose
-                && node.kind == rho_desk::NodeKind::Prose
-                && node.parent == Some(heading)
-        })?;
-        let heading_buffer = desk.buffers.get(&heading)?.clone();
-        let merged = format!(
-            "{}{}",
-            heading_buffer.read(cx).text(),
-            desk.buffers.get(&prose)?.read(cx).text()
-        );
-        heading_buffer.update(cx, |buffer, cx| {
-            let len = buffer.len();
-            buffer.edit([(0..len, merged)], None, cx);
-        });
-        desk.next_tree_clock = desk.next_tree_clock.checked_add(1)?;
-        let messages = vec![ClientMessage::DeskTreeApply {
-            operation: rho_desk::TreeOperation::Delete {
-                timestamp: rho_desk::TreeClock {
-                    value: desk.next_tree_clock,
-                    replica_id: desk.replica_id,
-                },
-                node_ids: vec![prose],
-            },
-        }];
-        Some((messages, vec![heading, prose]))
-    }
-
-    pub fn prepare_move_to(
-        &mut self,
-        host: HostId,
-        node_id: rho_desk::NodeId,
-        parent: Option<rho_desk::NodeId>,
-        order: rho_desk::OrderKey,
-    ) -> Option<(rho_desk::OperationBatch, Vec<ClientMessage>)> {
-        let desk = self.tree_hosts.get_mut(&host)?;
-        desk.document
-            .materialize()
-            .iter()
-            .find(|node| node.id == node_id)?;
-        desk.next_tree_clock = desk.next_tree_clock.checked_add(1)?;
-        let messages = vec![ClientMessage::DeskTreeApply {
-            operation: rho_desk::TreeOperation::Move {
-                timestamp: rho_desk::TreeClock {
-                    value: desk.next_tree_clock,
-                    replica_id: desk.replica_id,
-                },
-                node_id,
-                parent,
-                order,
-            },
-        }];
-        let mut expected = vec![node_id];
-        expected.extend(parent);
-        let batch = self.operation_batch(host, expected, messages.clone(), None)?;
-        Some((batch, messages))
-    }
-
-    pub fn prepare_open_prose(
-        &mut self,
-        host: HostId,
-        relative: rho_desk::NodeId,
-        above: bool,
-        cx: &gpui::App,
-    ) -> Option<PreparedOpenProse> {
-        let desk = self.tree_hosts.get_mut(&host)?;
-        let nodes = desk.document.materialize();
-        let node = nodes.iter().find(|node| node.id == relative)?;
-        if node.kind != rho_desk::NodeKind::Heading || node.owner != rho_desk::NodeOwner::User {
-            return None;
-        }
-        let (parent, order, adjacent_id) = if above {
-            let previous = nodes
+    ) {
+        for text in texts {
+            let operations = text
+                .operations
                 .iter()
-                .filter(|candidate| candidate.parent == node.parent && candidate.order < node.order)
-                .max_by_key(|candidate| &candidate.order);
-            if let Some(previous) = previous.filter(|node| node.kind == rho_desk::NodeKind::Prose) {
-                return Some(PreparedOpenProse::Existing {
-                    node_id: previous.id,
-                    offset: desk.buffers.get(&previous.id)?.read(cx).len(),
-                    open_above: false,
-                });
-            }
-            (
-                node.parent,
-                rho_desk::OrderKey::between(previous.map(|node| &node.order), Some(&node.order)),
-                previous.map(|node| node.id),
-            )
-        } else {
-            let first = nodes
-                .iter()
-                .filter(|candidate| candidate.parent == Some(relative))
-                .min_by_key(|candidate| &candidate.order);
-            if let Some(first) = first.filter(|node| node.kind == rho_desk::NodeKind::Prose) {
-                return Some(PreparedOpenProse::Existing {
-                    node_id: first.id,
-                    offset: 0,
-                    open_above: true,
-                });
-            }
-            (
-                Some(relative),
-                rho_desk::OrderKey::between(None, first.map(|node| &node.order)),
-                first.map(|node| node.id),
-            )
-        };
-        desk.next_node_counter = desk.next_node_counter.checked_add(1)?;
-        desk.next_tree_clock = desk.next_tree_clock.checked_add(1)?;
-        let node_id = rho_desk::NodeId {
-            replica_id: desk.replica_id,
-            counter: desk.next_node_counter,
-        };
-        let messages = vec![ClientMessage::DeskTreeApply {
-            operation: rho_desk::TreeOperation::Create {
-                timestamp: rho_desk::TreeClock {
-                    value: desk.next_tree_clock,
-                    replica_id: desk.replica_id,
-                },
-                node_id,
-                kind: rho_desk::NodeKind::Prose,
-                owner: rho_desk::NodeOwner::User,
-                parent,
-                order,
-            },
-        }];
-        let mut expected = vec![relative];
-        expected.extend(adjacent_id);
-        let batch = self.operation_batch(host, expected, messages.clone(), None)?;
-        Some(PreparedOpenProse::Created {
-            batch,
-            messages,
-            node_id,
-        })
-    }
-    pub fn capture_subtree(
-        &self,
-        host: HostId,
-        root: rho_desk::NodeId,
-        cx: &gpui::App,
-    ) -> Option<DeskSubtree> {
-        let desk = self.tree_hosts.get(&host)?;
-        let nodes = desk.document.materialize();
-        let mut included = BTreeSet::from([root]);
-        let mut captured = Vec::new();
-        for node in nodes {
-            if node.id != root && !node.parent.is_some_and(|parent| included.contains(&parent)) {
-                continue;
-            }
-            included.insert(node.id);
-            if node.owner == rho_desk::NodeOwner::User {
-                captured.push((node.clone(), desk.buffers.get(&node.id)?.read(cx).text()));
-            }
-        }
-        (!captured.is_empty()).then_some(DeskSubtree {
-            nodes: captured,
-            relocated_machine_rows: Vec::new(),
-            relocation_destination: String::new(),
-        })
-    }
-
-    pub fn prepare_delete_subtree(
-        &mut self,
-        host: HostId,
-        root: rho_desk::NodeId,
-        cx: &gpui::App,
-    ) -> Option<(
-        rho_desk::OperationBatch,
-        Vec<ClientMessage>,
-        DeskSubtree,
-        Option<rho_desk::NodeId>,
-    )> {
-        let mut subtree = self.capture_subtree(host, root, cx)?;
-        let ids = subtree
-            .nodes
-            .iter()
-            .map(|(node, _)| node.id)
-            .collect::<Vec<_>>();
-        let desk = self.tree_hosts.get_mut(&host)?;
-        let nodes = desk.document.materialize();
-        let root_node = nodes.iter().find(|node| node.id == root)?;
-        let deleted = ids.iter().copied().collect::<BTreeSet<_>>();
-        for node in &nodes {
-            if node.owner != rho_desk::NodeOwner::Machine
-                || !node.parent.is_some_and(|parent| deleted.contains(&parent))
+                .filter_map(|operation| operation.to_text().ok())
+                .map(language::Operation::Buffer)
+                .collect::<Vec<_>>();
+            match self
+                .hosts
+                .get(&host)
+                .and_then(|desk| desk.buffers.get(&text.node_id))
             {
-                continue;
-            }
-            let original_parent = node.parent?;
-            let mut destination = Some(original_parent);
-            while destination.is_some_and(|parent| deleted.contains(&parent)) {
-                destination = nodes
-                    .iter()
-                    .find(|candidate| Some(candidate.id) == destination)
-                    .and_then(|candidate| candidate.parent);
-            }
-            subtree.relocated_machine_rows.push(RelocatedMachineRow {
-                node_id: node.id,
-                destination,
-                source_batch: None,
-            });
-            if subtree.relocation_destination.is_empty() {
-                subtree.relocation_destination = destination
-                    .and_then(|parent| desk.buffers.get(&parent))
-                    .map(|buffer| buffer.read(cx).text())
-                    .filter(|title| !title.is_empty())
-                    .unwrap_or_else(|| "root".into());
+                Some(buffer) => {
+                    let buffer = buffer.clone();
+                    buffer.update(cx, |buffer, cx| buffer.apply_ops(operations, cx));
+                }
+                None => {
+                    let buffer = self.new_note_buffer(host, text.node_id, operations, cx);
+                    if let Some(desk) = self.hosts.get_mut(&host) {
+                        desk.buffers.insert(text.node_id, buffer);
+                    }
+                }
             }
         }
-        let root_index = nodes.iter().position(|node| node.id == root)?;
-        let previous = nodes[..root_index]
-            .iter()
-            .rev()
-            .find(|node| node.parent == root_node.parent && !ids.contains(&node.id));
-        let next = nodes[root_index + 1..]
-            .iter()
-            .find(|node| node.parent == root_node.parent && !ids.contains(&node.id));
-        if previous.is_some_and(|node| node.kind == rho_desk::NodeKind::Prose)
-            && next.is_some_and(|node| node.kind == rho_desk::NodeKind::Prose)
-        {
-            // A heading cannot be removed if doing so would create two
-            // adjacent prose runs. Empty-row Backspace owns the lossless
-            // prose join/undo path.
-            return None;
-        }
-        let mut messages = Vec::new();
-        desk.next_tree_clock = desk.next_tree_clock.checked_add(1)?;
-        messages.push(ClientMessage::DeskTreeApply {
-            operation: rho_desk::TreeOperation::Delete {
-                timestamp: rho_desk::TreeClock {
-                    value: desk.next_tree_clock,
-                    replica_id: desk.replica_id,
-                },
-                node_ids: ids.clone(),
-            },
+    }
+
+    /// A note's body, as an editor buffer whose local edits go back to the
+    /// daemon as text operations.
+    fn new_note_buffer(
+        &mut self,
+        host: HostId,
+        node_id: rho_desk::NodeId,
+        operations: Vec<language::Operation>,
+        cx: &mut Context<Workspace>,
+    ) -> Entity<Buffer> {
+        let buffer_id = BufferId::new(self.next_buffer_id).expect("nonzero GUI buffer id");
+        self.next_buffer_id += 1;
+        let namespace = self.hosts.get(&host).map_or(0, |desk| desk.namespace);
+        let buffer = cx.new(|cx| {
+            let mut buffer = Buffer::remote(
+                buffer_id,
+                ReplicaId::new(namespace),
+                Capability::ReadWrite,
+                "",
+            );
+            buffer.apply_ops(operations, cx);
+            buffer
         });
-        let mut expected = ids;
-        expected.extend(subtree.relocated_machine_rows.iter().map(|row| row.node_id));
-        expected.extend(
-            subtree
-                .relocated_machine_rows
-                .iter()
-                .filter_map(|row| row.destination),
-        );
-        let mut batch = self.operation_batch(host, expected, messages.clone(), None)?;
-        if !subtree.relocated_machine_rows.is_empty() {
-            batch.machine_relocation =
-                Some(rho_desk::MachineRelocationIntent::EvacuateDeletedChildren);
+        let subscription = watch_note_buffer(&buffer, host, node_id, cx);
+        if let Some(desk) = self.hosts.get_mut(&host) {
+            desk._subscriptions.push(subscription);
         }
-        for relocation in &mut subtree.relocated_machine_rows {
-            relocation.source_batch = Some(batch.id);
-        }
-        let focus = next
-            .filter(|node| node.owner == rho_desk::NodeOwner::User)
-            .or_else(|| previous.filter(|node| node.owner == rho_desk::NodeOwner::User))
-            .or_else(|| {
-                root_node
-                    .parent
-                    .and_then(|parent| nodes.iter().find(|node| node.id == parent))
-            })
-            .or(next)
-            .or(previous)
-            .map(|node| node.id);
-        Some((batch, messages, subtree, focus))
+        buffer
     }
 
-    pub fn prepare_delete_exact_leaf(
-        &mut self,
-        host: HostId,
-        expected: rho_desk::NodeExpectation,
-        cx: &gpui::App,
-    ) -> Option<(rho_desk::OperationBatch, Vec<ClientMessage>)> {
-        if self.node_has_descendants(host, expected.node_id) {
-            return None;
-        }
-        let (mut batch, messages, subtree, _) =
-            self.prepare_delete_subtree(host, expected.node_id, cx)?;
-        if subtree.nodes.len() != 1 {
-            return None;
-        }
-        batch.expected = vec![expected];
-        self.pending_batches.insert((host, batch.id), batch.clone());
-        Some((batch, messages))
+    /// A machine row's title is derived from live metadata rather than from
+    /// a text CRDT, so its buffer is local and read-only: nothing it holds
+    /// is ever sent to the daemon.
+    fn new_derived_buffer(&mut self, cx: &mut Context<Workspace>) -> Entity<Buffer> {
+        let buffer_id = BufferId::new(self.next_buffer_id).expect("nonzero GUI buffer id");
+        self.next_buffer_id += 1;
+        cx.new(|_| Buffer::remote(buffer_id, ReplicaId::new(0), Capability::ReadOnly, ""))
     }
 
-    pub fn prepare_paste_subtree(
-        &mut self,
-        host: HostId,
-        relative: rho_desk::NodeId,
-        before: bool,
-        subtree: &DeskSubtree,
-    ) -> Option<(
-        rho_desk::OperationBatch,
-        Vec<ClientMessage>,
-        rho_desk::NodeId,
-    )> {
-        let desk = self.tree_hosts.get_mut(&host)?;
-        let materialized = desk.document.materialize();
-        let relative_node = materialized.iter().find(|node| node.id == relative)?;
-        let siblings = || {
-            materialized
-                .iter()
-                .filter(|node| node.parent == relative_node.parent)
+    /// Gives every live node a buffer and drops the buffers of nodes that
+    /// are gone. Notes get theirs from the daemon's text history; machine
+    /// rows get an empty local one the dashboard fills with a derived title.
+    pub fn reconcile_buffers(&mut self, host: HostId, cx: &mut Context<Workspace>) {
+        let Some(desk) = self.hosts.get(&host) else {
+            return;
         };
-        let adjacent = if before {
-            siblings()
-                .filter(|node| node.order < relative_node.order)
-                .max_by_key(|node| &node.order)
-        } else {
-            siblings()
-                .filter(|node| node.order > relative_node.order)
-                .min_by_key(|node| &node.order)
-        };
-        let adjacent_id = adjacent.map(|node| node.id);
-        let root_order = if before {
-            rho_desk::OrderKey::between(
-                adjacent.map(|node| &node.order),
-                Some(&relative_node.order),
-            )
-        } else {
-            rho_desk::OrderKey::between(
-                Some(&relative_node.order),
-                adjacent.map(|node| &node.order),
-            )
-        };
-        let mut ids = BTreeMap::new();
-        for (node, _) in &subtree.nodes {
-            desk.next_node_counter = desk.next_node_counter.checked_add(1)?;
-            ids.insert(
-                node.id,
-                rho_desk::NodeId {
-                    replica_id: desk.replica_id,
-                    counter: desk.next_node_counter,
-                },
-            );
-        }
-        let root_old = subtree.nodes.first()?.0.id;
-        let root_new = ids[&root_old];
-        let mut messages = Vec::new();
-        for (node, text) in &subtree.nodes {
-            desk.next_tree_clock = desk.next_tree_clock.checked_add(1)?;
-            let node_id = ids[&node.id];
-            messages.push(ClientMessage::DeskTreeApply {
-                operation: rho_desk::TreeOperation::Create {
-                    timestamp: rho_desk::TreeClock {
-                        value: desk.next_tree_clock,
-                        replica_id: desk.replica_id,
-                    },
-                    node_id,
-                    kind: node.kind,
-                    owner: rho_desk::NodeOwner::User,
-                    parent: if node.id == root_old {
-                        relative_node.parent
-                    } else {
-                        node.parent.and_then(|parent| ids.get(&parent).copied())
-                    },
-                    order: if node.id == root_old {
-                        root_order.clone()
-                    } else {
-                        node.order.clone()
-                    },
-                },
-            });
-            if !text.is_empty() {
-                messages.push(text_apply_message(desk.replica_id, node_id, text));
-            }
-            append_node_metadata(desk, &mut messages, node_id, node)?;
-        }
-        let mut expected = vec![relative];
-        expected.extend(adjacent_id);
-        let batch = self.operation_batch(host, expected, messages.clone(), None)?;
-        Some((batch, messages, root_new))
-    }
-
-    pub fn prepare_restore_subtree(
-        &mut self,
-        host: HostId,
-        subtree: &DeskSubtree,
-    ) -> Option<(
-        rho_desk::OperationBatch,
-        Vec<ClientMessage>,
-        rho_desk::NodeId,
-    )> {
-        let desk = self.tree_hosts.get_mut(&host)?;
-        let root_old = subtree.nodes.first()?.0.id;
-        let mut ids = BTreeMap::new();
-        for (node, _) in &subtree.nodes {
-            desk.next_node_counter = desk.next_node_counter.checked_add(1)?;
-            ids.insert(
-                node.id,
-                rho_desk::NodeId {
-                    replica_id: desk.replica_id,
-                    counter: desk.next_node_counter,
-                },
-            );
-        }
-        let root_new = ids[&root_old];
-        let mut messages = Vec::new();
-        for (node, text) in &subtree.nodes {
-            desk.next_tree_clock = desk.next_tree_clock.checked_add(1)?;
-            let node_id = ids[&node.id];
-            messages.push(ClientMessage::DeskTreeApply {
-                operation: rho_desk::TreeOperation::Create {
-                    timestamp: rho_desk::TreeClock {
-                        value: desk.next_tree_clock,
-                        replica_id: desk.replica_id,
-                    },
-                    node_id,
-                    kind: node.kind,
-                    owner: rho_desk::NodeOwner::User,
-                    parent: if node.id == root_old {
-                        node.parent
-                    } else {
-                        node.parent.and_then(|parent| ids.get(&parent).copied())
-                    },
-                    order: node.order.clone(),
-                },
-            });
-            if !text.is_empty() {
-                messages.push(text_apply_message(desk.replica_id, node_id, text));
-            }
-            append_node_metadata(desk, &mut messages, node_id, node)?;
-        }
-        let mut expected = subtree
-            .nodes
-            .first()?
-            .0
-            .parent
+        let live = desk
+            .view
+            .materialize()
             .into_iter()
+            .map(|node| (node.id, node.kind))
+            .collect::<BTreeMap<_, _>>();
+        let stale = desk
+            .buffers
+            .keys()
+            .copied()
+            .filter(|node_id| !live.contains_key(node_id))
             .collect::<Vec<_>>();
-        expected.extend(subtree.relocated_machine_rows.iter().map(|row| row.node_id));
-        let mut batch = self.operation_batch(host, expected, messages.clone(), None)?;
-        if let Some(delete_batch_id) = subtree
-            .relocated_machine_rows
-            .first()
-            .and_then(|row| row.source_batch)
-        {
-            batch.machine_relocation = Some(rho_desk::MachineRelocationIntent::Restore {
-                delete_batch_id,
-                replacements: ids
-                    .iter()
-                    .map(|(deleted, replacement)| rho_desk::NodeReplacement {
-                        deleted: *deleted,
-                        replacement: *replacement,
-                    })
-                    .collect(),
-            });
+        let missing = live
+            .iter()
+            .filter(|(node_id, _)| !desk.buffers.contains_key(node_id))
+            .map(|(node_id, kind)| (*node_id, *kind))
+            .collect::<Vec<_>>();
+        if let Some(desk) = self.hosts.get_mut(&host) {
+            for node_id in stale {
+                desk.buffers.remove(&node_id);
+            }
         }
-        Some((batch, messages, root_new))
+        for (node_id, kind) in missing {
+            let buffer = match kind {
+                rho_desk::cells::NodeKind::Note => {
+                    self.new_note_buffer(host, node_id, Vec::new(), cx)
+                }
+                _ => self.new_derived_buffer(cx),
+            };
+            if let Some(desk) = self.hosts.get_mut(&host) {
+                desk.buffers.insert(node_id, buffer);
+            }
+        }
     }
-    pub fn tree_node(
+
+    /// A text operation from the daemon (another device, or this one echoed
+    /// back). Applying an operation the buffer already has is a no-op.
+    pub fn text_applied(
+        &mut self,
+        host: HostId,
+        node_id: rho_desk::NodeId,
+        operation: rho_desk::TextOperation,
+        cx: &mut Context<Workspace>,
+    ) {
+        let Ok(operation) = operation.to_text() else {
+            return;
+        };
+        let Some(buffer) = self
+            .hosts
+            .get(&host)
+            .and_then(|desk| desk.buffers.get(&node_id))
+            .cloned()
+        else {
+            return;
+        };
+        buffer.update(cx, |buffer, cx| {
+            buffer.apply_ops([language::Operation::Buffer(operation)], cx)
+        });
+    }
+
+    /// The nodes and buffers the dashboard renders.
+    pub fn tree_source(
+        &self,
+        host: HostId,
+    ) -> Option<(
+        Vec<rho_desk::cells::MaterializedNode>,
+        BTreeMap<rho_desk::NodeId, Entity<Buffer>>,
+    )> {
+        let desk = self.hosts.get(&host)?;
+        Some((desk.view.materialize(), desk.buffers.clone()))
+    }
+
+    pub fn node(
         &self,
         host: HostId,
         node_id: rho_desk::NodeId,
-    ) -> Option<rho_desk::MaterializedNode> {
-        self.tree_hosts
+    ) -> Option<rho_desk::cells::MaterializedNode> {
+        self.hosts
             .get(&host)?
-            .document
+            .view
             .materialize()
             .into_iter()
             .find(|node| node.id == node_id)
     }
 
-    pub fn node_expectation(
-        &self,
+    pub fn buffer(&self, host: HostId, node_id: rho_desk::NodeId) -> Option<&Entity<Buffer>> {
+        self.hosts.get(&host)?.buffers.get(&node_id)
+    }
+
+    /// True while the host has answered a handshake, so callers can tell an
+    /// empty desk from one that has not arrived yet.
+    pub fn is_synced(&self, host: HostId) -> bool {
+        self.hosts.contains_key(&host)
+    }
+
+    /// Sends a mutation and shows it at once. The daemon's answer either
+    /// confirms it or takes it back.
+    pub fn apply(
+        &mut self,
         host: HostId,
-        node_id: rho_desk::NodeId,
-        cx: &gpui::App,
-    ) -> Option<rho_desk::NodeExpectation> {
-        let desk = self.tree_hosts.get(&host)?;
-        let node = desk
-            .document
-            .materialize()
-            .into_iter()
-            .find(|node| node.id == node_id)?;
-        Some(rho_desk::NodeExpectation {
-            node_id,
-            kind: node.kind,
-            owner: node.owner,
-            parent: node.parent,
-            order: node.order,
-            text_version: desk
-                .buffers
-                .get(&node_id)?
-                .read(cx)
-                .snapshot()
-                .version()
-                .iter()
-                .filter(|clock| clock.value != 0)
-                .map(Into::into)
-                .collect(),
+        writes: Vec<rho_desk::cells::CellWrite>,
+        verdict: Option<(rho_desk::NodeId, rho_desk::cells::VerdictEvent)>,
+    ) -> Option<ClientMessage> {
+        let device = self.device;
+        let desk = self.hosts.get_mut(&host)?;
+        if writes.is_empty() {
+            return None;
+        }
+        let stamp = desk.next_stamp(device);
+        let verdict = verdict.map(|(node, event)| {
+            let event = match event {
+                rho_desk::cells::VerdictEvent::Applied {
+                    verdict, changes, ..
+                } => rho_desk::cells::VerdictEvent::Applied {
+                    verdict,
+                    at: stamp,
+                    changes,
+                },
+                undone => undone,
+            };
+            (node, event)
+        });
+        let mutation = rho_desk::cells::CellMutation {
+            stamp,
+            writes,
+            verdict,
+        };
+        if let Err(error) = desk.view.apply_mutation(&mutation) {
+            tracing::error!(%error, "refusing to send an invalid Desk mutation");
+            return None;
+        }
+        desk.pending.push(mutation.clone());
+        Some(ClientMessage::DeskMutationApply { mutation })
+    }
+
+    /// The next node id in this connection's namespace. Ids from another
+    /// namespace are rejected by the daemon, so creation goes through here.
+    pub fn new_node_id(&mut self, host: HostId) -> Option<rho_desk::NodeId> {
+        let desk = self.hosts.get_mut(&host)?;
+        desk.next_node_counter = desk.next_node_counter.checked_add(1)?;
+        Some(rho_desk::NodeId {
+            replica_id: desk.namespace,
+            counter: desk.next_node_counter,
         })
     }
 
-    pub fn node_has_descendants(&self, host: HostId, node_id: rho_desk::NodeId) -> bool {
-        self.tree_hosts.get(&host).is_some_and(|desk| {
-            desk.document
+    pub fn namespace(&self, host: HostId) -> Option<u16> {
+        Some(self.hosts.get(&host)?.namespace)
+    }
+
+    pub fn value(
+        &self,
+        host: HostId,
+        node_id: rho_desk::NodeId,
+        field: &rho_desk::cells::Field,
+    ) -> Option<rho_desk::cells::Value> {
+        self.hosts.get(&host)?.view.value(node_id, field).cloned()
+    }
+
+    pub fn verdict_event(
+        &self,
+        host: HostId,
+        node_id: rho_desk::NodeId,
+        stamp: rho_desk::cells::Stamp,
+    ) -> Option<rho_desk::cells::VerdictEvent> {
+        self.hosts
+            .get(&host)?
+            .view
+            .verdict_event(node_id, stamp)
+            .cloned()
+    }
+}
+
+/// A yanked subtree, ready to be pasted as fresh notes. Only notes are
+/// captured: machine rows belong to the daemon and are never cloned.
+#[derive(Clone, Debug, Default)]
+pub struct DeskCapture {
+    /// Parents come before their children, so paste can map old ids to new
+    /// ones in one pass.
+    pub nodes: Vec<DeskCaptureNode>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DeskCaptureNode {
+    pub id: rho_desk::NodeId,
+    pub parent: Option<rho_desk::NodeId>,
+    pub text: String,
+}
+
+/// Structure verbs, as cell writes. Each returns the writes a verb needs;
+/// the caller sends them through [`DeskCells::apply`] so one keypress is one
+/// mutation.
+impl DeskCells {
+    /// A new note under `parent`. Every common field is written, because the
+    /// daemon rejects a partial creation.
+    pub fn create_note_writes(
+        &mut self,
+        host: HostId,
+        parent: Option<rho_desk::NodeId>,
+    ) -> Option<(rho_desk::NodeId, Vec<rho_desk::cells::CellWrite>)> {
+        let node_id = self.new_node_id(host)?;
+        Some((
+            node_id,
+            create_note_writes(node_id, parent, now_timestamp()),
+        ))
+    }
+
+    /// The note the cursor sits on gains a sibling or a child. Sibling order
+    /// is `(CreatedAt, NodeId)` and `CreatedAt` cannot be rewritten, so a new
+    /// row always lands after the existing siblings.
+    pub fn new_note_writes(
+        &mut self,
+        host: HostId,
+        relative: rho_desk::NodeId,
+        child: bool,
+    ) -> Option<(rho_desk::NodeId, Vec<rho_desk::cells::CellWrite>)> {
+        let node = self.node(host, relative)?;
+        let parent = if child { Some(relative) } else { node.parent };
+        self.create_note_writes(host, parent)
+    }
+
+    /// Deletes exactly one cell. Live descendants are not tombstoned: the
+    /// materializer roots any whose parent chain now crosses a deleted node,
+    /// and undoing this one cell puts the hierarchy back.
+    pub fn delete_writes(&self, node_id: rho_desk::NodeId) -> Vec<rho_desk::cells::CellWrite> {
+        vec![rho_desk::cells::CellWrite {
+            node: node_id,
+            field: rho_desk::cells::Field::Deleted,
+            value: rho_desk::cells::Value::Bool(true),
+        }]
+    }
+
+    /// Promote or demote: the row keeps its identity and changes parent.
+    /// Demoting adopts the previous sibling, promoting joins the grandparent.
+    pub fn structure_move_writes(
+        &self,
+        host: HostId,
+        node_id: rho_desk::NodeId,
+        demote: bool,
+    ) -> Option<Vec<rho_desk::cells::CellWrite>> {
+        let nodes = self.hosts.get(&host)?.view.materialize();
+        let node = nodes.iter().find(|node| node.id == node_id)?;
+        let parent = if demote {
+            let previous = nodes
+                .iter()
+                .filter(|other| other.parent == node.parent && other.id != node_id)
+                .filter(|other| (other.created_at, other.id) < (node.created_at, node.id))
+                .next_back()?;
+            Some(previous.id)
+        } else {
+            let parent = nodes.iter().find(|other| Some(other.id) == node.parent)?;
+            parent.parent
+        };
+        if parent == node.parent {
+            return None;
+        }
+        Some(vec![parent_write(node_id, parent)])
+    }
+
+    /// The row a deleted or emptied one hands the cursor to: the previous
+    /// visible row in materialized order.
+    pub fn row_above(&self, host: HostId, node_id: rho_desk::NodeId) -> Option<rho_desk::NodeId> {
+        let nodes = self.hosts.get(&host)?.view.materialize();
+        let index = nodes.iter().position(|node| node.id == node_id)?;
+        nodes.get(index.checked_sub(1)?).map(|node| node.id)
+    }
+
+    /// Where the cursor lands when a row is deleted: the row above, or the
+    /// first row below that does not hang off it. Without this a delete at
+    /// the very top leaves the cursor inside the removed excerpt, and the
+    /// next structure verb has no row to work from.
+    pub fn row_after_delete(
+        &self,
+        host: HostId,
+        node_id: rho_desk::NodeId,
+    ) -> Option<rho_desk::NodeId> {
+        let nodes = self.hosts.get(&host)?.view.materialize();
+        let index = nodes.iter().position(|node| node.id == node_id)?;
+        if let Some(above) = index.checked_sub(1).and_then(|above| nodes.get(above)) {
+            return Some(above.id);
+        }
+        let descends = |mut candidate: Option<rho_desk::NodeId>| {
+            while let Some(current) = candidate {
+                if current == node_id {
+                    return true;
+                }
+                candidate = nodes
+                    .iter()
+                    .find(|node| node.id == current)
+                    .and_then(|node| node.parent);
+            }
+            false
+        };
+        nodes
+            .get(index + 1..)?
+            .iter()
+            .find(|node| !descends(Some(node.id)))
+            .map(|node| node.id)
+    }
+
+    /// True while any live row still calls this node its parent.
+    pub fn has_children(&self, host: HostId, node_id: rho_desk::NodeId) -> bool {
+        self.hosts.get(&host).is_some_and(|desk| {
+            desk.view
                 .materialize()
                 .iter()
                 .any(|node| node.parent == Some(node_id))
         })
     }
 
-    pub fn prepare_temporal_batch(
-        &mut self,
+    /// The workdir a note is staffed from: its machine-owned `File` child.
+    pub fn file_path(
+        &self,
         host: HostId,
         node_id: rho_desk::NodeId,
-        values: Vec<(rho_desk::TemporalKind, Option<rho_desk::TemporalMark>)>,
-    ) -> Option<(rho_desk::OperationBatch, Vec<ClientMessage>)> {
-        let desk = self.tree_hosts.get_mut(&host)?;
-        let node = desk
-            .document
-            .materialize()
-            .into_iter()
-            .find(|node| node.id == node_id)?;
-        if node.kind != rho_desk::NodeKind::Heading || node.owner != rho_desk::NodeOwner::User {
-            return None;
-        }
-        let mut messages = Vec::with_capacity(values.len());
-        for (kind, value) in values {
-            desk.next_tree_clock = desk.next_tree_clock.checked_add(1)?;
-            messages.push(ClientMessage::DeskTreeApply {
-                operation: rho_desk::TreeOperation::SetTemporal {
-                    timestamp: rho_desk::TreeClock {
-                        value: desk.next_tree_clock,
-                        replica_id: desk.replica_id,
-                    },
-                    node_id,
-                    kind,
-                    value,
-                },
-            });
-        }
-        let batch = self.operation_batch(host, vec![node_id], messages.clone(), None)?;
-        Some((batch, messages))
-    }
-    pub fn tree_source(
-        &self,
-        host: HostId,
-    ) -> Option<(
-        Vec<rho_desk::MaterializedNode>,
-        BTreeMap<rho_desk::NodeId, Entity<Buffer>>,
-    )> {
-        let desk = self.tree_hosts.get(&host)?;
-        Some((desk.document.materialize(), desk.buffers.clone()))
+    ) -> Option<camino::Utf8PathBuf> {
+        let nodes = self.hosts.get(&host)?.view.materialize();
+        crate::dashboard::node_file_path(&nodes, node_id)
     }
 
-    pub fn tree_node_for_buffers(
+    /// Every live note in the subtree, parents first, with its text.
+    pub fn capture(
         &self,
-        buffer_ids: &[BufferId],
-        require_newline: bool,
+        host: HostId,
+        root: rho_desk::NodeId,
         cx: &gpui::App,
-    ) -> Option<(HostId, rho_desk::NodeId)> {
-        self.tree_hosts.iter().find_map(|(host, desk)| {
-            desk.buffers.iter().find_map(|(node_id, buffer)| {
-                let buffer = buffer.read(cx);
-                (buffer_ids.contains(&buffer.remote_id())
-                    && (!require_newline || buffer.text().contains('\n')))
-                .then_some((*host, *node_id))
-            })
-        })
-    }
-
-    pub fn operation_batch(
-        &mut self,
-        host: HostId,
-        expected_ids: Vec<rho_desk::NodeId>,
-        messages: Vec<ClientMessage>,
-        reuse_id: Option<rho_desk::TreeClock>,
-    ) -> Option<rho_desk::OperationBatch> {
-        let desk = self.tree_hosts.get_mut(&host)?;
-        let nodes = desk
-            .document
-            .materialize()
-            .into_iter()
-            .map(|node| (node.id, node))
-            .collect::<BTreeMap<_, _>>();
-        let mut expected = Vec::new();
-        for node_id in expected_ids.into_iter().collect::<BTreeSet<_>>() {
-            let node = nodes.get(&node_id)?;
-            expected.push(rho_desk::NodeExpectation {
-                node_id,
-                kind: node.kind,
-                owner: node.owner,
-                parent: node.parent,
-                order: node.order.clone(),
-                text_version: desk.document.text_version(node_id).ok()?,
-            });
-        }
-        let operations = messages
-            .into_iter()
-            .filter_map(|message| match message {
-                ClientMessage::DeskTreeApply { operation } => {
-                    Some(rho_desk::BatchOperation::Tree(operation))
-                }
-                ClientMessage::DeskNodeTextApply {
-                    node_id,
-                    operation,
-                    transaction,
-                } => Some(rho_desk::BatchOperation::Text {
-                    node_id,
-                    operation,
-                    transaction,
-                }),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        if reuse_id.is_none() {
-            desk.next_tree_clock = desk.next_tree_clock.checked_add(1)?;
-        }
-        let batch = rho_desk::OperationBatch {
-            id: reuse_id.unwrap_or(rho_desk::TreeClock {
-                value: desk.next_tree_clock,
-                replica_id: desk.replica_id,
-            }),
-            expected,
-            operations,
-            machine_relocation: None,
-        };
-        self.pending_batches.insert((host, batch.id), batch.clone());
-        Some(batch)
-    }
-
-    pub fn reset_rejected_batch(
-        &mut self,
-        host: HostId,
-        id: rho_desk::TreeClock,
-        snapshot: rho_desk::Snapshot,
-        cx: &mut Context<Workspace>,
-    ) -> Vec<rho_desk::BatchOperation> {
-        self.pending_batches.remove(&(host, id));
-        let dependent = self
-            .pending_batch_text
-            .remove(&(host, id))
-            .unwrap_or_default();
-        self.replace_tree_snapshot(host, snapshot, cx);
-        dependent
-    }
-
-    pub fn tree_anchor_at(
-        &self,
-        host: HostId,
-        node_id: rho_desk::NodeId,
-        offset: usize,
-        bias: text::Bias,
-        cx: &gpui::App,
-    ) -> Option<text::Anchor> {
-        let buffer = self.tree_hosts.get(&host)?.buffers.get(&node_id)?.read(cx);
-        Some(buffer.anchor_at(offset.min(buffer.len()), bias))
-    }
-
-    pub fn resolve_tree_anchor(
-        &self,
-        host: HostId,
-        node_id: rho_desk::NodeId,
-        anchor: text::Anchor,
-        cx: &gpui::App,
-    ) -> Option<usize> {
-        let buffer = self.tree_hosts.get(&host)?.buffers.get(&node_id)?.read(cx);
-        let anchor = text::Anchor::new(
-            anchor.timestamp(),
-            anchor.offset,
-            anchor.bias,
-            buffer.remote_id(),
-        );
-        Some(anchor.to_offset(&buffer.snapshot()))
-    }
-
-    pub fn replay_text_edit(
-        &mut self,
-        host: HostId,
-        node_id: rho_desk::NodeId,
-        edit: &(std::ops::Range<usize>, String),
-        cx: &mut Context<Workspace>,
-    ) -> bool {
-        let Some(buffer) = self
-            .tree_hosts
-            .get(&host)
-            .and_then(|desk| desk.buffers.get(&node_id))
-            .cloned()
-        else {
-            return false;
-        };
-        let len = buffer.read(cx).len();
-        if edit.0.start > edit.0.end || edit.0.end > len {
-            return false;
-        }
-        buffer.update(cx, |buffer, cx| {
-            buffer.edit([(edit.0.clone(), edit.1.as_str())], None, cx)
-        });
-        true
-    }
-
-    pub fn record_pending_batch_text(
-        &mut self,
-        host: HostId,
-        node_id: rho_desk::NodeId,
-        operation: rho_desk::TextOperation,
-        transaction: Option<rho_desk::TextTransaction>,
-    ) {
-        let id = self
-            .pending_batches
-            .iter()
-            .find_map(|((batch_host, id), batch)| {
-                (*batch_host == host
-                    && batch.operations.iter().any(|operation| {
-                        matches!(operation, rho_desk::BatchOperation::Tree(
-                        rho_desk::TreeOperation::Create { node_id: created, .. }
-                    ) if *created == node_id)
-                    }))
-                .then_some(*id)
-            });
-        if let Some(id) = id {
-            self.pending_batch_text.entry((host, id)).or_default().push(
-                rho_desk::BatchOperation::Text {
-                    node_id,
-                    operation,
-                    transaction,
-                },
-            );
-        }
-    }
-
-    pub fn update_pending_batch(&mut self, host: HostId, batch: &rho_desk::OperationBatch) {
-        self.pending_batches.insert((host, batch.id), batch.clone());
-    }
-
-    pub fn keep_pending_batch_text(
-        &mut self,
-        host: HostId,
-        id: rho_desk::TreeClock,
-        operations: Vec<rho_desk::BatchOperation>,
-    ) {
-        self.pending_batch_text.insert((host, id), operations);
-    }
-
-    pub fn apply_tree_snapshot(
-        &mut self,
-        host: HostId,
-        mut snapshot: rho_desk::Snapshot,
-        replica_id: u16,
-        cx: &mut Context<Workspace>,
-    ) -> bool {
-        if self
-            .tree_hosts
-            .get(&host)
-            .is_some_and(|desk| snapshot_is_stale(desk.sequence, snapshot.sequence))
-        {
-            return false;
-        }
-        if let Some(replacement) = self.pending_replacements.remove(&host)
-            && replacement.sequence > snapshot.sequence
-        {
-            snapshot = replacement;
-        }
-        let sequence = snapshot.sequence;
-        let next_tree_clock = snapshot
-            .version
-            .iter()
-            .filter(|clock| clock.replica_id == replica_id)
-            .map(|clock| clock.value)
-            .max()
-            .unwrap_or(0);
-        let next_node_counter = snapshot
-            .nodes
-            .iter()
-            .filter(|node| node.id.replica_id == replica_id)
-            .map(|node| node.id.counter)
-            .max()
-            .unwrap_or(0);
-        let Ok(document) = rho_desk::Document::from_snapshot(snapshot.clone()) else {
-            return true;
-        };
-        let owners = document
-            .materialize()
-            .into_iter()
-            .map(|node| (node.id, node.owner))
-            .collect::<BTreeMap<_, _>>();
-        let mut buffers = BTreeMap::new();
-        let mut subscriptions = Vec::new();
-        for text in snapshot.texts {
-            let buffer_id = BufferId::new(self.next_buffer_id).expect("nonzero GUI buffer id");
-            self.next_buffer_id += 1;
-            let capability = if owners.get(&text.node_id) == Some(&rho_desk::NodeOwner::User) {
-                Capability::ReadWrite
-            } else {
-                Capability::ReadOnly
-            };
-            let node_id = text.node_id;
-            let (buffer, subscription) = make_tree_buffer(
-                buffer_id,
-                replica_id,
-                capability,
-                text.operations,
-                host,
-                node_id,
-                cx,
-            );
-            subscriptions.push(subscription);
-            buffers.insert(node_id, buffer);
-        }
-        self.tree_hosts.insert(
-            host,
-            HostTreeDesk {
-                document,
-                buffers,
-                _subscriptions: subscriptions,
-                sequence,
-                replica_id,
-                next_tree_clock,
-                next_node_counter,
-            },
-        );
-        let pending = self.pending_tree.remove(&host).unwrap_or_default();
-        for (_, event) in pending {
-            if event.sequence() <= sequence {
+    ) -> Option<DeskCapture> {
+        let desk = self.hosts.get(&host)?;
+        let nodes = desk.view.materialize();
+        let mut kept: BTreeSet<rho_desk::NodeId> = BTreeSet::new();
+        let mut captured = Vec::new();
+        for node in &nodes {
+            let inside =
+                node.id == root || node.parent.is_some_and(|parent| kept.contains(&parent));
+            if !inside || node.kind != rho_desk::cells::NodeKind::Note {
                 continue;
             }
-            let gap = match event {
-                PendingTreeEvent::Tree(record) => self.apply_tree(host, record, cx),
-                PendingTreeEvent::Text(record) => self.apply_node_text(host, record, cx),
-            };
-            if gap {
-                return true;
-            }
+            kept.insert(node.id);
+            captured.push(DeskCaptureNode {
+                id: node.id,
+                parent: node.parent,
+                text: desk
+                    .buffers
+                    .get(&node.id)
+                    .map(|buffer| buffer.read(cx).text())
+                    .unwrap_or_default(),
+            });
         }
-        false
+        (!captured.is_empty()).then_some(DeskCapture { nodes: captured })
     }
 
-    pub fn replace_tree_snapshot(
-        &mut self,
-        host: HostId,
-        snapshot: rho_desk::Snapshot,
-        cx: &mut Context<Workspace>,
-    ) -> bool {
-        let Some(replica_id) = self.tree_hosts.get(&host).map(|desk| desk.replica_id) else {
-            self.pending_replacements.insert(host, snapshot);
-            return false;
-        };
-        if self
-            .tree_hosts
-            .get(&host)
-            .is_some_and(|desk| snapshot.sequence <= desk.sequence)
-        {
-            return false;
-        }
-        self.apply_tree_snapshot(host, snapshot, replica_id, cx)
-    }
-
-    /// Returns true when a sequence gap requires a fresh snapshot.
-    pub fn apply_tree(
-        &mut self,
-        host: HostId,
-        record: rho_desk::TreeOpRecord,
-        cx: &mut Context<Workspace>,
-    ) -> bool {
-        let created = match &record.operation {
-            rho_desk::TreeOperation::Create { node_id, owner, .. } => Some((*node_id, *owner)),
-            _ => None,
-        };
-        let deleted = match &record.operation {
-            rho_desk::TreeOperation::Delete { node_ids, .. } => node_ids.clone(),
-            _ => Vec::new(),
-        };
-        let new_buffer_id = created.map(|_| {
-            let id = BufferId::new(self.next_buffer_id).expect("nonzero GUI buffer id");
-            self.next_buffer_id += 1;
-            id
-        });
-        let Some(desk) = self.tree_hosts.get_mut(&host) else {
-            self.pending_tree
-                .entry(host)
-                .or_default()
-                .insert(record.sequence, PendingTreeEvent::Tree(record));
-            return false;
-        };
-        if record.sequence <= desk.sequence {
-            return false;
-        }
-        if sequence_has_gap(desk.sequence, record.sequence) {
-            return true;
-        }
-        let timestamp = record.operation.timestamp();
-        let applied = match desk.document.apply(record.operation) {
-            Ok(applied) => applied,
-            Err(_) => return true,
-        };
-        if applied && let (Some((node_id, owner)), Some(buffer_id)) = (created, new_buffer_id) {
-            let capability = if owner == rho_desk::NodeOwner::User {
-                Capability::ReadWrite
-            } else {
-                Capability::ReadOnly
-            };
-            let (buffer, subscription) = make_tree_buffer(
-                buffer_id,
-                desk.replica_id,
-                capability,
-                Vec::new(),
-                host,
-                node_id,
-                cx,
-            );
-            desk.buffers.insert(node_id, buffer);
-            desk._subscriptions.push(subscription);
-            if node_id.replica_id == desk.replica_id {
-                desk.next_node_counter = desk.next_node_counter.max(node_id.counter);
-            }
-        }
-        if applied {
-            for node_id in deleted {
-                desk.buffers.remove(&node_id);
-            }
-        }
-        desk.sequence = record.sequence;
-        if timestamp.replica_id == desk.replica_id {
-            desk.next_tree_clock = desk.next_tree_clock.max(timestamp.value);
-        }
-        false
-    }
-
-    pub fn prepare_structure_move(
-        &mut self,
-        host: HostId,
-        node_id: rho_desk::NodeId,
-        demote: bool,
-    ) -> Option<rho_desk::TreeOperation> {
-        let desk = self.tree_hosts.get_mut(&host)?;
-        let nodes = desk.document.materialize();
-        let index = nodes.iter().position(|node| node.id == node_id)?;
-        let node = &nodes[index];
-        if node.owner != rho_desk::NodeOwner::User || node.kind != rho_desk::NodeKind::Heading {
-            return None;
-        }
-        let (parent, order) = if demote {
-            let previous = nodes[..index].iter().rev().find(|candidate| {
-                candidate.parent == node.parent && candidate.kind == rho_desk::NodeKind::Heading
-            })?;
-            let last = nodes
-                .iter()
-                .filter(|candidate| candidate.parent == Some(previous.id))
-                .map(|candidate| &candidate.order)
-                .max();
-            (Some(previous.id), rho_desk::OrderKey::between(last, None))
-        } else {
-            let parent_id = node.parent?;
-            let parent_node = nodes.iter().find(|candidate| candidate.id == parent_id)?;
-            if parent_node.kind != rho_desk::NodeKind::Heading {
-                return None;
-            }
-            let next = nodes
-                .iter()
-                .filter(|candidate| candidate.parent == parent_node.parent)
-                .filter(|candidate| candidate.order > parent_node.order)
-                .map(|candidate| &candidate.order)
-                .min();
-            (
-                parent_node.parent,
-                rho_desk::OrderKey::between(Some(&parent_node.order), next),
-            )
-        };
-        desk.next_tree_clock = desk.next_tree_clock.checked_add(1)?;
-        Some(rho_desk::TreeOperation::Move {
-            timestamp: rho_desk::TreeClock {
-                value: desk.next_tree_clock,
-                replica_id: desk.replica_id,
-            },
-            node_id,
-            parent,
-            order,
-        })
-    }
-
-    pub fn prepare_new_heading(
+    /// Re-creates a captured subtree under the cursor's parent. Returns the
+    /// new root, the creation writes, and the text each new note wants once
+    /// the daemon has accepted them.
+    #[allow(clippy::type_complexity)]
+    pub fn paste_writes(
         &mut self,
         host: HostId,
         relative: rho_desk::NodeId,
-        child: bool,
-        above: bool,
-    ) -> Option<rho_desk::TreeOperation> {
-        let desk = self.tree_hosts.get_mut(&host)?;
-        let nodes = desk.document.materialize();
-        let node = nodes.iter().find(|node| node.id == relative)?;
-        if node.kind != rho_desk::NodeKind::Heading || node.owner != rho_desk::NodeOwner::User {
-            return None;
-        }
-        let (parent, order) = if child {
-            let last = nodes
-                .iter()
-                .filter(|candidate| candidate.parent == Some(relative))
-                .map(|candidate| &candidate.order)
-                .max();
-            (Some(relative), rho_desk::OrderKey::between(last, None))
-        } else if above {
-            let previous = nodes
-                .iter()
-                .filter(|candidate| candidate.parent == node.parent && candidate.order < node.order)
-                .map(|candidate| &candidate.order)
-                .max();
-            (
-                node.parent,
-                rho_desk::OrderKey::between(previous, Some(&node.order)),
-            )
-        } else {
-            let next = nodes
-                .iter()
-                .filter(|candidate| candidate.parent == node.parent && candidate.order > node.order)
-                .map(|candidate| &candidate.order)
-                .min();
-            (
-                node.parent,
-                rho_desk::OrderKey::between(Some(&node.order), next),
-            )
-        };
-        Some(new_heading_operation(desk, parent, order)?)
-    }
-
-    /// A tag on a node rho just created. Filing a Slack thread uses this so
-    /// the filed threads are findable as a set rather than as loose headings.
-    pub fn prepare_set_tag(
-        &mut self,
-        host: HostId,
-        node_id: rho_desk::NodeId,
-        tag: &str,
-    ) -> Option<rho_desk::TreeOperation> {
-        let desk = self.tree_hosts.get_mut(&host)?;
-        desk.next_tree_clock = desk.next_tree_clock.checked_add(1)?;
-        Some(rho_desk::TreeOperation::SetTag {
-            timestamp: rho_desk::TreeClock {
-                value: desk.next_tree_clock,
-                replica_id: desk.replica_id,
-            },
-            node_id,
-            tag: tag.to_owned(),
-            present: true,
-        })
-    }
-
-    pub fn prepare_reorder(
-        &mut self,
-        host: HostId,
-        node_id: rho_desk::NodeId,
-        down: bool,
-    ) -> Option<rho_desk::TreeOperation> {
-        let desk = self.tree_hosts.get_mut(&host)?;
-        let nodes = desk.document.materialize();
-        let node = nodes.iter().find(|node| node.id == node_id)?;
-        if node.kind != rho_desk::NodeKind::Heading || node.owner != rho_desk::NodeOwner::User {
-            return None;
-        }
-        let siblings = nodes
-            .iter()
-            .filter(|candidate| candidate.parent == node.parent)
-            .collect::<Vec<_>>();
-        let index = siblings
-            .iter()
-            .position(|candidate| candidate.id == node_id)?;
-        let order = if down {
-            let next_index = (index + 1..siblings.len())
-                .find(|&i| siblings[i].kind == rho_desk::NodeKind::Heading)?;
-            let next = siblings[next_index];
-            rho_desk::OrderKey::between(
-                Some(&next.order),
-                siblings.get(next_index + 1).map(|n| &n.order),
-            )
-        } else {
-            let previous_index = (0..index)
-                .rev()
-                .find(|&i| siblings[i].kind == rho_desk::NodeKind::Heading)?;
-            let previous = siblings[previous_index];
-            rho_desk::OrderKey::between(
-                previous_index
-                    .checked_sub(1)
-                    .and_then(|i| siblings.get(i))
-                    .map(|n| &n.order),
-                Some(&previous.order),
-            )
-        };
-        desk.next_tree_clock = desk.next_tree_clock.checked_add(1)?;
-        Some(rho_desk::TreeOperation::Move {
-            timestamp: rho_desk::TreeClock {
-                value: desk.next_tree_clock,
-                replica_id: desk.replica_id,
-            },
-            node_id,
-            parent: node.parent,
-            order,
-        })
-    }
-
-    /// Deletes an empty user heading. When it sits between two prose
-    /// siblings, their text is joined first and the redundant right-hand
-    /// prose node is deleted with the heading.
-    pub fn prepare_delete_empty(
-        &mut self,
-        host: HostId,
-        node_id: rho_desk::NodeId,
-        cx: &mut Context<Workspace>,
+        capture: &DeskCapture,
     ) -> Option<(
-        Vec<ClientMessage>,
-        Option<(rho_desk::NodeId, usize)>,
-        Vec<rho_desk::NodeId>,
-        DeskDeleteEmptyUndo,
+        rho_desk::NodeId,
+        Vec<rho_desk::cells::CellWrite>,
+        Vec<(rho_desk::NodeId, String)>,
     )> {
-        let desk = self.tree_hosts.get_mut(&host)?;
-        let nodes = desk.document.materialize();
-        let node = nodes.iter().find(|node| node.id == node_id)?;
-        if node.kind != rho_desk::NodeKind::Heading
-            || node.owner != rho_desk::NodeOwner::User
-            || !desk.buffers.get(&node_id)?.read(cx).text().is_empty()
-        {
-            return None;
-        }
-        let siblings = nodes
-            .iter()
-            .filter(|candidate| candidate.parent == node.parent)
-            .collect::<Vec<_>>();
-        let index = siblings
-            .iter()
-            .position(|candidate| candidate.id == node_id)?;
-        let previous = index
-            .checked_sub(1)
-            .and_then(|index| siblings.get(index))
-            .filter(|node| {
-                node.kind == rho_desk::NodeKind::Prose && node.owner == rho_desk::NodeOwner::User
-            });
-        let sibling_next = siblings.get(index + 1).filter(|node| {
-            node.kind == rho_desk::NodeKind::Prose && node.owner == rho_desk::NodeOwner::User
-        });
-        let children = nodes
-            .iter()
-            .filter(|candidate| candidate.parent == Some(node_id))
-            .collect::<Vec<_>>();
-        if children.len() > 1
-            || children.first().is_some_and(|node| {
-                node.kind != rho_desk::NodeKind::Prose || node.owner != rho_desk::NodeOwner::User
-            })
-        {
-            return None;
-        }
-        let child = children.first().copied();
-        let right = child.or(sibling_next.copied());
-        let undo = DeskDeleteEmptyUndo {
-            heading: node.clone(),
-            deleted_right: previous.zip(right).map(|(_, right)| {
-                (
-                    right.clone(),
-                    desk.buffers.get(&right.id).unwrap().read(cx).text(),
-                )
-            }),
-            previous_text: previous.map(|previous| {
-                (
-                    previous.id,
-                    desk.buffers.get(&previous.id).unwrap().read(cx).text(),
-                )
-            }),
-            moved_child: if previous.is_none() {
-                child.map(|child| child.id)
+        let target = self.node(host, relative)?;
+        let root_source = capture.nodes.first()?.id;
+        let created_at = now_timestamp();
+        let mut mapping: BTreeMap<rho_desk::NodeId, rho_desk::NodeId> = BTreeMap::new();
+        let mut writes = Vec::new();
+        let mut texts = Vec::new();
+        for source in &capture.nodes {
+            let node_id = self.new_node_id(host)?;
+            let parent = if source.id == root_source {
+                target.parent
             } else {
-                None
-            },
-        };
-        let mut expected = vec![node_id];
-        expected.extend(previous.map(|node| node.id));
-        expected.extend(right.map(|node| node.id));
-        let mut delete_ids = vec![node_id];
-        let mut messages = Vec::new();
-        let focus = if let (Some(previous), Some(right)) = (previous, right) {
-            let previous_len = desk.buffers.get(&previous.id)?.read(cx).len();
-            let previous_text = desk.buffers.get(&previous.id)?.read(cx).text();
-            let right_text = desk.buffers.get(&right.id)?.read(cx).text().to_owned();
-            if !right_text.is_empty() {
-                let joined = prose_join_suffix(&previous_text, &right_text);
-                desk.buffers.get(&previous.id)?.update(cx, |buffer, cx| {
-                    let len = buffer.len();
-                    buffer.edit([(len..len, joined)], None, cx);
-                });
-            }
-            delete_ids.push(right.id);
-            Some((previous.id, previous_len))
-        } else if let Some(previous) = previous {
-            Some((previous.id, desk.buffers.get(&previous.id)?.read(cx).len()))
-        } else {
-            right.map(|node| (node.id, 0))
-        };
-        if previous.is_none()
-            && let Some(child) = child
-        {
-            desk.next_tree_clock = desk.next_tree_clock.checked_add(1)?;
-            messages.push(ClientMessage::DeskTreeApply {
-                operation: rho_desk::TreeOperation::Move {
-                    timestamp: rho_desk::TreeClock {
-                        value: desk.next_tree_clock,
-                        replica_id: desk.replica_id,
-                    },
-                    node_id: child.id,
-                    parent: node.parent,
-                    order: node.order.clone(),
-                },
-            });
-            delete_ids.retain(|id| *id != child.id);
-        }
-        desk.next_tree_clock = desk.next_tree_clock.checked_add(1)?;
-        messages.push(ClientMessage::DeskTreeApply {
-            operation: rho_desk::TreeOperation::Delete {
-                timestamp: rho_desk::TreeClock {
-                    value: desk.next_tree_clock,
-                    replica_id: desk.replica_id,
-                },
-                node_ids: delete_ids,
-            },
-        });
-        Some((messages, focus, expected, undo))
-    }
-
-    /// Reverses `prepare_delete_empty`. Deleted CRDT ids cannot be revived,
-    /// so the empty heading (and a joined-away prose node) receive fresh ids.
-    pub fn prepare_restore_deleted_empty(
-        &mut self,
-        host: HostId,
-        undo: &DeskDeleteEmptyUndo,
-        cx: &mut Context<Workspace>,
-    ) -> Option<(Vec<ClientMessage>, rho_desk::NodeId, Vec<rho_desk::NodeId>)> {
-        let desk = self.tree_hosts.get_mut(&host)?;
-        let materialized = desk.document.materialize();
-        if let Some((previous, _)) = &undo.previous_text {
-            materialized.iter().find(|node| node.id == *previous)?;
-        }
-        if let Some(child) = undo.moved_child {
-            materialized.iter().find(|node| node.id == child)?;
-        }
-
-        desk.next_node_counter = desk.next_node_counter.checked_add(1)?;
-        desk.next_tree_clock = desk.next_tree_clock.checked_add(1)?;
-        let heading_id = rho_desk::NodeId {
-            replica_id: desk.replica_id,
-            counter: desk.next_node_counter,
-        };
-        let mut messages = vec![ClientMessage::DeskTreeApply {
-            operation: rho_desk::TreeOperation::Create {
-                timestamp: rho_desk::TreeClock {
-                    value: desk.next_tree_clock,
-                    replica_id: desk.replica_id,
-                },
-                node_id: heading_id,
-                kind: undo.heading.kind,
-                owner: undo.heading.owner,
-                parent: undo.heading.parent,
-                order: undo.heading.order.clone(),
-            },
-        }];
-        append_node_metadata(desk, &mut messages, heading_id, &undo.heading)?;
-        if let Some((right, text)) = &undo.deleted_right {
-            desk.next_node_counter = desk.next_node_counter.checked_add(1)?;
-            desk.next_tree_clock = desk.next_tree_clock.checked_add(1)?;
-            let right_id = rho_desk::NodeId {
-                replica_id: desk.replica_id,
-                counter: desk.next_node_counter,
+                source
+                    .parent
+                    .and_then(|parent| mapping.get(&parent).copied())
             };
-            messages.push(ClientMessage::DeskTreeApply {
-                operation: rho_desk::TreeOperation::Create {
-                    timestamp: rho_desk::TreeClock {
-                        value: desk.next_tree_clock,
-                        replica_id: desk.replica_id,
-                    },
-                    node_id: right_id,
-                    kind: right.kind,
-                    owner: right.owner,
-                    parent: (right.parent == Some(undo.heading.id))
-                        .then_some(heading_id)
-                        .or(right.parent),
-                    order: right.order.clone(),
-                },
-            });
-            if !text.is_empty() {
-                messages.push(text_apply_message(desk.replica_id, right_id, text));
+            mapping.insert(source.id, node_id);
+            writes.extend(create_note_writes(node_id, parent, created_at));
+            if !source.text.is_empty() {
+                texts.push((node_id, source.text.clone()));
             }
-            append_node_metadata(desk, &mut messages, right_id, right)?;
         }
-        if let Some(child) = undo.moved_child {
-            desk.next_tree_clock = desk.next_tree_clock.checked_add(1)?;
-            messages.push(ClientMessage::DeskTreeApply {
-                operation: rho_desk::TreeOperation::Move {
-                    timestamp: rho_desk::TreeClock {
-                        value: desk.next_tree_clock,
-                        replica_id: desk.replica_id,
-                    },
-                    node_id: child,
-                    parent: Some(heading_id),
-                    order: materialized
-                        .iter()
-                        .find(|node| node.id == child)?
-                        .order
-                        .clone(),
-                },
-            });
-        }
-        if let Some((previous, text)) = &undo.previous_text {
-            let buffer = desk.buffers.get(previous)?.clone();
-            buffer.update(cx, |buffer, cx| {
-                let len = buffer.len();
-                buffer.edit([(0..len, text.as_str())], None, cx);
-            });
-        }
-        let mut expected = undo.heading.parent.into_iter().collect::<Vec<_>>();
-        expected.extend(undo.previous_text.iter().map(|(id, _)| *id));
-        expected.extend(undo.moved_child);
-        Some((messages, heading_id, expected))
+        let root = mapping.get(&root_source).copied()?;
+        Some((root, writes, texts))
     }
 
-    pub fn recognize_heading(
+    /// The writes that put back whatever these writes are about to replace.
+    /// A field with no current value cannot be unset, so undoing a creation
+    /// is a delete rather than an inverse (see `dashboard_new_heading`).
+    pub fn inverse_writes(
+        &self,
+        host: HostId,
+        writes: &[rho_desk::cells::CellWrite],
+    ) -> Vec<rho_desk::cells::CellWrite> {
+        let Some(desk) = self.hosts.get(&host) else {
+            return Vec::new();
+        };
+        writes
+            .iter()
+            .filter_map(|write| {
+                let value = desk.view.value(write.node, &write.field)?.clone();
+                (value != write.value).then_some(rho_desk::cells::CellWrite {
+                    node: write.node,
+                    field: write.field.clone(),
+                    value,
+                })
+            })
+            .collect()
+    }
+
+    /// A dealt verdict: the field it changes, plus the log entry recording
+    /// exactly what it changed so an undo can be validated against it.
+    pub fn verdict_writes(
         &mut self,
         host: HostId,
         node_id: rho_desk::NodeId,
-        line_end: usize,
-        focus_after: bool,
-        cx: &mut Context<Workspace>,
-    ) -> Option<(Vec<ClientMessage>, rho_desk::NodeId, Vec<rho_desk::NodeId>)> {
-        let Some(desk) = self.tree_hosts.get_mut(&host) else {
-            return None;
+        verdict: DeskVerdict,
+    ) -> Option<(
+        Vec<rho_desk::cells::CellWrite>,
+        (rho_desk::NodeId, rho_desk::cells::VerdictEvent),
+    )> {
+        use rho_desk::cells::{Field, Value, Verdict};
+
+        let (verdict, mut writes, change) = match verdict {
+            DeskVerdict::Done | DeskVerdict::Dismiss => {
+                let state = if matches!(verdict, DeskVerdict::Done) {
+                    rho_desk::cells::State::Done
+                } else {
+                    rho_desk::cells::State::Dismissed
+                };
+                let verdict = if matches!(verdict, DeskVerdict::Done) {
+                    Verdict::Done
+                } else {
+                    Verdict::Dismiss
+                };
+                (
+                    verdict,
+                    Vec::new(),
+                    (node_id, Field::State, Value::State(state)),
+                )
+            }
+            DeskVerdict::Defer { until } => (
+                Verdict::Defer { until },
+                Vec::new(),
+                (
+                    node_id,
+                    Field::DeferUntil,
+                    Value::OptionalTimestamp(Some(until)),
+                ),
+            ),
+            DeskVerdict::File { parent } => (
+                Verdict::File { parent },
+                Vec::new(),
+                (node_id, Field::Parent, Value::Parent(Some(parent))),
+            ),
+            DeskVerdict::Todo { defer_until, pace } => {
+                let (note, mut writes) = self.create_note_writes(host, Some(node_id))?;
+                // The creation already writes every common field, so the
+                // cadence replaces those values rather than repeating them.
+                for write in &mut writes {
+                    match write.field {
+                        Field::DeferUntil => {
+                            write.value = Value::OptionalTimestamp(Some(defer_until));
+                        }
+                        Field::PaceDays => write.value = Value::Days(pace),
+                        _ => {}
+                    }
+                }
+                (
+                    Verdict::Todo { note },
+                    writes,
+                    (note, Field::Deleted, Value::Bool(false)),
+                )
+            }
         };
-        let nodes = desk.document.materialize();
-        let Some(node) = nodes
+        let (change_node, field, after) = change;
+        let before = self
+            .hosts
+            .get(&host)?
+            .view
+            .value(change_node, &field)
+            .cloned()
+            // A note this mutation creates has no prior cell; the verdict log
+            // records its arrival as the deletion it was born out of.
+            .or_else(|| {
+                (field == Field::Deleted && change_node != node_id).then_some(Value::Bool(true))
+            });
+        if before.as_ref() == Some(&after) {
+            return None;
+        }
+        if !writes
             .iter()
-            .find(|node| node.id == node_id && node.kind == rho_desk::NodeKind::Prose)
+            .any(|write| write.node == change_node && write.field == field)
+        {
+            writes.push(rho_desk::cells::CellWrite {
+                node: change_node,
+                field: field.clone(),
+                value: after.clone(),
+            });
+        } else if let Some(write) = writes
+            .iter_mut()
+            .find(|write| write.node == change_node && write.field == field)
+        {
+            write.value = after.clone();
+        }
+        let event = rho_desk::cells::VerdictEvent::Applied {
+            verdict,
+            at: rho_desk::cells::Stamp {
+                device: self.device,
+                version: 0,
+            },
+            changes: vec![rho_desk::cells::FieldChange {
+                node: change_node,
+                field,
+                before,
+                after: Some(after),
+            }],
+        };
+        Some((writes, (node_id, event)))
+    }
+
+    /// Undoes an applied verdict by reapplying its before-values and
+    /// appending the `Undone` log entry the daemon validates against them.
+    pub fn undo_verdict_writes(
+        &self,
+        host: HostId,
+        node_id: rho_desk::NodeId,
+        at: rho_desk::cells::Stamp,
+    ) -> Option<(
+        Vec<rho_desk::cells::CellWrite>,
+        (rho_desk::NodeId, rho_desk::cells::VerdictEvent),
+    )> {
+        let rho_desk::cells::VerdictEvent::Applied { changes, .. } =
+            self.verdict_event(host, node_id, at)?
         else {
             return None;
         };
-        let Some(buffer) = desk.buffers.get(&node_id).cloned() else {
-            return None;
-        };
-        let text = buffer.read(cx).text();
-        let line_end = line_end.min(text.len());
-        let start = text[..line_end].rfind('\n').map_or(0, |offset| offset + 1);
-        if !text[start..line_end].starts_with("* ") {
-            return None;
-        }
-        let physical_line_end = text[line_end..]
-            .find('\n')
-            .map_or(text.len(), |offset| line_end + offset);
-        let after_start = (physical_line_end < text.len())
-            .then_some(physical_line_end + 1)
-            .unwrap_or(physical_line_end);
-        let before = text[..start].to_owned();
-        let title = text[start + 2..physical_line_end].to_owned();
-        let after = text[after_start..].to_owned();
-        buffer.update(cx, |buffer, cx| {
-            let len = buffer.len();
-            buffer.edit([(0..len, before.as_str())], None, cx);
-        });
-
-        let next = nodes
+        let writes = changes
             .iter()
-            .filter(|candidate| candidate.parent == node.parent && candidate.order > node.order)
-            .min_by_key(|candidate| &candidate.order);
-        let next_order = next.map(|candidate| &candidate.order);
-        let heading_order = if before.is_empty() {
-            node.order.clone()
-        } else {
-            rho_desk::OrderKey::between(Some(&node.order), next_order)
-        };
-        let after_order = rho_desk::OrderKey::between(None, None);
-        let mut next_id = || {
-            desk.next_node_counter += 1;
-            rho_desk::NodeId {
-                replica_id: desk.replica_id,
-                counter: desk.next_node_counter,
-            }
-        };
-        let heading_id = next_id();
-        let after_id = next_id();
-        let mut next_clock = || {
-            desk.next_tree_clock += 1;
-            rho_desk::TreeClock {
-                value: desk.next_tree_clock,
-                replica_id: desk.replica_id,
-            }
-        };
-        let mut messages = Vec::new();
-        if before.is_empty() {
-            messages.push(ClientMessage::DeskTreeApply {
-                operation: rho_desk::TreeOperation::Delete {
-                    timestamp: next_clock(),
-                    node_ids: vec![node_id],
-                },
-            });
-        }
-        messages.push(ClientMessage::DeskTreeApply {
-            operation: rho_desk::TreeOperation::Create {
-                timestamp: next_clock(),
-                node_id: heading_id,
-                kind: rho_desk::NodeKind::Heading,
-                owner: rho_desk::NodeOwner::User,
-                parent: node.parent,
-                order: heading_order,
-            },
-        });
-        messages.push(ClientMessage::DeskTreeApply {
-            operation: rho_desk::TreeOperation::Create {
-                timestamp: next_clock(),
-                node_id: after_id,
-                kind: rho_desk::NodeKind::Prose,
-                owner: rho_desk::NodeOwner::User,
-                parent: Some(heading_id),
-                order: after_order,
-            },
-        });
-        if !title.is_empty() {
-            messages.push(text_apply_message(desk.replica_id, heading_id, &title));
-        }
-        if !after.is_empty() {
-            messages.push(text_apply_message(desk.replica_id, after_id, &after));
-        }
-        let mut expected = vec![node_id];
-        expected.extend(next.map(|node| node.id));
-        Some((
-            messages,
-            if focus_after { after_id } else { heading_id },
-            expected,
+            .filter_map(|change| {
+                Some(rho_desk::cells::CellWrite {
+                    node: change.node,
+                    field: change.field.clone(),
+                    value: change.before.clone()?,
+                })
+            })
+            .collect::<Vec<_>>();
+        (!writes.is_empty()).then_some((
+            writes,
+            (node_id, rho_desk::cells::VerdictEvent::Undone { of: at }),
         ))
-    }
-
-    /// Enter ends a heading's single-line title and moves the remainder into
-    /// a prose child. This keeps the node kind structural even though the
-    /// native editor initially delivers the newline to the title buffer.
-    pub fn split_heading_on_newline(
-        &mut self,
-        host: HostId,
-        node_id: rho_desk::NodeId,
-        newline_offset: usize,
-        cx: &mut Context<Workspace>,
-    ) -> Option<(Vec<ClientMessage>, rho_desk::NodeId, Vec<rho_desk::NodeId>)> {
-        let desk = self.tree_hosts.get_mut(&host)?;
-        let nodes = desk.document.materialize();
-        nodes.iter().find(|node| {
-            node.id == node_id
-                && node.kind == rho_desk::NodeKind::Heading
-                && node.owner == rho_desk::NodeOwner::User
-        })?;
-        let buffer = desk.buffers.get(&node_id)?.clone();
-        let text = buffer.read(cx).text();
-        let newline_offset = (text.as_bytes().get(newline_offset) == Some(&b'\n'))
-            .then_some(newline_offset)
-            .or_else(|| text.find('\n'))?;
-        let title = text[..newline_offset].to_owned();
-        let prose = text[newline_offset + 1..].to_owned();
-        buffer.update(cx, |buffer, cx| {
-            let len = buffer.len();
-            buffer.edit([(0..len, title)], None, cx);
-        });
-        let first_child = nodes
-            .iter()
-            .filter(|candidate| candidate.parent == Some(node_id))
-            .min_by_key(|candidate| &candidate.order);
-        desk.next_node_counter = desk.next_node_counter.checked_add(1)?;
-        desk.next_tree_clock = desk.next_tree_clock.checked_add(1)?;
-        let prose_id = rho_desk::NodeId {
-            replica_id: desk.replica_id,
-            counter: desk.next_node_counter,
-        };
-        let mut messages = vec![ClientMessage::DeskTreeApply {
-            operation: rho_desk::TreeOperation::Create {
-                timestamp: rho_desk::TreeClock {
-                    value: desk.next_tree_clock,
-                    replica_id: desk.replica_id,
-                },
-                node_id: prose_id,
-                kind: rho_desk::NodeKind::Prose,
-                owner: rho_desk::NodeOwner::User,
-                parent: Some(node_id),
-                order: rho_desk::OrderKey::between(None, first_child.map(|node| &node.order)),
-            },
-        }];
-        if !prose.is_empty() {
-            messages.push(text_apply_message(desk.replica_id, prose_id, &prose));
-        }
-        let mut expected = vec![node_id];
-        expected.extend(first_child.map(|node| node.id));
-        Some((messages, prose_id, expected))
-    }
-
-    pub fn apply_optimistic(
-        &mut self,
-        host: HostId,
-        messages: &[ClientMessage],
-        cx: &mut Context<Workspace>,
-    ) {
-        let mut creates = BTreeMap::new();
-        for message in messages {
-            if let ClientMessage::DeskTreeApply {
-                operation: rho_desk::TreeOperation::Create { node_id, owner, .. },
-            } = message
-            {
-                let buffer_id = BufferId::new(self.next_buffer_id).expect("nonzero GUI buffer id");
-                self.next_buffer_id += 1;
-                creates.insert(*node_id, (*owner, buffer_id));
-            }
-        }
-        let Some(desk) = self.tree_hosts.get_mut(&host) else {
-            return;
-        };
-        for message in messages {
-            match message {
-                ClientMessage::DeskTreeApply { operation } => {
-                    if matches!(operation, rho_desk::TreeOperation::Delete { .. }) {
-                        continue;
-                    }
-                    if desk.document.apply(operation.clone()) != Ok(true) {
-                        continue;
-                    }
-                    if let rho_desk::TreeOperation::Create { node_id, .. } = operation {
-                        let (owner, buffer_id) = creates[node_id];
-                        let capability = if owner == rho_desk::NodeOwner::User {
-                            Capability::ReadWrite
-                        } else {
-                            Capability::ReadOnly
-                        };
-                        let (buffer, subscription) = make_tree_buffer(
-                            buffer_id,
-                            desk.replica_id,
-                            capability,
-                            Vec::new(),
-                            host,
-                            *node_id,
-                            cx,
-                        );
-                        desk.buffers.insert(*node_id, buffer);
-                        desk._subscriptions.push(subscription);
-                    }
-                }
-                ClientMessage::DeskNodeTextApply {
-                    node_id, operation, ..
-                } => {
-                    if let (Some(buffer), Ok(operation)) =
-                        (desk.buffers.get(node_id), operation.to_text())
-                    {
-                        buffer.update(cx, |buffer, cx| {
-                            buffer.apply_ops([language::Operation::Buffer(operation)], cx)
-                        });
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-
-    pub fn apply_optimistic_delete(&mut self, host: HostId, operation: &rho_desk::TreeOperation) {
-        let rho_desk::TreeOperation::Delete { node_ids, .. } = operation else {
-            return;
-        };
-        let Some(desk) = self.tree_hosts.get_mut(&host) else {
-            return;
-        };
-        if desk.document.apply(operation.clone()) == Ok(true) {
-            for node_id in node_ids {
-                desk.buffers.remove(node_id);
-            }
-        }
-    }
-
-    pub fn apply_node_text(
-        &mut self,
-        host: HostId,
-        record: rho_desk::TextOpRecord,
-        cx: &mut Context<Workspace>,
-    ) -> bool {
-        let Some(desk) = self.tree_hosts.get_mut(&host) else {
-            self.pending_tree
-                .entry(host)
-                .or_default()
-                .insert(record.sequence, PendingTreeEvent::Text(record));
-            return false;
-        };
-        if record.sequence <= desk.sequence {
-            return false;
-        }
-        if sequence_has_gap(desk.sequence, record.sequence) {
-            return true;
-        }
-        if !desk
-            .document
-            .apply_text(record.node_id, record.operation.clone(), record.transaction)
-            .unwrap_or(false)
-        {
-            return true;
-        }
-        if let (Some(buffer), Ok(operation)) = (
-            desk.buffers.get(&record.node_id),
-            record.operation.to_text(),
-        ) {
-            buffer.update(cx, |buffer, cx| {
-                buffer.apply_ops([language::Operation::Buffer(operation)], cx)
-            });
-        }
-        desk.sequence = record.sequence;
-        false
-    }
-
-    /// Applies one accepted mixed batch and advances the shared stream once.
-    pub fn apply_batch(
-        &mut self,
-        host: HostId,
-        record: rho_desk::BatchOpRecord,
-        cx: &mut Context<Workspace>,
-    ) -> bool {
-        self.pending_batches.remove(&(host, record.batch.id));
-        self.pending_batch_text.remove(&(host, record.batch.id));
-        let Some(desk) = self.tree_hosts.get_mut(&host) else {
-            return true;
-        };
-        if record.sequence <= desk.sequence {
-            return false;
-        }
-        if sequence_has_gap(desk.sequence, record.sequence) {
-            return true;
-        }
-        for operation in record.batch.operations {
-            match operation {
-                rho_desk::BatchOperation::Tree(operation) => {
-                    let created = match &operation {
-                        rho_desk::TreeOperation::Create { node_id, owner, .. } => {
-                            Some((*node_id, *owner))
-                        }
-                        _ => None,
-                    };
-                    let deleted = match &operation {
-                        rho_desk::TreeOperation::Delete { node_ids, .. } => node_ids.clone(),
-                        _ => Vec::new(),
-                    };
-                    let applied = match desk.document.apply(operation) {
-                        Ok(applied) => applied,
-                        Err(_) => return true,
-                    };
-                    if applied && let Some((node_id, owner)) = created {
-                        let buffer_id =
-                            BufferId::new(self.next_buffer_id).expect("nonzero GUI buffer id");
-                        self.next_buffer_id += 1;
-                        let capability = if owner == rho_desk::NodeOwner::User {
-                            Capability::ReadWrite
-                        } else {
-                            Capability::ReadOnly
-                        };
-                        let (buffer, subscription) = make_tree_buffer(
-                            buffer_id,
-                            desk.replica_id,
-                            capability,
-                            Vec::new(),
-                            host,
-                            node_id,
-                            cx,
-                        );
-                        desk.buffers.insert(node_id, buffer);
-                        desk._subscriptions.push(subscription);
-                    }
-                    if applied {
-                        for node_id in deleted {
-                            desk.buffers.remove(&node_id);
-                        }
-                    }
-                }
-                rho_desk::BatchOperation::Text {
-                    node_id,
-                    operation,
-                    transaction,
-                } => {
-                    if desk
-                        .document
-                        .apply_text(node_id, operation.clone(), transaction)
-                        .is_err()
-                    {
-                        return true;
-                    }
-                    if let (Some(buffer), Ok(operation)) =
-                        (desk.buffers.get(&node_id), operation.to_text())
-                    {
-                        buffer.update(cx, |buffer, cx| {
-                            buffer.apply_ops([language::Operation::Buffer(operation)], cx)
-                        });
-                    }
-                }
-            }
-        }
-        for operation in record.daemon_tree_operations {
-            if desk.document.apply(operation).is_err() {
-                return true;
-            }
-        }
-        desk.sequence = record.sequence;
-        false
     }
 }
 
-fn make_tree_buffer(
-    buffer_id: BufferId,
-    replica_id: u16,
-    capability: Capability,
-    operations: Vec<rho_desk::TextOperation>,
+/// What the dealer asked for, before it becomes cells.
+#[derive(Clone, Debug)]
+pub enum DeskVerdict {
+    Done,
+    Dismiss,
+    Defer {
+        until: rho_desk::cells::Timestamp,
+    },
+    File {
+        parent: rho_desk::NodeId,
+    },
+    Todo {
+        defer_until: rho_desk::cells::Timestamp,
+        pace: u32,
+    },
+}
+
+pub fn now_timestamp() -> rho_desk::cells::Timestamp {
+    rho_desk::cells::Timestamp {
+        unix_ms: chrono::Utc::now().timestamp_millis(),
+        precision: rho_desk::cells::TimestampPrecision::Millisecond,
+    }
+}
+
+pub fn day_timestamp(date: chrono::NaiveDate) -> rho_desk::cells::Timestamp {
+    rho_desk::cells::Timestamp {
+        unix_ms: date
+            .and_hms_opt(0, 0, 0)
+            .map_or(0, |at| at.and_utc().timestamp_millis()),
+        precision: rho_desk::cells::TimestampPrecision::Day,
+    }
+}
+
+fn parent_write(
+    node_id: rho_desk::NodeId,
+    parent: Option<rho_desk::NodeId>,
+) -> rho_desk::cells::CellWrite {
+    rho_desk::cells::CellWrite {
+        node: node_id,
+        field: rho_desk::cells::Field::Parent,
+        value: rho_desk::cells::Value::Parent(parent),
+    }
+}
+
+/// The eight common fields a client must write to create a note.
+fn create_note_writes(
+    node_id: rho_desk::NodeId,
+    parent: Option<rho_desk::NodeId>,
+    created_at: rho_desk::cells::Timestamp,
+) -> Vec<rho_desk::cells::CellWrite> {
+    use rho_desk::cells::{Field, Value};
+
+    let write = |field, value| rho_desk::cells::CellWrite {
+        node: node_id,
+        field,
+        value,
+    };
+    vec![
+        write(Field::Kind, Value::Kind(rho_desk::cells::NodeKind::Note)),
+        parent_write(node_id, parent),
+        write(Field::Deleted, Value::Bool(false)),
+        write(Field::CreatedAt, Value::Timestamp(created_at)),
+        write(Field::State, Value::State(rho_desk::cells::State::Open)),
+        write(Field::DeferUntil, Value::OptionalTimestamp(None)),
+        write(Field::Deadline, Value::OptionalTimestamp(None)),
+        write(Field::PaceDays, Value::Days(0)),
+    ]
+}
+
+/// Rewrites a machine row's title. A derived row is not a CRDT: it is
+/// replaced wholesale, and its capability keeps the reader from typing into
+/// it.
+pub(crate) fn write_derived_title(
+    buffer: &Entity<Buffer>,
+    title: &str,
+    cx: &mut Context<Workspace>,
+) {
+    buffer.update(cx, |buffer, cx| {
+        if buffer.text() == title {
+            return;
+        }
+        let end = buffer.len();
+        buffer.set_capability(Capability::ReadWrite, cx);
+        buffer.edit([(0..end, title)], None, cx);
+        buffer.set_capability(Capability::ReadOnly, cx);
+    });
+}
+
+/// Watches a note body and sends every local edit to the daemon.
+fn watch_note_buffer(
+    buffer: &Entity<Buffer>,
     host: HostId,
     node_id: rho_desk::NodeId,
     cx: &mut Context<Workspace>,
-) -> (Entity<Buffer>, gpui::Subscription) {
-    let buffer = cx.new(|cx| {
-        let mut buffer = Buffer::remote(buffer_id, ReplicaId::new(replica_id), capability, "");
-        buffer.apply_ops(
-            operations
-                .iter()
-                .filter_map(|operation| operation.to_text().ok())
-                .map(language::Operation::Buffer)
-                .collect::<Vec<_>>(),
-            cx,
-        );
-        buffer
-    });
-    let mut previous_text = buffer.read(cx).text();
-    let mut pending_visible_edit = None;
-    let subscription = cx.subscribe(&buffer, move |workspace, buffer, event, cx| {
-        let current_text = buffer.read(cx).text();
-        match event {
-            BufferEvent::Edited { source } => {
-                pending_visible_edit = source
-                    .is_local()
-                    .then(|| visible_text_edit(&previous_text, &current_text))
-                    .flatten();
-                previous_text = current_text;
-                return;
-            }
-            BufferEvent::Operation {
-                operation: language::Operation::Buffer(operation),
-                is_local: true,
-            } => {
-                let operation = rho_desk::TextOperation::from_text(operation);
-                let timestamp = operation.timestamp();
-                let visible_edit = pending_visible_edit
-                    .take()
-                    .or_else(|| visible_text_edit(&previous_text, &current_text));
-                previous_text = current_text;
-                workspace.send_desk_node_text(
-                    host,
-                    node_id,
-                    operation,
-                    rho_desk::TextTransaction {
-                        id: timestamp,
-                        edit_ids: vec![timestamp],
-                    },
-                    visible_edit,
-                    cx,
-                );
-                return;
-            }
-            BufferEvent::Operation { .. } => {
-                pending_visible_edit = None;
-                previous_text = current_text;
-                return;
-            }
-            _ => return,
+) -> gpui::Subscription {
+    cx.subscribe(buffer, move |workspace, _, event, cx| {
+        if let BufferEvent::Operation {
+            operation: language::Operation::Buffer(operation),
+            is_local: true,
+        } = event
+        {
+            let operation = rho_desk::TextOperation::from_text(operation);
+            let timestamp = operation.timestamp();
+            workspace.send_desk_text(
+                host,
+                node_id,
+                operation,
+                rho_desk::TextTransaction {
+                    id: timestamp,
+                    edit_ids: vec![timestamp],
+                },
+                cx,
+            );
         }
-    });
-    (buffer, subscription)
-}
-
-fn visible_text_edit(before: &str, after: &str) -> Option<(std::ops::Range<usize>, String)> {
-    if before == after {
-        return None;
-    }
-    let start = before
-        .chars()
-        .zip(after.chars())
-        .take_while(|(left, right)| left == right)
-        .map(|(character, _)| character.len_utf8())
-        .sum::<usize>();
-    let suffix = before[start..]
-        .chars()
-        .rev()
-        .zip(after[start..].chars().rev())
-        .take_while(|(left, right)| left == right)
-        .map(|(character, _)| character.len_utf8())
-        .sum::<usize>();
-    let before_end = before.len() - suffix;
-    let after_end = after.len() - suffix;
-    Some((start..before_end, after[start..after_end].to_owned()))
-}
-
-fn new_heading_operation(
-    desk: &mut HostTreeDesk,
-    parent: Option<rho_desk::NodeId>,
-    order: rho_desk::OrderKey,
-) -> Option<rho_desk::TreeOperation> {
-    desk.next_node_counter = desk.next_node_counter.checked_add(1)?;
-    desk.next_tree_clock = desk.next_tree_clock.checked_add(1)?;
-    Some(rho_desk::TreeOperation::Create {
-        timestamp: rho_desk::TreeClock {
-            value: desk.next_tree_clock,
-            replica_id: desk.replica_id,
-        },
-        node_id: rho_desk::NodeId {
-            replica_id: desk.replica_id,
-            counter: desk.next_node_counter,
-        },
-        kind: rho_desk::NodeKind::Heading,
-        owner: rho_desk::NodeOwner::User,
-        parent,
-        order,
     })
 }
 
-fn prose_join_suffix(previous: &str, next: &str) -> String {
-    if !previous.is_empty() && !next.is_empty() && !previous.ends_with('\n') {
-        format!("\n{next}")
-    } else {
-        next.to_owned()
+/// This GUI's device identity, persisted once in the client state directory.
+///
+/// The daemon binds one writer connection per device, and a device's stamps
+/// must keep ascending across restarts, so a fresh id every launch would
+/// both lock the GUI out of a second window and lose that ordering.
+pub fn desk_device() -> rho_desk::cells::DeviceId {
+    #[cfg(test)]
+    {
+        // Tests run several GUIs in one process; each is its own device.
+        rho_desk::cells::DeviceId(uuid::Uuid::new_v4().into_bytes())
     }
-}
-
-fn text_apply_message(replica_id: u16, node_id: rho_desk::NodeId, text: &str) -> ClientMessage {
-    let mut buffer = text::Buffer::new(
-        ReplicaId::new(replica_id),
-        BufferId::new(node_id.counter).expect("nonzero Desk node counter"),
-        "",
-    );
-    let operation = rho_desk::TextOperation::from_text(&buffer.edit([(0..0, text)]));
-    let timestamp = operation.timestamp();
-    ClientMessage::DeskNodeTextApply {
-        node_id,
-        operation,
-        transaction: Some(rho_desk::TextTransaction {
-            id: timestamp,
-            edit_ids: vec![timestamp],
-        }),
-    }
-}
-
-fn append_node_metadata(
-    desk: &mut HostTreeDesk,
-    messages: &mut Vec<ClientMessage>,
-    node_id: rho_desk::NodeId,
-    source: &rho_desk::MaterializedNode,
-) -> Option<()> {
-    for (&kind, &value) in &source.temporal {
-        desk.next_tree_clock = desk.next_tree_clock.checked_add(1)?;
-        messages.push(ClientMessage::DeskTreeApply {
-            operation: rho_desk::TreeOperation::SetTemporal {
-                timestamp: rho_desk::TreeClock {
-                    value: desk.next_tree_clock,
-                    replica_id: desk.replica_id,
-                },
-                node_id,
-                kind,
-                value: Some(value),
-            },
-        });
-    }
-    for (&kind, value) in &source.bindings {
-        desk.next_tree_clock = desk.next_tree_clock.checked_add(1)?;
-        messages.push(ClientMessage::DeskTreeApply {
-            operation: rho_desk::TreeOperation::SetBinding {
-                timestamp: rho_desk::TreeClock {
-                    value: desk.next_tree_clock,
-                    replica_id: desk.replica_id,
-                },
-                node_id,
-                kind,
-                value: Some(value.clone()),
-            },
-        });
-    }
-    for tag in &source.tags {
-        desk.next_tree_clock = desk.next_tree_clock.checked_add(1)?;
-        messages.push(ClientMessage::DeskTreeApply {
-            operation: rho_desk::TreeOperation::SetTag {
-                timestamp: rho_desk::TreeClock {
-                    value: desk.next_tree_clock,
-                    replica_id: desk.replica_id,
-                },
-                node_id,
-                tag: tag.clone(),
-                present: true,
-            },
-        });
-    }
-    Some(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{prose_join_suffix, sequence_has_gap, snapshot_is_stale};
-
-    #[test]
-    fn prose_merge_preserves_the_excerpt_line_boundary() {
-        assert_eq!(prose_join_suffix("before", "after"), "\nafter");
-        assert_eq!(prose_join_suffix("before\n", "after"), "after");
-        assert_eq!(prose_join_suffix("", "after"), "after");
-        assert_eq!(prose_join_suffix("before", ""), "");
-    }
-
-    #[test]
-    fn tree_sequence_accepts_duplicates_and_next_but_detects_loss() {
-        assert!(!sequence_has_gap(7, 7));
-        assert!(!sequence_has_gap(7, 8));
-        assert!(sequence_has_gap(7, 9));
-        assert!(!sequence_has_gap(u64::MAX, u64::MAX));
-    }
-
-    #[test]
-    fn tree_snapshot_never_regresses_live_state() {
-        assert!(snapshot_is_stale(11, 10));
-        assert!(!snapshot_is_stale(11, 11));
-        assert!(!snapshot_is_stale(11, 12));
+    #[cfg(not(test))]
+    {
+        let path = dirs::state_dir().map(|base| base.join("rho").join("desk-device"));
+        if let Some(path) = &path
+            && let Ok(bytes) = std::fs::read(path)
+            && let Ok(bytes) = <[u8; 16]>::try_from(bytes.as_slice())
+        {
+            return rho_desk::cells::DeviceId(bytes);
+        }
+        let device = rho_desk::cells::DeviceId(uuid::Uuid::new_v4().into_bytes());
+        if let Some(path) = &path {
+            if let Some(parent) = path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if let Err(error) = std::fs::write(path, device.0) {
+                tracing::warn!(%error, "could not persist the Desk device id");
+            }
+        }
+        device
     }
 }

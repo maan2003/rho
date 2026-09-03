@@ -38,9 +38,9 @@ pub const AGENT_COST_WINDOW_DAYS: u64 = 7;
 /// Maximum encoded GUI performance snapshot accepted by the daemon.
 pub const MAX_GUI_TELEMETRY_BYTES: usize = 8 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the daemon.
-pub const IROH_ALPN: &[u8] = b"rho/ui/5";
+pub const IROH_ALPN: &[u8] = b"rho/ui/6";
 #[cfg(not(target_family = "wasm"))]
-const PROTOCOL_LOG_MAGIC: &[u8; 4] = b"RUP4";
+const PROTOCOL_LOG_MAGIC: &[u8; 4] = b"RUP5";
 
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -128,6 +128,18 @@ pub fn socket_path() -> anyhow::Result<std::path::PathBuf> {
 pub enum ClientMessage {
     Ping,
     Subscribe,
+    DeskSync {
+        device: desk_tree::cells::DeviceId,
+        known: desk_tree::cells::Version,
+    },
+    DeskMutationApply {
+        mutation: desk_tree::cells::CellMutation,
+    },
+    DeskTextApply {
+        node_id: desk_tree::NodeId,
+        operation: desk_tree::TextOperation,
+        transaction: Option<desk_tree::TextTransaction>,
+    },
     /// Refreshes only the structured Desk stream after sequence loss.
     DeskTreeSubscribe,
     /// Fetches the native Desk tree without allocating a replica.
@@ -147,6 +159,7 @@ pub enum ClientMessage {
         request_id: u64,
         parent: desk_tree::NodeId,
         page_id: desk_tree::PageId,
+        url: String,
     },
     DeskPageUnbind {
         request_id: u64,
@@ -594,6 +607,27 @@ pub struct LandLeaseHolder {
 #[derive(Clone, Debug, PartialEq, Encode, Decode, Pack, Unpack)]
 pub enum ServerMessage {
     Pong,
+    DeskSynced {
+        node_namespace: u16,
+        delta: desk_tree::cells::Snapshot,
+        texts: Vec<desk_tree::NodeTextSnapshot>,
+    },
+    DeskMutationAccepted {
+        stamp: desk_tree::cells::Stamp,
+    },
+    DeskMutationRejected {
+        stamp: desk_tree::cells::Stamp,
+        reason: String,
+    },
+    DeskCellsAvailable {
+        frontier: desk_tree::cells::Version,
+    },
+    DeskTextApplied {
+        node_id: desk_tree::NodeId,
+        operation: desk_tree::TextOperation,
+        transaction: Option<desk_tree::TextTransaction>,
+    },
+    DeskResyncRequired,
     DeskTreeSnapshot {
         snapshot: desk_tree::Snapshot,
         replica_id: u16,
@@ -1311,8 +1345,76 @@ mod tests {
 
     #[test]
     fn protocol_log_rejects_previous_wire_epoch() {
-        let mut old = &b"RUP3"[..];
+        let mut old = &b"RUP4"[..];
         assert!(read_protocol_log_record(&mut old).is_err());
+    }
+
+    #[test]
+    fn desk_cells_messages_round_trip() {
+        use desk_tree::cells::{CellMutation, CellWrite, DeviceId, Field, Stamp, Value, Version};
+
+        let device = DeviceId([7; 16]);
+        let node = desk_tree::NodeId {
+            replica_id: 4,
+            counter: 9,
+        };
+        let mutation = CellMutation {
+            stamp: Stamp {
+                device,
+                version: 12,
+            },
+            writes: vec![CellWrite {
+                node,
+                field: Field::Tag("next".into()),
+                value: Value::Bool(true),
+            }],
+            verdict: None,
+        };
+        let text_operation = desk_tree::TextOperation::Edit {
+            timestamp: desk_tree::TreeClock {
+                value: 1,
+                replica_id: 4,
+            },
+            version: Vec::new(),
+            ranges: vec![(0, 0)],
+            new_text: vec!["note".into()],
+        };
+        for message in [
+            ClientMessage::DeskSync {
+                device,
+                known: Version::from([(device, 11)]),
+            },
+            ClientMessage::DeskMutationApply { mutation },
+            ClientMessage::DeskTextApply {
+                node_id: node,
+                operation: text_operation.clone(),
+                transaction: None,
+            },
+        ] {
+            let bytes = senax_encoder::pack(&message).unwrap();
+            let mut slice: &[u8] = &bytes;
+            let decoded: ClientMessage = senax_encoder::unpack(&mut slice).unwrap();
+            assert_eq!(decoded, message);
+        }
+        let message = ServerMessage::DeskSynced {
+            node_namespace: 4,
+            delta: desk_tree::cells::Snapshot::default(),
+            texts: Vec::new(),
+        };
+        let bytes = senax_encoder::pack(&message).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded: ServerMessage = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(decoded, message);
+
+        let message = ServerMessage::DeskTextApplied {
+            node_id: node,
+            operation: text_operation,
+            transaction: None,
+        };
+        let bytes = senax_encoder::pack(&message).unwrap();
+        let mut slice: &[u8] = &bytes;
+        let decoded: ServerMessage = senax_encoder::unpack(&mut slice).unwrap();
+        assert_eq!(decoded, message);
     }
 
     #[test]

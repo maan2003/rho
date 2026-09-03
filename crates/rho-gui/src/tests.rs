@@ -453,72 +453,53 @@ fn phone_empty_feed_flick_down_undoes_the_last_verdict(cx: &mut TestAppContext) 
 }
 
 #[gpui::test]
-fn phone_blocks_navigation_while_a_tree_verdict_is_pending(cx: &mut TestAppContext) {
-    use rho_desk::{
-        BatchOpRecord, Document, NodeId, NodeKind, NodeOwner, OrderKey, Replica, ReplicaAuthor,
-        TextOperation, TreeClock, TreeOperation,
-    };
-
-    let mut document = Document::default();
-    document.add_replica(Replica {
-        replica_id: 1,
-        author: ReplicaAuthor::Machine,
-    });
-    let heading = NodeId {
-        replica_id: 1,
-        counter: 1,
-    };
-    document
-        .apply(TreeOperation::Create {
-            timestamp: TreeClock {
-                value: 1,
-                replica_id: 1,
-            },
-            node_id: heading,
-            kind: NodeKind::Heading,
-            owner: NodeOwner::User,
-            parent: None,
-            order: OrderKey(vec![100]),
-        })
-        .unwrap();
-    document
-        .apply(TreeOperation::SetTemporal {
-            timestamp: TreeClock {
-                value: 2,
-                replica_id: 1,
-            },
-            node_id: heading,
-            kind: rho_desk::TemporalKind::Todo,
-            value: Some(rho_desk::TemporalMark {
-                year: 2020,
-                month: 1,
-                day: 1,
-                minute_of_day: None,
-                pace_days: 1,
-            }),
-        })
-        .unwrap();
-    let mut title = text::Buffer::new(text::ReplicaId::new(1), text::BufferId::new(1).unwrap(), "");
-    document
-        .apply_text(
-            heading,
-            TextOperation::from_text(&title.edit([(0..0, "Pending phone verdict")])),
-            None,
-        )
-        .unwrap();
+fn deleting_the_top_row_leaves_the_cursor_on_a_live_row(cx: &mut TestAppContext) {
+    // Nothing sits above the first root, and its child follows it out of the
+    // tree, so the cursor has to fall to the next root. Landing on neither
+    // used to swallow the next structure keypress.
+    let mut desk = DeskFixture::new();
+    let first = desk.note(None, "First root");
+    desk.note(Some(first), "Its child");
+    let second = desk.note(None, "Second root");
 
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskTreeSnapshot {
-                    snapshot: document.snapshot(),
-                    replica_id: 42,
-                },
-                window,
-                cx,
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.take_host_messages_for_test(HostId::default());
+            assert_eq!(
+                workspace
+                    .desk_cells
+                    .row_after_delete(HostId::default(), first),
+                Some(second)
             );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn phone_blocks_navigation_while_a_tree_verdict_is_pending(cx: &mut TestAppContext) {
+    // A note woken long ago, so the dealer offers it as a card.
+    let mut desk = DeskFixture::new();
+    let note = desk.note(None, "Pending phone verdict");
+    desk.set(
+        note,
+        rho_desk::cells::Field::DeferUntil,
+        rho_desk::cells::Value::OptionalTimestamp(Some(rho_desk::cells::Timestamp {
+            unix_ms: 1_577_836_800_000,
+            precision: rho_desk::cells::TimestampPrecision::Day,
+        })),
+    );
+    desk.set(
+        note,
+        rho_desk::cells::Field::PaceDays,
+        rho_desk::cells::Value::Days(1),
+    );
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
             workspace.take_host_messages_for_test(HostId::default());
         })
         .unwrap();
@@ -535,16 +516,11 @@ fn phone_blocks_navigation_while_a_tree_verdict_is_pending(cx: &mut TestAppConte
     cx.dispatch_action(*workspace, crate::DashboardDealDone);
     cx.dispatch_action(*workspace, crate::UndoVerdict);
     cx.run_until_parked();
-    let verdict_batch = workspace
+    let verdict_stamp = workspace
         .update(cx, |workspace, _, _| {
-            workspace
-                .take_host_messages_for_test(HostId::default())
-                .into_iter()
-                .find_map(|message| match message {
-                    rho_ui_proto::ClientMessage::DeskTreeBatchApply { batch } => Some(batch),
-                    _ => None,
-                })
-                .expect("tree verdict batch")
+            take_desk_mutation(workspace, HostId::default())
+                .expect("tree verdict mutation")
+                .stamp
         })
         .unwrap();
 
@@ -589,7 +565,7 @@ fn phone_blocks_navigation_while_a_tree_verdict_is_pending(cx: &mut TestAppConte
                     .into_iter()
                     .all(|message| !matches!(
                         message,
-                        rho_ui_proto::ClientMessage::DeskTreeBatchApply { .. }
+                        rho_ui_proto::ClientMessage::DeskMutationApply { .. }
                     ))
             );
         })
@@ -599,12 +575,9 @@ fn phone_blocks_navigation_while_a_tree_verdict_is_pending(cx: &mut TestAppConte
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(
                 HostId::default(),
-                ConnEvent::DeskTreeBatchApplied(BatchOpRecord {
-                    sequence: 1,
-                    timestamp_ms: 1,
-                    batch: verdict_batch,
-                    daemon_tree_operations: Vec::new(),
-                }),
+                ConnEvent::DeskMutationAccepted {
+                    stamp: verdict_stamp,
+                },
                 window,
                 cx,
             );
@@ -640,28 +613,18 @@ fn phone_blocks_navigation_while_a_tree_verdict_is_pending(cx: &mut TestAppConte
     })
     .unwrap();
     cx.run_until_parked();
-    let undo_batch = workspace
+    let undo_stamp = workspace
         .update(cx, |workspace, _, _| {
-            workspace
-                .take_host_messages_for_test(HostId::default())
-                .into_iter()
-                .find_map(|message| match message {
-                    rho_ui_proto::ClientMessage::DeskTreeBatchApply { batch } => Some(batch),
-                    _ => None,
-                })
-                .expect("tree verdict undo batch")
+            take_desk_mutation(workspace, HostId::default())
+                .expect("tree verdict undo mutation")
+                .stamp
         })
         .unwrap();
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(
                 HostId::default(),
-                ConnEvent::DeskTreeBatchApplied(BatchOpRecord {
-                    sequence: 2,
-                    timestamp_ms: 2,
-                    batch: undo_batch,
-                    daemon_tree_operations: Vec::new(),
-                }),
+                ConnEvent::DeskMutationAccepted { stamp: undo_stamp },
                 window,
                 cx,
             );
@@ -3656,73 +3619,16 @@ fn ordinary_ready_does_not_replay_but_reconnect_resubscribes_retained_transcript
 
 #[gpui::test]
 fn dealer_recompute_keeps_only_top_three_agent_cards_warm(cx: &mut TestAppContext) {
-    use rho_desk::{
-        Binding, BindingKind, Document, NodeId, NodeKind, NodeOwner, OrderKey, Replica,
-        ReplicaAuthor, TextOperation, TreeClock, TreeOperation,
-    };
     use rho_ui_proto::{
         AgentDisposition, AgentRole, AuthState, ClientMessage, UiAgentFacts, UiAgentSummary,
         UiAttention, WorkspaceInfo,
     };
 
     let ids = [agent(21), agent(22), agent(23), agent(24)];
-    let mut document = Document::default();
-    document.add_replica(Replica {
-        replica_id: 1,
-        author: ReplicaAuthor::Machine,
-    });
+    let mut desk = DeskFixture::new();
     for (index, agent_id) in ids.iter().copied().enumerate() {
-        let heading = NodeId {
-            replica_id: 1,
-            counter: index as u64 * 2 + 1,
-        };
-        let row = NodeId {
-            replica_id: 1,
-            counter: index as u64 * 2 + 2,
-        };
-        for (offset, node_id, kind, owner, parent) in [
-            (0, heading, NodeKind::Heading, NodeOwner::User, None),
-            (1, row, NodeKind::Agent, NodeOwner::Machine, Some(heading)),
-        ] {
-            document
-                .apply(TreeOperation::Create {
-                    timestamp: TreeClock {
-                        value: (index * 3 + offset + 1) as u32,
-                        replica_id: 1,
-                    },
-                    node_id,
-                    kind,
-                    owner,
-                    parent,
-                    order: OrderKey(vec![(index as u16 + 1) * 20]),
-                })
-                .unwrap();
-        }
-        document
-            .apply(TreeOperation::SetBinding {
-                timestamp: TreeClock {
-                    value: (index * 3 + 3) as u32,
-                    replica_id: 1,
-                },
-                node_id: row,
-                kind: BindingKind::Agent,
-                value: Some(Binding::Agent(agent_id)),
-            })
-            .unwrap();
-        let mut title = text::Buffer::new(
-            text::ReplicaId::new(1),
-            text::BufferId::new(index as u64 + 1).unwrap(),
-            "",
-        );
-        document
-            .apply_text(
-                heading,
-                TextOperation::from_text(
-                    &title.edit([(0..0, format!("Warm agent {}", index + 1))]),
-                ),
-                None,
-            )
-            .unwrap();
+        let heading = desk.note(None, &format!("Warm agent {}", index + 1));
+        desk.agent_row(heading, agent_id);
     }
     let summaries = ids
         .iter()
@@ -3758,15 +3664,7 @@ fn dealer_recompute_keeps_only_top_three_agent_cards_warm(cx: &mut TestAppContex
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskTreeSnapshot {
-                    snapshot: document.snapshot(),
-                    replica_id: 42,
-                },
-                window,
-                cx,
-            );
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
             workspace.handle_event(
                 HostId::default(),
                 ConnEvent::Ready {
@@ -4232,55 +4130,14 @@ fn filing_completion_keeps_duplicate_heading_identity() {
 
 #[gpui::test]
 fn deal_file_bare_enter_uses_the_offered_heading_completion(cx: &mut TestAppContext) {
-    use rho_desk::{
-        Document, NodeId, NodeKind, NodeOwner, OrderKey, Replica, ReplicaAuthor, TextOperation,
-        TreeClock, TreeOperation,
-    };
-
-    let mut document = Document::default();
-    document.add_replica(Replica {
-        replica_id: 1,
-        author: ReplicaAuthor::Machine,
-    });
-    let destination = NodeId {
-        replica_id: 1,
-        counter: 1,
-    };
-    document
-        .apply(TreeOperation::Create {
-            timestamp: TreeClock {
-                value: 1,
-                replica_id: 1,
-            },
-            node_id: destination,
-            kind: NodeKind::Heading,
-            owner: NodeOwner::User,
-            parent: None,
-            order: OrderKey(vec![100]),
-        })
-        .unwrap();
-    let mut title = text::Buffer::new(text::ReplicaId::new(1), text::BufferId::new(1).unwrap(), "");
-    document
-        .apply_text(
-            destination,
-            TextOperation::from_text(&title.edit([(0..0, "Verdict agent")])),
-            None,
-        )
-        .unwrap();
+    let mut desk = DeskFixture::new();
+    let destination = desk.note(None, "Verdict agent");
 
     cx.update(bind_test_keymaps);
     let workspace = test_workspace(cx);
     let inbox_id = workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskTreeSnapshot {
-                    snapshot: document.snapshot(),
-                    replica_id: 42,
-                },
-                window,
-                cx,
-            );
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
             let id = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
                 kind: crate::inbox::InboxKind::Capture,
                 text: "Inbox QA item".into(),
@@ -4313,55 +4170,40 @@ fn deal_file_bare_enter_uses_the_offered_heading_completion(cx: &mut TestAppCont
     // dealer flow: bare Enter must accept it rather than submit an empty name.
     cx.dispatch_action(*workspace, crate::MinibufferConfirm);
     cx.run_until_parked();
-    let messages = workspace
+    // Filing creates the note first; its title arrives as text once the
+    // daemon has accepted that creation.
+    let (created, stamp) = workspace
         .update(cx, |workspace, _, _| {
-            workspace.take_host_messages_for_test(HostId::default())
+            let messages = workspace.take_host_messages_for_test(HostId::default());
+            let mutation = messages
+                .iter()
+                .find_map(|message| match message {
+                    rho_ui_proto::ClientMessage::DeskMutationApply { mutation } => Some(mutation),
+                    _ => None,
+                })
+                .expect("filing mutation");
+            let created = mutation
+                .writes
+                .iter()
+                .find_map(|write| {
+                    (write.field == rho_desk::cells::Field::Parent
+                        && write.value == rho_desk::cells::Value::Parent(Some(destination)))
+                    .then_some(write.node)
+                })
+                .expect("note filed under the offered heading");
+            // The title follows the creation on the same ordered connection.
+            assert!(messages.iter().any(|message| matches!(
+                message,
+                rho_ui_proto::ClientMessage::DeskTextApply { node_id, .. } if *node_id == created
+            )));
+            (created, mutation.stamp)
         })
         .unwrap();
-    assert!(messages.iter().any(|message| matches!(
-        message,
-        rho_ui_proto::ClientMessage::DeskTreeApply {
-            operation: TreeOperation::Create {
-                parent: Some(parent),
-                ..
-            }
-        } if *parent == destination
-    )));
-    assert!(messages.iter().any(|message| matches!(
-        message,
-        rho_ui_proto::ClientMessage::DeskNodeTextApply { .. }
-    )));
-    let created = messages
-        .iter()
-        .find_map(|message| match message {
-            rho_ui_proto::ClientMessage::DeskTreeApply {
-                operation: TreeOperation::Create { node_id, .. },
-            } => Some(*node_id),
-            _ => None,
-        })
-        .unwrap();
-    let (title_operation, title_transaction) = messages
-        .iter()
-        .find_map(|message| match message {
-            rho_ui_proto::ClientMessage::DeskNodeTextApply {
-                node_id,
-                operation,
-                transaction,
-            } if *node_id == created => Some((operation.clone(), transaction.clone())),
-            _ => None,
-        })
-        .expect("filing title edit");
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(
                 HostId::default(),
-                ConnEvent::DeskNodeTextApplied(rho_desk::TextOpRecord {
-                    sequence: 1,
-                    timestamp_ms: 1,
-                    node_id: created,
-                    operation: title_operation,
-                    transaction: title_transaction,
-                }),
+                ConnEvent::DeskMutationAccepted { stamp },
                 window,
                 cx,
             );
@@ -4370,33 +4212,21 @@ fn deal_file_bare_enter_uses_the_offered_heading_completion(cx: &mut TestAppCont
         })
         .unwrap();
     cx.dispatch_action(*workspace, crate::UndoVerdict);
-    let undo_batch = workspace
+    let undo_stamp = workspace
         .update(cx, |workspace, _, _| {
-            workspace
-                .take_host_messages_for_test(HostId::default())
-                .into_iter()
-                .find_map(|message| match message {
-                    rho_ui_proto::ClientMessage::DeskTreeBatchApply { batch } => Some(batch),
-                    _ => None,
-                })
-                .expect("filing undo batch")
+            let mutation =
+                take_desk_mutation(workspace, HostId::default()).expect("filing undo mutation");
+            assert!(mutation.writes.iter().any(|write| write.node == created
+                && write.field == rho_desk::cells::Field::Deleted
+                && write.value == rho_desk::cells::Value::Bool(true)));
+            mutation.stamp
         })
         .unwrap();
-    assert!(undo_batch.operations.iter().any(|operation| matches!(
-        operation,
-        rho_desk::BatchOperation::Tree(TreeOperation::Delete { node_ids, .. })
-            if node_ids == &vec![created]
-    )));
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(
                 HostId::default(),
-                ConnEvent::DeskTreeBatchApplied(rho_desk::BatchOpRecord {
-                    sequence: 2,
-                    timestamp_ms: 2,
-                    batch: undo_batch,
-                    daemon_tree_operations: Vec::new(),
-                }),
+                ConnEvent::DeskMutationAccepted { stamp: undo_stamp },
                 window,
                 cx,
             );
@@ -4419,6 +4249,8 @@ fn deal_file_bare_enter_uses_the_offered_heading_completion(cx: &mut TestAppCont
         })
         .unwrap();
 
+    // Filing again, then giving the filed note a child: the undo no longer
+    // owns a bare leaf, so it refuses rather than deleting someone's work.
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.prepare_deal_filing_for_test(inbox_id.clone());
@@ -4432,50 +4264,39 @@ fn deal_file_bare_enter_uses_the_offered_heading_completion(cx: &mut TestAppCont
         })
         .unwrap();
     cx.run_until_parked();
-    let second_created = workspace
+    let (second_created, second_stamp) = workspace
         .update(cx, |workspace, _, _| {
-            workspace
-                .take_host_messages_for_test(HostId::default())
-                .into_iter()
-                .find_map(|message| match message {
-                    rho_ui_proto::ClientMessage::DeskTreeApply {
-                        operation: TreeOperation::Create { node_id, .. },
-                    } => Some(node_id),
-                    _ => None,
+            let mutation =
+                take_desk_mutation(workspace, HostId::default()).expect("second filing mutation");
+            let created = mutation
+                .writes
+                .iter()
+                .find_map(|write| {
+                    (write.field == rho_desk::cells::Field::Parent
+                        && write.value == rho_desk::cells::Value::Parent(Some(destination)))
+                    .then_some(write.node)
                 })
-                .unwrap()
-        })
-        .unwrap();
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(workspace.verdict_undo_count_for_test(), 1);
+                .expect("second note filed under the offered heading");
+            (created, mutation.stamp)
         })
         .unwrap();
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(
                 HostId::default(),
-                ConnEvent::DeskTreeApplied(rho_desk::TreeOpRecord {
-                    sequence: 3,
-                    timestamp_ms: 3,
-                    operation: TreeOperation::Create {
-                        timestamp: TreeClock {
-                            value: 10_000,
-                            replica_id: 42,
-                        },
-                        node_id: NodeId {
-                            replica_id: 42,
-                            counter: 10_000,
-                        },
-                        kind: NodeKind::Heading,
-                        owner: NodeOwner::User,
-                        parent: Some(second_created),
-                        order: OrderKey(vec![100]),
-                    },
-                }),
+                ConnEvent::DeskMutationAccepted {
+                    stamp: second_stamp,
+                },
                 window,
                 cx,
             );
+            assert_eq!(workspace.verdict_undo_count_for_test(), 1);
+        })
+        .unwrap();
+    let child_note = desk.new_node(rho_desk::cells::NodeKind::Note, Some(second_created));
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
             workspace.undo_verdict(window, cx);
             assert_eq!(
                 workspace.echo_text_for_test(),
@@ -4488,15 +4309,12 @@ fn deal_file_bare_enter_uses_the_offered_heading_completion(cx: &mut TestAppCont
                     .iter()
                     .all(|message| !matches!(
                         message,
-                        rho_ui_proto::ClientMessage::DeskTreeBatchApply { .. }
+                        rho_ui_proto::ClientMessage::DeskMutationApply { .. }
                     ))
             );
-            let nodes =
-                Document::from_snapshot(workspace.desk_snapshot_for_test(HostId::default()))
-                    .unwrap()
-                    .materialize();
+            let nodes = workspace.desk_cells_snapshot_for_test(HostId::default());
             assert!(nodes.iter().any(|node| node.id == second_created));
-            assert!(nodes.iter().any(|node| node.parent == Some(second_created)));
+            assert!(nodes.iter().any(|node| node.id == child_note));
         })
         .unwrap();
 }
@@ -4724,72 +4542,29 @@ fn undo_verdict_with_empty_stack_echoes(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppContext) {
-    use rho_desk::{
-        BatchOpRecord, Document, NodeId, NodeKind, NodeOwner, OrderKey, Replica, ReplicaAuthor,
-        TemporalKind, TemporalMark, TextOperation, TreeClock, TreeOperation,
+    // A woken note with a cadence: dealt, then undone back to exactly the
+    // cells the verdict replaced.
+    let mut desk = DeskFixture::new();
+    let note = desk.note(None, "Named card");
+    let woke = rho_desk::cells::Timestamp {
+        unix_ms: 1_577_836_800_000,
+        precision: rho_desk::cells::TimestampPrecision::Day,
     };
-
-    let mut document = Document::default();
-    document.add_replica(Replica {
-        replica_id: 1,
-        author: ReplicaAuthor::Machine,
-    });
-    let heading = NodeId {
-        replica_id: 1,
-        counter: 1,
-    };
-    document
-        .apply(TreeOperation::Create {
-            timestamp: TreeClock {
-                value: 1,
-                replica_id: 1,
-            },
-            node_id: heading,
-            kind: NodeKind::Heading,
-            owner: NodeOwner::User,
-            parent: None,
-            order: OrderKey(vec![100]),
-        })
-        .unwrap();
-    let prior = TemporalMark {
-        year: 2020,
-        month: 1,
-        day: 1,
-        minute_of_day: None,
-        pace_days: 1,
-    };
-    document
-        .apply(TreeOperation::SetTemporal {
-            timestamp: TreeClock {
-                value: 2,
-                replica_id: 1,
-            },
-            node_id: heading,
-            kind: TemporalKind::Todo,
-            value: Some(prior),
-        })
-        .unwrap();
-    let mut title = text::Buffer::new(text::ReplicaId::new(1), text::BufferId::new(1).unwrap(), "");
-    document
-        .apply_text(
-            heading,
-            TextOperation::from_text(&title.edit([(0..0, "Named card")])),
-            None,
-        )
-        .unwrap();
+    desk.set(
+        note,
+        rho_desk::cells::Field::DeferUntil,
+        rho_desk::cells::Value::OptionalTimestamp(Some(woke)),
+    );
+    desk.set(
+        note,
+        rho_desk::cells::Field::PaceDays,
+        rho_desk::cells::Value::Days(1),
+    );
 
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskTreeSnapshot {
-                    snapshot: document.snapshot(),
-                    replica_id: 42,
-                },
-                window,
-                cx,
-            );
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
             workspace.open_deal_mode(window, cx);
             workspace.take_host_messages_for_test(HostId::default());
         })
@@ -4799,30 +4574,22 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
         ($action:expr, $echo:literal) => {{
             cx.dispatch_action(*workspace, $action);
             cx.run_until_parked();
-            let batch = workspace
+            let stamp = workspace
                 .update(cx, |workspace, _, _| {
-                    workspace
-                        .take_host_messages_for_test(HostId::default())
-                        .into_iter()
-                        .find_map(|message| match message {
-                            rho_ui_proto::ClientMessage::DeskTreeBatchApply { batch } => {
-                                Some(batch)
-                            }
-                            _ => None,
-                        })
-                        .expect("verdict batch")
+                    let mutation = take_desk_mutation(workspace, HostId::default())
+                        .expect("verdict mutation");
+                    assert!(matches!(
+                        mutation.verdict,
+                        Some((_, rho_desk::cells::VerdictEvent::Applied { .. }))
+                    ));
+                    mutation.stamp
                 })
                 .unwrap();
             workspace
                 .update(cx, |workspace, window, cx| {
                     workspace.handle_event(
                         HostId::default(),
-                        ConnEvent::DeskTreeBatchApplied(BatchOpRecord {
-                            sequence: 1,
-                            timestamp_ms: 1,
-                            batch,
-                            daemon_tree_operations: Vec::new(),
-                        }),
+                        ConnEvent::DeskMutationAccepted { stamp },
                         window,
                         cx,
                     );
@@ -4830,39 +4597,31 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
                 })
                 .unwrap();
             cx.dispatch_action(*workspace, crate::UndoVerdict);
-            let undo_batch = workspace
+            let undo_stamp = workspace
                 .update(cx, |workspace, _, _| {
-                    let node = Document::from_snapshot(
-                        workspace.desk_snapshot_for_test(HostId::default()),
-                    )
-                    .unwrap()
-                    .materialize()
-                    .into_iter()
-                    .find(|node| node.id == heading)
-                    .unwrap();
-                    assert_eq!(node.temporal.get(&TemporalKind::Todo), Some(&prior));
-                    workspace
-                        .take_host_messages_for_test(HostId::default())
+                    let mutation =
+                        take_desk_mutation(workspace, HostId::default()).expect("undo mutation");
+                    // Undo is the log's own inverse, not a replayed edit.
+                    assert!(matches!(
+                        mutation.verdict,
+                        Some((_, rho_desk::cells::VerdictEvent::Undone { of })) if of == stamp
+                    ));
+                    let node = workspace
+                        .desk_cells_snapshot_for_test(HostId::default())
                         .into_iter()
-                        .find_map(|message| match message {
-                            rho_ui_proto::ClientMessage::DeskTreeBatchApply { batch } => {
-                                Some(batch)
-                            }
-                            _ => None,
-                        })
-                        .expect("undo batch")
+                        .find(|candidate| candidate.id == note)
+                        .unwrap();
+                    assert_eq!(node.state, rho_desk::cells::State::Open);
+                    assert_eq!(node.defer_until, Some(woke));
+                    assert_eq!(node.pace_days, 1);
+                    mutation.stamp
                 })
                 .unwrap();
             workspace
                 .update(cx, |workspace, window, cx| {
                     workspace.handle_event(
                         HostId::default(),
-                        ConnEvent::DeskTreeBatchApplied(BatchOpRecord {
-                            sequence: 2,
-                            timestamp_ms: 2,
-                            batch: undo_batch,
-                            daemon_tree_operations: Vec::new(),
-                        }),
+                        ConnEvent::DeskMutationAccepted { stamp: undo_stamp },
                         window,
                         cx,
                     );
@@ -4870,7 +4629,7 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
                         workspace.current_deal_card_for_test().map(|card| card.0),
                         Some(crate::dashboard::DealCardIdentity::Tree {
                             host: HostId::default(),
-                            node_id: heading,
+                            node_id: note,
                         })
                     );
                     assert_eq!(
@@ -4893,14 +4652,9 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
     cx.dispatch_action(*workspace, crate::DashboardDealDone);
     let delayed = workspace
         .update(cx, |workspace, _, _| {
-            workspace
-                .take_host_messages_for_test(HostId::default())
-                .into_iter()
-                .find_map(|message| match message {
-                    rho_ui_proto::ClientMessage::DeskTreeBatchApply { batch } => Some(batch),
-                    _ => None,
-                })
-                .unwrap()
+            take_desk_mutation(workspace, HostId::default())
+                .expect("delayed verdict mutation")
+                .stamp
         })
         .unwrap();
     workspace
@@ -4915,12 +4669,7 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
             workspace.reopen_deal_for_test(replacement);
             workspace.handle_event(
                 HostId::default(),
-                ConnEvent::DeskTreeBatchApplied(BatchOpRecord {
-                    sequence: 3,
-                    timestamp_ms: 3,
-                    batch: delayed,
-                    daemon_tree_operations: Vec::new(),
-                }),
+                ConnEvent::DeskMutationAccepted { stamp: delayed },
                 window,
                 cx,
             );
@@ -5853,103 +5602,34 @@ fn streaming_markdown_parses_the_edited_turn_without_revisiting_history(cx: &mut
 
 #[gpui::test]
 fn tree_desk_composes_one_native_buffer_per_node(cx: &mut TestAppContext) {
-    use rho_desk::{
-        Document, NodeId, NodeKind, NodeOwner, OrderKey, Replica, ReplicaAuthor, TextOperation,
-        TreeClock, TreeOperation,
-    };
-
-    let mut document = Document::default();
-    document.add_replica(Replica {
-        replica_id: 1,
-        author: ReplicaAuthor::Machine,
-    });
-    let heading = NodeId {
-        replica_id: 1,
-        counter: 1,
-    };
-    let prose = NodeId {
-        replica_id: 1,
-        counter: 2,
-    };
-    let agent_row = NodeId {
-        replica_id: 1,
-        counter: 3,
-    };
-    for (clock, id, kind, owner, parent) in [
-        (1, heading, NodeKind::Heading, NodeOwner::User, None),
-        (2, prose, NodeKind::Prose, NodeOwner::User, Some(heading)),
-        (
-            3,
-            agent_row,
-            NodeKind::Agent,
-            NodeOwner::Machine,
-            Some(heading),
-        ),
-    ] {
-        document
-            .apply(TreeOperation::Create {
-                timestamp: TreeClock {
-                    value: clock,
-                    replica_id: 1,
-                },
-                node_id: id,
-                kind,
-                owner,
-                parent,
-                order: OrderKey(vec![100]),
-            })
-            .unwrap();
-    }
-    for (clock, id, kind) in [
-        (4, heading, rho_desk::TemporalKind::Todo),
-        (5, prose, rho_desk::TemporalKind::Deadline),
-    ] {
-        document
-            .apply(TreeOperation::SetTemporal {
-                timestamp: TreeClock {
-                    value: clock,
-                    replica_id: 1,
-                },
-                node_id: id,
-                kind,
-                value: Some(rho_desk::TemporalMark {
-                    year: 2026,
-                    month: 3,
-                    day: 1,
-                    minute_of_day: None,
-                    pace_days: 1,
-                }),
-            })
-            .unwrap();
-    }
-    for (id, value) in [(heading, "Parent"), (prose, "body\n"), (agent_row, "agent")] {
-        let mut buffer = text::Buffer::new(
-            text::ReplicaId::new(1),
-            text::BufferId::new(id.counter).unwrap(),
-            "",
-        );
-        document
-            .apply_text(
-                id,
-                TextOperation::from_text(&buffer.edit([(0..0, value)])),
-                None,
-            )
-            .unwrap();
-    }
+    // A note with a child note and a machine agent row: one buffer each,
+    // composed into the one editor the user types in.
+    let mut desk = DeskFixture::new();
+    let parent = desk.note(None, "Parent");
+    let child = desk.note(Some(parent), "body");
+    let agent_row = desk.agent_row(parent, agent(31));
+    desk.set(
+        parent,
+        rho_desk::cells::Field::DeferUntil,
+        rho_desk::cells::Value::OptionalTimestamp(Some(rho_desk::cells::Timestamp {
+            unix_ms: 1_772_323_200_000,
+            precision: rho_desk::cells::TimestampPrecision::Day,
+        })),
+    );
+    desk.set(
+        child,
+        rho_desk::cells::Field::Deadline,
+        rho_desk::cells::Value::OptionalTimestamp(Some(rho_desk::cells::Timestamp {
+            unix_ms: 1_772_323_200_000,
+            precision: rho_desk::cells::TimestampPrecision::Day,
+        })),
+    );
 
     cx.update(bind_test_keymaps);
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskTreeSnapshot {
-                    snapshot: document.snapshot(),
-                    replica_id: 42,
-                },
-                window,
-                cx,
-            );
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
         })
         .unwrap();
     cx.run_until_parked();
@@ -5964,87 +5644,28 @@ fn tree_desk_composes_one_native_buffer_per_node(cx: &mut TestAppContext) {
                 .text()
         })
         .unwrap();
-    assert_eq!(text, "Parent\nbody\n\nagent");
+    assert_eq!(text, "Parent\nbody\n");
     workspace
         .update(cx, |workspace, _, cx| {
+            // The dated note and its dated child each carry one hint.
             assert_eq!(workspace.dashboard_editor().read(cx).eol_hints().len(), 2);
-        })
-        .unwrap();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            let editor = workspace.dashboard_editor();
-            editor.update(cx, |editor, cx| {
-                editor.change_selections(Default::default(), window, cx, |selections| {
-                    let offset = editor::MultiBufferOffset(3);
-                    selections.select_ranges([offset..offset]);
-                });
-            });
-            let mut replacement = document.snapshot();
-            replacement.sequence = 1;
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskTreeReplaced(replacement),
-                window,
-                cx,
+            assert!(
+                workspace
+                    .tree_buffer_for_test(HostId::default(), agent_row)
+                    .is_some(),
+                "the machine row still gets its own derived buffer"
             );
         })
         .unwrap();
-    cx.simulate_keystrokes(*workspace, "i X escape");
-    cx.run_until_parked();
-    let after_replacement = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .dashboard_editor()
-                .read(cx)
-                .buffer()
-                .read(cx)
-                .snapshot(cx)
-                .text()
-        })
-        .unwrap();
-    assert!(
-        after_replacement.starts_with("ParXent"),
-        "replacement cursor moved: {after_replacement:?}"
-    );
-    workspace
-        .update(cx, |workspace, window, cx| {
-            let editor = workspace.dashboard_editor();
-            window.focus(&editor.read(cx).focus_handle(cx), cx);
-            editor.update(cx, |editor, cx| {
-                editor.change_selections(Default::default(), window, cx, |selections| {
-                    let offset = editor::MultiBufferOffset(0);
-                    selections.select_ranges([offset..offset]);
-                });
-            });
-        })
-        .unwrap();
-    cx.simulate_keystrokes(*workspace, "escape tab");
-    cx.run_until_parked();
-    let folded = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .dashboard_editor()
-                .update(cx, |editor, cx| editor.display_text(cx))
-        })
-        .unwrap();
-    assert!(folded.contains("ParXent"), "folded display: {folded:?}");
-    assert!(!folded.contains("body"), "folded display: {folded:?}");
 
-    // Marker recognition runs between the space and the next keystroke: the
-    // remaining title input must land in the optimistically-created heading
-    // buffer, not in the prose buffer that contained the marker.
-    cx.simulate_keystrokes(*workspace, "tab");
+    // `* ` at the start of a line is the one recognition kept: it creates a
+    // note rather than leaving stars in the text.
     workspace
         .update(cx, |workspace, window, cx| {
-            let editor = workspace.dashboard_editor();
-            editor.update(cx, |editor, cx| {
-                editor.change_selections(Default::default(), window, cx, |selections| {
-                    let offset = editor::MultiBufferOffset("ParXent\n".len());
-                    selections.select_ranges([offset..offset]);
-                });
-            });
+            workspace.focus_tree_node_for_test(HostId::default(), child, window, cx);
         })
         .unwrap();
+    cx.run_until_parked();
     cx.simulate_keystrokes(*workspace, "i * space F a s t escape");
     cx.run_until_parked();
     let recognized = workspace
@@ -6058,70 +5679,56 @@ fn tree_desk_composes_one_native_buffer_per_node(cx: &mut TestAppContext) {
                 .text()
         })
         .unwrap();
-    assert!(recognized.contains("Fastbody"), "tree text: {recognized:?}");
     assert!(!recognized.contains("* "), "tree text: {recognized:?}");
-
-    // Vim search is hosted by the composed editor even without a Zed pane;
-    // its query must never become document input.
-    let before_search = workspace
+    let created = workspace
         .update(cx, |workspace, _, cx| {
             workspace
                 .tree_nodes_for_test(HostId::default(), cx)
-                .to_vec()
+                .into_iter()
+                .find_map(|(node_id, kind, _, _)| {
+                    (kind == rho_desk::cells::NodeKind::Note && node_id.replica_id == 42)
+                        .then_some(node_id)
+                })
+                .expect("recognition created a note in the client namespace")
         })
         .unwrap();
-    cx.simulate_keystrokes(*workspace, "/ F a s t enter");
+
+    // Vim search is hosted by the composed editor; its query is never input.
+    let before_search = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace.tree_nodes_for_test(HostId::default(), cx)
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "/ P a r enter");
     cx.run_until_parked();
     workspace
         .update(cx, |workspace, _, cx| {
             assert_eq!(
                 workspace.tree_nodes_for_test(HostId::default(), cx),
-                before_search.as_slice()
+                before_search
             );
         })
         .unwrap();
 
-    // A composed heading is a semantic row: dd removes its node/subtree and
-    // an immediate p pastes the captured subtree relative to the surviving
-    // row selected after deletion. Undoing paste and delete restores it too.
-    cx.simulate_keystrokes(*workspace, "d d");
-    cx.run_until_parked();
-    assert!(!display_text(&workspace, cx).contains("Fastbody"));
-    cx.simulate_keystrokes(*workspace, "p");
-    cx.run_until_parked();
-    let pasted_display = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .dashboard_editor()
-                .update(cx, |editor, cx| editor.display_text(cx))
+    // `dd` on a row is one cell write, and `u` puts that cell back.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.focus_tree_node_for_test(HostId::default(), created, window, cx);
         })
         .unwrap();
-    assert_eq!(
-        pasted_display.matches("Fastbody").count(),
-        1,
-        "paste left a stale composed row: {pasted_display:?}"
-    );
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "escape d d");
+    cx.run_until_parked();
     workspace
         .update(cx, |workspace, _, cx| {
-            let pasted = workspace
-                .tree_nodes_for_test(HostId::default(), cx)
-                .iter()
-                .find_map(|(node_id, kind, _, text)| {
-                    (*kind == rho_desk::NodeKind::Heading && text == "Fastbody").then_some(*node_id)
-                })
-                .expect("pasted heading");
-            assert_eq!(
-                workspace
-                    .tree_cursor_for_test(cx)
-                    .map(|(_, node_id, _)| node_id),
-                Some(pasted),
-                "paste must focus the restored subtree root"
+            assert!(
+                !workspace
+                    .tree_nodes_for_test(HostId::default(), cx)
+                    .iter()
+                    .any(|(node_id, _, _, _)| *node_id == created)
             );
         })
         .unwrap();
-    cx.simulate_keystrokes(*workspace, "u");
-    cx.run_until_parked();
-    assert!(!display_text(&workspace, cx).contains("Fastbody"));
     cx.simulate_keystrokes(*workspace, "u");
     cx.run_until_parked();
     workspace
@@ -6130,130 +5737,16 @@ fn tree_desk_composes_one_native_buffer_per_node(cx: &mut TestAppContext) {
                 workspace
                     .tree_nodes_for_test(HostId::default(), cx)
                     .iter()
-                    .any(|(_, kind, _, text)| *kind == rho_desk::NodeKind::Heading
-                        && text == "Fastbody")
-            );
-        })
-        .unwrap();
-    let restored = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .tree_nodes_for_test(HostId::default(), cx)
-                .iter()
-                .find(|(_, kind, _, text)| {
-                    *kind == rho_desk::NodeKind::Heading && text == "Fastbody"
-                })
-                .unwrap()
-                .0
-        })
-        .unwrap();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.focus_tree_node_for_test(HostId::default(), restored, window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    // Enter in a heading is one semantic split: it creates a prose child,
-    // and one `u` removes that child while restoring the original title.
-    let prose_children_before_split = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .tree_nodes_for_test(HostId::default(), cx)
-                .iter()
-                .filter(|(_, kind, parent, _)| {
-                    *kind == rho_desk::NodeKind::Prose && *parent == Some(restored)
-                })
-                .count()
-        })
-        .unwrap();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace
-                .dashboard_editor()
-                .update(cx, |editor, cx| editor.handle_input("\n", window, cx));
-        })
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            let nodes = workspace.tree_nodes_for_test(HostId::default(), cx);
-            assert_eq!(
-                nodes
-                    .iter()
-                    .filter(|(_, kind, parent, _)| *kind == rho_desk::NodeKind::Prose
-                        && *parent == Some(restored))
-                    .count(),
-                prose_children_before_split + 1,
-                "split nodes: {nodes:?}"
-            );
-        })
-        .unwrap();
-    cx.simulate_keystrokes(*workspace, "u");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            let nodes = workspace.tree_nodes_for_test(HostId::default(), cx);
-            assert!(nodes.iter().any(
-                |(_, kind, _, text)| *kind == rho_desk::NodeKind::Heading && text == "Fastbody"
-            ));
-            assert_eq!(
-                nodes
-                    .iter()
-                    .filter(|(_, kind, parent, _)| *kind == rho_desk::NodeKind::Prose
-                        && *parent == Some(restored))
-                    .count(),
-                prose_children_before_split
-            );
-            workspace.focus_tree_node_for_test(HostId::default(), restored, window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-
-    // Backspace on an empty structural row merges it away. Its inverse must
-    // recreate an empty heading even though tombstoned CRDT ids cannot be
-    // reused.
-    let headings_before_merge = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .tree_nodes_for_test(HostId::default(), cx)
-                .iter()
-                .filter(|(_, kind, _, _)| *kind == rho_desk::NodeKind::Heading)
-                .count()
-        })
-        .unwrap();
-    cx.simulate_keystrokes(*workspace, "alt-enter escape backspace");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert_eq!(
-                workspace
-                    .tree_nodes_for_test(HostId::default(), cx)
-                    .iter()
-                    .filter(|(_, kind, _, _)| *kind == rho_desk::NodeKind::Heading)
-                    .count(),
-                headings_before_merge
-            );
-        })
-        .unwrap();
-    cx.simulate_keystrokes(*workspace, "u");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert_eq!(
-                workspace
-                    .tree_nodes_for_test(HostId::default(), cx)
-                    .iter()
-                    .filter(|(_, kind, _, _)| *kind == rho_desk::NodeKind::Heading)
-                    .count(),
-                headings_before_merge + 1
+                    .any(|(node_id, _, _, _)| *node_id == created),
+                "undo restores the deleted cell"
             );
         })
         .unwrap();
 
+    // alt-enter is the structural `o`: a new note, undone by one `u`.
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.focus_tree_node_for_test(HostId::default(), restored, window, cx);
+            workspace.focus_tree_node_for_test(HostId::default(), parent, window, cx);
         })
         .unwrap();
     cx.run_until_parked();
@@ -6261,131 +5754,43 @@ fn tree_desk_composes_one_native_buffer_per_node(cx: &mut TestAppContext) {
     cx.run_until_parked();
     workspace
         .update(cx, |workspace, _, cx| {
-            assert!(workspace
-                .tree_nodes_for_test(HostId::default(), cx)
-                .iter()
-                .any(|(_, kind, _, text)|
-                    *kind == rho_desk::NodeKind::Heading && text == "new"));
-        })
-        .unwrap();
-    cx.simulate_keystrokes(*workspace, "u");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(!workspace
-                .tree_nodes_for_test(HostId::default(), cx)
-                .iter()
-                .any(|(_, kind, _, text)|
-                    *kind == rho_desk::NodeKind::Heading && text == "new"));
-        })
-        .unwrap();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.focus_tree_node_for_test(HostId::default(), restored, window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "shift-o a b o v e escape");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            let nodes = workspace.tree_nodes_for_test(HostId::default(), cx);
-            assert!(nodes.iter().any(|(_, kind, _, text)|
-                *kind == rho_desk::NodeKind::Prose && text == "above"));
-            assert!(nodes.iter().any(
-                |(_, kind, _, text)| *kind == rho_desk::NodeKind::Heading && text == "Fastbody"
-            ));
-        })
-        .unwrap();
-    cx.simulate_keystrokes(*workspace, "u");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            assert!(!workspace
-                .tree_nodes_for_test(HostId::default(), cx)
-                .iter()
-                .any(|(_, kind, _, text)|
-                    *kind == rho_desk::NodeKind::Prose && text == "above"));
-            workspace.focus_tree_node_for_test(HostId::default(), restored, window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    cx.simulate_keystrokes(*workspace, "y y p");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert_eq!(
-                workspace
-                    .tree_nodes_for_test(HostId::default(), cx)
-                    .iter()
-                    .filter(|(_, kind, _, text)| {
-                        *kind == rho_desk::NodeKind::Heading && text == "Fastbody"
-                    })
-                    .count(),
-                2
-            );
-        })
-        .unwrap();
-    let before_agent_flow = workspace
-        .update(cx, |workspace, _, cx| {
-            workspace
-                .tree_nodes_for_test(HostId::default(), cx)
-                .to_vec()
-        })
-        .unwrap();
-    cx.simulate_keystrokes(*workspace, "shift-r c");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(workspace.dashboard_has_new_draft_for_test());
-            assert_eq!(
-                workspace.tree_nodes_for_test(HostId::default(), cx),
-                before_agent_flow.as_slice()
-            );
-        })
-        .unwrap();
-    cx.simulate_keystrokes(*workspace, "q");
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            assert!(!workspace.dashboard_has_new_draft_for_test());
-            assert!(!workspace.has_new_agent_configuration_for_test());
             assert!(
                 workspace
                     .tree_nodes_for_test(HostId::default(), cx)
                     .iter()
-                    .all(|(_, _, _, text)| text != "q")
+                    .any(
+                        |(_, kind, _, text)| *kind == rho_desk::cells::NodeKind::Note
+                            && text == "new"
+                    )
+            );
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "u");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert!(
+                !workspace
+                    .tree_nodes_for_test(HostId::default(), cx)
+                    .iter()
+                    .any(
+                        |(_, kind, _, text)| *kind == rho_desk::cells::NodeKind::Note
+                            && text == "new"
+                    )
             );
         })
         .unwrap();
 
-    // Deleting a user heading never tombstones its machine-owned agent row.
-    // The same batch reparents the row, tells the user, and undo moves it
-    // beneath the fresh restored heading id after daemon acceptance (covered
-    // by the daemon's constrained-relocation test).
+    // Deleting a note leaves its machine row alone: the materializer roots
+    // the orphan instead of the client tombstoning what it does not own.
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.focus_tree_node_for_test(HostId::default(), heading, window, cx);
+            workspace.take_host_messages_for_test(HostId::default());
+            workspace.focus_tree_node_for_test(HostId::default(), parent, window, cx);
         })
         .unwrap();
-    cx.simulate_keystrokes(*workspace, "escape d d");
     cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
-            let nodes = workspace.tree_nodes_for_test(HostId::default(), cx);
-            assert!(
-                nodes.iter().any(|(id, kind, parent, _)| *id == agent_row
-                    && *kind == NodeKind::Agent
-                    && parent.is_none()),
-                "post-delete nodes: {nodes:?}"
-            );
-            assert_eq!(
-                workspace.echo_text_for_test(),
-                Some("moved 1 agent rows to root")
-            );
-        })
-        .unwrap();
-    cx.simulate_keystrokes(*workspace, "u");
+    cx.simulate_keystrokes(*workspace, "escape d d");
     cx.run_until_parked();
     workspace
         .update(cx, |workspace, _, cx| {
@@ -6393,55 +5798,29 @@ fn tree_desk_composes_one_native_buffer_per_node(cx: &mut TestAppContext) {
             assert!(
                 nodes
                     .iter()
-                    .any(|(_, kind, _, text)| *kind == NodeKind::Heading && text == "ParXent")
+                    .any(|(node_id, kind, parent_id, _)| *node_id == agent_row
+                        && *kind == rho_desk::cells::NodeKind::Agent
+                        && parent_id.is_none()),
+                "post-delete nodes: {nodes:?}"
             );
-            assert!(nodes.iter().any(|(id, kind, parent, _)| *id == agent_row
-                && *kind == NodeKind::Agent
-                && parent.is_none()));
         })
         .unwrap();
 
-    // If a retryable split conflict cannot be replayed against the fresh
-    // snapshot, its external undo entry is discarded instead of poisoning
-    // the next ordinary `u`.
-    let (before_failed_retry, undo_count) = workspace
+    // A rejected mutation takes its optimistic view back.
+    let rejected = workspace
         .update(cx, |workspace, _, _| {
-            workspace.take_host_messages_for_test(HostId::default());
-            (
-                workspace.desk_snapshot_for_test(HostId::default()),
-                workspace.semantic_undo_count_for_test(),
-            )
-        })
-        .unwrap();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace
-                .dashboard_editor()
-                .update(cx, |editor, cx| editor.handle_input("\n", window, cx));
-        })
-        .unwrap();
-    cx.run_until_parked();
-    let rejected_id = workspace
-        .update(cx, |workspace, _, _| {
-            workspace
-                .take_host_messages_for_test(HostId::default())
-                .into_iter()
-                .find_map(|message| match message {
-                    rho_ui_proto::ClientMessage::DeskTreeBatchApply { batch } => Some(batch.id),
-                    _ => None,
-                })
-                .expect("split batch")
+            take_desk_mutation(workspace, HostId::default())
+                .expect("delete mutation")
+                .stamp
         })
         .unwrap();
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(
                 HostId::default(),
-                ConnEvent::DeskTreeBatchRejected {
-                    id: rejected_id,
-                    retryable: true,
+                ConnEvent::DeskMutationRejected {
+                    stamp: rejected,
                     reason: "test conflict".into(),
-                    snapshot: before_failed_retry,
                 },
                 window,
                 cx,
@@ -6450,287 +5829,98 @@ fn tree_desk_composes_one_native_buffer_per_node(cx: &mut TestAppContext) {
         .unwrap();
     cx.run_until_parked();
     workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(workspace.semantic_undo_count_for_test(), undo_count);
+        .update(cx, |workspace, _, cx| {
+            let nodes = workspace.tree_nodes_for_test(HostId::default(), cx);
+            assert!(
+                nodes.iter().any(|(node_id, _, _, _)| *node_id == parent),
+                "rejection restores the last merged cells: {nodes:?}"
+            );
         })
         .unwrap();
 }
 
 #[gpui::test]
-fn delayed_title_after_o_heading_recognition_targets_the_replacement(cx: &mut TestAppContext) {
-    use rho_desk::{
-        BatchOpRecord, BatchOperation, Document, NodeId, NodeKind, NodeOwner, OrderKey, Replica,
-        ReplicaAuthor, TextOperation, TreeClock, TreeOperation,
-    };
+fn a_verdict_on_one_device_reaches_the_other_after_cells_available(cx: &mut TestAppContext) {
+    // Two GUIs on one desk: the first deals a verdict, the daemon accepts
+    // it, and the second sees it only because the poke made it sync.
+    let mut desk = DeskFixture::new();
+    let note = desk.note(None, "Shared card");
+    desk.set(
+        note,
+        rho_desk::cells::Field::DeferUntil,
+        rho_desk::cells::Value::OptionalTimestamp(Some(rho_desk::cells::Timestamp {
+            unix_ms: 1_577_836_800_000,
+            precision: rho_desk::cells::TimestampPrecision::Day,
+        })),
+    );
 
-    let mut document = Document::default();
-    document.add_replica(Replica {
-        replica_id: 1,
-        author: ReplicaAuthor::Machine,
-    });
-    let heading = NodeId {
-        replica_id: 1,
-        counter: 1,
-    };
-    document
-        .apply(TreeOperation::Create {
-            timestamp: TreeClock {
-                value: 1,
-                replica_id: 1,
-            },
-            node_id: heading,
-            kind: NodeKind::Heading,
-            owner: NodeOwner::User,
-            parent: None,
-            order: OrderKey(vec![100]),
+    let first = test_workspace(cx);
+    let second = test_workspace(cx);
+    for workspace in [&first, &second] {
+        workspace
+            .update(cx, |workspace, window, cx| {
+                workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+                workspace.open_deal_mode(window, cx);
+                workspace.take_host_messages_for_test(HostId::default());
+            })
+            .unwrap();
+    }
+    cx.run_until_parked();
+
+    cx.dispatch_action(*first, crate::DashboardDealDone);
+    cx.run_until_parked();
+    let mutation = first
+        .update(cx, |workspace, _, _| {
+            take_desk_mutation(workspace, HostId::default()).expect("verdict mutation")
         })
         .unwrap();
-    let mut title = text::Buffer::new(text::ReplicaId::new(1), text::BufferId::new(1).unwrap(), "");
-    document
-        .apply_text(
-            heading,
-            TextOperation::from_text(&title.edit([(0..0, "Parent")])),
-            None,
-        )
-        .unwrap();
-
-    cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
-    workspace
+    first
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(
                 HostId::default(),
-                ConnEvent::DeskTreeSnapshot {
-                    snapshot: document.snapshot(),
-                    replica_id: 42,
+                ConnEvent::DeskMutationAccepted {
+                    stamp: mutation.stamp,
                 },
                 window,
                 cx,
             );
-            workspace.focus_tree_node_for_test(HostId::default(), heading, window, cx);
-            workspace.take_host_messages_for_test(HostId::default());
-        })
-        .unwrap();
-    cx.simulate_keystrokes(*workspace, "o");
-    cx.run_until_parked();
-    let open_batch = workspace
-        .update(cx, |workspace, _, _| {
-            workspace
-                .take_host_messages_for_test(HostId::default())
-                .into_iter()
-                .find_map(|message| match message {
-                    rho_ui_proto::ClientMessage::DeskTreeBatchApply { batch } => Some(batch),
-                    _ => None,
-                })
-                .expect("o creates a prose row")
-        })
-        .unwrap();
-    let prose = open_batch
-        .operations
-        .iter()
-        .find_map(|operation| match operation {
-            BatchOperation::Tree(TreeOperation::Create {
-                node_id,
-                kind: NodeKind::Prose,
-                ..
-            }) => Some(*node_id),
-            _ => None,
-        })
-        .unwrap();
-    let stale_source = workspace
-        .update(cx, |workspace, _, _| {
-            workspace
-                .tree_buffer_for_test(HostId::default(), prose)
-                .expect("opened prose buffer")
-        })
-        .unwrap();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskTreeBatchApplied(BatchOpRecord {
-                    sequence: 1,
-                    timestamp_ms: 1,
-                    batch: open_batch,
-                    daemon_tree_operations: Vec::new(),
-                }),
-                window,
-                cx,
-            );
         })
         .unwrap();
 
-    cx.simulate_keystrokes(*workspace, "* space");
-    cx.run_until_parked();
-    let recognition_batch = workspace
-        .update(cx, |workspace, _, _| {
-            let messages = workspace.take_host_messages_for_test(HostId::default());
-            messages
-                .iter()
-                .cloned()
-                .into_iter()
-                .find_map(|message| match message {
-                    rho_ui_proto::ClientMessage::DeskTreeBatchApply { batch } => Some(batch),
-                    _ => None,
-                })
-                .unwrap_or_else(|| panic!("marker recognition batch; messages: {messages:?}"))
-        })
-        .unwrap();
-    let replacement = recognition_batch
-        .operations
-        .iter()
-        .find_map(|operation| match operation {
-            BatchOperation::Tree(TreeOperation::Create {
-                node_id,
-                kind: NodeKind::Heading,
-                ..
-            }) => Some(*node_id),
-            _ => None,
-        })
-        .unwrap();
-    assert!(recognition_batch.operations.iter().any(|operation| matches!(
-        operation,
-        BatchOperation::Tree(TreeOperation::Delete { node_ids, .. }) if node_ids == &vec![prose]
-    )));
-    let mut delayed_ack = recognition_batch.clone();
-    delayed_ack.id.value += 100;
-    workspace
-        .update(cx, |workspace, _, _| {
-            workspace.clone_pending_desk_intent_for_test(
-                HostId::default(),
-                recognition_batch.id,
-                delayed_ack.id,
-            );
-        })
-        .unwrap();
-    cx.simulate_keystrokes(*workspace, "a b");
-    cx.run_until_parked();
-    workspace
+    // The daemon now holds the verdict; the second device is only poked.
+    desk.store.apply_mutation(&mutation).unwrap();
+    let frontier = desk.store.version().clone();
+    second
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskTreeBatchApplied(BatchOpRecord {
-                    sequence: 2,
-                    timestamp_ms: 2,
-                    batch: recognition_batch,
-                    daemon_tree_operations: Vec::new(),
-                }),
-                window,
-                cx,
-            );
-        })
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
             assert_eq!(
-                workspace.tree_cursor_for_test(cx),
-                Some((HostId::default(), replacement, 2)),
-                "accepted recognition must preserve the replacement caret"
-            );
-        })
-        .unwrap();
-    let before_ack_edits = workspace
-        .update(cx, |workspace, _, _| {
-            workspace
-                .take_host_messages_for_test(HostId::default())
-                .into_iter()
-                .filter_map(|message| match message {
-                    rho_ui_proto::ClientMessage::DeskNodeTextApply {
-                        node_id,
-                        operation,
-                        transaction,
-                    } => Some((node_id, operation, transaction)),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        })
-        .unwrap();
-
-    let snapshot_after_recognition = workspace
-        .update(cx, |workspace, _, _| {
-            workspace.desk_snapshot_for_test(HostId::default())
-        })
-        .unwrap();
-    // This is the later stale source-buffer event, after recognition has
-    // fully completed and daemon acceptance replaced the prose node. Editing
-    // the retained entity exercises Edited -> Operation subscription order.
-    stale_source.update(cx, |buffer, cx| {
-        buffer.edit([(0..0, "Recognized")], None, cx);
-    });
-    cx.run_until_parked();
-    let mut edits = before_ack_edits;
-    edits.extend(
-        workspace
-            .update(cx, |workspace, _, _| {
                 workspace
-                    .take_host_messages_for_test(HostId::default())
+                    .desk_cells_snapshot_for_test(HostId::default())
                     .into_iter()
-                    .filter_map(|message| match message {
-                        rho_ui_proto::ClientMessage::DeskNodeTextApply {
-                            node_id,
-                            operation,
-                            transaction,
-                        } => Some((node_id, operation, transaction)),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .unwrap(),
-    );
-    assert!(
-        !edits.is_empty(),
-        "late title produced no persisted text edit"
-    );
-    assert!(edits.iter().all(|(node_id, ..)| *node_id == replacement));
-    let mut reconstructed = Document::from_snapshot(snapshot_after_recognition).unwrap();
-    for (node_id, operation, transaction) in edits {
-        assert!(
-            reconstructed
-                .apply_text(node_id, operation, transaction)
-                .unwrap()
-        );
-    }
-    assert_eq!(
-        reconstructed
-            .text(replacement, 42, text::BufferId::new(999).unwrap(),)
-            .unwrap(),
-        "Recognizedab"
-    );
-
-    // An acknowledgement may arrive after the user deliberately navigates
-    // elsewhere. In that case it must not pull the cursor back to the
-    // optimistically-created replacement.
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.focus_tree_node_for_test(HostId::default(), heading, window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, window, cx| {
+                    .find(|node| node.id == note)
+                    .map(|node| node.state),
+                Some(rho_desk::cells::State::Open),
+                "the poke has not arrived yet"
+            );
             workspace.handle_event(
                 HostId::default(),
-                ConnEvent::DeskTreeBatchApplied(BatchOpRecord {
-                    sequence: 3,
-                    timestamp_ms: 3,
-                    batch: delayed_ack,
-                    daemon_tree_operations: Vec::new(),
-                }),
+                ConnEvent::DeskCellsAvailable { frontier },
                 window,
                 cx,
             );
-        })
-        .unwrap();
-    cx.run_until_parked();
-    workspace
-        .update(cx, |workspace, _, cx| {
+            let sync = workspace
+                .take_host_messages_for_test(HostId::default())
+                .into_iter()
+                .any(|message| matches!(message, rho_ui_proto::ClientMessage::DeskSync { .. }));
+            assert!(sync, "a poke asks for the delta rather than carrying it");
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
             assert_eq!(
                 workspace
-                    .tree_cursor_for_test(cx)
-                    .map(|(_, node_id, _)| node_id),
-                Some(heading),
-                "a delayed acknowledgement stole deliberate navigation"
+                    .desk_cells_snapshot_for_test(HostId::default())
+                    .into_iter()
+                    .find(|node| node.id == note)
+                    .map(|node| node.state),
+                Some(rho_desk::cells::State::Done),
+                "the verdict from the other device is visible here"
             );
         })
         .unwrap();
@@ -7202,10 +6392,6 @@ fn a_verdict_ends_the_deal_even_when_the_item_went_quiet(cx: &mut TestAppContext
 /// as its full path, and submitting one opens the surface that path names.
 #[gpui::test]
 fn find_offers_every_node_as_a_path_and_opens_the_one_chosen(cx: &mut TestAppContext) {
-    use rho_desk::{
-        Binding, BindingKind, Document, NodeId, NodeKind, NodeOwner, OrderKey, Replica,
-        ReplicaAuthor, TextOperation, TreeClock, TreeOperation,
-    };
     use rho_ui_proto::{
         AgentDisposition, AgentRole, AuthState, UiAgentFacts, UiAgentSummary, UiAttention,
         WorkspaceInfo,
@@ -7220,98 +6406,23 @@ fn find_offers_every_node_as_a_path_and_opens_the_one_chosen(cx: &mut TestAppCon
     });
     let agent_id = agent(31);
     let page_id = rho_browser::PageId(uuid::Uuid::from_u128(7));
-    let node = |counter| NodeId {
-        replica_id: 1,
-        counter,
-    };
-    let (root, topic, row, page) = (node(1), node(2), node(3), node(4));
 
-    let mut document = Document::default();
-    document.add_replica(Replica {
-        replica_id: 1,
-        author: ReplicaAuthor::Machine,
-    });
-    for (index, (node_id, kind, owner, parent)) in [
-        (root, NodeKind::Heading, NodeOwner::User, None),
-        (topic, NodeKind::Heading, NodeOwner::User, Some(root)),
-        (row, NodeKind::Agent, NodeOwner::Machine, Some(topic)),
-        (page, NodeKind::Page, NodeOwner::Machine, Some(topic)),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        document
-            .apply(TreeOperation::Create {
-                timestamp: TreeClock {
-                    value: index as u32 + 1,
-                    replica_id: 1,
-                },
-                node_id,
-                kind,
-                owner,
-                parent,
-                order: OrderKey(vec![(index as u16 + 1) * 20]),
-            })
-            .unwrap();
-    }
-    for (index, (node_id, kind, value)) in [
-        (row, BindingKind::Agent, Binding::Agent(agent_id)),
-        (
-            page,
-            BindingKind::Page,
-            Binding::Page(rho_desk::PageId(*page_id.0.as_bytes())),
-        ),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        document
-            .apply(TreeOperation::SetBinding {
-                timestamp: TreeClock {
-                    value: index as u32 + 10,
-                    replica_id: 1,
-                },
-                node_id,
-                kind,
-                value: Some(value),
-            })
-            .unwrap();
-    }
-    for (index, (node_id, title)) in [
-        (root, "nixos"),
-        (topic, "poco on linux"),
-        (row, "warm agent"),
-        (page, "release notes"),
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        let mut buffer = text::Buffer::new(
-            text::ReplicaId::new(1),
-            text::BufferId::new(index as u64 + 1).unwrap(),
-            "",
-        );
-        document
-            .apply_text(
-                node_id,
-                TextOperation::from_text(&buffer.edit([(0..0, title.to_owned())])),
-                None,
-            )
-            .unwrap();
-    }
+    let mut desk = DeskFixture::new();
+    let root = desk.note(None, "nixos");
+    let topic = desk.note(Some(root), "poco on linux");
+    desk.agent_row(topic, agent_id);
+    let page = desk.page_row(topic, page_id);
+    // With no live browser record, a page row says what it points at.
+    desk.set(
+        page,
+        rho_desk::cells::Field::Url,
+        rho_desk::cells::Value::Text("release notes".to_owned()),
+    );
 
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.handle_event(
-                HostId::default(),
-                ConnEvent::DeskTreeSnapshot {
-                    snapshot: document.snapshot(),
-                    replica_id: 42,
-                },
-                window,
-                cx,
-            );
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
             workspace.handle_event(
                 HostId::default(),
                 ConnEvent::Ready {
@@ -7440,4 +6551,135 @@ fn the_find_chord_wins_against_the_bundled_keymaps(cx: &mut TestAppContext) {
             );
         }
     });
+}
+
+/// A desk as the daemon would hand it over: cells the client merges, plus a
+/// text history per note. Tests build one and send it as `DeskSynced`.
+struct DeskFixture {
+    device: rho_desk::cells::DeviceId,
+    store: rho_desk::cells::Store,
+    texts: Vec<rho_desk::NodeTextSnapshot>,
+    next_node: u64,
+}
+
+impl DeskFixture {
+    /// Node ids come from the daemon's namespace; the client is given 42.
+    const NAMESPACE: u16 = 42;
+    const DAEMON_NAMESPACE: u16 = 1;
+
+    fn new() -> Self {
+        let device = rho_desk::cells::DeviceId([9; 16]);
+        Self {
+            device,
+            store: rho_desk::cells::Store::new(device),
+            texts: Vec::new(),
+            next_node: 0,
+        }
+    }
+
+    fn note(&mut self, parent: Option<rho_desk::NodeId>, text: &str) -> rho_desk::NodeId {
+        let node_id = self.new_node(rho_desk::cells::NodeKind::Note, parent);
+        if !text.is_empty() {
+            let mut buffer = text::Buffer::new(
+                text::ReplicaId::new(Self::DAEMON_NAMESPACE),
+                text::BufferId::new(u64::from(node_id.counter as u32) + 1).unwrap(),
+                "",
+            );
+            let operation = rho_desk::TextOperation::from_text(&buffer.edit([(0..0, text)]));
+            self.texts.push(rho_desk::NodeTextSnapshot {
+                node_id,
+                operations: vec![operation],
+                transactions: Vec::new(),
+            });
+        }
+        node_id
+    }
+
+    /// A machine row the daemon owns, bound to a live agent.
+    fn agent_row(&mut self, parent: rho_desk::NodeId, agent_id: AgentId) -> rho_desk::NodeId {
+        let node_id = self.new_node(rho_desk::cells::NodeKind::Agent, Some(parent));
+        self.set(
+            node_id,
+            rho_desk::cells::Field::AgentId,
+            rho_desk::cells::Value::AgentId(agent_id),
+        );
+        node_id
+    }
+
+    /// A machine page row, as the daemon writes it after a bind.
+    fn page_row(
+        &mut self,
+        parent: rho_desk::NodeId,
+        page_id: rho_browser::PageId,
+    ) -> rho_desk::NodeId {
+        let node_id = self.new_node(rho_desk::cells::NodeKind::Page, Some(parent));
+        self.set(
+            node_id,
+            rho_desk::cells::Field::PageRef,
+            rho_desk::cells::Value::PageRef(rho_desk::PageId(*page_id.0.as_bytes())),
+        );
+        node_id
+    }
+
+    fn new_node(
+        &mut self,
+        kind: rho_desk::cells::NodeKind,
+        parent: Option<rho_desk::NodeId>,
+    ) -> rho_desk::NodeId {
+        use rho_desk::cells::{Field, Value};
+
+        self.next_node += 1;
+        let node_id = rho_desk::NodeId {
+            replica_id: Self::DAEMON_NAMESPACE,
+            counter: self.next_node,
+        };
+        let created_at = rho_desk::cells::Timestamp {
+            unix_ms: 1_600_000_000_000 + self.next_node as i64,
+            precision: rho_desk::cells::TimestampPrecision::Millisecond,
+        };
+        for (field, value) in [
+            (Field::Kind, Value::Kind(kind)),
+            (Field::Parent, Value::Parent(parent)),
+            (Field::Deleted, Value::Bool(false)),
+            (Field::CreatedAt, Value::Timestamp(created_at)),
+            (Field::State, Value::State(rho_desk::cells::State::Open)),
+            (Field::DeferUntil, Value::OptionalTimestamp(None)),
+            (Field::Deadline, Value::OptionalTimestamp(None)),
+            (Field::PaceDays, Value::Days(0)),
+        ] {
+            self.store.write(node_id, field, value).unwrap();
+        }
+        node_id
+    }
+
+    fn set(
+        &mut self,
+        node_id: rho_desk::NodeId,
+        field: rho_desk::cells::Field,
+        value: rho_desk::cells::Value,
+    ) {
+        self.store.write(node_id, field, value).unwrap();
+    }
+
+    fn synced(&self) -> ConnEvent {
+        ConnEvent::DeskSynced {
+            node_namespace: Self::NAMESPACE,
+            delta: self.store.snapshot(),
+            texts: self.texts.clone(),
+        }
+    }
+}
+
+/// The daemon's answer to the one mutation the GUI just sent.
+fn take_desk_mutation(
+    workspace: &mut Workspace,
+    host: HostId,
+) -> Option<rho_desk::cells::CellMutation> {
+    workspace
+        .take_host_messages_for_test(host)
+        .into_iter()
+        .find_map(|message| match message {
+            rho_ui_proto::ClientMessage::DeskMutationApply { mutation } => Some(mutation),
+            _ => None,
+        })
 }

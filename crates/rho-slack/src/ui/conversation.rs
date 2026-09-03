@@ -93,12 +93,6 @@ impl Fill {
         self.moved = true;
     }
 
-    /// Whether to ask now, given where the view sits. Asking marks the
-    /// action spent.
-    fn wants_page(&mut self, near_top: bool) -> bool {
-        self.wants(near_top.then_some(Want::Older)).is_some()
-    }
-
     /// The one page this action buys, if the view is sitting on something
     /// worth asking for.
     fn wants(&mut self, want: Option<Want>) -> Option<Want> {
@@ -1701,20 +1695,34 @@ mod tests {
     #[test]
     fn one_action_buys_exactly_one_page() {
         let mut fill = Fill::default();
-        assert!(fill.wants_page(true), "opening onto a gap asks once");
-        assert!(
-            !fill.wants_page(true),
+        assert_eq!(
+            fill.wants(Some(Want::Older)),
+            Some(Want::Older),
+            "opening onto a gap asks once"
+        );
+        assert_eq!(
+            fill.wants(Some(Want::Older)),
+            None,
             "the page landing does not buy another"
         );
         fill.user_moved();
-        assert!(fill.wants_page(true), "the reader scrolling buys one more");
-        assert!(!fill.wants_page(true), "and only one");
+        assert_eq!(
+            fill.wants(Some(Want::Older)),
+            Some(Want::Older),
+            "the reader scrolling buys one more"
+        );
+        assert_eq!(fill.wants(Some(Want::Older)), None, "and only one");
         let mut fill = Fill::default();
-        assert!(
-            !fill.wants_page(false),
+        assert_eq!(
+            fill.wants(None),
+            None,
             "a reader away from the top asks for nothing"
         );
-        assert!(fill.wants_page(true), "and has spent nothing");
+        assert_eq!(
+            fill.wants(Some(Want::Older)),
+            Some(Want::Older),
+            "and has spent nothing"
+        );
     }
 
     #[test]

@@ -47,8 +47,9 @@ Modelled on cr-sqlite's "a row is a map of CRDTs" and Figma's multiplayer:
 - Last-writer-wins register for `parent`, `kind`, `deleted`, `state`,
   `defer_until`, `deadline`, and every reference field. Each cell carries a
   stamp `(device, version)`; newest wins, device id breaks ties.
-- Add-wins set for `tags` (and any future multi-valued field), so two
-  devices adding concurrently both keep theirs.
+- One boolean LWW cell per tag. Opposing writes at the same numeric version
+  choose add (`true`) regardless of the device tie-breaker; writes with
+  different versions follow ordinary LWW. This is not a causal add-wins set.
 - Grow-only log for verdicts: `(node, stamp) → VerdictEvent`, merged by
   union. `state` is the current value; the log is history and undo.
 - Text CRDT for `body`: the editor's buffer already is one; its operations

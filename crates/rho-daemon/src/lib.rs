@@ -990,6 +990,8 @@ struct AgentRegistry {
     pool: Arc<AgentPool>,
     db: RhoDb,
     desk_tree: desk_tree::DeskTreeStore,
+    desk_cells: desk_cells::DeskCellStore,
+    desk_devices: Mutex<HashSet<rho_desk::cells::DeviceId>>,
     visualizations: rho_visualizations::VisualizationStore,
     inference: Inference,
     /// The database's machine seed, announced in `Ready` so clients can
@@ -1045,10 +1047,26 @@ impl AgentRegistry {
         })
         .await
         .map_err(anyhow::Error::msg)?;
+        let (desk_cells, migration_report, migrated_now) =
+            desk_cells::DeskCellStore::new(db.clone(), machine_seed)
+                .await
+                .map_err(anyhow::Error::msg)?;
+        if migrated_now {
+            tracing::info!(
+                warnings = migration_report.warnings.len(),
+                page_urls_awaiting_backfill = migration_report.page_urls_awaiting_backfill.len(),
+                ?migration_report.kind_counts,
+                rooted_by_chain_rule = migration_report.rooted_by_chain_rule,
+                dropped_marks = migration_report.dropped_marks,
+                "migrated Desk tree V1 to cells V2"
+            );
+        }
         let registry = Self {
             pool,
             db,
             desk_tree,
+            desk_cells,
+            desk_devices: Mutex::new(HashSet::new()),
             visualizations,
             inference,
             machine_seed,
@@ -1706,6 +1724,7 @@ where
     let _ = outgoing_tx.send(agents.ready_message().await);
     let mut local_subscriptions = HashMap::new();
     let mut presentation_watches = HashMap::new();
+    let mut desk_session = None;
 
     // Announce every agent created in the pool — by clients or by other
     // agents spawning children — so it shows up on this connection.
@@ -1750,10 +1769,7 @@ where
                     }
                 }
                 Err(broadcast::error::RecvError::Lagged(_)) => {
-                    if events_tx
-                        .send(ServerMessage::DeskTreeResyncRequired)
-                        .is_err()
-                    {
+                    if events_tx.send(ServerMessage::DeskResyncRequired).is_err() {
                         break;
                     }
                 }
@@ -1794,6 +1810,7 @@ where
             agent_streams.as_ref(),
             &mut local_subscriptions,
             &mut presentation_watches,
+            &mut desk_session,
             message,
         )
         .await
@@ -1812,6 +1829,9 @@ where
             }
         }
     };
+    if let Some((device, _)) = desk_session {
+        agents.desk_devices.lock().await.remove(&device);
+    }
     events_task.abort();
     for (_, subscription) in local_subscriptions {
         subscription.abort();
@@ -2511,11 +2531,85 @@ async fn handle_message(
     agent_streams: Option<&IrohAgentStreams>,
     local_subscriptions: &mut HashMap<AgentId, tokio::task::JoinHandle<()>>,
     presentation_watches: &mut HashMap<AgentId, rho_agent::presentation::Watch>,
+    desk_session: &mut Option<(rho_desk::cells::DeviceId, u16)>,
     message: ClientMessage,
 ) -> anyhow::Result<Refresh> {
     match message {
         ClientMessage::Ping => {
             let _ = outgoing_tx.send(ServerMessage::Pong);
+            Ok(Refresh::None)
+        }
+        ClientMessage::DeskSync { device, known } => {
+            if desk_session.is_some_and(|(bound, _)| bound != device) {
+                anyhow::bail!("Desk connection is already bound to another device");
+            }
+            let node_namespace = agents
+                .desk_cells
+                .node_namespace(device)
+                .await
+                .map_err(anyhow::Error::msg)?;
+            let delta = agents
+                .desk_cells
+                .sync_since(&known)
+                .map_err(anyhow::Error::msg)?;
+            if desk_session.is_none() && !agents.desk_devices.lock().await.insert(device) {
+                anyhow::bail!("Desk device already has an active writer connection");
+            }
+            *desk_session = Some((device, node_namespace));
+            let _ = outgoing_tx.send(ServerMessage::DeskSynced {
+                node_namespace,
+                delta,
+                texts: agents.desk_cells.texts(),
+            });
+            Ok(Refresh::None)
+        }
+        ClientMessage::DeskMutationApply { mutation } => {
+            let stamp = mutation.stamp;
+            let Some((device, namespace)) = *desk_session else {
+                let _ = outgoing_tx.send(ServerMessage::DeskMutationRejected {
+                    stamp,
+                    reason: "Desk connection must sync before writing".into(),
+                });
+                return Ok(Refresh::None);
+            };
+            match agents
+                .desk_cells
+                .apply_mutation(device, namespace, mutation)
+                .await
+            {
+                Ok(()) => {
+                    let _ = outgoing_tx.send(ServerMessage::DeskMutationAccepted { stamp });
+                    let frontier = agents.desk_cells.frontier().map_err(anyhow::Error::msg)?;
+                    let _ = agents
+                        .events
+                        .send(ServerMessage::DeskCellsAvailable { frontier });
+                }
+                Err(reason) => {
+                    let _ = outgoing_tx.send(ServerMessage::DeskMutationRejected { stamp, reason });
+                }
+            }
+            Ok(Refresh::None)
+        }
+        ClientMessage::DeskTextApply {
+            node_id,
+            operation,
+            transaction,
+        } => {
+            let Some((_, namespace)) = *desk_session else {
+                anyhow::bail!("Desk connection must sync before writing text");
+            };
+            if agents
+                .desk_cells
+                .apply_text(namespace, node_id, operation.clone(), transaction.clone())
+                .await
+                .map_err(anyhow::Error::msg)?
+            {
+                let _ = agents.events.send(ServerMessage::DeskTextApplied {
+                    node_id,
+                    operation,
+                    transaction,
+                });
+            }
             Ok(Refresh::None)
         }
         ClientMessage::DeskTreeSubscribe => {
@@ -2586,15 +2680,17 @@ async fn handle_message(
             request_id,
             parent,
             page_id,
+            url,
         } => {
             let result = agents
-                .desk_tree
-                .bind_machine(parent, rho_desk::Binding::Page(page_id))
+                .desk_cells
+                .bind_machine(parent, desk_cells::MachineBinding::Page { page_id, url })
                 .await;
-            if let Ok(Some(record)) = &result {
-                let _ = agents.events.send(ServerMessage::DeskTreeBatchApplied {
-                    record: record.clone(),
-                });
+            if matches!(result, Ok(true)) {
+                let frontier = agents.desk_cells.frontier().map_err(anyhow::Error::msg)?;
+                let _ = agents
+                    .events
+                    .send(ServerMessage::DeskCellsAvailable { frontier });
             }
             let _ = outgoing_tx.send(ServerMessage::DeskPageBindingResult {
                 request_id,
@@ -2606,11 +2702,12 @@ async fn handle_message(
             request_id,
             node_id,
         } => {
-            let result = agents.desk_tree.unbind_machine_node(node_id).await;
-            if let Ok(Some(record)) = &result {
-                let _ = agents.events.send(ServerMessage::DeskTreeBatchApplied {
-                    record: record.clone(),
-                });
+            let result = agents.desk_cells.unbind_machine_node(node_id).await;
+            if matches!(result, Ok(true)) {
+                let frontier = agents.desk_cells.frontier().map_err(anyhow::Error::msg)?;
+                let _ = agents
+                    .events
+                    .send(ServerMessage::DeskCellsAvailable { frontier });
             }
             let _ = outgoing_tx.send(ServerMessage::DeskPageBindingResult {
                 request_id,
@@ -2854,7 +2951,7 @@ async fn handle_message(
         } => {
             if let Some(parent) = desk_parent {
                 agents
-                    .desk_tree
+                    .desk_cells
                     .validate_machine_parent(parent)
                     .map_err(anyhow::Error::msg)?;
             }
@@ -2865,15 +2962,22 @@ async fn handle_message(
             // creation broadcast (all connections, including this one).
             let (agent_id, agent) = agents.create(role, start).await?;
             if let Some(parent) = desk_parent {
-                if let Some(record) = agents
-                    .desk_tree
-                    .bind_machine(parent, rho_desk::Binding::Agent(agent_id))
+                if agents
+                    .desk_cells
+                    .bind_machine(
+                        parent,
+                        desk_cells::MachineBinding::Agent {
+                            agent_id,
+                            host: agents.machine_seed,
+                        },
+                    )
                     .await
                     .map_err(anyhow::Error::msg)?
                 {
+                    let frontier = agents.desk_cells.frontier().map_err(anyhow::Error::msg)?;
                     let _ = agents
                         .events
-                        .send(ServerMessage::DeskTreeBatchApplied { record });
+                        .send(ServerMessage::DeskCellsAvailable { frontier });
                 }
             }
             if let Some(content) = content {
@@ -3060,15 +3164,19 @@ async fn handle_message(
         } => {
             agents.set_disposition(agent_id, disposition).await;
             if disposition == AgentDisposition::Hidden {
-                if let Some(record) = agents
-                    .desk_tree
-                    .unbind_machine(rho_desk::Binding::Agent(agent_id))
+                if agents
+                    .desk_cells
+                    .unbind_machine(&desk_cells::MachineBinding::Agent {
+                        agent_id,
+                        host: agents.machine_seed,
+                    })
                     .await
                     .map_err(anyhow::Error::msg)?
                 {
+                    let frontier = agents.desk_cells.frontier().map_err(anyhow::Error::msg)?;
                     let _ = agents
                         .events
-                        .send(ServerMessage::DeskTreeBatchApplied { record });
+                        .send(ServerMessage::DeskCellsAvailable { frontier });
                 }
             }
             // Hidden changes what the rail folds, which clients read off

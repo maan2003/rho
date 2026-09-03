@@ -79,18 +79,21 @@ AI APIs.
   transaction; the journal is
   never uploaded, analyzed, or used to adapt behavior automatically, and has no
   automatic retention, so users control it like other sensitive local state.
-- The daemon's structured Desk store accepts tree operations only from an
-  allocated user replica and node-text operations only from allocated user or
-  agent replicas. Client operations cannot create or structurally edit
-  machine-owned nodes, and machine-node text is read-only. Individual node
-  text retains the Desk's 4 MiB bounds; delete batches, text edit ranges,
-  transactions, tags, and fractional-order depth are independently capped
-  before persistence. Mixed structural/text batches validate exact source
-  node state and canonical text versions, then persist as one idempotent log
-  record; a failed precondition consumes no sequence or partial operation.
-  A one-time, locally recorded migration may read the retired org snapshot,
-  installs the native tree and migration marker atomically, deletes the old
-  tables, and sends no content elsewhere. Runtime code never reads org text.
+- A Desk connection binds one persisted random `DeviceId` to a daemon-assigned
+  node/text namespace before writing. Cell mutations are bounded, atomic, and
+  idempotent by stamp; they must advance that device's frontier without an
+  unobservable clock jump. Clients can create only complete user-owned notes
+  in their namespace. Raw kind cells enforce ownership even for deleted rows;
+  machine nodes are read-only except for exact state/defer/parent changes
+  recorded by a validated user verdict. Node text is namespace-bound,
+  causally complete, and capped at 4 MiB; tags, cell strings, paths,
+  transactions, verdict changes, and mutation write counts have independent
+  bounds before persistence. Failed validation commits no frontier, cell,
+  verdict, text, or mutation-log entry.
+  The one-time native-tree V1 conversion and completion marker commit
+  atomically and send no content elsewhere. Frozen V1 tables remain untouched
+  for rollback but are not a runtime truth after cutover; rollback after V2
+  writes requires the pre-upgrade database copy.
 - Opt-in GUI and daemon Dial9 profiles contain thread names, function symbols,
   local source paths, precise activity timing, and frontend marker metadata.
   GUI editor markers include numeric edit counts, affected row ranges, map row

@@ -40,7 +40,7 @@ use crate::chime::Chime;
 use crate::connection::{
     AgentFrameAllocation, ConnEvent, Connection, GitApprovalDecision, HostEvent,
 };
-use crate::desk_view::DeskTreeSync;
+use crate::desk_view::DeskCells;
 use crate::draft_view::DraftModel;
 use crate::hosts::{HostStatus, Hosts};
 use crate::inbox::{
@@ -340,27 +340,6 @@ struct HostProject {
 }
 
 #[derive(Clone)]
-enum PendingDeskBatchIntent {
-    Recognize {
-        node_id: rho_desk::NodeId,
-        input: ClientMessage,
-        anchor: text::Anchor,
-        focus_after: bool,
-        created: rho_desk::NodeId,
-        focus_abandoned: bool,
-    },
-    SplitHeading {
-        node_id: rho_desk::NodeId,
-        input: ClientMessage,
-        anchor: text::Anchor,
-        created: rho_desk::NodeId,
-    },
-    DeleteEmpty {
-        node_id: rho_desk::NodeId,
-    },
-}
-
-#[derive(Clone)]
 struct PendingTreeVerdict {
     event: crate::dashboard::DealerEvent,
     echo: String,
@@ -379,10 +358,11 @@ struct VerdictUndo {
 
 #[derive(Clone)]
 enum VerdictUndoState {
-    DeskMarks {
+    /// The applied verdict this undo appends `Undone { of }` against.
+    DeskVerdict {
         host: HostId,
         node: rho_desk::NodeId,
-        prior: Vec<(rho_desk::TemporalKind, Option<rho_desk::TemporalMark>)>,
+        at: rho_desk::cells::Stamp,
     },
     Inbox {
         id: crate::inbox::InboxId,
@@ -391,7 +371,6 @@ enum VerdictUndoState {
     Filed {
         host: HostId,
         node: rho_desk::NodeId,
-        expected: rho_desk::NodeExpectation,
         prior: crate::inbox::InboxItem,
     },
     PageFiled,
@@ -407,59 +386,12 @@ fn undo_sequence_insert_position(existing: impl Iterator<Item = u64>, sequence: 
         .count()
 }
 
-enum DeskSemanticUndo {
-    DeleteCreated {
-        host: HostId,
-        root: rho_desk::NodeId,
-    },
-    RestoreDeleted {
-        host: HostId,
-        subtree: crate::desk_view::DeskSubtree,
-    },
-    StructureMove {
-        host: HostId,
-        node_id: rho_desk::NodeId,
-        parent: Option<rho_desk::NodeId>,
-        order: rho_desk::OrderKey,
-    },
-    RestoreDeletedEmpty {
-        host: HostId,
-        undo: crate::desk_view::DeskDeleteEmptyUndo,
-    },
-    MergeSplit {
-        host: HostId,
-        heading: rho_desk::NodeId,
-        prose: rho_desk::NodeId,
-    },
-}
-
-fn temporal_verdict_values(
-    kind: rho_desk::TemporalKind,
-    mark: rho_desk::TemporalMark,
-) -> Vec<(rho_desk::TemporalKind, Option<rho_desk::TemporalMark>)> {
-    match kind {
-        rho_desk::TemporalKind::Todo => vec![
-            (rho_desk::TemporalKind::Deadline, None),
-            (rho_desk::TemporalKind::Defer, None),
-            (rho_desk::TemporalKind::Reminder, None),
-            (rho_desk::TemporalKind::Todo, Some(mark)),
-        ],
-        rho_desk::TemporalKind::Defer => vec![
-            (rho_desk::TemporalKind::Reminder, None),
-            (rho_desk::TemporalKind::Defer, Some(mark)),
-        ],
-        rho_desk::TemporalKind::Done => vec![
-            (rho_desk::TemporalKind::Discarded, None),
-            (rho_desk::TemporalKind::Done, Some(mark)),
-        ],
-        rho_desk::TemporalKind::Discarded => vec![
-            (rho_desk::TemporalKind::Done, None),
-            (rho_desk::TemporalKind::Discarded, Some(mark)),
-        ],
-        rho_desk::TemporalKind::Deadline | rho_desk::TemporalKind::Reminder => {
-            vec![(kind, Some(mark))]
-        }
-    }
+/// A structure verb, as the writes that put the desk back. Undo of a
+/// creation is the note's deletion; undo of a deletion or a move is the
+/// cell it replaced.
+struct DeskSemanticUndo {
+    host: HostId,
+    writes: Vec<rho_desk::cells::CellWrite>,
 }
 
 pub struct Workspace {
@@ -565,29 +497,25 @@ pub struct Workspace {
     /// Compact Helix-style key guide shown on deal entry and `?`.
     /// Canonical per-host CRDT Desk buffers shared by dashboard and source
     /// views.
-    desk_tree_sync: DeskTreeSync,
+    pub(crate) desk_cells: DeskCells,
     /// Set by `InputHandled` and consumed by the following buffer edit. The
     /// editor announces input before mutating its buffer, while heading
     /// recognition must run immediately after that mutation so subsequent
     /// typing lands in the newly-created node buffer.
-    pending_heading_recognition: Option<(bool, HostId, rho_desk::NodeId, usize)>,
+    pending_heading_recognition: Option<(HostId, rho_desk::NodeId, usize)>,
     pending_heading_undo: Option<clock::Lamport>,
-    desk_batch_editing: bool,
-    desk_batch_text: Vec<ClientMessage>,
-    pending_desk_batch_intents: BTreeMap<(HostId, rho_desk::TreeClock), PendingDeskBatchIntent>,
-    /// Late editor events can still originate from a row replaced by an
-    /// accepted recognition batch. Node ids are never reused, so retaining
-    /// this redirect safely carries those edits to the replacement buffer.
-    desk_text_retargets: BTreeMap<(HostId, rho_desk::NodeId), rho_desk::NodeId>,
-    pending_tree_verdicts: BTreeMap<(HostId, rho_desk::TreeClock), PendingTreeVerdict>,
-    pending_tree_undos: BTreeMap<(HostId, rho_desk::TreeClock), PendingTreeUndo>,
+    pending_tree_verdicts: BTreeMap<(HostId, rho_desk::cells::Stamp), PendingTreeVerdict>,
+    pending_tree_undos: BTreeMap<(HostId, rho_desk::cells::Stamp), PendingTreeUndo>,
+    /// Text a paste owes its new notes, held until the daemon accepts the
+    /// creation those notes came from.
+    pending_desk_texts: BTreeMap<(HostId, rho_desk::cells::Stamp), Vec<(rho_desk::NodeId, String)>>,
     verdict_undo: Vec<VerdictUndo>,
     next_verdict_undo_sequence: u64,
-    desk_semantic_clipboard: Option<crate::desk_view::DeskSubtree>,
+    desk_semantic_clipboard: Option<crate::desk_view::DeskCapture>,
     /// One-shot recovery for `p` while Vim still holds the removed excerpt.
     desk_semantic_paste_target: Option<(HostId, rho_desk::NodeId)>,
     desk_semantic_undo: BTreeMap<clock::Lamport, DeskSemanticUndo>,
-    pending_semantic_batches: BTreeMap<(HostId, rho_desk::TreeClock), clock::Lamport>,
+    pending_semantic_batches: BTreeMap<(HostId, rho_desk::cells::Stamp), clock::Lamport>,
     pending_semantic_group: Option<clock::Lamport>,
     /// Agent shown beside the dashboard cursor. Kept separate from the
     /// focused task so cursor previews do not rebuild or reorder the rail.
@@ -1051,54 +979,20 @@ impl Workspace {
                     if let Some((host, node_id, offset)) =
                         this.dashboard.tree_node_cursor_offset(cx)
                     {
-                        this.pending_heading_recognition = Some((false, host, node_id, offset + 1));
-                        this.desk_batch_text.clear();
-                        this.desk_batch_editing = true;
+                        this.pending_heading_recognition = Some((host, node_id, offset + 1));
                     }
                 }
-                editor::EditorEvent::InputHandled { text, .. } if text.contains('\n') => {
-                    if let Some((host, node_id, offset)) =
-                        this.dashboard.tree_node_cursor_offset(cx)
+                editor::EditorEvent::BuffersEdited { .. } => {
+                    if let Some((host, node_id, line_end)) = this.pending_heading_recognition.take()
                     {
-                        if this
-                            .desk_tree_sync
-                            .tree_node(host, node_id)
-                            .is_some_and(|node| node.kind == rho_desk::NodeKind::Heading)
-                        {
-                            let transaction_id = this.dashboard.push_external_undo_transaction(cx);
-                            this.pending_heading_undo = Some(transaction_id);
-                        }
-                        let newline = text.find('\n').unwrap_or(0);
-                        this.pending_heading_recognition =
-                            Some((true, host, node_id, offset + newline));
-                        this.desk_batch_text.clear();
-                        this.desk_batch_editing = true;
-                    }
-                }
-                editor::EditorEvent::BuffersEdited { buffer_ids } => {
-                    if let Some((focus_after, mut host, mut node_id, line_end)) =
-                        this.pending_heading_recognition.take()
-                    {
-                        if let Some((edited_host, edited_node)) = this
-                            .desk_tree_sync
-                            .tree_node_for_buffers(buffer_ids, focus_after, cx)
-                        {
-                            host = edited_host;
-                            node_id = edited_node;
-                        }
                         // Replacing the editor composition from inside its
                         // BuffersEdited dispatch can leave the next queued
                         // keystroke attached to the row we just deleted.
                         // Reconcile at the end of this GPUI update instead,
                         // before another platform input event is dispatched.
                         cx.defer_in(window, move |this, window, cx| {
-                            this.recognize_desk_heading_after_edit(
-                                focus_after,
-                                host,
-                                node_id,
-                                line_end,
-                                window,
-                                cx,
+                            this.recognize_desk_note_after_edit(
+                                host, node_id, line_end, window, cx,
                             );
                         });
                     }
@@ -1118,20 +1012,6 @@ impl Workspace {
                     this.prompt_dashboard_search(*backwards, window, cx);
                 }
                 editor::EditorEvent::SelectionsChanged { local: true } => {
-                    let cursor = this.dashboard.tree_node_cursor_offset(cx);
-                    for ((host, _), intent) in &mut this.pending_desk_batch_intents {
-                        if let PendingDeskBatchIntent::Recognize {
-                            created,
-                            focus_abandoned,
-                            ..
-                        } = intent
-                            && !cursor.is_some_and(|(cursor_host, node_id, _)| {
-                                cursor_host == *host && node_id == *created
-                            })
-                        {
-                            *focus_abandoned = true;
-                        }
-                    }
                     this.refresh_dashboard(window, cx);
                     this.dashboard_cursor_moved(window, cx);
                 }
@@ -1272,14 +1152,11 @@ impl Workspace {
             chime_above_threshold: false,
             dashboard,
             mode_indicator,
-            desk_tree_sync: DeskTreeSync::default(),
+            desk_cells: DeskCells::new(crate::desk_view::desk_device()),
             pending_heading_recognition: None,
             pending_heading_undo: None,
-            desk_batch_editing: false,
-            desk_batch_text: Vec::new(),
-            pending_desk_batch_intents: BTreeMap::new(),
-            desk_text_retargets: BTreeMap::new(),
             pending_tree_verdicts: BTreeMap::new(),
+            pending_desk_texts: BTreeMap::new(),
             pending_tree_undos: BTreeMap::new(),
             verdict_undo: Vec::new(),
             next_verdict_undo_sequence: 0,
@@ -2135,137 +2012,42 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         match event {
-            ConnEvent::DeskTreeSnapshot {
-                snapshot,
-                replica_id,
+            ConnEvent::DeskSynced {
+                node_namespace,
+                delta,
+                texts,
             } => {
-                if self
-                    .desk_tree_sync
-                    .apply_tree_snapshot(host, snapshot, replica_id, cx)
+                if let Some(again) = self
+                    .desk_cells
+                    .synced(host, node_namespace, delta, texts, cx)
                 {
-                    self.send_to_host(host, ClientMessage::DeskTreeSubscribe);
+                    self.send_to_host(host, again);
                 }
                 self.sync_tree_dashboard(host, window, cx);
             }
-            ConnEvent::DeskTreeApplied(record) => {
-                if self.desk_tree_sync.apply_tree(host, record, cx) {
-                    self.send_to_host(host, ClientMessage::DeskTreeSubscribe);
-                }
-                self.sync_tree_dashboard(host, window, cx);
-            }
-            #[cfg(test)]
-            ConnEvent::DeskTreeReplaced(snapshot) => {
-                self.desk_tree_sync
-                    .replace_tree_snapshot(host, snapshot, cx);
-                self.sync_tree_dashboard(host, window, cx);
-            }
-            ConnEvent::DeskNodeTextApplied(record) => {
-                if self.desk_tree_sync.apply_node_text(host, record, cx) {
-                    self.send_to_host(host, ClientMessage::DeskTreeSubscribe);
-                }
-                self.sync_tree_dashboard(host, window, cx);
-            }
-            ConnEvent::DeskTreeBatchApplied(record) => {
-                self.pending_semantic_batches
-                    .remove(&(host, record.batch.id));
-                let verdict = self.pending_tree_verdicts.remove(&(host, record.batch.id));
-                let undone = self.pending_tree_undos.remove(&(host, record.batch.id));
-                let recognition_focus = self
-                    .pending_desk_batch_intents
-                    .remove(&(host, record.batch.id))
-                    .and_then(|intent| match intent {
-                        PendingDeskBatchIntent::Recognize {
-                            created,
-                            focus_abandoned: false,
-                            ..
-                        } if self.dashboard.is_focused(window, cx) => {
-                            let offset = self
-                                .dashboard
-                                .tree_node_cursor_offset(cx)
-                                .filter(|(cursor_host, cursor_node, _)| {
-                                    *cursor_host == host && *cursor_node == created
-                                })
-                                .map_or(0, |(_, _, offset)| offset);
-                            Some((created, offset))
-                        }
-                        _ => None,
-                    });
-                if self.desk_tree_sync.apply_batch(host, record, cx) {
-                    self.send_to_host(host, ClientMessage::DeskTreeSubscribe);
-                }
-                self.sync_tree_dashboard(host, window, cx);
-                if let Some((focus, offset)) = recognition_focus {
-                    let cursor_after_sync = self.dashboard.tree_node_cursor_offset(cx);
-                    cx.on_next_frame(window, move |this, window, cx| {
-                        if !this.dashboard.is_focused(window, cx)
-                            || this.dashboard.tree_node_cursor_offset(cx) != cursor_after_sync
-                        {
-                            return;
-                        }
-                        this.dashboard
-                            .move_to_tree_position_when_ready(host, focus, offset);
-                        this.sync_tree_dashboard(host, window, cx);
-                    });
-                    cx.notify();
-                }
-                if let Some(verdict) = verdict {
-                    let submitted_card_is_current = self
-                        .dashboard
-                        .current_deal_card()
-                        .is_some_and(|card| card.identity == verdict.event.card);
-                    let undo_sequence = verdict.undo.sequence;
-                    self.restore_verdict_undo(verdict.undo);
-                    if verdict.phone_verdict.is_some() && submitted_card_is_current {
-                        self.phone_completed_verdict(undo_sequence);
-                    }
-                    self.dashboard.record_dealer_event(verdict.event);
-                    if let Some(phone_verdict) = verdict.phone_verdict {
-                        self.record_phone_verdict(phone_verdict, cx);
-                    }
-                    if submitted_card_is_current {
-                        if verdict.phone_verdict.is_some() {
-                            self.restore_phone_feed(window, cx);
-                        }
-                        self.finish_deal_verdict(window, cx);
-                    }
-                    self.echo(&verdict.echo, StyleClass::SystemInfo, cx);
-                }
-                if let Some(undone) = undone {
-                    self.complete_verdict_undo(undone.entry, window, cx);
+            ConnEvent::DeskCellsAvailable { frontier } => {
+                if let Some(sync) = self.desk_cells.cells_available(host, frontier) {
+                    self.send_to_host(host, sync);
                 }
             }
-            ConnEvent::DeskTreeBatchRejected {
-                id,
-                retryable,
-                reason,
-                snapshot,
-            } => {
-                self.pending_tree_verdicts.remove(&(host, id));
-                let undone = self.pending_tree_undos.remove(&(host, id));
-                let semantic_can_retry =
-                    retryable && self.pending_desk_batch_intents.contains_key(&(host, id));
-                if !semantic_can_retry
-                    && let Some(transaction_id) = self.pending_semantic_batches.remove(&(host, id))
-                {
-                    self.discard_desk_semantic_transaction(transaction_id, cx);
-                }
-                self.retry_desk_batch(host, id, retryable, snapshot, window, cx);
+            ConnEvent::DeskResyncRequired => {
+                let sync = self.desk_cells.resync_required(host);
+                self.send_to_host(host, sync);
+            }
+            ConnEvent::DeskMutationAccepted { stamp } => {
+                self.desk_cells.mutation_accepted(host, stamp);
+                self.complete_desk_mutation(host, stamp, window, cx);
                 self.sync_tree_dashboard(host, window, cx);
-                if let Some(undone) = undone {
-                    let entry = undone.entry;
-                    if matches!(entry.state, VerdictUndoState::Filed { .. }) {
-                        self.echo(
-                            &format!("cannot undo filing: {} was edited", entry.card.breadcrumb),
-                            StyleClass::SystemInfo,
-                            cx,
-                        );
-                    } else {
-                        self.restore_verdict_undo(entry);
-                    }
-                }
-                if !retryable {
-                    self.notice_on(None, &reason, StyleClass::SystemInfo, cx);
-                }
+            }
+            ConnEvent::DeskMutationRejected { stamp, reason } => {
+                self.desk_cells.mutation_rejected(host, stamp, cx);
+                self.reject_desk_mutation(host, stamp, cx);
+                self.sync_tree_dashboard(host, window, cx);
+                self.notice_on(None, &format!("desk: {reason}"), StyleClass::SystemInfo, cx);
+            }
+            ConnEvent::DeskTextApplied { node_id, operation } => {
+                self.desk_cells.text_applied(host, node_id, operation, cx);
+                self.sync_tree_dashboard(host, window, cx);
             }
             ConnEvent::DeskPageBindingResult { request_id, error } => {
                 if let Some(pending) = self.pending_page_filings.remove(&(host, request_id)) {
@@ -2348,9 +2130,6 @@ impl Workspace {
                         }
                     }
                 }
-            }
-            ConnEvent::DeskTreeResyncRequired => {
-                self.send_to_host(host, ClientMessage::DeskTreeSubscribe);
             }
             ConnEvent::Ready {
                 agents,
@@ -2593,6 +2372,10 @@ impl Workspace {
             }
             ConnEvent::Recovered => {
                 self.hosts.set_status(host, HostStatus::Online);
+                // The Desk handshake belongs to the connection, not to the
+                // window: a reconnect asks only for what it is missing.
+                let sync = self.desk_cells.sync(host);
+                self.send_to_host(host, sync);
                 let source = self.host_label(host);
                 self.notice_on(
                     None,
@@ -3700,28 +3483,17 @@ impl Workspace {
             && let Some(crate::dashboard::RowTarget::TreeTopic { host, node_id, .. }) =
                 self.dashboard.cursor_target(&self.registry, cx)
         {
-            let today = chrono::Local::now().date_naive();
-            let mark = rho_desk::TemporalMark {
-                year: chrono::Datelike::year(&today),
-                month: chrono::Datelike::month(&today) as u8,
-                day: chrono::Datelike::day(&today) as u8,
-                minute_of_day: None,
-                pace_days: 0,
-            };
-            let kind = if hide {
-                rho_desk::TemporalKind::Discarded
+            let state = if hide {
+                rho_desk::cells::State::Dismissed
             } else {
-                rho_desk::TemporalKind::Done
+                rho_desk::cells::State::Done
             };
-            if let Some((batch, messages)) = self.desk_tree_sync.prepare_temporal_batch(
-                host,
-                node_id,
-                temporal_verdict_values(kind, mark),
-            ) {
-                self.desk_tree_sync.apply_optimistic(host, &messages, cx);
-                self.sync_tree_dashboard(host, window, cx);
-                self.send_to_host(host, ClientMessage::DeskTreeBatchApply { batch });
-            }
+            let writes = vec![rho_desk::cells::CellWrite {
+                node: node_id,
+                field: rho_desk::cells::Field::State,
+                value: rho_desk::cells::Value::State(state),
+            }];
+            self.apply_desk_writes(host, writes, None, window, cx);
             return;
         }
         if !self.require_connected(cx) {
@@ -4229,7 +4001,7 @@ impl Workspace {
             .pending_filing_selected
             .take()
             .and_then(|(host, parent)| {
-                self.append_tree_heading_tagged(host, parent, true, false, &title, tags, window, cx)
+                self.append_tree_heading_tagged(host, parent, true, &title, tags, window, cx)
                     .map(|node| (host, node))
             });
         let Some((host, node)) = filed else {
@@ -4279,7 +4051,6 @@ impl Workspace {
             .pending_filing_card
             .take()
             .and_then(|(card_id, card)| (card_id == id).then_some(card))
-            && let Some(expected) = self.desk_tree_sync.node_expectation(host, node, cx)
         {
             let entry = self.next_verdict_undo(
                 card,
@@ -4288,7 +4059,6 @@ impl Workspace {
                 VerdictUndoState::Filed {
                     host,
                     node,
-                    expected,
                     prior: removed,
                 },
             );
@@ -4333,6 +4103,9 @@ impl Workspace {
         let Ok(page) = id.parse::<rho_browser::PageId>() else {
             return false;
         };
+        // A page filed while its browser is not running has no URL yet; the
+        // daemon backfills it rather than losing the filing.
+        let url = rho_browser::live_page_url(page).unwrap_or_default();
         let request_id = self.next_page_binding_request_id;
         self.next_page_binding_request_id = self.next_page_binding_request_id.wrapping_add(1);
         self.pending_page_filings.insert(
@@ -4350,6 +4123,7 @@ impl Workspace {
                 request_id,
                 parent,
                 page_id: rho_desk::PageId(*page.0.as_bytes()),
+                url,
             },
         );
         true
@@ -5355,8 +5129,14 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn desk_snapshot_for_test(&self, host: HostId) -> rho_desk::Snapshot {
-        self.desk_tree_sync.snapshot_for_test(host).unwrap()
+    pub(crate) fn desk_cells_snapshot_for_test(
+        &self,
+        host: HostId,
+    ) -> Vec<rho_desk::cells::MaterializedNode> {
+        self.desk_cells
+            .tree_source(host)
+            .map(|(nodes, _)| nodes)
+            .unwrap_or_default()
     }
 
     #[cfg(test)]
@@ -6366,27 +6146,12 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn clone_pending_desk_intent_for_test(
-        &mut self,
-        host: HostId,
-        from: rho_desk::TreeClock,
-        to: rho_desk::TreeClock,
-    ) {
-        let intent = self.pending_desk_batch_intents[&(host, from)].clone();
-        self.pending_desk_batch_intents.insert((host, to), intent);
-    }
-
-    #[cfg(test)]
     pub(crate) fn tree_buffer_for_test(
         &self,
         host: HostId,
         node_id: rho_desk::NodeId,
     ) -> Option<Entity<language::Buffer>> {
-        self.desk_tree_sync
-            .tree_source(host)?
-            .1
-            .get(&node_id)
-            .cloned()
+        self.desk_cells.buffer(host, node_id).cloned()
     }
 
     #[cfg(test)]
@@ -6396,11 +6161,11 @@ impl Workspace {
         cx: &App,
     ) -> Vec<(
         rho_desk::NodeId,
-        rho_desk::NodeKind,
+        rho_desk::cells::NodeKind,
         Option<rho_desk::NodeId>,
         String,
     )> {
-        self.desk_tree_sync
+        self.desk_cells
             .tree_source(host)
             .into_iter()
             .flat_map(|(nodes, buffers)| {
@@ -6832,68 +6597,24 @@ impl Workspace {
     /// their source. The reconcile is idempotent and cheap, so calling
     /// it from several funnels is fine.
     fn sync_tree_dashboard(&mut self, host: HostId, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some((nodes, buffers)) = self.desk_tree_sync.tree_source(host) {
+        if let Some((nodes, buffers)) = self.desk_cells.tree_source(host) {
             self.dashboard.set_tree_source(host, nodes, buffers, cx);
             self.refresh_dashboard(window, cx);
         }
     }
 
-    pub(crate) fn send_desk_node_text(
+    /// A note-body edit, on its way to the daemon as a text operation.
+    pub(crate) fn send_desk_text(
         &mut self,
         host: HostId,
         node_id: rho_desk::NodeId,
         operation: rho_desk::TextOperation,
         transaction: rho_desk::TextTransaction,
-        visible_edit: Option<(std::ops::Range<usize>, String)>,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) {
-        if self.desk_batch_editing {
-            self.desk_batch_text.push(ClientMessage::DeskNodeTextApply {
-                node_id,
-                operation,
-                transaction: Some(transaction),
-            });
-            return;
-        }
-        if self.desk_tree_sync.tree_node(host, node_id).is_none()
-            && let Some(replacement) = self.desk_text_retargets.get(&(host, node_id)).copied()
-            && let Some(visible_edit) = visible_edit.as_ref()
-            && self
-                .desk_tree_sync
-                .replay_text_edit(host, replacement, visible_edit, cx)
-        {
-            return;
-        }
-        if let rho_desk::TextOperation::Edit {
-            ranges, new_text, ..
-        } = &operation
-            && let Some((index, newline)) = new_text
-                .iter()
-                .enumerate()
-                .find_map(|(index, text)| text.find('\n').map(|newline| (index, newline)))
-        {
-            let offset = ranges
-                .get(index)
-                .map_or(newline, |range| range.0 as usize + newline);
-            self.pending_heading_recognition = Some((true, host, node_id, offset));
-            self.desk_batch_text.clear();
-            self.desk_batch_editing = true;
-            self.desk_batch_text.push(ClientMessage::DeskNodeTextApply {
-                node_id,
-                operation,
-                transaction: Some(transaction),
-            });
-            return;
-        }
-        self.desk_tree_sync.record_pending_batch_text(
-            host,
-            node_id,
-            operation.clone(),
-            Some(transaction.clone()),
-        );
         self.send_to_host(
             host,
-            ClientMessage::DeskNodeTextApply {
+            ClientMessage::DeskTextApply {
                 node_id,
                 operation,
                 transaction: Some(transaction),
@@ -6901,421 +6622,163 @@ impl Workspace {
         );
     }
 
-    fn recognize_desk_heading_after_edit(
+    /// Sends one mutation and remembers what its acceptance still owes:
+    /// the editor's undo entry, a dealt verdict, or text for pasted notes.
+    fn apply_desk_writes(
         &mut self,
-        focus_after: bool,
+        host: HostId,
+        writes: Vec<rho_desk::cells::CellWrite>,
+        verdict: Option<(rho_desk::NodeId, rho_desk::cells::VerdictEvent)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<rho_desk::cells::Stamp> {
+        let message = self.desk_cells.apply(host, writes, verdict)?;
+        let ClientMessage::DeskMutationApply { mutation } = &message else {
+            return None;
+        };
+        let stamp = mutation.stamp;
+        // A created note needs its buffer before anything can be typed into
+        // it, and the daemon's answer may be a frame away.
+        self.desk_cells.reconcile_buffers(host, cx);
+        self.sync_tree_dashboard(host, window, cx);
+        self.send_to_host(host, message);
+        Some(stamp)
+    }
+
+    /// The daemon took the mutation. Everything that was waiting on that
+    /// answer happens here, in the order the user sees it.
+    fn complete_desk_mutation(
+        &mut self,
+        host: HostId,
+        stamp: rho_desk::cells::Stamp,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_semantic_batches.remove(&(host, stamp));
+        // Pasted notes exist now, so their bodies can be typed into the
+        // buffers the sync just created. Each edit sends its own text op.
+        for (node_id, text) in self
+            .pending_desk_texts
+            .remove(&(host, stamp))
+            .unwrap_or_default()
+        {
+            let Some(buffer) = self.desk_cells.buffer(host, node_id).cloned() else {
+                continue;
+            };
+            buffer.update(cx, |buffer, cx| {
+                buffer.edit([(0..0, text.as_str())], None, cx);
+            });
+        }
+        if let Some(verdict) = self.pending_tree_verdicts.remove(&(host, stamp)) {
+            let submitted_card_is_current = self
+                .dashboard
+                .current_deal_card()
+                .is_some_and(|card| card.identity == verdict.event.card);
+            let undo_sequence = verdict.undo.sequence;
+            self.restore_verdict_undo(verdict.undo);
+            if verdict.phone_verdict.is_some() && submitted_card_is_current {
+                self.phone_completed_verdict(undo_sequence);
+            }
+            self.dashboard.record_dealer_event(verdict.event);
+            if let Some(phone_verdict) = verdict.phone_verdict {
+                self.record_phone_verdict(phone_verdict, cx);
+            }
+            if submitted_card_is_current {
+                if verdict.phone_verdict.is_some() {
+                    self.restore_phone_feed(window, cx);
+                }
+                self.finish_deal_verdict(window, cx);
+            }
+            self.echo(&verdict.echo, StyleClass::SystemInfo, cx);
+        }
+        if let Some(undone) = self.pending_tree_undos.remove(&(host, stamp)) {
+            self.complete_verdict_undo(undone.entry, window, cx);
+        }
+    }
+
+    /// The daemon refused it. `DeskCells` has already restored the last
+    /// merged cells; what is left is to take back what the answer promised.
+    fn reject_desk_mutation(
+        &mut self,
+        host: HostId,
+        stamp: rho_desk::cells::Stamp,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_desk_texts.remove(&(host, stamp));
+        self.pending_tree_verdicts.remove(&(host, stamp));
+        if let Some(transaction_id) = self.pending_semantic_batches.remove(&(host, stamp)) {
+            self.discard_desk_semantic_transaction(transaction_id, cx);
+        }
+        if let Some(undone) = self.pending_tree_undos.remove(&(host, stamp)) {
+            self.restore_verdict_undo(undone.entry);
+        }
+    }
+
+    /// Records the editor undo entry a structure verb owns, so `u` emits the
+    /// inverse writes rather than replaying text.
+    fn record_desk_semantic_undo(
+        &mut self,
+        host: HostId,
+        stamp: rho_desk::cells::Stamp,
+        writes: Vec<rho_desk::cells::CellWrite>,
+        cx: &mut Context<Self>,
+    ) -> clock::Lamport {
+        let transaction_id = self.dashboard.push_external_undo_transaction(cx);
+        self.desk_semantic_undo
+            .insert(transaction_id, DeskSemanticUndo { host, writes });
+        self.pending_semantic_batches
+            .insert((host, stamp), transaction_id);
+        transaction_id
+    }
+
+    /// `* ` typed at the start of a line becomes a note: the line-local
+    /// recognition the design keeps. Nothing else is ever parsed.
+    fn recognize_desk_note_after_edit(
+        &mut self,
         host: HostId,
         node_id: rho_desk::NodeId,
         line_end: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let heading_undo = self.pending_heading_undo.take();
-        let input = self.desk_batch_text.first().cloned();
-        // Recognition stays attached to the inserted space before `line_end`;
-        // splitting stays attached to the inserted newline on its right.
-        let marker_anchor =
-            self.desk_tree_sync
-                .tree_anchor_at(host, node_id, line_end, text::Bias::Left, cx);
-        let newline_anchor =
-            self.desk_tree_sync
-                .tree_anchor_at(host, node_id, line_end, text::Bias::Right, cx);
-        let recognized =
-            self.desk_tree_sync
-                .recognize_heading(host, node_id, line_end, focus_after, cx);
-        let split_undo = recognized.is_none() && focus_after;
-        let (outcome, intent) = if recognized.is_some() {
-            let created = recognized.as_ref().unwrap().1;
-            (
-                recognized,
-                input
-                    .zip(marker_anchor)
-                    .map(|(input, anchor)| PendingDeskBatchIntent::Recognize {
-                        node_id,
-                        input,
-                        anchor,
-                        focus_after,
-                        created,
-                        focus_abandoned: false,
-                    }),
-            )
+        self.pending_heading_undo.take();
+        let Some(buffer) = self.desk_cells.buffer(host, node_id).cloned() else {
+            return;
+        };
+        let text = buffer.read(cx).text();
+        let cursor = line_end.min(text.len());
+        let line_start = text[..cursor].rfind('\n').map_or(0, |index| index + 1);
+        if !text[line_start..].starts_with("* ") || cursor < line_start + 2 {
+            return;
+        }
+        let line_end_offset = text[line_start..]
+            .find('\n')
+            .map_or(text.len(), |index| line_start + index);
+        let body = text[line_start + 2..line_end_offset].to_owned();
+        let Some((created, writes)) = self.desk_cells.new_note_writes(host, node_id, false) else {
+            return;
+        };
+        // The recognized line leaves the source note; the star is a
+        // keystroke, never stored text.
+        let removed = line_start..if text[line_end_offset..].starts_with('\n') {
+            line_end_offset + 1
         } else {
-            let split = focus_after
-                .then(|| {
-                    self.desk_tree_sync
-                        .split_heading_on_newline(host, node_id, line_end, cx)
-                })
-                .flatten();
-            let created = split.as_ref().map(|outcome| outcome.1).unwrap_or(node_id);
-            (
-                split,
-                input.zip(newline_anchor).map(|(input, anchor)| {
-                    PendingDeskBatchIntent::SplitHeading {
-                        node_id,
-                        input,
-                        anchor,
-                        created,
-                    }
-                }),
-            )
+            line_end_offset
         };
-        let Some((mut messages, focus, expected)) = outcome else {
-            self.desk_batch_editing = false;
-            if let Some(transaction_id) = heading_undo {
-                self.dashboard.group_until_transaction(transaction_id, cx);
-            }
-            for message in std::mem::take(&mut self.desk_batch_text) {
-                self.send_to_host(host, message);
-            }
+        buffer.update(cx, |buffer, cx| {
+            buffer.edit([(removed, "")], None, cx);
+        });
+        let undo = self.desk_cells.delete_writes(created);
+        let Some(stamp) = self.apply_desk_writes(host, writes, None, window, cx) else {
             return;
         };
-        // Capture source expectations before the optimistic delete removes
-        // the row from materialization. Cleanup and follow-on edits are added
-        // to this same pending batch after their buffer events arrive.
-        let Some(mut batch) =
-            self.desk_tree_sync
-                .operation_batch(host, expected, messages.clone(), None)
-        else {
-            self.desk_batch_editing = false;
-            return;
-        };
-        // Install the replacement composition before returning to the input
-        // loop. Follow-on keystrokes must target the created row, never the
-        // source node this same batch deletes.
-        self.desk_tree_sync.apply_optimistic(host, &messages, cx);
-        for message in &messages {
-            if let ClientMessage::DeskTreeApply { operation } = message
-                && matches!(operation, rho_desk::TreeOperation::Delete { .. })
-            {
-                self.desk_tree_sync.apply_optimistic_delete(host, operation);
-            }
+        if !body.is_empty() {
+            self.pending_desk_texts
+                .insert((host, stamp), vec![(created, body)]);
         }
-        self.dashboard.move_to_tree_node_when_ready(host, focus);
-        if messages.iter().any(|message| {
-            matches!(
-                message,
-                ClientMessage::DeskTreeApply {
-                    operation: rho_desk::TreeOperation::Delete { node_ids, .. }
-                } if node_ids.contains(&node_id)
-            )
-        }) {
-            self.desk_text_retargets.insert((host, node_id), focus);
-        }
+        self.record_desk_semantic_undo(host, stamp, undo, cx);
+        self.dashboard.move_to_tree_node_when_ready(host, created);
         self.sync_tree_dashboard(host, window, cx);
-        let heading_undo = heading_undo
-            .or_else(|| split_undo.then(|| self.dashboard.push_external_undo_transaction(cx)));
-        if let Some(transaction_id) = heading_undo {
-            self.desk_semantic_undo.insert(
-                transaction_id,
-                DeskSemanticUndo::MergeSplit {
-                    host,
-                    heading: node_id,
-                    prose: focus,
-                },
-            );
-        }
-        // Buffer subscriptions are delivered after the edit that strips the
-        // marker/newline returns. Keep capture mode active until those
-        // programmatic cleanup operations have reached `send_desk_node_text`;
-        // otherwise they escape as a standalone edit to the node this batch
-        // deletes.
-        cx.defer_in(window, move |this, _window, _cx| {
-            this.desk_batch_editing = false;
-            let mut captured = std::mem::take(&mut this.desk_batch_text);
-            let created = intent.as_ref().and_then(|intent| match intent {
-                PendingDeskBatchIntent::Recognize { created, .. }
-                | PendingDeskBatchIntent::SplitHeading { created, .. } => Some(*created),
-                PendingDeskBatchIntent::DeleteEmpty { .. } => None,
-            });
-            let mut dependent = Vec::new();
-            captured.retain(|message| {
-                let targets_created = matches!(
-                    message,
-                    ClientMessage::DeskNodeTextApply { node_id, .. }
-                        if Some(*node_id) == created
-                );
-                if targets_created {
-                    dependent.push(message.clone());
-                }
-                !targets_created
-            });
-            captured.append(&mut messages);
-            captured.append(&mut dependent);
-            let messages = captured;
-            if let Some(transaction_id) = heading_undo {
-                this.dashboard.group_until_transaction(transaction_id, _cx);
-            }
-            batch.operations = messages
-                .iter()
-                .filter_map(|message| match message {
-                    ClientMessage::DeskTreeApply { operation } => {
-                        Some(rho_desk::BatchOperation::Tree(operation.clone()))
-                    }
-                    ClientMessage::DeskNodeTextApply {
-                        node_id,
-                        operation,
-                        transaction,
-                    } => Some(rho_desk::BatchOperation::Text {
-                        node_id: *node_id,
-                        operation: operation.clone(),
-                        transaction: transaction.clone(),
-                    }),
-                    _ => None,
-                })
-                .collect();
-            this.desk_tree_sync.update_pending_batch(host, &batch);
-            if let Some(intent) = intent {
-                this.pending_desk_batch_intents
-                    .insert((host, batch.id), intent);
-            }
-            if let Some(transaction_id) = heading_undo {
-                this.pending_semantic_batches
-                    .insert((host, batch.id), transaction_id);
-            }
-            this.send_to_host(host, ClientMessage::DeskTreeBatchApply { batch });
-        });
-    }
-
-    fn retry_desk_batch(
-        &mut self,
-        host: HostId,
-        id: rho_desk::TreeClock,
-        retryable: bool,
-        snapshot: rho_desk::Snapshot,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let intent = self.pending_desk_batch_intents.remove(&(host, id));
-        let semantic_transaction = self.pending_semantic_batches.remove(&(host, id));
-        let cursor_before = self
-            .dashboard
-            .tree_node_cursor_offset(cx)
-            .filter(|(cursor_host, _, _)| *cursor_host == host)
-            .map(|(_, node_id, offset)| (node_id, offset));
-        let dependent = self
-            .desk_tree_sync
-            .reset_rejected_batch(host, id, snapshot, cx);
-        let Some(intent) = intent.filter(|_| retryable) else {
-            if let Some(transaction_id) = semantic_transaction {
-                self.discard_desk_semantic_transaction(transaction_id, cx);
-            }
-            return;
-        };
-        self.desk_batch_text.clear();
-        self.desk_batch_editing = true;
-        let (prepared, next_intent, old_created, delete_node, focus_offset) = match intent {
-            PendingDeskBatchIntent::Recognize {
-                node_id,
-                input,
-                anchor,
-                focus_after,
-                created,
-                focus_abandoned,
-            } => {
-                self.desk_tree_sync
-                    .apply_optimistic(host, std::slice::from_ref(&input), cx);
-                self.desk_batch_text.push(input.clone());
-                let line_end = self
-                    .desk_tree_sync
-                    .resolve_tree_anchor(host, node_id, anchor, cx);
-                let prepared = line_end.and_then(|line_end| {
-                    self.desk_tree_sync
-                        .recognize_heading(host, node_id, line_end, focus_after, cx)
-                });
-                (
-                    prepared,
-                    Some((node_id, input, anchor, focus_after, false, focus_abandoned)),
-                    Some(created),
-                    None,
-                    None,
-                )
-            }
-            PendingDeskBatchIntent::SplitHeading {
-                node_id,
-                input,
-                anchor,
-                created,
-            } => {
-                self.desk_tree_sync
-                    .apply_optimistic(host, std::slice::from_ref(&input), cx);
-                self.desk_batch_text.push(input.clone());
-                let line_end = self
-                    .desk_tree_sync
-                    .resolve_tree_anchor(host, node_id, anchor, cx);
-                let prepared = line_end.and_then(|line_end| {
-                    self.desk_tree_sync
-                        .split_heading_on_newline(host, node_id, line_end, cx)
-                });
-                (
-                    prepared,
-                    Some((node_id, input, anchor, true, true, false)),
-                    Some(created),
-                    None,
-                    None,
-                )
-            }
-            PendingDeskBatchIntent::DeleteEmpty { node_id } => {
-                let mut focus_offset = None;
-                let prepared = self
-                    .desk_tree_sync
-                    .prepare_delete_empty(host, node_id, cx)
-                    .map(|(messages, focus, expected, _)| {
-                        focus_offset = focus.map(|(_, offset)| offset);
-                        (
-                            messages,
-                            focus.map(|(node, _)| node).unwrap_or(node_id),
-                            expected,
-                        )
-                    });
-                (prepared, None, None, Some(node_id), focus_offset)
-            }
-        };
-        cx.defer_in(window, move |this, window, cx| {
-            this.finish_retry_desk_batch(
-                host,
-                id,
-                prepared,
-                next_intent,
-                old_created,
-                delete_node,
-                focus_offset,
-                cursor_before,
-                dependent,
-                semantic_transaction,
-                window,
-                cx,
-            );
-        });
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn finish_retry_desk_batch(
-        &mut self,
-        host: HostId,
-        id: rho_desk::TreeClock,
-        prepared: Option<(Vec<ClientMessage>, rho_desk::NodeId, Vec<rho_desk::NodeId>)>,
-        next_intent: Option<(
-            rho_desk::NodeId,
-            ClientMessage,
-            text::Anchor,
-            bool,
-            bool,
-            bool,
-        )>,
-        old_created: Option<rho_desk::NodeId>,
-        delete_node: Option<rho_desk::NodeId>,
-        focus_offset: Option<usize>,
-        cursor_before: Option<(rho_desk::NodeId, usize)>,
-        mut dependent: Vec<rho_desk::BatchOperation>,
-        semantic_transaction: Option<clock::Lamport>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.desk_batch_editing = false;
-        let Some((mut messages, focus, expected)) = prepared else {
-            self.desk_batch_text.clear();
-            if let Some(transaction_id) = semantic_transaction {
-                self.discard_desk_semantic_transaction(transaction_id, cx);
-            }
-            return;
-        };
-        let mut captured = std::mem::take(&mut self.desk_batch_text);
-        captured.append(&mut messages);
-        let mut batch =
-            match self
-                .desk_tree_sync
-                .operation_batch(host, expected, captured.clone(), Some(id))
-            {
-                Some(batch) => batch,
-                None => {
-                    if let Some(transaction_id) = semantic_transaction {
-                        self.discard_desk_semantic_transaction(transaction_id, cx);
-                    }
-                    return;
-                }
-            };
-        if let Some(old_created) = old_created {
-            for operation in &mut dependent {
-                if let rho_desk::BatchOperation::Text { node_id, .. } = operation
-                    && *node_id == old_created
-                {
-                    *node_id = focus;
-                }
-            }
-            if let Some(transaction_id) = semantic_transaction
-                && let Some(DeskSemanticUndo::MergeSplit { prose, .. }) =
-                    self.desk_semantic_undo.get_mut(&transaction_id)
-                && *prose == old_created
-            {
-                *prose = focus;
-            }
-        }
-        batch.operations.extend(dependent.clone());
-        self.desk_tree_sync.update_pending_batch(host, &batch);
-        self.desk_tree_sync
-            .keep_pending_batch_text(host, id, dependent.clone());
-        let dependent_messages = dependent.into_iter().map(|operation| match operation {
-            rho_desk::BatchOperation::Tree(operation) => ClientMessage::DeskTreeApply { operation },
-            rho_desk::BatchOperation::Text {
-                node_id,
-                operation,
-                transaction,
-            } => ClientMessage::DeskNodeTextApply {
-                node_id,
-                operation,
-                transaction,
-            },
-        });
-        captured.extend(dependent_messages);
-        self.desk_tree_sync.apply_optimistic(host, &captured, cx);
-        let cursor_after = cursor_before.map(|(node_id, offset)| {
-            if old_created == Some(node_id) {
-                (focus, offset)
-            } else if delete_node == Some(node_id) {
-                (focus, focus_offset.unwrap_or(offset))
-            } else {
-                (node_id, offset)
-            }
-        });
-        if let Some((node_id, offset)) = cursor_after {
-            self.dashboard
-                .move_to_tree_position_when_ready(host, node_id, offset);
-        }
-        self.sync_tree_dashboard(host, window, cx);
-        let new_intent = match next_intent {
-            Some((node_id, input, anchor, focus_after, false, focus_abandoned)) => {
-                PendingDeskBatchIntent::Recognize {
-                    node_id,
-                    input,
-                    anchor,
-                    focus_after,
-                    created: focus,
-                    focus_abandoned,
-                }
-            }
-            Some((node_id, input, anchor, _, true, _)) => PendingDeskBatchIntent::SplitHeading {
-                node_id,
-                input,
-                anchor,
-                created: focus,
-            },
-            None => PendingDeskBatchIntent::DeleteEmpty {
-                node_id: delete_node.unwrap_or(focus),
-            },
-        };
-        // As on the initial attempt, install the intent only after selection
-        // events from the optimistic recomposition have drained. Otherwise
-        // that programmatic cursor movement can look like the user abandoned
-        // the recreated heading before its retry is even sent.
-        cx.defer_in(window, move |this, _window, _cx| {
-            this.pending_desk_batch_intents
-                .insert((host, id), new_intent);
-            if let Some(transaction_id) = semantic_transaction {
-                this.pending_semantic_batches
-                    .insert((host, id), transaction_id);
-            }
-            this.send_to_host(host, ClientMessage::DeskTreeBatchApply { batch });
-        });
     }
 
     fn discard_desk_semantic_transaction(
@@ -8467,24 +7930,23 @@ impl Workspace {
             return;
         };
         match entry.state.clone() {
-            VerdictUndoState::DeskMarks { host, node, prior } => {
-                let Some((batch, messages)) = self
-                    .desk_tree_sync
-                    .prepare_temporal_batch(host, node, prior)
+            VerdictUndoState::DeskVerdict { host, node, at } => {
+                // Undo is the log's own inverse: the daemon accepts `Undone`
+                // only while the cells still hold what the verdict wrote.
+                let Some((writes, verdict)) = self.desk_cells.undo_verdict_writes(host, node, at)
                 else {
                     self.restore_verdict_undo(entry);
-                    self.echo(
-                        "undo: Desk heading is unavailable",
-                        StyleClass::SystemInfo,
-                        cx,
-                    );
+                    self.echo("undo: Desk note is unavailable", StyleClass::SystemInfo, cx);
+                    return;
+                };
+                let Some(stamp) = self.apply_desk_writes(host, writes, Some(verdict), window, cx)
+                else {
+                    self.restore_verdict_undo(entry);
+                    self.echo("undo: Desk note is unavailable", StyleClass::SystemInfo, cx);
                     return;
                 };
                 self.pending_tree_undos
-                    .insert((host, batch.id), PendingTreeUndo { entry });
-                self.desk_tree_sync.apply_optimistic(host, &messages, cx);
-                self.sync_tree_dashboard(host, window, cx);
-                self.send_to_host(host, ClientMessage::DeskTreeBatchApply { batch });
+                    .insert((host, stamp), PendingTreeUndo { entry });
             }
             VerdictUndoState::Inbox { id, prior } => {
                 debug_assert_eq!(id, prior.id);
@@ -8495,19 +7957,13 @@ impl Workspace {
                 }
                 self.complete_verdict_undo(entry, window, cx);
             }
-            VerdictUndoState::Filed {
-                host,
-                node,
-                expected,
-                ..
-            } => {
-                if self
-                    .desk_tree_sync
-                    .node_expectation(host, node, cx)
-                    .as_ref()
-                    != Some(&expected)
-                    || self.desk_tree_sync.node_has_descendants(host, node)
-                {
+            VerdictUndoState::Filed { host, node, .. } => {
+                let filed_leaf = self
+                    .desk_cells
+                    .node(host, node)
+                    .is_some_and(|node| node.kind == rho_desk::cells::NodeKind::Note)
+                    && !self.desk_cells.has_children(host, node);
+                if !filed_leaf {
                     self.echo(
                         &format!("cannot undo filing: {} was edited", entry.card.breadcrumb),
                         StyleClass::SystemInfo,
@@ -8515,10 +7971,8 @@ impl Workspace {
                     );
                     return;
                 }
-                let Some((batch, messages)) = self
-                    .desk_tree_sync
-                    .prepare_delete_exact_leaf(host, expected, cx)
-                else {
+                let writes = self.desk_cells.delete_writes(node);
+                let Some(stamp) = self.apply_desk_writes(host, writes, None, window, cx) else {
                     self.echo(
                         &format!("cannot undo filing: {} was edited", entry.card.breadcrumb),
                         StyleClass::SystemInfo,
@@ -8527,10 +7981,7 @@ impl Workspace {
                     return;
                 };
                 self.pending_tree_undos
-                    .insert((host, batch.id), PendingTreeUndo { entry });
-                self.desk_tree_sync.apply_optimistic(host, &messages, cx);
-                self.sync_tree_dashboard(host, window, cx);
-                self.send_to_host(host, ClientMessage::DeskTreeBatchApply { batch });
+                    .insert((host, stamp), PendingTreeUndo { entry });
             }
             VerdictUndoState::PageFiled => {
                 // A future implementation can undo the machine-owned node by
@@ -8549,9 +8000,7 @@ impl Workspace {
     fn submit_tree_verdict(
         &mut self,
         target_node: Option<rho_desk::NodeId>,
-        kind: rho_desk::TemporalKind,
-        at: chrono::NaiveDateTime,
-        pace_days: u32,
+        dealt: crate::desk_view::DeskVerdict,
         verdict: crate::dashboard::DealerVerdict,
         verb: String,
         window: &mut Window,
@@ -8574,96 +8023,72 @@ impl Workspace {
         let Some(node_id) = target_node.or(card.topic_node_id) else {
             return false;
         };
-        let mark = rho_desk::TemporalMark {
-            year: chrono::Datelike::year(&at.date()),
-            month: chrono::Datelike::month(&at.date()) as u8,
-            day: chrono::Datelike::day(&at.date()) as u8,
-            minute_of_day: (at.time() != chrono::NaiveTime::MIN).then(|| {
-                chrono::Timelike::hour(&at.time()) as u16 * 60
-                    + chrono::Timelike::minute(&at.time()) as u16
-            }),
-            pace_days,
-        };
-        let values = temporal_verdict_values(kind, mark);
-        let Some(node) = self.desk_tree_sync.tree_node(card.host, node_id) else {
-            return false;
-        };
-        let prior = values
-            .iter()
-            .map(|(kind, _)| (*kind, node.temporal.get(kind).copied()))
-            .collect();
-        let Some((batch, messages)) = self
-            .desk_tree_sync
-            .prepare_temporal_batch(card.host, node_id, values)
+        let phone_verdict = self.phone.enabled.then(|| match dealt {
+            crate::desk_view::DeskVerdict::Done => crate::journal::PhoneVerdict::Done,
+            crate::desk_view::DeskVerdict::Dismiss => crate::journal::PhoneVerdict::Dismiss,
+            crate::desk_view::DeskVerdict::Defer { .. } => crate::journal::PhoneVerdict::Defer,
+            crate::desk_view::DeskVerdict::Todo { .. } => crate::journal::PhoneVerdict::Todo,
+            crate::desk_view::DeskVerdict::File { .. } => crate::journal::PhoneVerdict::File,
+        });
+        let Some((writes, applied)) = self.desk_cells.verdict_writes(card.host, node_id, dealt)
         else {
             return false;
         };
         let echo = format!("{verb}: {}", card.breadcrumb);
+        let Some(stamp) = self.apply_desk_writes(card.host, writes, Some(applied), window, cx)
+        else {
+            return false;
+        };
         let undo = self.next_verdict_undo(
             card.clone(),
             verdict,
             verb,
-            VerdictUndoState::DeskMarks {
+            VerdictUndoState::DeskVerdict {
                 host: card.host,
                 node: node_id,
-                prior,
+                at: stamp,
             },
         );
         self.pending_tree_verdicts.insert(
-            (card.host, batch.id),
+            (card.host, stamp),
             PendingTreeVerdict {
                 event,
                 echo,
                 undo,
-                phone_verdict: if self.phone.enabled {
-                    match kind {
-                        rho_desk::TemporalKind::Done => Some(crate::journal::PhoneVerdict::Done),
-                        rho_desk::TemporalKind::Discarded => {
-                            Some(crate::journal::PhoneVerdict::Dismiss)
-                        }
-                        rho_desk::TemporalKind::Defer => Some(crate::journal::PhoneVerdict::Defer),
-                        rho_desk::TemporalKind::Todo => Some(crate::journal::PhoneVerdict::Todo),
-                        rho_desk::TemporalKind::Deadline | rho_desk::TemporalKind::Reminder => None,
-                    }
-                } else {
-                    None
-                },
+                phone_verdict,
             },
         );
-        self.desk_tree_sync
-            .apply_optimistic(card.host, &messages, cx);
-        self.sync_tree_dashboard(card.host, window, cx);
-        self.send_to_host(card.host, ClientMessage::DeskTreeBatchApply { batch });
         true
     }
 
-    fn set_node_temporal(
+    /// Sets a field on a row outside the dealer: no verdict, no undo entry.
+    /// Sibling order is derived from `(CreatedAt, NodeId)`, so moving a row
+    /// among its siblings has no cell to write in this slice.
+    fn reordering_unavailable(&mut self, cx: &mut Context<Self>) {
+        self.notice_on(
+            None,
+            "reordering rows is not available",
+            StyleClass::SystemInfo,
+            cx,
+        );
+    }
+
+    fn set_node_field(
         &mut self,
         host: HostId,
         node_id: rho_desk::NodeId,
-        kind: rho_desk::TemporalKind,
-        at: chrono::NaiveDateTime,
+        field: rho_desk::cells::Field,
+        value: rho_desk::cells::Value,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let mark = rho_desk::TemporalMark {
-            year: chrono::Datelike::year(&at.date()),
-            month: chrono::Datelike::month(&at.date()) as u8,
-            day: chrono::Datelike::day(&at.date()) as u8,
-            minute_of_day: None,
-            pace_days: 0,
-        };
-        let Some((batch, messages)) = self.desk_tree_sync.prepare_temporal_batch(
-            host,
-            node_id,
-            temporal_verdict_values(kind, mark),
-        ) else {
-            return false;
-        };
-        self.desk_tree_sync.apply_optimistic(host, &messages, cx);
-        self.sync_tree_dashboard(host, window, cx);
-        self.send_to_host(host, ClientMessage::DeskTreeBatchApply { batch });
-        true
+        let writes = vec![rho_desk::cells::CellWrite {
+            node: node_id,
+            field,
+            value,
+        }];
+        self.apply_desk_writes(host, writes, None, window, cx)
+            .is_some()
     }
 
     fn defer_deal_edit(
@@ -8730,13 +8155,9 @@ impl Workspace {
     ) {
         let workdir = match intent {
             NewAgentIntent::Staff((host, node_id)) => self
-                .desk_tree_sync
-                .tree_node(host, node_id)
-                .and_then(|node| node.bindings.get(&rho_desk::BindingKind::File).cloned())
-                .and_then(|binding| match binding {
-                    rho_desk::Binding::File(path) => Some(HostPath { host, path }),
-                    _ => None,
-                }),
+                .desk_cells
+                .file_path(host, node_id)
+                .map(|path| HostPath { host, path }),
             NewAgentIntent::QuickSpawn => {
                 let row_workdir = match self.dashboard.cursor_target(&self.registry, cx) {
                     Some(crate::dashboard::RowTarget::TreeAgent { agent_id, .. }) => {
@@ -8785,16 +8206,8 @@ impl Workspace {
         _cx: &mut Context<Self>,
     ) -> Option<HostPath> {
         let (host, node_id) = topic;
-        if let Some(rho_desk::Binding::File(path)) = self
-            .desk_tree_sync
-            .tree_node(host, node_id)?
-            .bindings
-            .get(&rho_desk::BindingKind::File)
-        {
-            return Some(HostPath {
-                host,
-                path: path.clone(),
-            });
+        if let Some(path) = self.desk_cells.file_path(host, node_id) {
+            return Some(HostPath { host, path });
         }
         let mut candidates = self.workdirs.iter().filter(|workdir| workdir.host == host);
         let only = candidates.next()?;
@@ -9287,22 +8700,6 @@ impl Workspace {
         }
     }
 
-    fn dashboard_open_native_line(
-        &mut self,
-        above: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let action = if above {
-            "vim::InsertLineAbove"
-        } else {
-            "vim::InsertLineBelow"
-        };
-        if let Ok(action) = cx.build_action(action, None) {
-            window.dispatch_action(action, cx);
-        }
-    }
-
     /// A freshly opened draft row only exists on screen after a sync:
     /// splice it in now so the pending cursor lands on it, then enter
     /// insert there — never on the read-only row the cursor came from.
@@ -9482,89 +8879,69 @@ impl Workspace {
     }
 
     fn dashboard_new_heading(&mut self, child: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((host, node_id)) = self.dashboard.tree_node_at_cursor(cx) else {
+        // An empty desk has no row to hang the new one off, so the first
+        // note is a root: the key still works on a desk with nothing in it.
+        // A cursor left in a removed excerpt still names its old node, and
+        // the verb must not be swallowed: an unknown row falls back to a root.
+        let (host, relative) = match self.dashboard.tree_node_at_cursor(cx) {
+            Some((host, node_id)) => (
+                host,
+                self.desk_cells.node(host, node_id).map(|node| node.id),
+            ),
+            None => match self.hosts.primary() {
+                Some(host) if self.desk_cells.is_synced(host) => (host, None),
+                _ => return,
+            },
+        };
+        let created = match relative {
+            Some(relative) => self.desk_cells.new_note_writes(host, relative, child),
+            None => self.desk_cells.create_note_writes(host, None),
+        };
+        let Some((created, writes)) = created else {
             return;
         };
-        if let Some(operation) = self
-            .desk_tree_sync
-            .prepare_new_heading(host, node_id, child, false)
-        {
-            if let rho_desk::TreeOperation::Create { node_id, .. } = &operation {
-                self.dashboard.move_to_tree_node_when_ready(host, *node_id);
-                let transaction_id = self.dashboard.push_external_undo_transaction(cx);
-                self.desk_semantic_undo.insert(
-                    transaction_id,
-                    DeskSemanticUndo::DeleteCreated {
-                        host,
-                        root: *node_id,
-                    },
-                );
-                self.pending_semantic_group = Some(transaction_id);
-            }
-            let message = ClientMessage::DeskTreeApply { operation };
-            self.desk_tree_sync
-                .apply_optimistic(host, std::slice::from_ref(&message), cx);
-            self.sync_tree_dashboard(host, window, cx);
-            self.send_to_host(host, message);
-            // The structural shortcut is the equivalent of Vim's `o`: the
-            // new row is ready for text immediately, rather than consuming
-            // the first title characters as normal-mode commands.
-            self.dashboard_enter_insert(window, cx);
-        }
-    }
-
-    fn apply_desk_semantic_batch(
-        &mut self,
-        host: HostId,
-        batch: rho_desk::OperationBatch,
-        messages: Vec<ClientMessage>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.desk_tree_sync.apply_optimistic(host, &messages, cx);
-        for message in &messages {
-            if let ClientMessage::DeskTreeApply { operation } = message
-                && matches!(operation, rho_desk::TreeOperation::Delete { .. })
-            {
-                self.desk_tree_sync.apply_optimistic_delete(host, operation);
-            }
-        }
+        let undo = self.desk_cells.delete_writes(created);
+        let Some(stamp) = self.apply_desk_writes(host, writes, None, window, cx) else {
+            return;
+        };
+        self.dashboard.move_to_tree_node_when_ready(host, created);
         self.sync_tree_dashboard(host, window, cx);
-        self.send_to_host(host, ClientMessage::DeskTreeBatchApply { batch });
+        let transaction_id = self.record_desk_semantic_undo(host, stamp, undo, cx);
+        self.pending_semantic_group = Some(transaction_id);
+        // The structural shortcut is the equivalent of Vim's `o`: the
+        // new row is ready for text immediately, rather than consuming
+        // the first title characters as normal-mode commands.
+        self.dashboard_enter_insert(window, cx);
     }
 
     fn paste_desk_semantic_subtree(
         &mut self,
         host: HostId,
         node_id: rho_desk::NodeId,
-        before: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(subtree) = self.desk_semantic_clipboard.clone() else {
+        let Some(capture) = self.desk_semantic_clipboard.clone() else {
             return;
         };
-        let Some((batch, messages, root)) = self
-            .desk_tree_sync
-            .prepare_paste_subtree(host, node_id, before, &subtree)
+        let Some((root, writes, texts)) = self.desk_cells.paste_writes(host, node_id, &capture)
         else {
             return;
         };
+        let undo = self.desk_cells.delete_writes(root);
         self.dashboard.move_to_tree_node_when_ready(host, root);
-        let batch_id = batch.id;
-        self.apply_desk_semantic_batch(host, batch, messages, window, cx);
+        let Some(stamp) = self.apply_desk_writes(host, writes, None, window, cx) else {
+            return;
+        };
+        if !texts.is_empty() {
+            self.pending_desk_texts.insert((host, stamp), texts);
+        }
         cx.on_next_frame(window, move |this, window, cx| {
             this.dashboard.move_to_tree_node_when_ready(host, root);
             this.sync_tree_dashboard(host, window, cx);
         });
         cx.notify();
-        let transaction_id = self.dashboard.push_external_undo_transaction(cx);
-        self.desk_semantic_undo.insert(
-            transaction_id,
-            DeskSemanticUndo::DeleteCreated { host, root },
-        );
-        self.pending_semantic_batches
-            .insert((host, batch_id), transaction_id);
+        self.record_desk_semantic_undo(host, stamp, undo, cx);
     }
 
     fn handle_desk_semantic_row_action(
@@ -9579,21 +8956,20 @@ impl Workspace {
         };
         match action {
             editor::SemanticRowAction::Yank => {
-                self.desk_semantic_clipboard =
-                    self.desk_tree_sync.capture_subtree(host, node_id, cx);
+                self.desk_semantic_clipboard = self.desk_cells.capture(host, node_id, cx);
             }
             editor::SemanticRowAction::Delete => {
-                let Some((batch, messages, subtree, focus)) = self
-                    .desk_tree_sync
-                    .prepare_delete_subtree(host, node_id, cx)
-                else {
+                let Some(capture) = self.desk_cells.capture(host, node_id, cx) else {
                     return;
                 };
-                let relocation_notice = subtree.relocation_notice();
-                self.desk_semantic_clipboard = Some(subtree.clone());
+                let writes = self.desk_cells.delete_writes(node_id);
+                let undo = self.desk_cells.inverse_writes(host, &writes);
+                self.desk_semantic_clipboard = Some(capture);
+                let focus = self.desk_cells.row_after_delete(host, node_id);
                 self.desk_semantic_paste_target = focus.map(|focus| (host, focus));
-                let batch_id = batch.id;
-                self.apply_desk_semantic_batch(host, batch, messages, window, cx);
+                let Some(stamp) = self.apply_desk_writes(host, writes, None, window, cx) else {
+                    return;
+                };
                 if let Some(focus) = focus {
                     // Vim finishes its linewise delete after emitting the
                     // semantic action and can overwrite a synchronous cursor
@@ -9608,88 +8984,47 @@ impl Workspace {
                     });
                     cx.notify();
                 }
-                let transaction_id = self.dashboard.push_external_undo_transaction(cx);
-                self.desk_semantic_undo.insert(
-                    transaction_id,
-                    DeskSemanticUndo::RestoreDeleted { host, subtree },
-                );
-                self.pending_semantic_batches
-                    .insert((host, batch_id), transaction_id);
-                if let Some(notice) = relocation_notice {
-                    self.echo(&notice, StyleClass::SystemInfo, cx);
-                }
+                self.record_desk_semantic_undo(host, stamp, undo, cx);
             }
-            editor::SemanticRowAction::Paste { before } => {
+            editor::SemanticRowAction::Paste { .. } => {
                 self.desk_semantic_paste_target = None;
-                self.paste_desk_semantic_subtree(host, node_id, before, window, cx);
+                self.paste_desk_semantic_subtree(host, node_id, window, cx);
             }
             editor::SemanticRowAction::Open { above } => {
-                let Some(prepared) = self
-                    .desk_tree_sync
-                    .prepare_open_prose(host, node_id, above, cx)
+                // Sibling order is `(CreatedAt, NodeId)` and `CreatedAt`
+                // cannot be rewritten, so `O` opens after the row like `o`.
+                if above {
+                    self.echo(
+                        "open above: new rows land after their siblings",
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
+                }
+                let Some((created, writes)) = self.desk_cells.new_note_writes(host, node_id, false)
                 else {
                     return;
                 };
-                match prepared {
-                    crate::desk_view::PreparedOpenProse::Existing {
-                        node_id,
-                        offset,
-                        open_above,
-                    } => {
-                        self.dashboard
-                            .move_to_tree_position_when_ready(host, node_id, offset);
-                        self.sync_tree_dashboard(host, window, cx);
-                        self.dashboard_open_native_line(open_above, window, cx);
-                    }
-                    crate::desk_view::PreparedOpenProse::Created {
-                        batch,
-                        messages,
-                        node_id,
-                    } => {
-                        let batch_id = batch.id;
-                        self.dashboard.move_to_tree_node_when_ready(host, node_id);
-                        self.apply_desk_semantic_batch(host, batch, messages, window, cx);
-                        let transaction_id = self.dashboard.push_external_undo_transaction(cx);
-                        self.desk_semantic_undo.insert(
-                            transaction_id,
-                            DeskSemanticUndo::DeleteCreated {
-                                host,
-                                root: node_id,
-                            },
-                        );
-                        self.pending_semantic_batches
-                            .insert((host, batch_id), transaction_id);
-                        self.pending_semantic_group = Some(transaction_id);
-                        self.dashboard_enter_insert(window, cx);
-                    }
-                }
+                let undo = self.desk_cells.delete_writes(created);
+                self.dashboard.move_to_tree_node_when_ready(host, created);
+                let Some(stamp) = self.apply_desk_writes(host, writes, None, window, cx) else {
+                    return;
+                };
+                let transaction_id = self.record_desk_semantic_undo(host, stamp, undo, cx);
+                self.pending_semantic_group = Some(transaction_id);
+                self.dashboard_enter_insert(window, cx);
             }
             editor::SemanticRowAction::Indent { outdent } => {
-                let demote = !outdent;
-                let Some(original) = self.desk_tree_sync.tree_node(host, node_id) else {
-                    return;
-                };
-                let Some(operation) = self
-                    .desk_tree_sync
-                    .prepare_structure_move(host, node_id, demote)
+                let Some(writes) = self
+                    .desk_cells
+                    .structure_move_writes(host, node_id, !outdent)
                 else {
                     return;
                 };
-                let message = ClientMessage::DeskTreeApply { operation };
-                self.desk_tree_sync
-                    .apply_optimistic(host, std::slice::from_ref(&message), cx);
-                self.sync_tree_dashboard(host, window, cx);
-                self.send_to_host(host, message);
-                let transaction_id = self.dashboard.push_external_undo_transaction(cx);
-                self.desk_semantic_undo.insert(
-                    transaction_id,
-                    DeskSemanticUndo::StructureMove {
-                        host,
-                        node_id,
-                        parent: original.parent,
-                        order: original.order,
-                    },
-                );
+                let undo = self.desk_cells.inverse_writes(host, &writes);
+                let Some(stamp) = self.apply_desk_writes(host, writes, None, window, cx) else {
+                    return;
+                };
+                self.record_desk_semantic_undo(host, stamp, undo, cx);
             }
         }
     }
@@ -9703,87 +9038,7 @@ impl Workspace {
         let Some(undo) = self.desk_semantic_undo.remove(&transaction_id) else {
             return;
         };
-        match undo {
-            DeskSemanticUndo::DeleteCreated { host, root } => {
-                let Some((batch, messages, _, _)) =
-                    self.desk_tree_sync.prepare_delete_subtree(host, root, cx)
-                else {
-                    return;
-                };
-                self.apply_desk_semantic_batch(host, batch, messages, window, cx);
-            }
-            DeskSemanticUndo::RestoreDeleted { host, subtree } => {
-                let Some((batch, messages, root)) =
-                    self.desk_tree_sync.prepare_restore_subtree(host, &subtree)
-                else {
-                    return;
-                };
-                self.dashboard.move_to_tree_node_when_ready(host, root);
-                self.apply_desk_semantic_batch(host, batch, messages, window, cx);
-            }
-            DeskSemanticUndo::StructureMove {
-                host,
-                node_id,
-                parent,
-                order,
-            } => {
-                let Some((batch, messages)) = self
-                    .desk_tree_sync
-                    .prepare_move_to(host, node_id, parent, order)
-                else {
-                    return;
-                };
-                self.apply_desk_semantic_batch(host, batch, messages, window, cx);
-            }
-            DeskSemanticUndo::RestoreDeletedEmpty { host, undo } => {
-                self.desk_batch_editing = true;
-                self.desk_batch_text.clear();
-                let prepared = self
-                    .desk_tree_sync
-                    .prepare_restore_deleted_empty(host, &undo, cx);
-                self.desk_batch_editing = false;
-                let Some((mut messages, root, expected)) = prepared else {
-                    self.desk_batch_text.clear();
-                    return;
-                };
-                let mut captured = std::mem::take(&mut self.desk_batch_text);
-                captured.append(&mut messages);
-                let Some(batch) =
-                    self.desk_tree_sync
-                        .operation_batch(host, expected, captured.clone(), None)
-                else {
-                    return;
-                };
-                self.dashboard.move_to_tree_node_when_ready(host, root);
-                self.apply_desk_semantic_batch(host, batch, captured, window, cx);
-            }
-            DeskSemanticUndo::MergeSplit {
-                host,
-                heading,
-                prose,
-            } => {
-                self.desk_batch_editing = true;
-                self.desk_batch_text.clear();
-                let prepared = self
-                    .desk_tree_sync
-                    .prepare_merge_split(host, heading, prose, cx);
-                self.desk_batch_editing = false;
-                let Some((mut messages, expected)) = prepared else {
-                    self.desk_batch_text.clear();
-                    return;
-                };
-                let mut captured = std::mem::take(&mut self.desk_batch_text);
-                captured.append(&mut messages);
-                let Some(batch) =
-                    self.desk_tree_sync
-                        .operation_batch(host, expected, captured.clone(), None)
-                else {
-                    return;
-                };
-                self.dashboard.move_to_tree_node_when_ready(host, heading);
-                self.apply_desk_semantic_batch(host, batch, captured, window, cx);
-            }
-        }
+        self.apply_desk_writes(undo.host, undo.writes, None, window, cx);
     }
 
     fn append_tree_heading(
@@ -9791,12 +9046,12 @@ impl Workspace {
         host: HostId,
         relative: rho_desk::NodeId,
         child: bool,
-        above: bool,
+        _above: bool,
         title: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.append_tree_heading_tagged(host, relative, child, above, title, &[], window, cx)
+        self.append_tree_heading_tagged(host, relative, child, title, &[], window, cx)
             .is_some()
     }
 
@@ -9805,108 +9060,54 @@ impl Workspace {
         host: HostId,
         relative: rho_desk::NodeId,
         child: bool,
-        above: bool,
         title: &str,
         tags: &[&str],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<rho_desk::NodeId> {
-        let Some(operation) = self
-            .desk_tree_sync
-            .prepare_new_heading(host, relative, child, above)
-        else {
-            return None;
-        };
-        let rho_desk::TreeOperation::Create { node_id, .. } = &operation else {
-            return None;
-        };
-        let node_id = *node_id;
-        let message = ClientMessage::DeskTreeApply { operation };
-        self.dashboard.move_to_tree_node_when_ready(host, node_id);
-        self.desk_tree_sync
-            .apply_optimistic(host, std::slice::from_ref(&message), cx);
-        self.sync_tree_dashboard(host, window, cx);
-        self.send_to_host(host, message);
+        let (created, mut writes) = self.desk_cells.new_note_writes(host, relative, child)?;
         for tag in tags {
-            let Some(operation) = self.desk_tree_sync.prepare_set_tag(host, node_id, tag) else {
-                continue;
-            };
-            let message = ClientMessage::DeskTreeApply { operation };
-            self.desk_tree_sync
-                .apply_optimistic(host, std::slice::from_ref(&message), cx);
-            self.send_to_host(host, message);
+            writes.push(rho_desk::cells::CellWrite {
+                node: created,
+                field: rho_desk::cells::Field::Tag((*tag).to_owned()),
+                value: rho_desk::cells::Value::Bool(true),
+            });
         }
+        self.dashboard.move_to_tree_node_when_ready(host, created);
+        self.apply_desk_writes(host, writes, None, window, cx)?;
         self.sync_tree_dashboard(host, window, cx);
         self.dashboard
             .rename_cursor_topic(title, cx)
-            .then_some(node_id)
-    }
-
-    fn dashboard_reorder(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((host, node_id)) = self.dashboard.tree_node_at_cursor(cx) else {
-            return;
-        };
-        if let Some(operation) = self.desk_tree_sync.prepare_reorder(host, node_id, down) {
-            let message = ClientMessage::DeskTreeApply { operation };
-            self.desk_tree_sync
-                .apply_optimistic(host, std::slice::from_ref(&message), cx);
-            self.sync_tree_dashboard(host, window, cx);
-            self.send_to_host(host, message);
-        }
+            .then_some(created)
     }
 
     fn dashboard_delete_empty(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some((host, node_id)) = self.dashboard.tree_node_at_cursor(cx) {
-            self.desk_batch_editing = true;
-            self.desk_batch_text.clear();
-            let prepared = self.desk_tree_sync.prepare_delete_empty(host, node_id, cx);
-            self.desk_batch_editing = false;
-            if let Some((mut messages, focus, expected, undo)) = prepared {
-                let mut captured = std::mem::take(&mut self.desk_batch_text);
-                captured.append(&mut messages);
-                let messages = captured;
-                let Some(batch) =
-                    self.desk_tree_sync
-                        .operation_batch(host, expected, messages.clone(), None)
-                else {
-                    return;
-                };
-                self.pending_desk_batch_intents.insert(
-                    (host, batch.id),
-                    PendingDeskBatchIntent::DeleteEmpty { node_id },
-                );
-                if let Some((focus, offset)) = focus {
-                    self.dashboard
-                        .move_to_tree_position_when_ready(host, focus, offset);
-                }
-                self.desk_tree_sync.apply_optimistic(host, &messages, cx);
-                for message in &messages {
-                    if let ClientMessage::DeskTreeApply { operation } = message
-                        && matches!(operation, rho_desk::TreeOperation::Delete { .. })
-                    {
-                        self.desk_tree_sync.apply_optimistic_delete(host, operation);
-                    }
-                }
-                self.sync_tree_dashboard(host, window, cx);
-                let batch_id = batch.id;
-                self.send_to_host(host, ClientMessage::DeskTreeBatchApply { batch });
-                let transaction_id = self.dashboard.push_external_undo_transaction(cx);
-                self.desk_semantic_undo.insert(
-                    transaction_id,
-                    DeskSemanticUndo::RestoreDeletedEmpty { host, undo },
-                );
-                self.pending_semantic_batches
-                    .insert((host, batch_id), transaction_id);
-                return;
-            }
-            self.desk_batch_text.clear();
+        let Some((host, node_id)) = self.dashboard.tree_node_at_cursor(cx) else {
+            return;
+        };
+        let empty = self
+            .desk_cells
+            .buffer(host, node_id)
+            .is_some_and(|buffer| buffer.read(cx).is_empty());
+        if !empty {
+            self.notice_on(
+                None,
+                "delete: heading is not empty",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
         }
-        self.notice_on(
-            None,
-            "delete: heading is not empty",
-            StyleClass::SystemInfo,
-            cx,
-        );
+        let focus = self.desk_cells.row_above(host, node_id);
+        let writes = self.desk_cells.delete_writes(node_id);
+        let undo = self.desk_cells.inverse_writes(host, &writes);
+        if let Some(focus) = focus {
+            self.dashboard.move_to_tree_node_when_ready(host, focus);
+        }
+        let Some(stamp) = self.apply_desk_writes(host, writes, None, window, cx) else {
+            return;
+        };
+        self.record_desk_semantic_undo(host, stamp, undo, cx);
     }
 
     fn dashboard_undo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -11322,7 +10523,6 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &DashboardDealDone, window, cx| {
                 vim::take_count(cx);
                 let card = this.dashboard.current_deal_card().cloned();
-                let today = chrono::Local::now().date_naive();
                 let now = chrono::Local::now().fixed_offset();
                 if card
                     .as_ref()
@@ -11330,9 +10530,7 @@ impl Render for Workspace {
                 {
                     if !this.submit_tree_verdict(
                         None,
-                        rho_desk::TemporalKind::Done,
-                        today.and_time(chrono::NaiveTime::MIN),
-                        0,
+                        crate::desk_view::DeskVerdict::Done,
                         crate::dashboard::DealerVerdict::Done,
                         "done".to_owned(),
                         window,
@@ -11406,7 +10604,6 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &DashboardDealDiscard, window, cx| {
                 vim::take_count(cx);
                 let card = this.dashboard.current_deal_card().cloned();
-                let today = chrono::Local::now().date_naive();
                 let now = chrono::Local::now().fixed_offset();
                 if card
                     .as_ref()
@@ -11414,9 +10611,7 @@ impl Render for Workspace {
                 {
                     if !this.submit_tree_verdict(
                         None,
-                        rho_desk::TemporalKind::Discarded,
-                        today.and_time(chrono::NaiveTime::MIN),
-                        0,
+                        crate::desk_view::DeskVerdict::Dismiss,
                         crate::dashboard::DealerVerdict::Dismiss,
                         "discard".to_owned(),
                         window,
@@ -11505,10 +10700,11 @@ impl Render for Workspace {
                     let days = count.max(1);
                     if !this.submit_tree_verdict(
                         None,
-                        rho_desk::TemporalKind::Defer,
-                        (today + chrono::Duration::days(i64::from(days)))
-                            .and_time(chrono::NaiveTime::MIN),
-                        days,
+                        crate::desk_view::DeskVerdict::Defer {
+                            until: crate::desk_view::day_timestamp(
+                                today + chrono::Duration::days(i64::from(days)),
+                            ),
+                        },
                         crate::dashboard::DealerVerdict::Defer,
                         format!("snooze {days}d"),
                         window,
@@ -11593,10 +10789,11 @@ impl Render for Workspace {
                         let days = count.max(1);
                         if !this.submit_tree_verdict(
                             Some(room_node),
-                            rho_desk::TemporalKind::Defer,
-                            (today + chrono::Duration::days(i64::from(days)))
-                                .and_time(chrono::NaiveTime::MIN),
-                            days,
+                            crate::desk_view::DeskVerdict::Defer {
+                                until: crate::desk_view::day_timestamp(
+                                    today + chrono::Duration::days(i64::from(days)),
+                                ),
+                            },
                             crate::dashboard::DealerVerdict::Defer,
                             format!("snooze {days}d"),
                             window,
@@ -11623,9 +10820,10 @@ impl Render for Workspace {
                     let days = count.max(1);
                     if !this.submit_tree_verdict(
                         None,
-                        rho_desk::TemporalKind::Todo,
-                        today.and_time(chrono::NaiveTime::MIN),
-                        days,
+                        crate::desk_view::DeskVerdict::Todo {
+                            defer_until: crate::desk_view::day_timestamp(today),
+                            pace: days,
+                        },
                         crate::dashboard::DealerVerdict::Done,
                         "todo".to_owned(),
                         window,
@@ -11896,13 +11094,11 @@ impl Render for Workspace {
                     this.dashboard
                         .tree_node_at_cursor(cx)
                         .is_some_and(|(host, node_id)| {
-                            this.set_node_temporal(
+                            this.set_node_field(
                                 host,
                                 node_id,
-                                rho_desk::TemporalKind::Discarded,
-                                chrono::Local::now()
-                                    .date_naive()
-                                    .and_time(chrono::NaiveTime::MIN),
+                                rho_desk::cells::Field::State,
+                                rho_desk::cells::Value::State(rho_desk::cells::State::Dismissed),
                                 window,
                                 cx,
                             )
@@ -11957,7 +11153,7 @@ impl Render for Workspace {
                     cx.propagate();
                     return;
                 }
-                this.dashboard_reorder(false, window, cx);
+                this.reordering_unavailable(cx);
             }))
             .on_action(
                 cx.listener(|this, _: &DashboardMoveSubtreeDown, window, cx| {
@@ -11965,7 +11161,7 @@ impl Render for Workspace {
                         cx.propagate();
                         return;
                     }
-                    this.dashboard_reorder(true, window, cx);
+                    this.reordering_unavailable(cx);
                 }),
             )
             .on_action(cx.listener(|this, _: &DashboardDeleteEmpty, window, cx| {
@@ -11997,7 +11193,7 @@ impl Render for Workspace {
                     cx,
                 ) {
                     if let Some((host, node_id)) = this.desk_semantic_paste_target.take() {
-                        this.paste_desk_semantic_subtree(host, node_id, false, window, cx);
+                        this.paste_desk_semantic_subtree(host, node_id, window, cx);
                     } else {
                         cx.propagate();
                     }
@@ -12010,7 +11206,7 @@ impl Render for Workspace {
                         cx,
                     ) {
                         if let Some((host, node_id)) = this.desk_semantic_paste_target.take() {
-                            this.paste_desk_semantic_subtree(host, node_id, true, window, cx);
+                            this.paste_desk_semantic_subtree(host, node_id, window, cx);
                         } else {
                             cx.propagate();
                         }
@@ -12241,36 +11437,6 @@ mod tests {
     fn labels_agent_role() {
         let label = agent_role_label(AgentRole::pm());
         assert_eq!(label.text, "pm");
-    }
-
-    #[test]
-    fn tree_verdicts_replace_conflicting_temporal_family_members_atomically() {
-        use rho_desk::TemporalKind::{Defer, Discarded, Done, Reminder, Todo};
-
-        let mark = rho_desk::TemporalMark {
-            year: 2026,
-            month: 3,
-            day: 18,
-            minute_of_day: None,
-            pace_days: 7,
-        };
-        assert_eq!(
-            temporal_verdict_values(Done, mark),
-            vec![(Discarded, None), (Done, Some(mark))]
-        );
-        assert_eq!(
-            temporal_verdict_values(Discarded, mark),
-            vec![(Done, None), (Discarded, Some(mark))]
-        );
-        assert_eq!(
-            temporal_verdict_values(Defer, mark),
-            vec![(Reminder, None), (Defer, Some(mark))]
-        );
-        assert_eq!(
-            temporal_verdict_values(Todo, mark).last(),
-            Some(&(Todo, Some(mark)))
-        );
-        assert_eq!(temporal_verdict_values(Todo, mark).len(), 4);
     }
 
     #[test]

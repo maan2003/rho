@@ -131,14 +131,16 @@ than by running a supervisor, extension protocol, or daemon process graph.
   `dirs::state_dir()/rho/gui-telemetry`; it applies no automatic retention.
   This path is independent of the opt-in Dial9 CPU sampler and preserves the
   existing `--cpu-profile` export.
-  The Desk is one daemon-owned movable tree per host, with stable node ids and
-  one Zed text CRDT per node. Headings and prose are user-owned nodes; agent,
-  page, and runtime file rows are machine-owned nodes with typed bindings.
-  Metadata such as todo/defer/done marks is typed tree state. GUI clients
-  compose the node buffers into the familiar outline, project shared read-only
-  runtime buffers beside their machine rows, and submit structural/text
-  changes as atomic semantic batches. Org-looking output from `rho desk cat`
-  and `rho desk checkout` is presentation only and is never parsed.
+  The Desk is one daemon-owned cell tree per host, with stable node ids and a
+  separate Zed text CRDT for each editable note. Each `(node, field)` is an LWW
+  cell synchronized by per-device version vectors through the mandatory daemon
+  hub. Note ownership is user-derived; agent, page, thread, pull-request, and
+  file nodes are machine-owned and carry typed reference fields. State,
+  defer/deadline, cadence, parents, deletion, and tags are typed cells. GUI
+  clients compose cells and note buffers into the familiar outline and submit
+  atomic cell mutations or text operations. Org-looking output from
+  `rho desk cat` and `rho desk checkout` is presentation only and is never
+  parsed.
   `rho-gui` supplies its context strip, theme mapping, and focus/show policy,
   while GPUI web owns only the immediate pointer-down routing region.
   Native web pages are client-local first-class resources owned by `rho-browser`.

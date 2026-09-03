@@ -2133,6 +2133,50 @@ impl BufferSnapshot {
         rope
     }
 
+    /// Returns whether sorted CRDT full offsets exist at `version` and fall on
+    /// UTF-8 boundaries. Remote edit ranges must be checked before they are
+    /// used to slice the fragment tree.
+    pub fn are_valid_full_offsets_for_version(
+        &self,
+        offsets: impl IntoIterator<Item = FullOffset>,
+        version: &clock::Global,
+    ) -> bool {
+        let mut offsets = offsets.into_iter().peekable();
+        let mut cursor = self.fragments.cursor::<FragmentTextSummary>(&None);
+        cursor.next();
+        let mut versioned_start = 0;
+        while let Some(fragment) = cursor.item() {
+            if version.observed(fragment.timestamp) {
+                let versioned_end = versioned_start + fragment.len as usize;
+                while offsets
+                    .peek()
+                    .is_some_and(|offset| offset.0 <= versioned_end)
+                {
+                    let offset = offsets.next().unwrap();
+                    if offset.0 < versioned_start {
+                        return false;
+                    }
+                    if offset.0 == versioned_start || offset.0 == versioned_end {
+                        continue;
+                    }
+                    let local = offset.0 - versioned_start;
+                    let start = cursor.start();
+                    let boundary = if fragment.visible {
+                        self.visible_text.is_char_boundary(start.visible + local)
+                    } else {
+                        self.deleted_text.is_char_boundary(start.deleted + local)
+                    };
+                    if !boundary {
+                        return false;
+                    }
+                }
+                versioned_start = versioned_end;
+            }
+            cursor.next();
+        }
+        offsets.all(|offset| offset.0 == versioned_start)
+    }
+
     pub fn remote_id(&self) -> BufferId {
         self.remote_id
     }

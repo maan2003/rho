@@ -387,20 +387,24 @@ impl TextOperation {
                     .collect(),
                 new_text: edit.new_text.iter().map(ToString::to_string).collect(),
             },
-            Operation::Undo(undo) => Self::Undo {
-                timestamp: undo.timestamp.into(),
-                version: undo
-                    .version
-                    .iter()
-                    .filter(|c| c.value != 0)
-                    .map(Into::into)
-                    .collect(),
-                counts: undo
+            Operation::Undo(undo) => {
+                let mut counts = undo
                     .counts
                     .iter()
                     .map(|(clock, count)| ((*clock).into(), *count))
-                    .collect(),
-            },
+                    .collect::<Vec<_>>();
+                counts.sort_by_key(|(clock, _)| *clock);
+                Self::Undo {
+                    timestamp: undo.timestamp.into(),
+                    version: undo
+                        .version
+                        .iter()
+                        .filter(|c| c.value != 0)
+                        .map(Into::into)
+                        .collect(),
+                    counts,
+                }
+            }
         }
     }
 
@@ -1081,6 +1085,21 @@ pub fn todo_priority(at: chrono::NaiveDateTime, pace_days: u32, now: chrono::Nai
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_undo_counts_have_a_canonical_wire_order() {
+        let operation = text::Operation::Undo(text::UndoOperation {
+            timestamp: clock(3, 1).into(),
+            version: Global::new(),
+            counts: [(clock(2, 2).into(), 1), (clock(1, 1).into(), 1)]
+                .into_iter()
+                .collect(),
+        });
+        let TextOperation::Undo { counts, .. } = TextOperation::from_text(&operation) else {
+            panic!("undo changed variants")
+        };
+        assert!(counts.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    }
 
     fn clock(value: u32, replica_id: u16) -> TreeClock {
         TreeClock { value, replica_id }

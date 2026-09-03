@@ -101,7 +101,7 @@ pub enum Value {
     OptionalTimestamp(Option<Timestamp>),
     State(State),
     AgentId(AgentId),
-    Host(u32),
+    Host(u64),
     PageRef(PageId),
     Text(String),
     Number(u64),
@@ -185,9 +185,23 @@ pub enum VerdictEvent {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct CellWrite {
+    pub node: NodeId,
+    pub field: Field,
+    pub value: Value,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
+pub struct CellMutation {
+    pub stamp: Stamp,
+    pub writes: Vec<CellWrite>,
+    pub verdict: Option<(NodeId, VerdictEvent)>,
+}
+
 pub type Version = BTreeMap<DeviceId, u64>;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct Snapshot {
     pub cells: Vec<Cell>,
     pub verdicts: Vec<(NodeId, Stamp, VerdictEvent)>,
@@ -230,6 +244,49 @@ impl Store {
 
     pub fn version(&self) -> &Version {
         &self.version
+    }
+
+    pub fn from_snapshot(device: DeviceId, snapshot: Snapshot) -> Result<Self, String> {
+        let mut store = Self::new(device);
+        store.merge(snapshot)?;
+        Ok(store)
+    }
+
+    pub fn apply_mutation(&mut self, mutation: &CellMutation) -> Result<(), String> {
+        if mutation.writes.is_empty() || mutation.writes.len() > 4096 {
+            return Err("Desk cell mutation write count is invalid".into());
+        }
+        if mutation.verdict.as_ref().is_some_and(|(_, event)| {
+            matches!(event, VerdictEvent::Applied { changes, .. } if changes.len() > 4096)
+        }) {
+            return Err("Desk verdict change count is invalid".into());
+        }
+        if let Some((_, VerdictEvent::Applied { at, .. })) = &mutation.verdict
+            && *at != mutation.stamp
+        {
+            return Err("Desk verdict event stamp does not match its mutation".into());
+        }
+        let delta = Snapshot {
+            cells: mutation
+                .writes
+                .iter()
+                .map(|write| {
+                    Cell::new(
+                        write.node,
+                        write.field.clone(),
+                        mutation.stamp,
+                        write.value.clone(),
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+            verdicts: mutation
+                .verdict
+                .iter()
+                .map(|(node, event)| (*node, mutation.stamp, event.clone()))
+                .collect(),
+            version: Version::from([(mutation.stamp.device, mutation.stamp.version)]),
+        };
+        self.merge(delta)
     }
 
     pub fn write(&mut self, node: NodeId, field: Field, value: Value) -> Result<Cell, String> {
@@ -500,10 +557,14 @@ impl Store {
         output
     }
 
-    fn value(&self, node: NodeId, field: &Field) -> Option<&Value> {
+    pub fn value(&self, node: NodeId, field: &Field) -> Option<&Value> {
         self.cells
             .get(&(node, field.clone()))
             .map(|cell| &cell.value)
+    }
+
+    pub fn verdict_event(&self, node: NodeId, stamp: Stamp) -> Option<&VerdictEvent> {
+        self.verdicts.get(&(node, stamp))
     }
 }
 

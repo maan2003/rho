@@ -74,26 +74,30 @@ impl EventSink {
 }
 
 pub enum ConnEvent {
-    DeskTreeSnapshot {
-        snapshot: rho_desk::Snapshot,
-        replica_id: u16,
+    DeskSynced {
+        node_namespace: u16,
+        delta: rho_desk::cells::Snapshot,
+        texts: Vec<rho_desk::NodeTextSnapshot>,
     },
-    #[cfg(test)]
-    DeskTreeReplaced(rho_desk::Snapshot),
-    DeskTreeApplied(rho_desk::TreeOpRecord),
-    DeskNodeTextApplied(rho_desk::TextOpRecord),
-    DeskTreeBatchApplied(rho_desk::BatchOpRecord),
-    DeskTreeBatchRejected {
-        id: rho_desk::TreeClock,
-        retryable: bool,
+    DeskMutationAccepted {
+        stamp: rho_desk::cells::Stamp,
+    },
+    DeskMutationRejected {
+        stamp: rho_desk::cells::Stamp,
         reason: String,
-        snapshot: rho_desk::Snapshot,
     },
+    DeskCellsAvailable {
+        frontier: rho_desk::cells::Version,
+    },
+    DeskTextApplied {
+        node_id: rho_desk::NodeId,
+        operation: rho_desk::TextOperation,
+    },
+    DeskResyncRequired,
     DeskPageBindingResult {
         request_id: u64,
         error: Option<String>,
     },
-    DeskTreeResyncRequired,
     Ready {
         agents: Vec<UiAgentSummary>,
         iris_agent: Option<AgentId>,
@@ -1032,7 +1036,6 @@ fn replay_safe(message: &ClientMessage) -> bool {
         message,
         ClientMessage::Ping
             | ClientMessage::Subscribe
-            | ClientMessage::DeskTreeSubscribe
             | ClientMessage::SubscribeAgent { .. }
             | ClientMessage::AgentStreamFocus { .. }
             | ClientMessage::GitTransportRegister
@@ -1138,7 +1141,6 @@ async fn run(
     }
 
     write_frame(&mut stream, &ClientMessage::ChatGptUsage).await?;
-    write_frame(&mut stream, &ClientMessage::DeskTreeSubscribe).await?;
 
     write_frame(&mut stream, &ClientMessage::GitTransportRegister).await?;
 
@@ -1218,37 +1220,41 @@ async fn run(
             },
         };
         let event = match message {
-            ServerMessage::DeskTreeSnapshot {
-                snapshot,
-                replica_id,
-            } => Some(ConnEvent::DeskTreeSnapshot {
-                snapshot,
-                replica_id,
+            ServerMessage::DeskSynced {
+                node_namespace,
+                delta,
+                texts,
+            } => Some(ConnEvent::DeskSynced {
+                node_namespace,
+                delta,
+                texts,
             }),
-            ServerMessage::DeskTreeApplied { record } => Some(ConnEvent::DeskTreeApplied(record)),
-            ServerMessage::DeskNodeTextApplied { record } => {
-                Some(ConnEvent::DeskNodeTextApplied(record))
+            ServerMessage::DeskMutationAccepted { stamp } => {
+                Some(ConnEvent::DeskMutationAccepted { stamp })
             }
-            // Phase-1 clients re-snapshot after an atomic batch; Phase 2
-            // applies the record directly without exposing partial state.
-            ServerMessage::DeskTreeBatchApplied { record } => {
-                Some(ConnEvent::DeskTreeBatchApplied(record))
+            ServerMessage::DeskMutationRejected { stamp, reason } => {
+                Some(ConnEvent::DeskMutationRejected { stamp, reason })
             }
-            ServerMessage::DeskTreeBatchRejected {
-                id,
-                retryable,
-                reason,
-                snapshot,
-            } => Some(ConnEvent::DeskTreeBatchRejected {
-                id,
-                retryable,
-                reason,
-                snapshot,
-            }),
+            ServerMessage::DeskCellsAvailable { frontier } => {
+                Some(ConnEvent::DeskCellsAvailable { frontier })
+            }
+            ServerMessage::DeskTextApplied {
+                node_id,
+                operation,
+                transaction: _,
+            } => Some(ConnEvent::DeskTextApplied { node_id, operation }),
+            ServerMessage::DeskResyncRequired => Some(ConnEvent::DeskResyncRequired),
+            // The old tree stream is dead weight until 5pha's side drops
+            // it from the protocol; nothing here listens.
+            ServerMessage::DeskTreeSnapshot { .. }
+            | ServerMessage::DeskTreeApplied { .. }
+            | ServerMessage::DeskNodeTextApplied { .. }
+            | ServerMessage::DeskTreeBatchApplied { .. }
+            | ServerMessage::DeskTreeBatchRejected { .. }
+            | ServerMessage::DeskTreeResyncRequired => None,
             ServerMessage::DeskPageBindingResult { request_id, error } => {
                 Some(ConnEvent::DeskPageBindingResult { request_id, error })
             }
-            ServerMessage::DeskTreeResyncRequired => Some(ConnEvent::DeskTreeResyncRequired),
             // Read-only CLI reply; the GUI subscribes instead.
             ServerMessage::DeskTreeDocument { .. } => None,
             ServerMessage::Ready {

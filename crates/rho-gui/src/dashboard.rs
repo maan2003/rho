@@ -357,7 +357,7 @@ pub struct Dashboard {
 }
 
 struct TreeHostSource {
-    nodes: Vec<rho_desk::MaterializedNode>,
+    nodes: Vec<rho_desk::cells::MaterializedNode>,
     buffers: BTreeMap<rho_desk::NodeId, Entity<Buffer>>,
 }
 
@@ -367,7 +367,7 @@ fn nearest_tree_heading(
 ) -> Option<rho_desk::NodeId> {
     while let Some(id) = node_id {
         let node = source.nodes.iter().find(|node| node.id == id)?;
-        if node.kind == rho_desk::NodeKind::Heading {
+        if node.kind == rho_desk::cells::NodeKind::Note {
             return Some(id);
         }
         node_id = node.parent;
@@ -418,7 +418,7 @@ impl Dashboard {
     pub fn tree_heading_named(&self, title: &str, cx: &App) -> Option<(HostId, rho_desk::NodeId)> {
         self.tree_hosts.iter().find_map(|(host, source)| {
             source.nodes.iter().find_map(|node| {
-                (node.kind == rho_desk::NodeKind::Heading
+                (node.kind == rho_desk::cells::NodeKind::Note
                     && source
                         .buffers
                         .get(&node.id)
@@ -457,33 +457,15 @@ impl Dashboard {
             for heading in source
                 .nodes
                 .iter()
-                .filter(|node| node.kind == rho_desk::NodeKind::Heading)
+                .filter(|node| node.kind == rho_desk::cells::NodeKind::Note)
             {
-                let terminal = heading.temporal.contains_key(&rho_desk::TemporalKind::Done)
-                    || heading
-                        .temporal
-                        .contains_key(&rho_desk::TemporalKind::Discarded);
+                let terminal = heading.state != rho_desk::cells::State::Open;
                 let ancestor_deferred = std::iter::successors(heading.parent, |parent| {
                     nodes.get(parent).and_then(|node| node.parent)
                 })
                 .filter_map(|parent| nodes.get(&parent))
-                .any(|node| {
-                    node.temporal
-                        .get(&rho_desk::TemporalKind::Defer)
-                        .is_some_and(|mark| {
-                            tree_mark_priority(
-                                rho_desk::TemporalKind::Defer,
-                                mark,
-                                now.naive_local(),
-                            ) == f64::NEG_INFINITY
-                        })
-                });
-                let locally_deferred = heading.temporal.iter().any(|(kind, mark)| {
-                    matches!(
-                        kind,
-                        rho_desk::TemporalKind::Defer | rho_desk::TemporalKind::Reminder
-                    ) && tree_mark_priority(*kind, mark, now.naive_local()) == f64::NEG_INFINITY
-                });
+                .any(|node| desk_deferred(node, now.naive_local()));
+                let locally_deferred = desk_deferred(heading, now.naive_local());
                 if terminal || ancestor_deferred || locally_deferred {
                     order += 1;
                     continue;
@@ -494,15 +476,11 @@ impl Dashboard {
                     .nodes
                     .iter()
                     .filter(|node| node.parent == Some(heading.id))
-                    .filter_map(
-                        |node| match node.bindings.get(&rho_desk::BindingKind::Agent) {
-                            Some(rho_desk::Binding::Agent(agent_id)) => Some((node.id, *agent_id)),
-                            _ => None,
-                        },
-                    )
+                    .filter_map(|node| Some((node.id, node_agent(node)?)))
                     .collect::<Vec<_>>();
-                for (kind, mark) in &heading.temporal {
-                    let priority = tree_mark_priority(*kind, mark, now.naive_local());
+                for (mark, at) in desk_marks(heading) {
+                    let priority =
+                        desk_mark_priority(mark, at, heading.pace_days, now.naive_local());
                     if priority <= DEAL_QUEUE_FLOOR {
                         continue;
                     }
@@ -514,9 +492,9 @@ impl Dashboard {
                         priority,
                         virtual_reply: false,
                         order,
-                        fingerprint: DealFingerprint(format!("{kind:?}:{mark:?}")),
+                        fingerprint: DealFingerprint(format!("{mark:?}:{at:?}")),
                         card: DealCard {
-                            label: tree_temporal_label(*kind, mark, now.naive_local(), priority),
+                            label: desk_mark_label(mark, at, now.naive_local()),
                             priority,
                             host: *host,
                             subject_node_id: Some(heading.id),
@@ -531,14 +509,10 @@ impl Dashboard {
                         },
                     });
                 }
-                let todo_gated = heading
-                    .temporal
-                    .get(&rho_desk::TemporalKind::Todo)
-                    .is_some_and(|mark| {
-                        tree_mark_priority(rho_desk::TemporalKind::Todo, mark, now.naive_local())
-                            <= DEAL_QUEUE_FLOOR
-                    });
-                if !todo_gated {
+                // The old model gated a topic's agent cards on its todo
+                // mark not being ripe yet. With marks as fields the same
+                // gate is the note being deferred, which is checked above.
+                {
                     for (machine_node_id, root_agent) in bindings {
                         let mut agents = vec![root_agent];
                         let mut cursor = 0;
@@ -715,7 +689,7 @@ impl Dashboard {
             let node = source.nodes.iter().find(|node| node.id == node_id)?;
             let Some(parent) = node.parent else { break };
             let parent_node = source.nodes.iter().find(|node| node.id == parent)?;
-            if parent_node.kind != rho_desk::NodeKind::Heading {
+            if parent_node.kind != rho_desk::cells::NodeKind::Note {
                 break;
             }
             node_id = parent;
@@ -879,7 +853,7 @@ impl Dashboard {
     pub fn set_tree_source(
         &mut self,
         host: HostId,
-        nodes: Vec<rho_desk::MaterializedNode>,
+        nodes: Vec<rho_desk::cells::MaterializedNode>,
         buffers: BTreeMap<rho_desk::NodeId, Entity<Buffer>>,
         cx: &mut Context<Workspace>,
     ) {
@@ -1190,7 +1164,7 @@ impl Dashboard {
                 return Some((card.host, node_id));
             };
             let parent_node = source.nodes.iter().find(|node| node.id == parent)?;
-            if parent_node.kind != rho_desk::NodeKind::Heading {
+            if parent_node.kind != rho_desk::cells::NodeKind::Note {
                 return Some((card.host, node_id));
             }
             node_id = parent;
@@ -1278,24 +1252,33 @@ impl Dashboard {
         for (host, source) in &self.tree_hosts {
             for node in &source.nodes {
                 let Some(parent) = node.parent else { continue };
-                if let Some(rho_desk::Binding::Agent(agent_id)) =
-                    node.bindings.get(&rho_desk::BindingKind::Agent)
-                {
+                if let Some(agent_id) = node_agent(node) {
                     self.tree_heading_agents
                         .entry((*host, parent))
                         .or_default()
-                        .push(*agent_id);
+                        .push(agent_id);
                 }
-                if let Some(rho_desk::Binding::Page(page_id)) =
-                    node.bindings.get(&rho_desk::BindingKind::Page)
-                {
-                    let page_id = rho_browser::PageId(uuid::Uuid::from_bytes(page_id.0));
+                if let Some(page_id) = node_page(node) {
                     self.tree_heading_pages
                         .entry((*host, parent))
                         .or_default()
                         .push(page_id);
                     self.referenced_pages.insert(page_id);
                 }
+            }
+        }
+        // Machine rows carry no stored text: their titles are derived from
+        // live metadata every reconcile.
+        for source in self.tree_hosts.values() {
+            for node in &source.nodes {
+                let Some(buffer) = source.buffers.get(&node.id) else {
+                    continue;
+                };
+                if is_note(node) {
+                    continue;
+                }
+                let title = derived_title(node, registry);
+                crate::desk_view::write_derived_title(buffer, &title, cx);
             }
         }
         let cursor_anchor = self.editor.update(cx, |editor, cx| {
@@ -1319,7 +1302,7 @@ impl Dashboard {
             .iter()
             .flat_map(|(host, source)| {
                 source.nodes.iter().filter_map(move |node| {
-                    if raw_mode && node.owner != rho_desk::NodeOwner::User {
+                    if raw_mode && !is_note(node) {
                         return None;
                     }
                     Some((*host, node.clone(), source.buffers.get(&node.id)?.clone()))
@@ -1328,7 +1311,7 @@ impl Dashboard {
             .collect::<Vec<_>>();
         let semantic_rows = rows
             .iter()
-            .filter(|(_, node, _)| node.kind == rho_desk::NodeKind::Heading)
+            .filter(|(_, node, _)| node.kind == rho_desk::cells::NodeKind::Note)
             .map(|(_, _, buffer)| buffer.read(cx).remote_id())
             .collect();
         self.editor.update(cx, |editor, _| {
@@ -1438,7 +1421,7 @@ impl Dashboard {
                 .parent
                 .and_then(|parent| depths.get(&(*host, parent)).copied())
                 .unwrap_or(0usize)
-                + usize::from(node.kind == rho_desk::NodeKind::Heading);
+                + usize::from(node.kind == rho_desk::cells::NodeKind::Note);
             depths.insert((*host, node.id), depth);
             tree_depths.insert((*host, node.id), tree_depth);
         }
@@ -1471,42 +1454,33 @@ impl Dashboard {
                 false
             });
             let prefix = match node.kind {
-                rho_desk::NodeKind::Heading => {
+                rho_desk::cells::NodeKind::Note => {
                     format!("{} ", "*".repeat(depths[&(*host, node.id)].max(1)))
                 }
-                rho_desk::NodeKind::Agent => {
-                    let label = node
-                        .bindings
-                        .get(&rho_desk::BindingKind::Agent)
-                        .and_then(|binding| match binding {
-                            rho_desk::Binding::Agent(agent_id) => Some(format!(
+                rho_desk::cells::NodeKind::Agent => {
+                    let label = node_agent(node)
+                        .map(|agent_id| {
+                            format!(
                                 "{} {} ",
-                                match registry.attention(*agent_id) {
+                                match registry.attention(agent_id) {
                                     UiAttention::Quiet => "○",
                                     UiAttention::Working => "·",
                                     UiAttention::Pending => "●",
                                     UiAttention::NeedsInput => "!",
                                 },
-                                registry.agent_human_name(*agent_id)
-                            )),
-                            _ => None,
+                                registry.agent_human_name(agent_id)
+                            )
                         })
                         .unwrap_or_default();
                     format!("  • {label}")
                 }
-                rho_desk::NodeKind::Page => "  ◦ ".to_owned(),
-                rho_desk::NodeKind::File => "  ◦ ".to_owned(),
-                rho_desk::NodeKind::Draft => "  › ".to_owned(),
-                rho_desk::NodeKind::Prose => String::new(),
+                _ => "  ◦ ".to_owned(),
             };
             let class = match node.kind {
-                rho_desk::NodeKind::Heading => {
+                rho_desk::cells::NodeKind::Note => {
                     Some(DashClass::for_depth(depths[&(*host, node.id)]))
                 }
-                rho_desk::NodeKind::Agent | rho_desk::NodeKind::Page | rho_desk::NodeKind::File => {
-                    Some(DashClass::Muted)
-                }
-                _ => None,
+                _ => Some(DashClass::Muted),
             };
             if let Some(class) = class
                 && let Some((_, ranges)) = highlights.iter_mut().find(|(key, _)| *key == class)
@@ -1519,26 +1493,22 @@ impl Dashboard {
                 inlays.push(inlay);
             }
             let mut hints = Vec::new();
-            for (kind, mark) in &node.temporal {
-                let kind = match kind {
-                    rho_desk::TemporalKind::Todo => "todo",
-                    rho_desk::TemporalKind::Deadline => "due",
-                    rho_desk::TemporalKind::Defer => "defer",
-                    rho_desk::TemporalKind::Reminder => "remind",
-                    rho_desk::TemporalKind::Done => "done",
-                    rho_desk::TemporalKind::Discarded => "discarded",
-                };
-                hints.push(format!(
-                    "{kind} {:04}-{:02}-{:02} · {}d",
-                    mark.year, mark.month, mark.day, mark.pace_days
-                ));
+            match node.state {
+                rho_desk::cells::State::Done => hints.push("done".to_owned()),
+                rho_desk::cells::State::Dismissed => hints.push("discarded".to_owned()),
+                rho_desk::cells::State::Open => {}
             }
-            for binding in node.bindings.values() {
-                match binding {
-                    rho_desk::Binding::Agent(_) => {}
-                    rho_desk::Binding::Page(_) => hints.push("page".to_owned()),
-                    rho_desk::Binding::File(path) => hints.push(path.to_string()),
-                }
+            if let Some(at) = node.defer_until {
+                hints.push(format!("defer {} · {}d", desk_date(at), node.pace_days));
+            }
+            if let Some(at) = node.deadline {
+                hints.push(format!("due {} · {}d", desk_date(at), node.pace_days));
+            }
+            if node.kind == rho_desk::cells::NodeKind::Page {
+                hints.push("page".to_owned());
+            }
+            if let Some(path) = node_path(node) {
+                hints.push(path);
             }
             if !hidden_by_fold && !hints.is_empty() {
                 let text: gpui::SharedString = hints.join(" · ").into();
@@ -1565,12 +1535,12 @@ impl Dashboard {
                 editor.highlight_text(class.key(), ranges, class.style(cx), cx);
             }
         });
-        self.apply_tree_folds(&rows, &tree_depths, cx);
+        self.apply_tree_folds(rows.as_slice(), &tree_depths, cx);
     }
 
     fn apply_tree_folds(
         &self,
-        rows: &[(HostId, rho_desk::MaterializedNode, Entity<Buffer>)],
+        rows: &[(HostId, rho_desk::cells::MaterializedNode, Entity<Buffer>)],
         depths: &HashMap<(HostId, rho_desk::NodeId), usize>,
         cx: &mut Context<Workspace>,
     ) {
@@ -1734,34 +1704,30 @@ impl Dashboard {
             CursorPlace::Tree(host, node_id, _) => {
                 let source = self.tree_hosts.get(&host)?;
                 let node = source.nodes.iter().find(|node| node.id == node_id)?;
-                let topic = if node.kind == rho_desk::NodeKind::Heading {
+                let topic = if node.kind == rho_desk::cells::NodeKind::Note {
                     Some(node.id)
                 } else {
                     nearest_tree_heading(source, node.parent)
                 };
                 match node.kind {
-                    rho_desk::NodeKind::Agent => {
-                        match node.bindings.get(&rho_desk::BindingKind::Agent)? {
-                            rho_desk::Binding::Agent(agent_id) => Some(RowTarget::TreeAgent {
-                                host,
-                                node_id,
-                                topic_node_id: topic?,
-                                agent_id: *agent_id,
-                            }),
-                            _ => Some(RowTarget::None),
-                        }
-                    }
-                    rho_desk::NodeKind::Page => {
-                        match node.bindings.get(&rho_desk::BindingKind::Page)? {
-                            rho_desk::Binding::Page(page_id) => Some(RowTarget::TreePage {
-                                host,
-                                node_id,
-                                topic_node_id: topic?,
-                                page_id: rho_browser::PageId(uuid::Uuid::from_bytes(page_id.0)),
-                            }),
-                            _ => Some(RowTarget::None),
-                        }
-                    }
+                    rho_desk::cells::NodeKind::Agent => match node_agent(node) {
+                        Some(agent_id) => Some(RowTarget::TreeAgent {
+                            host,
+                            node_id,
+                            topic_node_id: topic?,
+                            agent_id,
+                        }),
+                        None => Some(RowTarget::None),
+                    },
+                    rho_desk::cells::NodeKind::Page => match node_page(node) {
+                        Some(page_id) => Some(RowTarget::TreePage {
+                            host,
+                            node_id,
+                            topic_node_id: topic?,
+                            page_id,
+                        }),
+                        None => Some(RowTarget::None),
+                    },
                     _ => {
                         let topic = topic?;
                         let first_attention = self
@@ -1775,7 +1741,7 @@ impl Dashboard {
                             host,
                             node_id: topic,
                             first_attention,
-                            on_heading_line: node.kind == rho_desk::NodeKind::Heading,
+                            on_heading_line: node.kind == rho_desk::cells::NodeKind::Note,
                         })
                     }
                 }
@@ -1790,7 +1756,7 @@ impl Dashboard {
             CursorPlace::Tree(host, node_id, _) => {
                 let source = self.tree_hosts.get(&host)?;
                 let node = source.nodes.iter().find(|node| node.id == node_id)?;
-                let topic = if node.kind == rho_desk::NodeKind::Heading {
+                let topic = if node.kind == rho_desk::cells::NodeKind::Note {
                     node.id
                 } else {
                     nearest_tree_heading(source, node.parent)?
@@ -1821,7 +1787,7 @@ impl Dashboard {
                 source
                     .nodes
                     .iter()
-                    .any(|node| node.id == node_id && node.kind == rho_desk::NodeKind::Heading)
+                    .any(|node| node.id == node_id && node.kind == rho_desk::cells::NodeKind::Note)
             })
         })
     }
@@ -1835,7 +1801,7 @@ impl Dashboard {
             source
                 .nodes
                 .iter()
-                .any(|node| node.id == node_id && node.kind == rho_desk::NodeKind::Heading)
+                .any(|node| node.id == node_id && node.kind == rho_desk::cells::NodeKind::Note)
         });
         if !is_heading {
             return false;
@@ -2029,43 +1995,178 @@ fn age_label(days: f64) -> String {
     }
 }
 
-fn tree_mark_at(mark: &rho_desk::TemporalMark) -> chrono::NaiveDateTime {
-    mark.at().unwrap_or(chrono::NaiveDateTime::MIN)
+/// A dated mark on a Desk node, as the dealer reads it: a field, never text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeskMark {
+    /// `DeferUntil`: nothing until the date, then it ages. A migrated todo
+    /// keeps its cadence in `PaceDays`; a migrated defer has none.
+    Wakes,
+    Deadline,
 }
 
-fn tree_mark_priority(
-    kind: rho_desk::TemporalKind,
-    mark: &rho_desk::TemporalMark,
+fn desk_time(at: rho_desk::cells::Timestamp) -> Option<chrono::NaiveDateTime> {
+    chrono::DateTime::from_timestamp_millis(at.unix_ms).map(|time| time.naive_local())
+}
+
+/// Days between a mark and now, whole days when the mark is only a date.
+fn desk_elapsed(at: rho_desk::cells::Timestamp, now: chrono::NaiveDateTime) -> Option<f64> {
+    let time = desk_time(at)?;
+    Some(
+        if at.precision == rho_desk::cells::TimestampPrecision::Day {
+            now.date().signed_duration_since(time.date()).num_days() as f64
+        } else {
+            now.signed_duration_since(time).num_seconds() as f64 / 86_400.0
+        },
+    )
+}
+
+/// The dated marks a node carries. An Open node with neither is a note, not
+/// a card: the desk is where you write, and writing is not a queue.
+fn desk_marks(
+    node: &rho_desk::cells::MaterializedNode,
+) -> Vec<(DeskMark, rho_desk::cells::Timestamp)> {
+    if node.state != rho_desk::cells::State::Open {
+        return Vec::new();
+    }
+    let mut marks = Vec::new();
+    if let Some(at) = node.defer_until {
+        marks.push((DeskMark::Wakes, at));
+    }
+    if let Some(at) = node.deadline {
+        marks.push((DeskMark::Deadline, at));
+    }
+    marks
+}
+
+/// Whether a node is still waiting for its date, which hides it and every
+/// card under it.
+fn desk_deferred(node: &rho_desk::cells::MaterializedNode, now: chrono::NaiveDateTime) -> bool {
+    node.defer_until
+        .and_then(|at| desk_elapsed(at, now))
+        .is_some_and(|elapsed| elapsed < 0.0)
+}
+
+fn desk_mark_priority(
+    mark: DeskMark,
+    at: rho_desk::cells::Timestamp,
+    pace_days: u32,
     now: chrono::NaiveDateTime,
 ) -> f64 {
-    rho_desk::temporal_priority(kind, *mark, now)
+    let Some(elapsed) = desk_elapsed(at, now) else {
+        return f64::NEG_INFINITY;
+    };
+    let pace = f64::from(pace_days);
+    match mark {
+        // One curve serves both of yesterday's marks: a todo carried its
+        // cadence, a defer had none, and `elapsed - pace` is each of them.
+        DeskMark::Wakes if elapsed < 0.0 => f64::NEG_INFINITY,
+        DeskMark::Wakes => elapsed - pace,
+        DeskMark::Deadline if elapsed < -pace => f64::NEG_INFINITY,
+        DeskMark::Deadline if elapsed <= 0.0 => elapsed / pace.max(1.0),
+        DeskMark::Deadline => 1_000_000.0 + elapsed,
+    }
 }
 
-fn tree_temporal_label(
-    kind: rho_desk::TemporalKind,
-    mark: &rho_desk::TemporalMark,
+fn desk_mark_label(
+    mark: DeskMark,
+    at: rho_desk::cells::Timestamp,
     now: chrono::NaiveDateTime,
-    priority: f64,
 ) -> String {
-    let elapsed = now.signed_duration_since(tree_mark_at(mark)).num_seconds() as f64 / 86_400.0;
-    match kind {
-        rho_desk::TemporalKind::Deadline if elapsed > 0.0 => {
+    let Some(elapsed) = desk_elapsed(at, now) else {
+        return String::new();
+    };
+    match mark {
+        DeskMark::Deadline if elapsed > 0.0 => {
             format!("deadline · {}d late", elapsed.floor() as u64)
         }
-        rho_desk::TemporalKind::Deadline => format!("deadline · {}d", (-elapsed).ceil() as u64),
-        rho_desk::TemporalKind::Todo if priority >= 0.0 => {
-            format!("todo · ripe {}d", priority.floor() as u64)
-        }
-        rho_desk::TemporalKind::Todo => "todo".to_owned(),
-        rho_desk::TemporalKind::Reminder => "reminder".to_owned(),
-        rho_desk::TemporalKind::Defer => format!("deferred · woke {}", age_label(elapsed)),
-        rho_desk::TemporalKind::Done | rho_desk::TemporalKind::Discarded => String::new(),
+        DeskMark::Deadline => format!("deadline · {}d", (-elapsed).ceil() as u64),
+        // A woken node reads the same whether it was a todo or a defer:
+        // the cadence lives in the curve, not in two words for one field.
+        DeskMark::Wakes => format!("deferred · woke {}", age_label(elapsed)),
     }
+}
+
+/// The agent a machine row is bound to.
+fn node_agent(node: &rho_desk::cells::MaterializedNode) -> Option<AgentId> {
+    match node.fields.get(&rho_desk::cells::Field::AgentId) {
+        Some(rho_desk::cells::Value::AgentId(agent_id)) => Some(*agent_id),
+        _ => None,
+    }
+}
+
+fn node_page(node: &rho_desk::cells::MaterializedNode) -> Option<rho_browser::PageId> {
+    match node.fields.get(&rho_desk::cells::Field::PageRef) {
+        Some(rho_desk::cells::Value::PageRef(page_id)) => {
+            Some(rho_browser::PageId(uuid::Uuid::from_bytes(page_id.0)))
+        }
+        _ => None,
+    }
+}
+
+/// A note's workdir lives on its machine-owned `File` child rather than on
+/// the note itself, so callers look one level down.
+pub(crate) fn node_file_path(
+    nodes: &[rho_desk::cells::MaterializedNode],
+    node_id: rho_desk::NodeId,
+) -> Option<camino::Utf8PathBuf> {
+    nodes
+        .iter()
+        .filter(|node| node.parent == Some(node_id) && node.kind == rho_desk::cells::NodeKind::File)
+        .find_map(
+            |node| match node.fields.get(&rho_desk::cells::Field::Path) {
+                Some(rho_desk::cells::Value::Path(path)) => Some(path.clone()),
+                _ => None,
+            },
+        )
+}
+
+fn node_path(node: &rho_desk::cells::MaterializedNode) -> Option<String> {
+    match node.fields.get(&rho_desk::cells::Field::Path) {
+        Some(rho_desk::cells::Value::Path(path)) => Some(path.to_string()),
+        _ => None,
+    }
+}
+
+/// What a machine row says. Agent rows carry their name in the row prefix
+/// already, so their buffer stays empty rather than repeating it.
+fn derived_title(node: &rho_desk::cells::MaterializedNode, _registry: &AgentRegistry) -> String {
+    use rho_desk::cells::{Field, NodeKind, Value};
+
+    let text = |field| match node.fields.get(&field) {
+        Some(Value::Text(text)) => Some(text.clone()),
+        _ => None,
+    };
+    match node.kind {
+        NodeKind::Agent | NodeKind::Note => String::new(),
+        NodeKind::Page => node_page(node)
+            .and_then(rho_browser::live_page_name)
+            .or_else(|| text(Field::Url))
+            .unwrap_or_else(|| "page".to_owned()),
+        NodeKind::File => node_path(node).unwrap_or_default(),
+        NodeKind::Thread => match (text(Field::Channel), text(Field::ThreadTs)) {
+            (Some(channel), Some(ts)) => format!("#{channel} · {ts}"),
+            (Some(channel), None) => format!("#{channel}"),
+            _ => "thread".to_owned(),
+        },
+        NodeKind::PullRequest => match (
+            text(Field::Repo),
+            node.fields.get(&Field::PullRequestNumber),
+        ) {
+            (Some(repo), Some(Value::Number(number))) => format!("{repo}#{number}"),
+            (Some(repo), _) => repo,
+            _ => "pull request".to_owned(),
+        },
+    }
+}
+
+/// A note is the user's to write in; every other kind is the machine's row.
+fn is_note(node: &rho_desk::cells::MaterializedNode) -> bool {
+    node.kind == rho_desk::cells::NodeKind::Note
 }
 
 fn tree_breadcrumb(
     node_id: rho_desk::NodeId,
-    nodes: &HashMap<rho_desk::NodeId, &rho_desk::MaterializedNode>,
+    nodes: &HashMap<rho_desk::NodeId, &rho_desk::cells::MaterializedNode>,
     titles: &HashMap<rho_desk::NodeId, String>,
 ) -> String {
     let mut path = Vec::new();
@@ -2074,7 +2175,7 @@ fn tree_breadcrumb(
         let Some(node) = nodes.get(&node_id) else {
             break;
         };
-        if node.kind == rho_desk::NodeKind::Heading {
+        if node.kind == rho_desk::cells::NodeKind::Note {
             path.push(titles.get(&node_id).map_or("", String::as_str));
         }
         cursor = node.parent;
@@ -2280,7 +2381,7 @@ impl Dashboard {
             .iter()
             .flat_map(|(host, source)| {
                 source.nodes.iter().filter_map(move |node| {
-                    if node.kind != rho_desk::NodeKind::Heading {
+                    if node.kind != rho_desk::cells::NodeKind::Note {
                         return None;
                     }
                     let title = source.buffers.get(&node.id)?.read(cx).text();
@@ -2335,7 +2436,7 @@ impl Dashboard {
                     }
                 };
                 let candidate = match node.kind {
-                    rho_desk::NodeKind::Heading => {
+                    rho_desk::cells::NodeKind::Note => {
                         if breadcrumb.is_empty() {
                             continue;
                         }
@@ -2357,28 +2458,24 @@ impl Dashboard {
                                 .unwrap_or_default(),
                         }
                     }
-                    rho_desk::NodeKind::Agent => {
-                        let Some(rho_desk::Binding::Agent(agent_id)) =
-                            node.bindings.get(&rho_desk::BindingKind::Agent)
-                        else {
+                    rho_desk::cells::NodeKind::Agent => {
+                        let Some(agent_id) = node_agent(node) else {
                             continue;
                         };
                         FindCandidate {
                             path: under(
                                 title_of(node.id)
-                                    .unwrap_or_else(|| registry.agent_human_name(*agent_id)),
+                                    .unwrap_or_else(|| registry.agent_human_name(agent_id)),
                             ),
                             kind: "agent",
-                            target: FindTarget::Agent(*agent_id),
+                            target: FindTarget::Agent(agent_id),
                             recency: registry
-                                .agent_last_active(*agent_id)
+                                .agent_last_active(agent_id)
                                 .map_or(0, |active| active.0 as i64),
                         }
                     }
-                    rho_desk::NodeKind::Page => {
-                        let Some(rho_desk::Binding::Page(page_id)) =
-                            node.bindings.get(&rho_desk::BindingKind::Page)
-                        else {
+                    rho_desk::cells::NodeKind::Page => {
+                        let Some(page_id) = node_page(node) else {
                             continue;
                         };
                         let Some(title) = title_of(node.id) else {
@@ -2387,9 +2484,7 @@ impl Dashboard {
                         FindCandidate {
                             path: under(title),
                             kind: "page",
-                            target: FindTarget::Page(rho_browser::PageId(uuid::Uuid::from_bytes(
-                                page_id.0,
-                            ))),
+                            target: FindTarget::Page(page_id),
                             recency: 0,
                         }
                     }
@@ -2414,7 +2509,7 @@ impl Dashboard {
                 source
                     .nodes
                     .iter()
-                    .filter(|node| node.kind == rho_desk::NodeKind::Heading)
+                    .filter(|node| node.kind == rho_desk::cells::NodeKind::Note)
                     .filter_map(|node| {
                         let title = source.buffers.get(&node.id)?.read(cx).text();
                         title.to_lowercase().contains(&needle).then(|| {
@@ -2497,10 +2592,7 @@ impl Dashboard {
             .ok_or("Desk text unavailable")?
             .read(cx)
             .text();
-        let project = match node.bindings.get(&rho_desk::BindingKind::File) {
-            Some(rho_desk::Binding::File(path)) => Some(path.to_string()),
-            _ => None,
-        };
+        let project = node_file_path(&source.nodes, node.id).map(|path| path.to_string());
         Ok((host, node_id, text, project))
     }
 
@@ -2553,7 +2645,7 @@ impl Dashboard {
                 source
                     .nodes
                     .iter()
-                    .filter(|node| node.kind == rho_desk::NodeKind::Heading)
+                    .filter(|node| node.kind == rho_desk::cells::NodeKind::Note)
                     .map(move |node| (*host, node.id))
             })
             .collect::<HashSet<_>>();
@@ -2660,4 +2752,12 @@ mod tests {
             DealCardIdentity::Inbox("slack".into())
         );
     }
+}
+
+/// A mark's date as the reader sees it in an end-of-line hint.
+fn desk_date(at: rho_desk::cells::Timestamp) -> String {
+    desk_time(at).map_or_else(
+        || "unknown".to_owned(),
+        |time| time.format("%Y-%m-%d").to_string(),
+    )
 }
