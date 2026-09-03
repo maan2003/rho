@@ -164,6 +164,10 @@ the moment the upgrade is confirmed.
    upgrade; Slack inbox items are not carried, they re-derive from the
    mirror. Every agent gets a root
    `agent` node at creation, quick-spawn included, made by the daemon.
+   Creation itself follows `CREATE-DESIGN.md` (3 Sep): `n` from anywhere,
+   the area always asked with context first, the draft page carrying the
+   agent fields; `DeskPageBind.parent` optional so the new-page flow lands
+   in the tree, since the inbox it landed in is gone.
    Pulled in from slice 3 on 3 Sep so Slack never stops being dealt: a
    `thread` node is created when a ping or a reply to the user would have
    made an inbox item, through a `DeskThreadBind` request from the GUI to
