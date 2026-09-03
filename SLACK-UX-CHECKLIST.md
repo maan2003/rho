@@ -214,6 +214,14 @@ done right after the transcript primitive (2.4) and before 2.10:
       the item's range and the rows below it do not change across the
       swap; the fake serves file bytes with a `/control` delay so the rig
       shows the placeholder state.
+- [ ] 1.24 A stale new-agent draft is the only way out of a conversation.
+      Seen by b8os in the rig on 3 Sep: `ctrl-k` out of a Slack conversation
+      surfaced a leftover "draft" compose buffer as the only buffer, with no
+      way back to the desk short of a restart. Reproduce, find why a draft
+      that was never submitted stays in the surface timeline, and make
+      closing or leaving it land on the desk (or Home once it exists).
+      Folds into the retirement of the old entry points after Home if the
+      cause is the old new-agent flow.
 - [x] 1.20 Line layout, done with 2.4. Decided by the user: `<name>: <body>  <time>`.
       No time column on the left, no padded author column, no tab after
       the name: the name, a colon, one space, the body. The time goes on
