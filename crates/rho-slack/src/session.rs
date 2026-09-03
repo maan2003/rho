@@ -480,11 +480,12 @@ impl Session {
     }
 
     /// The context a ping needs, fetched once when the feed names it: the
-    /// window of the conversation ending at the pinging message, so the card
-    /// opens from the mirror with no network wait. One call, never a page
-    /// back, never a second conversation, and never at all when the mirror
-    /// already holds the message. This is what the web client fetches when
-    /// the notification is clicked; rho does it a moment earlier.
+    /// window of the conversation on both sides of the pinging message, so
+    /// the card opens from the mirror with no network wait. Two bounded
+    /// calls, never a page back, never a second conversation, and never at
+    /// all when the mirror already holds the message. This is what the web
+    /// client fetches when the notification is clicked; rho does it a moment
+    /// earlier.
     fn prefetch_ping(&mut self, key: &ThreadKey, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else {
             return;
@@ -506,13 +507,13 @@ impl Session {
                 .await
         });
         self._tasks.push(cx.spawn(async move |this, cx| {
-            let Ok(Ok(page)) = task.await else {
+            let Ok(Ok(messages)) = task.await else {
                 return;
             };
             let _ = this.update(cx, |session, cx| {
                 // Straight to the mirror: nobody has opened this conversation,
                 // so there is no surface to feed and no read marker to move.
-                session.mirror_page(&source, &page.messages, false, false);
+                session.mirror_page(&source, &messages, false, false);
                 cx.notify();
             });
         }));
@@ -874,9 +875,10 @@ fn insert_message(messages: &mut Vec<Message>, message: Message) {
 /// One screenful and then some: enough to read, cheap to decode.
 const MIRROR_PAGE: usize = 50;
 
-/// How much of a conversation a ping brings with it. Wide enough to read the
-/// exchange the ping sits in, narrow enough to be one ordinary request.
-const PING_WINDOW: usize = 40;
+/// How much of a conversation a ping brings with it, on each side of the
+/// pinged message. Wide enough to read the exchange it sits in, narrow
+/// enough to be two ordinary requests.
+const PING_WINDOW: usize = 20;
 
 /// The mirror lives beside rho's other state. A machine without a state
 /// directory simply runs without one: the client still works, it just has

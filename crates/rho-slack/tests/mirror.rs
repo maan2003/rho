@@ -217,12 +217,13 @@ fn an_edited_message_overwrites_in_place() {
     assert!(held[0].edited, "and it says it was edited");
 }
 
-/// A ping brings its own context, once. The budget is what Slack's own web
-/// client spends when someone clicks the notification: the window the message
-/// sits in, and the thread if it is one. A ping for something already
+/// A ping brings its own context, once: the twenty messages before it and
+/// the twenty after, so the reader lands with both sides of the exchange,
+/// plus the thread when it is one. The budget is what Slack's own web client
+/// spends when someone clicks the notification. A ping for something already
 /// mirrored spends nothing.
 #[tokio::test]
-async fn a_ping_costs_one_window_and_one_thread() {
+async fn a_ping_costs_a_window_on_both_sides_and_one_thread() {
     let fake = Fake::start().await.unwrap();
     fake.add_channel("C1", "design");
     for index in 0..60 {
@@ -245,10 +246,10 @@ async fn a_ping_costs_one_window_and_one_thread() {
         "the ping is news the first time"
     );
     let window = client
-        .conversations_history_around(&channel, &pinged, 40)
+        .conversations_history_around(&channel, &pinged, 20)
         .await
         .unwrap();
-    mirror.insert_messages(&scope(), &window.messages);
+    mirror.insert_messages(&scope(), &window);
     client
         .conversations_replies(&channel, &pinged, None)
         .await
@@ -256,34 +257,48 @@ async fn a_ping_costs_one_window_and_one_thread() {
 
     assert_eq!(
         fake.calls("conversations.history"),
-        1,
-        "one window, never a page back"
+        2,
+        "one window each side, never a page back"
     );
     assert_eq!(fake.calls("conversations.replies"), 1, "and one thread");
     assert_eq!(
-        fake.last_field("conversations.history", "latest")
-            .as_deref(),
-        Some("150.000000"),
-        "the window ends at the message the ping named"
+        fake.fields("conversations.history", "latest"),
+        vec![Some("150.000000".to_owned()), None],
+        "the first call ends at the pinged message"
     );
     assert_eq!(
-        fake.last_field("conversations.history", "limit").as_deref(),
-        Some("40"),
-        "and is bounded"
+        fake.fields("conversations.history", "oldest"),
+        vec![None, Some("150.000000".to_owned())],
+        "and the second starts there"
+    );
+    assert_eq!(
+        fake.fields("conversations.history", "limit"),
+        vec![Some("20".to_owned()), Some("20".to_owned())],
+        "both are bounded"
+    );
+
+    let seen = window
+        .iter()
+        .map(|message| message.ts.clone())
+        .collect::<Vec<_>>();
+    assert!(
+        seen.iter().any(|ts| ts.is_newer_than(&pinged)),
+        "the reader gets what came after the ping"
     );
     assert!(
-        window
-            .messages
-            .iter()
-            .all(|message| !message.ts.is_newer_than(&pinged)),
-        "nothing beyond the ping is pulled in"
+        seen.iter().any(|ts| pinged.is_newer_than(ts)),
+        "and what came before it"
+    );
+    assert!(
+        seen.windows(2).all(|pair| pair[1].is_newer_than(&pair[0])),
+        "in one run, in order, with no message twice"
     );
 
     // The second ping for the same message is free: the guard is the mirror.
     assert!(mirror.holds(&scope(), &pinged));
     assert_eq!(
         fake.calls("conversations.history"),
-        1,
+        2,
         "a mirrored ping costs no request"
     );
 }

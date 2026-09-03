@@ -58,9 +58,9 @@ struct State {
     /// many times. This is how a poll-failure notice gets tested.
     failures: BTreeMap<String, usize>,
     calls: BTreeMap<String, usize>,
-    /// The form fields of the last call to each method, so a test can assert
-    /// what rho asked for and not merely that it asked.
-    last_form: BTreeMap<String, BTreeMap<String, String>>,
+    /// The form fields of every call to each method, in order, so a test can
+    /// assert what rho asked for and not merely that it asked.
+    forms: BTreeMap<String, Vec<BTreeMap<String, String>>>,
 }
 
 pub struct Fake {
@@ -345,10 +345,28 @@ impl Fake {
         self.state
             .lock()
             .unwrap()
-            .last_form
+            .forms
             .get(method)?
+            .last()?
             .get(field)
             .cloned()
+    }
+
+    /// A field of every call to `method`, in the order they were made. A
+    /// request budget is a shape, not a number, so a test asserts both.
+    pub fn fields(&self, method: &str, field: &str) -> Vec<Option<String>> {
+        self.state
+            .lock()
+            .unwrap()
+            .forms
+            .get(method)
+            .map(|calls| {
+                calls
+                    .iter()
+                    .map(|form| form.get(field).cloned())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
     }
 
     pub fn calls(&self, method: &str) -> usize {
@@ -744,7 +762,11 @@ fn handle(
         }
     }
     let form = parse_form(body);
-    state.last_form.insert(method.to_owned(), form.clone());
+    state
+        .forms
+        .entry(method.to_owned())
+        .or_default()
+        .push(form.clone());
     let field = |name: &str| form.get(name).cloned().unwrap_or_default();
     match method {
         "rtm.connect" => json!({

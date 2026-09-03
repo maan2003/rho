@@ -111,7 +111,7 @@ the composer rather than queueing, for now.
 
 The mirror fills only on demand. Nothing is prefetched: a conversation's
 history is fetched when the user opens it, older pages when the reader
-scrolls up to a gap (or on `shift-p`), one page at a time,
+scrolls up to a gap, one page at a time, with no manual "load older",
 and the tail only for conversations that are open or that the feed named.
 Rho never walks a workspace's history in the background, never fans out
 over the conversation list, and never re-fetches what the mirror already
@@ -138,8 +138,8 @@ Shape to borrow, from matrix-rust-sdk's event cache (cloned under
 of chunks with explicit gaps. A gap is a record, not an assumption: it
 carries the cursor needed to fill it (for Slack, the `latest` timestamp
 to page back from). Opening a conversation shows the newest chunk;
-scrolling into the gap behind it (or `shift-p`) fills it, one page at a
-time, so a conversation reads as complete; coming back after downtime appends the
+scrolling into the gap behind it fills it, one page at a time, so a
+conversation reads as if it had always been whole; coming back after downtime appends the
 live tail as a new chunk and, if it does not reach the cached newest
 timestamp, leaves a gap between them rather than pretending continuity.
 Dedup by timestamp on every insert. Slack's model is simpler than

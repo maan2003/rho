@@ -169,8 +169,8 @@ under test. If the fake cannot produce a state, extend the fake.
       or a hole left by downtime), the session fetches the page that fills
       it, one page in flight at a time, and the cursor stays on the line
       it was on while the lines above grow. History-begins makes the top a
-      no-op, never a request. `shift-p` stays as the explicit form; the
-      echo reports `loaded 100 older` through the Messages buffer. This is
+      no-op, never a request. There is no manual form: `shift-p` and its
+      echo are removed, the user wants no "load older" to exist. This is
       still on demand under the budget rule: the web client fetches
       exactly the same page when a user scrolls to it.
 - [ ] 2.5 Next unread conversation from inside a conversation: `shift-n`,
@@ -203,7 +203,7 @@ under test. If the fake cannot produce a state, extend the fake.
       channel or DM otherwise, scrolled so the pinging message is in view
       with the cursor on it and the message itself in a highlight class
       that stays until the surface closes. Enough history above it to
-      read what led to it (the surface's normal tail, `shift-p` for more).
+      read what led to it (the surface's normal tail, scrolling for more).
       Deal keys (`d`, `x`, `s`, `S`, `t`, `f`, `q`) work on that surface
       exactly as on an agent surface, and a verdict closes it and moves on.
       The card line still shows in the queue; the surface is what you look
@@ -246,7 +246,7 @@ under test. If the fake cannot produce a state, extend the fake.
       its cached newest ts; restart shows the mirror before the socket is
       up; offline, everything cached is readable and sending fails loudly
       into the composer. Fill is on demand only: history when a
-      conversation is opened, older pages only on `shift-p`, tails only for
+      conversation is opened, older pages as the reader scrolls, tails only for
       open conversations and those the feed named; no background walk of
       history, no fan-out over the list, no re-fetch of what the mirror
       holds. Decided: a ping named by the activity feed triggers one bounded
@@ -298,7 +298,7 @@ under test. If the fake cannot produce a state, extend the fake.
 
 - [ ] 5.1 The list: `enter` open, `s` narrow, `shift-n` next unread, `q`
       close. The conversation: `enter` open the thread under the cursor or
-      the file link, `i` compose, `shift-p` older, `shift-n` next unread,
+      the file link, `i` compose, `shift-n` next unread,
       `ctrl-k` back to the channel, `G` end and clear `new`, `q` close.
       Composer: `enter` send, `shift-enter` newline, `escape` normal mode.
       Documented once, in `SLACK-DESIGN.md`, and every binding has a test.

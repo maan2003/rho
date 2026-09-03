@@ -329,26 +329,48 @@ impl Client {
         Ok(page)
     }
 
-    /// The window of a conversation ending at `ts`: what a person sees when
-    /// they click a notification and land on the message. One call, bounded,
-    /// and never paged: it is context for a ping, not a history walk.
+    /// The window of a conversation around `ts`: what a person sees when they
+    /// click a notification and land on the message, with context on both
+    /// sides of it. Two bounded calls, never paged — it is context for a
+    /// ping, not a history walk.
     pub async fn conversations_history_around(
         &self,
         channel: &ChannelId,
         ts: &Ts,
-        limit: usize,
-    ) -> anyhow::Result<MessagePage> {
-        let fields = vec![
-            ("channel", channel.0.clone()),
-            ("limit", limit.to_string()),
-            ("latest", ts.0.clone()),
-            ("inclusive", "true".to_owned()),
-        ];
-        let body = self.post_form("conversations.history", &fields).await?;
-        let mut page = parse_message_page(&body, channel);
-        page.messages
+        span: usize,
+    ) -> anyhow::Result<Vec<Message>> {
+        let before = self
+            .history_window(
+                channel,
+                span,
+                &[("latest", ts.0.clone()), ("inclusive", "true".to_owned())],
+            )
+            .await?;
+        let after = self
+            .history_window(
+                channel,
+                span,
+                &[("oldest", ts.0.clone()), ("inclusive", "false".to_owned())],
+            )
+            .await?;
+        let mut messages = before;
+        messages.extend(after);
+        messages
             .sort_by(|left, right| left.ts.epoch_seconds().total_cmp(&right.ts.epoch_seconds()));
-        Ok(page)
+        messages.dedup_by(|left, right| left.ts == right.ts);
+        Ok(messages)
+    }
+
+    async fn history_window(
+        &self,
+        channel: &ChannelId,
+        limit: usize,
+        bounds: &[(&str, String)],
+    ) -> anyhow::Result<Vec<Message>> {
+        let mut fields = vec![("channel", channel.0.clone()), ("limit", limit.to_string())];
+        fields.extend(bounds.iter().cloned());
+        let body = self.post_form("conversations.history", &fields).await?;
+        Ok(parse_message_page(&body, channel).messages)
     }
 
     /// Every conversation the user is in, across all four kinds.
