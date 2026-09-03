@@ -116,6 +116,21 @@ Nothing else lands until this does; every screenshot below comes from it.
       `deck.pdf · pdf · 220 KB`; `enter` on it downloads to the cache and
       hands the path to `xdg-open`. `[file: …]` placeholders are a defect.
 
+- [ ] 1.13 Avatars, decided: a small avatar sits before the author name on
+      each message line in the compact layout, one line tall, a fixed width
+      so the name and body columns never shift. Source: `profile.image_48`
+      from `users.info` or `users.list`, keyed by user id plus
+      `avatar_hash` so a changed picture refetches and an unchanged one
+      never does. Cache in two layers: on disk under the state cache
+      (`~/.local/state/rho/slack-avatars/<hash>.png`, written once, never
+      expired), and in memory for the open session. Fetch lazily when a line
+      first renders; until the bytes arrive the slot is blank, not a
+      placeholder glyph. The avatar is decoration through the editor's
+      inlay path, never text: yank and search see only the name. Bot
+      messages use `bot_profile.icons.image_48` the same way. If the vendored
+      editor cannot place an image inline at a fixed width without breaking
+      line layout, report that before working around it.
+
 ## Phase 2: unread, position, and moving around
 
 - [ ] 2.1 Unread rule. Now none. Rho: `── new ──` at `last_read`; opening a
