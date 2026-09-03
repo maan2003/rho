@@ -118,6 +118,20 @@ holds. The request pattern must look like a person reading, because an
 unofficial client that bulk-pulls history is the kind Slack detects and
 bans.
 
+Shape to borrow, from matrix-rust-sdk's event cache (cloned under
+`~/src/matrix-rust-sdk`, `crates/matrix-sdk-common/src/linked_chunk` and
+`crates/matrix-sdk/src/event_cache`): a conversation's history is a chain
+of chunks with explicit gaps. A gap is a record, not an assumption: it
+carries the cursor needed to fill it (for Slack, the `latest` timestamp
+to page back from). Opening a conversation shows the newest chunk;
+`shift-p` fills the gap behind it; coming back after downtime appends the
+live tail as a new chunk and, if it does not reach the cached newest
+timestamp, leaves a gap between them rather than pretending continuity.
+Dedup by timestamp on every insert. Slack's model is simpler than
+Matrix's (no encryption, no state events, a total order by `ts`), so the
+port is the chunk-and-gap idea and the update stream to the view, not the
+code.
+
 **Why:** Slack's own web client does exactly this (an IndexedDB mirror, so
 boot is instant and history scrolls without a round trip). Rho's promise
 is that the UI never waits on a remote, and the GitHub design already
