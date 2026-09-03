@@ -70,6 +70,108 @@ pub fn render_message(
     crate::emoji::render(rendered.trim_end())
 }
 
+/// What the reader sees for a link, and where it points: the rendered text
+/// shows the label alone, so the URL travels beside it and reaches the line
+/// metadata `enter` reads.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Link {
+    pub label: String,
+    pub url: String,
+}
+
+/// Every link in a message, in the order the renderer prints them. Walked
+/// from the source rather than from the rendered text, because the rendered
+/// text no longer carries the URL.
+pub fn links(blocks: &[Value], text: &str, attachments: &[Attachment]) -> Vec<Link> {
+    let mut found = Vec::new();
+    if blocks.is_empty() {
+        mrkdwn_links(text, &mut found);
+    } else {
+        for block in blocks {
+            block_links(block, &mut found);
+        }
+    }
+    for attachment in attachments {
+        if let Some(url) = attachment.url.clone() {
+            let label = attachment
+                .title
+                .clone()
+                .or_else(|| attachment.text.clone())
+                .or_else(|| attachment.fallback.clone())
+                .unwrap_or_else(|| url.clone());
+            found.push(Link { label, url });
+        }
+    }
+    found
+}
+
+fn block_links(block: &Value, found: &mut Vec<Link>) {
+    match string(block, "type") {
+        "rich_text"
+        | "rich_text_section"
+        | "rich_text_quote"
+        | "rich_text_preformatted"
+        | "rich_text_list"
+        | "context"
+        | "actions" => {
+            for element in array(block, "elements") {
+                block_links(element, found);
+            }
+        }
+        "link" => {
+            let url = string(block, "url").to_owned();
+            let label = match string(block, "text") {
+                "" => url.clone(),
+                text => text.to_owned(),
+            };
+            if !url.is_empty() {
+                found.push(Link { label, url });
+            }
+        }
+        "section" | "header" => {
+            if let Some(text) = block.get("text").map(|text| string(text, "text")) {
+                mrkdwn_links(text, found);
+            }
+            for field in array(block, "fields") {
+                mrkdwn_links(string(field, "text"), found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The `<url|label>` escapes in a plain-text body, in the order they appear.
+fn mrkdwn_links(text: &str, found: &mut Vec<Link>) {
+    let mut rest = text;
+    while let Some(start) = rest.find('<') {
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('>') else {
+            return;
+        };
+        let body = &after[..end];
+        rest = &after[end + 1..];
+        let (target, label) = match body.split_once('|') {
+            Some((target, label)) => (target, Some(label)),
+            None => (body, None),
+        };
+        if matches!(target.chars().next(), Some('@' | '#' | '!') | None) {
+            continue;
+        }
+        let url = unescape_entities(target);
+        found.push(Link {
+            label: label.map(unescape_entities).unwrap_or_else(|| url.clone()),
+            url,
+        });
+    }
+}
+
+/// The bar down the left of an unfurl. Every line of the card carries it,
+/// which is what makes the card one thing rather than several lines.
+pub const UNFURL_BAR: &str = "\u{258e} ";
+
+/// How much of someone else's page an unfurl is allowed to bring with it.
+const UNFURL_LINES: usize = 2;
+
 /// An attachment: a link preview, or an app's own card.
 ///
 /// A preview collapses to its title. Slack paints the whole page under the
@@ -88,7 +190,26 @@ fn render_attachment(attachment: &Attachment, names: &dyn Names) -> Vec<String> 
         return Vec::new();
     }
     if attachment.is_unfurl {
-        return vec![format!("↗ {}", render_mrkdwn(&headline, names))];
+        // A quote box, not loose lines: the reader sees one card hanging off
+        // the message. The title names the page, the site says where it is,
+        // and two lines of description are as much of someone else's web
+        // page as a conversation should carry.
+        let title = render_mrkdwn(&headline, names);
+        let head = match attachment.service.as_deref() {
+            Some(site) if !site.is_empty() => format!("{title} · {site}"),
+            _ => title.clone(),
+        };
+        let mut lines = vec![format!("{UNFURL_BAR}{head}")];
+        if let Some(text) = attachment.text.as_deref().filter(|text| *text != headline) {
+            lines.extend(
+                render_mrkdwn(text, names)
+                    .lines()
+                    .filter(|line| !line.trim().is_empty())
+                    .take(UNFURL_LINES)
+                    .map(|line| format!("{UNFURL_BAR}{line}")),
+            );
+        }
+        return lines;
     }
     let mut lines = Vec::new();
     if let Some(pretext) = &attachment.pretext {
@@ -263,13 +384,14 @@ fn render_inline(element: &Value, names: &dyn Names) -> String {
         }
         "emoji" => format!(":{}:", string(element, "name")),
         "broadcast" => format!("@{}", string(element, "range")),
+        // The label is all the reader needs; printing the URL beside it
+        // says the same thing twice. `links` carries the URL to the line,
+        // which is what `enter` opens.
         "link" => {
             let url = string(element, "url");
             match string(element, "text") {
                 "" => url.to_owned(),
-                // `label <url>`: the label reads, the url is still there to
-                // yank, and the angle brackets say where one ends.
-                text => format!("{text} <{url}>"),
+                text => text.to_owned(),
             }
         }
         // A date element always ships the text Slack itself would show.
@@ -385,7 +507,7 @@ fn render_escape(body: &str, names: &dyn Names) -> String {
             None => format!("@{}", target[1..].split('^').next().unwrap_or_default()),
         },
         _ => match label {
-            Some(label) => format!("{label} <{target}>"),
+            Some(label) => label.to_owned(),
             None => target.to_owned(),
         },
     }
@@ -522,8 +644,33 @@ mod tests {
             }],
         }));
         assert_eq!(
-            rendered,
-            "the plan <https://rho.example/x> and https://bare.example"
+            rendered, "the plan and https://bare.example",
+            "a labelled link reads as its label; a bare one is its own label"
+        );
+        let links = links(
+            &[json!({
+                "type": "rich_text",
+                "elements": [{
+                    "type": "rich_text_section",
+                    "elements": [
+                        {"type": "link", "url": "https://rho.example/x", "text": "the plan"},
+                        {"type": "link", "url": "https://bare.example"},
+                    ],
+                }],
+            })],
+            "",
+            &[],
+        );
+        assert_eq!(
+            links
+                .iter()
+                .map(|link| (link.label.as_str(), link.url.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("the plan", "https://rho.example/x"),
+                ("https://bare.example", "https://bare.example"),
+            ],
+            "the address the text no longer shows still reaches the line"
         );
     }
 
@@ -567,7 +714,17 @@ mod tests {
                 "<@U1> see <#C1|design> and <https://x.example|docs> &amp; <!here>",
                 &Roster
             ),
-            "@ada see #design and docs <https://x.example> & @here"
+            "@ada see #design and docs & @here"
+        );
+        let mut found = Vec::new();
+        mrkdwn_links("see <https://x.example|docs> and <@U1>", &mut found);
+        assert_eq!(
+            found,
+            vec![Link {
+                label: "docs".to_owned(),
+                url: "https://x.example".to_owned(),
+            }],
+            "a mention is not a link"
         );
         // An unterminated escape is text, not a panic.
         assert_eq!(render_mrkdwn("a < b", &Roster), "a < b");
@@ -585,6 +742,7 @@ mod tests {
                 ("duration".to_owned(), "4m12s".to_owned()),
             ],
             is_unfurl: false,
+            ..Attachment::default()
         };
         assert_eq!(
             render_message(&[], "deploy finished", &[card], &[], &Roster),
@@ -598,11 +756,14 @@ mod tests {
             pretext: None,
             fields: Vec::new(),
             is_unfurl: true,
+            service: Some("example.com".to_owned()),
+            url: Some("https://example.com/post".to_owned()),
+            ..Attachment::default()
         };
         assert_eq!(
             render_message(&[], "worth a read", &[preview], &[], &Roster),
-            "worth a read\n↗ Worth a read",
-            "a preview is a line, not a page"
+            "worth a read\n\u{258e} Worth a read · example.com\n\u{258e} A long preview body that never reaches the buffer.",
+            "a preview is a quote box of a title and two lines, not a page"
         );
     }
 
@@ -618,6 +779,7 @@ mod tests {
                 pretext: None,
                 fields: Vec::new(),
                 is_unfurl: false,
+                ..Attachment::default()
             }],
             &[FileSummary {
                 id: "F1".to_owned(),

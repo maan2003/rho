@@ -32,6 +32,7 @@ pub(crate) enum SurfaceKind {
     SlackList,
     SlackConversation,
     Messages,
+    Image,
 }
 
 impl SurfaceKind {
@@ -54,11 +55,12 @@ impl SurfaceKind {
             Self::SlackList => "slack_list",
             Self::SlackConversation => "slack_conversation",
             Self::Messages => "messages",
+            Self::Image => "image",
         }
     }
 }
 
-const SURFACE_KINDS: [SurfaceKind; 13] = [
+const SURFACE_KINDS: [SurfaceKind; 14] = [
     SurfaceKind::Dashboard,
     SurfaceKind::Draft,
     SurfaceKind::Transcript,
@@ -72,6 +74,7 @@ const SURFACE_KINDS: [SurfaceKind; 13] = [
     SurfaceKind::SlackList,
     SurfaceKind::SlackConversation,
     SurfaceKind::Messages,
+    SurfaceKind::Image,
 ];
 
 #[derive(Clone, Copy)]

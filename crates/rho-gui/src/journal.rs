@@ -219,6 +219,9 @@ pub enum SurfaceIdentity {
     SlackConversation {
         thread: SlackThread,
     },
+    Image {
+        title: String,
+    },
     Dashboard,
 }
 

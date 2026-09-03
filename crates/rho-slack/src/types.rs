@@ -191,7 +191,7 @@ impl Message {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Attachment {
     pub title: Option<String>,
     pub text: Option<String>,
@@ -204,6 +204,10 @@ pub struct Attachment {
     /// whole page; rho collapses it, because the reader asked for the
     /// conversation, not the web.
     pub is_unfurl: bool,
+    /// Where the card points, which is what `enter` on it opens.
+    pub url: Option<String>,
+    /// The site Slack named for an unfurl, `github.com` and the like.
+    pub service: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -223,7 +227,13 @@ impl FileSummary {
     /// reader needs to decide whether to open it.
     pub fn line(&self) -> String {
         let mut parts = vec![self.title.clone()];
-        if !self.filetype.is_empty() {
+        // `image.png · png` says it twice. The type earns its place only
+        // when the name does not already carry it.
+        let named = self
+            .title
+            .rsplit_once('.')
+            .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case(&self.filetype));
+        if !self.filetype.is_empty() && !named {
             parts.push(self.filetype.clone());
         }
         if self.size > 0 {

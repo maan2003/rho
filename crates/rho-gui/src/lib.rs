@@ -11,6 +11,7 @@ pub mod draft_view;
 pub mod editor_config;
 pub mod highlights;
 pub mod hosts;
+pub(crate) mod image_view;
 pub mod inbox;
 pub mod journal;
 pub mod minibuffer;
@@ -236,6 +237,10 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             BrowserExit,
             Some("RhoGui > RhoBrowser"),
         ),
+        // A picture surface has nothing to type into: the two keys that mean
+        // "I am done looking" both close it.
+        KeyBinding::new("q", SurfaceClose, Some("RhoGui > RhoImage")),
+        KeyBinding::new("escape", SurfaceClose, Some("RhoGui > RhoImage")),
         KeyBinding::new("ctrl-alt-shift-p", UploadGuiTelemetry, Some("RhoGui")),
         // Capture is global and modal: one chord, type, enter, and focus is
         // restored to the exact surface that owned it.

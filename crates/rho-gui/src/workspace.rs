@@ -208,6 +208,7 @@ pub(crate) enum SurfaceView {
     ZulipNarrow(Entity<rho_zulip::ui::NarrowView>),
     SlackList(Entity<rho_slack::ui::ListView>),
     SlackConversation(Entity<rho_slack::ui::ConversationView>),
+    Image(Entity<crate::image_view::ImageView>),
 }
 
 impl SurfaceView {
@@ -227,6 +228,7 @@ impl SurfaceView {
             Self::ZulipNarrow(_) => SurfaceKind::ZulipNarrow,
             Self::SlackList(_) => SurfaceKind::SlackList,
             Self::SlackConversation(_) => SurfaceKind::SlackConversation,
+            Self::Image(_) => SurfaceKind::Image,
         }
     }
 }
@@ -616,6 +618,9 @@ pub struct Workspace {
     /// to reach into the session.
     pub(crate) slack_labels: HashMap<rho_slack::session::Source, String>,
     pub(crate) _slack_subscription: Option<gpui::Subscription>,
+    /// One per open conversation surface, for what a conversation asks the
+    /// frame to show: a picture full-window, so far.
+    pub(crate) _slack_view_subscriptions: Vec<gpui::Subscription>,
     /// Machine-owned arrivals. This store is client-local and never enters a
     /// Desk CRDT buffer until an explicit filing verdict.
     pub(crate) inbox: InboxStore,
@@ -1295,6 +1300,7 @@ impl Workspace {
             slack_degraded: None,
             slack_labels: HashMap::new(),
             _slack_subscription: None,
+            _slack_view_subscriptions: Vec::new(),
             // Tests build many concurrent workspaces; they must never open
             // (or pollute) the user's real inbox database.
             inbox: if cfg!(test) {
@@ -3926,7 +3932,12 @@ impl Workspace {
         }
     }
 
-    fn create_browser_page(&mut self, url: String, window: &Window, cx: &mut Context<Self>) {
+    pub(crate) fn create_browser_page(
+        &mut self,
+        url: String,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) {
         let context = self.capture_context(window, cx);
         let create = rho_browser::create_page(url, cx);
         cx.spawn(async move |this, cx| {
@@ -5553,6 +5564,7 @@ impl Workspace {
                 .get(source)
                 .cloned()
                 .unwrap_or_else(|| "slack".to_owned()),
+            SurfaceKey::Image { title, .. } => title.clone(),
         }
     }
 
@@ -5591,6 +5603,7 @@ impl Workspace {
             SurfaceKey::ZulipNarrow { .. } => "zulip",
             SurfaceKey::SlackList => "slack list",
             SurfaceKey::SlackConversation(_) => "slack",
+            SurfaceKey::Image { .. } => "image",
         }
     }
 
@@ -5782,6 +5795,9 @@ impl Workspace {
             SurfaceKey::SlackConversation(source) => SurfaceIdentity::SlackConversation {
                 thread: crate::slack::journal_thread(source),
             },
+            SurfaceKey::Image { title, .. } => SurfaceIdentity::Image {
+                title: title.clone(),
+            },
         }
     }
 
@@ -5859,6 +5875,7 @@ impl Workspace {
                     let editor = view.read(cx).editor().clone();
                     editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
                 }
+                SurfaceView::Image(_) => 0,
             };
             (Self::journal_surface(&pane.surface.key), position)
         };
@@ -7424,6 +7441,9 @@ impl Workspace {
             SurfaceView::ZulipNarrow(view) => view.read(cx).editor().clone(),
             SurfaceView::SlackList(view) => view.read(cx).editor().clone(),
             SurfaceView::SlackConversation(view) => view.read(cx).editor().clone(),
+            SurfaceView::Image(_) => self
+                .any_draft_editor()
+                .expect("the draft context always holds a draft surface"),
         }
     }
 
@@ -7471,6 +7491,7 @@ impl Workspace {
             SurfaceView::ZulipNarrow(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::SlackList(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::SlackConversation(view) => view.read(cx).editor().focus_handle(cx),
+            SurfaceView::Image(view) => view.read(cx).focus_handle(cx),
         }
     }
 
@@ -7491,6 +7512,7 @@ impl Workspace {
             | SurfaceKey::ZulipInbox
             | SurfaceKey::ZulipNarrow { .. } => None,
             SurfaceKey::SlackList | SurfaceKey::SlackConversation(_) => None,
+            SurfaceKey::Image { .. } => None,
             SurfaceKey::Browser(_) => None,
         };
         if let Some(agent_id) = agent_id {
@@ -7572,6 +7594,9 @@ impl Workspace {
             SurfaceKey::SlackConversation(_) => {
                 unreachable!("slack conversations are created by open_slack_source")
             }
+            SurfaceKey::Image { .. } => {
+                unreachable!("image surfaces are created by open_image")
+            }
         };
         Self::wrap_surface(key, view)
     }
@@ -7609,6 +7634,7 @@ impl Workspace {
             | SurfaceKey::ZulipInbox
             | SurfaceKey::ZulipNarrow { .. } => None,
             SurfaceKey::SlackList | SurfaceKey::SlackConversation(_) => None,
+            SurfaceKey::Image { .. } => None,
         };
         if self.connected()
             && let Some(agent_id) = selected
@@ -10657,6 +10683,12 @@ impl Workspace {
                 .into_any_element(),
             SurfaceView::SlackConversation(view) => div()
                 .id("rho-surface-slack-conversation")
+                .size_full()
+                .overflow_hidden()
+                .child(view.clone())
+                .into_any_element(),
+            SurfaceView::Image(view) => div()
+                .id("rho-surface-image")
                 .size_full()
                 .overflow_hidden()
                 .child(view.clone())

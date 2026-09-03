@@ -38,6 +38,13 @@ pub enum SurfaceKey {
     /// One Slack conversation. The source is the identity: two threads in
     /// the same channel are two surfaces, and their labels are not unique.
     SlackConversation(rho_slack::session::Source),
+    /// A picture, shown full-window. The cached path is the identity; the
+    /// title rides along because that path is rho's own bookkeeping and no
+    /// reader should be shown it.
+    Image {
+        path: Utf8PathBuf,
+        title: String,
+    },
 }
 
 impl SurfaceKey {

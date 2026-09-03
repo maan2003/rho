@@ -214,6 +214,14 @@ impl Workspace {
                 let view = cx.new(|cx| {
                     rho_slack::ui::ConversationView::new(session, source, hooks, window, cx)
                 });
+                self._slack_view_subscriptions.push(cx.subscribe(
+                    &view,
+                    |workspace, view, event, cx| match event {
+                        rho_slack::ui::conversation::Event::OpenFile(file) => {
+                            workspace.open_slack_image(view, file.clone(), cx);
+                        }
+                    },
+                ));
                 Self::wrap_surface(key, SurfaceView::SlackConversation(view))
             }
         };
@@ -246,7 +254,21 @@ impl Workspace {
             let view = view.clone();
             let file = view.update(cx, |view, cx| view.cursor_file(cx));
             if let Some(file) = file {
-                view.update(cx, |view, cx| view.open_file(file, cx));
+                if file.is_image() {
+                    self.open_slack_image(view, file, cx);
+                } else {
+                    view.update(cx, |view, cx| view.open_file(file, cx));
+                }
+                return;
+            }
+        }
+        // A link's label shows no address, so the line carries the URL: the
+        // reader on it asked for the page, not for the thread around it.
+        if let SurfaceView::SlackConversation(view) = &self.active_pane().surface.view {
+            let view = view.clone();
+            let link = view.update(cx, |view, cx| view.cursor_link(cx));
+            if let Some(link) = link {
+                self.create_browser_page(link, window, cx);
                 return;
             }
         }
@@ -263,6 +285,64 @@ impl Workspace {
         if let Some(source) = source {
             self.open_slack_source(source, window, cx);
         }
+    }
+
+    /// A picture opens in rho, not in the desktop's viewer: the bytes are
+    /// already cached for the thumbnail, so this is usually instant.
+    fn open_slack_image(
+        &mut self,
+        view: gpui::Entity<rho_slack::ui::ConversationView>,
+        file: rho_slack::types::FileSummary,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let path = view.update(cx, |view, cx| view.file_path(&file, cx));
+        let title = file.title.clone();
+        cx.spawn(async move |this, cx| {
+            let path = path.await;
+            let _ = this.update_in(cx, |this, window, cx| match path {
+                Ok(path) => match camino::Utf8PathBuf::from_path_buf(path) {
+                    Ok(path) => this.open_image(path, title, window, cx),
+                    Err(path) => {
+                        tracing::warn!(path = %path.display(), "slack image path is not utf-8");
+                    }
+                },
+                Err(error) => {
+                    tracing::warn!(error = %error, "slack image fetch failed");
+                    this.notice_on(
+                        None,
+                        &format!("slack: {error:#}"),
+                        crate::style::StyleClass::SystemInfo,
+                        cx,
+                    );
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Shows a cached picture full-window. Opened from a conversation, so
+    /// `ctrl-k` walks back to it and `q` closes.
+    pub(crate) fn open_image(
+        &mut self,
+        path: camino::Utf8PathBuf,
+        title: String,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let key = SurfaceKey::Image {
+            path: path.clone(),
+            title,
+        };
+        let surface = match self.find_surface(|surface| surface.key == key).cloned() {
+            Some(surface) => surface,
+            None => {
+                let view = cx.new(|cx| crate::image_view::ImageView::new(path, cx));
+                crate::workspace::Workspace::wrap_surface(key, SurfaceView::Image(view))
+            }
+        };
+        self.show_slack_surface(surface, cx);
+        self.focus_active_surface(window, cx);
+        cx.notify();
     }
 
     /// `i`: into the composer, which is where a reply is written.

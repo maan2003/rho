@@ -65,6 +65,18 @@ impl rho_transcript::Style for Class {
     fn highlight_style(self, cx: &gpui::App) -> gpui::HighlightStyle {
         self.resolve(cx)
     }
+
+    /// An unfurl is a card, not a run of words: a faint tint behind the whole
+    /// of it is what makes it read as one.
+    fn background(self, bucket: u32, cx: &App) -> Option<(HighlightKey, gpui::Hsla)> {
+        if self != Class::Unfurl {
+            return None;
+        }
+        let key = HighlightKey::SyntaxTreeView(
+            SLACK_TRANSCRIPT_KEY_BASE + (bucket as usize + 1) * Class::ALL.len() * 2 + self.slot(),
+        );
+        Some((key, cx.theme().colors().element_background.into()))
+    }
 }
 
 /// A semantic span class. Colors resolve against the active theme at
@@ -89,10 +101,15 @@ pub enum Class {
     Muted,
     /// A failure notice.
     Error,
+    /// A link: the label the reader sees, whose URL `enter` opens.
+    Link,
+    /// An unfurl's quote box, which reads as one card rather than as loose
+    /// lines: the bar down its left and a faint tint over the whole of it.
+    Unfurl,
 }
 
 impl Class {
-    pub const ALL: [Class; 9] = [
+    pub const ALL: [Class; 11] = [
         Class::Sender,
         Class::You,
         Class::Time,
@@ -102,6 +119,8 @@ impl Class {
         Class::Mention,
         Class::Muted,
         Class::Error,
+        Class::Link,
+        Class::Unfurl,
     ];
 
     fn slot(self) -> usize {
@@ -115,6 +134,8 @@ impl Class {
             Self::Mention => 6,
             Self::Muted => 7,
             Self::Error => 8,
+            Self::Link => 9,
+            Self::Unfurl => 10,
         }
     }
 
@@ -134,6 +155,7 @@ impl Class {
             Self::Mention => (colors.terminal_ansi_yellow, FontWeight::BOLD),
             Self::Muted => (colors.text_muted, FontWeight::NORMAL),
             Self::Error => (colors.terminal_ansi_red, FontWeight::NORMAL),
+            Self::Link | Self::Unfurl => (colors.link_text_hover, FontWeight::NORMAL),
         };
         HighlightStyle {
             color: Some(color.into()),

@@ -159,11 +159,11 @@ done right after the transcript primitive (2.4) and before 2.10:
 - [x] 1.15 Moot after 1.20. Rows by the longest author start their body one column right
       of the others (padding is off by one when the name fills the
       column). Bodies align in one column across the surface.
-- [ ] 1.16 Links print twice: `<url|text>` renders as `text <url>` and
+- [x] 1.16 Links print twice: `<url|text>` renders as `text <url>` and
       `<url>` as `url <url>`. Render the text once in the link class, the
       URL once only when there is no text; the URL stays reachable through
       line metadata for `enter`.
-- [ ] 1.17 Unfurls, the user finds them "very weird" as loose lines:
+- [x] 1.17 Unfurls, the user finds them "very weird" as loose lines:
       render as a quote box. Each unfurl line is prefixed with a left bar
       `▎ ` in the link colour and the whole range carries a faint
       background tint through the editor's background highlight, so it
@@ -171,13 +171,24 @@ done right after the transcript primitive (2.4) and before 2.10:
       line in the link class, then at most two description lines, no
       blank lines. The x.com unfurl took ten loose lines with the whole
       tweet body. `enter` on it opens the URL. Collapsible later.
-- [ ] 1.18 Images, decided by the user: a small inline version, and a
+- [x] 1.18 Images, decided by the user: a small inline version, and a
       full-screen view on click or `enter`. Inline stays a thumbnail
       (about 12 lines high, aspect preserved). Click or `enter` on the
       thumbnail or its file line opens a rho image surface that fits the
       image to the window, `q` or `escape` returns to the conversation;
       no external opener for images. The file line drops the type when
       the extension already says it: `image.png · 141 KB`.
+- [ ] 1.21 Time placement, corrected after 32-unfurl: the time trails the
+      last line of the message's own text, and chrome under a message
+      (reactions, reply count, file lines, thumbnails, unfurl cards, bot
+      attachment fields) never carries a time. Seen: `▎ A long preview
+      body …  16:41` inside the quote box and `image.png · 220 KB  09:40`.
+      Also: mrkdwn emphasis (`*bold*`, `_italic_`, `~struck~`) renders as
+      raw markers in plain text; keep the markers, style the span (bold,
+      italic, strike). And the unfurl tint on the first row starts after
+      the bar; square it. And the screenshot rig lacks an emoji font, so
+      reactions and `morning! ▯` show tofu; install one so screenshots are
+      truthful.
 - [x] 1.20 Line layout, done with 2.4. Decided by the user: `<name>: <body>  <time>`.
       No time column on the left, no padded author column, no tab after
       the name: the name, a colon, one space, the body. The time goes on
@@ -188,7 +199,7 @@ done right after the transcript primitive (2.4) and before 2.10:
       reply-count, file and unfurl lines under a message indent the same.
       Day rules and system lines unchanged. Replaces the column layout of
       1.4; update its screenshot.
-- [ ] 1.19 Custom emoji (`:forrest_gump_wave:`) stay as the shortcode in
+- [x] 1.19 Custom emoji (`:forrest_gump_wave:`) stay as the shortcode in
       muted text until the image inlay (1.13) lands, then render inline
       through it.
 

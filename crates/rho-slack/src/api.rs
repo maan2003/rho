@@ -626,6 +626,13 @@ pub fn parse_message(value: &Value, fallback_channel: &ChannelId) -> Option<Mess
                     .collect(),
                 is_unfurl: attachment["is_msg_unfurl"].as_bool().unwrap_or(false)
                     || attachment["is_app_unfurl"].as_bool().unwrap_or(false),
+                url: string(&attachment["title_link"])
+                    .or_else(|| string(&attachment["original_url"]))
+                    .or_else(|| string(&attachment["from_url"]))
+                    .filter(|url| !url.is_empty()),
+                service: string(&attachment["service_name"])
+                    .or_else(|| string(&attachment["service_url"]))
+                    .filter(|name| !name.is_empty()),
             })
             .collect(),
         subtype: string(&value["subtype"]).filter(|subtype| !subtype.is_empty()),

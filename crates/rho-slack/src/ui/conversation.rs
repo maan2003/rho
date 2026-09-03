@@ -14,7 +14,7 @@ use std::ops::Range;
 use editor::scroll::AutoscrollStrategy;
 use editor::{Editor, EditorEvent, EditorMode, SelectionEffects, SizingBehavior};
 use gpui::prelude::*;
-use gpui::{App, Context, Entity, Window, div};
+use gpui::{App, Context, Entity, EventEmitter, Window, div};
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use rho_transcript::{BlockSpec, Item, Transcript};
@@ -44,8 +44,21 @@ pub struct ConversationView {
     /// that come back for those are not the reader moving, and must not buy
     /// another page.
     moved: Moved,
+    /// Messages drawn before their picture had finished downloading, by the
+    /// file the message is waiting on. Nothing in the update log speaks for
+    /// a download, so the surface remembers this itself.
+    awaiting_images: Vec<(Ts, String)>,
     _subscriptions: Vec<gpui::Subscription>,
 }
+
+/// What the surface asks its host for. Showing a picture is the host's
+/// business: this crate knows which file was asked for, not what the frame
+/// around it can draw.
+pub enum Event {
+    OpenFile(FileSummary),
+}
+
+impl EventEmitter<Event> for ConversationView {}
 
 /// One page per user action, and the two cases where nobody has asked yet:
 /// opening a conversation whose mirrored run is short, and a gap line on a
@@ -100,6 +113,9 @@ struct LineMeta {
     thread: Option<Ts>,
     /// The file the line names, which `enter` opens instead.
     file: Option<FileSummary>,
+    /// The URL the line stands for. The text shows a link's label alone, so
+    /// this is the only place the address survives for `enter` to open.
+    link: Option<String>,
 }
 
 type Rendered = Item<Row, Class, LineMeta>;
@@ -219,6 +235,7 @@ impl ConversationView {
             revision: 0,
             fill: Fill::default(),
             moved: Moved::default(),
+            awaiting_images: Vec::new(),
             _subscriptions: subscriptions,
         };
         view.transcript.attach(&view.editor.clone(), cx);
@@ -256,6 +273,15 @@ impl ConversationView {
         })
     }
 
+    /// The URL the cursor's line stands for: a link's label shows no address,
+    /// so `enter` reads it from here.
+    pub fn cursor_link(&self, cx: &mut Context<Self>) -> Option<String> {
+        let row = self.cursor_row(cx) as u32;
+        self.transcript
+            .line_meta(row, cx)
+            .and_then(|meta| meta.link.clone())
+    }
+
     /// The thread the cursor is in, for opening a thread from a channel. A
     /// thread surface has none: it is already the thread.
     pub fn cursor_thread(&self, cx: &mut Context<Self>) -> Option<ThreadKey> {
@@ -286,6 +312,17 @@ impl ConversationView {
         let source = self.source.clone();
         self.session
             .update(cx, |session, cx| session.send(&source, text, cx));
+    }
+
+    /// Where the file's bytes are, fetched if the cache lacks them: a host
+    /// showing a picture itself needs the path, not the desktop's opener.
+    pub fn file_path(
+        &mut self,
+        file: &FileSummary,
+        cx: &mut Context<Self>,
+    ) -> gpui::Task<anyhow::Result<std::path::PathBuf>> {
+        self.session
+            .update(cx, |session, cx| session.file_path(file, cx))
     }
 
     /// Opens the file under the cursor with whatever the desktop uses for
@@ -349,6 +386,7 @@ impl ConversationView {
             Some(updates) => self.apply_updates(updates, window, cx),
         }
         self.revision = revision;
+        self.settle_images(cx);
         self.refresh_chrome(cx);
         self.keep_filling(cx);
         cx.notify();
@@ -368,6 +406,31 @@ impl ConversationView {
         });
         if self.fill.wants_page(near_top(position, screen)) {
             self.load_older(cx);
+        }
+    }
+
+    /// A picture whose bytes were still arriving when its message was
+    /// drawn. The download changes nothing about the message, so no update
+    /// speaks for it: the surface re-renders that one message itself once
+    /// the file is on disk.
+    fn settle_images(&mut self, cx: &mut Context<Self>) {
+        let ready = {
+            let session = self.session.read(cx);
+            self.awaiting_images
+                .iter()
+                .filter(|(_, id)| session.cached_file(id).is_some_and(|path| path.exists()))
+                .map(|(ts, _)| ts.clone())
+                .collect::<Vec<_>>()
+        };
+        if ready.is_empty() {
+            return;
+        }
+        let messages = self.shown_messages(cx);
+        for ts in ready {
+            let key = Row::Message(ts);
+            if let Some(item) = self.item_for_key(&key, &messages, cx) {
+                self.transcript.replace(&key, item, cx);
+            }
         }
     }
 
@@ -589,15 +652,20 @@ impl ConversationView {
                 Some((line as u32, file.clone()))
             })
             .collect::<Vec<_>>();
+        self.awaiting_images
+            .retain(|(waiting, _)| waiting != &message.ts);
         for (line, file) in images {
             let path = self.session.update(cx, |session, cx| {
                 session.cache_file(&file, cx);
                 session.cached_file(&file.id).map(std::path::Path::to_owned)
             });
             let Some(path) = path.filter(|path| path.exists()) else {
+                self.awaiting_images
+                    .push((message.ts.clone(), file.id.clone()));
                 continue;
             };
-            item.blocks.push(image_block(line, path));
+            item.blocks
+                .push(image_block(line, path, file, cx.entity().downgrade()));
         }
         item
     }
@@ -885,11 +953,19 @@ fn day_before(
 }
 
 /// A picture under the line that names it, indented to the body column.
-fn image_block(line: u32, path: std::path::PathBuf) -> BlockSpec {
+/// Clicking it asks for the full-size view, the same thing `enter` on the
+/// file line asks for.
+fn image_block(
+    line: u32,
+    path: std::path::PathBuf,
+    file: FileSummary,
+    view: gpui::WeakEntity<ConversationView>,
+) -> BlockSpec {
     BlockSpec {
         line,
         height: IMAGE_ROWS,
         render: std::sync::Arc::new(move |cx| {
+            let (file, view) = (file.clone(), view.clone());
             // The spacer is real text in the transcript's own font, which is
             // the only way to land the picture exactly under the body column
             // whatever font the reader has set.
@@ -901,9 +977,18 @@ fn image_block(line: u32, path: std::path::PathBuf) -> BlockSpec {
                 .text_size(style.font_size)
                 .child(" ".repeat(BODY_INDENT))
                 .child(
-                    gpui::img(path.clone())
-                        .max_h(cx.line_height * IMAGE_ROWS as f32)
-                        .max_w_full(),
+                    div()
+                        .id(("slack-image", line))
+                        .cursor_pointer()
+                        .on_click(move |_, _, cx| {
+                            let file = file.clone();
+                            let _ = view.update(cx, |_, cx| cx.emit(Event::OpenFile(file)));
+                        })
+                        .child(
+                            gpui::img(path.clone())
+                                .max_h(cx.line_height * IMAGE_ROWS as f32)
+                                .max_w_full(),
+                        ),
                 )
                 .into_any_element()
         }),
@@ -912,7 +997,7 @@ fn image_block(line: u32, path: std::path::PathBuf) -> BlockSpec {
 }
 
 /// How many lines tall an inline image preview is allowed to be.
-const IMAGE_ROWS: u32 = 10;
+const IMAGE_ROWS: u32 = 12;
 
 /// One message as an item: `name: body  time`.
 ///
@@ -933,7 +1018,11 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
     // muted line, without a name of their own.
     if let Some(line) = system_line(message, model) {
         spans.push(Span::styled(format!("{line}\n"), Class::Muted));
-        lines.push(LineMeta { thread, file: None });
+        lines.push(LineMeta {
+            thread,
+            file: None,
+            link: None,
+        });
         return item(Row::Message(message.ts.clone()), spans, lines);
     }
 
@@ -949,7 +1038,8 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
 
     let body = model.render(message);
     let body = body.trim_end().replace('\n', &format!("\n{indent}"));
-    push_body(&mut spans, &body, model);
+    let links = crate::block::links(&message.blocks, &message.text, &message.attachments);
+    push_body(&mut spans, &body, model, &links);
     if message.edited {
         // The reader is told what they are looking at is not what was sent.
         spans.push(Span::styled(" (edited)", Class::Muted));
@@ -968,6 +1058,7 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
                 .iter()
                 .find(|file| line.trim() == file.line())
                 .cloned(),
+            link: link_on(line, &links),
         }
     }));
 
@@ -977,6 +1068,7 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
         lines.push(LineMeta {
             thread: thread.clone(),
             file: None,
+            link: None,
         });
     }
     if !in_thread && message.is_broadcast() {
@@ -989,6 +1081,7 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
         lines.push(LineMeta {
             thread: thread.clone(),
             file: None,
+            link: None,
         });
     }
     // The thread under a message is one line, not a fold-out: the reader
@@ -998,7 +1091,11 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
             format!("{indent}{}\n", replies_line(message)),
             Class::Topic,
         ));
-        lines.push(LineMeta { thread, file: None });
+        lines.push(LineMeta {
+            thread,
+            file: None,
+            link: None,
+        });
     }
     item(Row::Message(message.ts.clone()), spans, lines)
 }
@@ -1028,7 +1125,37 @@ fn muted_item(key: Row, text: impl Into<String>, class: Class) -> Rendered {
 
 fn item(key: Row, spans: Vec<Span>, lines: Vec<LineMeta>) -> Rendered {
     let (text, styles) = lay_out(&spans);
-    Item::new(key, text).with_styles(styles).with_lines(lines)
+    let backgrounds = unfurl_ranges(&text);
+    Item::new(key, text)
+        .with_styles(styles)
+        .with_backgrounds(backgrounds)
+        .with_lines(lines)
+}
+
+/// The runs of lines an unfurl covers, each one tinted so the card reads as
+/// a box rather than as a bar beside loose lines.
+fn unfurl_ranges(text: &str) -> Vec<(Class, Range<usize>)> {
+    let mut ranges: Vec<(Class, Range<usize>)> = Vec::new();
+    let mut offset = 0;
+    let mut previous: Option<usize> = None;
+    for (row, line) in text.split_inclusive('\n').enumerate() {
+        if line
+            .trim_start()
+            .starts_with(crate::block::UNFURL_BAR.trim_end())
+        {
+            let start = offset + (line.len() - line.trim_start().len());
+            let end = offset + line.trim_end_matches('\n').len();
+            match (previous, ranges.last_mut()) {
+                // One card, however many lines: the tint runs through the
+                // newline and the indent between them.
+                (Some(above), Some((_, range))) if above + 1 == row => range.end = end,
+                _ => ranges.push((Class::Unfurl, start..end)),
+            }
+            previous = Some(row);
+        }
+        offset += line.len();
+    }
+    ranges
 }
 
 /// Where a continuation line, a reaction row, a thread count and a picture
@@ -1095,16 +1222,52 @@ fn replies_line(message: &Message) -> String {
 /// A body, with the workspace's own emoji muted. `:forrest_gump_wave:` is a
 /// picture everywhere but here, so it reads as chrome rather than as a word
 /// someone typed.
-fn push_body(spans: &mut Vec<Span>, body: &str, model: &Model) {
+/// The link a line stands for: the first whose label the line carries, so
+/// `enter` opens what the reader is looking at.
+fn link_on(line: &str, links: &[crate::block::Link]) -> Option<String> {
+    links
+        .iter()
+        .find(|link| line.contains(&link.label))
+        .map(|link| link.url.clone())
+}
+
+fn push_body(spans: &mut Vec<Span>, body: &str, model: &Model, links: &[crate::block::Link]) {
     let mut marked: Vec<(Range<usize>, Class)> = Vec::new();
+    // Link labels, in the order they were rendered, so the same word used
+    // twice colours the occurrence it belongs to.
+    let mut from = 0;
+    for link in links {
+        let Some(at) = body[from..].find(&link.label) else {
+            continue;
+        };
+        let start = from + at;
+        from = start + link.label.len();
+        marked.push((start..from, Class::Link));
+    }
     // Lines the renderer added rather than the author: an attachment's card
     // and a collapsed link preview. They read as chrome, not as speech.
     let mut offset = 0;
+    let mut in_unfurl = false;
     for line in body.split('\n') {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("— ") || trimmed.starts_with("↗ ") {
-            let start = offset + (line.len() - trimmed.len());
+        let start = offset + (line.len() - trimmed.len());
+        if trimmed.starts_with("— ") {
             marked.push((start..offset + line.len(), Class::Muted));
+        }
+        if trimmed.starts_with(crate::block::UNFURL_BAR.trim_end()) {
+            // The bar is the card's edge, the first line names the page:
+            // both read as the link. What follows is the page's own words.
+            let bar = start + crate::block::UNFURL_BAR.len();
+            marked.push((
+                start..match in_unfurl {
+                    true => bar.min(offset + line.len()),
+                    false => offset + line.len(),
+                },
+                Class::Link,
+            ));
+            in_unfurl = true;
+        } else {
+            in_unfurl = false;
         }
         offset += line.len() + 1;
     }
@@ -1687,21 +1850,71 @@ mod tests {
             "a bot is named like anyone: {text}"
         );
         assert!(text.contains("branch: main"), "{text}");
-        assert!(text.contains("↗ Worth a read"), "{text}");
-        assert!(
-            !text.contains("buried"),
-            "a preview never paints its body: {text}"
-        );
         let muted = classed(&text, &styles, Class::Muted)
             .iter()
             .map(|span| span.trim().to_owned())
             .collect::<Vec<_>>();
-        assert!(
-            muted.iter().any(|span| span == "↗ Worth a read"),
-            "{muted:?}"
-        );
         assert!(muted.iter().any(|span| span == "— pipeline"), "{muted:?}");
         assert_eq!(lines.len(), text.matches('\n').count());
+    }
+
+    #[test]
+    fn an_unfurl_reads_as_a_quote_box_and_enter_opens_it() {
+        let preview = parsed(json!({
+            "ts": "1700000120.0",
+            "user": "U1",
+            "text": "worth a read <https://example.com/post|the post>",
+            "attachments": [{
+                "is_msg_unfurl": true,
+                "title": "Worth a read",
+                "text": "the first line\n\nthe second line\nthe third line",
+                "service_name": "example.com",
+                "title_link": "https://example.com/post",
+            }],
+        }));
+        let (text, styles, lines) = render_messages(&[preview.clone()], &model(), false);
+        assert!(
+            text.contains("\u{258e} Worth a read · example.com"),
+            "the title names the page and the site says where it is: {text}"
+        );
+        assert!(
+            text.contains("\u{258e} the second line") && !text.contains("the third line"),
+            "two lines of someone else's page, no more: {text}"
+        );
+        assert!(
+            !text.contains("\u{258e} \n"),
+            "no blank lines inside the box: {text}"
+        );
+        let linked = classed(&text, &styles, Class::Link);
+        assert!(
+            linked.iter().any(|span| span.contains("Worth a read")),
+            "the card's first line reads as the link: {linked:?}"
+        );
+        assert!(
+            linked.iter().any(|span| span.contains("the post")),
+            "so does the label in the body: {linked:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .filter(|meta| meta.link.as_deref() == Some("https://example.com/post"))
+                .count()
+                >= 2,
+            "every line of the card opens the page it stands for"
+        );
+        let item = message_item(&preview, &model(), false);
+        let tint = item
+            .backgrounds
+            .iter()
+            .find(|(class, _)| *class == Class::Unfurl)
+            .map(|(_, range)| range.clone())
+            .expect("the card carries a tint");
+        assert_eq!(
+            item.text[tint.clone()].lines().count(),
+            3,
+            "one tint over the whole card, not one per line: {:?}",
+            &item.text[tint]
+        );
     }
 
     #[test]

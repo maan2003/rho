@@ -13,7 +13,7 @@ use std::time::Duration;
 use anyhow::Context as _;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
-use gpui::{Context, EventEmitter, Task};
+use gpui::{AppContext as _, Context, EventEmitter, Task};
 use tokio::sync::Notify;
 
 use crate::api::Client;
@@ -871,6 +871,46 @@ impl Session {
     /// Where a file's bytes are, once they have been fetched.
     pub fn cached_file(&self, id: &str) -> Option<&std::path::Path> {
         self.cached_files.get(id).map(std::path::PathBuf::as_path)
+    }
+
+    /// The file's path in the cache, fetching the bytes first when the cache
+    /// does not have them. A host that can show the file itself asks for
+    /// this rather than handing the file to the desktop.
+    pub fn file_path(
+        &mut self,
+        file: &crate::types::FileSummary,
+        cx: &mut Context<Self>,
+    ) -> gpui::Task<anyhow::Result<std::path::PathBuf>> {
+        let path = match file_cache_path(file) {
+            Ok(path) => path,
+            Err(error) => return gpui::Task::ready(Err(error)),
+        };
+        if path.exists() {
+            self.cached_files.insert(file.id.clone(), path.clone());
+            return gpui::Task::ready(Ok(path));
+        }
+        let Some(client) = self.client.clone() else {
+            return gpui::Task::ready(Err(anyhow::anyhow!("not connected")));
+        };
+        if file.url.is_empty() {
+            return gpui::Task::ready(Err(anyhow::anyhow!("the file has no address")));
+        }
+        self.cached_files.insert(file.id.clone(), path.clone());
+        let url = file.url.clone();
+        let task = gpui_tokio::Tokio::spawn(cx, async move {
+            let bytes = client.download(&url).await?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, bytes)?;
+            anyhow::Ok(path)
+        });
+        cx.background_spawn(async move {
+            match task.await {
+                Ok(fetched) => fetched,
+                Err(error) => Err(anyhow::anyhow!("{error}")),
+            }
+        })
     }
 
     /// Fetches a file into the state cache so a surface can show it. Called

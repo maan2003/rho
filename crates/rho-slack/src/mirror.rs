@@ -527,6 +527,8 @@ struct StoredAttachment {
     pretext: Option<String>,
     fields: Vec<(String, String)>,
     is_unfurl: bool,
+    url: Option<String>,
+    service: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
@@ -569,6 +571,8 @@ impl From<&Message> for StoredMessage {
                     pretext: attachment.pretext.clone(),
                     fields: attachment.fields.clone(),
                     is_unfurl: attachment.is_unfurl,
+                    url: attachment.url.clone(),
+                    service: attachment.service.clone(),
                 })
                 .collect(),
             files: message
@@ -623,6 +627,8 @@ impl From<&StoredMessage> for Message {
                     pretext: attachment.pretext.clone(),
                     fields: attachment.fields.clone(),
                     is_unfurl: attachment.is_unfurl,
+                    url: attachment.url.clone(),
+                    service: attachment.service.clone(),
                 })
                 .collect(),
             files: stored
