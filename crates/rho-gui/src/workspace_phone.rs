@@ -19,6 +19,8 @@ const TARGET_HEIGHT: Pixels = px(48.);
 pub(super) struct PhoneUi {
     pub(super) enabled: bool,
     forced: bool,
+    touch_debug: bool,
+    last_gesture: Option<String>,
     stack: Vec<(ContextId, SurfaceKey)>,
     dashboard_press: Option<(Point<Pixels>, Option<crate::dashboard::RowTarget>)>,
     pub(super) dashboard_focus: FocusHandle,
@@ -34,6 +36,8 @@ impl PhoneUi {
             // environment override.
             enabled: false,
             forced,
+            touch_debug: std::env::var("RHO_PHONE_TOUCH_DEBUG").is_ok_and(|value| value == "1"),
+            last_gesture: None,
             stack: Vec::new(),
             dashboard_press: None,
             dashboard_focus: cx.focus_handle(),
@@ -67,6 +71,38 @@ impl PhoneUi {
 
     pub(super) fn retain_contexts(&mut self, mut keep: impl FnMut(&ContextId) -> bool) {
         self.stack.retain(|entry| keep(&entry.0));
+    }
+
+    pub(super) fn touch_debug_enabled(&self) -> bool {
+        self.touch_debug
+    }
+
+    fn record_flick(&mut self, direction: crate::journal::PhoneFlickDirection, moved_card: bool) {
+        let direction = match direction {
+            crate::journal::PhoneFlickDirection::Up => "up",
+            crate::journal::PhoneFlickDirection::Down => "down",
+        };
+        let outcome = if moved_card { "moved" } else { "stayed" };
+        self.last_gesture = Some(format!("flick {direction} · {outcome}"));
+    }
+
+    fn record_verdict(&mut self, verdict: crate::journal::PhoneVerdict) {
+        let verdict = match verdict {
+            crate::journal::PhoneVerdict::Done => "done",
+            crate::journal::PhoneVerdict::Dismiss => "dismiss",
+            crate::journal::PhoneVerdict::Defer => "defer",
+            crate::journal::PhoneVerdict::Todo => "todo",
+            crate::journal::PhoneVerdict::File => "file",
+            crate::journal::PhoneVerdict::Reply => "reply",
+        };
+        self.last_gesture = Some(format!("verdict {verdict}"));
+    }
+
+    fn touch_debug_label(&self, contacts: usize) -> String {
+        format!(
+            "contacts {contacts} · last {}",
+            self.last_gesture.as_deref().unwrap_or("none")
+        )
     }
 }
 
@@ -300,6 +336,53 @@ impl Workspace {
             self.focus_active_surface(window, cx);
         }
         cx.notify();
+    }
+
+    pub(super) fn record_phone_flick(
+        &mut self,
+        direction: crate::journal::PhoneFlickDirection,
+        moved_card: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.phone.enabled {
+            return;
+        }
+        self.phone.record_flick(direction, moved_card);
+        crate::journal::record(crate::journal::Event::PhoneFlick {
+            direction,
+            moved_card,
+        });
+        cx.notify();
+    }
+
+    pub(super) fn record_phone_verdict(
+        &mut self,
+        verdict: crate::journal::PhoneVerdict,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.phone.enabled {
+            return;
+        }
+        self.phone.record_verdict(verdict);
+        crate::journal::record(crate::journal::Event::PhoneVerdict { verdict });
+        cx.notify();
+    }
+
+    pub(super) fn render_phone_touch_debug(&self, contacts: usize) -> Option<AnyElement> {
+        self.phone.touch_debug.then(|| {
+            div()
+                .id("phone-touch-debug")
+                .absolute()
+                .top_2()
+                .right_2()
+                .px_2()
+                .py_1()
+                .rounded_sm()
+                .bg(gpui::black().opacity(0.75))
+                .text_color(gpui::white())
+                .child(self.phone.touch_debug_label(contacts))
+                .into_any_element()
+        })
     }
 
     pub(super) fn render_phone_body(
@@ -625,6 +708,23 @@ mod tests {
                 phone.stack.last(),
                 Some(&(ContextId::Draft, SurfaceKey::Draft))
             );
+        });
+    }
+
+    #[gpui::test]
+    fn touch_debug_label_reports_contacts_and_last_gesture(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let mut phone = PhoneUi::new(cx);
+            assert_eq!(phone.touch_debug_label(2), "contacts 2 · last none");
+
+            phone.record_flick(crate::journal::PhoneFlickDirection::Up, false);
+            assert_eq!(
+                phone.touch_debug_label(1),
+                "contacts 1 · last flick up · stayed"
+            );
+
+            phone.record_verdict(crate::journal::PhoneVerdict::Done);
+            assert_eq!(phone.touch_debug_label(0), "contacts 0 · last verdict done");
         });
     }
 }

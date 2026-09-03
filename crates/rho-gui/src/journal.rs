@@ -142,6 +142,42 @@ pub enum DealerVerdict {
 }
 
 #[derive(
+    Clone,
+    Copy,
+    Debug,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    senax_encoder::Encode,
+    senax_encoder::Decode,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PhoneFlickDirection {
+    Up,
+    Down,
+}
+
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    senax_encoder::Encode,
+    senax_encoder::Decode,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum PhoneVerdict {
+    Done,
+    Dismiss,
+    Defer,
+    Todo,
+    File,
+    Reply,
+}
+
+#[derive(
     Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
 )]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -474,6 +510,13 @@ pub enum Event {
         surface: SurfaceIdentity,
         rough_position: i64,
     },
+    PhoneFlick {
+        direction: PhoneFlickDirection,
+        moved_card: bool,
+    },
+    PhoneVerdict {
+        verdict: PhoneVerdict,
+    },
 }
 
 impl Event {
@@ -508,6 +551,8 @@ impl Event {
             Self::Find { .. } => "find",
             Self::Dealer { .. } => "dealer",
             Self::VerdictUndone { .. } => "verdict_undone",
+            Self::PhoneFlick { .. } => "phone_flick",
+            Self::PhoneVerdict { .. } => "phone_verdict",
         }
     }
 }
@@ -869,5 +914,25 @@ mod tests {
         };
         let encoded = serde_json::to_string(&event).unwrap();
         assert_eq!(serde_json::from_str::<Event>(&encoded).unwrap(), event);
+    }
+
+    #[test]
+    fn phone_events_round_trip_gesture_outcomes() {
+        for event in [
+            Event::PhoneFlick {
+                direction: PhoneFlickDirection::Up,
+                moved_card: true,
+            },
+            Event::PhoneFlick {
+                direction: PhoneFlickDirection::Down,
+                moved_card: false,
+            },
+            Event::PhoneVerdict {
+                verdict: PhoneVerdict::Todo,
+            },
+        ] {
+            let encoded = serde_json::to_string(&event).unwrap();
+            assert_eq!(serde_json::from_str::<Event>(&encoded).unwrap(), event);
+        }
     }
 }

@@ -1738,6 +1738,9 @@ impl Workspace {
                 }
             }
         }
+        if self.phone.touch_debug_enabled() {
+            cx.notify();
+        }
     }
 
     fn step_surface_back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -11737,6 +11740,11 @@ impl Render for Workspace {
                     }),
             )
             .child(self.render_status_line(&text_style, cx))
+            .children(if phone {
+                self.render_phone_touch_debug(self.shell_touches.len())
+            } else {
+                None
+            })
             .children(
                 match (
                     &self.pending_git_approval,
