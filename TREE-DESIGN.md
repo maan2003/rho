@@ -151,9 +151,15 @@ left in place until the next release.
    the desk tree, the desk view kept working over it. Replaces the
    order-key and move machinery in `rho-desk` and the daemon.
 2. Identity: `NodeId` through the dealer, undo, journal, and deal views;
-   the inbox retired; captures as root notes.
-3. Slack: `thread` nodes created on ingest; the mirror's verdict table
-   removed; deals straight from nodes (Slack checklist 2.10 lands here).
+   the inbox retired; captures as root notes. Every agent gets a root
+   `agent` node at creation, quick-spawn included, made by the daemon.
+   Pulled in from slice 3 on 3 Sep so Slack never stops being dealt: a
+   `thread` node is created when a ping or a reply to the user would have
+   made an inbox item, through a `DeskThreadBind` request from the GUI to
+   the daemon (the shape of `DeskPageBind`), and the dealer deals the node;
+   Slack verdicts live in its log from then on (Slack checklist 2.10).
+3. Slack: the mirror's verdict table removed; anything left that still
+   deals from the mirror rather than from nodes.
 4. Notes: multi-line `body` on the text CRDT, the note surface, "notes for
    this" from any surface, the map over the tree; `DESK-DESIGN.md` retired
    to notes-and-filing.
