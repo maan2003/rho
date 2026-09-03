@@ -68,9 +68,9 @@ response, as a small XML element, so declaring costs nothing and needs no
 tool round trip:
 
 ```xml
-<wants kind="needs-input" blocked="false" ask="decision">
+<rho-wants kind="needs-input" blocked="false" ask="decision">
 V2 has no place for a todo's date; (b) maps it to defer_until, your call.
-</wants>
+</rho-wants>
 ```
 
 `kind` is one of `quiet`, `show`, `needs-input`, `done`; `blocked` and `ask`
@@ -79,6 +79,24 @@ The daemon strips the element from the transcript text, records it as a
 typed event, and sets the fields; the element never renders. One element
 per turn; the last one in a turn wins. No element means the turn's default
 (quiet while working, done when the turn ends).
+
+Why a tag and not a tool: a tool call ends the turn and costs an inference
+step for a fact that never needs a result back. Four rules keep the tag
+safe:
+
+- Parse only outside code fences and only the last top-level element, or
+  any agent that discusses the feature sets its own status by quoting the
+  syntax (this document would).
+- Strip while streaming, not after the turn, so a half-typed tag never
+  flickers on screen.
+- A malformed element is absent, logged, and never fails the turn.
+- The name is distinctive (`<rho-wants>` rather than `<wants>`), so it
+  cannot collide with markup an agent is talking about.
+
+Forgetting is the weak spot and is survivable: a missing tag is the turn's
+default, and the states that matter most (stalled, crashed) are observed by
+the daemon, so a forgetful agent degrades to "no self-declaration", never to
+silence. A tool would only win if the declaration needed an answer back.
 
 ## Where it lives
 
