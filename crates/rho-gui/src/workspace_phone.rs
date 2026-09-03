@@ -274,6 +274,7 @@ impl Workspace {
         if change.exited {
             self.phone.flick = None;
             self.phone.drag_offset = Pixels::ZERO;
+            self.phone.snap = None;
             self.deal_focus_pending = self.dashboard.deal_mode();
             self.update_statuses(cx);
             if self.dashboard.set_phone_browse_mode(false) {
@@ -416,6 +417,21 @@ impl Workspace {
                 .snap
                 .map(|snap| (snap.from.as_f32(), snap.to.as_f32())),
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn phone_start_snap_for_test(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.start_phone_snap(
+            px(-300.),
+            px(-800.),
+            Some(crate::journal::PhoneFlickDirection::Up),
+            window,
+            cx,
+        );
     }
 
     #[cfg(test)]
@@ -698,6 +714,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let source = direction.and_then(|_| {
+            self.dashboard
+                .current_deal_card()
+                .map(|card| card.identity.clone())
+        });
         let generation = self.phone.next_snap_generation;
         self.phone.next_snap_generation = self.phone.next_snap_generation.wrapping_add(1);
         self.phone.snap = Some(PhoneSnap {
@@ -716,7 +737,15 @@ impl Workspace {
                     return;
                 }
                 this.phone.snap = None;
-                if let Some(direction) = direction {
+                if let Some(direction) = direction
+                    && this.phone.enabled
+                    && this.phone.root == PhoneRoot::Feed
+                    && this.phone.stack.is_empty()
+                    && this
+                        .dashboard
+                        .current_deal_card()
+                        .is_some_and(|card| Some(&card.identity) == source.as_ref())
+                {
                     this.commit_phone_flick(direction, window, cx);
                 }
                 cx.notify();

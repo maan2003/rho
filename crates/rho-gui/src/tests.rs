@@ -275,6 +275,49 @@ fn phone_entry_opens_the_feed_and_one_finger_flicks_to_the_next_card(cx: &mut Te
 }
 
 #[gpui::test]
+fn leaving_phone_mode_cancels_a_delayed_flick_commit(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, _, _| {
+            for text in ["First resize card", "Second resize card"] {
+                let id = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
+                    kind: crate::inbox::InboxKind::Capture,
+                    text: text.into(),
+                    source: crate::inbox::SourceReference::None,
+                    context: crate::inbox::CapturedContext::default(),
+                    waiting_on: None,
+                });
+                workspace.age_inbox_for_test(&id, 0);
+            }
+        })
+        .unwrap();
+    cx.simulate_window_resize(*workspace, size(px(400.), px(800.)));
+    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+    let first = workspace
+        .update(cx, |workspace, window, cx| {
+            let identity = workspace.current_deal_card_for_test().unwrap().0;
+            workspace.phone_start_snap_for_test(window, cx);
+            identity
+        })
+        .unwrap();
+
+    cx.simulate_window_resize(*workspace, size(px(800.), px(800.)));
+    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
+        .unwrap();
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(200));
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(workspace.current_deal_card_for_test().unwrap().0, first);
+            assert_eq!(workspace.phone_last_gesture_for_test(), None);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn cancelling_phone_file_keeps_the_current_feed_card(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     let id = workspace
