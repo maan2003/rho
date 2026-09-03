@@ -189,6 +189,18 @@ done right after the transcript primitive (2.4) and before 2.10:
       the bar; square it. And the screenshot rig lacks an emoji font, so
       reactions and `morning! ▯` show tofu; install one so screenshots are
       truthful.
+- [ ] 1.22 Rough edges seen by the user on 3 Sep in a live DM (screenshot
+      in the session): (a) an unfurl renders as a muted `— Tau of Unix` line
+      plus an indented description, not the decided quote box (`▎` bar and
+      tint, 1.21), so it reads as a stray dash; every unfurl, link preview
+      or otherwise, is the box. (b) a soft-wrapped message continues at
+      column 0 (`models can go  18:39`), while a hard line break continues
+      at two columns (`  btw fman …`); both continue at two columns, so the
+      body's left edge is one line. (c) the image label `image.png · 320 KB`
+      sits as a full-height text line above the thumbnail; it becomes the
+      muted small caption style used for chrome, and the thumbnail keeps
+      its 12-line cap. Screenshot the same DM shape on the fake before and
+      after.
 - [x] 1.20 Line layout, done with 2.4. Decided by the user: `<name>: <body>  <time>`.
       No time column on the left, no padded author column, no tab after
       the name: the name, a colon, one space, the body. The time goes on
@@ -376,6 +388,19 @@ done right after the transcript primitive (2.4) and before 2.10:
       shows `@ada`; the wire carries `<@U1>`.
 - [ ] 3.4 In a thread surface `enter` sends to the thread. "Also send to
       channel", editing, and deleting stay deferred.
+
+- [ ] 3.5 Sending images. Asked by the user on 3 Sep. A paste of image
+      bytes into the composer, or a file path dropped on it, attaches the
+      image: the composer shows a thumbnail chip (`image.png · 320 KB`) above
+      the text, `enter` uploads and posts the text as the message with the
+      file attached, through `files.getUploadURLExternal` and
+      `files.completeUploadExternal` (`files.upload` is retired). The sent
+      message appears once as the same inline image every other message
+      gets, from the mirror, never rendered from local bytes. The fake
+      serves both upload endpoints and stores the bytes so the round trip is
+      testable; a failed upload fails loudly into the composer with the
+      text kept, like a failed send. Journal `SlackFileSent { conversation,
+      bytes }`. Screenshot the chip and the sent result on the fake.
 
 ## Phase 4: status and health
 
