@@ -294,3 +294,230 @@ async fn history_marking_and_the_conversation_list_come_from_slack() {
     assert!(rows[0].unread);
     assert_eq!(rows[1].label, "@ada", "a DM is named from the roster");
 }
+
+/// Phase 0 of the UX checklist: the fake can reach the state the reference
+/// screenshot was taken in. Everything the rendering items are judged
+/// against comes from here, so the fixture itself is worth a test.
+#[tokio::test]
+async fn the_fake_serves_the_reference_workspace() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_user_named("UD", "david", "David");
+    fake.add_group("G1", "mpdm-david--manmeet--keith-1", &["ME", "UD", "UK"]);
+    fake.add_private_channel("P1", "founders");
+    for index in 0..120 {
+        fake.add_message(
+            "G1",
+            json!({"ts": format!("{}.0", 1000 + index), "user": "UD", "text": "backlog"}),
+        );
+    }
+    fake.set_last_read("G1", "1050.0");
+    fake.add_emoji("forrest_gump_wave", "https://example.com/wave.png");
+    let client = client(&fake);
+
+    let conversations = client.conversations().await.unwrap();
+    let group = conversations
+        .iter()
+        .find(|conversation| conversation.id == ChannelId("G1".into()))
+        .expect("the group DM is served");
+    assert_eq!(group.kind, rho_slack::types::ConversationKind::Group);
+    assert_eq!(group.name, "mpdm-david--manmeet--keith-1");
+    assert!(
+        conversations
+            .iter()
+            .any(|conversation| conversation.id == ChannelId("P1".into())),
+        "a private channel is a conversation like any other"
+    );
+
+    // A display name that differs from the handle is what the roster shows.
+    assert_eq!(
+        client
+            .user_info(&rho_slack::UserId("UD".into()))
+            .await
+            .unwrap()
+            .name,
+        "David"
+    );
+
+    // History pages backwards, newest page first.
+    let newest = client
+        .conversations_history(&ChannelId("G1".into()), None)
+        .await
+        .unwrap();
+    assert_eq!(newest.messages.len(), rho_slack::api::PAGE);
+    let cursor = newest
+        .older_cursor
+        .expect("120 messages do not fit in one page");
+    let older = client
+        .conversations_history(&ChannelId("G1".into()), Some(&cursor))
+        .await
+        .unwrap();
+    assert!(
+        older
+            .messages
+            .last()
+            .unwrap()
+            .ts
+            .is_newer_than(&Ts("0".into())),
+        "the second page is real history"
+    );
+    assert!(
+        !older
+            .messages
+            .iter()
+            .any(|message| newest.messages.contains(message)),
+        "paging never repeats a message"
+    );
+
+    // The two fields no client method reads yet, which the unread rule and
+    // the emoji table will: they are served now so those items have a
+    // fixture to build against.
+    let raw = |method: &str, field: &str, value: &str| {
+        let base = fake.api_base().to_owned();
+        let method = method.to_owned();
+        let body = format!("{field}={value}");
+        async move {
+            reqwest::Client::new()
+                .post(format!("{base}/{method}"))
+                .header("Content-Type", "application/x-www-form-urlencoded")
+                .body(body)
+                .send()
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        }
+    };
+    let info = raw("conversations.info", "channel", "G1").await;
+    assert_eq!(info["channel"]["last_read"], json!("1050.0"));
+    let emoji = raw("emoji.list", "token", "x").await;
+    assert!(emoji["emoji"]["forrest_gump_wave"].is_string());
+
+    // Avatars are real bytes on the same host, which is what the avatar
+    // cache will fetch.
+    let profile = raw("users.info", "user", "UD").await;
+    let avatar = profile["user"]["profile"]["image_48"]
+        .as_str()
+        .expect("every user carries a picture")
+        .to_owned();
+    assert!(profile["user"]["avatar_hash"].is_string());
+    let bytes = reqwest::get(avatar).await.unwrap().bytes().await.unwrap();
+    assert_eq!(&bytes[1..4], b"PNG");
+}
+
+/// Checklist 0.7: the QA run drives live events by poking the fake over
+/// HTTP, and every one of them both moves the workspace and goes out on the
+/// socket. All the mocking is server side: nothing here reaches into the
+/// client.
+#[tokio::test]
+async fn the_control_route_drives_live_events_over_the_socket() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_user_named("UD", "david", "David");
+    fake.add_channel("C1", "design");
+    fake.set_count("C1", false, 0, "100.0");
+    fake.add_message("C1", json!({"ts": "100.0", "user": "UD", "text": "parent"}));
+
+    let (sender, mut receiver) = mpsc::unbounded();
+    let catch_up = Arc::new(Notify::new());
+    let _socket = tokio::spawn(run_socket(
+        client(&fake),
+        sender,
+        catch_up.clone(),
+        timings(),
+    ));
+    let Wire::Connected(_) = next_wire(&mut receiver).await else {
+        panic!("the socket announces itself first");
+    };
+    wait_until_live(&catch_up).await;
+    assert!(matches!(
+        next_wire(&mut receiver).await,
+        Wire::Frame(WsEvent::Hello)
+    ));
+
+    let poke = reqwest::Client::new();
+    let control = |request: serde_json::Value| {
+        let poke = poke.clone();
+        let url = fake.control_url();
+        async move {
+            let response: serde_json::Value = poke
+                .post(url)
+                .json(&request)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(response["ok"], json!(true), "control refused {response}");
+            response["ts"].as_str().unwrap_or_default().to_owned()
+        }
+    };
+
+    let ts = control(json!({
+        "kind": "message",
+        "channel": "C1",
+        "user": "UD",
+        "text": "posted from the control route <@ME>",
+    }))
+    .await;
+    let Wire::Frame(WsEvent::Message(message)) = next_wire(&mut receiver).await else {
+        panic!("a live message reaches the socket");
+    };
+    assert_eq!(message.text, "posted from the control route <@ME>");
+    assert_eq!(message.channel, ChannelId("C1".into()));
+
+    control(json!({
+        "kind": "reply",
+        "channel": "C1",
+        "thread_ts": ts,
+        "user": "UD",
+        "text": "and a reply",
+    }))
+    .await;
+    let Wire::Frame(WsEvent::Message(reply)) = next_wire(&mut receiver).await else {
+        panic!("a live reply reaches the socket");
+    };
+    assert_eq!(reply.thread_root(), Ts(ts.clone()));
+
+    // A mention moves the unread counter the conversation list reads, and
+    // lands in the feed, which is the source rho trusts over the socket.
+    let client = client(&fake);
+    let counts = client.counts().await.unwrap();
+    let count = counts
+        .conversations
+        .iter()
+        .find(|count| count.channel == ChannelId("C1".into()))
+        .expect("the channel is counted");
+    assert!(count.has_unreads);
+    assert_eq!(count.mention_count, 1);
+    assert!(!poll_feed(&client, None).await.unwrap().is_empty());
+
+    control(json!({"kind": "reaction", "channel": "C1", "ts": &ts, "user": "UD", "name": "eyes"}))
+        .await;
+    control(json!({"kind": "edit", "channel": "C1", "ts": &ts, "text": "edited by control"})).await;
+    // History is the proof the events are real: a client that reopens the
+    // conversation must see exactly what the socket announced.
+    let history = client
+        .conversations_history(&ChannelId("C1".into()), None)
+        .await
+        .unwrap();
+    let live = history
+        .messages
+        .iter()
+        .find(|message| message.ts == Ts(ts.clone()))
+        .expect("the live message is in history");
+    assert_eq!(live.text, "edited by control");
+
+    control(json!({"kind": "delete", "channel": "C1", "ts": &ts})).await;
+    let history = client
+        .conversations_history(&ChannelId("C1".into()), None)
+        .await
+        .unwrap();
+    assert!(
+        !history
+            .messages
+            .iter()
+            .any(|message| message.ts == Ts(ts.clone())),
+        "a deleted message leaves history"
+    );
+}
