@@ -101,6 +101,8 @@ per conversation and per thread (`subscriptions.thread.mark`,
 private copy of any of these; the mirror caches them and Slack corrects
 it. Only what Slack has no place for, the dealer's verdicts, lives in rho,
 on the thread node, where the tree already syncs it between rho devices.
+Verdicts are not mirrored into Slack's Later (saved items) either: the
+user's call, 3 Sep; the tree's CRDT is the only sync for them.
 
 **Why:** the user's rule, 3 Sep. Slack's own clients on the phone and the
 desktop share this state already; a private copy in rho would drift the
