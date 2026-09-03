@@ -170,7 +170,15 @@ under test. If the fake cannot produce a state, extend the fake.
       it, one page in flight at a time, and the cursor stays on the line
       it was on while the lines above grow. History-begins makes the top a
       no-op, never a request. There is no manual form: `shift-p` and its
-      echo are removed, the user wants no "load older" to exist. This is
+      echo are removed, the user wants no "load older" to exist. Every
+      re-render is incremental, decided by the user: a keyed transcript
+      primitive (new crate `rho-transcript`, prior art in rho-gui's
+      `TranscriptModel`) where each message owns an anchored range; a
+      prepend, append, edit, reaction, or deletion edits only its own
+      range, so cost is proportional to what changed and cursor, scroll,
+      highlights and image blocks outside it survive. Whole-text render
+      plus diff is rejected as O(conversation) per event. Blocks 2.8 and
+      2.9, so it comes before 2.10. This is
       still on demand under the budget rule: the web client fetches
       exactly the same page when a user scrolls to it.
 - [ ] 2.5 Next unread conversation from inside a conversation: `shift-n`,

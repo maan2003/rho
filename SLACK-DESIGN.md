@@ -112,6 +112,9 @@ the composer rather than queueing, for now.
 The mirror fills only on demand. Nothing is prefetched: a conversation's
 history is fetched when the user opens it, older pages when the reader
 scrolls up to a gap, one page at a time, with no manual "load older",
+and every update reaches the screen as an incremental edit of only the
+messages that changed (a keyed transcript primitive shared with the rest
+of rho), never a re-render of the conversation,
 and the tail only for conversations that are open or that the feed named.
 Rho never walks a workspace's history in the background, never fans out
 over the conversation list, and never re-fetches what the mirror already
