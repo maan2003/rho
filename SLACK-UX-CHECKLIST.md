@@ -335,6 +335,23 @@ done right after the transcript primitive (2.4) and before 2.10:
       the fake must model that, and the both-sides test must run on a
       channel long enough to tell (500 messages, ping in the middle, context
       visible below the ping in the screenshot).
+- [ ] 2.13 Marking the old backlog done. Asked by the user on 3 Sep. On the
+      Slack list, a command `mark read before` opens a minibuffer taking an
+      age or a date (`7d`, `2026-08-15`, default `7d`) and shows the count
+      it would touch before acting (`14 conversations · 3 threads · enter`).
+      Acting means the real Slack action a person would take:
+      `conversations.mark` to the latest message of every conversation
+      whose newest message is older than the cutoff, one request per
+      conversation, no pagination beyond what the mirror already holds;
+      threads the user is in get `subscriptions.thread.mark` the same way.
+      In rho, reading is the verdict, so those obligations are discharged;
+      once thread nodes exist (slice 2) the same command writes a `done`
+      verdict on every open thread node older than the cutoff, one log
+      entry each, undone as a batch with `shift-u`. Nothing newer than the
+      cutoff is touched, ever. Journal `SlackMarkedReadBefore { cutoff,
+      conversations, threads }`. The fake counts the mark calls; the test
+      asserts exactly one per old conversation and zero for newer ones.
+      Screenshot the confirmation line and the list after.
 - [ ] 2.10 No inbox in between, decided. Today a Slack obligation is copied
       into the rho inbox (`SlackItems`, `InboxKind::Slack`,
       `SourceReference::SlackThread`) and dealt from there. Rho: the dealer
