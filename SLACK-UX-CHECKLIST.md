@@ -395,14 +395,20 @@ done right after the transcript primitive (2.4) and before 2.10:
       `ts`, which would have raised it, is dropped as a duplicate. Fix
       both: `seen` records a message only once it has a reason (channel
       traffic is never "seen"; the feed stays the truth it was designed to
-      be); participation persists in the mirror and is derived on load
-      from any mirrored message by the user with a thread root, and a feed
-      `thread_v2` item marks the thread participated. Tests: a live reply
-      in an unknown thread followed by the feed item raises exactly once;
-      a restart with the user's reply in the mirror keeps the thread
-      participated. Comes right after 2.14, since 2.14 removes the third
-      way this card could have gone quiet (a `channel_marked` from the
-      phone).
+      be); and "threads that are mine" comes from Slack, not from what rho
+      happened to watch (the user's rule, 3 Sep: state lives in Slack so
+      every client agrees). On connect, `subscriptions.thread.getView`
+      lists the followed threads with their `last_read`; live,
+      `thread_subscribed` / `thread_unsubscribed` / `thread_marked` keep
+      it current (emacs-slack `slack-all-threads-buffer.el`,
+      `slack-thread-event.el`). Slack follows a thread for the user when
+      they post or are mentioned, so a phone reply counts. The
+      `participated` set and any mirror copy of it go. Tests: a live reply
+      in a followed-but-never-seen thread raises; the same reply in an
+      unfollowed thread does not; the feed item after the live reply is a
+      no-op, not a drop. Comes right after 2.14, since 2.14 removes the
+      third way this card could have gone quiet (a `channel_marked` from
+      the phone).
 - [ ] 2.10 No inbox in between, decided. Today a Slack obligation is copied
       into the rho inbox (`SlackItems`, `InboxKind::Slack`,
       `SourceReference::SlackThread`) and dealt from there. Rho: the dealer

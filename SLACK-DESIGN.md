@@ -91,6 +91,22 @@ them re-raises it as "needs reply" from a fresh start.
 enough that an agent that just spoke still leads. A coworker's wait costs
 more than an agent's, but not so much more that Slack should always win.
 
+### State lives in Slack wherever Slack has a place for it
+
+Which threads are the user's is Slack's follow list
+(`subscriptions.thread.getView` on connect, `thread_subscribed` and
+`thread_unsubscribed` live). What has been read is Slack's read cursors,
+per conversation and per thread (`subscriptions.thread.mark`,
+`thread_marked`). Ignoring a thread is Slack's unfollow. Rho keeps no
+private copy of any of these; the mirror caches them and Slack corrects
+it. Only what Slack has no place for, the dealer's verdicts, lives in rho,
+on the thread node, where the tree already syncs it between rho devices.
+
+**Why:** the user's rule, 3 Sep. Slack's own clients on the phone and the
+desktop share this state already; a private copy in rho would drift the
+moment the user touched another client, which is exactly what made a
+thread reply vanish (checklist 2.16).
+
 ### Ingest: the activity feed for truth, the websocket for latency
 
 Catch-up and deduplication come from polling `activity.feed`, the endpoint
