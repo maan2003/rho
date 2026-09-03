@@ -198,6 +198,24 @@ pub enum SurfaceIdentity {
     Dashboard,
 }
 
+/// Who ignored the thread: this rho, or Slack telling rho that another
+/// client did.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    senax_encoder::Encode,
+    senax_encoder::Decode,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum IgnoredBy {
+    Rho,
+    Slack,
+}
+
 /// A Slack thread as the journal names it: the workspace and conversation a
 /// person would recognise, plus the thread's own key so two threads in one
 /// conversation stay distinct.
@@ -437,6 +455,12 @@ pub enum Event {
     SlackReplied {
         thread: SlackThread,
     },
+    /// The thread stopped being the user's: `x` here, which tells Slack, or
+    /// an unfollow in another client, which Slack tells rho.
+    SlackThreadIgnored {
+        thread: SlackThread,
+        by: IgnoredBy,
+    },
     /// The old backlog marked read in one go: the cutoff the user gave and
     /// how much it touched. The verdicts it wrote are undone as a batch,
     /// which is what `SlackMarkReadBeforeUndone` records; the marking
@@ -536,6 +560,7 @@ impl Event {
             Self::SlackDisconnected { .. } => "slack_disconnected",
             Self::SlackThreadBound { .. } => "slack_thread_bound",
             Self::SlackReplied { .. } => "slack_replied",
+            Self::SlackThreadIgnored { .. } => "slack_thread_ignored",
             Self::SlackMarkedReadBefore { .. } => "slack_marked_read_before",
             Self::SlackMarkReadBeforeUndone { .. } => "slack_mark_read_before_undone",
             Self::MinibufferOpened { .. } => "minibuffer_opened",

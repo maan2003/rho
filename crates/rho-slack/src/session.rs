@@ -73,6 +73,8 @@ pub enum SessionEvent {
     Changed(Vec<Change>),
     /// The user's own reply landed in this thread.
     Replied(ThreadKey),
+    /// Something the user should be told, once, in the message strip.
+    Notice(String),
     Health(Signal),
 }
 
@@ -371,8 +373,12 @@ impl Session {
                 if let Ok(emoji) = emoji {
                     session.model.set_custom_emoji(emoji);
                 }
+                let mut dropped = Vec::new();
                 if let Ok(followed) = followed {
-                    session.model.set_followed(
+                    // A thread the list stops naming was unfollowed
+                    // somewhere else, possibly while rho was off; its card
+                    // is discarded on the way in rather than dealt again.
+                    dropped = session.model.set_followed(
                         followed
                             .into_iter()
                             .map(|thread| (thread.channel, thread.thread_ts)),
@@ -385,6 +391,7 @@ impl Session {
                     .tracked()
                     .into_iter()
                     .map(Change::Updated)
+                    .chain(dropped.into_iter().map(Change::Discarded))
                     .collect();
                 session.announce(known, cx);
                 cx.notify();
@@ -420,7 +427,13 @@ impl Session {
                 self.model.follow(&channel, &thread_ts);
             }
             Wire::Frame(WsEvent::Unsubscribed { channel, thread_ts }) => {
-                self.model.unfollow(&channel, &thread_ts);
+                // Ignored here or in another client: either way Slack has
+                // said the thread is no longer the user's, and the card goes
+                // with it.
+                let key = self.model.key(&channel, &thread_ts);
+                if self.model.unfollow(&channel, &thread_ts) {
+                    self.announce(vec![Change::Discarded(key)], cx);
+                }
             }
             Wire::Frame(WsEvent::Marked { channel, ts }) => {
                 // Read elsewhere. Only the badge is stale: reading is not a
@@ -1242,6 +1255,40 @@ impl Session {
                 tracing::warn!(error = %error, "slack mark-read failed");
             }
             let _ = this.update(cx, |_, cx| cx.notify());
+        }));
+    }
+
+    /// Slack's ignore thread: the discard the user just made here, made
+    /// everywhere they read Slack. One request, and rho keeps no
+    /// subscription state of its own, so the socket's `thread_unsubscribed`
+    /// that follows is the confirmation rather than a second source of
+    /// truth. A failure is reported and changes nothing local: the discard
+    /// already stands.
+    pub fn ignore_thread(&mut self, key: &ThreadKey, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.model.unfollow(&key.channel, &key.thread_ts);
+        cx.notify();
+        let (channel, thread_ts) = (key.channel.clone(), key.thread_ts.clone());
+        let task = gpui_tokio::Tokio::spawn(cx, async move {
+            client.ignore_thread(&channel, &thread_ts).await
+        });
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let failed = match task.await {
+                Ok(Err(error)) => Some(format!("{error:#}")),
+                Err(error) => Some(format!("{error}")),
+                Ok(Ok(())) => None,
+            };
+            let _ = this.update(cx, |_, cx| {
+                if let Some(reason) = failed {
+                    tracing::warn!(error = %reason, "slack ignore-thread failed");
+                    cx.emit(SessionEvent::Notice(
+                        "slack: the thread is still followed in Slack".to_owned(),
+                    ));
+                }
+                cx.notify();
+            });
         }));
     }
 

@@ -1115,7 +1115,7 @@ impl Workspace {
         // Slack runs from startup, not from the first time the surface is
         // opened: a mention has to become a card whether or not anyone is
         // looking at Slack.
-        this.slack_session(cx);
+        this.slack_session(window, cx);
         this
     }
 
@@ -6563,7 +6563,7 @@ impl Workspace {
             }
             SurfaceKey::SlackList => {
                 let session = self
-                    .slack_session(cx)
+                    .slack_session(window, cx)
                     .expect("the slack list is only opened once a session exists");
                 let hooks = Self::slack_hooks();
                 SurfaceView::SlackList(
@@ -7386,6 +7386,25 @@ impl Workspace {
         self.refresh_dashboard(window, cx);
     }
 
+    /// Closes a thread card because Slack said the thread is not the user's
+    /// any more. No undo entry: the verdict was made in another client, and
+    /// `shift-u` here could not take it back there.
+    pub(crate) fn discard_thread_card(
+        &mut self,
+        card: crate::dashboard::DealCardId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((writes, verdict)) = self.desk_cells.verdict_writes(
+            card.host,
+            card.node_id,
+            crate::desk_view::DeskVerdict::Dismiss,
+        ) else {
+            return;
+        };
+        self.apply_desk_writes(card.host, writes, Some(verdict), window, cx);
+    }
+
     /// Writes a done verdict on each node and leaves one undo entry for the
     /// lot. Unlike a dealt verdict this does not wait for the daemon's
     /// answer before arming the undo: there is no card in front of the user
@@ -7555,6 +7574,14 @@ impl Workspace {
             crate::desk_view::DeskVerdict::Todo { .. } => crate::journal::PhoneVerdict::Todo,
             crate::desk_view::DeskVerdict::File { .. } => crate::journal::PhoneVerdict::File,
         });
+        // `x` on a thread card is Slack's ignore thread: the same keystroke
+        // that closes the card here stops Slack raising it anywhere else.
+        if matches!(dealt, crate::desk_view::DeskVerdict::Dismiss)
+            && target_node.is_none()
+            && let Some(thread) = self.dashboard.card_thread(card.identity)
+        {
+            self.slack_ignore_thread(&thread, cx);
+        }
         let Some((writes, applied)) = self.desk_cells.verdict_writes(card.host, node_id, dealt)
         else {
             return false;

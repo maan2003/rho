@@ -142,7 +142,7 @@ impl Workspace {
     /// Opens the conversation list, starting the session on first entry.
     /// This is the way in: everything else is reached from a row.
     pub(crate) fn open_slack(&mut self, window: &mut gpui::Window, cx: &mut gpui::Context<Self>) {
-        if self.slack_session(cx).is_none() {
+        if self.slack_session(window, cx).is_none() {
             self.notice_on(
                 None,
                 "slack: no workspace registered",
@@ -163,6 +163,7 @@ impl Workspace {
     /// is the one rho lives in.
     pub(crate) fn slack_session(
         &mut self,
+        window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) -> Option<gpui::Entity<Session>> {
         if let Some(session) = &self.slack {
@@ -172,9 +173,14 @@ impl Workspace {
         let name = store.workspaces().next()?;
         let credentials = store.get(&name)?.clone();
         let session = cx.new(|cx| Session::new(credentials, cx));
-        self._slack_subscription = Some(cx.subscribe(&session, |workspace, session, event, cx| {
-            workspace.on_slack_event(session, event, cx);
-        }));
+        // Window-scoped: a thread ignored in another client closes its card
+        // here, and closing a card writes to the tree.
+        self._slack_subscription =
+            Some(
+                cx.subscribe_in(&session, window, |workspace, session, event, window, cx| {
+                    workspace.on_slack_event(session.clone(), event, window, cx);
+                }),
+            );
         self.slack = Some(session.clone());
         Some(session)
     }
@@ -220,7 +226,7 @@ impl Workspace {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) -> bool {
-        if self.slack_session(cx).is_none() {
+        if self.slack_session(window, cx).is_none() {
             return false;
         }
         let source = Self::slack_deal_source(workspace, channel, thread_ts, latest_ts);
@@ -243,7 +249,7 @@ impl Workspace {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
-        let Some(session) = self.slack_session(cx) else {
+        let Some(session) = self.slack_session(window, cx) else {
             return;
         };
         self.active_context = ContextId::Slack;
@@ -415,6 +421,55 @@ impl Workspace {
 
     /// `s`: narrow the listing to what the user types. The prompt is the
     /// search, so there is nothing extra to dismiss afterwards.
+    /// `x` on a thread card is Slack's ignore thread: rho's discard is the
+    /// verdict on the node, and the same keystroke tells Slack, so no other
+    /// client raises the thread either. Rho keeps no subscription state; if
+    /// the call fails the discard still stands and the notice says the
+    /// thread is still followed in Slack.
+    pub(crate) fn slack_ignore_thread(&mut self, thread: &ThreadRef, cx: &mut gpui::Context<Self>) {
+        let Some(session) = self.slack.clone() else {
+            return;
+        };
+        let key = ThreadKey {
+            workspace: rho_slack::config::WorkspaceName(thread.workspace.clone()),
+            channel: ChannelId(thread.channel.clone()),
+            thread_ts: Ts(thread.thread_ts.clone()),
+        };
+        crate::journal::record(crate::journal::Event::SlackThreadIgnored {
+            thread: journal_thread_labelled(session.read(cx).model(), &key),
+            by: crate::journal::IgnoredBy::Rho,
+        });
+        session.update(cx, |session, cx| session.ignore_thread(&key, cx));
+    }
+
+    /// The other direction: Slack says the thread was unfollowed, here or
+    /// anywhere else, so the card is discarded. An already closed card has
+    /// nothing to do, which is also what stops rho's own `x` from writing
+    /// the verdict twice when the socket echoes it back.
+    pub(crate) fn slack_thread_discarded(
+        &mut self,
+        key: &ThreadKey,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(card) = self.dashboard.thread_card_id(&thread_ref(key)) else {
+            return;
+        };
+        if !self.dashboard.node_is_open(card) {
+            return;
+        }
+        let thread = self
+            .slack
+            .as_ref()
+            .map(|session| journal_thread_labelled(session.read(cx).model(), key))
+            .unwrap_or_else(|| journal_thread(&Source::Thread(key.clone())));
+        crate::journal::record(crate::journal::Event::SlackThreadIgnored {
+            thread,
+            by: crate::journal::IgnoredBy::Slack,
+        });
+        self.discard_thread_card(card, window, cx);
+    }
+
     /// `mark read before`: the backlog older than a cutoff, marked read in
     /// Slack and closed here. The prompt shows what it would touch before
     /// anything happens, because the action is not reversible in Slack.
@@ -554,6 +609,7 @@ impl Workspace {
         &mut self,
         session: gpui::Entity<Session>,
         event: &SessionEvent,
+        window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
         // The roster can land after a surface was opened, so every cached
@@ -581,11 +637,24 @@ impl Workspace {
                     // dealer deals the node. The daemon answers with the node
                     // it already had when the thread was raised before, so a
                     // reconnect never makes a second one.
-                    if let Change::Raised(key) | Change::Updated(key) = change {
-                        self.bind_slack_thread(key, cx);
+                    match change {
+                        Change::Raised(key) | Change::Updated(key) => {
+                            self.bind_slack_thread(key, cx)
+                        }
+                        // Slack said the thread is not the user's any more.
+                        // That is a verdict made in another client, so the
+                        // card closes here without asking.
+                        Change::Discarded(key) => {
+                            let key = key.clone();
+                            self.slack_thread_discarded(&key, window, cx);
+                        }
+                        Change::Replied(_) => {}
                     }
                 }
                 self.invalidate_dealer_signals(cx);
+            }
+            SessionEvent::Notice(text) => {
+                self.notice_on(None, text, StyleClass::StatusError, cx);
             }
             SessionEvent::Replied(key) => {
                 let thread = journal_thread_labelled(session.read(cx).model(), key);
@@ -904,7 +973,7 @@ mod tests {
             .iter()
             .filter_map(|change| match change {
                 Change::Raised(key) | Change::Updated(key) => Some(thread_ref(key)),
-                Change::Replied(_) => None,
+                Change::Replied(_) | Change::Discarded(_) => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(binds.len(), 2, "a raise and an update both bind");

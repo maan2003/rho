@@ -533,6 +533,21 @@ impl Client {
         Ok(())
     }
 
+    /// Stops following a thread: Slack's "ignore thread", which is what a
+    /// discard here means everywhere else the user reads Slack. One request;
+    /// Slack owns the list, so there is nothing to remember locally.
+    pub async fn ignore_thread(&self, channel: &ChannelId, thread_ts: &Ts) -> anyhow::Result<()> {
+        self.post_form(
+            "subscriptions.thread.remove",
+            &[
+                ("channel", channel.0.clone()),
+                ("thread_ts", thread_ts.0.clone()),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Marks a thread read up to `ts`. A thread is unread on its own count,
     /// so marking the conversation does not quiet it; this is the call
     /// Slack's own client makes when the reader leaves the thread.

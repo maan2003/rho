@@ -7405,3 +7405,43 @@ fn marking_the_backlog_closes_every_old_card_and_undoes_as_one(cx: &mut TestAppC
         })
         .unwrap();
 }
+
+/// A thread ignored in another client stops being the user's everywhere:
+/// Slack says so on the socket, and the card closes here without a keystroke
+/// and without an undo entry, because `shift-u` could not take it back in
+/// Slack either.
+#[gpui::test]
+fn a_thread_unfollowed_in_slack_closes_its_card(cx: &mut TestAppContext) {
+    use rho_slack::{ChannelId, Ts, WorkspaceName};
+
+    let mut desk = DeskFixture::new();
+    let thread = desk.thread_row(None, "C1", "500.0");
+    let key = rho_slack::ThreadKey {
+        workspace: WorkspaceName("acme".to_owned()),
+        channel: ChannelId("C1".to_owned()),
+        thread_ts: Ts("500.0".to_owned()),
+    };
+    let card = crate::dashboard::DealCardId {
+        host: HostId::default(),
+        node_id: thread,
+    };
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            assert!(workspace.dashboard.node_is_open(card));
+
+            workspace.slack_thread_discarded(&key, window, cx);
+            assert!(
+                !workspace.dashboard.node_is_open(card),
+                "the card closes on Slack's word"
+            );
+            assert_eq!(
+                workspace.verdict_undo_count_for_test(),
+                0,
+                "a verdict made in another client is not this one's to undo"
+            );
+        })
+        .unwrap();
+}

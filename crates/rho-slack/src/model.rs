@@ -63,6 +63,10 @@ pub enum Change {
     /// The user answered. The card stays and says `replied`: verdicts are
     /// the user's keys only, so nothing here closes it and nothing binds.
     Replied(ThreadKey),
+    /// The thread stopped being the user's, because they ignored it here or
+    /// unfollowed it in another client. Slack's own verdict, so the card
+    /// goes; nothing rho stores says otherwise.
+    Discarded(ThreadKey),
 }
 
 /// A dealer card's worth of a thread, with no ids and no raw timestamps.
@@ -348,11 +352,28 @@ impl Model {
     /// The follow list as Slack has it, from `subscriptions.thread.getView`
     /// on connect. It replaces whatever rho held: Slack is the truth, and a
     /// thread missing from it is one the user has unfollowed somewhere else.
-    pub fn set_followed(&mut self, threads: impl IntoIterator<Item = (ChannelId, Ts)>) {
-        self.followed = threads
+    /// Returns the tracked threads the list no longer names: unfollowed in
+    /// another client, possibly while rho was away. Their cards are Slack's
+    /// to discard.
+    pub fn set_followed(
+        &mut self,
+        threads: impl IntoIterator<Item = (ChannelId, Ts)>,
+    ) -> Vec<ThreadKey> {
+        let now = threads
             .into_iter()
             .map(|(channel, thread_ts)| self.key(&channel, &thread_ts))
-            .collect();
+            .collect::<BTreeSet<_>>();
+        let dropped = self
+            .followed
+            .difference(&now)
+            .filter(|key| self.threads.contains_key(key))
+            .cloned()
+            .collect::<Vec<_>>();
+        self.followed = now;
+        for key in &dropped {
+            self.threads.remove(key);
+        }
+        dropped
     }
 
     pub fn follow(&mut self, channel: &ChannelId, thread_ts: &Ts) {
@@ -363,9 +384,16 @@ impl Model {
     /// A thread unfollowed anywhere stops being the user's business. The
     /// card it raised is left to the verdict that closes it; what goes is
     /// the standing claim that its next reply is theirs.
-    pub fn unfollow(&mut self, channel: &ChannelId, thread_ts: &Ts) {
+    /// Returns whether rho is tracking the thread, which is the difference
+    /// between an unfollow that discards a card and one that changes
+    /// nothing the user can see.
+    pub fn unfollow(&mut self, channel: &ChannelId, thread_ts: &Ts) -> bool {
         let key = self.key(channel, thread_ts);
         self.followed.remove(&key);
+        // The thread goes with the follow. Nothing here remembers that it
+        // was ever raised, so following it again in Slack raises it only
+        // when somebody writes in it.
+        self.threads.remove(&key).is_some()
     }
 
     pub fn follows(&self, key: &ThreadKey) -> bool {

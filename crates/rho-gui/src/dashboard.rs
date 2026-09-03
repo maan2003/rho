@@ -929,6 +929,16 @@ impl Dashboard {
         self.node_card(|node| node_thread(node).as_ref() == Some(thread))
     }
 
+    /// The thread a card stands for, if it is a thread card at all.
+    pub fn card_thread(&self, card: DealCardId) -> Option<ThreadRef> {
+        self.tree_hosts
+            .get(&card.host)?
+            .nodes
+            .iter()
+            .find(|node| node.id == card.node_id)
+            .and_then(node_thread)
+    }
+
     /// Every open Slack thread node, with the thread it stands for. The
     /// backlog command needs them all at once rather than the one the
     /// cursor is on.

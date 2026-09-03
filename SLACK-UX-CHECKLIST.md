@@ -400,7 +400,7 @@ done right after the transcript primitive (2.4) and before 2.10:
       a reply from them after `d` re-raises; a 2h-old ping outranks a
       2h-old blocked agent but not one the user messaged 10 minutes ago.
       Screenshot a deal queue holding both.
-- [ ] 2.15 Discard is Slack's ignore thread. Decided by the user on 3 Sep,
+- [x] 2.15 Discard is Slack's ignore thread. Decided by the user on 3 Sep,
       recorded in SLACK-DESIGN under "A Slack thread is shaped like an
       agent". `x` on a thread card calls `subscriptions.thread.remove`
       for that thread (one request, failure lands as a notice, the rho
@@ -411,6 +411,21 @@ done right after the transcript primitive (2.4) and before 2.10:
       message from someone else. Fake records the unfollow calls; tests
       cover both directions. Journal `SlackThreadIgnored { thread, by:
       Rho | Slack }`.
+      Landed 3 Sep. `x` on a thread card sends one
+      `subscriptions.thread.remove` and the discard stands whatever Slack
+      answers; a failure is a notice saying the thread is still followed
+      there. The other way, `thread_unsubscribed` closes the card, and so
+      does a thread the follow list stops naming on the next connect, which
+      is the unfollow that happened while rho was off. Unfollowing drops
+      the thread from the model entirely, so following it again in Slack
+      raises nothing until somebody writes in it. Rig: `x` on #design sent
+      exactly one remove and dealt the next card; a `/control` unsubscribe
+      for #random closed that card with no keystroke
+      (screens/{discard,unsub,after-unsub-home}.png).
+      Worth a decision: `shift-u` after `x` reopens the node, but the card
+      does not come back, because rho no longer follows the thread and a
+      card with nothing in the mirror is not dealt. Undo does not re-follow
+      in Slack, per the rule that external effects are not reversed.
 - [x] 2.16 A thread reply the user never saw. Landed 3 Sep. Original: Reported by the user on 3
       Sep: a reply in a thread they had posted in raised nothing, no chime,
       no lamp, not in a manual deal. Two causes in `model.rs`, either one

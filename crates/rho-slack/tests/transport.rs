@@ -757,3 +757,123 @@ async fn marking_the_backlog_touches_only_what_is_older_than_the_cutoff() {
         "the newer thread is left alone"
     );
 }
+
+/// Discard is Slack's ignore thread, in both directions. Here: `x` sends
+/// `subscriptions.thread.remove`, and Slack's own list stops naming the
+/// thread. There: an unfollow from another client arrives on the socket and
+/// the thread stops being the user's. Following it again raises nothing
+/// until somebody writes in it.
+#[tokio::test]
+async fn ignoring_a_thread_travels_both_ways() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_user("U1", "ada");
+    fake.add_channel("C1", "design");
+    fake.add_channel("C2", "random");
+    fake.follow_thread("C1", "500.0");
+    fake.follow_thread("C2", "600.0");
+    let client = client(&fake);
+
+    let mut model = Model::new(rho_slack::WorkspaceName("acme".into()));
+    model.set_self(rho_slack::UserId("ME".into()));
+    model.add_users(client.users().await.unwrap());
+    model.add_conversations(client.conversations().await.unwrap());
+    model.set_followed(
+        client
+            .followed_threads()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|thread| (thread.channel, thread.thread_ts)),
+    );
+
+    let (sender, mut receiver) = mpsc::unbounded();
+    let catch_up = Arc::new(Notify::new());
+    let _socket = tokio::spawn(run_socket(
+        client.clone(),
+        sender,
+        catch_up.clone(),
+        timings(),
+    ));
+    wait_until_live(&catch_up).await;
+
+    // Both threads are the user's, and a reply in either raises a card.
+    for (channel, thread_ts) in [("C1", "500.0"), ("C2", "600.0")] {
+        fake.live_reply(channel, thread_ts, "U1", "any update?");
+    }
+    let mut raised = 0;
+    while raised < 2 {
+        if let Wire::Frame(WsEvent::Message(message)) = next_wire(&mut receiver).await
+            && let Some(Change::Raised(_)) = model.note_message(&message, 0)
+        {
+            raised += 1;
+        }
+    }
+
+    // `x` here: one request, and Slack's list is the only record of it.
+    client
+        .ignore_thread(&ChannelId("C1".into()), &Ts("500.0".into()))
+        .await
+        .unwrap();
+    assert_eq!(fake.calls("subscriptions.thread.remove"), 1);
+    assert_eq!(
+        fake.fields("subscriptions.thread.remove", "thread_ts"),
+        vec![Some("500.0".to_owned())]
+    );
+    let followed = client.followed_threads().await.unwrap();
+    assert_eq!(
+        followed
+            .iter()
+            .map(|thread| thread.channel.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["C2"],
+        "the ignored thread is gone from Slack's own list"
+    );
+    // The list on the next connect discards the card rho still holds.
+    let dropped = model.set_followed(
+        followed
+            .into_iter()
+            .map(|thread| (thread.channel, thread.thread_ts)),
+    );
+    assert_eq!(dropped.len(), 1);
+    assert_eq!(dropped[0].channel, ChannelId("C1".into()));
+    assert_eq!(model.obligations(0).len(), 1, "only the other card is left");
+
+    // The other direction: unfollowed in another client, live.
+    fake.live(json!({"kind": "unsubscribe", "channel": "C2", "thread_ts": "600.0"}));
+    loop {
+        if let Wire::Frame(WsEvent::Unsubscribed { channel, thread_ts }) =
+            next_wire(&mut receiver).await
+        {
+            assert!(
+                model.unfollow(&channel, &thread_ts),
+                "rho was holding a card for it, so the card is discarded"
+            );
+            break;
+        }
+    }
+    assert!(model.obligations(0).is_empty());
+
+    // Followed again in Slack: nothing comes back until somebody writes.
+    fake.live(json!({"kind": "subscribe", "channel": "C2", "thread_ts": "600.0"}));
+    loop {
+        if let Wire::Frame(WsEvent::Subscribed { channel, thread_ts }) =
+            next_wire(&mut receiver).await
+        {
+            model.follow(&channel, &thread_ts);
+            break;
+        }
+    }
+    assert!(
+        model.obligations(0).is_empty(),
+        "following is not an obligation"
+    );
+    fake.live_reply("C2", "600.0", "U1", "still there?");
+    loop {
+        if let Wire::Frame(WsEvent::Message(message)) = next_wire(&mut receiver).await
+            && let Some(Change::Raised(_)) = model.note_message(&message, 0)
+        {
+            break;
+        }
+    }
+    assert_eq!(model.obligations(0).len(), 1, "the next message raises it");
+}
