@@ -140,6 +140,7 @@ actions!(
         SlackCompose,
         SlackSearch,
         SlackMarkReadBefore,
+        SlackNextUnread,
         SlackEditMessage,
         SlackEditLast,
         SlackCancelEdit,
@@ -422,6 +423,10 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             KeyBinding::new("i", SlackCompose, Some(context)),
             KeyBinding::new("s", SlackSearch, Some(context)),
             KeyBinding::new("e", SlackEditMessage, Some(context)),
+            // The next conversation with something in it, the way `n` walks
+            // the Zulip inbox. `shift-n` and not `n`, because `n` in a
+            // transcript is the search the reader just ran.
+            KeyBinding::new("shift-n", SlackNextUnread, Some(context)),
         ]);
     }
     // Marking the old backlog is a list-wide verb, so it lives on the list

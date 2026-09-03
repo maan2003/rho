@@ -298,6 +298,28 @@ impl Workspace {
         self.display_surface_with_method(surface, crate::journal::SurfaceShowMethod::Command, cx);
     }
 
+    /// `shift-n`: the next conversation with something unread, or the list
+    /// when there is none. Reading through what came in is one key, and it
+    /// ends somewhere that says so rather than on a conversation the
+    /// reader has already read.
+    pub(crate) fn slack_next_unread(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        let Some(session) = self.slack_session(window, cx) else {
+            return;
+        };
+        let here = match &self.active_pane().surface.view {
+            SurfaceView::SlackConversation(view) => Some(view.read(cx).source().channel().clone()),
+            _ => None,
+        };
+        match session.read(cx).model().next_unread(here.as_ref()) {
+            Some(channel) => self.open_slack_source(Source::Conversation(channel), window, cx),
+            None => self.open_slack(window, cx),
+        }
+    }
+
     /// `enter` on a list row, or on a message: the row's conversation, or
     /// the thread the message is in.
     pub(crate) fn slack_open_row(

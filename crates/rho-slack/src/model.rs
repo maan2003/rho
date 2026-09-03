@@ -386,6 +386,23 @@ impl Model {
         rows
     }
 
+    /// The next conversation with something unread, in the order the list
+    /// shows them, starting after `from`. Wraps, so reading through the
+    /// unread ones is one key pressed repeatedly; `None` when there is
+    /// nothing left, which is what sends the reader back to the list.
+    pub fn next_unread(&self, from: Option<&ChannelId>) -> Option<ChannelId> {
+        let rows = self.conversation_rows();
+        let unread = |row: &ConversationRow| row.unread || row.mention_count > 0;
+        let at = from
+            .and_then(|from| rows.iter().position(|row| &row.id == from))
+            .map_or(0, |at| at + 1);
+        rows.iter()
+            .skip(at)
+            .chain(rows.iter().take(at))
+            .find(|row| unread(row) && Some(&row.id) != from)
+            .map(|row| row.id.clone())
+    }
+
     /// What `mark read before` would touch, as a plan the caller can count
     /// before it acts and then act on unchanged. `before` is a cutoff in
     /// epoch seconds; nothing newer than it is ever in here.
@@ -1301,5 +1318,33 @@ mod tests {
             model.unread_dms(0).is_empty(),
             "a second roster fetch raises nothing again"
         );
+    }
+
+    #[test]
+    fn the_next_unread_conversation_wraps_and_never_lands_where_it_started() {
+        let mut model = model();
+        let count = |channel: &str, unread: bool| ConversationCount {
+            channel: ChannelId(channel.into()),
+            has_unreads: unread,
+            mention_count: 0,
+            latest: Some(Ts("100".into())),
+            last_read: None,
+        };
+        model.set_counts([count("C1", true), count("D1", true)]);
+        let order = model
+            .conversation_rows()
+            .into_iter()
+            .map(|row| row.id)
+            .collect::<Vec<_>>();
+        let (first, second) = (order[0].clone(), order[1].clone());
+        assert_eq!(model.next_unread(None), Some(first.clone()));
+        assert_eq!(model.next_unread(Some(&first)), Some(second.clone()));
+        // Round again: one key, pressed until there is nothing left.
+        assert_eq!(model.next_unread(Some(&second)), Some(first.clone()));
+
+        // The one the reader is in does not count, however unread Slack
+        // still thinks it is: they are looking at it.
+        model.set_counts([count("C1", false), count("D1", true)]);
+        assert_eq!(model.next_unread(Some(&ChannelId("D1".into()))), None);
     }
 }

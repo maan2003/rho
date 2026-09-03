@@ -70,9 +70,9 @@ use crate::{
     MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious, OverviewToggle,
     PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt,
     ShellPagerAll, ShellPagerMore, ShellPagerQuit, SlackCancelEdit, SlackCompose, SlackEditLast,
-    SlackEditMessage, SlackMarkReadBefore, SlackOpenRow, SlackSearch, SubmitPrompt, SurfaceBack,
-    SurfaceClose, TaskBoard, UndoVerdict, UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder,
-    ZulipNextUnread, ZulipOpenRow,
+    SlackEditMessage, SlackMarkReadBefore, SlackNextUnread, SlackOpenRow, SlackSearch,
+    SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, UndoVerdict, UploadGuiTelemetry,
+    VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
 };
 
 pub(crate) const MESSAGE_LOG_CAP: usize = 4096;
@@ -9830,6 +9830,9 @@ impl Render for Workspace {
                 if let Ok(action) = cx.build_action("vim::NormalBefore", None) {
                     window.dispatch_action(action, cx);
                 }
+            }))
+            .on_action(cx.listener(|this, _: &SlackNextUnread, window, cx| {
+                this.slack_next_unread(window, cx);
             }))
             .on_action(cx.listener(|this, _: &SlackMarkReadBefore, window, cx| {
                 this.prompt_slack_mark_read_before(window, cx);

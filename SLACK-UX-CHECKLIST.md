@@ -4,10 +4,9 @@ Reconciled against main on 3 Sep. Genuinely open, in order:
 
 - 1.13 avatars (waits on the editor's inline-image inlay), 1.22 rough edges
   (b) soft-wrap column waits on the vendored editor.
-- 2.5 `shift-n` next unread; 2.6 list row counts, time column, and the
-  muted section.
+- 2.6 list row counts, time column, and the muted section.
 - 3.1 composer boundary and placeholder; 3.3 completion.
-- 5.1 the one key table, once 2.5 has its key.
+- 5.1 the one key table.
 
 4.2 stays deferred.
 
@@ -338,9 +337,14 @@ done right after the transcript primitive (2.4) and before 2.10:
       2.9, so it comes before 2.10. This is
       still on demand under the budget rule: the web client fetches
       exactly the same page when a user scrolls to it.
-- [ ] 2.5 Next unread conversation from inside a conversation: `shift-n`,
+- [x] 2.5 Next unread conversation from inside a conversation: `shift-n`,
       the same key Zulip uses in rho. Wraps to the list when nothing is
-      unread.
+      unread. `Model::next_unread` walks the list order from the row you
+      are on, wraps once, and never lands where it started; when nothing
+      is left it opens the list. Bound in the four Slack normal/helix
+      `!VimDeal` contexts, not plain `n`, which is the reader's search.
+      Rig: 25-01-next, 25-02, 25-03, 25-04-list walk group DM ->
+      #design -> #random -> @David -> list.
 - [ ] 2.6 Conversation list rows. Now `#design @1`, `@ada unread`, a rule,
       then the rest. Rho: `label  @2 · 5 new  14:27`; unread first, then by
       recency; muted conversations at the bottom under a rule. No

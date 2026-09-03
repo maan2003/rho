@@ -6476,6 +6476,12 @@ fn deal_keys_reach_a_dealt_slack_conversation(cx: &mut TestAppContext) {
         assert_eq!(routes("i", &reading), Some("rho_gui::SlackCompose"));
         assert_eq!(routes("s", &reading), Some("rho_gui::SlackSearch"));
         assert_eq!(routes("e", &reading), Some("rho_gui::SlackEditMessage"));
+        // `shift-n` walks the unread conversations. `n` is left to the
+        // search the reader just ran in the transcript.
+        assert_eq!(
+            routes("shift-n", &reading),
+            Some("rho_gui::SlackNextUnread")
+        );
 
         // In the composer, `up` is the Slack habit of editing the last
         // message and `escape` cancels an open edit. Both fall through to
