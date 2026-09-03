@@ -14,15 +14,18 @@ your call" into a message and hoping.
 ## The idea: a self-declared status, phrased as what the human should do
 
 The three, named as the agent's speech acts (settled 3 Sep after two
-renames; the user's original words in quotes; the tags are `<tell-human/>`,
+renames; the user's original words in quotes; the tags are `<show-human/>`,
 `<ask-human/>`, `<answer-human/>`):
 
-- **heads-up**: "working and not blocked on the human, but I have some
-  stuff to show". Unprompted news the agent judges worth a look, and a
-  finished task: the task was assigned, not asked, so its completion is
-  news, not an answer. Most of a primary agent's life. The human looks
-  out of interest, or when the daemon's observed idle time says the
-  finished agent has been waiting long enough.
+- **show**: "working and not blocked on the human, but I have some stuff
+  to show". Something concrete to look at that the human did not ask for
+  and would want to see: a result, a screenshot, a landed change, a
+  finished task (assigned, not asked, so its completion is news, not an
+  answer). The threshold is the artifact: progress, intentions, and
+  "still working" are never a show. Named `show` rather than `tell` or
+  `heads-up` on 3 Sep because tell would be overused; show needs a thing.
+  The human looks out of interest, or when the daemon's observed idle
+  time says the finished agent has been waiting long enough.
 - **ask**: "might not be totally blocked, but the human would help
   massively". The agent needs something from the human.
 - **answer**: "the human should check its response", narrowed to a
@@ -40,8 +43,8 @@ Added in the talk that followed:
   an element, and whether the agent is running or idle is the daemon's
   observation, not a declaration (the user's call on 3 Sep, over an
   earlier draft that had quiet as a declared default).
-- **heads-up is Slack's mention; unread is separate.** New output is a
-  system fact. Heads-up is the agent's judgement that something is worth
+- **show is Slack's mention; unread is separate.** New output is a
+  system fact. Show is the agent's judgement that something is worth
   the human's eyes. Keep both, like a channel with chatter versus one
   where the human was named.
 - **ask carries no details.** Whether the ask blocks is observed, not
@@ -72,7 +75,7 @@ sets the state and the reason; the curve is the human's, never the agent's.
 
 ## What clears each, or the status rots
 
-Heads-up and answer clear when the human opens the transcript (the read
+Show and answer clear when the human opens the transcript (the read
 cursor, as in Slack). Ask clears when the human replies or performs the
 act. Every status clears when the agent starts a new turn, so a stale answer
 cannot outlive the next piece of work. An agent with a question
@@ -88,11 +91,11 @@ tool round trip:
 <ask-human/>
 ```
 
-The element name is the act with the human as its object, `tell-human`,
+The element name is the act with the human as its object, `show-human`,
 `ask-human`, `answer-human`, and that is the whole element: no attributes,
 no body. Named so on 3 Sep because the goal is to put the act in the
 agent's mind from the token alone; writing `<ask-human/>` is the thought
-"I am asking the human". `tell` is the doc's `heads-up`. No body: the user's call on
+"I am asking the human". No body: the user's call on
 3 Sep, a reason line is tokens spent repeating what the reply already
 says. The reason shown on Home and in the deal bar is the last line of the
 turn's own text, which Home shows for a running agent anyway. The daemon
