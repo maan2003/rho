@@ -786,6 +786,106 @@ fn undo_verdict_binding_is_confined_to_deal_normal_mode(cx: &mut TestAppContext)
     });
 }
 
+#[gpui::test]
+fn escape_leaves_deal_mode_on_every_dealt_surface(cx: &mut TestAppContext) {
+    use gpui::{KeyContext, Keystroke};
+
+    cx.update(bind_test_keymaps);
+    cx.update(|cx| {
+        let keymap = cx.key_bindings();
+        let keymap = keymap.borrow();
+        let stroke = Keystroke::parse("escape").unwrap();
+        let routes_to_leave = |contexts: &[KeyContext]| {
+            keymap
+                .bindings_for_input(&[stroke.clone()], contexts)
+                .0
+                .first()
+                .is_some_and(|binding| binding.action().partial_eq(&crate::DealLeave))
+        };
+        // A dealt editor, whatever surface it belongs to.
+        assert!(routes_to_leave(&[
+            KeyContext::parse("RhoGui").unwrap(),
+            KeyContext::parse("Editor VimDeal vim_mode=normal vim_operator=none").unwrap(),
+        ]));
+        // A dealt surface with no editor at all.
+        assert!(routes_to_leave(&[
+            KeyContext::parse("RhoGuiDeal").unwrap(),
+            KeyContext::parse("RhoBrowser").unwrap(),
+        ]));
+        // Insert inside a deal belongs to the editor: escape there returns
+        // to DEAL rather than ending the deal.
+        assert!(!routes_to_leave(&[
+            KeyContext::parse("RhoGuiDeal").unwrap(),
+            KeyContext::parse("Editor VimControl vim_mode=insert vim_operator=none").unwrap(),
+        ]));
+    });
+}
+
+#[gpui::test]
+fn escape_ends_the_deal_and_leaves_the_surface_where_it_is(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            for text in ["Inbox QA item", "Inbox QA second item"] {
+                let id = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
+                    kind: crate::inbox::InboxKind::Capture,
+                    text: text.into(),
+                    source: crate::inbox::SourceReference::None,
+                    context: crate::inbox::CapturedContext::default(),
+                    waiting_on: None,
+                });
+                workspace.age_inbox_for_test(&id, 0);
+            }
+            workspace.open_deal_mode(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let dealt = workspace
+        .update(cx, |workspace, _, _| {
+            assert!(workspace.dashboard_deal_mode_for_test());
+            workspace.current_surface_name_for_test()
+        })
+        .unwrap();
+    let editor = active_editor(&workspace, cx);
+    assert!(
+        cx.update(|cx| vim::editor_in_deal_mode(&editor, cx)),
+        "the dealt editor is in DEAL before escape"
+    );
+
+    cx.dispatch_action(*workspace, crate::DealLeave);
+    cx.run_until_parked();
+
+    assert!(
+        !cx.update(|cx| vim::editor_in_deal_mode(&editor, cx)),
+        "escape leaves DEAL for normal"
+    );
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                !workspace.dashboard_deal_mode_for_test(),
+                "the dealer's own state ends with the mode"
+            );
+            assert_eq!(
+                workspace.current_surface_name_for_test(),
+                dealt,
+                "the surface stays where the reader left it"
+            );
+        })
+        .unwrap();
+
+    // And the next deal is a fresh one rather than a mode that never ended.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_deal_mode(window, cx);
+            assert!(
+                workspace.dashboard_deal_mode_for_test(),
+                "ctrl-j after escape deals the next card, not a stuck mode"
+            );
+        })
+        .unwrap();
+}
+
 fn test_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace> {
     cx.update(init_test_app);
     let target = AttachTarget::Unix(std::env::temp_dir().join("rho-gui-test-nonexistent.sock"));

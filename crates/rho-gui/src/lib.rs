@@ -127,6 +127,7 @@ actions!(
         SurfaceBack,
         DealOpen,
         DealCloseAndNext,
+        DealLeave,
         OverviewToggle,
         SurfaceClose,
         ZulipNextUnread,
@@ -463,6 +464,11 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         "VimDeal && vim_operator == none",
     ] {
         cx.bind_keys([
+            // Deal mode refuses ordinary mode switches, so vim's own escape
+            // is dropped inside it: this is the deliberate way out, and it
+            // is the workspace's, not vim's, because a dealt surface is not
+            // always an editor.
+            KeyBinding::new("escape", DealLeave, Some(context)),
             KeyBinding::new("q", SurfaceClose, Some(context)),
             KeyBinding::new("d", DashboardDealDone, Some(context)),
             KeyBinding::new("x", DashboardDealDiscard, Some(context)),
@@ -475,6 +481,9 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             KeyBinding::new("f", DashboardDealFile, Some(context)),
         ]);
     }
+    // Every dealt surface, whatever it is: a browser page and a picture have
+    // no vim mode to leave, and escape must still end the deal.
+    cx.bind_keys([KeyBinding::new("escape", DealLeave, Some("RhoGuiDeal"))]);
     cx.bind_keys([KeyBinding::new(
         "shift-u",
         UndoVerdict,

@@ -611,6 +611,26 @@ pub fn enter_deal_mode(editor: &Entity<Editor>, window: &mut Window, cx: &mut Ap
     true
 }
 
+/// Leaves Deal mode for normal editing on an application-owned surface.
+/// Deal refuses ordinary mode switches on purpose, so the application asks
+/// for the transition directly rather than dispatching to whatever holds
+/// focus, which during a surface promotion is not the dealt editor.
+pub fn exit_deal_mode(editor: &Entity<Editor>, window: &mut Window, cx: &mut App) -> bool {
+    let Some(addon) = editor.read(cx).addon::<VimAddon>().cloned() else {
+        return false;
+    };
+    addon.entity.update(cx, |vim, cx| {
+        let mode = match vim.mode {
+            Mode::HelixDeal => Mode::HelixNormal,
+            Mode::Deal => Mode::Normal,
+            _ => return false,
+        };
+        vim.allow_deal_transition = true;
+        vim.switch_mode(mode, true, window, cx);
+        true
+    })
+}
+
 /// Returns whether an application-owned editor is still in a Deal mode.
 pub fn editor_in_deal_mode(editor: &Entity<Editor>, cx: &App) -> bool {
     editor

@@ -69,12 +69,12 @@ use crate::{
     DashboardNow, DashboardPasteRow, DashboardPasteRowBefore, DashboardPromote,
     DashboardRenameTopic, DashboardReply, DashboardStaff, DashboardSubmit,
     DashboardToggleAgentTree, DashboardToggleSubagents, DashboardUndo, DashboardYankRow,
-    DealCloseAndNext, DealOpen, GitApprovalAllow, GitApprovalDeny, InboxCapture, MessagesOpen,
-    MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious,
-    OverviewToggle, PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof,
-    ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit, SlackCompose, SlackOpenRow,
-    SlackSearch, SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, UndoVerdict,
-    UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
+    DealCloseAndNext, DealLeave, DealOpen, GitApprovalAllow, GitApprovalDeny, InboxCapture,
+    MessagesOpen, MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext,
+    MinibufferPrevious, OverviewToggle, PastePrompt, RailFocus, RailOpen, RoleCycle,
+    RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit,
+    SlackCompose, SlackOpenRow, SlackSearch, SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard,
+    UndoVerdict, UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
 };
 
 pub(crate) const MESSAGE_LOG_CAP: usize = 4096;
@@ -8157,6 +8157,71 @@ impl Workspace {
         true
     }
 
+    /// The editor the current deal is being read in, when the dealt surface
+    /// has one. A browser page and a picture do not.
+    fn deal_editor(&self, cx: &App) -> Option<Entity<editor::Editor>> {
+        match &self.active_pane().surface.view {
+            SurfaceView::DeskNode(editor) | SurfaceView::Inbox(editor) => Some(editor.clone()),
+            SurfaceView::Transcript { editor, .. } => Some(editor.clone()),
+            SurfaceView::SlackConversation(view) => Some(view.read(cx).editor().clone()),
+            _ => None,
+        }
+    }
+
+    /// The one way out of deal mode. Vim's Deal refuses ordinary mode
+    /// switches and the dashboard keeps deal state of its own, so both are
+    /// ended here: anywhere else they can disagree and the reader is left in
+    /// a mode nothing will take them out of. The surface stays where it is.
+    fn leave_deal_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.deal_view = None;
+        self.deal_hints_visible = false;
+        self.deal_controls_visible = false;
+        self.deal_current_interacted = false;
+        self.end_deal_session();
+        match self.deal_editor(cx) {
+            // The dealt editor is not always what holds focus by now, and
+            // Deal mode ignores anything but a direct ask.
+            Some(editor) => {
+                vim::exit_deal_mode(&editor, window, cx);
+            }
+            // The phone has no vim to leave; the dealer's own state is all
+            // there is to end there.
+            None if self.phone.enabled => {}
+            None => {
+                if let Ok(action) = cx.build_action("vim::ExitDealMode", None) {
+                    window.dispatch_action(action, cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// `escape` on a dealt surface: the deal is over, the surface stays, and
+    /// the keyboard is back to normal. Recorded as an open, which is what
+    /// looking at something and moving on is.
+    fn deal_leave(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.dashboard.deal_mode() {
+            cx.propagate();
+            return;
+        }
+        // Escape out of insert inside a deal belongs to the editor, which
+        // returns to DEAL. Only escape in DEAL itself leaves.
+        if self
+            .deal_editor(cx)
+            .is_some_and(|editor| !vim::editor_in_deal_mode(&editor, cx))
+        {
+            cx.propagate();
+            return;
+        }
+        self.dashboard.record_deal_verdict_as(
+            crate::dashboard::DealerVerdict::Open,
+            chrono::Local::now().fixed_offset(),
+        );
+        self.dashboard.end_deal(cx);
+        self.leave_deal_mode(window, cx);
+        self.refresh_dashboard(window, cx);
+    }
+
     fn finish_presenting_deal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         crate::journal::record(crate::journal::Event::DealMode {
             action: crate::journal::DealModeAction::Enter,
@@ -8170,11 +8235,7 @@ impl Workspace {
             cx.notify();
             return;
         }
-        let editor = match &self.active_pane().surface.view {
-            SurfaceView::DeskNode(editor) | SurfaceView::Inbox(editor) => Some(editor.clone()),
-            SurfaceView::Transcript { editor, .. } => Some(editor.clone()),
-            _ => None,
-        };
+        let editor = self.deal_editor(cx);
         if let Some(editor) = editor {
             // Surface promotion happens before the new editor is mounted in
             // GPUI's action dispatch tree, so enter the owned Vim instance
@@ -8240,14 +8301,7 @@ impl Workspace {
                 .skip_card(card.identity, chrono::Local::now().fixed_offset(), cx);
         }
         self.dashboard.end_deal(cx);
-        self.end_deal_session();
-        self.deal_view = None;
-        self.deal_current_interacted = false;
-        if !self.phone.enabled
-            && let Ok(action) = cx.build_action("vim::ExitDealMode", None)
-        {
-            window.dispatch_action(action, cx);
-        }
+        self.leave_deal_mode(window, cx);
     }
 
     fn finish_dashboard_deal_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -8257,12 +8311,7 @@ impl Workspace {
         if self.dashboard.deal_mode() {
             self.present_current_deal(window, cx);
         } else {
-            self.end_deal_session();
-            if !self.phone.enabled
-                && let Ok(action) = cx.build_action("vim::ExitDealMode", None)
-            {
-                window.dispatch_action(action, cx);
-            }
+            self.leave_deal_mode(window, cx);
         }
         self.refresh_dashboard(window, cx);
     }
@@ -11022,6 +11071,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &SurfaceClose, window, cx| {
                 this.close_current_surface(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &DealLeave, window, cx| {
+                this.deal_leave(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &MessagesOpen, window, cx| {
                 this.cmd_messages(window, cx);
             }))
@@ -11667,12 +11719,7 @@ impl Render for Workspace {
                 if !this.dashboard.end_deal(cx) {
                     return;
                 }
-                this.end_deal_session();
-                if !this.phone.enabled
-                    && let Ok(action) = cx.build_action("vim::ExitDealMode", None)
-                {
-                    window.dispatch_action(action, cx);
-                }
+                this.leave_deal_mode(window, cx);
                 match source {
                     Some(crate::dashboard::DealerInboxSource::Page(page)) => {
                         this.open_browser_page(page, window, cx);
