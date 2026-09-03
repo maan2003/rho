@@ -66,6 +66,10 @@ pub struct ConversationView {
     /// than the surface, so both are settled on the refresh that brings it.
     unread_at: Option<Ts>,
     unread_placed: bool,
+    /// Messages that arrived at the live end while the reader was reading
+    /// further up. The status line says how many; reaching the end again
+    /// clears it, because then they have been seen.
+    unseen: usize,
     /// The picture the next message carries, if the reader attached one.
     /// One at a time: a second attachment replaces it, which is what the
     /// chip shows.
@@ -331,6 +335,7 @@ impl ConversationView {
             unread_from: None,
             unread_at: None,
             unread_placed: false,
+            unseen: 0,
             editing_message: None,
             held_compose: None,
             attached: None,
@@ -357,6 +362,12 @@ impl ConversationView {
             view.select_compose(window, cx);
         }
         view
+    }
+
+    /// How many messages have arrived at the end while the reader was
+    /// elsewhere in the conversation, for the status line to say.
+    pub fn unseen(&self) -> usize {
+        self.unseen
     }
 
     pub fn editor(&self) -> &Entity<Editor> {
@@ -948,6 +959,23 @@ impl ConversationView {
     /// Carries out the plan: each operation is one transcript edit.
     fn apply_updates(&mut self, updates: Vec<Update>, window: &mut Window, cx: &mut Context<Self>) {
         let messages = self.shown_messages(cx);
+        // Only what lands at the live end counts: a page of history
+        // arriving above is not something the reader is missing.
+        let tail = self
+            .transcript
+            .keys()
+            .filter_map(|key| match key {
+                Row::Message(ts) => Some(ts.clone()),
+                _ => None,
+            })
+            .last();
+        self.unseen += updates
+            .iter()
+            .filter(|update| match update {
+                Update::Inserted(ts) => tail.as_ref().is_none_or(|tail| ts.is_newer_than(tail)),
+                _ => false,
+            })
+            .count();
         let ops = plan(&updates, &messages, &self.transcript);
         // The first message of a page arriving above everything on screen:
         // where the cursor goes if it was resting on the gap line.
@@ -1263,6 +1291,13 @@ fn wanted_at(position: f64, screen: f64, cursor: f64, holes: &[(f64, Ts)]) -> Op
     hole.or_else(|| {
         (near_top(position, screen) && cursor <= screen.max(1.0)).then_some(Want::Older)
     })
+}
+
+/// Whether the end of the conversation is on screen. A view that has not
+/// been laid out reports no visible lines and counts as at the end: that is
+/// what opening looks like, and opening is not missing anything.
+fn at_tail(position: f64, screen: f64, last: f64) -> bool {
+    screen <= 0.0 || position + screen >= last
 }
 
 /// Whether the view is close enough to the top to ask for older messages.
@@ -2022,6 +2057,12 @@ impl gpui::Render for ConversationView {
                 editor.visible_line_count().unwrap_or(0.0),
             )
         });
+        // Reaching the end is what reads them: `G` clears the count
+        // because it puts the end on screen, not because it is `G`.
+        let last = self.multi_buffer.read(cx).snapshot(cx).max_point().row as f64;
+        if at_tail(position, screen, last) {
+            self.unseen = 0;
+        }
         self.fill(position, screen, cx);
         div()
             .id("rho-slack-conversation")
@@ -2950,6 +2991,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![Class::Unread],
             "it reads as unread, not as chrome"
+        );
+    }
+
+    #[test]
+    fn the_end_of_the_conversation_is_what_clears_the_new_count() {
+        // A view that has not been laid out yet: opening is not missing
+        // anything, so nothing is counted against it.
+        assert!(at_tail(0.0, 0.0, 0.0));
+        // The last line on screen is the end.
+        assert!(at_tail(20.0, 30.0, 50.0));
+        assert!(at_tail(21.0, 30.0, 50.0), "past the end counts too");
+        assert!(
+            !at_tail(10.0, 30.0, 50.0),
+            "a reader twenty lines up is missing what arrives"
         );
     }
 }

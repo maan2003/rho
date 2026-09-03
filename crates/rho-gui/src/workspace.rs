@@ -9232,7 +9232,21 @@ impl Workspace {
             },
         );
         let right = self.render_status_right(cx);
-        self.status_row(div().child(left), right, text_style, window, cx)
+        // What arrived at the end of the conversation while the reader was
+        // further up. It sits beside the surface's name because that is
+        // what it is about, and it goes out when they reach the end.
+        let unseen = self.slack_unseen(cx).map(|unseen| {
+            div()
+                .text_color(cx.theme().colors().text_accent)
+                .child(format!("{unseen} new"))
+        });
+        self.status_row(
+            div().child(left).children(unseen),
+            right,
+            text_style,
+            window,
+            cx,
+        )
     }
 
     fn render_workspace(

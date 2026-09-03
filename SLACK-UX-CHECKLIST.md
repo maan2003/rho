@@ -4,9 +4,8 @@ Reconciled against main on 3 Sep. Genuinely open, in order:
 
 - 1.13 avatars (waits on the editor's inline-image inlay), 1.22 rough edges
   (b) soft-wrap column waits on the vendored editor.
-- 2.3 the `3 new` status segment (the anchoring half landed); 2.5
-  `shift-n` next unread; 2.6 list row counts, time column, and the muted
-  section.
+- 2.5 `shift-n` next unread; 2.6 list row counts, time column, and the
+  muted section.
 - 3.1 composer boundary and placeholder; 3.3 completion.
 - 5.1 the one key table, once 2.5 has its key.
 
@@ -310,7 +309,14 @@ done right after the transcript primitive (2.4) and before 2.10:
       holds this loosely; different read semantics may come later, so keep
       the mark call in one place.
       Landed: `Session::open` fetches with `mark_read`, and `mark_read` is the one call that marks (`session.rs`).
-- [ ] 2.3 Following the tail. Pinned at the bottom, a new message keeps the
+- [x] 2.3 Following the tail, done 3 Sep: the anchoring landed with 2.4;
+      the count is the rest of it. A message arriving at the live end while
+      the reader is further up counts; the status line says `3 new` beside
+      the conversation's name in the unread colour; and reaching the end
+      clears it, which is what `G` does. History arriving above is not
+      counted: the reader is not missing it. Screens `23-01-new-count`,
+      `23-02-cleared`.
+      Pinned at the bottom, a new message keeps the
       view at the bottom. Scrolled up, the view does not move and the
       surface's status segment shows `3 new`; `G` clears it.
 - [x] 2.4 Done: `crates/rho-transcript` keyed incremental transcript, scroll fill,

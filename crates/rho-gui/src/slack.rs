@@ -416,6 +416,16 @@ impl Workspace {
         }
     }
 
+    /// Messages that landed at the end of the conversation on screen while
+    /// the reader was further up. `None` when there is nothing to say,
+    /// which is every surface that is not a Slack conversation.
+    pub(crate) fn slack_unseen(&self, cx: &gpui::App) -> Option<usize> {
+        let SurfaceView::SlackConversation(view) = &self.active_pane().surface.view else {
+            return None;
+        };
+        Some(view.read(cx).unseen()).filter(|unseen| *unseen > 0)
+    }
+
     /// `enter` in the composer: send, or post the rewrite if an edit is
     /// open.
     pub(crate) fn slack_submit(&mut self, cx: &mut gpui::Context<Self>) {
