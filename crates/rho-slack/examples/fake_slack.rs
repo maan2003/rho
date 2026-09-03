@@ -332,9 +332,9 @@ fn seed_design(fake: &Fake, at: &dyn Fn(i64, i64, i64) -> String) {
 /// A conversation long enough that paging is exercised: 240 messages across
 /// four days, which is more than one page at any limit rho uses.
 fn seed_random_backlog(fake: &Fake, midnight: i64) {
-    for index in 0..240i64 {
-        // Four days back to two days back, ten minutes apart, so the buffer
-        // crosses day boundaries while paging.
+    for index in 0..500i64 {
+        // Four days back, ten minutes apart, so the buffer crosses day
+        // boundaries while paging and a page is nowhere near the start.
         let ts = midnight - 4 * 86_400 + index * 600;
         let user = if index % 2 == 0 { "UA" } else { "UB" };
         fake.add_message(

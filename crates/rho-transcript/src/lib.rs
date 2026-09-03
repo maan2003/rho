@@ -254,6 +254,14 @@ where
     }
 
     /// The metadata the caller attached to buffer row `row`.
+    /// The key of the item covering a row, for a caller that knows where
+    /// the cursor is rather than what it is on.
+    pub fn key_at_row(&self, row: u32, cx: &App) -> Option<&K> {
+        let snapshot = self.buffer.read(cx).snapshot();
+        let offset = snapshot.point_to_offset(text::Point::new(row, 0));
+        self.key_at(offset, cx)
+    }
+
     pub fn line_meta(&self, row: u32, cx: &App) -> Option<&M> {
         let snapshot = self.buffer.read(cx).snapshot();
         let found = self

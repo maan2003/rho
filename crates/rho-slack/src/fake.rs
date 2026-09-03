@@ -575,6 +575,16 @@ fn apply_live(state: &mut State, frames: &broadcast::Sender<Frame>, request: &Va
         let _ = frames.send(Frame::Text(frame.to_string().into()));
     };
     match request["kind"].as_str().unwrap_or_default() {
+        // What the budget is judged on: how many calls each method has
+        // taken, so a QA run can say what one keypress cost.
+        "calls" => {
+            let calls = state
+                .calls
+                .iter()
+                .map(|(method, count)| (method.clone(), json!(count)))
+                .collect::<serde_json::Map<_, _>>();
+            return json!({"ok": true, "calls": calls});
+        }
         kind @ ("message" | "reply") => {
             let text = field("text");
             let user = match field("user").as_str() {

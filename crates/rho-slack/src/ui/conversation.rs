@@ -36,7 +36,49 @@ pub struct ConversationView {
     editor: Entity<Editor>,
     /// How far the session's messages have been applied here.
     revision: u64,
+    /// One user action buys one page. Set when a fill is asked for, cleared
+    /// when the reader scrolls or moves the cursor themselves, so a landed
+    /// page cannot walk the whole conversation back to its beginning.
+    fill: Fill,
+    /// Where the surface last put the view and the cursor itself. The events
+    /// that come back for those are not the reader moving, and must not buy
+    /// another page.
+    moved: Moved,
     _subscriptions: Vec<gpui::Subscription>,
+}
+
+/// One page per user action, and the two cases where nobody has asked yet:
+/// opening a conversation whose mirrored run is short, and a gap line on a
+/// view that has not asked for anything.
+#[derive(Default)]
+struct Fill {
+    asked: bool,
+}
+
+impl Fill {
+    /// The reader scrolled or moved the cursor: the next fill is theirs to
+    /// buy again.
+    fn user_moved(&mut self) {
+        self.asked = false;
+    }
+
+    /// Whether to ask now, given where the view sits. Asking marks the
+    /// action spent.
+    fn wants_page(&mut self, near_top: bool) -> bool {
+        if self.asked || !near_top {
+            return false;
+        }
+        self.asked = true;
+        true
+    }
+}
+
+/// What the surface moved on its own, so the resulting events can be told
+/// apart from the reader's own scrolling and cursor motion.
+#[derive(Default)]
+struct Moved {
+    scroll: Option<f64>,
+    cursor: Option<u32>,
 }
 
 /// What the transcript keys on. Day rules and the gap notice are items like
@@ -123,14 +165,46 @@ impl ConversationView {
         // are usually already there by the time the top comes into view.
         subscriptions.push(
             cx.subscribe(&editor, |this, editor, event: &EditorEvent, cx| {
-                if matches!(event, EditorEvent::ScrollPositionChanged { .. }) {
-                    let near_top = editor.update(cx, |editor, cx| {
-                        let screen = editor.visible_line_count().unwrap_or(0.0);
-                        editor.scroll_position(cx).y <= screen.max(1.0)
-                    });
-                    if near_top {
-                        this.load_older(cx);
+                match event {
+                    EditorEvent::ScrollPositionChanged { .. } => {
+                        let (position, screen) = editor.update(cx, |editor, cx| {
+                            (
+                                editor.scroll_position(cx).y,
+                                editor.visible_line_count().unwrap_or(0.0),
+                            )
+                        });
+                        // The surface's own re-anchoring comes back as a
+                        // scroll event too. Only the reader's counts.
+                        if this.moved.scroll == Some(position) {
+                            this.moved.scroll = None;
+                        } else {
+                            this.fill.user_moved();
+                        }
+                        if this.fill.wants_page(near_top(position, screen)) {
+                            this.load_older(cx);
+                        }
                     }
+                    EditorEvent::SelectionsChanged { local: true } => {
+                        let row = this.cursor_row(cx) as u32;
+                        if this.moved.cursor == Some(row) {
+                            this.moved.cursor = None;
+                            return;
+                        }
+                        this.fill.user_moved();
+                        // A reader already at the top who presses `gg` moves
+                        // the cursor without moving the view, so the scroll
+                        // event never comes: the motion is the action.
+                        let (position, screen) = editor.update(cx, |editor, cx| {
+                            (
+                                editor.scroll_position(cx).y,
+                                editor.visible_line_count().unwrap_or(0.0),
+                            )
+                        });
+                        if this.fill.wants_page(near_top(position, screen)) {
+                            this.load_older(cx);
+                        }
+                    }
+                    _ => {}
                 }
             }),
         );
@@ -143,6 +217,8 @@ impl ConversationView {
             multi_buffer,
             editor,
             revision: 0,
+            fill: Fill::default(),
+            moved: Moved::default(),
             _subscriptions: subscriptions,
         };
         view.transcript.attach(&view.editor.clone(), cx);
@@ -274,7 +350,25 @@ impl ConversationView {
         }
         self.revision = revision;
         self.refresh_chrome(cx);
+        self.keep_filling(cx);
         cx.notify();
+    }
+
+    /// The two cases where a gap sits on screen and no scroll event will
+    /// ever come to ask about it: opening a conversation the mirror holds
+    /// only a short run of, and a gap line on a view nobody has asked from
+    /// yet. It buys one page, like any other action, and a page landing
+    /// does not buy another.
+    fn keep_filling(&mut self, cx: &mut Context<Self>) {
+        let (position, screen) = self.editor.update(cx, |editor, cx| {
+            (
+                editor.scroll_position(cx).y,
+                editor.visible_line_count().unwrap_or(0.0),
+            )
+        });
+        if self.fill.wants_page(near_top(position, screen)) {
+            self.load_older(cx);
+        }
     }
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
@@ -297,13 +391,28 @@ impl ConversationView {
     fn apply_updates(&mut self, updates: Vec<Update>, window: &mut Window, cx: &mut Context<Self>) {
         let messages = self.shown_messages(cx);
         let ops = plan(&updates, &messages, &self.transcript);
+        // The first message of a page arriving above everything on screen:
+        // where the cursor goes if it was resting on the gap line.
+        let first_loaded = ops
+            .iter()
+            .find(|op| reaches_the_top(op, &self.transcript))
+            .and_then(|op| match op {
+                Op::Insert { keys, .. } => keys
+                    .iter()
+                    .find(|key| matches!(key, Row::Message(_)))
+                    .cloned(),
+                _ => None,
+            });
         // A reader at the very top is anchored to the top itself, so older
         // messages arriving above would slide their line down the screen.
         // Re-taking the anchor after the insertion point first is what keeps
         // the view on the message it was showing.
-        if ops.iter().any(|op| self.reaches_the_top(op)) {
-            self.editor
-                .update(cx, |editor, cx| editor.pin_scroll_to_content(window, cx));
+        if ops.iter().any(|op| reaches_the_top(op, &self.transcript)) {
+            let pinned = self.editor.update(cx, |editor, cx| {
+                editor.pin_scroll_to_content(window, cx);
+                editor.scroll_position(cx).y
+            });
+            self.moved.scroll = Some(pinned);
         }
         for op in ops {
             match op {
@@ -326,18 +435,41 @@ impl ConversationView {
                 }
             }
         }
+        if let Some(key) = first_loaded {
+            self.leave_the_gap_line(&key, window, cx);
+        }
     }
 
-    /// Whether an operation changes the text above everything on screen.
-    fn reaches_the_top(&self, op: &Op) -> bool {
-        let Op::Insert { before, .. } = op else {
-            return false;
+    /// Puts the cursor on the first message of a page that has just landed,
+    /// if it was sitting on the gap line the page arrived under. The reader
+    /// ends up looking at content rather than at a line that no longer says
+    /// anything, and the view stops being at the very top, so the next
+    /// scroll is a fresh action rather than the same one repeating.
+    fn leave_the_gap_line(&mut self, key: &Row, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(start) = self.transcript.range_of(key).map(|range| range.start) else {
+            return;
         };
-        before.as_ref().is_some_and(|before| {
-            self.transcript
-                .key_before(before)
-                .is_none_or(|key| matches!(key, Row::Notice | Row::Gap))
-        })
+        // Only a cursor the page arrived above is moved: one sitting in the
+        // conversation is the reader's own place and stays put.
+        let snapshot = self.transcript.buffer().read(cx).snapshot();
+        let first = text::ToPoint::to_point(&start, &snapshot).row;
+        if self.cursor_row(cx) as u32 > first {
+            return;
+        }
+        let Some(anchor) = self
+            .multi_buffer
+            .read(cx)
+            .snapshot(cx)
+            .anchor_in_excerpt(start)
+        else {
+            return;
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections.select_anchor_ranges([anchor..anchor]);
+            });
+        });
+        self.moved.cursor = Some(self.cursor_row(cx) as u32);
     }
 
     fn item_for_key(
@@ -484,6 +616,35 @@ enum Op {
     },
     Replace(Row),
     Remove(Row),
+}
+
+/// Whether the view is close enough to the top to ask for older messages.
+/// One screen early, so the page has usually landed by the time the top
+/// comes into view. A view that has never been laid out reports no visible
+/// lines and counts as at the top: that is what opening looks like.
+fn near_top(position: f64, screen: f64) -> bool {
+    position <= screen.max(1.0)
+}
+
+/// Whether an operation puts text above everything on screen. Only chrome
+/// may sit above such a run: the gap notice, a loading or error line, and
+/// the day rule heading the message the page arrives over. It is what says
+/// the scroll has to be re-anchored and the cursor taken off the gap line.
+fn reaches_the_top(op: &Op, placed: &impl Placed) -> bool {
+    let Op::Insert { before, .. } = op else {
+        return false;
+    };
+    let Some(before) = before.clone() else {
+        return false;
+    };
+    let mut above = placed.above(&before);
+    while let Some(key) = above {
+        if !matches!(key, Row::Notice | Row::Gap | Row::Day(_)) {
+            return false;
+        }
+        above = placed.above(&key);
+    }
+    true
 }
 
 /// What the transcript already holds, which is all the planner needs to
@@ -1094,6 +1255,76 @@ mod tests {
             .filter(|(candidate, _)| *candidate == class)
             .map(|(_, range)| text[range.clone()].to_owned())
             .collect()
+    }
+
+    #[test]
+    fn a_page_landing_over_a_day_rule_still_reaches_the_top() {
+        let older = message("1.0", None, "older");
+        let shown = [older.clone(), message("2.0", None, "newest")];
+        let held = held(&shown[1..]);
+        let ops = plan(&[Update::Inserted(older.ts.clone())], &shown, &held);
+        assert!(
+            ops.iter().any(|op| reaches_the_top(op, &held)),
+            "a day rule above the first message is chrome, not content: {ops:?}"
+        );
+        let deeper = Held(vec![
+            Row::Gap,
+            Row::Day("Tue 1 Sep".into()),
+            Row::Message(Ts("2.0".into())),
+        ]);
+        assert!(
+            reaches_the_top(
+                &Op::Insert {
+                    before: Some(Row::Message(Ts("2.0".into()))),
+                    keys: vec![Row::Message(Ts("1.0".into()))],
+                },
+                &deeper
+            ),
+            "the gap line and its day rule are both chrome"
+        );
+        assert!(
+            !reaches_the_top(
+                &Op::Insert {
+                    before: Some(Row::Message(Ts("2.0".into()))),
+                    keys: vec![Row::Message(Ts("1.5".into()))],
+                },
+                &Held(vec![
+                    Row::Message(Ts("1.0".into())),
+                    Row::Message(Ts("2.0".into())),
+                ])
+            ),
+            "a message above means the run landed in the middle"
+        );
+    }
+
+    #[test]
+    fn one_action_buys_exactly_one_page() {
+        let mut fill = Fill::default();
+        assert!(fill.wants_page(true), "opening onto a gap asks once");
+        assert!(
+            !fill.wants_page(true),
+            "the page landing does not buy another"
+        );
+        fill.user_moved();
+        assert!(fill.wants_page(true), "the reader scrolling buys one more");
+        assert!(!fill.wants_page(true), "and only one");
+        let mut fill = Fill::default();
+        assert!(
+            !fill.wants_page(false),
+            "a reader away from the top asks for nothing"
+        );
+        assert!(fill.wants_page(true), "and has spent nothing");
+    }
+
+    #[test]
+    fn the_top_of_the_view_is_what_asks() {
+        assert!(near_top(0.0, 0.0), "a view not laid out yet is at the top");
+        assert!(near_top(0.0, 40.0), "the top itself asks");
+        assert!(near_top(39.0, 40.0), "a screen early still asks");
+        assert!(
+            !near_top(41.0, 40.0),
+            "a reader who has scrolled away is left alone"
+        );
     }
 
     #[test]
