@@ -386,7 +386,7 @@ done right after the transcript primitive (2.4) and before 2.10:
       message from someone else. Fake records the unfollow calls; tests
       cover both directions. Journal `SlackThreadIgnored { thread, by:
       Rho | Slack }`.
-- [ ] 2.16 A thread reply the user never saw. Reported by the user on 3
+- [x] 2.16 A thread reply the user never saw. Landed 3 Sep. Original: Reported by the user on 3
       Sep: a reply in a thread they had posted in raised nothing, no chime,
       no lamp, not in a manual deal. Two causes in `model.rs`, either one
       enough. First, `participated` is in memory only, filled when rho
