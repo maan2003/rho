@@ -68,7 +68,7 @@ Added in the talk that followed:
 ## Ranking: by what burns
 
 Went wrong and an ask from an agent that has gone idle: steep. Answer:
-medium, the human forgets. An ask from an agent still working: between. Heads-up: flat while the agent is working, and
+medium, the human forgets. An ask from an agent still working: between. Show: flat while the agent is working, and
 rising with the daemon's observed idle time once it stops, which is how a
 finished task climbs without a state of its own. Nothing declared: below the cutoff. The agent
 sets the state and the reason; the curve is the human's, never the agent's.
