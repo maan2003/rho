@@ -4,7 +4,6 @@ Reconciled against main on 3 Sep. Genuinely open, in order:
 
 - 1.13 avatars (waits on the editor's inline-image inlay), 1.22 rough edges
   (b) soft-wrap column waits on the vendored editor.
-- 5.1 the one key table.
 
 4.2 stays deferred.
 
@@ -735,12 +734,23 @@ done right after the transcript primitive (2.4) and before 2.10:
 
 ## Phase 5: one key table
 
-- [ ] 5.1 The list: `enter` open, `s` narrow, `shift-n` next unread, `q`
+- [x] 5.1 The list: `enter` open, `s` narrow, `shift-n` next unread, `q`
       close. The conversation: `enter` open the thread under the cursor or
       the file link, `i` compose, `shift-n` next unread,
       `ctrl-k` back to the channel, `G` end and clear `new`, `q` close.
       Composer: `enter` send, `shift-enter` newline, `escape` normal mode.
       Documented once, in `SLACK-DESIGN.md`, and every binding has a test.
+      Landed 3 Sep: `SLACK-DESIGN.md` gained "The keys, in one table", three
+      short tables and the two notes that do not fit a row (`G` is vim's and
+      clears the count by putting the end on screen; the composer's keys
+      belong to the completion menu while it is open). The prose elsewhere
+      in that document that named keys now points at the table instead, so
+      there is one place to be wrong. Two rows the item did not list are
+      real and documented: `m` on the list marks read before an age or date,
+      and `e` in a conversation rewrites your own message. Every row has an
+      assertion in `every_key_in_the_slack_table_is_bound`, both normal and
+      helix. A stale `Space+K` in the same document is corrected to
+      `ctrl-k`.
 
 ## Still deferred
 

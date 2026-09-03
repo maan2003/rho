@@ -229,19 +229,17 @@ identity per thread; verdicts do not, they are the tree's.
 
 A conversation surface is built the way the agent transcript is: a
 read-only editor holding the rendered messages, vim motions and search
-work inside it, a composer below it. `i` focuses the composer, Enter sends,
-`q` closes, and it enters the deal history like every other surface.
+work inside it, a composer below it. The keys are in the table below, and
+it enters the deal history like every other surface.
 A picture goes with a message rather than instead of one: paste it, drop
 it, or name it with the attach prompt, and a muted chip over the composer
 says what is waiting; `enter` uploads it and the message comes back from
 Slack with the picture on it.
-Rewriting what was already sent is `e` on the reader's own message (or
-`up` on an empty composer, Slack's habit): the composer holds the old
-text, the message is tinted while the edit is open, `enter` posts
-`chat.update` and `escape` gives the composer back what it held. A
+Rewriting what was already sent puts the old text in the composer and
+tints the message while the edit is open; posting it is `chat.update`. A
 channel, a direct message, a group message, and a thread are the same
 surface with a different source; opening a thread from a channel is
-opening a child surface, and Space+K returns. Older history loads as the
+opening a child surface, and `ctrl-k` returns. Older history loads as the
 user scrolls up. Reading a conversation in rho marks it read in Slack, so
 the phone and other clients agree; read state is the unread badge and
 nothing else, it never discharges a card.
@@ -254,13 +252,59 @@ four surfaces.
 ### A conversation list is the way in
 
 A list surface shows the user's channels and direct messages, unread ones
-first with the unread count, the rest by recency; a line per conversation,
-Enter opens it, search narrows it. Unread state comes from Slack, and the
-websocket keeps it current.
+first with the unread count, the rest by recency; a line per conversation.
+Unread state comes from Slack, and the websocket keeps it current.
 
 **Why:** the dealer only deals what the user is obliged to answer; the
 rest of Slack is browsed, and browsing needs a list. It is the one piece of
 Slack's own navigation worth keeping.
+
+### The keys, in one table
+
+Every Slack key, in one place. Anything not listed is vim: motions,
+search, `G` to the end. Reading is the whole of the interface, so the
+table is short on purpose, and each row below has an assertion in
+`every_key_in_the_slack_table_is_bound`.
+
+The list:
+
+| Key | Does |
+| --- | --- |
+| `enter` | open the conversation under the cursor |
+| `s` | narrow the list to what you type |
+| `shift-n` | next conversation with something unread |
+| `m` | mark read: asks for an age or a date, marks everything older |
+| `q` | close the surface |
+
+A conversation:
+
+| Key | Does |
+| --- | --- |
+| `enter` | open the thread under the cursor, or the file link |
+| `i` | go to the composer |
+| `e` | rewrite your own message under the cursor |
+| `s` | search the conversation |
+| `shift-n` | next conversation with something unread |
+| `ctrl-k` | out of a thread, back to the channel |
+| `q` | close the surface |
+
+The composer:
+
+| Key | Does |
+| --- | --- |
+| `enter` | send |
+| `shift-enter` | a second line |
+| `up` | rewrite the last thing you said, when the composer is empty |
+| `escape` | put back what the composer held, then normal mode |
+
+`G` is vim's and is not bound here: it clears the `n new` count because it
+puts the end of the conversation on screen, which is what reading them
+means. With the completion menu open the composer's `enter`, `shift-enter`,
+`up` and `escape` belong to the menu instead, so `enter` takes the name
+being offered rather than posting half of it.
+
+**Why:** a key table that lives in two places is a key table that is wrong
+in one of them. This is the only one, and the test is what keeps it true.
 
 ### Block Kit renders to text
 

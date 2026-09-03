@@ -6414,6 +6414,84 @@ fn q_on_home_or_the_map_is_a_no_op(cx: &mut TestAppContext) {
         .unwrap();
 }
 
+/// The key table in `SLACK-DESIGN.md`, one assertion per row. A key that
+/// stops being bound is a documentation bug as much as a behaviour one, so
+/// this is the test that fails when the two drift apart.
+#[gpui::test]
+fn every_key_in_the_slack_table_is_bound(cx: &mut TestAppContext) {
+    use gpui::{KeyContext, Keystroke};
+
+    cx.update(bind_test_keymaps);
+    cx.update(|cx| {
+        let keymap = cx.key_bindings();
+        let keymap = keymap.borrow();
+        let routes = |key: &str, contexts: &[KeyContext]| {
+            let stroke = Keystroke::parse(key).unwrap();
+            keymap
+                .bindings_for_input(&[stroke], contexts)
+                .0
+                .first()
+                .map(|binding| binding.action().name())
+        };
+        // Both normal modes, because a helix reader is reading the same
+        // conversation and the table does not have a second column.
+        let surface = |name: &str, mode: &str| {
+            [
+                KeyContext::parse("RhoGui").unwrap(),
+                KeyContext::parse(name).unwrap(),
+                KeyContext::parse(&format!(
+                    "Editor VimControl vim_mode={mode} vim_operator=none"
+                ))
+                .unwrap(),
+            ]
+        };
+        for mode in ["normal", "helix_normal"] {
+            let list = surface("RhoSlackList", mode);
+            assert_eq!(routes("enter", &list), Some("rho_gui::SlackOpenRow"));
+            assert_eq!(routes("s", &list), Some("rho_gui::SlackSearch"));
+            assert_eq!(routes("shift-n", &list), Some("rho_gui::SlackNextUnread"));
+            assert_eq!(routes("m", &list), Some("rho_gui::SlackMarkReadBefore"));
+            assert_eq!(routes("q", &list), Some("rho_gui::SurfaceClose"));
+
+            let conversation = surface("RhoSlackConversation", mode);
+            assert_eq!(
+                routes("enter", &conversation),
+                Some("rho_gui::SlackOpenRow")
+            );
+            assert_eq!(routes("i", &conversation), Some("rho_gui::SlackCompose"));
+            assert_eq!(routes("s", &conversation), Some("rho_gui::SlackSearch"));
+            assert_eq!(
+                routes("e", &conversation),
+                Some("rho_gui::SlackEditMessage")
+            );
+            assert_eq!(
+                routes("shift-n", &conversation),
+                Some("rho_gui::SlackNextUnread")
+            );
+            assert_eq!(routes("q", &conversation), Some("rho_gui::SurfaceClose"));
+            // Out of a thread and back to the channel it was opened from,
+            // which is the same key that walks back anywhere else in rho.
+            assert_eq!(
+                routes("ctrl-k", &conversation),
+                Some("rho_gui::SurfaceBack")
+            );
+        }
+
+        let composing = [
+            KeyContext::parse("RhoGui").unwrap(),
+            KeyContext::parse("RhoSlackConversation").unwrap(),
+            KeyContext::parse("Editor vim_mode=insert").unwrap(),
+        ];
+        assert_eq!(routes("enter", &composing), Some("rho_gui::SubmitPrompt"));
+        assert_eq!(routes("shift-enter", &composing), Some("editor::Newline"));
+        assert_eq!(routes("up", &composing), Some("rho_gui::SlackEditLast"));
+        assert_eq!(
+            routes("escape", &composing),
+            Some("rho_gui::SlackCancelEdit")
+        );
+    });
+}
+
 #[gpui::test]
 fn deal_keys_reach_a_dealt_slack_conversation(cx: &mut TestAppContext) {
     use gpui::{KeyContext, Keystroke};
