@@ -183,7 +183,6 @@ impl rho_transcript::Style for HomeClass {
 /// motions, search and vim come from it rather than from list chrome.
 pub struct HomeView {
     transcript: Transcript<HomeKey, HomeClass, HomeTarget>,
-    multi_buffer: Entity<MultiBuffer>,
     editor: Entity<Editor>,
     rows: HomeRows,
 }
@@ -224,7 +223,6 @@ impl HomeView {
         });
         let mut view = Self {
             transcript: Transcript::new(buffer),
-            multi_buffer,
             editor,
             rows: HomeRows::default(),
         };
@@ -232,6 +230,7 @@ impl HomeView {
         // A Home nobody has told anything yet still answers the question.
         let items = view.items();
         view.reconcile(items, cx);
+        view.focus_first_row(cx);
         view
     }
 
@@ -255,15 +254,6 @@ impl HomeView {
             .unwrap_or(HomeTarget::None)
     }
 
-    /// The first card Home would deal, which is the dealer's own top card.
-    pub(crate) fn top_card(&self) -> Option<DealCardId> {
-        self.rows.next.first().map(|row| row.card.clone())
-    }
-
-    pub(crate) fn rows(&self) -> &HomeRows {
-        &self.rows
-    }
-
     pub(crate) fn set_rows(&mut self, rows: HomeRows, cx: &mut Context<Self>) {
         if rows == self.rows {
             return;
@@ -284,14 +274,17 @@ impl HomeView {
     /// selection is changed without the effects a keypress would carry.
     fn focus_first_row(&mut self, cx: &mut Context<Self>) {
         let last = self.transcript.buffer().read(cx).snapshot().max_point().row;
-        let Some(row) = (0..=last).find(|row| {
-            !matches!(
-                self.transcript.line_meta(*row, cx),
-                None | Some(HomeTarget::None)
-            )
-        }) else {
-            return;
-        };
+        // With nothing to open the cursor still belongs on the one line
+        // there is, not on the blank row after it, which would read as an
+        // editable line.
+        let row = (0..=last)
+            .find(|row| {
+                !matches!(
+                    self.transcript.line_meta(*row, cx),
+                    None | Some(HomeTarget::None)
+                )
+            })
+            .unwrap_or(0);
         self.editor.update(cx, |editor, cx| {
             let snapshot = editor.display_snapshot(cx);
             editor.selections.change_with(&snapshot, |selections| {

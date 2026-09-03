@@ -311,7 +311,7 @@ than by running a supervisor, extension protocol, or daemon process graph.
   so compositor enter/leave cannot race application input or modal actions.
   Known limit (3 Sep): `wtype` never delivers a shift *modifier* through
   Sway to gpui, only shifted characters via text mode, so bindings that
-  differ by shift (`shift-u`, `shift-r`, `shift-f`) cannot be pressed in the
+  differ by shift (`shift-u`, `shift-f`) cannot be pressed in the
   rig and get no screenshots. The fix is our own `zwp_virtual_keyboard`
   client uploading a `us` keymap and sending keycodes plus modifier state,
   about a day; queued after the Slack list, not mid-slice.

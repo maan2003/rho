@@ -52,7 +52,6 @@ actions!(
         AgentNew,
         AgentDone,
         AgentHide,
-        DashboardNewAgent,
         DashboardCancelDraft,
         DashboardReply,
         DashboardSubmit,
@@ -60,7 +59,6 @@ actions!(
         DashboardArchive,
         DashboardBack,
         DashboardJump,
-        DashboardStaff,
         DashboardGoto,
         DashboardToggleAgentTree,
         DashboardToggleSubagents,
@@ -409,9 +407,8 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
     // Desk verbs, vim-native: text editing stays pure vim everywhere.
     // Talking to agents is one verb: `r` on a heading line opens a draft —
     // a reply when the heading is staffed, a first message when it isn't —
-    // and propagates to vim (replace-char) anywhere else. `shift-r` opens
-    // a quick-spawn draft whose heading is written for you and titled by
-    // the agent's generated summary. Done/hide live on ctrl-shift-d and
+    // and propagates to vim (replace-char) anywhere else. Making an agent
+    // is `space n a` from anywhere. Done/hide live on ctrl-shift-d and
     // the space menu, so `o`, `d`, and `x` keep their vim meaning.
     // Navigation uses vim-idiomatic `g`-prefixed gotos and works anywhere.
     cx.bind_keys([
@@ -443,7 +440,6 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         cx.bind_keys([
             KeyBinding::new("enter", RailOpen, Some(context)),
             KeyBinding::new("r", DashboardReply, Some(context)),
-            KeyBinding::new("shift-r", DashboardNewAgent, Some(context)),
             KeyBinding::new("tab", DashboardToggleSubagents, Some(context)),
             KeyBinding::new("z a", DashboardToggleSubagents, Some(context)),
             KeyBinding::new("shift-tab", DashboardCycleGlobal, Some(context)),

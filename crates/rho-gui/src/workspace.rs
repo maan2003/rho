@@ -62,17 +62,16 @@ use crate::{
     DashboardDealReply, DashboardDealRoomSnooze, DashboardDealSnooze, DashboardDealTodo,
     DashboardDeleteEmpty, DashboardDeleteRow, DashboardDemote, DashboardGoto,
     DashboardHeadingAbove, DashboardHeadingBelow, DashboardJump, DashboardMoveSubtreeDown,
-    DashboardMoveSubtreeUp, DashboardNewAgent, DashboardNewChild, DashboardNewSibling,
-    DashboardNow, DashboardPasteRow, DashboardPasteRowBefore, DashboardPromote,
-    DashboardRenameTopic, DashboardReply, DashboardStaff, DashboardSubmit,
-    DashboardToggleAgentTree, DashboardToggleSubagents, DashboardUndo, DashboardYankRow,
-    DealCloseAndNext, DealLeave, DealOpen, FindNode, GitApprovalAllow, GitApprovalDeny,
-    HomeOpenRow, MessagesOpen, MinibufferCancel, MinibufferComplete, MinibufferConfirm,
-    MinibufferNext, MinibufferPrevious, OverviewToggle, PastePrompt, RailFocus, RailOpen,
-    RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore,
-    ShellPagerQuit, SlackCompose, SlackOpenRow, SlackSearch, SubmitPrompt, SurfaceBack,
-    SurfaceClose, TaskBoard, UndoVerdict, UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder,
-    ZulipNextUnread, ZulipOpenRow,
+    DashboardMoveSubtreeUp, DashboardNewChild, DashboardNewSibling, DashboardNow,
+    DashboardPasteRow, DashboardPasteRowBefore, DashboardPromote, DashboardRenameTopic,
+    DashboardReply, DashboardSubmit, DashboardToggleAgentTree, DashboardToggleSubagents,
+    DashboardUndo, DashboardYankRow, DealCloseAndNext, DealLeave, DealOpen, FindNode,
+    GitApprovalAllow, GitApprovalDeny, HomeOpenRow, MessagesOpen, MinibufferCancel,
+    MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious, OverviewToggle,
+    PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt,
+    ShellPagerAll, ShellPagerMore, ShellPagerQuit, SlackCompose, SlackOpenRow, SlackSearch,
+    SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, UndoVerdict, UploadGuiTelemetry,
+    VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
 };
 
 pub(crate) const MESSAGE_LOG_CAP: usize = 4096;
@@ -410,7 +409,9 @@ pub struct Workspace {
     workdirs: Vec<HostProject>,
     /// Launch arguments for a configured Desk staffing or quick-spawn. The
     /// transient edits these; the writable dashboard row owns the message.
-    new_agent_draft: Option<NewAgentDraft>,
+    /// Where `n a` files the agent the draft page is composing. `None`
+    /// is the root, which is also what an ordinary draft sends.
+    draft_area: Option<(HostId, rho_desk::NodeId)>,
     /// A NewAgent request from the draft is in flight; the draft buffer is
     /// kept intact until the daemon confirms creation, so a rejected request
     /// (bad working directory, say) never loses the message.
@@ -544,7 +545,6 @@ pub struct Workspace {
     transient_focus: gpui::FocusHandle,
     /// Evil's one-shot `SPC u` prefix. The next supported Desk command
     /// consumes it; every other non-modifier key clears it.
-    universal_argument: bool,
     git_approval_focus: gpui::FocusHandle,
     /// Focus beneath the single modal overlay. Transients, minibuffers, and
     /// Git approval hand this target between them so borrowing keyboard
@@ -566,7 +566,7 @@ pub struct Workspace {
     iris_host: Option<HostId>,
     _event_task: Task<()>,
     _dashboard_subscription: gpui::Subscription,
-    _universal_argument_subscription: gpui::Subscription,
+    _keystroke_subscription: gpui::Subscription,
     _window_activation_subscription: gpui::Subscription,
     phone: phone::PhoneUi,
 }
@@ -792,77 +792,6 @@ impl Subject {
     }
 }
 
-#[derive(Clone)]
-struct NewAgentDraft {
-    intent: NewAgentIntent,
-    host: Option<HostId>,
-    workdir: Option<HostPath>,
-    workspace: DraftWorkspace,
-    role: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NewAgentIntent {
-    Staff((HostId, rho_desk::NodeId)),
-    QuickSpawn,
-}
-
-impl NewAgentIntent {
-    fn topic(self) -> Option<(HostId, rho_desk::NodeId)> {
-        match self {
-            Self::Staff(topic) => Some(topic),
-            Self::QuickSpawn => None,
-        }
-    }
-
-    fn compose_label(self) -> &'static str {
-        match self {
-            Self::Staff(_) => "compose · staff heading",
-            Self::QuickSpawn => "compose · quick-spawn",
-        }
-    }
-}
-
-#[derive(Clone)]
-enum DraftWorkspace {
-    NewOn(DraftBase),
-    Join(String),
-    Sandbox(DraftBase),
-}
-
-#[derive(Clone)]
-enum DraftBase {
-    Auto,
-    Explicit(String),
-}
-
-impl DraftBase {
-    fn from_input(input: &str) -> Self {
-        if input.eq_ignore_ascii_case(crate::draft_view::DEFAULT_START) {
-            Self::Auto
-        } else {
-            Self::Explicit(input.to_owned())
-        }
-    }
-
-    fn target(&self) -> &str {
-        match self {
-            Self::Auto => crate::draft_view::DEFAULT_START,
-            Self::Explicit(target) => target,
-        }
-    }
-}
-
-impl DraftWorkspace {
-    fn label(&self) -> String {
-        match self {
-            Self::NewOn(base) => format!("new on {}", base.target()),
-            Self::Join(target) => format!("join {target}"),
-            Self::Sandbox(base) => format!("sandbox on {}", base.target()),
-        }
-    }
-}
-
 impl Workspace {
     pub fn new(specs: Vec<HostSpec>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (hosts, events) = Hosts::new();
@@ -990,7 +919,7 @@ impl Workspace {
                 _ => {}
             },
         );
-        let universal_argument_subscription = cx.observe_keystrokes(|this, event, window, cx| {
+        let keystroke_subscription = cx.observe_keystrokes(|this, event, window, cx| {
             if this.desk_semantic_paste_target.is_some()
                 && !event.keystroke.key.eq_ignore_ascii_case("p")
                 && !matches!(
@@ -1042,17 +971,6 @@ impl Workspace {
             } else {
                 this.last_shift_tap = None;
             }
-            if this.universal_argument
-                && !matches!(
-                    event.keystroke.key.as_str(),
-                    "shift" | "control" | "alt" | "platform" | "function"
-                )
-            {
-                // Supported actions consume the prefix before observers run;
-                // anything still armed here was an unrelated command.
-                this.universal_argument = false;
-                cx.notify();
-            }
         });
         let mut last_window_active = None;
         let window_activation_subscription =
@@ -1085,7 +1003,7 @@ impl Workspace {
             message_evictions_since_rebase: 0,
             message_rebase_scheduled: false,
             workdirs: Vec::new(),
-            new_agent_draft: None,
+            draft_area: None,
             awaiting_draft_agent: None,
             ready_hosts: HashSet::new(),
             replay_hosts: HashSet::new(),
@@ -1159,7 +1077,6 @@ impl Workspace {
             transient: None,
             transient_stack: Vec::new(),
             transient_focus: cx.focus_handle(),
-            universal_argument: false,
             git_approval_focus: cx.focus_handle(),
             overlay_return_focus: None,
             echo: None,
@@ -1172,16 +1089,13 @@ impl Workspace {
             iris_host: None,
             _event_task: event_task,
             _dashboard_subscription: dashboard_subscription,
-            _universal_argument_subscription: universal_argument_subscription,
+            _keystroke_subscription: keystroke_subscription,
             _window_activation_subscription: window_activation_subscription,
             phone: phone::PhoneUi::new(cx),
         };
         for spec in specs {
             this.attach_host(spec, cx);
         }
-        let draft = this.make_surface(SurfaceKey::Draft, window, cx);
-        this.display_surface(draft, cx);
-        this.seed_draft(false, window, cx);
         // A cold start lands on Home: what is running, what is next, and
         // what sits just under the line, without dealing a card.
         this.overview_open = false;
@@ -1460,7 +1374,7 @@ impl Workspace {
     }
 
     fn forget_discarded_draft(&mut self, cx: &mut Context<Self>) {
-        self.new_agent_draft = None;
+        self.draft_area = None;
         let key = SurfaceKey::Draft;
         self.navigation_skips.remove(&key);
         crate::journal::record(crate::journal::Event::SurfaceClosed {
@@ -1500,7 +1414,7 @@ impl Workspace {
         cx.notify();
     }
 
-    fn home_view(&self) -> Option<Entity<crate::home::HomeView>> {
+    pub(crate) fn home_view(&self) -> Option<Entity<crate::home::HomeView>> {
         self.find_surface(|surface| surface.key == SurfaceKey::Home)
             .and_then(|surface| match &surface.view {
                 SurfaceView::Home(view) => Some(view.clone()),
@@ -3026,14 +2940,19 @@ impl Workspace {
             }
         };
         self.awaiting_draft_agent = Some(host);
-        // Start a top-level agent from the draft.
+        // `n a` chose an area, and that is where the agent is filed; an
+        // ordinary draft has none and starts at the root.
+        let desk_parent = self
+            .draft_area
+            .take()
+            .and_then(|(area_host, node_id)| (area_host == host).then_some(node_id));
         self.hosts.send(
             host,
             ClientMessage::NewAgent {
                 role,
                 start,
                 content: Some(content),
-                desk_parent: None,
+                desk_parent,
             },
         );
     }
@@ -4525,24 +4444,6 @@ impl Workspace {
         })
     }
 
-    fn resolve_workdir_on_host(&self, argument: &str, host: HostId) -> Result<HostPath, String> {
-        if let Some(registered) = self.registered_workdir(argument) {
-            return (registered.host == host)
-                .then_some(registered)
-                .ok_or_else(|| "project belongs to a different host".to_owned());
-        }
-        if argument.contains(':') {
-            let workdir = self.resolve_workdir(argument)?;
-            return (workdir.host == host)
-                .then_some(workdir)
-                .ok_or_else(|| "project belongs to a different host".to_owned());
-        }
-        Ok(HostPath {
-            host,
-            path: Utf8PathBuf::from(argument),
-        })
-    }
-
     /// Records a notice outside the conversation and flashes it in the echo
     /// area.
     pub(crate) fn notice_on(
@@ -4902,6 +4803,9 @@ impl Workspace {
         crate::journal::record(crate::journal::Event::AgentSelected {
             agent_id: agent_id.map(|id| id.encoded()),
         });
+        // Any other route to the draft page composes at the root; only
+        // `n a` sets an area, and it sets it after this.
+        self.draft_area = None;
         if self.connected()
             && let Some(agent_id) = agent_id
         {
@@ -5875,13 +5779,8 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn has_new_agent_configuration_for_test(&self) -> bool {
-        self.new_agent_draft.is_some()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn has_universal_argument_for_test(&self) -> bool {
-        self.universal_argument
+    pub(crate) fn draft_area_for_test(&self) -> Option<(HostId, rho_desk::NodeId)> {
+        self.draft_area
     }
 
     #[cfg(test)]
@@ -6499,19 +6398,13 @@ impl Workspace {
             SurfaceView::File(view) => view.read(cx).editor().clone(),
             SurfaceView::Shell { editor, .. } => editor.clone(),
             SurfaceView::Diff(view) => view.read(cx).editor().clone(),
-            SurfaceView::Terminal(_) => self
-                .any_draft_editor()
-                .expect("the draft context always holds a draft surface"),
-            SurfaceView::Browser(_) => self
-                .any_draft_editor()
-                .expect("the draft context always holds a draft surface"),
+            SurfaceView::Terminal(_) => self.chrome_editor(),
+            SurfaceView::Browser(_) => self.chrome_editor(),
             SurfaceView::ZulipInbox(view) => view.read(cx).editor().clone(),
             SurfaceView::ZulipNarrow(view) => view.read(cx).editor().clone(),
             SurfaceView::SlackList(view) => view.read(cx).editor().clone(),
             SurfaceView::SlackConversation(view) => view.read(cx).editor().clone(),
-            SurfaceView::Image(_) => self
-                .any_draft_editor()
-                .expect("the draft context always holds a draft surface"),
+            SurfaceView::Image(_) => self.chrome_editor(),
         }
     }
 
@@ -6523,9 +6416,16 @@ impl Workspace {
         }
     }
 
-    /// Some draft editor, from the draft context's surface list (founded at
-    /// startup, never pruned). Used only where any editor serves, e.g. text
-    /// style for chrome while a terminal surface is focused.
+    /// An editor to answer text-style questions with while the surface in
+    /// view has none of its own (a terminal, a page, an image). Any will
+    /// do; the desk's own editor exists for the life of the workspace.
+    fn chrome_editor(&self) -> Entity<editor::Editor> {
+        self.any_draft_editor()
+            .unwrap_or_else(|| self.dashboard.editor().clone())
+    }
+
+    /// Some draft editor, when one is open. Used only where any editor
+    /// serves, e.g. text style for chrome while a terminal is focused.
     fn any_draft_editor(&self) -> Option<Entity<editor::Editor>> {
         self.surfaces
             .get(&ContextId::Draft)?
@@ -7329,8 +7229,14 @@ impl Workspace {
             self.refresh_dashboard(window, cx);
         } else {
             // Empty lands on Home rather than on whatever was last open:
-            // there is nothing to deal, so the glance is the answer.
-            self.notice_on(None, "nothing needs attention", StyleClass::SystemInfo, cx);
+            // there is nothing to deal, so the glance is the answer. Home
+            // says so in the buffer, so the echo area is left alone and the
+            // title still reads "home".
+            self.append_message(
+                "nothing needs attention".to_owned(),
+                StyleClass::SystemInfo,
+                cx,
+            );
             self.open_home(window, cx);
         }
     }
@@ -7660,48 +7566,45 @@ impl Workspace {
         model.update(cx, |model, cx| model.focus_prompt(&editor, window, cx));
     }
 
-    pub(crate) fn configure_dashboard_staff(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(topic) = self.dashboard.tree_node_at_cursor(cx) {
-            self.begin_new_agent_configuration(NewAgentIntent::Staff(topic), window, cx);
-            return;
-        }
-        let Some(topic) = self.dashboard.cursor_topic(cx) else {
-            self.notice_on(
-                None,
-                "staff: choose a Desk heading",
-                StyleClass::SystemInfo,
-                cx,
-            );
-            return;
-        };
-        self.begin_new_agent_configuration(NewAgentIntent::Staff(topic), window, cx);
-    }
-
-    pub(crate) fn configure_dashboard_quick_spawn(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.begin_new_agent_configuration(NewAgentIntent::QuickSpawn, window, cx);
-    }
-
-    /// `n a` with an area chosen: the area is the agent's parent, and the
-    /// root is the quick-spawn flow's own inheritance.
+    /// `n a` with an area chosen: the draft page carries the fields, so
+    /// there is no transient in front of it. The area is the agent's
+    /// parent and where its workdir is inherited from; the body is focused
+    /// so typing composes the first message straight away.
     pub(crate) fn new_agent_in_area(
         &mut self,
         area: Option<(HostId, rho_desk::NodeId)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let intent = match area {
-            Some(topic) => NewAgentIntent::Staff(topic),
-            None => NewAgentIntent::QuickSpawn,
-        };
-        self.begin_new_agent_configuration(intent, window, cx);
+        let workdir = area
+            .and_then(|(host, node_id)| self.area_workdir(host, node_id))
+            .or_else(|| self.only_workdir());
+        let label = workdir
+            .as_ref()
+            .map(|workdir| self.workdir_label(workdir))
+            .unwrap_or_default();
+        self.select_agent_inner(None, true, window, cx);
+        self.draft_area = area;
+        let editor = self.focused_draft_editor();
+        self.draft_model.update(cx, |view, cx| {
+            view.set_body_text("", cx);
+            view.clear_attachments(cx);
+            view.set_role_text(crate::draft_view::DEFAULT_ROLE, cx);
+            view.set_start_text(crate::draft_view::DEFAULT_START, cx);
+            view.seed(&label, true, editor.as_ref(), window, cx);
+        });
+    }
+
+    /// The workdir to fall back on when nothing else names one: a single
+    /// registered project is not a choice worth asking about.
+    fn only_workdir(&self) -> Option<HostPath> {
+        match self.workdirs.as_slice() {
+            [workdir] => Some(HostPath {
+                host: workdir.host,
+                path: workdir.project.path.clone(),
+            }),
+            _ => None,
+        }
     }
 
     /// The workdir a new thing under an area inherits: the area's own
@@ -7714,121 +7617,6 @@ impl Workspace {
         }
         let agent_id = self.desk_cells.nearest_agent(host, node_id)?;
         self.agent_workdir(agent_id)
-    }
-
-    fn begin_new_agent_configuration(
-        &mut self,
-        intent: NewAgentIntent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let workdir = match intent {
-            NewAgentIntent::Staff((host, node_id)) => self.area_workdir(host, node_id),
-            NewAgentIntent::QuickSpawn => {
-                let row_workdir = match self.dashboard.cursor_target(&self.registry, cx) {
-                    Some(crate::dashboard::RowTarget::TreeAgent { agent_id, .. }) => {
-                        self.agent_workdir(agent_id)
-                    }
-                    _ => self
-                        .dashboard
-                        .cursor_topic(cx)
-                        .and_then(|topic| self.workdir_for_desk_topic(topic, cx)),
-                };
-                row_workdir.or_else(|| {
-                    self.registry
-                        .selected_agent()
-                        .copied()
-                        .and_then(|agent_id| self.agent_workdir(agent_id))
-                })
-            }
-        }
-        .or_else(|| match self.workdirs.as_slice() {
-            [workdir] => Some(HostPath {
-                host: workdir.host,
-                path: workdir.project.path.clone(),
-            }),
-            _ => None,
-        });
-        let host = match intent {
-            NewAgentIntent::Staff((host, _)) => Some(host),
-            NewAgentIntent::QuickSpawn => workdir
-                .as_ref()
-                .map(|workdir| workdir.host)
-                .or_else(|| self.hosts.primary()),
-        };
-        self.new_agent_draft = Some(NewAgentDraft {
-            intent,
-            host,
-            workdir,
-            workspace: DraftWorkspace::NewOn(DraftBase::Auto),
-            role: crate::draft_view::DEFAULT_ROLE.to_owned(),
-        });
-        self.open_new_agent_transient(window, cx);
-    }
-
-    fn workdir_for_desk_topic(
-        &self,
-        topic: (HostId, rho_desk::NodeId),
-        _cx: &mut Context<Self>,
-    ) -> Option<HostPath> {
-        let (host, node_id) = topic;
-        if let Some(path) = self.desk_cells.file_path(host, node_id) {
-            return Some(HostPath { host, path });
-        }
-        let mut candidates = self.workdirs.iter().filter(|workdir| workdir.host == host);
-        let only = candidates.next()?;
-        candidates.next().is_none().then(|| HostPath {
-            host,
-            path: only.project.path.clone(),
-        })
-    }
-
-    pub(crate) fn open_new_agent_transient(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.new_agent_draft.is_none() {
-            // A new agent starts where the subject works.
-            let subject = self.subject(window, cx);
-            let contextual = subject
-                .agent
-                .and_then(|agent_id| self.agent_workdir(agent_id));
-            let workdir = contextual.or_else(|| match self.workdirs.as_slice() {
-                [workdir] => Some(HostPath {
-                    host: workdir.host,
-                    path: workdir.project.path.clone(),
-                }),
-                _ => None,
-            });
-            self.new_agent_draft = Some(NewAgentDraft {
-                intent: NewAgentIntent::QuickSpawn,
-                host: workdir
-                    .as_ref()
-                    .map(|workdir| workdir.host)
-                    .or_else(|| self.hosts.primary()),
-                workdir,
-                workspace: DraftWorkspace::NewOn(DraftBase::Auto),
-                role: crate::draft_view::DEFAULT_ROLE.to_owned(),
-            });
-        }
-        let draft = self.new_agent_draft.as_ref().expect("draft initialized");
-        let host = draft
-            .host
-            .map(|host| self.host_label(host))
-            .unwrap_or_else(|| "<choose>".to_owned());
-        let project = draft
-            .workdir
-            .as_ref()
-            .map(|workdir| self.workdir_label(workdir))
-            .unwrap_or_else(|| "<choose>".to_owned());
-        self.open_transient(
-            crate::transient::new_agent_menu(
-                host,
-                project,
-                draft.workspace.label(),
-                draft.role.clone(),
-                draft.intent.compose_label(),
-            ),
-            window,
-            cx,
-        );
     }
 
     pub(crate) fn open_usage_transient(
@@ -7904,245 +7692,28 @@ impl Workspace {
         );
     }
 
-    pub(crate) fn prompt_new_agent_project(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, _: &gpui::App| {
-            let needle = input.trim().to_lowercase();
-            let selected_host = workspace
-                .new_agent_draft
-                .as_ref()
-                .and_then(|draft| draft.host);
-            workspace
-                .workdirs
-                .iter()
-                .filter(|workdir| selected_host.is_none_or(|host| workdir.host == host))
-                .map(|workdir| {
-                    (
-                        workdir.project.name.clone(),
-                        workdir.project.path.to_string(),
-                    )
-                })
-                .filter(|(name, path)| {
-                    name.to_lowercase().contains(&needle) || path.to_lowercase().contains(&needle)
-                })
-                .map(|(name, path)| crate::commands::Candidate {
-                    value: name,
-                    description: path,
-                })
-                .collect()
-        });
-        let on_submit = std::rc::Rc::new(
-            |workspace: &mut Workspace,
-             input: String,
-             window: &mut Window,
-             cx: &mut Context<Workspace>| {
-                let input = input.trim();
-                if !input.is_empty() {
-                    let selected_host = workspace
-                        .new_agent_draft
-                        .as_ref()
-                        .and_then(|draft| draft.host);
-                    let resolved = match selected_host {
-                        Some(host) => workspace.resolve_workdir_on_host(input, host),
-                        None => workspace.resolve_workdir(input),
-                    };
-                    match resolved {
-                        Ok(workdir) => {
-                            if let Some(draft) = &mut workspace.new_agent_draft {
-                                draft.host = Some(workdir.host);
-                                draft.workdir = Some(workdir);
-                            }
-                        }
-                        Err(message) => {
-                            workspace.notice_on(None, &message, StyleClass::SystemInfo, cx)
-                        }
-                    }
-                }
-                workspace.open_new_agent_transient(window, cx);
-            },
-        );
-        self.open_prompt("project:", complete, on_submit, window, cx);
-    }
-
-    pub(crate) fn open_new_agent_workspace_transient(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.open_transient(crate::transient::new_agent_workspace_menu(), window, cx);
-    }
-
-    pub(crate) fn prompt_new_agent_host(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, _: &gpui::App| {
-            let needle = input.trim().to_lowercase();
-            workspace
-                .hosts
-                .iter()
-                .filter(|host| host.name.to_lowercase().contains(&needle))
-                .map(|host| crate::commands::Candidate {
-                    value: host.name.clone(),
-                    description: host.status.label(),
-                })
-                .collect()
-        });
-        let on_submit = std::rc::Rc::new(
-            |workspace: &mut Workspace,
-             input: String,
-             window: &mut Window,
-             cx: &mut Context<Workspace>| {
-                let name = input.trim();
-                if let Some(host) = workspace.hosts.by_name(name).map(|host| host.id) {
-                    if let Some(draft) = &mut workspace.new_agent_draft
-                        && draft.host != Some(host)
-                    {
-                        draft.host = Some(host);
-                        draft.workdir = None;
-                    }
-                } else if !name.is_empty() {
-                    workspace.notice_on(
-                        None,
-                        &format!("no attached host named `{name}`"),
-                        StyleClass::SystemInfo,
-                        cx,
-                    );
-                }
-                workspace.open_new_agent_transient(window, cx);
-            },
-        );
-        self.open_prompt("host:", complete, on_submit, window, cx);
-    }
-
-    pub(crate) fn prompt_new_agent_workspace(
-        &mut self,
-        mode: crate::draft_view::StartFieldMode,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        use crate::draft_view::StartFieldMode;
-
-        let complete =
-            std::rc::Rc::new(move |workspace: &Workspace, input: &str, _: &gpui::App| {
-                let needle = input.trim().to_lowercase();
-                let mut candidates = workspace.live_agent_targets();
-                candidates.insert(
-                    0,
-                    if mode == StartFieldMode::Join {
-                        crate::commands::Candidate {
-                            value: "user".to_owned(),
-                            description: "your checkout".to_owned(),
-                        }
-                    } else {
-                        crate::commands::Candidate {
-                            value: crate::draft_view::DEFAULT_START.to_owned(),
-                            description: "local main → local master → trunk".to_owned(),
-                        }
-                    },
-                );
-                candidates
-                    .into_iter()
-                    .filter(|candidate| {
-                        candidate.value.to_lowercase().contains(&needle)
-                            || candidate.description.to_lowercase().contains(&needle)
-                    })
-                    .collect()
-            });
-        let on_submit = std::rc::Rc::new(
-            move |workspace: &mut Workspace,
-                  input: String,
-                  window: &mut Window,
-                  cx: &mut Context<Workspace>| {
-                let input = input.trim();
-                if !input.is_empty()
-                    && let Some(draft) = &mut workspace.new_agent_draft
-                {
-                    draft.workspace = match mode {
-                        StartFieldMode::NewOn => {
-                            DraftWorkspace::NewOn(DraftBase::from_input(input))
-                        }
-                        StartFieldMode::Join => DraftWorkspace::Join(input.to_owned()),
-                        StartFieldMode::Sandbox => {
-                            DraftWorkspace::Sandbox(DraftBase::from_input(input))
-                        }
-                    };
-                }
-                workspace.open_new_agent_transient(window, cx);
-            },
-        );
-        let prompt = match mode {
-            StartFieldMode::NewOn => "new workspace on:",
-            StartFieldMode::Join => "join workspace:",
-            StartFieldMode::Sandbox => "sandbox on:",
-        };
-        self.open_prompt(prompt, complete, on_submit, window, cx);
-    }
-
-    pub(crate) fn cycle_new_agent_role(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(draft) = &mut self.new_agent_draft {
-            draft.role = cycle_agent_role_text(&draft.role).to_owned();
-        }
-        self.open_new_agent_transient(window, cx);
-    }
-
-    pub(crate) fn compose_configured_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(intent) = self.new_agent_draft.as_ref().map(|draft| draft.intent) else {
-            return;
-        };
-        match intent {
-            NewAgentIntent::Staff(topic) => self.dashboard.open_new_tree_draft(topic, window, cx),
-            _ => self.dashboard.open_new_draft(intent.topic(), window, cx),
-        }
-        self.dashboard_focus_draft(window, cx);
-    }
-
-    fn configured_agent_launch(
+    /// What a new agent under an area starts as: the area's inherited
+    /// workdir, a fresh workspace on the auto base, and the default role.
+    /// The fields on the draft page override this; a heading draft has no
+    /// page, so this is all it gets.
+    fn launch_for_area(
         &self,
-    ) -> Result<(HostId, rho_ui_proto::StartMode, AgentRole), String> {
-        use crate::draft_view::StartFieldMode;
-
-        let draft = self
-            .new_agent_draft
-            .as_ref()
-            .ok_or_else(|| "new agent has no launch configuration".to_owned())?;
-        let (mode, target) = match &draft.workspace {
-            DraftWorkspace::NewOn(base) => (StartFieldMode::NewOn, base.target()),
-            DraftWorkspace::Join(target) => (StartFieldMode::Join, target.as_str()),
-            DraftWorkspace::Sandbox(base) => (StartFieldMode::Sandbox, base.target()),
-        };
-        let selected_host = match draft.intent {
-            NewAgentIntent::Staff((host, _)) => Some(host),
-            NewAgentIntent::QuickSpawn => draft.host,
-        };
-        let (host, start) = self.parse_start(mode, target, draft.workdir.clone(), selected_host)?;
-        let role = parse_agent_role(&draft.role)?;
-        Ok((host, start, role))
-    }
-
-    fn submit_configured_agent(
-        &mut self,
-        topic: Option<(HostId, rho_desk::NodeId)>,
-        body: String,
         host: HostId,
-        start: rho_ui_proto::StartMode,
-        role: AgentRole,
-        _cx: &mut Context<Self>,
-    ) {
-        let desk_parent = self
-            .new_agent_draft
-            .as_ref()
-            .and_then(|draft| match draft.intent {
-                NewAgentIntent::Staff((topic_host, node_id)) if topic_host == host => Some(node_id),
-                _ => None,
-            });
-        let _ = topic;
-        self.send_to_host(
-            host,
-            ClientMessage::NewAgent {
-                role,
-                start,
-                content: Some(vec![ContentPart::Text { text: body }]),
-                desk_parent,
+        node_id: rho_desk::NodeId,
+    ) -> Result<(HostId, rho_ui_proto::StartMode, AgentRole), String> {
+        let workdir = self
+            .area_workdir(host, node_id)
+            .or_else(|| self.only_workdir())
+            .ok_or_else(|| "new agent: no working directory for this area".to_owned())?;
+        let role = parse_agent_role(crate::draft_view::DEFAULT_ROLE)?;
+        Ok((
+            workdir.host,
+            rho_ui_proto::StartMode::NewOn {
+                repo: workdir.path,
+                revset: crate::draft_view::AUTO_BASE_REVSET.to_owned(),
             },
-        );
-        self.new_agent_draft = None;
+            role,
+        ))
     }
 
     /// `enter` on a bound Desk heading opens its agent.
@@ -8175,42 +7746,26 @@ impl Workspace {
                 let Some(body) = self.dashboard.take_new_draft(cx) else {
                     return;
                 };
-                let (host, start, role) = match self.configured_agent_launch() {
-                    Ok(v) => v,
+                let (host, start, role) = match self.launch_for_area(topic_host, node_id) {
+                    Ok(launch) => launch,
                     Err(message) => {
                         self.notice_on(None, &message, StyleClass::SystemInfo, cx);
                         return;
                     }
                 };
-                self.submit_configured_agent(
-                    Some((topic_host, node_id)),
-                    body,
+                self.send_to_host(
                     host,
-                    start,
-                    role,
-                    cx,
+                    ClientMessage::NewAgent {
+                        role,
+                        start,
+                        content: Some(vec![ContentPart::Text { text: body }]),
+                        desk_parent: Some(node_id),
+                    },
                 );
                 self.refresh_dashboard(window, cx);
             }
-            Some(RowTarget::NewDraft) => {
-                if !self.require_connected(cx) {
-                    return;
-                }
-                if let Some(body) = self.dashboard.take_new_draft(cx) {
-                    self.spawn_unfiled_dashboard_agent(body, window, cx);
-                }
-            }
             _ => {}
         }
-    }
-
-    pub(crate) fn set_universal_argument(&mut self, cx: &mut Context<Self>) {
-        self.universal_argument = true;
-        cx.notify();
-    }
-
-    fn take_universal_argument(&mut self) -> bool {
-        std::mem::take(&mut self.universal_argument)
     }
 
     /// Insert-mode enter: send when the cursor is in a draft, and drop
@@ -8236,7 +7791,6 @@ impl Workspace {
     }
 
     fn dashboard_reply(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.new_agent_draft = None;
         match self.dashboard.cursor_target(&self.registry, cx) {
             Some(crate::dashboard::RowTarget::TreeAgent { agent_id, .. }) => {
                 self.open_agent(agent_id, window, cx)
@@ -8272,128 +7826,6 @@ impl Workspace {
     pub(crate) fn dashboard_focus_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_dashboard(window, cx);
         self.dashboard_enter_insert(window, cx);
-    }
-
-    /// A quick spawn has no heading to inherit `:project:` from, so the
-    /// project comes from a picker (skipped when only one is registered).
-    fn spawn_unfiled_dashboard_agent(
-        &mut self,
-        body: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.workdirs.is_empty() {
-            self.notice_on(
-                None,
-                "new agent: no registered projects",
-                StyleClass::SystemInfo,
-                cx,
-            );
-            return;
-        }
-        if let [workdir] = self.workdirs.as_slice() {
-            let workdir = workdir.clone();
-            self.quick_spawn_on(workdir, body, cx);
-            return;
-        }
-        let complete = std::rc::Rc::new(|workspace: &Workspace, input: &str, _: &gpui::App| {
-            let needle = input.trim().to_lowercase();
-            let multiple_hosts = workspace
-                .workdirs
-                .iter()
-                .map(|workdir| workdir.host)
-                .collect::<std::collections::HashSet<_>>()
-                .len()
-                > 1;
-            workspace
-                .workdirs
-                .iter()
-                .filter(|candidate| {
-                    candidate.project.name.to_lowercase().contains(&needle)
-                        || candidate
-                            .project
-                            .path
-                            .as_str()
-                            .to_lowercase()
-                            .contains(&needle)
-                })
-                .map(|candidate| crate::commands::Candidate {
-                    value: candidate.project.name.clone(),
-                    description: if multiple_hosts {
-                        format!(
-                            "{} · {}",
-                            workspace.registry.host_name(candidate.host),
-                            candidate.project.path
-                        )
-                    } else {
-                        candidate.project.path.to_string()
-                    },
-                })
-                .collect()
-        });
-        let on_submit = std::rc::Rc::new(
-            move |workspace: &mut Workspace,
-                  input: String,
-                  _window: &mut Window,
-                  cx: &mut Context<Workspace>| {
-                let input = input.trim();
-                let Some(workdir) = workspace
-                    .workdirs
-                    .iter()
-                    .find(|candidate| {
-                        candidate.project.name == input || candidate.project.path == input
-                    })
-                    .cloned()
-                else {
-                    workspace.notice_on(
-                        None,
-                        "new agent: choose a listed project",
-                        StyleClass::SystemInfo,
-                        cx,
-                    );
-                    return;
-                };
-                workspace.quick_spawn_on(workdir, body.clone(), cx);
-            },
-        );
-        self.open_prompt("project:", complete, on_submit, window, cx);
-    }
-
-    /// Quick spawn (`shift-r`): the desk gets a `* …` placeholder heading,
-    /// the agent spawns bound to it, and the title fills itself in from
-    /// the agent's generated summary once one exists. Hosts without a
-    /// desk fall back to an unfiled spawn.
-    fn quick_spawn_on(&mut self, workdir: HostProject, body: String, cx: &mut Context<Self>) {
-        self.spawn_unfiled_agent_on(workdir, body, cx);
-    }
-
-    fn spawn_unfiled_agent_on(
-        &mut self,
-        workdir: HostProject,
-        body: String,
-        cx: &mut Context<Self>,
-    ) {
-        let role_text = self.draft_model.read(cx).role_text(cx).trim().to_owned();
-        let role = match parse_agent_role(&role_text) {
-            Ok(role) => role,
-            Err(message) => {
-                self.notice_on(None, &message, StyleClass::SystemInfo, cx);
-                return;
-            }
-        };
-        self.send_to_host(
-            workdir.host,
-            ClientMessage::NewAgent {
-                role,
-                start: rho_ui_proto::StartMode::NewOn {
-                    repo: workdir.project.path,
-                    revset: crate::draft_view::AUTO_BASE_REVSET.to_owned(),
-                },
-                content: (!body.trim().is_empty())
-                    .then_some(vec![ContentPart::Text { text: body }]),
-                desk_parent: None,
-            },
-        );
     }
 
     /// Vim-style `o`/`O` on a heading line: insert a sibling node below or
@@ -8440,16 +7872,6 @@ impl Workspace {
     fn dashboard_new_heading_applies(&mut self, window: &Window, cx: &mut Context<Self>) -> bool {
         self.dashboard.is_focused(window, cx)
             && (self.dashboard.cursor_on_heading_line(cx) || self.dashboard.tree_is_empty())
-    }
-
-    fn staff_dashboard_node(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.new_agent_draft = None;
-        let Some(topic) = self.dashboard.cursor_topic(cx) else {
-            self.notice_on(None, "staff: choose a topic", StyleClass::SystemInfo, cx);
-            return;
-        };
-        self.dashboard.open_new_draft(Some(topic), window, cx);
-        self.dashboard_focus_draft(window, cx);
     }
 
     fn dashboard_new_heading(&mut self, child: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -9945,19 +9367,8 @@ impl Render for Workspace {
                 }
                 this.cmd_agent_done(true, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &DashboardStaff, window, cx| {
-                if !this.dashboard_verb_applies(window, cx) {
-                    cx.propagate();
-                    return;
-                }
-                this.staff_dashboard_node(window, cx);
-            }))
             .on_action(cx.listener(|this, _: &DashboardReply, window, cx| {
-                if this.take_universal_argument() {
-                    this.configure_dashboard_staff(window, cx);
-                } else {
-                    this.dashboard_reply(window, cx);
-                }
+                this.dashboard_reply(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardSubmit, window, cx| {
                 this.dashboard_submit(window, cx);
@@ -9978,15 +9389,6 @@ impl Render for Workspace {
                     }
                 } else {
                     cx.propagate();
-                }
-            }))
-            .on_action(cx.listener(|this, _: &DashboardNewAgent, window, cx| {
-                if this.take_universal_argument() {
-                    this.configure_dashboard_quick_spawn(window, cx);
-                } else {
-                    this.new_agent_draft = None;
-                    this.dashboard.open_new_draft(None, window, cx);
-                    this.dashboard_focus_draft(window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &DashboardHeadingBelow, window, cx| {
@@ -10573,10 +9975,9 @@ impl Render for Workspace {
                     &self.pending_git_approval,
                     &self.minibuffer,
                     &self.transient,
-                    self.universal_argument,
                     &self.echo,
                 ) {
-                    (Some(pending), _, _, _, _) => {
+                    (Some(pending), _, _, _) => {
                         let colors = cx.theme().colors();
                         let focused = self.git_approval_focus.is_focused(window);
                         let mut deny = div().flex().flex_row().px_1().child("n deny");
@@ -10624,12 +10025,12 @@ impl Render for Workspace {
                                 .into_any_element(),
                         )
                     }
-                    (None, Some(minibuffer), _, _, _) => Some(if phone {
+                    (None, Some(minibuffer), _, _) => Some(if phone {
                         minibuffer.render_phone(&text_style, cx)
                     } else {
                         minibuffer.render(&text_style, cx)
                     }),
-                    (None, None, Some(transient), _, _) => {
+                    (None, None, Some(transient), _) => {
                         if phone {
                             self.render_phone_transient_sheet(&text_style, cx)
                         } else {
@@ -10642,19 +10043,8 @@ impl Render for Workspace {
                             )
                         }
                     }
-                    (None, None, None, true, _) => Some(
-                        bottom_strip(&text_style, cx)
-                            .child(
-                                div()
-                                    .px_2()
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .child("SPC u"),
-                            )
-                            .child(div().px_2().child("universal argument"))
-                            .into_any_element(),
-                    ),
-                    (None, None, None, false, Some(_)) => None,
-                    (None, None, None, false, None) => None,
+                    (None, None, None, Some(_)) => None,
+                    (None, None, None, None) => None,
                 },
             )
     }

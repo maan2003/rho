@@ -84,12 +84,15 @@ call, 3 Sep: Find finds.
 `NewAgent.desk_parent`; a note is an ordinary `DeskMutationApply`. Nothing
 else changes on the wire.
 
-## Landed, still to retire
+## Retired
 
-Slice 2 built the new flow beside the old one. `shift-r`, staff,
-quick-spawn with a universal argument, the `new agent` transient, and
-`browser › new page` are still bound; they go in one change after Home,
-so the desk never has two ways to make a thing for long.
+Slice 2 built the new flow beside the old one; the old one is gone as of
+the change after Home. `shift-r`, staff (`u r` on a heading), quick-spawn
+with a universal argument, and the `new agent` transient are unbound and
+deleted, and with them the universal argument itself, which had no other
+consumer. `browser › new page` had already gone with the rail. `n a` now
+opens the draft page directly: the area sets the parent and the inherited
+workdir, and the page's own fields are the only configuration.
 
 ## Deliberately deferred
 

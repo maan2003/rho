@@ -114,27 +114,6 @@ impl Transient {
 
     /// A value-setting item. Like upstream Transient infixes, its current
     /// value is rendered separately from the command description.
-    fn infix(
-        self,
-        key: &'static str,
-        description: impl Into<String>,
-        value: impl Into<String>,
-        run: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
-    ) -> Self {
-        self.push(key, description, Some(value.into()), false, None, run)
-    }
-
-    /// An infix that updates immediately and keeps the transient open.
-    fn infix_toggle(
-        self,
-        key: &'static str,
-        description: impl Into<String>,
-        value: impl Into<String>,
-        run: impl Fn(&mut Workspace, &mut Window, &mut Context<Workspace>) + 'static,
-    ) -> Self {
-        self.push(key, description, Some(value.into()), true, None, run)
-    }
-
     /// An item present only while `when` holds of the subject at menu open.
     fn item_when(
         self,
@@ -703,9 +682,6 @@ pub fn root_menu() -> Transient {
         })
         .item("s", "status…", |workspace, window, cx| {
             workspace.open_transient(status_menu(), window, cx);
-        })
-        .item("u", "universal argument", |workspace, _, cx| {
-            workspace.set_universal_argument(cx);
         })
         .item("shift-u", "undo verdict", |_, window, cx| {
             window.dispatch_action(Box::new(crate::UndoVerdict), cx);
@@ -1642,56 +1618,6 @@ pub(crate) fn bucket_cost_usd(bucket: &rho_ui_proto::AgentUsageBucket, model: &s
         / 1_000_000.0
 }
 
-pub fn new_agent_menu(
-    host: String,
-    project: String,
-    workspace: String,
-    role: String,
-    compose_label: &'static str,
-) -> Transient {
-    Transient::new("new agent")
-        .infix("h", "host", host, |workspace, window, cx| {
-            workspace.prompt_new_agent_host(window, cx);
-        })
-        .infix("p", "project", project, |workspace, window, cx| {
-            workspace.prompt_new_agent_project(window, cx);
-        })
-        .infix("w", "workspace", workspace, |workspace, window, cx| {
-            workspace.open_new_agent_workspace_transient(window, cx);
-        })
-        .infix_toggle("r", "role", role, |workspace, window, cx| {
-            workspace.cycle_new_agent_role(window, cx);
-        })
-        .item("c", compose_label, |workspace, window, cx| {
-            workspace.compose_configured_agent(window, cx);
-        })
-}
-
-pub fn new_agent_workspace_menu() -> Transient {
-    Transient::new("workspace")
-        .item("n", "new on…", |workspace, window, cx| {
-            workspace.prompt_new_agent_workspace(
-                crate::draft_view::StartFieldMode::NewOn,
-                window,
-                cx,
-            );
-        })
-        .item("j", "join…", |workspace, window, cx| {
-            workspace.prompt_new_agent_workspace(
-                crate::draft_view::StartFieldMode::Join,
-                window,
-                cx,
-            );
-        })
-        .item("s", "sandbox on…", |workspace, window, cx| {
-            workspace.prompt_new_agent_workspace(
-                crate::draft_view::StartFieldMode::Sandbox,
-                window,
-                cx,
-            );
-        })
-}
-
 /// `space h`: the attached daemons. Attaching and detaching are rare, so
 /// they live one level down rather than on the root's crowded first row.
 fn hosts_menu() -> Transient {
@@ -1794,17 +1720,12 @@ mod tests {
     }
 
     #[test]
-    fn leader_keeps_usage_under_status_and_u_is_a_prefix() {
+    fn leader_keeps_usage_under_status() {
         let root = root_menu();
         assert!(
             root.items
                 .iter()
                 .any(|item| { item.key == "s" && item.description == "status…" })
-        );
-        assert!(
-            root.items
-                .iter()
-                .any(|item| { item.key == "u" && item.description == "universal argument" })
         );
         assert!(!root.items.iter().any(|item| item.description == "usage…"));
 

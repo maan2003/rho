@@ -6064,12 +6064,15 @@ fn q_closes_unlisted_standalone_draft_surface(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn q_discards_shift_r_draft_from_surface_history(cx: &mut TestAppContext) {
+fn q_discards_a_heading_draft_from_surface_history(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
+    let mut desk = DeskFixture::new();
+    let heading = desk.note(None, "unstaffed heading");
     let workspace = overview_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            // Opening the standalone composer from overview records Draft in
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            // Opening the composer from the overview records Draft in
             // history, matching the state that exposed the human QA failure.
             workspace.select_agent(None, window, cx);
             assert!(
@@ -6080,13 +6083,17 @@ fn q_discards_shift_r_draft_from_surface_history(cx: &mut TestAppContext) {
             );
         })
         .unwrap();
+    cx.run_until_parked();
     workspace
         .update(cx, |workspace, window, cx| {
-            // Shift-R lives on the map, which the home key no longer opens.
+            // Heading drafts live on the map, which the home key no longer
+            // opens; `r` on an unstaffed heading is what writes one now.
             workspace.open_overview(window, cx);
+            workspace.focus_tree_node_for_test(HostId::default(), heading, window, cx);
         })
         .unwrap();
-    cx.simulate_keystrokes(*workspace, "shift-r");
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "r");
     workspace
         .update(cx, |workspace, _, _| {
             assert!(workspace.dashboard_has_new_draft_for_test())
@@ -6113,22 +6120,28 @@ fn q_discards_shift_r_draft_from_surface_history(cx: &mut TestAppContext) {
         .update(cx, |workspace, _, _| {
             assert!(
                 workspace.overview_open_for_test(),
-                "history reopened the discarded Shift-R draft"
+                "history reopened the discarded draft"
             )
         })
         .unwrap();
 }
 
 #[gpui::test]
-fn discarding_shift_r_draft_preserves_non_draft_history_cursor(cx: &mut TestAppContext) {
+fn discarding_a_heading_draft_preserves_non_draft_history_cursor(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
+    let mut desk = DeskFixture::new();
+    let heading = desk.note(None, "unstaffed heading");
     let workspace = overview_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
             workspace.configure_surface_history_for_test(&["current"], window, cx);
+            workspace.open_overview(window, cx);
+            workspace.focus_tree_node_for_test(HostId::default(), heading, window, cx);
         })
         .unwrap();
-    cx.simulate_keystrokes(*workspace, "f24 shift-r q f24");
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "r q f24");
     workspace
         .update(cx, |workspace, _, _| {
             assert!(!workspace.overview_open_for_test());
@@ -7115,6 +7128,9 @@ fn an_empty_queue_lands_on_home(cx: &mut TestAppContext) {
                     .iter()
                     .any(|message| message.contains("nothing needs attention"))
             );
+            // Home says it in the buffer, so the echo area stays quiet and
+            // the title still reads "home".
+            assert_eq!(workspace.echo_text_for_test(), None);
         })
         .unwrap();
     let text = buffer_text(&workspace, cx);
@@ -7122,6 +7138,21 @@ fn an_empty_queue_lands_on_home(cx: &mut TestAppContext) {
         text.contains("nothing needs attention"),
         "home text: {text:?}"
     );
+    // The cursor sits on the one line there is, never on the blank row
+    // after it, which would read as an editable line.
+    let editor = active_editor(&workspace, cx);
+    let row = workspace
+        .update(cx, |_, _, cx| {
+            editor.update(cx, |editor, cx| {
+                editor
+                    .selections
+                    .newest::<language::Point>(&editor.display_snapshot(cx))
+                    .head()
+                    .row
+            })
+        })
+        .unwrap();
+    assert_eq!(row, 0, "the cursor left the only line");
 }
 
 #[gpui::test]
@@ -7177,6 +7208,143 @@ fn home_starts_with_the_cursor_on_the_first_row(cx: &mut TestAppContext) {
                     host: HostId::default(),
                     node_id: first,
                 }
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn new_agent_opens_the_draft_page_and_files_under_the_area(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let mut desk = DeskFixture::new();
+    let area = desk.due_note(None, "the area in view");
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Ready {
+                    agents: Vec::new(),
+                    iris_agent: None,
+                    // The one registered project is the workdir the draft
+                    // inherits when the area names none.
+                    projects: vec![rho_ui_proto::UiProject {
+                        path: "/tmp/rho-test-repo".into(),
+                        name: "rho".to_owned(),
+                        description: String::new(),
+                    }],
+                    auth: rho_ui_proto::AuthState {
+                        namespaces: Vec::new(),
+                        disabled_namespaces: Vec::new(),
+                        active_namespace: None,
+                    },
+                    machine_seed: 0,
+                    agent_counter: 1,
+                },
+                window,
+                cx,
+            );
+            workspace.force_host_online(HostId::default());
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // `space n a`, then bare Enter on the offered context row: the row the
+    // cursor is on in Home.
+    cx.simulate_keystrokes(*workspace, "space n a");
+    cx.run_until_parked();
+    cx.dispatch_action(*workspace, crate::MinibufferConfirm);
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                !workspace.has_transient_for_test(),
+                "the new-agent transient is retired: the draft page carries the fields"
+            );
+            assert_eq!(workspace.current_surface_name_for_test(), "draft");
+            assert_eq!(
+                workspace.draft_area_for_test(),
+                Some((HostId::default(), area))
+            );
+            workspace.take_host_messages_for_test(HostId::default());
+        })
+        .unwrap();
+
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.insert("look at the deploy", window, cx)
+            });
+        })
+        .expect("type the first message");
+    cx.dispatch_action(*workspace, crate::SubmitPrompt);
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            let sent = workspace.take_host_messages_for_test(HostId::default());
+            let parent = sent
+                .iter()
+                .find_map(|message| match message {
+                    rho_ui_proto::ClientMessage::NewAgent { desk_parent, .. } => Some(*desk_parent),
+                    _ => None,
+                })
+                .expect("the draft started an agent");
+            assert_eq!(parent, Some(area), "the agent was not filed under the area");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_cold_start_leaves_no_draft_in_the_timeline(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(workspace.current_surface_name_for_test(), "home");
+            // 1.24: the compose buffer nobody asked for was the only way
+            // out of a conversation, because it sat in the timeline from
+            // startup. Now it exists only while `n a` is composing.
+            assert!(
+                workspace
+                    .find_surface(|surface| surface.key == crate::pane::SurfaceKey::Draft)
+                    .is_none(),
+                "a cold start left a draft surface behind"
+            );
+            assert!(
+                !workspace
+                    .surface_history_for_test()
+                    .0
+                    .contains(&"draft".to_owned())
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn shift_r_no_longer_writes_a_desk_draft(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let mut desk = DeskFixture::new();
+    let heading = desk.note(None, "unstaffed heading");
+    let workspace = overview_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.focus_tree_node_for_test(HostId::default(), heading, window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes(*workspace, "shift-r");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                !workspace.dashboard_has_new_draft_for_test(),
+                "shift-r still makes an agent; `space n a` is the one way"
             );
         })
         .unwrap();

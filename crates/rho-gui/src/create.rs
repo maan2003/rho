@@ -53,12 +53,27 @@ struct Area {
 }
 
 impl Workspace {
-    /// The node the reader is looking at: the row under the cursor on the
-    /// desk, else the node behind the surface in view.
+    /// The node the reader is looking at: the row under the cursor on
+    /// Home or the desk, else the node behind the surface in view.
     pub(crate) fn context_area(
         &mut self,
         cx: &mut Context<Self>,
     ) -> Option<(HostId, rho_desk::NodeId)> {
+        // Home is a window onto the same nodes, so its cursor names an
+        // area exactly as the desk's does.
+        if self.active_pane().surface.key == crate::pane::SurfaceKey::Home
+            && let Some(view) = self.home_view()
+        {
+            match view.update(cx, |view, cx| view.cursor_target(cx)) {
+                crate::home::HomeTarget::Card(card) => return Some((card.host, card.node_id)),
+                crate::home::HomeTarget::Agent(agent_id) => {
+                    if let Some(card) = self.dashboard.agent_card_id(agent_id) {
+                        return Some((card.host, card.node_id));
+                    }
+                }
+                crate::home::HomeTarget::None => {}
+            }
+        }
         if let Some(node) = self.dashboard.tree_node_at_cursor(cx) {
             return Some(node);
         }
