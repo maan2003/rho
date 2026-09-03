@@ -985,7 +985,28 @@ fn handle(
                 }))
                 .collect::<Vec<_>>(),
         }),
-        "client.counts" => json!({"ok": true, "channels": state.counts, "mpims": [], "ims": []}),
+        "client.counts" => {
+            // Slack carries the read cursor here as well as in
+            // `conversations.info`; it is the same fact, and this is the
+            // call every client makes at startup.
+            let counts = state
+                .counts
+                .iter()
+                .map(|count| {
+                    let mut count = count.clone();
+                    let read = state
+                        .conversations
+                        .iter()
+                        .find(|conversation| conversation["id"] == count["id"])
+                        .and_then(|conversation| conversation["last_read"].as_str())
+                        .unwrap_or_default()
+                        .to_owned();
+                    count["last_read"] = json!(read);
+                    count
+                })
+                .collect::<Vec<_>>();
+            json!({"ok": true, "channels": counts, "mpims": [], "ims": []})
+        }
         "activity.feed" => {
             let items = state.feed.clone();
             json!({"ok": true, "items": items})
@@ -1076,7 +1097,17 @@ fn handle(
             json!({"ok": true, "messages": messages, "has_more": false})
         }
         "conversations.mark" => {
-            state.marked.push((field("channel"), field("ts")));
+            let (channel, ts) = (field("channel"), field("ts"));
+            // Reading moves the cursor, here as on the server: the next
+            // client to ask sees the conversation read up to this message.
+            if let Some(conversation) = state
+                .conversations
+                .iter_mut()
+                .find(|conversation| conversation["id"] == json!(channel))
+            {
+                conversation["last_read"] = json!(ts);
+            }
+            state.marked.push((channel, ts));
             json!({"ok": true})
         }
         // Slack's two-step upload: reserve a URL, POST the bytes to it, then

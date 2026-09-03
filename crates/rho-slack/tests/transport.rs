@@ -1211,3 +1211,52 @@ async fn a_dm_unread_at_startup_raises_a_card() {
         "a reconnect does not raise them again"
     );
 }
+
+/// Where the unread rule goes. Slack carries the read cursor in the counts
+/// every client asks for at startup, and moves it when a conversation is
+/// marked read, so rho needs no request of its own to know where the reader
+/// stopped.
+#[tokio::test]
+async fn the_read_cursor_comes_with_the_counts_and_moves_when_marked() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_channel("C9", "deploys");
+    fake.set_last_read("C9", "500.0");
+    fake.set_count("C9", true, 0, "900.0");
+    let client = client(&fake);
+
+    let cursor = |counts: rho_slack::api::Counts| {
+        counts
+            .conversations
+            .into_iter()
+            .find(|count| count.channel == ChannelId("C9".into()))
+            .expect("the channel is counted")
+            .last_read
+    };
+    assert_eq!(
+        cursor(client.counts().await.unwrap()),
+        Some(Ts("500.0".into()))
+    );
+
+    client
+        .mark_read(&ChannelId("C9".into()), &Ts("900.0".into()))
+        .await
+        .unwrap();
+    assert_eq!(
+        cursor(client.counts().await.unwrap()),
+        Some(Ts("900.0".into())),
+        "reading moves the cursor, here as on the server"
+    );
+
+    // A conversation nobody has ever read has no cursor, and no rule.
+    fake.add_channel("C10", "quiet");
+    fake.set_count("C10", true, 0, "100.0");
+    let counts = client.counts().await.unwrap();
+    assert_eq!(
+        counts
+            .conversations
+            .into_iter()
+            .find(|count| count.channel == ChannelId("C10".into()))
+            .and_then(|count| count.last_read),
+        None
+    );
+}

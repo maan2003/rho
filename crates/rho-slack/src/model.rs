@@ -299,6 +299,7 @@ impl Model {
                 has_unreads: false,
                 mention_count: 0,
                 latest: None,
+                last_read: None,
             });
         if count
             .latest
@@ -477,11 +478,20 @@ impl Model {
     /// when Slack says another client did. Reading is not a verdict: this
     /// clears the unread counts and leaves every card exactly where it was.
     pub fn mark_read(&mut self, channel: &ChannelId, ts: &Ts) {
-        let _ = ts;
         if let Some(count) = self.counts.get_mut(channel) {
             count.has_unreads = false;
             count.mention_count = 0;
+            // The cursor moves with the badge. A surface already open keeps
+            // its own copy of where the rule goes, so reading here never
+            // moves a rule out from under the reader.
+            count.last_read = Some(ts.clone());
         }
+    }
+
+    /// Slack's read cursor for the conversation: the message the unread
+    /// rule sits under.
+    pub fn last_read(&self, channel: &ChannelId) -> Option<&Ts> {
+        self.counts.get(channel)?.last_read.as_ref()
     }
 
     /// Fills in the body of a message rho already knows about. The feed
@@ -1168,18 +1178,21 @@ mod tests {
                 has_unreads: true,
                 mention_count: 0,
                 latest: Some(Ts("10".into())),
+                last_read: None,
             },
             ConversationCount {
                 channel: ChannelId("D1".into()),
                 has_unreads: true,
                 mention_count: 3,
                 latest: Some(Ts("5".into())),
+                last_read: None,
             },
             ConversationCount {
                 channel: ChannelId("C2".into()),
                 has_unreads: false,
                 mention_count: 0,
                 latest: Some(Ts("99".into())),
+                last_read: None,
             },
         ]);
         let rows = model.conversation_rows();
@@ -1265,6 +1278,7 @@ mod tests {
                 has_unreads: true,
                 mention_count: 1,
                 latest: Some(Ts("300".into())),
+                last_read: None,
             },
             // A channel with unreads is backlog, not an obligation.
             ConversationCount {
@@ -1272,6 +1286,7 @@ mod tests {
                 has_unreads: true,
                 mention_count: 0,
                 latest: Some(Ts("301".into())),
+                last_read: None,
             },
         ]);
         let raised = model.unread_dms(0);

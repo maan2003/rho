@@ -128,6 +128,9 @@ pub struct ConversationCount {
     pub mention_count: u32,
     /// The newest message Slack knows about, which orders the list.
     pub latest: Option<Ts>,
+    /// Slack's own read cursor: everything after it is what the reader has
+    /// not seen. The unread rule is drawn here.
+    pub last_read: Option<Ts>,
 }
 
 impl Client {
@@ -514,6 +517,9 @@ impl Client {
                             mention_count: count["mention_count"].as_u64().unwrap_or(0) as u32,
                             latest: string(&count["latest"])
                                 .filter(|latest| !latest.is_empty())
+                                .map(Ts),
+                            last_read: string(&count["last_read"])
+                                .filter(|read| !read.is_empty() && read.parse::<f64>() != Ok(0.0))
                                 .map(Ts),
                         })
                     }),

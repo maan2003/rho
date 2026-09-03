@@ -56,6 +56,16 @@ pub struct ConversationView {
     /// loaded when the deal opens; the first refresh that brings it in does
     /// the scroll.
     dealt_placed: bool,
+    /// Slack's read cursor as it stood when the surface opened. Opening
+    /// marks the conversation read, so this is taken once and kept: the
+    /// rule has to stay where the reader found it for as long as they are
+    /// reading, or it would vanish out from under them.
+    unread_from: Option<Ts>,
+    /// The message the rule currently sits above, and whether the cursor
+    /// has been put there yet. The first unread may arrive a page later
+    /// than the surface, so both are settled on the refresh that brings it.
+    unread_at: Option<Ts>,
+    unread_placed: bool,
     /// The picture the next message carries, if the reader attached one.
     /// One at a time: a second attachment replaces it, which is what the
     /// chip shows.
@@ -181,6 +191,9 @@ enum Row {
     /// "newer messages not loaded", under the message a hole sits over.
     Newer(Ts),
     Day(String),
+    /// `── new ──`: everything under it arrived since the reader last read
+    /// the conversation.
+    Unread,
     Message(Ts),
     /// The picture waiting to go with the next message, under everything
     /// and over the composer.
@@ -315,6 +328,9 @@ impl ConversationView {
             moved: Moved::default(),
             dealt: None,
             dealt_placed: false,
+            unread_from: None,
+            unread_at: None,
+            unread_placed: false,
             editing_message: None,
             held_compose: None,
             attached: None,
@@ -323,8 +339,23 @@ impl ConversationView {
         };
         view.transcript.attach(&view.editor.clone(), cx);
         session.update(cx, |session, cx| session.open(&source, cx));
+        // Read before the open's own mark can land, and only for a
+        // conversation: a thread's read cursor is Slack's per-thread one,
+        // which is a different fact.
+        if matches!(source, Source::Conversation(_)) {
+            view.unread_from = session
+                .read(cx)
+                .model()
+                .last_read(source.channel())
+                .cloned();
+        }
         view.refresh(window, cx);
-        view.select_compose(window, cx);
+        // A conversation with nothing new opens on the composer, which is
+        // what the reader came to do. One with unread messages opens on the
+        // first of them instead; `refresh` has already put the cursor there.
+        if !view.unread_placed {
+            view.select_compose(window, cx);
+        }
         view
     }
 
@@ -731,6 +762,76 @@ impl ConversationView {
     }
 
     /// Puts the cursor on the dealt message once it is in the transcript.
+    /// Keeps `── new ──` above the first message the reader has not seen.
+    /// The anchor is recomputed rather than remembered because a page of
+    /// older messages can land above it, and the rule belongs over the
+    /// oldest unread one, not over whichever was first on screen.
+    fn refresh_unread(&mut self, cx: &mut Context<Self>) {
+        let Some(from) = self.unread_from.clone() else {
+            return;
+        };
+        let first = first_unread(&self.shown_messages(cx), &from);
+        if first == self.unread_at {
+            return;
+        }
+        self.editing = true;
+        if self.unread_at.is_some() {
+            self.transcript.remove(&Row::Unread, cx);
+        }
+        self.unread_at = first.clone();
+        if let Some(ts) = first {
+            self.transcript
+                .insert_before(Some(&Row::Message(ts)), vec![unread_rule()], cx);
+        }
+        self.editing = false;
+    }
+
+    /// Opens the conversation on the first thing the reader has not read.
+    /// Not the composer, which is where a conversation with nothing new
+    /// opens, and not the top, which is last week. Once only: after that
+    /// the cursor is the reader's own.
+    fn place_unread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.unread_placed || self.dealt.is_some() {
+            return;
+        }
+        // The reader started writing while the page was in flight. Their
+        // cursor is theirs now; the rule is still on screen to scroll to.
+        if !self.input.read(cx).is_empty() {
+            self.unread_placed = true;
+            return;
+        }
+        let Some(ts) = self.unread_at.clone() else {
+            return;
+        };
+        let Some(start) = self
+            .transcript
+            .range_of(&Row::Message(ts))
+            .map(|range| range.start)
+        else {
+            return;
+        };
+        let Some(anchor) = self
+            .multi_buffer
+            .read(cx)
+            .snapshot(cx)
+            .anchor_in_excerpt(start)
+        else {
+            return;
+        };
+        self.unread_placed = true;
+        self.editor.update(cx, |editor, cx| {
+            // Near the top rather than centred: what the reader wants in
+            // front of them is everything under the rule.
+            editor.change_selections(
+                SelectionEffects::scroll(Autoscroll::focused()),
+                window,
+                cx,
+                |selections| selections.select_anchor_ranges([anchor..anchor]),
+            );
+        });
+        self.moved.cursor = Some(self.cursor_row(cx) as u32);
+    }
+
     fn place_dealt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.dealt_placed {
             return;
@@ -792,7 +893,9 @@ impl ConversationView {
         self.revision = revision;
         // A deal may open on a message the tail does not hold yet: the page
         // that brings it in is where the cursor goes.
+        self.refresh_unread(cx);
         self.place_dealt(window, cx);
+        self.place_unread(window, cx);
         self.settle_images(cx);
         self.refresh_chrome(cx);
         self.refresh_holes(cx);
@@ -824,6 +927,9 @@ impl ConversationView {
     fn rebuild(&mut self, cx: &mut Context<Self>) {
         self.editing = true;
         self.transcript.clear(cx);
+        // The rule went with everything else; where it belongs is worked
+        // out again from the run that replaces it.
+        self.unread_at = None;
         let messages = self.shown_messages(cx);
         let mut items = Vec::new();
         let mut last: Option<i64> = None;
@@ -938,6 +1044,7 @@ impl ConversationView {
                 let message = messages.iter().find(|message| &message.ts == ts)?.clone();
                 Some(self.item_for(&message, cx))
             }
+            Row::Unread => Some(unread_rule()),
             Row::Notice | Row::Gap | Row::Newer(_) | Row::Chip => None,
         }
     }
@@ -1179,7 +1286,7 @@ fn reaches_the_top(op: &Op, placed: &impl Placed) -> bool {
     };
     let mut above = placed.above(&before);
     while let Some(key) = above {
-        if !matches!(key, Row::Notice | Row::Gap | Row::Day(_)) {
+        if !matches!(key, Row::Notice | Row::Gap | Row::Day(_) | Row::Unread) {
             return false;
         }
         above = placed.above(&key);
@@ -1672,6 +1779,22 @@ fn mark_dealt(item: &mut Rendered) {
 /// The break between days, which is the only separator the transcript has.
 fn day_item(at: i64) -> Rendered {
     day_rule(day_label(at))
+}
+
+/// The oldest message the reader has not seen, out of the run on screen.
+/// Recomputed on every refresh: a page of older messages landing above can
+/// carry unread ones with it, and the rule belongs over the oldest of them.
+fn first_unread(messages: &[Message], from: &Ts) -> Option<Ts> {
+    messages
+        .iter()
+        .find(|message| message.ts.is_newer_than(from))
+        .map(|message| message.ts.clone())
+}
+
+/// The unread rule. It reads as unread rather than as chrome: a day break
+/// is where the reader is in the week, this is where they stopped.
+fn unread_rule() -> Rendered {
+    muted_item(Row::Unread, "── new ──\n", Class::Unread)
 }
 
 fn day_rule(label: String) -> Rendered {
@@ -2793,6 +2916,40 @@ mod tests {
             restored_compose("refused".into(), "typed since"),
             "refused\ntyped since",
             "neither the refused message nor the new one is dropped"
+        );
+    }
+
+    #[test]
+    fn the_unread_rule_sits_over_the_oldest_message_the_reader_has_not_seen() {
+        let held = |timestamps: &[&str]| {
+            timestamps
+                .iter()
+                .map(|ts| parsed(json!({"ts": ts, "user": "UD", "text": "said"})))
+                .collect::<Vec<_>>()
+        };
+        let read = Ts("300.0".into());
+        assert_eq!(
+            first_unread(&held(&["100.0", "400.0", "500.0"]), &read),
+            Some(Ts("400.0".into()))
+        );
+        // A page of older messages landing above carries unread ones with
+        // it: the rule moves up to the oldest of them, not the one that
+        // happened to be first on screen before.
+        assert_eq!(
+            first_unread(&held(&["100.0", "350.0", "400.0"]), &read),
+            Some(Ts("350.0".into()))
+        );
+        assert_eq!(first_unread(&held(&["100.0", "200.0"]), &read), None);
+
+        let rule = unread_rule();
+        assert_eq!(rule.text, "── new ──\n");
+        assert_eq!(
+            rule.styles
+                .iter()
+                .map(|(class, _)| *class)
+                .collect::<Vec<_>>(),
+            vec![Class::Unread],
+            "it reads as unread, not as chrome"
         );
     }
 }

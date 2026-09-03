@@ -4,9 +4,9 @@ Reconciled against main on 3 Sep. Genuinely open, in order:
 
 - 1.13 avatars (waits on the editor's inline-image inlay), 1.22 rough edges
   (b) soft-wrap column waits on the vendored editor.
-- 2.1 unread rule and cursor on first unread; 2.3 the `3 new` status
-  segment (the anchoring half landed); 2.5 `shift-n` next unread; 2.6 list
-  row counts, time column, and the muted section.
+- 2.3 the `3 new` status segment (the anchoring half landed); 2.5
+  `shift-n` next unread; 2.6 list row counts, time column, and the muted
+  section.
 - 3.1 composer boundary and placeholder; 3.3 completion.
 - 5.1 the one key table, once 2.5 has its key.
 
@@ -293,7 +293,16 @@ done right after the transcript primitive (2.4) and before 2.10:
 
 ## Phase 2: unread, position, and moving around
 
-- [ ] 2.1 Unread rule. Now none. Rho: `── new ──` at `last_read`; opening a
+- [x] 2.1 Unread rule, done 3 Sep: `── new ──` in the unread class sits
+      over the oldest message newer than Slack's read cursor, which arrives
+      in `client.counts` at no extra request. The surface takes the cursor
+      once when it opens, so marking the conversation read does not pull
+      the rule out from under the reader, and a page of older messages
+      landing above moves the rule up to the oldest unread one. The cursor
+      opens on the first unread line; a conversation with nothing new opens
+      on the composer, and a reader already typing keeps their cursor.
+      `G` still goes to the end. Screens `21-01-unread-rule`, `21-02-end`.
+      Rho: `── new ──` at `last_read`; opening a
       conversation puts the cursor on the first unread line, not the
       composer and not the top. `G` still goes to the end. The rule stays
       until the surface is closed.
