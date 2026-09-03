@@ -1,7 +1,10 @@
 # Home
 
-Status: design, decided with the user on 2026-09-03. Changes the cold-start
-and overview rules of `DESK-DESIGN.md`; the dealer itself is untouched.
+Status: decided with the user on 2026-09-03, built the same day
+(`crates/rho-gui/src/home.rs`). Changes the cold-start and overview rules
+of `DESK-DESIGN.md`; the dealer itself is untouched. As built: the desk map
+keeps a root-menu key of its own (`o desk map`); the overview key pressed on
+Home returns to the surface the reader came from.
 
 ## The problem
 
