@@ -435,10 +435,11 @@ impl Session {
             // Which threads are the user's is Slack's list, asked for once
             // per connect, the way the web client asks for it.
             let followed = client.followed_threads().await;
-            (users, conversations, counts, emoji, followed)
+            let muted = client.muted_channels().await;
+            (users, conversations, counts, emoji, followed, muted)
         });
         self._tasks.push(cx.spawn(async move |this, cx| {
-            let Ok((users, conversations, counts, emoji, followed)) = task.await else {
+            let Ok((users, conversations, counts, emoji, followed, muted)) = task.await else {
                 return;
             };
             let _ = this.update(cx, |session, cx| {
@@ -462,6 +463,9 @@ impl Session {
                 }
                 if let Ok(emoji) = emoji {
                     session.model.set_custom_emoji(emoji);
+                }
+                if let Ok(muted) = muted {
+                    session.model.set_muted(muted);
                 }
                 let mut dropped = Vec::new();
                 if let Ok(followed) = followed {

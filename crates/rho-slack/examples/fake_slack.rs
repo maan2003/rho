@@ -74,6 +74,13 @@ async fn main() -> anyhow::Result<()> {
     fake.add_feed_mention("C1", &at(0, 8, 0));
     fake.set_count("C2", true, 1, &backlog_ping);
     fake.add_feed_mention("C2", &backlog_ping);
+    // Slack counts DM messages for us; a channel arrives as `has_unreads`
+    // with no number, so the list has one of each to show.
+    fake.set_unread_count("D1", 3);
+    // One muted channel, unread, so the bottom section of the list is in
+    // every screenshot and is visibly not somewhere the reader is owed.
+    fake.set_count("P1", true, 0, &at(0, 7, 30));
+    fake.mute("P1");
 
     println!("RHO_SLACK_API_BASE={}", fake.api_base());
     println!("ws={}", fake.ws_url());

@@ -126,6 +126,10 @@ pub struct ConversationCount {
     pub channel: ChannelId,
     pub has_unreads: bool,
     pub mention_count: u32,
+    /// How many messages are waiting. Slack only counts these for DMs and
+    /// group DMs (`dm_count`); a channel arrives as `has_unreads` alone and
+    /// gains a number only as messages land while rho is running.
+    pub unread_count: u32,
     /// The newest message Slack knows about, which orders the list.
     pub latest: Option<Ts>,
     /// Slack's own read cursor: everything after it is what the reader has
@@ -515,6 +519,7 @@ impl Client {
                             channel: ChannelId(string(&count["id"])?),
                             has_unreads: count["has_unreads"].as_bool().unwrap_or(false),
                             mention_count: count["mention_count"].as_u64().unwrap_or(0) as u32,
+                            unread_count: count["dm_count"].as_u64().unwrap_or(0) as u32,
                             latest: string(&count["latest"])
                                 .filter(|latest| !latest.is_empty())
                                 .map(Ts),
@@ -530,6 +535,21 @@ impl Client {
 
     /// Marks a conversation read up to `ts`, so the phone and the web client
     /// agree with what rho has shown.
+    /// The channels the user has muted, from `users.prefs.get`. Muting is a
+    /// preference rather than a fact about the channel, so it comes from
+    /// here and not from `conversations.info`; the web client reads it at
+    /// boot the same way, once per connect.
+    pub async fn muted_channels(&self) -> anyhow::Result<Vec<ChannelId>> {
+        let body = self.post_form("users.prefs.get", &[]).await?;
+        Ok(string(&body["prefs"]["muted_channels"])
+            .unwrap_or_default()
+            .split(',')
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(|id| ChannelId(id.to_owned()))
+            .collect())
+    }
+
     pub async fn mark_read(&self, channel: &ChannelId, ts: &Ts) -> anyhow::Result<()> {
         self.post_form(
             "conversations.mark",

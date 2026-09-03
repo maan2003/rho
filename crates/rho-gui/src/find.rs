@@ -410,6 +410,8 @@ mod tests {
                 label: "#design".to_owned(),
                 unread: false,
                 mention_count: 0,
+                unread_count: 0,
+                muted: false,
                 latest: Some(Ts::from("120.000000")),
             }],
             vec![(

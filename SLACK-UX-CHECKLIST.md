@@ -4,7 +4,6 @@ Reconciled against main on 3 Sep. Genuinely open, in order:
 
 - 1.13 avatars (waits on the editor's inline-image inlay), 1.22 rough edges
   (b) soft-wrap column waits on the vendored editor.
-- 2.6 list row counts, time column, and the muted section.
 - 3.1 composer boundary and placeholder; 3.3 completion.
 - 5.1 the one key table.
 
@@ -345,10 +344,19 @@ done right after the transcript primitive (2.4) and before 2.10:
       `!VimDeal` contexts, not plain `n`, which is the reader's search.
       Rig: 25-01-next, 25-02, 25-03, 25-04-list walk group DM ->
       #design -> #random -> @David -> list.
-- [ ] 2.6 Conversation list rows. Now `#design @1`, `@ada unread`, a rule,
+- [x] 2.6 Conversation list rows. Now `#design @1`, `@ada unread`, a rule,
       then the rest. Rho: `label  @2 · 5 new  14:27`; unread first, then by
       recency; muted conversations at the bottom under a rule. No
-      last-message preview. Presence is deferred.
+      last-message preview. Presence is deferred. Landed 3 Sep: the row is
+      the name, then `@2 · 5 new`, then the clock time of the newest
+      message. The number is Slack's `dm_count` for DMs plus everything rho
+      has watched land; a channel unread from before the last start has no
+      number to give and says `unread` rather than inventing one. Muting
+      comes from `users.prefs.get`, once per connect the way the web client
+      reads it, and a muted conversation sinks under the one rule and is
+      never where `shift-n` takes the reader. Screens `26-01-list` and
+      `26-02-live` (a live mention moving #design to the top as
+      `@2 · 1 new`).
 - [x] 2.8 Live updates, done 3 Sep: `reaction_added`/`reaction_removed`
       parse to `WsEvent::Reacted` and are applied to the held message in
       every open surface and the mirror; `Model::note_counts` moves the

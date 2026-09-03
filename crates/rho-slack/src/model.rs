@@ -99,6 +99,13 @@ pub struct ConversationRow {
     pub label: String,
     pub unread: bool,
     pub mention_count: u32,
+    /// How many messages are waiting, when Slack counts them or rho has
+    /// watched them land. Zero with `unread` set means "something is here"
+    /// and no number to put on it.
+    pub unread_count: u32,
+    /// Muted in Slack, from any client. These sit at the bottom of the list
+    /// and never pull the reader with `shift-n`.
+    pub muted: bool,
     pub latest: Option<Ts>,
 }
 
@@ -119,6 +126,8 @@ pub struct Model {
     /// this list: it subscribes a thread the user posts in or is mentioned
     /// in, from any client, so rho never has to remember what it watched.
     followed: BTreeSet<ThreadKey>,
+    /// The channels the user muted, whichever client they muted them in.
+    muted: BTreeSet<ChannelId>,
 }
 
 impl Names for Model {
@@ -162,6 +171,7 @@ impl Model {
             threads: BTreeMap::new(),
             seen: BTreeSet::new(),
             followed: BTreeSet::new(),
+            muted: BTreeSet::new(),
         }
     }
 
@@ -284,6 +294,12 @@ impl Model {
         }
     }
 
+    /// Slack's muted list, replacing whatever rho held: unmuting elsewhere
+    /// has to bring a conversation back up out of the muted section.
+    pub fn set_muted(&mut self, muted: impl IntoIterator<Item = ChannelId>) {
+        self.muted = muted.into_iter().collect();
+    }
+
     /// Moves the list's own counters for a message off the socket. This is
     /// every message, not only the ones that raise a card: the list names
     /// the whole workspace, and without this its badges sit at whatever
@@ -298,6 +314,7 @@ impl Model {
                 channel: message.channel.clone(),
                 has_unreads: false,
                 mention_count: 0,
+                unread_count: 0,
                 latest: None,
                 last_read: None,
             });
@@ -313,9 +330,11 @@ impl Model {
         if from_you {
             count.has_unreads = false;
             count.mention_count = 0;
+            count.unread_count = 0;
             return;
         }
         count.has_unreads = true;
+        count.unread_count += 1;
         if pings_you {
             count.mention_count += 1;
         }
@@ -351,7 +370,8 @@ impl Model {
     }
 
     /// The conversation list: unread first with their counts, then the rest
-    /// by recency. Within a group, the noisier conversation sorts first.
+    /// by recency, and the muted ones under both. Within a group, the
+    /// noisier conversation sorts first.
     pub fn conversation_rows(&self) -> Vec<ConversationRow> {
         let mut rows = self
             .conversations
@@ -363,14 +383,18 @@ impl Model {
                     label: self.label(&conversation.id),
                     unread: count.is_some_and(|count| count.has_unreads),
                     mention_count: count.map_or(0, |count| count.mention_count),
+                    unread_count: count.map_or(0, |count| count.unread_count),
+                    muted: self.muted.contains(&conversation.id),
                     latest: count.and_then(|count| count.latest.clone()),
                 }
             })
             .collect::<Vec<_>>();
         rows.sort_by(|left, right| {
-            right
-                .unread
-                .cmp(&left.unread)
+            // Muted goes to the bottom whatever it holds: the whole point of
+            // muting is that its traffic stops competing for the top.
+            left.muted
+                .cmp(&right.muted)
+                .then_with(|| right.unread.cmp(&left.unread))
                 .then_with(|| right.mention_count.cmp(&left.mention_count))
                 .then_with(|| {
                     let latest = |row: &ConversationRow| {
@@ -392,7 +416,7 @@ impl Model {
     /// nothing left, which is what sends the reader back to the list.
     pub fn next_unread(&self, from: Option<&ChannelId>) -> Option<ChannelId> {
         let rows = self.conversation_rows();
-        let unread = |row: &ConversationRow| row.unread || row.mention_count > 0;
+        let unread = |row: &ConversationRow| !row.muted && (row.unread || row.mention_count > 0);
         let at = from
             .and_then(|from| rows.iter().position(|row| &row.id == from))
             .map_or(0, |at| at + 1);
@@ -498,6 +522,7 @@ impl Model {
         if let Some(count) = self.counts.get_mut(channel) {
             count.has_unreads = false;
             count.mention_count = 0;
+            count.unread_count = 0;
             // The cursor moves with the badge. A surface already open keeps
             // its own copy of where the rule goes, so reading here never
             // moves a rule out from under the reader.
@@ -1194,6 +1219,7 @@ mod tests {
                 channel: ChannelId("C1".into()),
                 has_unreads: true,
                 mention_count: 0,
+                unread_count: 0,
                 latest: Some(Ts("10".into())),
                 last_read: None,
             },
@@ -1201,6 +1227,7 @@ mod tests {
                 channel: ChannelId("D1".into()),
                 has_unreads: true,
                 mention_count: 3,
+                unread_count: 0,
                 latest: Some(Ts("5".into())),
                 last_read: None,
             },
@@ -1208,6 +1235,7 @@ mod tests {
                 channel: ChannelId("C2".into()),
                 has_unreads: false,
                 mention_count: 0,
+                unread_count: 0,
                 latest: Some(Ts("99".into())),
                 last_read: None,
             },
@@ -1226,7 +1254,7 @@ mod tests {
 
     #[test]
     fn a_dm_takes_its_name_from_the_roster() {
-        let mut model = model();
+        let model = model();
         assert_eq!(model.label(&ChannelId("D1".into())), "@ada");
         assert_eq!(model.label(&ChannelId("C1".into())), "#design");
         assert_eq!(
@@ -1255,6 +1283,8 @@ mod tests {
 
         model.note_counts(&message("C1", "101", "U1", "hey <@ME> look"));
         assert_eq!(row(&model, "C1").mention_count, 1);
+        // Two messages watched land, so the list can now say how many.
+        assert_eq!(row(&model, "C1").unread_count, 2);
         // A DM counts as a mention the same way Slack counts it.
         model.note_counts(&message("D1", "102", "U1", "ping"));
         assert_eq!(row(&model, "D1").mention_count, 1);
@@ -1294,6 +1324,7 @@ mod tests {
                 channel: ChannelId("D1".into()),
                 has_unreads: true,
                 mention_count: 1,
+                unread_count: 0,
                 latest: Some(Ts("300".into())),
                 last_read: None,
             },
@@ -1302,6 +1333,7 @@ mod tests {
                 channel: ChannelId("C1".into()),
                 has_unreads: true,
                 mention_count: 0,
+                unread_count: 0,
                 latest: Some(Ts("301".into())),
                 last_read: None,
             },
@@ -1327,6 +1359,7 @@ mod tests {
             channel: ChannelId(channel.into()),
             has_unreads: unread,
             mention_count: 0,
+            unread_count: 0,
             latest: Some(Ts("100".into())),
             last_read: None,
         };
@@ -1346,5 +1379,37 @@ mod tests {
         // still thinks it is: they are looking at it.
         model.set_counts([count("C1", false), count("D1", true)]);
         assert_eq!(model.next_unread(Some(&ChannelId("D1".into()))), None);
+    }
+
+    #[test]
+    fn a_muted_conversation_sinks_and_never_pulls_the_reader() {
+        let mut model = model();
+        model.set_counts([ConversationCount {
+            channel: ChannelId("C1".into()),
+            has_unreads: true,
+            mention_count: 0,
+            unread_count: 4,
+            latest: Some(Ts("300".into())),
+            last_read: None,
+        }]);
+        assert_eq!(model.conversation_rows()[0].id, ChannelId("C1".into()));
+
+        // Muted in another client: it keeps its count, loses its place, and
+        // stops being somewhere `shift-n` will take the reader.
+        model.set_muted([ChannelId("C1".into())]);
+        let rows = model.conversation_rows();
+        assert_eq!(
+            rows.last().map(|row| &row.id),
+            Some(&ChannelId("C1".into()))
+        );
+        assert!(
+            rows.last()
+                .is_some_and(|row| row.muted && row.unread_count == 4)
+        );
+        assert_eq!(model.next_unread(None), None);
+
+        // Unmuted again, and it comes straight back up.
+        model.set_muted([]);
+        assert_eq!(model.conversation_rows()[0].id, ChannelId("C1".into()));
     }
 }

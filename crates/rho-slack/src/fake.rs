@@ -73,6 +73,8 @@ struct State {
     /// puts the composer in: a message on its way, and one refused.
     send_delay_ms: u64,
     send_fails: bool,
+    /// The channels the user has muted, as `users.prefs.get` lists them.
+    muted: Vec<String>,
     /// Bytes that arrived through the upload URL, by the file id the
     /// upload was reserved under. Serving them back at `/files/` is what
     /// makes a sent picture the same round trip as a received one.
@@ -253,6 +255,23 @@ impl Fake {
             "mention_count": mentions,
             "latest": latest,
         }));
+    }
+
+    /// Mutes a channel, as the user would have in any client.
+    pub fn mute(&self, channel: &str) {
+        self.state.lock().unwrap().muted.push(channel.to_owned());
+    }
+
+    /// Slack's own unread number, which it keeps for DMs and group DMs only.
+    pub fn set_unread_count(&self, channel: &str, unread: u32) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(count) = state
+            .counts
+            .iter_mut()
+            .find(|count| count["id"] == json!(channel))
+        {
+            count["dm_count"] = json!(unread);
+        }
     }
 
     /// Adds a message to a conversation's history, and to the activity feed
@@ -722,6 +741,15 @@ fn apply_live(state: &mut State, frames: &broadcast::Sender<Frame>, request: &Va
             state.send_delay_ms = request["ms"].as_u64().unwrap_or_default();
             return json!({"ok": true});
         }
+        // Muting, which in Slack is a preference and not a fact about the
+        // channel, so it lands in `users.prefs.get` and nowhere else.
+        "mute" => {
+            state.muted.retain(|held| held != &channel);
+            if request["mute"].as_bool().unwrap_or(true) {
+                state.muted.push(channel);
+            }
+            return json!({"ok": true});
+        }
         "send_fail" => {
             state.send_fails = request["fail"].as_bool().unwrap_or(true);
             return json!({"ok": true});
@@ -892,6 +920,9 @@ fn bump_count(state: &mut State, channel: &str, ts: &str, mentions_me: bool) {
     };
     count["has_unreads"] = json!(true);
     count["latest"] = json!(ts);
+    if let Some(unread) = count["dm_count"].as_u64() {
+        count["dm_count"] = json!(unread + 1);
+    }
     if mentions_me {
         let mentions = count["mention_count"].as_u64().unwrap_or(0) + 1;
         count["mention_count"] = json!(mentions);
@@ -954,6 +985,10 @@ fn handle(
             }
         }
         "emoji.list" => json!({"ok": true, "emoji": state.emoji}),
+        "users.prefs.get" => json!({
+            "ok": true,
+            "prefs": {"muted_channels": state.muted.join(",")},
+        }),
         // Slack's own client sends this when a reader leaves a thread; it is
         // the only way to quiet a thread's unread badge without posting.
         "subscriptions.thread.mark" => json!({"ok": true}),

@@ -1260,3 +1260,66 @@ async fn the_read_cursor_comes_with_the_counts_and_moves_when_marked() {
         None
     );
 }
+
+/// Muting is a preference, not a fact about the channel, so it arrives from
+/// `users.prefs.get` and follows the user between clients. Slack's own unread
+/// number rides along with the counts for DMs, which is where the list's
+/// `5 new` comes from before rho has watched anything land.
+#[tokio::test]
+async fn muting_and_the_dm_count_come_back_from_the_server() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_channel("C9", "noise");
+    fake.set_count("C9", true, 0, "900.0");
+    fake.add_channel("D9", "ada");
+    fake.set_count("D9", true, 0, "901.0");
+    fake.set_unread_count("D9", 5);
+    let client = client(&fake);
+
+    assert_eq!(client.muted_channels().await.unwrap(), Vec::new());
+    let unread = |counts: rho_slack::api::Counts, channel: &str| {
+        counts
+            .conversations
+            .into_iter()
+            .find(|count| count.channel == ChannelId(channel.into()))
+            .expect("the conversation is counted")
+            .unread_count
+    };
+    let counts = client.counts().await.unwrap();
+    assert_eq!(unread(counts.clone(), "D9"), 5);
+    assert_eq!(
+        unread(counts, "C9"),
+        0,
+        "a channel has no number of its own, only `has_unreads`"
+    );
+
+    let poke = reqwest::Client::new();
+    let muted: serde_json::Value = poke
+        .post(fake.control_url())
+        .json(&json!({"kind": "mute", "channel": "C9"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(muted["ok"], json!(true));
+    assert_eq!(
+        client.muted_channels().await.unwrap(),
+        vec![ChannelId("C9".into())]
+    );
+
+    let _: serde_json::Value = poke
+        .post(fake.control_url())
+        .json(&json!({"kind": "mute", "channel": "C9", "mute": false}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        client.muted_channels().await.unwrap(),
+        Vec::new(),
+        "unmuting elsewhere has to come back too"
+    );
+}

@@ -1,7 +1,8 @@
 //! The way in: every conversation on one line, unread first.
 //!
-//! Unread before read, mentions before plain unreads, then recency — the
-//! order a person actually wants to walk. The listing is generated read-only
+//! Unread before read, mentions before plain unreads, then recency, with the
+//! muted ones under a rule at the bottom — the order a person actually wants
+//! to walk. The listing is generated read-only
 //! text in an ordinary editor, so motions and search come for free, and the
 //! cursor is restored by the conversation it was sitting on rather than by
 //! line number: an arriving message must not move the selection under a
@@ -19,7 +20,7 @@ use theme::ActiveTheme as _;
 use crate::model::ConversationRow;
 use crate::session::{Session, Source, Status};
 use crate::types::ChannelId;
-use crate::ui::{Class, Hooks, Span, apply_highlights, lay_out};
+use crate::ui::{Class, Hooks, Span, apply_highlights, clock_time, lay_out};
 
 pub struct ListView {
     session: Entity<Session>,
@@ -210,8 +211,9 @@ impl ListView {
     }
 }
 
-/// One line per conversation: the name, then its unread count, then how
-/// recently it spoke. No ids and no timestamps.
+/// One line per conversation: the name, what is waiting in it, and when it
+/// last spoke. No ids and no last-message preview — the list is for choosing
+/// where to go, and a preview is the conversation's job.
 fn render_rows(rows: &[ConversationRow], filter: &str) -> (Vec<Vec<Span>>, Vec<Option<ChannelId>>) {
     let needle = filter.trim().to_lowercase();
     let matching = rows
@@ -227,26 +229,47 @@ fn render_rows(rows: &[ConversationRow], filter: &str) -> (Vec<Vec<Span>>, Vec<O
     }
     let mut lines = Vec::with_capacity(matching.len());
     let mut targets = Vec::with_capacity(matching.len());
-    let mut unread_section = false;
+    let mut muted_section = false;
     for row in matching {
-        let mut spans = Vec::new();
-        // One break between what is waiting and what is merely there, so
-        // the eye stops where the reading stops.
-        if !unread_section && row.unread {
-            unread_section = true;
-        } else if unread_section && !row.unread {
-            unread_section = false;
+        // The one break in the list: everything under it was muted, so an
+        // unread there is not something the reader owes anybody.
+        if row.muted && !muted_section {
+            muted_section = true;
             lines.push(vec![Span::styled("─────", Class::Muted)]);
             targets.push(None);
         }
-        spans.push(Span::styled(row.label.clone(), Class::Conversation));
+        let mut spans = vec![Span::styled(row.label.clone(), Class::Conversation)];
+        let mut waiting = Vec::new();
         if row.mention_count > 0 {
-            spans.push(Span::styled(
-                format!("  @{}", row.mention_count),
+            waiting.push(Span::styled(
+                format!("@{}", row.mention_count),
                 Class::Mention,
             ));
-        } else if row.unread {
-            spans.push(Span::styled("  unread", Class::Unread));
+        }
+        // A number when there is one to give. Slack counts DMs for us and
+        // rho counts what it watched land; a channel unread since before
+        // the last start has neither, and says so in words.
+        if row.unread_count > 0 {
+            waiting.push(Span::styled(
+                format!("{} new", row.unread_count),
+                Class::Unread,
+            ));
+        } else if row.unread && row.mention_count == 0 {
+            waiting.push(Span::styled("unread", Class::Unread));
+        }
+        for (at, span) in waiting.into_iter().enumerate() {
+            spans.push(Span::plain(match at {
+                0 => "  ",
+                _ => " · ",
+            }));
+            spans.push(span);
+        }
+        if let Some(latest) = &row.latest {
+            spans.push(Span::plain("  "));
+            spans.push(Span::styled(
+                clock_time(latest.epoch_seconds() as i64),
+                Class::Time,
+            ));
         }
         lines.push(spans);
         targets.push(Some(row.id.clone()));
@@ -275,7 +298,9 @@ mod tests {
             label: label.to_owned(),
             unread,
             mention_count: mentions,
-            latest: Some(Ts("1.0".into())),
+            unread_count: 0,
+            muted: false,
+            latest: None,
         }
     }
 
@@ -284,20 +309,37 @@ mod tests {
     }
 
     #[test]
-    fn unread_conversations_sit_above_the_rest_behind_one_break() {
-        let (lines, targets) = render_rows(
-            &[
-                row("#design", true, 2),
-                row("@ada", true, 0),
-                row("#random", false, 0),
-            ],
-            "",
+    fn a_row_carries_its_counts_and_the_time_it_last_spoke() {
+        let mut design = row("#design", true, 2);
+        design.unread_count = 5;
+        // A fixed instant so the clock column is the same wherever this
+        // runs: the offset is the machine's, the format is what is asserted.
+        design.latest = Some(Ts("1755780420.000100".into()));
+        let expected = format!(
+            "#design  @2 · 5 new  {}",
+            crate::ui::clock_time(1_755_780_420)
         );
+        let (lines, _) = render_rows(&[design], "");
+        assert_eq!(text(&lines[0]), expected);
+    }
+
+    #[test]
+    fn a_channel_unread_from_before_the_last_start_says_so_in_words() {
+        // Slack counts messages for DMs only, so a channel that was already
+        // unread at connect has no number to show and must not invent one.
+        let (lines, _) = render_rows(&[row("#design", true, 0)], "");
+        assert_eq!(text(&lines[0]), "#design  unread");
+    }
+
+    #[test]
+    fn muted_conversations_sit_at_the_bottom_under_one_break() {
+        let mut muted = row("#noise", true, 0);
+        muted.muted = true;
+        let (lines, targets) = render_rows(&[row("#design", true, 2), muted], "");
         assert_eq!(text(&lines[0]), "#design  @2");
-        assert_eq!(text(&lines[1]), "@ada  unread");
-        assert_eq!(text(&lines[2]), "─────", "read conversations start here");
-        assert_eq!(targets[2], None, "the break opens nothing");
-        assert_eq!(text(&lines[3]), "#random");
+        assert_eq!(text(&lines[1]), "─────", "muted conversations start here");
+        assert_eq!(targets[1], None, "the break opens nothing");
+        assert_eq!(text(&lines[2]), "#noise  unread");
     }
 
     #[test]
