@@ -13,18 +13,23 @@ your call" into a message and hoping.
 
 ## The idea: a self-declared status, phrased as what the human should do
 
-The user's three, in their words:
+The three, named as the agent's speech acts (settled 3 Sep after two
+renames; the user's original words in quotes):
 
-- **show**: "working and not blocked on the human, but I have some stuff to
-  show". Most of a primary agent's life. The human looks out of interest.
-- **needs input**: "might not be totally blocked, but the human would help
-  massively".
-- **check**: "the human should check its response". A question answered,
-  or a task finished: without the look it was useless, and a finished task
-  usually has a follow-up. First named `done`; renamed on 3 Sep because it
-  is about the exchange, not the task: an agent can be mid-work and still
-  owe the human a look at the reply it just gave. Check nests inside
-  working; done did not.
+- **heads-up**: "working and not blocked on the human, but I have some
+  stuff to show". Unprompted news the agent judges worth a look. Most of a
+  primary agent's life. The human looks out of interest.
+- **ask**: "might not be totally blocked, but the human would help
+  massively". The agent needs something from the human.
+- **answer**: "the human should check its response". The human asked or
+  assigned something and this reply is the answer; without the look the
+  exchange was useless, and a finished task usually has a follow-up.
+  First `done`, then `check`: renamed because it is about the exchange,
+  not the task. An agent can be mid-work and still owe the human a look at
+  the reply it just gave, so answer nests inside working. A reply that
+  answers nothing ("ok" → "noted") is not an answer and declares nothing;
+  the agent judges that, it is never derived from what triggered the
+  turn.
 
 Added in the talk that followed:
 
@@ -32,17 +37,17 @@ Added in the talk that followed:
   an element, and whether the agent is running or idle is the daemon's
   observation, not a declaration (the user's call on 3 Sep, over an
   earlier draft that had quiet as a declared default).
-- **show is Slack's mention; unread is separate.** New output is a system
-  fact. Show is the agent's judgement that something is worth the human's
-  eyes. Keep both, like a channel with chatter versus one where the human
-  was named.
-- **needs input carries two details, not two more states:** blocked or not
+- **heads-up is Slack's mention; unread is separate.** New output is a
+  system fact. Heads-up is the agent's judgement that something is worth
+  the human's eyes. Keep both, like a channel with chatter versus one
+  where the human was named.
+- **ask carries two details, not two more states:** blocked or not
   (blocked burns the agent's time and context), and the kind of ask: a
   decision, or an act only the human can do (restart the daemon, push,
   approve). The act kind is the one that goes unnoticed today.
-- **check is Slack's "replied".** The agent's turn ended with a result and
-  the ball is with the human; its twin, a turn that ended with a question,
-  is needs input. The deal bar words already exist: `needs reply · 1.9h`,
+- **answer is Slack's "replied".** The agent's turn ended with a result
+  and the ball is with the human; its twin, a turn that ended with a
+  question, is ask. The deal bar words already exist: `needs reply · 1.9h`,
   `finished · 40m`.
 - **went wrong is observed, never self-declared:** stalled (no events for
   minutes), crashed, waiting on a tool permission. Comes from the system,
@@ -54,16 +59,16 @@ Added in the talk that followed:
 
 ## Ranking: by what burns
 
-Went wrong and needs-input-blocked: steep. Check: medium, the human forgets
-and the agent's context goes cold. Needs-input-not-blocked: between. Show:
+Went wrong and a blocked ask: steep. Answer: medium, the human forgets
+and the agent's context goes cold. An unblocked ask: between. Heads-up:
 flat, the human comes when interested. Nothing declared: below the cutoff. The agent
 sets the state and the reason; the curve is the human's, never the agent's.
 
 ## What clears each, or the status rots
 
-Show and check clear when the human opens the transcript (the read cursor,
-as in Slack). Needs input clears when the human replies or performs the
-act. Every status clears when the agent starts a new turn, so a stale check
+Heads-up and answer clear when the human opens the transcript (the read
+cursor, as in Slack). Ask clears when the human replies or performs the
+act. Every status clears when the agent starts a new turn, so a stale answer
 cannot outlive the next piece of work. An agent with a question
 and things to show reports the higher one, the question on top.
 
@@ -74,11 +79,11 @@ response, as a small XML element, so declaring costs nothing and needs no
 tool round trip:
 
 ```xml
-<rho-wants kind="needs-input" blocked="false" ask="decision"/>
+<rho-wants kind="ask" blocked="false" for="decision"/>
 ```
 
-`kind` is one of `show`, `needs-input`, `check`; `blocked` and `ask`
-(`decision` or `act`) only on `needs-input`. No body: the user's call on
+`kind` is one of `heads-up`, `ask`, `answer`; `blocked` and `for`
+(`decision` or `act`) only on `ask`. No body: the user's call on
 3 Sep, a reason line is tokens spent repeating what the reply already
 says. The reason shown on Home and in the deal bar is the last line of the
 turn's own text, which Home shows for a running agent anyway. The daemon
