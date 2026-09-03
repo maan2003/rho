@@ -730,10 +730,13 @@ fn apply_live(state: &mut State, frames: &broadcast::Sender<Frame>, request: &Va
                 "" => "UD".to_owned(),
                 user => user.to_owned(),
             };
+            // Taking one off is the same route: Slack has one reaction on a
+            // message from the client's side, added or removed.
+            let removing = request["remove"].as_bool().unwrap_or(false);
             let Some(message) = message_mut(state, &channel, &ts) else {
                 return json!({"ok": false, "error": "message_not_found"});
             };
-            let reactions = message["reactions"]
+            let mut reactions = message["reactions"]
                 .as_array()
                 .cloned()
                 .unwrap_or_default()
@@ -741,23 +744,27 @@ fn apply_live(state: &mut State, frames: &broadcast::Sender<Frame>, request: &Va
                 .map(|mut reaction| {
                     if reaction["name"] == json!(name) {
                         let mut users = reaction["users"].as_array().cloned().unwrap_or_default();
-                        users.push(json!(user));
+                        if removing {
+                            users.retain(|held| held != &json!(user));
+                        } else {
+                            users.push(json!(user));
+                        }
                         reaction["count"] = json!(users.len());
                         reaction["users"] = json!(users);
                     }
                     reaction
                 })
+                .filter(|reaction| reaction["count"] != json!(0))
                 .collect::<Vec<_>>();
             let had = reactions
                 .iter()
                 .any(|reaction| reaction["name"] == json!(name));
-            let mut reactions = reactions;
-            if !had {
+            if !had && !removing {
                 reactions.push(json!({"name": name, "users": [user], "count": 1}));
             }
             message["reactions"] = json!(reactions);
             push(json!({
-                "type": "reaction_added",
+                "type": if removing { "reaction_removed" } else { "reaction_added" },
                 "user": user,
                 "reaction": name,
                 "item": {"type": "message", "channel": channel, "ts": ts},

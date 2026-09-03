@@ -591,6 +591,24 @@ async fn the_control_route_drives_live_events_over_the_socket() {
 
     control(json!({"kind": "reaction", "channel": "C1", "ts": &ts, "user": "UD", "name": "eyes"}))
         .await;
+    let Wire::Frame(WsEvent::Reacted {
+        ts: on,
+        name,
+        added,
+        ..
+    }) = next_wire(&mut receiver).await
+    else {
+        panic!("a reaction reaches the socket");
+    };
+    assert_eq!((on, name, added), (Ts(ts.clone()), "eyes".to_owned(), true));
+    control(
+        json!({"kind": "reaction", "channel": "C1", "ts": &ts, "user": "UD", "name": "eyes", "remove": true}),
+    )
+    .await;
+    let Wire::Frame(WsEvent::Reacted { added, .. }) = next_wire(&mut receiver).await else {
+        panic!("taking a reaction off reaches the socket too");
+    };
+    assert!(!added);
     control(json!({"kind": "edit", "channel": "C1", "ts": &ts, "text": "edited by control"})).await;
     // History is the proof the events are real: a client that reopens the
     // conversation must see exactly what the socket announced.

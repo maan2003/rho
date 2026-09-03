@@ -23,7 +23,7 @@ use crate::health::{Health, Signal};
 use crate::mirror::{Mirror, Scope};
 use crate::model::{Change, ConversationRow, Model};
 use crate::socket::{Timings, Wire, poll_feed, run_feed, run_socket};
-use crate::types::{ChannelId, Message, ThreadKey, Ts};
+use crate::types::{ChannelId, Message, Reaction, ThreadKey, Ts, UserId};
 
 /// How often health is re-examined. An outage produces no events at all, so
 /// something has to look at the clock.
@@ -193,6 +193,44 @@ impl Loaded {
         true
     }
 
+    /// An emoji on a held message. Slack sends the reaction, never the
+    /// message it landed on, so the count is kept here rather than paid for
+    /// with a refetch of the whole conversation.
+    fn react(&mut self, ts: &Ts, user: &UserId, name: &str, added: bool) -> bool {
+        let Some(held) = self.messages.iter_mut().find(|held| &held.ts == ts) else {
+            return false;
+        };
+        let at = held.reactions.iter().position(|held| held.name == name);
+        match (at, added) {
+            (None, true) => held.reactions.push(Reaction {
+                name: name.to_owned(),
+                count: 1,
+                users: vec![user.clone()],
+            }),
+            (Some(index), true) => {
+                let reaction = &mut held.reactions[index];
+                if reaction.users.contains(user) {
+                    return false;
+                }
+                reaction.users.push(user.clone());
+                // Slack truncates the user list on a heavily reacted
+                // message, so the count is its own number, not a length.
+                reaction.count += 1;
+            }
+            (Some(index), false) => {
+                let reaction = &mut held.reactions[index];
+                reaction.users.retain(|held| held != user);
+                reaction.count = reaction.count.saturating_sub(1);
+                if reaction.count == 0 {
+                    held.reactions.remove(index);
+                }
+            }
+            (None, false) => return false,
+        }
+        self.record(Update::Replaced(ts.clone()));
+        true
+    }
+
     fn remove(&mut self, ts: &Ts) -> bool {
         let Some(index) = self.messages.iter().position(|held| &held.ts == ts) else {
             return false;
@@ -219,6 +257,15 @@ pub struct Session {
     /// What rho already knows, on disk. Surfaces render from here before the
     /// network answers, and a refresh asks only for what it does not hold.
     mirror: Option<Arc<Mirror>>,
+    /// The conversation last opened, which is the one on screen. Only this
+    /// one re-syncs its tail: every conversation ever opened stays in
+    /// `loaded`, and re-syncing all of them would spend a request a minute
+    /// on each.
+    focused: Option<Source>,
+    /// Whether a connection has already been made. The roster fetch covers
+    /// the first one; a later one is a reconnect, and what happened during
+    /// the outage has to be asked for.
+    connected_once: bool,
     _tasks: Vec<Task<()>>,
 }
 
@@ -238,6 +285,8 @@ impl Session {
                 pending_sends: 0,
                 cached_files: HashMap::new(),
                 mirror: open_mirror(),
+                focused: None,
+                connected_once: false,
                 _tasks: Vec::new(),
             },
         }
@@ -254,6 +303,8 @@ impl Session {
             pending_sends: 0,
             cached_files: HashMap::new(),
             mirror: open_mirror(),
+            focused: None,
+            connected_once: false,
             _tasks: Vec::new(),
         };
         session.seed_from_mirror();
@@ -410,6 +461,13 @@ impl Session {
                 self.model.set_self(connection.self_id);
                 let signal = self.health.connected(now);
                 self.signal(signal, cx);
+                // What the outage swallowed is not replayed by Slack: the
+                // list's counters and the open transcript are both stale by
+                // exactly as long as the socket was down.
+                if std::mem::replace(&mut self.connected_once, true) {
+                    self.refresh_counts(cx);
+                }
+                self.resync_tail(cx);
                 cx.emit(SessionEvent::Connected);
             }
             Wire::Frame(WsEvent::Message(message)) => {
@@ -435,6 +493,15 @@ impl Session {
                     self.announce(vec![Change::Discarded(key)], cx);
                 }
             }
+            Wire::Frame(WsEvent::Reacted {
+                channel,
+                ts,
+                user,
+                name,
+                added,
+            }) => {
+                self.react(&channel, &ts, &user, &name, added);
+            }
             Wire::Frame(WsEvent::Marked { channel, ts }) => {
                 // Read elsewhere. Only the badge is stale: reading is not a
                 // verdict, so every card stays exactly where it was.
@@ -450,6 +517,7 @@ impl Session {
             Wire::Feed(items) => {
                 let signal = self.health.feed_ok();
                 self.signal(signal, cx);
+                self.resync_tail(cx);
                 let mut changes = Vec::new();
                 for item in &items {
                     if let Some(change) = self.model.note_activity(item, now) {
@@ -476,6 +544,9 @@ impl Session {
     }
 
     fn receive(&mut self, message: Message, now: i64, cx: &mut Context<Self>) {
+        // The counters move for channel traffic too: the list is the whole
+        // workspace, and `note_message` answers only about cards.
+        self.model.note_counts(&message);
         let change = self.model.note_message(&message, now);
         self.route(&message);
         self.announce(change.into_iter().collect(), cx);
@@ -582,6 +653,75 @@ impl Session {
         }
     }
 
+    /// A reaction from any client, applied in place to every open surface
+    /// holding the message and to the mirror behind them.
+    fn react(&mut self, channel: &ChannelId, ts: &Ts, user: &UserId, name: &str, added: bool) {
+        let sources = self
+            .loaded
+            .keys()
+            .filter(|source| source.channel() == channel)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut reacted = None;
+        for source in sources {
+            if let Some(loaded) = self.loaded.get_mut(&source)
+                && loaded.react(ts, user, name, added)
+            {
+                reacted = loaded.messages.iter().find(|held| &held.ts == ts).cloned();
+            }
+        }
+        let Some(message) = reacted else {
+            return;
+        };
+        if let Some(mirror) = self.mirror.as_ref() {
+            let workspace = self.model.workspace().0.clone();
+            let thread = Scope::thread(&workspace, channel, &message.thread_root());
+            mirror.insert_messages(&thread, std::slice::from_ref(&message));
+            if message.is_top_level() {
+                let conversation = Scope::conversation(&workspace, channel);
+                mirror.insert_messages(&conversation, std::slice::from_ref(&message));
+            }
+        }
+    }
+
+    /// Asks the conversation on screen for anything newer than its last
+    /// message. The socket is the fast path, not the reliable one: a socket
+    /// that dies without saying so delivers nothing, and this is what makes
+    /// that case a minute of lag instead of silence.
+    fn resync_tail(&mut self, cx: &mut Context<Self>) {
+        let Some(source @ Source::Conversation(_)) = self.focused.clone() else {
+            return;
+        };
+        let Some(loaded) = self.loaded.get(&source) else {
+            return;
+        };
+        if loaded.loading {
+            return;
+        }
+        let Some(since) = loaded.messages.last().map(|last| last.ts.clone()) else {
+            return;
+        };
+        self.fetch(source, None, false, Some(since), cx);
+    }
+
+    /// The unread counts again, after an outage. Nothing else in the roster
+    /// goes stale off a dropped socket, so nothing else is asked for.
+    fn refresh_counts(&mut self, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let task = gpui_tokio::Tokio::spawn(cx, async move { client.counts().await });
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let Ok(Ok(counts)) = task.await else {
+                return;
+            };
+            let _ = this.update(cx, |session, cx| {
+                session.model.set_counts(counts.conversations);
+                cx.notify();
+            });
+        }));
+    }
+
     /// The open surfaces a message belongs to: its conversation, and the
     /// thread it was said in.
     fn sources_for(&self, channel: &ChannelId, thread_ts: &Ts) -> Vec<Source> {
@@ -643,6 +783,7 @@ impl Session {
 
     /// Loads a conversation's newest page the first time it is entered.
     pub fn open(&mut self, source: &Source, cx: &mut Context<Self>) {
+        self.focused = Some(source.clone());
         if self.loaded.contains_key(source) {
             return;
         }
@@ -1820,5 +1961,41 @@ mod tests {
         }
         assert_eq!(loaded.updates_since(0), None, "the log no longer reaches");
         assert!(loaded.updates_since(loaded.revision() - 1).is_some());
+    }
+
+    #[test]
+    fn a_reaction_lands_on_the_held_message_and_leaves_with_the_last_reader() {
+        let mut loaded = Loaded::default();
+        loaded.insert(message("1.0", "hello"));
+        let ts = Ts("1.0".into());
+        let you = UserId("ME".into());
+        let them = UserId("U9".into());
+        assert!(loaded.react(&ts, &you, "eyes", true));
+        assert!(
+            !loaded.react(&ts, &you, "eyes", true),
+            "the same reader twice is still one reaction"
+        );
+        assert!(loaded.react(&ts, &them, "eyes", true));
+        assert_eq!(loaded.messages[0].reactions[0].count, 2);
+        assert!(loaded.react(&ts, &them, "eyes", false));
+        assert!(loaded.react(&ts, &you, "eyes", false));
+        assert!(
+            loaded.messages[0].reactions.is_empty(),
+            "the last one off takes the row with it"
+        );
+        assert!(
+            !loaded.react(&Ts("9.0".into()), &you, "eyes", true),
+            "a reaction on a message not held changes nothing"
+        );
+        // The surface rewrites that one line rather than the transcript.
+        assert_eq!(
+            loaded.updates_since(1),
+            Some(vec![
+                Update::Replaced(ts.clone()),
+                Update::Replaced(ts.clone()),
+                Update::Replaced(ts.clone()),
+                Update::Replaced(ts),
+            ])
+        );
     }
 }

@@ -7,9 +7,7 @@ Reconciled against main on 3 Sep. Genuinely open, in order:
 - 2.1 unread rule and cursor on first unread; 2.3 the `3 new` status
   segment (the anchoring half landed); 2.5 `shift-n` next unread; 2.6 list
   row counts, time column, and the muted section; 2.7 DMs in `mpim` and
-  unread DMs from `client.counts` at startup (one-to-one DMs landed);
-  2.8 (b) live counts, `reaction_*` frames, and tail re-sync on reconnect
-  (edits and deletions landed with 3.6).
+  unread DMs from `client.counts` at startup (one-to-one DMs landed).
 - 3.1 composer boundary and placeholder; 3.2 `shift-enter`, the muted
   local echo, and keeping the text on a failed send (`enter` sends);
   3.3 completion.
@@ -335,7 +333,13 @@ done right after the transcript primitive (2.4) and before 2.10:
       then the rest. Rho: `label  @2 · 5 new  14:27`; unread first, then by
       recency; muted conversations at the bottom under a rule. No
       last-message preview. Presence is deferred.
-- [ ] 2.8 Live updates, reported broken by the user in real use. Phase 0
+- [x] 2.8 Live updates, done 3 Sep: `reaction_added`/`reaction_removed`
+      parse to `WsEvent::Reacted` and are applied to the held message in
+      every open surface and the mirror; `Model::note_counts` moves the
+      list's badges on every frame, including channel traffic, and a
+      reconnect refetches `client.counts`; the conversation on screen
+      re-syncs its tail on connect, on reconnect, and on every feed poll.
+      Reported broken by the user in real use. Phase 0
       found the causes against the fake: (a) `events.rs::parse` drops
       `message_changed`, `message_deleted`, and every `reaction_*` frame,
       so edits and deletions never reach the buffer; (b) `client.counts`

@@ -9,7 +9,7 @@
 use serde_json::Value;
 
 use crate::api::parse_message;
-use crate::types::{ChannelId, Message, Ts};
+use crate::types::{ChannelId, Message, Ts, UserId};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum WsEvent {
@@ -49,6 +49,15 @@ pub enum WsEvent {
         channel: ChannelId,
         thread_ts: Ts,
     },
+    /// An emoji went on or came off a message, from any client. The count
+    /// under the message moves; nothing about the conversation does.
+    Reacted {
+        channel: ChannelId,
+        ts: Ts,
+        user: UserId,
+        name: String,
+        added: bool,
+    },
     /// Slack refused the session on an accepted socket, which is what an
     /// `invalid_auth` handshake failure looks like from the inside.
     Failed(String),
@@ -71,6 +80,7 @@ pub fn parse(frame: &Value) -> WsEvent {
             WsEvent::Failed(message.to_owned())
         }
         "message" => parse_message_frame(frame),
+        kind @ ("reaction_added" | "reaction_removed") => reaction(frame, kind == "reaction_added"),
         // `thread` frames announce activity in a thread; the reply itself
         // arrives as an ordinary `message` with a `thread_ts`, so the model
         // learns nothing new here and the frame is deliberately dropped.
@@ -107,6 +117,25 @@ pub fn parse(frame: &Value) -> WsEvent {
                 ts: Ts(last_read.to_owned()),
             },
             _ => WsEvent::Ignored,
+        },
+        _ => WsEvent::Ignored,
+    }
+}
+
+/// A reaction frame names the message it lands on inside `item`; a reaction
+/// on a file or a comment names no message timestamp and is not ours.
+fn reaction(frame: &Value, added: bool) -> WsEvent {
+    let item = &frame["item"];
+    let channel = item["channel"].as_str().filter(|it| !it.is_empty());
+    let ts = item["ts"].as_str().filter(|it| !it.is_empty());
+    let name = frame["reaction"].as_str().filter(|it| !it.is_empty());
+    match (channel, ts, name) {
+        (Some(channel), Some(ts), Some(name)) => WsEvent::Reacted {
+            channel: ChannelId(channel.to_owned()),
+            ts: Ts(ts.to_owned()),
+            user: UserId(frame["user"].as_str().unwrap_or_default().to_owned()),
+            name: name.to_owned(),
+            added,
         },
         _ => WsEvent::Ignored,
     }
@@ -296,6 +325,45 @@ mod tests {
                 channel: ChannelId("C1".into()),
                 ts: Ts("31.0".into()),
             }
+        );
+    }
+
+    #[test]
+    fn reactions_name_the_message_they_land_on() {
+        assert_eq!(
+            parse(&json!({
+                "type": "reaction_added",
+                "user": "U9",
+                "reaction": "eyes",
+                "item": {"type": "message", "channel": "C1", "ts": "40.0"},
+            })),
+            WsEvent::Reacted {
+                channel: ChannelId("C1".into()),
+                ts: Ts("40.0".into()),
+                user: UserId("U9".into()),
+                name: "eyes".into(),
+                added: true,
+            }
+        );
+        assert!(matches!(
+            parse(&json!({
+                "type": "reaction_removed",
+                "user": "U9",
+                "reaction": "eyes",
+                "item": {"type": "message", "channel": "C1", "ts": "40.0"},
+            })),
+            WsEvent::Reacted { added: false, .. }
+        ));
+        // A reaction on a file names no message, so there is nothing to
+        // rewrite and the frame is not ours.
+        assert_eq!(
+            parse(&json!({
+                "type": "reaction_added",
+                "user": "U9",
+                "reaction": "eyes",
+                "item": {"type": "file", "file": "F1"},
+            })),
+            WsEvent::Ignored
         );
     }
 }

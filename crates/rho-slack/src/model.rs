@@ -284,6 +284,46 @@ impl Model {
         }
     }
 
+    /// Moves the list's own counters for a message off the socket. This is
+    /// every message, not only the ones that raise a card: the list names
+    /// the whole workspace, and without this its badges sit at whatever
+    /// `client.counts` said at connect until the next restart.
+    pub fn note_counts(&mut self, message: &Message) {
+        let from_you = message.user.as_ref() == Some(&self.self_id);
+        let is_dm = self
+            .conversations
+            .get(&message.channel)
+            .is_some_and(|conversation| conversation.kind == ConversationKind::DirectMessage);
+        let pings_you = is_dm || self.mentions_you(message);
+        let count = self
+            .counts
+            .entry(message.channel.clone())
+            .or_insert_with(|| ConversationCount {
+                channel: message.channel.clone(),
+                has_unreads: false,
+                mention_count: 0,
+                latest: None,
+            });
+        if count
+            .latest
+            .as_ref()
+            .is_none_or(|latest| message.ts.is_newer_than(latest))
+        {
+            count.latest = Some(message.ts.clone());
+        }
+        // Posting is reading: a message the user sent from any client marks
+        // the conversation read in Slack, so rho must not badge it here.
+        if from_you {
+            count.has_unreads = false;
+            count.mention_count = 0;
+            return;
+        }
+        count.has_unreads = true;
+        if pings_you {
+            count.mention_count += 1;
+        }
+    }
+
     /// The conversation list: unread first with their counts, then the rest
     /// by recency. Within a group, the noisier conversation sorts first.
     pub fn conversation_rows(&self) -> Vec<ConversationRow> {
@@ -733,8 +773,6 @@ mod tests {
 
     use serde_json::json;
 
-    use super::*;
-
     const DAY: i64 = 86_400_000;
 
     fn model() -> Model {
@@ -1132,5 +1170,37 @@ mod tests {
             "#a conversation",
             "an unknown channel never reads as its id"
         );
+    }
+
+    #[test]
+    fn the_list_counters_move_on_every_frame_not_only_the_raised_ones() {
+        let mut model = model();
+        let row = |model: &Model, channel: &str| {
+            model
+                .conversation_rows()
+                .into_iter()
+                .find(|row| row.id == ChannelId(channel.into()))
+                .expect("the conversation is listed")
+        };
+        // Channel traffic raises nothing and still has to badge the list.
+        model.note_counts(&message("C1", "100", "U1", "shipping today"));
+        let listed = row(&model, "C1");
+        assert!(listed.unread);
+        assert_eq!(listed.mention_count, 0);
+        assert_eq!(listed.latest, Some(Ts("100".into())));
+
+        model.note_counts(&message("C1", "101", "U1", "hey <@ME> look"));
+        assert_eq!(row(&model, "C1").mention_count, 1);
+        // A DM counts as a mention the same way Slack counts it.
+        model.note_counts(&message("D1", "102", "U1", "ping"));
+        assert_eq!(row(&model, "D1").mention_count, 1);
+
+        // Answering from any client is reading: the badge goes out here
+        // rather than waiting for the read marker to come back round.
+        model.note_counts(&message("C1", "103", "ME", "on it"));
+        let listed = row(&model, "C1");
+        assert!(!listed.unread);
+        assert_eq!(listed.mention_count, 0);
+        assert_eq!(listed.latest, Some(Ts("103".into())));
     }
 }
