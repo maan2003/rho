@@ -14,6 +14,11 @@ pub const OUTAGE_GRACE: Duration = Duration::from_secs(180);
 /// Consecutive failed polls before the feed counts as broken. One is a
 /// hiccup; three in a row is Slack refusing us.
 pub const FEED_FAILURE_LIMIT: u32 = 3;
+/// Consecutive failed connections before the socket counts as broken. One is
+/// a reconnect nobody needs to hear about; two in a row is a session Slack is
+/// refusing, and a refused session that says nothing is exactly the silence
+/// this whole module exists to prevent.
+pub const CONNECT_FAILURE_LIMIT: u32 = 2;
 
 /// What the GUI should do about a change in health.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -29,6 +34,7 @@ pub struct Health {
     connected: bool,
     disconnected_since_ms: Option<i64>,
     feed_failures: u32,
+    connect_failures: u32,
     reason: Option<String>,
     /// Set when a socket comes back while degraded: the lamp stays lit until
     /// the catch-up poll that follows has landed, because until then rho
@@ -47,6 +53,7 @@ impl Health {
 
     pub fn connected(&mut self, _now_ms: i64) -> Option<Signal> {
         self.connected = true;
+        self.connect_failures = 0;
         self.disconnected_since_ms = None;
         if self.is_degraded() {
             self.awaiting_catch_up = true;
@@ -54,10 +61,22 @@ impl Health {
         None
     }
 
-    pub fn disconnected(&mut self, now_ms: i64) -> Option<Signal> {
+    /// The socket ended, or never started. `reason` is what Slack or the
+    /// network said, and it reaches the user verbatim: "the socket is down"
+    /// is not actionable, `invalid_auth` is.
+    pub fn disconnected(&mut self, now_ms: i64, reason: &str) -> Option<Signal> {
         self.connected = false;
         self.disconnected_since_ms.get_or_insert(now_ms);
-        None
+        self.connect_failures = self.connect_failures.saturating_add(1);
+        tracing::warn!(
+            reason,
+            failures = self.connect_failures,
+            "slack socket down"
+        );
+        match self.connect_failures >= CONNECT_FAILURE_LIMIT {
+            true => self.degrade(&format!("slack: {reason}")),
+            false => None,
+        }
     }
 
     /// Called on every poll result and on the clock, so an outage that never
@@ -65,7 +84,11 @@ impl Health {
     pub fn tick(&mut self, now_ms: i64) -> Option<Signal> {
         let out_for = self.disconnected_since_ms.map(|since| now_ms - since);
         match out_for {
-            Some(elapsed) if elapsed >= OUTAGE_GRACE.as_millis() as i64 => {
+            // A named reason is never replaced by the generic one: what
+            // Slack said is more use than the fact that time passed.
+            Some(elapsed)
+                if elapsed >= OUTAGE_GRACE.as_millis() as i64 && self.reason.is_none() =>
+            {
                 self.degrade("slack: connection lost")
             }
             _ => None,
@@ -123,16 +146,36 @@ mod tests {
     fn a_short_outage_says_nothing() {
         let mut health = Health::default();
         health.connected(0);
-        health.disconnected(0);
+        assert_eq!(health.disconnected(0, "connection reset"), None);
+        health.connected(MINUTE);
         assert_eq!(health.tick(MINUTE), None, "a reconnect is not news");
         assert!(!health.is_degraded());
+    }
+
+    #[test]
+    fn a_session_slack_keeps_refusing_says_what_slack_said() {
+        let mut health = Health::default();
+        assert_eq!(health.disconnected(0, "connecting to Slack: 401"), None);
+        assert_eq!(
+            health.disconnected(1_000, "connecting to Slack: 401"),
+            Some(Signal::Degraded(
+                "slack: connecting to Slack: 401".to_owned()
+            )),
+            "a refused session names Slack and the error, not silence"
+        );
+        assert_eq!(
+            health.tick(9 * MINUTE),
+            None,
+            "the named reason stands; time passing adds nothing"
+        );
+        assert_eq!(health.reason(), Some("slack: connecting to Slack: 401"));
     }
 
     #[test]
     fn a_long_outage_lights_the_lamp_once_and_clears_only_after_a_catch_up() {
         let mut health = Health::default();
         health.connected(0);
-        health.disconnected(0);
+        health.disconnected(0, "closed");
         assert_eq!(
             health.tick(4 * MINUTE),
             Some(Signal::Degraded("slack: connection lost".to_owned()))
@@ -167,7 +210,7 @@ mod tests {
     fn a_poll_that_lands_while_the_socket_is_down_does_not_clear_the_lamp() {
         let mut health = Health::default();
         health.connected(0);
-        health.disconnected(0);
+        health.disconnected(0, "closed");
         health.tick(4 * MINUTE);
         assert_eq!(health.feed_ok(), None);
         assert!(health.is_degraded(), "the session is still not live");

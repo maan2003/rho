@@ -27,6 +27,9 @@ pub enum WsEvent {
         channel: ChannelId,
         ts: Ts,
     },
+    /// Slack refused the session on an accepted socket, which is what an
+    /// `invalid_auth` handshake failure looks like from the inside.
+    Failed(String),
     Ignored,
 }
 
@@ -38,6 +41,13 @@ pub fn parse(frame: &Value) -> WsEvent {
             Some(url) if !url.is_empty() => WsEvent::ReconnectUrl(url.to_owned()),
             _ => WsEvent::Ignored,
         },
+        "error" => {
+            let message = frame["error"]["msg"]
+                .as_str()
+                .or_else(|| frame["error"].as_str())
+                .unwrap_or("unknown error");
+            WsEvent::Failed(message.to_owned())
+        }
         "message" => parse_message_frame(frame),
         // `thread` frames announce activity in a thread; the reply itself
         // arrives as an ordinary `message` with a `thread_ts`, so the model

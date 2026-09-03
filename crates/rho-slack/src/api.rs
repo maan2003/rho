@@ -20,6 +20,14 @@ const DEFAULT_BASE: &str = "https://slack.com/api";
 /// one request, shallow enough that the first screen paints quickly.
 pub const PAGE: usize = 50;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Slack refuses a websocket handshake that arrives without a user agent,
+/// and an `xoxc` session belongs to the desktop client, so rho presents
+/// itself as one. The same string goes on every HTTP call, so what Slack
+/// accepts from one it accepts from the other.
+const USER_AGENT: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) \
+     Slack/4.36.140 Chrome/120.0.6099.199 Electron/28.1.0 Safari/537.36";
+/// The origin Slack's own client sends on the RTM upgrade.
+const SOCKET_ORIGIN: &str = "https://api.slack.com";
 
 /// The activity types the feed is asked for: everything that can put the user
 /// under an obligation. Reactions and channel chatter are deliberately absent
@@ -126,6 +134,7 @@ impl Client {
         // same provider at startup; whichever runs first wins.
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let http = reqwest::Client::builder()
+            .user_agent(USER_AGENT)
             .timeout(REQUEST_TIMEOUT)
             .build()
             .context("building the Slack HTTP client")?;
@@ -142,6 +151,31 @@ impl Client {
 
     fn endpoint(&self, method: &str) -> String {
         format!("{}/{method}", self.base)
+    }
+
+    /// The websocket upgrade, carrying the same session the API calls do.
+    /// Slack has required this of `xoxc` sessions since 2023: an upgrade
+    /// without the token, the cookie, a user agent, and an origin is answered
+    /// with `invalid_auth`, and then rate-limited. A socket that never asks
+    /// for them is simply silent, which is worse than an error.
+    pub fn socket_request(
+        &self,
+        url: &str,
+    ) -> anyhow::Result<tokio_tungstenite::tungstenite::handshake::client::Request> {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
+
+        let mut request = url
+            .into_client_request()
+            .context("building the Slack websocket handshake")?;
+        let headers = request.headers_mut();
+        headers.insert(
+            "Authorization",
+            format!("Bearer {}", self.credentials.token).parse()?,
+        );
+        headers.insert("Cookie", format!("d={};", self.credentials.cookie).parse()?);
+        headers.insert("User-Agent", USER_AGENT.parse()?);
+        headers.insert("Origin", SOCKET_ORIGIN.parse()?);
+        Ok(request)
     }
 
     fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {

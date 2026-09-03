@@ -351,7 +351,7 @@ async fn serve_socket(
     stream: TcpStream,
     mut frames: broadcast::Receiver<Frame>,
 ) -> anyhow::Result<()> {
-    let mut socket = tokio_tungstenite::accept_async(stream).await?;
+    let mut socket = tokio_tungstenite::accept_hdr_async(stream, check_handshake).await?;
     socket
         .send(Frame::Text(json!({"type": "hello"}).to_string().into()))
         .await?;
@@ -374,6 +374,39 @@ async fn serve_socket(
             }
         }
     }
+}
+
+/// Slack refuses an `xoxc` websocket handshake that does not carry the web
+/// session, and has since 2023. The fake refuses one too, so a client that
+/// forgets a header fails here rather than going silent in front of the user.
+fn check_handshake(
+    request: &tokio_tungstenite::tungstenite::handshake::server::Request,
+    response: tokio_tungstenite::tungstenite::handshake::server::Response,
+) -> Result<
+    tokio_tungstenite::tungstenite::handshake::server::Response,
+    tokio_tungstenite::tungstenite::handshake::server::ErrorResponse,
+> {
+    let header = |name: &str| {
+        request
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let refused = header("authorization").is_empty()
+        || !header("cookie").contains("d=")
+        || header("user-agent").is_empty()
+        || header("origin").is_empty();
+    if refused {
+        let mut error =
+            tokio_tungstenite::tungstenite::handshake::server::ErrorResponse::new(Some(
+                json!({"type": "error", "error": {"msg": "invalid_auth", "code": 401}}).to_string(),
+            ));
+        *error.status_mut() = tokio_tungstenite::tungstenite::http::StatusCode::UNAUTHORIZED;
+        return Err(error);
+    }
+    Ok(response)
 }
 
 async fn serve_api(

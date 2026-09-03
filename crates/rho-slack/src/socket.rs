@@ -119,7 +119,7 @@ pub async fn run_socket(
         if announce && sink.send(Wire::Connected(connection)).await.is_err() {
             return;
         }
-        match pump(&url, &mut sink, &catch_up, timings).await {
+        match pump(&client, &url, &mut sink, &catch_up, timings).await {
             Ok(next_url) => {
                 attempt = 0;
                 reconnect_url = next_url;
@@ -138,12 +138,18 @@ pub async fn run_socket(
 /// One connection's life. Returns the URL to reconnect with when Slack gave
 /// one, or an error describing why the socket ended.
 async fn pump(
+    client: &Client,
     url: &str,
     sink: &mut UnboundedSender<Wire>,
     catch_up: &Notify,
     timings: Timings,
 ) -> Result<Option<String>, String> {
-    let (mut socket, _) = tokio_tungstenite::connect_async(url)
+    // The handshake carries the session: without it Slack answers
+    // `invalid_auth` and the socket is silent rather than wrong.
+    let request = client
+        .socket_request(url)
+        .map_err(|error| format!("connecting to Slack: {error:#}"))?;
+    let (mut socket, _) = tokio_tungstenite::connect_async(request)
         .await
         .map_err(|error| format!("connecting to Slack: {error}"))?;
     catch_up.notify_one();
@@ -187,6 +193,11 @@ async fn pump(
                 match event {
                     WsEvent::Pong => awaiting_pong = false,
                     WsEvent::ReconnectUrl(url) => reconnect_url = Some(url),
+                    // Slack can accept the upgrade and then refuse the
+                    // session, which is the shape `invalid_auth` takes. It
+                    // is not a blip: it backs off like any other failure and
+                    // says what Slack said.
+                    WsEvent::Failed(error) => return Err(format!("Slack refused the socket: {error}")),
                     WsEvent::Ignored => {}
                     event => {
                         if sink.send(Wire::Frame(event)).await.is_err() {

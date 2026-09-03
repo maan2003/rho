@@ -241,7 +241,7 @@ impl Session {
             }
             Wire::Frame(_) => {}
             Wire::Disconnected(reason) => {
-                let signal = self.health.disconnected(now);
+                let signal = self.health.disconnected(now, &reason);
                 self.signal(signal, cx);
                 cx.emit(SessionEvent::Disconnected(reason));
             }

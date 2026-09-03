@@ -521,3 +521,80 @@ async fn the_control_route_drives_live_events_over_the_socket() {
         "a deleted message leaves history"
     );
 }
+
+/// The websocket handshake carries the web session. Slack has refused an
+/// `xoxc` upgrade without it since 2023, and the failure is silent from the
+/// user's side: the socket simply never delivers. The fake refuses the same
+/// way, so a regression fails here rather than in front of the user.
+#[tokio::test]
+async fn the_websocket_handshake_carries_the_session() {
+    let fake = Fake::start().await.unwrap();
+    let client = client(&fake);
+
+    let request = client.socket_request(fake.ws_url()).unwrap();
+    let header = |name: &str| {
+        request
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned()
+    };
+    assert!(header("authorization").starts_with("Bearer xoxc-"));
+    assert!(header("cookie").starts_with("d=cookie"));
+    assert!(!header("user-agent").is_empty());
+    assert_eq!(header("origin"), "https://api.slack.com");
+
+    // The bare upgrade rho used to send is refused.
+    assert!(
+        tokio_tungstenite::connect_async(fake.ws_url())
+            .await
+            .is_err(),
+        "an unauthenticated handshake is not a session"
+    );
+    // The authenticated one is accepted and greets us.
+    let (mut socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+        .await
+        .expect("the fake went quiet")
+        .expect("the socket hung up")
+        .unwrap();
+    assert!(frame.to_text().unwrap().contains("hello"));
+}
+
+/// A session Slack keeps refusing says so. The lamp on its own is a red dot
+/// with no cause; the notice carries what Slack said.
+#[tokio::test]
+async fn a_refused_session_names_slack_and_the_error() {
+    let fake = Fake::start().await.unwrap();
+    // rtm.connect itself failing is the same silence from the user's side.
+    fake.fail_next("rtm.connect", 4);
+    let (sender, mut receiver) = mpsc::unbounded();
+    let _socket = tokio::spawn(run_socket(
+        client(&fake),
+        sender,
+        Arc::new(Notify::new()),
+        timings(),
+    ));
+
+    let Wire::Disconnected(reason) = next_wire(&mut receiver).await else {
+        panic!("a refused session reports itself");
+    };
+    assert!(
+        reason.contains("fatal_error"),
+        "the reason is Slack's: {reason}"
+    );
+
+    let mut health = rho_slack::health::Health::default();
+    assert_eq!(
+        health.disconnected(0, &reason),
+        None,
+        "one failure is a blip"
+    );
+    let Some(rho_slack::health::Signal::Degraded(notice)) = health.disconnected(1_000, &reason)
+    else {
+        panic!("a second failure in a row is news");
+    };
+    assert!(notice.starts_with("slack: "), "the notice names Slack");
+    assert!(notice.contains("fatal_error"), "and says what Slack said");
+}
