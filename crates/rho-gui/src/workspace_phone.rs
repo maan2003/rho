@@ -1098,6 +1098,24 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.phone_verdict_with(
+            verdict,
+            move |_, window, cx| window.dispatch_action(action, cx),
+            window,
+            cx,
+        );
+    }
+
+    /// The bookkeeping around a verdict taken by thumb, for the buttons
+    /// whose verdict is a call rather than an action: the snooze chips,
+    /// which each name their own time.
+    pub(crate) fn phone_verdict_with(
+        &mut self,
+        verdict: crate::journal::PhoneVerdict,
+        run: impl FnOnce(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.phone.snap.is_some() || self.phone_current_deal_has_pending_tree_verdict() {
             return;
         }
@@ -1107,7 +1125,7 @@ impl Workspace {
             .map(|card| card.identity.clone());
         let pending_before = self.pending_tree_verdicts.len();
         let undo_before = self.verdict_undo.last().map(|entry| entry.sequence);
-        window.dispatch_action(action, cx);
+        run(self, window, cx);
         cx.defer_in(window, move |this, _window, cx| {
             let after = this
                 .dashboard
@@ -1181,14 +1199,11 @@ impl Workspace {
                 )),
             )
             .child(
+                // Defer asks how long: the same question the `s` operator's
+                // unit answers on a keyboard.
                 item("phone-verdict-defer", "◷", "defer").on_click(cx.listener(
                     |this, _, window, cx| {
-                        this.dispatch_phone_verdict(
-                            crate::journal::PhoneVerdict::Defer,
-                            Box::new(crate::DashboardDealSnooze),
-                            window,
-                            cx,
-                        );
+                        this.open_transient(crate::transient::snooze_sheet(), window, cx);
                     },
                 )),
             )

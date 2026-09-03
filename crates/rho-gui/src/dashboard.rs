@@ -2860,9 +2860,15 @@ mod tests {
 }
 
 /// A mark's date as the reader sees it in an end-of-line hint.
+/// A mark's date, with its clock time when it has one: a snooze of an hour
+/// comes back this afternoon, and a bare date would not say when.
 fn desk_date(at: rho_desk::cells::Timestamp) -> String {
+    let format = match at.precision {
+        rho_desk::cells::TimestampPrecision::Day => "%Y-%m-%d",
+        _ => "%Y-%m-%d %H:%M",
+    };
     desk_time(at).map_or_else(
         || "unknown".to_owned(),
-        |time| time.format("%Y-%m-%d").to_string(),
+        |time| time.format(format).to_string(),
     )
 }

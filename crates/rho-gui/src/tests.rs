@@ -737,6 +737,73 @@ fn bind_test_keymaps(cx: &mut App) {
     crate::bind_rho_key_overrides(cx);
 }
 
+/// `s` is the snooze operator: on its own it waits, and the unit after it
+/// picks the span. Shared by the deal-routing tests.
+fn assert_snooze_operator(keymap: &gpui::Keymap, contexts: &[gpui::KeyContext]) {
+    use gpui::Keystroke;
+
+    let (bindings, pending) =
+        keymap.bindings_for_input(&[Keystroke::parse("s").unwrap()], contexts);
+    assert!(pending, "`s` should wait for its unit: {bindings:?}");
+    assert!(bindings.is_empty(), "`s` alone should snooze nothing");
+    for (unit, action) in [
+        ("m", "rho_gui::DashboardDealSnoozeMinutes"),
+        ("h", "rho_gui::DashboardDealSnoozeHours"),
+        ("d", "rho_gui::DashboardDealSnooze"),
+        ("s", "rho_gui::DashboardDealSnooze"),
+        ("w", "rho_gui::DashboardDealSnoozeWeeks"),
+    ] {
+        let strokes = [
+            Keystroke::parse("s").unwrap(),
+            Keystroke::parse(unit).unwrap(),
+        ];
+        let (bindings, _) = keymap.bindings_for_input(&strokes, contexts);
+        assert_eq!(
+            bindings.first().map(|binding| binding.action().name()),
+            Some(action),
+            "`s{unit}` did not route to {action}",
+        );
+    }
+}
+
+/// `45sm` is 45 minutes and `2sd` two days: the unit picks the span, the
+/// count multiplies it, and the words the bar says name the time it lands on.
+#[test]
+fn a_snooze_lands_on_its_unit_and_says_the_time() {
+    use chrono::TimeZone as _;
+
+    use crate::workspace::{SnoozeUnit, snooze_target};
+
+    let now = chrono::Local
+        .with_ymd_and_hms(2026, 9, 3, 14, 30, 0)
+        .earliest()
+        .expect("a local afternoon");
+    let (at, said) = snooze_target(SnoozeUnit::Minutes, 45, now);
+    assert_eq!(
+        at.unix_ms,
+        (now + chrono::Duration::minutes(45)).timestamp_millis()
+    );
+    assert_eq!(
+        at.precision,
+        rho_desk::cells::TimestampPrecision::Millisecond
+    );
+    assert_eq!(said, "snooze until 15:15");
+
+    // Three hours from half past two crosses no day, so the hour is enough.
+    let (_, said) = snooze_target(SnoozeUnit::Hours, 3, now);
+    assert_eq!(said, "snooze until 17:30");
+    // Twelve does cross it, and then the bar names the day as well.
+    let (_, said) = snooze_target(SnoozeUnit::Hours, 12, now);
+    assert_eq!(said, "snooze until Fri 4 Sep 02:30");
+
+    // Days and weeks land on a date, as a defer always has.
+    let (at, said) = snooze_target(SnoozeUnit::Days, 2, now);
+    assert_eq!(at.precision, rho_desk::cells::TimestampPrecision::Day);
+    assert_eq!(said, "snooze until Sat 5 Sep");
+    let (_, said) = snooze_target(SnoozeUnit::Weeks, 1, now);
+    assert_eq!(said, "snooze until Thu 10 Sep");
+}
+
 #[gpui::test]
 fn native_page_deal_context_routes_verdict_keys(cx: &mut TestAppContext) {
     use gpui::{KeyContext, Keystroke};
@@ -767,7 +834,7 @@ fn native_page_deal_context_routes_verdict_keys(cx: &mut TestAppContext) {
         assert_route!("q", crate::SurfaceClose);
         assert_route!("d", crate::DashboardDealDone);
         assert_route!("x", crate::DashboardDealDiscard);
-        assert_route!("s", crate::DashboardDealSnooze);
+        assert_snooze_operator(&keymap, &contexts);
         assert_route!("t", crate::DashboardDealTodo);
         assert_route!("shift-u", crate::UndoVerdict);
     });
@@ -4536,7 +4603,7 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
         .unwrap();
 
     macro_rules! verdict_and_undo {
-        ($action:expr, $echo:literal) => {{
+        ($action:expr, $echo:expr) => {{
             cx.dispatch_action(*workspace, $action);
             cx.run_until_parked();
             let stamp = workspace
@@ -4609,7 +4676,13 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
 
     verdict_and_undo!(crate::DashboardDealDone, "done: Named card");
     verdict_and_undo!(crate::DashboardDealDiscard, "discard: Named card");
-    verdict_and_undo!(crate::DashboardDealSnooze, "snooze 1d: Named card");
+    // The snooze operator's default unit is a day, and the bar says the day
+    // it comes back on rather than the distance.
+    let tomorrow = (chrono::Local::now().date_naive() + chrono::Duration::days(1))
+        .format("%a %-d %b")
+        .to_string();
+    let snoozed = format!("snooze until {tomorrow}: Named card");
+    verdict_and_undo!(crate::DashboardDealSnooze, snoozed.as_str());
     verdict_and_undo!(crate::DashboardDealTodo, "todo: Named card");
 
     // A delayed acknowledgement belongs to the submitted card, even if the
@@ -6309,6 +6382,18 @@ fn deal_keys_reach_a_dealt_slack_conversation(cx: &mut TestAppContext) {
                 .first()
                 .map(|binding| binding.action().name())
         };
+        // A whole sequence, for the keys that take a second stroke.
+        let routes_all = |keys: &str, contexts: &[KeyContext]| {
+            let strokes: Vec<Keystroke> = keys
+                .split(' ')
+                .map(|key| Keystroke::parse(key).unwrap())
+                .collect();
+            keymap
+                .bindings_for_input(&strokes, contexts)
+                .0
+                .first()
+                .map(|binding| binding.action().name())
+        };
         // A conversation puts its editor a level deeper than the deal keys'
         // plain `Editor` context, and the bundled vim keymap binds `d` and
         // `s` up there: without a binding at this depth the deal keys are
@@ -6321,7 +6406,16 @@ fn deal_keys_reach_a_dealt_slack_conversation(cx: &mut TestAppContext) {
                 .unwrap(),
         ];
         assert_eq!(routes("d", &dealt), Some("rho_gui::DashboardDealDone"));
-        assert_eq!(routes("s", &dealt), Some("rho_gui::DashboardDealSnooze"));
+        // `s` waits for its unit here too, so the vim keymap's own `s` never
+        // gets the key on a dealt conversation.
+        assert_eq!(
+            routes_all("s d", &dealt),
+            Some("rho_gui::DashboardDealSnooze")
+        );
+        assert_eq!(
+            routes_all("s h", &dealt),
+            Some("rho_gui::DashboardDealSnoozeHours")
+        );
         assert_eq!(routes("i", &dealt), Some("rho_gui::DashboardDealInsert"));
         assert_eq!(routes("escape", &dealt), Some("rho_gui::DealLeave"));
 

@@ -343,6 +343,64 @@ struct VerdictUndo {
     state: VerdictUndoState,
 }
 
+/// The unit half of the snooze operator (`s` then `m`, `h`, `d`, `w` or `s`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SnoozeUnit {
+    Minutes,
+    Hours,
+    Days,
+    Weeks,
+}
+
+/// Where a snooze lands and how the bar says it. Minutes and hours keep the
+/// clock, so a card can come back this afternoon; days and weeks land on a
+/// date, which is what a defer has always been.
+pub(crate) fn snooze_target(
+    unit: SnoozeUnit,
+    count: i64,
+    now: chrono::DateTime<chrono::Local>,
+) -> (rho_desk::cells::Timestamp, String) {
+    match unit {
+        SnoozeUnit::Minutes | SnoozeUnit::Hours => {
+            let ahead = match unit {
+                SnoozeUnit::Minutes => chrono::Duration::minutes(count),
+                _ => chrono::Duration::hours(count),
+            };
+            let at = now + ahead;
+            (
+                rho_desk::cells::Timestamp {
+                    unix_ms: at.timestamp_millis(),
+                    precision: rho_desk::cells::TimestampPrecision::Millisecond,
+                },
+                snooze_said(at, now),
+            )
+        }
+        SnoozeUnit::Days | SnoozeUnit::Weeks => {
+            let days = match unit {
+                SnoozeUnit::Days => count,
+                _ => count * 7,
+            };
+            let date = now.date_naive() + chrono::Duration::days(days);
+            (
+                crate::desk_view::day_timestamp(date),
+                format!("snooze until {}", date.format("%a %-d %b")),
+            )
+        }
+    }
+}
+
+/// The bar's words for a snooze with a clock time: the hour alone when it
+/// is still today, the day in front of it when it is not.
+fn snooze_said(
+    at: chrono::DateTime<chrono::Local>,
+    now: chrono::DateTime<chrono::Local>,
+) -> String {
+    match at.date_naive() == now.date_naive() {
+        true => format!("snooze until {}", at.format("%H:%M")),
+        false => format!("snooze until {}", at.format("%a %-d %b %H:%M")),
+    }
+}
+
 #[derive(Clone)]
 enum VerdictUndoState {
     /// The applied verdict this undo appends `Undone { of }` against.
@@ -3461,6 +3519,63 @@ impl Workspace {
         // rail-visible through the selection exemption.
         if hide && sent && hid_open_agent {
             self.select_agent(None, window, cx);
+        }
+    }
+
+    /// The snooze operator: `s` and a unit, with vim's count in front, so
+    /// `45sm` is 45 minutes, `3sh` three hours, `2sd` two days, `sw` a week
+    /// and `ss` the default day. The deal bar echoes the time it comes back.
+    pub(crate) fn deal_snooze(
+        &mut self,
+        unit: SnoozeUnit,
+        count: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let count = count.unwrap_or(1).max(1) as i64;
+        let (until, said) = snooze_target(unit, count, chrono::Local::now());
+        self.deal_snooze_until(until, said, window, cx);
+    }
+
+    /// A snooze that already knows its time: the phone's chips, which name
+    /// an hour of the day rather than a distance from now.
+    pub(crate) fn deal_snooze_at(
+        &mut self,
+        at: chrono::DateTime<chrono::Local>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let until = rho_desk::cells::Timestamp {
+            unix_ms: at.timestamp_millis(),
+            precision: rho_desk::cells::TimestampPrecision::Millisecond,
+        };
+        self.deal_snooze_until(until, snooze_said(at, chrono::Local::now()), window, cx);
+    }
+
+    fn deal_snooze_until(
+        &mut self,
+        until: rho_desk::cells::Timestamp,
+        said: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.dashboard.current_deal_card().is_none() {
+            self.echo("snooze: nothing under the deal", StyleClass::SystemInfo, cx);
+            return;
+        }
+        if !self.submit_tree_verdict(
+            None,
+            crate::desk_view::DeskVerdict::Defer { until },
+            crate::dashboard::DealerVerdict::Defer,
+            said,
+            window,
+            cx,
+        ) {
+            self.echo(
+                "snooze: the note is unavailable",
+                StyleClass::SystemInfo,
+                cx,
+            );
         }
     }
 
@@ -7086,31 +7201,6 @@ impl Workspace {
         cx.stop_propagation();
     }
 
-    pub(crate) fn prompt_snooze(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let complete = std::rc::Rc::new(|_: &Workspace, _: &str, _: &gpui::App| Vec::new());
-        let on_submit = std::rc::Rc::new(
-            |workspace: &mut Workspace,
-             input: String,
-             window: &mut Window,
-             cx: &mut Context<Workspace>| {
-                let input = input.trim();
-                if input.is_empty() {
-                    return;
-                }
-                match parse_duration_ms(input) {
-                    Some(duration_ms) => workspace.cmd_agent_snooze(duration_ms, window, cx),
-                    None => workspace.notice_on(
-                        None,
-                        &format!("snooze: bad duration `{input}` (30m, 2h, 1d)"),
-                        StyleClass::SystemInfo,
-                        cx,
-                    ),
-                }
-            },
-        );
-        self.open_prompt("snooze (30m/2h/1d):", complete, on_submit, window, cx);
-    }
-
     /// Prompt for a path to open from the current agent's workspace.
     pub(crate) fn prompt_open_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let complete = std::rc::Rc::new(|_: &Workspace, _: &str, _: &gpui::App| Vec::new());
@@ -9870,32 +9960,27 @@ impl Render for Workspace {
                 );
             }))
             .on_action(cx.listener(|this, _: &DashboardDealSnooze, window, cx| {
-                let count = vim::take_count(cx).unwrap_or(1) as u32;
-                let today = chrono::Local::now().date_naive();
-                if this.dashboard.current_deal_card().is_some() {
-                    let days = count.max(1);
-                    if !this.submit_tree_verdict(
-                        None,
-                        crate::desk_view::DeskVerdict::Defer {
-                            until: crate::desk_view::day_timestamp(
-                                today + chrono::Duration::days(i64::from(days)),
-                            ),
-                        },
-                        crate::dashboard::DealerVerdict::Defer,
-                        format!("snooze {days}d"),
-                        window,
-                        cx,
-                    ) {
-                        this.echo(
-                            "snooze: the note is unavailable",
-                            StyleClass::SystemInfo,
-                            cx,
-                        );
-                    }
-                    return;
-                }
-                this.echo("snooze: nothing under the deal", StyleClass::SystemInfo, cx);
+                let count = vim::take_count(cx);
+                this.deal_snooze(SnoozeUnit::Days, count, window, cx);
             }))
+            .on_action(
+                cx.listener(|this, _: &crate::DashboardDealSnoozeMinutes, window, cx| {
+                    let count = vim::take_count(cx);
+                    this.deal_snooze(SnoozeUnit::Minutes, count, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::DashboardDealSnoozeHours, window, cx| {
+                    let count = vim::take_count(cx);
+                    this.deal_snooze(SnoozeUnit::Hours, count, window, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &crate::DashboardDealSnoozeWeeks, window, cx| {
+                    let count = vim::take_count(cx);
+                    this.deal_snooze(SnoozeUnit::Weeks, count, window, cx);
+                }),
+            )
             .on_action(
                 cx.listener(|this, _: &DashboardDealRoomSnooze, window, cx| {
                     let count = vim::take_count(cx).unwrap_or(1) as u32;

@@ -107,6 +107,19 @@ exactly then and rises from zero.
 "not now, an hour", which a prompt makes slow and a day-granular key makes
 wrong. Count-plus-unit is already in the user's fingers from vim.
 
+Landed 3 Sep. `s` is an operator: `sm`, `sh`, `sd`, `sw` and `ss` (a day),
+with vim's count in front, and `s` on its own waits for the unit rather
+than snoozing. Minutes and hours land on the clock (millisecond precision,
+so a card can come back this afternoon); days and weeks land on a date, as
+a defer always has. The bar says the time it comes back on (`snooze until
+22:54`, `snooze until Sat 5 Sep`), and the map's mark hint carries the
+clock time with it. The phone's defer button opens the chips instead of
+taking a day; the agent snooze prompt is gone. One thing left open: a
+snoozed node keeps whatever `pace_days` it had, because `Verdict::Defer`
+writes one field and both the writer and the daemon's checker read that
+shape from `rho-desk`. Zeroing the pace on a snooze is a shared change and
+a profile upgrade.
+
 ## Deliberately deferred
 
 - Editing anything from Home.

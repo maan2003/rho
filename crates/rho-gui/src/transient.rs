@@ -1706,8 +1706,74 @@ fn snooze_menu() -> Transient {
         .item("d", "1 day", |workspace, window, cx| {
             workspace.cmd_agent_snooze(24 * 60 * MINUTE_MS, window, cx);
         })
-        .item("c", "custom…", |workspace, window, cx| {
-            workspace.prompt_snooze(window, cx);
+}
+
+/// The phone's answer to "how long": the times a thumb picks, where a
+/// keyboard types a count and a unit. `tonight` and `tomorrow` name an hour
+/// of the day, so they land on the clock and not on a distance from now.
+pub(crate) fn snooze_sheet() -> Transient {
+    fn later(
+        workspace: &mut Workspace,
+        at: chrono::DateTime<chrono::Local>,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        workspace.phone_verdict_with(
+            crate::journal::PhoneVerdict::Defer,
+            move |workspace, window, cx| workspace.deal_snooze_at(at, window, cx),
+            window,
+            cx,
+        );
+    }
+    fn ahead(
+        workspace: &mut Workspace,
+        unit: crate::workspace::SnoozeUnit,
+        count: usize,
+        window: &mut Window,
+        cx: &mut Context<Workspace>,
+    ) {
+        workspace.phone_verdict_with(
+            crate::journal::PhoneVerdict::Defer,
+            move |workspace, window, cx| workspace.deal_snooze(unit, Some(count), window, cx),
+            window,
+            cx,
+        );
+    }
+    /// A named hour of the day. `tonight` is this evening while it is still
+    /// ahead and the next one after that; `tomorrow` is always the next day,
+    /// even when read before nine in the morning.
+    fn at_hour(hour: u32, tomorrow: bool) -> chrono::DateTime<chrono::Local> {
+        use chrono::TimeZone as _;
+        let now = chrono::Local::now();
+        let mut day = now.date_naive();
+        let time = chrono::NaiveTime::from_hms_opt(hour, 0, 0).unwrap_or_default();
+        if tomorrow || day.and_time(time) <= now.naive_local() {
+            day += chrono::Duration::days(1);
+        }
+        chrono::Local
+            .from_local_datetime(&day.and_time(time))
+            .earliest()
+            .unwrap_or(now)
+    }
+    use crate::workspace::SnoozeUnit;
+    Transient::new("snooze")
+        .item("m", "30m", |workspace, window, cx| {
+            ahead(workspace, SnoozeUnit::Minutes, 30, window, cx);
+        })
+        .item("h", "2h", |workspace, window, cx| {
+            ahead(workspace, SnoozeUnit::Hours, 2, window, cx);
+        })
+        .item("t", "tonight (18:00)", |workspace, window, cx| {
+            later(workspace, at_hour(18, false), window, cx);
+        })
+        .item("shift-t", "tomorrow (09:00)", |workspace, window, cx| {
+            later(workspace, at_hour(9, true), window, cx);
+        })
+        .item("d", "3d", |workspace, window, cx| {
+            ahead(workspace, SnoozeUnit::Days, 3, window, cx);
+        })
+        .item("w", "next week", |workspace, window, cx| {
+            ahead(workspace, SnoozeUnit::Weeks, 1, window, cx);
         })
 }
 
@@ -1726,6 +1792,25 @@ mod tests {
             ["Cycle folds", "Edit notes", "New…"]
         );
         assert_eq!(phone_desk_menu(true).phone_rows()[1].1, "Done editing");
+    }
+
+    #[test]
+    fn the_phone_snooze_sheet_offers_the_decided_chips() {
+        assert_eq!(
+            snooze_sheet()
+                .phone_rows()
+                .iter()
+                .map(|(_, description, _)| description.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "30m",
+                "2h",
+                "tonight (18:00)",
+                "tomorrow (09:00)",
+                "3d",
+                "next week"
+            ]
+        );
     }
 
     #[test]
