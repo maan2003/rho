@@ -525,6 +525,63 @@ impl DeskTreeStore {
                 ));
             }
         }
+        let deleted = batch
+            .operations
+            .iter()
+            .filter_map(|operation| match operation {
+                BatchOperation::Tree(TreeOperation::Delete { node_ids, .. }) => Some(node_ids),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect::<BTreeSet<_>>();
+        let mut effective_nodes = materialized
+            .values()
+            .map(|node| (node.id, (node.owner, node.parent)))
+            .collect::<BTreeMap<_, _>>();
+        for operation in &batch.operations {
+            match operation {
+                BatchOperation::Tree(TreeOperation::Create {
+                    node_id,
+                    owner,
+                    parent,
+                    ..
+                }) => {
+                    effective_nodes.insert(*node_id, (*owner, *parent));
+                }
+                BatchOperation::Tree(TreeOperation::Move {
+                    node_id, parent, ..
+                }) => {
+                    if let Some((_, effective_parent)) = effective_nodes.get_mut(node_id) {
+                        *effective_parent = *parent;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if effective_nodes.iter().any(|(node_id, (owner, parent))| {
+            if *owner != NodeOwner::User || deleted.contains(node_id) {
+                return false;
+            }
+            let mut parent = *parent;
+            let mut visited = BTreeSet::new();
+            while let Some(parent_id) = parent {
+                if deleted.contains(&parent_id) {
+                    return true;
+                }
+                if !visited.insert(parent_id) {
+                    break;
+                }
+                parent = effective_nodes
+                    .get(&parent_id)
+                    .and_then(|(_, parent)| *parent);
+            }
+            false
+        }) {
+            return Err(BatchApplyError::Conflict(
+                "Desk batch delete omitted a user descendant".into(),
+            ));
+        }
         let machine_moves = derive_machine_relocations(&mut write, &materialized, &batch)?;
         for operation in &batch.operations {
             match operation {
@@ -1548,6 +1605,146 @@ mod tests {
                 .materialize()
                 .is_empty()
         );
+    }
+
+    #[tokio::test]
+    async fn batch_delete_cannot_orphan_user_descendants() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = RhoDb::open(directory.path().join("desk-delete-child.redb"));
+        let store = DeskTreeStore::new(db, Some(""), |_| None).await.unwrap();
+        let replica = store.allocate_replica(ReplicaAuthor::User).await.unwrap();
+        let parent = NodeId {
+            replica_id: replica,
+            counter: 1,
+        };
+        let child = NodeId {
+            replica_id: replica,
+            counter: 2,
+        };
+        let other = NodeId {
+            replica_id: replica,
+            counter: 3,
+        };
+        let created = NodeId {
+            replica_id: replica,
+            counter: 4,
+        };
+        for (timestamp, node_id, parent) in [
+            (1, parent, None),
+            (2, child, Some(parent)),
+            (3, other, None),
+        ] {
+            store
+                .apply_tree(TreeOperation::Create {
+                    timestamp: TreeClock {
+                        value: timestamp,
+                        replica_id: replica,
+                    },
+                    node_id,
+                    kind: NodeKind::Heading,
+                    owner: NodeOwner::User,
+                    parent,
+                    order: OrderKey(vec![100]),
+                })
+                .await
+                .unwrap();
+        }
+        let before = Document::from_snapshot(store.snapshot()).unwrap();
+        let result = store
+            .apply_batch(OperationBatch {
+                id: TreeClock {
+                    value: 3,
+                    replica_id: replica,
+                },
+                expected: vec![expectation(&before, parent)],
+                operations: vec![BatchOperation::Tree(TreeOperation::Delete {
+                    timestamp: TreeClock {
+                        value: 4,
+                        replica_id: replica,
+                    },
+                    node_ids: vec![parent],
+                })],
+                machine_relocation: None,
+            })
+            .await;
+        assert!(matches!(result, Err(BatchApplyError::Conflict(_))));
+        let created_below_deleted = store
+            .apply_batch(OperationBatch {
+                id: TreeClock {
+                    value: 4,
+                    replica_id: replica,
+                },
+                expected: vec![expectation(&before, parent), expectation(&before, child)],
+                operations: vec![
+                    BatchOperation::Tree(TreeOperation::Delete {
+                        timestamp: TreeClock {
+                            value: 5,
+                            replica_id: replica,
+                        },
+                        node_ids: vec![parent, child],
+                    }),
+                    BatchOperation::Tree(TreeOperation::Create {
+                        timestamp: TreeClock {
+                            value: 6,
+                            replica_id: replica,
+                        },
+                        node_id: created,
+                        kind: NodeKind::Heading,
+                        owner: NodeOwner::User,
+                        parent: Some(child),
+                        order: OrderKey(vec![100]),
+                    }),
+                ],
+                machine_relocation: None,
+            })
+            .await;
+        assert!(matches!(
+            created_below_deleted,
+            Err(BatchApplyError::Conflict(_))
+        ));
+        let moved_below_deleted = store
+            .apply_batch(OperationBatch {
+                id: TreeClock {
+                    value: 4,
+                    replica_id: replica,
+                },
+                expected: vec![
+                    expectation(&before, parent),
+                    expectation(&before, child),
+                    expectation(&before, other),
+                ],
+                operations: vec![
+                    BatchOperation::Tree(TreeOperation::Delete {
+                        timestamp: TreeClock {
+                            value: 5,
+                            replica_id: replica,
+                        },
+                        node_ids: vec![parent, child],
+                    }),
+                    BatchOperation::Tree(TreeOperation::Move {
+                        timestamp: TreeClock {
+                            value: 6,
+                            replica_id: replica,
+                        },
+                        node_id: other,
+                        parent: Some(child),
+                        order: OrderKey(vec![100]),
+                    }),
+                ],
+                machine_relocation: None,
+            })
+            .await;
+        assert!(matches!(
+            moved_below_deleted,
+            Err(BatchApplyError::Conflict(_))
+        ));
+        let nodes = Document::from_snapshot(store.snapshot())
+            .unwrap()
+            .materialize();
+        assert!(nodes.iter().any(|node| node.id == parent));
+        assert!(nodes.iter().any(|node| node.id == child));
+        assert!(nodes.iter().any(|node| node.id == other));
+        assert!(!nodes.iter().any(|node| node.id == created));
     }
 
     #[tokio::test]

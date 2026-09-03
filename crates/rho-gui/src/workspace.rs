@@ -655,7 +655,7 @@ pub struct Workspace {
     /// Desk CRDT buffer until an explicit filing verdict.
     pub(crate) inbox: InboxStore,
     pending_inbox_item: Option<InboxId>,
-    pending_filing_card: Option<crate::dashboard::DealCard>,
+    pending_filing_card: Option<(InboxId, crate::dashboard::DealCard)>,
     pending_filing_destinations: Vec<(String, String, HostId, rho_desk::NodeId)>,
     pending_filing_selected: Option<(HostId, rho_desk::NodeId)>,
     #[cfg(feature = "native")]
@@ -4198,6 +4198,7 @@ impl Workspace {
     }
 
     pub(crate) fn prompt_file_inbox_item(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.pending_filing_card = None;
         if self.pending_inbox_item.is_none() {
             return;
         }
@@ -4240,6 +4241,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
+        self.pending_filing_card = None;
         if self.inbox.get(id).is_none() {
             return Err(format!("inbox item {} no longer exists", id.0));
         }
@@ -4250,14 +4252,19 @@ impl Workspace {
 
     fn file_inbox_item(&mut self, heading: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(id) = self.pending_inbox_item.clone() else {
+            self.pending_filing_card = None;
             return;
         };
         let Some(item) = self.inbox.get(&id).cloned() else {
+            self.pending_filing_card = None;
             return;
         };
         if let SourceReference::Page { id: page_id } = &item.source {
             let target = self.pending_filing_selected.take();
-            let card = self.pending_filing_card.take();
+            let card = self
+                .pending_filing_card
+                .take()
+                .and_then(|(card_id, card)| (card_id == id).then_some(card));
             if !self.file_inbox_page(target, heading, page_id, &id, card, cx) {
                 self.notice_on(None, "file: heading not found", StyleClass::SystemInfo, cx);
             }
@@ -4286,12 +4293,14 @@ impl Workspace {
                     .map(|node| (host, node))
             });
         let Some((host, node)) = filed else {
+            self.pending_filing_card = None;
             self.notice_on(None, "file: heading not found", StyleClass::SystemInfo, cx);
             return;
         };
         let removed = match self.inbox.verdict(&id, Verdict::Filed) {
             Ok(Some(removed)) => removed,
             Ok(None) => {
+                self.pending_filing_card = None;
                 self.notice_on(
                     None,
                     "file: inbox item is unavailable",
@@ -4301,6 +4310,7 @@ impl Workspace {
                 return;
             }
             Err(error) => {
+                self.pending_filing_card = None;
                 tracing::error!(%error, "retiring filed inbox item");
                 self.notice_on(
                     None,
@@ -4318,8 +4328,11 @@ impl Workspace {
             },
         });
         self.pending_inbox_item = None;
-        if let Some(card) = self.pending_filing_card.take()
-            && let Some(expected) = self.desk_tree_sync.node_expectation(host, node)
+        if let Some(card) = self
+            .pending_filing_card
+            .take()
+            .and_then(|(card_id, card)| (card_id == id).then_some(card))
+            && let Some(expected) = self.desk_tree_sync.node_expectation(host, node, cx)
         {
             let entry = self.next_verdict_undo(
                 card,
@@ -6827,6 +6840,13 @@ impl Workspace {
     }
 
     #[cfg(test)]
+    pub(crate) fn pending_filing_card_for_test(&self) -> Option<(InboxId, String)> {
+        self.pending_filing_card
+            .as_ref()
+            .map(|(id, card)| (id.clone(), card.breadcrumb.clone()))
+    }
+
+    #[cfg(test)]
     pub(crate) fn complete_filing_for_test(
         &mut self,
         host: HostId,
@@ -6841,8 +6861,12 @@ impl Workspace {
 
     #[cfg(test)]
     pub(crate) fn prepare_deal_filing_for_test(&mut self, id: InboxId) {
-        self.pending_inbox_item = Some(id);
-        self.pending_filing_card = self.dashboard.current_deal_card().cloned();
+        self.pending_inbox_item = Some(id.clone());
+        self.pending_filing_card = self
+            .dashboard
+            .current_deal_card()
+            .cloned()
+            .map(|card| (id, card));
     }
 
     #[cfg(test)]
@@ -7776,6 +7800,7 @@ impl Workspace {
 
     fn minibuffer_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(minibuffer) = self.minibuffer.take() {
+            self.pending_filing_card = None;
             crate::journal::record(crate::journal::Event::MinibufferCancelled {
                 prompt: minibuffer.prompt().to_owned(),
                 input: minibuffer.input(cx),
@@ -8472,7 +8497,13 @@ impl Workspace {
                 expected,
                 ..
             } => {
-                if self.desk_tree_sync.node_expectation(host, node).as_ref() != Some(&expected) {
+                if self
+                    .desk_tree_sync
+                    .node_expectation(host, node, cx)
+                    .as_ref()
+                    != Some(&expected)
+                    || self.desk_tree_sync.node_has_descendants(host, node)
+                {
                     self.echo(
                         &format!("cannot undo filing: {} was edited", entry.card.breadcrumb),
                         StyleClass::SystemInfo,
@@ -8480,10 +8511,15 @@ impl Workspace {
                     );
                     return;
                 }
-                let Some((batch, messages, _, _)) =
-                    self.desk_tree_sync.prepare_delete_subtree(host, node, cx)
+                let Some((batch, messages)) = self
+                    .desk_tree_sync
+                    .prepare_delete_exact_leaf(host, expected, cx)
                 else {
-                    self.restore_verdict_undo(entry);
+                    self.echo(
+                        &format!("cannot undo filing: {} was edited", entry.card.breadcrumb),
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
                     return;
                 };
                 self.pending_tree_undos
@@ -11720,7 +11756,7 @@ impl Render for Workspace {
                         this.notice_on(None, &format!("file: {error}"), StyleClass::SystemInfo, cx);
                         return;
                     }
-                    this.pending_filing_card = filing_card;
+                    this.pending_filing_card = filing_card.map(|card| (id, card));
                     this.dashboard.end_deal(cx);
                     this.finish_dashboard_deal_action(window, cx);
                     return;

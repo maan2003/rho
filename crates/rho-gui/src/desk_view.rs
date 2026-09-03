@@ -393,6 +393,25 @@ impl DeskTreeSync {
         Some((batch, messages, subtree, focus))
     }
 
+    pub fn prepare_delete_exact_leaf(
+        &mut self,
+        host: HostId,
+        expected: rho_desk::NodeExpectation,
+        cx: &gpui::App,
+    ) -> Option<(rho_desk::OperationBatch, Vec<ClientMessage>)> {
+        if self.node_has_descendants(host, expected.node_id) {
+            return None;
+        }
+        let (mut batch, messages, subtree, _) =
+            self.prepare_delete_subtree(host, expected.node_id, cx)?;
+        if subtree.nodes.len() != 1 {
+            return None;
+        }
+        batch.expected = vec![expected];
+        self.pending_batches.insert((host, batch.id), batch.clone());
+        Some((batch, messages))
+    }
+
     pub fn prepare_paste_subtree(
         &mut self,
         host: HostId,
@@ -575,6 +594,7 @@ impl DeskTreeSync {
         &self,
         host: HostId,
         node_id: rho_desk::NodeId,
+        cx: &gpui::App,
     ) -> Option<rho_desk::NodeExpectation> {
         let desk = self.tree_hosts.get(&host)?;
         let node = desk
@@ -588,7 +608,25 @@ impl DeskTreeSync {
             owner: node.owner,
             parent: node.parent,
             order: node.order,
-            text_version: desk.document.text_version(node_id).ok()?,
+            text_version: desk
+                .buffers
+                .get(&node_id)?
+                .read(cx)
+                .snapshot()
+                .version()
+                .iter()
+                .filter(|clock| clock.value != 0)
+                .map(Into::into)
+                .collect(),
+        })
+    }
+
+    pub fn node_has_descendants(&self, host: HostId, node_id: rho_desk::NodeId) -> bool {
+        self.tree_hosts.get(&host).is_some_and(|desk| {
+            desk.document
+                .materialize()
+                .iter()
+                .any(|node| node.parent == Some(node_id))
         })
     }
 

@@ -3659,8 +3659,31 @@ fn deal_file_bare_enter_uses_the_offered_heading_completion(cx: &mut TestAppCont
             _ => None,
         })
         .unwrap();
+    let (title_operation, title_transaction) = messages
+        .iter()
+        .find_map(|message| match message {
+            rho_ui_proto::ClientMessage::DeskNodeTextApply {
+                node_id,
+                operation,
+                transaction,
+            } if *node_id == created => Some((operation.clone(), transaction.clone())),
+            _ => None,
+        })
+        .expect("filing title edit");
     workspace
-        .update(cx, |workspace, _, _| {
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskNodeTextApplied(rho_desk::TextOpRecord {
+                    sequence: 1,
+                    timestamp_ms: 1,
+                    node_id: created,
+                    operation: title_operation,
+                    transaction: title_transaction,
+                }),
+                window,
+                cx,
+            );
             assert_eq!(workspace.verdict_undo_count_for_test(), 1);
             assert!(workspace.inbox_item_for_test(&inbox_id).is_none());
         })
@@ -3688,8 +3711,8 @@ fn deal_file_bare_enter_uses_the_offered_heading_completion(cx: &mut TestAppCont
             workspace.handle_event(
                 HostId::default(),
                 ConnEvent::DeskTreeBatchApplied(rho_desk::BatchOpRecord {
-                    sequence: 1,
-                    timestamp_ms: 1,
+                    sequence: 2,
+                    timestamp_ms: 2,
                     batch: undo_batch,
                     daemon_tree_operations: Vec::new(),
                 }),
@@ -3701,6 +3724,17 @@ fn deal_file_bare_enter_uses_the_offered_heading_completion(cx: &mut TestAppCont
                 workspace.echo_text_for_test(),
                 Some("undid file: Inbox QA item")
             );
+            assert_eq!(
+                workspace.current_deal_card_for_test().map(|card| card.0),
+                Some(crate::dashboard::DealCardIdentity::Inbox(
+                    inbox_id.0.clone()
+                ))
+            );
+            assert_eq!(
+                workspace.rendered_deal_card_for_test(),
+                workspace.current_deal_card_for_test()
+            );
+            assert!(workspace.dashboard_deal_mode_for_test());
         })
         .unwrap();
 
@@ -3736,84 +3770,97 @@ fn deal_file_bare_enter_uses_the_offered_heading_completion(cx: &mut TestAppCont
             assert_eq!(workspace.verdict_undo_count_for_test(), 1);
         })
         .unwrap();
-    let buffer = workspace
-        .update(cx, |workspace, _, _| {
-            workspace
-                .tree_buffer_for_test(HostId::default(), second_created)
-                .unwrap()
-        })
-        .unwrap();
-    buffer.update(cx, |buffer, cx| {
-        let end = buffer.len();
-        buffer.edit([(end..end, " edited")], None, cx);
-    });
-    cx.run_until_parked();
-    let edited_snapshot = workspace
-        .update(cx, |workspace, _, _| {
-            let mut document =
-                Document::from_snapshot(workspace.desk_snapshot_for_test(HostId::default()))
-                    .unwrap();
-            for message in workspace.take_host_messages_for_test(HostId::default()) {
-                if let rho_ui_proto::ClientMessage::DeskNodeTextApply {
-                    node_id,
-                    operation,
-                    transaction,
-                } = message
-                {
-                    document
-                        .apply_text(node_id, operation, transaction)
-                        .unwrap();
-                }
-            }
-            document
-                .apply(TreeOperation::Move {
-                    timestamp: TreeClock {
-                        value: 10_000,
-                        replica_id: 1,
-                    },
-                    node_id: second_created,
-                    parent: Some(destination),
-                    order: OrderKey(vec![999]),
-                })
-                .unwrap();
-            document.snapshot()
-        })
-        .unwrap();
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.undo_verdict(window, cx);
-        })
-        .unwrap();
-    let undo_id = workspace
-        .update(cx, |workspace, _, _| {
-            workspace
-                .take_host_messages_for_test(HostId::default())
-                .into_iter()
-                .find_map(|message| match message {
-                    rho_ui_proto::ClientMessage::DeskTreeBatchApply { batch } => Some(batch.id),
-                    _ => None,
-                })
-                .unwrap()
-        })
-        .unwrap();
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(
                 HostId::default(),
-                ConnEvent::DeskTreeBatchRejected {
-                    id: undo_id,
-                    retryable: true,
-                    reason: "edited".into(),
-                    snapshot: edited_snapshot,
-                },
+                ConnEvent::DeskTreeApplied(rho_desk::TreeOpRecord {
+                    sequence: 3,
+                    timestamp_ms: 3,
+                    operation: TreeOperation::Create {
+                        timestamp: TreeClock {
+                            value: 10_000,
+                            replica_id: 42,
+                        },
+                        node_id: NodeId {
+                            replica_id: 42,
+                            counter: 10_000,
+                        },
+                        kind: NodeKind::Heading,
+                        owner: NodeOwner::User,
+                        parent: Some(second_created),
+                        order: OrderKey(vec![100]),
+                    },
+                }),
                 window,
                 cx,
             );
+            workspace.undo_verdict(window, cx);
             assert_eq!(
                 workspace.echo_text_for_test(),
                 Some("cannot undo filing: Inbox QA item was edited")
             );
             assert_eq!(workspace.verdict_undo_count_for_test(), 0);
+            assert!(
+                workspace
+                    .take_host_messages_for_test(HostId::default())
+                    .iter()
+                    .all(|message| !matches!(
+                        message,
+                        rho_ui_proto::ClientMessage::DeskTreeBatchApply { .. }
+                    ))
+            );
+            let nodes =
+                Document::from_snapshot(workspace.desk_snapshot_for_test(HostId::default()))
+                    .unwrap()
+                    .materialize();
+            assert!(nodes.iter().any(|node| node.id == second_created));
+            assert!(nodes.iter().any(|node| node.parent == Some(second_created)));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn cancelled_filing_cannot_leak_its_card_into_the_next_item(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    let (first, second) = workspace
+        .update(cx, |workspace, window, cx| {
+            let first = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
+                kind: crate::inbox::InboxKind::Capture,
+                text: "First filing".into(),
+                source: crate::inbox::SourceReference::None,
+                context: crate::inbox::CapturedContext::default(),
+                waiting_on: None,
+            });
+            let second = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
+                kind: crate::inbox::InboxKind::Capture,
+                text: "Second filing".into(),
+                source: crate::inbox::SourceReference::None,
+                context: crate::inbox::CapturedContext::default(),
+                waiting_on: None,
+            });
+            workspace.age_inbox_for_test(&first, 0);
+            workspace.open_deal_mode(window, cx);
+            (first, second)
+        })
+        .unwrap();
+
+    cx.dispatch_action(*workspace, crate::DashboardDealFile);
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(
+                workspace.pending_filing_card_for_test(),
+                Some((first.clone(), "First filing".into()))
+            );
+        })
+        .unwrap();
+    cx.dispatch_action(*workspace, crate::MinibufferCancel);
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(workspace.pending_filing_card_for_test(), None);
+            workspace.prepare_deal_filing_for_test(second);
+            assert_eq!(workspace.pending_filing_card_for_test(), None);
         })
         .unwrap();
 }
@@ -4146,6 +4193,11 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
                             node_id: heading,
                         })
                     );
+                    assert_eq!(
+                        workspace.rendered_deal_card_for_test(),
+                        workspace.current_deal_card_for_test()
+                    );
+                    assert!(workspace.dashboard_deal_mode_for_test());
                 })
                 .unwrap();
         }};
