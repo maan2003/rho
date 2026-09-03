@@ -154,9 +154,12 @@ under test. If the fake cannot produce a state, extend the fake.
 Polish from the user's live screenshot of 3 Sep ("still a bit ugly"),
 done right after the transcript primitive (2.4) and before 2.10:
 
-- [ ] 1.14 The reader's own author column prints the handle (`maan2003`)
-      while everyone else gets a display name. Same resolution for the
-      reader as for everyone: the roster's display name.
+- [ ] 1.14 Names: the user wants the handle (`maan2003`), not the display
+      name (`Manmeet`), for the reader's own column and self-mentions.
+      Assumed until the user says otherwise: handles for everyone else
+      too, in the author column, mentions, and DM titles, so one rule
+      names everyone. If the user wants display names for others, only
+      the reader flips.
 - [ ] 1.15 Rows by the longest author start their body one column right
       of the others (padding is off by one when the name fills the
       column). Bodies align in one column across the surface.
@@ -167,11 +170,13 @@ done right after the transcript primitive (2.4) and before 2.10:
 - [ ] 1.17 Unfurls are one muted line `↗ title · site` plus at most two
       lines of description, no blank lines inside. The x.com unfurl took
       ten lines with the whole tweet body. Collapsible later.
-- [ ] 1.18 Image preview scales to fit the text width minus the body
-      indent, capped at 24 lines high, aspect preserved; a 2048px
-      screenshot was shown at about 480px and unreadable. The file line
-      drops the type when the extension already says it: `image.png ·
-      141 KB`.
+- [ ] 1.18 Images, decided by the user: a small inline version, and a
+      full-screen view on click or `enter`. Inline stays a thumbnail
+      (about 12 lines high, aspect preserved). Click or `enter` on the
+      thumbnail or its file line opens a rho image surface that fits the
+      image to the window, `q` or `escape` returns to the conversation;
+      no external opener for images. The file line drops the type when
+      the extension already says it: `image.png · 141 KB`.
 - [ ] 1.19 Custom emoji (`:forrest_gump_wave:`) stay as the shortcode in
       muted text until the image inlay (1.13) lands, then render inline
       through it.
