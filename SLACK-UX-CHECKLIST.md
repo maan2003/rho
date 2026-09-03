@@ -229,7 +229,12 @@ under test. If the fake cannot produce a state, extend the fake.
       conversation is opened, older pages only on `shift-p`, tails only for
       open conversations and those the feed named; no background walk of
       history, no fan-out over the list, no re-fetch of what the mirror
-      holds. The request pattern must look like a person reading; the fake
+      holds. OPEN, not decided: whether a ping named by the activity feed
+      may trigger one bounded fetch at ingest (the thread plus a small
+      window of the channel around the parent) so the 2.9 deal surface
+      renders from the mirror with no network wait; the user wants this
+      thought through before anything is built. The request pattern must
+      look like a person reading; the fake
       counts calls per method and a test asserts that opening the list
       fetches no history. Screenshot: the list and a conversation open
       with the fake stopped.
