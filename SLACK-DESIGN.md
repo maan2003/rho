@@ -61,6 +61,12 @@ unread and nothing more. A newer message from someone else after any
 verdict brings the thread back, keyed on the latest message timestamp,
 the same way an agent reply voids a skip.
 
+Discard is also Slack's "ignore thread": `x` on a thread card unfollows it
+in Slack (`subscriptions.thread.remove`), and a thread unfollowed in Slack
+(`thread_unsubscribed` on the socket, or absent from the feed) is
+discarded in rho. Rho keeps no subscription state of its own; Slack's
+follow list is the truth and the two clients agree.
+
 **Why:** the dealer, its curves, verdict keys, deal history, and journal
 already model exactly this for agents. Slack adds no new concept; it adds
 another source of the same card. Reading and replying used to count as
@@ -72,9 +78,10 @@ Closing a thread is a decision only the user makes.
 
 Both are someone waiting on the user. A thread that needs a reply takes
 the agent blocked curve with a higher head start: 1.1 where an agent
-starts at 1.0, rising at the same 12 per day. An agent that just replied
-keeps its recency bonus (up to 1.5 in the first hour), so it still deals
-first; past that, equal waits favour Slack. A thread the user has replied
+starts at 1.0, rising at the same 12 per day. An agent the user just
+spoke to keeps its recency bonus (1.5 at the moment of the user's message
+or opening its surface, gone within the hour), so it still deals first;
+past that, equal waits favour Slack. A thread the user has replied
 to takes the agent fyi curve: 0 at the reply, falling a third per day,
 under the queue floor after three days, so it is dealt only when nothing
 else is waiting and fades on its own if they never answer. A reply from

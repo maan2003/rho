@@ -365,12 +365,24 @@ done right after the transcript primitive (2.4) and before 2.10:
       and nothing else; the "reading elsewhere is a verdict too" branch
       goes. A `needs reply` card scores like a blocked agent with a 1.1
       head start and the same 12 per day slope, replacing the pace-0 todo
-      curve plus `age_days`; a just-replied agent (recency bonus up to
-      1.5 in the first hour) still ranks above it. Tests: own reply keeps
+      curve plus `age_days`; an agent the user just spoke to (recency bonus
+      up to 1.5, fed by the user's sends and surface opens, gone within the
+      hour) still ranks above it. Tests: own reply keeps
       the card and relabels it; a read on another client keeps the card;
       a reply from them after `d` re-raises; a 2h-old ping outranks a
-      2h-old blocked agent but not a 10-minute-old one. Screenshot a deal
-      queue holding both.
+      2h-old blocked agent but not one the user messaged 10 minutes ago.
+      Screenshot a deal queue holding both.
+- [ ] 2.15 Discard is Slack's ignore thread. Decided by the user on 3 Sep,
+      recorded in SLACK-DESIGN under "A Slack thread is shaped like an
+      agent". `x` on a thread card calls `subscriptions.thread.remove`
+      for that thread (one request, failure lands as a notice, the rho
+      discard stands either way); `thread_unsubscribed` on the websocket,
+      and a thread the feed stops naming after an unfollow elsewhere,
+      discard the card in rho. Rho stores no subscription state. Follow
+      again in Slack (`thread_subscribed`) re-raises only on the next
+      message from someone else. Fake records the unfollow calls; tests
+      cover both directions. Journal `SlackThreadIgnored { thread, by:
+      Rho | Slack }`.
 - [ ] 2.10 No inbox in between, decided. Today a Slack obligation is copied
       into the rho inbox (`SlackItems`, `InboxKind::Slack`,
       `SourceReference::SlackThread`) and dealt from there. Rho: the dealer
