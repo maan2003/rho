@@ -225,8 +225,14 @@ under test. If the fake cannot produce a state, extend the fake.
       refreshes behind it; a conversation fetches only what is newer than
       its cached newest ts; restart shows the mirror before the socket is
       up; offline, everything cached is readable and sending fails loudly
-      into the composer. Screenshot: the list and a conversation open with
-      the fake stopped.
+      into the composer. Fill is on demand only: history when a
+      conversation is opened, older pages only on `shift-p`, tails only for
+      open conversations and those the feed named; no background walk of
+      history, no fan-out over the list, no re-fetch of what the mirror
+      holds. The request pattern must look like a person reading; the fake
+      counts calls per method and a test asserts that opening the list
+      fetches no history. Screenshot: the list and a conversation open
+      with the fake stopped.
 - [ ] 2.7 Direct messages raise cards. Slack's `activity.feed` does not
       carry DMs, only mentions, reactions, and thread replies; a DM never
       reaches the inbox today. Rho: a websocket `message` in an `im` or

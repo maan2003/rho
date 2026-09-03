@@ -109,6 +109,15 @@ conversation. A restart shows yesterday's Slack before the socket is up;
 offline, all of it is readable. Sending while offline fails loudly into
 the composer rather than queueing, for now.
 
+The mirror fills only on demand. Nothing is prefetched: a conversation's
+history is fetched when the user opens it, older pages only on `shift-p`,
+and the tail only for conversations that are open or that the feed named.
+Rho never walks a workspace's history in the background, never fans out
+over the conversation list, and never re-fetches what the mirror already
+holds. The request pattern must look like a person reading, because an
+unofficial client that bulk-pulls history is the kind Slack detects and
+bans.
+
 **Why:** Slack's own web client does exactly this (an IndexedDB mirror, so
 boot is instant and history scrolls without a round trip). Rho's promise
 is that the UI never waits on a remote, and the GitHub design already
