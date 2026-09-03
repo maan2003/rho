@@ -231,6 +231,10 @@ A conversation surface is built the way the agent transcript is: a
 read-only editor holding the rendered messages, vim motions and search
 work inside it, a composer below it. `i` focuses the composer, Enter sends,
 `q` closes, and it enters the deal history like every other surface.
+A picture goes with a message rather than instead of one: paste it, drop
+it, or name it with the attach prompt, and a muted chip over the composer
+says what is waiting; `enter` uploads it and the message comes back from
+Slack with the picture on it.
 Rewriting what was already sent is `e` on the reader's own message (or
 `up` on an empty composer, Slack's habit): the composer holds the old
 text, the message is tinted while the edit is open, `enter` posts

@@ -751,6 +751,9 @@ fn slack_menu() -> Transient {
         .item("o", "conversations", |workspace, window, cx| {
             workspace.open_slack(window, cx);
         })
+        .item("a", "attach file…", |workspace, window, cx| {
+            workspace.prompt_slack_attach(window, cx);
+        })
         .item("m", "mark read before…", |workspace, window, cx| {
             workspace.prompt_slack_mark_read_before(window, cx);
         })

@@ -1398,6 +1398,47 @@ impl Session {
         }));
     }
 
+    /// Sends a picture with the message. The bytes go up first, then Slack
+    /// posts the message with the file on it, and what appears is that
+    /// message coming back like any other: never the local bytes.
+    pub fn send_file(
+        &mut self,
+        source: &Source,
+        name: String,
+        bytes: Vec<u8>,
+        text: String,
+        cx: &mut Context<Self>,
+    ) -> Task<anyhow::Result<()>> {
+        let Some(client) = self.client.clone() else {
+            return Task::ready(Err(anyhow::anyhow!("slack is not connected")));
+        };
+        let channel = source.channel().clone();
+        let thread_ts = source.thread_ts().cloned();
+        let source = source.clone();
+        let task = gpui_tokio::Tokio::spawn(cx, async move {
+            client
+                .upload_file(&channel, thread_ts.as_ref(), &name, bytes, &text)
+                .await
+        });
+        cx.spawn(async move |this, cx| {
+            let sent = match task.await {
+                Ok(sent) => sent,
+                Err(error) => Err(anyhow::anyhow!("{error}")),
+            };
+            if let Err(error) = &sent {
+                tracing::warn!(error = %error, "slack file send failed");
+                let message = format!("{error:#}");
+                let _ = this.update(cx, |session, cx| {
+                    if let Some(loaded) = session.loaded.get_mut(&source) {
+                        loaded.error = Some(message);
+                    }
+                    cx.notify();
+                });
+            }
+            sent
+        })
+    }
+
     /// Rewrites a message the reader already sent. What appears is Slack's
     /// own `message_changed` coming back down the socket, so the screen
     /// shows the edit that landed rather than the one that was asked for.

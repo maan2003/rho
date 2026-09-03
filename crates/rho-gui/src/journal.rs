@@ -480,6 +480,12 @@ pub enum Event {
         conversation: String,
         ts: String,
     },
+    /// A picture sent with a message: `files.getUploadURLExternal` and
+    /// `files.completeUploadExternal` on Slack's side.
+    SlackFileSent {
+        conversation: String,
+        bytes: u64,
+    },
     MinibufferOpened {
         prompt: String,
     },
@@ -571,6 +577,7 @@ impl Event {
             Self::SlackMarkedReadBefore { .. } => "slack_marked_read_before",
             Self::SlackMarkReadBeforeUndone { .. } => "slack_mark_read_before_undone",
             Self::SlackMessageEdited { .. } => "slack_message_edited",
+            Self::SlackFileSent { .. } => "slack_file_sent",
             Self::MinibufferOpened { .. } => "minibuffer_opened",
             Self::MinibufferSubmitted { .. } => "minibuffer_submitted",
             Self::MinibufferCancelled { .. } => "minibuffer_cancelled",

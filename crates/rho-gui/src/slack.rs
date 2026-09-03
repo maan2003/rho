@@ -9,7 +9,7 @@ use rho_slack::config::{CredentialStore, Credentials, WorkspaceName};
 use rho_slack::health::Signal;
 use rho_slack::model::{Change, Model, Waiting};
 use rho_slack::session::{Session, SessionEvent, Source};
-use rho_slack::types::{ChannelId, ThreadKey, Ts};
+use rho_slack::types::{ChannelId, ThreadKey, Ts, human_size};
 use rho_slack::ui::conversation::EditStart;
 
 use crate::dashboard::{DealerThread, ThreadRef};
@@ -270,6 +270,13 @@ impl Workspace {
                         rho_slack::ui::conversation::Event::OpenFile(file) => {
                             workspace.open_slack_image(view, file.clone(), cx);
                         }
+                        rho_slack::ui::conversation::Event::AttachFailed(said) => {
+                            workspace.echo(
+                                &format!("slack: {said}"),
+                                StyleClass::SystemImportant,
+                                cx,
+                            );
+                        }
                     },
                 ));
                 Self::wrap_surface(key, SurfaceView::SlackConversation(view))
@@ -416,14 +423,22 @@ impl Workspace {
             return;
         };
         let view = view.clone();
-        let edited = view.update(cx, |view, cx| {
+        let (edited, attached) = view.update(cx, |view, cx| {
+            let channel = view.source().channel().clone();
             let edited = view
                 .editing_message()
                 .cloned()
-                .map(|ts| (view.source().channel().clone(), ts));
+                .map(|ts| (channel.clone(), ts));
+            let attached = view.attached_size().map(|bytes| (channel, bytes));
             view.submit(cx);
-            edited
+            (edited, attached)
         });
+        if let (Some((channel, bytes)), Some(session)) = (attached, self.slack.clone()) {
+            crate::journal::record(crate::journal::Event::SlackFileSent {
+                conversation: session.read(cx).model().label(&channel),
+                bytes,
+            });
+        }
         let (Some((channel, ts)), Some(session)) = (edited, self.slack.clone()) else {
             return;
         };
@@ -431,6 +446,109 @@ impl Workspace {
             conversation: session.read(cx).model().label(&channel),
             ts: ts.0,
         });
+    }
+
+    /// Attaches a picture to the conversation's next message: clipboard
+    /// bytes (`ctrl-v`) or a path (a drop, or the attach prompt). Returns
+    /// whether the surface took it, so the paste path can fall back to
+    /// pasting text where there is no conversation.
+    pub(crate) fn slack_attach_bytes(
+        &mut self,
+        name: String,
+        bytes: Vec<u8>,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let SurfaceView::SlackConversation(view) = &self.active_pane().surface.view else {
+            return false;
+        };
+        let size = bytes.len() as u64;
+        let replaced = view
+            .clone()
+            .update(cx, |view, cx| view.attach(name.clone(), bytes, cx));
+        let said = match replaced {
+            true => format!("slack: {name} attached, replacing the last one"),
+            false => format!("slack: {name} attached · {}", human_size(size)),
+        };
+        self.echo(&said, StyleClass::SystemInfo, cx);
+        true
+    }
+
+    pub(crate) fn slack_attach_path(
+        &mut self,
+        path: &std::path::Path,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let SurfaceView::SlackConversation(view) = &self.active_pane().surface.view else {
+            return false;
+        };
+        match view
+            .clone()
+            .update(cx, |view, cx| view.attach_path(path, cx))
+        {
+            Ok(replaced) => {
+                let said = match replaced {
+                    true => format!("slack: {} attached, replacing the last one", path.display()),
+                    false => format!("slack: {} attached", path.display()),
+                };
+                self.echo(&said, StyleClass::SystemInfo, cx);
+            }
+            // A path that cannot be read is worth saying out loud now
+            // rather than at send time.
+            Err(error) => self.echo(
+                &format!("slack: {error:#}"),
+                StyleClass::SystemImportant,
+                cx,
+            ),
+        }
+        true
+    }
+
+    /// Drops the waiting picture without sending it.
+    pub(crate) fn slack_clear_attachment(&mut self, cx: &mut gpui::Context<Self>) -> bool {
+        let SurfaceView::SlackConversation(view) = &self.active_pane().surface.view else {
+            return false;
+        };
+        let cleared = view
+            .clone()
+            .update(cx, |view, cx| view.clear_attachment(cx));
+        if cleared {
+            self.echo("slack: attachment cleared", StyleClass::SystemInfo, cx);
+        }
+        cleared
+    }
+
+    /// The attach prompt: the keyboard's way to the same thing a drop does.
+    pub(crate) fn prompt_slack_attach(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) {
+        self.open_prompt(
+            "attach file:",
+            std::rc::Rc::new(|_: &Workspace, needle: &str, _: &gpui::App| {
+                let path = std::path::Path::new(needle.trim());
+                let description = match path.is_file() {
+                    true => "enter attaches it".to_owned(),
+                    false => "a path to a file".to_owned(),
+                };
+                vec![Candidate {
+                    value: needle.trim().to_owned(),
+                    description,
+                }]
+            }),
+            std::rc::Rc::new(|workspace: &mut Workspace, input, _window, cx| {
+                let path = std::path::PathBuf::from(input.trim());
+                if !workspace.slack_attach_path(&path, cx) {
+                    workspace.echo(
+                        "slack: open a conversation first",
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
+                }
+            }),
+            window,
+            cx,
+        );
     }
 
     /// `e`: rewrite the message under the cursor. Someone else's message is

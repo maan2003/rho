@@ -68,6 +68,13 @@ struct State {
     /// a QA run has to be able to look at what the reader sees while a
     /// picture is still coming.
     file_delay_ms: u64,
+    /// Bytes that arrived through the upload URL, by the file id the
+    /// upload was reserved under. Serving them back at `/files/` is what
+    /// makes a sent picture the same round trip as a received one.
+    uploads: BTreeMap<String, Vec<u8>>,
+    /// Where the fake is listening, because Slack hands out an absolute
+    /// upload URL and the client posts the bytes wherever it is told.
+    api_base: String,
 }
 
 pub struct Fake {
@@ -87,6 +94,7 @@ impl Fake {
 
         let api = TcpListener::bind("127.0.0.1:0").await?;
         let api_base = format!("http://{}/api", api.local_addr()?);
+        state.lock().unwrap().api_base = api_base.clone();
         let sockets = TcpListener::bind("127.0.0.1:0").await?;
         let ws_url = format!("ws://{}", sockets.local_addr()?);
 
@@ -473,7 +481,19 @@ async fn serve_api(
         // Avatars and file downloads are bytes, not JSON: the same server
         // serves them because that is how Slack does it, on the same host
         // and behind the same credentials.
-        if let Some(bytes) = binary_route(&path) {
+        // The upload URL Slack hands out: the bytes go straight to it, and
+        // the fake keeps them so the picture it serves afterwards is the
+        // one that was sent.
+        if let Some(id) = path.strip_prefix("/upload/") {
+            state
+                .lock()
+                .unwrap()
+                .uploads
+                .insert(id.to_owned(), body.clone());
+            write_json(&mut stream, &json!({"ok": true})).await?;
+            continue;
+        }
+        if let Some(bytes) = binary_route(&path, &state) {
             let delay = match path.starts_with("/files/") {
                 true => state.lock().unwrap().file_delay_ms,
                 false => 0,
@@ -486,13 +506,14 @@ async fn serve_api(
                 bytes.len()
             );
             stream.write_all(head.as_bytes()).await?;
-            stream.write_all(bytes).await?;
+            stream.write_all(&bytes).await?;
             stream.flush().await?;
             continue;
         }
         // The control route is not Slack's; it is how a QA run asks the fake
         // to behave like a workspace someone else is typing in. It stays on
         // the server so nothing about the client changes under test.
+        let body = String::from_utf8_lossy(&body).into_owned();
         if path == "/control" {
             let request: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
             let response = apply_live(&mut state.lock().unwrap(), &frames, &request);
@@ -520,30 +541,39 @@ async fn write_json(stream: &mut TcpStream, response: &Value) -> anyhow::Result<
 /// The byte routes: avatars, and the file an attachment points at. Two
 /// colours so a screenshot shows that the right picture reached the right
 /// author.
-fn binary_route(path: &str) -> Option<&'static [u8]> {
+fn binary_route(path: &str, state: &Arc<Mutex<State>>) -> Option<Vec<u8>> {
     if path.starts_with("/thumbs/") {
         // Slack's smallest thumbnail: the placeholder, so it is tiny on
         // purpose and blurs when the box blows it up.
         static THUMB: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-        return Some(THUMB.get_or_init(|| preview_png(64, 40)).as_slice());
+        return Some(THUMB.get_or_init(|| preview_png(64, 40)).clone());
     }
-    if path.starts_with("/files/") {
+    if let Some(name) = path.strip_prefix("/files/") {
+        // A picture the reader sent themselves comes back as the bytes they
+        // sent, so the message they see is not a different picture.
+        let id = name.split('/').next().unwrap_or_default();
+        if let Some(bytes) = state.lock().unwrap().uploads.get(id) {
+            return Some(bytes.clone());
+        }
         // A file is what a preview is judged on, so it is big enough to
         // look at rather than a 16-pixel square.
         static PREVIEW: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-        return Some(PREVIEW.get_or_init(|| preview_png(320, 200)).as_slice());
+        return Some(PREVIEW.get_or_init(|| preview_png(320, 200)).clone());
     }
     let name = path.strip_prefix("/avatars/")?.trim_end_matches(".png");
-    Some(match name {
-        "davidav" | "adaav" | "botav" => AVATAR_BLUE,
-        _ => AVATAR_GREEN,
-    })
+    Some(
+        match name {
+            "davidav" | "adaav" | "botav" => AVATAR_BLUE,
+            _ => AVATAR_GREEN,
+        }
+        .to_vec(),
+    )
 }
 
 /// Reads one HTTP request, returning its path and body. Enough of HTTP/1.1
 /// for a client we control: a request line, headers, and a `Content-Length`
 /// body.
-async fn read_request(stream: &mut TcpStream) -> anyhow::Result<Option<(String, String)>> {
+async fn read_request(stream: &mut TcpStream) -> anyhow::Result<Option<(String, Vec<u8>)>> {
     let mut buffer = Vec::new();
     let head_end = loop {
         if let Some(index) = find(&buffer, b"\r\n\r\n") {
@@ -581,7 +611,7 @@ async fn read_request(stream: &mut TcpStream) -> anyhow::Result<Option<(String, 
         }
         body.extend_from_slice(&chunk[..read]);
     }
-    Ok(Some((path, String::from_utf8_lossy(&body).into_owned())))
+    Ok(Some((path, body)))
 }
 
 fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
@@ -790,6 +820,21 @@ fn next_ts(state: &State, channel: &str, now: u64) -> String {
         .and_then(|ts| ts.split('.').next()?.parse::<u64>().ok())
         .unwrap_or(0);
     format!("{}.000000", now.max(newest + 1))
+}
+
+/// The size in the PNG header, which is what Slack would have measured for
+/// itself: the box a picture is drawn in comes from these two numbers.
+fn png_size(bytes: &[u8]) -> (u32, u32) {
+    let number = |at: usize| {
+        bytes
+            .get(at..at + 4)
+            .map(|slice| u32::from_be_bytes([slice[0], slice[1], slice[2], slice[3]]))
+            .unwrap_or_default()
+    };
+    match bytes.starts_with(b"\x89PNG") {
+        true => (number(16), number(20)),
+        false => (0, 0),
+    }
 }
 
 fn message_mut<'a>(state: &'a mut State, channel: &str, ts: &str) -> Option<&'a mut Value> {
@@ -1005,6 +1050,64 @@ fn handle(
             state.marked.push((field("channel"), field("ts")));
             json!({"ok": true})
         }
+        // Slack's two-step upload: reserve a URL, POST the bytes to it, then
+        // say where the file goes. The fake follows the same order, so a
+        // client that skips a step gets nothing.
+        "files.getUploadURLExternal" => {
+            let id = format!("FUP{}", state.uploads.len() + state.calls.len());
+            let url = format!("{}/upload/{id}", state.api_base.trim_end_matches("/api"));
+            json!({"ok": true, "upload_url": url, "file_id": id})
+        }
+        "files.completeUploadExternal" => {
+            let channel = field("channel_id");
+            let thread_ts = match field("thread_ts") {
+                empty if empty.is_empty() => None,
+                thread_ts => Some(thread_ts),
+            };
+            let files: Value = serde_json::from_str(&field("files")).unwrap_or(Value::Null);
+            let id = files[0]["id"].as_str().unwrap_or_default().to_owned();
+            let title = files[0]["title"].as_str().unwrap_or("file").to_owned();
+            let bytes = state.uploads.get(&id).cloned().unwrap_or_default();
+            if bytes.is_empty() {
+                return json!({"ok": false, "error": "upload_not_found"});
+            }
+            let (width, height) = png_size(&bytes);
+            let base = state.api_base.trim_end_matches("/api").to_owned();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_secs())
+                .unwrap_or_default();
+            let ts = next_ts(&state, &channel, now);
+            let mut message = json!({
+                "type": "message",
+                "ts": ts,
+                "user": "ME",
+                "channel": channel,
+                "text": field("initial_comment"),
+                "files": [{
+                    "id": id,
+                    "name": title,
+                    "title": title,
+                    "mimetype": "image/png",
+                    "filetype": "png",
+                    "size": bytes.len(),
+                    "url_private": format!("{base}/files/{id}/{title}"),
+                    "original_w": width,
+                    "original_h": height,
+                    "thumb_64": format!("{base}/thumbs/{id}.png"),
+                }],
+            });
+            if let Some(thread_ts) = &thread_ts {
+                message["thread_ts"] = json!(thread_ts);
+            }
+            state
+                .history
+                .entry(channel.clone())
+                .or_default()
+                .push(message.clone());
+            let _ = frames.send(Frame::Text(message.to_string().into()));
+            json!({"ok": true, "files": [{"id": id, "title": title}]})
+        }
         // An edit is `chat.update` plus the socket event every other client
         // sees, so the round trip a reader makes here is the live one.
         "chat.update" => {
@@ -1154,6 +1257,11 @@ fn decode(value: &str) -> String {
         index += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// The same picture the fake serves, for a test that needs bytes to send.
+pub fn sample_png(width: u32, height: u32) -> Vec<u8> {
+    preview_png(width, height)
 }
 
 /// A recognisable picture, built rather than embedded: a colour wash with a

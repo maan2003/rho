@@ -599,6 +599,54 @@ impl Client {
         Ok(Ts(string(&response["ts"]).unwrap_or_default()))
     }
 
+    /// Sends a file the way Slack's own client does: reserve an upload URL,
+    /// POST the bytes to it, then say which conversation the file belongs
+    /// to. The message with the file on it comes back over the socket, so
+    /// nothing here paints anything.
+    pub async fn upload_file(
+        &self,
+        channel: &ChannelId,
+        thread_ts: Option<&Ts>,
+        name: &str,
+        bytes: Vec<u8>,
+        comment: &str,
+    ) -> anyhow::Result<()> {
+        let reserved = self
+            .post_form(
+                "files.getUploadURLExternal",
+                &[
+                    ("filename", name.to_owned()),
+                    ("length", bytes.len().to_string()),
+                ],
+            )
+            .await?;
+        let url = string(&reserved["upload_url"]).unwrap_or_default();
+        let file_id = string(&reserved["file_id"]).unwrap_or_default();
+        if url.is_empty() || file_id.is_empty() {
+            anyhow::bail!("slack gave no upload url");
+        }
+        let response = self
+            .authorize(self.http.post(url))
+            .body(bytes)
+            .send()
+            .await
+            .context("uploading file bytes")?;
+        if !response.status().is_success() {
+            anyhow::bail!("upload refused: {}", response.status());
+        }
+        let files = json!([{"id": file_id, "title": name}]).to_string();
+        let mut fields = vec![("files", files), ("channel_id", channel.0.clone())];
+        if !comment.is_empty() {
+            fields.push(("initial_comment", comment.to_owned()));
+        }
+        if let Some(thread_ts) = thread_ts {
+            fields.push(("thread_ts", thread_ts.0.clone()));
+        }
+        self.post_form("files.completeUploadExternal", &fields)
+            .await?;
+        Ok(())
+    }
+
     /// Rewrites a message the reader already sent. Slack answers with the
     /// new text and tells every other client on the socket, so nothing here
     /// has to paint the change itself.

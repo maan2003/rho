@@ -572,6 +572,35 @@ done right after the transcript primitive (2.4) and before 2.10:
       testable; a failed upload fails loudly into the composer with the
       text kept, like a failed send. Journal `SlackFileSent { conversation,
       bytes }`. Screenshot the chip and the sent result on the fake.
+      Landed 3 Sep. Three ways in, all the same attachment: `ctrl-v` in the
+      composer takes clipboard image bytes (named `image.png` after the
+      format, since a clipboard carries no filename), a file dropped on the
+      conversation takes the path, and `space s a` (attach file…) is the
+      keyboard's way to the same thing, which is what the rig can drive.
+      One picture at a time: a second attachment replaces the first and the
+      notice says so, rather than a chip quietly changing under the reader.
+      The chip is one muted line kept between the transcript and the
+      composer (`mock.png · 49 KB`), and `space p c` (clear images) drops
+      it. `enter` uploads through `files.getUploadURLExternal`, a POST of
+      the bytes to the URL Slack hands out, and
+      `files.completeUploadExternal`; the message with the file on it comes
+      back over the socket and is drawn from the mirror like anyone else's
+      picture, never from the local bytes. A refusal puts the chip and the
+      words back in the composer and the error on the transcript's notice
+      line. The fake serves all three steps, keeps the uploaded bytes, and
+      serves them back at `/files/`, so the picture in the transcript is
+      the picture that left; it reads the PNG header for `original_w`/`_h`,
+      which is what sizes the box. Tests: the upload round trip (bytes
+      served back byte-for-byte, one call to each endpoint), a refused
+      upload posting nothing, and the chip's wording. Rig:
+      screens/35-02-prompt.png (the prompt), 35-03-chip.png (the chip),
+      35-04-sent.png (the picture in the transcript). Budget: two calls for
+      a picture message and no `chat.postMessage`, journal
+      `slack_file_sent` once with the channel named and the byte count.
+      Deviation to note: the paste and drop paths cannot be driven from the
+      headless rig (no clipboard tool, no second wayland client to drag
+      from), so the prompt is what the screenshots use; the three paths meet
+      at the same `attach`.
 
 - [x] 3.6 Editing a sent message. Landed 3 Sep; escape on an open edit
       cancels and leaves insert in one press (ruled 3 Sep, done with 3.5).
@@ -594,8 +623,9 @@ done right after the transcript primitive (2.4) and before 2.10:
       own text, whatever was half-written is put aside, and the message
       carries the dealt tint while the edit is open. `enter` posts
       `chat.update` and gives the composer its held text back; `escape`
-      does the same without posting, and with no edit open falls through to
-      vim, so leaving the composer still works. What repaints is Slack's
+      does the same without posting and leaves insert in the one press
+      (ruled 3 Sep: two escapes to get out is a trap), and with no edit
+      open it falls through to vim as before. What repaints is Slack's
       own `message_changed` coming back down the socket, so the screen
       shows the edit that landed: one item replaced, the `(edited)` marker
       already in the renderer. Someone else's message says so and does
@@ -604,7 +634,8 @@ done right after the transcript primitive (2.4) and before 2.10:
       test drives the whole round trip. Rig: screens/36-16-edit-open.png
       (`up`), 36-22-edit-open-key-e.png (`e`), 36-17-edited.png (the
       result), 36-19-cancelled.png (`escape`), 36-21-notyours.png (the
-      notice). Budget: one `chat.update` for the edit and nothing else,
+      notice); esc-02-open.png / esc-03-cancelled.png show the one-press
+      cancel putting the half-written line back with the mode in normal. Budget: one `chat.update` for the edit and nothing else,
       journal `slack_message_edited` once with the channel named.
 
 ## Phase 4: status and health

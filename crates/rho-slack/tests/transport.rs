@@ -996,3 +996,95 @@ async fn editing_a_sent_message_updates_slack_and_comes_back_on_the_socket() {
     assert_eq!(page.messages.last().unwrap().text, "on it, by tuesday");
     assert_eq!(fake.calls("chat.update"), 1);
 }
+
+#[tokio::test]
+async fn sending_an_image_uploads_it_and_the_message_comes_back_with_the_file() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_channel("C1", "design");
+    let client = client(&fake);
+    let (sender, mut receiver) = mpsc::unbounded();
+    let catch_up = Arc::new(Notify::new());
+    let _socket = tokio::spawn(run_socket(
+        client.clone(),
+        sender,
+        catch_up.clone(),
+        timings(),
+    ));
+    let Wire::Connected(_) = next_wire(&mut receiver).await else {
+        panic!("the first thing a session learns is who it is");
+    };
+    wait_until_live(&catch_up).await;
+    assert!(matches!(
+        next_wire(&mut receiver).await,
+        Wire::Frame(WsEvent::Hello)
+    ));
+
+    // The fake reads the PNG header for the size it reports back, the same
+    // as Slack measuring an upload.
+    let png = rho_slack::fake::sample_png(24, 16);
+    client
+        .upload_file(
+            &ChannelId("C1".into()),
+            None,
+            "shot.png",
+            png.clone(),
+            "here it is",
+        )
+        .await
+        .unwrap();
+
+    let Wire::Frame(WsEvent::Message(message)) = next_wire(&mut receiver).await else {
+        panic!("a completed upload arrives as the message it is attached to");
+    };
+    assert_eq!(message.text, "here it is");
+    let file = message
+        .files
+        .first()
+        .expect("the file rides on the message");
+    assert_eq!(file.title, "shot.png");
+    assert_eq!(file.size, png.len() as u64);
+    assert_eq!((file.original_w, file.original_h), (24, 16));
+
+    // And the bytes Slack serves back are the bytes that were sent, so the
+    // picture in the transcript is the picture that left.
+    let served = reqwest::Client::new()
+        .get(&file.url)
+        .header("authorization", "Bearer xoxc-test")
+        .header("cookie", "d=cookie")
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(served.as_ref(), png.as_slice());
+    assert_eq!(fake.calls("files.getUploadURLExternal"), 1);
+    assert_eq!(fake.calls("files.completeUploadExternal"), 1);
+}
+
+#[tokio::test]
+async fn a_refused_upload_fails_rather_than_posting_a_message() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_channel("C1", "design");
+    fake.fail_next("files.completeUploadExternal", 1);
+    let client = client(&fake);
+
+    let sent = client
+        .upload_file(
+            &ChannelId("C1".into()),
+            None,
+            "shot.png",
+            rho_slack::fake::sample_png(8, 8),
+            "here it is",
+        )
+        .await;
+
+    assert!(sent.is_err(), "a refused upload is not a sent message");
+    // Nothing was posted, so there is nothing for the reader to find later:
+    // the composer keeping the words is the only place it survives.
+    let page = client
+        .conversations_history(&ChannelId("C1".into()), None)
+        .await
+        .unwrap();
+    assert!(page.messages.is_empty());
+}

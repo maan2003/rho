@@ -297,7 +297,7 @@ pub const IMAGE_COLUMNS: u32 = 48;
 /// A monospace cell's width over its height, near enough for sizing a box.
 pub const CELL_ASPECT: f32 = 0.5;
 
-fn human_size(bytes: u64) -> String {
+pub fn human_size(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
     match bytes {

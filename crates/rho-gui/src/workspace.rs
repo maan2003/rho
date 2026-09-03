@@ -2976,7 +2976,9 @@ impl Workspace {
         let dashboard_mode = self.dashboard_mode(window, cx);
         let pane_prompt = matches!(
             self.active_pane().surface.view,
-            SurfaceView::Draft { .. } | SurfaceView::Transcript { .. }
+            SurfaceView::Draft { .. }
+                | SurfaceView::Transcript { .. }
+                | SurfaceView::SlackConversation(_)
         );
         let images = item
             .entries
@@ -3013,6 +3015,12 @@ impl Workspace {
                 }
             };
             let added = match &self.active_pane().surface.view {
+                // A picture pasted into a conversation is an attachment on
+                // the next message, not bytes pasted into the composer.
+                SurfaceView::SlackConversation(_) => {
+                    let name = format!("image.{}", extension(image.format));
+                    self.slack_attach_bytes(name, image.bytes.clone(), cx)
+                }
                 SurfaceView::Draft { .. } => {
                     self.draft_model.update(cx, |model, cx| {
                         model.add_image(media_type.to_owned(), image.bytes.clone(), cx)
@@ -3043,6 +3051,7 @@ impl Workspace {
             false
         } else {
             match &self.active_pane().surface.view {
+                SurfaceView::SlackConversation(_) => self.slack_clear_attachment(cx),
                 SurfaceView::Draft { .. } => self
                     .draft_model
                     .update(cx, |model, cx| model.clear_attachments(cx)),
@@ -9466,9 +9475,16 @@ impl Render for Workspace {
                     cx.propagate();
                 }
             }))
-            .on_action(cx.listener(|this, _: &SlackCancelEdit, _window, cx| {
+            .on_action(cx.listener(|this, _: &SlackCancelEdit, window, cx| {
                 if !this.slack_cancel_edit(cx) {
                     cx.propagate();
+                    return;
+                }
+                // One press, not two: cancelling puts the reader back in
+                // normal mode with the composer as it was, the same as
+                // escape does when there is no edit open.
+                if let Ok(action) = cx.build_action("vim::NormalBefore", None) {
+                    window.dispatch_action(action, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &SlackMarkReadBefore, window, cx| {
@@ -10201,6 +10217,17 @@ pub fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
         .unwrap_or(0)
+}
+
+/// The name a pasted picture gets: the clipboard carries no filename, and
+/// Slack shows one.
+fn extension(format: gpui::ImageFormat) -> &'static str {
+    match format {
+        gpui::ImageFormat::Jpeg => "jpg",
+        gpui::ImageFormat::Webp => "webp",
+        gpui::ImageFormat::Gif => "gif",
+        _ => "png",
+    }
 }
 
 /// `30m`, `2h`, `1d`; a bare number means minutes.

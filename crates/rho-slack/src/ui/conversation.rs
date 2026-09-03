@@ -56,6 +56,10 @@ pub struct ConversationView {
     /// loaded when the deal opens; the first refresh that brings it in does
     /// the scroll.
     dealt_placed: bool,
+    /// The picture the next message carries, if the reader attached one.
+    /// One at a time: a second attachment replaces it, which is what the
+    /// chip shows.
+    attached: Option<Attached>,
     /// The message being rewritten, if `e` is open on one: tinted, and what
     /// `enter` updates instead of sending. The composer's own text is held
     /// beside it so `escape` gives the reader back what they were writing.
@@ -73,6 +77,29 @@ pub struct ConversationView {
 /// around it can draw.
 pub enum Event {
     OpenFile(FileSummary),
+    /// A dropped path that could not be read. The host says so; this crate
+    /// has no notice line of its own.
+    AttachFailed(String),
+}
+
+/// A picture waiting to go with the next message: what the chip shows and
+/// what `enter` uploads.
+#[derive(Clone)]
+pub struct Attached {
+    pub name: String,
+    pub bytes: std::sync::Arc<Vec<u8>>,
+}
+
+impl Attached {
+    /// The chip, which reads like a file line in the transcript because it
+    /// is about to become one.
+    fn line(&self) -> String {
+        format!(
+            "{} · {}",
+            self.name,
+            crate::types::human_size(self.bytes.len() as u64)
+        )
+    }
 }
 
 /// What asking for an edit did. A message that is not the reader's own is
@@ -155,6 +182,9 @@ enum Row {
     Newer(Ts),
     Day(String),
     Message(Ts),
+    /// The picture waiting to go with the next message, under everything
+    /// and over the composer.
+    Chip,
 }
 
 /// What a line offers the cursor.
@@ -287,6 +317,7 @@ impl ConversationView {
             dealt_placed: false,
             editing_message: None,
             held_compose: None,
+            attached: None,
             awaiting_images: Vec::new(),
             _subscriptions: subscriptions,
         };
@@ -355,10 +386,15 @@ impl ConversationView {
     /// was not actually sent.
     pub fn submit(&mut self, cx: &mut Context<Self>) {
         let text = self.input.read(cx).text();
-        if text.trim().is_empty() {
+        // A picture is a message on its own; words are not required.
+        if text.trim().is_empty() && self.attached.is_none() {
             return;
         }
         let source = self.source.clone();
+        if let Some(file) = self.attached.take() {
+            self.send_attached(file, text, cx);
+            return;
+        }
         if let Some(ts) = self.editing_message.take() {
             // The composer goes back to whatever the reader had put aside to
             // make the edit, the same as cancelling: the rewrite is done
@@ -446,6 +482,100 @@ impl ConversationView {
         self.set_compose(held, cx);
         self.retint(&ts, cx);
         true
+    }
+
+    /// Attaches a picture to the next message. One at a time: a second
+    /// replaces the first, and the answer says so, because a chip that
+    /// quietly changed under the reader would send the wrong file.
+    pub fn attach(&mut self, name: String, bytes: Vec<u8>, cx: &mut Context<Self>) -> bool {
+        let replaced = self.attached.is_some();
+        self.attached = Some(Attached {
+            name,
+            bytes: std::sync::Arc::new(bytes),
+        });
+        self.refresh_chip(cx);
+        cx.notify();
+        replaced
+    }
+
+    /// Reads a file from disk and attaches it: the path a drop or a prompt
+    /// gave. The bytes are read here so the failure is one the reader hears
+    /// about before they press enter.
+    pub fn attach_path(
+        &mut self,
+        path: &std::path::Path,
+        cx: &mut Context<Self>,
+    ) -> anyhow::Result<bool> {
+        let bytes = std::fs::read(path)
+            .map_err(|error| anyhow::anyhow!("reading {}: {error}", path.display()))?;
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".to_owned());
+        Ok(self.attach(name, bytes, cx))
+    }
+
+    /// Drops the attachment without sending it.
+    pub fn clear_attachment(&mut self, cx: &mut Context<Self>) -> bool {
+        let had = self.attached.take().is_some();
+        if had {
+            self.refresh_chip(cx);
+            cx.notify();
+        }
+        had
+    }
+
+    /// How big the waiting picture is, for the host's journal.
+    pub fn attached_size(&self) -> Option<u64> {
+        self.attached.as_ref().map(|file| file.bytes.len() as u64)
+    }
+
+    /// Uploads the picture with the message. Nothing is drawn from the
+    /// local bytes: the message arrives from Slack like any other. A
+    /// refusal puts the chip and the words back, so the reader can try
+    /// again without retyping.
+    fn send_attached(&mut self, file: Attached, text: String, cx: &mut Context<Self>) {
+        self.set_compose(String::new(), cx);
+        self.refresh_chip(cx);
+        let source = self.source.clone();
+        let sending = self.session.update(cx, |session, cx| {
+            session.send_file(
+                &source,
+                file.name.clone(),
+                file.bytes.as_ref().clone(),
+                text.clone(),
+                cx,
+            )
+        });
+        cx.spawn(async move |this, cx| {
+            if sending.await.is_err() {
+                let _ = this.update(cx, |this, cx| {
+                    this.attached = Some(file);
+                    this.set_compose(text, cx);
+                    this.refresh_chip(cx);
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// The chip line, kept last: it belongs between the transcript and the
+    /// composer, and a message arriving appends itself after whatever is
+    /// at the end.
+    fn refresh_chip(&mut self, cx: &mut Context<Self>) {
+        let Some(file) = self.attached.clone() else {
+            self.transcript.remove(&Row::Chip, cx);
+            return;
+        };
+        let item = muted_item(Row::Chip, format!("{}\n", file.line()), Class::Muted);
+        let last = self.transcript.keys().last().cloned();
+        if last.as_ref() == Some(&Row::Chip) {
+            self.transcript.replace(&Row::Chip, item, cx);
+            return;
+        }
+        self.transcript.remove(&Row::Chip, cx);
+        self.transcript.insert_before(None, vec![item], cx);
     }
 
     /// Which message an open edit is about, for the host's journal.
@@ -650,6 +780,7 @@ impl ConversationView {
         self.settle_images(cx);
         self.refresh_chrome(cx);
         self.refresh_holes(cx);
+        self.refresh_chip(cx);
         cx.notify();
     }
 
@@ -791,7 +922,7 @@ impl ConversationView {
                 let message = messages.iter().find(|message| &message.ts == ts)?.clone();
                 Some(self.item_for(&message, cx))
             }
-            Row::Notice | Row::Gap | Row::Newer(_) => None,
+            Row::Notice | Row::Gap | Row::Newer(_) | Row::Chip => None,
         }
     }
 
@@ -1730,9 +1861,23 @@ impl gpui::Render for ConversationView {
         });
         self.fill(position, screen, cx);
         div()
+            .id("rho-slack-conversation")
             .key_context("RhoSlackConversation")
             .size_full()
             .bg(cx.theme().colors().editor_background)
+            // A file dropped on the conversation is an attachment for the
+            // next message, the same as pasting one.
+            .on_drop(
+                cx.listener(|this, paths: &gpui::ExternalPaths, _window, cx| {
+                    let Some(path) = paths.paths().first().cloned() else {
+                        return;
+                    };
+                    match this.attach_path(&path, cx) {
+                        Ok(_) => {}
+                        Err(error) => cx.emit(Event::AttachFailed(format!("{error:#}"))),
+                    }
+                }),
+            )
             .child(self.editor.clone())
     }
 }
@@ -1770,6 +1915,15 @@ mod tests {
 
     /// The transcript as one string, its classes, and its line map: what
     /// the surface would put in the buffer, built the way `rebuild` does.
+    #[test]
+    fn a_chip_reads_like_the_file_line_it_becomes() {
+        let waiting = Attached {
+            name: "image.png".to_owned(),
+            bytes: std::sync::Arc::new(vec![0; 327_680]),
+        };
+        assert_eq!(waiting.line(), "image.png · 320 KB");
+    }
+
     fn render_messages(
         messages: &[Message],
         model: &Model,
