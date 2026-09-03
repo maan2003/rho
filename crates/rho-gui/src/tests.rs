@@ -182,6 +182,429 @@ fn phone_entry_disables_modal_editing_app_wide(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn phone_entry_opens_the_feed_and_one_finger_flicks_to_the_next_card(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, _, _| {
+            for text in ["First phone card", "Second phone card"] {
+                let id = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
+                    kind: crate::inbox::InboxKind::Capture,
+                    text: text.into(),
+                    source: crate::inbox::SourceReference::None,
+                    context: crate::inbox::CapturedContext::default(),
+                    waiting_on: None,
+                });
+                workspace.age_inbox_for_test(&id, 0);
+            }
+        })
+        .unwrap();
+
+    cx.simulate_window_resize(*workspace, gpui::size(gpui::px(400.), gpui::px(800.)));
+    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+    let first = workspace
+        .update(cx, |workspace, _, _| {
+            assert!(workspace.phone_feed_for_test());
+            workspace.current_deal_card_for_test().unwrap().0
+        })
+        .unwrap();
+
+    cx.update_window(*workspace, |_, window, cx| {
+        for event in [
+            TouchEvent {
+                id: TouchId(1),
+                phase: TouchPhase::Started,
+                position: point(px(200.), px(600.)),
+                timestamp: std::time::Duration::ZERO,
+                ..Default::default()
+            },
+            TouchEvent {
+                id: TouchId(1),
+                phase: TouchPhase::Moved,
+                position: point(px(200.), px(300.)),
+                timestamp: std::time::Duration::from_millis(80),
+                ..Default::default()
+            },
+            TouchEvent {
+                id: TouchId(1),
+                phase: TouchPhase::Ended,
+                position: point(px(200.), px(300.)),
+                timestamp: std::time::Duration::from_millis(100),
+                ..Default::default()
+            },
+        ] {
+            window.dispatch_event(event.to_platform_input(), cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(workspace.phone_feed_for_test());
+            assert_ne!(workspace.current_deal_card_for_test().unwrap().0, first);
+            assert_eq!(
+                workspace.phone_last_gesture_for_test(),
+                Some("flick up · moved")
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn cancelling_phone_file_keeps_the_current_feed_card(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let id = workspace
+        .update(cx, |workspace, _, _| {
+            let id = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
+                kind: crate::inbox::InboxKind::Capture,
+                text: "Keep this phone card".into(),
+                source: crate::inbox::SourceReference::None,
+                context: crate::inbox::CapturedContext::default(),
+                waiting_on: None,
+            });
+            workspace.age_inbox_for_test(&id, 0);
+            id
+        })
+        .unwrap();
+    cx.simulate_window_resize(*workspace, gpui::size(gpui::px(400.), gpui::px(800.)));
+    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+
+    cx.dispatch_action(*workspace, crate::DashboardDealFile);
+    cx.dispatch_action(*workspace, crate::MinibufferCancel);
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(workspace.phone_feed_for_test());
+            assert_eq!(
+                workspace.current_deal_card_for_test().unwrap().0,
+                crate::dashboard::DealCardIdentity::Inbox(id.0)
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn phone_back_from_a_surface_reveals_the_hidden_feed_card(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let expected = workspace
+        .update(cx, |workspace, _, _| {
+            let id = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
+                kind: crate::inbox::InboxKind::Capture,
+                text: "Feed stays put".into(),
+                source: crate::inbox::SourceReference::None,
+                context: crate::inbox::CapturedContext::default(),
+                waiting_on: None,
+            });
+            workspace.age_inbox_for_test(&id, 0);
+            crate::dashboard::DealCardIdentity::Inbox(id.0)
+        })
+        .unwrap();
+    cx.simulate_window_resize(*workspace, gpui::size(gpui::px(400.), gpui::px(800.)));
+    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.enter_draft(None, window, cx);
+            workspace.phone_back_for_test(window, cx);
+            assert!(workspace.phone_feed_for_test());
+            assert!(workspace.phone_feed_is_active_for_test());
+            assert_eq!(workspace.current_deal_card_for_test().unwrap().0, expected);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn phone_empty_feed_flick_down_undoes_the_last_verdict(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    let expected = workspace
+        .update(cx, |workspace, _, _| {
+            let id = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
+                kind: crate::inbox::InboxKind::Capture,
+                text: "Last phone card".into(),
+                source: crate::inbox::SourceReference::None,
+                context: crate::inbox::CapturedContext::default(),
+                waiting_on: None,
+            });
+            workspace.age_inbox_for_test(&id, 0);
+            crate::dashboard::DealCardIdentity::Inbox(id.0)
+        })
+        .unwrap();
+    cx.simulate_window_resize(*workspace, gpui::size(gpui::px(400.), gpui::px(800.)));
+    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+    cx.dispatch_action(*workspace, crate::DashboardDealDone);
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(workspace.current_deal_card_for_test(), None);
+            workspace.phone_remember_last_verdict_for_test();
+        })
+        .unwrap();
+
+    cx.update_window(*workspace, |_, window, cx| {
+        for event in [
+            TouchEvent {
+                id: TouchId(1),
+                phase: TouchPhase::Started,
+                position: point(px(200.), px(250.)),
+                timestamp: std::time::Duration::ZERO,
+                ..Default::default()
+            },
+            TouchEvent {
+                id: TouchId(1),
+                phase: TouchPhase::Moved,
+                position: point(px(200.), px(550.)),
+                timestamp: std::time::Duration::from_millis(80),
+                ..Default::default()
+            },
+            TouchEvent {
+                id: TouchId(1),
+                phase: TouchPhase::Ended,
+                position: point(px(200.), px(550.)),
+                timestamp: std::time::Duration::from_millis(100),
+                ..Default::default()
+            },
+        ] {
+            window.dispatch_event(event.to_platform_input(), cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(workspace.current_deal_card_for_test().unwrap().0, expected);
+            assert!(workspace.phone_feed_is_active_for_test());
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn phone_blocks_navigation_while_a_tree_verdict_is_pending(cx: &mut TestAppContext) {
+    use rho_desk::{
+        BatchOpRecord, Document, NodeId, NodeKind, NodeOwner, OrderKey, Replica, ReplicaAuthor,
+        TextOperation, TreeClock, TreeOperation,
+    };
+
+    let mut document = Document::default();
+    document.add_replica(Replica {
+        replica_id: 1,
+        author: ReplicaAuthor::Machine,
+    });
+    let heading = NodeId {
+        replica_id: 1,
+        counter: 1,
+    };
+    document
+        .apply(TreeOperation::Create {
+            timestamp: TreeClock {
+                value: 1,
+                replica_id: 1,
+            },
+            node_id: heading,
+            kind: NodeKind::Heading,
+            owner: NodeOwner::User,
+            parent: None,
+            order: OrderKey(vec![100]),
+        })
+        .unwrap();
+    document
+        .apply(TreeOperation::SetTemporal {
+            timestamp: TreeClock {
+                value: 2,
+                replica_id: 1,
+            },
+            node_id: heading,
+            kind: rho_desk::TemporalKind::Todo,
+            value: Some(rho_desk::TemporalMark {
+                year: 2020,
+                month: 1,
+                day: 1,
+                minute_of_day: None,
+                pace_days: 1,
+            }),
+        })
+        .unwrap();
+    let mut title = text::Buffer::new(text::ReplicaId::new(1), text::BufferId::new(1).unwrap(), "");
+    document
+        .apply_text(
+            heading,
+            TextOperation::from_text(&title.edit([(0..0, "Pending phone verdict")])),
+            None,
+        )
+        .unwrap();
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskTreeSnapshot {
+                    snapshot: document.snapshot(),
+                    replica_id: 42,
+                },
+                window,
+                cx,
+            );
+            workspace.take_host_messages_for_test(HostId::default());
+        })
+        .unwrap();
+    cx.simulate_window_resize(*workspace, size(px(400.), px(800.)));
+    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+
+    let identity = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.current_deal_card_for_test().unwrap().0
+        })
+        .unwrap();
+    cx.dispatch_action(*workspace, crate::DashboardDealDone);
+    cx.run_until_parked();
+    let verdict_batch = workspace
+        .update(cx, |workspace, _, _| {
+            workspace
+                .take_host_messages_for_test(HostId::default())
+                .into_iter()
+                .find_map(|message| match message {
+                    rho_ui_proto::ClientMessage::DeskTreeBatchApply { batch } => Some(batch),
+                    _ => None,
+                })
+                .expect("tree verdict batch")
+        })
+        .unwrap();
+
+    // Neither another verdict nor an upward flick may move or mutate the card
+    // until the first verdict is acknowledged.
+    cx.dispatch_action(*workspace, crate::DashboardDealDone);
+    cx.update_window(*workspace, |_, window, cx| {
+        for event in [
+            TouchEvent {
+                id: TouchId(1),
+                phase: TouchPhase::Started,
+                position: point(px(200.), px(600.)),
+                timestamp: std::time::Duration::ZERO,
+                ..Default::default()
+            },
+            TouchEvent {
+                id: TouchId(1),
+                phase: TouchPhase::Moved,
+                position: point(px(200.), px(300.)),
+                timestamp: std::time::Duration::from_millis(80),
+                ..Default::default()
+            },
+            TouchEvent {
+                id: TouchId(1),
+                phase: TouchPhase::Ended,
+                position: point(px(200.), px(300.)),
+                timestamp: std::time::Duration::from_millis(100),
+                ..Default::default()
+            },
+        ] {
+            window.dispatch_event(event.to_platform_input(), cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(workspace.current_deal_card_for_test().unwrap().0, identity);
+            assert!(
+                workspace
+                    .take_host_messages_for_test(HostId::default())
+                    .into_iter()
+                    .all(|message| !matches!(
+                        message,
+                        rho_ui_proto::ClientMessage::DeskTreeBatchApply { .. }
+                    ))
+            );
+        })
+        .unwrap();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskTreeBatchApplied(BatchOpRecord {
+                    sequence: 1,
+                    timestamp_ms: 1,
+                    batch: verdict_batch,
+                    daemon_tree_operations: Vec::new(),
+                }),
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+
+    cx.update_window(*workspace, |_, window, cx| {
+        for event in [
+            TouchEvent {
+                id: TouchId(2),
+                phase: TouchPhase::Started,
+                position: point(px(200.), px(250.)),
+                timestamp: std::time::Duration::ZERO,
+                ..Default::default()
+            },
+            TouchEvent {
+                id: TouchId(2),
+                phase: TouchPhase::Moved,
+                position: point(px(200.), px(550.)),
+                timestamp: std::time::Duration::from_millis(80),
+                ..Default::default()
+            },
+            TouchEvent {
+                id: TouchId(2),
+                phase: TouchPhase::Ended,
+                position: point(px(200.), px(550.)),
+                timestamp: std::time::Duration::from_millis(100),
+                ..Default::default()
+            },
+        ] {
+            window.dispatch_event(event.to_platform_input(), cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let undo_batch = workspace
+        .update(cx, |workspace, _, _| {
+            workspace
+                .take_host_messages_for_test(HostId::default())
+                .into_iter()
+                .find_map(|message| match message {
+                    rho_ui_proto::ClientMessage::DeskTreeBatchApply { batch } => Some(batch),
+                    _ => None,
+                })
+                .expect("tree verdict undo batch")
+        })
+        .unwrap();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskTreeBatchApplied(BatchOpRecord {
+                    sequence: 2,
+                    timestamp_ms: 2,
+                    batch: undo_batch,
+                    daemon_tree_operations: Vec::new(),
+                }),
+                window,
+                cx,
+            );
+            assert_eq!(workspace.current_deal_card_for_test().unwrap().0, identity);
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn touch_editing_strips_vim_from_live_editors(cx: &mut TestAppContext) {
     cx.update(|cx| {
         assets::Assets.load_test_fonts(cx);
@@ -4388,7 +4811,7 @@ fn f24_alias_toggles_desk_overview(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn two_finger_swipe_up_toggles_desk_overview(cx: &mut TestAppContext) {
+fn two_finger_swipe_down_toggles_desk_overview(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
@@ -4408,10 +4831,10 @@ fn two_finger_swipe_up_toggles_desk_overview(cx: &mut TestAppContext) {
         for event in [
             touch(1, TouchPhase::Started, 500., 0),
             touch(2, TouchPhase::Started, 500., 1),
-            touch(1, TouchPhase::Moved, 400., 20),
-            touch(2, TouchPhase::Moved, 400., 21),
-            touch(1, TouchPhase::Ended, 400., 30),
-            touch(2, TouchPhase::Ended, 400., 31),
+            touch(1, TouchPhase::Moved, 600., 20),
+            touch(2, TouchPhase::Moved, 600., 21),
+            touch(1, TouchPhase::Ended, 600., 30),
+            touch(2, TouchPhase::Ended, 600., 31),
         ] {
             window.dispatch_event(event.to_platform_input(), cx);
         }

@@ -180,6 +180,7 @@ struct PendingPageFiling {
     inbox_id: InboxId,
     heading: String,
     card: Option<crate::dashboard::DealCard>,
+    phone_event: Option<crate::dashboard::DealerEvent>,
 }
 
 #[derive(Clone)]
@@ -361,6 +362,7 @@ struct PendingTreeVerdict {
     event: crate::dashboard::DealerEvent,
     echo: String,
     undo: VerdictUndo,
+    phone_verdict: Option<crate::journal::PhoneVerdict>,
 }
 
 #[derive(Clone)]
@@ -619,6 +621,7 @@ pub struct Workspace {
     pub(crate) inbox: InboxStore,
     pending_inbox_item: Option<InboxId>,
     pending_filing_card: Option<(InboxId, crate::dashboard::DealCard)>,
+    pending_phone_filing_event: Option<crate::dashboard::DealerEvent>,
     pending_filing_destinations: Vec<(String, String, HostId, rho_desk::NodeId)>,
     pending_filing_selected: Option<(HostId, rho_desk::NodeId)>,
     next_page_binding_request_id: u64,
@@ -1304,6 +1307,7 @@ impl Workspace {
             },
             pending_inbox_item: None,
             pending_filing_card: None,
+            pending_phone_filing_event: None,
             pending_filing_destinations: Vec::new(),
             pending_filing_selected: None,
             next_page_binding_request_id: 1,
@@ -1660,6 +1664,10 @@ impl Workspace {
     }
 
     fn shell_touch(&mut self, event: &TouchEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.phone.enabled {
+            self.phone_debug_touch(event, cx);
+            return;
+        }
         match event.phase {
             TouchPhase::Started => {
                 self.shell_touches.insert(
@@ -1698,7 +1706,7 @@ impl Workspace {
                             if dy.abs() >= SHELL_SWIPE_DISTANCE.as_f32()
                                 && dy.abs() >= dx.abs() * 1.25
                             {
-                                if dy > 0. {
+                                if dy < 0. {
                                     Some(Box::new(DealOpen) as Box<dyn gpui::Action>)
                                 } else if !self.dashboard.deal_mode() {
                                     Some(Box::new(OverviewToggle) as Box<dyn gpui::Action>)
@@ -2198,9 +2206,19 @@ impl Workspace {
                         .dashboard
                         .current_deal_card()
                         .is_some_and(|card| card.identity == verdict.event.card);
+                    let undo_sequence = verdict.undo.sequence;
                     self.restore_verdict_undo(verdict.undo);
+                    if verdict.phone_verdict.is_some() && submitted_card_is_current {
+                        self.phone_completed_verdict(undo_sequence);
+                    }
                     self.dashboard.record_dealer_event(verdict.event);
+                    if let Some(phone_verdict) = verdict.phone_verdict {
+                        self.record_phone_verdict(phone_verdict, cx);
+                    }
                     if submitted_card_is_current {
+                        if verdict.phone_verdict.is_some() {
+                            self.restore_phone_feed(window, cx);
+                        }
                         self.finish_deal_verdict(window, cx);
                     }
                     self.echo(&verdict.echo, StyleClass::SystemInfo, cx);
@@ -2247,6 +2265,13 @@ impl Workspace {
                     match error {
                         None => match self.inbox.verdict(&pending.inbox_id, Verdict::Filed) {
                             Ok(Some(_)) => {
+                                let submitted_card_is_current =
+                                    pending.phone_event.as_ref().is_some_and(|event| {
+                                        self.dashboard
+                                            .current_deal_card()
+                                            .is_some_and(|current| current.identity == event.card)
+                                    });
+                                let mut undo_sequence = None;
                                 if let Some(card) = pending.card {
                                     let entry = self.next_verdict_undo(
                                         card,
@@ -2254,6 +2279,7 @@ impl Workspace {
                                         "file".to_owned(),
                                         VerdictUndoState::PageFiled,
                                     );
+                                    undo_sequence = Some(entry.sequence);
                                     self.restore_verdict_undo(entry);
                                 }
                                 crate::journal::record(crate::journal::Event::InboxVerdict {
@@ -2265,7 +2291,24 @@ impl Workspace {
                                 if self.pending_inbox_item.as_ref() == Some(&pending.inbox_id) {
                                     self.pending_inbox_item = None;
                                 }
-                                self.refresh_dashboard(window, cx);
+                                if let Some(event) = pending.phone_event {
+                                    self.dashboard.record_dealer_event(event);
+                                    self.record_phone_verdict(
+                                        crate::journal::PhoneVerdict::File,
+                                        cx,
+                                    );
+                                    if submitted_card_is_current {
+                                        if let Some(sequence) = undo_sequence {
+                                            self.phone_completed_verdict(sequence);
+                                        }
+                                        self.restore_phone_feed(window, cx);
+                                        self.finish_deal_verdict(window, cx);
+                                    } else {
+                                        self.refresh_dashboard(window, cx);
+                                    }
+                                } else {
+                                    self.refresh_dashboard(window, cx);
+                                }
                                 self.echo(
                                     &format!("filed under {}", pending.heading),
                                     StyleClass::SystemInfo,
@@ -4125,6 +4168,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Result<(), String> {
         self.pending_filing_card = None;
+        self.pending_phone_filing_event = None;
         if self.inbox.get(id).is_none() {
             return Err(format!("inbox item {} no longer exists", id.0));
         }
@@ -4144,11 +4188,12 @@ impl Workspace {
         };
         if let SourceReference::Page { id: page_id } = &item.source {
             let target = self.pending_filing_selected.take();
+            let phone_event = self.pending_phone_filing_event.take();
             let card = self
                 .pending_filing_card
                 .take()
                 .and_then(|(card_id, card)| (card_id == id).then_some(card));
-            if !self.file_inbox_page(target, heading, page_id, &id, card, cx) {
+            if !self.file_inbox_page(target, heading, page_id, &id, card, phone_event, cx) {
                 self.notice_on(None, "file: heading not found", StyleClass::SystemInfo, cx);
             }
             // A page filing is not retired until the daemon acknowledges the
@@ -4211,6 +4256,13 @@ impl Workspace {
             },
         });
         self.pending_inbox_item = None;
+        let phone_event = self.pending_phone_filing_event.take();
+        let submitted_card_is_current = phone_event.as_ref().is_some_and(|event| {
+            self.dashboard
+                .current_deal_card()
+                .is_some_and(|card| card.identity == event.card)
+        });
+        let mut undo_sequence = None;
         if let Some(card) = self
             .pending_filing_card
             .take()
@@ -4228,9 +4280,24 @@ impl Workspace {
                     prior: removed,
                 },
             );
+            undo_sequence = Some(entry.sequence);
             self.restore_verdict_undo(entry);
         }
-        self.refresh_dashboard(window, cx);
+        if let Some(event) = phone_event {
+            self.dashboard.record_dealer_event(event);
+            self.record_phone_verdict(crate::journal::PhoneVerdict::File, cx);
+            if submitted_card_is_current {
+                if let Some(sequence) = undo_sequence {
+                    self.phone_completed_verdict(sequence);
+                }
+                self.restore_phone_feed(window, cx);
+                self.finish_deal_verdict(window, cx);
+            } else {
+                self.refresh_dashboard(window, cx);
+            }
+        } else {
+            self.refresh_dashboard(window, cx);
+        }
         self.echo(
             &format!("filed under {heading}"),
             StyleClass::SystemInfo,
@@ -4245,6 +4312,7 @@ impl Workspace {
         id: &str,
         inbox_id: &InboxId,
         card: Option<crate::dashboard::DealCard>,
+        phone_event: Option<crate::dashboard::DealerEvent>,
         _cx: &mut Context<Self>,
     ) -> bool {
         let Some((host, parent)) = target else {
@@ -4261,6 +4329,7 @@ impl Workspace {
                 inbox_id: inbox_id.clone(),
                 heading: heading.to_owned(),
                 card,
+                phone_event,
             },
         );
         self.send_to_host(
@@ -5831,7 +5900,12 @@ impl Workspace {
             None => list.push(surface.clone()),
         }
         if self.phone.enabled {
-            self.phone.show(self.active_context, surface.key.clone());
+            if method == crate::journal::SurfaceShowMethod::Deal {
+                self.phone
+                    .show_feed(self.active_context, surface.key.clone());
+            } else {
+                self.phone.show(self.active_context, surface.key.clone());
+            }
         }
         let shown = match self.contexts.entry(self.active_context) {
             Entry::Vacant(entry) => {
@@ -7597,6 +7671,10 @@ impl Workspace {
     fn minibuffer_cancel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(minibuffer) = self.minibuffer.take() {
             self.pending_filing_card = None;
+            if minibuffer.prompt() == "file under:" {
+                self.pending_inbox_item = None;
+                self.pending_phone_filing_event = None;
+            }
             crate::journal::record(crate::journal::Event::MinibufferCancelled {
                 prompt: minibuffer.prompt().to_owned(),
                 input: minibuffer.input(cx),
@@ -7983,7 +8061,9 @@ impl Workspace {
                 self.make_surface(SurfaceKey::Transcript(*agent_id), window, cx)
             }
             crate::dashboard::DealCardIdentity::Inbox(id) => {
-                if let Some(crate::dashboard::DealerInboxSource::Page(page)) = card.inbox_source {
+                if !self.phone.enabled
+                    && let Some(crate::dashboard::DealerInboxSource::Page(page)) = card.inbox_source
+                {
                     if let Some(model) = rho_browser::open_page(page, cx) {
                         self.observe_browser_metadata(&model, cx);
                         let view = cx.new(|cx| rho_browser::PageView::new(model, page, cx));
@@ -8042,7 +8122,11 @@ impl Workspace {
             surface: surface.clone(),
         });
         self.display_surface_with_method(surface, crate::journal::SurfaceShowMethod::Deal, cx);
-        self.focus_active_surface(window, cx);
+        if self.phone.enabled {
+            window.focus(&self.phone.dashboard_focus, cx);
+        } else {
+            self.focus_active_surface(window, cx);
+        }
         self.finish_presenting_deal(window, cx);
         true
     }
@@ -8055,6 +8139,11 @@ impl Workspace {
                 .current_deal_card()
                 .map(|card| Self::journal_card_identity(&card.identity)),
         });
+        if self.phone.enabled {
+            self.deal_focus_pending = false;
+            cx.notify();
+            return;
+        }
         let editor = match &self.active_pane().surface.view {
             SurfaceView::DeskNode(editor) | SurfaceView::Inbox(editor) => Some(editor.clone()),
             SurfaceView::Transcript { editor, .. } => Some(editor.clone()),
@@ -8073,6 +8162,9 @@ impl Workspace {
     }
 
     fn deal_next(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.phone.enabled && self.phone_current_deal_has_pending_tree_verdict() {
+            return;
+        }
         if self.dashboard.deal_mode() {
             self.skip_and_end_deal(window, cx);
         }
@@ -8123,7 +8215,9 @@ impl Workspace {
         self.end_deal_session();
         self.deal_view = None;
         self.deal_current_interacted = false;
-        if let Ok(action) = cx.build_action("vim::ExitDealMode", None) {
+        if !self.phone.enabled
+            && let Ok(action) = cx.build_action("vim::ExitDealMode", None)
+        {
             window.dispatch_action(action, cx);
         }
     }
@@ -8136,7 +8230,9 @@ impl Workspace {
             self.present_current_deal(window, cx);
         } else {
             self.end_deal_session();
-            if let Ok(action) = cx.build_action("vim::ExitDealMode", None) {
+            if !self.phone.enabled
+                && let Ok(action) = cx.build_action("vim::ExitDealMode", None)
+            {
                 window.dispatch_action(action, cx);
             }
         }
@@ -8326,6 +8422,9 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.phone.enabled && self.phone_current_deal_has_pending_tree_verdict() {
+            return false;
+        }
         let Some(card) = self.dashboard.current_deal_card().cloned() else {
             return false;
         };
@@ -8375,7 +8474,24 @@ impl Workspace {
         );
         self.pending_tree_verdicts.insert(
             (card.host, batch.id),
-            PendingTreeVerdict { event, echo, undo },
+            PendingTreeVerdict {
+                event,
+                echo,
+                undo,
+                phone_verdict: if self.phone.enabled {
+                    match kind {
+                        rho_desk::TemporalKind::Done => Some(crate::journal::PhoneVerdict::Done),
+                        rho_desk::TemporalKind::Discarded => {
+                            Some(crate::journal::PhoneVerdict::Dismiss)
+                        }
+                        rho_desk::TemporalKind::Defer => Some(crate::journal::PhoneVerdict::Defer),
+                        rho_desk::TemporalKind::Todo => Some(crate::journal::PhoneVerdict::Todo),
+                        rho_desk::TemporalKind::Deadline | rho_desk::TemporalKind::Reminder => None,
+                    }
+                } else {
+                    None
+                },
+            },
         );
         self.desk_tree_sync
             .apply_optimistic(card.host, &messages, cx);
@@ -9963,7 +10079,7 @@ impl Workspace {
             self.deal_view = view;
         }
 
-        if created {
+        if created && !self.phone.enabled {
             let focus = match self.deal_view.as_ref() {
                 Some(DealView::Desk { editor, .. }) | Some(DealView::Inbox { editor, .. }) => {
                     Some(editor.focus_handle(cx))
@@ -9998,7 +10114,7 @@ impl Workspace {
             }
         }
 
-        if std::mem::take(&mut self.deal_focus_pending) {
+        if std::mem::take(&mut self.deal_focus_pending) && !self.phone.enabled {
             cx.defer_in(window, |this, window, cx| {
                 if !this.dashboard.deal_mode() {
                     return;
@@ -11455,17 +11571,31 @@ impl Render for Workspace {
                     if this.inbox.get(&id).is_none() {
                         return;
                     }
-                    this.dashboard.record_deal_verdict_as(
-                        crate::dashboard::DealerVerdict::File,
-                        chrono::Local::now().fixed_offset(),
-                    );
+                    let phone = this.phone.enabled;
+                    let phone_event = phone
+                        .then(|| {
+                            this.dashboard.prepare_deal_verdict(
+                                crate::dashboard::DealerVerdict::File,
+                                chrono::Local::now().fixed_offset(),
+                            )
+                        })
+                        .flatten();
+                    if !phone {
+                        this.dashboard.record_deal_verdict_as(
+                            crate::dashboard::DealerVerdict::File,
+                            chrono::Local::now().fixed_offset(),
+                        );
+                    }
                     if let Err(error) = this.begin_inbox_filing(&id, window, cx) {
                         this.notice_on(None, &format!("file: {error}"), StyleClass::SystemInfo, cx);
                         return;
                     }
                     this.pending_filing_card = filing_card.map(|card| (id, card));
-                    this.dashboard.end_deal(cx);
-                    this.finish_dashboard_deal_action(window, cx);
+                    this.pending_phone_filing_event = phone_event;
+                    if !phone {
+                        this.dashboard.end_deal(cx);
+                        this.finish_dashboard_deal_action(window, cx);
+                    }
                     return;
                 }
             }))
@@ -11474,12 +11604,17 @@ impl Render for Workspace {
                 let Some(card) = this.dashboard.current_deal_card().cloned() else {
                     return;
                 };
-                let opens_page = matches!(
-                    &card.inbox_source,
-                    Some(crate::dashboard::DealerInboxSource::Page(_))
-                );
+                let source = card.inbox_source.clone();
+                let opens_page =
+                    matches!(source, Some(crate::dashboard::DealerInboxSource::Page(_)));
+                let opens_slack = this.phone.enabled
+                    && matches!(
+                        source,
+                        Some(crate::dashboard::DealerInboxSource::SlackThread { .. })
+                    );
                 if card.agent_id.is_none()
                     && !opens_page
+                    && !opens_slack
                     && !matches!(card.kind, crate::dashboard::DealCardKind::Desk)
                 {
                     return;
@@ -11492,16 +11627,52 @@ impl Render for Workspace {
                     return;
                 }
                 this.end_deal_session();
-                if let Ok(action) = cx.build_action("vim::ExitDealMode", None) {
+                if !this.phone.enabled
+                    && let Ok(action) = cx.build_action("vim::ExitDealMode", None)
+                {
                     window.dispatch_action(action, cx);
                 }
-                if let Some(crate::dashboard::DealerInboxSource::Page(page)) = card.inbox_source {
-                    this.open_browser_page(page, window, cx);
-                    return;
-                }
-                if let Some(agent_id) = card.agent_id {
-                    this.open_agent(agent_id, window, cx);
-                    return;
+                match source {
+                    Some(crate::dashboard::DealerInboxSource::Page(page)) => {
+                        this.open_browser_page(page, window, cx);
+                    }
+                    Some(crate::dashboard::DealerInboxSource::SlackThread {
+                        workspace,
+                        channel,
+                        thread_ts,
+                    }) if this.phone.enabled => {
+                        let source = rho_slack::session::Source::Thread(rho_slack::ThreadKey {
+                            workspace: rho_slack::WorkspaceName(workspace),
+                            channel: rho_slack::ChannelId::from(channel.as_str()),
+                            thread_ts: rho_slack::Ts(thread_ts),
+                        });
+                        this.open_slack_source(source, window, cx);
+                        if let SurfaceView::SlackConversation(view) =
+                            &this.active_pane().surface.view
+                        {
+                            let view = view.clone();
+                            view.update(cx, |view, cx| view.select_compose(window, cx));
+                            window.focus(&view.read(cx).editor().focus_handle(cx), cx);
+                        }
+                    }
+                    _ if card.agent_id.is_some() => {
+                        let agent_id = card.agent_id.unwrap();
+                        this.open_agent(agent_id, window, cx);
+                        if this.phone.enabled
+                            && let SurfaceView::Transcript { model, editor } =
+                                &this.active_pane().surface.view
+                        {
+                            let (model, editor) = (model.clone(), editor.clone());
+                            model.update(cx, |model, cx| model.focus_prompt(&editor, window, cx));
+                        }
+                    }
+                    _ if this.phone.enabled
+                        && matches!(card.kind, crate::dashboard::DealCardKind::Desk) =>
+                    {
+                        this.phone_open_desk(window, cx);
+                        this.phone_toggle_dashboard_editing(window, cx);
+                    }
+                    _ => {}
                 }
             }))
             .on_action(
@@ -11734,12 +11905,12 @@ impl Render for Workspace {
                     .flex()
                     .flex_col()
                     .child(if phone {
-                        self.render_phone_body(&text_style, cx)
+                        self.render_phone_body(&text_style, window, cx)
                     } else {
                         self.render_workspace(window, &text_style, cx)
                     }),
             )
-            .child(self.render_status_line(&text_style, cx))
+            .children((!phone).then(|| self.render_status_line(&text_style, cx)))
             .children(if phone {
                 self.render_phone_touch_debug(self.shell_touches.len())
             } else {

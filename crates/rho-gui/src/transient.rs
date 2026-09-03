@@ -708,6 +708,22 @@ pub fn root_menu() -> Transient {
     menu.item("q", "quit", |_, _, cx| cx.quit())
 }
 
+pub fn phone_root_menu() -> Transient {
+    Transient::new("menu")
+        .item("d", "Desk", |workspace, window, cx| {
+            workspace.phone_open_desk(window, cx);
+        })
+        .item("s", "Slack", |workspace, window, cx| {
+            workspace.open_slack(window, cx);
+        })
+        .item("a", "Agents", |workspace, window, cx| {
+            workspace.open_transient(agent_menu(), window, cx);
+        })
+        .item("i", "Status", |workspace, window, cx| {
+            workspace.open_transient(status_menu(), window, cx);
+        })
+}
+
 pub fn phone_desk_menu(raw_mode: bool) -> Transient {
     Transient::new("Desk")
         .item("f", "Cycle folds", |workspace, window, cx| {
