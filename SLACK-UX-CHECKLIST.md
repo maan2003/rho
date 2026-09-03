@@ -23,6 +23,12 @@ composer line, `@you` mentions.
 
 Nothing else lands until this does; every screenshot below comes from it.
 
+Rule: all mocking is server side. The fake is a fake Slack server, HTTP
+endpoints plus websocket, and the unmodified client talks to it through
+`RHO_SLACK_API_BASE`. No client-side stubs, no test-only rendering paths,
+no state injected into the GUI, no flags that change what the client does
+under test. If the fake cannot produce a state, extend the fake.
+
 - [ ] 0.1 The fake serves a group DM (`is_mpim`, name
       `mpdm-david--manmeet--keith-1`, three members including self) and a
       private channel (`is_private`).
