@@ -28,7 +28,8 @@ time in notes, name on the map).
 Kinds, and the fields each adds to the common ones:
 
 - `note`: `body`, free-form text. The only kind with user-written text.
-- `agent`: `agent_id`, `host`.
+- `agent`: `agent_id`, `host` (the machine seed, u64, the durable machine
+  identity; never a GUI attachment index).
 - `page`: `page` (browser reference), `url`.
 - `thread`: `workspace`, `channel`, `ts` (Slack; a channel is a thread
   with no parent message).
