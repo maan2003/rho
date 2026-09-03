@@ -45,7 +45,24 @@ pub fn render_message(
     files: &[FileSummary],
     names: &dyn Names,
 ) -> String {
-    let mut rendered = if blocks.is_empty() {
+    let (mut rendered, chrome) = render_parts(blocks, text, attachments, files, names);
+    for line in chrome {
+        push_line(&mut rendered, &line);
+    }
+    rendered
+}
+
+/// What the sender wrote, and the lines the renderer hangs under it: an
+/// attachment's card, a bot's fields, a file. The split is what lets the
+/// time trail the message's own last line rather than the chrome's.
+pub fn render_parts(
+    blocks: &[Value],
+    text: &str,
+    attachments: &[Attachment],
+    files: &[FileSummary],
+    names: &dyn Names,
+) -> (String, Vec<String>) {
+    let said = if blocks.is_empty() {
         render_mrkdwn(text, names)
     } else {
         let parts = blocks
@@ -55,19 +72,83 @@ pub fn render_message(
             .collect::<Vec<_>>();
         parts.join("\n")
     };
+    let mut chrome = Vec::new();
     for attachment in attachments {
-        for line in render_attachment(attachment, names) {
-            push_line(&mut rendered, &line);
-        }
+        chrome.extend(render_attachment(attachment, names));
     }
     for file in files {
         // A file is a thing the reader can open, named the way it would be
         // in a shell: no placeholder, no id.
-        push_line(&mut rendered, &file.line());
+        chrome.push(file.line());
     }
     // Shortcodes become glyphs last, so it happens once for blocks, plain
     // text, and attachment lines alike.
-    crate::emoji::render(rendered.trim_end())
+    (
+        crate::emoji::render(said.trim_end()),
+        chrome
+            .iter()
+            .map(|line| crate::emoji::render(line.trim_end()))
+            .collect(),
+    )
+}
+
+/// A run of mrkdwn emphasis, markers included. Slack's markers stay in the
+/// text so a yanked line pastes back into a reply; a surface styles the run
+/// so it still reads as formatting rather than as punctuation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Emphasis {
+    Bold,
+    Italic,
+    Struck,
+}
+
+/// Every emphasised run in rendered text. Conservative on purpose: a marker
+/// opens only after whitespace and closes only before whitespace or
+/// punctuation, so `snake_case` names and `:shortcodes:` are left alone, and
+/// code keeps whatever was typed in it.
+pub fn emphasis(text: &str) -> Vec<(Emphasis, std::ops::Range<usize>)> {
+    let bytes = text.as_bytes();
+    let mut found = Vec::new();
+    let mut index = 0;
+    let mut in_code = false;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if byte == b'`' {
+            in_code = !in_code;
+            index += 1;
+            continue;
+        }
+        let kind = match byte {
+            b'*' => Emphasis::Bold,
+            b'_' => Emphasis::Italic,
+            b'~' => Emphasis::Struck,
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+        let opens = index == 0 || bytes[index - 1].is_ascii_whitespace();
+        let has_content = bytes
+            .get(index + 1)
+            .is_some_and(|next| !next.is_ascii_whitespace() && *next != byte);
+        if in_code || !opens || !has_content {
+            index += 1;
+            continue;
+        }
+        let end = bytes[index + 1..]
+            .iter()
+            .position(|candidate| *candidate == byte || *candidate == b'\n')
+            .map(|offset| index + 1 + offset)
+            .filter(|end| bytes[*end] == byte && !bytes[end - 1].is_ascii_whitespace());
+        match end {
+            Some(end) => {
+                found.push((kind, index..end + 1));
+                index = end + 1;
+            }
+            None => index += 1,
+        }
+    }
+    found
 }
 
 /// What the reader sees for a link, and where it points: the rendered text
@@ -537,6 +618,32 @@ fn array<'a>(value: &'a Value, key: &str) -> &'a [Value] {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn emphasis_keeps_its_markers_and_skips_what_only_looks_like_it() {
+        let text = "*bold*, _italic_, ~struck~, `*not bold*`";
+        let found = emphasis(text)
+            .into_iter()
+            .map(|(kind, range)| (kind, text[range].to_owned()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            found,
+            vec![
+                (Emphasis::Bold, "*bold*".to_owned()),
+                (Emphasis::Italic, "_italic_".to_owned()),
+                (Emphasis::Struck, "~struck~".to_owned()),
+            ],
+            "code keeps what was typed in it"
+        );
+        assert!(
+            emphasis(":forrest_gump_wave: and snake_case_name").is_empty(),
+            "an underscore inside a word is part of the word"
+        );
+        assert!(
+            emphasis("2 * 3 * 4").is_empty(),
+            "a marker with nothing against it is arithmetic"
+        );
+    }
     use serde_json::json;
 
     use super::*;

@@ -106,10 +106,16 @@ pub enum Class {
     /// An unfurl's quote box, which reads as one card rather than as loose
     /// lines: the bar down its left and a faint tint over the whole of it.
     Unfurl,
+    /// Slack's own emphasis, markers and all: the text keeps `*bold*` so a
+    /// yanked line pastes back, and the style is what makes it read as
+    /// formatting rather than as punctuation.
+    Bold,
+    Italic,
+    Struck,
 }
 
 impl Class {
-    pub const ALL: [Class; 11] = [
+    pub const ALL: [Class; 14] = [
         Class::Sender,
         Class::You,
         Class::Time,
@@ -121,6 +127,9 @@ impl Class {
         Class::Error,
         Class::Link,
         Class::Unfurl,
+        Class::Bold,
+        Class::Italic,
+        Class::Struck,
     ];
 
     fn slot(self) -> usize {
@@ -136,6 +145,9 @@ impl Class {
             Self::Error => 8,
             Self::Link => 9,
             Self::Unfurl => 10,
+            Self::Bold => 11,
+            Self::Italic => 12,
+            Self::Struck => 13,
         }
     }
 
@@ -145,6 +157,20 @@ impl Class {
 
     pub fn resolve(self, cx: &App) -> HighlightStyle {
         let colors = cx.theme().colors();
+        // Emphasis is shape, not colour: the run stays the body's own text
+        // colour and reads as bold, italic or struck through.
+        if matches!(self, Self::Bold | Self::Italic | Self::Struck) {
+            return HighlightStyle {
+                color: Some(colors.text.into()),
+                font_weight: (self == Self::Bold).then_some(FontWeight::BOLD),
+                font_style: (self == Self::Italic).then_some(gpui::FontStyle::Italic),
+                strikethrough: (self == Self::Struck).then(|| gpui::StrikethroughStyle {
+                    thickness: gpui::px(1.0),
+                    color: Some(colors.text.into()),
+                }),
+                ..HighlightStyle::default()
+            };
+        }
         let (color, weight) = match self {
             Self::Sender => (colors.terminal_ansi_cyan, FontWeight::BOLD),
             Self::You => (colors.text_accent, FontWeight::BOLD),
@@ -156,6 +182,7 @@ impl Class {
             Self::Muted => (colors.text_muted, FontWeight::NORMAL),
             Self::Error => (colors.terminal_ansi_red, FontWeight::NORMAL),
             Self::Link | Self::Unfurl => (colors.link_text_hover, FontWeight::NORMAL),
+            Self::Bold | Self::Italic | Self::Struck => unreachable!("styled above"),
         };
         HighlightStyle {
             color: Some(color.into()),

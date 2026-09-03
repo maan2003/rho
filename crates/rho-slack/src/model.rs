@@ -363,6 +363,19 @@ impl Model {
 
     /// Renders a message the way the surface shows it, with whatever names
     /// are known right now.
+    /// The message's own words and the lines the renderer hangs under
+    /// them, kept apart for a surface that puts the time at the end of the
+    /// words rather than at the end of the chrome.
+    pub fn render_parts(&self, message: &Message) -> (String, Vec<String>) {
+        crate::block::render_parts(
+            &message.blocks,
+            &message.text,
+            &message.attachments,
+            &message.files,
+            self,
+        )
+    }
+
     pub fn render(&self, message: &Message) -> String {
         render_message(
             &message.blocks,

@@ -1036,31 +1036,42 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
     ));
     spans.push(Span::plain(": "));
 
-    let body = model.render(message);
-    let body = body.trim_end().replace('\n', &format!("\n{indent}"));
+    let (said, chrome) = model.render_parts(message);
+    let said = said.trim_end().replace('\n', &format!("\n{indent}"));
     let links = crate::block::links(&message.blocks, &message.text, &message.attachments);
-    push_body(&mut spans, &body, model, &links);
+    push_body(&mut spans, &said, model, &links);
     if message.edited {
         // The reader is told what they are looking at is not what was sent.
         spans.push(Span::styled(" (edited)", Class::Muted));
     }
     // The time trails the words rather than heading them: it is the least
-    // of what the reader came for.
+    // of what the reader came for. It trails the words only: what the
+    // renderer hangs under a message (a card, a file, a picture) was not
+    // said at a time of its own.
     spans.push(Span::styled(format!("  {}", clock_time(at)), Class::Time));
     spans.push(Span::plain("\n"));
     // A file's line is the one that reads as the file: `enter` there opens
     // it rather than the thread.
-    lines.extend(body.split('\n').map(|line| {
-        LineMeta {
-            thread: thread.clone(),
-            file: message
-                .files
-                .iter()
-                .find(|file| line.trim() == file.line())
-                .cloned(),
-            link: link_on(line, &links),
-        }
-    }));
+    let meta = |line: &str| LineMeta {
+        thread: thread.clone(),
+        file: message
+            .files
+            .iter()
+            .find(|file| line.trim() == file.line())
+            .cloned(),
+        link: link_on(line, &links),
+    };
+    lines.extend(said.split('\n').map(&meta));
+    if !chrome.is_empty() {
+        let text = chrome
+            .iter()
+            .map(|line| format!("{indent}{line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        push_body(&mut spans, &text, model, &links);
+        spans.push(Span::plain("\n"));
+        lines.extend(text.split('\n').map(&meta));
+    }
 
     if !message.reactions.is_empty() {
         spans.push(Span::plain(indent.clone()));
@@ -1137,21 +1148,20 @@ fn item(key: Row, spans: Vec<Span>, lines: Vec<LineMeta>) -> Rendered {
 fn unfurl_ranges(text: &str) -> Vec<(Class, Range<usize>)> {
     let mut ranges: Vec<(Class, Range<usize>)> = Vec::new();
     let mut offset = 0;
-    let mut previous: Option<usize> = None;
-    for (row, line) in text.split_inclusive('\n').enumerate() {
+    for line in text.split_inclusive('\n') {
         if line
             .trim_start()
             .starts_with(crate::block::UNFURL_BAR.trim_end())
         {
+            // One tint per row, each starting at the bar: a range spanning
+            // the newline between two rows would tint the indent of the
+            // second and leave the first starting a column further in, so
+            // the card's left edge came out ragged.
             let start = offset + (line.len() - line.trim_start().len());
-            let end = offset + line.trim_end_matches('\n').len();
-            match (previous, ranges.last_mut()) {
-                // One card, however many lines: the tint runs through the
-                // newline and the indent between them.
-                (Some(above), Some((_, range))) if above + 1 == row => range.end = end,
-                _ => ranges.push((Class::Unfurl, start..end)),
-            }
-            previous = Some(row);
+            ranges.push((
+                Class::Unfurl,
+                start..offset + line.trim_end_matches('\n').len(),
+            ));
         }
         offset += line.len();
     }
@@ -1270,6 +1280,18 @@ fn push_body(spans: &mut Vec<Span>, body: &str, model: &Model, links: &[crate::b
             in_unfurl = false;
         }
         offset += line.len() + 1;
+    }
+    // Slack's emphasis keeps its markers in the text, so the style is the
+    // only thing that tells the reader it is emphasis.
+    for (kind, range) in crate::block::emphasis(body) {
+        marked.push((
+            range,
+            match kind {
+                crate::block::Emphasis::Bold => Class::Bold,
+                crate::block::Emphasis::Italic => Class::Italic,
+                crate::block::Emphasis::Struck => Class::Struck,
+            },
+        ));
     }
     for range in crate::emoji::shortcodes(body) {
         if model.is_custom_emoji(&body[range.start + 1..range.end - 1]) {
@@ -1903,18 +1925,67 @@ mod tests {
             "every line of the card opens the page it stands for"
         );
         let item = message_item(&preview, &model(), false);
-        let tint = item
+        let tints = item
             .backgrounds
             .iter()
-            .find(|(class, _)| *class == Class::Unfurl)
-            .map(|(_, range)| range.clone())
-            .expect("the card carries a tint");
-        assert_eq!(
-            item.text[tint.clone()].lines().count(),
-            3,
-            "one tint over the whole card, not one per line: {:?}",
-            &item.text[tint]
+            .filter(|(class, _)| *class == Class::Unfurl)
+            .map(|(_, range)| item.text[range.clone()].to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(tints.len(), 3, "every row of the card is tinted: {tints:?}");
+        assert!(
+            tints
+                .iter()
+                .all(|row| row.starts_with(crate::block::UNFURL_BAR.trim_end())),
+            "the card's left edge is the bar on every row: {tints:?}"
         );
+    }
+
+    #[test]
+    fn the_time_trails_the_words_and_never_the_chrome_under_them() {
+        let with_file = parsed(json!({
+            "ts": "1700000000.0",
+            "user": "U1",
+            "text": "here is the mock",
+            "files": [{
+                "id": "F1",
+                "name": "image.png",
+                "title": "image.png",
+                "filetype": "png",
+                "size": 225_280,
+                "url_private": "https://files.example.com/image.png",
+            }],
+        }));
+        let (text, _, _) = render_messages(&[with_file], &model(), false);
+        let timed = text
+            .lines()
+            .filter(|line| line.contains(&clock_time(1_700_000_000)))
+            .collect::<Vec<_>>();
+        assert_eq!(timed.len(), 1, "one time, on one line: {text}");
+        assert!(
+            timed[0].contains("here is the mock"),
+            "the time trails what was said: {text}"
+        );
+        assert!(
+            text.lines().any(|line| line.trim() == "image.png · 220 KB"),
+            "the file line carries no time of its own: {text}"
+        );
+    }
+
+    #[test]
+    fn mrkdwn_emphasis_keeps_its_markers_and_is_styled() {
+        let (text, styles, _) = render_messages(
+            &[message(
+                "1700000000.0",
+                None,
+                "*bold*, _italic_, ~struck~, `inline code`",
+            )],
+            &model(),
+            false,
+        );
+        assert!(text.contains("*bold*"), "the markers stay: {text}");
+        assert_eq!(classed(&text, &styles, Class::Bold), vec!["*bold*"]);
+        assert_eq!(classed(&text, &styles, Class::Italic), vec!["_italic_"]);
+        assert_eq!(classed(&text, &styles, Class::Struck), vec!["~struck~"]);
     }
 
     #[test]

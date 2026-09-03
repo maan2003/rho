@@ -178,7 +178,7 @@ done right after the transcript primitive (2.4) and before 2.10:
       image to the window, `q` or `escape` returns to the conversation;
       no external opener for images. The file line drops the type when
       the extension already says it: `image.png · 141 KB`.
-- [ ] 1.21 Time placement, corrected after 32-unfurl: the time trails the
+- [x] 1.21 Time placement, corrected after 32-unfurl: the time trails the
       last line of the message's own text, and chrome under a message
       (reactions, reply count, file lines, thumbnails, unfurl cards, bot
       attachment fields) never carries a time. Seen: `▎ A long preview
