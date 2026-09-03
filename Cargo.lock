@@ -14132,6 +14132,7 @@ name = "rho-slack"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "chrono",
  "dirs",
  "editor",
@@ -14141,9 +14142,12 @@ dependencies = [
  "gpui_tokio",
  "language",
  "multi_buffer",
+ "redb",
  "reqwest 0.12.28",
+ "rho-db",
  "rho-slack",
  "rustls",
+ "senax-encoder",
  "serde",
  "serde_json",
  "tempfile",

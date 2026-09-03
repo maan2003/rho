@@ -308,6 +308,49 @@ impl Client {
         Ok(page)
     }
 
+    /// The tail of a conversation: only what is newer than `oldest`. This is
+    /// what a mirrored conversation asks for when it is reopened, so nothing
+    /// already on disk is fetched twice.
+    pub async fn conversations_history_since(
+        &self,
+        channel: &ChannelId,
+        oldest: &Ts,
+    ) -> anyhow::Result<MessagePage> {
+        let fields = vec![
+            ("channel", channel.0.clone()),
+            ("limit", PAGE.to_string()),
+            ("oldest", oldest.0.clone()),
+            ("inclusive", "false".to_owned()),
+        ];
+        let body = self.post_form("conversations.history", &fields).await?;
+        let mut page = parse_message_page(&body, channel);
+        page.messages
+            .sort_by(|left, right| left.ts.epoch_seconds().total_cmp(&right.ts.epoch_seconds()));
+        Ok(page)
+    }
+
+    /// The window of a conversation ending at `ts`: what a person sees when
+    /// they click a notification and land on the message. One call, bounded,
+    /// and never paged: it is context for a ping, not a history walk.
+    pub async fn conversations_history_around(
+        &self,
+        channel: &ChannelId,
+        ts: &Ts,
+        limit: usize,
+    ) -> anyhow::Result<MessagePage> {
+        let fields = vec![
+            ("channel", channel.0.clone()),
+            ("limit", limit.to_string()),
+            ("latest", ts.0.clone()),
+            ("inclusive", "true".to_owned()),
+        ];
+        let body = self.post_form("conversations.history", &fields).await?;
+        let mut page = parse_message_page(&body, channel);
+        page.messages
+            .sort_by(|left, right| left.ts.epoch_seconds().total_cmp(&right.ts.epoch_seconds()));
+        Ok(page)
+    }
+
     /// Every conversation the user is in, across all four kinds.
     pub async fn conversations(&self) -> anyhow::Result<Vec<Conversation>> {
         let mut conversations = Vec::new();

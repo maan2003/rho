@@ -136,7 +136,13 @@ impl ListView {
     fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let held = self.rows.get(self.cursor_row(cx)).cloned().flatten();
         let session = self.session.read(cx);
+        // Whatever the mirror holds is shown whatever the socket is doing:
+        // a restart reads its conversations before Slack answers, and an
+        // offline workspace stays readable. The status line is for when
+        // there is genuinely nothing to show yet.
+        let known = session.rows();
         let (lines, rows) = match session.status() {
+            _ if !known.is_empty() => render_rows(&known, &self.filter),
             Status::Failed(reason) => (
                 vec![vec![
                     Span::styled("slack unavailable: ", Class::Error),
@@ -148,7 +154,7 @@ impl ListView {
                 vec![vec![Span::styled("connecting to slack…", Class::Muted)]],
                 vec![None],
             ),
-            Status::Connected => render_rows(&session.rows(), &self.filter),
+            Status::Connected => render_rows(&known, &self.filter),
         };
         let mut lines = lines;
         let mut rows = rows;

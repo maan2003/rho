@@ -20,6 +20,7 @@ use crate::api::Client;
 use crate::config::Credentials;
 use crate::events::WsEvent;
 use crate::health::{Health, Signal};
+use crate::mirror::{Mirror, Scope};
 use crate::model::{Change, ConversationRow, Model};
 use crate::socket::{Timings, Wire, poll_feed, run_feed, run_socket};
 use crate::types::{ChannelId, Message, ThreadKey, Ts};
@@ -98,6 +99,9 @@ pub struct Session {
     /// Files already fetched into the state cache, by Slack file id. An
     /// image is shown from here, so a redraw never refetches.
     cached_files: HashMap<String, std::path::PathBuf>,
+    /// What rho already knows, on disk. Surfaces render from here before the
+    /// network answers, and a refresh asks only for what it does not hold.
+    mirror: Option<Arc<Mirror>>,
     _tasks: Vec<Task<()>>,
 }
 
@@ -116,6 +120,7 @@ impl Session {
                 catch_up: Arc::new(Notify::new()),
                 pending_sends: 0,
                 cached_files: HashMap::new(),
+                mirror: open_mirror(),
                 _tasks: Vec::new(),
             },
         }
@@ -131,8 +136,10 @@ impl Session {
             catch_up: Arc::new(Notify::new()),
             pending_sends: 0,
             cached_files: HashMap::new(),
+            mirror: open_mirror(),
             _tasks: Vec::new(),
         };
+        session.seed_from_mirror();
         session.start(client, Timings::default(), cx);
         session
     }
@@ -189,6 +196,27 @@ impl Session {
         self.load_roster(client, cx);
     }
 
+    /// Names from the last run, before the network says anything. The list
+    /// is readable at once and offline, which is the whole point of the
+    /// mirror; the roster fetch behind it only corrects what changed.
+    fn seed_from_mirror(&mut self) {
+        let Some(mirror) = self.mirror.clone() else {
+            return;
+        };
+        let workspace = self.model.workspace().0.clone();
+        let users = mirror.users(&workspace);
+        if !users.is_empty() {
+            self.model.add_users(users);
+        }
+        let conversations = mirror.conversations(&workspace);
+        if !conversations.is_empty() {
+            self.model.add_conversations(conversations);
+        }
+        if let Some(id) = mirror.self_id(&workspace) {
+            self.model.set_self(id);
+        }
+    }
+
     /// Users, conversations, and unread counts: everything the list surface
     /// needs before a single message arrives.
     fn load_roster(&mut self, client: Arc<Client>, cx: &mut Context<Self>) {
@@ -205,9 +233,18 @@ impl Session {
             };
             let _ = this.update(cx, |session, cx| {
                 if let Ok(users) = users {
+                    if let Some(mirror) = session.mirror.as_ref() {
+                        mirror.put_users(&session.model.workspace().0.clone(), &users);
+                    }
                     session.model.add_users(users);
                 }
                 if let Ok(conversations) = conversations {
+                    if let Some(mirror) = session.mirror.as_ref() {
+                        mirror.put_conversations(
+                            &session.model.workspace().0.clone(),
+                            &conversations,
+                        );
+                    }
                     session.model.add_conversations(conversations);
                 }
                 if let Ok(counts) = counts {
@@ -235,6 +272,9 @@ impl Session {
         match event {
             Wire::Connected(connection) => {
                 self.status = Status::Connected;
+                if let Some(mirror) = self.mirror.as_ref() {
+                    mirror.set_self_id(&self.model.workspace().0, &connection.self_id);
+                }
                 self.model.set_self(connection.self_id);
                 let signal = self.health.connected(now);
                 self.signal(signal, cx);
@@ -269,6 +309,7 @@ impl Session {
                 // blank line under a nameless conversation.
                 for change in &changes {
                     if let Change::Raised(key) | Change::Updated(key) = change {
+                        self.prefetch_ping(&key.clone(), cx);
                         self.ensure_thread_loaded(&key.clone(), cx);
                     }
                 }
@@ -293,6 +334,17 @@ impl Session {
     /// room. A reply never appears in the channel body; what changes there
     /// is the count line under its parent.
     fn route(&mut self, message: &Message) {
+        // The mirror follows the socket, so a conversation that was open when
+        // the message arrived reads the same after a restart.
+        if let Some(mirror) = self.mirror.as_ref() {
+            let workspace = self.model.workspace().0.clone();
+            let thread = Scope::thread(&workspace, &message.channel, &message.thread_root());
+            mirror.insert_messages(&thread, std::slice::from_ref(message));
+            if message.is_top_level() {
+                let conversation = Scope::conversation(&workspace, &message.channel);
+                mirror.insert_messages(&conversation, std::slice::from_ref(message));
+            }
+        }
         let conversation = Source::Conversation(message.channel.clone());
         let thread = Source::Thread(ThreadKey {
             workspace: self.model.workspace().clone(),
@@ -374,14 +426,24 @@ impl Session {
         if self.loaded.contains_key(source) {
             return;
         }
+        // The mirror answers first, so the conversation is on screen before
+        // the network is asked anything. What it holds also bounds the
+        // request: only messages newer than its newest are fetched.
+        let cached = self
+            .mirror
+            .as_ref()
+            .map(|mirror| mirror.newest_chunk(&self.scope(source), MIRROR_PAGE))
+            .unwrap_or_default();
+        let since = cached.last().map(|message| message.ts.clone());
         self.loaded.insert(
             source.clone(),
             Loaded {
                 loading: true,
+                messages: cached,
                 ..Loaded::default()
             },
         );
-        self.fetch(source.clone(), None, true, cx);
+        self.fetch(source.clone(), None, true, since, cx);
     }
 
     /// Pages further back, which is what scrolling to the top asks for.
@@ -397,8 +459,63 @@ impl Session {
             loaded.reached_oldest = true;
             return;
         }
-        loaded.loading = true;
-        self.fetch(source.clone(), cursor, false, cx);
+        let _ = loaded;
+        // The mirror knows when there is nothing older: the first page ever
+        // sent here is a fact, recorded when Slack said `has_more: false`.
+        // Asking again would be a request whose answer is already on disk.
+        if self
+            .mirror
+            .as_ref()
+            .is_some_and(|mirror| mirror.history_begins(&self.scope(source)))
+        {
+            if let Some(loaded) = self.loaded.get_mut(source) {
+                loaded.reached_oldest = true;
+            }
+            return;
+        }
+        if let Some(loaded) = self.loaded.get_mut(source) {
+            loaded.loading = true;
+        }
+        self.fetch(source.clone(), cursor, false, None, cx);
+    }
+
+    /// The context a ping needs, fetched once when the feed names it: the
+    /// window of the conversation ending at the pinging message, so the card
+    /// opens from the mirror with no network wait. One call, never a page
+    /// back, never a second conversation, and never at all when the mirror
+    /// already holds the message. This is what the web client fetches when
+    /// the notification is clicked; rho does it a moment earlier.
+    fn prefetch_ping(&mut self, key: &ThreadKey, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let scope = Scope::conversation(&self.model.workspace().0, &key.channel);
+        if self
+            .mirror
+            .as_ref()
+            .is_none_or(|mirror| mirror.holds(&scope, &key.thread_ts))
+        {
+            return;
+        }
+        let source = Source::Conversation(key.channel.clone());
+        let channel = key.channel.clone();
+        let ts = key.thread_ts.clone();
+        let task = gpui_tokio::Tokio::spawn(cx, async move {
+            client
+                .conversations_history_around(&channel, &ts, PING_WINDOW)
+                .await
+        });
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let Ok(Ok(page)) = task.await else {
+                return;
+            };
+            let _ = this.update(cx, |session, cx| {
+                // Straight to the mirror: nobody has opened this conversation,
+                // so there is no surface to feed and no read marker to move.
+                session.mirror_page(&source, &page.messages, false, false);
+                cx.notify();
+            });
+        }));
     }
 
     /// Loads a thread the feed raised but nobody has opened. The feed says
@@ -417,7 +534,7 @@ impl Session {
                 ..Loaded::default()
             },
         );
-        self.fetch(source, None, false, cx);
+        self.fetch(source, None, false, None, cx);
     }
 
     fn fetch(
@@ -425,19 +542,26 @@ impl Session {
         source: Source,
         cursor: Option<String>,
         mark_read: bool,
+        since: Option<Ts>,
         cx: &mut Context<Self>,
     ) {
         let Some(client) = self.client.clone() else {
             return;
         };
         let request = source.clone();
+        // Kept out of the request future, which takes ownership: the result
+        // handler needs to know whether this was a bounded tail fetch.
+        let bounded = since.clone();
         let task = gpui_tokio::Tokio::spawn(cx, async move {
             match &request {
-                Source::Conversation(channel) => {
-                    client
-                        .conversations_history(channel, cursor.as_deref())
-                        .await
-                }
+                Source::Conversation(channel) => match &since {
+                    Some(since) => client.conversations_history_since(channel, since).await,
+                    None => {
+                        client
+                            .conversations_history(channel, cursor.as_deref())
+                            .await
+                    }
+                },
                 Source::Thread(key) => {
                     client
                         .conversations_replies(&key.channel, &key.thread_ts, cursor.as_deref())
@@ -452,14 +576,22 @@ impl Session {
             let _ = this.update(cx, |session, cx| {
                 let now = now_ms();
                 let mut changes = Vec::new();
+                let mut fetched = Vec::new();
+                let mut reached_oldest = false;
                 {
                     let loaded = session.loaded.entry(source.clone()).or_default();
                     loaded.loading = false;
                     match page {
                         Ok(page) => {
                             loaded.error = None;
-                            loaded.reached_oldest = page.older_cursor.is_none();
-                            loaded.older_cursor = page.older_cursor;
+                            // A tail fetch says nothing about how far back the
+                            // history goes: it asked only for what is new.
+                            if bounded.is_none() {
+                                reached_oldest = page.older_cursor.is_none();
+                                loaded.reached_oldest = reached_oldest;
+                                loaded.older_cursor = page.older_cursor;
+                            }
+                            fetched = page.messages.clone();
                             for message in page.messages {
                                 insert_message(&mut loaded.messages, message);
                             }
@@ -467,6 +599,7 @@ impl Session {
                         Err(error) => loaded.error = Some(format!("{error:#}")),
                     }
                 }
+                session.mirror_page(&source, &fetched, bounded.is_none(), reached_oldest);
                 let messages = session
                     .loaded
                     .get(&source)
@@ -540,6 +673,47 @@ impl Session {
                 cx.notify();
             });
         }));
+    }
+
+    /// Writes a fetched page into the mirror and records what it says about
+    /// the shape of the history: a page that reached the beginning ends the
+    /// chain, and one that did not leaves a gap carrying the cursor to fill
+    /// it. Nothing here guesses — an unfilled hole is always a record.
+    fn mirror_page(
+        &self,
+        source: &Source,
+        messages: &[Message],
+        paged: bool,
+        reached_oldest: bool,
+    ) {
+        let Some(mirror) = self.mirror.as_ref() else {
+            return;
+        };
+        let scope = self.scope(source);
+        let filled = mirror.oldest_ts(&scope);
+        mirror.insert_messages(&scope, messages);
+        if !paged {
+            return;
+        }
+        if let Some(filled) = filled {
+            // Whatever hole sat at the old bottom has just been paged
+            // through.
+            mirror.clear_gap(&scope, &filled);
+        }
+        if reached_oldest {
+            mirror.set_history_begins(&scope);
+        } else if let Some(oldest) = messages.first().map(|message| message.ts.clone()) {
+            mirror.put_gap(&scope, &oldest, &oldest);
+        }
+    }
+
+    /// The mirror's name for a source: a conversation, or one thread in it.
+    fn scope(&self, source: &Source) -> Scope {
+        let workspace = self.model.workspace().0.clone();
+        match source {
+            Source::Conversation(channel) => Scope::conversation(&workspace, channel),
+            Source::Thread(key) => Scope::thread(&workspace, &key.channel, &key.thread_ts),
+        }
     }
 
     /// Downloads a file into the state cache and hands it to the desktop.
@@ -696,6 +870,28 @@ fn insert_message(messages: &mut Vec<Message>, message: Message) {
 
 /// Where a downloaded file lives: the state cache, keyed on Slack's file id
 /// so two files with the same name never collide.
+/// How much of a mirrored conversation is shown before the network answers.
+/// One screenful and then some: enough to read, cheap to decode.
+const MIRROR_PAGE: usize = 50;
+
+/// How much of a conversation a ping brings with it. Wide enough to read the
+/// exchange the ping sits in, narrow enough to be one ordinary request.
+const PING_WINDOW: usize = 40;
+
+/// The mirror lives beside rho's other state. A machine without a state
+/// directory simply runs without one: the client still works, it just has
+/// nothing to show before the first response.
+fn open_mirror() -> Option<Arc<Mirror>> {
+    let path = dirs::state_dir()?.join("rho").join("slack.redb");
+    match Mirror::open(&path) {
+        Ok(mirror) => Some(Arc::new(mirror)),
+        Err(error) => {
+            tracing::warn!(error = %error, "slack mirror unavailable");
+            None
+        }
+    }
+}
+
 fn file_cache_path(file: &crate::types::FileSummary) -> anyhow::Result<std::path::PathBuf> {
     let base = dirs::state_dir().context("state directory not available")?;
     let name = file

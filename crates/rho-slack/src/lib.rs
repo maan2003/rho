@@ -24,6 +24,8 @@ pub mod events;
 #[cfg(feature = "fake")]
 pub mod fake;
 pub mod health;
+#[cfg(feature = "ui")]
+pub mod mirror;
 pub mod model;
 #[cfg(feature = "ui")]
 pub mod session;

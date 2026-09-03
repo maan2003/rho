@@ -58,6 +58,9 @@ struct State {
     /// many times. This is how a poll-failure notice gets tested.
     failures: BTreeMap<String, usize>,
     calls: BTreeMap<String, usize>,
+    /// The form fields of the last call to each method, so a test can assert
+    /// what rho asked for and not merely that it asked.
+    last_form: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 pub struct Fake {
@@ -334,6 +337,18 @@ impl Fake {
 
     pub fn marked(&self) -> Vec<(String, String)> {
         self.state.lock().unwrap().marked.clone()
+    }
+
+    /// A field of the last call to `method`, for asserting that a refresh
+    /// bounded itself by what the mirror already holds.
+    pub fn last_field(&self, method: &str, field: &str) -> Option<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .last_form
+            .get(method)?
+            .get(field)
+            .cloned()
     }
 
     pub fn calls(&self, method: &str) -> usize {
@@ -729,6 +744,7 @@ fn handle(
         }
     }
     let form = parse_form(body);
+    state.last_form.insert(method.to_owned(), form.clone());
     let field = |name: &str| form.get(name).cloned().unwrap_or_default();
     match method {
         "rtm.connect" => json!({
@@ -775,6 +791,37 @@ fn handle(
             // Slack hands history back newest first, and pages backwards from
             // there, so the cursor counts messages already handed out.
             messages.reverse();
+            // `oldest` is how a mirrored conversation refreshes: only what
+            // it does not already hold.
+            // `latest` is the window a ping opens: everything up to and
+            // including the message the notification named.
+            let latest = field("latest");
+            if !latest.is_empty() {
+                let ceiling = latest.parse::<f64>().unwrap_or(f64::MAX);
+                let inclusive = field("inclusive") == "true";
+                messages.retain(|message| {
+                    message["ts"]
+                        .as_str()
+                        .and_then(|ts| ts.parse::<f64>().ok())
+                        .is_some_and(|ts| {
+                            if inclusive {
+                                ts <= ceiling
+                            } else {
+                                ts < ceiling
+                            }
+                        })
+                });
+            }
+            let oldest = field("oldest");
+            if !oldest.is_empty() {
+                let floor = oldest.parse::<f64>().unwrap_or(0.0);
+                messages.retain(|message| {
+                    message["ts"]
+                        .as_str()
+                        .and_then(|ts| ts.parse::<f64>().ok())
+                        .is_some_and(|ts| ts > floor)
+                });
+            }
             let limit = field("limit").parse::<usize>().unwrap_or(50).max(1);
             let start = field("cursor").parse::<usize>().unwrap_or(0);
             let end = (start + limit).min(messages.len());
