@@ -82,6 +82,14 @@ pub struct Loaded {
     pub messages: Vec<Message>,
     pub loading: bool,
     pub reached_oldest: bool,
+    /// The messages a hole sits over: everything newer than one of these,
+    /// up to the next message loaded, is unknown. A deal opens on the chunk
+    /// its message is in, which on a long history is not the newest chunk.
+    pub holes: Vec<Ts>,
+    /// Whether the newest message loaded is known not to be the newest
+    /// there is: a run caught up one page at a time says so under its last
+    /// message until it reaches the live end.
+    pub behind_live: bool,
     older_cursor: Option<String>,
     pub error: Option<String>,
     /// Bumped by every change to `messages`, so a surface knows whether what
@@ -153,6 +161,20 @@ impl Loaded {
                 self.record(Update::Inserted(ts));
             }
         }
+    }
+
+    /// A message off the socket. A run that has not caught up with the live
+    /// end is not next to what just arrived: the jump is a hole, and the
+    /// arrival is the live end itself.
+    fn insert_live(&mut self, message: Message) {
+        if self.behind_live
+            && let Some(last) = self.messages.last()
+            && message.ts.is_newer_than(&last.ts)
+        {
+            self.holes.push(last.ts.clone());
+            self.behind_live = false;
+        }
+        self.insert(message);
     }
 
     /// Overwrites a message in place: an edit, or a reply count that grew.
@@ -451,13 +473,13 @@ impl Session {
             thread_ts: message.thread_root(),
         });
         if let Some(loaded) = self.loaded.get_mut(&thread) {
-            loaded.insert(message.clone());
+            loaded.insert_live(message.clone());
         }
         let Some(loaded) = self.loaded.get_mut(&conversation) else {
             return;
         };
         if message.is_top_level() {
-            loaded.insert(message.clone());
+            loaded.insert_live(message.clone());
         }
         if message.thread_ts.is_some() {
             // A reply is not channel content, but the fact that the thread
@@ -622,6 +644,131 @@ impl Session {
         self.fetch(source.clone(), None, true, since, cx);
     }
 
+    /// Brings the chunk holding `ts` into an open conversation. A deal is
+    /// answered on the message it is about, which on a long history is a
+    /// different chunk from the newest one. Both come off the mirror, so
+    /// this costs no request; the hole between them is recorded rather than
+    /// papered over.
+    pub fn open_at(&mut self, source: &Source, ts: &Ts, cx: &mut Context<Self>) {
+        self.open(source, cx);
+        let scope = self.scope(source);
+        let Some(mirror) = self.mirror.clone() else {
+            return;
+        };
+        let Some(loaded) = self.loaded.get_mut(source) else {
+            return;
+        };
+        if loaded.messages.iter().any(|held| &held.ts == ts) {
+            return;
+        }
+        let chunk = mirror.chunk_containing(&scope, ts, MIRROR_PAGE);
+        let Some(newest) = chunk.last().map(|message| message.ts.clone()) else {
+            return;
+        };
+        for message in chunk {
+            loaded.insert(message);
+        }
+        loaded.holes.push(newest);
+        // The bottom of the run moved down to this chunk: what sits under it
+        // is the chunk's own gap, and the paging cursor from the newest
+        // chunk's page would ask about the wrong place entirely.
+        loaded.older_cursor = None;
+        loaded.reached_oldest =
+            mirror.gap_at_or_below(&scope, ts).is_none() && mirror.history_begins(&scope);
+        cx.notify();
+    }
+
+    /// Fills a hole from below: one page forward from the message it sits
+    /// over, which is what scrolling onto the row asks for. One page per
+    /// action, the same rule as paging back.
+    pub fn load_newer(&mut self, source: &Source, after: Ts, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        // A thread is fetched whole, so it never has a hole in the middle.
+        let Source::Conversation(channel) = source.clone() else {
+            return;
+        };
+        let Some(loaded) = self.loaded.get_mut(source) else {
+            return;
+        };
+        // The hole under the last message loaded is not recorded: it is the
+        // run not having caught up, and which message it sits over changes
+        // with every page.
+        let tail =
+            loaded.behind_live && loaded.messages.last().is_some_and(|last| last.ts == after);
+        if loaded.loading || !(tail || loaded.holes.contains(&after)) {
+            return;
+        }
+        loaded.loading = true;
+        // The chunk over the hole, which is what the page has to reach for
+        // the hole to be closed.
+        let above = loaded
+            .messages
+            .iter()
+            .find(|message| message.ts.is_newer_than(&after))
+            .map(|message| message.ts.clone());
+        let scope = self.scope(source);
+        let source = source.clone();
+        let task = gpui_tokio::Tokio::spawn(cx, {
+            let after = after.clone();
+            async move { client.conversations_history_since(&channel, &after).await }
+        });
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let Ok(page) = task.await else {
+                return;
+            };
+            let _ = this.update(cx, |session, cx| {
+                let mut fetched = Vec::new();
+                let mut closed = false;
+                {
+                    let Some(loaded) = session.loaded.get_mut(&source) else {
+                        return;
+                    };
+                    loaded.loading = false;
+                    match page {
+                        Ok(page) => {
+                            loaded.error = None;
+                            fetched = page.messages.clone();
+                            let newest = fetched.last().map(|message| message.ts.clone());
+                            closed = match (&above, &newest) {
+                                // The page ran into the chunk above: the two
+                                // runs are one now.
+                                (Some(above), Some(newest)) => !above.is_newer_than(newest),
+                                // Nothing above: the hole ends at the live
+                                // end, and a short page is how that is known.
+                                (None, _) => !page.has_more,
+                                (Some(_), None) => false,
+                            };
+                            for message in page.messages {
+                                loaded.insert(message);
+                            }
+                            loaded.holes.retain(|hole| hole != &after);
+                            match (closed, newest) {
+                                // A hole between two chunks moves down to
+                                // the page's own end; the tail's is not
+                                // recorded at all, it is `behind_live`.
+                                (false, Some(newest)) if above.is_some() => {
+                                    loaded.holes.push(newest)
+                                }
+                                (true, _) if above.is_none() => loaded.behind_live = false,
+                                _ => {}
+                            }
+                        }
+                        Err(error) => loaded.error = Some(format!("{error:#}")),
+                    }
+                }
+                if let Some(mirror) = session.mirror.as_ref() {
+                    mirror.insert_messages(&scope, &fetched);
+                    if let (true, Some(above)) = (closed, above) {
+                        mirror.clear_gap(&scope, &above);
+                    }
+                }
+                cx.notify();
+            });
+        }));
+    }
+
     /// Pages further back, which is what scrolling to the top asks for.
     /// Fills the history above what is loaded, which is what scrolling near
     /// the top asks for. One page in flight per conversation, so a burst of
@@ -632,17 +779,18 @@ impl Session {
             return;
         };
         let scope = self.scope(source);
-        let gap = self
-            .mirror
-            .as_ref()
-            .and_then(|mirror| {
-                if mirror.history_begins(&scope) {
-                    None
-                } else {
-                    mirror.gap_below(&scope, None)
-                }
-            })
-            .map(|(_, gap)| gap.page_before);
+        // The gap under the bottom of what is loaded, which after a deal is
+        // the dealt chunk's, not the newest chunk's.
+        let oldest = loaded.messages.first().map(|message| message.ts.clone());
+        let gap = self.mirror.as_ref().and_then(|mirror| {
+            if mirror.history_begins(&scope) {
+                return None;
+            }
+            match &oldest {
+                Some(oldest) => mirror.gap_at_or_below(&scope, oldest),
+                None => mirror.gap_below(&scope, None).map(|(at, _)| at),
+            }
+        });
         let Some(request) = older_request(
             loaded.loading,
             loaded.reached_oldest,
@@ -837,6 +985,14 @@ impl Session {
                                 reached_oldest = page.older_cursor.is_none();
                                 loaded.reached_oldest = reached_oldest;
                                 loaded.older_cursor = page.older_cursor;
+                            } else {
+                                // A catch-up page runs forward from what the
+                                // mirror held. More behind it means the run
+                                // still stops short of the live end. A
+                                // thread comes whole or not at all, so there
+                                // is nothing to say about it.
+                                loaded.behind_live =
+                                    page.has_more && matches!(source, Source::Conversation(_));
                             }
                             fetched = page.messages.clone();
                             for message in page.messages {
@@ -1190,11 +1346,22 @@ fn mirror_live(mirror: &Mirror, scope: &Scope, message: &Message) {
 /// and without the record the surface would take those twenty messages for
 /// the whole conversation and refuse to page back from them.
 fn mirror_island(mirror: &Mirror, scope: &Scope, messages: &[Message]) {
+    // Taken before the write, or the island would find itself.
+    let above = messages
+        .last()
+        .and_then(|newest| mirror.next_newer(scope, &newest.ts));
     mirror.insert_messages(scope, messages);
     if let Some(oldest) = messages.first()
         && !mirror.history_begins(scope)
     {
         mirror.put_gap(scope, &oldest.ts, &oldest.ts);
+    }
+    // Whatever was already held over the island is a run the island never
+    // met. Joining them would draw a hole as history, so the run above
+    // starts a chunk of its own. If the two turn out to be neighbours after
+    // all, the first page forward closes the record.
+    if let Some(above) = above {
+        mirror.put_gap(scope, &above, &above);
     }
 }
 
@@ -1320,6 +1487,38 @@ mod tests {
                 Some(Older::Before(ts)) if ts == Ts("10.0".into())
             ),
             "so scrolling to the top has something to ask for"
+        );
+    }
+
+    #[test]
+    fn a_window_written_under_a_run_does_not_join_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let mirror = Mirror::open(dir.path().join("slack.redb")).unwrap();
+        let scope = Scope::conversation("T1", &ChannelId("C1".into()));
+        let tail: Vec<Message> = (400..420)
+            .map(|i| message(&format!("{i}.0"), "the newest chunk"))
+            .collect();
+        mirror.insert_messages(&scope, &tail);
+        let window: Vec<Message> = (100..120)
+            .map(|i| message(&format!("{i}.0"), "around the ping"))
+            .collect();
+        mirror_island(&mirror, &scope, &window);
+
+        assert_eq!(
+            mirror.newest_chunk(&scope, 100).len(),
+            tail.len(),
+            "the newest chunk stops where the run above the window starts"
+        );
+        let chunk = mirror.chunk_containing(&scope, &Ts("110.0".into()), 100);
+        assert_eq!(
+            chunk.first().map(|message| message.ts.clone()),
+            Some(Ts("100.0".into())),
+            "and a deal on the window opens on the window"
+        );
+        assert_eq!(
+            chunk.last().map(|message| message.ts.clone()),
+            Some(Ts("119.0".into())),
+            "which stops before the hole over it"
         );
     }
 

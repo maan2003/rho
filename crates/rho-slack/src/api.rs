@@ -97,6 +97,10 @@ pub struct MessagePage {
     pub messages: Vec<Message>,
     /// The cursor for the page *before* this one, when more history exists.
     pub older_cursor: Option<String>,
+    /// Whether the range asked for holds more than came back. A page fetched
+    /// forward has no cursor of its own — the next one starts at its newest
+    /// message — so this is what says the run has not caught up yet.
+    pub has_more: bool,
 }
 
 /// Slack's own unread bookkeeping, from `client.counts`.
@@ -577,15 +581,15 @@ fn parse_message_page(body: &Value, channel: &ChannelId) -> MessagePage {
         .iter()
         .filter_map(|message| parse_message(message, channel))
         .collect();
-    let older_cursor = body["has_more"]
-        .as_bool()
-        .unwrap_or(false)
+    let has_more = body["has_more"].as_bool().unwrap_or(false);
+    let older_cursor = has_more
         .then(|| string(&body["response_metadata"]["next_cursor"]))
         .flatten()
         .filter(|cursor| !cursor.is_empty());
     MessagePage {
         messages,
         older_cursor,
+        has_more,
     }
 }
 

@@ -866,15 +866,34 @@ fn handle(
             }
             let limit = field("limit").parse::<usize>().unwrap_or(50).max(1);
             let start = field("cursor").parse::<usize>().unwrap_or(0);
-            let end = (start + limit).min(messages.len());
-            let page = messages.get(start..end).unwrap_or_default().to_vec();
-            let has_more = end < messages.len();
+            // `oldest` on its own pages forward: Slack answers with the
+            // messages closest to it, not with the newest in the range. It
+            // is what a catch-up and the after-half of a ping's window ask
+            // for, and on a long conversation the two are nowhere near each
+            // other. With `latest` set the window is bounded above instead,
+            // and paging runs backwards from there as usual.
+            let forward = !oldest.is_empty() && latest.is_empty();
+            let (page, has_more, next) = if forward {
+                let from = messages.len().saturating_sub(limit);
+                (
+                    messages.get(from..).unwrap_or_default().to_vec(),
+                    from > 0,
+                    from,
+                )
+            } else {
+                let end = (start + limit).min(messages.len());
+                (
+                    messages.get(start..end).unwrap_or_default().to_vec(),
+                    end < messages.len(),
+                    end,
+                )
+            };
             json!({
                 "ok": true,
                 "messages": page,
                 "has_more": has_more,
                 "response_metadata": {
-                    "next_cursor": if has_more { end.to_string() } else { String::new() },
+                    "next_cursor": if has_more { next.to_string() } else { String::new() },
                 },
             })
         }

@@ -226,7 +226,11 @@ fn an_edited_message_overwrites_in_place() {
 async fn a_ping_costs_a_window_on_both_sides_and_one_thread() {
     let fake = Fake::start().await.unwrap();
     fake.add_channel("C1", "design");
-    for index in 0..60 {
+    // Long enough to tell the window apart from the tail: a ping in the
+    // middle of a busy channel is hundreds of messages from the newest one,
+    // and a fetch that answers with the newest would look right on a short
+    // conversation and be useless on this one.
+    for index in 0..500 {
         fake.add_message(
             "C1",
             json!({
@@ -239,7 +243,7 @@ async fn a_ping_costs_a_window_on_both_sides_and_one_thread() {
     let client = client(&fake);
     let (_dir, mirror) = mirror();
     let channel = ChannelId::from("C1");
-    let pinged = Ts::from("150.000000");
+    let pinged = Ts::from("350.000000");
 
     assert!(
         !mirror.holds(&scope(), &pinged),
@@ -263,12 +267,12 @@ async fn a_ping_costs_a_window_on_both_sides_and_one_thread() {
     assert_eq!(fake.calls("conversations.replies"), 1, "and one thread");
     assert_eq!(
         fake.fields("conversations.history", "latest"),
-        vec![Some("150.000000".to_owned()), None],
+        vec![Some("350.000000".to_owned()), None],
         "the first call ends at the pinged message"
     );
     assert_eq!(
         fake.fields("conversations.history", "oldest"),
-        vec![None, Some("150.000000".to_owned())],
+        vec![None, Some("350.000000".to_owned())],
         "and the second starts there"
     );
     assert_eq!(
@@ -281,9 +285,15 @@ async fn a_ping_costs_a_window_on_both_sides_and_one_thread() {
         .iter()
         .map(|message| message.ts.clone())
         .collect::<Vec<_>>();
-    assert!(
-        seen.iter().any(|ts| ts.is_newer_than(&pinged)),
-        "the reader gets what came after the ping"
+    assert_eq!(
+        seen.first().map(|ts| ts.0.as_str()),
+        Some("331.000000"),
+        "the window starts twenty messages before the ping"
+    );
+    assert_eq!(
+        seen.last().map(|ts| ts.0.as_str()),
+        Some("370.000000"),
+        "and ends twenty after it, not at the newest message in the channel"
     );
     assert!(
         seen.iter().any(|ts| pinged.is_newer_than(ts)),

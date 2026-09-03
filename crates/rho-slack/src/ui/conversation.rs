@@ -36,6 +36,10 @@ pub struct ConversationView {
     editor: Entity<Editor>,
     /// How far the session's messages have been applied here.
     revision: u64,
+    /// Whether the surface is writing the transcript. The edits move the
+    /// cursor and the view on their own, and none of that is the reader
+    /// asking for anything.
+    editing: bool,
     /// One user action buys one page. Set when a fill is asked for, cleared
     /// when the reader scrolls or moves the cursor themselves, so a landed
     /// page cannot walk the whole conversation back to its beginning.
@@ -74,6 +78,11 @@ impl EventEmitter<Event> for ConversationView {}
 #[derive(Default)]
 struct Fill {
     asked: bool,
+    /// Whether the reader has moved at all. A conversation opening onto a
+    /// gap asks once for history, but a run that has not caught up with the
+    /// live end waits to be scrolled onto: opening is not a request to walk
+    /// forward through everything missed.
+    moved: bool,
 }
 
 impl Fill {
@@ -81,17 +90,37 @@ impl Fill {
     /// buy again.
     fn user_moved(&mut self) {
         self.asked = false;
+        self.moved = true;
     }
 
     /// Whether to ask now, given where the view sits. Asking marks the
     /// action spent.
     fn wants_page(&mut self, near_top: bool) -> bool {
-        if self.asked || !near_top {
-            return false;
-        }
-        self.asked = true;
-        true
+        self.wants(near_top.then_some(Want::Older)).is_some()
     }
+
+    /// The one page this action buys, if the view is sitting on something
+    /// worth asking for.
+    fn wants(&mut self, want: Option<Want>) -> Option<Want> {
+        if self.asked {
+            return None;
+        }
+        let want = match want? {
+            Want::Newer(_) if !self.moved => return None,
+            want => want,
+        };
+        self.asked = true;
+        Some(want)
+    }
+}
+
+/// Which side of the loaded run a page is wanted on. Paging back happens at
+/// the top; a hole is filled forward from the message it sits over, because
+/// that is the end the reader has read up to.
+#[derive(Clone, Debug, PartialEq)]
+enum Want {
+    Older,
+    Newer(Ts),
 }
 
 /// What the surface moved on its own, so the resulting events can be told
@@ -100,6 +129,10 @@ impl Fill {
 struct Moved {
     scroll: Option<f64>,
     cursor: Option<u32>,
+    /// Whether the reader has just moved the cursor. The scroll that brings
+    /// the view to it is part of that motion, not a second action: without
+    /// this, one `G` at the bottom of a hole buys two pages.
+    after_selection: bool,
 }
 
 /// What the transcript keys on. Day rules and the gap notice are items like
@@ -110,6 +143,8 @@ enum Row {
     Notice,
     /// "older messages not loaded", while the run does not reach the start.
     Gap,
+    /// "newer messages not loaded", under the message a hole sits over.
+    Newer(Ts),
     Day(String),
     Message(Ts),
 }
@@ -190,43 +225,39 @@ impl ConversationView {
         subscriptions.push(
             cx.subscribe(&editor, |this, editor, event: &EditorEvent, cx| {
                 match event {
-                    EditorEvent::ScrollPositionChanged { .. } => {
-                        let (position, screen) = editor.update(cx, |editor, cx| {
-                            (
-                                editor.scroll_position(cx).y,
-                                editor.visible_line_count().unwrap_or(0.0),
-                            )
-                        });
+                    EditorEvent::ScrollPositionChanged { local, autoscroll } => {
+                        let position = editor.update(cx, |editor, cx| editor.scroll_position(cx).y);
                         // The surface's own re-anchoring comes back as a
-                        // scroll event too. Only the reader's counts.
+                        // scroll event too, and so does the view following
+                        // the content when a page lands under the cursor.
+                        // Only the reader's own counts, or one keypress at
+                        // the bottom of a hole would walk the whole way down
+                        // it a page at a time.
                         if this.moved.scroll == Some(position) {
                             this.moved.scroll = None;
-                        } else {
+                        } else if *local && !*autoscroll && !this.moved.after_selection {
                             this.fill.user_moved();
                         }
-                        if this.fill.wants_page(near_top(position, screen)) {
-                            this.load_older(cx);
-                        }
+                        this.moved.after_selection = false;
+                        cx.notify();
                     }
+                    // A reader already at the top who presses `gg` moves the
+                    // cursor without moving the view, so no scroll event
+                    // comes: the motion is the action.
                     EditorEvent::SelectionsChanged { local: true } => {
+                        // An edit under the cursor shifts it: the transcript
+                        // growing is not the reader moving.
+                        if this.editing {
+                            return;
+                        }
                         let row = this.cursor_row(cx) as u32;
                         if this.moved.cursor == Some(row) {
                             this.moved.cursor = None;
                             return;
                         }
+                        this.moved.after_selection = true;
                         this.fill.user_moved();
-                        // A reader already at the top who presses `gg` moves
-                        // the cursor without moving the view, so the scroll
-                        // event never comes: the motion is the action.
-                        let (position, screen) = editor.update(cx, |editor, cx| {
-                            (
-                                editor.scroll_position(cx).y,
-                                editor.visible_line_count().unwrap_or(0.0),
-                            )
-                        });
-                        if this.fill.wants_page(near_top(position, screen)) {
-                            this.load_older(cx);
-                        }
+                        cx.notify();
                     }
                     _ => {}
                 }
@@ -241,6 +272,7 @@ impl ConversationView {
             multi_buffer,
             editor,
             revision: 0,
+            editing: false,
             fill: Fill::default(),
             moved: Moved::default(),
             dealt: None,
@@ -354,6 +386,44 @@ impl ConversationView {
             .update(cx, |session, cx| session.load_older(&source, cx));
     }
 
+    /// Fills the hole under `after` with one page forward.
+    fn load_newer(&mut self, after: Ts, cx: &mut Context<Self>) {
+        let source = self.source.clone();
+        self.session
+            .update(cx, |session, cx| session.load_newer(&source, after, cx));
+    }
+
+    /// What the view is sitting on, if it is sitting on something worth a
+    /// page: the top of the run, or a hole in it.
+    fn wanted(&self, position: f64, screen: f64, cursor: f64, cx: &App) -> Option<Want> {
+        let snapshot = self.transcript.buffer().read(cx).snapshot();
+        let holes = self
+            .transcript
+            .keys()
+            .filter_map(|key| {
+                let Row::Newer(ts) = key else {
+                    return None;
+                };
+                let start = self.transcript.range_of(key)?.start;
+                let row = text::ToPoint::to_point(&start, &snapshot).row as f64;
+                Some((row, ts.clone()))
+            })
+            .collect::<Vec<_>>();
+        wanted_at(position, screen, cursor, &holes)
+    }
+
+    /// Buys the page the view is sitting on, if this action has not spent
+    /// one already.
+    fn fill(&mut self, position: f64, screen: f64, cx: &mut Context<Self>) {
+        let cursor = self.cursor_row(cx) as f64;
+        let want = self.wanted(position, screen, cursor, cx);
+        match self.fill.wants(want) {
+            Some(Want::Older) => self.load_older(cx),
+            Some(Want::Newer(after)) => self.load_newer(after, cx),
+            None => {}
+        }
+    }
+
     /// Puts the cursor in the composer: what `i` asks for.
     pub fn select_compose(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let end = {
@@ -385,12 +455,17 @@ impl ConversationView {
         }
         self.dealt = Some(ts.clone());
         self.dealt_placed = false;
+        // The message may be in an older chunk than the one the surface
+        // opened on, which is the ordinary case on a long history.
+        let source = self.source.clone();
+        self.session
+            .update(cx, |session, cx| session.open_at(&source, &ts, cx));
         let key = Row::Message(ts);
         let messages = self.shown_messages(cx);
         if let Some(item) = self.item_for_key(&key, &messages, cx) {
             self.transcript.replace(&key, item, cx);
         }
-        self.place_dealt(window, cx);
+        self.refresh(window, cx);
     }
 
     /// Puts the cursor on the dealt message once it is in the transcript.
@@ -458,25 +533,8 @@ impl ConversationView {
         self.place_dealt(window, cx);
         self.settle_images(cx);
         self.refresh_chrome(cx);
-        self.keep_filling(cx);
+        self.refresh_holes(cx);
         cx.notify();
-    }
-
-    /// The two cases where a gap sits on screen and no scroll event will
-    /// ever come to ask about it: opening a conversation the mirror holds
-    /// only a short run of, and a gap line on a view nobody has asked from
-    /// yet. It buys one page, like any other action, and a page landing
-    /// does not buy another.
-    fn keep_filling(&mut self, cx: &mut Context<Self>) {
-        let (position, screen) = self.editor.update(cx, |editor, cx| {
-            (
-                editor.scroll_position(cx).y,
-                editor.visible_line_count().unwrap_or(0.0),
-            )
-        });
-        if self.fill.wants_page(near_top(position, screen)) {
-            self.load_older(cx);
-        }
     }
 
     /// A picture whose bytes were still arriving when its message was
@@ -505,6 +563,7 @@ impl ConversationView {
     }
 
     fn rebuild(&mut self, cx: &mut Context<Self>) {
+        self.editing = true;
         self.transcript.clear(cx);
         let messages = self.shown_messages(cx);
         let mut items = Vec::new();
@@ -518,6 +577,7 @@ impl ConversationView {
             items.push(self.item_for(message, cx));
         }
         self.transcript.insert_before(None, items, cx);
+        self.editing = false;
     }
 
     /// Carries out the plan: each operation is one transcript edit.
@@ -547,6 +607,7 @@ impl ConversationView {
             });
             self.moved.scroll = Some(pinned);
         }
+        self.editing = true;
         for op in ops {
             match op {
                 Op::Insert { before, keys } => {
@@ -571,6 +632,7 @@ impl ConversationView {
         if let Some(key) = first_loaded {
             self.leave_the_gap_line(&key, window, cx);
         }
+        self.editing = false;
     }
 
     /// Puts the cursor on the first message of a page that has just landed,
@@ -617,7 +679,7 @@ impl ConversationView {
                 let message = messages.iter().find(|message| &message.ts == ts)?.clone();
                 Some(self.item_for(&message, cx))
             }
-            Row::Notice | Row::Gap => None,
+            Row::Notice | Row::Gap | Row::Newer(_) => None,
         }
     }
 
@@ -658,6 +720,51 @@ impl ConversationView {
             .then_some(Row::Gap)
             .or(first);
         self.put_top(Row::Notice, notice, after_notice, cx);
+    }
+
+    /// The rows that say history is missing in the middle: one under each
+    /// chunk that does not run into what sits over it. A hole between two
+    /// loaded chunks and a run that has not caught up with the live end are
+    /// the same thing to a reader, so they read the same and fill the same
+    /// way.
+    fn refresh_holes(&mut self, cx: &mut Context<Self>) {
+        let Some((mut holes, behind_live)) = self
+            .session
+            .read(cx)
+            .loaded(&self.source)
+            .map(|loaded| (loaded.holes.clone(), loaded.behind_live))
+        else {
+            return;
+        };
+        let shown = self.shown_messages(cx);
+        if behind_live && let Some(last) = shown.last() {
+            holes.push(last.ts.clone());
+        }
+        // A hole over a message this surface does not show — a reply in a
+        // channel — has no line to sit under.
+        holes.retain(|ts| self.transcript.contains(&Row::Message(ts.clone())));
+        let wanted = holes
+            .iter()
+            .cloned()
+            .map(Row::Newer)
+            .collect::<HashSet<_>>();
+        for key in self.transcript.keys().cloned().collect::<Vec<_>>() {
+            if matches!(key, Row::Newer(_)) && !wanted.contains(&key) {
+                self.transcript.remove(&key, cx);
+            }
+        }
+        for ts in holes {
+            let key = Row::Newer(ts.clone());
+            if self.transcript.contains(&key) {
+                continue;
+            }
+            // Above the day rule that heads the chunk over it: the rule
+            // belongs to the messages under it, not to the hole.
+            let before = self.transcript.key_after(&Row::Message(ts)).cloned();
+            let item = muted_item(key, "newer messages not loaded\n", Class::Muted);
+            self.transcript
+                .insert_before(before.as_ref(), vec![item], cx);
+        }
     }
 
     /// Puts one chrome item in place, replacing or removing it as its state
@@ -757,6 +864,24 @@ enum Op {
     },
     Replace(Row),
     Remove(Row),
+}
+
+/// What the view is sitting on, if it is sitting on something worth a page.
+///
+/// The cursor decides, not the scroll: a motion moves it a frame before the
+/// view follows, so asking on the scroll alone would fetch the top of the
+/// buffer while the reader is standing at the bottom of it. A hole the
+/// reader has read down to, or one on screen, is asked forward; only a
+/// reader who is at the top with the cursor asks backwards.
+fn wanted_at(position: f64, screen: f64, cursor: f64, holes: &[(f64, Ts)]) -> Option<Want> {
+    let hole = holes.iter().find_map(|(row, ts)| {
+        let read_up_to = cursor + 1.0 >= *row;
+        let on_screen = row + 1.0 >= position && *row <= position + screen;
+        (read_up_to || on_screen).then(|| Want::Newer(ts.clone()))
+    });
+    hole.or_else(|| {
+        (near_top(position, screen) && cursor <= screen.max(1.0)).then_some(Want::Older)
+    })
 }
 
 /// Whether the view is close enough to the top to ask for older messages.
@@ -1404,6 +1529,16 @@ fn push_body(spans: &mut Vec<Span>, body: &str, model: &Model, links: &[crate::b
 
 impl gpui::Render for ConversationView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // One page per frame, which is what makes it one page per keypress:
+        // a motion raises a scroll event and a selection event, and a
+        // conversation opening onto a gap raises neither.
+        let (position, screen) = self.editor.update(cx, |editor, cx| {
+            (
+                editor.scroll_position(cx).y,
+                editor.visible_line_count().unwrap_or(0.0),
+            )
+        });
+        self.fill(position, screen, cx);
         div()
             .key_context("RhoSlackConversation")
             .size_full()
@@ -1580,6 +1715,66 @@ mod tests {
             "a reader away from the top asks for nothing"
         );
         assert!(fill.wants_page(true), "and has spent nothing");
+    }
+
+    #[test]
+    fn a_hole_is_filled_forward_and_costs_the_same_one_page() {
+        let mut fill = Fill::default();
+        let hole = Want::Newer(Ts("2.0".into()));
+        assert_eq!(
+            fill.wants(Some(hole.clone())),
+            None,
+            "opening at the bottom of a run is not a request to walk forward"
+        );
+        fill.user_moved();
+        assert_eq!(
+            fill.wants(Some(hole.clone())),
+            Some(hole.clone()),
+            "a reader sitting on the hole asks for the page under it"
+        );
+        assert_eq!(
+            fill.wants(Some(Want::Older)),
+            None,
+            "and that spends the action, whichever end the next one wants"
+        );
+        fill.user_moved();
+        assert_eq!(
+            fill.wants(Some(hole.clone())),
+            Some(hole),
+            "moving buys one"
+        );
+        let mut fill = Fill::default();
+        assert_eq!(
+            fill.wants(None),
+            None,
+            "a view sitting on neither end asks for nothing"
+        );
+    }
+
+    #[test]
+    fn the_cursor_decides_which_end_is_asked_about() {
+        let hole = [(93.0, Ts("2.0".into()))];
+        assert_eq!(
+            wanted_at(3.0, 38.0, 95.0, &hole),
+            Some(Want::Newer(Ts("2.0".into()))),
+            "a reader who pressed `G` is at the bottom, whatever the view has \
+             caught up to yet"
+        );
+        assert_eq!(
+            wanted_at(60.0, 38.0, 61.0, &hole),
+            Some(Want::Newer(Ts("2.0".into()))),
+            "and a hole scrolled onto is asked about too"
+        );
+        assert_eq!(
+            wanted_at(0.0, 38.0, 0.0, &hole),
+            Some(Want::Older),
+            "at the top it is history that is missing"
+        );
+        assert_eq!(
+            wanted_at(60.0, 38.0, 61.0, &[]),
+            None,
+            "and in the middle of a run with no hole, nothing is"
+        );
     }
 
     #[test]

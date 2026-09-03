@@ -291,7 +291,9 @@ done right after the transcript primitive (2.4) and before 2.10:
       is the state then its age, `needs reply · 1.9h` when the last word
       is theirs and `replied · 1.9h` when it is the reader's; nothing
       else. The queue card label follows the same words.
-- [ ] 2.12 A hole in the history is drawn, never hidden. Seen on 3 Sep
+- [x] 2.12 Done 3 Sep (`f3004e8d`): `newer messages not loaded` rows, forward
+      fill one page per action, fake models `oldest` alone as forward paging,
+      cursor-per-frame purchase rule (screens 48–50). A hole in the history is drawn, never hidden. Seen on 3 Sep
       (screen 46): the ping's prefetched window and the conversation's tail
       rendered as one continuous run, message 250 then a day rule then 481,
       with about 230 messages missing and nothing on screen saying so. The

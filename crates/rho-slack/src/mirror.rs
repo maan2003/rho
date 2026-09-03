@@ -192,6 +192,74 @@ impl Mirror {
         messages
     }
 
+    /// The run `ts` sits in: bounded below by the gap under its chunk and
+    /// above by the next gap over it. This is what a deal opens on — the
+    /// messages around the one being answered, not the newest ones, which
+    /// may be a different chunk entirely.
+    pub fn chunk_containing(&self, scope: &Scope, ts: &Ts, limit: usize) -> Vec<Message> {
+        let floor = self.gap_at_or_below(scope, ts);
+        let ceiling = self.gap_above(scope, ts);
+        let txn = self.db.read();
+        let table = txn.open_table(MESSAGES);
+        let end = match &ceiling {
+            Some(ceiling) => scope.key(ceiling),
+            None => scope.end(),
+        };
+        let mut messages = Vec::new();
+        let mut iter = table.range(scope.prefix().as_str()..end.as_str());
+        while let Some((key, value)) = iter.next_back() {
+            if let Some(floor) = &floor
+                && ts_of(key.value()).is_some_and(|held| floor.is_newer_than(&held))
+            {
+                break;
+            }
+            messages.push(value.value().as_ref().into());
+            if messages.len() >= limit {
+                break;
+            }
+        }
+        messages.reverse();
+        messages
+    }
+
+    /// The gap at or under `ts`: the bottom of the chunk `ts` belongs to.
+    pub fn gap_at_or_below(&self, scope: &Scope, ts: &Ts) -> Option<Ts> {
+        let txn = self.db.read();
+        let table = txn.open_table(GAPS);
+        let mut iter = table.range(scope.prefix().as_str()..=scope.key(ts).as_str());
+        iter.next_back().and_then(|(key, _)| ts_of(key.value()))
+    }
+
+    /// The next gap over `ts`, which is where its chunk stops.
+    pub fn gap_above(&self, scope: &Scope, ts: &Ts) -> Option<Ts> {
+        let txn = self.db.read();
+        let table = txn.open_table(GAPS);
+        let mut iter = table.range(scope.key(ts).as_str()..scope.end().as_str());
+        loop {
+            let (key, _) = iter.next()?;
+            let at = ts_of(key.value())?;
+            if at.is_newer_than(ts) {
+                return Some(at);
+            }
+        }
+    }
+
+    /// The oldest message held over `ts`. A run written under an existing
+    /// one starts a chunk there, and that is where the record of the hole
+    /// between them belongs.
+    pub fn next_newer(&self, scope: &Scope, ts: &Ts) -> Option<Ts> {
+        let txn = self.db.read();
+        let table = txn.open_table(MESSAGES);
+        let mut iter = table.range(scope.key(ts).as_str()..scope.end().as_str());
+        loop {
+            let (key, _) = iter.next()?;
+            let held = ts_of(key.value())?;
+            if held.is_newer_than(ts) {
+                return Some(held);
+            }
+        }
+    }
+
     /// Everything the mirror holds for a scope, oldest first. Gaps are not
     /// hidden here: a caller that has already filled them wants the lot.
     pub fn all_messages(&self, scope: &Scope) -> Vec<Message> {

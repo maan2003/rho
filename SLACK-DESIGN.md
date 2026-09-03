@@ -145,6 +145,16 @@ scrolling into the gap behind it fills it, one page at a time, so a
 conversation reads as if it had always been whole; coming back after downtime appends the
 live tail as a new chunk and, if it does not reach the cached newest
 timestamp, leaves a gap between them rather than pretending continuity.
+Every gap is drawn where it sits (`older messages not loaded`,
+`newer messages not loaded`), never hidden between two runs; a ping's
+prefetched window is a chunk of its own with gaps on both sides, and the
+newest chunk stays loaded under it so live messages keep landing. A gap
+below the reader fills forward the same way a gap above fills back: one
+page per user action, and a stale conversation waits for the reader to
+move before it spends a page. What counts as a user action is decided by
+the cursor once per frame, not by scroll events: a vim motion moves the
+cursor a frame before the view follows, autoscroll is never the reader,
+and a page landing under the cursor cannot buy the next one.
 Dedup by timestamp on every insert. Slack's model is simpler than
 Matrix's (no encryption, no state events, a total order by `ts`), so the
 port is the chunk-and-gap idea and the update stream to the view, not the
