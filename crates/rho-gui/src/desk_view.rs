@@ -734,58 +734,78 @@ impl DeskCells {
     )> {
         use rho_desk::cells::{Field, Value, Verdict};
 
-        let (verdict, mut writes, change) = match verdict {
-            DeskVerdict::Done | DeskVerdict::Dismiss => {
-                let state = if matches!(verdict, DeskVerdict::Done) {
-                    rho_desk::cells::State::Done
-                } else {
-                    rho_desk::cells::State::Dismissed
-                };
-                let verdict = if matches!(verdict, DeskVerdict::Done) {
-                    Verdict::Done
-                } else {
-                    Verdict::Dismiss
-                };
-                (
-                    verdict,
-                    Vec::new(),
-                    (node_id, Field::State, Value::State(state)),
-                )
-            }
-            DeskVerdict::Defer { until } => (
-                Verdict::Defer { until },
-                Vec::new(),
-                (
-                    node_id,
-                    Field::DeferUntil,
-                    Value::OptionalTimestamp(Some(until)),
-                ),
-            ),
-            DeskVerdict::File { parent } => (
-                Verdict::File { parent },
-                Vec::new(),
-                (node_id, Field::Parent, Value::Parent(Some(parent))),
-            ),
-            DeskVerdict::Todo { defer_until, pace } => {
-                let (note, mut writes) = self.create_note_writes(host, Some(node_id))?;
-                // The creation already writes every common field, so the
-                // cadence replaces those values rather than repeating them.
-                for write in &mut writes {
-                    match write.field {
-                        Field::DeferUntil => {
-                            write.value = Value::OptionalTimestamp(Some(defer_until));
-                        }
-                        Field::PaceDays => write.value = Value::Days(pace),
-                        _ => {}
-                    }
+        let (verdict, mut writes, change): (Verdict, Vec<rho_desk::cells::CellWrite>, _) =
+            match verdict {
+                DeskVerdict::Done | DeskVerdict::Dismiss => {
+                    let state = if matches!(verdict, DeskVerdict::Done) {
+                        rho_desk::cells::State::Done
+                    } else {
+                        rho_desk::cells::State::Dismissed
+                    };
+                    let verdict = if matches!(verdict, DeskVerdict::Done) {
+                        Verdict::Done
+                    } else {
+                        Verdict::Dismiss
+                    };
+                    (
+                        verdict,
+                        Vec::new(),
+                        (node_id, Field::State, Value::State(state)),
+                    )
                 }
-                (
-                    Verdict::Todo { note },
-                    writes,
-                    (note, Field::Deleted, Value::Bool(false)),
-                )
-            }
-        };
+                DeskVerdict::Defer { until } => (
+                    Verdict::Defer { until },
+                    Vec::new(),
+                    (
+                        node_id,
+                        Field::DeferUntil,
+                        Value::OptionalTimestamp(Some(until)),
+                    ),
+                ),
+                DeskVerdict::File { parent } => (
+                    Verdict::File { parent },
+                    Vec::new(),
+                    (node_id, Field::Parent, Value::Parent(Some(parent))),
+                ),
+                DeskVerdict::Todo { defer_until, pace } => {
+                    let (note, mut writes) = self.create_note_writes(host, Some(node_id))?;
+                    // The creation already writes every common field, so the
+                    // cadence replaces those values rather than repeating them.
+                    for write in &mut writes {
+                        match write.field {
+                            Field::DeferUntil => {
+                                write.value = Value::OptionalTimestamp(Some(defer_until));
+                            }
+                            Field::PaceDays => write.value = Value::Days(pace),
+                            _ => {}
+                        }
+                    }
+                    // A todo is the one verdict that writes a whole new note, so
+                    // its log entry carries all three cells that make the note a
+                    // live cadence, against the values a node that never existed
+                    // is read as having. One of them is not enough: the daemon
+                    // checks the entry against exactly this shape.
+                    let changes = vec![
+                        field_change(note, Field::Deleted, Value::Bool(true), Value::Bool(false)),
+                        field_change(
+                            note,
+                            Field::DeferUntil,
+                            Value::OptionalTimestamp(None),
+                            Value::OptionalTimestamp(Some(defer_until)),
+                        ),
+                        field_change(note, Field::PaceDays, Value::Days(0), Value::Days(pace)),
+                    ];
+                    let event = rho_desk::cells::VerdictEvent::Applied {
+                        verdict: Verdict::Todo { note },
+                        at: rho_desk::cells::Stamp {
+                            device: self.device,
+                            version: 0,
+                        },
+                        changes,
+                    };
+                    return Some((writes, (node_id, event)));
+                }
+            };
         let (change_node, field, after) = change;
         let before = self
             .hosts
@@ -910,6 +930,20 @@ fn parent_write(
 }
 
 /// The eight common fields a client must write to create a note.
+fn field_change(
+    node: rho_desk::NodeId,
+    field: rho_desk::cells::Field,
+    before: rho_desk::cells::Value,
+    after: rho_desk::cells::Value,
+) -> rho_desk::cells::FieldChange {
+    rho_desk::cells::FieldChange {
+        node,
+        field,
+        before: Some(before),
+        after: Some(after),
+    }
+}
+
 fn create_note_writes(
     node_id: rho_desk::NodeId,
     parent: Option<rho_desk::NodeId>,

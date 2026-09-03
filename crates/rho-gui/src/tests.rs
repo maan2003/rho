@@ -750,6 +750,163 @@ fn undo_verdict_binding_is_confined_to_deal_normal_mode(cx: &mut TestAppContext)
 }
 
 #[gpui::test]
+fn a_todo_verdict_logs_every_cell_that_makes_the_new_note_a_cadence(cx: &mut TestAppContext) {
+    // The daemon validates the log entry against exactly these three
+    // changes, and rejects the whole mutation otherwise: a todo that only
+    // logged the new note's arrival never reached the tree.
+    use rho_desk::cells::{Field, Value};
+
+    let mut desk = DeskFixture::new();
+    let note = desk.note(None, "Named card");
+    let woke = rho_desk::cells::Timestamp {
+        unix_ms: 1_577_836_800_000,
+        precision: rho_desk::cells::TimestampPrecision::Day,
+    };
+    desk.set(
+        note,
+        Field::DeferUntil,
+        Value::OptionalTimestamp(Some(woke)),
+    );
+    desk.set(note, Field::PaceDays, Value::Days(1));
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.open_deal_mode(window, cx);
+            workspace.take_host_messages_for_test(HostId::default());
+        })
+        .unwrap();
+
+    cx.dispatch_action(*workspace, crate::DashboardDealTodo);
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            let mutation = take_desk_mutation(workspace, HostId::default()).expect("todo mutation");
+            let Some((
+                verdict_node,
+                rho_desk::cells::VerdictEvent::Applied {
+                    verdict, changes, ..
+                },
+            )) = mutation.verdict
+            else {
+                panic!("the todo verdict did not log an applied entry");
+            };
+            assert_eq!(verdict_node, note, "the entry hangs off the dealt heading");
+            let rho_desk::cells::Verdict::Todo { note: created } = verdict else {
+                panic!("the entry is not a todo");
+            };
+            assert_eq!(changes.len(), 3);
+            assert!(changes.iter().all(|change| change.node == created));
+            let change = |field: Field| {
+                changes
+                    .iter()
+                    .find(|change| change.field == field)
+                    .unwrap_or_else(|| panic!("no change for {field:?}"))
+            };
+            let deleted = change(Field::Deleted);
+            assert_eq!(deleted.before, Some(Value::Bool(true)));
+            assert_eq!(deleted.after, Some(Value::Bool(false)));
+            let defer = change(Field::DeferUntil);
+            assert_eq!(defer.before, Some(Value::OptionalTimestamp(None)));
+            assert!(matches!(
+                defer.after,
+                Some(Value::OptionalTimestamp(Some(_)))
+            ));
+            let pace = change(Field::PaceDays);
+            assert_eq!(pace.before, Some(Value::Days(0)));
+            assert!(matches!(pace.after, Some(Value::Days(_))));
+            // The daemon also requires the note to be parented on the heading.
+            assert!(mutation.writes.iter().any(|write| write.node == created
+                && write.field == Field::Parent
+                && write.value == Value::Parent(Some(note))));
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn undo_verdict_reaches_the_desk_tree_outside_a_deal(cx: &mut TestAppContext) {
+    use gpui::{KeyContext, Keystroke};
+
+    cx.update(bind_test_keymaps);
+    cx.update(|cx| {
+        let keymap = cx.key_bindings();
+        let keymap = keymap.borrow();
+        let stroke = Keystroke::parse("shift-u").unwrap();
+        let resolves = |contexts: &[KeyContext]| {
+            keymap
+                .bindings_for_input(&[stroke.clone()], contexts)
+                .0
+                .first()
+                .is_some_and(|binding| binding.action().partial_eq(&crate::UndoVerdict))
+        };
+        // The desk itself, with no card on screen: vim binds `shift-u` one
+        // level up, so without this the verb is lost on the tree.
+        for mode in ["normal", "helix_normal"] {
+            assert!(
+                resolves(&[
+                    KeyContext::parse("RhoGui").unwrap(),
+                    KeyContext::parse("RhoDashboard").unwrap(),
+                    KeyContext::parse(&format!(
+                        "Editor VimControl vim_mode={mode} vim_operator=none"
+                    ))
+                    .unwrap(),
+                ]),
+                "shift-u did not reach UndoVerdict on the tree in {mode}"
+            );
+        }
+        // Typing is still typing.
+        assert!(!resolves(&[
+            KeyContext::parse("RhoGui").unwrap(),
+            KeyContext::parse("RhoDashboard").unwrap(),
+            KeyContext::parse("Editor VimControl vim_mode=insert vim_operator=none").unwrap(),
+        ]));
+    });
+}
+
+#[gpui::test]
+fn the_first_heading_can_be_written_on_an_empty_desk(cx: &mut TestAppContext) {
+    // No row means no heading line to stand on, and the verb still has to
+    // produce the first note rather than fall through to the editor.
+    let desk = DeskFixture::new();
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.take_host_messages_for_test(HostId::default());
+        })
+        .unwrap();
+
+    cx.dispatch_action(*workspace, crate::DashboardNewSibling);
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            let mutation =
+                take_desk_mutation(workspace, HostId::default()).expect("first note mutation");
+            assert!(
+                mutation
+                    .writes
+                    .iter()
+                    .any(|write| write.field == rho_desk::cells::Field::Kind
+                        && write.value
+                            == rho_desk::cells::Value::Kind(rho_desk::cells::NodeKind::Note)),
+                "the first row on an empty desk is not a note"
+            );
+            assert!(
+                mutation
+                    .writes
+                    .iter()
+                    .any(|write| write.field == rho_desk::cells::Field::Parent
+                        && write.value == rho_desk::cells::Value::Parent(None)),
+                "the first row on an empty desk is not a root"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn escape_leaves_deal_mode_on_every_dealt_surface(cx: &mut TestAppContext) {
     use gpui::{KeyContext, Keystroke};
 

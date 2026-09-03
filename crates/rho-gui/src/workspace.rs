@@ -8868,6 +8868,14 @@ impl Workspace {
         self.dashboard.is_focused(window, cx) && self.dashboard.cursor_on_heading_line(cx)
     }
 
+    /// The new-heading verbs also apply when there is nothing to stand on:
+    /// a desk with no rows has no heading line, and without this the very
+    /// first note could never be written from the keyboard.
+    fn dashboard_new_heading_applies(&mut self, window: &Window, cx: &mut Context<Self>) -> bool {
+        self.dashboard.is_focused(window, cx)
+            && (self.dashboard.cursor_on_heading_line(cx) || self.dashboard.tree_is_empty())
+    }
+
     fn staff_dashboard_node(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.new_agent_draft = None;
         let Some(topic) = self.dashboard.cursor_topic(cx) else {
@@ -11135,14 +11143,14 @@ impl Render for Workspace {
                 );
             }))
             .on_action(cx.listener(|this, _: &DashboardNewSibling, window, cx| {
-                if !this.dashboard_verb_applies(window, cx) {
+                if !this.dashboard_new_heading_applies(window, cx) {
                     cx.propagate();
                     return;
                 }
                 this.dashboard_new_heading(false, window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardNewChild, window, cx| {
-                if !this.dashboard_verb_applies(window, cx) {
+                if !this.dashboard_new_heading_applies(window, cx) {
                     cx.propagate();
                     return;
                 }

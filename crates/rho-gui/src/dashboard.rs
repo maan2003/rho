@@ -1784,6 +1784,14 @@ impl Dashboard {
 
     /// Whether the cursor is somewhere dashboard verbs apply: a heading
     /// line of the document or a generated agent row.
+    /// No rows at all, on any host: the desk the user is looking at is
+    /// blank rather than merely scrolled away from its rows.
+    pub fn tree_is_empty(&self) -> bool {
+        self.tree_hosts
+            .values()
+            .all(|source| source.nodes.is_empty())
+    }
+
     pub fn cursor_on_heading_line(&self, cx: &mut Context<Workspace>) -> bool {
         self.tree_node_at_cursor(cx).is_some_and(|(host, node_id)| {
             self.tree_hosts.get(&host).is_some_and(|source| {

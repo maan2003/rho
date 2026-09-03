@@ -464,6 +464,10 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             KeyBinding::new("g h", DashboardJump, Some(context)),
             // Not `c r`: a `c` prefix would shadow helix's change verb.
             KeyBinding::new("g r", DashboardRenameTopic, Some(context)),
+            // Undoing a verdict is the same verb whether or not a card is
+            // still on screen: a done row on the desk is undone from the
+            // desk. Bound here so it outranks vim's own `shift-u`.
+            KeyBinding::new("shift-u", UndoVerdict, Some(context)),
         ]);
     }
     // A surface with a key context of its own puts the dealt editor deeper
