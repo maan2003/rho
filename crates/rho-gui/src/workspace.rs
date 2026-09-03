@@ -10566,6 +10566,7 @@ impl Workspace {
         let row = div()
             .id("rho-status-line")
             .h(height)
+            .min_h_0()
             .w_full()
             .px_2()
             .border_b_1()
