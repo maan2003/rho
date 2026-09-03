@@ -648,6 +648,11 @@ pub fn root_menu() -> Transient {
         .item("r", "rail", |workspace, window, cx| {
             workspace.focus_rail(window, cx);
         })
+        // Home took the front door; the map keeps a key of its own so the
+        // notes store stays one press away from it.
+        .item("o", "desk map", |workspace, window, cx| {
+            workspace.open_overview(window, cx);
+        })
         .item("e", "Desk raw source", |workspace, window, cx| {
             workspace.cmd_toggle_raw_desk(window, cx);
         })

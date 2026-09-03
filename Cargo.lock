@@ -13911,6 +13911,7 @@ dependencies = [
  "rho-rpc",
  "rho-rtc",
  "rho-slack",
+ "rho-transcript",
  "rho-ui-proto",
  "rho-zulip",
  "rodio",

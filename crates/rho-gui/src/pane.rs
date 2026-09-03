@@ -10,6 +10,9 @@ use crate::registry::HostId;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SurfaceKey {
     Draft,
+    /// The dealer's ranking, read at a glance. Home is where a cold start
+    /// and an empty queue land.
+    Home,
     Messages,
     DeskNode {
         host: HostId,

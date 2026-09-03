@@ -67,11 +67,12 @@ use crate::{
     DashboardRenameTopic, DashboardReply, DashboardStaff, DashboardSubmit,
     DashboardToggleAgentTree, DashboardToggleSubagents, DashboardUndo, DashboardYankRow,
     DealCloseAndNext, DealLeave, DealOpen, FindNode, GitApprovalAllow, GitApprovalDeny,
-    MessagesOpen, MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext,
-    MinibufferPrevious, OverviewToggle, PastePrompt, RailFocus, RailOpen, RoleCycle,
-    RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit,
-    SlackCompose, SlackOpenRow, SlackSearch, SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard,
-    UndoVerdict, UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
+    HomeOpenRow, MessagesOpen, MinibufferCancel, MinibufferComplete, MinibufferConfirm,
+    MinibufferNext, MinibufferPrevious, OverviewToggle, PastePrompt, RailFocus, RailOpen,
+    RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore,
+    ShellPagerQuit, SlackCompose, SlackOpenRow, SlackSearch, SubmitPrompt, SurfaceBack,
+    SurfaceClose, TaskBoard, UndoVerdict, UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder,
+    ZulipNextUnread, ZulipOpenRow,
 };
 
 pub(crate) const MESSAGE_LOG_CAP: usize = 4096;
@@ -174,6 +175,7 @@ pub(crate) enum SurfaceView {
     Draft {
         editor: Entity<editor::Editor>,
     },
+    Home(Entity<crate::home::HomeView>),
     Messages(Entity<editor::Editor>),
     DeskNode(Entity<editor::Editor>),
     Transcript {
@@ -201,6 +203,9 @@ impl SurfaceView {
         use crate::telemetry::SurfaceKind;
         match self {
             Self::Draft { .. } => SurfaceKind::Draft,
+            // Home stands where the desk map stood, and is read the same
+            // way, so it counts as the same kind of screen.
+            Self::Home(_) => SurfaceKind::Dashboard,
             Self::Messages(_) => SurfaceKind::Messages,
             Self::DeskNode(_) => SurfaceKind::Dashboard,
             Self::Transcript { .. } => SurfaceKind::Transcript,
@@ -1098,7 +1103,7 @@ impl Workspace {
             active_context: ContextId::Draft,
             surface_history: Vec::new(),
             history_cursor: 0,
-            overview_open: true,
+            overview_open: false,
             navigation_skips: HashMap::new(),
             last_shift_tap: None,
             shell_touches: HashMap::new(),
@@ -1177,10 +1182,13 @@ impl Workspace {
         let draft = this.make_surface(SurfaceKey::Draft, window, cx);
         this.display_surface(draft, cx);
         this.seed_draft(false, window, cx);
-        // Startup lands in home mode: the dashboard is the front door.
-        this.overview_open = true;
-        let dashboard_focus = this.dashboard.focus_handle(cx);
-        window.focus(&dashboard_focus, cx);
+        // A cold start lands on Home: what is running, what is next, and
+        // what sits just under the line, without dealing a card.
+        this.overview_open = false;
+        let home = this.make_surface(SurfaceKey::Home, window, cx);
+        this.display_surface(home, cx);
+        this.refresh_home(cx);
+        this.focus_active_surface(window, cx);
         // Seed the listing before any event arrives ("+ new agent").
         this.refresh_dashboard(window, cx);
         // Slack runs from startup, not from the first time the surface is
@@ -1398,7 +1406,9 @@ impl Workspace {
             self.refresh_dashboard(window, cx);
             return;
         }
-        if self.overview_open {
+        // The overview and Home are both floors: there is nothing under
+        // them to reveal, so `q` on either stays put.
+        if self.overview_open || self.active_pane().surface.key == SurfaceKey::Home {
             return;
         }
         let was_dealing = self.dashboard.deal_mode();
@@ -1419,7 +1429,7 @@ impl Workspace {
         let Some(removed) = removed else {
             if key == SurfaceKey::Draft {
                 self.history_cursor = self.surface_history.len();
-                self.open_overview(window, cx);
+                self.open_home(window, cx);
             } else if let Some(previous) = self.surface_history.get(self.history_cursor).cloned() {
                 self.show_warm_surface(
                     previous,
@@ -1428,7 +1438,7 @@ impl Workspace {
                     cx,
                 );
             } else {
-                self.open_overview(window, cx);
+                self.open_home(window, cx);
             }
             cx.notify();
             return;
@@ -1444,7 +1454,7 @@ impl Workspace {
             self.show_warm_surface(previous, crate::journal::SurfaceShowMethod::Mru, window, cx);
         } else {
             self.history_cursor = self.surface_history.len();
-            self.open_overview(window, cx);
+            self.open_home(window, cx);
         }
         cx.notify();
     }
@@ -1476,7 +1486,130 @@ impl Workspace {
         cx.notify();
     }
 
-    fn open_overview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Home is the front door: a cold start, an emptied queue, and the
+    /// overview key all land here.
+    pub(crate) fn open_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dashboard.deal_mode() {
+            self.skip_and_end_deal(window, cx);
+        }
+        self.overview_open = false;
+        let surface = self.make_surface(SurfaceKey::Home, window, cx);
+        self.display_surface(surface, cx);
+        self.refresh_home(cx);
+        self.focus_active_surface(window, cx);
+        cx.notify();
+    }
+
+    fn home_view(&self) -> Option<Entity<crate::home::HomeView>> {
+        self.find_surface(|surface| surface.key == SurfaceKey::Home)
+            .and_then(|surface| match &surface.view {
+                SurfaceView::Home(view) => Some(view.clone()),
+                _ => None,
+            })
+    }
+
+    /// Rebuilds Home from the dealer's own hand. Called wherever the dealer
+    /// is invalidated, so nothing here polls.
+    pub(crate) fn refresh_home(&mut self, cx: &mut Context<Self>) {
+        let Some(view) = self.home_view() else {
+            return;
+        };
+        let rows = self.home_rows(cx);
+        view.update(cx, |view, cx| view.set_rows(rows, cx));
+    }
+
+    fn home_rows(&mut self, cx: &mut Context<Self>) -> crate::home::HomeRows {
+        let now = chrono::Local::now().fixed_offset();
+        let threads = self.slack_thread_facts(cx);
+        let hand = self.dashboard.dealer_hand(
+            &self.registry,
+            &threads,
+            now,
+            &self.agent_last_interaction,
+            cx,
+        );
+        let registry = &self.registry;
+        let mut rows = crate::home::split_hand(&hand.cards, |card| {
+            crate::home::card_title(card, |agent_id| registry.agent_id_label(agent_id))
+        });
+        let now_ms = now.timestamp_millis();
+        let mut running = self
+            .registry
+            .known_agents()
+            .copied()
+            .filter(|agent_id| self.registry.agent_facts(*agent_id).turn_running)
+            .collect::<Vec<_>>();
+        running.sort_by_key(|agent_id| self.registry.agent_id_label(*agent_id));
+        rows.running = running
+            .into_iter()
+            .map(|agent_id| {
+                let facts = self.registry.agent_facts(agent_id);
+                crate::home::RunningRow {
+                    agent_id,
+                    name: self.registry.agent_id_label(agent_id),
+                    // Where it is filed, not the whole path: the row is
+                    // about the agent, and the leaf is what names the work.
+                    topic: self
+                        .dashboard
+                        .breadcrumb_for_agent(agent_id, cx)
+                        .and_then(|path| path.rsplit(" › ").next().map(str::to_owned))
+                        .unwrap_or_default(),
+                    elapsed: crate::home::elapsed_label(
+                        facts.last_user_message_at.0 as i64,
+                        now_ms,
+                    ),
+                    last_line: self
+                        .registry
+                        .agent_activity(agent_id)
+                        .unwrap_or_default()
+                        .to_owned(),
+                }
+            })
+            .collect();
+        rows
+    }
+
+    /// Enter on a Home row. Any row opens as a deal through the dealer, so
+    /// the surface, the verdict keys, undo and the timeline behave exactly
+    /// as if the card had been dealt from the top.
+    fn home_open_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(view) = self.home_view() else {
+            return;
+        };
+        let target = view.update(cx, |view, cx| view.cursor_target(cx));
+        let card = match target {
+            crate::home::HomeTarget::Card(card) => card,
+            // A running agent is not a card: its row opens the agent.
+            crate::home::HomeTarget::Agent(agent_id) => {
+                self.select_agent_inner(Some(agent_id), true, window, cx);
+                return;
+            }
+            crate::home::HomeTarget::None => return,
+        };
+        if self.dashboard.deal_mode() {
+            self.skip_and_end_deal(window, cx);
+        }
+        let now = chrono::Local::now().fixed_offset();
+        let threads = self.slack_thread_facts(cx);
+        if self
+            .dashboard
+            .deal_chosen(
+                &self.registry,
+                &threads,
+                now,
+                &card,
+                &self.agent_last_interaction,
+                cx,
+            )
+            .is_some()
+        {
+            self.deal_session_open = true;
+            self.present_current_deal(window, cx);
+            self.refresh_dashboard(window, cx);
+        }
+    }
+
+    pub(crate) fn open_overview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.dashboard.deal_mode() {
             self.skip_and_end_deal(window, cx);
         }
@@ -1495,8 +1628,18 @@ impl Workspace {
             self.overview_open = false;
             self.focus_active_surface(window, cx);
             cx.notify();
+        } else if self.active_pane().surface.key == SurfaceKey::Home {
+            // Already home: the key shows what the reader was reading, the
+            // way closing the overview used to reveal it again. It does not
+            // step through history, so pressing it twice is a round trip.
+            let index = self
+                .history_cursor
+                .min(self.surface_history.len().saturating_sub(1));
+            if let Some(warm) = self.surface_history.get(index).cloned() {
+                self.show_warm_surface(warm, crate::journal::SurfaceShowMethod::Mru, window, cx);
+            }
         } else {
-            self.open_overview(window, cx);
+            self.open_home(window, cx);
         }
     }
 
@@ -1699,6 +1842,9 @@ impl Workspace {
         for agent_id in warm_agents {
             self.subscribe_agent(agent_id, cx);
         }
+        // Home is a window onto this same ranking, so it is rebuilt wherever
+        // the dealer is invalidated and never on a timer.
+        self.refresh_home(cx);
         let top = candidates.cards.first();
         if self.phone.enabled && top.is_some() && !self.dashboard.deal_mode() {
             self.phone.feed_retry = true;
@@ -4855,6 +5001,7 @@ impl Workspace {
     fn surface_name(&self, key: &SurfaceKey) -> String {
         match key {
             SurfaceKey::Draft => "draft".to_owned(),
+            SurfaceKey::Home => "home".to_owned(),
             SurfaceKey::Messages => "messages".to_owned(),
             SurfaceKey::DeskNode { .. } => "desk".to_owned(),
             SurfaceKey::Transcript(agent_id) => self.registry.agent_display_label(*agent_id),
@@ -4888,6 +5035,7 @@ impl Workspace {
     fn surface_kind(key: &SurfaceKey) -> &'static str {
         match key {
             SurfaceKey::Draft => "compose",
+            SurfaceKey::Home => "home",
             SurfaceKey::Messages => "messages",
             SurfaceKey::DeskNode { .. } => "desk heading",
             SurfaceKey::Transcript(_) => "transcript",
@@ -5055,6 +5203,7 @@ impl Workspace {
         use crate::journal::SurfaceIdentity;
         match key {
             SurfaceKey::Draft => SurfaceIdentity::Draft,
+            SurfaceKey::Home => SurfaceIdentity::Home,
             SurfaceKey::Messages => SurfaceIdentity::Messages,
             SurfaceKey::DeskNode { host, node_id } => SurfaceIdentity::DeskNode {
                 host: host.0,
@@ -5137,6 +5286,10 @@ impl Workspace {
         } else {
             let pane = self.active_pane();
             let position = match &pane.surface.view {
+                SurfaceView::Home(view) => {
+                    let editor = view.read(cx).editor().clone();
+                    editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
+                }
                 SurfaceView::Draft { editor, .. }
                 | SurfaceView::Messages(editor)
                 | SurfaceView::DeskNode(editor)
@@ -5211,7 +5364,9 @@ impl Workspace {
             Some(existing) => *existing = surface.clone(),
             None => list.push(surface.clone()),
         }
-        if self.phone.enabled {
+        // Home is not a card on the phone: it is what the feed shows when
+        // there is nothing to deal, so it never joins the stack.
+        if self.phone.enabled && surface.key != SurfaceKey::Home {
             if method == crate::journal::SurfaceShowMethod::Deal {
                 self.phone
                     .show_feed(self.active_context, surface.key.clone());
@@ -5982,6 +6137,21 @@ impl Workspace {
         self.dashboard.reopen_deal(card);
     }
 
+    /// The state a cold start used to leave behind before Home took the
+    /// front door: a seeded prompt with the desk map drawn over it. Tests
+    /// about the map, the prompt, or the tree still start there.
+    #[cfg(test)]
+    pub(crate) fn open_startup_overview_for_test(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let draft = self.make_surface(SurfaceKey::Draft, window, cx);
+        self.display_surface(draft, cx);
+        self.seed_draft(false, window, cx);
+        self.open_overview(window, cx);
+    }
+
     #[cfg(test)]
     pub(crate) fn verdict_undo_count_for_test(&self) -> usize {
         self.verdict_undo.len()
@@ -6322,6 +6492,7 @@ impl Workspace {
     pub(crate) fn active_editor(&self, cx: &gpui::App) -> Entity<editor::Editor> {
         match &self.active_pane().surface.view {
             SurfaceView::Draft { editor, .. } => editor.clone(),
+            SurfaceView::Home(view) => view.read(cx).editor().clone(),
             SurfaceView::Messages(editor) => editor.clone(),
             SurfaceView::DeskNode(editor) => editor.clone(),
             SurfaceView::Transcript { editor, .. } => editor.clone(),
@@ -6376,6 +6547,7 @@ impl Workspace {
         }
         match &self.active_pane().surface.view {
             SurfaceView::Draft { editor, .. } => editor.focus_handle(cx),
+            SurfaceView::Home(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::Messages(editor) => editor.focus_handle(cx),
             SurfaceView::DeskNode(editor) => editor.focus_handle(cx),
             SurfaceView::Transcript { editor, .. } => editor.focus_handle(cx),
@@ -6403,6 +6575,7 @@ impl Workspace {
             | SurfaceKey::Diff { agent_id }
             | SurfaceKey::Terminal { agent_id, .. } => Some(*agent_id),
             SurfaceKey::Draft
+            | SurfaceKey::Home
             | SurfaceKey::Messages
             | SurfaceKey::DeskNode { .. }
             | SurfaceKey::ZulipInbox
@@ -6442,6 +6615,9 @@ impl Workspace {
                 let model = self.draft_model.clone();
                 let editor = model.update(cx, |model, cx| model.build_editor(window, cx));
                 SurfaceView::Draft { editor }
+            }
+            SurfaceKey::Home => {
+                SurfaceView::Home(cx.new(|cx| crate::home::HomeView::new(window, cx)))
             }
             SurfaceKey::Messages => SurfaceView::Messages(self.messages_editor.clone()),
             SurfaceKey::DeskNode { .. } => {
@@ -6523,7 +6699,8 @@ impl Workspace {
                 None
             }
             // Files and chat keep whatever agent context was current.
-            SurfaceKey::DeskNode { .. }
+            SurfaceKey::Home
+            | SurfaceKey::DeskNode { .. }
             | SurfaceKey::Messages
             | SurfaceKey::File { .. }
             | SurfaceKey::ZulipInbox
@@ -7151,7 +7328,10 @@ impl Workspace {
             self.present_current_deal(window, cx);
             self.refresh_dashboard(window, cx);
         } else {
+            // Empty lands on Home rather than on whatever was last open:
+            // there is nothing to deal, so the glance is the answer.
             self.notice_on(None, "nothing needs attention", StyleClass::SystemInfo, cx);
+            self.open_home(window, cx);
         }
     }
 
@@ -9314,6 +9494,12 @@ impl Workspace {
                 .overflow_hidden()
                 .child(editor.clone())
                 .into_any_element(),
+            SurfaceView::Home(view) => div()
+                .id("rho-surface-home")
+                .size_full()
+                .overflow_hidden()
+                .child(view.clone())
+                .into_any_element(),
             SurfaceView::Messages(editor) => div()
                 .id("rho-surface-messages")
                 .size_full()
@@ -9692,6 +9878,9 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &MessagesOpen, window, cx| {
                 this.cmd_messages(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &HomeOpenRow, window, cx| {
+                this.home_open_row(window, cx);
             }))
             .on_action(cx.listener(|this, _: &BrowserExit, window, cx| {
                 this.focus_rail(window, cx);

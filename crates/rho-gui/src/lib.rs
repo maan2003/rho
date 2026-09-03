@@ -13,6 +13,7 @@ pub mod draft_view;
 pub mod editor_config;
 pub(crate) mod find;
 pub mod highlights;
+pub mod home;
 pub mod hosts;
 pub(crate) mod image_view;
 pub mod journal;
@@ -137,7 +138,8 @@ actions!(
         SlackCompose,
         SlackSearch,
         FindNode,
-        MessagesOpen
+        MessagesOpen,
+        HomeOpenRow
     ]
 );
 
@@ -363,6 +365,7 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
     // of a thread back to the channel it was opened from.
     cx.bind_keys([
         KeyBinding::new("enter", SlackOpenRow, Some("RhoSlackList > Editor")),
+        KeyBinding::new("enter", HomeOpenRow, Some("RhoHome > Editor")),
         KeyBinding::new(
             "enter",
             SubmitPrompt,

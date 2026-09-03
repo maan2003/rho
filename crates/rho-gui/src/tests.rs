@@ -946,7 +946,7 @@ fn the_first_heading_can_be_written_on_an_empty_desk(cx: &mut TestAppContext) {
     // No row means no heading line to stand on, and the verb still has to
     // produce the first note rather than fall through to the editor.
     let desk = DeskFixture::new();
-    let workspace = test_workspace(cx);
+    let workspace = overview_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(HostId::default(), desk.synced(), window, cx);
@@ -1077,6 +1077,19 @@ fn escape_ends_the_deal_and_leaves_the_surface_where_it_is(cx: &mut TestAppConte
         .unwrap();
 }
 
+/// A workspace sitting on the desk map. Cold start lands on Home now, so
+/// tests about the map, the prompt, or the tree open it the way Home's root
+/// menu does.
+fn overview_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace> {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_startup_overview_for_test(window, cx);
+        })
+        .unwrap();
+    workspace
+}
+
 fn test_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace> {
     cx.update(init_test_app);
     let target = AttachTarget::Unix(std::env::temp_dir().join("rho-gui-test-nonexistent.sock"));
@@ -1090,7 +1103,7 @@ fn test_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace> {
 #[gpui::test]
 fn modal_overlays_preserve_dashboard_and_surface_modes(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
+    let workspace = overview_workspace(cx);
 
     workspace
         .update(cx, |workspace, window, cx| {
@@ -3362,7 +3375,7 @@ fn frames_coalesce_while_subscribed_model_is_loading(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn empty_prompt_shows_placeholder_and_gutter(cx: &mut TestAppContext) {
-    let workspace = test_workspace(cx);
+    let workspace = overview_workspace(cx);
     let text = display_text(&workspace, cx);
     assert!(
         text.contains("Write a message…"),
@@ -3429,7 +3442,7 @@ fn previous_agent_frames_do_not_leave_intentional_draft(cx: &mut TestAppContext)
 
 #[gpui::test]
 fn editing_startup_draft_prevents_first_frame_auto_selection(cx: &mut TestAppContext) {
-    let workspace = test_workspace(cx);
+    let workspace = overview_workspace(cx);
     let editor = active_editor(&workspace, cx);
     workspace
         .update(cx, |_, window, cx| {
@@ -3525,7 +3538,7 @@ fn messages_surface_renders_in_order_and_follows_new_entries(cx: &mut TestAppCon
 #[gpui::test]
 fn first_messages_open_joins_surface_history(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
+    let workspace = overview_workspace(cx);
     feed_frame(
         &workspace,
         cx,
@@ -4019,7 +4032,7 @@ fn display_elision_opens_and_closes_with_fold_keys(cx: &mut TestAppContext) {
 
 #[gpui::test]
 fn submit_prompt_bubbles_from_the_editor_to_the_workspace(cx: &mut TestAppContext) {
-    let workspace = test_workspace(cx);
+    let workspace = overview_workspace(cx);
     let editor = active_editor(&workspace, cx);
     workspace
         .update(cx, |_, window, cx| {
@@ -4622,54 +4635,55 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
 }
 
 #[gpui::test]
-fn double_shift_toggles_desk_overview(cx: &mut TestAppContext) {
+fn double_shift_opens_home(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.select_agent(None, window, cx);
-            assert!(!workspace.is_dashboard_mode(window, cx));
+            workspace.configure_surface_history_for_test(&["current"], window, cx);
+            assert_eq!(workspace.current_surface_name_for_test(), "current");
         })
         .unwrap();
     cx.simulate_keystrokes(*workspace, "shift shift");
     workspace
-        .update(cx, |workspace, window, cx| {
-            assert!(workspace.is_dashboard_mode(window, cx));
+        .update(cx, |workspace, _, _| {
+            assert_eq!(workspace.current_surface_name_for_test(), "home");
         })
         .unwrap();
+    // Pressing it again is the way back to what the reader was reading.
     cx.simulate_keystrokes(*workspace, "shift shift");
     workspace
-        .update(cx, |workspace, window, cx| {
-            assert!(!workspace.is_dashboard_mode(window, cx));
+        .update(cx, |workspace, _, _| {
+            assert_eq!(workspace.current_surface_name_for_test(), "current");
         })
         .unwrap();
 }
 
 #[gpui::test]
-fn f24_alias_toggles_desk_overview(cx: &mut TestAppContext) {
+fn f24_alias_opens_home(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.select_agent(None, window, cx);
-            assert!(!workspace.is_dashboard_mode(window, cx));
+            workspace.configure_surface_history_for_test(&["current"], window, cx);
+            assert_eq!(workspace.current_surface_name_for_test(), "current");
         })
         .unwrap();
     cx.simulate_keystrokes(*workspace, "f24");
     workspace
-        .update(cx, |workspace, window, cx| {
-            assert!(workspace.is_dashboard_mode(window, cx));
+        .update(cx, |workspace, _, _| {
+            assert_eq!(workspace.current_surface_name_for_test(), "home");
         })
         .unwrap();
 }
 
 #[gpui::test]
-fn two_finger_swipe_down_toggles_desk_overview(cx: &mut TestAppContext) {
+fn two_finger_swipe_down_opens_home(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
-            workspace.select_agent(None, window, cx);
+            workspace.configure_surface_history_for_test(&["current"], window, cx);
             window.simulate_next_frame(cx);
-            assert!(!workspace.is_dashboard_mode(window, cx));
+            assert_eq!(workspace.current_surface_name_for_test(), "current");
         })
         .unwrap();
     cx.update_window(*workspace, |_, window, cx| {
@@ -4693,8 +4707,8 @@ fn two_finger_swipe_down_toggles_desk_overview(cx: &mut TestAppContext) {
     })
     .unwrap();
     workspace
-        .update(cx, |workspace, window, cx| {
-            assert!(workspace.is_dashboard_mode(window, cx));
+        .update(cx, |workspace, _, _| {
+            assert_eq!(workspace.current_surface_name_for_test(), "home");
         })
         .unwrap();
 }
@@ -5563,7 +5577,7 @@ fn tree_desk_composes_one_native_buffer_per_node(cx: &mut TestAppContext) {
     );
 
     cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
+    let workspace = overview_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(HostId::default(), desk.synced(), window, cx);
@@ -6020,7 +6034,7 @@ fn deal_and_overview_append_at_the_end_and_dedupe_existing_entries(cx: &mut Test
 #[gpui::test]
 fn q_closes_unlisted_standalone_draft_surface(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
+    let workspace = overview_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.configure_surface_history_for_test(&["previous"], window, cx);
@@ -6033,16 +6047,17 @@ fn q_closes_unlisted_standalone_draft_surface(cx: &mut TestAppContext) {
     cx.simulate_keystrokes(*workspace, "q");
     workspace
         .update(cx, |workspace, _, _| {
-            assert!(workspace.overview_open_for_test())
+            assert_eq!(workspace.current_surface_name_for_test(), "home");
         })
         .unwrap();
 
     cx.simulate_keystrokes(*workspace, "f24");
     workspace
         .update(cx, |workspace, _, _| {
-            assert!(
-                workspace.overview_open_for_test(),
-                "overview toggle resurrected the closed draft"
+            assert_ne!(
+                workspace.current_surface_name_for_test(),
+                "draft",
+                "the home key resurrected the closed draft"
             )
         })
         .unwrap();
@@ -6051,7 +6066,7 @@ fn q_closes_unlisted_standalone_draft_surface(cx: &mut TestAppContext) {
 #[gpui::test]
 fn q_discards_shift_r_draft_from_surface_history(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
+    let workspace = overview_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
             // Opening the standalone composer from overview records Draft in
@@ -6065,7 +6080,12 @@ fn q_discards_shift_r_draft_from_surface_history(cx: &mut TestAppContext) {
             );
         })
         .unwrap();
-    cx.simulate_keystrokes(*workspace, "f24");
+    workspace
+        .update(cx, |workspace, window, cx| {
+            // Shift-R lives on the map, which the home key no longer opens.
+            workspace.open_overview(window, cx);
+        })
+        .unwrap();
     cx.simulate_keystrokes(*workspace, "shift-r");
     workspace
         .update(cx, |workspace, _, _| {
@@ -6102,7 +6122,7 @@ fn q_discards_shift_r_draft_from_surface_history(cx: &mut TestAppContext) {
 #[gpui::test]
 fn discarding_shift_r_draft_preserves_non_draft_history_cursor(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
-    let workspace = test_workspace(cx);
+    let workspace = overview_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.configure_surface_history_for_test(&["current"], window, cx);
@@ -6184,7 +6204,7 @@ fn q_closes_current_surface_and_reveals_previous(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn q_on_last_surface_lands_on_overview(cx: &mut TestAppContext) {
+fn q_on_last_surface_lands_on_home(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
     let workspace = test_workspace(cx);
     workspace
@@ -6197,33 +6217,41 @@ fn q_on_last_surface_lands_on_overview(cx: &mut TestAppContext) {
 
     workspace
         .update(cx, |workspace, _, _| {
-            assert!(workspace.overview_open_for_test())
+            assert_eq!(workspace.current_surface_name_for_test(), "home");
         })
         .unwrap();
 
     cx.simulate_keystrokes(*workspace, "f24");
     workspace
         .update(cx, |workspace, _, _| {
-            assert!(
-                workspace.overview_open_for_test(),
-                "overview toggle resurrected a closed surface"
+            assert_eq!(
+                workspace.current_surface_name_for_test(),
+                "home",
+                "the home key resurrected a closed surface"
             )
         })
         .unwrap();
 }
 
 #[gpui::test]
-fn q_on_overview_is_a_no_op(cx: &mut TestAppContext) {
+fn q_on_home_or_the_map_is_a_no_op(cx: &mut TestAppContext) {
     cx.update(bind_test_keymaps);
+    // Home is the floor: there is nothing under it to reveal.
     let workspace = test_workspace(cx);
+    cx.simulate_keystrokes(*workspace, "q");
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(workspace.current_surface_name_for_test(), "home");
+        })
+        .unwrap();
+
+    let workspace = overview_workspace(cx);
     let before = workspace
         .update(cx, |workspace, _, _| {
             workspace.current_surface_name_for_test()
         })
         .unwrap();
-
     cx.simulate_keystrokes(*workspace, "q");
-
     workspace
         .update(cx, |workspace, _, _| {
             assert!(workspace.overview_open_for_test());
@@ -6425,7 +6453,7 @@ fn new_note_files_itself_under_the_area_the_cursor_is_on(cx: &mut TestAppContext
     let elsewhere = desk.note(None, "elsewhere");
     let context = desk.note(None, "the area in view");
 
-    let workspace = test_workspace(cx);
+    let workspace = overview_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(HostId::default(), desk.synced(), window, cx);
@@ -6805,4 +6833,351 @@ fn take_desk_mutation(
             rho_ui_proto::ClientMessage::DeskMutationApply { mutation } => Some(mutation),
             _ => None,
         })
+}
+
+#[gpui::test]
+fn home_reads_as_next_running_and_later(cx: &mut TestAppContext) {
+    cx.update(init_test_app);
+    let home = cx.add_window(|window, cx| crate::home::HomeView::new(window, cx));
+
+    // Empty first: the glance still answers, in the deal bar's own words.
+    let text = home
+        .update(cx, |home, _, cx| {
+            let editor = home.editor().clone();
+            editor.read(cx).buffer().read(cx).snapshot(cx).text()
+        })
+        .unwrap();
+    assert_eq!(text, "nothing needs attention\n");
+
+    let card = |node: u64| crate::dashboard::DealCardId {
+        host: HostId::default(),
+        node_id: rho_desk::NodeId {
+            replica_id: 7,
+            counter: node,
+        },
+    };
+    let rows = crate::home::HomeRows {
+        next: vec![crate::home::HomeRow {
+            title: "#design › release date".to_owned(),
+            label: "needs reply · 1.9h".to_owned(),
+            card: card(1),
+        }],
+        running: vec![crate::home::RunningRow {
+            agent_id: agent(1),
+            name: "eng-5pha".to_owned(),
+            topic: "phone feed".to_owned(),
+            elapsed: "12m".to_owned(),
+            last_line: "wiring the flick recogniser".to_owned(),
+        }],
+        later: vec![crate::home::HomeRow {
+            title: "#random".to_owned(),
+            label: "quiet · 5.4d".to_owned(),
+            card: card(2),
+        }],
+    };
+    let text = home
+        .update(cx, |home, _, cx| {
+            home.set_rows(rows, cx);
+            let editor = home.editor().clone();
+            editor.read(cx).buffer().read(cx).snapshot(cx).text()
+        })
+        .unwrap();
+    assert_eq!(
+        text,
+        concat!(
+            "next\n",
+            "  #design › release date  needs reply · 1.9h\n",
+            "running\n",
+            "  eng-5pha  phone feed  12m   wiring the flick recogniser\n",
+            "later\n",
+            "  #random  quiet · 5.4d\n",
+        ),
+        "later comes last so the periphery falls off the bottom"
+    );
+}
+
+#[gpui::test]
+fn a_cold_start_lands_on_home_and_says_what_is_waiting(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    desk.due_note(None, "Ship the release");
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(workspace.current_surface_name_for_test(), "home");
+            assert!(
+                workspace.current_deal_card_for_test().is_none(),
+                "sitting down deals nothing"
+            );
+        })
+        .unwrap();
+    let text = buffer_text(&workspace, cx);
+    assert!(text.contains("next"), "home text: {text:?}");
+    assert!(text.contains("Ship the release"), "home text: {text:?}");
+    // The same words the deal bar uses for the same card.
+    assert!(text.contains("deferred · woke"), "home text: {text:?}");
+}
+
+#[gpui::test]
+fn enter_on_a_home_row_deals_that_card(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let mut desk = DeskFixture::new();
+    desk.due_note(None, "First in the queue");
+    let second = desk.due_note(None, "Second in the queue");
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // The cursor picks a row out of the hand rather than taking the top.
+    let editor = active_editor(&workspace, cx);
+    workspace
+        .update(cx, |_, window, cx| {
+            editor.update(cx, |editor, cx| {
+                let snapshot = editor.buffer().read(cx).snapshot(cx);
+                let offset = snapshot
+                    .text()
+                    .find("Second in the queue")
+                    .expect("second row");
+                editor.change_selections(
+                    editor::SelectionEffects::no_scroll(),
+                    window,
+                    cx,
+                    |selections| {
+                        let offset = editor::MultiBufferOffset(offset);
+                        selections.select_ranges([offset..offset]);
+                    },
+                );
+            });
+        })
+        .expect("place cursor on the second row");
+
+    cx.dispatch_action(*workspace, crate::HomeOpenRow);
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                workspace.dashboard_deal_mode_for_test(),
+                "a row opens as a deal in every respect"
+            );
+            let (identity, _) = workspace
+                .current_deal_card_for_test()
+                .expect("the row was dealt");
+            assert_eq!(
+                identity,
+                crate::dashboard::DealCardId {
+                    host: HostId::default(),
+                    node_id: second,
+                },
+                "the dealt card is the row the cursor was on"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_running_agents_row_follows_its_last_line(cx: &mut TestAppContext) {
+    use rho_ui_proto::{
+        AgentDisposition, AgentRole, AuthState, UiAgentFacts, UiAgentSummary, UiAttention,
+        WorkspaceInfo,
+    };
+
+    let running = agent(31);
+    let mut desk = DeskFixture::new();
+    let heading = desk.note(None, "phone feed");
+    desk.agent_row(heading, running);
+    let summary = |activity: &str| UiAgentSummary {
+        agent_id: running,
+        parent_agent: None,
+        display_name: None,
+        created_at: UnixMs(1),
+        updated_at: UnixMs(1),
+        role: AgentRole::default(),
+        workspace: WorkspaceInfo::UserCheckout {
+            repo: "/tmp".into(),
+        },
+        attention: UiAttention::Working,
+        last_active: UnixMs(1),
+        facts: UiAgentFacts {
+            turn_running: true,
+            last_user_message_at: UnixMs(chrono::Local::now().timestamp_millis() as u64),
+            ..Default::default()
+        },
+        hidden: false,
+        disposition: AgentDisposition::Pending,
+        last_user_message_text: String::new(),
+        activity: Some(activity.to_owned()),
+        turn_report: None,
+        labels: Vec::new(),
+    };
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Ready {
+                    agents: vec![summary("wiring the flick recogniser")],
+                    iris_agent: None,
+                    projects: Vec::new(),
+                    auth: AuthState {
+                        namespaces: Vec::new(),
+                        disabled_namespaces: Vec::new(),
+                        active_namespace: None,
+                    },
+                    machine_seed: 0,
+                    agent_counter: 40,
+                },
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let tag = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.registry.agent_id_label(running)
+        })
+        .unwrap();
+    let text = buffer_text(&workspace, cx);
+    assert!(text.contains("running"), "home text: {text:?}");
+    assert!(text.contains(&tag), "home text: {text:?}");
+    assert!(text.contains("phone feed"), "home text: {text:?}");
+    assert!(
+        text.contains("wiring the flick recogniser"),
+        "home text: {text:?}"
+    );
+
+    // The next line the agent says edits that row and nothing else.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Ready {
+                    agents: vec![summary("unfurl box: background tint")],
+                    iris_agent: None,
+                    projects: Vec::new(),
+                    auth: AuthState {
+                        namespaces: Vec::new(),
+                        disabled_namespaces: Vec::new(),
+                        active_namespace: None,
+                    },
+                    machine_seed: 0,
+                    agent_counter: 40,
+                },
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let text = buffer_text(&workspace, cx);
+    assert!(
+        text.contains("unfurl box: background tint"),
+        "home text: {text:?}"
+    );
+    assert!(
+        !text.contains("wiring the flick recogniser"),
+        "the row kept a stale line: {text:?}"
+    );
+}
+
+#[gpui::test]
+fn an_empty_queue_lands_on_home(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.configure_surface_history_for_test(&["current"], window, cx);
+            assert_eq!(workspace.current_surface_name_for_test(), "current");
+            workspace.open_deal_mode(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(workspace.current_surface_name_for_test(), "home");
+            assert!(
+                workspace
+                    .message_log_texts()
+                    .iter()
+                    .any(|message| message.contains("nothing needs attention"))
+            );
+        })
+        .unwrap();
+    let text = buffer_text(&workspace, cx);
+    assert!(
+        text.contains("nothing needs attention"),
+        "home text: {text:?}"
+    );
+}
+
+#[gpui::test]
+fn the_phone_feed_is_home_when_there_is_nothing_to_deal(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    cx.simulate_window_resize(*workspace, gpui::size(gpui::px(400.), gpui::px(800.)));
+    cx.update_window(*workspace, |_, window, cx| window.simulate_next_frame(cx))
+        .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(workspace.current_deal_card_for_test().is_none());
+            assert_eq!(workspace.current_surface_name_for_test(), "home");
+            assert!(
+                !workspace.phone_has_surface_for_test(&crate::pane::SurfaceKey::Home),
+                "home is the feed's own empty state, not a card on the stack"
+            );
+        })
+        .unwrap();
+    let text = buffer_text(&workspace, cx);
+    assert!(
+        text.contains("nothing needs attention"),
+        "home text: {text:?}"
+    );
+}
+
+#[gpui::test]
+fn home_starts_with_the_cursor_on_the_first_row(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let mut desk = DeskFixture::new();
+    let first = desk.due_note(None, "First in the queue");
+    desk.due_note(None, "Second in the queue");
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // No motion: the first Enter deals rather than landing on a heading.
+    cx.dispatch_action(*workspace, crate::HomeOpenRow);
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            let (identity, _) = workspace
+                .current_deal_card_for_test()
+                .expect("the top row was dealt");
+            assert_eq!(
+                identity,
+                crate::dashboard::DealCardId {
+                    host: HostId::default(),
+                    node_id: first,
+                }
+            );
+        })
+        .unwrap();
 }

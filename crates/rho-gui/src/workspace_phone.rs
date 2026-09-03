@@ -999,19 +999,26 @@ impl Workspace {
                         }))
                         .child("deal"),
                 )
-                .child(
-                    div()
+                .child({
+                    // Home is the card after the last deal: flick past the
+                    // queue and the glance is what is left.
+                    let body = div()
                         .id("phone-feed-empty-body")
                         .capture_touch(cx.listener(Self::phone_touch))
                         .flex_1()
                         .min_h_0()
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .text_color(colors.text_muted)
-                        .child("nothing needs attention"),
-                )
+                        .w_full();
+                    match self.home_view() {
+                        Some(view) => body.child(view).into_any_element(),
+                        None => body
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_color(colors.text_muted)
+                            .child("nothing needs attention")
+                            .into_any_element(),
+                    }
+                })
                 .child(self.render_phone_bar(cx))
                 .into_any_element();
         }

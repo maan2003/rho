@@ -1054,6 +1054,45 @@ impl Dashboard {
     ) -> Option<DealCard> {
         let hand = self.dealer_hand(registry, threads, now, agent_interactions, cx);
         let (card, fingerprint, considered_not_dealt) = select_deal(&hand, exclude)?;
+        Some(self.begin_deal(card, fingerprint, considered_not_dealt))
+    }
+
+    /// Deals a card the user picked out of the hand — a Home row — instead
+    /// of the top of it. Everything else about the session is the same:
+    /// the surface, the verdict keys, undo and the timeline cannot tell
+    /// the two apart.
+    pub fn deal_chosen(
+        &mut self,
+        registry: &AgentRegistry,
+        threads: &HashMap<ThreadRef, DealerThread>,
+        now: chrono::DateTime<chrono::FixedOffset>,
+        wanted: &DealCardId,
+        agent_interactions: &HashMap<AgentId, i64>,
+        cx: &mut Context<Workspace>,
+    ) -> Option<DealCard> {
+        let hand = self.dealer_hand(registry, threads, now, agent_interactions, cx);
+        let at = hand
+            .cards
+            .iter()
+            .position(|card| card.identity == *wanted)?;
+        let card = hand.cards[at].clone();
+        let fingerprint = hand.fingerprints.get(&card.identity)?.clone();
+        let considered_not_dealt = hand
+            .cards
+            .iter()
+            .skip(at + 1)
+            .take(5)
+            .map(|card| card.identity.clone())
+            .collect();
+        Some(self.begin_deal(card, fingerprint, considered_not_dealt))
+    }
+
+    fn begin_deal(
+        &mut self,
+        card: DealCard,
+        fingerprint: DealFingerprint,
+        considered_not_dealt: Vec<DealCardId>,
+    ) -> DealCard {
         self.deal = Some(DealSession {
             card: card.clone(),
             fingerprint,
@@ -1064,7 +1103,7 @@ impl Dashboard {
         self.deal_active = true;
         self.deal_empty_success = false;
         self.pending_tree_cursor = Some((card.host, card.topic_node_id, 0));
-        Some(card)
+        card
     }
 
     pub fn reopen_deal(&mut self, card: DealCard) {
@@ -2039,7 +2078,7 @@ fn fyi_reply_priority(wait_days: f64) -> f64 {
     -wait_days / FYI_REPLY_PACE_DAYS
 }
 
-fn age_label(days: f64) -> String {
+pub(crate) fn age_label(days: f64) -> String {
     if days < 1.0 / 24.0 {
         format!("{}m", (days * 1_440.0).max(0.0).round() as i64)
     } else if days < 1.0 {

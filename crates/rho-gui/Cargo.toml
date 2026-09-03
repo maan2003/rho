@@ -66,6 +66,7 @@ rho-rpc = { workspace = true, features = ["native-client"] }
 rho-rtc.workspace = true
 rho-ui-proto.workspace = true
 rho-slack = { workspace = true, features = ["ui"] }
+rho-transcript.workspace = true
 image = { version = "0.25", default-features = false }
 org-element = { version = "0.1.0", default-features = false }
 rho-zulip = { workspace = true, features = ["ui"] }
