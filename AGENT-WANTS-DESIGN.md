@@ -43,10 +43,12 @@ Added in the talk that followed:
   system fact. Heads-up is the agent's judgement that something is worth
   the human's eyes. Keep both, like a channel with chatter versus one
   where the human was named.
-- **ask carries two details, not two more states:** blocked or not
-  (blocked burns the agent's time and context), and the kind of ask: a
-  decision, or an act only the human can do (restart the daemon, push,
-  approve). The act kind is the one that goes unnoticed today.
+- **ask carries no details.** Whether the ask blocks is observed, not
+  declared: an agent that asked and went idle is blocked, one that asked
+  and kept working is not. Whether it wants a decision or an act (restart
+  the daemon, push, approve) is in the reply's own words and changes no
+  rank. An earlier draft had `blocked` and `for` attributes; dropped on
+  3 Sep as redundant.
 - **answer is Slack's "replied".** The agent's turn ended with a result
   and the ball is with the human; its twin, a turn that ended with a
   question, is ask. The deal bar words already exist: `needs reply · 1.9h`,
@@ -61,8 +63,8 @@ Added in the talk that followed:
 
 ## Ranking: by what burns
 
-Went wrong and a blocked ask: steep. Answer: medium, the human forgets.
-An unblocked ask: between. Heads-up: flat while the agent is working, and
+Went wrong and an ask from an agent that has gone idle: steep. Answer:
+medium, the human forgets. An ask from an agent still working: between. Heads-up: flat while the agent is working, and
 rising with the daemon's observed idle time once it stops, which is how a
 finished task climbs without a state of its own. Nothing declared: below the cutoff. The agent
 sets the state and the reason; the curve is the human's, never the agent's.
@@ -82,11 +84,11 @@ response, as a small XML element, so declaring costs nothing and needs no
 tool round trip:
 
 ```xml
-<rho-wants kind="ask" blocked="false" for="decision"/>
+<rho-wants kind="ask"/>
 ```
 
-`kind` is one of `heads-up`, `ask`, `answer`; `blocked` and `for`
-(`decision` or `act`) only on `ask`. No body: the user's call on
+`kind` is one of `heads-up`, `ask`, `answer`, and that is the whole
+element. No body: the user's call on
 3 Sep, a reason line is tokens spent repeating what the reply already
 says. The reason shown on Home and in the deal bar is the last line of the
 turn's own text, which Home shows for a running agent anyway. The daemon
