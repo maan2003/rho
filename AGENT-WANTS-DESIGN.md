@@ -19,9 +19,12 @@ The user's three, in their words:
   show". Most of a primary agent's life. The human looks out of interest.
 - **needs input**: "might not be totally blocked, but the human would help
   massively".
-- **done, check**: "the agent is done, the human should check its response".
-  A question answered, or a task finished: without the look it was useless,
-  and a finished task usually has a follow-up.
+- **check**: "the human should check its response". A question answered,
+  or a task finished: without the look it was useless, and a finished task
+  usually has a follow-up. First named `done`; renamed on 3 Sep because it
+  is about the exchange, not the task: an agent can be mid-work and still
+  owe the human a look at the reply it just gave. Check nests inside
+  working; done did not.
 
 Added in the talk that followed:
 
@@ -37,7 +40,7 @@ Added in the talk that followed:
   (blocked burns the agent's time and context), and the kind of ask: a
   decision, or an act only the human can do (restart the daemon, push,
   approve). The act kind is the one that goes unnoticed today.
-- **done is Slack's "replied".** The agent's turn ended with a result and
+- **check is Slack's "replied".** The agent's turn ended with a result and
   the ball is with the human; its twin, a turn that ended with a question,
   is needs input. The deal bar words already exist: `needs reply · 1.9h`,
   `finished · 40m`.
@@ -51,16 +54,16 @@ Added in the talk that followed:
 
 ## Ranking: by what burns
 
-Went wrong and needs-input-blocked: steep. Done: medium, the human forgets
+Went wrong and needs-input-blocked: steep. Check: medium, the human forgets
 and the agent's context goes cold. Needs-input-not-blocked: between. Show:
 flat, the human comes when interested. Nothing declared: below the cutoff. The agent
 sets the state and the reason; the curve is the human's, never the agent's.
 
 ## What clears each, or the status rots
 
-Show and done clear when the human opens the transcript (the read cursor,
+Show and check clear when the human opens the transcript (the read cursor,
 as in Slack). Needs input clears when the human replies or performs the
-act. Every status clears when the agent starts a new turn, so a stale done
+act. Every status clears when the agent starts a new turn, so a stale check
 cannot outlive the next piece of work. An agent with a question
 and things to show reports the higher one, the question on top.
 
@@ -74,7 +77,7 @@ tool round trip:
 <rho-wants kind="needs-input" blocked="false" ask="decision"/>
 ```
 
-`kind` is one of `show`, `needs-input`, `done`; `blocked` and `ask`
+`kind` is one of `show`, `needs-input`, `check`; `blocked` and `ask`
 (`decision` or `act`) only on `needs-input`. No body: the user's call on
 3 Sep, a reason line is tokens spent repeating what the reply already
 says. The reason shown on Home and in the deal bar is the last line of the
