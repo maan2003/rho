@@ -4,7 +4,7 @@ Reconciled against main on 3 Sep. Genuinely open, in order:
 
 - 1.13 avatars (waits on the editor's inline-image inlay), 1.22 rough edges
   (b) soft-wrap column waits on the vendored editor.
-- 3.1 composer boundary and placeholder; 3.3 completion.
+- 3.3 completion.
 - 5.1 the one key table.
 
 4.2 stays deferred.
@@ -600,10 +600,16 @@ done right after the transcript primitive (2.4) and before 2.10:
 
 ## Phase 3: composing
 
-- [ ] 3.1 Composer boundary. Now a bare line under the last message. Rho:
+- [x] 3.1 Composer boundary. Now a bare line under the last message. Rho:
       the same shape as the agent transcript's prompt: its rule and its
       marker, then the input; a muted placeholder `message #design` while
       empty. Whatever the transcript does, the Slack surface does too.
+      Landed 3 Sep: the same three things the agent prompt wears, from the
+      same editor APIs — the blank-line gap above the input, an accent
+      stripe down the gutter beside it, and a muted inlay standing in the
+      empty line. A thread's composer says `reply in #design` instead,
+      because that is the one place the reader can be wrong about where the
+      words land. Screens `31-01-empty` and `31-02-typed`.
 - [x] 3.2 Sending, done 3 Sep: `shift-enter` is bound to the editor's
       newline in the composer's own context, so it beats the prompt's
       `enter`; `Session::send` shows the message at once under a local

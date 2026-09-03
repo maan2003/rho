@@ -12,10 +12,10 @@ use std::collections::HashSet;
 use std::ops::Range;
 
 use editor::scroll::{Autoscroll, AutoscrollStrategy};
-use editor::{Editor, EditorEvent, EditorMode, SelectionEffects, SizingBehavior};
+use editor::{Editor, EditorEvent, EditorMode, Inlay, SelectionEffects, SizingBehavior};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, EventEmitter, Window, div};
-use language::{Buffer, Capability, Point};
+use language::{Buffer, BufferEvent, Capability, InlayId, Point};
 use multi_buffer::{MultiBuffer, PathKey};
 use rho_transcript::{BlockSpec, Item, Transcript};
 use theme::ActiveTheme as _;
@@ -24,6 +24,14 @@ use crate::model::Model;
 use crate::session::{Session, Source, Update};
 use crate::types::{CELL_ASPECT, FileSummary, IMAGE_COLUMNS, Message, ThreadKey, Ts};
 use crate::ui::{Class, Hooks, Span, clock_time, crosses_day, day_label, lay_out};
+
+/// The composer's placeholder, which is the only custom inlay this surface
+/// puts in its editor.
+const COMPOSE_PLACEHOLDER_INLAY_ID: usize = 0;
+
+/// The stripe down the gutter beside the composer, the agent transcript's
+/// prompt marker worn by the Slack surface.
+pub struct ComposeGutter;
 
 pub struct ConversationView {
     session: Entity<Session>,
@@ -274,6 +282,14 @@ impl ConversationView {
         let mut subscriptions = vec![cx.observe_in(&session, window, |this, _, window, cx| {
             this.refresh(window, cx);
         })];
+        // The placeholder goes on the first keystroke and comes back when the
+        // reader empties the composer again, so the boundary is never a bare
+        // line whatever they do to it.
+        subscriptions.push(cx.subscribe(&input, |this, _, event: &BufferEvent, cx| {
+            if matches!(event, BufferEvent::Edited { .. }) {
+                this.apply_compose_chrome(cx);
+            }
+        }));
         // History fills as the reader scrolls, and there is no other way to
         // ask for it. The fetch starts a screen early so the older messages
         // are usually already there by the time the top comes into view.
@@ -354,6 +370,7 @@ impl ConversationView {
                 .last_read(source.channel())
                 .cloned();
         }
+        view.apply_compose_chrome(cx);
         view.refresh(window, cx);
         // A conversation with nothing new opens on the composer, which is
         // what the reader came to do. One with unread messages opens on the
@@ -726,6 +743,50 @@ impl ConversationView {
             Some(Want::Newer(after)) => self.load_newer(after, cx),
             None => {}
         }
+    }
+
+    /// The composer's chrome, which is the agent transcript's prompt worn by
+    /// a Slack surface: a stripe down the gutter marking where the reader
+    /// writes, and, while there is nothing in it, a muted `message #design`
+    /// standing in the empty line rather than a bare gap.
+    fn apply_compose_chrome(&self, cx: &mut Context<Self>) {
+        let placeholder = self.compose_placeholder(cx);
+        let (empty, start, end) = {
+            let buffer = self.input.read(cx);
+            (
+                buffer.is_empty(),
+                buffer.anchor_before(0),
+                buffer.anchor_after(buffer.len()),
+            )
+        };
+        let snapshot = self.multi_buffer.read(cx).snapshot(cx);
+        let (Some(start), Some(end)) = (
+            snapshot.anchor_in_excerpt(start),
+            snapshot.anchor_in_excerpt(end),
+        ) else {
+            return;
+        };
+        let inlays = match empty {
+            true => vec![Inlay::custom(
+                COMPOSE_PLACEHOLDER_INLAY_ID,
+                start,
+                placeholder,
+            )],
+            false => Vec::new(),
+        };
+        self.editor.update(cx, |editor, cx| {
+            editor.splice_inlays(&[InlayId::Custom(COMPOSE_PLACEHOLDER_INLAY_ID)], inlays, cx);
+            editor.highlight_gutter::<ComposeGutter>(
+                vec![start..end],
+                |cx| cx.theme().colors().text_accent.into(),
+                cx,
+            );
+        });
+    }
+
+    fn compose_placeholder(&self, cx: &App) -> String {
+        let label = self.session.read(cx).model().label(self.source.channel());
+        compose_placeholder(&label, matches!(self.source, Source::Thread(_)))
     }
 
     /// Puts the cursor in the composer: what `i` asks for.
@@ -1785,6 +1846,16 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
         });
     }
     item(Row::Message(message.ts.clone()), spans, lines)
+}
+
+/// What the empty composer says it is for. A thread's composer says so in
+/// its own words, because a reply landing in the channel instead is the
+/// mistake this line exists to prevent.
+fn compose_placeholder(label: &str, thread: bool) -> String {
+    match thread {
+        false => format!("message {label}"),
+        true => format!("reply in {label}"),
+    }
 }
 
 /// The composer after a refused send: the words that did not go out, and
@@ -3006,5 +3077,13 @@ mod tests {
             !at_tail(10.0, 30.0, 50.0),
             "a reader twenty lines up is missing what arrives"
         );
+    }
+
+    #[test]
+    fn the_empty_composer_says_where_the_message_is_going() {
+        assert_eq!(compose_placeholder("#design", false), "message #design");
+        // A thread's composer is the one place the reader can be wrong about
+        // where the words land, so it says the thread out loud.
+        assert_eq!(compose_placeholder("#design", true), "reply in #design");
     }
 }
