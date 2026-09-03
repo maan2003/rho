@@ -1,5 +1,22 @@
 # Slack UX checklist
 
+Reconciled against main on 3 Sep. Genuinely open, in order:
+
+- 1.13 avatars (waits on the editor's inline-image inlay), 1.22 rough edges
+  (b) soft-wrap column waits on the vendored editor.
+- 2.1 unread rule and cursor on first unread; 2.3 the `3 new` status
+  segment (the anchoring half landed); 2.5 `shift-n` next unread; 2.6 list
+  row counts, time column, and the muted section; 2.7 DMs in `mpim` and
+  unread DMs from `client.counts` at startup (one-to-one DMs landed);
+  2.8 (b) live counts, `reaction_*` frames, and tail re-sync on reconnect
+  (edits and deletions landed with 3.6).
+- 3.1 composer boundary and placeholder; 3.2 `shift-enter`, the muted
+  local echo, and keeping the text on a failed send (`enter` sends);
+  3.3 completion.
+- 5.1 the one key table, once 2.5 and 3.2 have their keys.
+
+4.2 stays deferred.
+
 Owner: the primary agent (eng-en1p) with the user. The engineer works the
 items in order and does not reorder or skip. Items marked "decided" carry
 the user's call and are not up for debate; anything else the engineer finds
@@ -285,9 +302,10 @@ done right after the transcript primitive (2.4) and before 2.10:
       conversation puts the cursor on the first unread line, not the
       composer and not the top. `G` still goes to the end. The rule stays
       until the surface is closed.
-- [ ] 2.2 Read marking, decided for now: on open, as Slack does. The user
+- [x] 2.2 Read marking, decided for now: on open, as Slack does. The user
       holds this loosely; different read semantics may come later, so keep
       the mark call in one place.
+      Landed: `Session::open` fetches with `mark_read`, and `mark_read` is the one call that marks (`session.rs`).
 - [ ] 2.3 Following the tail. Pinned at the bottom, a new message keeps the
       view at the bottom. Scrolled up, the view does not move and the
       surface's status segment shows `3 new`; `G` clears it.
@@ -493,7 +511,7 @@ done right after the transcript primitive (2.4) and before 2.10:
       no-op, not a drop. Comes right after 2.14, since 2.14 removes the
       third way this card could have gone quiet (a `channel_marked` from
       the phone).
-- [ ] 2.10 No inbox in between, decided. Today a Slack obligation is copied
+- [x] 2.10 No inbox in between, decided. Today a Slack obligation is copied
       into the rho inbox (`SlackItems`, `InboxKind::Slack`,
       `SourceReference::SlackThread`) and dealt from there. Rho: the dealer
       takes Slack candidates straight from the session's store, as agent
@@ -508,6 +526,7 @@ done right after the transcript primitive (2.4) and before 2.10:
       creating the machine-owned desk node. Undo (eng-5pha's verdict undo
       stack) must cover this store the way it covers desk marks: add a
       variant, do not bypass it. Human-entered inbox items are out of scope.
+      Landed with tree slice 2: the dealer takes Slack candidates from the session store and `SlackItems`/`InboxKind::Slack` are gone.
 - [x] 2.11 Local mirror in rho-db, done (`slack.redb`, derived chunks, gap
       records, history-begins flag, ping prefetch is two history calls, 20 before and
       20 after the ping, plus one replies call; the user chose both-sided
@@ -557,10 +576,11 @@ done right after the transcript primitive (2.4) and before 2.10:
 - [ ] 3.3 Completion. `@` completes over conversation members, `:` over
       emoji, `#` over channels, through rho's prompt completion. The editor
       shows `@ada`; the wire carries `<@U1>`.
-- [ ] 3.4 In a thread surface `enter` sends to the thread. "Also send to
+- [x] 3.4 In a thread surface `enter` sends to the thread. "Also send to
       channel", editing, and deleting stay deferred.
+      Landed: `Session::send` posts with the source's `thread_ts`, covered against the fake in `tests/transport.rs`.
 
-- [ ] 3.5 Sending images. Asked by the user on 3 Sep. A paste of image
+- [x] 3.5 Sending images. Asked by the user on 3 Sep. A paste of image
       bytes into the composer, or a file path dropped on it, attaches the
       image: the composer shows a thumbnail chip (`image.png · 320 KB`) above
       the text, `enter` uploads and posts the text as the message with the
@@ -601,6 +621,7 @@ done right after the transcript primitive (2.4) and before 2.10:
       headless rig (no clipboard tool, no second wayland client to drag
       from), so the prompt is what the screenshots use; the three paths meet
       at the same `attach`.
+      Landed 3 Sep, as the account in this item records.
 
 - [x] 3.6 Editing a sent message. Landed 3 Sep; escape on an open edit
       cancels and leaves insert in one press (ruled 3 Sep, done with 3.5).
@@ -640,13 +661,14 @@ done right after the transcript primitive (2.4) and before 2.10:
 
 ## Phase 4: status and health
 
-- [ ] 4.1 Status bar. The surface segment reads the conversation label, and
+- [x] 4.1 Status bar. The surface segment reads the conversation label, and
       `· thread` inside a thread. Nothing about the connection while it is
       healthy; degraded shows the lamp and the notice (already). Found in
       Phase 0: the `disconnected` seen in the bar is rho's own daemon
       status, not Slack. Keep it that way, and make sure a Slack outage
       never borrows that word: Slack's state is the lamp plus a notice
       that names Slack.
+      Landed: the surface segment is `Session::label`, which appends `· thread` for a thread source; a Slack outage shows the lamp and a notice that names Slack, never `disconnected`.
 - [ ] 4.2 Typing indicators and presence: deferred, unchanged.
 
 ## Phase 5: one key table
