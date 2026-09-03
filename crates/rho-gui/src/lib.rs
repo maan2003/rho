@@ -379,16 +379,20 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
     // Rewriting what was sent: `up` on an empty composer is Slack's own
     // habit, and `escape` puts back whatever the composer held. Both fall
     // through to the editor's usual answer when no edit is open.
+    // Each is qualified with `!showing_completions`, the way the agent
+    // prompt's own `enter` is: with the completion menu open these keys
+    // belong to it, so `up` walks the list, `escape` closes it, and `enter`
+    // takes the name instead of posting half of it.
     cx.bind_keys([
         KeyBinding::new(
             "up",
             SlackEditLast,
-            Some("RhoSlackConversation > Editor && vim_mode == insert"),
+            Some("RhoSlackConversation > Editor && vim_mode == insert && !showing_completions"),
         ),
         KeyBinding::new(
             "escape",
             SlackCancelEdit,
-            Some("RhoSlackConversation > Editor && vim_mode == insert"),
+            Some("RhoSlackConversation > Editor && vim_mode == insert && !showing_completions"),
         ),
     ]);
     cx.bind_keys([
@@ -397,7 +401,7 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         KeyBinding::new(
             "enter",
             SubmitPrompt,
-            Some("RhoSlackConversation > Editor && vim_mode == insert"),
+            Some("RhoSlackConversation > Editor && vim_mode == insert && !showing_completions"),
         ),
         // A message with a second line is written, not sent twice: the
         // newline is bound explicitly because the prompt's `RhoGui > Editor`
@@ -405,7 +409,7 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         KeyBinding::new(
             "shift-enter",
             editor::actions::Newline,
-            Some("RhoSlackConversation > Editor && vim_mode == insert"),
+            Some("RhoSlackConversation > Editor && vim_mode == insert && !showing_completions"),
         ),
     ]);
     // Deal mode reports itself as normal (plus `VimDeal`), and these

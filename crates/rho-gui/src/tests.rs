@@ -6500,6 +6500,23 @@ fn deal_keys_reach_a_dealt_slack_conversation(cx: &mut TestAppContext) {
         // A second line is written with shift-enter; without the binding the
         // prompt's own `enter` would take the key and send the half message.
         assert_eq!(routes("shift-enter", &composing), Some("editor::Newline"));
+
+        // With the completion menu open the same keys are its: `enter`
+        // takes the name being offered instead of posting half of it, and
+        // `up` walks the list instead of reaching for the last message.
+        let completing = [
+            KeyContext::parse("RhoGui").unwrap(),
+            KeyContext::parse("RhoSlackConversation").unwrap(),
+            KeyContext::parse("Editor vim_mode=insert showing_completions").unwrap(),
+        ];
+        assert_eq!(
+            routes("enter", &completing),
+            Some("editor::ConfirmCompletion")
+        );
+        assert_eq!(
+            routes("up", &completing),
+            Some("editor::ContextMenuPrevious")
+        );
     });
 }
 

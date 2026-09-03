@@ -4,7 +4,6 @@ Reconciled against main on 3 Sep. Genuinely open, in order:
 
 - 1.13 avatars (waits on the editor's inline-image inlay), 1.22 rough edges
   (b) soft-wrap column waits on the vendored editor.
-- 3.3 completion.
 - 5.1 the one key table.
 
 4.2 stays deferred.
@@ -624,9 +623,21 @@ done right after the transcript primitive (2.4) and before 2.10:
       appears at once in the muted class until the server's echo replaces
       it. On failure the text stays in the composer and the error goes to
       the Messages buffer. Typed text is never lost.
-- [ ] 3.3 Completion. `@` completes over conversation members, `:` over
+- [x] 3.3 Completion. `@` completes over conversation members, `:` over
       emoji, `#` over channels, through rho's prompt completion. The editor
-      shows `@ada`; the wire carries `<@U1>`.
+      shows `@ada`; the wire carries `<@U1>`. Landed 3 Sep: a
+      `CompletionProvider` on the composer's buffer alone, so the read-only
+      transcript beside it offers nothing. `Model::suggestions` answers for
+      the sigil; `Model::encode` turns `@ada` into `<@U1>` and `#design`
+      into `<#C1|design>` on the way out, for a caption too. A sigil only
+      counts at the start of a word, so `me@example.com` and `https://x`
+      stay prose, and a name nobody answers to is left as typed.
+      The composer's `enter`, `shift-enter`, `up` and `escape` are now
+      qualified `!showing_completions`, the way the agent prompt's own
+      `enter` is: with the menu open those keys are the menu's. Without
+      that, `enter` posted the half-typed name. Screens `33-01-at`,
+      `33-02-emoji`, `33-03-sent` (the echo comes back as `@David` in the
+      mention class and `:tada:` as the glyph), `33-04-channel`.
 - [x] 3.4 In a thread surface `enter` sends to the thread. "Also send to
       channel", editing, and deleting stay deferred.
       Landed: `Session::send` posts with the source's `thread_ts`, covered against the fake in `tests/transport.rs`.

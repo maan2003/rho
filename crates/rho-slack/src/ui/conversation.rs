@@ -10,12 +10,16 @@
 
 use std::collections::HashSet;
 use std::ops::Range;
+use std::rc::Rc;
 
 use editor::scroll::{Autoscroll, AutoscrollStrategy};
-use editor::{Editor, EditorEvent, EditorMode, Inlay, SelectionEffects, SizingBehavior};
+use editor::{
+    CompletionContext, CompletionProvider, Editor, EditorEvent, EditorMode, Inlay,
+    SelectionEffects, SizingBehavior,
+};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, EventEmitter, Window, div};
-use language::{Buffer, BufferEvent, Capability, InlayId, Point};
+use language::{Buffer, BufferEvent, Capability, CodeLabel, InlayId, Point, ToOffset as _};
 use multi_buffer::{MultiBuffer, PathKey};
 use rho_transcript::{BlockSpec, Item, Transcript};
 use theme::ActiveTheme as _;
@@ -276,6 +280,13 @@ impl ConversationView {
             (hooks.configure_editor)(&mut editor, window, cx);
             editor.disable_header_for_buffer(transcript.read(cx).remote_id(), cx);
             editor.disable_header_for_buffer(input.read(cx).remote_id(), cx);
+            // Completion is the composer's, not the transcript's: the
+            // provider answers for that one buffer and nothing else.
+            editor.set_completion_provider(Some(Rc::new(ComposeCompletions {
+                session: session.downgrade(),
+                channel: source.channel().clone(),
+                input: input.entity_id(),
+            })));
             editor
         });
 
@@ -2117,6 +2128,123 @@ fn push_body(
     spans.push(Span::plain(body[cursor..].to_owned()));
 }
 
+/// The token the composer would complete: where it starts, which sigil
+/// opened it, and what has been typed since. A sigil only counts at the
+/// start of a word, so `https://x` and `me@example.com` are prose.
+fn compose_token(before: &str) -> Option<(usize, char, &str)> {
+    let name_start = before
+        .char_indices()
+        .rev()
+        .take_while(|(_, character)| is_name_char(*character))
+        .last()
+        .map_or(before.len(), |(at, _)| at);
+    let sigil_at = before[..name_start]
+        .char_indices()
+        .next_back()
+        .filter(|(_, character)| matches!(character, '@' | '#' | ':'))?
+        .0;
+    let opens_word = before[..sigil_at]
+        .chars()
+        .next_back()
+        .is_none_or(|character| !is_name_char(character) && character != ':');
+    if !opens_word {
+        return None;
+    }
+    let needle = &before[name_start..];
+    // There are thousands of emoji and no useful first page of them: the
+    // list is worth showing once the reader has narrowed it at all.
+    if before[sigil_at..].starts_with(':') && needle.is_empty() {
+        return None;
+    }
+    Some((sigil_at, before[sigil_at..].chars().next()?, needle))
+}
+
+fn is_name_char(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '_' | '-' | '.')
+}
+
+/// Completion in the composer: `@` over the people, `#` over the channels,
+/// `:` over the emoji, through the editor's own completion menu so it reads
+/// and moves like completion everywhere else in rho.
+struct ComposeCompletions {
+    session: gpui::WeakEntity<Session>,
+    channel: crate::types::ChannelId,
+    /// The composer's buffer. The transcript shares this editor and must
+    /// never offer anything: it is not writable.
+    input: gpui::EntityId,
+}
+
+impl CompletionProvider for ComposeCompletions {
+    fn completions(
+        &self,
+        buffer: &Entity<Buffer>,
+        buffer_position: language::Anchor,
+        _trigger: CompletionContext,
+        _window: &mut Window,
+        cx: &mut Context<Editor>,
+    ) -> gpui::Task<anyhow::Result<Vec<project::CompletionResponse>>> {
+        let empty = gpui::Task::ready(Ok(Vec::new()));
+        if buffer.entity_id() != self.input {
+            return empty;
+        }
+        let Some(session) = self.session.upgrade() else {
+            return empty;
+        };
+        let read = buffer.read(cx);
+        let cursor = buffer_position.to_offset(read);
+        let before = read.text_for_range(0..cursor).collect::<String>();
+        let Some((start, sigil, needle)) = compose_token(&before) else {
+            return empty;
+        };
+        let replace_range = read.anchor_before(start)..read.anchor_before(cursor);
+        let completions = session
+            .read(cx)
+            .model()
+            .suggestions(&self.channel, sigil, needle)
+            .into_iter()
+            .map(|suggestion| project::Completion {
+                replace_range: replace_range.clone(),
+                new_text: suggestion.value.clone(),
+                label: CodeLabel::plain(suggestion.value, None),
+                documentation: match suggestion.detail.is_empty() {
+                    true => None,
+                    false => Some(project::lsp_store::CompletionDocumentation::SingleLine(
+                        suggestion.detail.into(),
+                    )),
+                },
+                source: project::CompletionSource::Custom,
+                icon_path: None,
+                icon_color: None,
+                match_start: None,
+                snippet_deduplication_key: None,
+                insert_text_mode: None,
+                confirm: None,
+                group: None,
+            })
+            .collect();
+        gpui::Task::ready(Ok(vec![project::CompletionResponse {
+            completions,
+            display_options: project::CompletionDisplayOptions {
+                dynamic_width: true,
+            },
+            is_incomplete: false,
+        }]))
+    }
+
+    fn is_completion_trigger(
+        &self,
+        _buffer: &Entity<Buffer>,
+        _position: language::Anchor,
+        text: &str,
+        _trigger_in_words: bool,
+        _cx: &mut Context<Editor>,
+    ) -> bool {
+        text.chars().last().is_some_and(|character| {
+            matches!(character, '@' | '#' | ':') || is_name_char(character)
+        })
+    }
+}
+
 impl gpui::Render for ConversationView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // One page per frame, which is what makes it one page per keypress:
@@ -3085,5 +3213,19 @@ mod tests {
         // A thread's composer is the one place the reader can be wrong about
         // where the words land, so it says the thread out loud.
         assert_eq!(compose_placeholder("#design", true), "reply in #design");
+    }
+
+    #[test]
+    fn only_a_sigil_that_opens_a_word_completes() {
+        assert_eq!(compose_token("hey @ad"), Some((4, '@', "ad")));
+        assert_eq!(compose_token("see #des"), Some((4, '#', "des")));
+        assert_eq!(compose_token("(@ad"), Some((1, '@', "ad")));
+        assert_eq!(compose_token("nice :tad"), Some((5, ':', "tad")));
+        // An address and a URL are prose, and a bare `:` has no useful
+        // first page of emoji to show.
+        assert_eq!(compose_token("me@example.com"), None);
+        assert_eq!(compose_token("https://x"), None);
+        assert_eq!(compose_token("nice :"), None);
+        assert_eq!(compose_token("plain words"), None);
     }
 }

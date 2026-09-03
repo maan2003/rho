@@ -14124,6 +14124,7 @@ dependencies = [
  "gpui_tokio",
  "language",
  "multi_buffer",
+ "project",
  "redb",
  "reqwest 0.12.28",
  "rho-db",

@@ -92,6 +92,25 @@ pub struct MarkPlan {
     pub threads: Vec<(ThreadKey, Ts)>,
 }
 
+/// How many completions the composer offers at once. There are thousands of
+/// emoji; a list longer than this is not read, it is scrolled past.
+const SUGGESTION_LIMIT: usize = 20;
+
+/// Whether a character can be part of a handle or a channel name, which is
+/// what bounds a mention in typed text.
+fn is_name_char(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '_' | '-' | '.')
+}
+
+/// One thing the composer offers for the token being typed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Suggestion {
+    /// What replaces the token: `@ada`, `#design`, `:tada:`.
+    pub value: String,
+    /// What it is, beside it: a display name, or the glyph itself.
+    pub detail: String,
+}
+
 /// One line of the conversation list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConversationRow {
@@ -408,6 +427,130 @@ impl Model {
                 .then_with(|| left.label.cmp(&right.label))
         });
         rows
+    }
+
+    /// What the composer offers for the token being typed. `@` is the
+    /// people the reader could be talking to, `#` the channels, `:` the
+    /// emoji, custom ones included. The value is what the editor shows and
+    /// what a yank of the line carries; `encode` turns it into the wire
+    /// form on the way out.
+    pub fn suggestions(&self, channel: &ChannelId, sigil: char, needle: &str) -> Vec<Suggestion> {
+        let needle = needle.to_lowercase();
+        let mut found = match sigil {
+            '@' => self
+                .members_of(channel)
+                .into_iter()
+                .filter(|user| user.id != self.self_id)
+                .map(|user| Suggestion {
+                    value: format!("@{}", user.handle),
+                    detail: user.name.clone(),
+                })
+                .collect::<Vec<_>>(),
+            '#' => self
+                .conversations
+                .values()
+                .filter(|conversation| conversation.kind == ConversationKind::Channel)
+                .map(|conversation| Suggestion {
+                    value: format!("#{}", conversation.name),
+                    detail: String::new(),
+                })
+                .collect(),
+            ':' => self
+                .custom_emoji
+                .iter()
+                .map(|name| Suggestion {
+                    value: format!(":{name}:"),
+                    // Nowhere but Slack has a glyph for one of these, which
+                    // is why it stays a shortcode on screen too.
+                    detail: "custom".to_owned(),
+                })
+                .chain(emojis::iter().filter_map(|emoji| {
+                    Some(Suggestion {
+                        value: format!(":{}:", emoji.shortcode()?),
+                        detail: emoji.as_str().to_owned(),
+                    })
+                }))
+                .collect(),
+            _ => Vec::new(),
+        };
+        found.retain(|found| found.value.to_lowercase().contains(&needle));
+        // What starts with what was typed comes first: a reader who has
+        // typed `@ad` means Ada before they mean anyone merely containing it.
+        found.sort_by_key(|found| {
+            let value = found.value.to_lowercase();
+            let starts = !value[1..].starts_with(&needle);
+            (starts, value)
+        });
+        found.truncate(SUGGESTION_LIMIT);
+        found
+    }
+
+    /// Everyone the conversation could mean. Slack only lists members for a
+    /// group DM, so a channel falls back to the workspace roster, which is
+    /// what its member list would mostly be anyway.
+    fn members_of(&self, channel: &ChannelId) -> Vec<&User> {
+        let members = self
+            .conversations
+            .get(channel)
+            .map(|conversation| conversation.members.as_slice())
+            .unwrap_or_default();
+        match members.is_empty() {
+            true => self.users.values().collect(),
+            false => members
+                .iter()
+                .filter_map(|member| self.users.get(member))
+                .collect(),
+        }
+    }
+
+    /// The wire form of what the reader typed: `@ada` becomes `<@U1>` and
+    /// `#design` becomes `<#C1|design>`, which is what every other client
+    /// sends and what makes the mention count for the person named. A name
+    /// nobody answers to is left exactly as typed: it was prose.
+    pub fn encode(&self, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(at) = rest.find(['@', '#']) {
+            let (before, from) = rest.split_at(at);
+            out.push_str(before);
+            let sigil = from.chars().next().expect("the sigil was just found");
+            let name = from[1..]
+                .split(|character: char| !is_name_char(character))
+                .next()
+                .unwrap_or_default();
+            // A sigil mid-word is an email address or a fragment, not a
+            // mention: only one starting a word can name anybody.
+            let starts_word = before
+                .chars()
+                .last()
+                .is_none_or(|character| !is_name_char(character));
+            match self.wire_form(sigil, name).filter(|_| starts_word) {
+                Some(wire) => out.push_str(&wire),
+                None => {
+                    out.push(sigil);
+                    out.push_str(name);
+                }
+            }
+            rest = &from[1 + name.len()..];
+        }
+        out.push_str(rest);
+        out
+    }
+
+    fn wire_form(&self, sigil: char, name: &str) -> Option<String> {
+        match sigil {
+            '@' => {
+                let user = self.users.values().find(|user| user.handle == name)?;
+                Some(format!("<@{}>", user.id.0))
+            }
+            _ => {
+                let conversation = self
+                    .conversations
+                    .values()
+                    .find(|conversation| conversation.name == name)?;
+                Some(format!("<#{}|{}>", conversation.id.0, conversation.name))
+            }
+        }
     }
 
     /// The next conversation with something unread, in the order the list
@@ -1411,5 +1554,50 @@ mod tests {
         // Unmuted again, and it comes straight back up.
         model.set_muted([]);
         assert_eq!(model.conversation_rows()[0].id, ChannelId("C1".into()));
+    }
+
+    #[test]
+    fn the_composer_completes_people_channels_and_emoji() {
+        let model = model();
+        let design = ChannelId("C1".into());
+        let values = |sigil, needle: &str| {
+            model
+                .suggestions(&design, sigil, needle)
+                .into_iter()
+                .map(|found| found.value)
+                .collect::<Vec<_>>()
+        };
+        // The reader is never a mention of themselves.
+        assert_eq!(values('@', ""), vec!["@ada"]);
+        assert_eq!(values('@', "ad"), vec!["@ada"]);
+        assert!(values('@', "zzz").is_empty());
+        assert_eq!(values('#', "des"), vec!["#design"]);
+
+        let tada = model.suggestions(&design, ':', "tada");
+        assert_eq!(tada[0].value, ":tada:");
+        assert_eq!(tada[0].detail, "🎉", "the glyph is what says which one");
+        // A workspace's own emoji has no glyph anywhere else, and is offered
+        // the same as any other.
+        let mut model = model;
+        model.set_custom_emoji(["forrest_gump_wave".to_owned()]);
+        assert_eq!(
+            model.suggestions(&design, ':', "forrest")[0].value,
+            ":forrest_gump_wave:"
+        );
+    }
+
+    #[test]
+    fn a_sent_mention_goes_out_in_the_form_slack_counts() {
+        let model = model();
+        assert_eq!(
+            model.encode("morning @ada, see #design"),
+            "morning <@U1>, see <#C1|design>"
+        );
+        // Nobody by that name, and a sigil inside a word: both are prose.
+        assert_eq!(
+            model.encode("mail me@example.com about @nobody"),
+            "mail me@example.com about @nobody"
+        );
+        assert_eq!(model.encode(":tada: ships"), ":tada: ships");
     }
 }

@@ -1591,6 +1591,11 @@ impl Session {
         if text.trim().is_empty() {
             return Task::ready(Ok(()));
         }
+        // What the reader typed is what they read: `@ada` on screen, and
+        // `<@U1>` on the wire, which is the only form that makes the
+        // mention count for Ada. The echo comes back in the same form, so
+        // the local line and Slack's reply still match on text.
+        let text = self.model.encode(&text);
         self.pending_sends += 1;
         let channel = source.channel().clone();
         let thread_ts = source.thread_ts().cloned();
@@ -1703,6 +1708,9 @@ impl Session {
         let channel = source.channel().clone();
         let thread_ts = source.thread_ts().cloned();
         let source = source.clone();
+        // A caption is a message like any other: a name in it has to reach
+        // the person named.
+        let text = self.model.encode(&text);
         let task = gpui_tokio::Tokio::spawn(cx, async move {
             client
                 .upload_file(&channel, thread_ts.as_ref(), &name, bytes, &text)
