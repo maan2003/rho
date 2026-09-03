@@ -18,10 +18,10 @@ renames; the user's original words in quotes; the tags are `<show-human/>`,
 `<ask-human/>`, `<answer-human/>`):
 
 - **show**: "working and not blocked on the human, but I have some stuff
-  to show". Something concrete to look at that the human did not ask for
-  and would want to see: a result, a screenshot, a landed change, a
-  finished task (assigned, not asked, so its completion is news, not an
-  answer). The threshold is the artifact: progress, intentions, and
+  to show". Something concrete to look at: a result, a screenshot, a
+  landed change, a finished task. Whether the human assigned it does not
+  matter; the split with answer is question versus thing, not asked versus
+  unasked. The threshold is the artifact: progress, intentions, and
   "still working" are never a show. Named `show` rather than `tell` or
   `heads-up` on 3 Sep because tell would be overused; show needs a thing.
   The human looks out of interest, or when the daemon's observed idle
@@ -122,6 +122,29 @@ Forgetting is the weak spot and is survivable: a missing tag declares
 nothing, and the states that matter most (stalled, crashed) are observed
 by the daemon, so a forgetful agent degrades to "no self-declaration",
 never to silence. A tool would only win if the declaration needed an answer back.
+
+## The system prompt text
+
+```
+## Telling the human what this turn needs
+
+End a reply with exactly one of these tags when it applies, on its own line,
+nothing inside it. Leave it out when none applies; most turns have none.
+
+<answer-human/>  The human asked a question and this reply answers it.
+                 Not for acknowledgements ("noted") and not for finished tasks.
+<ask-human/>     This reply asks the human for something only they can give:
+                 a decision, or an act like a restart or an approval.
+<show-human/>    Something concrete to look at: a result, a screenshot, a
+                 landed change, a finished task. Progress, intentions, and
+                 "still working" never count.
+
+The tag is not a summary and carries no words; the reply's last line is
+the reason. The daemon strips it, so never write one inside a code block
+or when quoting these rules.
+```
+
+About 130 words per turn; if it must shrink, keep the three definitions.
 
 ## Where it lives
 
