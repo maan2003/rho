@@ -232,7 +232,6 @@ impl Minibuffer {
         self.selection_moved = true;
     }
 
-    #[cfg(feature = "native")]
     pub fn select(&mut self, index: usize) {
         if index < self.candidates.len() {
             self.selected = index;
@@ -345,7 +344,6 @@ impl Minibuffer {
             .into_any_element()
     }
 
-    #[cfg(feature = "native")]
     pub(crate) fn render_phone(
         &self,
         text_style: &gpui::TextStyle,

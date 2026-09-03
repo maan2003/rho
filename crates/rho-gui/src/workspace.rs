@@ -11,21 +11,11 @@
 //! travels down — and for the few places where a daemon-side *name* (a
 //! repository path, a short agent label) is only unique within one machine.
 
-#[cfg(feature = "native")]
 #[path = "workspace_phone.rs"]
 mod phone;
-#[cfg(all(test, feature = "native"))]
-pub(crate) use phone::set_touch_modal_editing;
-#[cfg(all(target_family = "wasm", not(feature = "native")))]
-#[path = "workspace_web.rs"]
-mod web;
-
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
-#[cfg(feature = "native")]
 use std::path::PathBuf;
-use std::time::Duration;
-#[cfg(feature = "native")]
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Context as _;
 use camino::Utf8PathBuf;
@@ -36,6 +26,8 @@ use gpui::{
     App, ClipboardEntry, Context, Entity, Focusable as _, Point, Task, TouchEvent, TouchId,
     TouchPhase, Window, div, px,
 };
+#[cfg(test)]
+pub(crate) use phone::set_touch_modal_editing;
 use rho_core::ContentPart;
 #[cfg(test)]
 use rho_ui_proto::AdvisorIntelligence;
@@ -44,11 +36,10 @@ use settings::Settings as _;
 use theme::ActiveTheme as _;
 
 use crate::agent_view::AgentModel;
-#[cfg(feature = "native")]
 use crate::chime::Chime;
-#[cfg(feature = "native")]
-use crate::connection::GitApprovalDecision;
-use crate::connection::{AgentFrameAllocation, ConnEvent, Connection, HostEvent};
+use crate::connection::{
+    AgentFrameAllocation, ConnEvent, Connection, GitApprovalDecision, HostEvent,
+};
 use crate::desk_view::DeskTreeSync;
 use crate::draft_view::DraftModel;
 use crate::hosts::{HostStatus, Hosts};
@@ -179,14 +170,12 @@ impl DealView {
     }
 }
 
-#[cfg(feature = "native")]
 struct PendingGitApproval {
     request_id: u64,
     prompt: String,
     response: tokio::sync::oneshot::Sender<GitApprovalDecision>,
 }
 
-#[cfg(feature = "native")]
 struct PendingPageFiling {
     inbox_id: InboxId,
     heading: String,
@@ -213,20 +202,14 @@ pub(crate) enum SurfaceView {
     },
     Diff(Entity<crate::diff_view::DiffView>),
     Terminal(Entity<crate::terminal_view::TerminalView>),
-    #[cfg(feature = "native")]
     Browser(Entity<rho_browser::PageView>),
-    #[cfg(feature = "native")]
     ZulipInbox(Entity<rho_zulip::ui::InboxView>),
-    #[cfg(feature = "native")]
     ZulipNarrow(Entity<rho_zulip::ui::NarrowView>),
-    #[cfg(feature = "native")]
     SlackList(Entity<rho_slack::ui::ListView>),
-    #[cfg(feature = "native")]
     SlackConversation(Entity<rho_slack::ui::ConversationView>),
 }
 
 impl SurfaceView {
-    #[cfg(feature = "native")]
     fn telemetry_kind(&self) -> crate::telemetry::SurfaceKind {
         use crate::telemetry::SurfaceKind;
         match self {
@@ -238,15 +221,10 @@ impl SurfaceView {
             Self::Shell { .. } => SurfaceKind::Shell,
             Self::Diff(_) => SurfaceKind::Diff,
             Self::Terminal(_) => SurfaceKind::Terminal,
-            #[cfg(feature = "native")]
             Self::Browser(_) => SurfaceKind::Browser,
-            #[cfg(feature = "native")]
             Self::ZulipInbox(_) => SurfaceKind::ZulipInbox,
-            #[cfg(feature = "native")]
             Self::ZulipNarrow(_) => SurfaceKind::ZulipNarrow,
-            #[cfg(feature = "native")]
             Self::SlackList(_) => SurfaceKind::SlackList,
-            #[cfg(feature = "native")]
             Self::SlackConversation(_) => SurfaceKind::SlackConversation,
         }
     }
@@ -276,7 +254,6 @@ pub(crate) enum ContextId {
 /// socket may be forwarded from another machine, so the GUI's own cwd and
 /// home mean nothing to the daemon and must never leak into agent working
 /// directories.
-#[cfg(feature = "native")]
 #[derive(Clone)]
 pub enum AttachTarget {
     Unix(PathBuf),
@@ -287,7 +264,6 @@ pub enum AttachTarget {
     },
 }
 
-#[cfg(feature = "native")]
 impl AttachTarget {
     /// How the host reads in chrome and error text.
     pub fn describe(&self) -> String {
@@ -302,14 +278,12 @@ impl AttachTarget {
 
 /// One daemon to attach: the short name it is known by in this client, and
 /// how to reach it.
-#[cfg(feature = "native")]
 #[derive(Clone)]
 pub struct HostSpec {
     pub name: String,
     pub target: AttachTarget,
 }
 
-#[cfg(feature = "native")]
 impl HostSpec {
     /// Parses the one-line host form used both on the command line and in
     /// the attach prompt: `<name>=unix:<socket>` or
@@ -545,7 +519,6 @@ pub struct Workspace {
     agent_cost_days: u64,
     duration_timer: Option<Task<()>>,
     /// Attention chime output; lazily opened on the first play.
-    #[cfg(feature = "native")]
     chime: Chime,
     /// Each context retains one viewport over its surfaces.
     contexts: HashMap<ContextId, Pane<Surface>>,
@@ -583,7 +556,6 @@ pub struct Workspace {
     /// beside the active tree.
     dashboard: crate::dashboard::Dashboard,
     /// The vendored modal engine's status item, kept visible in Rho's frame.
-    #[cfg(feature = "native")]
     mode_indicator: Entity<vim::ModeIndicator>,
     /// Compact Helix-style key guide shown on deal entry and `?`.
     /// Canonical per-host CRDT Desk buffers shared by dashboard and source
@@ -616,14 +588,11 @@ pub struct Workspace {
     /// focused task so cursor previews do not rebuild or reorder the rail.
     dashboard_preview: Option<AgentId>,
     /// Client-local web page shown in the same right-hand preview card.
-    #[cfg(feature = "native")]
     dashboard_web_preview: Option<(rho_browser::PageId, Entity<rho_browser::PageView>)>,
     /// Browser resources referenced by the last reconciled Desk documents.
-    #[cfg(feature = "native")]
     browser_pages: HashSet<rho_browser::PageId>,
     browser_metadata_subscription: Option<gpui::Subscription>,
     /// Unreferenced browser pages waiting out the Desk edit grace period.
-    #[cfg(feature = "native")]
     browser_page_gc: HashMap<rho_browser::PageId, Task<()>>,
     /// Read-only document shown when the synthetic Iris row is targeted.
     iris_preview: Entity<editor::Editor>,
@@ -633,23 +602,17 @@ pub struct Workspace {
     iris_agents: HashMap<HostId, AgentId>,
     /// The Zulip client, started the first time its dashboard row is
     /// opened. Chat costs nothing until asked for.
-    #[cfg(feature = "native")]
     zulip: Option<Entity<rho_zulip::session::Session>>,
-    #[cfg(feature = "native")]
     pub(crate) slack: Option<Entity<rho_slack::session::Session>>,
     /// Threads rho has raised into the inbox, so a reconnect or a restart
     /// updates the card it already made rather than making a second one.
-    #[cfg(feature = "native")]
     pub(crate) slack_items: crate::slack::SlackItems,
     /// Set while the Slack session cannot be trusted to be current. It lights
     /// the lamp on its own, because nothing else in the queue knows.
-    #[cfg(feature = "native")]
     pub(crate) slack_degraded: Option<String>,
     /// A readable name per open conversation, so naming a surface never has
     /// to reach into the session.
-    #[cfg(feature = "native")]
     pub(crate) slack_labels: HashMap<rho_slack::session::Source, String>,
-    #[cfg(feature = "native")]
     pub(crate) _slack_subscription: Option<gpui::Subscription>,
     /// Machine-owned arrivals. This store is client-local and never enters a
     /// Desk CRDT buffer until an explicit filing verdict.
@@ -658,9 +621,7 @@ pub struct Workspace {
     pending_filing_card: Option<(InboxId, crate::dashboard::DealCard)>,
     pending_filing_destinations: Vec<(String, String, HostId, rho_desk::NodeId)>,
     pending_filing_selected: Option<(HostId, rho_desk::NodeId)>,
-    #[cfg(feature = "native")]
     next_page_binding_request_id: u64,
-    #[cfg(feature = "native")]
     pending_page_filings: BTreeMap<(HostId, u64), PendingPageFiling>,
     scroll_journal_task: Option<Task<()>>,
     /// The completing-read strip at the bottom of the window, when open.
@@ -675,7 +636,6 @@ pub struct Workspace {
     /// Evil's one-shot `SPC u` prefix. The next supported Desk command
     /// consumes it; every other non-modifier key clears it.
     universal_argument: bool,
-    #[cfg(feature = "native")]
     git_approval_focus: gpui::FocusHandle,
     /// Focus beneath the single modal overlay. Transients, minibuffers, and
     /// Git approval hand this target between them so borrowing keyboard
@@ -684,7 +644,6 @@ pub struct Workspace {
     /// The last system notice, flashed in the bottom strip (emacs echo
     /// area). Cleared by its own timer or when the minibuffer opens.
     echo: Option<Echo>,
-    #[cfg(feature = "native")]
     pending_git_approval: Option<PendingGitApproval>,
     realtime_task: Option<Task<()>>,
     realtime_stop: Option<tokio::sync::oneshot::Sender<()>>,
@@ -700,9 +659,6 @@ pub struct Workspace {
     _dashboard_subscription: gpui::Subscription,
     _universal_argument_subscription: gpui::Subscription,
     _window_activation_subscription: gpui::Subscription,
-    #[cfg(all(target_family = "wasm", not(feature = "native")))]
-    web: web::WebUi,
-    #[cfg(feature = "native")]
     phone: phone::PhoneUi,
 }
 
@@ -725,7 +681,6 @@ impl Workspace {
                 .map(Connection::visualization_client)
                 .unwrap_or_else(crate::connection::VisualizationClient::detached);
             let model = cx.new(|cx| AgentModel::new(workspace, visualization_client, cx));
-            #[cfg(feature = "native")]
             self.refresh_view_status(&agent_id, &model, cx);
             self.models.insert(agent_id, model.clone());
             model
@@ -739,7 +694,6 @@ impl Workspace {
 
     pub(crate) fn finish_initial_agent_load(&mut self, agent_id: AgentId, cx: &mut Context<Self>) {
         self.finish_agent_load(agent_id, cx);
-        #[cfg(feature = "native")]
         if let Some(model) = self.models.get(&agent_id).cloned() {
             self.refresh_view_status(&agent_id, &model, cx);
         }
@@ -1001,7 +955,6 @@ impl DraftWorkspace {
 }
 
 impl Workspace {
-    #[cfg(feature = "native")]
     pub fn new(specs: Vec<HostSpec>, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (hosts, events) = Hosts::new();
         let workspace = cx.entity().downgrade();
@@ -1334,15 +1287,10 @@ impl Workspace {
             iris_preview,
             iris_agents: HashMap::new(),
             zulip: None,
-            #[cfg(feature = "native")]
             slack: None,
-            #[cfg(feature = "native")]
             slack_items: crate::slack::SlackItems::default(),
-            #[cfg(feature = "native")]
             slack_degraded: None,
-            #[cfg(feature = "native")]
             slack_labels: HashMap::new(),
-            #[cfg(feature = "native")]
             _slack_subscription: None,
             // Tests build many concurrent workspaces; they must never open
             // (or pollute) the user's real inbox database.
@@ -1397,7 +1345,6 @@ impl Workspace {
         // Slack runs from startup, not from the first time the surface is
         // opened: a mention has to become a card whether or not anyone is
         // looking at Slack.
-        #[cfg(feature = "native")]
         this.slack_session(cx);
         this
     }
@@ -1405,7 +1352,6 @@ impl Workspace {
     /// Attaches a daemon. The name is registered with the registry first so
     /// that labels and chrome can qualify by host from the moment the host
     /// exists, not only once it answers.
-    #[cfg(feature = "native")]
     pub(crate) fn attach_host(&mut self, spec: HostSpec, cx: &App) -> HostId {
         let host = self.hosts.attach(spec.name.clone(), spec.target, cx);
         self.registry.attach_host(host, spec.name);
@@ -1906,7 +1852,6 @@ impl Workspace {
                 SurfaceKey::Transcript(agent_id) => {
                     card.identity != crate::dashboard::DealCardIdentity::Agent(*agent_id)
                 }
-                #[cfg(feature = "native")]
                 SurfaceKey::Browser(page) => !matches!(
                     card.inbox_source,
                     Some(crate::dashboard::DealerInboxSource::Page(id)) if id == *page
@@ -1934,7 +1879,6 @@ impl Workspace {
             max_priority.is_some_and(|priority| priority >= crate::dashboard::LAMP_THRESHOLD);
         // A Slack session that has lost touch is worth the lamp on its own:
         // the queue cannot rank a mention nobody has received yet.
-        #[cfg(feature = "native")]
         {
             lamp_on = lamp_on || self.slack_degraded.is_some();
         }
@@ -1960,7 +1904,6 @@ impl Workspace {
         }
         if chime_above && !self.chime_above_threshold {
             if let (Some(priority), Some(card)) = (max_priority, card) {
-                #[cfg(feature = "native")]
                 if !cfg!(test) {
                     self.chime.play();
                 }
@@ -2004,7 +1947,6 @@ impl Workspace {
         };
         self.contexts.retain(|context, _| keep(context));
         self.surfaces.retain(|context, _| keep(context));
-        #[cfg(feature = "native")]
         self.phone.retain_contexts(keep);
         if !self.contexts.contains_key(&self.active_context) {
             self.active_context = ContextId::Draft;
@@ -2298,7 +2240,6 @@ impl Workspace {
                 }
             }
             ConnEvent::DeskPageBindingResult { request_id, error } => {
-                #[cfg(feature = "native")]
                 if let Some(pending) = self.pending_page_filings.remove(&(host, request_id)) {
                     match error {
                         None => match self.inbox.verdict(&pending.inbox_id, Verdict::Filed) {
@@ -2380,8 +2321,6 @@ impl Workspace {
                     entry.auth = Some(auth);
                 }
                 self.hosts.set_status(host, HostStatus::Online);
-                #[cfg(all(target_family = "wasm", not(feature = "native")))]
-                self.web.online(host);
                 self.refresh_draft_agent_targets(cx);
                 if first_ready && matches!(self.registry.active_pane(), ActivePane::Startup) {
                     // The startup scaffold guessed before daemon data existed;
@@ -2611,14 +2550,12 @@ impl Workspace {
                 cx.notify();
             }
             ConnEvent::Disconnected(reason) => {
-                #[cfg(feature = "native")]
                 let had_git_approval = if let Some(pending) = self.pending_git_approval.take() {
                     let _ = pending.response.send(GitApprovalDecision::Done);
                     true
                 } else {
                     false
                 };
-                #[cfg(feature = "native")]
                 if had_git_approval {
                     self.finish_overlay_focus(window, cx);
                 }
@@ -2646,7 +2583,6 @@ impl Workspace {
                 self.update_statuses(cx);
                 cx.notify();
             }
-            #[cfg(feature = "native")]
             ConnEvent::GitTransportApproval {
                 request_id,
                 prompt,
@@ -2684,7 +2620,6 @@ impl Workspace {
                 self.echo = None;
                 cx.notify();
             }
-            #[cfg(feature = "native")]
             ConnEvent::GitTransportDone { request_id } => {
                 if self
                     .pending_git_approval
@@ -2697,16 +2632,6 @@ impl Workspace {
                     self.finish_overlay_focus(window, cx);
                     cx.notify();
                 }
-            }
-            #[cfg(all(target_family = "wasm", not(feature = "native")))]
-            ConnEvent::AuthorizationRequired => {
-                self.web.authorization_required(host);
-                cx.notify();
-            }
-            #[cfg(all(target_family = "wasm", not(feature = "native")))]
-            ConnEvent::EnrollmentRequired(code) => {
-                self.web.enrollment_required(host, code);
-                cx.notify();
             }
         }
         // Every daemon event funnels through here, so this one call is
@@ -2883,12 +2808,10 @@ impl Workspace {
             model.clone().update(cx, |model, cx| model.submit(cx));
             return;
         }
-        #[cfg(feature = "native")]
         if matches!(self.active_pane().surface.view, SurfaceView::ZulipNarrow(_)) {
             self.zulip_submit(cx);
             return;
         }
-        #[cfg(feature = "native")]
         if matches!(
             self.active_pane().surface.view,
             SurfaceView::SlackConversation(_)
@@ -3014,23 +2937,7 @@ impl Workspace {
         };
         let (stop, stop_rx) = tokio::sync::oneshot::channel();
         let (input_muted, input_muted_rx) = tokio::sync::watch::channel(self.iris_input_muted);
-        #[cfg(feature = "native")]
         let task = connection.start_native_realtime(stop_rx, input_muted_rx, cx);
-        #[cfg(all(target_family = "wasm", not(feature = "native")))]
-        let task = {
-            let dialer = connection.realtime_dialer();
-            cx.spawn(async move |_, cx| {
-                crate::realtime_client::run(
-                    move |offer_sdp| {
-                        let dialer = dialer.clone();
-                        async move { dialer.open(offer_sdp).await }
-                    },
-                    stop_rx,
-                    input_muted_rx,
-                )
-                .await
-            })
-        };
         self.realtime_stop = Some(stop);
         self.realtime_input_muted = Some(input_muted);
         let starting = match self.hosts.len() > 1 {
@@ -3039,13 +2946,10 @@ impl Workspace {
         };
         self.notice_on(None, &starting, StyleClass::SystemInfo, cx);
         self.realtime_task = Some(cx.spawn(async move |this, cx| {
-            #[cfg(feature = "native")]
             let result = match task.await {
                 Ok(result) => result,
                 Err(error) => Err(anyhow::anyhow!("realtime task failed: {error}")),
             };
-            #[cfg(all(target_family = "wasm", not(feature = "native")))]
-            let result = task.await;
             if result.is_err() {
                 cx.background_executor()
                     .timer(std::time::Duration::from_secs(2))
@@ -3070,7 +2974,6 @@ impl Workspace {
 
     /// `enter` on the dashboard's Zulip row: switch to the Zulip context
     /// and show its inbox. The client starts on first entry.
-    #[cfg(feature = "native")]
     pub(crate) fn open_zulip(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.zulip_session(cx);
         self.active_context = ContextId::Zulip;
@@ -3080,7 +2983,6 @@ impl Workspace {
         cx.notify();
     }
 
-    #[cfg(feature = "native")]
     fn zulip_session(&mut self, cx: &mut Context<Self>) -> Entity<rho_zulip::session::Session> {
         self.zulip
             .get_or_insert_with(|| cx.new(rho_zulip::session::Session::new))
@@ -3090,7 +2992,6 @@ impl Workspace {
     /// The host services the Zulip surfaces borrow: editor chrome and the
     /// transcript's Markdown pipeline, so chat reads like every other
     /// buffer in the frame.
-    #[cfg(feature = "native")]
     fn zulip_hooks() -> rho_zulip::ui::Hooks {
         rho_zulip::ui::Hooks {
             configure_editor: crate::editor_config::configure,
@@ -3101,7 +3002,6 @@ impl Workspace {
     /// Shows one Zulip conversation, marking the conversation being left
     /// as read — a Gnus summary buffer's exit, which is what makes `n`
     /// walk unreads down to nothing.
-    #[cfg(feature = "native")]
     pub(crate) fn open_zulip_narrow(
         &mut self,
         narrow: rho_zulip::Narrow,
@@ -3129,7 +3029,6 @@ impl Workspace {
     }
 
     /// Marks the conversation on screen read, if one is.
-    #[cfg(feature = "native")]
     fn leave_zulip_narrow(&mut self, cx: &mut Context<Self>) {
         if let SurfaceView::ZulipNarrow(view) = &self.active_pane().surface.view {
             view.clone().update(cx, |view, cx| view.mark_read(cx));
@@ -3138,7 +3037,6 @@ impl Workspace {
 
     /// `enter` inside the Zulip inbox: open the conversation under the
     /// cursor.
-    #[cfg(feature = "native")]
     fn zulip_open_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let SurfaceView::ZulipInbox(view) = &self.active_pane().surface.view else {
             return;
@@ -3152,7 +3050,6 @@ impl Workspace {
     /// The reading loop: the next unread conversation anywhere, marking
     /// the one being left as read. With nothing unread it returns to the
     /// inbox rather than sitting on a read conversation.
-    #[cfg(feature = "native")]
     fn zulip_next_unread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(session) = self.zulip.clone() else {
             return;
@@ -3172,7 +3069,6 @@ impl Workspace {
     }
 
     /// `P`: page further back in the conversation on screen.
-    #[cfg(feature = "native")]
     fn zulip_load_older(&mut self, cx: &mut Context<Self>) {
         if let SurfaceView::ZulipNarrow(view) = &self.active_pane().surface.view {
             view.clone().update(cx, |view, cx| view.load_older(cx));
@@ -3180,7 +3076,6 @@ impl Workspace {
     }
 
     /// `enter` in a Zulip conversation: send the composed message.
-    #[cfg(feature = "native")]
     fn zulip_submit(&mut self, cx: &mut Context<Self>) {
         if let SurfaceView::ZulipNarrow(view) = &self.active_pane().surface.view {
             view.clone().update(cx, |view, cx| view.submit(cx));
@@ -3924,7 +3819,6 @@ impl Workspace {
         }
     }
 
-    #[cfg(feature = "native")]
     pub fn open_browser_page(
         &mut self,
         id: rho_browser::PageId,
@@ -3945,7 +3839,6 @@ impl Workspace {
         cx.notify();
     }
 
-    #[cfg(feature = "native")]
     pub fn cmd_browser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let on_submit = std::rc::Rc::new(
             |workspace: &mut Workspace,
@@ -3973,17 +3866,6 @@ impl Workspace {
         );
     }
 
-    #[cfg(all(target_family = "wasm", not(feature = "native")))]
-    pub fn cmd_browser(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.notice_on(
-            None,
-            "browser pages are available in the native client",
-            StyleClass::SystemInfo,
-            cx,
-        );
-    }
-
-    #[cfg(feature = "native")]
     fn observe_browser_metadata(
         &mut self,
         model: &Entity<rho_browser::PageModel>,
@@ -3998,7 +3880,6 @@ impl Workspace {
         }
     }
 
-    #[cfg(feature = "native")]
     fn create_browser_page(&mut self, url: String, window: &Window, cx: &mut Context<Self>) {
         let context = self.capture_context(window, cx);
         let create = rho_browser::create_page(url, cx);
@@ -4174,7 +4055,6 @@ impl Workspace {
             Err(error) => tracing::error!(%error, "discarding inbox item"),
         }
         self.drop_transient();
-        #[cfg(feature = "native")]
         self.scan_browser_pages_for_gc(cx);
     }
 
@@ -4355,7 +4235,6 @@ impl Workspace {
         );
     }
 
-    #[cfg(feature = "native")]
     fn file_inbox_page(
         &mut self,
         target: Option<(HostId, rho_desk::NodeId)>,
@@ -4392,19 +4271,6 @@ impl Workspace {
         true
     }
 
-    #[cfg(not(feature = "native"))]
-    fn file_inbox_page(
-        &mut self,
-        _target: Option<(HostId, rho_desk::NodeId)>,
-        _heading: &str,
-        _id: &str,
-        _inbox_id: &InboxId,
-        _card: Option<crate::dashboard::DealCard>,
-        _cx: &mut Context<Self>,
-    ) -> bool {
-        false
-    }
-
     pub(crate) fn cmd_diff(&mut self, window: &Window, cx: &mut Context<Self>) {
         let Some(agent_id) = self.subject_agent_or_notice("diff", window, cx) else {
             return;
@@ -4428,7 +4294,6 @@ impl Workspace {
         self.notice_on(None, env!("CARGO_PKG_VERSION"), StyleClass::SystemInfo, cx);
     }
 
-    #[cfg(feature = "native")]
     pub(crate) fn cmd_upload_gui_telemetry(&mut self, cx: &mut Context<Self>) {
         let host = match self.registry.selected_agent().copied() {
             Some(agent_id) => self.host_of(agent_id),
@@ -4485,16 +4350,6 @@ impl Workspace {
         .detach();
     }
 
-    #[cfg(all(target_family = "wasm", not(feature = "native")))]
-    pub(crate) fn cmd_upload_gui_telemetry(&mut self, cx: &mut Context<Self>) {
-        self.notice_on(
-            None,
-            "performance snapshots are available in the native GUI",
-            StyleClass::SystemInfo,
-            cx,
-        );
-    }
-
     /// The attached daemons and how each is doing, as one notice line.
     pub(crate) fn cmd_hosts(&mut self, cx: &mut Context<Self>) {
         let listing = self
@@ -4515,7 +4370,6 @@ impl Workspace {
 
     /// Attaches a daemon named on the spot, for a machine that is not worth
     /// putting in the host list.
-    #[cfg(feature = "native")]
     pub(crate) fn cmd_host_attach(&mut self, spec: &str, cx: &mut Context<Self>) {
         let spec = match HostSpec::parse(spec, "rho") {
             Ok(spec) => spec,
@@ -4537,16 +4391,6 @@ impl Workspace {
         self.notice_on(
             None,
             &format!("attaching {name}…"),
-            StyleClass::SystemInfo,
-            cx,
-        );
-    }
-
-    #[cfg(all(target_family = "wasm", not(feature = "native")))]
-    pub(crate) fn cmd_host_attach(&mut self, _: &str, cx: &mut Context<Self>) {
-        self.notice_on(
-            None,
-            "attach: browser hosts come from the page URL",
             StyleClass::SystemInfo,
             cx,
         );
@@ -4843,7 +4687,6 @@ impl Workspace {
         for surfaces in self.surfaces.values_mut() {
             surfaces.retain(|surface| surface.key != SurfaceKey::Transcript(agent_id));
         }
-        #[cfg(feature = "native")]
         self.phone.remove_key(&SurfaceKey::Transcript(agent_id));
         self.pending_syncs.remove(&agent_id);
         self.models.remove(&agent_id);
@@ -5463,7 +5306,6 @@ impl Workspace {
         let view = self.materialize_model(&agent_id, window, cx);
         view.update(cx, |view, cx| view.tick_timers(now_ms(), cx));
         self.dashboard_preview = Some(agent_id);
-        #[cfg(feature = "native")]
         {
             self.dashboard_web_preview = None;
         }
@@ -5473,7 +5315,6 @@ impl Workspace {
         cx.notify();
     }
 
-    #[cfg(feature = "native")]
     fn preview_browser_page(
         &mut self,
         id: rho_browser::PageId,
@@ -5561,7 +5402,6 @@ impl Workspace {
             return;
         }
         let target = self.dashboard.cursor_target(&self.registry, cx);
-        #[cfg(feature = "native")]
         if let Some(RowTarget::TreePage { page_id, .. }) = target {
             self.preview_browser_page(page_id, window, cx);
             return;
@@ -5589,15 +5429,11 @@ impl Workspace {
     /// Hides the preview pane: the cursor is on a header, prose, or an
     /// unstaffed heading, so no agent claims the frame.
     fn clear_dashboard_preview(&mut self, cx: &mut Context<Self>) {
-        #[cfg(feature = "native")]
         let web_preview_empty = self.dashboard_web_preview.is_none();
-        #[cfg(not(feature = "native"))]
-        let web_preview_empty = true;
         if self.dashboard_preview.is_none() && web_preview_empty {
             return;
         }
         self.dashboard_preview = None;
-        #[cfg(feature = "native")]
         {
             self.dashboard_web_preview = None;
         }
@@ -5636,13 +5472,10 @@ impl Workspace {
                 "term {}/{terminal_id}",
                 self.registry.agent_id_label(*agent_id)
             ),
-            #[cfg(feature = "native")]
             SurfaceKey::Browser(browser) => browser.to_string(),
             SurfaceKey::ZulipInbox => "zulip".to_owned(),
             SurfaceKey::ZulipNarrow { label } => label.clone(),
-            #[cfg(feature = "native")]
             SurfaceKey::SlackList => "slack".to_owned(),
-            #[cfg(feature = "native")]
             SurfaceKey::SlackConversation(source) => self
                 .slack_labels
                 .get(source)
@@ -5681,13 +5514,10 @@ impl Workspace {
             SurfaceKey::Shell(_) => "shell",
             SurfaceKey::Diff { .. } => "diff",
             SurfaceKey::Terminal { .. } => "terminal",
-            #[cfg(feature = "native")]
             SurfaceKey::Browser(_) => "browser",
             SurfaceKey::ZulipInbox => "zulip inbox",
             SurfaceKey::ZulipNarrow { .. } => "zulip",
-            #[cfg(feature = "native")]
             SurfaceKey::SlackList => "slack list",
-            #[cfg(feature = "native")]
             SurfaceKey::SlackConversation(_) => "slack",
         }
     }
@@ -5813,7 +5643,6 @@ impl Workspace {
             return;
         }
         list.retain(|surface| surface.key != key);
-        #[cfg(feature = "native")]
         if self.phone.enabled {
             self.phone.remove(self.active_context, &key);
         }
@@ -5870,7 +5699,6 @@ impl Workspace {
                 agent_id: agent_id.into(),
                 terminal_id: *terminal_id,
             },
-            #[cfg(feature = "native")]
             SurfaceKey::Browser(page_id) => SurfaceIdentity::Browser {
                 page_id: page_id.to_string(),
             },
@@ -5878,9 +5706,7 @@ impl Workspace {
             SurfaceKey::ZulipNarrow { label } => SurfaceIdentity::ZulipNarrow {
                 label: label.clone(),
             },
-            #[cfg(feature = "native")]
             SurfaceKey::SlackList => SurfaceIdentity::SlackList,
-            #[cfg(feature = "native")]
             SurfaceKey::SlackConversation(source) => SurfaceIdentity::SlackConversation {
                 thread: crate::slack::journal_thread(source),
             },
@@ -5944,24 +5770,19 @@ impl Workspace {
                     editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
                 }
                 SurfaceView::Terminal(view) => view.read(cx).scroll_offset() as i64,
-                #[cfg(feature = "native")]
                 SurfaceView::Browser(_) => 0,
-                #[cfg(feature = "native")]
                 SurfaceView::ZulipInbox(view) => {
                     let editor = view.read(cx).editor().clone();
                     editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
                 }
-                #[cfg(feature = "native")]
                 SurfaceView::ZulipNarrow(view) => {
                     let editor = view.read(cx).editor().clone();
                     editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
                 }
-                #[cfg(feature = "native")]
                 SurfaceView::SlackList(view) => {
                     let editor = view.read(cx).editor().clone();
                     editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
                 }
-                #[cfg(feature = "native")]
                 SurfaceView::SlackConversation(view) => {
                     let editor = view.read(cx).editor().clone();
                     editor.update(cx, |editor, cx| editor.scroll_position(cx).y as i64)
@@ -6006,7 +5827,6 @@ impl Workspace {
             Some(existing) => *existing = surface.clone(),
             None => list.push(surface.clone()),
         }
-        #[cfg(feature = "native")]
         if self.phone.enabled {
             self.phone.show(self.active_context, surface.key.clone());
         }
@@ -6897,7 +6717,6 @@ impl Workspace {
                     editor.focus_handle(cx)
                 }
                 SurfaceView::Transcript { editor, .. } => editor.focus_handle(cx),
-                #[cfg(feature = "native")]
                 SurfaceView::Browser(view) => view.read(cx).focus_handle(cx),
                 _ => return,
             },
@@ -7419,7 +7238,6 @@ impl Workspace {
             tracing::warn!(%error, "waking deferred inbox items");
         }
         self.dashboard.sync(&self.registry, &self.inbox, window, cx);
-        #[cfg(feature = "native")]
         {
             let pages = self.dashboard.page_ids();
             if pages != self.browser_pages {
@@ -7441,7 +7259,6 @@ impl Workspace {
         self.invalidate_dealer_signals(cx);
     }
 
-    #[cfg(feature = "native")]
     fn scan_browser_pages_for_gc(&mut self, cx: &mut Context<Self>) {
         let Some(list) = rho_browser::list_pages_if_running(cx) else {
             return;
@@ -7464,7 +7281,6 @@ impl Workspace {
         .detach();
     }
 
-    #[cfg(feature = "native")]
     fn schedule_browser_page_gc(&mut self, page: rho_browser::PageId, cx: &mut Context<Self>) {
         const GRACE: Duration = Duration::from_secs(10 * 60);
         if self.browser_page_gc.contains_key(&page) || self.browser_page_retained(page) {
@@ -7486,7 +7302,6 @@ impl Workspace {
         self.browser_page_gc.insert(page, gc);
     }
 
-    #[cfg(feature = "native")]
     fn browser_page_retained(&self, page: rho_browser::PageId) -> bool {
         self.dashboard.page_ids().contains(&page)
             || self.inbox.items().iter().any(|item| {
@@ -7525,17 +7340,12 @@ impl Workspace {
             SurfaceView::Terminal(_) => self
                 .any_draft_editor()
                 .expect("the draft context always holds a draft surface"),
-            #[cfg(feature = "native")]
             SurfaceView::Browser(_) => self
                 .any_draft_editor()
                 .expect("the draft context always holds a draft surface"),
-            #[cfg(feature = "native")]
             SurfaceView::ZulipInbox(view) => view.read(cx).editor().clone(),
-            #[cfg(feature = "native")]
             SurfaceView::ZulipNarrow(view) => view.read(cx).editor().clone(),
-            #[cfg(feature = "native")]
             SurfaceView::SlackList(view) => view.read(cx).editor().clone(),
-            #[cfg(feature = "native")]
             SurfaceView::SlackConversation(view) => view.read(cx).editor().clone(),
         }
     }
@@ -7562,7 +7372,6 @@ impl Workspace {
     }
 
     fn active_surface_focus(&self, cx: &App) -> gpui::FocusHandle {
-        #[cfg(feature = "native")]
         if self.phone.enabled
             && matches!(
                 self.active_pane().surface.view,
@@ -7580,15 +7389,10 @@ impl Workspace {
             SurfaceView::Shell { editor, .. } => editor.focus_handle(cx),
             SurfaceView::Diff(view) => view.read(cx).editor().focus_handle(cx),
             SurfaceView::Terminal(view) => view.read(cx).focus_handle(cx),
-            #[cfg(feature = "native")]
             SurfaceView::Browser(view) => view.read(cx).focus_handle(cx),
-            #[cfg(feature = "native")]
             SurfaceView::ZulipInbox(view) => view.read(cx).editor().focus_handle(cx),
-            #[cfg(feature = "native")]
             SurfaceView::ZulipNarrow(view) => view.read(cx).editor().focus_handle(cx),
-            #[cfg(feature = "native")]
             SurfaceView::SlackList(view) => view.read(cx).editor().focus_handle(cx),
-            #[cfg(feature = "native")]
             SurfaceView::SlackConversation(view) => view.read(cx).editor().focus_handle(cx),
         }
     }
@@ -7609,9 +7413,7 @@ impl Workspace {
             | SurfaceKey::Inbox(_)
             | SurfaceKey::ZulipInbox
             | SurfaceKey::ZulipNarrow { .. } => None,
-            #[cfg(feature = "native")]
             SurfaceKey::SlackList | SurfaceKey::SlackConversation(_) => None,
-            #[cfg(feature = "native")]
             SurfaceKey::Browser(_) => None,
         };
         if let Some(agent_id) = agent_id {
@@ -7668,11 +7470,9 @@ impl Workspace {
             SurfaceKey::Terminal { .. } => {
                 unreachable!("terminal surfaces are created by open_terminal_surface")
             }
-            #[cfg(feature = "native")]
             SurfaceKey::Browser(_) => {
                 unreachable!("browser surfaces are created by cmd_browser")
             }
-            #[cfg(feature = "native")]
             SurfaceKey::ZulipInbox => {
                 let session = self.zulip_session(cx);
                 let hooks = Self::zulip_hooks();
@@ -7680,12 +7480,9 @@ impl Workspace {
                     cx.new(|cx| rho_zulip::ui::InboxView::new(session, hooks, window, cx)),
                 )
             }
-            #[cfg(not(feature = "native"))]
-            SurfaceKey::ZulipInbox => unreachable!("the Zulip client is native-only"),
             SurfaceKey::ZulipNarrow { .. } => {
                 unreachable!("conversation surfaces are created by open_zulip_narrow")
             }
-            #[cfg(feature = "native")]
             SurfaceKey::SlackList => {
                 let session = self
                     .slack_session(cx)
@@ -7695,7 +7492,6 @@ impl Workspace {
                     cx.new(|cx| rho_slack::ui::ListView::new(session, hooks, window, cx)),
                 )
             }
-            #[cfg(feature = "native")]
             SurfaceKey::SlackConversation(_) => {
                 unreachable!("slack conversations are created by open_slack_source")
             }
@@ -7719,7 +7515,6 @@ impl Workspace {
                 self.registry.select_agent(agent_id);
                 Some(agent_id)
             }
-            #[cfg(feature = "native")]
             SurfaceKey::Browser(_) => None,
             SurfaceKey::Diff { agent_id } => {
                 self.registry.select_agent(agent_id);
@@ -7736,7 +7531,6 @@ impl Workspace {
             | SurfaceKey::File { .. }
             | SurfaceKey::ZulipInbox
             | SurfaceKey::ZulipNarrow { .. } => None,
-            #[cfg(feature = "native")]
             SurfaceKey::SlackList | SurfaceKey::SlackConversation(_) => None,
         };
         if self.connected()
@@ -7785,7 +7579,6 @@ impl Workspace {
         cx.notify();
     }
 
-    #[cfg(feature = "native")]
     pub(crate) fn phone_choose_minibuffer(
         &mut self,
         index: usize,
@@ -7810,7 +7603,6 @@ impl Workspace {
         }
     }
 
-    #[cfg(feature = "native")]
     fn finish_git_approval(
         &mut self,
         decision: GitApprovalDecision,
@@ -7869,16 +7661,7 @@ impl Workspace {
     }
 
     fn has_modal_overlay(&self) -> bool {
-        self.minibuffer.is_some() || self.transient.is_some() || {
-            #[cfg(feature = "native")]
-            {
-                self.pending_git_approval.is_some()
-            }
-            #[cfg(not(feature = "native"))]
-            {
-                false
-            }
-        }
+        self.minibuffer.is_some() || self.transient.is_some() || self.pending_git_approval.is_some()
     }
 
     /// Captures normal focus on the first overlay in a chain. Replacements
@@ -8197,7 +7980,6 @@ impl Workspace {
                 self.make_surface(SurfaceKey::Transcript(*agent_id), window, cx)
             }
             crate::dashboard::DealCardIdentity::Inbox(id) => {
-                #[cfg(feature = "native")]
                 if let Some(crate::dashboard::DealerInboxSource::Page(page)) = card.inbox_source {
                     if let Some(model) = rho_browser::open_page(page, cx) {
                         self.observe_browser_metadata(&model, cx);
@@ -8233,7 +8015,6 @@ impl Workspace {
                 let editor = cx.new(|cx| {
                     let multi_buffer =
                         cx.new(|cx| multi_buffer::MultiBuffer::singleton(buffer, cx));
-                    #[cfg(feature = "native")]
                     let mut editor = editor::Editor::new(
                         editor::EditorMode::Full {
                             scale_ui_elements_with_buffer_font_size: true,
@@ -8242,17 +8023,6 @@ impl Workspace {
                         },
                         multi_buffer,
                         None,
-                        window,
-                        cx,
-                    );
-                    #[cfg(not(feature = "native"))]
-                    let mut editor = editor::Editor::new(
-                        editor::EditorMode::Full {
-                            scale_ui_elements_with_buffer_font_size: true,
-                            show_active_line_background: false,
-                            sizing_behavior: editor::SizingBehavior::ExcludeOverscrollMargin,
-                        },
-                        multi_buffer,
                         window,
                         cx,
                     );
@@ -9145,7 +8915,6 @@ impl Workspace {
         use crate::dashboard::RowTarget;
         match self.dashboard.cursor_target(&self.registry, cx) {
             Some(RowTarget::TreeAgent { agent_id, .. }) => self.open_agent(agent_id, window, cx),
-            #[cfg(feature = "native")]
             Some(RowTarget::TreePage { page_id, .. }) => {
                 self.open_browser_page(page_id, window, cx)
             }
@@ -9444,11 +9213,6 @@ impl Workspace {
     /// Desk; otherwise the caller propagates the key back to vim.
     fn dashboard_verb_applies(&mut self, window: &Window, cx: &mut Context<Self>) -> bool {
         self.dashboard.is_focused(window, cx) && self.dashboard.cursor_on_heading_line(cx)
-    }
-
-    #[cfg(all(target_family = "wasm", not(feature = "native")))]
-    fn dashboard_open_clicked_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.dashboard_open(window, cx);
     }
 
     fn staff_dashboard_node(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -10033,10 +9797,7 @@ impl Workspace {
             .line_height(text_style.line_height)
             .text_color(text_style.color)
             .key_context("RhoDashboard");
-        #[cfg(feature = "native")]
         let compact_dashboard = self.phone.enabled;
-        #[cfg(not(feature = "native"))]
-        let compact_dashboard = true;
         let container = container
             // The dashboard owns the preview card's reclaimed horizontal
             // space, rather than leaving a blank wrapper beside the card.
@@ -10055,12 +9816,6 @@ impl Workspace {
             .relative()
             .overflow_hidden()
             .child(self.dashboard.editor().clone());
-        #[cfg(all(target_family = "wasm", not(feature = "native")))]
-        let dashboard = dashboard
-            // The editor consumes bubble-phase mouse events. Capture the
-            // press/release around it, then open after its cursor has moved.
-            .capture_any_mouse_down(cx.listener(Self::dashboard_pointer_down))
-            .capture_any_mouse_up(cx.listener(Self::dashboard_pointer_up));
         container.child(dashboard).into_any_element()
     }
 
@@ -10094,7 +9849,6 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
-        #[cfg(feature = "native")]
         if let Some((_, view)) = &self.dashboard_web_preview {
             return Some(
                 div()
@@ -10181,7 +9935,6 @@ impl Workspace {
                     let editor = cx.new(|cx| {
                         let multi_buffer =
                             cx.new(|cx| multi_buffer::MultiBuffer::singleton(buffer, cx));
-                        #[cfg(feature = "native")]
                         let mut editor = editor::Editor::new(
                             editor::EditorMode::Full {
                                 scale_ui_elements_with_buffer_font_size: true,
@@ -10190,17 +9943,6 @@ impl Workspace {
                             },
                             multi_buffer,
                             None,
-                            window,
-                            cx,
-                        );
-                        #[cfg(not(feature = "native"))]
-                        let mut editor = editor::Editor::new(
-                            editor::EditorMode::Full {
-                                scale_ui_elements_with_buffer_font_size: true,
-                                show_active_line_background: false,
-                                sizing_behavior: editor::SizingBehavior::ExcludeOverscrollMargin,
-                            },
-                            multi_buffer,
                             window,
                             cx,
                         );
@@ -10301,7 +10043,6 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let path = match &card.inbox_source {
-            #[cfg(feature = "native")]
             Some(crate::dashboard::DealerInboxSource::Page(page)) => {
                 let leaf = rho_browser::live_page_name(*page).unwrap_or_else(|| "page".to_owned());
                 format!("{} / {leaf}", card.breadcrumb.replace(" › ", " / "))
@@ -10467,14 +10208,11 @@ impl Workspace {
     fn render_status_right(&self, cx: &App) -> gpui::AnyElement {
         let colors = cx.theme().colors();
         let status = cx.theme().status();
-        #[cfg(feature = "native")]
         let mode = self
             .mode_indicator
             .read(cx)
             .plain_mode(cx)
             .unwrap_or_else(|| "normal".to_owned());
-        #[cfg(not(feature = "native"))]
-        let mode = "normal".to_owned();
         let mode_color = if self.dashboard.deal_mode() {
             colors.terminal_ansi_bright_magenta
         } else if mode.contains("insert") {
@@ -10572,7 +10310,6 @@ impl Workspace {
                         .breadcrumb_for_agent(*agent_id, cx)
                         .map_or(leaf.clone(), |path| format!("{path} / {leaf}"))
                 }
-                #[cfg(feature = "native")]
                 SurfaceKey::Browser(page) => {
                     let leaf =
                         rho_browser::live_page_name(*page).unwrap_or_else(|| "page".to_owned());
@@ -10635,7 +10372,6 @@ impl Workspace {
         // Modal overlays borrow keyboard focus; the frame stays in the mode
         // recorded beneath the overlay for its whole replacement chain.
         let home = self.overview_open;
-        #[cfg(feature = "native")]
         {
             let focused_surface = if home {
                 crate::telemetry::SurfaceKind::Dashboard
@@ -10647,10 +10383,7 @@ impl Workspace {
         }
         let iris = false;
         self.sync_diff_visibility(!home, cx);
-        #[cfg(feature = "native")]
         let web_preview_visible = self.dashboard_web_preview.is_some();
-        #[cfg(not(feature = "native"))]
-        let web_preview_visible = false;
         let show_surface = !home || iris || self.dashboard_preview.is_some() || web_preview_visible;
         let rail = home.then(|| self.render_rail(show_surface, text_style, cx));
         // Same hairline the rail uses against the preview.
@@ -10716,13 +10449,10 @@ impl Workspace {
 
     fn dashboard_mode(&self, window: &Window, cx: &App) -> bool {
         let dashboard = self.dashboard.focus_handle(cx);
-        #[cfg(feature = "native")]
         let browser_preview_focused = self
             .dashboard_web_preview
             .as_ref()
             .is_some_and(|(_, view)| view.read(cx).focus_handle(cx).is_focused(window));
-        #[cfg(not(feature = "native"))]
-        let browser_preview_focused = false;
         self.overview_open
             || self.overlay_return_focus.as_ref() == Some(&dashboard)
             || browser_preview_focused
@@ -10788,28 +10518,24 @@ impl Workspace {
                 .overflow_hidden()
                 .child(view.clone())
                 .into_any_element(),
-            #[cfg(feature = "native")]
             SurfaceView::ZulipInbox(view) => div()
                 .id("rho-surface-zulip-inbox")
                 .size_full()
                 .overflow_hidden()
                 .child(view.clone())
                 .into_any_element(),
-            #[cfg(feature = "native")]
             SurfaceView::ZulipNarrow(view) => div()
                 .id("rho-surface-zulip-narrow")
                 .size_full()
                 .overflow_hidden()
                 .child(view.clone())
                 .into_any_element(),
-            #[cfg(feature = "native")]
             SurfaceView::SlackList(view) => div()
                 .id("rho-surface-slack-list")
                 .size_full()
                 .overflow_hidden()
                 .child(view.clone())
                 .into_any_element(),
-            #[cfg(feature = "native")]
             SurfaceView::SlackConversation(view) => div()
                 .id("rho-surface-slack-conversation")
                 .size_full()
@@ -10835,7 +10561,6 @@ impl Workspace {
                 .overflow_hidden()
                 .child(view.clone())
                 .into_any_element(),
-            #[cfg(feature = "native")]
             SurfaceView::Browser(view) => div()
                 .id("rho-surface-browser")
                 .size_full()
@@ -11100,7 +10825,6 @@ fn agent_role_label(config: AgentRole) -> RoleLabel {
     }
 }
 
-#[cfg(feature = "native")]
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let editor = self.active_editor(cx);
@@ -11151,38 +10875,22 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(Self::shell_eof))
             .on_action(cx.listener(|this, _: &ZulipOpenRow, window, cx| {
-                #[cfg(feature = "native")]
                 this.zulip_open_row(window, cx);
-                #[cfg(not(feature = "native"))]
-                let _ = window;
             }))
             .on_action(cx.listener(|this, _: &ZulipNextUnread, window, cx| {
-                #[cfg(feature = "native")]
                 this.zulip_next_unread(window, cx);
-                #[cfg(not(feature = "native"))]
-                let _ = window;
             }))
             .on_action(cx.listener(|this, _: &ZulipLoadOlder, _, cx| {
-                #[cfg(feature = "native")]
                 this.zulip_load_older(cx);
             }))
             .on_action(cx.listener(|this, _: &SlackOpenRow, window, cx| {
-                #[cfg(feature = "native")]
                 this.slack_open_row(window, cx);
-                #[cfg(not(feature = "native"))]
-                let _ = window;
             }))
             .on_action(cx.listener(|this, _: &SlackCompose, window, cx| {
-                #[cfg(feature = "native")]
                 this.slack_compose(window, cx);
-                #[cfg(not(feature = "native"))]
-                let _ = window;
             }))
             .on_action(cx.listener(|this, _: &SlackSearch, window, cx| {
-                #[cfg(feature = "native")]
                 this.prompt_slack_search(window, cx);
-                #[cfg(not(feature = "native"))]
-                let _ = window;
             }))
             .on_action(cx.listener(|this, _: &ShellPagerMore, _, cx| {
                 this.shell_pager_action(rho_ui_proto::shell::PagerAction::Continue, cx);
@@ -11763,13 +11471,10 @@ impl Render for Workspace {
                 let Some(card) = this.dashboard.current_deal_card().cloned() else {
                     return;
                 };
-                #[cfg(feature = "native")]
                 let opens_page = matches!(
                     &card.inbox_source,
                     Some(crate::dashboard::DealerInboxSource::Page(_))
                 );
-                #[cfg(not(feature = "native"))]
-                let opens_page = false;
                 if card.agent_id.is_none()
                     && !opens_page
                     && !matches!(card.kind, crate::dashboard::DealCardKind::Desk)
@@ -11787,7 +11492,6 @@ impl Render for Workspace {
                 if let Ok(action) = cx.build_action("vim::ExitDealMode", None) {
                     window.dispatch_action(action, cx);
                 }
-                #[cfg(feature = "native")]
                 if let Some(crate::dashboard::DealerInboxSource::Page(page)) = card.inbox_source {
                     this.open_browser_page(page, window, cx);
                     return;
@@ -12125,17 +11829,11 @@ impl Render for Workspace {
     }
 }
 
-#[cfg(feature = "native")]
 pub fn now_ms() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))
         .unwrap_or(0)
-}
-
-#[cfg(not(feature = "native"))]
-pub fn now_ms() -> u64 {
-    js_sys::Date::now().max(0.0) as u64
 }
 
 /// `30m`, `2h`, `1d`; a bare number means minutes.

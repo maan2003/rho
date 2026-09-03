@@ -10073,7 +10073,6 @@ dependencies = [
  "n0-qlog",
  "rand 0.10.2",
  "rand_pcg",
- "ring",
  "rustc-hash 2.1.3",
  "rustls",
  "rustls-pki-types",
@@ -13880,26 +13879,21 @@ dependencies = [
  "clock",
  "collections",
  "command_palette",
- "console_error_panic_hook",
  "criterion",
  "dirs",
  "editor",
  "fs",
  "futures 0.3.33",
- "getrandom 0.2.17",
  "gpui",
  "gpui_platform",
  "gpui_tokio",
- "hkdf",
  "image",
  "iroh",
- "js-sys",
  "json-stream",
  "language",
  "languages",
  "libc",
  "multi_buffer",
- "n0-future",
  "node_runtime",
  "octo-types",
  "org-element",
@@ -13917,7 +13911,6 @@ dependencies = [
  "rho-rpc",
  "rho-rtc",
  "rho-slack",
- "rho-touch-keyboard",
  "rho-ui-proto",
  "rho-zulip",
  "rodio",
@@ -13930,7 +13923,6 @@ dependencies = [
  "serde",
  "serde_json",
  "settings",
- "sha2 0.10.9",
  "smallvec",
  "tempfile",
  "text",
@@ -13947,10 +13939,6 @@ dependencies = [
  "uuid",
  "vim",
  "vim_mode_setting",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
- "zeroize",
 ]
 
 [[package]]
@@ -14064,7 +14052,6 @@ dependencies = [
  "prefix-id",
  "rho-core",
  "rho-ui-proto",
- "web-time",
 ]
 
 [[package]]
@@ -14075,7 +14062,6 @@ dependencies = [
  "async-compression",
  "futures 0.3.33",
  "iroh",
- "n0-future",
  "noq-proto",
  "redb",
  "rho-db",
@@ -14084,7 +14070,6 @@ dependencies = [
  "senax-encoder",
  "tempfile",
  "tokio",
- "wasm-bindgen-futures",
 ]
 
 [[package]]
@@ -14093,15 +14078,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "futures 0.3.33",
- "gloo-timers",
- "js-sys",
  "libwebrtc",
  "rodio",
  "tokio",
  "tracing",
- "wasm-bindgen",
- "wasm-bindgen-futures",
- "web-sys",
 ]
 
 [[package]]
@@ -17135,7 +17115,6 @@ dependencies = [
  "http",
  "httparse",
  "rand 0.10.2",
- "ring",
  "rustls-pki-types",
  "sha1_smol",
  "simdutf8",

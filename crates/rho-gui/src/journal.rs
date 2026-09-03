@@ -9,31 +9,22 @@
 //! browser profile; the standalone dump command is correspondingly offline and
 //! must be run after the GUI exits.
 
-#[cfg(feature = "native")]
 use std::fs::{File, OpenOptions};
-#[cfg(feature = "native")]
 use std::os::fd::AsRawFd as _;
-#[cfg(feature = "native")]
 use std::path::{Path, PathBuf};
-#[cfg(feature = "native")]
 use std::sync::{OnceLock, mpsc};
 
-#[cfg(feature = "native")]
 use redb::{TableDefinition, TableHandle as _};
-#[cfg(feature = "native")]
 use rho_db::{RhoDb, Sen, SenValue};
 use serde::{Deserialize, Serialize};
 
 pub const FILE_NAME: &str = "action-journal.redb";
 const LOCK_FILE_NAME: &str = "action-journal.lock";
 
-#[cfg(feature = "native")]
 const EVENTS: TableDefinition<u64, Sen<Entry>> = TableDefinition::new("gui_action_journal_v3");
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(
-    feature = "native",
-    derive(senax_encoder::Encode, senax_encoder::Decode)
+#[derive(
+    Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
 )]
 pub struct Entry {
     /// RFC 3339 UTC wall-clock time captured at the interaction site.
@@ -41,10 +32,15 @@ pub struct Entry {
     pub event: Event,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(
-    feature = "native",
-    derive(senax_encoder::Encode, senax_encoder::Decode)
+#[derive(
+    Clone,
+    Debug,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    senax_encoder::Encode,
+    senax_encoder::Decode,
 )]
 pub struct NodeIdentity {
     pub replica_id: u16,
@@ -60,10 +56,15 @@ impl From<rho_desk::NodeId> for NodeIdentity {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(
-    feature = "native",
-    derive(senax_encoder::Encode, senax_encoder::Decode)
+#[derive(
+    Clone,
+    Debug,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    senax_encoder::Encode,
+    senax_encoder::Decode,
 )]
 pub struct AgentIdentity(pub String);
 
@@ -84,10 +85,8 @@ impl From<&str> for AgentIdentity {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(
-    feature = "native",
-    derive(senax_encoder::Encode, senax_encoder::Decode)
+#[derive(
+    Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
 )]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum DealerCardIdentity {
@@ -108,10 +107,8 @@ pub enum DealerCardIdentity {
     },
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(
-    feature = "native",
-    derive(senax_encoder::Encode, senax_encoder::Decode)
+#[derive(
+    Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum DealerInboxKind {
@@ -121,10 +118,8 @@ pub enum DealerInboxKind {
     Slack,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(
-    feature = "native",
-    derive(senax_encoder::Encode, senax_encoder::Decode)
+#[derive(
+    Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
 )]
 #[serde(tag = "type", content = "inbox_kind", rename_all = "snake_case")]
 pub enum DealerCardKind {
@@ -133,10 +128,8 @@ pub enum DealerCardKind {
     Inbox(DealerInboxKind),
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(
-    feature = "native",
-    derive(senax_encoder::Encode, senax_encoder::Decode)
+#[derive(
+    Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum DealerVerdict {
@@ -148,10 +141,8 @@ pub enum DealerVerdict {
     File,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(
-    feature = "native",
-    derive(senax_encoder::Encode, senax_encoder::Decode)
+#[derive(
+    Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
 )]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SurfaceIdentity {
@@ -198,10 +189,8 @@ pub enum SurfaceIdentity {
 /// A Slack thread as the journal names it: the workspace and conversation a
 /// person would recognise, plus the thread's own key so two threads in one
 /// conversation stay distinct.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(
-    feature = "native",
-    derive(senax_encoder::Encode, senax_encoder::Decode)
+#[derive(
+    Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
 )]
 pub struct SlackThread {
     pub workspace: String,
@@ -209,10 +198,8 @@ pub struct SlackThread {
     pub thread: String,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(
-    feature = "native",
-    derive(senax_encoder::Encode, senax_encoder::Decode)
+#[derive(
+    Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum CaptureMethod {
@@ -220,10 +207,8 @@ pub enum CaptureMethod {
     TabBirth,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(
-    feature = "native",
-    derive(senax_encoder::Encode, senax_encoder::Decode)
+#[derive(
+    Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
 )]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InboxVerdict {
@@ -232,10 +217,16 @@ pub enum InboxVerdict {
     Defer { until_ms: i64 },
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(
-    feature = "native",
-    derive(senax_encoder::Encode, senax_encoder::Decode)
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    senax_encoder::Encode,
+    senax_encoder::Decode,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum SurfaceShowMethod {
@@ -246,10 +237,16 @@ pub enum SurfaceShowMethod {
     Deal,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(
-    feature = "native",
-    derive(senax_encoder::Encode, senax_encoder::Decode)
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    senax_encoder::Encode,
+    senax_encoder::Decode,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryDirection {
@@ -257,10 +254,16 @@ pub enum HistoryDirection {
     Forward,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(
-    feature = "native",
-    derive(senax_encoder::Encode, senax_encoder::Decode)
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    senax_encoder::Encode,
+    senax_encoder::Decode,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryAppendMethod {
@@ -269,10 +272,16 @@ pub enum HistoryAppendMethod {
     Command,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(
-    feature = "native",
-    derive(senax_encoder::Encode, senax_encoder::Decode)
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    senax_encoder::Encode,
+    senax_encoder::Decode,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum HistoryRemoveMethod {
@@ -280,10 +289,16 @@ pub enum HistoryRemoveMethod {
     Dedupe,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(
-    feature = "native",
-    derive(senax_encoder::Encode, senax_encoder::Decode)
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    senax_encoder::Encode,
+    senax_encoder::Decode,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum DealModeAction {
@@ -292,10 +307,16 @@ pub enum DealModeAction {
     Exit,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
-#[cfg_attr(
-    feature = "native",
-    derive(senax_encoder::Encode, senax_encoder::Decode)
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Serialize,
+    Deserialize,
+    PartialEq,
+    Eq,
+    senax_encoder::Encode,
+    senax_encoder::Decode,
 )]
 #[serde(rename_all = "snake_case")]
 pub enum SignalState {
@@ -303,20 +324,16 @@ pub enum SignalState {
     Off,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(
-    feature = "native",
-    derive(senax_encoder::Encode, senax_encoder::Decode)
+#[derive(
+    Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
 )]
 pub struct BuildIdentity {
     pub version: String,
     pub git_commit: Option<String>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(
-    feature = "native",
-    derive(senax_encoder::Encode, senax_encoder::Decode)
+#[derive(
+    Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
 )]
 pub struct DealerPolicySnapshot {
     pub queue_floor: f64,
@@ -332,10 +349,8 @@ pub struct DealerPolicySnapshot {
     pub agent_recency_window_ms: i64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-#[cfg_attr(
-    feature = "native",
-    derive(senax_encoder::Encode, senax_encoder::Decode)
+#[derive(
+    Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
 )]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
@@ -497,13 +512,11 @@ impl Event {
     }
 }
 
-#[cfg(feature = "native")]
 enum Message {
     Entry(Entry),
     Flush(mpsc::SyncSender<()>),
 }
 
-#[cfg(feature = "native")]
 pub struct Journal {
     db: RhoDb,
     _lock: File,
@@ -511,7 +524,6 @@ pub struct Journal {
     path: PathBuf,
 }
 
-#[cfg(feature = "native")]
 impl Journal {
     pub fn open(state_dir: &Path) -> std::io::Result<Self> {
         std::fs::create_dir_all(state_dir)?;
@@ -574,7 +586,6 @@ impl Journal {
     }
 }
 
-#[cfg(feature = "native")]
 fn acquire_lock(state_dir: &Path) -> std::io::Result<File> {
     let path = state_dir.join(LOCK_FILE_NAME);
     let file = OpenOptions::new()
@@ -592,7 +603,6 @@ fn acquire_lock(state_dir: &Path) -> std::io::Result<File> {
     Ok(file)
 }
 
-#[cfg(feature = "native")]
 fn next_sequence(db: &RhoDb) -> u64 {
     db.read()
         .open_table(EVENTS)
@@ -605,7 +615,6 @@ fn next_sequence(db: &RhoDb) -> u64 {
         })
 }
 
-#[cfg(feature = "native")]
 fn writer(db: RhoDb, mut sequence: u64, receiver: mpsc::Receiver<Message>) {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -632,10 +641,8 @@ fn writer(db: RhoDb, mut sequence: u64, receiver: mpsc::Receiver<Message>) {
     }
 }
 
-#[cfg(feature = "native")]
 static GLOBAL: OnceLock<Journal> = OnceLock::new();
 
-#[cfg(feature = "native")]
 pub fn init(state_dir: &Path) -> std::io::Result<()> {
     let journal = Journal::open(state_dir)?;
     GLOBAL.set(journal).map_err(|_| {
@@ -656,7 +663,6 @@ pub fn init(state_dir: &Path) -> std::io::Result<()> {
 
 /// Waits until all previously enqueued events have committed. Normal GUI
 /// shutdown calls this; interaction sites should only use [`record`].
-#[cfg(feature = "native")]
 pub fn flush() {
     if let Some(journal) = GLOBAL.get()
         && let Err(error) = journal.flush()
@@ -665,18 +671,13 @@ pub fn flush() {
     }
 }
 
-/// Records an event if the native journal has been initialized. Browser GUI
-/// builds intentionally keep the same one-line API but do not persist locally.
+/// Records an event if the journal has been initialized.
 pub fn record(event: Event) {
-    #[cfg(feature = "native")]
     if let Some(journal) = GLOBAL.get() {
         journal.record(event);
     }
-    #[cfg(not(feature = "native"))]
-    let _ = event;
 }
 
-#[cfg(feature = "native")]
 pub fn dump(
     state_dir: &Path,
     kind: Option<&str>,
@@ -691,7 +692,6 @@ pub fn dump(
     dump_db(&db, kind, output)
 }
 
-#[cfg(feature = "native")]
 #[derive(Serialize)]
 struct DumpEntry<'a> {
     sequence: u64,
@@ -699,7 +699,6 @@ struct DumpEntry<'a> {
     event: &'a Event,
 }
 
-#[cfg(feature = "native")]
 fn dump_db(db: &RhoDb, kind: Option<&str>, mut output: impl std::io::Write) -> anyhow::Result<()> {
     let read = db.read();
     if !read.has_table(EVENTS.name()) {
@@ -723,7 +722,7 @@ fn dump_db(db: &RhoDb, kind: Option<&str>, mut output: impl std::io::Write) -> a
     Ok(())
 }
 
-#[cfg(all(test, feature = "native"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 

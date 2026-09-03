@@ -6,20 +6,14 @@ license.workspace = true
 repository.workspace = true
 rust-version = "1.91"
 
-[features]
-default = ["server"]
-# The enrollment/approval server. Disabling it leaves the client and shared
-# code paths, which also compile for wasm32 (the web UI client).
-server = ["dep:redb", "dep:redb-derive", "dep:rho-db", "dep:tokio"]
-
 [dependencies]
 anyhow.workspace = true
 iroh.workspace = true
-redb = { workspace = true, optional = true }
-redb-derive = { workspace = true, optional = true }
-rho-db = { workspace = true, optional = true }
+redb = { workspace = true }
+redb-derive = { workspace = true }
+rho-db = { workspace = true }
 sha2.workspace = true
-tokio = { workspace = true, optional = true }
+tokio = { workspace = true }
 
 [dev-dependencies]
 tempfile.workspace = true

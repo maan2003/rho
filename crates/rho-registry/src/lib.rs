@@ -12,11 +12,7 @@ use camino::Utf8PathBuf;
 use rho_ui_proto::{AgentId, UiAgentSummary};
 
 pub fn now_ms() -> u64 {
-    #[cfg(not(target_family = "wasm"))]
     use std::time::{SystemTime, UNIX_EPOCH};
-
-    #[cfg(target_family = "wasm")]
-    use web_time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_millis().try_into().unwrap_or(u64::MAX))

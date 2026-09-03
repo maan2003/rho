@@ -10,7 +10,6 @@ rust-version.workspace = true
 anyhow.workspace = true
 futures.workspace = true
 
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 libwebrtc.workspace = true
 rodio = { git = "https://github.com/RustAudio/rodio", rev = "e50e726ddd0292f6ef9de0dda6b90af4ed1fb66a", default-features = false, features = [
   "playback",
@@ -18,32 +17,3 @@ rodio = { git = "https://github.com/RustAudio/rodio", rev = "e50e726ddd0292f6ef9
 ] }
 tokio.workspace = true
 tracing.workspace = true
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-gloo-timers = { version = "0.3", features = ["futures"] }
-js-sys = "0.3"
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = [
-  "Blob",
-  "Event",
-  "EventTarget",
-  "HtmlAudioElement",
-  "HtmlMediaElement",
-  "MediaDevices",
-  "MediaStream",
-  "MediaStreamConstraints",
-  "MediaStreamTrack",
-  "Navigator",
-  "RtcConfiguration",
-  "RtcIceGatheringState",
-  "RtcIceServer",
-  "RtcPeerConnection",
-  "RtcPeerConnectionState",
-  "RtcRtpSender",
-  "RtcSdpType",
-  "RtcSessionDescription",
-  "RtcSessionDescriptionInit",
-  "RtcTrackEvent",
-  "Window",
-] }

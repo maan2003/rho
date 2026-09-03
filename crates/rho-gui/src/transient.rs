@@ -64,7 +64,6 @@ impl Transient {
         self.title
     }
 
-    #[cfg(feature = "native")]
     pub(crate) fn phone_rows(&self) -> Vec<(String, String, Option<String>)> {
         self.items
             .iter()
@@ -78,7 +77,6 @@ impl Transient {
             .collect()
     }
 
-    #[cfg(feature = "native")]
     pub(crate) fn action_at(&self, index: usize) -> Option<(TransientRun, bool)> {
         self.items
             .get(index)
@@ -704,16 +702,12 @@ pub fn root_menu() -> Transient {
         .item("shift-u", "undo verdict", |_, window, cx| {
             window.dispatch_action(Box::new(crate::UndoVerdict), cx);
         });
-    // Slack is a native-only client: it holds the desktop session's own
-    // token and cookie, which the browser build cannot.
-    #[cfg(feature = "native")]
     let menu = menu.item("shift-s", "slack…", |workspace, window, cx| {
         workspace.open_transient(slack_menu(), window, cx);
     });
     menu.item("q", "quit", |_, _, cx| cx.quit())
 }
 
-#[cfg(feature = "native")]
 pub fn phone_desk_menu(raw_mode: bool) -> Transient {
     Transient::new("Desk")
         .item("f", "Cycle folds", |workspace, window, cx| {
@@ -741,7 +735,6 @@ fn browser_menu() -> Transient {
     })
 }
 
-#[cfg(feature = "native")]
 fn slack_menu() -> Transient {
     Transient::new("slack")
         .item("o", "conversations", |workspace, window, cx| {
@@ -1761,7 +1754,6 @@ fn snooze_menu() -> Transient {
 mod tests {
     use super::*;
 
-    #[cfg(feature = "native")]
     #[test]
     fn phone_desk_menu_switches_editing_label() {
         let browse = phone_desk_menu(false).phone_rows();

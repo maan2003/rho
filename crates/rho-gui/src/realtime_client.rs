@@ -6,7 +6,6 @@ use futures::StreamExt as _;
 use rho_rtc::{RtcEvent, RtcSession, SdpAnswer};
 use rho_ui_proto::realtime::{RealtimeClientFrame, RealtimeServerFrame};
 
-#[cfg(feature = "native")]
 use crate::connection::{ChannelDialer, dial_realtime};
 
 pub(crate) struct RealtimeChannel {
@@ -16,7 +15,6 @@ pub(crate) struct RealtimeChannel {
     pub(crate) _transport: crate::connection::ChannelTask,
 }
 
-#[cfg(feature = "native")]
 pub(crate) async fn run_native(
     dialer: ChannelDialer,
     stop: tokio::sync::oneshot::Receiver<()>,

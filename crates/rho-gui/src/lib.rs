@@ -1,16 +1,9 @@
 //! The Rho GPUI client views and native application integration.
 
 pub mod agent_view;
-#[cfg(feature = "native")]
 pub(crate) mod chime;
 pub(crate) mod commands;
-#[cfg(feature = "native")]
 pub(crate) mod connection;
-#[cfg(all(target_family = "wasm", not(feature = "native")))]
-#[path = "connection_web.rs"]
-pub(crate) mod connection;
-#[cfg(all(target_family = "wasm", not(feature = "native")))]
-pub(crate) use connection as connection_web;
 pub mod dashboard;
 pub mod desk_view;
 pub(crate) mod diff_view;
@@ -25,13 +18,11 @@ pub mod pane;
 pub(crate) mod realtime_client;
 pub mod render;
 pub mod rho_assets;
-#[cfg(all(test, feature = "native"))]
+#[cfg(test)]
 mod sampler;
 pub(crate) mod shell_view;
-#[cfg(feature = "native")]
 pub mod slack;
 pub mod style;
-#[cfg(feature = "native")]
 #[doc(hidden)]
 pub mod telemetry;
 pub(crate) mod terminal_view;
@@ -146,7 +137,6 @@ actions!(
     ]
 );
 
-#[cfg(feature = "native")]
 #[doc(hidden)]
 #[derive(serde::Serialize)]
 pub struct Distribution {
@@ -158,7 +148,6 @@ pub struct Distribution {
     max: f64,
 }
 
-#[cfg(feature = "native")]
 #[doc(hidden)]
 pub fn distribution(values: impl IntoIterator<Item = u64>, scale: f64) -> Distribution {
     let mut values = values.into_iter().collect::<Vec<_>>();
@@ -528,5 +517,5 @@ pub fn init_vim_mode(cx: &mut App) -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(all(test, feature = "native"))]
+#[cfg(test)]
 mod tests;

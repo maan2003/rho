@@ -226,7 +226,6 @@ fn bind_test_keymaps(cx: &mut App) {
     crate::bind_rho_key_overrides(cx);
 }
 
-#[cfg(feature = "native")]
 #[gpui::test]
 fn native_page_deal_context_routes_verdict_keys(cx: &mut TestAppContext) {
     use gpui::{KeyContext, Keystroke};
@@ -3958,7 +3957,6 @@ fn cancelled_filing_cannot_leak_its_card_into_the_next_item(cx: &mut TestAppCont
         .unwrap();
 }
 
-#[cfg(feature = "native")]
 #[gpui::test]
 fn page_filing_undo_stays_on_the_stack_until_unbind_exists(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);

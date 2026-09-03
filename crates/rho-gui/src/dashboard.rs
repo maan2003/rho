@@ -154,7 +154,6 @@ pub struct DealerInboxItem {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum DealerInboxSource {
-    #[cfg(feature = "native")]
     Page(rho_browser::PageId),
     /// Enough to reopen the conversation surface on the thread. Ids live here
     /// because this is addressing, not display; the card shows the label.
@@ -255,7 +254,6 @@ pub enum RowTarget {
         topic_node_id: rho_desk::NodeId,
         agent_id: AgentId,
     },
-    #[cfg(feature = "native")]
     TreePage {
         host: HostId,
         node_id: rho_desk::NodeId,
@@ -297,16 +295,13 @@ pub struct Dashboard {
     element_keys: HashMap<LineKey, u64>,
     tree_element_keys: HashMap<(HostId, rho_desk::NodeId), u64>,
     tree_heading_agents: HashMap<(HostId, rho_desk::NodeId), Vec<AgentId>>,
-    #[cfg(feature = "native")]
     tree_heading_pages: HashMap<(HostId, rho_desk::NodeId), Vec<rho_browser::PageId>>,
     next_element_key: u64,
     /// Generated rows in display order, from the last sync.
     /// What each generated key means, for cursor lookup.
     targets: HashMap<LineKey, RowTarget>,
-    #[cfg(feature = "native")]
     /// Every bound browser page, including additional bindings on a heading
     /// whose preview can display only one page.
-    #[cfg(feature = "native")]
     referenced_pages: HashSet<rho_browser::PageId>,
     /// Roots whose binding tag lives inside an `:archive:` zone, as of the
     /// last sync. Archived agents are muted: no chime, quiet decorations.
@@ -747,8 +742,6 @@ impl Dashboard {
         self.breadcrumb_for_node(host, node_id, cx)
     }
 
-    #[cfg(feature = "native")]
-    #[cfg(feature = "native")]
     pub fn breadcrumb_for_page(&self, page_id: rho_browser::PageId, cx: &App) -> Option<String> {
         let (host, node_id) = self
             .tree_heading_pages
@@ -765,8 +758,6 @@ impl Dashboard {
         self.room_for_node(host, node_id, cx)
     }
 
-    #[cfg(feature = "native")]
-    #[cfg(feature = "native")]
     pub fn room_for_page(&self, page_id: rho_browser::PageId, cx: &App) -> Option<DeskRoom> {
         let (host, node_id) = self
             .tree_heading_pages
@@ -784,7 +775,6 @@ impl Dashboard {
             multi_buffer
         });
         let editor = cx.new(|cx| {
-            #[cfg(feature = "native")]
             let mut editor = Editor::new(
                 EditorMode::Full {
                     scale_ui_elements_with_buffer_font_size: true,
@@ -793,17 +783,6 @@ impl Dashboard {
                 },
                 multi_buffer.clone(),
                 None,
-                window,
-                cx,
-            );
-            #[cfg(not(feature = "native"))]
-            let mut editor = Editor::new(
-                EditorMode::Full {
-                    scale_ui_elements_with_buffer_font_size: true,
-                    show_active_line_background: false,
-                    sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
-                },
-                multi_buffer.clone(),
                 window,
                 cx,
             );
@@ -822,12 +801,9 @@ impl Dashboard {
             element_keys: HashMap::new(),
             tree_element_keys: HashMap::new(),
             tree_heading_agents: HashMap::new(),
-            #[cfg(feature = "native")]
             tree_heading_pages: HashMap::new(),
             next_element_key: 0,
             targets: HashMap::new(),
-            #[cfg(feature = "native")]
-            #[cfg(feature = "native")]
             referenced_pages: HashSet::new(),
             new_draft: None,
             tree_new_draft_parent: None,
@@ -888,7 +864,6 @@ impl Dashboard {
         true
     }
 
-    #[cfg(feature = "native")]
     pub fn page_ids(&self) -> HashSet<rho_browser::PageId> {
         self.referenced_pages.clone()
     }
@@ -1294,9 +1269,7 @@ impl Dashboard {
         cx: &mut Context<Workspace>,
     ) {
         self.tree_heading_agents.clear();
-        #[cfg(feature = "native")]
         self.tree_heading_pages.clear();
-        #[cfg(feature = "native")]
         self.referenced_pages.clear();
         for (host, source) in &self.tree_hosts {
             for node in &source.nodes {
@@ -1309,7 +1282,6 @@ impl Dashboard {
                         .or_default()
                         .push(*agent_id);
                 }
-                #[cfg(feature = "native")]
                 if let Some(rho_desk::Binding::Page(page_id)) =
                     node.bindings.get(&rho_desk::BindingKind::Page)
                 {
@@ -1775,7 +1747,6 @@ impl Dashboard {
                             _ => Some(RowTarget::None),
                         }
                     }
-                    #[cfg(feature = "native")]
                     rho_desk::NodeKind::Page => {
                         match node.bindings.get(&rho_desk::BindingKind::Page)? {
                             rho_desk::Binding::Page(page_id) => Some(RowTarget::TreePage {
@@ -2125,13 +2096,10 @@ fn dealer_inbox_items(
                 InboxKind::Slack => DealerInboxKind::Slack,
             };
             let source = match &item.source {
-                #[cfg(feature = "native")]
                 SourceReference::Page { id } => id
                     .parse()
                     .map(DealerInboxSource::Page)
                     .unwrap_or_else(|_| DealerInboxSource::Other(id.clone())),
-                #[cfg(not(feature = "native"))]
-                SourceReference::Page { id } => DealerInboxSource::Other(id.clone()),
                 SourceReference::SlackThread {
                     workspace,
                     channel,

@@ -1,6 +1,6 @@
-//! Cross-platform realtime audio sessions.
+//! Native realtime audio sessions.
 //!
-//! This crate owns WebRTC and local/browser audio devices. OpenAI provider
+//! This crate owns WebRTC and local audio devices. OpenAI provider
 //! control traffic is handled out-of-band by `rho-openai-realtime`.
 
 use anyhow::Context as _;
@@ -49,15 +49,8 @@ pub enum RtcEvent {
     Closed,
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 mod native;
-#[cfg(not(target_arch = "wasm32"))]
 pub use native::RtcSession;
-
-#[cfg(target_arch = "wasm32")]
-mod browser;
-#[cfg(target_arch = "wasm32")]
-pub use browser::RtcSession;
 
 #[cfg(test)]
 mod tests {

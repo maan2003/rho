@@ -27,7 +27,6 @@ use rho_ui_proto::AgentId;
 use rho_ui_proto::remote::UiAgentState;
 use text::{Buffer as TextBuffer, BufferId, ReplicaId};
 
-#[cfg(feature = "native")]
 use crate::commands::WorkspaceCompletionProvider;
 use crate::store::FrameSummary;
 use crate::style::{self, PROMPT_DRAFT_HIGHLIGHT_KEY, StyleClass};
@@ -201,7 +200,6 @@ impl AgentModel {
                     sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
                 },
                 multi_buffer,
-                #[cfg(feature = "native")]
                 None,
                 window,
                 cx,
@@ -238,7 +236,6 @@ impl AgentModel {
                     sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
                 },
                 multi_buffer,
-                #[cfg(feature = "native")]
                 None,
                 window,
                 cx,
@@ -246,7 +243,6 @@ impl AgentModel {
             crate::editor_config::configure(&mut editor, window, cx);
             editor.disable_bracket_colorization(cx);
             editor.disable_header_for_buffer(prompt_id, cx);
-            #[cfg(feature = "native")]
             editor.set_completion_provider(Some(WorkspaceCompletionProvider::new(
                 workspace, None, None, None,
             )));

@@ -103,7 +103,7 @@ than by running a supervisor, extension protocol, or daemon process graph.
   top of Claude Code's own harness prompt.
 - CLI and UI crates assemble concrete providers, tools, stores, and terminal
   rendering. They should not own inference protocol details. `rho-gui` uses
-  `rho-touch-keyboard` for the browser client's reusable in-canvas keyboard
+  `rho-touch-keyboard` for the phone's reusable in-canvas keyboard
   core (layout, key dispatch, repeat, and local calibration telemetry).
   Each attached daemon is a named GUI host. Host-scoped settings and new-agent
   creation route through that identity explicitly; choosing a project never
@@ -321,10 +321,8 @@ than by running a supervisor, extension protocol, or daemon process graph.
   protocol as untrusted: it assigns execution ids, retains accepted command
   text, validates response ordering and bounds, sanitizes output, and exposes
   only canonical structured state to clients.
-- `rho-rtc` owns only target-specific WebRTC media and audio devices: native
-  libwebrtc plus microphone/playback, and browser WebRTC plus `getUserMedia` and
-  HTML audio playback. They negotiate audio only and create no WebRTC data
-  channel. Audio capture remains disabled until the daemon confirms that the
+- `rho-rtc` owns native WebRTC media and microphone/playback audio devices.
+  It negotiates audio only and creates no WebRTC data channel. Audio capture remains disabled until the daemon confirms that the
   provider sideband is connected.
   `rho-openai-realtime` separately owns the typed OpenAI realtime wire protocol
   and authenticated sideband WebSocket. The daemon resolves OAuth, exchanges
@@ -570,14 +568,8 @@ ten-minute same-connection recovery window and raises the daemon's incoming
 bidirectional stream credit from its pre-authentication limit. Iroh already
 sends five-second transport heartbeats; after ten seconds without receiving an
 authenticated QUIC datagram, the native GUI presents a temporary bottom
-recovery strip until the same connection responds or finally closes. The
-browser client speaks the same native UI protocol over the same iroh ALPN, so
-both clients share one wire vocabulary and agent policy. It retains only its
-selected-agent subscription, accepts 16 concurrent daemon-initiated streams,
-and reserves decompressed frames against a 64 MiB aggregate allocation budget.
-The page is a static GPUI/wasm bundle (`crates/rho-gui-web`, its own Cargo
-workspace) which boots the portable `rho-gui` dashboard and connects as an iroh
-client from the browser.
+recovery strip until the same connection responds or finally closes. The web
+target was removed on 2026-09-03 because the phone runs the native app.
 
 Native GUI file and diff surfaces share one GUI-local remote-workspace registry
 per workspace, and therefore one Zed `language::Buffer` identity and dirty state

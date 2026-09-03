@@ -723,21 +723,13 @@ fn build_editor(
     cx: &mut App,
 ) -> Entity<editor::Editor> {
     cx.new(|cx| {
-        let mut editor = editor::Editor::new(
-            editor::EditorMode::full(),
-            multibuffer,
-            #[cfg(feature = "native")]
-            None,
-            window,
-            cx,
-        );
+        let mut editor =
+            editor::Editor::new(editor::EditorMode::full(), multibuffer, None, window, cx);
         crate::editor_config::configure_diff(&mut editor, window, cx);
-        #[cfg(feature = "native")]
         editor.set_diff_hunk_delegate(
             Some(Arc::new(editor::RestoreOnlyUnstagedDiffHunkDelegate)),
             cx,
         );
-        #[cfg(feature = "native")]
         {
             editor.disable_diagnostics(cx);
             editor.set_expand_all_diff_hunks(cx);

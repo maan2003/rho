@@ -337,7 +337,7 @@ AI APIs.
   response is queued, or a transient delivery failure, can lose that response;
   subscriptions are not an outbox and do not replay missed deliveries.
 
-## Remote UI transports (iroh and web UI)
+## Remote UI transport (iroh)
 
 - With `rho daemon --iroh`, the daemon serves the full UI protocol over iroh
   (relay-backed QUIC). An enrolled client is fully privileged: everything a
@@ -395,10 +395,8 @@ AI APIs.
   128 MiB while allowing small frames to bypass a waiting large allocation.
   The reservation remains attached to the decoded GUI event until consumption,
   so slow UI handling cannot refill an unbounded queue of large agent frames.
-  The web UI retains only one selected-agent subscription, advertises 16
-  unidirectional stream credits for replacement overlap, and applies a 64 MiB
-  aggregate decompressed-frame allocation budget. A malformed individual
-  agent stream is discarded without tearing down unrelated control traffic.
+  A malformed individual agent stream is discarded without tearing down
+  unrelated control traffic.
   Setting `QLOGDIR` opts the process into writing a qlog file for every iroh
   connection. Qlog records transport metadata such as endpoint addresses,
   connection IDs, packet timing and sizes, stream IDs and offsets, loss, and
@@ -425,38 +423,6 @@ AI APIs.
   `--remote-rho <path>` selects the remote executable (default `rho`) and
   accepts only a nonempty shell-safe path alphabet; it is not an arbitrary
   remote shell command.
-- The browser UI (a static GPUI/wasm page in `crates/rho-gui-web`, hostable anywhere) is
-  an iroh client like any other: it connects on the native UI ALPN and passes
-  the same per-key enrollment before the daemon serves it. Its session uses
-  the same framed native UI protocol and therefore has the same privileges as
-  the native GUI. The browser uses a user-verifying WebAuthn credential's
-  PRF extension to derive a stable, daemon-specific iroh key on each connect;
-  only the non-secret credential id and daemon id are kept in local storage.
-  The PRF output and derived iroh key remain in browser memory and are never
-  persisted. The hosting origin and all JavaScript it serves are fully trusted.
-  On static hosts that cannot set response headers (including GitHub Pages),
-  the page's same-origin COI service worker adds COOP and COEP after its first
-  activation and reloads the page so threaded wasm can use `SharedArrayBuffer`:
-  code running after the user approves the WebAuthn prompt can read the
-  derived enrolled key and thereby gain persistent daemon access. Deploy the
-  page on a dedicated origin without third-party scripts and treat its build
-  and publishing pipeline as security-critical. The page refuses to run when
-  framed and ships a restrictive meta CSP. GPUI background work runs in module
-  workers created from same-page blobs; `worker-src` permits those blobs, while
-  the locally carried `wasm_thread` bootstrap avoids JavaScript `eval` and
-  imports only the build's same-origin wasm-bindgen shim. Production hosting
-  must additionally send `Content-Security-Policy: frame-ancestors 'none'` as
-  an HTTP header.
-  Besides user-authored text, the page sends bounded agent creation choices
-  (topic, registered workdir, role, base revset, and workspace mode).
-  A compromised origin can register a persistent service worker as well as
-  steal an unlocked key, so recovery requires revoking the endpoint, clearing
-  the origin's browser site data, verifying the deployment, and enrolling a
-  new identity.
-  `rho iroh revoke <endpoint-id>` removes persistent and in-memory trust through
-  the local daemon socket; already-established connections are not forcibly
-  closed and must be disconnected (or the daemon restarted) during compromise
-  recovery. In-memory trust is always lost when the daemon exits.
 - Inbound data on the iroh ALPN is remote, semi-trusted input: oversized UI
   protocol frames are rejected (`MAX_FRAME_LEN`) and malformed frames end the
   connection.
@@ -629,9 +595,8 @@ metadata; it performs no inference and creates no agent or workspace.
 
 ## Realtime voice provider (`rho-rtc` / `rho-openai-realtime`)
 
-- Native and browser Iris start when the user toggles voice. The dashboard row
-  and both clients' controls expose that voice-session state. `rho-rtc`
-  captures and plays audio using target-specific native or browser facilities.
+- Iris starts when the user toggles voice. The dashboard row exposes that
+  voice-session state. `rho-rtc` captures and plays audio using native devices.
   Encoded media flows directly between the GUI-owned WebRTC peer and ChatGPT,
   never through the daemon. Audio capture stays disabled until sideband
   readiness. Rho creates no WebRTC data channel; all provider control traffic

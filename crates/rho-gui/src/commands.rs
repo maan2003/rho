@@ -1,19 +1,13 @@
 //! Prompt completions: `@` agent mentions and the draft's field buffers.
 
-#[cfg(feature = "native")]
 use std::rc::Rc;
 
-#[cfg(feature = "native")]
 use editor::{CompletionContext, CompletionProvider, Editor};
-#[cfg(feature = "native")]
 use gpui::{Context, Entity, Task, WeakEntity, Window};
-#[cfg(feature = "native")]
 use language::{Buffer, CodeLabel, ToOffset as _};
-#[cfg(feature = "native")]
 use project::{Completion, CompletionDisplayOptions, CompletionResponse, CompletionSource};
 
 pub use crate::minibuffer::{Candidate, token_start};
-#[cfg(feature = "native")]
 use crate::workspace::Workspace;
 
 /// Completion candidates for the text before the cursor: `@` mentions of
@@ -121,7 +115,6 @@ pub fn role_field_candidates(text_before_cursor: &str) -> Vec<Candidate> {
     Vec::new()
 }
 
-#[cfg(feature = "native")]
 pub struct WorkspaceCompletionProvider {
     workspace: WeakEntity<Workspace>,
     /// The draft view's workdir field buffer: completions in it come from
@@ -135,7 +128,6 @@ pub struct WorkspaceCompletionProvider {
     start_buffer: Option<gpui::EntityId>,
 }
 
-#[cfg(feature = "native")]
 impl WorkspaceCompletionProvider {
     pub fn new(
         workspace: WeakEntity<Workspace>,
@@ -152,7 +144,6 @@ impl WorkspaceCompletionProvider {
     }
 }
 
-#[cfg(feature = "native")]
 impl CompletionProvider for WorkspaceCompletionProvider {
     fn completions(
         &self,

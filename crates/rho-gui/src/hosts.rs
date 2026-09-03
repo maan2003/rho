@@ -12,11 +12,8 @@ use futures::channel::mpsc as futures_mpsc;
 use gpui::App;
 use rho_ui_proto::ClientMessage;
 
-#[cfg(not(feature = "native"))]
-use crate::connection::AttachTarget;
 use crate::connection::{Connection, HostEvent};
 use crate::registry::HostId;
-#[cfg(feature = "native")]
 use crate::workspace::AttachTarget;
 
 /// Where a host is in its connection lifecycle. Only `Online` accepts
@@ -106,15 +103,6 @@ impl Hosts {
             connection,
         });
         id
-    }
-
-    /// Continues a browser attachment from a user gesture, allowing WebAuthn
-    /// to display its verification prompt. Native attachments dial eagerly.
-    #[cfg(not(feature = "native"))]
-    pub fn authorize(&self, host: HostId) {
-        if let Some(connection) = self.connection(host) {
-            connection.authorize();
-        }
     }
 
     /// Drops a host and tears its connection down. Surfaces and transcripts

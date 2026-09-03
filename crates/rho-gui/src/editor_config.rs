@@ -14,7 +14,6 @@ pub fn configure(editor: &mut Editor, window: &mut Window, cx: &mut Context<Edit
     editor.set_show_code_actions(false, cx);
     editor.set_show_runnables(false, cx);
     editor.set_show_breakpoints(false, cx);
-    #[cfg(feature = "native")]
     editor.set_show_bookmarks(false, cx);
     editor.set_show_vertical_scrollbar(false, cx);
     editor.set_show_horizontal_scrollbar(false, cx);
@@ -24,7 +23,6 @@ pub fn configure(editor: &mut Editor, window: &mut Window, cx: &mut Context<Edit
     editor.set_show_wrap_guides(false, cx);
     editor.set_show_indent_guides(false, cx);
     editor.set_autoindent(false);
-    #[cfg(feature = "native")]
     editor.set_show_edit_predictions(Some(false), window, cx);
     editor.set_use_selection_highlight(false);
     editor.disable_expand_excerpt_buttons(cx);
@@ -54,14 +52,12 @@ pub fn configure_file(editor: &mut Editor, window: &mut Window, cx: &mut Context
     editor.set_show_code_actions(false, cx);
     editor.set_show_runnables(false, cx);
     editor.set_show_breakpoints(false, cx);
-    #[cfg(feature = "native")]
     editor.set_show_bookmarks(false, cx);
     editor.set_show_vertical_scrollbar(false, cx);
     editor.set_show_horizontal_scrollbar(false, cx);
     editor.set_offset_content(false, cx);
     editor.set_show_wrap_guides(false, cx);
     editor.set_show_indent_guides(false, cx);
-    #[cfg(feature = "native")]
     editor.set_show_edit_predictions(Some(false), window, cx);
     editor.disable_expand_excerpt_buttons(cx);
 }

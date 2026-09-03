@@ -308,8 +308,8 @@ pub fn configure_embedded_environment() {
 pub struct DaemonArgs {
     #[arg(long = "socket-path")]
     pub socket_path: Option<PathBuf>,
-    /// Also listen for UI clients (including the web UI) over iroh
-    /// (relay-backed). Remote clients must be enrolled once via
+    /// Also listen for remote UI clients over iroh (relay-backed).
+    /// Remote clients must be enrolled once via
     /// `rho iroh approve <code>` on this machine.
     #[arg(long = "iroh")]
     pub iroh: bool,
@@ -1797,8 +1797,8 @@ where
         .await
         {
             Ok(Refresh::Ready) => {
-                // Registry changes show on every client (GUI rails, the web
-                // UI, a waiting CLI), so the refreshed snapshot goes through
+                // Registry changes show on every client (GUI rails and a
+                // waiting CLI), so the refreshed snapshot goes through
                 // the daemon-wide event fanout, not just this connection.
                 let _ = agents.events.send(agents.ready_message().await);
             }

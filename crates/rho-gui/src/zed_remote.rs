@@ -747,14 +747,8 @@ impl FileView {
     ) -> Self {
         let editor = cx.new(|cx| {
             let multibuffer = cx.new(|cx| multi_buffer::MultiBuffer::singleton(buffer.clone(), cx));
-            let mut editor = editor::Editor::new(
-                editor::EditorMode::full(),
-                multibuffer,
-                #[cfg(feature = "native")]
-                None,
-                window,
-                cx,
-            );
+            let mut editor =
+                editor::Editor::new(editor::EditorMode::full(), multibuffer, None, window, cx);
             crate::editor_config::configure_file(&mut editor, window, cx);
             editor
         });
@@ -792,7 +786,6 @@ pub(crate) fn language_registry(cx: &mut App) -> Arc<language::LanguageRegistry>
             cx.background_executor().clone(),
         ));
         languages.set_theme(cx.theme().clone());
-        #[cfg(feature = "native")]
         {
             let fs: Arc<dyn fs::Fs> =
                 Arc::new(fs::RealFs::new(None, cx.background_executor().clone()));

@@ -1,6 +1,5 @@
 # The client-side agent registry and rail policy, shared by every Rho
-# client surface (native GUI, web UI) so ordering, folding, and naming
-# behave identically everywhere. Must stay compilable for wasm32.
+# native client surface so ordering, folding, and naming behave identically.
 [package]
 edition.workspace = true
 license = "GPL-3.0-or-later"
@@ -15,6 +14,3 @@ camino.workspace = true
 prefix-id = { workspace = true, default-features = false }
 rho-core.workspace = true
 rho-ui-proto.workspace = true
-
-[target.'cfg(target_family = "wasm")'.dependencies]
-web-time = "1"

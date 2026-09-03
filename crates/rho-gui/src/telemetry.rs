@@ -7,17 +7,14 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 const CPU_ROTATION_PERIOD: std::time::Duration = std::time::Duration::from_secs(2);
-#[cfg(feature = "native")]
 const CPU_TRACE_DISK_BUDGET: u64 = 2 * 1024 * 1024;
 const CPU_SNAPSHOT_SEGMENTS: usize = 5;
 
 const MAX_SNAPSHOT_FRAMES: usize = 8_192;
 const MAX_SNAPSHOT_EDITOR_EVENTS: usize = 4_096;
 static STARTED: OnceLock<Instant> = OnceLock::new();
-#[cfg(feature = "native")]
 static MONOTONIC_ORIGIN_NS: OnceLock<u64> = OnceLock::new();
 static SURFACES: OnceLock<Mutex<VecDeque<(Instant, SurfaceState)>>> = OnceLock::new();
-#[cfg(feature = "native")]
 static PASSIVE_CPU: OnceLock<Mutex<Option<PassiveCpuProfiler>>> = OnceLock::new();
 
 #[derive(Clone, Copy)]
@@ -208,19 +205,16 @@ struct BrowserFrameRecord {
 
 pub fn enable() {
     STARTED.get_or_init(Instant::now);
-    #[cfg(feature = "native")]
     MONOTONIC_ORIGIN_NS.get_or_init(rho_profiling::monotonic_ns);
     gpui::profiler::set_frame_trace_enabled(true);
     gpui::profiler::set_editor_trace_enabled(true);
 }
 
-#[cfg(feature = "native")]
 struct PassiveCpuProfiler {
     profiler: rho_profiling::CpuProfiler,
     _directory: tempfile::TempDir,
 }
 
-#[cfg(feature = "native")]
 pub fn enable_passive_cpu_profile() -> anyhow::Result<()> {
     let mut passive = PASSIVE_CPU
         .get_or_init(|| Mutex::new(None))
@@ -242,7 +236,6 @@ pub fn enable_passive_cpu_profile() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "native")]
 pub fn shutdown_passive_cpu_profile() {
     let passive = PASSIVE_CPU
         .get_or_init(|| Mutex::new(None))
@@ -269,7 +262,6 @@ pub(crate) fn record_surfaces(focused: SurfaceKind, visible: u16) {
 }
 
 pub(crate) fn snapshot() -> anyhow::Result<Vec<u8>> {
-    #[cfg(feature = "native")]
     let cpu_profiles = PASSIVE_CPU
         .get_or_init(|| Mutex::new(None))
         .lock()
@@ -278,8 +270,6 @@ pub(crate) fn snapshot() -> anyhow::Result<Vec<u8>> {
         .map(|passive| passive.profiler.snapshot_segments(CPU_SNAPSHOT_SEGMENTS))
         .transpose()?
         .unwrap_or_default();
-    #[cfg(not(feature = "native"))]
-    let cpu_profiles = Vec::new();
     snapshot_with_cpu_profiles(&cpu_profiles)
 }
 
@@ -440,16 +430,7 @@ fn snapshot_with_cpu_profiles(cpu_profiles: &[Vec<u8>]) -> anyhow::Result<Vec<u8
             target: env!("RHO_BUILD_TARGET"),
             debug_assertions: cfg!(debug_assertions),
         },
-        monotonic_origin_ns: {
-            #[cfg(feature = "native")]
-            {
-                MONOTONIC_ORIGIN_NS.get().copied()
-            }
-            #[cfg(not(feature = "native"))]
-            {
-                None
-            }
-        },
+        monotonic_origin_ns: { MONOTONIC_ORIGIN_NS.get().copied() },
         cpu_profile: (!cpu_profiles.is_empty()).then(|| {
             use base64::Engine as _;
             CpuProfileSnapshot {

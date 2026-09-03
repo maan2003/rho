@@ -24,7 +24,6 @@ use language::{Buffer, BufferEvent, Capability, InlayId, Point};
 use multi_buffer::{MultiBuffer, PathKey, ToOffset as _};
 use rho_core::ContentPart;
 
-#[cfg(feature = "native")]
 use crate::commands::WorkspaceCompletionProvider;
 use crate::style::{self, PROMPT_DRAFT_HIGHLIGHT_KEY, StyleClass};
 use crate::workspace::Workspace;
@@ -177,7 +176,6 @@ impl DraftModel {
                     sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
                 },
                 multi_buffer,
-                #[cfg(feature = "native")]
                 None,
                 window,
                 cx,
@@ -186,7 +184,6 @@ impl DraftModel {
             for buffer_id in buffer_ids {
                 editor.disable_header_for_buffer(buffer_id, cx);
             }
-            #[cfg(feature = "native")]
             editor.set_completion_provider(Some(WorkspaceCompletionProvider::new(
                 workspace,
                 Some(workdir_id),

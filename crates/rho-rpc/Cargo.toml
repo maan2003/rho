@@ -9,10 +9,8 @@ version.workspace = true
 
 [features]
 default = []
-browser-client = ["iroh/tls-ring"]
 native-client = ["iroh/qlog", "iroh/tls-aws-lc-rs", "dep:rustls"]
 server = [
-  "rho-iroh-auth/server",
   "iroh/qlog",
   "iroh/tls-aws-lc-rs",
   "dep:noq-proto",
@@ -26,20 +24,16 @@ anyhow.workspace = true
 async-compression.workspace = true
 iroh.workspace = true
 futures.workspace = true
-n0-future = "0.3"
 noq-proto = { workspace = true, optional = true }
 redb = { workspace = true, optional = true }
 rho-db = { workspace = true, optional = true }
-rho-iroh-auth = { workspace = true, default-features = false }
+rho-iroh-auth.workspace = true
 rustls = { workspace = true, optional = true }
 senax-encoder.workspace = true
 tokio = { version = "1", features = ["io-util", "rt", "sync", "time"] }
 
 [target.'cfg(unix)'.dependencies]
 tokio = { version = "1", features = ["net"] }
-
-[target.'cfg(target_family = "wasm")'.dependencies]
-wasm-bindgen-futures = "0.4"
 
 [dev-dependencies]
 tempfile.workspace = true

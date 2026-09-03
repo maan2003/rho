@@ -13,121 +13,77 @@ path = "src/lib.rs"
 [[bin]]
 name = "rho-gui"
 path = "src/main.rs"
-required-features = ["native"]
 
 [features]
-default = ["native"]
 # Exposes internal entry points for `benches/`.
 bench-support = []
-native = [
-  "dep:bytes",
-  "dep:clap",
-  "dep:command_palette",
-  "dep:dirs",
-  "dep:fs",
-  "dep:gpui_platform",
-  "dep:gpui_tokio",
-  "dep:iroh",
-  "dep:languages",
-  "dep:libc",
-  "dep:node_runtime",
-  "dep:octo-types",
-  "dep:project",
-  "dep:redb",
-  "dep:release_channel",
-  "dep:rho-browser",
-  "dep:rho-db",
-  "dep:rho-iroh-auth",
-  "dep:rho-profiling",
-  "dep:rho-rpc",
-  "dep:rho-slack",
-  "dep:rho-zulip",
-  "dep:rodio",
-  "dep:rustls",
-  "dep:search",
-  "dep:semver",
-  "dep:senax-encoder",
-  "dep:tempfile",
-  "dep:tokio",
-  "dep:tracing-subscriber",
-  "dep:util",
-  "editor/native",
-  "languages/load-grammars",
-  "rho-rpc/native-client",
-  "vim/zed-workspace",
-]
 
 [dependencies]
 anyhow.workspace = true
 assets = { path = "../../vendor/zed/crates/assets" }
 base64.workspace = true
 buffer_diff.workspace = true
-bytes = { workspace = true, optional = true }
+bytes = { workspace = true }
 camino.workspace = true
 chrono = { version = "0.4", default-features = false, features = [
   "clock",
   "std",
-  "wasmbind",
 ] }
-clap = { workspace = true, optional = true }
+clap = { workspace = true }
 clock = { path = "../../vendor/zed/crates/clock" }
 collections = { path = "../../vendor/zed/crates/collections" }
-command_palette = { path = "../../vendor/zed/crates/command_palette", optional = true }
-dirs = { workspace = true, optional = true }
-editor = { path = "../../vendor/zed/crates/editor", default-features = false }
-fs = { path = "../../vendor/zed/crates/fs", optional = true }
+command_palette = { path = "../../vendor/zed/crates/command_palette" }
+dirs = { workspace = true }
+editor = { path = "../../vendor/zed/crates/editor", default-features = false, features = ["native"] }
+fs = { path = "../../vendor/zed/crates/fs" }
 futures.workspace = true
-gpui = { path = "../../vendor/zed/crates/gpui", default-features = false }
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = ["wayland"] }
 gpui_platform = { path = "../../vendor/zed/crates/gpui_platform", default-features = false, features = [
   "font-kit",
   "wayland",
-], optional = true }
-gpui_tokio = { path = "../../vendor/zed/crates/gpui_tokio", optional = true }
-iroh = { workspace = true, optional = true }
+] }
+gpui_tokio = { path = "../../vendor/zed/crates/gpui_tokio" }
+iroh = { workspace = true }
 json-stream.workspace = true
 language = { path = "../../vendor/zed/crates/language" }
-languages = { path = "../../vendor/zed/crates/languages", optional = true }
-libc = { version = "0.2", optional = true }
+languages = { path = "../../vendor/zed/crates/languages", features = ["load-grammars"] }
+libc = { version = "0.2" }
 multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
-node_runtime = { path = "../../vendor/zed/crates/node_runtime", optional = true }
-octo-types = { workspace = true, optional = true }
+node_runtime = { path = "../../vendor/zed/crates/node_runtime" }
+octo-types = { workspace = true }
 path = { path = "../../vendor/zed/crates/path" }
-project = { path = "../../vendor/zed/crates/project", optional = true }
-redb = { workspace = true, optional = true }
-release_channel = { path = "../../vendor/zed/crates/release_channel", optional = true }
-rho-browser = { workspace = true, optional = true }
+project = { path = "../../vendor/zed/crates/project" }
+redb = { workspace = true }
+release_channel = { path = "../../vendor/zed/crates/release_channel" }
+rho-browser = { workspace = true }
 rho-core.workspace = true
-rho-db = { workspace = true, optional = true }
+rho-db = { workspace = true }
 rho-desk.workspace = true
-rho-iroh-auth = { workspace = true, optional = true }
-rho-profiling = { workspace = true, optional = true }
+rho-iroh-auth = { workspace = true }
+rho-profiling = { workspace = true }
 rho-registry.workspace = true
-rho-rpc = { workspace = true, optional = true }
+rho-rpc = { workspace = true, features = ["native-client"] }
 rho-rtc.workspace = true
 rho-ui-proto.workspace = true
-# The Slack client is native-only: it holds the desktop session's own
-# token and cookie, which the browser build cannot.
-rho-slack = { workspace = true, features = ["ui"], optional = true }
-# The Zulip client is native-only: no Zulip server sends CORS headers, so
-# the browser build could not reach one.
+rho-slack = { workspace = true, features = ["ui"] }
 image = { version = "0.25", default-features = false }
 org-element = { version = "0.1.0", default-features = false }
-rho-zulip = { workspace = true, features = ["ui"], optional = true }
+rho-zulip = { workspace = true, features = ["ui"] }
 rodio = { git = "https://github.com/RustAudio/rodio", rev = "e50e726ddd0292f6ef9de0dda6b90af4ed1fb66a", default-features = false, features = [
   "playback",
   "wav",
-], optional = true }
+] }
 rust-embed = { version = "8.11", features = ["include-exclude"] }
 rustc-hash = "2.1.0"
-rustls = { workspace = true, optional = true }
-search = { path = "../../vendor/zed/crates/search", optional = true }
-semver = { version = "1.0", features = ["serde"], optional = true }
-senax-encoder = { workspace = true, optional = true }
+rustls = { workspace = true }
+search = { path = "../../vendor/zed/crates/search" }
+semver = { version = "1.0", features = ["serde"] }
+senax-encoder = { workspace = true }
 serde.workspace = true
 serde_json.workspace = true
 settings = { path = "../../vendor/zed/crates/settings" }
 smallvec = "1"
-tempfile = { workspace = true, optional = true }
+tempfile = { workspace = true }
 text = { path = "../../vendor/zed/crates/text" }
 theme = { path = "../../vendor/zed/crates/theme" }
 theme_settings = { path = "../../vendor/zed/crates/theme_settings" }
@@ -137,24 +93,20 @@ tokio = { workspace = true, features = [
   "process",
   "rt",
   "signal",
-], optional = true }
+] }
 tracing.workspace = true
 tracing-subscriber = { version = "0.3", features = [
   "env-filter",
   "fmt",
-], optional = true }
+] }
 tree-sitter = "0.26"
 tree-sitter-md = { git = "https://github.com/tree-sitter-grammars/tree-sitter-markdown", rev = "9a23c1a96c0513d8fc6520972beedd419a973539" }
 ui = { path = "../../vendor/zed/crates/ui" }
 uuid.workspace = true
-util = { path = "../../vendor/zed/crates/util", optional = true }
-vim = { path = "../../vendor/zed/crates/vim", default-features = false }
+util = { path = "../../vendor/zed/crates/util" }
+vim = { path = "../../vendor/zed/crates/vim", default-features = false, features = ["zed-workspace"] }
 vim_mode_setting = { path = "../../vendor/zed/crates/vim_mode_setting" }
 
-[target.'cfg(not(target_family = "wasm"))'.dependencies]
-gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = [
-  "wayland",
-] }
 # unprefixed_malloc routes C-library allocations (freetype, fontconfig,
 # drivers) through jemalloc too; profiling stays inert until MALLOC_CONF
 # turns it on.
@@ -162,6 +114,7 @@ tikv-jemallocator = { version = "0.6", features = [
   "profiling",
   "unprefixed_malloc_on_supported_platforms",
 ] }
+
 
 [dev-dependencies]
 backtrace = "0.3"
@@ -172,30 +125,3 @@ editor = { path = "../../vendor/zed/crates/editor", features = [
 gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = [
   "test-support",
 ] }
-
-[target.'cfg(target_family = "wasm")'.dependencies]
-# Enables the browser entropy backend for the Zed language-model dependency
-# graph.
-console_error_panic_hook = "0.1"
-getrandom_02 = { package = "getrandom", version = "0.2", features = ["js"] }
-hkdf = "0.12"
-iroh = { workspace = true, features = ["tls-ring"] }
-js-sys = "0.3"
-n0-future = "0.3"
-rho-iroh-auth.workspace = true
-rho-rpc = { workspace = true, features = ["browser-client"] }
-rho-touch-keyboard = { path = "../rho-touch-keyboard" }
-sha2 = "0.10"
-tokio = { version = "1", default-features = false, features = ["sync"] }
-wasm-bindgen = "0.2"
-wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = [
-  "Crypto",
-  "Location",
-  "MediaQueryList",
-  "Navigator",
-  "Storage",
-  "Window",
-  "console",
-] }
-zeroize = "1"

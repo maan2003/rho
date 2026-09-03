@@ -141,7 +141,6 @@ impl ShellModel {
                     sizing_behavior: SizingBehavior::ExcludeOverscrollMargin,
                 },
                 multi_buffer,
-                #[cfg(feature = "native")]
                 None,
                 window,
                 cx,

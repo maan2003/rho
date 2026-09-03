@@ -44,10 +44,7 @@ members = [
   "crates/senax-encoder",
   "crates/senax-encoder/derive",
 ]
-# The GPUI browser client is its own workspace: it targets wasm32 and is built
-# with Trunk.
 exclude = [
-  "crates/rho-gui-web",
   "vendor/brush",
   "vendor/jj",
   "vendor/noq",
@@ -122,7 +119,7 @@ rho-db = { path = "crates/rho-db" }
 rho-desk = { path = "crates/rho-desk" }
 rho-image = { path = "crates/rho-image" }
 rho-inference = { path = "crates/rho-inference" }
-rho-iroh-auth = { path = "crates/rho-iroh-auth", default-features = false }
+rho-iroh-auth = { path = "crates/rho-iroh-auth" }
 rho-openai-realtime = { path = "crates/rho-openai-realtime" }
 rho-pr-monitor = { path = "crates/rho-pr-monitor" }
 rho-profiling = { path = "crates/rho-profiling" }
@@ -206,8 +203,4 @@ inherits = "release"
 iroh = { path = "vendor/iroh/iroh" }
 noq = { path = "vendor/noq/noq" }
 noq-proto = { path = "vendor/noq/noq-proto" }
-# On wasm32-unknown-unknown this crate supplies libc (malloc et al.) for the
-# tree-sitter runtime and grammars. Upstream's wasm malloc is a bump allocator
-# for isolated scanner instances that corrupts linear memory when linked into a
-# binary sharing its heap with Rust; our fork forwards to Rust's allocator.
 tree-sitter-language = { path = "vendor/tree-sitter-language" }

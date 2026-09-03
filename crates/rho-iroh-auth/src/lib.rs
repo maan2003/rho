@@ -4,11 +4,9 @@
 //! do. It only provides the auth-only first-stream exchange, enrollment and
 //! code parsing, and client helpers.
 
-#[cfg(feature = "server")]
 mod server;
 mod shared;
 
-#[cfg(feature = "server")]
 pub use server::{ApproveError, IrohAuth, PreapprovedEndpoint, ServerAuthDecision};
 pub use shared::{EnrollmentCode, ParseEnrollmentCodeError};
 
@@ -58,7 +56,6 @@ pub async fn authenticate_client(
 
 /// Serve the mandatory first-stream auth exchange. Application streams must
 /// not be accepted unless this returns `Approved`.
-#[cfg(feature = "server")]
 pub async fn authenticate_server_connection(
     auth: &IrohAuth,
     connection: &iroh::endpoint::Connection,

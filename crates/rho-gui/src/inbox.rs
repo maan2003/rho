@@ -9,27 +9,21 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::Context as _;
-#[cfg(feature = "native")]
 use redb::TableDefinition;
-#[cfg(feature = "native")]
 use rho_db::{RhoDb, Sen, SenValue};
-#[cfg(feature = "native")]
 use senax_encoder::{Decode, Encode};
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "native")]
 const ITEMS: TableDefinition<Sen<String>, Sen<InboxItem>> =
     TableDefinition::new("rho_gui_inbox_items_v2");
 
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "native", derive(Encode, Decode))]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
 #[serde(transparent)]
 pub struct InboxId(pub String);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "native", derive(Encode, Decode))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 #[serde(rename_all = "snake_case")]
 pub enum InboxKind {
     Ping,
@@ -40,8 +34,7 @@ pub enum InboxKind {
     Slack,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "native", derive(Encode, Decode))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SourceReference {
     Page {
@@ -67,8 +60,7 @@ pub enum SourceReference {
     None,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "native", derive(Encode, Decode))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, Encode, Decode)]
 pub struct NodeIdentity {
     pub replica_id: u16,
     pub counter: u64,
@@ -83,8 +75,7 @@ impl From<rho_desk::NodeId> for NodeIdentity {
     }
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "native", derive(Encode, Decode))]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 pub struct CapturedContext {
     pub host: Option<String>,
     pub room: Option<String>,
@@ -101,8 +92,7 @@ pub struct InboxDraft {
     pub waiting_on: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "native", derive(Encode, Decode))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Encode, Decode)]
 pub struct InboxItem {
     pub id: InboxId,
     pub kind: InboxKind,
@@ -111,13 +101,13 @@ pub struct InboxItem {
     pub context: CapturedContext,
     pub captured_at_ms: i64,
     #[serde(default)]
-    #[cfg_attr(feature = "native", senax(default))]
+    #[senax(default)]
     pub deferred_until_ms: Option<i64>,
     #[serde(default)]
-    #[cfg_attr(feature = "native", senax(default))]
+    #[senax(default)]
     pub resurfacing_count: u32,
     #[serde(default)]
-    #[cfg_attr(feature = "native", senax(default))]
+    #[senax(default)]
     pub waiting_on: Option<String>,
 }
 
@@ -130,7 +120,6 @@ pub enum Verdict {
 
 /// Small read/verdict API shared by the GUI and dealer.
 pub struct InboxStore {
-    #[cfg(feature = "native")]
     db: Option<RhoDb>,
     items: Vec<InboxItem>,
 }
@@ -145,18 +134,11 @@ impl InboxStore {
             .captured_at_ms = captured_at_ms;
     }
 
-    #[cfg(feature = "native")]
     pub fn open_default() -> anyhow::Result<Self> {
         let base = dirs::state_dir().context("state directory not available")?;
         Self::open(base.join("rho/inbox.redb"))
     }
 
-    #[cfg(not(feature = "native"))]
-    pub fn open_default() -> anyhow::Result<Self> {
-        Ok(Self { items: Vec::new() })
-    }
-
-    #[cfg(feature = "native")]
     pub fn open(path: impl Into<PathBuf>) -> anyhow::Result<Self> {
         let db = RhoDb::open(path.into());
         futures::executor::block_on(async {
@@ -179,14 +161,8 @@ impl InboxStore {
         })
     }
 
-    #[cfg(not(feature = "native"))]
-    pub fn open(_path: impl Into<PathBuf>) -> anyhow::Result<Self> {
-        Ok(Self::memory())
-    }
-
     pub fn memory() -> Self {
         Self {
-            #[cfg(feature = "native")]
             db: None,
             items: Vec::new(),
         }
@@ -337,17 +313,10 @@ impl InboxStore {
     }
 
     fn save(&self) -> anyhow::Result<()> {
-        #[cfg(not(feature = "native"))]
         {
-            return Ok(());
-        }
-        #[cfg(feature = "native")]
-        {
-            #[cfg(feature = "native")]
             let Some(db) = &self.db else {
                 return Ok(());
             };
-            #[cfg(feature = "native")]
             futures::executor::block_on(async {
                 let mut write = db.write().await;
                 let mut table = write.open_table(ITEMS);
