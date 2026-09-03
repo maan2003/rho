@@ -840,7 +840,7 @@ fn a_todo_verdict_logs_every_cell_that_makes_the_new_note_a_cadence(cx: &mut Tes
     cx.dispatch_action(*workspace, crate::DashboardDealTodo);
     cx.run_until_parked();
 
-    workspace
+    let (created, stamp) = workspace
         .update(cx, |workspace, _, _| {
             let mutation = take_desk_mutation(workspace, HostId::default()).expect("todo mutation");
             let Some((
@@ -897,6 +897,26 @@ fn a_todo_verdict_logs_every_cell_that_makes_the_new_note_a_cadence(cx: &mut Tes
             assert!(mutation.writes.iter().any(|write| write.node == created
                 && write.field == Field::Parent
                 && write.value == Value::Parent(Some(note))));
+            (created, mutation.stamp)
+        })
+        .unwrap();
+
+    // A note with no words of its own comes back in a week saying only
+    // `defer …`; it carries the words of the card it was written on.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskMutationAccepted { stamp },
+                window,
+                cx,
+            );
+            let buffer = workspace
+                .desk_cells
+                .buffer(HostId::default(), created)
+                .expect("the todo note has a buffer")
+                .clone();
+            assert_eq!(buffer.read(cx).text(), "Named card");
         })
         .unwrap();
 }

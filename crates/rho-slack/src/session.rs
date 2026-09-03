@@ -1268,7 +1268,9 @@ impl Session {
         let Some(client) = self.client.clone() else {
             return;
         };
-        self.model.unfollow(&key.channel, &key.thread_ts);
+        // The thread itself is kept: `shift-u` follows it again, and a card
+        // whose words rho had thrown away could not come back.
+        self.model.ignore(key);
         cx.notify();
         let (channel, thread_ts) = (key.channel.clone(), key.thread_ts.clone());
         let task = gpui_tokio::Tokio::spawn(cx, async move {
@@ -1285,6 +1287,36 @@ impl Session {
                     tracing::warn!(error = %reason, "slack ignore-thread failed");
                     cx.emit(SessionEvent::Notice(
                         "slack: the thread is still followed in Slack".to_owned(),
+                    ));
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Undoing a discard: the thread is the user's again, in Slack, because
+    /// that is where the discard was made. The card comes back with it.
+    pub fn follow_thread(&mut self, key: &ThreadKey, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        self.model.follow(&key.channel, &key.thread_ts);
+        cx.notify();
+        let (channel, thread_ts) = (key.channel.clone(), key.thread_ts.clone());
+        let task = gpui_tokio::Tokio::spawn(cx, async move {
+            client.follow_thread(&channel, &thread_ts).await
+        });
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let failed = match task.await {
+                Ok(Err(error)) => Some(format!("{error:#}")),
+                Err(error) => Some(format!("{error}")),
+                Ok(Ok(())) => None,
+            };
+            let _ = this.update(cx, |_, cx| {
+                if let Some(reason) = failed {
+                    tracing::warn!(error = %reason, "slack follow-thread failed");
+                    cx.emit(SessionEvent::Notice(
+                        "slack: the thread is still ignored in Slack".to_owned(),
                     ));
                 }
                 cx.notify();

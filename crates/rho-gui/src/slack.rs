@@ -430,16 +430,23 @@ impl Workspace {
         let Some(session) = self.slack.clone() else {
             return;
         };
-        let key = ThreadKey {
-            workspace: rho_slack::config::WorkspaceName(thread.workspace.clone()),
-            channel: ChannelId(thread.channel.clone()),
-            thread_ts: Ts(thread.thread_ts.clone()),
-        };
+        let key = thread_key(thread);
         crate::journal::record(crate::journal::Event::SlackThreadIgnored {
             thread: journal_thread_labelled(session.read(cx).model(), &key),
             by: crate::journal::IgnoredBy::Rho,
         });
         session.update(cx, |session, cx| session.ignore_thread(&key, cx));
+    }
+
+    /// `shift-u` after `x`: the discard was an unfollow in Slack, so the
+    /// undo is a follow there. Nothing else brings the card back, since the
+    /// follow list is what says the thread is the user's.
+    pub(crate) fn slack_follow_thread(&mut self, thread: &ThreadRef, cx: &mut gpui::Context<Self>) {
+        let Some(session) = self.slack.clone() else {
+            return;
+        };
+        let key = thread_key(thread);
+        session.update(cx, |session, cx| session.follow_thread(&key, cx));
     }
 
     /// The other direction: Slack says the thread was unfollowed, here or
@@ -842,6 +849,14 @@ fn parse_mark_cutoff(
     }
     let milliseconds = crate::workspace::parse_duration_ms(text)?;
     now.checked_sub_signed(chrono::TimeDelta::try_milliseconds(milliseconds as i64)?)
+}
+
+fn thread_key(thread: &ThreadRef) -> ThreadKey {
+    ThreadKey {
+        workspace: rho_slack::config::WorkspaceName(thread.workspace.clone()),
+        channel: ChannelId(thread.channel.clone()),
+        thread_ts: Ts(thread.thread_ts.clone()),
+    }
 }
 
 pub(crate) fn thread_ref(key: &ThreadKey) -> ThreadRef {

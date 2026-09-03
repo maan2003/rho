@@ -1231,7 +1231,7 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
     let (said, chrome) = model.render_parts(message);
     let said = said.trim_end().replace('\n', &format!("\n{indent}"));
     let links = crate::block::links(&message.blocks, &message.text, &message.attachments);
-    push_body(&mut spans, &said, model, &links);
+    push_body(&mut spans, &said, model, &links, &message.files);
     if message.edited {
         // The reader is told what they are looking at is not what was sent.
         spans.push(Span::styled(" (edited)", Class::Muted));
@@ -1260,7 +1260,7 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
             .map(|line| format!("{indent}{line}"))
             .collect::<Vec<_>>()
             .join("\n");
-        push_body(&mut spans, &text, model, &links);
+        push_body(&mut spans, &text, model, &links, &message.files);
         spans.push(Span::plain("\n"));
         lines.extend(text.split('\n').map(&meta));
     }
@@ -1441,7 +1441,13 @@ fn link_on(line: &str, links: &[crate::block::Link]) -> Option<String> {
         .map(|link| link.url.clone())
 }
 
-fn push_body(spans: &mut Vec<Span>, body: &str, model: &Model, links: &[crate::block::Link]) {
+fn push_body(
+    spans: &mut Vec<Span>,
+    body: &str,
+    model: &Model,
+    links: &[crate::block::Link],
+    files: &[FileSummary],
+) {
     let mut marked: Vec<(Range<usize>, Class)> = Vec::new();
     // Link labels, in the order they were rendered, so the same word used
     // twice colours the occurrence it belongs to.
@@ -1454,14 +1460,17 @@ fn push_body(spans: &mut Vec<Span>, body: &str, model: &Model, links: &[crate::b
         from = start + link.label.len();
         marked.push((start..from, Class::Link));
     }
-    // Lines the renderer added rather than the author: an attachment's card
-    // and a collapsed link preview. They read as chrome, not as speech.
+    // Lines the renderer added rather than the author: an attachment's card,
+    // preview or app card alike. They read as chrome, not as speech.
     let mut offset = 0;
     let mut in_unfurl = false;
     for line in body.split('\n') {
         let trimmed = line.trim_start();
         let start = offset + (line.len() - trimmed.len());
-        if trimmed.starts_with("— ") {
+        // A file's name and size are a caption, not something anyone said:
+        // muted like a timestamp, so the picture under it is what the eye
+        // lands on.
+        if files.iter().any(|file| trimmed == file.line()) {
             marked.push((start..offset + line.len(), Class::Muted));
         }
         if trimmed.starts_with(crate::block::UNFURL_BAR.trim_end()) {
@@ -2156,11 +2165,16 @@ mod tests {
             "a bot is named like anyone: {text}"
         );
         assert!(text.contains("branch: main"), "{text}");
-        let muted = classed(&text, &styles, Class::Muted)
-            .iter()
-            .map(|span| span.trim().to_owned())
-            .collect::<Vec<_>>();
-        assert!(muted.iter().any(|span| span == "— pipeline"), "{muted:?}");
+        // An app card is the same quote box as a preview: no stray dash in
+        // the middle of the conversation.
+        assert!(
+            text.lines().any(|line| {
+                line.trim_start() == format!("{}pipeline", crate::block::UNFURL_BAR)
+            }),
+            "{text}"
+        );
+        assert!(!text.contains("— pipeline"), "{text}");
+        let _ = &styles;
         assert_eq!(lines.len(), text.matches('\n').count());
     }
 
@@ -2252,6 +2266,30 @@ mod tests {
         assert!(
             text.lines().any(|line| line.trim() == "image.png · 220 KB"),
             "the file line carries no time of its own: {text}"
+        );
+    }
+
+    #[test]
+    fn a_file_line_is_a_muted_caption() {
+        let with_file = parsed(json!({
+            "ts": "1700000000.0",
+            "user": "U1",
+            "text": "here is the mock",
+            "files": [{
+                "id": "F1",
+                "name": "image.png",
+                "title": "image.png",
+                "filetype": "png",
+                "size": 225_280,
+                "url_private": "https://files.example.com/image.png",
+            }],
+        }));
+        let (text, styles, _) = render_messages(&[with_file], &model(), false);
+        assert!(
+            classed(&text, &styles, Class::Muted)
+                .iter()
+                .any(|span| span.trim() == "image.png · 220 KB"),
+            "the name and size read as chrome, not as words someone said: {text}"
         );
     }
 

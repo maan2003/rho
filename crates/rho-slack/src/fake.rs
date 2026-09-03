@@ -860,6 +860,13 @@ fn handle(
         // Slack's own client sends this when a reader leaves a thread; it is
         // the only way to quiet a thread's unread badge without posting.
         "subscriptions.thread.mark" => json!({"ok": true}),
+        "subscriptions.thread.add" => {
+            let entry = (field("channel"), field("thread_ts"));
+            if !state.followed.contains(&entry) {
+                state.followed.push(entry);
+            }
+            json!({"ok": true})
+        }
         // Ignore thread. The follow list is Slack's, so the removal shows up
         // in `getView` afterwards exactly as it would live.
         "subscriptions.thread.remove" => {

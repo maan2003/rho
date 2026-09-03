@@ -7370,6 +7370,14 @@ impl Workspace {
         let VerdictUndoState::DeskVerdict { card, verdict, .. } = state else {
             return;
         };
+        // A discarded thread was ignored in Slack, so taking the verdict
+        // back means following it again there; the card is dealt as before
+        // once it is the user's again.
+        if matches!(verdict, crate::dashboard::DealerVerdict::Dismiss)
+            && let Some(thread) = self.dashboard.card_thread(card.identity)
+        {
+            self.slack_follow_thread(&thread, cx);
+        }
         self.dashboard.clear_skip(&card.identity);
         crate::journal::record(crate::journal::Event::VerdictUndone {
             card: Self::journal_card_identity(&card.identity),
@@ -7587,10 +7595,23 @@ impl Workspace {
             return false;
         };
         let echo = format!("{verb}: {}", card.breadcrumb);
+        // A todo hangs a note under the card. Empty, it comes back in a week
+        // reading only `defer …`, so it is given the card's own words.
+        let todo_note = match &applied.1 {
+            rho_desk::cells::VerdictEvent::Applied {
+                verdict: rho_desk::cells::Verdict::Todo { note },
+                ..
+            } => Some(*note),
+            _ => None,
+        };
         let Some(stamp) = self.apply_desk_writes(card.host, writes, Some(applied), window, cx)
         else {
             return false;
         };
+        if let Some(note) = todo_note {
+            self.pending_desk_texts
+                .insert((card.host, stamp), vec![(note, card.breadcrumb.clone())]);
+        }
         let undo = self.next_verdict_undo(
             verb,
             VerdictUndoState::DeskVerdict {

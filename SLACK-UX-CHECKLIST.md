@@ -200,7 +200,26 @@ done right after the transcript primitive (2.4) and before 2.10:
       sits as a full-height text line above the thumbnail; it becomes the
       muted small caption style used for chrome, and the thumbnail keeps
       its 12-line cap. Screenshot the same DM shape on the fake before and
-      after.
+      after. Two more edges seen by eng-en1p on 3 Sep, in the same change:
+      (d) a todo note hangs under the dealt card but its `*` marker sat at
+      the left edge, shallower than the `◦` of its own parent, so it read as
+      the next root; (e) the note carried no words of its own, only
+      `defer … · 7d`, and should carry the dealt card's words.
+      Landed 3 Sep, except (b). (a): every attachment is the quote box now,
+      preview and app card alike, bar and tint down the left; the dash form
+      is gone and with it the styling that muted it. (c): the file line
+      (`image.png · 220 KB`) is muted chrome, the thumbnail keeps its
+      12-line cap. (d): a note under a card is indented four columns per
+      card it hangs under, so its stars start past the card's marker. (e):
+      the todo writes the card's own words into the new note, through the
+      same `pending_desk_texts` path a pasted note uses. Rig on the fake:
+      screens/64-dm.png is the reference DM (box, tinted card, muted file
+      caption), screens/69-desk.png the todo note under its card.
+      (b) is not done and needs the vendored editor: a soft wrap continues
+      at the wrapped line's own leading whitespace, which is zero for
+      `name: body`, so there is no client-side lever to make it two columns.
+      It wants a minimum soft-wrap indent per editor; b8os does not touch
+      the vendored editor.
 - [ ] 1.23 Images load without flicker. Seen by the user on 3 Sep: an
       image arriving in a conversation jumps. Two causes to remove: the
       box changes size when the bytes land, and the message item is
@@ -416,16 +435,19 @@ done right after the transcript primitive (2.4) and before 2.10:
       answers; a failure is a notice saying the thread is still followed
       there. The other way, `thread_unsubscribed` closes the card, and so
       does a thread the follow list stops naming on the next connect, which
-      is the unfollow that happened while rho was off. Unfollowing drops
-      the thread from the model entirely, so following it again in Slack
-      raises nothing until somebody writes in it. Rig: `x` on #design sent
-      exactly one remove and dealt the next card; a `/control` unsubscribe
-      for #random closed that card with no keystroke
+      is the unfollow that happened while rho was off. An unfollow from
+      Slack's side drops the thread from the model entirely, so following
+      it again there raises nothing until somebody writes in it. Rig: `x`
+      on #design sent exactly one remove and dealt the next card; a
+      `/control` unsubscribe for #random closed that card with no keystroke
       (screens/{discard,unsub,after-unsub-home}.png).
-      Worth a decision: `shift-u` after `x` reopens the node, but the card
-      does not come back, because rho no longer follows the thread and a
-      card with nothing in the mirror is not dealt. Undo does not re-follow
-      in Slack, per the rule that external effects are not reversed.
+      Undo re-follows: `shift-u` after `x` sends one
+      `subscriptions.thread.add` and the card is dealt again as it was,
+      since the discard is the unfollow and a half-visible undo is worse
+      than none. rho's own `x` therefore keeps the thread's words while
+      dropping the follow, so there is something to bring back; a failure
+      is a notice saying the thread is still ignored in Slack. The incoming
+      direction keeps no undo entry.
 - [x] 2.16 A thread reply the user never saw. Landed 3 Sep. Original: Reported by the user on 3
       Sep: a reply in a thread they had posted in raised nothing, no chime,
       no lamp, not in a manual deal. Two causes in `model.rs`, either one

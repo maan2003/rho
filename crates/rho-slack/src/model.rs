@@ -384,6 +384,13 @@ impl Model {
     /// A thread unfollowed anywhere stops being the user's business. The
     /// card it raised is left to the verdict that closes it; what goes is
     /// the standing claim that its next reply is theirs.
+    /// rho's own ignore: the follow goes, the thread stays. Undoing the
+    /// discard follows it again and the card comes back exactly as it was,
+    /// which an unfollow from Slack's side cannot promise.
+    pub fn ignore(&mut self, key: &ThreadKey) {
+        self.followed.remove(key);
+    }
+
     /// Returns whether rho is tracking the thread, which is the difference
     /// between an unfollow that discards a card and one that changes
     /// nothing the user can see.

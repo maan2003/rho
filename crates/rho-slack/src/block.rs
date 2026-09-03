@@ -255,6 +255,10 @@ const UNFURL_LINES: usize = 2;
 
 /// An attachment: a link preview, or an app's own card.
 ///
+/// Either way it is a quote box hanging off the message. Loose lines behind
+/// a dash read as a stray dash in the middle of speech; the bar down the
+/// left and the tint make the card one thing the reader can skip past.
+///
 /// A preview collapses to its title. Slack paints the whole page under the
 /// message, which buries the conversation the reader came for; the title is
 /// the part they act on and the link is already in the message above it.
@@ -270,48 +274,49 @@ fn render_attachment(attachment: &Attachment, names: &dyn Names) -> Vec<String> 
     if headline.trim().is_empty() {
         return Vec::new();
     }
-    if attachment.is_unfurl {
-        // A quote box, not loose lines: the reader sees one card hanging off
-        // the message. The title names the page, the site says where it is,
-        // and two lines of description are as much of someone else's web
-        // page as a conversation should carry.
-        let title = render_mrkdwn(&headline, names);
-        let head = match attachment.service.as_deref() {
-            Some(site) if !site.is_empty() => format!("{title} · {site}"),
-            _ => title.clone(),
-        };
-        let mut lines = vec![format!("{UNFURL_BAR}{head}")];
-        if let Some(text) = attachment.text.as_deref().filter(|text| *text != headline) {
-            lines.extend(
-                render_mrkdwn(text, names)
-                    .lines()
-                    .filter(|line| !line.trim().is_empty())
-                    .take(UNFURL_LINES)
-                    .map(|line| format!("{UNFURL_BAR}{line}")),
-            );
-        }
-        return lines;
-    }
+    // The title names the page and the site says where it is.
+    let title = render_mrkdwn(&headline, names);
     let mut lines = Vec::new();
-    if let Some(pretext) = &attachment.pretext {
-        lines.push(format!("— {}", render_mrkdwn(pretext, names)));
+    if let Some(pretext) = attachment
+        .pretext
+        .as_deref()
+        .filter(|_| !attachment.is_unfurl)
+    {
+        lines.push(render_mrkdwn(pretext, names));
     }
-    lines.push(format!("— {}", render_mrkdwn(&headline, names)));
-    if let Some(text) = &attachment.text {
-        if Some(text) != attachment.title.as_ref() {
-            lines.push(format!("  {}", render_mrkdwn(text, names)));
+    lines.push(match attachment.service.as_deref() {
+        Some(site) if !site.is_empty() => format!("{title} · {site}"),
+        _ => title,
+    });
+    if let Some(text) = attachment.text.as_deref().filter(|text| *text != headline) {
+        let body = render_mrkdwn(text, names);
+        let body = body
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        // Two lines of description are as much of someone else's web page as
+        // a conversation should carry; an app card's body is its own words,
+        // written for this message, so it is kept whole.
+        match attachment.is_unfurl {
+            true => lines.extend(body.into_iter().take(UNFURL_LINES)),
+            false => lines.extend(body),
         }
     }
     if !attachment.fields.is_empty() {
-        let fields = attachment
-            .fields
-            .iter()
-            .map(|(title, value)| format!("{title}: {}", render_mrkdwn(value, names)))
-            .collect::<Vec<_>>()
-            .join(" · ");
-        lines.push(format!("  {fields}"));
+        lines.push(
+            attachment
+                .fields
+                .iter()
+                .map(|(title, value)| format!("{title}: {}", render_mrkdwn(value, names)))
+                .collect::<Vec<_>>()
+                .join(" · "),
+        );
     }
     lines
+        .into_iter()
+        .map(|line| format!("{UNFURL_BAR}{line}"))
+        .collect()
 }
 
 fn push_line(target: &mut String, line: &str) {
@@ -853,7 +858,7 @@ mod tests {
         };
         assert_eq!(
             render_message(&[], "deploy finished", &[card], &[], &Roster),
-            "deploy finished\n— pipeline\n— build #412\n  all checks passed\n  branch: main · duration: 4m12s"
+            "deploy finished\n\u{258e} pipeline\n\u{258e} build #412\n\u{258e} all checks passed\n\u{258e} branch: main · duration: 4m12s"
         );
 
         let preview = Attachment {
@@ -899,7 +904,7 @@ mod tests {
         );
         assert_eq!(
             rendered,
-            "ping @grace\n— Build #12 failed\ntrace.txt · text · 2 KB"
+            "ping @grace\n\u{258e} Build #12 failed\ntrace.txt · text · 2 KB"
         );
     }
 }

@@ -548,6 +548,20 @@ impl Client {
         Ok(())
     }
 
+    /// Follows a thread again, which is how undoing a discard puts it back:
+    /// Slack's list is the truth, so the undo has to be made there too.
+    pub async fn follow_thread(&self, channel: &ChannelId, thread_ts: &Ts) -> anyhow::Result<()> {
+        self.post_form(
+            "subscriptions.thread.add",
+            &[
+                ("channel", channel.0.clone()),
+                ("thread_ts", thread_ts.0.clone()),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
     /// Marks a thread read up to `ts`. A thread is unread on its own count,
     /// so marking the conversation does not quiet it; this is the call
     /// Slack's own client makes when the reader leaves the thread.

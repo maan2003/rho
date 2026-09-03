@@ -877,3 +877,71 @@ async fn ignoring_a_thread_travels_both_ways() {
     }
     assert_eq!(model.obligations(0).len(), 1, "the next message raises it");
 }
+
+/// Undoing a discard is whole: `shift-u` follows the thread again in Slack,
+/// where the discard was made, and rho still holds the thread's words, so
+/// the card comes back as it was rather than half-back.
+#[tokio::test]
+async fn undoing_a_discard_follows_the_thread_again() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_user("U1", "ada");
+    fake.add_channel("C1", "design");
+    fake.follow_thread("C1", "500.0");
+    let client = client(&fake);
+
+    let mut model = Model::new(rho_slack::WorkspaceName("acme".into()));
+    model.set_self(rho_slack::UserId("ME".into()));
+    model.add_users(client.users().await.unwrap());
+    model.add_conversations(client.conversations().await.unwrap());
+    model.set_followed(
+        client
+            .followed_threads()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|thread| (thread.channel, thread.thread_ts)),
+    );
+    let key = model.key(&ChannelId("C1".into()), &Ts("500.0".into()));
+    model.note_message(
+        &rho_slack::api::parse_message(
+            &json!({"ts": "500.0", "thread_ts": "500.0", "user": "U1", "text": "any update?"}),
+            &ChannelId("C1".into()),
+        )
+        .unwrap(),
+        0,
+    );
+    assert_eq!(model.obligations(0).len(), 1);
+
+    // `x`: unfollowed in Slack, and rho keeps the thread so the undo has
+    // something to bring back.
+    model.ignore(&key);
+    client
+        .ignore_thread(&ChannelId("C1".into()), &Ts("500.0".into()))
+        .await
+        .unwrap();
+    assert!(!model.follows(&key));
+    assert!(client.followed_threads().await.unwrap().is_empty());
+
+    // `shift-u`: followed again, in Slack, and the card is the same card.
+    model.follow(&ChannelId("C1".into()), &Ts("500.0".into()));
+    client
+        .follow_thread(&ChannelId("C1".into()), &Ts("500.0".into()))
+        .await
+        .unwrap();
+    assert_eq!(fake.calls("subscriptions.thread.add"), 1);
+    assert_eq!(
+        client
+            .followed_threads()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|thread| thread.thread_ts)
+            .collect::<Vec<_>>(),
+        vec![Ts("500.0".into())]
+    );
+    let card = model
+        .card(&key, 0)
+        .expect("the thread is still rho's to deal");
+    assert_eq!(card.summary, "any update?");
+    assert_eq!(model.obligations(0).len(), 1);
+}

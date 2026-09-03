@@ -1532,6 +1532,9 @@ impl Dashboard {
             .collect::<Vec<_>>();
         let mut depths = HashMap::new();
         let mut tree_depths = HashMap::new();
+        // How many cards a row hangs under: a card's marker is two columns
+        // in, so anything below it starts past those columns.
+        let mut card_depths = HashMap::new();
         for (host, node, _) in &rows {
             let tree_depth = node
                 .parent
@@ -1543,8 +1546,14 @@ impl Dashboard {
                 .and_then(|parent| depths.get(&(*host, parent)).copied())
                 .unwrap_or(0usize)
                 + usize::from(node.kind == rho_desk::cells::NodeKind::Note);
+            let card_depth = node
+                .parent
+                .and_then(|parent| card_depths.get(&(*host, parent)).copied())
+                .unwrap_or(0usize)
+                + usize::from(node.kind != rho_desk::cells::NodeKind::Note);
             depths.insert((*host, node.id), depth);
             tree_depths.insert((*host, node.id), tree_depth);
+            card_depths.insert((*host, node.id), card_depth);
         }
         for (index, (host, node, buffer)) in rows.iter().enumerate() {
             let buffer_snapshot = buffer.read(cx).snapshot();
@@ -1576,7 +1585,14 @@ impl Dashboard {
             });
             let prefix = match node.kind {
                 rho_desk::cells::NodeKind::Note => {
-                    format!("{} ", "*".repeat(depths[&(*host, node.id)].max(1)))
+                    // A note under a card is indented past the card's marker
+                    // and words. At the left edge its `*` read as the next
+                    // root rather than as something belonging to the card.
+                    format!(
+                        "{}{} ",
+                        "    ".repeat(card_depths[&(*host, node.id)]),
+                        "*".repeat(depths[&(*host, node.id)].max(1))
+                    )
                 }
                 rho_desk::cells::NodeKind::Agent => {
                     let label = node_agent(node)

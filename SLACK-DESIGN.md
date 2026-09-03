@@ -65,7 +65,10 @@ Discard is also Slack's "ignore thread": `x` on a thread card unfollows it
 in Slack (`subscriptions.thread.remove`), and a thread unfollowed in Slack
 (`thread_unsubscribed` on the socket, or absent from the feed) is
 discarded in rho. Rho keeps no subscription state of its own; Slack's
-follow list is the truth and the two clients agree.
+follow list is the truth and the two clients agree. Undoing a discard is
+made in the same place: `shift-u` follows the thread again
+(`subscriptions.thread.add`) and the card is dealt as before. An undo that
+reopened the node but left the thread ignored would be worse than none.
 
 **Why:** the dealer, its curves, verdict keys, deal history, and journal
 already model exactly this for agents. Slack adds no new concept; it adds
