@@ -163,9 +163,14 @@ done right after the transcript primitive (2.4) and before 2.10:
       `<url>` as `url <url>`. Render the text once in the link class, the
       URL once only when there is no text; the URL stays reachable through
       line metadata for `enter`.
-- [ ] 1.17 Unfurls are one muted line `↗ title · site` plus at most two
-      lines of description, no blank lines inside. The x.com unfurl took
-      ten lines with the whole tweet body. Collapsible later.
+- [ ] 1.17 Unfurls, the user finds them "very weird" as loose lines:
+      render as a quote box. Each unfurl line is prefixed with a left bar
+      `▎ ` in the link colour and the whole range carries a faint
+      background tint through the editor's background highlight, so it
+      reads as one attached card. Inside: `title · site` on the first
+      line in the link class, then at most two description lines, no
+      blank lines. The x.com unfurl took ten loose lines with the whole
+      tweet body. `enter` on it opens the URL. Collapsible later.
 - [ ] 1.18 Images, decided by the user: a small inline version, and a
       full-screen view on click or `enter`. Inline stays a thumbnail
       (about 12 lines high, aspect preserved). Click or `enter` on the
