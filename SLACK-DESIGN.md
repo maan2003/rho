@@ -130,7 +130,13 @@ timestamp, leaves a gap between them rather than pretending continuity.
 Dedup by timestamp on every insert. Slack's model is simpler than
 Matrix's (no encryption, no state events, a total order by `ts`), so the
 port is the chunk-and-gap idea and the update stream to the view, not the
-code.
+code. Deliberate simplification: chunks are derived, not stored. Messages
+sit in one range-scannable table keyed by conversation and `ts`; only the
+gaps are records, each carrying the cursor to fill it. A chunk is the run
+between two gap records. Matrix stores chunk nodes because its timeline
+has no total order; Slack's does, so stored chunks would be a second
+source of truth. The beginning of history is recorded when a page returns
+`has_more = false`, so paging back at the top is a no-op, never a request.
 
 **Why:** Slack's own web client does exactly this (an IndexedDB mirror, so
 boot is instant and history scrolls without a round trip). Rho's promise
