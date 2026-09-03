@@ -240,6 +240,16 @@ impl Workspace {
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
+        // A file line is a file: the reader who put the cursor there asked
+        // for the attachment, not for the thread it hangs under.
+        if let SurfaceView::SlackConversation(view) = &self.active_pane().surface.view {
+            let view = view.clone();
+            let file = view.update(cx, |view, cx| view.cursor_file(cx));
+            if let Some(file) = file {
+                view.update(cx, |view, cx| view.open_file(file, cx));
+                return;
+            }
+        }
         let source = match &self.active_pane().surface.view {
             SurfaceView::SlackList(view) => {
                 view.clone().update(cx, |view, cx| view.cursor_source(cx))
@@ -317,6 +327,13 @@ impl Workspace {
         event: &SessionEvent,
         cx: &mut gpui::Context<Self>,
     ) {
+        // The roster can land after a surface was opened, so every cached
+        // title is re-read from the model: a conversation is never left
+        // reading "#a conversation" once its people are known.
+        for source in self.slack_labels.keys().cloned().collect::<Vec<_>>() {
+            let label = session.read(cx).label(&source);
+            self.slack_labels.insert(source, label);
+        }
         match event {
             SessionEvent::Connected => {
                 crate::journal::record(crate::journal::Event::SlackConnected {
@@ -532,6 +549,12 @@ mod tests {
             kind: ConversationKind::Channel,
             name: "design".into(),
             user: None,
+            members: Vec::new(),
+        }]);
+        model.add_users([rho_slack::types::User {
+            id: UserId("ME".into()),
+            name: "Manmeet".into(),
+            handle: "manmeet".into(),
         }]);
         model
     }
@@ -562,7 +585,7 @@ mod tests {
         assert_eq!(store.items().len(), 1);
         let item = &store.items()[0];
         assert_eq!(item.kind, InboxKind::Slack);
-        assert_eq!(item.text, "hey @you look");
+        assert_eq!(item.text, "hey @Manmeet look");
         assert_eq!(item.context.room.as_deref(), Some("#design"));
         assert_eq!(item.waiting_on, None, "the mention waits on you");
         assert!(matches!(

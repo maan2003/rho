@@ -464,7 +464,10 @@ async fn write_json(stream: &mut TcpStream, response: &Value) -> anyhow::Result<
 /// author.
 fn binary_route(path: &str) -> Option<&'static [u8]> {
     if path.starts_with("/files/") {
-        return Some(AVATAR_GREEN);
+        // A file is what a preview is judged on, so it is big enough to
+        // look at rather than a 16-pixel square.
+        static PREVIEW: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+        return Some(PREVIEW.get_or_init(|| preview_png(320, 200)).as_slice());
     }
     let name = path.strip_prefix("/avatars/")?.trim_end_matches(".png");
     Some(match name {
@@ -899,4 +902,78 @@ fn decode(value: &str) -> String {
         index += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// A recognisable picture, built rather than embedded: a colour wash with a
+/// diagonal through it, so a screenshot shows whether the image reached the
+/// screen the right way up and at the right size.
+fn preview_png(width: u32, height: u32) -> Vec<u8> {
+    let mut raw = Vec::new();
+    for y in 0..height {
+        raw.push(0); // no per-row filter
+        for x in 0..width {
+            let diagonal = (x * height).abs_diff(y * width) < width * 2;
+            if diagonal {
+                raw.extend_from_slice(&[20, 20, 30]);
+            } else {
+                raw.extend_from_slice(&[(x * 255 / width) as u8, (y * 255 / height) as u8, 200]);
+            }
+        }
+    }
+    let mut png = vec![137, 80, 78, 71, 13, 10, 26, 10];
+    let mut header = Vec::new();
+    header.extend_from_slice(&width.to_be_bytes());
+    header.extend_from_slice(&height.to_be_bytes());
+    header.extend_from_slice(&[8, 2, 0, 0, 0]); // 8-bit truecolour
+    push_chunk(&mut png, b"IHDR", &header);
+    push_chunk(&mut png, b"IDAT", &stored_zlib(&raw));
+    push_chunk(&mut png, b"IEND", &[]);
+    png
+}
+
+fn push_chunk(png: &mut Vec<u8>, kind: &[u8; 4], body: &[u8]) {
+    png.extend_from_slice(&(body.len() as u32).to_be_bytes());
+    png.extend_from_slice(kind);
+    png.extend_from_slice(body);
+    let mut crc_input = kind.to_vec();
+    crc_input.extend_from_slice(body);
+    png.extend_from_slice(&crc32(&crc_input).to_be_bytes());
+}
+
+/// Deflate's "stored" mode: no compression, which needs no library.
+fn stored_zlib(data: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x78, 0x01];
+    for (index, block) in data.chunks(0xffff).enumerate() {
+        let last = (index + 1) * 0xffff >= data.len();
+        out.push(u8::from(last));
+        out.extend_from_slice(&(block.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(!(block.len() as u16)).to_le_bytes());
+        out.extend_from_slice(block);
+    }
+    out.extend_from_slice(&adler32(data).to_be_bytes());
+    out
+}
+
+fn adler32(data: &[u8]) -> u32 {
+    let (mut a, mut b) = (1u32, 0u32);
+    for byte in data {
+        a = (a + *byte as u32) % 65521;
+        b = (b + a) % 65521;
+    }
+    (b << 16) | a
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for byte in data {
+        crc ^= *byte as u32;
+        for _ in 0..8 {
+            crc = if crc & 1 == 1 {
+                (crc >> 1) ^ 0xedb8_8320
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    !crc
 }

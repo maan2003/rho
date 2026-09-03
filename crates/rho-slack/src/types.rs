@@ -105,20 +105,18 @@ pub enum ConversationKind {
 pub struct Conversation {
     pub id: ChannelId,
     pub kind: ConversationKind,
+    /// Slack's own name. For a channel this is what the user reads; for a
+    /// group DM it is the machine name `mpdm-david--keith-1`, which is why
+    /// the label a group DM shows is built by the model out of its members
+    /// instead.
     pub name: String,
     /// The other person, for a one-to-one DM. Slack names a DM only by that
     /// id, so the label waits on the roster.
     pub user: Option<UserId>,
-}
-
-impl Conversation {
-    /// `#design` or `@ada`: the only address the user ever sees.
-    pub fn label(&self) -> String {
-        match self.kind {
-            ConversationKind::Channel | ConversationKind::Group => format!("#{}", self.name),
-            ConversationKind::DirectMessage => format!("@{}", self.name),
-        }
-    }
+    /// Everyone in a group DM, when Slack sent them. Absent on the
+    /// `users.conversations` payload, where the handles in `name` are all
+    /// there is to go on.
+    pub members: Vec<UserId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -126,6 +124,9 @@ pub struct User {
     pub id: UserId,
     /// The display name, falling back to the handle Slack always provides.
     pub name: String,
+    /// Slack's `name` field, the handle. A group DM's machine name is built
+    /// out of handles, so this is what turns one back into people.
+    pub handle: String,
 }
 
 /// One message as rho keeps it: who, when, the rendered text, and the two
@@ -145,6 +146,26 @@ pub struct Message {
     pub text: String,
     pub attachments: Vec<Attachment>,
     pub files: Vec<FileSummary>,
+    /// What the message *is* rather than what it says: `thread_broadcast`,
+    /// `channel_join`, and the rest of Slack's subtypes.
+    pub subtype: Option<String>,
+    /// The thread hanging under this message, as Slack counts it. Only a
+    /// parent carries these.
+    pub reply_count: u32,
+    pub latest_reply: Option<Ts>,
+    /// Whether the author changed it after sending.
+    pub edited: bool,
+    pub reactions: Vec<Reaction>,
+}
+
+/// One emoji on a message, with who put it there: a reader wants to know
+/// whether they already reacted, and that is the only reason the ids are
+/// kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reaction {
+    pub name: String,
+    pub count: u32,
+    pub users: Vec<UserId>,
 }
 
 impl Message {
@@ -153,6 +174,21 @@ impl Message {
     pub fn thread_root(&self) -> Ts {
         self.thread_ts.clone().unwrap_or_else(|| self.ts.clone())
     }
+
+    /// A reply that Slack also put in the channel. It belongs in both
+    /// places, unlike an ordinary reply, which belongs only in its thread.
+    pub fn is_broadcast(&self) -> bool {
+        self.subtype.as_deref() == Some("thread_broadcast")
+    }
+
+    /// Whether this message belongs on the channel surface: a top-level
+    /// message, or a reply Slack broadcast there.
+    pub fn is_top_level(&self) -> bool {
+        match &self.thread_ts {
+            None => true,
+            Some(thread_ts) => *thread_ts == self.ts || self.is_broadcast(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,9 +196,56 @@ pub struct Attachment {
     pub title: Option<String>,
     pub text: Option<String>,
     pub fallback: Option<String>,
+    /// The line an app puts above its card.
+    pub pretext: Option<String>,
+    /// An app card's labelled values, in the order Slack sent them.
+    pub fields: Vec<(String, String)>,
+    /// A link preview rather than an app's own message. Slack paints the
+    /// whole page; rho collapses it, because the reader asked for the
+    /// conversation, not the web.
+    pub is_unfurl: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileSummary {
+    pub id: String,
     pub title: String,
+    /// Slack's short type name, `png` or `pdf`.
+    pub filetype: String,
+    pub size: u64,
+    /// Where the bytes live. Reaching them needs the session's own token and
+    /// cookie, like everything else here.
+    pub url: String,
+}
+
+impl FileSummary {
+    /// `deck.pdf · pdf · 220 KB`: what it is and how big, which is all a
+    /// reader needs to decide whether to open it.
+    pub fn line(&self) -> String {
+        let mut parts = vec![self.title.clone()];
+        if !self.filetype.is_empty() {
+            parts.push(self.filetype.clone());
+        }
+        if self.size > 0 {
+            parts.push(human_size(self.size));
+        }
+        parts.join(" · ")
+    }
+
+    pub fn is_image(&self) -> bool {
+        matches!(
+            self.filetype.as_str(),
+            "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg"
+        )
+    }
+}
+
+fn human_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    match bytes {
+        bytes if bytes >= MB => format!("{:.1} MB", bytes as f64 / MB as f64),
+        bytes if bytes >= KB => format!("{} KB", bytes / KB),
+        bytes => format!("{bytes} B"),
+    }
 }

@@ -56,23 +56,60 @@ pub fn render_message(
         parts.join("\n")
     };
     for attachment in attachments {
-        // An attachment is a link preview or an app card: its title is the
-        // part a reader acts on, and the body is chrome.
-        let line = attachment
-            .title
-            .clone()
-            .or_else(|| attachment.text.clone())
-            .or_else(|| attachment.fallback.clone())
-            .unwrap_or_default();
-        if line.trim().is_empty() {
-            continue;
+        for line in render_attachment(attachment, names) {
+            push_line(&mut rendered, &line);
         }
-        push_line(&mut rendered, &format!("— {}", render_mrkdwn(&line, names)));
     }
     for file in files {
-        push_line(&mut rendered, &format!("[file: {}]", file.title));
+        // A file is a thing the reader can open, named the way it would be
+        // in a shell: no placeholder, no id.
+        push_line(&mut rendered, &file.line());
     }
-    rendered.trim_end().to_owned()
+    // Shortcodes become glyphs last, so it happens once for blocks, plain
+    // text, and attachment lines alike.
+    crate::emoji::render(rendered.trim_end())
+}
+
+/// An attachment: a link preview, or an app's own card.
+///
+/// A preview collapses to its title. Slack paints the whole page under the
+/// message, which buries the conversation the reader came for; the title is
+/// the part they act on and the link is already in the message above it.
+/// An app card keeps what it was given: its pretext, title, body, and the
+/// labelled values it hung under them.
+fn render_attachment(attachment: &Attachment, names: &dyn Names) -> Vec<String> {
+    let headline = attachment
+        .title
+        .clone()
+        .or_else(|| attachment.text.clone())
+        .or_else(|| attachment.fallback.clone())
+        .unwrap_or_default();
+    if headline.trim().is_empty() {
+        return Vec::new();
+    }
+    if attachment.is_unfurl {
+        return vec![format!("↗ {}", render_mrkdwn(&headline, names))];
+    }
+    let mut lines = Vec::new();
+    if let Some(pretext) = &attachment.pretext {
+        lines.push(format!("— {}", render_mrkdwn(pretext, names)));
+    }
+    lines.push(format!("— {}", render_mrkdwn(&headline, names)));
+    if let Some(text) = &attachment.text {
+        if Some(text) != attachment.title.as_ref() {
+            lines.push(format!("  {}", render_mrkdwn(text, names)));
+        }
+    }
+    if !attachment.fields.is_empty() {
+        let fields = attachment
+            .fields
+            .iter()
+            .map(|(title, value)| format!("{title}: {}", render_mrkdwn(value, names)))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        lines.push(format!("  {fields}"));
+    }
+    lines
 }
 
 fn push_line(target: &mut String, line: &str) {
@@ -230,7 +267,9 @@ fn render_inline(element: &Value, names: &dyn Names) -> String {
             let url = string(element, "url");
             match string(element, "text") {
                 "" => url.to_owned(),
-                text => format!("{text} ({url})"),
+                // `label <url>`: the label reads, the url is still there to
+                // yank, and the angle brackets say where one ends.
+                text => format!("{text} <{url}>"),
             }
         }
         // A date element always ships the text Slack itself would show.
@@ -346,7 +385,7 @@ fn render_escape(body: &str, names: &dyn Names) -> String {
             None => format!("@{}", target[1..].split('^').next().unwrap_or_default()),
         },
         _ => match label {
-            Some(label) => format!("{label} ({target})"),
+            Some(label) => format!("{label} <{target}>"),
             None => target.to_owned(),
         },
     }
@@ -484,7 +523,7 @@ mod tests {
         }));
         assert_eq!(
             rendered,
-            "the plan (https://rho.example/x) and https://bare.example"
+            "the plan <https://rho.example/x> and https://bare.example"
         );
     }
 
@@ -528,10 +567,43 @@ mod tests {
                 "<@U1> see <#C1|design> and <https://x.example|docs> &amp; <!here>",
                 &Roster
             ),
-            "@ada see #design and docs (https://x.example) & @here"
+            "@ada see #design and docs <https://x.example> & @here"
         );
         // An unterminated escape is text, not a panic.
         assert_eq!(render_mrkdwn("a < b", &Roster), "a < b");
+    }
+
+    #[test]
+    fn an_app_card_keeps_its_fields_and_a_link_preview_collapses() {
+        let card = Attachment {
+            title: Some("build #412".to_owned()),
+            text: Some("all checks passed".to_owned()),
+            fallback: Some("build #412 passed".to_owned()),
+            pretext: Some("pipeline".to_owned()),
+            fields: vec![
+                ("branch".to_owned(), "main".to_owned()),
+                ("duration".to_owned(), "4m12s".to_owned()),
+            ],
+            is_unfurl: false,
+        };
+        assert_eq!(
+            render_message(&[], "deploy finished", &[card], &[], &Roster),
+            "deploy finished\n— pipeline\n— build #412\n  all checks passed\n  branch: main · duration: 4m12s"
+        );
+
+        let preview = Attachment {
+            title: Some("Worth a read".to_owned()),
+            text: Some("A long preview body that never reaches the buffer.".to_owned()),
+            fallback: None,
+            pretext: None,
+            fields: Vec::new(),
+            is_unfurl: true,
+        };
+        assert_eq!(
+            render_message(&[], "worth a read", &[preview], &[], &Roster),
+            "worth a read\n↗ Worth a read",
+            "a preview is a line, not a page"
+        );
     }
 
     #[test]
@@ -543,15 +615,22 @@ mod tests {
                 title: Some("Build #12 failed".to_owned()),
                 text: None,
                 fallback: None,
+                pretext: None,
+                fields: Vec::new(),
+                is_unfurl: false,
             }],
             &[FileSummary {
+                id: "F1".to_owned(),
                 title: "trace.txt".to_owned(),
+                filetype: "text".to_owned(),
+                size: 2048,
+                url: "https://files.example/trace.txt".to_owned(),
             }],
             &Roster,
         );
         assert_eq!(
             rendered,
-            "ping @grace\n— Build #12 failed\n[file: trace.txt]"
+            "ping @grace\n— Build #12 failed\ntrace.txt · text · 2 KB"
         );
     }
 }

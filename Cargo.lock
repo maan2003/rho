@@ -14135,6 +14135,7 @@ dependencies = [
  "chrono",
  "dirs",
  "editor",
+ "emojis",
  "futures 0.3.33",
  "gpui",
  "gpui_tokio",

@@ -5541,7 +5541,7 @@ fn f21_steps_through_three_surfaces(cx: &mut TestAppContext) {
     cx.simulate_keystrokes(*workspace, "f21");
     workspace
         .update(cx, |workspace, _, _| {
-            assert_eq!(workspace.current_surface_name_for_test(), "inbox two");
+            assert_eq!(workspace.current_surface_name_for_test(), "two");
         })
         .unwrap();
     workspace
@@ -5552,7 +5552,7 @@ fn f21_steps_through_three_surfaces(cx: &mut TestAppContext) {
 
     workspace
         .update(cx, |workspace, _, _| {
-            assert_eq!(workspace.current_surface_name_for_test(), "inbox three");
+            assert_eq!(workspace.current_surface_name_for_test(), "three");
         })
         .unwrap();
 }
@@ -5566,7 +5566,7 @@ fn history_back_twice_then_forward_once_lands_on_the_middle_entry(cx: &mut TestA
             workspace.step_surface_back_for_test(window, cx);
             workspace.step_surface_back_for_test(window, cx);
             assert!(workspace.step_surface_forward_for_test(window, cx));
-            assert_eq!(workspace.current_surface_name_for_test(), "inbox two");
+            assert_eq!(workspace.current_surface_name_for_test(), "two");
         })
         .unwrap();
 }
@@ -5581,13 +5581,10 @@ fn history_forward_entries_do_not_reappear_as_backward_duplicates(cx: &mut TestA
             workspace.step_surface_back_for_test(window, cx);
             workspace.step_surface_forward_for_test(window, cx);
             workspace.step_surface_back_for_test(window, cx);
-            assert_eq!(workspace.current_surface_name_for_test(), "inbox three");
+            assert_eq!(workspace.current_surface_name_for_test(), "three");
             assert_eq!(
                 workspace.surface_history_for_test(),
-                (
-                    vec!["inbox three".into(), "inbox two".into(), "inbox one".into()],
-                    0
-                )
+                (vec!["three".into(), "two".into(), "one".into()], 0)
             );
         })
         .unwrap();
@@ -5602,10 +5599,10 @@ fn ordinary_open_of_recorded_surface_moves_the_history_cursor_without_reordering
         .update(cx, |workspace, window, cx| {
             workspace.configure_surface_history_for_test(&["one", "two", "three"], window, cx);
             workspace.open_history_index_for_test(0, cx);
-            assert_eq!(workspace.current_surface_name_for_test(), "inbox three");
+            assert_eq!(workspace.current_surface_name_for_test(), "three");
             assert_eq!(workspace.surface_history_for_test().1, 0);
             assert!(workspace.step_surface_forward_for_test(window, cx));
-            assert_eq!(workspace.current_surface_name_for_test(), "inbox two");
+            assert_eq!(workspace.current_surface_name_for_test(), "two");
         })
         .unwrap();
 }
@@ -5620,20 +5617,14 @@ fn deal_and_overview_append_at_the_end_and_dedupe_existing_entries(cx: &mut Test
             workspace.show_current_history_for_test(crate::journal::SurfaceShowMethod::Deal, cx);
             assert_eq!(
                 workspace.surface_history_for_test(),
-                (
-                    vec!["inbox three".into(), "inbox one".into(), "inbox two".into()],
-                    2
-                )
+                (vec!["three".into(), "one".into(), "two".into()], 2)
             );
 
             workspace
                 .show_current_history_for_test(crate::journal::SurfaceShowMethod::Overview, cx);
             assert_eq!(
                 workspace.surface_history_for_test(),
-                (
-                    vec!["inbox three".into(), "inbox one".into(), "inbox two".into()],
-                    2
-                )
+                (vec!["three".into(), "one".into(), "two".into()], 2)
             );
         })
         .unwrap();
@@ -5734,7 +5725,7 @@ fn discarding_shift_r_draft_preserves_non_draft_history_cursor(cx: &mut TestAppC
     workspace
         .update(cx, |workspace, _, _| {
             assert!(!workspace.overview_open_for_test());
-            assert_eq!(workspace.current_surface_name_for_test(), "inbox current");
+            assert_eq!(workspace.current_surface_name_for_test(), "current");
         })
         .unwrap();
 }
@@ -5754,9 +5745,9 @@ fn q_mid_list_removes_current_and_keeps_newer_entries_forward(cx: &mut TestAppCo
 
     workspace
         .update(cx, |workspace, window, cx| {
-            assert_eq!(workspace.current_surface_name_for_test(), "inbox three");
+            assert_eq!(workspace.current_surface_name_for_test(), "three");
             assert!(workspace.step_surface_forward_for_test(window, cx));
-            assert_eq!(workspace.current_surface_name_for_test(), "inbox one");
+            assert_eq!(workspace.current_surface_name_for_test(), "one");
         })
         .unwrap();
 }
@@ -5779,10 +5770,7 @@ fn typing_does_not_reorder_history(cx: &mut TestAppContext) {
         .update(cx, |workspace, _, _| {
             assert_eq!(
                 workspace.surface_history_for_test(),
-                (
-                    vec!["inbox three".into(), "inbox two".into(), "inbox one".into()],
-                    1
-                )
+                (vec!["three".into(), "two".into(), "one".into()], 1)
             );
         })
         .unwrap();
@@ -5802,7 +5790,7 @@ fn q_closes_current_surface_and_reveals_previous(cx: &mut TestAppContext) {
 
     workspace
         .update(cx, |workspace, _, _| {
-            assert_eq!(workspace.current_surface_name_for_test(), "inbox previous");
+            assert_eq!(workspace.current_surface_name_for_test(), "previous");
             assert!(!workspace.overview_open_for_test());
         })
         .unwrap();

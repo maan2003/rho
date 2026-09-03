@@ -90,9 +90,11 @@ pub struct ConversationRow {
 pub struct Model {
     workspace: WorkspaceName,
     self_id: UserId,
-    users: BTreeMap<UserId, String>,
+    users: BTreeMap<UserId, User>,
     conversations: BTreeMap<ChannelId, Conversation>,
     counts: BTreeMap<ChannelId, ConversationCount>,
+    /// The workspace's own emoji names, which stay shortcodes on screen.
+    custom_emoji: BTreeSet<String>,
     threads: BTreeMap<ThreadKey, Thread>,
     /// Every (channel, timestamp) the model has already accounted for. This
     /// is the whole of the deduplication between the feed and the socket.
@@ -104,12 +106,10 @@ pub struct Model {
 
 impl Names for Model {
     fn user(&self, id: &UserId) -> Option<String> {
-        // A mention of the reader reads as "you"; their own display name
-        // tells them nothing they did not know.
-        if id == &self.self_id {
-            return Some("you".to_owned());
-        }
-        self.users.get(id).cloned()
+        // The reader is a person in the conversation like anyone else: they
+        // read their own name, and the class is what marks it as theirs. A
+        // transcript that says "you" cannot be quoted to anybody.
+        self.users.get(id).map(|user| user.name.clone())
     }
 
     fn channel(&self, id: &ChannelId) -> Option<String> {
@@ -117,6 +117,20 @@ impl Names for Model {
             .get(id)
             .map(|conversation| conversation.name.clone())
     }
+}
+
+/// The handles baked into a group DM's machine name:
+/// `mpdm-david--manmeet--keith-1` is three handles separated by `--`, with a
+/// disambiguating suffix Slack appends.
+fn mpdm_handles(name: &str) -> Vec<String> {
+    let Some(rest) = name.strip_prefix("mpdm-") else {
+        return Vec::new();
+    };
+    let rest = rest.rsplit_once('-').map_or(rest, |(head, _)| head);
+    rest.split("--")
+        .filter(|handle| !handle.is_empty())
+        .map(str::to_owned)
+        .collect()
 }
 
 impl Model {
@@ -127,6 +141,7 @@ impl Model {
             users: BTreeMap::new(),
             conversations: BTreeMap::new(),
             counts: BTreeMap::new(),
+            custom_emoji: BTreeSet::new(),
             threads: BTreeMap::new(),
             seen: BTreeSet::new(),
             participated: BTreeSet::new(),
@@ -147,19 +162,15 @@ impl Model {
 
     pub fn add_users(&mut self, users: impl IntoIterator<Item = User>) {
         for user in users {
-            self.users.insert(user.id, user.name);
+            self.users.insert(user.id.clone(), user);
         }
     }
 
-    /// Registers conversations and names any DM whose partner is known.
+    /// Registers conversations. Names are not stored: a label is built from
+    /// the roster every time it is read, so a conversation that arrives
+    /// before the roster is still named once the roster lands.
     pub fn add_conversations(&mut self, conversations: impl IntoIterator<Item = Conversation>) {
-        for mut conversation in conversations {
-            if conversation.kind == ConversationKind::DirectMessage
-                && let Some(user) = conversation.user.clone()
-                && let Some(name) = self.users.get(&user)
-            {
-                conversation.name = name.clone();
-            }
+        for conversation in conversations {
             self.conversations
                 .insert(conversation.id.clone(), conversation);
         }
@@ -169,13 +180,85 @@ impl Model {
         self.conversations.get(channel)
     }
 
-    /// How a conversation reads in chrome. Unknown channels read as an
-    /// unnamed conversation rather than as their id.
+    /// How a conversation reads everywhere the user meets it: the list, the
+    /// surface title, the status bar, a dealer card, a filed heading.
+    /// `#design`, `@ada`, or, for a group DM, the people in it. Unknown
+    /// channels read as an unnamed conversation rather than as their id.
     pub fn label(&self, channel: &ChannelId) -> String {
-        self.conversations
-            .get(channel)
-            .map(Conversation::label)
-            .unwrap_or_else(|| "#a conversation".to_owned())
+        let Some(conversation) = self.conversations.get(channel) else {
+            return "#a conversation".to_owned();
+        };
+        // A display name can carry an emoji, and the list is a place a
+        // reader scans: a shortcode there is noise.
+        crate::emoji::render(&self.raw_label(conversation))
+    }
+
+    fn raw_label(&self, conversation: &Conversation) -> String {
+        match conversation.kind {
+            ConversationKind::Channel => format!("#{}", conversation.name),
+            ConversationKind::DirectMessage => {
+                let name = conversation
+                    .user
+                    .as_ref()
+                    .and_then(|user| self.users.get(user))
+                    .map(|user| user.name.clone())
+                    .unwrap_or_else(|| conversation.name.clone());
+                format!("@{name}")
+            }
+            ConversationKind::Group => self.group_label(conversation),
+        }
+    }
+
+    /// A group DM reads as the people in it, the way Slack's own client
+    /// shows one. Slack's name for it, `mpdm-david--manmeet--keith-1`, is a
+    /// machine string and never reaches the user.
+    fn group_label(&self, conversation: &Conversation) -> String {
+        let mut names: Vec<String> = conversation
+            .members
+            .iter()
+            .filter(|member| *member != &self.self_id)
+            .map(|member| {
+                self.users
+                    .get(member)
+                    .map(|user| user.name.clone())
+                    .unwrap_or_else(|| "someone".to_owned())
+            })
+            .collect();
+        // `users.conversations` does not carry members, so the handles baked
+        // into the machine name are all there is; they still name people.
+        if names.is_empty() {
+            let own = self
+                .users
+                .get(&self.self_id)
+                .map(|user| user.handle.clone());
+            names = mpdm_handles(&conversation.name)
+                .into_iter()
+                .filter(|handle| own.as_deref() != Some(handle.as_str()))
+                .map(|handle| self.display_of(&handle))
+                .collect();
+        }
+        if names.is_empty() {
+            return "a group".to_owned();
+        }
+        names.join(", ")
+    }
+
+    fn display_of(&self, handle: &str) -> String {
+        self.users
+            .values()
+            .find(|user| user.handle == handle)
+            .map(|user| user.name.clone())
+            .unwrap_or_else(|| handle.to_owned())
+    }
+
+    pub fn set_custom_emoji(&mut self, names: impl IntoIterator<Item = String>) {
+        self.custom_emoji.extend(names);
+    }
+
+    /// Whether `name` is a workspace emoji, which is the difference between
+    /// muting a shortcode and leaving a word alone.
+    pub fn is_custom_emoji(&self, name: &str) -> bool {
+        self.custom_emoji.contains(name)
     }
 
     pub fn set_counts(&mut self, counts: impl IntoIterator<Item = ConversationCount>) {
@@ -194,7 +277,7 @@ impl Model {
                 let count = self.counts.get(&conversation.id);
                 ConversationRow {
                     id: conversation.id.clone(),
-                    label: conversation.label(),
+                    label: self.label(&conversation.id),
                     unread: count.is_some_and(|count| count.has_unreads),
                     mention_count: count.map_or(0, |count| count.mention_count),
                     latest: count.and_then(|count| count.latest.clone()),
@@ -291,6 +374,15 @@ impl Model {
     }
 
     /// Who a message is from, as a name.
+    /// How a mention of the reader appears in a rendered body: the same
+    /// `@name` anyone else's mention gets, which is what the UI looks for
+    /// when it decides which text is theirs.
+    pub fn self_mention(&self) -> Option<String> {
+        self.users
+            .get(&self.self_id)
+            .map(|user| format!("@{}", user.name))
+    }
+
     pub fn author(&self, message: &Message) -> String {
         message
             .user
@@ -345,6 +437,11 @@ impl Model {
             text: String::new(),
             attachments: Vec::new(),
             files: Vec::new(),
+            subtype: None,
+            reply_count: 0,
+            latest_reply: None,
+            edited: false,
+            reactions: Vec::new(),
         };
         self.record(key, reason, &message, false, now_ms)
     }
@@ -541,11 +638,13 @@ mod tests {
         model.add_users([
             User {
                 id: UserId("ME".into()),
-                name: "you".to_owned(),
+                name: "Manmeet".to_owned(),
+                handle: "manmeet".to_owned(),
             },
             User {
                 id: UserId("U1".into()),
                 name: "ada".to_owned(),
+                handle: "ada".to_owned(),
             },
         ]);
         model.add_conversations([
@@ -554,12 +653,14 @@ mod tests {
                 kind: ConversationKind::Channel,
                 name: "design".to_owned(),
                 user: None,
+                members: Vec::new(),
             },
             Conversation {
                 id: ChannelId("D1".into()),
                 kind: ConversationKind::DirectMessage,
                 name: "someone".to_owned(),
                 user: Some(UserId("U1".into())),
+                members: Vec::new(),
             },
         ]);
         model
@@ -576,6 +677,11 @@ mod tests {
             text: text.into(),
             attachments: Vec::new(),
             files: Vec::new(),
+            subtype: None,
+            reply_count: 0,
+            latest_reply: None,
+            edited: false,
+            reactions: Vec::new(),
         }
     }
 
@@ -745,6 +851,70 @@ mod tests {
     }
 
     #[test]
+    fn a_group_dm_reads_as_the_people_in_it() {
+        let mut model = model();
+        model.add_users([User {
+            id: UserId("UK".into()),
+            name: "Keith".to_owned(),
+            handle: "keith".to_owned(),
+        }]);
+        model.add_conversations([
+            Conversation {
+                id: ChannelId("G1".into()),
+                kind: ConversationKind::Group,
+                name: "mpdm-manmeet--ada--keith-1".to_owned(),
+                user: None,
+                members: vec![
+                    UserId("ME".into()),
+                    UserId("U1".into()),
+                    UserId("UK".into()),
+                ],
+            },
+            // The same group as `users.conversations` sends it: a machine
+            // name and nothing else.
+            Conversation {
+                id: ChannelId("G2".into()),
+                kind: ConversationKind::Group,
+                name: "mpdm-manmeet--ada--keith-1".to_owned(),
+                user: None,
+                members: Vec::new(),
+            },
+        ]);
+
+        assert_eq!(model.label(&ChannelId("G1".into())), "ada, Keith");
+        assert_eq!(
+            model.label(&ChannelId("G2".into())),
+            "ada, Keith",
+            "the handles in the machine name still name people"
+        );
+        assert!(
+            !model.label(&ChannelId("G2".into())).contains("mpdm"),
+            "a machine name never reaches the user"
+        );
+    }
+
+    #[test]
+    fn a_conversation_that_arrives_before_the_roster_is_named_once_it_lands() {
+        let mut model = Model::new(WorkspaceName("acme".into()));
+        model.set_self(UserId("ME".into()));
+        model.add_conversations([Conversation {
+            id: ChannelId("D1".into()),
+            kind: ConversationKind::DirectMessage,
+            name: "someone".to_owned(),
+            user: Some(UserId("U1".into())),
+            members: Vec::new(),
+        }]);
+        assert_eq!(model.label(&ChannelId("D1".into())), "@someone");
+
+        model.add_users([User {
+            id: UserId("U1".into()),
+            name: "Ada Lovelace".to_owned(),
+            handle: "ada".to_owned(),
+        }]);
+        assert_eq!(model.label(&ChannelId("D1".into())), "@Ada Lovelace");
+    }
+
+    #[test]
     fn the_conversation_list_puts_unread_first_then_recency() {
         let mut model = model();
         model.add_conversations([Conversation {
@@ -752,6 +922,7 @@ mod tests {
             kind: ConversationKind::Channel,
             name: "quiet".to_owned(),
             user: None,
+            members: Vec::new(),
         }]);
         model.set_counts([
             ConversationCount {

@@ -19,6 +19,7 @@
 pub mod api;
 pub mod block;
 pub mod config;
+pub mod emoji;
 pub mod events;
 #[cfg(feature = "fake")]
 pub mod fake;

@@ -5515,7 +5515,7 @@ impl Workspace {
             SurfaceKey::Draft => "draft".to_owned(),
             SurfaceKey::Messages => "messages".to_owned(),
             SurfaceKey::DeskNode { .. } => "desk".to_owned(),
-            SurfaceKey::Inbox(id) => format!("inbox {id}"),
+            SurfaceKey::Inbox(id) => self.inbox_surface_label(id),
             SurfaceKey::Transcript(agent_id) => self.registry.agent_display_label(*agent_id),
             SurfaceKey::File { path, .. } => path.to_string(),
             SurfaceKey::Shell(agent_id) => {
@@ -5544,6 +5544,25 @@ impl Workspace {
                 .cloned()
                 .unwrap_or_else(|| "slack".to_owned()),
         }
+    }
+
+    /// What a dealt card is about, for the status bar. An inbox id is rho's
+    /// own bookkeeping: the person reading it wants the conversation the
+    /// card came from.
+    fn inbox_surface_label(&self, id: &str) -> String {
+        let Some(item) = self.inbox.get(&InboxId(id.to_owned())) else {
+            return "inbox".to_owned();
+        };
+        if let Some(room) = item.context.room.as_ref().filter(|room| !room.is_empty()) {
+            return room.clone();
+        }
+        match item.kind {
+            crate::inbox::InboxKind::Ping => "ping",
+            crate::inbox::InboxKind::Capture => "capture",
+            crate::inbox::InboxKind::Obligation => "obligation",
+            crate::inbox::InboxKind::Slack => "slack",
+        }
+        .to_owned()
     }
 
     fn surface_kind(key: &SurfaceKey) -> &'static str {
@@ -6450,15 +6469,33 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let editor = self.active_editor(cx);
+        // Each surface gets a real inbox item, because a surface is named
+        // after what its card is about, not after its id.
         self.surface_history = names
             .iter()
             .rev()
-            .map(|name| WarmSurface {
-                context: self.active_context,
-                surface: Self::wrap_surface(
-                    SurfaceKey::Inbox((*name).to_owned()),
-                    SurfaceView::Inbox(editor.clone()),
-                ),
+            .map(|name| {
+                let id = self
+                    .inbox
+                    .append(crate::inbox::InboxDraft {
+                        kind: crate::inbox::InboxKind::Capture,
+                        text: (*name).to_owned(),
+                        source: crate::inbox::SourceReference::None,
+                        context: crate::inbox::CapturedContext {
+                            host: None,
+                            room: Some((*name).to_owned()),
+                            focused_surface: String::new(),
+                        },
+                        waiting_on: None,
+                    })
+                    .expect("the test inbox accepts an item");
+                WarmSurface {
+                    context: self.active_context,
+                    surface: Self::wrap_surface(
+                        SurfaceKey::Inbox(id.0),
+                        SurfaceView::Inbox(editor.clone()),
+                    ),
+                }
             })
             .collect();
         self.history_cursor = self.surface_history.len().saturating_sub(1);

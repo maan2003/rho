@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context as _;
 use futures::StreamExt as _;
 use futures::channel::mpsc;
 use gpui::{Context, EventEmitter, Task};
@@ -94,6 +95,9 @@ pub struct Session {
     /// the outage left before the lamp goes out.
     catch_up: Arc<Notify>,
     pending_sends: usize,
+    /// Files already fetched into the state cache, by Slack file id. An
+    /// image is shown from here, so a redraw never refetches.
+    cached_files: HashMap<String, std::path::PathBuf>,
     _tasks: Vec<Task<()>>,
 }
 
@@ -111,6 +115,7 @@ impl Session {
                 loaded: HashMap::new(),
                 catch_up: Arc::new(Notify::new()),
                 pending_sends: 0,
+                cached_files: HashMap::new(),
                 _tasks: Vec::new(),
             },
         }
@@ -125,6 +130,7 @@ impl Session {
             loaded: HashMap::new(),
             catch_up: Arc::new(Notify::new()),
             pending_sends: 0,
+            cached_files: HashMap::new(),
             _tasks: Vec::new(),
         };
         session.start(client, Timings::default(), cx);
@@ -190,10 +196,11 @@ impl Session {
             let users = client.users().await;
             let conversations = client.conversations().await;
             let counts = client.counts().await;
-            (users, conversations, counts)
+            let emoji = client.custom_emoji().await;
+            (users, conversations, counts, emoji)
         });
         self._tasks.push(cx.spawn(async move |this, cx| {
-            let Ok((users, conversations, counts)) = task.await else {
+            let Ok((users, conversations, counts, emoji)) = task.await else {
                 return;
             };
             let _ = this.update(cx, |session, cx| {
@@ -205,6 +212,9 @@ impl Session {
                 }
                 if let Ok(counts) = counts {
                     session.model.set_counts(counts.conversations);
+                }
+                if let Ok(emoji) = emoji {
+                    session.model.set_custom_emoji(emoji);
                 }
                 // Anything raised before the roster landed was named
                 // "#a conversation"; now it has a name, so say so again.
@@ -279,24 +289,36 @@ impl Session {
     }
 
     /// Puts an arriving message into every open surface it belongs to: the
-    /// conversation, and the thread when it is a reply.
+    /// thread it was said in, and the channel only when it was said to the
+    /// room. A reply never appears in the channel body; what changes there
+    /// is the count line under its parent.
     fn route(&mut self, message: &Message) {
-        let sources = [
-            Source::Conversation(message.channel.clone()),
-            Source::Thread(ThreadKey {
-                workspace: self.model.workspace().clone(),
-                channel: message.channel.clone(),
-                thread_ts: message.thread_root(),
-            }),
-        ];
-        for source in sources {
-            // A thread reply belongs in its thread, and in the channel only
-            // when Slack also broadcast it there.
-            if matches!(&source, Source::Conversation(_)) && message.thread_ts.is_some() {
-                continue;
-            }
-            if let Some(loaded) = self.loaded.get_mut(&source) {
-                insert_message(&mut loaded.messages, message.clone());
+        let conversation = Source::Conversation(message.channel.clone());
+        let thread = Source::Thread(ThreadKey {
+            workspace: self.model.workspace().clone(),
+            channel: message.channel.clone(),
+            thread_ts: message.thread_root(),
+        });
+        if let Some(loaded) = self.loaded.get_mut(&thread) {
+            insert_message(&mut loaded.messages, message.clone());
+        }
+        let Some(loaded) = self.loaded.get_mut(&conversation) else {
+            return;
+        };
+        if message.is_top_level() {
+            insert_message(&mut loaded.messages, message.clone());
+        }
+        if message.thread_ts.is_some() {
+            // A reply is not channel content, but the fact that the thread
+            // grew is: the count line is how the reader learns it.
+            let root = message.thread_root();
+            if let Some(parent) = loaded
+                .messages
+                .iter_mut()
+                .find(|candidate| candidate.ts == root)
+            {
+                parent.reply_count = parent.reply_count.saturating_add(1);
+                parent.latest_reply = Some(message.ts.clone());
             }
         }
     }
@@ -470,6 +492,97 @@ impl Session {
         }));
     }
 
+    /// Where a file's bytes are, once they have been fetched.
+    pub fn cached_file(&self, id: &str) -> Option<&std::path::Path> {
+        self.cached_files.get(id).map(std::path::PathBuf::as_path)
+    }
+
+    /// Fetches a file into the state cache so a surface can show it. Called
+    /// when an image first comes into view, never ahead of time: the reader
+    /// asked for a conversation, not for a download queue.
+    pub fn cache_file(&mut self, file: &crate::types::FileSummary, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        if file.url.is_empty() || self.cached_files.contains_key(&file.id) {
+            return;
+        }
+        // Claimed before the fetch starts, so a second redraw does not queue
+        // the same download again.
+        let Ok(path) = file_cache_path(file) else {
+            return;
+        };
+        self.cached_files.insert(file.id.clone(), path.clone());
+        if path.exists() {
+            return;
+        }
+        let file = file.clone();
+        let task = gpui_tokio::Tokio::spawn(cx, async move {
+            let bytes = client.download(&file.url).await?;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, bytes)?;
+            anyhow::Ok(file.id)
+        });
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let fetched = match task.await {
+                Ok(fetched) => fetched,
+                Err(error) => Err(anyhow::anyhow!("{error}")),
+            };
+            let _ = this.update(cx, |_session, cx| {
+                match fetched {
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(error = %error, "slack file fetch failed");
+                    }
+                }
+                cx.notify();
+            });
+        }));
+    }
+
+    /// Downloads a file into the state cache and hands it to the desktop.
+    /// The bytes are written once and never expire: a Slack file id is
+    /// immutable, so a second open is a local read.
+    pub fn open_file(&mut self, file: &crate::types::FileSummary, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        if file.url.is_empty() {
+            return;
+        }
+        let file = file.clone();
+        let task = gpui_tokio::Tokio::spawn(cx, async move {
+            let path = file_cache_path(&file)?;
+            if !path.exists() {
+                let bytes = client.download(&file.url).await?;
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&path, bytes)?;
+            }
+            // The desktop decides what opens it; rho is not a viewer.
+            std::process::Command::new("xdg-open")
+                .arg(&path)
+                .spawn()
+                .map(|_| ())
+                .map_err(anyhow::Error::from)
+        });
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let opened = match task.await {
+                Ok(opened) => opened,
+                Err(error) => Err(anyhow::anyhow!("{error}")),
+            };
+            if let Err(error) = opened {
+                tracing::warn!(error = %error, "slack file open failed");
+                let _ = this.update(cx, |session, cx| {
+                    session.signal(Some(Signal::Degraded(format!("slack: {error:#}"))), cx);
+                });
+            }
+        }));
+    }
+
     /// Tells Slack the conversation has been read, so rho does not leave the
     /// phone showing a badge for something the user has already seen.
     pub fn mark_read(&mut self, source: &Source, cx: &mut Context<Self>) {
@@ -551,6 +664,11 @@ impl Session {
             text,
             attachments: Vec::new(),
             files: Vec::new(),
+            subtype: None,
+            reply_count: 0,
+            latest_reply: None,
+            edited: false,
+            reactions: Vec::new(),
         };
         let key = self.model.key(&message.channel, &message.thread_root());
         self.receive(message, now_ms(), cx);
@@ -574,6 +692,21 @@ fn insert_message(messages: &mut Vec<Message>, message: Message) {
         Ok(_) => {}
         Err(index) => messages.insert(index, message),
     }
+}
+
+/// Where a downloaded file lives: the state cache, keyed on Slack's file id
+/// so two files with the same name never collide.
+fn file_cache_path(file: &crate::types::FileSummary) -> anyhow::Result<std::path::PathBuf> {
+    let base = dirs::state_dir().context("state directory not available")?;
+    let name = file
+        .title
+        .rsplit(['/', '\\'])
+        .next()
+        .filter(|name| !name.is_empty())
+        .unwrap_or("file");
+    Ok(base
+        .join("rho/slack-files")
+        .join(format!("{}-{name}", file.id)))
 }
 
 fn now_ms() -> i64 {

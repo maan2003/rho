@@ -345,6 +345,31 @@ impl Client {
         parse_conversation(&body["channel"]).context("conversations.info returned no channel")
     }
 
+    /// The workspace's custom emoji, by name. They have no glyph anywhere
+    /// but Slack, so knowing which shortcodes are real is what keeps a
+    /// custom one from reading as a stray word.
+    pub async fn custom_emoji(&self) -> anyhow::Result<Vec<String>> {
+        let body = self.post_form("emoji.list", &[]).await?;
+        Ok(body["emoji"]
+            .as_object()
+            .map(|emoji| emoji.keys().cloned().collect())
+            .unwrap_or_default())
+    }
+
+    /// The bytes behind a file. Slack serves them from the same session as
+    /// the API, so an unauthenticated fetch gets a login page rather than a
+    /// file.
+    pub async fn download(&self, url: &str) -> anyhow::Result<Vec<u8>> {
+        let response = self
+            .authorize(self.http.get(url))
+            .send()
+            .await
+            .with_context(|| format!("fetching {url}"))?
+            .error_for_status()
+            .with_context(|| format!("fetching {url}"))?;
+        Ok(response.bytes().await?.to_vec())
+    }
+
     pub async fn counts(&self) -> anyhow::Result<Counts> {
         let body = self
             .post_form(
@@ -409,6 +434,7 @@ impl Client {
         Ok(parse_user(&body["user"]).unwrap_or_else(|| User {
             id: user.clone(),
             name: "someone".to_owned(),
+            handle: String::new(),
         }))
     }
 
@@ -504,6 +530,39 @@ pub fn parse_message(value: &Value, fallback_channel: &ChannelId) -> Option<Mess
                 title: string(&attachment["title"]).filter(|title| !title.is_empty()),
                 text: string(&attachment["text"]).filter(|text| !text.is_empty()),
                 fallback: string(&attachment["fallback"]).filter(|text| !text.is_empty()),
+                pretext: string(&attachment["pretext"]).filter(|text| !text.is_empty()),
+                fields: attachment["fields"]
+                    .as_array()
+                    .map(Vec::as_slice)
+                    .unwrap_or_default()
+                    .iter()
+                    .filter_map(|field| Some((string(&field["title"])?, string(&field["value"])?)))
+                    .collect(),
+                is_unfurl: attachment["is_msg_unfurl"].as_bool().unwrap_or(false)
+                    || attachment["is_app_unfurl"].as_bool().unwrap_or(false),
+            })
+            .collect(),
+        subtype: string(&value["subtype"]).filter(|subtype| !subtype.is_empty()),
+        reply_count: value["reply_count"].as_u64().unwrap_or(0) as u32,
+        latest_reply: string(&value["latest_reply"]).map(Ts),
+        edited: value["edited"].is_object(),
+        reactions: value["reactions"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|reaction| {
+                Some(crate::types::Reaction {
+                    name: string(&reaction["name"])?,
+                    count: reaction["count"].as_u64().unwrap_or(0) as u32,
+                    users: reaction["users"]
+                        .as_array()
+                        .map(Vec::as_slice)
+                        .unwrap_or_default()
+                        .iter()
+                        .filter_map(|user| string(user).map(UserId))
+                        .collect(),
+                })
             })
             .collect(),
         files: value["files"]
@@ -513,9 +572,13 @@ pub fn parse_message(value: &Value, fallback_channel: &ChannelId) -> Option<Mess
             .iter()
             .filter_map(|file| {
                 Some(FileSummary {
-                    title: string(&file["title"])
-                        .or_else(|| string(&file["name"]))
+                    id: string(&file["id"]).unwrap_or_default(),
+                    title: string(&file["name"])
+                        .or_else(|| string(&file["title"]))
                         .filter(|title| !title.is_empty())?,
+                    filetype: string(&file["filetype"]).unwrap_or_default(),
+                    size: file["size"].as_u64().unwrap_or(0),
+                    url: string(&file["url_private"]).unwrap_or_default(),
                 })
             })
             .collect(),
@@ -543,17 +606,25 @@ fn parse_conversation(value: &Value) -> Option<Conversation> {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| "someone".to_owned()),
         user,
+        members: value["members"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|member| string(member).map(UserId))
+            .collect(),
     })
 }
 
 fn parse_user(value: &Value) -> Option<User> {
     let id = UserId(string(&value["id"])?);
+    let handle = string(&value["name"]).unwrap_or_default();
     let name = string(&value["profile"]["display_name"])
         .filter(|name| !name.is_empty())
         .or_else(|| string(&value["profile"]["real_name"]).filter(|name| !name.is_empty()))
         .or_else(|| string(&value["name"]))
         .unwrap_or_else(|| "someone".to_owned());
-    Some(User { id, name })
+    Some(User { id, name, handle })
 }
 
 /// The activity feed nests its payload differently per type; this pulls the
@@ -675,18 +746,24 @@ mod tests {
     }
 
     #[test]
-    fn conversation_kinds_and_labels_come_from_the_flags() {
+    fn conversation_kinds_and_members_come_from_the_flags() {
         let channel = parse_conversation(&json!({"id": "C1", "name": "design"})).unwrap();
         assert_eq!(channel.kind, ConversationKind::Channel);
-        assert_eq!(channel.label(), "#design");
+        assert_eq!(channel.name, "design");
 
-        let group =
-            parse_conversation(&json!({"id": "G1", "name": "trio", "is_mpim": true})).unwrap();
+        let group = parse_conversation(
+            &json!({"id": "G1", "name": "trio", "is_mpim": true, "members": ["ME", "U7"]}),
+        )
+        .unwrap();
         assert_eq!(group.kind, ConversationKind::Group);
+        assert_eq!(
+            group.members,
+            vec![UserId("ME".into()), UserId("U7".into())]
+        );
 
         let dm = parse_conversation(&json!({"id": "D1", "is_im": true, "user": "U7"})).unwrap();
         assert_eq!(dm.kind, ConversationKind::DirectMessage);
         assert_eq!(dm.user, Some(UserId("U7".into())));
-        assert_eq!(dm.label(), "@someone");
+        assert!(dm.members.is_empty());
     }
 }
