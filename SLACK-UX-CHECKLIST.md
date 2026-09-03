@@ -223,7 +223,16 @@ under test. If the fake cannot produce a state, extend the fake.
       user as a bare message body with nothing around it) must at least
       carry a header line `David · #design · Thu 3 Sep 10:02` above the
       text and the conversation label in the status segment; that part is
-      Phase 1 work under 1.1.
+      Phase 1 work under 1.1. The deal bar for a Slack deal, seen by the
+      user on 3 Sep: `Dawid (dpc), Shaurya / Started looking at this. Some
+      initial comments for your … | waiting on you · 1.9h · from Dawid
+      (dpc), Shaurya`. Wrong three ways: the message excerpt repeats what
+      is on screen, "from …" repeats the conversation name on the left,
+      and "you" is banned. Decided: left segment is the conversation only
+      (`#design`, `#design › thread`, or the DM names); the state segment
+      is the state then its age, `needs reply · 1.9h` when the last word
+      is theirs and `replied · 1.9h` when it is the reader's; nothing
+      else. The queue card label follows the same words.
 - [ ] 2.10 No inbox in between, decided. Today a Slack obligation is copied
       into the rho inbox (`SlackItems`, `InboxKind::Slack`,
       `SourceReference::SlackThread`) and dealt from there. Rho: the dealer
