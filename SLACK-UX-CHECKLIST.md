@@ -1,8 +1,9 @@
 # Slack UX checklist
 
 Owner: the primary agent (eng-en1p) with the user. The engineer works the
-items in order and does not reorder or skip; open decisions are marked and
-get settled by the user before the item is built.
+items in order and does not reorder or skip. Items marked "decided" carry
+the user's call and are not up for debate; anything else the engineer finds
+unclear goes back to the owner before it is built.
 
 Every item is judged the same way:
 
@@ -60,26 +61,38 @@ Nothing else lands until this does; every screenshot below comes from it.
       the glyph (a shortcode table, e.g. the `emojis` crate); workspace
       custom emoji stay `:name:` in the muted class. Applies to bodies,
       reactions, and the conversation list.
-- [ ] 1.3 Mentions. Now `@you` in plain text. Rho: a mention of self renders
-      in the same class as the user's own author name so it stands out on a
-      scan; other mentions in the sender class. DECISION (user): the text
-      stays `@you` or becomes `@<display name>`; the same choice applies to
-      the own-message author line.
-- [ ] 1.4 Message grouping. Now a header line per message and a blank line
-      after each. Slack repeats no header for the same author within a few
-      minutes. DECISION (user): keep one header per message (emacs
-      slack.el), or header only when the author changes or five minutes
-      pass (Slack). Either way the body starts at column zero.
+- [ ] 1.3 Names, decided: the word `you` appears nowhere. The user's own
+      messages carry the user's display name like anyone else's, and a
+      mention of the user renders as `@<display name>`, the same string the
+      author line uses. Self is distinguished by class only: own author name
+      and mentions of self in the "you" class, everyone else in the sender
+      class.
+- [ ] 1.4 Message layout, decided: compact, IRC and Discord-compact style.
+      Time, author, and the first line of the body on one line:
+      `14:27  David   Hope manifold isn't stressing you out too much`.
+      Author names pad to a fixed column per conversation so bodies line
+      up. Continuation lines of a multi-line body align under the body
+      column; if the buffer's language would read that indent as a code
+      block, switch the surface to a plain language and style through spans
+      (the spans already carry every class). No blank line between
+      messages; day separators are the only breaks. Reaction and reply
+      lines (1.6, 1.7) sit under the body, aligned to the body column.
 - [ ] 1.5 Day separators stay `── Fri 21 Aug ──`; times stay `14:27`;
       absolute, never "today" or "2h ago".
-- [ ] 1.6 Threads visible from the parent. Now nothing marks a parent as
-      having replies. Rho: a muted line under the parent, `↳ 3 replies ·
-      14:41`, and `enter` on it opens the thread exactly as on the parent's
-      own lines. A `thread_broadcast` reply in the channel reads `also sent
-      to the channel` in the muted class.
+- [ ] 1.6 Threads isolated, decided. Now replies are interleaved with the
+      channel's messages and marked `in thread`. Slack keeps replies out of
+      the channel entirely; rho does the same. The channel surface shows
+      only top-level messages (`thread_ts` absent or equal to `ts`) plus
+      `thread_broadcast` replies, which read `also sent to the channel` in
+      the muted class. A parent with replies carries one muted line under
+      its body, `↳ 3 replies · 14:41`, and `enter` on it or on the parent
+      opens the thread surface, which is the only place replies render.
+      A reply arriving over the websocket updates the parent's count line,
+      never the channel body. The `in thread` marker goes away.
 - [ ] 1.7 Reactions. Now absent. Rho: one muted line under the message,
-      `👍 3 · 🎉 1`, with `(you)` after any the user added. Reading them is
-      in scope; adding stays deferred.
+      `👍 3 · 🎉 1`; a reaction the user added renders in the "you" class
+      instead of muted, no word for it. Reading them is in scope; adding
+      stays deferred.
 - [ ] 1.8 Edited and deleted. `(edited)` in the muted class after the time;
       a `message_deleted` frame removes the message from the buffer.
 - [ ] 1.9 mrkdwn coverage. Every construct seeded in 0.2 renders as
@@ -92,14 +105,16 @@ Nothing else lands until this does; every screenshot below comes from it.
       through `render_block`; legacy `attachments` render title, pretext,
       text, and fields. Link unfurls (`is_msg_unfurl`, `is_app_unfurl`)
       collapse to one muted line `↗ title`, never the full preview.
-- [ ] 1.11 System messages. `channel_join`, `channel_leave`,
-      `channel_topic`, `pinned_item` render as one muted line `— David
-      joined —`. DECISION (user): hide join and leave by default.
-- [ ] 1.12 Files. Now `[file: image.png]`. Rho: `image.png · png · 220 KB`
-      as a link line; `enter` on it downloads through the API with the
-      session's token to the state cache and opens it in rho's browser
-      surface (images) or hands the path to `xdg-open` (everything else).
-      Inline image rendering is deferred.
+- [ ] 1.11 System messages, decided: shown, because Slack shows them.
+      `channel_join`, `channel_leave`, `channel_topic`, `pinned_item`
+      render as one muted line `— David joined —`.
+- [ ] 1.12 Files, decided: images preview inline. An image file renders as
+      the picture itself under the message, bounded to a sane height, the
+      way the agent transcript shows images (reuse that path and
+      `rho-image`); fetched through the API with the session's token and
+      cookie into the state cache. Any other file is a link line
+      `deck.pdf · pdf · 220 KB`; `enter` on it downloads to the cache and
+      hands the path to `xdg-open`. `[file: …]` placeholders are a defect.
 
 ## Phase 2: unread, position, and moving around
 
@@ -107,8 +122,9 @@ Nothing else lands until this does; every screenshot below comes from it.
       conversation puts the cursor on the first unread line, not the
       composer and not the top. `G` still goes to the end. The rule stays
       until the surface is closed.
-- [ ] 2.2 Read marking. Now on open. DECISION (user): mark read on open
-      (Slack) or when the cursor reaches the bottom.
+- [ ] 2.2 Read marking, decided for now: on open, as Slack does. The user
+      holds this loosely; different read semantics may come later, so keep
+      the mark call in one place.
 - [ ] 2.3 Following the tail. Pinned at the bottom, a new message keeps the
       view at the bottom. Scrolled up, the view does not move and the
       surface's status segment shows `3 new`; `G` clears it.
@@ -165,12 +181,13 @@ Nothing else lands until this does; every screenshot below comes from it.
 ## Still deferred
 
 Adding reactions, file upload, edit and delete, presence and typing, message
-search, automatic token extraction, dialogs and modals, inline images.
+search, automatic token extraction, dialogs and modals.
 
 ## Done means
 
 The reference conversation, re-seeded in the fake, renders as: the label
-`David, Keith`; emoji as glyphs; the file as an openable link line; a reply
+`David, Keith`; emoji as glyphs; the image shown inline; compact one-line
+headers with the user's own name, never `you`; a reply
 count under any threaded parent; reactions under any reacted message; the
 `── new ──` rule at the right place with the cursor on it; the composer with
 the transcript's boundary; and a screenshot per item in
