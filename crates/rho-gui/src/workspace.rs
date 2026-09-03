@@ -190,6 +190,7 @@ struct PendingGitApproval {
 struct PendingPageFiling {
     inbox_id: InboxId,
     heading: String,
+    card: Option<crate::dashboard::DealCard>,
 }
 
 #[derive(Clone)]
@@ -383,13 +384,14 @@ enum PendingDeskBatchIntent {
 
 #[derive(Clone)]
 struct PendingTreeVerdict {
-    verdict: crate::dashboard::DealerVerdict,
+    event: crate::dashboard::DealerEvent,
     echo: String,
     undo: VerdictUndo,
 }
 
 #[derive(Clone)]
 struct VerdictUndo {
+    sequence: u64,
     card: crate::dashboard::DealCard,
     verdict: crate::dashboard::DealerVerdict,
     verb: String,
@@ -407,10 +409,23 @@ enum VerdictUndoState {
         id: crate::inbox::InboxId,
         prior: crate::inbox::InboxItem,
     },
+    Filed {
+        host: HostId,
+        node: rho_desk::NodeId,
+        expected: rho_desk::NodeExpectation,
+        prior: crate::inbox::InboxItem,
+    },
+    PageFiled,
 }
 
 struct PendingTreeUndo {
     entry: VerdictUndo,
+}
+
+fn undo_sequence_insert_position(existing: impl Iterator<Item = u64>, sequence: u64) -> usize {
+    existing
+        .take_while(|candidate| *candidate < sequence)
+        .count()
 }
 
 enum DeskSemanticUndo {
@@ -590,6 +605,7 @@ pub struct Workspace {
     pending_tree_verdicts: BTreeMap<(HostId, rho_desk::TreeClock), PendingTreeVerdict>,
     pending_tree_undos: BTreeMap<(HostId, rho_desk::TreeClock), PendingTreeUndo>,
     verdict_undo: Vec<VerdictUndo>,
+    next_verdict_undo_sequence: u64,
     desk_semantic_clipboard: Option<crate::desk_view::DeskSubtree>,
     /// One-shot recovery for `p` while Vim still holds the removed excerpt.
     desk_semantic_paste_target: Option<(HostId, rho_desk::NodeId)>,
@@ -639,6 +655,7 @@ pub struct Workspace {
     /// Desk CRDT buffer until an explicit filing verdict.
     pub(crate) inbox: InboxStore,
     pending_inbox_item: Option<InboxId>,
+    pending_filing_card: Option<crate::dashboard::DealCard>,
     pending_filing_destinations: Vec<(String, String, HostId, rho_desk::NodeId)>,
     pending_filing_selected: Option<(HostId, rho_desk::NodeId)>,
     #[cfg(feature = "native")]
@@ -1303,6 +1320,7 @@ impl Workspace {
             pending_tree_verdicts: BTreeMap::new(),
             pending_tree_undos: BTreeMap::new(),
             verdict_undo: Vec::new(),
+            next_verdict_undo_sequence: 0,
             desk_semantic_clipboard: None,
             desk_semantic_paste_target: None,
             desk_semantic_undo: BTreeMap::new(),
@@ -1337,6 +1355,7 @@ impl Workspace {
                 })
             },
             pending_inbox_item: None,
+            pending_filing_card: None,
             pending_filing_destinations: Vec::new(),
             pending_filing_selected: None,
             next_page_binding_request_id: 1,
@@ -1895,6 +1914,19 @@ impl Workspace {
                 _ => true,
             }
         });
+        let warm_agents = candidates
+            .cards
+            .iter()
+            .filter(|card| matches!(card.kind, crate::dashboard::DealCardKind::Agent))
+            .filter_map(|card| card.agent_id)
+            .take(3)
+            .filter(|agent_id| {
+                self.agent_online(*agent_id) && !self.subscriptions.contains(*agent_id)
+            })
+            .collect::<Vec<_>>();
+        for agent_id in warm_agents {
+            self.subscribe_agent(agent_id, cx);
+        }
         let top = candidates.cards.first();
         let max_priority = top.map(|card| card.priority);
         let card = top.map(|card| Self::journal_card_identity(&card.identity));
@@ -2217,12 +2249,15 @@ impl Workspace {
                     cx.notify();
                 }
                 if let Some(verdict) = verdict {
-                    self.verdict_undo.push(verdict.undo);
-                    self.dashboard.record_deal_verdict_as(
-                        verdict.verdict,
-                        chrono::Local::now().fixed_offset(),
-                    );
-                    self.finish_deal_verdict(window, cx);
+                    let submitted_card_is_current = self
+                        .dashboard
+                        .current_deal_card()
+                        .is_some_and(|card| card.identity == verdict.event.card);
+                    self.restore_verdict_undo(verdict.undo);
+                    self.dashboard.record_dealer_event(verdict.event);
+                    if submitted_card_is_current {
+                        self.finish_deal_verdict(window, cx);
+                    }
                     self.echo(&verdict.echo, StyleClass::SystemInfo, cx);
                 }
                 if let Some(undone) = undone {
@@ -2236,9 +2271,7 @@ impl Workspace {
                 snapshot,
             } => {
                 self.pending_tree_verdicts.remove(&(host, id));
-                if let Some(undone) = self.pending_tree_undos.remove(&(host, id)) {
-                    self.verdict_undo.push(undone.entry);
-                }
+                let undone = self.pending_tree_undos.remove(&(host, id));
                 let semantic_can_retry =
                     retryable && self.pending_desk_batch_intents.contains_key(&(host, id));
                 if !semantic_can_retry
@@ -2248,6 +2281,18 @@ impl Workspace {
                 }
                 self.retry_desk_batch(host, id, retryable, snapshot, window, cx);
                 self.sync_tree_dashboard(host, window, cx);
+                if let Some(undone) = undone {
+                    let entry = undone.entry;
+                    if matches!(entry.state, VerdictUndoState::Filed { .. }) {
+                        self.echo(
+                            &format!("cannot undo filing: {} was edited", entry.card.breadcrumb),
+                            StyleClass::SystemInfo,
+                            cx,
+                        );
+                    } else {
+                        self.restore_verdict_undo(entry);
+                    }
+                }
                 if !retryable {
                     self.notice_on(None, &reason, StyleClass::SystemInfo, cx);
                 }
@@ -2256,18 +2301,17 @@ impl Workspace {
                 #[cfg(feature = "native")]
                 if let Some(pending) = self.pending_page_filings.remove(&(host, request_id)) {
                     match error {
-                        None => {
-                            if let Err(error) =
-                                self.inbox.verdict(&pending.inbox_id, Verdict::Filed)
-                            {
-                                tracing::error!(%error, "retiring filed inbox page");
-                                self.notice_on(
-                                    None,
-                                    "filed, but inbox persistence failed",
-                                    StyleClass::SystemInfo,
-                                    cx,
-                                );
-                            } else {
+                        None => match self.inbox.verdict(&pending.inbox_id, Verdict::Filed) {
+                            Ok(Some(_)) => {
+                                if let Some(card) = pending.card {
+                                    let entry = self.next_verdict_undo(
+                                        card,
+                                        crate::dashboard::DealerVerdict::File,
+                                        "file".to_owned(),
+                                        VerdictUndoState::PageFiled,
+                                    );
+                                    self.restore_verdict_undo(entry);
+                                }
                                 crate::journal::record(crate::journal::Event::InboxVerdict {
                                     inbox_id: pending.inbox_id.0.clone(),
                                     verdict: crate::journal::InboxVerdict::File {
@@ -2284,7 +2328,22 @@ impl Workspace {
                                     cx,
                                 );
                             }
-                        }
+                            Ok(None) => self.notice_on(
+                                None,
+                                "file: inbox item is unavailable",
+                                StyleClass::SystemInfo,
+                                cx,
+                            ),
+                            Err(error) => {
+                                tracing::error!(%error, "retiring filed inbox page");
+                                self.notice_on(
+                                    None,
+                                    "filed, but inbox persistence failed",
+                                    StyleClass::SystemInfo,
+                                    cx,
+                                );
+                            }
+                        },
                         Some(reason) => {
                             self.notice_on(
                                 None,
@@ -4198,7 +4257,8 @@ impl Workspace {
         };
         if let SourceReference::Page { id: page_id } = &item.source {
             let target = self.pending_filing_selected.take();
-            if !self.file_inbox_page(target, heading, page_id, &id, cx) {
+            let card = self.pending_filing_card.take();
+            if !self.file_inbox_page(target, heading, page_id, &id, card, cx) {
                 self.notice_on(None, "file: heading not found", StyleClass::SystemInfo, cx);
             }
             // A page filing is not retired until the daemon acknowledges the
@@ -4221,23 +4281,36 @@ impl Workspace {
         let filed = self
             .pending_filing_selected
             .take()
-            .is_some_and(|(host, parent)| {
+            .and_then(|(host, parent)| {
                 self.append_tree_heading_tagged(host, parent, true, false, &title, tags, window, cx)
+                    .map(|node| (host, node))
             });
-        if !filed {
+        let Some((host, node)) = filed else {
             self.notice_on(None, "file: heading not found", StyleClass::SystemInfo, cx);
             return;
-        }
-        if let Err(error) = self.inbox.verdict(&id, Verdict::Filed) {
-            tracing::error!(%error, "retiring filed inbox item");
-            self.notice_on(
-                None,
-                "filed, but inbox persistence failed",
-                StyleClass::SystemInfo,
-                cx,
-            );
-            return;
-        }
+        };
+        let removed = match self.inbox.verdict(&id, Verdict::Filed) {
+            Ok(Some(removed)) => removed,
+            Ok(None) => {
+                self.notice_on(
+                    None,
+                    "file: inbox item is unavailable",
+                    StyleClass::SystemInfo,
+                    cx,
+                );
+                return;
+            }
+            Err(error) => {
+                tracing::error!(%error, "retiring filed inbox item");
+                self.notice_on(
+                    None,
+                    "filed, but inbox persistence failed",
+                    StyleClass::SystemInfo,
+                    cx,
+                );
+                return;
+            }
+        };
         crate::journal::record(crate::journal::Event::InboxVerdict {
             inbox_id: id.0.clone(),
             verdict: crate::journal::InboxVerdict::File {
@@ -4245,6 +4318,22 @@ impl Workspace {
             },
         });
         self.pending_inbox_item = None;
+        if let Some(card) = self.pending_filing_card.take()
+            && let Some(expected) = self.desk_tree_sync.node_expectation(host, node)
+        {
+            let entry = self.next_verdict_undo(
+                card,
+                crate::dashboard::DealerVerdict::File,
+                "file".to_owned(),
+                VerdictUndoState::Filed {
+                    host,
+                    node,
+                    expected,
+                    prior: removed,
+                },
+            );
+            self.restore_verdict_undo(entry);
+        }
         self.refresh_dashboard(window, cx);
         self.echo(
             &format!("filed under {heading}"),
@@ -4260,6 +4349,7 @@ impl Workspace {
         heading: &str,
         id: &str,
         inbox_id: &InboxId,
+        card: Option<crate::dashboard::DealCard>,
         _cx: &mut Context<Self>,
     ) -> bool {
         let Some((host, parent)) = target else {
@@ -4275,6 +4365,7 @@ impl Workspace {
             PendingPageFiling {
                 inbox_id: inbox_id.clone(),
                 heading: heading.to_owned(),
+                card,
             },
         );
         self.send_to_host(
@@ -4295,6 +4386,7 @@ impl Workspace {
         _heading: &str,
         _id: &str,
         _inbox_id: &InboxId,
+        _card: Option<crate::dashboard::DealCard>,
         _cx: &mut Context<Self>,
     ) -> bool {
         false
@@ -6636,6 +6728,11 @@ impl Workspace {
     }
 
     #[cfg(test)]
+    pub(crate) fn forget_agent_subscription_for_test(&mut self, agent_id: AgentId) {
+        self.subscriptions.forget(agent_id);
+    }
+
+    #[cfg(test)]
     pub(crate) fn current_deal_card_for_test(
         &self,
     ) -> Option<(
@@ -6710,8 +6807,42 @@ impl Workspace {
     }
 
     #[cfg(test)]
+    pub(crate) fn retire_inbox_for_test(&mut self, id: &InboxId) {
+        self.inbox.retire(id).expect("retire test inbox item");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn current_deal_card_value_for_test(&self) -> Option<crate::dashboard::DealCard> {
+        self.dashboard.current_deal_card().cloned()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reopen_deal_for_test(&mut self, card: crate::dashboard::DealCard) {
+        self.dashboard.reopen_deal(card);
+    }
+
+    #[cfg(test)]
     pub(crate) fn verdict_undo_count_for_test(&self) -> usize {
         self.verdict_undo.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn complete_filing_for_test(
+        &mut self,
+        host: HostId,
+        parent: rho_desk::NodeId,
+        heading: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.pending_filing_selected = Some((host, parent));
+        self.file_inbox_item(heading, window, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_deal_filing_for_test(&mut self, id: InboxId) {
+        self.pending_inbox_item = Some(id);
+        self.pending_filing_card = self.dashboard.current_deal_card().cloned();
     }
 
     #[cfg(test)]
@@ -8247,8 +8378,15 @@ impl Workspace {
             card,
             verdict,
             verb,
+            state,
             ..
         } = entry;
+        if let VerdictUndoState::Filed { prior, .. } = state
+            && let Err(error) = self.inbox.restore(prior)
+        {
+            self.echo(&format!("undo: {error}"), StyleClass::SystemInfo, cx);
+            return;
+        }
         self.dashboard.clear_skip(&card.identity);
         crate::journal::record(crate::journal::Event::VerdictUndone {
             card: Self::journal_card_identity(&card.identity),
@@ -8265,6 +8403,35 @@ impl Workspace {
         self.refresh_dashboard(window, cx);
     }
 
+    fn next_verdict_undo(
+        &mut self,
+        card: crate::dashboard::DealCard,
+        verdict: crate::dashboard::DealerVerdict,
+        verb: String,
+        state: VerdictUndoState,
+    ) -> VerdictUndo {
+        let sequence = self.next_verdict_undo_sequence;
+        self.next_verdict_undo_sequence = self
+            .next_verdict_undo_sequence
+            .checked_add(1)
+            .expect("verdict undo sequence overflow");
+        VerdictUndo {
+            sequence,
+            card,
+            verdict,
+            verb,
+            state,
+        }
+    }
+
+    fn restore_verdict_undo(&mut self, entry: VerdictUndo) {
+        let index = undo_sequence_insert_position(
+            self.verdict_undo.iter().map(|candidate| candidate.sequence),
+            entry.sequence,
+        );
+        self.verdict_undo.insert(index, entry);
+    }
+
     pub(crate) fn undo_verdict(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(entry) = self.verdict_undo.pop() else {
             self.echo("nothing to undo", StyleClass::SystemInfo, cx);
@@ -8276,7 +8443,7 @@ impl Workspace {
                     .desk_tree_sync
                     .prepare_temporal_batch(host, node, prior)
                 else {
-                    self.verdict_undo.push(entry);
+                    self.restore_verdict_undo(entry);
                     self.echo(
                         "undo: Desk heading is unavailable",
                         StyleClass::SystemInfo,
@@ -8293,11 +8460,48 @@ impl Workspace {
             VerdictUndoState::Inbox { id, prior } => {
                 debug_assert_eq!(id, prior.id);
                 if let Err(error) = self.inbox.restore(prior) {
-                    self.verdict_undo.push(entry);
+                    self.restore_verdict_undo(entry);
                     self.echo(&format!("undo: {error}"), StyleClass::SystemInfo, cx);
                     return;
                 }
                 self.complete_verdict_undo(entry, window, cx);
+            }
+            VerdictUndoState::Filed {
+                host,
+                node,
+                expected,
+                ..
+            } => {
+                if self.desk_tree_sync.node_expectation(host, node).as_ref() != Some(&expected) {
+                    self.echo(
+                        &format!("cannot undo filing: {} was edited", entry.card.breadcrumb),
+                        StyleClass::SystemInfo,
+                        cx,
+                    );
+                    return;
+                }
+                let Some((batch, messages, _, _)) =
+                    self.desk_tree_sync.prepare_delete_subtree(host, node, cx)
+                else {
+                    self.restore_verdict_undo(entry);
+                    return;
+                };
+                self.pending_tree_undos
+                    .insert((host, batch.id), PendingTreeUndo { entry });
+                self.desk_tree_sync.apply_optimistic(host, &messages, cx);
+                self.sync_tree_dashboard(host, window, cx);
+                self.send_to_host(host, ClientMessage::DeskTreeBatchApply { batch });
+            }
+            VerdictUndoState::PageFiled => {
+                // A future implementation can undo the machine-owned node by
+                // adding DeskPageUnbind; no tree batch can remove it safely.
+                let title = entry.card.breadcrumb.clone();
+                self.restore_verdict_undo(entry);
+                self.echo(
+                    &format!("cannot undo page filing yet: {title}"),
+                    StyleClass::SystemInfo,
+                    cx,
+                );
             }
         }
     }
@@ -8314,6 +8518,12 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> bool {
         let Some(card) = self.dashboard.current_deal_card().cloned() else {
+            return false;
+        };
+        let Some(event) = self
+            .dashboard
+            .prepare_deal_verdict(verdict, chrono::Local::now().fixed_offset())
+        else {
             return false;
         };
         let Some(node_id) = target_node.or(card.topic_node_id) else {
@@ -8344,23 +8554,19 @@ impl Workspace {
             return false;
         };
         let echo = format!("{verb}: {}", card.breadcrumb);
-        let undo = VerdictUndo {
-            card: card.clone(),
+        let undo = self.next_verdict_undo(
+            card.clone(),
             verdict,
             verb,
-            state: VerdictUndoState::DeskMarks {
+            VerdictUndoState::DeskMarks {
                 host: card.host,
                 node: node_id,
                 prior,
             },
-        };
+        );
         self.pending_tree_verdicts.insert(
             (card.host, batch.id),
-            PendingTreeVerdict {
-                verdict,
-                echo,
-                undo,
-            },
+            PendingTreeVerdict { event, echo, undo },
         );
         self.desk_tree_sync
             .apply_optimistic(card.host, &messages, cx);
@@ -9535,6 +9741,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> bool {
         self.append_tree_heading_tagged(host, relative, child, above, title, &[], window, cx)
+            .is_some()
     }
 
     fn append_tree_heading_tagged(
@@ -9547,15 +9754,15 @@ impl Workspace {
         tags: &[&str],
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> bool {
+    ) -> Option<rho_desk::NodeId> {
         let Some(operation) = self
             .desk_tree_sync
             .prepare_new_heading(host, relative, child, above)
         else {
-            return false;
+            return None;
         };
         let rho_desk::TreeOperation::Create { node_id, .. } = &operation else {
-            return false;
+            return None;
         };
         let node_id = *node_id;
         let message = ClientMessage::DeskTreeApply { operation };
@@ -9574,7 +9781,9 @@ impl Workspace {
             self.send_to_host(host, message);
         }
         self.sync_tree_dashboard(host, window, cx);
-        self.dashboard.rename_cursor_topic(title, cx)
+        self.dashboard
+            .rename_cursor_topic(title, cx)
+            .then_some(node_id)
     }
 
     fn dashboard_reorder(&mut self, down: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -11060,12 +11269,6 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &DashboardDealDone, window, cx| {
                 vim::take_count(cx);
                 let card = this.dashboard.current_deal_card().cloned();
-                let prior_inbox = card.as_ref().and_then(|card| match &card.identity {
-                    crate::dashboard::DealCardIdentity::Inbox(id) => {
-                        this.inbox.get(&crate::inbox::InboxId(id.clone())).cloned()
-                    }
-                    _ => None,
-                });
                 let today = chrono::Local::now().date_naive();
                 let now = chrono::Local::now().fixed_offset();
                 if card
@@ -11114,23 +11317,26 @@ impl Render for Workspace {
                                 &crate::inbox::InboxId(id.clone()),
                                 crate::inbox::Verdict::Discarded,
                             )
-                            .map(|_| ())
                             .map_err(|_| "nothing under the deal: the inbox item is unavailable")
+                            .and_then(|item| {
+                                item.ok_or("nothing under the deal: the inbox item is unavailable")
+                            })
                     }
                     _ => Err("nothing under the deal: the deal card disappeared"),
                 };
                 let handled = result.is_ok();
                 if handled {
-                    if let (Some(card), Some(item)) = (card.clone(), prior_inbox) {
-                        this.verdict_undo.push(VerdictUndo {
+                    if let (Some(card), Ok(item)) = (card.clone(), &result) {
+                        let entry = this.next_verdict_undo(
                             card,
-                            verdict: crate::dashboard::DealerVerdict::Done,
-                            verb: "done".to_owned(),
-                            state: VerdictUndoState::Inbox {
+                            crate::dashboard::DealerVerdict::Done,
+                            "done".to_owned(),
+                            VerdictUndoState::Inbox {
                                 id: item.id.clone(),
-                                prior: item,
+                                prior: item.clone(),
                             },
-                        });
+                        );
+                        this.restore_verdict_undo(entry);
                     }
                     this.dashboard
                         .record_deal_verdict_as(crate::dashboard::DealerVerdict::Done, now);
@@ -11149,12 +11355,6 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &DashboardDealDiscard, window, cx| {
                 vim::take_count(cx);
                 let card = this.dashboard.current_deal_card().cloned();
-                let prior_inbox = card.as_ref().and_then(|card| match &card.identity {
-                    crate::dashboard::DealCardIdentity::Inbox(id) => {
-                        this.inbox.get(&crate::inbox::InboxId(id.clone())).cloned()
-                    }
-                    _ => None,
-                });
                 let today = chrono::Local::now().date_naive();
                 let now = chrono::Local::now().fixed_offset();
                 if card
@@ -11203,23 +11403,26 @@ impl Render for Workspace {
                                 &crate::inbox::InboxId(id.clone()),
                                 crate::inbox::Verdict::Discarded,
                             )
-                            .map(|_| ())
                             .map_err(|_| "nothing under the deal: the inbox item is unavailable")
+                            .and_then(|item| {
+                                item.ok_or("nothing under the deal: the inbox item is unavailable")
+                            })
                     }
                     _ => Err("nothing under the deal: the deal card disappeared"),
                 };
                 let handled = result.is_ok();
                 if handled {
-                    if let (Some(card), Some(item)) = (card.clone(), prior_inbox) {
-                        this.verdict_undo.push(VerdictUndo {
+                    if let (Some(card), Ok(item)) = (card.clone(), &result) {
+                        let entry = this.next_verdict_undo(
                             card,
-                            verdict: crate::dashboard::DealerVerdict::Dismiss,
-                            verb: "discard".to_owned(),
-                            state: VerdictUndoState::Inbox {
+                            crate::dashboard::DealerVerdict::Dismiss,
+                            "discard".to_owned(),
+                            VerdictUndoState::Inbox {
                                 id: item.id.clone(),
-                                prior: item,
+                                prior: item.clone(),
                             },
-                        });
+                        );
+                        this.restore_verdict_undo(entry);
                     }
                     this.dashboard
                         .record_deal_verdict_as(crate::dashboard::DealerVerdict::Dismiss, now);
@@ -11306,15 +11509,16 @@ impl Render for Workspace {
                 let handled = result.is_ok();
                 if handled {
                     if let (Some(card), Some(item)) = (card.clone(), prior_inbox) {
-                        this.verdict_undo.push(VerdictUndo {
+                        let entry = this.next_verdict_undo(
                             card,
-                            verdict: crate::dashboard::DealerVerdict::Defer,
-                            verb: format!("snooze {}d", count.max(1)),
-                            state: VerdictUndoState::Inbox {
+                            crate::dashboard::DealerVerdict::Defer,
+                            format!("snooze {}d", count.max(1)),
+                            VerdictUndoState::Inbox {
                                 id: item.id.clone(),
                                 prior: item,
                             },
-                        });
+                        );
+                        this.restore_verdict_undo(entry);
                     }
                     this.dashboard
                         .record_deal_verdict_as(crate::dashboard::DealerVerdict::Defer, now);
@@ -11503,6 +11707,7 @@ impl Render for Workspace {
                     .current_deal_card()
                     .map(|card| card.identity.clone())
                 {
+                    let filing_card = this.dashboard.current_deal_card().cloned();
                     let id = crate::inbox::InboxId(id);
                     if this.inbox.get(&id).is_none() {
                         return;
@@ -11515,6 +11720,7 @@ impl Render for Workspace {
                         this.notice_on(None, &format!("file: {error}"), StyleClass::SystemInfo, cx);
                         return;
                     }
+                    this.pending_filing_card = filing_card;
                     this.dashboard.end_deal(cx);
                     this.finish_dashboard_deal_action(window, cx);
                     return;
@@ -11974,5 +12180,16 @@ mod tests {
             Some(&(Todo, Some(mark)))
         );
         assert_eq!(temporal_verdict_values(Todo, mark).len(), 4);
+    }
+
+    #[test]
+    fn rejected_undos_return_to_their_original_lifo_positions() {
+        let mut sequences = vec![0, 3];
+        for rejected in [2, 1] {
+            let index = undo_sequence_insert_position(sequences.iter().copied(), rejected);
+            sequences.insert(index, rejected);
+        }
+        assert_eq!(sequences, vec![0, 1, 2, 3]);
+        assert_eq!(sequences.pop(), Some(3));
     }
 }

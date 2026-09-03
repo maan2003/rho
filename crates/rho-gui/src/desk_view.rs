@@ -571,6 +571,27 @@ impl DeskTreeSync {
             .find(|node| node.id == node_id)
     }
 
+    pub fn node_expectation(
+        &self,
+        host: HostId,
+        node_id: rho_desk::NodeId,
+    ) -> Option<rho_desk::NodeExpectation> {
+        let desk = self.tree_hosts.get(&host)?;
+        let node = desk
+            .document
+            .materialize()
+            .into_iter()
+            .find(|node| node.id == node_id)?;
+        Some(rho_desk::NodeExpectation {
+            node_id,
+            kind: node.kind,
+            owner: node.owner,
+            parent: node.parent,
+            order: node.order,
+            text_version: desk.document.text_version(node_id).ok()?,
+        })
+    }
+
     pub fn prepare_temporal_batch(
         &mut self,
         host: HostId,

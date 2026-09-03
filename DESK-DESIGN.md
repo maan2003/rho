@@ -268,6 +268,7 @@ signal special-case, so dealing order agrees with the signals.
 **Cold start boots into the desk.** Sitting down starts at the map: orient
 first, then open a surface or ask for a deal. This also keeps the rule
 that the dealer never moves you anywhere on its own — including at startup.
+The top three ranked agent cards keep their transcript subscriptions warm so a deal opens immediately.
 
 ## Deliberately deferred
 

@@ -1075,10 +1075,21 @@ impl Dashboard {
         verdict: DealerVerdict,
         now: chrono::DateTime<chrono::FixedOffset>,
     ) {
-        let Some(deal) = &self.deal else { return };
+        let Some(event) = self.prepare_deal_verdict(verdict, now) else {
+            return;
+        };
+        self.record_dealer_event(event);
+    }
+
+    pub fn prepare_deal_verdict(
+        &self,
+        verdict: DealerVerdict,
+        now: chrono::DateTime<chrono::FixedOffset>,
+    ) -> Option<DealerEvent> {
+        let deal = self.deal.as_ref()?;
         let skip_until = (verdict == DealerVerdict::Skip)
             .then(|| now + chrono::Duration::minutes(SKIP_COOLDOWN_MINUTES));
-        let event = DealerEvent {
+        Some(DealerEvent {
             card: deal.card.identity.clone(),
             kind: deal.card.kind,
             verdict,
@@ -1090,14 +1101,14 @@ impl Dashboard {
                 .min(u128::from(u64::MAX)) as u64,
             considered_not_dealt: deal.considered_not_dealt.clone(),
             skip_until,
-        };
+        })
+    }
+
+    pub fn record_dealer_event(&mut self, event: DealerEvent) {
+        let verdict = event.verdict;
         if verdict != DealerVerdict::Skip {
             self.skipped.remove(&event.card);
         }
-        self.record_dealer_event(event);
-    }
-
-    fn record_dealer_event(&mut self, event: DealerEvent) {
         fn identity(card: &DealCardIdentity) -> crate::journal::DealerCardIdentity {
             match card {
                 DealCardIdentity::Tree { host, node_id } => {

@@ -2974,6 +2974,202 @@ fn ordinary_ready_does_not_replay_but_reconnect_resubscribes_retained_transcript
 }
 
 #[gpui::test]
+fn dealer_recompute_keeps_only_top_three_agent_cards_warm(cx: &mut TestAppContext) {
+    use rho_desk::{
+        Binding, BindingKind, Document, NodeId, NodeKind, NodeOwner, OrderKey, Replica,
+        ReplicaAuthor, TextOperation, TreeClock, TreeOperation,
+    };
+    use rho_ui_proto::{
+        AgentDisposition, AgentRole, AuthState, ClientMessage, UiAgentFacts, UiAgentSummary,
+        UiAttention, WorkspaceInfo,
+    };
+
+    let ids = [agent(21), agent(22), agent(23), agent(24)];
+    let mut document = Document::default();
+    document.add_replica(Replica {
+        replica_id: 1,
+        author: ReplicaAuthor::Machine,
+    });
+    for (index, agent_id) in ids.iter().copied().enumerate() {
+        let heading = NodeId {
+            replica_id: 1,
+            counter: index as u64 * 2 + 1,
+        };
+        let row = NodeId {
+            replica_id: 1,
+            counter: index as u64 * 2 + 2,
+        };
+        for (offset, node_id, kind, owner, parent) in [
+            (0, heading, NodeKind::Heading, NodeOwner::User, None),
+            (1, row, NodeKind::Agent, NodeOwner::Machine, Some(heading)),
+        ] {
+            document
+                .apply(TreeOperation::Create {
+                    timestamp: TreeClock {
+                        value: (index * 3 + offset + 1) as u32,
+                        replica_id: 1,
+                    },
+                    node_id,
+                    kind,
+                    owner,
+                    parent,
+                    order: OrderKey(vec![(index as u16 + 1) * 20]),
+                })
+                .unwrap();
+        }
+        document
+            .apply(TreeOperation::SetBinding {
+                timestamp: TreeClock {
+                    value: (index * 3 + 3) as u32,
+                    replica_id: 1,
+                },
+                node_id: row,
+                kind: BindingKind::Agent,
+                value: Some(Binding::Agent(agent_id)),
+            })
+            .unwrap();
+        let mut title = text::Buffer::new(
+            text::ReplicaId::new(1),
+            text::BufferId::new(index as u64 + 1).unwrap(),
+            "",
+        );
+        document
+            .apply_text(
+                heading,
+                TextOperation::from_text(
+                    &title.edit([(0..0, format!("Warm agent {}", index + 1))]),
+                ),
+                None,
+            )
+            .unwrap();
+    }
+    let summaries = ids
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(index, agent_id)| UiAgentSummary {
+            agent_id,
+            parent_agent: None,
+            display_name: Some(format!("warm {}", index + 1)),
+            created_at: UnixMs(1),
+            updated_at: UnixMs(1),
+            role: AgentRole::default(),
+            workspace: WorkspaceInfo::UserCheckout {
+                repo: "/tmp".into(),
+            },
+            attention: UiAttention::Pending,
+            last_active: UnixMs((ids.len() - index) as u64),
+            facts: UiAgentFacts {
+                last_turn_ended: Some(UnixMs(1)),
+                last_user_message_at: UnixMs(0),
+                needs_you_hint: true,
+                ..Default::default()
+            },
+            hidden: false,
+            disposition: AgentDisposition::Pending,
+            last_user_message_text: String::new(),
+            activity: None,
+            turn_report: None,
+            labels: Vec::new(),
+        })
+        .collect();
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskTreeSnapshot {
+                    snapshot: document.snapshot(),
+                    replica_id: 42,
+                },
+                window,
+                cx,
+            );
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Ready {
+                    agents: summaries,
+                    iris_agent: None,
+                    projects: Vec::new(),
+                    auth: AuthState {
+                        namespaces: Vec::new(),
+                        disabled_namespaces: Vec::new(),
+                        active_namespace: None,
+                    },
+                    machine_seed: 0,
+                    agent_counter: 30,
+                },
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, cx| {
+            workspace.take_host_messages_for_test(HostId::default());
+            // The highest card is already warm. The recompute must not resend
+            // it or expand the warm set to the fourth card.
+            for agent_id in ids.into_iter().skip(1) {
+                workspace.forget_agent_subscription_for_test(agent_id);
+            }
+            let inbox = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
+                kind: crate::inbox::InboxKind::Capture,
+                text: "not a transcript".into(),
+                source: crate::inbox::SourceReference::None,
+                context: crate::inbox::CapturedContext::default(),
+                waiting_on: None,
+            });
+            workspace.age_inbox_for_test(&inbox, 0);
+            workspace.invalidate_dealer_signals(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let subscribed = workspace
+        .update(cx, |workspace, _, _| {
+            workspace
+                .take_host_messages_for_test(HostId::default())
+                .into_iter()
+                .filter_map(|message| match message {
+                    ClientMessage::SubscribeAgents { agent_ids } => Some(agent_ids),
+                    _ => None,
+                })
+                .flatten()
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+    assert_eq!(subscribed, vec![ids[1], ids[2]]);
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::Disconnected("test".into()),
+                window,
+                cx,
+            );
+            for agent_id in ids {
+                workspace.forget_agent_subscription_for_test(agent_id);
+            }
+            workspace.take_host_messages_for_test(HostId::default());
+            workspace.invalidate_dealer_signals(cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                workspace
+                    .take_host_messages_for_test(HostId::default())
+                    .into_iter()
+                    .all(|message| !matches!(message, ClientMessage::SubscribeAgents { .. }))
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
 fn display_elision_opens_and_closes_with_fold_keys(cx: &mut TestAppContext) {
     let workspace = test_workspace(cx);
     cx.update(bind_test_keymaps);
@@ -3393,7 +3589,7 @@ fn deal_file_bare_enter_uses_the_offered_heading_completion(cx: &mut TestAppCont
 
     cx.update(bind_test_keymaps);
     let workspace = test_workspace(cx);
-    workspace
+    let inbox_id = workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(
                 HostId::default(),
@@ -3413,6 +3609,7 @@ fn deal_file_bare_enter_uses_the_offered_heading_completion(cx: &mut TestAppCont
             });
             workspace.age_inbox_for_test(&id, 0);
             workspace.open_deal_mode(window, cx);
+            id
         })
         .unwrap();
     cx.run_until_parked();
@@ -3453,6 +3650,259 @@ fn deal_file_bare_enter_uses_the_offered_heading_completion(cx: &mut TestAppCont
         message,
         rho_ui_proto::ClientMessage::DeskNodeTextApply { .. }
     )));
+    let created = messages
+        .iter()
+        .find_map(|message| match message {
+            rho_ui_proto::ClientMessage::DeskTreeApply {
+                operation: TreeOperation::Create { node_id, .. },
+            } => Some(*node_id),
+            _ => None,
+        })
+        .unwrap();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(workspace.verdict_undo_count_for_test(), 1);
+            assert!(workspace.inbox_item_for_test(&inbox_id).is_none());
+        })
+        .unwrap();
+    cx.dispatch_action(*workspace, crate::UndoVerdict);
+    let undo_batch = workspace
+        .update(cx, |workspace, _, _| {
+            workspace
+                .take_host_messages_for_test(HostId::default())
+                .into_iter()
+                .find_map(|message| match message {
+                    rho_ui_proto::ClientMessage::DeskTreeBatchApply { batch } => Some(batch),
+                    _ => None,
+                })
+                .expect("filing undo batch")
+        })
+        .unwrap();
+    assert!(undo_batch.operations.iter().any(|operation| matches!(
+        operation,
+        rho_desk::BatchOperation::Tree(TreeOperation::Delete { node_ids, .. })
+            if node_ids == &vec![created]
+    )));
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskTreeBatchApplied(rho_desk::BatchOpRecord {
+                    sequence: 1,
+                    timestamp_ms: 1,
+                    batch: undo_batch,
+                    daemon_tree_operations: Vec::new(),
+                }),
+                window,
+                cx,
+            );
+            assert!(workspace.inbox_item_for_test(&inbox_id).is_some());
+            assert_eq!(
+                workspace.echo_text_for_test(),
+                Some("undid file: Inbox QA item")
+            );
+        })
+        .unwrap();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.prepare_deal_filing_for_test(inbox_id.clone());
+            workspace.complete_filing_for_test(
+                HostId::default(),
+                destination,
+                "Verdict agent",
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let second_created = workspace
+        .update(cx, |workspace, _, _| {
+            workspace
+                .take_host_messages_for_test(HostId::default())
+                .into_iter()
+                .find_map(|message| match message {
+                    rho_ui_proto::ClientMessage::DeskTreeApply {
+                        operation: TreeOperation::Create { node_id, .. },
+                    } => Some(node_id),
+                    _ => None,
+                })
+                .unwrap()
+        })
+        .unwrap();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(workspace.verdict_undo_count_for_test(), 1);
+        })
+        .unwrap();
+    let buffer = workspace
+        .update(cx, |workspace, _, _| {
+            workspace
+                .tree_buffer_for_test(HostId::default(), second_created)
+                .unwrap()
+        })
+        .unwrap();
+    buffer.update(cx, |buffer, cx| {
+        let end = buffer.len();
+        buffer.edit([(end..end, " edited")], None, cx);
+    });
+    cx.run_until_parked();
+    let edited_snapshot = workspace
+        .update(cx, |workspace, _, _| {
+            let mut document =
+                Document::from_snapshot(workspace.desk_snapshot_for_test(HostId::default()))
+                    .unwrap();
+            for message in workspace.take_host_messages_for_test(HostId::default()) {
+                if let rho_ui_proto::ClientMessage::DeskNodeTextApply {
+                    node_id,
+                    operation,
+                    transaction,
+                } = message
+                {
+                    document
+                        .apply_text(node_id, operation, transaction)
+                        .unwrap();
+                }
+            }
+            document
+                .apply(TreeOperation::Move {
+                    timestamp: TreeClock {
+                        value: 10_000,
+                        replica_id: 1,
+                    },
+                    node_id: second_created,
+                    parent: Some(destination),
+                    order: OrderKey(vec![999]),
+                })
+                .unwrap();
+            document.snapshot()
+        })
+        .unwrap();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.undo_verdict(window, cx);
+        })
+        .unwrap();
+    let undo_id = workspace
+        .update(cx, |workspace, _, _| {
+            workspace
+                .take_host_messages_for_test(HostId::default())
+                .into_iter()
+                .find_map(|message| match message {
+                    rho_ui_proto::ClientMessage::DeskTreeBatchApply { batch } => Some(batch.id),
+                    _ => None,
+                })
+                .unwrap()
+        })
+        .unwrap();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskTreeBatchRejected {
+                    id: undo_id,
+                    retryable: true,
+                    reason: "edited".into(),
+                    snapshot: edited_snapshot,
+                },
+                window,
+                cx,
+            );
+            assert_eq!(
+                workspace.echo_text_for_test(),
+                Some("cannot undo filing: Inbox QA item was edited")
+            );
+            assert_eq!(workspace.verdict_undo_count_for_test(), 0);
+        })
+        .unwrap();
+}
+
+#[cfg(feature = "native")]
+#[gpui::test]
+fn page_filing_undo_stays_on_the_stack_until_unbind_exists(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let inbox_id = workspace
+        .update(cx, |workspace, window, cx| {
+            let page_id = uuid::Uuid::new_v4();
+            let id = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
+                kind: crate::inbox::InboxKind::Capture,
+                text: "Filed research page".into(),
+                source: crate::inbox::SourceReference::Page {
+                    id: page_id.to_string(),
+                },
+                context: crate::inbox::CapturedContext::default(),
+                waiting_on: None,
+            });
+            workspace.reopen_deal_for_test(crate::dashboard::DealCard {
+                label: "Filed research page".into(),
+                priority: 1.0,
+                host: HostId::default(),
+                subject_node_id: None,
+                topic_node_id: None,
+                agent_id: None,
+                agent_tag: None,
+                breadcrumb: "Filed research page".into(),
+                room: None,
+                kind: crate::dashboard::DealCardKind::Inbox(
+                    crate::dashboard::DealerInboxKind::Capture,
+                ),
+                identity: crate::dashboard::DealCardIdentity::Inbox(id.0.clone()),
+                inbox_source: Some(crate::dashboard::DealerInboxSource::Page(
+                    rho_browser::PageId(page_id),
+                )),
+            });
+            workspace.prepare_deal_filing_for_test(id.clone());
+            workspace.complete_filing_for_test(
+                HostId::default(),
+                rho_desk::NodeId {
+                    replica_id: 1,
+                    counter: 1,
+                },
+                "Research",
+                window,
+                cx,
+            );
+            id
+        })
+        .unwrap();
+    let request_id = workspace
+        .update(cx, |workspace, _, _| {
+            workspace
+                .take_host_messages_for_test(HostId::default())
+                .into_iter()
+                .find_map(|message| match message {
+                    rho_ui_proto::ClientMessage::DeskPageBind { request_id, .. } => {
+                        Some(request_id)
+                    }
+                    _ => None,
+                })
+                .expect("page binding request")
+        })
+        .unwrap();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskPageBindingResult {
+                    request_id,
+                    error: None,
+                },
+                window,
+                cx,
+            );
+            assert!(workspace.inbox_item_for_test(&inbox_id).is_none());
+            assert_eq!(workspace.verdict_undo_count_for_test(), 1);
+
+            workspace.undo_verdict(window, cx);
+
+            assert_eq!(
+                workspace.echo_text_for_test(),
+                Some("cannot undo page filing yet: Filed research page")
+            );
+            assert_eq!(workspace.verdict_undo_count_for_test(), 1);
+        })
+        .unwrap();
 }
 
 #[gpui::test]
@@ -3497,6 +3947,38 @@ fn inbox_verdict_echo_names_card_and_undo_restores_it(cx: &mut TestAppContext) {
             assert_eq!(
                 workspace.current_deal_card_for_test().map(|card| card.0),
                 Some(crate::dashboard::DealCardIdentity::Inbox(id.0.clone()))
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn missing_inbox_item_is_not_a_successful_verdict(cx: &mut TestAppContext) {
+    let workspace = test_workspace(cx);
+    let id = workspace
+        .update(cx, |workspace, window, cx| {
+            let id = workspace.append_inbox_for_test(crate::inbox::InboxDraft {
+                kind: crate::inbox::InboxKind::Capture,
+                text: "Retired elsewhere".into(),
+                source: crate::inbox::SourceReference::None,
+                context: crate::inbox::CapturedContext::default(),
+                waiting_on: None,
+            });
+            workspace.age_inbox_for_test(&id, 0);
+            workspace.open_deal_mode(window, cx);
+            workspace.retire_inbox_for_test(&id);
+            id
+        })
+        .unwrap();
+
+    cx.dispatch_action(*workspace, crate::DashboardDealDone);
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(workspace.inbox_item_for_test(&id).is_none());
+            assert_eq!(workspace.verdict_undo_count_for_test(), 0);
+            assert_eq!(
+                workspace.echo_text_for_test(),
+                Some("done: nothing under the deal: the inbox item is unavailable")
             );
         })
         .unwrap();
@@ -3673,6 +4155,52 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
     verdict_and_undo!(crate::DashboardDealDiscard, "discard: Named card");
     verdict_and_undo!(crate::DashboardDealSnooze, "snooze 1d: Named card");
     verdict_and_undo!(crate::DashboardDealTodo, "todo: Named card");
+
+    // A delayed acknowledgement belongs to the submitted card, even if the
+    // user has moved on to another deal in the meantime.
+    cx.dispatch_action(*workspace, crate::DashboardDealDone);
+    let delayed = workspace
+        .update(cx, |workspace, _, _| {
+            workspace
+                .take_host_messages_for_test(HostId::default())
+                .into_iter()
+                .find_map(|message| match message {
+                    rho_ui_proto::ClientMessage::DeskTreeBatchApply { batch } => Some(batch),
+                    _ => None,
+                })
+                .unwrap()
+        })
+        .unwrap();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            let mut replacement = workspace.current_deal_card_value_for_test().unwrap();
+            replacement.identity = crate::dashboard::DealCardIdentity::Inbox("replacement".into());
+            replacement.kind =
+                crate::dashboard::DealCardKind::Inbox(crate::dashboard::DealerInboxKind::Capture);
+            replacement.topic_node_id = None;
+            replacement.subject_node_id = None;
+            replacement.agent_id = None;
+            workspace.reopen_deal_for_test(replacement);
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskTreeBatchApplied(BatchOpRecord {
+                    sequence: 3,
+                    timestamp_ms: 3,
+                    batch: delayed,
+                    daemon_tree_operations: Vec::new(),
+                }),
+                window,
+                cx,
+            );
+            assert_eq!(
+                workspace.current_deal_card_for_test().map(|card| card.0),
+                Some(crate::dashboard::DealCardIdentity::Inbox(
+                    "replacement".into()
+                ))
+            );
+            assert_eq!(workspace.echo_text_for_test(), Some("done: Named card"));
+        })
+        .unwrap();
 }
 
 #[gpui::test]
