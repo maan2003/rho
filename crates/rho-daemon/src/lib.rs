@@ -206,17 +206,7 @@ impl PlatformSecrets {
     }
 }
 
-fn socket_is_live(socket_path: &Path) -> bool {
-    std::os::unix::net::UnixStream::connect(socket_path).is_ok()
-}
-
 fn prepare_socket_path(socket_path: &Path, name: &str) -> anyhow::Result<()> {
-    if socket_is_live(socket_path) {
-        anyhow::bail!(
-            "refusing to start: {name} socket {} is already served by a live listener",
-            socket_path.display()
-        );
-    }
     match std::fs::remove_file(socket_path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -236,11 +226,18 @@ fn lock_runtime_directory(paths: &rho_ui_proto::RuntimePaths) -> anyhow::Result<
         .with_context(|| format!("open daemon runtime lock {}", path.display()))?;
     if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         anyhow::bail!(
-            "refusing to start: runtime directory {} is being initialized by another daemon",
-            paths.directory().display()
+            "refusing to start: runtime directory {} is owned by another daemon (lock file {})",
+            paths.directory().display(),
+            path.display()
         );
     }
     Ok(lock)
+}
+
+struct RuntimeSockets {
+    paths: rho_ui_proto::RuntimePaths,
+    server: Server,
+    _lock: std::fs::File,
 }
 
 fn spawn_octo_server(
@@ -262,10 +259,10 @@ fn spawn_octo_server(
 fn start_runtime_sockets(
     socket_path: Option<PathBuf>,
     secrets: PlatformSecrets,
-) -> anyhow::Result<(rho_ui_proto::RuntimePaths, Server)> {
+) -> anyhow::Result<RuntimeSockets> {
     let paths = rho_ui_proto::RuntimePaths::new(socket_path)?;
     std::fs::create_dir_all(paths.directory()).context("create runtime directory")?;
-    let _runtime_lock = lock_runtime_directory(&paths)?;
+    let lock = lock_runtime_directory(&paths)?;
     let octo_socket = paths.octo_socket();
     prepare_socket_path(paths.socket(), "rho daemon")?;
     prepare_socket_path(&octo_socket, "octo")?;
@@ -274,7 +271,11 @@ fn start_runtime_sockets(
     let listener = tokio::net::UnixListener::bind(paths.socket())
         .with_context(|| format!("bind rho daemon socket {}", paths.socket().display()))?;
     spawn_octo_server(octo_listener, secrets)?;
-    Ok((paths, Server::from_listener(listener)))
+    Ok(RuntimeSockets {
+        paths,
+        server: Server::from_listener(listener),
+        _lock: lock,
+    })
 }
 
 /// Re-exported so daemon entry points can set up the user+mount namespace
@@ -350,8 +351,7 @@ impl DaemonProfiler {
 
 pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     let platform_secrets = PlatformSecrets::from_fd_store();
-    let (runtime_paths, server) =
-        start_runtime_sockets(args.socket_path, platform_secrets.clone())?;
+    let runtime = start_runtime_sockets(args.socket_path, platform_secrets.clone())?;
 
     // The daemon's own cwd must never matter: agents each carry their own
     // working directory. Park the process somewhere empty and read-only so
@@ -365,7 +365,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
     user_environment.push((FIND_DENY_ROOTS_ENV.into(), find_deny_roots()));
     user_environment.push((
         rho_ui_proto::RuntimePaths::SOCKET_ENV.into(),
-        runtime_paths.socket().as_os_str().to_owned(),
+        runtime.paths.socket().as_os_str().to_owned(),
     ));
     configure_octo_git_transport(&mut user_environment)?;
     let user_environment = rho_workspaces::UserEnvironment::new(user_environment);
@@ -400,7 +400,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
             path_overrides,
             user_environment,
             platform_secrets,
-            runtime_paths.octo_socket(),
+            runtime.paths.octo_socket(),
         )
         .await?,
     );
@@ -494,7 +494,7 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
                 agents.pool.flush_agent_usage(None).await;
                 return Ok(());
             }
-            connection = server.accept() => {
+            connection = runtime.server.accept() => {
                 let connection = connection?;
                 let agents = agents.clone();
                 let iroh_auth = iroh_auth.clone();
@@ -4077,6 +4077,7 @@ fn expand_home(path: &Utf8Path) -> Option<Utf8PathBuf> {
 mod tests {
     use std::collections::BTreeMap;
     use std::ffi::{OsStr, OsString};
+    use std::os::fd::AsRawFd as _;
     use std::sync::Arc;
 
     use rho_agent::db::{
@@ -4089,20 +4090,20 @@ mod tests {
     use super::{
         AgentUsageModel, GitProviderClaim, GitTransportBroker, MAX_IMAGE_BASE64_BYTES,
         MAX_INPUT_IMAGES, PlatformSecrets, claude_quota_history, configure_octo_git_transport,
-        hourly_global_usage_series, lock_runtime_directory, merge_hourly_agent_cost_bucket,
-        persist_gui_telemetry, prepare_image_content, quota_burn, quota_summaries,
-        rewind_destination_materialized, rewind_source_prefix, start_runtime_sockets,
-        validate_image_content,
+        hourly_global_usage_series, merge_hourly_agent_cost_bucket, persist_gui_telemetry,
+        prepare_image_content, quota_burn, quota_summaries, rewind_destination_materialized,
+        rewind_source_prefix, start_runtime_sockets, validate_image_content,
     };
 
     #[tokio::test]
     async fn explicit_socket_keeps_runtime_files_beside_it() {
         let runtime = tempfile::tempdir().unwrap();
-        let (paths, server) = start_runtime_sockets(
+        let sockets = start_runtime_sockets(
             Some(runtime.path().join("qa/rho.sock")),
             PlatformSecrets::default(),
         )
         .unwrap();
+        let paths = &sockets.paths;
 
         assert!(paths.socket().exists());
         assert!(paths.octo_socket().exists());
@@ -4116,66 +4117,73 @@ mod tests {
                 .collect::<Vec<_>>(),
             [std::ffi::OsString::from("qa")]
         );
-        drop(server);
-    }
-
-    #[test]
-    fn concurrent_runtime_setup_is_refused() {
-        let runtime = tempfile::tempdir().unwrap();
-        let paths = rho_ui_proto::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
-        let _lock = lock_runtime_directory(&paths).unwrap();
-
-        let error = lock_runtime_directory(&paths).unwrap_err();
-
-        assert!(
-            format!("{error:#}").contains("being initialized by another daemon"),
-            "{error:#}"
-        );
+        drop(sockets);
     }
 
     #[tokio::test]
-    async fn live_socket_refuses_replacement() {
+    async fn second_daemon_is_refused_while_first_holds_runtime_lock() {
         let runtime = tempfile::tempdir().unwrap();
         let paths = rho_ui_proto::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
-        let live = std::os::unix::net::UnixListener::bind(paths.socket()).unwrap();
+        let first =
+            start_runtime_sockets(Some(paths.socket().to_owned()), PlatformSecrets::default())
+                .unwrap();
 
         let error = match start_runtime_sockets(
             Some(paths.socket().to_owned()),
             PlatformSecrets::default(),
         ) {
-            Ok(_) => panic!("daemon replaced a live socket"),
+            Ok(_) => panic!("second daemon acquired the runtime directory"),
             Err(error) => error,
         };
+        let message = format!("{error:#}");
 
         assert!(
-            format!("{error:#}").contains("already served by a live listener"),
-            "{error:#}"
+            message.contains(&paths.directory().display().to_string()),
+            "{message}"
         );
+        assert!(
+            message.contains(&paths.daemon_lock().display().to_string()),
+            "{message}"
+        );
+        drop(first);
+    }
+
+    #[tokio::test]
+    async fn stale_socket_files_are_removed_and_rebound() {
+        let runtime = tempfile::tempdir().unwrap();
+        let paths = rho_ui_proto::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
+        drop(std::os::unix::net::UnixListener::bind(paths.socket()).unwrap());
+        drop(std::os::unix::net::UnixListener::bind(paths.octo_socket()).unwrap());
+
+        let sockets =
+            start_runtime_sockets(Some(paths.socket().to_owned()), PlatformSecrets::default())
+                .unwrap();
+
         assert!(std::os::unix::net::UnixStream::connect(paths.socket()).is_ok());
-        drop(live);
+        assert!(std::os::unix::net::UnixStream::connect(paths.octo_socket()).is_ok());
+        drop(sockets);
     }
 
     #[tokio::test]
-    async fn live_octo_socket_refuses_daemon_start() {
+    async fn runtime_lock_remains_held_after_socket_setup_returns() {
         let runtime = tempfile::tempdir().unwrap();
         let paths = rho_ui_proto::RuntimePaths::new(Some(runtime.path().join("rho.sock"))).unwrap();
-        let live = std::os::unix::net::UnixListener::bind(paths.octo_socket()).unwrap();
+        let sockets =
+            start_runtime_sockets(Some(paths.socket().to_owned()), PlatformSecrets::default())
+                .unwrap();
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(paths.daemon_lock())
+            .unwrap();
 
-        let error = match start_runtime_sockets(
-            Some(paths.socket().to_owned()),
-            PlatformSecrets::default(),
-        ) {
-            Ok(_) => panic!("daemon replaced a live octo socket"),
-            Err(error) => error,
-        };
-
-        assert!(
-            format!("{error:#}").contains("already served by a live listener"),
-            "{error:#}"
+        let result = unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(result, -1);
+        assert_eq!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::WouldBlock
         );
-        assert!(!paths.socket().exists());
-        assert!(std::os::unix::net::UnixStream::connect(paths.octo_socket()).is_ok());
-        drop(live);
+        drop(sockets);
     }
 
     fn assistant_message(uuid: uuid::Uuid, timestamp: &str) -> rho_claude::SessionMessage {
