@@ -415,6 +415,20 @@ done right after the transcript primitive (2.4) and before 2.10:
       text kept, like a failed send. Journal `SlackFileSent { conversation,
       bytes }`. Screenshot the chip and the sent result on the fake.
 
+- [ ] 3.6 Editing a sent message. Asked by the user on 3 Sep. On one of
+      the reader's own messages, `e` in normal mode (the Slack conversation
+      context, outside a deal) opens the composer prefilled with that
+      message's text and the message tinted while the edit is open;
+      `enter` posts `chat.update`, `escape` cancels and restores the
+      composer to whatever it held. `up` in an empty composer edits the
+      reader's last message, the Slack habit. The updated message
+      re-renders from the mirror with the existing `(edited)` marker, one
+      item, nothing else redrawn. Not the reader's message: `e` does
+      nothing and says so in a notice. The fake serves `chat.update` and
+      the socket `message_changed` event so the round trip is the real one.
+      Journal `SlackMessageEdited { conversation, ts }`. Screenshot the edit
+      open and the result on the fake.
+
 ## Phase 4: status and health
 
 - [ ] 4.1 Status bar. The surface segment reads the conversation label, and
