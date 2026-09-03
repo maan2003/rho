@@ -527,7 +527,6 @@ pub struct Workspace {
     deal_current_interacted: bool,
     deal_view: Option<DealView>,
     deal_focus_pending: bool,
-    deal_hints_visible: bool,
     deal_controls_visible: bool,
     agent_last_interaction: HashMap<AgentId, i64>,
     dealer_signal_eval_scheduled: bool,
@@ -1101,7 +1100,6 @@ impl Workspace {
             deal_current_interacted: false,
             deal_view: None,
             deal_focus_pending: false,
-            deal_hints_visible: false,
             deal_controls_visible: false,
             agent_last_interaction: HashMap::new(),
             dealer_signal_eval_scheduled: false,
@@ -7466,7 +7464,6 @@ impl Workspace {
     /// a mode nothing will take them out of. The surface stays where it is.
     fn leave_deal_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.deal_view = None;
-        self.deal_hints_visible = false;
         self.deal_controls_visible = false;
         self.deal_current_interacted = false;
         self.end_deal_session();
@@ -7602,7 +7599,6 @@ impl Workspace {
 
     fn finish_dashboard_deal_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.deal_view = None;
-        self.deal_hints_visible = false;
         self.deal_controls_visible = false;
         if self.dashboard.deal_mode() {
             self.present_current_deal(window, cx);
@@ -8918,10 +8914,6 @@ impl Workspace {
                     .child(card.label.clone()),
             );
         let right = self.render_status_right(cx);
-        if self.deal_hints_visible {
-            return self.status_row(line
-                .child("· q close · d done · x dismiss · s defer · S defer heading · t todo · f file · Ctrl-J next"), right, text_style, window, cx);
-        }
         if self.deal_controls_visible {
             return self.status_row(
                 line.child(

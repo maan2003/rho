@@ -6452,6 +6452,12 @@ fn every_key_in_the_slack_table_is_bound(cx: &mut TestAppContext) {
             assert_eq!(routes("shift-n", &list), Some("rho_gui::SlackNextUnread"));
             assert_eq!(routes("m", &list), Some("rho_gui::SlackMarkReadBefore"));
             assert_eq!(routes("q", &list), Some("rho_gui::SurfaceClose"));
+            // The composer and the rewrite belong to a conversation. On the
+            // list the keys go back to vim, the way they do on every other
+            // surface that has no use for them: a binding that does nothing
+            // is worse than no binding.
+            assert_ne!(routes("i", &list), Some("rho_gui::SlackCompose"));
+            assert_ne!(routes("e", &list), Some("rho_gui::SlackEditMessage"));
 
             let conversation = surface("RhoSlackConversation", mode);
             assert_eq!(

@@ -424,13 +424,23 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
     ] {
         cx.bind_keys([
             KeyBinding::new("q", SurfaceClose, Some(context)),
-            KeyBinding::new("i", SlackCompose, Some(context)),
             KeyBinding::new("s", SlackSearch, Some(context)),
-            KeyBinding::new("e", SlackEditMessage, Some(context)),
             // The next conversation with something in it, the way `n` walks
             // the Zulip inbox. `shift-n` and not `n`, because `n` in a
             // transcript is the search the reader just ran.
             KeyBinding::new("shift-n", SlackNextUnread, Some(context)),
+        ]);
+    }
+    // Writing is a conversation's, not the list's: both of these take a key
+    // vim has a use for, so on a surface where they do nothing they have to
+    // give it back rather than swallow it.
+    for context in [
+        "RhoSlackConversation > Editor && vim_mode == normal && !VimDeal",
+        "RhoSlackConversation > Editor && vim_mode == helix_normal && !VimDeal",
+    ] {
+        cx.bind_keys([
+            KeyBinding::new("i", SlackCompose, Some(context)),
+            KeyBinding::new("e", SlackEditMessage, Some(context)),
         ]);
     }
     // Marking the old backlog is a list-wide verb, so it lives on the list
