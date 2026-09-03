@@ -77,9 +77,11 @@ store by the machine.
 Every device keeps a version counter; every cell records the stamp that
 wrote it; every device remembers the last version it saw from each peer.
 Sync is the set of cells newer than that, in either direction, over any
-channel. Today the daemon hosts the store and the GUI talks to it through
-the existing protocol carrying cells instead of tree operations; the
-planned peer-to-peer future swaps the transport, not the model.
+channel. For now the daemon is mandatory and is the hub: every GUI syncs
+with the daemon only, never with another GUI, and the daemon's store is
+the one every device converges to. The GUI talks to it through the
+existing protocol carrying cells instead of tree operations. The planned
+peer-to-peer future swaps the transport, not the model.
 
 ### The membrane
 
