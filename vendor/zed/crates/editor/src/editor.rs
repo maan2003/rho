@@ -1193,6 +1193,9 @@ pub struct Editor {
     in_leading_whitespace: bool,
     next_inlay_id: usize,
     next_color_inlay_id: usize,
+    next_image_inlay_id: usize,
+    #[cfg(any(feature = "test-support", feature = "wrap-test-support"))]
+    image_renderer_element_counts: Vec<(InlayId, usize)>,
     _subscriptions: Vec<Subscription>,
     pixel_position_of_newest_cursor: Option<gpui::Point<Pixels>>,
     gutter_dimensions: GutterDimensions,
@@ -2738,6 +2741,9 @@ impl Editor {
             #[cfg(feature = "native")]
             inlay_hints: None,
             next_color_inlay_id: 0,
+            next_image_inlay_id: 0,
+            #[cfg(any(feature = "test-support", feature = "wrap-test-support"))]
+            image_renderer_element_counts: Vec::new(),
             post_scroll_update: Task::ready(()),
             #[cfg(feature = "native")]
             linked_edit_ranges: Default::default(),

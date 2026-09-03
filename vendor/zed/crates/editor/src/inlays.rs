@@ -18,9 +18,9 @@
 #[cfg(feature = "native")]
 pub mod inlay_hints;
 
-use std::sync::OnceLock;
+use std::sync::{Arc, LazyLock, OnceLock};
 
-use gpui::{Context, HighlightStyle, Hsla, Rgba, Task};
+use gpui::{Context, HighlightStyle, Hsla, RenderImage, Rgba, Task};
 use language::InlayId;
 use multi_buffer::Anchor;
 #[cfg(feature = "native")]
@@ -64,6 +64,10 @@ pub struct Inlay {
 pub enum InlayContent {
     Text(text::Rope),
     Color(Hsla),
+    Image {
+        image: Arc<RenderImage>,
+        columns: u8,
+    },
 }
 
 impl Inlay {
@@ -102,6 +106,19 @@ impl Inlay {
         }
     }
 
+    pub fn image(
+        id: usize,
+        position: Anchor,
+        image: Arc<RenderImage>,
+        columns: u8,
+    ) -> Option<Self> {
+        (columns > 0).then_some(Self {
+            id: InlayId::Image(id),
+            position,
+            content: InlayContent::Image { image, columns },
+        })
+    }
+
     pub fn edit_prediction<T: Into<Rope>>(id: usize, position: Anchor, text: T) -> Self {
         Self {
             id: InlayId::EditPrediction(id),
@@ -136,9 +153,15 @@ impl Inlay {
 
     pub fn text(&self) -> &Rope {
         static COLOR_TEXT: OnceLock<Rope> = OnceLock::new();
+        static IMAGE_TEXT: LazyLock<Vec<Rope>> = LazyLock::new(|| {
+            (0..=u8::MAX)
+                .map(|columns| Rope::from(" ".repeat(usize::from(columns))))
+                .collect()
+        });
         match &self.content {
             InlayContent::Text(text) => text,
             InlayContent::Color(_) => COLOR_TEXT.get_or_init(|| Rope::from("◼")),
+            InlayContent::Image { columns, .. } => &IMAGE_TEXT[usize::from(*columns)],
         }
     }
 
@@ -168,6 +191,71 @@ impl InlineValueCache {
 }
 
 impl Editor {
+    /// Adds a fixed-cell image decoration at `position`.
+    ///
+    /// The image occupies `columns` character cells at the surrounding line's
+    /// existing height. Zero-width images are rejected.
+    pub fn add_image_inlay(
+        &mut self,
+        position: Anchor,
+        image: Arc<RenderImage>,
+        columns: u8,
+        cx: &mut Context<Self>,
+    ) -> Option<InlayId> {
+        let id = InlayId::Image(self.next_image_inlay_id);
+        let inlay = Inlay::image(self.next_image_inlay_id, position, image, columns)?;
+        self.next_image_inlay_id = self.next_image_inlay_id.checked_add(1)?;
+        self.splice_inlays(&[], vec![inlay], cx);
+        Some(id)
+    }
+
+    /// Replaces an image while preserving its anchor and cell width.
+    pub fn replace_image_inlay(
+        &mut self,
+        id: InlayId,
+        image: Arc<RenderImage>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(inlay) = self
+            .display_map
+            .read(cx)
+            .current_inlays()
+            .find(|inlay| inlay.id == id && matches!(inlay.content, InlayContent::Image { .. }))
+            .cloned()
+        else {
+            return false;
+        };
+        let InlayContent::Image { columns, .. } = inlay.content else {
+            return false;
+        };
+        let Some(replacement) = Inlay::image(id.id(), inlay.position, image, columns) else {
+            return false;
+        };
+        self.splice_inlays(&[id], vec![replacement], cx);
+        true
+    }
+
+    /// Removes the image decoration identified by `id`.
+    pub fn remove_image_inlay(&mut self, id: InlayId, cx: &mut Context<Self>) -> bool {
+        let exists = self
+            .display_map
+            .read(cx)
+            .current_inlays()
+            .any(|inlay| inlay.id == id && matches!(inlay.content, InlayContent::Image { .. }));
+        if exists {
+            self.splice_inlays(&[id], Vec::new(), cx);
+        }
+        exists
+    }
+
+    #[cfg(any(feature = "test-support", feature = "wrap-test-support"))]
+    pub fn image_renderer_element_count(&self, id: InlayId) -> usize {
+        self.image_renderer_element_counts
+            .iter()
+            .find_map(|(renderer_id, count)| (*renderer_id == id).then_some(*count))
+            .unwrap_or(0)
+    }
+
     /// Replaces the editor's end-of-line hints: annotations painted
     /// after each anchored line's content, outside text flow. Unlike
     /// inlays they occupy no display columns, so carets, motions, and
@@ -231,7 +319,7 @@ impl Editor {
             .collect()
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "test-support", feature = "wrap-test-support"))]
     pub fn all_inlays(&self, cx: &gpui::App) -> Vec<Inlay> {
         self.display_map
             .read(cx)

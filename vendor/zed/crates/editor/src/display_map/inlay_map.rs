@@ -423,6 +423,24 @@ impl<'a> Iterator for InlayChunks<'a> {
                         }
                         self.highlight_styles.inlay_hint
                     }
+                    InlayId::Image(_) => {
+                        if let InlayContent::Image { image, .. } = &inlay.content {
+                            let image = image.clone();
+                            renderer = Some(ChunkRenderer {
+                                id: ChunkRendererId::Inlay(inlay.id),
+                                render: Arc::new(move |_| {
+                                    div()
+                                        .size_full()
+                                        .overflow_hidden()
+                                        .child(gpui::img(image.clone()).size_full())
+                                        .into_any_element()
+                                }),
+                                constrain_width: true,
+                                measured_width: None,
+                            });
+                        }
+                        self.highlight_styles.inlay_hint
+                    }
                 };
                 let next_inlay_highlight_endpoint;
                 let offset_in_inlay = self.output_offset - self.transforms.start().0;

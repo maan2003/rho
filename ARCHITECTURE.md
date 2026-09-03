@@ -113,6 +113,11 @@ than by running a supervisor, extension protocol, or daemon process graph.
   re-encoded as single-frame PNG pixels before persistence or provider upload.
   Source metadata, profiles, animation, and encoding are intentionally
   discarded.
+  The vendored editor owns fixed-cell image inlays as a common decoration
+  primitive: an anchored image reserves an explicit number of character cells,
+  scales and clips within one existing line height, and never enters buffer
+  text, selection, search, or clipboard semantics; cursor motion only steps
+  across its reserved span.
   Native `rho-gui` enables GPUI's fixed-size frame and numeric editor-pipeline
   timing rings by default. `rho-browser-wayland` also retains a small numeric
   scene-pipeline ring spanning compositor scene production/coalescing, GUI

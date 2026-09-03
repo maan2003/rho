@@ -1,7 +1,7 @@
 use super::{
     Highlights,
     dimensions::RowDelta,
-    fold_map::{Chunk, FoldRows},
+    fold_map::{Chunk, ChunkRendererId, FoldRows},
     row_scale_map::RowScaleSnapshot,
     tab_map::{self, TabEdit, TabPoint, TabSnapshot},
 };
@@ -771,6 +771,7 @@ impl WrapSnapshot {
                 let mut line = String::new();
                 let mut line_fragments = Vec::new();
                 let mut remaining = None;
+                let mut pending_renderer: Option<(ChunkRendererId, Pixels, usize, bool)> = None;
                 let mut chunks = new_tab_snapshot.chunks(
                     TabPoint::new(edit.new_rows.start, 0)..new_tab_snapshot.max_point(),
                     LanguageAwareStyling {
@@ -781,8 +782,16 @@ impl WrapSnapshot {
                 );
                 let mut edit_transforms = Vec::<Transform>::new();
                 for (i, _) in (edit.new_rows.start..edit.new_rows.end).enumerate() {
+                    macro_rules! flush_renderer {
+                        () => {
+                            if let Some((_, width, len, _)) = pending_renderer.take() {
+                                line_fragments.push(gpui::LineFragment::element(width, len));
+                            }
+                        };
+                    }
                     while let Some(chunk) = remaining.take().or_else(|| chunks.next()) {
                         if let Some(ix) = chunk.text.find('\n') {
+                            flush_renderer!();
                             let (prefix, suffix) = chunk.text.split_at(ix + 1);
                             line_fragments.push(gpui::LineFragment::text(prefix));
                             line.push_str(prefix);
@@ -792,17 +801,38 @@ impl WrapSnapshot {
                             });
                             break;
                         } else {
-                            if let Some(width) =
-                                chunk.renderer.as_ref().and_then(|r| r.measured_width)
+                            if let Some(renderer) = chunk.renderer.as_ref()
+                                && (renderer.constrain_width || renderer.measured_width.is_some())
                             {
-                                line_fragments
-                                    .push(gpui::LineFragment::element(width, chunk.text.len()));
+                                let measured = renderer.measured_width.is_some();
+                                let chunk_width = renderer
+                                    .measured_width
+                                    .unwrap_or_else(|| line_wrapper.width_for_text(chunk.text));
+                                if let Some((id, width, len, pending_is_measured)) =
+                                    pending_renderer.as_mut()
+                                    && *id == renderer.id
+                                {
+                                    *len += chunk.text.len();
+                                    if !*pending_is_measured {
+                                        *width += chunk_width;
+                                    }
+                                } else {
+                                    flush_renderer!();
+                                    pending_renderer = Some((
+                                        renderer.id,
+                                        chunk_width,
+                                        chunk.text.len(),
+                                        measured,
+                                    ));
+                                }
                             } else {
+                                flush_renderer!();
                                 line_fragments.push(gpui::LineFragment::text(chunk.text));
                             }
                             line.push_str(chunk.text);
                         }
                     }
+                    flush_renderer!();
 
                     if line.is_empty() {
                         break;

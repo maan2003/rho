@@ -1703,7 +1703,9 @@ impl<'a> HighlightedChunk<'a> {
                 chunks.next();
                 let (prefix, suffix) = text.split_at(chunk.len());
                 text = suffix;
-                if let Some(replacement) = replacement(ch) {
+                if renderer.is_none()
+                    && let Some(replacement) = replacement(ch)
+                {
                     let invisible_highlight = HighlightStyle {
                         background_color: Some(editor_style.status.hint_background.into()),
                         underline: Some(UnderlineStyle {

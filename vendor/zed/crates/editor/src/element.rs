@@ -59,6 +59,8 @@ use gpui::{
     relative, size, solid_background, transparent_black,
 };
 use itertools::Itertools;
+#[cfg(any(feature = "test-support", feature = "wrap-test-support"))]
+use language::InlayId;
 use language::{
     HighlightedText, IndentGuideSettings, LanguageAwareStyling,
     language_settings::ShowWhitespaceSetting,
@@ -7513,19 +7515,36 @@ impl LineWithInvisibles {
 
         let ellipsis = SharedString::from("⋯");
 
-        for highlighted_chunk in chunks.chain([HighlightedChunk {
-            text: "\n",
-            style: None,
-            is_tab: false,
-            is_inlay: false,
-            replacement: None,
-        }]) {
+        let mut chunks = chunks
+            .chain([HighlightedChunk {
+                text: "\n",
+                style: None,
+                is_tab: false,
+                is_inlay: false,
+                replacement: None,
+            }])
+            .peekable();
+        while let Some(highlighted_chunk) = chunks.next() {
             if let Some(replacement) = highlighted_chunk.replacement {
+                let mut replacement_text = Cow::Borrowed(highlighted_chunk.text);
+                if let ChunkReplacement::Renderer(renderer) = &replacement {
+                    while chunks.peek().is_some_and(|next| {
+                        matches!(
+                            &next.replacement,
+                            Some(ChunkReplacement::Renderer(next_renderer))
+                                if next_renderer.id == renderer.id
+                        )
+                    }) {
+                        let next = chunks.next().unwrap();
+                        replacement_text.to_mut().push_str(next.text);
+                    }
+                }
+
                 if line_exceeded_max_len {
                     continue;
                 }
 
-                if len + line.len() + highlighted_chunk.text.len() > max_line_len {
+                if len + line.len() + replacement_text.len() > max_line_len {
                     line_exceeded_max_len = true;
                     continue;
                 }
@@ -7553,15 +7572,15 @@ impl LineWithInvisibles {
                 match replacement {
                     ChunkReplacement::Renderer(renderer) => {
                         let available_width = if renderer.constrain_width {
-                            let chunk = if highlighted_chunk.text == ellipsis.as_ref() {
+                            let chunk = if replacement_text == ellipsis.as_ref() {
                                 ellipsis.clone()
                             } else {
-                                SharedString::from(Arc::from(highlighted_chunk.text))
+                                SharedString::from(Arc::from(replacement_text.as_ref()))
                             };
                             let shaped_line = window.text_system().shape_line(
                                 chunk,
                                 font_size,
-                                &[text_style.to_run(highlighted_chunk.text.len())],
+                                &[text_style.to_run(replacement_text.len())],
                                 None,
                             );
                             AvailableSpace::Definite(shaped_line.width)
@@ -7582,13 +7601,13 @@ impl LineWithInvisibles {
                         );
 
                         width += size.width;
-                        len += highlighted_chunk.text.len();
-                        line_byte_offset += highlighted_chunk.text.len();
+                        len += replacement_text.len();
+                        line_byte_offset += replacement_text.len();
                         fragments.push(LineFragment::Element {
                             id: renderer.id,
                             element: Some(element),
                             size,
-                            len: highlighted_chunk.text.len(),
+                            len: replacement_text.len(),
                         });
                     }
                     ChunkReplacement::Str(x) => {
@@ -9047,6 +9066,31 @@ impl Element for EditorElement {
                         window,
                         cx,
                     );
+                    #[cfg(any(feature = "test-support", feature = "wrap-test-support"))]
+                    self.editor.update(cx, |editor, _| {
+                        editor.image_renderer_element_counts.clear();
+                        for id in line_layouts
+                            .iter()
+                            .flat_map(|layout| &layout.fragments)
+                            .filter_map(|fragment| match fragment {
+                                LineFragment::Element {
+                                    id: ChunkRendererId::Inlay(InlayId::Image(id)),
+                                    ..
+                                } => Some(InlayId::Image(*id)),
+                                _ => None,
+                            })
+                        {
+                            if let Some((_, count)) = editor
+                                .image_renderer_element_counts
+                                .iter_mut()
+                                .find(|(renderer_id, _)| *renderer_id == id)
+                            {
+                                *count += 1;
+                            } else {
+                                editor.image_renderer_element_counts.push((id, 1));
+                            }
+                        }
+                    });
                     let new_renderer_widths = (!is_minimap).then(|| {
                         line_layouts
                             .iter()

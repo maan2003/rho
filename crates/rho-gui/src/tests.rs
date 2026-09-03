@@ -1,7 +1,7 @@
 //! End-to-end tests: synthetic protocol frames in, rendered editor state out.
 
-use editor::Editor;
-use editor::display_map::{Block, DisplayRow};
+use editor::display_map::{Block, DisplayPoint, DisplayRow};
+use editor::{Copy, Editor, MoveRight, SelectionEffects};
 use gpui::{
     App, AppContext as _, Entity, Focusable as _, InputEvent as _, Modifiers, MouseButton,
     MouseDownEvent, MouseUpEvent, TestAppContext, TouchEvent, TouchId, TouchPhase, WindowHandle,
@@ -28,6 +28,99 @@ fn frame_distribution_reports_nearest_rank_percentiles() {
     assert_eq!(distribution.p95, 100.0);
     assert_eq!(distribution.p99, 100.0);
     assert_eq!(distribution.max, 100.0);
+}
+
+#[gpui::test]
+fn image_inlays_are_fixed_cell_decorations(cx: &mut TestAppContext) {
+    cx.update(init_test_app);
+    let editor = cx.add_window(|window, cx| {
+        let mut editor = Editor::multi_line(window, cx);
+        editor.set_text("ab", window, cx);
+        window.focus(&editor.focus_handle(cx), cx);
+        editor
+    });
+    let replacement = std::sync::Arc::new(gpui::RenderImage::new(smallvec::SmallVec::new()));
+
+    let (id, original_anchor) = editor
+        .update(cx, |editor, window, cx| {
+            let snapshot = editor.buffer().read(cx).snapshot(cx);
+            let anchor = snapshot.anchor_after(editor::MultiBufferOffset(1));
+            let image = std::sync::Arc::new(gpui::RenderImage::new(smallvec::SmallVec::new()));
+            let id = editor
+                .add_image_inlay(anchor, image, 129, cx)
+                .expect("positive-width image inlay");
+
+            // 129 cells crosses Rope's 128-byte dependency chunk boundary, but
+            // remains one logical and rendered image inlay.
+            assert_eq!(editor.display_snapshot(cx).line_len(DisplayRow(0)), 131);
+            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
+                selections
+                    .select_ranges([editor::MultiBufferOffset(1)..editor::MultiBufferOffset(1)]);
+            });
+            editor.move_right(&MoveRight, window, cx);
+            let display = editor.display_snapshot(cx);
+            assert_eq!(
+                editor.selections.newest_display(&display).head(),
+                DisplayPoint::new(DisplayRow(0), 131)
+            );
+            (id, anchor)
+        })
+        .expect("add image inlay");
+
+    cx.update_window(*editor, |_, window, cx| window.simulate_next_frame(cx))
+        .expect("render image inlay");
+    cx.run_until_parked();
+    editor
+        .update(cx, |editor, window, cx| {
+            assert_eq!(editor.image_renderer_element_count(id), 1);
+            assert!(editor.replace_image_inlay(id, replacement, cx));
+            let replaced_anchor = editor
+                .all_inlays(cx)
+                .into_iter()
+                .find(|inlay| inlay.id == id)
+                .expect("replaced image inlay")
+                .position;
+            assert_eq!(replaced_anchor, original_anchor);
+
+            // This width falls inside the image. The inlay must move as one
+            // wide glyph rather than split across soft-wrapped rows.
+            editor.set_soft_wrap_mode(language::language_settings::SoftWrap::EditorWidth, cx);
+            window.refresh();
+        })
+        .expect("replace and wrap image inlay");
+    cx.simulate_window_resize(*editor, gpui::size(gpui::px(100.), gpui::px(200.)));
+    cx.run_until_parked();
+    cx.update_window(*editor, |_, window, cx| window.simulate_next_frame(cx))
+        .expect("render wrapped image inlay");
+    cx.run_until_parked();
+
+    editor
+        .update(cx, |editor, _, cx| {
+            let display = editor.display_snapshot(cx);
+            let line_lengths = (0..=display.max_point().row().0)
+                .map(|row| display.line_len(DisplayRow(row)))
+                .collect::<Vec<_>>();
+            assert!(line_lengths.contains(&129), "{line_lengths:?}");
+            assert!(
+                line_lengths
+                    .iter()
+                    .all(|len| *len == 0 || *len == 1 || *len == 129)
+            );
+            assert_eq!(editor.image_renderer_element_count(id), 1);
+        })
+        .expect("inspect wrapped image inlay");
+
+    cx.dispatch_action(*editor, Copy);
+    assert_eq!(
+        cx.read_from_clipboard().and_then(|item| item.text()),
+        Some("ab\n".into())
+    );
+    editor
+        .update(cx, |editor, _, cx| {
+            assert!(editor.remove_image_inlay(id, cx));
+            assert_eq!(editor.display_snapshot(cx).line_len(DisplayRow(0)), 2);
+        })
+        .expect("remove image inlay");
 }
 
 fn init_test_app(cx: &mut App) {

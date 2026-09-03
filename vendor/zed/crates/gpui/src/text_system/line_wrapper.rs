@@ -135,6 +135,15 @@ impl LineWrapper {
         })
     }
 
+    /// Returns the width of \`text\` using this wrapper's font and font size.
+    pub fn width_for_text(&mut self, text: &str) -> Pixels {
+        text.chars()
+            .map(|character| self.width_for_char(character))
+            .fold(Pixels::ZERO, |width, character_width| {
+                width + character_width
+            })
+    }
+
     /// Determines if a line should be truncated based on its width.
     ///
     /// Returns the truncation index in `line`.
