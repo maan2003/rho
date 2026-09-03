@@ -265,9 +265,11 @@ from an agent you are actively driving reaches you immediately while a
 background agent's completion waits quietly — as a curve bonus, not a
 signal special-case, so dealing order agrees with the signals.
 
-**Cold start boots into the desk.** Sitting down starts at the map: orient
-first, then open a surface or ask for a deal. This also keeps the rule
-that the dealer never moves you anywhere on its own — including at startup.
+**Cold start boots into Home** (superseded on 2026-09-03, see
+`HOME-DESIGN.md`; this paragraph kept for the why). Sitting down started at
+the map: orient first, then open a surface or ask for a deal. Home keeps
+the rule that the dealer never moves you anywhere on its own, including at
+startup.
 The top three ranked agent cards keep their transcript subscriptions warm so a deal opens immediately.
 
 ## Deliberately deferred

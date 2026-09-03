@@ -1,0 +1,102 @@
+# Home
+
+Status: design, decided with the user on 2026-09-03. Changes the cold-start
+and overview rules of `DESK-DESIGN.md`; the dealer itself is untouched.
+
+## The problem
+
+The desk was home: cold start lands on the map, "nothing to deal" lands on
+the map, the overview is the map. But the desk is a notes store, and most
+of the day is not notes. What is missing is a glance: what is running, what
+is coming up next, and what sits just under the line. Today the only way to
+learn any of that is to deal, one card at a time.
+
+## Decisions
+
+### Home is a window onto the dealer's own ranking
+
+One buffer, one surface, called Home. It shows the dealer's list with the
+cutoff drawn as a line. Nothing is scored twice: the rows are the same
+cards, in the same order, with the same words the deal bar uses (`needs
+reply · 1.9h`, `finished · 2.0d`). Slack threads, agents, pings, and
+captures are all just cards, so channels need no section of their own: a
+thread waiting on a reply is above the line, a channel with mere chatter is
+below it.
+
+### Order: Next, Running, Later
+
+```
+next
+  #design › release date      needs reply · 1.9h
+  eng-b8os                    finished · 40m
+  capture: try the new flake  unfiled · 3.0d
+
+running
+  eng-5pha   phone feed        12m   "wiring the flick recogniser"
+  eng-b8os   slack polish       3m   "unfurl box: background tint"
+
+later
+  #random                     quiet · 5.4d
+  eng-qeo0                    finished · 6.0d
+```
+
+- **Next** is the top of the queue above the cutoff, capped at a handful of
+  rows (5). A preview of what is coming, not the queue.
+- **Running** is every live agent: name, what it is on, elapsed, its last
+  output line, updated live from the transcript subscriptions.
+- **Later** is the rows just under the cutoff, muted, capped the same way.
+  Peripheral vision: enough to know what is around, not enough to groom.
+
+Later comes last on purpose: when Next and Running are tall it falls off
+the bottom of the screen and is reached by scrolling, so the periphery
+costs nothing when the foreground is busy.
+
+### Dealing stays the act
+
+Any row opens as a deal through the dealer: the surface, verdict keys,
+undo, and the timeline behave exactly as if the card had been dealt. `ctrl-j`
+from Home deals the top card as anywhere else. Home never closes anything
+itself; it has no verdict keys of its own.
+
+### Home is where empty lands
+
+Cold start lands on Home. "Nothing needs attention" lands on Home. The
+overview key opens Home. On the phone, Home is the card after the last
+deal: flick past the queue and it is what you see.
+
+### What Home does not do
+
+- No counts leak out of it: the lamp and chime stay contentless, as in
+  `DESK-DESIGN.md`.
+- No scrolling into the whole queue: the caps are hard, so Home cannot
+  become an inbox to tidy.
+- No pronoun: the word "you" does not appear; sections are `next`,
+  `running`, `later`.
+
+### Built on the transcript primitive
+
+Home is one keyed incremental transcript (`crates/rho-transcript`): each
+row is an item keyed by card identity or agent id, so a score change,
+an agent's new output line, or a card crossing the cutoff edits only its
+row. The dealer's invalidation is the trigger; nothing polls.
+
+## The desk after Home
+
+The desk loses cold start, the empty landing, and the overview job. What
+remains is notes and filing: a note attached to a room, an agent, a
+channel, or a repository, opened from that thing with one key, and the tree
+as the store that agents file into. That is a smaller design and gets its
+own pass once Home exists; until then the map stays reachable from Home.
+
+## Deliberately deferred
+
+- Editing anything from Home.
+- Per-section keys beyond open and deal.
+- GitHub rows (arrive with the GitHub integration as ordinary cards).
+
+## What done means
+
+Sitting down shows Next, Running, Later in one glance without dealing;
+opening a row is a deal in every respect; an agent's last line updates
+live; the periphery scrolls in only when asked; a screenshot per state
+(busy, empty, phone) from fakes and the dealer's test fixtures.
