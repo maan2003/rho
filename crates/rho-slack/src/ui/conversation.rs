@@ -11,7 +11,7 @@
 use std::collections::HashSet;
 use std::ops::Range;
 
-use editor::scroll::AutoscrollStrategy;
+use editor::scroll::{Autoscroll, AutoscrollStrategy};
 use editor::{Editor, EditorEvent, EditorMode, SelectionEffects, SizingBehavior};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, EventEmitter, Window, div};
@@ -417,10 +417,15 @@ impl ConversationView {
             return;
         };
         self.editor.update(cx, |editor, cx| {
-            editor.set_autoscroll_pin(anchor, AutoscrollStrategy::Center, cx);
-            editor.change_selections(SelectionEffects::no_scroll(), window, cx, |selections| {
-                selections.select_anchor_ranges([anchor..anchor]);
-            });
+            // Centred once, not pinned: a pin re-asserts itself every frame,
+            // so in a conversation long enough to scroll it would drag the
+            // reader back onto the message the moment they moved off it.
+            editor.change_selections(
+                SelectionEffects::scroll(Autoscroll::center()),
+                window,
+                cx,
+                |selections| selections.select_anchor_ranges([anchor..anchor]),
+            );
         });
         // The surface moved the cursor, not the reader: that must not spend
         // the reader's one page of history.

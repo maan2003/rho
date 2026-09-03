@@ -291,6 +291,23 @@ done right after the transcript primitive (2.4) and before 2.10:
       is the state then its age, `needs reply · 1.9h` when the last word
       is theirs and `replied · 1.9h` when it is the reader's; nothing
       else. The queue card label follows the same words.
+- [ ] 2.12 A hole in the history is drawn, never hidden. Seen on 3 Sep
+      (screen 46): the ping's prefetched window and the conversation's tail
+      rendered as one continuous run, message 250 then a day rule then 481,
+      with about 230 messages missing and nothing on screen saying so. The
+      transcript draws a gap only at the top (`Row::Gap`). Decided: the
+      surface opens at the mirror chunk containing the dealt message, not
+      the newest; a `newer messages not loaded` row sits under a chunk that
+      does not reach the live end, and between any two loaded chunks; a
+      scroll to the bottom of such a chunk fetches exactly one page forward
+      (`oldest` set, `latest` unset), the same one-page-per-user-action rule
+      as `gg`, filled with the existing `mirror_island` gap records. Real
+      Slack answers `oldest` without `latest` with the messages closest to
+      `oldest`, paging forward (docs.slack.dev, conversations.history), so
+      the "after" half of the ping prefetch is right and the fake is wrong:
+      the fake must model that, and the both-sides test must run on a
+      channel long enough to tell (500 messages, ping in the middle, context
+      visible below the ping in the screenshot).
 - [ ] 2.10 No inbox in between, decided. Today a Slack obligation is copied
       into the rho inbox (`SlackItems`, `InboxKind::Slack`,
       `SourceReference::SlackThread`) and dealt from there. Rho: the dealer

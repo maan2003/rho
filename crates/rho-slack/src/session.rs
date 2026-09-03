@@ -743,6 +743,7 @@ impl Session {
         let source = Source::Conversation(key.channel.clone());
         let channel = key.channel.clone();
         let ts = key.thread_ts.clone();
+        let scope = scope.clone();
         let task = gpui_tokio::Tokio::spawn(cx, async move {
             client
                 .conversations_history_around(&channel, &ts, PING_WINDOW)
@@ -756,6 +757,9 @@ impl Session {
                 // Straight to the mirror: nobody has opened this conversation,
                 // so there is no surface to feed and no read marker to move.
                 session.mirror_page(&source, &messages, false, false);
+                if let Some(mirror) = session.mirror.as_ref() {
+                    mirror_island(mirror, &scope, &messages);
+                }
                 cx.notify();
             });
         }));
@@ -1181,6 +1185,19 @@ fn mirror_live(mirror: &Mirror, scope: &Scope, message: &Message) {
     }
 }
 
+/// Records what a ping's window does not know. The window is an island:
+/// it was fetched around one message, so nothing is known below its oldest,
+/// and without the record the surface would take those twenty messages for
+/// the whole conversation and refuse to page back from them.
+fn mirror_island(mirror: &Mirror, scope: &Scope, messages: &[Message]) {
+    mirror.insert_messages(scope, messages);
+    if let Some(oldest) = messages.first()
+        && !mirror.history_begins(scope)
+    {
+        mirror.put_gap(scope, &oldest.ts, &oldest.ts);
+    }
+}
+
 /// What the newest-page request on open is bounded by. A mirror holding a
 /// real run only needs what came after it; a mirror holding a handful of
 /// messages the socket dropped in while the conversation was closed is an
@@ -1274,6 +1291,35 @@ mod tests {
             refresh_since(&run),
             run.last().map(|message| message.ts.clone()),
             "a real run is only topped up"
+        );
+    }
+
+    #[test]
+    fn a_pings_window_leaves_a_gap_under_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let mirror = Mirror::open(dir.path().join("slack.redb")).unwrap();
+        let scope = Scope::conversation("T1", &ChannelId("C1".into()));
+        let window: Vec<Message> = (10..30)
+            .map(|i| message(&format!("{i}.0"), "around the ping"))
+            .collect();
+        mirror_island(&mirror, &scope, &window);
+        let gap = mirror.gap_below(&scope, None);
+        assert_eq!(
+            gap.as_ref().map(|(_, gap)| gap.page_before.clone()),
+            Some(Ts("10.0".into())),
+            "the window says nothing about what came before it"
+        );
+        assert_eq!(
+            mirror.newest_chunk(&scope, 50).len(),
+            window.len(),
+            "the run stops at the gap rather than joining the page above it"
+        );
+        assert!(
+            matches!(
+                older_request(false, false, None, gap.map(|(at, _)| at)),
+                Some(Older::Before(ts)) if ts == Ts("10.0".into())
+            ),
+            "so scrolling to the top has something to ask for"
         );
     }
 

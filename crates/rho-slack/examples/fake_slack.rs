@@ -58,7 +58,7 @@ async fn main() -> anyhow::Result<()> {
 
     seed_reference_group(&fake, &at);
     seed_design(&fake, &at);
-    seed_random_backlog(&fake, midnight);
+    let backlog_ping = seed_random_backlog(&fake, midnight);
 
     fake.add_message(
         "D1",
@@ -72,6 +72,8 @@ async fn main() -> anyhow::Result<()> {
     fake.set_count("C1", true, 1, &at(0, 8, 0));
     fake.set_count("D1", true, 0, &at(0, 9, 12));
     fake.add_feed_mention("C1", &at(0, 8, 0));
+    fake.set_count("C2", true, 1, &backlog_ping);
+    fake.add_feed_mention("C2", &backlog_ping);
 
     println!("RHO_SLACK_API_BASE={}", fake.api_base());
     println!("ws={}", fake.ws_url());
@@ -331,21 +333,28 @@ fn seed_design(fake: &Fake, at: &dyn Fn(i64, i64, i64) -> String) {
 
 /// A conversation long enough that paging is exercised: 240 messages across
 /// four days, which is more than one page at any limit rho uses.
-fn seed_random_backlog(fake: &Fake, midnight: i64) {
+///
+/// The ping sits in the middle of it, which is the case a dealt
+/// conversation has to survive: the message to answer is nowhere near the
+/// tail, so opening it is a scroll into the history, not to the bottom.
+/// Returns the ping's timestamp.
+fn seed_random_backlog(fake: &Fake, midnight: i64) -> String {
+    const PING: i64 = 250;
+    let mut ping = String::new();
     for index in 0..500i64 {
         // Four days back, ten minutes apart, so the buffer crosses day
         // boundaries while paging and a page is nowhere near the start.
-        let ts = midnight - 4 * 86_400 + index * 600;
+        let ts = format!("{}.000000", midnight - 4 * 86_400 + index * 600);
         let user = if index % 2 == 0 { "UA" } else { "UB" };
-        fake.add_message(
-            "C2",
-            json!({
-                "ts": format!("{ts}.000000"),
-                "user": user,
-                "text": format!("backlog message {}", index + 1),
-            }),
-        );
+        let text = if index == PING {
+            ping = ts.clone();
+            "<@ME> can you take the release notes for this one?".to_owned()
+        } else {
+            format!("backlog message {}", index + 1)
+        };
+        fake.add_message("C2", json!({"ts": ts, "user": user, "text": text}));
     }
+    ping
 }
 
 /// The scripted workspace: a message every few seconds, then the events that
