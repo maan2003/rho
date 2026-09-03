@@ -35,6 +35,20 @@ pub enum WsEvent {
         channel: ChannelId,
         ts: Ts,
     },
+    /// Slack started following a thread for the user: they posted in it,
+    /// were mentioned, or followed it by hand on another client. The follow
+    /// list is what makes a later reply theirs, so rho takes it from here
+    /// rather than from what it happened to watch.
+    Subscribed {
+        channel: ChannelId,
+        thread_ts: Ts,
+    },
+    /// The thread was unfollowed, here or anywhere else. It stops being the
+    /// user's business, which is what Slack's "ignore thread" means.
+    Unsubscribed {
+        channel: ChannelId,
+        thread_ts: Ts,
+    },
     /// Slack refused the session on an accepted socket, which is what an
     /// `invalid_auth` handshake failure looks like from the inside.
     Failed(String),
@@ -61,7 +75,7 @@ pub fn parse(frame: &Value) -> WsEvent {
         // arrives as an ordinary `message` with a `thread_ts`, so the model
         // learns nothing new here and the frame is deliberately dropped.
         "thread" => WsEvent::Ignored,
-        "channel_marked" | "im_marked" | "group_marked" | "thread_marked" => {
+        "channel_marked" | "im_marked" | "group_marked" => {
             match (frame["channel"].as_str(), frame["ts"].as_str()) {
                 (Some(channel), Some(ts)) => WsEvent::Marked {
                     channel: ChannelId(channel.to_owned()),
@@ -70,8 +84,44 @@ pub fn parse(frame: &Value) -> WsEvent {
                 _ => WsEvent::Ignored,
             }
         }
+        // The three subscription frames all carry the same `subscription`
+        // object; a thread read elsewhere moves the cursor inside it.
+        "thread_subscribed" => {
+            subscription(frame).map_or(WsEvent::Ignored, |(channel, ts)| WsEvent::Subscribed {
+                channel,
+                thread_ts: ts,
+            })
+        }
+        "thread_unsubscribed" => {
+            subscription(frame).map_or(WsEvent::Ignored, |(channel, ts)| WsEvent::Unsubscribed {
+                channel,
+                thread_ts: ts,
+            })
+        }
+        "thread_marked" => match (
+            subscription(frame),
+            frame["subscription"]["last_read"].as_str(),
+        ) {
+            (Some((channel, _)), Some(last_read)) => WsEvent::Marked {
+                channel,
+                ts: Ts(last_read.to_owned()),
+            },
+            _ => WsEvent::Ignored,
+        },
         _ => WsEvent::Ignored,
     }
+}
+
+/// The channel and thread a subscription frame names.
+fn subscription(frame: &Value) -> Option<(ChannelId, Ts)> {
+    let subscription = &frame["subscription"];
+    let channel = subscription["channel"]
+        .as_str()
+        .filter(|it| !it.is_empty())?;
+    let thread_ts = subscription["thread_ts"]
+        .as_str()
+        .filter(|it| !it.is_empty())?;
+    Some((ChannelId(channel.to_owned()), Ts(thread_ts.to_owned())))
 }
 
 fn parse_message_frame(frame: &Value) -> WsEvent {
@@ -169,6 +219,49 @@ mod tests {
                 channel: ChannelId("C1".into()),
                 ts: Ts("20.0".into()),
             }
+        );
+    }
+
+    #[test]
+    fn the_subscription_frames_name_their_thread() {
+        assert_eq!(
+            parse(&json!({
+                "type": "thread_subscribed",
+                "subscription": {"type": "thread", "channel": "C1", "thread_ts": "500.0"},
+            })),
+            WsEvent::Subscribed {
+                channel: ChannelId("C1".into()),
+                thread_ts: Ts("500.0".into()),
+            }
+        );
+        assert_eq!(
+            parse(&json!({
+                "type": "thread_unsubscribed",
+                "subscription": {"type": "thread", "channel": "C1", "thread_ts": "500.0"},
+            })),
+            WsEvent::Unsubscribed {
+                channel: ChannelId("C1".into()),
+                thread_ts: Ts("500.0".into()),
+            }
+        );
+        // A thread read on another client moves the cursor inside the
+        // subscription, which is where the timestamp has to come from.
+        assert_eq!(
+            parse(&json!({
+                "type": "thread_marked",
+                "subscription": {
+                    "type": "thread", "channel": "C1",
+                    "thread_ts": "500.0", "last_read": "501.0",
+                },
+            })),
+            WsEvent::Marked {
+                channel: ChannelId("C1".into()),
+                ts: Ts("501.0".into()),
+            }
+        );
+        assert_eq!(
+            parse(&json!({"type": "thread_subscribed", "subscription": {}})),
+            WsEvent::Ignored
         );
     }
 

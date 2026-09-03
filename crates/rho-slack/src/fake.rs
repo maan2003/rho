@@ -54,6 +54,9 @@ struct State {
     marked: Vec<(String, String)>,
     /// Custom workspace emoji, as `emoji.list` returns them.
     emoji: BTreeMap<String, String>,
+    /// The threads Slack follows for the user, as
+    /// `subscriptions.thread.getView` lists them: (channel, thread_ts).
+    followed: Vec<(String, String)>,
     /// Requests that should fail with `ok: false`, by method name and how
     /// many times. This is how a poll-failure notice gets tested.
     failures: BTreeMap<String, usize>,
@@ -245,6 +248,17 @@ impl Fake {
             .entry(channel.to_owned())
             .or_default()
             .push(message);
+    }
+
+    /// Slack follows a thread for the user when they post in it or are
+    /// mentioned in it. Seeding one is how a test reaches the state a phone
+    /// reply leaves behind: followed, with rho having never seen a thing.
+    pub fn follow_thread(&self, channel: &str, thread_ts: &str) {
+        let mut state = self.state.lock().unwrap();
+        let entry = (channel.to_owned(), thread_ts.to_owned());
+        if !state.followed.contains(&entry) {
+            state.followed.push(entry);
+        }
     }
 
     pub fn add_feed_mention(&self, channel: &str, ts: &str) {
@@ -635,6 +649,27 @@ fn apply_live(state: &mut State, frames: &broadcast::Sender<Frame>, request: &Va
             push(frame);
             json!({"ok": true, "ts": ts})
         }
+        // Following and unfollowing, the way any Slack client does it: the
+        // list the next connect reads and the live frame move together.
+        kind @ ("subscribe" | "unsubscribe") => {
+            let thread_ts = field("thread_ts");
+            let entry = (channel.clone(), thread_ts.clone());
+            state.followed.retain(|held| held != &entry);
+            if kind == "subscribe" {
+                state.followed.push(entry);
+            }
+            push(json!({
+                "type": if kind == "subscribe" { "thread_subscribed" } else { "thread_unsubscribed" },
+                "subscription": {
+                    "type": "thread",
+                    "channel": channel,
+                    "thread_ts": thread_ts,
+                    "last_read": "0000000000.000000",
+                },
+                "event_ts": event_ts,
+            }));
+            return json!({"ok": true});
+        }
         "reaction" => {
             let ts = field("ts");
             let name = field("name");
@@ -822,6 +857,18 @@ fn handle(
             }
         }
         "emoji.list" => json!({"ok": true, "emoji": state.emoji}),
+        "subscriptions.thread.getView" => json!({
+            "ok": true,
+            "threads": state
+                .followed
+                .iter()
+                .map(|(channel, thread_ts)| json!({
+                    "root_msg": {"channel": channel, "ts": thread_ts, "thread_ts": thread_ts},
+                    "last_read": "0000000000.000000",
+                    "unread_replies": 0,
+                }))
+                .collect::<Vec<_>>(),
+        }),
         "client.counts" => json!({"ok": true, "channels": state.counts, "mpims": [], "ims": []}),
         "activity.feed" => {
             let items = state.feed.clone();
@@ -946,6 +993,28 @@ fn handle(
                 .entry(channel.clone())
                 .or_default()
                 .push(message.clone());
+            // Slack follows a thread for whoever posts in it, and says so on
+            // the socket. That is the whole of how a reply, from here or from
+            // the phone, makes the thread the user's.
+            if let Some(root) = &thread_ts {
+                let entry = (channel.clone(), root.clone());
+                if !state.followed.contains(&entry) {
+                    state.followed.push(entry);
+                }
+                let _ = frames.send(Frame::Text(
+                    json!({
+                        "type": "thread_subscribed",
+                        "subscription": {
+                            "type": "thread",
+                            "channel": channel,
+                            "thread_ts": root,
+                            "last_read": ts,
+                        },
+                    })
+                    .to_string()
+                    .into(),
+                ));
+            }
             state.posted.push(Posted {
                 channel,
                 thread_ts,

@@ -103,6 +103,18 @@ pub struct MessagePage {
     pub has_more: bool,
 }
 
+/// One thread Slack follows for the user, from `subscriptions.thread.getView`.
+/// Which threads are the user's is Slack's answer, not rho's memory of what
+/// it happened to watch: a reply sent from the phone follows the thread just
+/// the same, and every client agrees after a restart.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FollowedThread {
+    pub channel: ChannelId,
+    pub thread_ts: Ts,
+    /// The user's read cursor inside the thread, when Slack sends one.
+    pub last_read: Option<Ts>,
+}
+
 /// Slack's own unread bookkeeping, from `client.counts`.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Counts {
@@ -460,6 +472,26 @@ impl Client {
         Ok(response.bytes().await?.to_vec())
     }
 
+    /// The threads Slack follows for the user. Slack subscribes them when the
+    /// user posts in a thread or is mentioned in one, so this is the whole of
+    /// "threads that are mine": one call on connect, then the socket keeps it
+    /// current.
+    pub async fn followed_threads(&self) -> anyhow::Result<Vec<FollowedThread>> {
+        let body = self
+            .post_form(
+                "subscriptions.thread.getView",
+                &[("limit", "50".to_owned()), ("current_ts", "0".to_owned())],
+            )
+            .await?;
+        Ok(body["threads"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(parse_followed_thread)
+            .collect())
+    }
+
     pub async fn counts(&self) -> anyhow::Result<Counts> {
         let body = self
             .post_form(
@@ -722,6 +754,28 @@ fn parse_user(value: &Value) -> Option<User> {
         .or_else(|| string(&value["name"]))
         .unwrap_or_else(|| "someone".to_owned());
     Some(User { id, name, handle })
+}
+
+/// A followed thread as `subscriptions.thread.getView` sends it: the root
+/// message carries the channel and the thread's own timestamp, and the
+/// subscription carries the read cursor.
+fn parse_followed_thread(thread: &Value) -> Option<FollowedThread> {
+    let root = &thread["root_msg"];
+    let channel = string(&root["channel"])
+        .or_else(|| string(&thread["channel"]))
+        .filter(|channel| !channel.is_empty())?;
+    let thread_ts = string(&root["thread_ts"])
+        .or_else(|| string(&root["ts"]))
+        .or_else(|| string(&thread["thread_ts"]))
+        .filter(|ts| !ts.is_empty())?;
+    Some(FollowedThread {
+        channel: ChannelId(channel),
+        thread_ts: Ts(thread_ts),
+        last_read: string(&thread["last_read"])
+            .or_else(|| string(&root["last_read"]))
+            .filter(|ts| !ts.is_empty())
+            .map(Ts),
+    })
 }
 
 /// The activity feed nests its payload differently per type; this pulls the

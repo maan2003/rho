@@ -340,10 +340,13 @@ impl Session {
             let conversations = client.conversations().await;
             let counts = client.counts().await;
             let emoji = client.custom_emoji().await;
-            (users, conversations, counts, emoji)
+            // Which threads are the user's is Slack's list, asked for once
+            // per connect, the way the web client asks for it.
+            let followed = client.followed_threads().await;
+            (users, conversations, counts, emoji, followed)
         });
         self._tasks.push(cx.spawn(async move |this, cx| {
-            let Ok((users, conversations, counts, emoji)) = task.await else {
+            let Ok((users, conversations, counts, emoji, followed)) = task.await else {
                 return;
             };
             let _ = this.update(cx, |session, cx| {
@@ -367,6 +370,13 @@ impl Session {
                 }
                 if let Ok(emoji) = emoji {
                     session.model.set_custom_emoji(emoji);
+                }
+                if let Ok(followed) = followed {
+                    session.model.set_followed(
+                        followed
+                            .into_iter()
+                            .map(|thread| (thread.channel, thread.thread_ts)),
+                    );
                 }
                 // Anything raised before the roster landed was named
                 // "#a conversation"; now it has a name, so say so again.
@@ -403,6 +413,14 @@ impl Session {
             }
             Wire::Frame(WsEvent::Deleted { channel, ts }) => {
                 self.delete(&channel, &ts);
+            }
+            Wire::Frame(WsEvent::Subscribed { channel, thread_ts }) => {
+                // Nothing is raised here: following a thread says its next
+                // reply is the user's business, not that one has arrived.
+                self.model.follow(&channel, &thread_ts);
+            }
+            Wire::Frame(WsEvent::Unsubscribed { channel, thread_ts }) => {
+                self.model.unfollow(&channel, &thread_ts);
             }
             Wire::Frame(WsEvent::Marked { channel, ts }) => {
                 // Read elsewhere. Only the badge is stale: reading is not a

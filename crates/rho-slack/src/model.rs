@@ -100,9 +100,11 @@ pub struct Model {
     /// Every (channel, timestamp) the model has already accounted for. This
     /// is the whole of the deduplication between the feed and the socket.
     seen: BTreeSet<(ChannelId, Ts)>,
-    /// Threads the user has posted in, which is what makes a later reply in
-    /// them an obligation rather than channel traffic.
-    participated: BTreeSet<ThreadKey>,
+    /// The threads Slack follows for the user, which is what makes a later
+    /// reply in one an obligation rather than channel traffic. Slack owns
+    /// this list: it subscribes a thread the user posts in or is mentioned
+    /// in, from any client, so rho never has to remember what it watched.
+    followed: BTreeSet<ThreadKey>,
 }
 
 impl Names for Model {
@@ -145,7 +147,7 @@ impl Model {
             custom_emoji: BTreeSet::new(),
             threads: BTreeMap::new(),
             seen: BTreeSet::new(),
-            participated: BTreeSet::new(),
+            followed: BTreeSet::new(),
         }
     }
 
@@ -304,6 +306,33 @@ impl Model {
         rows
     }
 
+    /// The follow list as Slack has it, from `subscriptions.thread.getView`
+    /// on connect. It replaces whatever rho held: Slack is the truth, and a
+    /// thread missing from it is one the user has unfollowed somewhere else.
+    pub fn set_followed(&mut self, threads: impl IntoIterator<Item = (ChannelId, Ts)>) {
+        self.followed = threads
+            .into_iter()
+            .map(|(channel, thread_ts)| self.key(&channel, &thread_ts))
+            .collect();
+    }
+
+    pub fn follow(&mut self, channel: &ChannelId, thread_ts: &Ts) {
+        let key = self.key(channel, thread_ts);
+        self.followed.insert(key);
+    }
+
+    /// A thread unfollowed anywhere stops being the user's business. The
+    /// card it raised is left to the verdict that closes it; what goes is
+    /// the standing claim that its next reply is theirs.
+    pub fn unfollow(&mut self, channel: &ChannelId, thread_ts: &Ts) {
+        let key = self.key(channel, thread_ts);
+        self.followed.remove(&key);
+    }
+
+    pub fn follows(&self, key: &ThreadKey) -> bool {
+        self.followed.contains(key)
+    }
+
     /// Marks a conversation read locally. Called both when rho reads one and
     /// when Slack says another client did. Reading is not a verdict: this
     /// clears the unread counts and leaves every card exactly where it was.
@@ -402,18 +431,17 @@ impl Model {
     pub fn note_message(&mut self, message: &Message, now_ms: i64) -> Option<Change> {
         let key = self.key(&message.channel, &message.thread_root());
         let from_you = message.user.as_ref() == Some(&self.self_id);
-        if from_you {
-            // Posting in a thread is what makes its later replies rho's
-            // business, whether the user started it or joined it.
-            self.participated.insert(key.clone());
-        }
+        // The reason is decided before the message is marked seen: channel
+        // traffic is never "seen", so a live message rho drops cannot poison
+        // the dedup and swallow the feed item for the same `ts` that would
+        // have raised it.
+        let reason = self.reason_for(message, &key, from_you)?;
         if !self
             .seen
             .insert((message.channel.clone(), message.ts.clone()))
         {
             return None;
         }
-        let reason = self.reason_for(message, &key, from_you)?;
         self.record(key, reason, message, from_you, now_ms)
     }
 
@@ -453,29 +481,27 @@ impl Model {
 
     /// Why this message obliges the user, or `None` for channel traffic.
     fn reason_for(&self, message: &Message, key: &ThreadKey, from_you: bool) -> Option<Reason> {
+        // A thread rho already tracks stays rho's business whoever spoke: a
+        // follow-up moves the verdict key, and the user's own reply is the
+        // message that flips whose turn it is.
+        if let Some(thread) = self.threads.get(key) {
+            return Some(thread.reason);
+        }
+        let followed = self.followed.contains(key);
+        if from_you {
+            return followed.then_some(Reason::Thread);
+        }
         let is_dm = self
             .conversations
             .get(&message.channel)
             .is_some_and(|conversation| conversation.kind == ConversationKind::DirectMessage);
-        // A reply in a thread the user is in stays their business even when
-        // their own reply is the one that arrived: it is the message that
-        // discharges the obligation.
-        let participating = self.participated.contains(key);
-        if from_you {
-            return participating.then_some(Reason::Thread);
-        }
-        // A thread rho already owes an answer to stays rho's business: a
-        // follow-up there moves the verdict key, it is not fresh traffic.
-        if let Some(thread) = self.threads.get(key) {
-            return Some(thread.reason);
-        }
         if is_dm {
             return Some(Reason::DirectMessage);
         }
         if self.mentions_you(message) {
             return Some(Reason::Mention);
         }
-        participating.then_some(Reason::Thread)
+        followed.then_some(Reason::Thread)
     }
 
     fn mentions_you(&self, message: &Message) -> bool {
@@ -724,6 +750,66 @@ mod tests {
             model.note_message(&reply("C1", "104", "103", "U1", "and another"), 0),
             None
         );
+    }
+
+    #[test]
+    fn a_reply_in_a_thread_slack_follows_for_the_user_raises() {
+        // The thread the user answered from their phone: Slack follows it,
+        // rho has never seen a message in it, and the reply is still theirs.
+        let mut followed = model();
+        followed.set_followed([(ChannelId("C1".into()), Ts("500".into()))]);
+        assert!(matches!(
+            followed.note_message(&reply("C1", "501", "500", "U1", "any update?"), 0),
+            Some(Change::Raised(_))
+        ));
+
+        // The same reply in a thread Slack does not follow is channel
+        // traffic, and unfollowing puts a thread back in that state.
+        let mut stranger = model();
+        assert_eq!(
+            stranger.note_message(&reply("C1", "601", "600", "U1", "any update?"), 0),
+            None
+        );
+        stranger.follow(&ChannelId("C1".into()), &Ts("700".into()));
+        stranger.unfollow(&ChannelId("C1".into()), &Ts("700".into()));
+        assert_eq!(
+            stranger.note_message(&reply("C1", "701", "700", "U1", "any update?"), 0),
+            None
+        );
+    }
+
+    #[test]
+    fn channel_traffic_is_never_seen_so_the_feed_can_still_raise_it() {
+        // The bug this guards: the live message was marked seen before its
+        // reason was decided, so the feed's item for the same `ts` — the one
+        // that knew the thread was the user's — was dropped as a duplicate.
+        let mut poisoned = model();
+        assert_eq!(
+            poisoned.note_message(&reply("C1", "801", "800", "U1", "any update?"), 0),
+            None
+        );
+        let item = ActivityItem {
+            channel: ChannelId("C1".into()),
+            ts: Ts("801".into()),
+            thread_ts: Some(Ts("800".into())),
+            kind: ActivityKind::ThreadReply,
+            unread: true,
+        };
+        assert!(matches!(
+            poisoned.note_activity(&item, 0),
+            Some(Change::Raised(_))
+        ));
+
+        // And when the live reply did raise it, the feed item for the same
+        // message is a no-op: one thread, raised once.
+        let mut live_first = model();
+        live_first.set_followed([(ChannelId("C1".into()), Ts("800".into()))]);
+        assert!(matches!(
+            live_first.note_message(&reply("C1", "801", "800", "U1", "any update?"), 0),
+            Some(Change::Raised(_))
+        ));
+        assert_eq!(live_first.note_activity(&item, 0), None);
+        assert_eq!(live_first.obligations(0).len(), 1);
     }
 
     #[test]

@@ -237,10 +237,19 @@ async fn a_thread_loads_and_a_reply_is_sent_into_it() {
     assert_eq!(posted[0].thread_ts.as_deref(), Some("500.0"));
     assert_eq!(posted[0].text, "looking now");
 
-    // And the reply is the done verdict once it comes back through the model.
+    // And the thread is the user's once they have posted in it: Slack
+    // subscribed them for it, which is where rho reads it from.
     let mut model = Model::new(rho_slack::WorkspaceName("acme".into()));
     model.set_self(rho_slack::UserId("ME".into()));
     model.add_conversations(client.conversations().await.unwrap());
+    model.set_followed(
+        client
+            .followed_threads()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|thread| (thread.channel, thread.thread_ts)),
+    );
     for message in client
         .conversations_replies(&ChannelId("C1".into()), &Ts("500.0".into()), None)
         .await
@@ -293,6 +302,83 @@ async fn history_marking_and_the_conversation_list_come_from_slack() {
     assert_eq!(rows[0].mention_count, 2);
     assert!(rows[0].unread);
     assert_eq!(rows[1].label, "@ada", "a DM is named from the roster");
+}
+
+/// Which threads are the user's comes from Slack: the list on connect, and
+/// the socket's subscription frames after that. This is the state a reply
+/// sent from the phone leaves behind, which rho could not see before.
+#[tokio::test]
+async fn the_follow_list_comes_from_slack_and_the_socket_keeps_it_current() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_user("U1", "ada");
+    fake.add_channel("C1", "design");
+    fake.follow_thread("C1", "500.0");
+    let client = client(&fake);
+
+    let followed = client.followed_threads().await.unwrap();
+    assert_eq!(followed.len(), 1);
+    assert_eq!(followed[0].channel, ChannelId("C1".into()));
+    assert_eq!(followed[0].thread_ts, Ts("500.0".into()));
+
+    let mut model = Model::new(rho_slack::WorkspaceName("acme".into()));
+    model.add_users(client.users().await.unwrap());
+    model.add_conversations(client.conversations().await.unwrap());
+    model.set_self(rho_slack::UserId("ME".into()));
+    model.set_followed(
+        followed
+            .into_iter()
+            .map(|thread| (thread.channel, thread.thread_ts)),
+    );
+
+    let (sender, mut receiver) = mpsc::unbounded();
+    let catch_up = Arc::new(Notify::new());
+    let _socket = tokio::spawn(run_socket(
+        client.clone(),
+        sender,
+        catch_up.clone(),
+        timings(),
+    ));
+    wait_until_live(&catch_up).await;
+
+    // A thread followed elsewhere: the frame carries the subscription, and
+    // nothing is raised until somebody actually writes in it.
+    fake.live(json!({"kind": "subscribe", "channel": "C1", "thread_ts": "700.0"}));
+    loop {
+        match next_wire(&mut receiver).await {
+            Wire::Frame(WsEvent::Subscribed { channel, thread_ts }) => {
+                assert_eq!(channel, ChannelId("C1".into()));
+                model.follow(&channel, &thread_ts);
+                break;
+            }
+            _ => continue,
+        }
+    }
+
+    // Both threads are now the user's, and a reply in either raises.
+    for thread_ts in ["500.0", "700.0"] {
+        fake.live_reply("C1", thread_ts, "U1", "any update?");
+    }
+    let mut raised = 0;
+    while raised < 2 {
+        if let Wire::Frame(WsEvent::Message(message)) = next_wire(&mut receiver).await {
+            if let Some(Change::Raised(_)) = model.note_message(&message, 0) {
+                raised += 1;
+            }
+        }
+    }
+    assert_eq!(model.obligations(0).len(), 2);
+
+    // Unfollowing on another client takes the standing claim back.
+    fake.live(json!({"kind": "unsubscribe", "channel": "C1", "thread_ts": "700.0"}));
+    loop {
+        if let Wire::Frame(WsEvent::Unsubscribed { channel, thread_ts }) =
+            next_wire(&mut receiver).await
+        {
+            model.unfollow(&channel, &thread_ts);
+            break;
+        }
+    }
+    assert!(!model.follows(&model.key(&ChannelId("C1".into()), &Ts("700.0".into()))));
 }
 
 /// Phase 0 of the UX checklist: the fake can reach the state the reference
