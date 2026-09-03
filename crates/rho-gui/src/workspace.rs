@@ -10288,6 +10288,7 @@ impl Workspace {
         &self,
         card: &crate::dashboard::DealCard,
         text_style: &gpui::TextStyle,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let path = match &card.inbox_source {
@@ -10320,21 +10321,6 @@ impl Workspace {
         };
         let path = Self::truncate_outline_path(&path);
         let line = div()
-            .id("rho-status-line")
-            .h(px(26.))
-            .w_full()
-            .px_2()
-            .border_t_1()
-            .border_color(cx.theme().colors().border_variant.opacity(0.6))
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_3()
-            .bg(cx.theme().colors().editor_background)
-            .text_color(cx.theme().colors().text)
-            .font_family(text_style.font_family.clone())
-            .text_size(text_style.font_size)
-            .line_height(text_style.line_height)
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -10350,15 +10336,12 @@ impl Workspace {
             );
         let right = self.render_status_right(cx);
         if self.deal_hints_visible {
-            return line
-                .child("· q close · d done · x dismiss · s defer · S defer heading · t todo · f file · Ctrl-J next")
-                .child(div().flex_1())
-                .child(right)
-                .into_any_element();
+            return self.status_row(line
+                .child("· q close · d done · x dismiss · s defer · S defer heading · t todo · f file · Ctrl-J next"), right, text_style, window, cx);
         }
         if self.deal_controls_visible {
-            return line
-                .child(
+            return self.status_row(
+                line.child(
                     div()
                         .id("deal-touch-close")
                         .on_click(|_, window, cx| {
@@ -10397,12 +10380,14 @@ impl Workspace {
                             window.dispatch_action(Box::new(DashboardDealNext), cx)
                         })
                         .child("next"),
-                )
-                .child(div().flex_1())
-                .child(right)
-                .into_any_element();
+                ),
+                right,
+                text_style,
+                window,
+                cx,
+            );
         }
-        line.child(div().flex_1()).child(right).into_any_element()
+        self.status_row(line, right, text_style, window, cx)
     }
 
     fn truncate_outline_path(path: &str) -> String {
@@ -10551,15 +10536,76 @@ impl Workspace {
             .into_any_element()
     }
 
+    /// The notch cutout in logical pixels, from `RHO_NOTCH=WxH` in physical
+    /// pixels (the M2 Air's is about 290x56). The window is taken to be
+    /// fullscreen: nothing checks where it sits on the output.
+    fn notch(window: &Window) -> Option<gpui::Size<gpui::Pixels>> {
+        static NOTCH: std::sync::OnceLock<Option<(f32, f32)>> = std::sync::OnceLock::new();
+        let (width, height) = (*NOTCH.get_or_init(|| {
+            let spec = std::env::var("RHO_NOTCH").ok()?;
+            let (width, height) = spec.split_once('x')?;
+            Some((width.trim().parse().ok()?, height.trim().parse().ok()?))
+        }))?;
+        let scale = window.scale_factor();
+        Some(gpui::size(px(width / scale), px(height / scale)))
+    }
+
+    /// The status line: one row across the top of the window. With a notch
+    /// the row is the notch's height and its middle, the notch's width,
+    /// stays empty, so `left` and `right` sit either side of it.
+    fn status_row(
+        &self,
+        left: gpui::Div,
+        right: gpui::AnyElement,
+        text_style: &gpui::TextStyle,
+        window: &Window,
+        cx: &App,
+    ) -> gpui::AnyElement {
+        let notch = Self::notch(window);
+        let height = notch.map_or(px(26.), |notch| notch.height.max(px(26.)));
+        let row = div()
+            .id("rho-status-line")
+            .h(height)
+            .w_full()
+            .px_2()
+            .border_b_1()
+            .border_color(cx.theme().colors().border_variant.opacity(0.6))
+            .flex()
+            .flex_row()
+            .items_center()
+            .bg(cx.theme().colors().editor_background)
+            .text_color(cx.theme().colors().text)
+            .font_family(text_style.font_family.clone())
+            .text_size(text_style.font_size)
+            .line_height(text_style.line_height);
+        let left = left
+            .flex_1()
+            .min_w_0()
+            .overflow_hidden()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_3();
+        match notch {
+            Some(notch) => row
+                .child(left)
+                .child(div().flex_none().w(notch.width))
+                .child(div().flex_1().flex().flex_row().justify_end().child(right)),
+            None => row.child(left).child(right),
+        }
+        .into_any_element()
+    }
+
     fn render_status_line(
         &mut self,
         text_style: &gpui::TextStyle,
+        window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         if self.dashboard.deal_mode()
             && let Some(card) = self.dashboard.current_deal_card()
         {
-            return self.render_deal_why(card, text_style, cx);
+            return self.render_deal_why(card, text_style, window, cx);
         }
         let path = if self.overview_open {
             let path = self
@@ -10602,25 +10648,7 @@ impl Workspace {
             },
         );
         let right = self.render_status_right(cx);
-        div()
-            .id("rho-status-line")
-            .h(px(26.))
-            .w_full()
-            .px_2()
-            .border_t_1()
-            .border_color(cx.theme().colors().border_variant.opacity(0.6))
-            .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .bg(cx.theme().colors().editor_background)
-            .text_color(cx.theme().colors().text)
-            .font_family(text_style.font_family.clone())
-            .text_size(text_style.font_size)
-            .line_height(text_style.line_height)
-            .child(left)
-            .child(right)
-            .into_any_element()
+        self.status_row(div().child(left), right, text_style, window, cx)
     }
 
     fn render_workspace(
@@ -12050,6 +12078,7 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &GitApprovalDeny, window, cx| {
                 this.finish_git_approval(GitApprovalDecision::Deny, window, cx);
             }))
+            .children((!phone).then(|| self.render_status_line(&text_style, window, cx)))
             .child(
                 div()
                     .flex_1()
@@ -12063,7 +12092,6 @@ impl Render for Workspace {
                         self.render_workspace(window, &text_style, cx)
                     }),
             )
-            .children((!phone).then(|| self.render_status_line(&text_style, cx)))
             .children(if phone {
                 self.render_phone_touch_debug(self.shell_touches.len())
             } else {
