@@ -56,6 +56,11 @@ pub struct ConversationView {
     /// loaded when the deal opens; the first refresh that brings it in does
     /// the scroll.
     dealt_placed: bool,
+    /// The message being rewritten, if `e` is open on one: tinted, and what
+    /// `enter` updates instead of sending. The composer's own text is held
+    /// beside it so `escape` gives the reader back what they were writing.
+    editing_message: Option<Ts>,
+    held_compose: Option<String>,
     /// Messages drawn before their picture had finished downloading, by the
     /// file the message is waiting on. Nothing in the update log speaks for
     /// a download, so the surface remembers this itself.
@@ -68,6 +73,15 @@ pub struct ConversationView {
 /// around it can draw.
 pub enum Event {
     OpenFile(FileSummary),
+}
+
+/// What asking for an edit did. A message that is not the reader's own is
+/// the one case worth telling them about: nothing happens, and silence
+/// would read as a broken key.
+pub enum EditStart {
+    Started(Ts),
+    NotYours,
+    Nothing,
 }
 
 impl EventEmitter<Event> for ConversationView {}
@@ -271,6 +285,8 @@ impl ConversationView {
             moved: Moved::default(),
             dealt: None,
             dealt_placed: false,
+            editing_message: None,
+            held_compose: None,
             awaiting_images: Vec::new(),
             _subscriptions: subscriptions,
         };
@@ -334,20 +350,126 @@ impl ConversationView {
         )
     }
 
-    /// Sends the compose region. The message appears when Slack accepts it,
-    /// so nothing is shown that was not actually sent.
+    /// Sends the compose region, or posts the rewrite if an edit is open.
+    /// The message appears when Slack accepts it, so nothing is shown that
+    /// was not actually sent.
     pub fn submit(&mut self, cx: &mut Context<Self>) {
         let text = self.input.read(cx).text();
         if text.trim().is_empty() {
             return;
         }
-        self.input.update(cx, |buffer, cx| {
-            let len = buffer.len();
-            buffer.edit([(0..len, "")], None, cx);
-        });
         let source = self.source.clone();
+        if let Some(ts) = self.editing_message.take() {
+            // The composer goes back to whatever the reader had put aside to
+            // make the edit, the same as cancelling: the rewrite is done
+            // with, and the half-written message is not.
+            let held = self.held_compose.take().unwrap_or_default();
+            self.set_compose(held, cx);
+            self.retint(&ts, cx);
+            self.session.update(cx, |session, cx| {
+                session.edit_message(&source, ts, text, cx)
+            });
+            return;
+        }
+        self.set_compose(String::new(), cx);
         self.session
             .update(cx, |session, cx| session.send(&source, text, cx));
+    }
+
+    /// The message the cursor is on, if the transcript has one there.
+    fn cursor_message(&self, cx: &mut Context<Self>) -> Option<Message> {
+        let row = self.cursor_row(cx) as u32;
+        let Row::Message(ts) = self.transcript.key_at_row(row, cx)?.clone() else {
+            return None;
+        };
+        self.shown_messages(cx)
+            .into_iter()
+            .find(|message| message.ts == ts)
+    }
+
+    /// `e`: rewrite the message under the cursor. Only the reader's own can
+    /// be rewritten, and saying so is the host's job, so a refusal is
+    /// reported rather than swallowed.
+    pub fn start_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> EditStart {
+        let Some(message) = self.cursor_message(cx) else {
+            return EditStart::Nothing;
+        };
+        if message.user.as_ref() != Some(self.session.read(cx).model().self_id()) {
+            return EditStart::NotYours;
+        }
+        self.begin_edit(&message, window, cx);
+        EditStart::Started(message.ts)
+    }
+
+    /// `up` in an empty composer: rewrite the last thing the reader said,
+    /// which is the habit Slack teaches. Nothing of theirs on screen, or a
+    /// composer with something in it, and this is not the reader asking.
+    pub fn edit_last_own(&mut self, window: &mut Window, cx: &mut Context<Self>) -> EditStart {
+        if !self.input.read(cx).text().trim().is_empty() || self.editing_message.is_some() {
+            return EditStart::Nothing;
+        }
+        let self_id = self.session.read(cx).model().self_id().clone();
+        let Some(message) = self
+            .shown_messages(cx)
+            .into_iter()
+            .filter(|message| message.user.as_ref() == Some(&self_id))
+            .next_back()
+        else {
+            return EditStart::Nothing;
+        };
+        self.begin_edit(&message, window, cx);
+        EditStart::Started(message.ts)
+    }
+
+    fn begin_edit(&mut self, message: &Message, window: &mut Window, cx: &mut Context<Self>) {
+        if self.held_compose.is_none() {
+            self.held_compose = Some(self.input.read(cx).text());
+        }
+        let previous = self.editing_message.replace(message.ts.clone());
+        // The composer holds what was sent, not what was drawn: an edit
+        // starts from the reader's own words.
+        self.set_compose(message.text.clone(), cx);
+        if let Some(previous) = previous.filter(|previous| previous != &message.ts) {
+            self.retint(&previous, cx);
+        }
+        self.retint(&message.ts, cx);
+        self.select_compose(window, cx);
+    }
+
+    /// `escape` with an edit open: the message stands as it was and the
+    /// composer holds what it held before.
+    pub fn cancel_edit(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(ts) = self.editing_message.take() else {
+            return false;
+        };
+        let held = self.held_compose.take().unwrap_or_default();
+        self.set_compose(held, cx);
+        self.retint(&ts, cx);
+        true
+    }
+
+    /// Which message an open edit is about, for the host's journal.
+    pub fn editing_message(&self) -> Option<&Ts> {
+        self.editing_message.as_ref()
+    }
+
+    fn set_compose(&mut self, text: String, cx: &mut Context<Self>) {
+        self.input.update(cx, |buffer, cx| {
+            let len = buffer.len();
+            buffer.edit([(0..len, text)], None, cx);
+        });
+    }
+
+    /// Redraws one message, which is how the tint goes on and comes off.
+    fn retint(&mut self, ts: &Ts, cx: &mut Context<Self>) {
+        let key = Row::Message(ts.clone());
+        let messages = self.shown_messages(cx);
+        let Some(item) = self.item_for_key(&key, &messages, cx) else {
+            return;
+        };
+        self.editing = true;
+        self.transcript.replace(&key, item, cx);
+        self.editing = false;
     }
 
     /// Where the file's bytes are, fetched if the cache lacks them: a host
@@ -814,7 +936,9 @@ impl ConversationView {
             .into_iter()
             .map(|(line, file)| (line, file.clone()))
             .collect::<Vec<_>>();
-        if self.dealt.as_ref() == Some(&message.ts) {
+        if self.dealt.as_ref() == Some(&message.ts)
+            || self.editing_message.as_ref() == Some(&message.ts)
+        {
             mark_dealt(&mut item);
         }
         self.awaiting_images

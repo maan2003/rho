@@ -69,9 +69,10 @@ use crate::{
     GitApprovalAllow, GitApprovalDeny, HomeOpenRow, MessagesOpen, MinibufferCancel,
     MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious, OverviewToggle,
     PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt,
-    ShellPagerAll, ShellPagerMore, ShellPagerQuit, SlackCompose, SlackMarkReadBefore, SlackOpenRow,
-    SlackSearch, SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, UndoVerdict,
-    UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
+    ShellPagerAll, ShellPagerMore, ShellPagerQuit, SlackCancelEdit, SlackCompose, SlackEditLast,
+    SlackEditMessage, SlackMarkReadBefore, SlackOpenRow, SlackSearch, SubmitPrompt, SurfaceBack,
+    SurfaceClose, TaskBoard, UndoVerdict, UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder,
+    ZulipNextUnread, ZulipOpenRow,
 };
 
 pub(crate) const MESSAGE_LOG_CAP: usize = 4096;
@@ -9452,6 +9453,23 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &SlackSearch, window, cx| {
                 this.prompt_slack_search(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SlackEditMessage, window, cx| {
+                // Not on a message of the reader's own: `e` is vim's own
+                // word motion again.
+                if !this.slack_edit_message(window, cx) {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SlackEditLast, window, cx| {
+                if !this.slack_edit_last(window, cx) {
+                    cx.propagate();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SlackCancelEdit, _window, cx| {
+                if !this.slack_cancel_edit(cx) {
+                    cx.propagate();
+                }
             }))
             .on_action(cx.listener(|this, _: &SlackMarkReadBefore, window, cx| {
                 this.prompt_slack_mark_read_before(window, cx);

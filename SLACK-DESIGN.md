@@ -230,7 +230,11 @@ state and read positions: one file, one identity per thread.
 A conversation surface is built the way the agent transcript is: a
 read-only editor holding the rendered messages, vim motions and search
 work inside it, a composer below it. `i` focuses the composer, Enter sends,
-`q` closes, and it enters the deal history like every other surface. A
+`q` closes, and it enters the deal history like every other surface.
+Rewriting what was already sent is `e` on the reader's own message (or
+`up` on an empty composer, Slack's habit): the composer holds the old
+text, the message is tinted while the edit is open, `enter` posts
+`chat.update` and `escape` gives the composer back what it held. A
 channel, a direct message, a group message, and a thread are the same
 surface with a different source; opening a thread from a channel is
 opening a child surface, and Space+K returns. Older history loads as the

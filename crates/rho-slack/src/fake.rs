@@ -1005,6 +1005,39 @@ fn handle(
             state.marked.push((field("channel"), field("ts")));
             json!({"ok": true})
         }
+        // An edit is `chat.update` plus the socket event every other client
+        // sees, so the round trip a reader makes here is the live one.
+        "chat.update" => {
+            let payload: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+            let channel = payload["channel"].as_str().unwrap_or_default().to_owned();
+            let ts = payload["ts"].as_str().unwrap_or_default().to_owned();
+            let text = payload["text"].as_str().unwrap_or_default().to_owned();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|since| since.as_secs())
+                .unwrap_or_default();
+            let event_ts = format!("{now}.000100");
+            let Some(message) = message_mut(&mut state, &channel, &ts) else {
+                return json!({"ok": false, "error": "message_not_found"});
+            };
+            let previous = message.clone();
+            message["text"] = json!(text);
+            message["edited"] = json!({"user": previous["user"].clone(), "ts": event_ts});
+            let edited = message.clone();
+            let _ = frames.send(Frame::Text(
+                json!({
+                    "type": "message",
+                    "subtype": "message_changed",
+                    "channel": channel,
+                    "ts": event_ts,
+                    "message": edited,
+                    "previous_message": previous,
+                })
+                .to_string()
+                .into(),
+            ));
+            json!({"ok": true, "ts": ts, "text": text})
+        }
         "chat.postMessage" => {
             let payload: Value = serde_json::from_str(body).unwrap_or(Value::Null);
             let channel = payload["channel"].as_str().unwrap_or_default().to_owned();

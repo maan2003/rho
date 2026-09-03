@@ -599,6 +599,20 @@ impl Client {
         Ok(Ts(string(&response["ts"]).unwrap_or_default()))
     }
 
+    /// Rewrites a message the reader already sent. Slack answers with the
+    /// new text and tells every other client on the socket, so nothing here
+    /// has to paint the change itself.
+    pub async fn update_message(
+        &self,
+        channel: &ChannelId,
+        ts: &Ts,
+        text: &str,
+    ) -> anyhow::Result<()> {
+        let body = json!({"channel": channel.0, "ts": ts.0, "text": text});
+        self.post_json("chat.update", body).await?;
+        Ok(())
+    }
+
     pub async fn user_info(&self, user: &UserId) -> anyhow::Result<User> {
         let body = self
             .post_form("users.info", &[("user", user.0.clone())])

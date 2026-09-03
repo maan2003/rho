@@ -6333,6 +6333,22 @@ fn deal_keys_reach_a_dealt_slack_conversation(cx: &mut TestAppContext) {
         ];
         assert_eq!(routes("i", &reading), Some("rho_gui::SlackCompose"));
         assert_eq!(routes("s", &reading), Some("rho_gui::SlackSearch"));
+        assert_eq!(routes("e", &reading), Some("rho_gui::SlackEditMessage"));
+
+        // In the composer, `up` is the Slack habit of editing the last
+        // message and `escape` cancels an open edit. Both fall through to
+        // the editor's own answer when there is nothing to edit.
+        let composing = [
+            KeyContext::parse("RhoGui").unwrap(),
+            KeyContext::parse("RhoSlackConversation").unwrap(),
+            KeyContext::parse("Editor vim_mode=insert").unwrap(),
+        ];
+        assert_eq!(routes("up", &composing), Some("rho_gui::SlackEditLast"));
+        assert_eq!(
+            routes("escape", &composing),
+            Some("rho_gui::SlackCancelEdit")
+        );
+        assert_eq!(routes("enter", &composing), Some("rho_gui::SubmitPrompt"));
     });
 }
 

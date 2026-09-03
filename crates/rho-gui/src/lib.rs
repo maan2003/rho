@@ -136,6 +136,9 @@ actions!(
         SlackCompose,
         SlackSearch,
         SlackMarkReadBefore,
+        SlackEditMessage,
+        SlackEditLast,
+        SlackCancelEdit,
         FindNode,
         MessagesOpen,
         HomeOpenRow
@@ -362,6 +365,21 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
     // cursor is on, `i` goes to the composer and `enter` there sends, `q`
     // closes, and `ctrl-k` (the surface-back key everywhere else) walks out
     // of a thread back to the channel it was opened from.
+    // Rewriting what was sent: `up` on an empty composer is Slack's own
+    // habit, and `escape` puts back whatever the composer held. Both fall
+    // through to the editor's usual answer when no edit is open.
+    cx.bind_keys([
+        KeyBinding::new(
+            "up",
+            SlackEditLast,
+            Some("RhoSlackConversation > Editor && vim_mode == insert"),
+        ),
+        KeyBinding::new(
+            "escape",
+            SlackCancelEdit,
+            Some("RhoSlackConversation > Editor && vim_mode == insert"),
+        ),
+    ]);
     cx.bind_keys([
         KeyBinding::new("enter", SlackOpenRow, Some("RhoSlackList > Editor")),
         KeyBinding::new("enter", HomeOpenRow, Some("RhoHome > Editor")),
@@ -385,6 +403,7 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             KeyBinding::new("q", SurfaceClose, Some(context)),
             KeyBinding::new("i", SlackCompose, Some(context)),
             KeyBinding::new("s", SlackSearch, Some(context)),
+            KeyBinding::new("e", SlackEditMessage, Some(context)),
         ]);
     }
     // Marking the old backlog is a list-wide verb, so it lives on the list

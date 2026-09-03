@@ -473,6 +473,13 @@ pub enum Event {
     SlackMarkReadBeforeUndone {
         cards: usize,
     },
+    /// The reader rewrote something they had already sent: `e` (or `up` on
+    /// an empty composer) and then `enter`, which is `chat.update` on
+    /// Slack's side.
+    SlackMessageEdited {
+        conversation: String,
+        ts: String,
+    },
     MinibufferOpened {
         prompt: String,
     },
@@ -563,6 +570,7 @@ impl Event {
             Self::SlackThreadIgnored { .. } => "slack_thread_ignored",
             Self::SlackMarkedReadBefore { .. } => "slack_marked_read_before",
             Self::SlackMarkReadBeforeUndone { .. } => "slack_mark_read_before_undone",
+            Self::SlackMessageEdited { .. } => "slack_message_edited",
             Self::MinibufferOpened { .. } => "minibuffer_opened",
             Self::MinibufferSubmitted { .. } => "minibuffer_submitted",
             Self::MinibufferCancelled { .. } => "minibuffer_cancelled",

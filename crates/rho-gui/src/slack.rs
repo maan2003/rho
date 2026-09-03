@@ -10,6 +10,7 @@ use rho_slack::health::Signal;
 use rho_slack::model::{Change, Model, Waiting};
 use rho_slack::session::{Session, SessionEvent, Source};
 use rho_slack::types::{ChannelId, ThreadKey, Ts};
+use rho_slack::ui::conversation::EditStart;
 
 use crate::dashboard::{DealerThread, ThreadRef};
 use crate::minibuffer::Candidate;
@@ -403,19 +404,95 @@ impl Workspace {
         if let SurfaceView::SlackConversation(view) = &self.active_pane().surface.view {
             view.clone()
                 .update(cx, |view, cx| view.select_compose(window, cx));
-            // `i` is vim's own insert key, and this binding took it: without
-            // this the cursor lands in the composer still in normal mode and
-            // the first character typed is swallowed as a motion.
-            if let Ok(action) = cx.build_action("vim::InsertBefore", None) {
-                window.dispatch_action(action, cx);
-            }
+            // `i` is vim's own insert key, and this binding took it.
+            self.enter_composer(window, cx);
         }
     }
 
-    /// `enter` in the composer: send.
+    /// `enter` in the composer: send, or post the rewrite if an edit is
+    /// open.
     pub(crate) fn slack_submit(&mut self, cx: &mut gpui::Context<Self>) {
-        if let SurfaceView::SlackConversation(view) = &self.active_pane().surface.view {
-            view.clone().update(cx, |view, cx| view.submit(cx));
+        let SurfaceView::SlackConversation(view) = &self.active_pane().surface.view else {
+            return;
+        };
+        let view = view.clone();
+        let edited = view.update(cx, |view, cx| {
+            let edited = view
+                .editing_message()
+                .cloned()
+                .map(|ts| (view.source().channel().clone(), ts));
+            view.submit(cx);
+            edited
+        });
+        let (Some((channel, ts)), Some(session)) = (edited, self.slack.clone()) else {
+            return;
+        };
+        crate::journal::record(crate::journal::Event::SlackMessageEdited {
+            conversation: session.read(cx).model().label(&channel),
+            ts: ts.0,
+        });
+    }
+
+    /// `e`: rewrite the message under the cursor. Someone else's message is
+    /// not the reader's to change, and a key that does nothing quietly
+    /// reads as broken, so the refusal is said out loud.
+    pub(crate) fn slack_edit_message(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let SurfaceView::SlackConversation(view) = &self.active_pane().surface.view else {
+            return false;
+        };
+        let view = view.clone();
+        match view.update(cx, |view, cx| view.start_edit(window, cx)) {
+            EditStart::Started(_) => {
+                self.enter_composer(window, cx);
+                true
+            }
+            EditStart::NotYours => {
+                self.echo(
+                    "slack: only your own messages can be edited",
+                    StyleClass::SystemInfo,
+                    cx,
+                );
+                true
+            }
+            EditStart::Nothing => false,
+        }
+    }
+
+    /// `up` in an empty composer: rewrite the last thing the reader said.
+    /// The composer is already in insert mode, so nothing switches here.
+    pub(crate) fn slack_edit_last(
+        &mut self,
+        window: &mut gpui::Window,
+        cx: &mut gpui::Context<Self>,
+    ) -> bool {
+        let SurfaceView::SlackConversation(view) = &self.active_pane().surface.view else {
+            return false;
+        };
+        let view = view.clone();
+        matches!(
+            view.update(cx, |view, cx| view.edit_last_own(window, cx)),
+            EditStart::Started(_)
+        )
+    }
+
+    /// `escape` with an edit open: the message stands and the composer is
+    /// given back what it held. With no edit open this is vim's escape.
+    pub(crate) fn slack_cancel_edit(&mut self, cx: &mut gpui::Context<Self>) -> bool {
+        let SurfaceView::SlackConversation(view) = &self.active_pane().surface.view else {
+            return false;
+        };
+        view.clone().update(cx, |view, cx| view.cancel_edit(cx))
+    }
+
+    /// Puts the cursor in the composer in insert mode: without the mode
+    /// switch the first character typed is swallowed as a motion.
+    fn enter_composer(&mut self, window: &mut gpui::Window, cx: &mut gpui::Context<Self>) {
+        if let Ok(action) = cx.build_action("vim::InsertBefore", None) {
+            window.dispatch_action(action, cx);
         }
     }
 

@@ -945,3 +945,54 @@ async fn undoing_a_discard_follows_the_thread_again() {
     assert_eq!(card.summary, "any update?");
     assert_eq!(model.obligations(0).len(), 1);
 }
+
+#[tokio::test]
+async fn editing_a_sent_message_updates_slack_and_comes_back_on_the_socket() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_channel("C1", "design");
+    fake.add_message("C1", json!({"ts": "500.0", "user": "ME", "text": "on it"}));
+    let client = client(&fake);
+    let (sender, mut receiver) = mpsc::unbounded();
+    let catch_up = Arc::new(Notify::new());
+    let _socket = tokio::spawn(run_socket(
+        client.clone(),
+        sender,
+        catch_up.clone(),
+        timings(),
+    ));
+    let Wire::Connected(_) = next_wire(&mut receiver).await else {
+        panic!("the first thing a session learns is who it is");
+    };
+    wait_until_live(&catch_up).await;
+    assert!(matches!(
+        next_wire(&mut receiver).await,
+        Wire::Frame(WsEvent::Hello)
+    ));
+
+    client
+        .update_message(
+            &ChannelId("C1".into()),
+            &Ts("500.0".into()),
+            "on it, by tuesday",
+        )
+        .await
+        .unwrap();
+
+    // The rewrite reaches every client the way it reaches Slack's own: as a
+    // change to the message that was there, carrying the edited marker.
+    let Wire::Frame(WsEvent::Edited(edited)) = next_wire(&mut receiver).await else {
+        panic!("an update comes back as an edit");
+    };
+    assert_eq!(edited.ts, Ts("500.0".into()));
+    assert_eq!(edited.text, "on it, by tuesday");
+    assert!(edited.edited);
+
+    // And the history Slack serves afterwards is the new text, so a reader
+    // who reopens the conversation sees the same thing.
+    let page = client
+        .conversations_history(&ChannelId("C1".into()), None)
+        .await
+        .unwrap();
+    assert_eq!(page.messages.last().unwrap().text, "on it, by tuesday");
+    assert_eq!(fake.calls("chat.update"), 1);
+}

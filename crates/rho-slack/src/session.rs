@@ -1398,6 +1398,38 @@ impl Session {
         }));
     }
 
+    /// Rewrites a message the reader already sent. What appears is Slack's
+    /// own `message_changed` coming back down the socket, so the screen
+    /// shows the edit that landed rather than the one that was asked for.
+    pub fn edit_message(&mut self, source: &Source, ts: Ts, text: String, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        if text.trim().is_empty() {
+            return;
+        }
+        let channel = source.channel().clone();
+        let source = source.clone();
+        let task = gpui_tokio::Tokio::spawn(cx, async move {
+            client.update_message(&channel, &ts, &text).await
+        });
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let sent = match task.await {
+                Ok(sent) => sent,
+                Err(error) => Err(anyhow::anyhow!("{error}")),
+            };
+            let _ = this.update(cx, |session, cx| {
+                if let Err(error) = sent {
+                    tracing::warn!(error = %error, "slack edit failed");
+                    if let Some(loaded) = session.loaded.get_mut(&source) {
+                        loaded.error = Some(format!("{error:#}"));
+                    }
+                }
+                cx.notify();
+            });
+        }));
+    }
+
     /// The message Slack accepted, shown at once. Slack echoes it back over
     /// the socket a moment later; the model deduplicates on the timestamp,
     /// so the echo changes nothing.

@@ -586,6 +586,24 @@ done right after the transcript primitive (2.4) and before 2.10:
       the socket `message_changed` event so the round trip is the real one.
       Journal `SlackMessageEdited { conversation, ts }`. Screenshot the edit
       open and the result on the fake.
+      Landed 3 Sep. `e` in the conversation's normal context (outside a
+      deal, where the deal keys still own the row) and `up` on an empty
+      composer both open the same edit: the composer holds the message's
+      own text, whatever was half-written is put aside, and the message
+      carries the dealt tint while the edit is open. `enter` posts
+      `chat.update` and gives the composer its held text back; `escape`
+      does the same without posting, and with no edit open falls through to
+      vim, so leaving the composer still works. What repaints is Slack's
+      own `message_changed` coming back down the socket, so the screen
+      shows the edit that landed: one item replaced, the `(edited)` marker
+      already in the renderer. Someone else's message says so and does
+      nothing (`slack: only your own messages can be edited`). The fake
+      serves `chat.update` and pushes the socket event, and the transport
+      test drives the whole round trip. Rig: screens/36-16-edit-open.png
+      (`up`), 36-22-edit-open-key-e.png (`e`), 36-17-edited.png (the
+      result), 36-19-cancelled.png (`escape`), 36-21-notyours.png (the
+      notice). Budget: one `chat.update` for the edit and nothing else,
+      journal `slack_message_edited` once with the channel named.
 
 ## Phase 4: status and health
 
