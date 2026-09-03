@@ -21,6 +21,14 @@ pub enum WsEvent {
     ReconnectUrl(String),
     /// A new message, in a channel, a DM, or a thread.
     Message(Box<Message>),
+    /// A message the author changed. It replaces the one already held: the
+    /// transcript rewrites that one line and nothing else.
+    Edited(Box<Message>),
+    /// A message the author deleted.
+    Deleted {
+        channel: ChannelId,
+        ts: Ts,
+    },
     /// The conversation was read somewhere else (phone, web), up to `ts`.
     /// The card it raised should go quiet without the user acting in rho.
     Marked {
@@ -67,14 +75,29 @@ pub fn parse(frame: &Value) -> WsEvent {
 }
 
 fn parse_message_frame(frame: &Value) -> WsEvent {
+    let channel = ChannelId(frame["channel"].as_str().unwrap_or_default().to_owned());
     // Edits, deletions, and joins all arrive as `message` with a subtype.
-    // Only `bot_message` and a plain message are content the reader wants;
-    // the rest would rewrite history under a reader mid-thread.
+    // An edit and a deletion each name one message, and the transcript
+    // rewrites only that message, so both are content; the rest are not.
     match frame["subtype"].as_str() {
         None | Some("bot_message") | Some("thread_broadcast") | Some("file_share") => {}
+        Some("message_changed") => {
+            return match parse_message(&frame["message"], &channel) {
+                Some(message) if !channel.0.is_empty() => WsEvent::Edited(Box::new(message)),
+                _ => WsEvent::Ignored,
+            };
+        }
+        Some("message_deleted") => {
+            return match frame["deleted_ts"].as_str() {
+                Some(ts) if !channel.0.is_empty() => WsEvent::Deleted {
+                    channel,
+                    ts: Ts(ts.to_owned()),
+                },
+                _ => WsEvent::Ignored,
+            };
+        }
         Some(_) => return WsEvent::Ignored,
     }
-    let channel = ChannelId(frame["channel"].as_str().unwrap_or_default().to_owned());
     match parse_message(frame, &channel) {
         Some(message) if !message.channel.0.is_empty() => WsEvent::Message(Box::new(message)),
         _ => WsEvent::Ignored,
@@ -118,16 +141,42 @@ mod tests {
     }
 
     #[test]
-    fn edits_deletions_and_unknown_types_are_ignored_by_name() {
+    fn an_edit_carries_the_message_it_replaces() {
+        let WsEvent::Edited(message) = parse(&json!({
+            "type": "message",
+            "subtype": "message_changed",
+            "channel": "C1",
+            "ts": "20.1",
+            "message": {"ts": "20.0", "user": "U2", "text": "any update? (fixed)", "edited": {"user": "U2", "ts": "20.1"}},
+        })) else {
+            panic!("an edit names the message it replaces");
+        };
+        assert_eq!(message.ts, Ts("20.0".into()));
+        assert!(message.edited);
+    }
+
+    #[test]
+    fn a_deletion_names_the_message_that_went() {
         assert_eq!(
-            parse(
-                &json!({"type": "message", "subtype": "message_changed", "channel": "C1", "ts": "1.0"})
-            ),
-            WsEvent::Ignored
+            parse(&json!({
+                "type": "message",
+                "subtype": "message_deleted",
+                "channel": "C1",
+                "ts": "20.1",
+                "deleted_ts": "20.0",
+            })),
+            WsEvent::Deleted {
+                channel: ChannelId("C1".into()),
+                ts: Ts("20.0".into()),
+            }
         );
+    }
+
+    #[test]
+    fn unknown_types_are_ignored_by_name() {
         assert_eq!(
             parse(
-                &json!({"type": "message", "subtype": "message_deleted", "channel": "C1", "ts": "1.0"})
+                &json!({"type": "message", "subtype": "channel_join", "channel": "C1", "ts": "1.0"})
             ),
             WsEvent::Ignored
         );

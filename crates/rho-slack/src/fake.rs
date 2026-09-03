@@ -591,6 +591,16 @@ fn apply_live(state: &mut State, frames: &broadcast::Sender<Frame>, request: &Va
                 .entry(channel.clone())
                 .or_default()
                 .push(message.clone());
+            if kind == "reply" {
+                // Slack keeps the thread's shape on its parent, so anything
+                // that re-sends the parent later carries the count with it.
+                let thread_ts = field("thread_ts");
+                if let Some(parent) = message_mut(state, &channel, &thread_ts) {
+                    let count = parent["reply_count"].as_u64().unwrap_or_default() + 1;
+                    parent["reply_count"] = json!(count);
+                    parent["latest_reply"] = json!(ts);
+                }
+            }
             let mentions_me = text.contains("<@ME>");
             bump_count(state, &channel, &ts, mentions_me);
             // The feed is the truth rho falls back on, so a live event that

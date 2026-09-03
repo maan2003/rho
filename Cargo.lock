@@ -5376,6 +5376,7 @@ dependencies = [
  "itertools 0.14.0",
  "log",
  "parking_lot",
+ "rand 0.9.5",
  "regex",
  "rope",
  "schemars 1.2.1",
@@ -14146,6 +14147,7 @@ dependencies = [
  "reqwest 0.12.28",
  "rho-db",
  "rho-slack",
+ "rho-transcript",
  "rustls",
  "senax-encoder",
  "serde",
@@ -14185,6 +14187,23 @@ dependencies = [
  "serde_json",
  "wasm-bindgen",
  "web-sys",
+]
+
+[[package]]
+name = "rho-transcript"
+version = "0.1.0"
+dependencies = [
+ "assets",
+ "editor",
+ "gpui",
+ "language",
+ "multi_buffer",
+ "release_channel",
+ "semver",
+ "settings",
+ "text",
+ "theme",
+ "theme_settings",
 ]
 
 [[package]]
@@ -18012,6 +18031,7 @@ dependencies = [
  "nix 0.29.0",
  "path",
  "percent-encoding",
+ "rand 0.9.5",
  "regex",
  "rust-embed",
  "schemars 1.2.1",
@@ -18025,6 +18045,7 @@ dependencies = [
  "tendril",
  "unicase",
  "url",
+ "util_macros",
  "walkdir",
  "which 6.0.3",
  "windows 0.61.3",

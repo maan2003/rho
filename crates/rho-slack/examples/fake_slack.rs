@@ -370,7 +370,11 @@ async fn live_script(fake: &Fake) {
         println!("live: reaction on {round}");
 
         tokio::time::sleep(BEAT).await;
-        fake.live_edit(GROUP, &ts, &format!("live message {round} (edited)"));
+        fake.live_edit(
+            GROUP,
+            &ts,
+            &format!("live message {round}, with a second thought"),
+        );
         println!("live: edit of {round}");
 
         tokio::time::sleep(BEAT).await;

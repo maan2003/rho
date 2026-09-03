@@ -141,7 +141,6 @@ actions!(
         ZulipLoadOlder,
         SlackOpenRow,
         SlackCompose,
-        SlackLoadOlder,
         SlackSearch,
         MessagesOpen
     ]
@@ -378,7 +377,6 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
         cx.bind_keys([
             KeyBinding::new("q", SurfaceClose, Some(context)),
             KeyBinding::new("i", SlackCompose, Some(context)),
-            KeyBinding::new("shift-p", SlackLoadOlder, Some(context)),
             KeyBinding::new("s", SlackSearch, Some(context)),
         ]);
     }

@@ -84,6 +84,99 @@ pub struct Loaded {
     pub reached_oldest: bool,
     older_cursor: Option<String>,
     pub error: Option<String>,
+    /// Bumped by every change to `messages`, so a surface knows whether what
+    /// it is showing is current.
+    revision: u64,
+    /// What changed, newest last, so a surface rewrites only those messages
+    /// instead of re-rendering the conversation on every socket frame.
+    log: Vec<(u64, Update)>,
+}
+
+/// One message-sized change to a loaded conversation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Update {
+    Inserted(Ts),
+    Replaced(Ts),
+    Removed(Ts),
+}
+
+/// How far back a surface may fall behind and still catch up by applying
+/// changes. Beyond it, rebuilding the whole transcript is the cheaper answer
+/// anyway.
+const LOG_LIMIT: usize = 512;
+
+impl Loaded {
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// The changes since `revision`, or `None` when the log no longer
+    /// reaches back that far and the surface must rebuild.
+    pub fn updates_since(&self, revision: u64) -> Option<Vec<Update>> {
+        if revision == self.revision {
+            return Some(Vec::new());
+        }
+        if revision > self.revision {
+            return None;
+        }
+        let oldest = self.log.first().map(|(at, _)| *at)?;
+        (oldest <= revision + 1).then(|| {
+            self.log
+                .iter()
+                .filter(|(at, _)| *at > revision)
+                .map(|(_, update)| update.clone())
+                .collect()
+        })
+    }
+
+    fn record(&mut self, update: Update) {
+        self.revision += 1;
+        self.log.push((self.revision, update));
+        if self.log.len() > LOG_LIMIT {
+            self.log.remove(0);
+        }
+    }
+
+    /// Inserts in timestamp order, ignoring one rho already holds. Both
+    /// sources can deliver the same message, and a page can arrive after the
+    /// socket.
+    fn insert(&mut self, message: Message) {
+        let ts = message.ts.clone();
+        match self.messages.binary_search_by(|held| {
+            held.ts
+                .epoch_seconds()
+                .total_cmp(&message.ts.epoch_seconds())
+        }) {
+            Ok(_) => {}
+            Err(index) => {
+                self.messages.insert(index, message);
+                self.record(Update::Inserted(ts));
+            }
+        }
+    }
+
+    /// Overwrites a message in place: an edit, or a reply count that grew.
+    fn replace(&mut self, message: Message) -> bool {
+        let Some(held) = self.messages.iter_mut().find(|held| held.ts == message.ts) else {
+            return false;
+        };
+        if *held == message {
+            return false;
+        }
+        let ts = message.ts.clone();
+        *held = message;
+        self.record(Update::Replaced(ts));
+        true
+    }
+
+    fn remove(&mut self, ts: &Ts) -> bool {
+        let Some(index) = self.messages.iter().position(|held| &held.ts == ts) else {
+            return false;
+        };
+        self.messages.remove(index);
+        self.record(Update::Removed(ts.clone()));
+        true
+    }
 }
 
 pub struct Session {
@@ -283,6 +376,12 @@ impl Session {
             Wire::Frame(WsEvent::Message(message)) => {
                 self.receive(*message, now, cx);
             }
+            Wire::Frame(WsEvent::Edited(message)) => {
+                self.edit(*message);
+            }
+            Wire::Frame(WsEvent::Deleted { channel, ts }) => {
+                self.delete(&channel, &ts);
+            }
             Wire::Frame(WsEvent::Marked { channel, ts }) => {
                 // Read elsewhere: Slack's own read cursor is the verdict, so
                 // the obligation is discharged here too.
@@ -339,10 +438,10 @@ impl Session {
         if let Some(mirror) = self.mirror.as_ref() {
             let workspace = self.model.workspace().0.clone();
             let thread = Scope::thread(&workspace, &message.channel, &message.thread_root());
-            mirror.insert_messages(&thread, std::slice::from_ref(message));
+            mirror_live(mirror, &thread, message);
             if message.is_top_level() {
                 let conversation = Scope::conversation(&workspace, &message.channel);
-                mirror.insert_messages(&conversation, std::slice::from_ref(message));
+                mirror_live(mirror, &conversation, message);
             }
         }
         let conversation = Source::Conversation(message.channel.clone());
@@ -352,27 +451,95 @@ impl Session {
             thread_ts: message.thread_root(),
         });
         if let Some(loaded) = self.loaded.get_mut(&thread) {
-            insert_message(&mut loaded.messages, message.clone());
+            loaded.insert(message.clone());
         }
         let Some(loaded) = self.loaded.get_mut(&conversation) else {
             return;
         };
         if message.is_top_level() {
-            insert_message(&mut loaded.messages, message.clone());
+            loaded.insert(message.clone());
         }
         if message.thread_ts.is_some() {
             // A reply is not channel content, but the fact that the thread
             // grew is: the count line is how the reader learns it.
             let root = message.thread_root();
-            if let Some(parent) = loaded
+            let grown = loaded
                 .messages
-                .iter_mut()
+                .iter()
                 .find(|candidate| candidate.ts == root)
-            {
-                parent.reply_count = parent.reply_count.saturating_add(1);
-                parent.latest_reply = Some(message.ts.clone());
+                .map(|parent| {
+                    let mut parent = parent.clone();
+                    parent.reply_count = parent.reply_count.saturating_add(1);
+                    parent.latest_reply = Some(message.ts.clone());
+                    parent
+                });
+            if let Some(parent) = grown {
+                loaded.replace(parent);
             }
         }
+    }
+
+    /// An edit overwrites the message in place, in the mirror and in every
+    /// open surface. Nothing else about the conversation moves.
+    fn edit(&mut self, message: Message) {
+        if let Some(mirror) = self.mirror.as_ref() {
+            let workspace = self.model.workspace().0.clone();
+            let thread = Scope::thread(&workspace, &message.channel, &message.thread_root());
+            mirror.insert_messages(&thread, std::slice::from_ref(&message));
+            if message.is_top_level() {
+                let conversation = Scope::conversation(&workspace, &message.channel);
+                mirror.insert_messages(&conversation, std::slice::from_ref(&message));
+            }
+        }
+        for source in self.sources_for(&message.channel, &message.thread_root()) {
+            if let Some(loaded) = self.loaded.get_mut(&source) {
+                loaded.replace(message.clone());
+            }
+        }
+    }
+
+    /// A deletion takes the message out of the mirror and out of every open
+    /// surface: what the author withdrew is not left on screen.
+    fn delete(&mut self, channel: &ChannelId, ts: &Ts) {
+        let workspace = self.model.workspace().0.clone();
+        let threads = self
+            .loaded
+            .keys()
+            .filter_map(|source| match source {
+                Source::Thread(key) if &key.channel == channel => Some(key.thread_ts.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if let Some(mirror) = self.mirror.as_ref() {
+            mirror.remove_message(&Scope::conversation(&workspace, channel), ts);
+            for thread in &threads {
+                mirror.remove_message(&Scope::thread(&workspace, channel, thread), ts);
+            }
+        }
+        let sources = self
+            .loaded
+            .keys()
+            .filter(|source| source.channel() == channel)
+            .cloned()
+            .collect::<Vec<_>>();
+        for source in sources {
+            if let Some(loaded) = self.loaded.get_mut(&source) {
+                loaded.remove(ts);
+            }
+        }
+    }
+
+    /// The open surfaces a message belongs to: its conversation, and the
+    /// thread it was said in.
+    fn sources_for(&self, channel: &ChannelId, thread_ts: &Ts) -> Vec<Source> {
+        vec![
+            Source::Conversation(channel.clone()),
+            Source::Thread(ThreadKey {
+                workspace: self.model.workspace().clone(),
+                channel: channel.clone(),
+                thread_ts: thread_ts.clone(),
+            }),
+        ]
     }
 
     fn announce(&mut self, changes: Vec<Change>, cx: &mut Context<Self>) {
@@ -434,12 +601,21 @@ impl Session {
             .as_ref()
             .map(|mirror| mirror.newest_chunk(&self.scope(source), MIRROR_PAGE))
             .unwrap_or_default();
-        let since = cached.last().map(|message| message.ts.clone());
+        let since = refresh_since(&cached);
+        let reached_oldest = self
+            .mirror
+            .as_ref()
+            .is_some_and(|mirror| mirror.history_begins(&self.scope(source)));
         self.loaded.insert(
             source.clone(),
             Loaded {
                 loading: true,
                 messages: cached,
+                reached_oldest,
+                // The mirror's own run is not a change, it is where the
+                // surface starts: a revision past zero says "you have seen
+                // nothing of this", so the first render is one bulk insert.
+                revision: 1,
                 ..Loaded::default()
             },
         );
@@ -447,36 +623,102 @@ impl Session {
     }
 
     /// Pages further back, which is what scrolling to the top asks for.
+    /// Fills the history above what is loaded, which is what scrolling near
+    /// the top asks for. One page in flight per conversation, so a burst of
+    /// scroll events is one request; a conversation whose beginning is known
+    /// costs nothing at all.
     pub fn load_older(&mut self, source: &Source, cx: &mut Context<Self>) {
-        let Some(loaded) = self.loaded.get_mut(source) else {
+        let Some(loaded) = self.loaded.get(source) else {
             return;
         };
-        if loaded.loading || loaded.reached_oldest {
-            return;
-        }
-        let cursor = loaded.older_cursor.clone();
-        if cursor.is_none() {
-            loaded.reached_oldest = true;
-            return;
-        }
-        let _ = loaded;
-        // The mirror knows when there is nothing older: the first page ever
-        // sent here is a fact, recorded when Slack said `has_more: false`.
-        // Asking again would be a request whose answer is already on disk.
-        if self
+        let scope = self.scope(source);
+        let gap = self
             .mirror
             .as_ref()
-            .is_some_and(|mirror| mirror.history_begins(&self.scope(source)))
-        {
-            if let Some(loaded) = self.loaded.get_mut(source) {
+            .and_then(|mirror| {
+                if mirror.history_begins(&scope) {
+                    None
+                } else {
+                    mirror.gap_below(&scope, None)
+                }
+            })
+            .map(|(_, gap)| gap.page_before);
+        let Some(request) = older_request(
+            loaded.loading,
+            loaded.reached_oldest,
+            loaded.older_cursor.clone(),
+            gap,
+        ) else {
+            // Nothing to ask for is not the same as nothing older: only a
+            // page that came back short says the conversation has a start.
+            if let Some(loaded) = self.loaded.get_mut(source)
+                && loaded.older_cursor.is_none()
+                && self
+                    .mirror
+                    .as_ref()
+                    .is_none_or(|mirror| mirror.history_begins(&scope))
+            {
                 loaded.reached_oldest = true;
             }
             return;
-        }
+        };
         if let Some(loaded) = self.loaded.get_mut(source) {
             loaded.loading = true;
         }
-        self.fetch(source.clone(), cursor, false, None, cx);
+        match request {
+            Older::Cursor(cursor) => self.fetch(source.clone(), Some(cursor), false, None, cx),
+            Older::Before(latest) => self.fill_gap(source.clone(), latest, cx),
+        }
+    }
+
+    /// Pages back from a gap's own cursor, which is how a conversation
+    /// restored from the mirror grows upwards: the in-memory paging cursor
+    /// died with the last run, the gap record did not.
+    fn fill_gap(&mut self, source: Source, latest: Ts, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let request = source.clone();
+        let task = gpui_tokio::Tokio::spawn(cx, async move {
+            match &request {
+                Source::Conversation(channel) => {
+                    client.conversations_history_before(channel, &latest).await
+                }
+                Source::Thread(key) => {
+                    client
+                        .conversations_replies(&key.channel, &key.thread_ts, None)
+                        .await
+                }
+            }
+        });
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            let Ok(page) = task.await else {
+                return;
+            };
+            let _ = this.update(cx, |session, cx| {
+                let mut fetched = Vec::new();
+                let mut reached_oldest = false;
+                {
+                    let loaded = session.loaded.entry(source.clone()).or_default();
+                    loaded.loading = false;
+                    match page {
+                        Ok(page) => {
+                            loaded.error = None;
+                            reached_oldest = page.older_cursor.is_none();
+                            loaded.reached_oldest = reached_oldest;
+                            loaded.older_cursor = page.older_cursor;
+                            fetched = page.messages.clone();
+                            for message in page.messages {
+                                loaded.insert(message);
+                            }
+                        }
+                        Err(error) => loaded.error = Some(format!("{error:#}")),
+                    }
+                }
+                session.mirror_page(&source, &fetched, true, reached_oldest);
+                cx.notify();
+            });
+        }));
     }
 
     /// The context a ping needs, fetched once when the feed names it: the
@@ -594,7 +836,7 @@ impl Session {
                             }
                             fetched = page.messages.clone();
                             for message in page.messages {
-                                insert_message(&mut loaded.messages, message);
+                                loaded.insert(message);
                             }
                         }
                         Err(error) => loaded.error = Some(format!("{error:#}")),
@@ -856,21 +1098,65 @@ impl Session {
     }
 }
 
-/// Inserts in timestamp order, ignoring one rho already holds. Both sources
-/// can deliver the same message, and a page can arrive after the socket.
-fn insert_message(messages: &mut Vec<Message>, message: Message) {
-    match messages.binary_search_by(|held| {
-        held.ts
-            .epoch_seconds()
-            .total_cmp(&message.ts.epoch_seconds())
-    }) {
-        Ok(_) => {}
-        Err(index) => messages.insert(index, message),
+/// Where a downloaded file lives: the state cache, keyed on Slack's file id
+/// so two files with the same name never collide.
+/// What filling the history above the loaded run costs, if anything.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Older {
+    /// Slack's own paging cursor, from a page fetched this run.
+    Cursor(String),
+    /// A gap record's cursor: the timestamp to page back from. This is what
+    /// a conversation restored from the mirror has instead.
+    Before(Ts),
+}
+
+/// Whether a scroll near the top should ask for anything. One page in flight
+/// at a time, and nothing at all once the beginning of the conversation is
+/// known: the answer is already on disk.
+pub fn older_request(
+    loading: bool,
+    reached_oldest: bool,
+    cursor: Option<String>,
+    gap: Option<Ts>,
+) -> Option<Older> {
+    if loading || reached_oldest {
+        return None;
+    }
+    match (cursor, gap) {
+        (Some(cursor), _) => Some(Older::Cursor(cursor)),
+        (None, Some(latest)) => Some(Older::Before(latest)),
+        (None, None) => None,
     }
 }
 
-/// Where a downloaded file lives: the state cache, keyed on Slack's file id
-/// so two files with the same name never collide.
+/// Puts a message the socket brought into the mirror. A message landing in
+/// a scope the mirror holds nothing for is an island: there is no telling
+/// what sits under it, so it gets a gap of its own and the reader is told
+/// as much until a page fills it.
+fn mirror_live(mirror: &Mirror, scope: &Scope, message: &Message) {
+    let empty = mirror.newest_chunk(scope, 1).is_empty();
+    mirror.insert_messages(scope, std::slice::from_ref(message));
+    if empty && !mirror.history_begins(scope) {
+        mirror.put_gap(scope, &message.ts, &message.ts);
+    }
+}
+
+/// What the newest-page request on open is bounded by. A mirror holding a
+/// real run only needs what came after it; a mirror holding a handful of
+/// messages the socket dropped in while the conversation was closed is an
+/// island with nothing under it, so opening it asks for the newest page
+/// outright. Either way it is one request.
+fn refresh_since(cached: &[Message]) -> Option<Ts> {
+    if cached.len() < MIRROR_MIN {
+        return None;
+    }
+    cached.last().map(|message| message.ts.clone())
+}
+
+/// Below this a mirrored run is not worth reading on its own, so opening
+/// the conversation fetches the newest page instead of only what is newer.
+const MIRROR_MIN: usize = 20;
+
 /// How much of a mirrored conversation is shown before the network answers.
 /// One screenful and then some: enough to read, cheap to decode.
 const MIRROR_PAGE: usize = 50;
@@ -938,18 +1224,112 @@ mod tests {
     }
 
     #[test]
-    fn a_message_held_twice_is_held_once() {
-        let mut messages = Vec::new();
-        insert_message(&mut messages, message("2.0", "second"));
-        insert_message(&mut messages, message("1.0", "first"));
-        insert_message(&mut messages, message("2.0", "second again"));
+    fn a_handful_of_live_messages_is_not_a_run_to_page_from() {
+        let island: Vec<Message> = (0..3).map(|i| message(&format!("{i}.0"), "live")).collect();
+        assert_eq!(refresh_since(&island), None, "an island bounds nothing");
+        let run: Vec<Message> = (0..MIRROR_MIN)
+            .map(|i| message(&format!("{i}.0"), "held"))
+            .collect();
         assert_eq!(
-            messages
+            refresh_since(&run),
+            run.last().map(|message| message.ts.clone()),
+            "a real run is only topped up"
+        );
+    }
+
+    #[test]
+    fn a_message_arriving_into_nothing_leaves_a_gap_under_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let mirror = Mirror::open(dir.path().join("slack.redb")).unwrap();
+        let scope = Scope::conversation("T1", &ChannelId("C1".into()));
+        mirror_live(&mirror, &scope, &message("2.0", "live"));
+        assert!(
+            mirror.gap_below(&scope, None).is_some(),
+            "nothing is known under a message the socket dropped in"
+        );
+        mirror_live(&mirror, &scope, &message("3.0", "and another"));
+        assert_eq!(
+            mirror
+                .gap_below(&scope, None)
+                .map(|(_, gap)| gap.page_before),
+            Some(Ts("2.0".into())),
+            "the next message continues the island, it does not re-cut it"
+        );
+    }
+
+    #[test]
+    fn a_message_held_twice_is_held_once() {
+        let mut loaded = Loaded::default();
+        loaded.insert(message("2.0", "second"));
+        loaded.insert(message("1.0", "first"));
+        loaded.insert(message("2.0", "second again"));
+        assert_eq!(
+            loaded
+                .messages
                 .iter()
                 .map(|message| message.text.as_str())
                 .collect::<Vec<_>>(),
             vec!["first", "second"],
             "the socket and a page deliver the same message"
         );
+        assert_eq!(
+            loaded.updates_since(0),
+            Some(vec![
+                Update::Inserted(Ts("2.0".into())),
+                Update::Inserted(Ts("1.0".into())),
+            ]),
+            "a message already held is not a change"
+        );
+    }
+
+    #[test]
+    fn the_change_log_names_exactly_what_moved() {
+        let mut loaded = Loaded::default();
+        loaded.insert(message("1.0", "first"));
+        loaded.insert(message("2.0", "second"));
+        let seen = loaded.revision();
+        loaded.replace(message("1.0", "first, fixed"));
+        loaded.remove(&Ts("2.0".into()));
+        assert_eq!(
+            loaded.updates_since(seen),
+            Some(vec![
+                Update::Replaced(Ts("1.0".into())),
+                Update::Removed(Ts("2.0".into())),
+            ]),
+            "a surface rewrites only the two messages that changed"
+        );
+        assert_eq!(
+            loaded.updates_since(loaded.revision()),
+            Some(Vec::new()),
+            "a surface that is up to date has nothing to do"
+        );
+        assert!(
+            !loaded.replace(message("1.0", "first, fixed")),
+            "an identical message is not a change"
+        );
+    }
+
+    #[test]
+    fn a_conversation_seeded_from_the_mirror_renders_in_one_go() {
+        let loaded = Loaded {
+            messages: vec![message("1.0", "from disk")],
+            revision: 1,
+            ..Loaded::default()
+        };
+        assert_eq!(
+            loaded.updates_since(0),
+            None,
+            "what the mirror held is rendered as one insert, not as changes"
+        );
+    }
+
+    #[test]
+    fn a_surface_too_far_behind_is_told_to_rebuild() {
+        let mut loaded = Loaded::default();
+        for index in 0..LOG_LIMIT + 2 {
+            loaded.insert(message(&format!("{index}.0"), "message"));
+        }
+        assert_eq!(loaded.updates_since(0), None, "the log no longer reaches");
+        assert!(loaded.updates_since(loaded.revision() - 1).is_some());
     }
 }

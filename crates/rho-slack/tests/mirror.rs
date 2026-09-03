@@ -302,3 +302,77 @@ async fn a_ping_costs_a_window_on_both_sides_and_one_thread() {
         "a mirrored ping costs no request"
     );
 }
+
+/// Scrolling into a gap is what fills history now: there is no manual
+/// "load older". The reader coming within a screen of the top costs exactly
+/// one page, bounded by the gap's own cursor; a second scroll while it is in
+/// flight costs nothing; and a conversation whose beginning rho already
+/// knows costs nothing at all.
+#[tokio::test]
+async fn scrolling_into_a_gap_costs_one_bounded_page() {
+    let fake = Fake::start().await.unwrap();
+    fake.add_user_named("UD", "david", "David");
+    fake.add_channel("C1", "design");
+    for at in ["100.000000", "200.000000", "500.000000"] {
+        fake.add_message("C1", json!({"ts": at, "user": "UD", "text": "said"}));
+    }
+    let client = client(&fake);
+    let (_dir, mirror) = mirror();
+    let scope = scope();
+    // What a restart sees: a run off the socket that does not reach back to
+    // the beginning, so the mirror carries the gap under it.
+    mirror.insert_messages(&scope, &[message("500.000000", "after the outage")]);
+    mirror.put_gap(&scope, &Ts::from("500.000000"), &Ts::from("500.000000"));
+
+    let gap = mirror.gap_below(&scope, None).map(|(at, _)| at);
+    let request = rho_slack::session::older_request(false, false, None, gap.clone());
+    let Some(rho_slack::session::Older::Before(cursor)) = request else {
+        panic!("a run with a gap under it pages from the gap's cursor: {request:?}");
+    };
+    assert_eq!(cursor, Ts::from("500.000000"));
+    let page = client
+        .conversations_history_before(&ChannelId::from("C1"), &cursor)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        fake.calls("conversations.history"),
+        1,
+        "scrolling to the top costs one page"
+    );
+    assert_eq!(
+        fake.last_field("conversations.history", "latest")
+            .as_deref(),
+        Some("500.000000"),
+        "and it is bounded by the gap's own cursor"
+    );
+    assert_eq!(
+        page.messages
+            .iter()
+            .map(|message| message.ts.0.as_str())
+            .collect::<Vec<_>>(),
+        vec!["100.000000", "200.000000"],
+        "the page is what sits under the gap"
+    );
+
+    // A second scroll before the page lands asks for nothing: one request is
+    // in flight per conversation.
+    assert_eq!(
+        rho_slack::session::older_request(true, false, None, gap),
+        None,
+        "a burst of scroll events is still one request"
+    );
+    assert_eq!(fake.calls("conversations.history"), 1);
+
+    // And once the beginning is known, the top is an echo, not a request.
+    mirror.insert_messages(&scope, &page.messages);
+    mirror.clear_gap(&scope, &Ts::from("500.000000"));
+    mirror.set_history_begins(&scope);
+    assert!(mirror.gap_below(&scope, None).is_none());
+    assert_eq!(
+        rho_slack::session::older_request(false, mirror.history_begins(&scope), None, None),
+        None,
+        "the beginning of history is on disk: nothing to ask for"
+    );
+    assert_eq!(fake.calls("conversations.history"), 1);
+}

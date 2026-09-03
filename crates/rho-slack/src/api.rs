@@ -373,6 +373,27 @@ impl Client {
         Ok(parse_message_page(&body, channel).messages)
     }
 
+    /// The page that fills a gap: everything before `latest`, which is the
+    /// cursor a gap record carries. This is what a reader scrolling into the
+    /// top of a run asks for.
+    pub async fn conversations_history_before(
+        &self,
+        channel: &ChannelId,
+        latest: &Ts,
+    ) -> anyhow::Result<MessagePage> {
+        let fields = vec![
+            ("channel", channel.0.clone()),
+            ("limit", PAGE.to_string()),
+            ("latest", latest.0.clone()),
+            ("inclusive", "false".to_owned()),
+        ];
+        let body = self.post_form("conversations.history", &fields).await?;
+        let mut page = parse_message_page(&body, channel);
+        page.messages
+            .sort_by(|left, right| left.ts.epoch_seconds().total_cmp(&right.ts.epoch_seconds()));
+        Ok(page)
+    }
+
     /// Every conversation the user is in, across all four kinds.
     pub async fn conversations(&self) -> anyhow::Result<Vec<Conversation>> {
         let mut conversations = Vec::new();

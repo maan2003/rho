@@ -81,8 +81,8 @@ use crate::{
     DealCloseAndNext, DealOpen, GitApprovalAllow, GitApprovalDeny, InboxCapture, MessagesOpen,
     MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious,
     OverviewToggle, PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof,
-    ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit, SlackCompose, SlackLoadOlder,
-    SlackOpenRow, SlackSearch, SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, UndoVerdict,
+    ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit, SlackCompose, SlackOpenRow,
+    SlackSearch, SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, UndoVerdict,
     UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
 };
 
@@ -11177,10 +11177,6 @@ impl Render for Workspace {
                 this.slack_compose(window, cx);
                 #[cfg(not(feature = "native"))]
                 let _ = window;
-            }))
-            .on_action(cx.listener(|this, _: &SlackLoadOlder, _, cx| {
-                #[cfg(feature = "native")]
-                this.slack_load_older(cx);
             }))
             .on_action(cx.listener(|this, _: &SlackSearch, window, cx| {
                 #[cfg(feature = "native")]

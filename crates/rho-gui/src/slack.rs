@@ -290,12 +290,6 @@ impl Workspace {
         }
     }
 
-    pub(crate) fn slack_load_older(&mut self, cx: &mut gpui::Context<Self>) {
-        if let SurfaceView::SlackConversation(view) = &self.active_pane().surface.view {
-            view.clone().update(cx, |view, cx| view.load_older(cx));
-        }
-    }
-
     /// `s`: narrow the listing to what the user types. The prompt is the
     /// search, so there is nothing extra to dismiss afterwards.
     pub(crate) fn prompt_slack_search(

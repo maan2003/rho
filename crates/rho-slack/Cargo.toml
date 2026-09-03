@@ -16,6 +16,7 @@ ui = [
   "dep:bytes",
   "dep:chrono",
   "dep:redb",
+  "dep:rho-transcript",
   "dep:rho-db",
   "dep:senax-encoder",
   "dep:editor",
@@ -62,6 +63,7 @@ tracing.workspace = true
 bytes = { workspace = true, optional = true }
 redb = { workspace = true, optional = true }
 rho-db = { workspace = true, optional = true }
+rho-transcript = { workspace = true, optional = true }
 senax-encoder = { workspace = true, optional = true }
 
 editor = { path = "../../vendor/zed/crates/editor", default-features = false, optional = true }

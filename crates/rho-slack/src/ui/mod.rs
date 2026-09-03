@@ -50,6 +50,23 @@ impl Hooks {
 /// slots so a frame holding both cannot collide.
 const SLACK_KEY_BASE: usize = usize::MAX - 500;
 
+/// The transcript needs a key per class per bucket, so it takes a wide block
+/// of its own rather than a handful of slots: room for far more messages
+/// than a conversation will ever hold on screen.
+const SLACK_TRANSCRIPT_KEY_BASE: usize = usize::MAX / 4;
+
+impl rho_transcript::Style for Class {
+    fn highlight_key(self, bucket: u32) -> HighlightKey {
+        HighlightKey::SyntaxTreeView(
+            SLACK_TRANSCRIPT_KEY_BASE + bucket as usize * Class::ALL.len() + self.slot(),
+        )
+    }
+
+    fn highlight_style(self, cx: &gpui::App) -> gpui::HighlightStyle {
+        self.resolve(cx)
+    }
+}
+
 /// A semantic span class. Colors resolve against the active theme at
 /// application time, so surfaces follow the host's theme for free.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -87,8 +104,8 @@ impl Class {
         Class::Error,
     ];
 
-    pub fn highlight_key(self) -> HighlightKey {
-        let slot = match self {
+    fn slot(self) -> usize {
+        match self {
             Self::Sender => 0,
             Self::You => 1,
             Self::Time => 2,
@@ -98,8 +115,11 @@ impl Class {
             Self::Mention => 6,
             Self::Muted => 7,
             Self::Error => 8,
-        };
-        HighlightKey::SyntaxTreeView(SLACK_KEY_BASE + slot)
+        }
+    }
+
+    pub fn highlight_key(self) -> HighlightKey {
+        HighlightKey::SyntaxTreeView(SLACK_KEY_BASE + self.slot())
     }
 
     pub fn resolve(self, cx: &App) -> HighlightStyle {

@@ -1,0 +1,35 @@
+# A keyed, incremental transcript: items in display order, each owning an
+# anchored range in one buffer. Every operation edits only the range it
+# names, so cursor, scroll and everything outside it survive. No domain
+# types: Slack, agents and later GitHub all drive the same primitive.
+[package]
+edition.workspace = true
+license = "GPL-3.0-or-later"
+name = "rho-transcript"
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+editor = { path = "../../vendor/zed/crates/editor", default-features = false }
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false }
+language = { path = "../../vendor/zed/crates/language" }
+multi_buffer = { path = "../../vendor/zed/crates/multi_buffer" }
+text = { path = "../../vendor/zed/crates/text" }
+
+[dev-dependencies]
+assets = { path = "../../vendor/zed/crates/assets" }
+editor = { path = "../../vendor/zed/crates/editor", features = [
+  "wrap-test-support",
+] }
+gpui = { path = "../../vendor/zed/crates/gpui", default-features = false, features = [
+  "test-support",
+] }
+release_channel = { path = "../../vendor/zed/crates/release_channel" }
+semver = "1"
+settings = { path = "../../vendor/zed/crates/settings", features = [
+  "test-support",
+] }
+theme = { path = "../../vendor/zed/crates/theme" }
+theme_settings = { path = "../../vendor/zed/crates/theme_settings" }

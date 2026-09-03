@@ -33,6 +33,7 @@ members = [
   "crates/rho-shell-proto",
   "crates/rho-slack",
   "crates/rho-tool-shell",
+  "crates/rho-transcript",
   "crates/rho-touch-keyboard",
   "crates/rho-ui-proto",
   "crates/rho-visualizations",
@@ -131,6 +132,7 @@ rho-rtc = { path = "crates/rho-rtc" }
 rho-shell = { path = "crates/rho-shell" }
 rho-shell-proto = { path = "crates/rho-shell-proto" }
 rho-slack = { path = "crates/rho-slack", default-features = false }
+rho-transcript = { path = "crates/rho-transcript" }
 rho-tool-shell = { path = "crates/rho-tool-shell" }
 rho-ui-proto = { path = "crates/rho-ui-proto" }
 rho-visualizations = { path = "crates/rho-visualizations" }

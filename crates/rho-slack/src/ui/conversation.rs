@@ -8,45 +8,59 @@
 //! prose carrying the host's Markdown pipeline, exactly like the agent
 //! transcript beside it.
 
+use std::collections::HashSet;
 use std::ops::Range;
 
 use editor::scroll::AutoscrollStrategy;
 use editor::{Editor, EditorEvent, EditorMode, SelectionEffects, SizingBehavior};
 use gpui::prelude::*;
-use gpui::{Context, Entity, Window, div};
+use gpui::{App, Context, Entity, Window, div};
 use language::{Buffer, Capability, Point};
 use multi_buffer::{MultiBuffer, PathKey};
-use text::Anchor;
+use rho_transcript::{BlockSpec, Item, Transcript};
 use theme::ActiveTheme as _;
 
 use crate::model::Model;
-use crate::session::{Session, Source};
+use crate::session::{Session, Source, Update};
 use crate::types::{FileSummary, Message, ThreadKey, Ts};
-use crate::ui::{
-    Class, Hooks, Span, apply_highlights, clock_time, crosses_day, day_label, lay_out,
-};
+use crate::ui::{Class, Hooks, Span, clock_time, crosses_day, day_label, lay_out};
 
 pub struct ConversationView {
     session: Entity<Session>,
     source: Source,
-    transcript: Entity<Buffer>,
+    /// The messages on screen, each keyed and each owning its own range: a
+    /// new message rewrites one item, not the conversation.
+    transcript: Transcript<Row, Class, LineMeta>,
     input: Entity<Buffer>,
     multi_buffer: Entity<MultiBuffer>,
     editor: Entity<Editor>,
-    /// The thread each transcript line belongs to, so `enter` on a message
-    /// knows which thread to open without any of it reaching the screen.
-    line_threads: Vec<Option<Ts>>,
-    /// The file each line offers, for the same reason: `enter` on a file
-    /// line opens the file rather than the thread it hangs under.
-    line_files: Vec<Option<FileSummary>>,
-    /// The preview blocks currently under image lines, so a redraw can take
-    /// them down before it puts the new ones up.
-    image_blocks: Vec<editor::display_map::CustomBlockId>,
-    /// How far the body column is indented, so a preview lines up under the
-    /// prose rather than under the clock.
-    body_indent: usize,
+    /// How far the session's messages have been applied here.
+    revision: u64,
     _subscriptions: Vec<gpui::Subscription>,
 }
+
+/// What the transcript keys on. Day rules and the gap notice are items like
+/// any other, so they insert and disappear through the same path.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Row {
+    /// The loading or failure line above everything.
+    Notice,
+    /// "older messages not loaded", while the run does not reach the start.
+    Gap,
+    Day(String),
+    Message(Ts),
+}
+
+/// What a line offers the cursor.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct LineMeta {
+    /// The thread the line belongs to, so `enter` opens the right one.
+    thread: Option<Ts>,
+    /// The file the line names, which `enter` opens instead.
+    file: Option<FileSummary>,
+}
+
+type Rendered = Item<Row, Class, LineMeta>;
 
 impl ConversationView {
     pub fn new(
@@ -104,14 +118,17 @@ impl ConversationView {
         let mut subscriptions = vec![cx.observe_in(&session, window, |this, _, window, cx| {
             this.refresh(window, cx);
         })];
-        // Reaching the top of the transcript is the ask for older history:
-        // the same gesture as scrolling back in any other reader.
+        // History fills as the reader scrolls, and there is no other way to
+        // ask for it. The fetch starts a screen early so the older messages
+        // are usually already there by the time the top comes into view.
         subscriptions.push(
             cx.subscribe(&editor, |this, editor, event: &EditorEvent, cx| {
                 if matches!(event, EditorEvent::ScrollPositionChanged { .. }) {
-                    let at_top =
-                        editor.update(cx, |editor, cx| editor.scroll_position(cx).y <= 0.5);
-                    if at_top {
+                    let near_top = editor.update(cx, |editor, cx| {
+                        let screen = editor.visible_line_count().unwrap_or(0.0);
+                        editor.scroll_position(cx).y <= screen.max(1.0)
+                    });
+                    if near_top {
                         this.load_older(cx);
                     }
                 }
@@ -121,16 +138,14 @@ impl ConversationView {
         let mut view = Self {
             session: session.clone(),
             source: source.clone(),
-            transcript,
+            transcript: Transcript::new(transcript),
             input,
             multi_buffer,
             editor,
-            line_threads: Vec::new(),
-            line_files: Vec::new(),
-            image_blocks: Vec::new(),
-            body_indent: 0,
+            revision: 0,
             _subscriptions: subscriptions,
         };
+        view.transcript.attach(&view.editor.clone(), cx);
         session.update(cx, |session, cx| session.open(&source, cx));
         view.refresh(window, cx);
         view.select_compose(window, cx);
@@ -149,7 +164,10 @@ impl ConversationView {
     /// before a thread, because the reader who put the cursor on a file line
     /// asked for the file.
     pub fn cursor_file(&self, cx: &mut Context<Self>) -> Option<FileSummary> {
-        self.line_files.get(self.cursor_row(cx)).cloned().flatten()
+        let row = self.cursor_row(cx) as u32;
+        self.transcript
+            .line_meta(row, cx)
+            .and_then(|meta| meta.file.clone())
     }
 
     fn cursor_row(&self, cx: &mut Context<Self>) -> usize {
@@ -168,11 +186,8 @@ impl ConversationView {
         if matches!(self.source, Source::Thread(_)) {
             return None;
         }
-        let thread_ts = self
-            .line_threads
-            .get(self.cursor_row(cx))
-            .cloned()
-            .flatten()?;
+        let row = self.cursor_row(cx) as u32;
+        let thread_ts = self.transcript.line_meta(row, cx)?.thread.clone()?;
         Some(
             self.session
                 .read(cx)
@@ -238,87 +253,211 @@ impl ConversationView {
         });
     }
 
-    fn refresh(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        let session = self.session.read(cx);
-        let Some(loaded) = session.loaded(&self.source) else {
+    /// Brings the transcript up to date with the session. Only the messages
+    /// the session says changed are rewritten: a socket frame costs one
+    /// item, a page costs one insert, and everything else keeps its anchors,
+    /// so the cursor and the scroll stay where the reader put them.
+    fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((revision, updates)) = self
+            .session
+            .read(cx)
+            .loaded(&self.source)
+            .map(|loaded| (loaded.revision(), loaded.updates_since(self.revision)))
+        else {
             return;
         };
-        let notice = match (&loaded.error, loaded.loading) {
-            (Some(error), _) => Some(Span::styled(format!("{error}\n\n"), Class::Error)),
-            (None, true) => Some(Span::styled("loading…\n\n", Class::Muted)),
-            (None, false) => None,
-        };
-        let mut spans = notice.iter().cloned().collect::<Vec<_>>();
-        let transcript = render_messages(
-            &loaded.messages,
-            session.model(),
-            matches!(self.source, Source::Thread(_)),
-        );
-        let (body, line_threads, line_files) =
-            (transcript.spans, transcript.threads, transcript.files);
-        spans.extend(body);
-        // The notice occupies its own lines above the transcript, so the
-        // line map has to start where the transcript does.
-        let leading = notice
-            .map(|notice| notice.text.matches('\n').count())
-            .unwrap_or(0);
-        let mut lines = vec![None; leading];
-        lines.extend(line_threads);
-        self.line_threads = lines;
-        let mut files = vec![None; leading];
-        files.extend(line_files);
-        self.line_files = files;
-        self.body_indent = transcript.indent;
-
-        let (text, styles) = lay_out(&spans);
-        let anchored = self.transcript.update(cx, |buffer, cx| {
-            let len = buffer.len();
-            buffer.edit([(0..len, text)], None, cx);
-            let snapshot = buffer.snapshot();
-            styles
-                .into_iter()
-                .map(|(class, range)| {
-                    let clamp = |offset: usize| offset.min(snapshot.len());
-                    (
-                        class,
-                        vec![
-                            snapshot.anchor_before(clamp(range.start))
-                                ..snapshot.anchor_after(clamp(range.end)),
-                        ],
-                    )
-                })
-                .collect::<Vec<(Class, Vec<Range<Anchor>>)>>()
-        });
-        apply_highlights(&self.editor, &self.multi_buffer, &anchored, cx);
-        self.refresh_images(cx);
+        match updates {
+            // A surface that has fallen too far behind (or has never been
+            // filled) renders the run it can see in one insert.
+            None => self.rebuild(cx),
+            Some(updates) => self.apply_updates(updates, window, cx),
+        }
+        self.revision = revision;
+        self.refresh_chrome(cx);
         cx.notify();
     }
 
-    /// Shows an image under the line that names it. The bytes are fetched
-    /// when the line is on screen for the first time and read from the state
-    /// cache after that, so scrolling costs nothing and nothing is
-    /// downloaded that the reader never opened.
-    fn refresh_images(&mut self, cx: &mut Context<Self>) {
-        let taken = std::mem::take(&mut self.image_blocks);
-        if !taken.is_empty() {
-            self.editor.update(cx, |editor, cx| {
-                editor.remove_blocks(taken.into_iter().collect(), None, cx);
-            });
+    fn rebuild(&mut self, cx: &mut Context<Self>) {
+        self.transcript.clear(cx);
+        let messages = self.shown_messages(cx);
+        let mut items = Vec::new();
+        let mut last: Option<i64> = None;
+        for message in &messages {
+            let at = message.ts.epoch_seconds() as i64;
+            if last.is_none_or(|last| crosses_day(last, at)) {
+                items.push(day_item(at));
+            }
+            last = Some(at);
+            items.push(self.item_for(message, cx));
         }
-        let images = self
-            .line_files
+        self.transcript.insert_before(None, items, cx);
+    }
+
+    /// Carries out the plan: each operation is one transcript edit.
+    fn apply_updates(&mut self, updates: Vec<Update>, window: &mut Window, cx: &mut Context<Self>) {
+        let messages = self.shown_messages(cx);
+        let ops = plan(&updates, &messages, &self.transcript);
+        // A reader at the very top is anchored to the top itself, so older
+        // messages arriving above would slide their line down the screen.
+        // Re-taking the anchor after the insertion point first is what keeps
+        // the view on the message it was showing.
+        if ops.iter().any(|op| self.reaches_the_top(op)) {
+            self.editor
+                .update(cx, |editor, cx| editor.pin_scroll_to_content(window, cx));
+        }
+        for op in ops {
+            match op {
+                Op::Insert { before, keys } => {
+                    let items = keys
+                        .iter()
+                        .filter_map(|key| self.item_for_key(key, &messages, cx))
+                        .collect::<Vec<_>>();
+                    if !items.is_empty() {
+                        self.transcript.insert_before(before.as_ref(), items, cx);
+                    }
+                }
+                Op::Replace(key) => {
+                    if let Some(item) = self.item_for_key(&key, &messages, cx) {
+                        self.transcript.replace(&key, item, cx);
+                    }
+                }
+                Op::Remove(key) => {
+                    self.transcript.remove(&key, cx);
+                }
+            }
+        }
+    }
+
+    /// Whether an operation changes the text above everything on screen.
+    fn reaches_the_top(&self, op: &Op) -> bool {
+        let Op::Insert { before, .. } = op else {
+            return false;
+        };
+        before.as_ref().is_some_and(|before| {
+            self.transcript
+                .key_before(before)
+                .is_none_or(|key| matches!(key, Row::Notice | Row::Gap))
+        })
+    }
+
+    fn item_for_key(
+        &mut self,
+        key: &Row,
+        messages: &[Message],
+        cx: &mut Context<Self>,
+    ) -> Option<Rendered> {
+        match key {
+            Row::Day(label) => Some(day_rule(label.clone())),
+            Row::Message(ts) => {
+                let message = messages.iter().find(|message| &message.ts == ts)?.clone();
+                Some(self.item_for(&message, cx))
+            }
+            Row::Notice | Row::Gap => None,
+        }
+    }
+
+    /// The loading, failure and gap lines above the transcript. They are
+    /// items too, so they cost one edit each and never disturb a message.
+    fn refresh_chrome(&mut self, cx: &mut Context<Self>) {
+        let Some((error, loading, reached_oldest)) = self
+            .session
+            .read(cx)
+            .loaded(&self.source)
+            .map(|loaded| (loaded.error.clone(), loaded.loading, loaded.reached_oldest))
+        else {
+            return;
+        };
+        let notice = match (error, loading) {
+            (Some(error), _) => Some(muted_item(
+                Row::Notice,
+                format!("{error}\n\n"),
+                Class::Error,
+            )),
+            (None, true) => Some(muted_item(Row::Notice, "loading…\n\n", Class::Muted)),
+            (None, false) => None,
+        };
+        // A run that does not reach the beginning says so on one muted line.
+        // The reader scrolling onto it is what fills it, so it is a state,
+        // not a button.
+        let gap = (!reached_oldest)
+            .then(|| muted_item(Row::Gap, "older messages not loaded\n", Class::Muted));
+        let first = self
+            .transcript
+            .keys()
+            .find(|key| !matches!(key, Row::Notice | Row::Gap))
+            .cloned();
+        self.put_top(Row::Gap, gap, first.clone(), cx);
+        let after_notice = self
+            .transcript
+            .contains(&Row::Gap)
+            .then_some(Row::Gap)
+            .or(first);
+        self.put_top(Row::Notice, notice, after_notice, cx);
+    }
+
+    /// Puts one chrome item in place, replacing or removing it as its state
+    /// changes, without touching anything below.
+    fn put_top(
+        &mut self,
+        key: Row,
+        item: Option<Rendered>,
+        before: Option<Row>,
+        cx: &mut Context<Self>,
+    ) {
+        match item {
+            None => {
+                self.transcript.remove(&key, cx);
+            }
+            Some(item) if self.transcript.contains(&key) => {
+                self.transcript.replace(&key, item, cx);
+            }
+            Some(item) => {
+                self.transcript
+                    .insert_before(before.as_ref(), vec![item], cx);
+            }
+        }
+    }
+
+    /// The messages this surface shows: replies live in their thread and
+    /// nowhere else, which is what Slack does and what makes a channel
+    /// readable. The exception is a reply the sender also sent to the
+    /// channel, which was addressed to the room.
+    fn shown_messages(&self, cx: &App) -> Vec<Message> {
+        let in_thread = matches!(self.source, Source::Thread(_));
+        self.session
+            .read(cx)
+            .loaded(&self.source)
+            .map(|loaded| {
+                loaded
+                    .messages
+                    .iter()
+                    .filter(|message| in_thread || message.is_top_level())
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// One message as an item, with its image previews attached. The bytes
+    /// are fetched when the line first renders and read from the state cache
+    /// after that, so scrolling costs nothing and nothing is downloaded that
+    /// the reader never opened.
+    fn item_for(&mut self, message: &Message, cx: &mut Context<Self>) -> Rendered {
+        let in_thread = matches!(self.source, Source::Thread(_));
+        let mut item = {
+            let session = self.session.read(cx);
+            message_item(message, session.model(), in_thread)
+        };
+        let images = item
+            .lines
             .iter()
             .enumerate()
-            .filter_map(|(row, file)| {
-                let file = file.as_ref().filter(|file| file.is_image())?;
-                Some((row as u32, file.clone()))
+            .filter_map(|(line, meta)| {
+                let file = meta.file.as_ref().filter(|file| file.is_image())?;
+                Some((line as u32, file.clone()))
             })
             .collect::<Vec<_>>();
-        if images.is_empty() {
-            return;
-        }
-        let mut blocks = Vec::new();
-        for (row, file) in images {
+        for (line, file) in images {
             let path = self.session.update(cx, |session, cx| {
                 session.cache_file(&file, cx);
                 session.cached_file(&file.id).map(std::path::Path::to_owned)
@@ -326,219 +465,415 @@ impl ConversationView {
             let Some(path) = path.filter(|path| path.exists()) else {
                 continue;
             };
-            let indent = self.body_indent;
-            let point = Point::new(row, 0);
-            let anchor = {
-                let transcript = self.transcript.read(cx);
-                if point > transcript.max_point() {
+            item.blocks.push(image_block(line, path));
+        }
+        item
+    }
+}
+
+/// What the transcript is asked to do about a batch of session updates.
+/// Deciding this apart from carrying it out is what lets a test say that a
+/// message off the socket costs exactly one append.
+#[derive(Clone, Debug, PartialEq)]
+enum Op {
+    /// A run of items, day rules included, in front of `before` (`None` is
+    /// the end): one page of history, or one arriving message.
+    Insert {
+        before: Option<Row>,
+        keys: Vec<Row>,
+    },
+    Replace(Row),
+    Remove(Row),
+}
+
+/// What the transcript already holds, which is all the planner needs to
+/// know about it.
+trait Placed {
+    fn holds(&self, key: &Row) -> bool;
+    fn above(&self, key: &Row) -> Option<Row>;
+    fn below(&self, key: &Row) -> Option<Row>;
+}
+
+impl Placed for Transcript<Row, Class, LineMeta> {
+    fn holds(&self, key: &Row) -> bool {
+        self.contains(key)
+    }
+
+    fn above(&self, key: &Row) -> Option<Row> {
+        self.key_before(key).cloned()
+    }
+
+    fn below(&self, key: &Row) -> Option<Row> {
+        self.key_after(key).cloned()
+    }
+}
+
+/// Turns the session's changes into transcript operations. Arriving messages
+/// are gathered into runs, so a page of history is one edit at the top
+/// rather than fifty, and a day rule rides with the message it heads.
+fn plan(updates: &[Update], shown: &[Message], placed: &impl Placed) -> Vec<Op> {
+    let mut ops = Vec::new();
+    let mut added: HashSet<Row> = HashSet::new();
+    let mut gone: HashSet<Row> = HashSet::new();
+    let held = |key: &Row, added: &HashSet<Row>, gone: &HashSet<Row>| {
+        (placed.holds(key) || added.contains(key)) && !gone.contains(key)
+    };
+    let arriving = updates
+        .iter()
+        .filter_map(|update| match update {
+            Update::Inserted(ts) => Some(ts.clone()),
+            _ => None,
+        })
+        .collect::<HashSet<_>>();
+    let mut pending: Vec<Ts> = Vec::new();
+    for update in updates {
+        match update {
+            Update::Inserted(ts) => pending.push(ts.clone()),
+            Update::Replaced(ts) => {
+                plan_inserts(
+                    std::mem::take(&mut pending),
+                    shown,
+                    &arriving,
+                    placed,
+                    &mut added,
+                    &gone,
+                    &mut ops,
+                );
+                let key = Row::Message(ts.clone());
+                if held(&key, &added, &gone) {
+                    ops.push(Op::Replace(key));
+                }
+            }
+            Update::Removed(ts) => {
+                plan_inserts(
+                    std::mem::take(&mut pending),
+                    shown,
+                    &arriving,
+                    placed,
+                    &mut added,
+                    &gone,
+                    &mut ops,
+                );
+                let key = Row::Message(ts.clone());
+                if !held(&key, &added, &gone) {
                     continue;
                 }
-                transcript.anchor_after(point)
-            };
-            let Some(anchor) = self
-                .multi_buffer
-                .read(cx)
-                .snapshot(cx)
-                .anchor_in_excerpt(anchor)
-            else {
-                continue;
-            };
-            blocks.push(editor::display_map::BlockProperties {
-                placement: editor::display_map::BlockPlacement::Below(anchor),
-                // Tall enough to read, short enough that a picture never
-                // pushes the conversation off the screen.
-                height: Some(IMAGE_ROWS),
-                style: editor::display_map::BlockStyle::Fixed,
-                render: std::sync::Arc::new(move |cx| {
-                    // The spacer is real text in the transcript's own font,
-                    // which is the only way to land the picture exactly under
-                    // the body column whatever font the reader has set.
-                    let style = cx.editor_style.text.clone();
-                    div()
-                        .flex()
-                        .items_start()
-                        .font_family(style.font_family.clone())
-                        .text_size(style.font_size)
-                        .child(" ".repeat(indent))
-                        .child(
-                            gpui::img(path.clone())
-                                .max_h(cx.line_height * IMAGE_ROWS as f32)
-                                .max_w_full(),
-                        )
-                        .into_any_element()
-                }),
-                priority: 0,
-            });
+                let above = placed.above(&key);
+                let below = placed.below(&key);
+                ops.push(Op::Remove(key.clone()));
+                gone.insert(key);
+                // A day rule with nothing left under it goes too.
+                let Some(Row::Day(label)) = above else {
+                    continue;
+                };
+                let heads_something = match below {
+                    Some(Row::Message(ts)) => day_label(ts.epoch_seconds() as i64) == label,
+                    _ => false,
+                };
+                if !heads_something {
+                    ops.push(Op::Remove(Row::Day(label.clone())));
+                    gone.insert(Row::Day(label));
+                }
+            }
         }
-        if blocks.is_empty() {
-            return;
+    }
+    plan_inserts(
+        pending, shown, &arriving, placed, &mut added, &gone, &mut ops,
+    );
+    ops
+}
+
+fn plan_inserts(
+    mut arrived: Vec<Ts>,
+    shown: &[Message],
+    arriving: &HashSet<Ts>,
+    placed: &impl Placed,
+    added: &mut HashSet<Row>,
+    gone: &HashSet<Row>,
+    ops: &mut Vec<Op>,
+) {
+    if arrived.is_empty() {
+        return;
+    }
+    arrived.sort_by(|left, right| left.epoch_seconds().total_cmp(&right.epoch_seconds()));
+    let held = |key: &Row, added: &HashSet<Row>| {
+        (placed.holds(key) || added.contains(key)) && !gone.contains(key)
+    };
+    let mut keys: Vec<Row> = Vec::new();
+    let mut before: Option<Row> = None;
+    let mut follows: Option<String> = None;
+    let mut previous_day: Option<i64> = None;
+    let mut last_day: Option<i64> = None;
+    for ts in arrived {
+        // A reply in a channel is not shown there at all; it changed the
+        // parent's count line instead, which arrives as its own update.
+        let Some(message) = shown.iter().find(|message| message.ts == ts) else {
+            continue;
+        };
+        let at = message.ts.epoch_seconds() as i64;
+        let next = anchor_after(shown, &ts, arriving, |key| held(key, added));
+        if !keys.is_empty() && next != before {
+            close_run(
+                std::mem::take(&mut keys),
+                before.clone(),
+                follows.take(),
+                last_day,
+                ops,
+            );
+            previous_day = None;
         }
-        self.image_blocks = self
-            .editor
-            .update(cx, |editor, cx| editor.insert_blocks(blocks, None, cx));
+        if keys.is_empty() {
+            before = next;
+            // The day rule heading the message the run lands on. It stays
+            // where it is when the run starts on that same day, and is dealt
+            // with by `close_run` when the run reaches back further.
+            let rule = match before.as_ref().and_then(|before| placed.above(before)) {
+                Some(Row::Day(label)) => Some(label),
+                _ => None,
+            };
+            let covered = rule.as_ref().is_some_and(|label| label == &day_label(at));
+            follows = match covered {
+                true => None,
+                false => rule,
+            };
+            previous_day = match covered {
+                true => Some(at),
+                false => day_before(before.as_ref(), shown, arriving, |key| held(key, added)),
+            };
+        }
+        // A day rule heads the first message of its day.
+        if previous_day.is_none_or(|last| crosses_day(last, at)) {
+            let rule = Row::Day(day_label(at));
+            keys.push(rule.clone());
+            added.insert(rule);
+        }
+        previous_day = Some(at);
+        last_day = Some(at);
+        let key = Row::Message(ts);
+        keys.push(key.clone());
+        added.insert(key);
+    }
+    close_run(keys, before, follows, last_day, ops);
+}
+
+/// Puts one run in, around the day rule that heads the message it lands on.
+/// A run ending on that same day now heads the day itself, so the old rule
+/// would sit in the middle of it: it comes down first, and the run takes its
+/// place. A run that ends earlier simply goes in above it.
+fn close_run(
+    keys: Vec<Row>,
+    before: Option<Row>,
+    follows: Option<String>,
+    last_day: Option<i64>,
+    ops: &mut Vec<Op>,
+) {
+    if keys.is_empty() {
+        return;
+    }
+    let stale = follows
+        .clone()
+        .filter(|label| last_day.is_some_and(|at| &day_label(at) == label));
+    match stale {
+        Some(label) => {
+            ops.push(Op::Remove(Row::Day(label)));
+            ops.push(Op::Insert { before, keys });
+        }
+        None => ops.push(Op::Insert {
+            before: follows.map(Row::Day).or(before),
+            keys,
+        }),
+    }
+}
+
+/// The item an arriving message goes in front of: the next message already
+/// on screen. `None` means the end.
+fn anchor_after(
+    shown: &[Message],
+    ts: &Ts,
+    arriving: &HashSet<Ts>,
+    held: impl Fn(&Row) -> bool,
+) -> Option<Row> {
+    shown
+        .iter()
+        .skip_while(|message| message.ts.epoch_seconds() <= ts.epoch_seconds())
+        .find(|message| !arriving.contains(&message.ts))
+        .map(|message| Row::Message(message.ts.clone()))
+        .filter(|row| held(row))
+}
+
+/// The day of the message the run will follow, which decides whether it
+/// needs a day rule of its own.
+fn day_before(
+    anchor: Option<&Row>,
+    shown: &[Message],
+    arriving: &HashSet<Ts>,
+    held: impl Fn(&Row) -> bool,
+) -> Option<i64> {
+    let before = match anchor {
+        Some(Row::Message(ts)) => shown
+            .iter()
+            .rev()
+            .filter(|message| message.ts.epoch_seconds() < ts.epoch_seconds())
+            .find(|message| !arriving.contains(&message.ts)),
+        _ => shown
+            .iter()
+            .rev()
+            .find(|message| !arriving.contains(&message.ts)),
+    }?;
+    held(&Row::Message(before.ts.clone())).then(|| before.ts.epoch_seconds() as i64)
+}
+
+/// A picture under the line that names it, indented to the body column.
+fn image_block(line: u32, path: std::path::PathBuf) -> BlockSpec {
+    BlockSpec {
+        line,
+        height: IMAGE_ROWS,
+        render: std::sync::Arc::new(move |cx| {
+            // The spacer is real text in the transcript's own font, which is
+            // the only way to land the picture exactly under the body column
+            // whatever font the reader has set.
+            let style = cx.editor_style.text.clone();
+            div()
+                .flex()
+                .items_start()
+                .font_family(style.font_family.clone())
+                .text_size(style.font_size)
+                .child(" ".repeat(BODY_INDENT))
+                .child(
+                    gpui::img(path.clone())
+                        .max_h(cx.line_height * IMAGE_ROWS as f32)
+                        .max_w_full(),
+                )
+                .into_any_element()
+        }),
+        priority: 0,
     }
 }
 
 /// How many lines tall an inline image preview is allowed to be.
 const IMAGE_ROWS: u32 = 10;
 
-/// Renders messages into spans, and the thread each produced line belongs
-/// to. Names, not ids; wall-clock times, not Slack timestamps.
+/// One message as an item: `name: body  time`.
 ///
-/// The shape is IRC's, which is the one people have read in a terminal for
-/// thirty years: time, author, and the message on one line, authors padded
-/// to a column so the bodies line up and the eye can run down them. No blank
-/// line between messages; a day is the only break.
-#[derive(Default)]
-struct Transcript {
-    spans: Vec<Span>,
-    /// The thread each line belongs to, so `enter` opens the right one.
-    threads: Vec<Option<Ts>>,
-    /// The file each line offers, so `enter` opens that instead.
-    files: Vec<Option<FileSummary>>,
-    /// Columns the body starts at, which chrome under a line matches.
-    indent: usize,
-}
-
-fn render_messages(messages: &[Message], model: &Model, in_thread: bool) -> Transcript {
-    // Replies live in their thread and nowhere else, which is what Slack
-    // does and what makes a channel readable. The exception is a reply the
-    // sender also sent to the channel, which was addressed to the room.
-    let shown = messages
-        .iter()
-        .filter(|message| in_thread || message.is_top_level())
-        .collect::<Vec<_>>();
+/// The shape is a chat log's, not a table's: the name introduces the words,
+/// the time trails them, and nothing is padded into a column, so one long
+/// name cannot push every other line across the screen. Continuation lines
+/// and the chrome under a message indent by [`BODY_INDENT`]. No blank line
+/// between messages; a day is the only break.
+fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
+    let at = message.ts.epoch_seconds() as i64;
+    let thread = Some(message.thread_root());
+    let indent = " ".repeat(BODY_INDENT);
     let mut spans = Vec::new();
     let mut lines = Vec::new();
-    let mut files: Vec<Option<FileSummary>> = Vec::new();
-    let mut last: Option<i64> = None;
-    let width = author_column(&shown, model);
-    // Continuation lines start under the body, so a wrapped sentence reads
-    // as one message rather than as a new one.
-    let indent = " ".repeat(TIME_WIDTH + 2 + width + 2);
-    for message in shown {
-        let at = message.ts.epoch_seconds() as i64;
-        if last.is_none_or(|last| crosses_day(last, at)) {
-            spans.push(Span::styled(
-                format!("── {} ──\n", day_label(at)),
-                Class::Muted,
-            ));
-            lines.push(None);
-            files.push(None);
-        }
-        let thread = Some(message.thread_root());
-        // Slack shows joins, leaves, and topic changes, and so does rho:
-        // leaving them out makes a channel read as if nothing happened.
-        // They are one muted line, without an author column of their own.
-        if let Some(line) = system_line(message, model) {
-            spans.push(Span::styled(format!("{indent}{line}\n"), Class::Muted));
-            lines.push(thread);
-            files.push(None);
-            last = Some(at);
-            continue;
-        }
-        let you = message.user.as_ref() == Some(model.self_id());
-        let author = fit(&model.author(message), width);
-        spans.push(Span::styled(format!("{}  ", clock_time(at)), Class::Time));
-        spans.push(Span::styled(
-            author.clone(),
-            match you {
-                true => Class::You,
-                false => Class::Sender,
-            },
-        ));
-        spans.push(Span::plain(format!(
-            "{}  ",
-            " ".repeat(width.saturating_sub(author.chars().count()))
-        )));
 
-        let body = model.render(message);
-        let body = body.trim_end().replace('\n', &format!("\n{indent}"));
-        push_body(&mut spans, &body, model);
-        if message.edited {
-            // The reader is told what they are looking at is not what was
-            // sent. It rides at the end of the body rather than after the
-            // time, which would push every other line's columns across.
-            spans.push(Span::styled(" (edited)", Class::Muted));
-        }
-        spans.push(Span::plain("\n"));
-        lines.extend(std::iter::repeat_n(
-            thread.clone(),
-            body.matches('\n').count() + 1,
-        ));
-        // A file's line is the one that reads as the file: `enter` there
-        // opens it rather than the thread.
-        files.extend(body.split('\n').map(|line| {
-            message
+    // Slack shows joins, leaves, and topic changes, and so does rho: leaving
+    // them out makes a channel read as if nothing happened. They are one
+    // muted line, without a name of their own.
+    if let Some(line) = system_line(message, model) {
+        spans.push(Span::styled(format!("{line}\n"), Class::Muted));
+        lines.push(LineMeta { thread, file: None });
+        return item(Row::Message(message.ts.clone()), spans, lines);
+    }
+
+    let you = message.user.as_ref() == Some(model.self_id());
+    spans.push(Span::styled(
+        model.author(message),
+        match you {
+            true => Class::You,
+            false => Class::Sender,
+        },
+    ));
+    spans.push(Span::plain(": "));
+
+    let body = model.render(message);
+    let body = body.trim_end().replace('\n', &format!("\n{indent}"));
+    push_body(&mut spans, &body, model);
+    if message.edited {
+        // The reader is told what they are looking at is not what was sent.
+        spans.push(Span::styled(" (edited)", Class::Muted));
+    }
+    // The time trails the words rather than heading them: it is the least
+    // of what the reader came for.
+    spans.push(Span::styled(format!("  {}", clock_time(at)), Class::Time));
+    spans.push(Span::plain("\n"));
+    // A file's line is the one that reads as the file: `enter` there opens
+    // it rather than the thread.
+    lines.extend(body.split('\n').map(|line| {
+        LineMeta {
+            thread: thread.clone(),
+            file: message
                 .files
                 .iter()
                 .find(|file| line.trim() == file.line())
-                .cloned()
-        }));
+                .cloned(),
+        }
+    }));
 
-        if !message.reactions.is_empty() {
-            spans.push(Span::plain(indent.clone()));
-            push_reactions(&mut spans, message, model);
-            lines.push(thread.clone());
-            files.push(None);
-        }
-        if !in_thread && message.is_broadcast() {
-            // It was said in a thread and sent here too: the reader should
-            // know which, or the thread reads as two conversations.
-            spans.push(Span::styled(
-                format!("{indent}also sent to the channel\n"),
-                Class::Muted,
-            ));
-            lines.push(thread.clone());
-            files.push(None);
-        }
-        // The thread under a message is one line, not a fold-out: the reader
-        // sees that it exists and opens it with `enter`.
-        if !in_thread && message.reply_count > 0 {
-            spans.push(Span::styled(
-                format!("{indent}{}\n", replies_line(message)),
-                Class::Topic,
-            ));
-            lines.push(thread);
-            files.push(None);
-        }
-        last = Some(at);
+    if !message.reactions.is_empty() {
+        spans.push(Span::plain(indent.clone()));
+        push_reactions(&mut spans, message, model);
+        lines.push(LineMeta {
+            thread: thread.clone(),
+            file: None,
+        });
     }
-    Transcript {
-        spans,
-        threads: lines,
-        files,
-        indent: indent.len(),
+    if !in_thread && message.is_broadcast() {
+        // It was said in a thread and sent here too: the reader should know
+        // which, or the thread reads as two conversations.
+        spans.push(Span::styled(
+            format!("{indent}also sent to the channel\n"),
+            Class::Muted,
+        ));
+        lines.push(LineMeta {
+            thread: thread.clone(),
+            file: None,
+        });
     }
+    // The thread under a message is one line, not a fold-out: the reader
+    // sees that it exists and opens it with `enter`.
+    if !in_thread && message.reply_count > 0 {
+        spans.push(Span::styled(
+            format!("{indent}{}\n", replies_line(message)),
+            Class::Topic,
+        ));
+        lines.push(LineMeta { thread, file: None });
+    }
+    item(Row::Message(message.ts.clone()), spans, lines)
 }
 
-/// `14:27`, which every line starts with.
-const TIME_WIDTH: usize = 5;
-/// Longer than this and one name would push every body across the screen, so
-/// it is cut instead. Long enough for "Ada Lovelace".
-const AUTHOR_LIMIT: usize = 14;
-
-/// The width the author column takes in this conversation: as wide as the
-/// longest name in it, so the bodies line up and no wider.
-fn author_column(messages: &[&Message], model: &Model) -> usize {
-    messages
-        .iter()
-        .map(|message| model.author(message).chars().count().min(AUTHOR_LIMIT))
-        .max()
-        .unwrap_or(0)
+/// The break between days, which is the only separator the transcript has.
+fn day_item(at: i64) -> Rendered {
+    day_rule(day_label(at))
 }
 
-fn fit(name: &str, width: usize) -> String {
-    match name.chars().count() > width {
-        true => {
-            name.chars()
-                .take(width.saturating_sub(1))
-                .collect::<String>()
-                + "…"
-        }
-        false => name.to_owned(),
-    }
+fn day_rule(label: String) -> Rendered {
+    muted_item(
+        Row::Day(label.clone()),
+        format!("── {label} ──\n"),
+        Class::Muted,
+    )
 }
+
+fn muted_item(key: Row, text: impl Into<String>, class: Class) -> Rendered {
+    let text = text.into();
+    let lines = text.matches('\n').count().max(1);
+    item(
+        key,
+        vec![Span::styled(text, class)],
+        vec![LineMeta::default(); lines],
+    )
+}
+
+fn item(key: Row, spans: Vec<Span>, lines: Vec<LineMeta>) -> Rendered {
+    let (text, styles) = lay_out(&spans);
+    Item::new(key, text).with_styles(styles).with_lines(lines)
+}
+
+/// Where a continuation line, a reaction row, a thread count and a picture
+/// all start: two columns in, so they read as belonging to the message
+/// above rather than as a message of their own.
+const BODY_INDENT: usize = 2;
 
 /// A membership or housekeeping event, as one line. Slack shows these and a
 /// channel reads wrong without them, but they are not what anyone came to
@@ -681,30 +1016,234 @@ mod tests {
         crate::api::parse_message(&value, &ChannelId("C1".into())).unwrap()
     }
 
-    fn rendered(spans: &[Span]) -> String {
-        spans.iter().map(|span| span.text.as_str()).collect()
+    /// The transcript as one string, its classes, and its line map: what
+    /// the surface would put in the buffer, built the way `rebuild` does.
+    fn render_messages(
+        messages: &[Message],
+        model: &Model,
+        in_thread: bool,
+    ) -> (String, Vec<(Class, Range<usize>)>, Vec<LineMeta>) {
+        let shown = messages
+            .iter()
+            .filter(|message| in_thread || message.is_top_level());
+        let mut items = Vec::new();
+        let mut last: Option<i64> = None;
+        for message in shown {
+            let at = message.ts.epoch_seconds() as i64;
+            if last.is_none_or(|last| crosses_day(last, at)) {
+                items.push(day_item(at));
+            }
+            last = Some(at);
+            items.push(message_item(message, model, in_thread));
+        }
+        let mut text = String::new();
+        let mut styles = Vec::new();
+        let mut lines = Vec::new();
+        for item in items {
+            let offset = text.len();
+            text.push_str(&item.text);
+            styles.extend(
+                item.styles
+                    .into_iter()
+                    .map(|(class, range)| (class, offset + range.start..offset + range.end)),
+            );
+            lines.extend(item.lines);
+        }
+        (text, styles, lines)
+    }
+
+    /// A stand-in for what the transcript holds, in display order.
+    struct Held(Vec<Row>);
+
+    impl Placed for Held {
+        fn holds(&self, key: &Row) -> bool {
+            self.0.contains(key)
+        }
+
+        fn above(&self, key: &Row) -> Option<Row> {
+            let at = self.0.iter().position(|held| held == key)?;
+            self.0.get(at.checked_sub(1)?).cloned()
+        }
+
+        fn below(&self, key: &Row) -> Option<Row> {
+            let at = self.0.iter().position(|held| held == key)?;
+            self.0.get(at + 1).cloned()
+        }
+    }
+
+    /// What a conversation open on the surface looks like: a day rule and
+    /// the messages under it.
+    fn held(messages: &[Message]) -> Held {
+        let mut keys = Vec::new();
+        let mut last: Option<i64> = None;
+        for message in messages {
+            let at = message.ts.epoch_seconds() as i64;
+            if last.is_none_or(|last| crosses_day(last, at)) {
+                keys.push(Row::Day(day_label(at)));
+            }
+            last = Some(at);
+            keys.push(Row::Message(message.ts.clone()));
+        }
+        Held(keys)
+    }
+
+    /// The text carrying one class, in order: what the reader sees painted.
+    fn classed(text: &str, styles: &[(Class, Range<usize>)], class: Class) -> Vec<String> {
+        styles
+            .iter()
+            .filter(|(candidate, _)| *candidate == class)
+            .map(|(_, range)| text[range.clone()].to_owned())
+            .collect()
     }
 
     #[test]
-    fn a_message_is_one_line_of_time_author_and_prose() {
-        let spans = render_messages(
+    fn a_message_off_the_socket_costs_one_append() {
+        let held = held(&[message("1700000000.0", None, "hello")]);
+        let arrived = message("1700000060.0", None, "and another");
+        let shown = [message("1700000000.0", None, "hello"), arrived.clone()];
+
+        let ops = plan(&[Update::Inserted(arrived.ts.clone())], &shown, &held);
+
+        assert_eq!(
+            ops,
+            vec![Op::Insert {
+                before: None,
+                keys: vec![Row::Message(arrived.ts)],
+            }],
+            "one item at the end, and nothing else is touched"
+        );
+    }
+
+    #[test]
+    fn an_edit_costs_one_replacement() {
+        let shown = [
+            message("1700000000.0", None, "hello"),
+            message("1700000060.0", None, "fixed"),
+        ];
+        let held = held(&shown);
+
+        let ops = plan(
+            &[Update::Replaced(Ts("1700000060.0".into()))],
+            &shown,
+            &held,
+        );
+
+        assert_eq!(
+            ops,
+            vec![Op::Replace(Row::Message(Ts("1700000060.0".into())))],
+            "the edited message is rewritten where it stands"
+        );
+    }
+
+    #[test]
+    fn a_page_of_history_costs_one_insert_at_the_top() {
+        let anchor = message("1700000600.0", None, "already here");
+        let held = held(std::slice::from_ref(&anchor));
+        let older = [
+            message("1700000000.0", None, "older"),
+            message("1700000060.0", None, "older still"),
+        ];
+        let shown = [older[0].clone(), older[1].clone(), anchor.clone()];
+
+        let ops = plan(
+            &older
+                .iter()
+                .map(|message| Update::Inserted(message.ts.clone()))
+                .collect::<Vec<_>>(),
+            &shown,
+            &held,
+        );
+
+        assert_eq!(
+            ops,
+            vec![Op::Insert {
+                before: Some(Row::Message(anchor.ts.clone())),
+                keys: vec![
+                    Row::Message(older[0].ts.clone()),
+                    Row::Message(older[1].ts.clone()),
+                ],
+            }],
+            "a whole page arrives as one run, under the day rule already there"
+        );
+    }
+
+    #[test]
+    fn a_page_reaching_back_a_day_takes_over_the_day_rule() {
+        // A day and a bit: the page ends on the same day as what is on
+        // screen, so the rule that used to head that day would end up in the
+        // middle of the page.
+        let day = 86_400.0;
+        let anchor = message("1700000600.0", None, "already here");
+        let older = [
+            message(&format!("{}.0", 1700000600.0 - day), None, "the day before"),
+            message("1700000000.0", None, "earlier the same day"),
+        ];
+        let held = held(std::slice::from_ref(&anchor));
+        let shown = [older[0].clone(), older[1].clone(), anchor.clone()];
+        let rule = |message: &Message| Row::Day(day_label(message.ts.epoch_seconds() as i64));
+
+        let ops = plan(
+            &older
+                .iter()
+                .map(|message| Update::Inserted(message.ts.clone()))
+                .collect::<Vec<_>>(),
+            &shown,
+            &held,
+        );
+
+        assert_eq!(
+            ops,
+            vec![
+                Op::Remove(rule(&anchor)),
+                Op::Insert {
+                    before: Some(Row::Message(anchor.ts.clone())),
+                    keys: vec![
+                        rule(&older[0]),
+                        Row::Message(older[0].ts.clone()),
+                        rule(&older[1]),
+                        Row::Message(older[1].ts.clone()),
+                    ],
+                },
+            ],
+            "the old rule comes down and the page brings its own"
+        );
+    }
+
+    #[test]
+    fn a_deleted_message_takes_its_day_rule_with_it() {
+        let only = message("1700000000.0", None, "hello");
+        let held = held(std::slice::from_ref(&only));
+
+        let ops = plan(&[Update::Removed(only.ts.clone())], &[], &held);
+
+        assert_eq!(
+            ops,
+            vec![
+                Op::Remove(Row::Message(only.ts.clone())),
+                Op::Remove(Row::Day(day_label(only.ts.epoch_seconds() as i64))),
+            ],
+            "nothing is left under the rule, so the rule goes"
+        );
+    }
+
+    #[test]
+    fn a_message_reads_as_name_body_then_time() {
+        let (text, styles, _) = render_messages(
             &[
                 message("1700000000.0", None, "hello"),
                 message("1700000060.0", None, "over\ntwo lines"),
             ],
             &model(),
             false,
-        )
-        .spans;
-        let text = rendered(&spans);
+        );
         assert!(!text.contains("1700000000"), "no raw timestamps: {text}");
         let body = text
             .lines()
             .find(|line| line.contains("hello"))
             .expect("the message is on a line");
         assert!(
-            body.ends_with("  ada  hello") && body.len() == "00:00  ada  hello".len(),
-            "time, author, body, one line: {body:?}"
+            body.starts_with("ada: hello  ") && body.len() == "ada: hello  00:00".len(),
+            "name, body, then the time trailing it: {body:?}"
         );
         assert!(
             !text.contains("\n\n"),
@@ -714,9 +1253,18 @@ mod tests {
             .lines()
             .find(|line| line.contains("two lines"))
             .expect("the second line of a body");
-        assert_eq!(
-            continuation, "            two lines",
-            "continuation lines align under the body column"
+        assert!(
+            continuation.starts_with("  two lines  "),
+            "a continuation line indents under its message, and the time \
+             trails the last line of the body: {continuation:?}"
+        );
+        let times = classed(&text, &styles, Class::Time);
+        assert_eq!(times.len(), 2, "one time per message: {times:?}");
+        assert!(
+            times
+                .iter()
+                .all(|time| time.starts_with("  ") && time.len() == 7),
+            "the time trails the body, two spaces after it: {times:?}"
         );
     }
 
@@ -731,19 +1279,13 @@ mod tests {
         let mut own = message("1700000000.0", None, "on it");
         own.user = Some(UserId("ME".into()));
         let mention = message("1700000001.0", None, "can <@ME> take this?");
-        let spans = render_messages(&[own, mention], &model, false).spans;
-        let text = rendered(&spans);
+        let (text, styles, _) = render_messages(&[own, mention], &model, false);
 
         assert!(!text.contains("you"), "the word never appears: {text}");
         assert!(text.contains("Manmeet"), "{text}");
         assert!(text.contains("can @Manmeet take this?"), "{text}");
-        let yours = spans
-            .iter()
-            .filter(|span| span.class == Some(Class::You))
-            .map(|span| span.text.as_str())
-            .collect::<Vec<_>>();
         assert_eq!(
-            yours,
+            classed(&text, &styles, Class::You),
             vec!["Manmeet", "@Manmeet"],
             "own author line and a mention of the reader, class only"
         );
@@ -753,7 +1295,7 @@ mod tests {
     fn standard_emoji_are_glyphs_and_workspace_emoji_stay_muted_shortcodes() {
         let mut model = model();
         model.set_custom_emoji(["forrest_gump_wave".to_owned()]);
-        let spans = render_messages(
+        let (text, styles, _) = render_messages(
             &[message(
                 "1700000000.0",
                 None,
@@ -761,19 +1303,18 @@ mod tests {
             )],
             &model,
             false,
-        )
-        .spans;
-        let text = rendered(&spans);
+        );
         assert!(text.contains("morning 👋"), "{text}");
         assert!(
             text.contains(":forrest_gump_wave:"),
             "a workspace emoji has no glyph to become: {text}"
         );
-        let muted = spans
-            .iter()
-            .find(|span| span.text == ":forrest_gump_wave:")
-            .expect("the custom shortcode is its own span");
-        assert_eq!(muted.class, Some(Class::Muted));
+        assert!(
+            classed(&text, &styles, Class::Muted)
+                .iter()
+                .any(|muted| muted == ":forrest_gump_wave:"),
+            "the shortcode reads as chrome: {text}"
+        );
     }
 
     #[test]
@@ -800,9 +1341,7 @@ mod tests {
         }));
         let messages = [parent, reply, broadcast];
 
-        let transcript = render_messages(&messages, &model(), false);
-        let (spans, lines) = (transcript.spans, transcript.threads);
-        let text = rendered(&spans);
+        let (text, _, lines) = render_messages(&messages, &model(), false);
         assert!(
             !text.contains("deal curve is fine"),
             "an ordinary reply belongs to its thread alone: {text}"
@@ -821,14 +1360,13 @@ mod tests {
         );
         let root = Ts("1700000000.0".into());
         assert_eq!(
-            lines.last().and_then(|line| line.clone()),
+            lines.last().and_then(|line| line.thread.clone()),
             Some(root),
             "enter on the count line opens the thread"
         );
 
         // The thread surface is where every reply renders.
-        let spans = render_messages(&messages, &model(), true).spans;
-        let text = rendered(&spans);
+        let (text, _, _) = render_messages(&messages, &model(), true);
         assert!(text.contains("deal curve is fine"), "{text}");
         assert!(
             !text.contains("↳ 3 replies"),
@@ -853,26 +1391,14 @@ mod tests {
                 {"name": "tada", "count": 1, "users": ["U1"]},
             ],
         }));
-        let transcript = render_messages(&[message], &model, false);
-        let (spans, lines) = (transcript.spans, transcript.threads);
-        let text = rendered(&spans);
+        let (text, styles, lines) = render_messages(&[message], &model, false);
         assert!(text.contains("👍 2 · 🎉 1"), "{text}");
         assert!(!text.contains("you"), "no word for it: {text}");
-        assert_eq!(
-            spans
-                .iter()
-                .find(|span| span.text == "👍 2")
-                .map(|span| span.class),
-            Some(Some(Class::You)),
+        assert!(
+            classed(&text, &styles, Class::You).contains(&"👍 2".to_owned()),
             "one the reader added is theirs"
         );
-        assert_eq!(
-            spans
-                .iter()
-                .find(|span| span.text == "🎉 1")
-                .map(|span| span.class),
-            Some(Some(Class::Muted))
-        );
+        assert!(classed(&text, &styles, Class::Muted).contains(&"🎉 1".to_owned()));
         assert_eq!(lines.len(), text.matches('\n').count());
     }
 
@@ -884,16 +1410,11 @@ mod tests {
             "text": "friday it is",
             "edited": {"user": "U1", "ts": "1700000100.0"},
         }));
-        let transcript = render_messages(&[message], &model(), false);
-        let (spans, lines) = (transcript.spans, transcript.threads);
-        let text = rendered(&spans);
-        assert!(text.contains("friday it is (edited)\n"), "{text}");
-        assert_eq!(
-            spans
-                .iter()
-                .find(|span| span.text == " (edited)")
-                .map(|span| span.class),
-            Some(Some(Class::Muted))
+        let (text, styles, lines) = render_messages(&[message], &model(), false);
+        assert!(text.contains("friday it is (edited)  "), "{text}");
+        assert!(
+            classed(&text, &styles, Class::Muted).contains(&" (edited)".to_owned()),
+            "{text}"
         );
         assert_eq!(lines.len(), text.matches('\n').count());
     }
@@ -923,9 +1444,7 @@ mod tests {
             "text": "worth a read",
             "attachments": [{"is_msg_unfurl": true, "title": "Worth a read", "text": "buried"}],
         }));
-        let transcript = render_messages(&[join, bot, preview], &model(), false);
-        let (spans, lines) = (transcript.spans, transcript.threads);
-        let text = rendered(&spans);
+        let (text, styles, lines) = render_messages(&[join, bot, preview], &model(), false);
 
         assert!(text.contains("— ada joined —"), "{text}");
         assert!(
@@ -942,10 +1461,9 @@ mod tests {
             !text.contains("buried"),
             "a preview never paints its body: {text}"
         );
-        let muted = spans
+        let muted = classed(&text, &styles, Class::Muted)
             .iter()
-            .filter(|span| span.class == Some(Class::Muted))
-            .map(|span| span.text.trim().to_owned())
+            .map(|span| span.trim().to_owned())
             .collect::<Vec<_>>();
         assert!(
             muted.iter().any(|span| span == "↗ Worth a read"),
@@ -961,18 +1479,17 @@ mod tests {
             message("1700000000.0", None, "first line\nsecond line"),
             message("1700000001.0", Some("1700000000.0"), "a reply"),
         ];
-        let transcript = render_messages(&messages, &model(), true);
-        let (spans, lines) = (transcript.spans, transcript.threads);
+        let (text, _, lines) = render_messages(&messages, &model(), true);
         assert_eq!(
             lines.len(),
-            rendered(&spans).matches('\n').count(),
+            text.matches('\n').count(),
             "the line map must cover the transcript exactly"
         );
         let root = Ts("1700000000.0".into());
         assert!(
             lines
                 .iter()
-                .filter(|line| line.as_ref() == Some(&root))
+                .filter(|line| line.thread.as_ref() == Some(&root))
                 .count()
                 >= 3,
             "both messages belong to the same thread"

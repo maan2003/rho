@@ -156,7 +156,7 @@ done right after the transcript primitive (2.4) and before 2.10:
 
 - [x] 1.14 Not a defect: display names for everyone, and `maan2003` is
       the user's display name. Nothing changes.
-- [ ] 1.15 Rows by the longest author start their body one column right
+- [x] 1.15 Moot after 1.20. Rows by the longest author start their body one column right
       of the others (padding is off by one when the name fills the
       column). Bodies align in one column across the surface.
 - [ ] 1.16 Links print twice: `<url|text>` renders as `text <url>` and
@@ -178,7 +178,7 @@ done right after the transcript primitive (2.4) and before 2.10:
       image to the window, `q` or `escape` returns to the conversation;
       no external opener for images. The file line drops the type when
       the extension already says it: `image.png · 141 KB`.
-- [ ] 1.20 Line layout, decided by the user: `<name>: <body>  <time>`.
+- [x] 1.20 Line layout, done with 2.4. Decided by the user: `<name>: <body>  <time>`.
       No time column on the left, no padded author column, no tab after
       the name: the name, a colon, one space, the body. The time goes on
       the right, muted, after the body: at the end of the last line of
@@ -204,7 +204,8 @@ done right after the transcript primitive (2.4) and before 2.10:
 - [ ] 2.3 Following the tail. Pinned at the bottom, a new message keeps the
       view at the bottom. Scrolled up, the view does not move and the
       surface's status segment shows `3 new`; `G` clears it.
-- [ ] 2.4 History fills as the reader scrolls, decided by the user: a
+- [x] 2.4 Done: `crates/rho-transcript` keyed incremental transcript, scroll fill,
+      no `shift-p`, screenshots 24-*. History fills as the reader scrolls, decided by the user: a
       conversation or thread must feel complete. When the cursor or
       viewport comes within a screen of a gap (the top of the loaded run,
       or a hole left by downtime), the session fetches the page that fills
