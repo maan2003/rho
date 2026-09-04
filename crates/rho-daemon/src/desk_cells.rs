@@ -36,6 +36,10 @@ const VERDICTS_READ: TableDefinition<Lenient<VerdictKey>, Lenient<VerdictEvent>>
 /// an error the client sees rather than a dead daemon.
 const MUTATIONS_READ: TableDefinition<Sen<Stamp>, Lenient<CellMutation>> =
     TableDefinition::new("rho_desk_fact_mutations_v1");
+/// Note bodies, read the same way. A text operation this build has never
+/// heard of would otherwise take the whole desk down with it.
+const BODIES_READ: TableDefinition<Sen<Id>, Lenient<BodySnapshot>> =
+    TableDefinition::new("rho_desk_note_body_v1");
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 struct CellAddress {
@@ -92,13 +96,28 @@ impl DeskCellStore {
             .ok_or_else(|| "Desk cells V2 metadata is missing".into())
     }
 
+    /// The words of every note this build can read. One it cannot is left
+    /// where it is: the reader loses that note's text for now rather than
+    /// the whole desk.
     pub(crate) fn bodies(&self) -> Vec<BodySnapshot> {
-        self.db
+        let mut skipped = 0usize;
+        let bodies: Vec<BodySnapshot> = self
+            .db
             .read()
-            .open_table(BODIES)
+            .open_table(BODIES_READ)
             .iter()
-            .map(|(_, value)| value.value().into_owned())
-            .collect()
+            .filter_map(|(_, value)| match value.value() {
+                Some(body) => Some(body),
+                None => {
+                    skipped += 1;
+                    None
+                }
+            })
+            .collect();
+        if skipped > 0 {
+            tracing::warn!("desk: skipped {skipped} note bodies this build cannot read");
+        }
+        bodies
     }
 
     /// The words of a note. Only a note has a body, which is the one thing
@@ -118,15 +137,19 @@ impl DeskCellStore {
             return Err("only a Desk note has a body".into());
         }
         let mut write = self.db.write().await;
-        let mut text = write
-            .open_table(BODIES)
-            .get(SenValue::borrowed(&id))
-            .map(|value| value.value().into_owned())
-            .unwrap_or(BodySnapshot {
+        // A body this build cannot read is not an empty one: appending to
+        // what we would have to guess at would drop the words already
+        // there, so the edit is refused until a build that reads it runs.
+        let mut text = match write.open_table(BODIES_READ).get(SenValue::borrowed(&id)) {
+            Some(value) => value
+                .value()
+                .ok_or("Desk note body was written by a newer build")?,
+            None => BodySnapshot {
                 id: id.clone(),
                 operations: Vec::new(),
                 transactions: Vec::new(),
-            });
+            },
+        };
         if let Some(old) = text
             .operations
             .iter()
@@ -1243,6 +1266,25 @@ mod tests {
         const NAME: &'static str = "rho-db::Sen<rho_desk::cells::Cell>";
     }
 
+    #[derive(Debug, Encode, Decode)]
+    enum LaterTextOperation {
+        Haunt { timestamp: rho_desk::TreeClock },
+    }
+
+    #[derive(Debug, Encode, Decode)]
+    struct LaterBody {
+        id: Id,
+        operations: Vec<LaterTextOperation>,
+        transactions: Vec<rho_desk::TextTransaction>,
+    }
+
+    #[derive(Debug)]
+    struct BodyName;
+
+    impl rho_db::RecordedTypeName for BodyName {
+        const NAME: &'static str = "rho-db::Sen<rho_desk::cells::BodySnapshot>";
+    }
+
     #[derive(Debug)]
     struct VerdictEventName;
 
@@ -1256,6 +1298,8 @@ mod tests {
         Sen<VerdictKey>,
         rho_db::SenAs<LaterVerdictEvent, VerdictEventName>,
     > = TableDefinition::new("rho_desk_fact_verdicts_v1");
+    const LATER_BODIES: TableDefinition<Sen<Id>, rho_db::SenAs<LaterBody, BodyName>> =
+        TableDefinition::new("rho_desk_note_body_v1");
 
     #[tokio::test]
     async fn a_row_this_build_cannot_read_is_skipped_rather_than_fatal() {
@@ -1295,6 +1339,23 @@ mod tests {
                 changes: Vec::new(),
             }),
         );
+        // A note whose words are written in operations this build does not
+        // have. Its id is one this build reads, so the note is on the map
+        // and only its text is out of reach.
+        let unreadable_note = Id::Note(Uuid::random());
+        write.open_table(LATER_BODIES).insert(
+            SenValue::owned(unreadable_note.clone()),
+            SenValue::owned(LaterBody {
+                id: unreadable_note.clone(),
+                operations: vec![LaterTextOperation::Haunt {
+                    timestamp: rho_desk::TreeClock {
+                        value: 1,
+                        replica_id: 9,
+                    },
+                }],
+                transactions: Vec::new(),
+            }),
+        );
         write.commit();
 
         // The desk still opens, and everything this build does understand
@@ -1305,6 +1366,22 @@ mod tests {
         assert!(snapshot.cells.iter().all(|cell| cell.id != later));
         assert!(snapshot.verdicts.is_empty());
         assert_eq!(db.read().open_table(LATER_CELLS).iter().count(), 3);
+
+        let bodies = store.bodies();
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies.iter().all(|body| body.id != unreadable_note));
+
+        // Appending to words it cannot read would drop them, so the edit
+        // is refused rather than written over the top.
+        let mut buffer =
+            text::Buffer::new(text::ReplicaId::new(3), text::BufferId::new(1).unwrap(), "");
+        let operation = rho_desk::TextOperation::from_text(&buffer.edit([(0..0, "later")]));
+        assert!(
+            store
+                .apply_body(3, unreadable_note, operation, None)
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
