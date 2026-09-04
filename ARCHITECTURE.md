@@ -131,16 +131,17 @@ than by running a supervisor, extension protocol, or daemon process graph.
   `dirs::state_dir()/rho/gui-telemetry`; it applies no automatic retention.
   This path is independent of the opt-in Dial9 CPU sampler and preserves the
   existing `--cpu-profile` export.
-  The Desk is one daemon-owned cell tree per host, with stable node ids and a
-  separate Zed text CRDT for each editable note. Each `(node, field)` is an LWW
-  cell synchronized by per-device version vectors through the mandatory daemon
-  hub. Note ownership is user-derived; agent, page, thread, pull-request, and
-  file nodes are machine-owned and carry typed reference fields. State,
-  defer/deadline, cadence, parents, deletion, and tags are typed cells. GUI
-  clients compose cells and note buffers into the familiar outline and submit
-  atomic cell mutations or text operations. Org-looking output from
-  `rho desk cat` and `rho desk checkout` is presentation only and is never
-  parsed.
+  The Desk is one store of the user's facts per host: a cell per
+  `(subject, property)`, LWW except for sets, synchronized by per-device
+  version vectors through the mandatory daemon hub, with a separate Zed text
+  CRDT for each note's body. A subject is an id its own source already
+  minted (an agent, a Slack unit, a page, a file, a pull request); rho mints
+  one only for a note or a label. Nothing is machine-owned, because the
+  daemon stores no facts of its own: where a thing is shown, what it is
+  called, and whether it is waiting are rules the GUI computes over the
+  store joined with the sources. GUI clients submit atomic cell mutations
+  or text operations. The native tree, its org-looking rendering, and the
+  `rho desk` command that printed it are gone.
   `rho-gui` supplies its context strip, theme mapping, and focus/show policy,
   while GPUI web owns only the immediate pointer-down routing region.
   Native web pages are client-local first-class resources owned by `rho-browser`.
@@ -532,7 +533,7 @@ transitions. `rho-iroh-auth` owns the trusted-client table, temporary trust,
 and pending enrollments in `rho-db`; the daemon supplies only the application
 ALPN and retains approve/revoke command routing. Each post-authentication application direction is
 one streaming zstd frame with a 128 KiB maximum history window; Senax length
-limits apply to decompressed payloads. The iroh ALPN is `rho/ui/5` and Unix
+limits apply to decompressed payloads. The iroh ALPN is `rho/ui/8` and Unix
 peers exchange the fixed `RHO-STREAM-4` preface before compression.
 The protocol crate owns only wire types, limits, and state diffs; `rho-daemon`
 projects the richer `rho-agent` runtime state into that wire shape. Consequently UI

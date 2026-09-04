@@ -38,9 +38,9 @@ pub const AGENT_COST_WINDOW_DAYS: u64 = 7;
 /// Maximum encoded GUI performance snapshot accepted by the daemon.
 pub const MAX_GUI_TELEMETRY_BYTES: usize = 8 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the daemon.
-pub const IROH_ALPN: &[u8] = b"rho/ui/7";
+pub const IROH_ALPN: &[u8] = b"rho/ui/8";
 #[cfg(not(target_family = "wasm"))]
-const PROTOCOL_LOG_MAGIC: &[u8; 4] = b"RUP7";
+const PROTOCOL_LOG_MAGIC: &[u8; 4] = b"RUP8";
 
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -140,21 +140,6 @@ pub enum ClientMessage {
         id: desk_tree::cells::Id,
         operation: desk_tree::TextOperation,
         transaction: Option<desk_tree::TextTransaction>,
-    },
-    /// Refreshes only the structured Desk stream after sequence loss.
-    DeskTreeSubscribe,
-    /// Fetches the native Desk tree without allocating a replica.
-    DeskTreeGet,
-    DeskTreeApply {
-        operation: desk_tree::TreeOperation,
-    },
-    DeskNodeTextApply {
-        node_id: desk_tree::NodeId,
-        operation: desk_tree::TextOperation,
-        transaction: Option<desk_tree::TextTransaction>,
-    },
-    DeskTreeBatchApply {
-        batch: desk_tree::OperationBatch,
     },
     NewAgent {
         role: AgentRole,
@@ -616,30 +601,6 @@ pub enum ServerMessage {
         transaction: Option<desk_tree::TextTransaction>,
     },
     DeskResyncRequired,
-    DeskTreeSnapshot {
-        snapshot: desk_tree::Snapshot,
-        replica_id: u16,
-    },
-    DeskTreeApplied {
-        record: desk_tree::TreeOpRecord,
-    },
-    DeskNodeTextApplied {
-        record: desk_tree::TextOpRecord,
-    },
-    DeskTreeBatchApplied {
-        record: desk_tree::BatchOpRecord,
-    },
-    DeskTreeBatchRejected {
-        id: desk_tree::TreeClock,
-        retryable: bool,
-        reason: String,
-        snapshot: desk_tree::Snapshot,
-    },
-    /// The daemon's broadcast receiver lagged; request a new tree snapshot.
-    DeskTreeResyncRequired,
-    DeskTreeDocument {
-        snapshot: desk_tree::Snapshot,
-    },
     Ready {
         agents: Vec<UiAgentSummary>,
         /// The daemon's hidden Iris coordinator, when it has been created.
@@ -1329,7 +1290,7 @@ mod tests {
 
     #[test]
     fn protocol_log_rejects_previous_wire_epoch() {
-        let mut old = &b"RUP6"[..];
+        let mut old = &b"RUP7"[..];
         assert!(read_protocol_log_record(&mut old).is_err());
     }
 
@@ -1400,56 +1361,6 @@ mod tests {
         let mut slice: &[u8] = &bytes;
         let decoded: ServerMessage = senax_encoder::unpack(&mut slice).unwrap();
         assert_eq!(decoded, message);
-    }
-
-    #[test]
-    fn desk_tree_messages_round_trip() {
-        let operation = desk_tree::TreeOperation::Create {
-            timestamp: desk_tree::TreeClock {
-                value: 7,
-                replica_id: 4,
-            },
-            node_id: desk_tree::NodeId {
-                replica_id: 4,
-                counter: 9,
-            },
-            kind: desk_tree::NodeKind::Heading,
-            owner: desk_tree::NodeOwner::User,
-            parent: None,
-            order: desk_tree::OrderKey(vec![100]),
-        };
-        let message = ClientMessage::DeskTreeApply {
-            operation: operation.clone(),
-        };
-        let bytes = senax_encoder::pack(&message).unwrap();
-        let mut slice: &[u8] = &bytes;
-        let decoded: ClientMessage = senax_encoder::unpack(&mut slice).unwrap();
-        assert_eq!(decoded, message);
-
-        let message = ClientMessage::DeskTreeBatchApply {
-            batch: desk_tree::OperationBatch {
-                id: desk_tree::TreeClock {
-                    value: 8,
-                    replica_id: 4,
-                },
-                expected: Vec::new(),
-                operations: vec![desk_tree::BatchOperation::Tree(operation)],
-                machine_relocation: None,
-            },
-        };
-        let bytes = senax_encoder::pack(&message).unwrap();
-        let mut slice: &[u8] = &bytes;
-        let decoded: ClientMessage = senax_encoder::unpack(&mut slice).unwrap();
-        assert_eq!(decoded, message);
-
-        let response = ServerMessage::DeskTreeSnapshot {
-            snapshot: desk_tree::Snapshot::default(),
-            replica_id: 4,
-        };
-        let bytes = senax_encoder::pack(&response).unwrap();
-        let mut slice: &[u8] = &bytes;
-        let decoded: ServerMessage = senax_encoder::unpack(&mut slice).unwrap();
-        assert_eq!(decoded, response);
     }
 
     #[test]

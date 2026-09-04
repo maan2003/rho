@@ -1240,16 +1240,6 @@ async fn run(
                 transaction: _,
             } => Some(ConnEvent::DeskTextApplied { id, operation }),
             ServerMessage::DeskResyncRequired => Some(ConnEvent::DeskResyncRequired),
-            // The old tree stream is dead weight until 5pha's side drops
-            // it from the protocol; nothing here listens.
-            ServerMessage::DeskTreeSnapshot { .. }
-            | ServerMessage::DeskTreeApplied { .. }
-            | ServerMessage::DeskNodeTextApplied { .. }
-            | ServerMessage::DeskTreeBatchApplied { .. }
-            | ServerMessage::DeskTreeBatchRejected { .. }
-            | ServerMessage::DeskTreeResyncRequired => None,
-            // Read-only CLI reply; the GUI subscribes instead.
-            ServerMessage::DeskTreeDocument { .. } => None,
             ServerMessage::Ready {
                 agents,
                 iris_agent,

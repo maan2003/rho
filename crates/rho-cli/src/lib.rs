@@ -14,7 +14,6 @@ use rho_daemon::debug::DebugArgs;
 use rho_inference::{AuthArgs, run_auth_cli};
 use rho_ui_proto::client::Client as UiClient;
 
-mod desk;
 mod land;
 mod mcp_agent_tools;
 mod pr;
@@ -76,7 +75,6 @@ async fn run(command: Command) -> Result<()> {
             rho_daemon::debug::run(args).await?;
             Ok(())
         }
-        Command::Desk(args) => desk::run(args).await,
         Command::Iroh(args) => run_iroh(args).await,
         Command::Land(args) => land::run(args).await,
         Command::McpAgentTools(args) => mcp_agent_tools::run(args).await,
@@ -181,7 +179,6 @@ enum Command {
     Auth(AuthArgs),
     Daemon(DaemonArgs),
     Debug(DebugArgs),
-    Desk(desk::DeskArgs),
     Iroh(IrohArgs),
     Land(LandArgs),
     McpAgentTools(McpAgentToolsArgs),
@@ -206,8 +203,6 @@ enum CliCommand {
     },
     Daemon(DaemonArgs),
     Debug(DebugArgs),
-    /// Read the native Desk tree as an org-looking shell/editor view.
-    Desk(desk::DeskArgs),
     Iroh(IrohArgs),
     Land(LandArgs),
     McpAgentTools(McpAgentToolsArgs),
@@ -337,7 +332,6 @@ impl Args {
             CliCommand::Auth { command } => Command::Auth(command),
             CliCommand::Daemon(args) => Command::Daemon(args),
             CliCommand::Debug(args) => Command::Debug(args),
-            CliCommand::Desk(args) => Command::Desk(args),
             CliCommand::Iroh(args) => Command::Iroh(args),
             CliCommand::Land(args) => Command::Land(args),
             CliCommand::McpAgentTools(args) => Command::McpAgentTools(args),

@@ -16,7 +16,7 @@ use rho_desk::cells::{
     Cell, DeviceId, Id, Property, SlackUnit, Stamp, State, Timestamp, Uuid, Verdict, VerdictEvent,
     Version,
 };
-use rho_desk::{NodeId, PageId};
+use rho_desk::{PageId, TextOperation, TextTransaction};
 use senax_encoder::{Decode, Encode};
 
 const OLD_CELLS: TableDefinition<SenAs<OldCellAddress, CellAddressName>, SenAs<OldCell, CellName>> =
@@ -25,12 +25,18 @@ const OLD_VERDICTS: TableDefinition<
     SenAs<OldVerdictKey, VerdictKeyName>,
     SenAs<OldVerdictEvent, VerdictEventName>,
 > = TableDefinition::new("rho_desk_verdicts_v1");
-const OLD_TEXTS: TableDefinition<Sen<NodeId>, Sen<rho_desk::NodeTextSnapshot>> =
-    TableDefinition::new("rho_desk_node_text_v2");
+const OLD_TEXTS: TableDefinition<
+    SenAs<OldNodeId, NodeIdName>,
+    SenAs<OldNodeTextSnapshot, NodeTextSnapshotName>,
+> = TableDefinition::new("rho_desk_node_text_v2");
 const OLD_MUTATIONS: &str = "rho_desk_mutations_v2";
 
 /// redb records the type names a table was created with, so the old rows
 /// answer to the names the old code had, not to these copies'.
+#[derive(Debug)]
+struct NodeIdName;
+#[derive(Debug)]
+struct NodeTextSnapshotName;
 #[derive(Debug)]
 struct CellAddressName;
 #[derive(Debug)]
@@ -39,6 +45,14 @@ struct CellName;
 struct VerdictKeyName;
 #[derive(Debug)]
 struct VerdictEventName;
+
+impl RecordedTypeName for NodeIdName {
+    const NAME: &'static str = "rho-db::Sen<rho_desk::NodeId>";
+}
+
+impl RecordedTypeName for NodeTextSnapshotName {
+    const NAME: &'static str = "rho-db::Sen<rho_desk::NodeTextSnapshot>";
+}
 
 impl RecordedTypeName for CellAddressName {
     const NAME: &'static str = "rho-db::Sen<rho_daemon::desk_cells::CellAddress>";
@@ -56,15 +70,30 @@ impl RecordedTypeName for VerdictEventName {
     const NAME: &'static str = "rho-db::Sen<rho_desk::cells::VerdictEvent>";
 }
 
+/// The node identity the old tree minted, and the words stored under it.
+/// Both are copies: the crate that owned them holds only the text CRDT now.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
+struct OldNodeId {
+    replica_id: u16,
+    counter: u64,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
+struct OldNodeTextSnapshot {
+    node_id: OldNodeId,
+    operations: Vec<TextOperation>,
+    transactions: Vec<TextTransaction>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 struct OldCellAddress {
-    node: NodeId,
+    node: OldNodeId,
     field: OldField,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 struct OldVerdictKey {
-    node: NodeId,
+    node: OldNodeId,
     stamp: Stamp,
 }
 
@@ -124,7 +153,7 @@ impl OldState {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 enum OldValue {
     Kind(OldNodeKind),
-    Parent(Option<NodeId>),
+    Parent(Option<OldNodeId>),
     Bool(bool),
     Timestamp(Timestamp),
     OptionalTimestamp(Option<Timestamp>),
@@ -140,7 +169,7 @@ enum OldValue {
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 struct OldCell {
-    node: NodeId,
+    node: OldNodeId,
     field: OldField,
     stamp: Stamp,
     value: OldValue,
@@ -151,13 +180,13 @@ enum OldVerdict {
     Done,
     Dismiss,
     Defer { until: Timestamp },
-    Todo { note: NodeId },
-    File { parent: NodeId },
+    Todo { note: OldNodeId },
+    File { parent: OldNodeId },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 struct OldFieldChange {
-    node: NodeId,
+    node: OldNodeId,
     field: OldField,
     before: Option<OldValue>,
     after: Option<OldValue>,
@@ -222,7 +251,7 @@ impl MigrationReport {
 
 /// A note keeps its identity through the conversion so that two devices
 /// converting the same state land on the same ids and still merge.
-fn note_uuid(node: NodeId) -> Uuid {
+fn note_uuid(node: OldNodeId) -> Uuid {
     let mut bytes = [0u8; 16];
     bytes[0] = 0x01;
     bytes[1..3].copy_from_slice(&node.replica_id.to_le_bytes());
@@ -263,7 +292,7 @@ impl OldNode {
         }
     }
 
-    fn parent(&self) -> Option<NodeId> {
+    fn parent(&self) -> Option<OldNodeId> {
         match self.value(&OldField::Parent) {
             Some(OldValue::Parent(parent)) => *parent,
             _ => None,
@@ -287,8 +316,8 @@ pub(crate) fn migrate(
     )>,
     String,
 > {
-    let mut nodes: BTreeMap<NodeId, OldNode> = BTreeMap::new();
-    let mut loose: BTreeMap<NodeId, Vec<OldCell>> = BTreeMap::new();
+    let mut nodes: BTreeMap<OldNodeId, OldNode> = BTreeMap::new();
+    let mut loose: BTreeMap<OldNodeId, Vec<OldCell>> = BTreeMap::new();
     {
         let table = write.open_table(OLD_CELLS);
         for (_, value) in table.iter() {
@@ -332,7 +361,7 @@ pub(crate) fn migrate(
         .filter_map(|node| node.parent())
         .collect::<BTreeSet<_>>();
 
-    let mut ids: BTreeMap<NodeId, Id> = BTreeMap::new();
+    let mut ids: BTreeMap<OldNodeId, Id> = BTreeMap::new();
     for (node, old) in &nodes {
         let id = match old.kind {
             OldNodeKind::Note => Some(Id::Note(note_uuid(*node))),
@@ -546,7 +575,7 @@ pub(crate) fn frontier(cells: &[Cell], verdicts: &[(Id, Stamp, VerdictEvent)]) -
     version
 }
 
-fn convert_verdict(ids: &BTreeMap<NodeId, Id>, event: OldVerdictEvent) -> Option<VerdictEvent> {
+fn convert_verdict(ids: &BTreeMap<OldNodeId, Id>, event: OldVerdictEvent) -> Option<VerdictEvent> {
     let (verdict, at, changes) = match event {
         OldVerdictEvent::Undone { of } => return Some(VerdictEvent::Undone { of }),
         OldVerdictEvent::Applied {
@@ -593,7 +622,7 @@ fn convert_verdict(ids: &BTreeMap<NodeId, Id>, event: OldVerdictEvent) -> Option
     })
 }
 
-fn property(field: &OldField, value: &OldValue, ids: &BTreeMap<NodeId, Id>) -> Option<Property> {
+fn property(field: &OldField, value: &OldValue, ids: &BTreeMap<OldNodeId, Id>) -> Option<Property> {
     Some(match (field, value) {
         (OldField::Parent, OldValue::Parent(parent)) => Property::Parent(match parent {
             Some(parent) => Some(ids.get(parent).cloned()?),
@@ -631,14 +660,14 @@ mod tests {
     /// The daemon that stored the rows, which is the one converting them.
     const MACHINE_SEED: u64 = 42;
 
-    fn node(counter: u64) -> NodeId {
-        NodeId {
+    fn node(counter: u64) -> OldNodeId {
+        OldNodeId {
             replica_id: 1,
             counter,
         }
     }
 
-    fn cell(node: NodeId, field: OldField, value: OldValue, version: u64) -> OldCell {
+    fn cell(node: OldNodeId, field: OldField, value: OldValue, version: u64) -> OldCell {
         OldCell {
             node,
             field,
@@ -668,7 +697,7 @@ mod tests {
         let agent = |counter: u64| {
             rho_core::AgentId::from_counter(counter, &rho_core::AgentIdDomain(42)).unwrap()
         };
-        let thread = |node: NodeId, ts: &str, parent: Option<NodeId>, version: u64| {
+        let thread = |node: OldNodeId, ts: &str, parent: Option<OldNodeId>, version: u64| {
             vec![
                 cell(
                     node,
@@ -835,7 +864,7 @@ mod tests {
             drop(verdicts);
             write.open_table(OLD_TEXTS).insert(
                 SenValue::owned(heading),
-                SenValue::owned(rho_desk::NodeTextSnapshot {
+                SenValue::owned(OldNodeTextSnapshot {
                     node_id: heading,
                     operations: Vec::new(),
                     transactions: Vec::new(),

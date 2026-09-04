@@ -33,9 +33,6 @@ mod agent_ui;
 pub mod debug;
 mod desk_cells;
 mod desk_migration;
-mod desk_org_migration;
-mod desk_org_migration_types;
-mod desk_tree;
 mod iris;
 mod realtime;
 mod secret_store;
@@ -989,7 +986,6 @@ impl GitTransportBroker {
 struct AgentRegistry {
     pool: Arc<AgentPool>,
     db: RhoDb,
-    desk_tree: desk_tree::DeskTreeStore,
     desk_cells: desk_cells::DeskCellStore,
     desk_devices: Mutex<HashSet<rho_desk::cells::DeviceId>>,
     visualizations: rho_visualizations::VisualizationStore,
@@ -1042,18 +1038,12 @@ impl AgentRegistry {
         let pr_monitor =
             rho_pr_monitor::PrMonitor::new(pool.clone(), db.clone(), octo_socket).await?;
         let visualizations = rho_visualizations::VisualizationStore::new(db.clone()).await;
-        let desk_tree = desk_tree::DeskTreeStore::new(db.clone(), None, |handle| {
-            desk_org_migration::resolve_agent_handle(&db, handle)
-        })
-        .await
-        .map_err(anyhow::Error::msg)?;
         let desk_cells = desk_cells::DeskCellStore::new(db.clone(), machine_seed)
             .await
             .map_err(anyhow::Error::msg)?;
         let registry = Self {
             pool,
             db,
-            desk_tree,
             desk_cells,
             desk_devices: Mutex::new(HashSet::new()),
             visualizations,
@@ -2603,70 +2593,6 @@ async fn handle_message(
                     operation,
                     transaction,
                 });
-            }
-            Ok(Refresh::None)
-        }
-        ClientMessage::DeskTreeSubscribe => {
-            let replica_id = agents
-                .desk_tree
-                .allocate_replica(rho_desk::ReplicaAuthor::User)
-                .await
-                .map_err(anyhow::Error::msg)?;
-            let _ = outgoing_tx.send(ServerMessage::DeskTreeSnapshot {
-                snapshot: agents.desk_tree.snapshot(),
-                replica_id,
-            });
-            Ok(Refresh::None)
-        }
-        ClientMessage::DeskTreeGet => {
-            let _ = outgoing_tx.send(ServerMessage::DeskTreeDocument {
-                snapshot: agents.desk_tree.snapshot(),
-            });
-            Ok(Refresh::None)
-        }
-        ClientMessage::DeskTreeApply { operation } => {
-            let record = agents
-                .desk_tree
-                .apply_tree(operation)
-                .await
-                .map_err(anyhow::Error::msg)?;
-            let _ = agents
-                .events
-                .send(ServerMessage::DeskTreeApplied { record });
-            Ok(Refresh::None)
-        }
-        ClientMessage::DeskNodeTextApply {
-            node_id,
-            operation,
-            transaction,
-        } => {
-            let record = agents
-                .desk_tree
-                .apply_text(node_id, operation, transaction)
-                .await
-                .map_err(anyhow::Error::msg)?;
-            let _ = agents
-                .events
-                .send(ServerMessage::DeskNodeTextApplied { record });
-            Ok(Refresh::None)
-        }
-        ClientMessage::DeskTreeBatchApply { batch } => {
-            let id = batch.id;
-            match agents.desk_tree.apply_batch(batch).await {
-                Ok(record) => {
-                    let _ = agents
-                        .events
-                        .send(ServerMessage::DeskTreeBatchApplied { record });
-                }
-                Err(error) => {
-                    let retryable = error.retryable();
-                    let _ = outgoing_tx.send(ServerMessage::DeskTreeBatchRejected {
-                        id,
-                        retryable,
-                        reason: error.to_string(),
-                        snapshot: agents.desk_tree.snapshot(),
-                    });
-                }
             }
             Ok(Refresh::None)
         }
