@@ -146,6 +146,14 @@ test is the one the Slack card already uses. Not synced, not stored;
 there is no fingerprint. Home renders the same fresh ranking with
 skipped rows shown and marked, never hidden, so Home is the truth and
 never reads the dealer's filtered output.
+Built 4 Sep (367ce0fb, b8os): `DealSession`, the hand, `deal_mode`,
+`skip_and_end_deal`, the considered-not-dealt bookkeeping and the
+fingerprint string are gone; skip is `(id, CardCursor, at)` with a typed
+cursor per source; status label, desktop frame, phone sheet, feed and
+flick all read the card in view. The journal's `DealMode` variants stay
+so old journals still decode. Follow-up in flight: space-j never steps
+forward through history, and a Home row under the cursor is the card in
+view for every verdict.
 
 Mark-read-before an age (`space shift-s m`) also writes
 `SlackHandledThrough` at the cutoff for every unit it covers, one
