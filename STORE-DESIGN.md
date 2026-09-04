@@ -168,11 +168,15 @@ One shot at daemon start, and then the code goes (the standing rule):
   kept; the node's own id is dropped. Notes under it re-parent to the
   agent id.
 - `page` nodes → `Page(page_ref)` the same way; `file` → `File`.
-- `thread` nodes → `Slack(unit)`: `state` done or dismissed becomes
-  `handled_through := the migration time` (a newer message reopens it,
-  which is the rule anyway), `defer_until` kept, notes re-parented. A
-  thread node at the root with no children and no verdict was
-  machine-made and leaves nothing behind.
+- `thread` nodes: one the user filed (a parent that is not the root) or
+  that has notes under it becomes `Slack(unit)` with `parent` and
+  `defer_until` kept and its notes re-parented. Every other thread node
+  was machine-made and leaves nothing behind, verdicts included: the
+  cursor is slice 2's relation, and done-ness on the old model was
+  already lost on every restart (Slack checklist 2.17), so nothing the
+  user still has is dropped. `DeskThreadBind` goes in slice 1 with them;
+  between slices 1 and 2 a Slack card has no verdict state, which is the
+  state it was effectively in.
 - The verdict log re-keyed to the new ids.
 
 Wire epoch bump; profile upgraded; the user restarts the daemon.
@@ -185,8 +189,11 @@ else is built on. The transient lands after slice 2.
 
 1. Store: `Id`, `Relation`, the cell key change, the migration, the
    views (map, Home, Find, notes-for-this, paths) reading through the join
-   of store and sources, `DeskPageBind` and agent-node creation gone.
-   Daemon change.
+   of store and sources, `DeskPageBind`, `DeskThreadBind`, and agent-node
+   creation gone. `body` is the cells store's own text table re-keyed;
+   the native tree's text and `Document`/`TreeOperation` wait for slice
+   2. `parent` keeps an explicit none (un-filing is a write, not a
+   delete); none and absent both read as root. Daemon change.
 2. Slack on the store (checklist 2.18): the unit model, `handled_through`
    as a fact, cards from the join, `DeskThreadBind` gone, the native tree
    store and `rho desk cat/checkout` gone.
