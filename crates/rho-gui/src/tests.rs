@@ -7160,6 +7160,25 @@ impl DeskFixture {
         id
     }
 
+    /// A conversation unit: a direct message or a channel someone mentioned
+    /// the user in, which is a card in its own right rather than a thread.
+    fn conversation_row(
+        &mut self,
+        parent: Option<rho_desk::cells::Id>,
+        channel: &str,
+        newest: &str,
+    ) -> rho_desk::cells::Id {
+        let unit = rho_desk::cells::SlackUnit {
+            workspace: "acme".to_owned(),
+            channel: channel.to_owned(),
+            thread: None,
+        };
+        self.slack_units.push((unit.clone(), newest.to_owned()));
+        let id = rho_desk::cells::Id::Slack(unit);
+        self.file(id.clone(), parent);
+        id
+    }
+
     /// What the mirror says about the rows `thread_row` made: every unit
     /// has one message from someone else and nothing handled yet, which is
     /// the state a card is dealt in.
@@ -8017,6 +8036,163 @@ fn a_done_on_another_device_closes_the_card_here(cx: &mut TestAppContext) {
             assert!(
                 !workspace.dashboard.node_is_open(card),
                 "the cursor arrived, so the card is gone here too"
+            );
+        })
+        .unwrap();
+}
+
+/// A mute is not a cursor. `d` says "up to here", so the next message is
+/// news again; `x` says "not this unit", and nothing arriving in it is
+/// news until the user opens it. Opening is the only thing that clears it,
+/// and it leaves the cursor alone, so what was already read stays read.
+#[gpui::test]
+fn a_muted_slack_unit_stays_off_home_until_it_is_opened(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    let node = desk.conversation_row(None, "D1", "600.0");
+    let unit = rho_desk::cells::SlackUnit {
+        workspace: "acme".to_owned(),
+        channel: "D1".to_owned(),
+        thread: None,
+    };
+    let card = crate::dashboard::DealCardId {
+        host: HostId::default(),
+        node_id: node.clone(),
+    };
+    let source = |newest: &str| {
+        vec![crate::desk_view::SlackSource {
+            unit: rho_desk::cells::SlackUnit {
+                workspace: "acme".to_owned(),
+                channel: "D1".to_owned(),
+                thread: None,
+            },
+            title: "lunch?".to_owned(),
+            newest: rho_desk::cells::SlackTs(newest.to_owned()),
+            newest_from_other: Some(rho_desk::cells::SlackTs(newest.to_owned())),
+        }]
+    };
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.set_slack_sources_for_test(HostId::default(), source("600.0"), window, cx);
+            assert!(workspace.dashboard.node_is_open(card.clone()));
+
+            assert!(workspace.apply_verdict_for_test(
+                HostId::default(),
+                &node,
+                crate::desk_view::DeskVerdict::Mute,
+                window,
+                cx,
+            ));
+            let facts = workspace
+                .desk_cells
+                .facts_of_slack_unit(Some(HostId::default()), &unit)
+                .unwrap();
+            assert_eq!(
+                facts.slack_handled_through,
+                Some(rho_desk::cells::SlackTs("600.0".to_owned())),
+                "a mute handles what was there, like a done"
+            );
+            assert_eq!(
+                facts.state,
+                rho_desk::cells::State::Muted,
+                "and says the unit itself is not wanted"
+            );
+
+            // Someone writes again. A done would be a card here.
+            workspace.set_slack_sources_for_test(HostId::default(), source("900.0"), window, cx);
+            assert!(
+                !workspace.dashboard.node_is_open(card.clone()),
+                "the mute is about the unit, not about a cursor"
+            );
+
+            // Opening it is the user taking the mute back.
+            workspace.open_slack_deal(&unit, window, cx);
+            let facts = workspace
+                .desk_cells
+                .facts_of_slack_unit(Some(HostId::default()), &unit)
+                .unwrap();
+            assert_eq!(facts.state, rho_desk::cells::State::Open);
+            assert_eq!(
+                facts.slack_handled_through,
+                Some(rho_desk::cells::SlackTs("600.0".to_owned())),
+                "the cursor stands, so what was read is not offered again"
+            );
+            workspace.set_slack_sources_for_test(HostId::default(), source("900.0"), window, cx);
+            assert!(
+                workspace.dashboard.node_is_open(card),
+                "the message that arrived while it was muted is a card again"
+            );
+        })
+        .unwrap();
+}
+
+/// Undoing a mute puts both facts back: the state that kept the unit quiet
+/// and the cursor the mute wrote. The Slack half of the undo, following the
+/// thread again, is `undoing_a_discard_follows_the_thread_again` in
+/// rho-slack's transport tests.
+#[gpui::test]
+fn undoing_a_mute_puts_the_unit_back_as_it_was(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    let node = desk.thread_row(None, "C1", "500.0");
+    let unit = rho_desk::cells::SlackUnit {
+        workspace: "acme".to_owned(),
+        channel: "C1".to_owned(),
+        thread: Some("500.0".to_owned()),
+    };
+    let card = crate::dashboard::DealCardId {
+        host: HostId::default(),
+        node_id: node.clone(),
+    };
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.set_slack_sources_for_test(
+                HostId::default(),
+                desk.slack_sources(),
+                window,
+                cx,
+            );
+            let (writes, event) = workspace
+                .desk_cells
+                .verdict_writes(
+                    HostId::default(),
+                    &node,
+                    crate::desk_view::DeskVerdict::Mute,
+                )
+                .expect("the unit has a source, so it can take a verdict");
+            let stamp = workspace
+                .apply_desk_writes(HostId::default(), writes, Some(event), window, cx)
+                .expect("the mute is written");
+            assert!(!workspace.dashboard.node_is_open(card.clone()));
+
+            let (writes, _) = workspace
+                .desk_cells
+                .undo_verdict_writes(HostId::default(), &node, stamp)
+                .expect("the verdict left an entry to undo");
+            workspace.apply_desk_writes(HostId::default(), writes, None, window, cx);
+            let facts = workspace
+                .desk_cells
+                .facts_of_slack_unit(Some(HostId::default()), &unit)
+                .unwrap();
+            assert_eq!(facts.state, rho_desk::cells::State::Open);
+            assert_eq!(
+                facts.slack_handled_through,
+                Some(rho_desk::cells::SlackTs(String::new())),
+                "the cursor goes back too, so the thread is owed again"
+            );
+            workspace.set_slack_sources_for_test(
+                HostId::default(),
+                desk.slack_sources(),
+                window,
+                cx,
+            );
+            assert!(
+                workspace.dashboard.node_is_open(card),
+                "the card comes back exactly as it was"
             );
         })
         .unwrap();

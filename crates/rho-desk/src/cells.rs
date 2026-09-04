@@ -422,10 +422,14 @@ pub fn verdict_changes(
         let slack = slack.ok_or("a verdict on a Slack unit needs its newest message")?;
         let handled = || change(Property::SlackHandledThrough(slack.newest.clone()));
         return match verdict {
-            // Mute is done plus the unfollow rho makes in Slack, which is
-            // the caller's to send: nothing here says a card can never come
-            // back, because following the thread again must bring it back.
-            Verdict::Done | Verdict::Mute => Ok(vec![handled()]),
+            Verdict::Done => Ok(vec![handled()]),
+            // Mute is done plus a state, because done alone is only "up to
+            // here" and the next message would be past it. The state is what
+            // keeps the unit quiet however much arrives; opening it clears
+            // the state, and the silence rho asks Slack for (a thread
+            // unfollowed, a conversation marked read) is the caller's to
+            // send, so following the thread again still brings the card back.
+            Verdict::Mute => Ok(vec![handled(), change(Property::State(State::Muted))]),
             // The cursor stays where it is, so the messages the user has not
             // handled are still theirs when the snooze ends. What is
             // recorded is where the unit stood, which is what makes a reply
@@ -1202,9 +1206,26 @@ mod tests {
                 after: Some(Property::SlackHandledThrough(newest.clone())),
             }]
         );
-        // Mute is done plus an unfollow in Slack; nothing here says the card
-        // can never come back, because following the thread again must.
-        assert_eq!(changes(Verdict::Mute), changes(Verdict::Done));
+        // Mute is done plus the state that keeps the unit quiet past the
+        // cursor, and the unfollow in Slack the caller sends; nothing here
+        // says the card can never come back, because opening it must.
+        assert_eq!(
+            changes(Verdict::Mute),
+            vec![
+                FactChange {
+                    id: unit.clone(),
+                    key: PropertyKey::SlackHandledThrough,
+                    before: Some(Property::SlackHandledThrough(SlackTs(String::new()))),
+                    after: Some(Property::SlackHandledThrough(newest.clone())),
+                },
+                FactChange {
+                    id: unit.clone(),
+                    key: PropertyKey::State,
+                    before: Some(Property::State(State::Open)),
+                    after: Some(Property::State(State::Muted)),
+                },
+            ]
+        );
         // A snooze leaves the cursor alone, so the messages the user has not
         // handled are still theirs when it ends, and records where the unit
         // stood so a reply arriving during the snooze voids it.

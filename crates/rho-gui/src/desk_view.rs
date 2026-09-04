@@ -193,9 +193,13 @@ fn slack_card(id: &Id, facts: &Facts, sources: &Sources) -> Option<SlackCard> {
         (None, _) => false,
     };
     Some(SlackCard {
-        state: match past(facts.slack_handled_through.as_ref()) {
-            true => State::Open,
-            false => State::Done,
+        // A mute is the one verdict the cursor cannot express: the user said
+        // "not this unit", not "not up to here", so nothing arriving past the
+        // cursor reopens it. Opening the unit is what clears the state.
+        state: match (facts.state, past(facts.slack_handled_through.as_ref())) {
+            (State::Muted, _) => State::Muted,
+            (_, true) => State::Open,
+            (_, false) => State::Done,
         },
         // The snooze recorded where the unit stood; anything from someone
         // else past that arrived while it was snoozed, and that is what

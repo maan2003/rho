@@ -75,10 +75,14 @@ Nothing but a verdict key moves them.
 - `t` todo: done, and a note whose `parent` is the unit is created at the
   area asked, deferred and paced the way todo notes are today; `j` on the
   unit opens the conversation.
-- `x` mute (was discard): done, and the unit is silenced where Slack has a place
-  for it: a thread is unfollowed (`subscriptions.thread.remove`), a
-  conversation is marked read up to `newest`. Undo follows the thread
-  again (`subscriptions.thread.add`).
+- `x` mute (was discard): `handled_through := newest` and `state := muted`,
+  and the unit is silenced where Slack has a place for it: a thread is
+  unfollowed (`subscriptions.thread.remove`), a conversation is marked read
+  up to `newest`. The state is the difference from `d`: a done is "up to
+  here", so the next message is news again, and a mute is "not this unit",
+  so nothing arriving in it is. Opening the unit clears the state, and only
+  that does; the cursor is left alone, so what was read stays read. Undo
+  follows the thread again (`subscriptions.thread.add`).
 - `s` snooze: `defer_until` set and `snoozed_at := newest`, cursor
   untouched, so the messages the user has not handled are still theirs when
   the snooze ends. A message from someone else newer than `snoozed_at`

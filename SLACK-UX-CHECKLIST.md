@@ -2,8 +2,6 @@
 
 Reconciled against main on 3 Sep. Genuinely open, in order:
 
-- 2.20 mute on a Slack unit is cursor + muted state + source silence
-  (2.18 landed it as the cursor only).
 - 2.19 a unit raised only by a live mention is gone after a restart
   once the feed cursor passed it; derive units from the mirror at startup.
 - then the verdict transient (`HOME-DESIGN.md`, no deal mode), the
@@ -569,10 +567,18 @@ done right after the transcript primitive (2.4) and before 2.10:
       no-op, not a drop. Comes right after 2.14, since 2.14 removes the
       third way this card could have gone quiet (a `channel_marked` from
       the phone).
-- [ ] 2.20 Mute on a Slack unit is a cursor plus `State(Muted)` plus the
-      source's own silence (a thread unfollowed, a conversation marked
-      read), and opening the unit clears the muted state (STORE-DESIGN
-      "Verdicts write facts"). 2.18 landed `x` as the cursor only, the
+- [x] 2.20 Mute on a Slack unit is a cursor plus `State(Muted)` plus the
+      source's own silence. Landed 4 Sep (b8os): `Verdict::Mute` writes both
+      facts, the derived card reads a stored `Muted` before it compares the
+      cursor, opening the unit (from a card or from the list) clears the
+      state and leaves the cursor, and `x` on a conversation unit marks it
+      read in Slack (`Session::mark_unit_read`, which does not need the
+      conversation on screen) as `x` on a thread unfollows it. Tests:
+      `a_muted_slack_unit_stays_off_home_until_it_is_opened`,
+      `undoing_a_mute_puts_the_unit_back_as_it_was`, the mute arm of
+      `a_verdict_on_a_slack_unit_writes_a_cursor_rather_than_a_state`, and
+      `undoing_a_discard_follows_the_thread_again` for the Slack half.
+      Original text: 2.18 landed `x` as the cursor only, the
       same as `d`; align it. Tests: a muted DM that gets a new message
       stays off Home until opened; a muted thread is unfollowed in Slack
       and undo follows it again.

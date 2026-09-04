@@ -7938,13 +7938,15 @@ impl Workspace {
             crate::desk_view::DeskVerdict::Todo { .. } => crate::journal::PhoneVerdict::Todo,
             crate::desk_view::DeskVerdict::File { .. } => crate::journal::PhoneVerdict::File,
         });
-        // `x` on a thread card is Slack's ignore thread: the same keystroke
-        // that closes the card here stops Slack raising it anywhere else.
+        // `x` on a Slack card silences the unit in Slack too: the same
+        // keystroke that closes the card here stops Slack raising it
+        // anywhere else, by unfollowing a thread or marking a conversation
+        // read.
         if matches!(dealt, crate::desk_view::DeskVerdict::Mute)
             && target_node.is_none()
-            && let Some(thread) = self.dashboard.card_thread(card.identity.clone())
+            && let Some(unit) = self.dashboard.card_thread(card.identity.clone())
         {
-            self.slack_ignore_thread(&thread, cx);
+            self.slack_silence_unit(&unit, cx);
         }
         let Some((writes, applied)) = self.desk_cells.verdict_writes(card.host, &node_id, dealt)
         else {

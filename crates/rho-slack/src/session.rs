@@ -1508,6 +1508,31 @@ impl Session {
         }));
     }
 
+    /// The conversation half of a mute: a thread is unfollowed, and a
+    /// conversation has nothing to unfollow, so the read marker at its
+    /// newest message is what stops every other client raising it. Unlike
+    /// `mark_read` this does not need the conversation on screen: a unit is
+    /// muted from a card, which the user has not opened.
+    pub fn mark_unit_read(&mut self, unit: &crate::model::Unit, cx: &mut Context<Self>) {
+        let Some(client) = self.client.clone() else {
+            return;
+        };
+        let Some(latest) = self.model.unit(unit).map(|facts| facts.newest.clone()) else {
+            return;
+        };
+        let channel = unit.channel.clone();
+        self.model.mark_read(&channel, &latest);
+        cx.notify();
+        let task =
+            gpui_tokio::Tokio::spawn(cx, async move { client.mark_read(&channel, &latest).await });
+        self._tasks.push(cx.spawn(async move |this, cx| {
+            if let Ok(Err(error)) = task.await {
+                tracing::warn!(error = %error, "slack mark-read failed");
+            }
+            let _ = this.update(cx, |_, cx| cx.notify());
+        }));
+    }
+
     /// Slack's ignore thread: the mute the user just made here, made
     /// everywhere they read Slack. One request, and rho keeps no
     /// subscription state of its own, so the socket's `thread_unsubscribed`
