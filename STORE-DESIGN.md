@@ -321,6 +321,24 @@ raw event produce". Gone from the wire: `SubscribeAgents`,
 `AgentAttention`, `AgentTurnReport`, and the summary's attention, facts,
 updated-at, and last-active fields.
 
+### Direction: sync is its own crate, mounted on a stream
+
+The user's call, 4 Sep. The log replication above and the held store
+segments are one mechanism, and it lives in a crate of its own
+(`rho-sync`) that knows nothing about agents, cells, or the daemon: a
+log is an owner id and append-only segments with positions; the crate
+serves the version-vector exchange, the tails, the whole logs for
+unknown owners, and the follow, over one stream, with pluggable log
+sources (the daemon's projected agent logs, read from redb; the held
+device segments, opaque bytes). The daemon mounts it: the connection is
+authenticated first by the existing iroh trust handshake, as every
+stream already is, and then a sync stream is opened like a terminal or
+a channel stream today, its first frame selecting the handler, and the
+crate owns the stream from there. Daemon code never touches sync
+frames; sync code never touches agents. The client side of the same
+crate is what the GUI uses to mirror, and, later, what a GUI-to-GUI
+direct path uses unchanged.
+
 ### Direction: agent transcripts are logs too, and the client decides attention
 
 The user's read on 4 Sep, not built and not a slice yet. An agent's
