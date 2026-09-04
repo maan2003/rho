@@ -184,9 +184,17 @@ The user's read on 4 Sep, not built and not part of any slice yet. The
 daemon should not need to read the graph, which may hold sensitive
 text, and the clients are rarely online at the same time, so sync is
 store-and-forward through the one always-on party the user already
-runs. The daemon becomes an iroh relay that holds: two operations,
-append an encrypted batch tagged (device, version), and read every batch
-since a (device, version) per device. Clients coalesce cell writes for a
+runs. The model is logs and paths: every device owns an append-only log
+of encrypted segments, each tagged (device, version), and a path is any
+way of copying segments to another device. A direct iroh connection
+streams them live when both are up; the daemon is a path that holds,
+storing segments until the other device asks; a local network or
+bluetooth path copies them when the devices are near; all the same two
+operations, append a segment and read every segment since a (device,
+version). No path has request-reply state, because the CRDT makes
+segments idempotent, order-free, and safe to receive twice; the only
+bookkeeping is the highest version seen per device, which the store
+already keeps. Clients coalesce cell writes for a
 few hundred milliseconds, encrypt the batch with a key only the clients
 hold (entered once per device, or passed by QR), and append; a client
 that is up receives the other's batches on the socket as they land, and
