@@ -36,7 +36,7 @@ const TREE_INLAY_ID_BASE: usize = 2_000_000;
 /// past the row prefixes that a long note cannot collide with them.
 const CONTINUATION_INLAY_ID_BASE: usize = 3_000_000;
 
-type DraftTopic = Option<(HostId, rho_desk::NodeId)>;
+type DraftTopic = Option<(HostId, rho_desk::cells::Id)>;
 type DraftState = (DraftTopic, Entity<Buffer>, gpui::Subscription);
 
 // Dealer curve tuning. These are deliberately all in one place: rho has one
@@ -96,7 +96,7 @@ pub struct DealCard {
     /// The note the card hangs under, which is the anchor the desk cursor
     /// follows and the key the dealer deduplicates on. The verdict itself
     /// lands on the card's own node, `identity`.
-    pub topic_node_id: rho_desk::NodeId,
+    pub topic_node_id: rho_desk::cells::Id,
     pub agent_id: Option<AgentId>,
     pub agent_tag: Option<String>,
     pub breadcrumb: String,
@@ -108,7 +108,7 @@ pub struct DealCard {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DeskRoom {
     pub host: HostId,
-    pub node_id: rho_desk::NodeId,
+    pub node_id: rho_desk::cells::Id,
     pub name: String,
 }
 
@@ -123,11 +123,11 @@ pub enum CardTarget {
     Missing,
 }
 
-/// Every card is a node in the tree, on the host that holds it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+/// Every card is a thing on the desk, on the host that holds it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DealCardId {
     pub host: HostId,
-    pub node_id: rho_desk::NodeId,
+    pub node_id: rho_desk::cells::Id,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -230,7 +230,7 @@ pub enum StructureDirection {
 /// shared Desk buffers directly.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum LineKey {
-    NewDraft(Option<(HostId, rho_desk::NodeId)>),
+    NewDraft(Option<(HostId, rho_desk::cells::Id)>),
 }
 
 /// One place an agent's shared runtime row is projected. The occurrence is
@@ -242,24 +242,24 @@ pub enum RowTarget {
     None,
     TreeTopic {
         host: HostId,
-        node_id: rho_desk::NodeId,
+        node_id: rho_desk::cells::Id,
         first_attention: Option<AgentId>,
         on_heading_line: bool,
     },
     TreeAgent {
         host: HostId,
-        node_id: rho_desk::NodeId,
-        topic_node_id: rho_desk::NodeId,
+        node_id: rho_desk::cells::Id,
+        topic_node_id: rho_desk::cells::Id,
         agent_id: AgentId,
     },
     TreePage {
         host: HostId,
-        node_id: rho_desk::NodeId,
-        topic_node_id: rho_desk::NodeId,
+        node_id: rho_desk::cells::Id,
+        topic_node_id: rho_desk::cells::Id,
         page_id: rho_browser::PageId,
     },
     NewDraft,
-    NewTreeDraft((HostId, rho_desk::NodeId)),
+    NewTreeDraft((HostId, rho_desk::cells::Id)),
 }
 
 /// Where the cursor is: on a generated row, or at an offset inside a
@@ -267,7 +267,7 @@ pub enum RowTarget {
 #[derive(Clone, Debug, PartialEq)]
 enum CursorPlace {
     Row(LineKey),
-    Tree(HostId, rho_desk::NodeId, usize),
+    Tree(HostId, rho_desk::cells::Id, usize),
 }
 
 /// One generated segment: a slice of a host document, or a generated
@@ -291,9 +291,9 @@ pub struct Dashboard {
     composition: Composition,
     /// Stable composition keys per line, allocated once and never reused.
     element_keys: HashMap<LineKey, u64>,
-    tree_element_keys: HashMap<(HostId, rho_desk::NodeId), u64>,
-    tree_heading_agents: HashMap<(HostId, rho_desk::NodeId), Vec<AgentId>>,
-    tree_heading_pages: HashMap<(HostId, rho_desk::NodeId), Vec<rho_browser::PageId>>,
+    tree_element_keys: HashMap<(HostId, rho_desk::cells::Id), u64>,
+    tree_heading_agents: HashMap<(HostId, rho_desk::cells::Id), Vec<AgentId>>,
+    tree_heading_pages: HashMap<(HostId, rho_desk::cells::Id), Vec<rho_browser::PageId>>,
     next_element_key: u64,
     /// Generated rows in display order, from the last sync.
     /// What each generated key means, for cursor lookup.
@@ -309,7 +309,7 @@ pub struct Dashboard {
     /// The inline new-agent draft, when open: its buffer plus the edit
     /// subscription that keeps chrome fresh.
     new_draft: Option<DraftState>,
-    tree_new_draft_parent: Option<(HostId, rho_desk::NodeId)>,
+    tree_new_draft_parent: Option<(HostId, rho_desk::cells::Id)>,
     /// Collapsed subtrees as anchored fold ranges, org-style: the fold
     /// is persistent state that rides edits, not something re-derived
     /// from the parse. The start anchor is right-biased (org's
@@ -340,8 +340,8 @@ pub struct Dashboard {
     /// Move the cursor to this document offset on the next sync.
     /// Reply placeholder inlays currently spliced in.
     tree_inlay_ids: Vec<InlayId>,
-    tree_collapsed: HashSet<(HostId, rho_desk::NodeId)>,
-    pending_tree_cursor: Option<(HostId, rho_desk::NodeId, usize)>,
+    tree_collapsed: HashSet<(HostId, rho_desk::cells::Id)>,
+    pending_tree_cursor: Option<(HostId, rho_desk::cells::Id, usize)>,
     /// The previous pass's inputs and output, so a sync whose world is
     /// unchanged returns without touching the editor.
     /// Buffers already registered as headerless with the editor. A
@@ -351,20 +351,20 @@ pub struct Dashboard {
 }
 
 struct TreeHostSource {
-    nodes: Vec<rho_desk::cells::MaterializedNode>,
-    buffers: BTreeMap<rho_desk::NodeId, Entity<Buffer>>,
+    nodes: Vec<crate::desk_view::DeskNode>,
+    buffers: BTreeMap<rho_desk::cells::Id, Entity<Buffer>>,
 }
 
 fn nearest_tree_heading(
     source: &TreeHostSource,
-    mut node_id: Option<rho_desk::NodeId>,
-) -> Option<rho_desk::NodeId> {
+    mut node_id: Option<rho_desk::cells::Id>,
+) -> Option<rho_desk::cells::Id> {
     while let Some(id) = node_id {
         let node = source.nodes.iter().find(|node| node.id == id)?;
-        if node.kind == rho_desk::cells::NodeKind::Note {
+        if node.is_note() {
             return Some(id);
         }
-        node_id = node.parent;
+        node_id = node.parent.clone();
     }
     None
 }
@@ -409,15 +409,19 @@ impl Dashboard {
         })
     }
 
-    pub fn tree_heading_named(&self, title: &str, cx: &App) -> Option<(HostId, rho_desk::NodeId)> {
+    pub fn tree_heading_named(
+        &self,
+        title: &str,
+        cx: &App,
+    ) -> Option<(HostId, rho_desk::cells::Id)> {
         self.tree_hosts.iter().find_map(|(host, source)| {
             source.nodes.iter().find_map(|node| {
-                (node.kind == rho_desk::cells::NodeKind::Note
+                (node.is_note()
                     && source
                         .buffers
                         .get(&node.id)
                         .is_some_and(|buffer| note_title(&buffer.read(cx).text()) == title.trim()))
-                .then_some((*host, node.id))
+                .then_some((*host, node.id.clone()))
             })
         })
     }
@@ -441,21 +445,17 @@ impl Dashboard {
             let nodes = source
                 .nodes
                 .iter()
-                .map(|node| (node.id, node))
+                .map(|node| (node.id.clone(), node))
                 .collect::<HashMap<_, _>>();
             let titles = source
                 .buffers
                 .iter()
-                .map(|(id, buffer)| (*id, note_title(&buffer.read(cx).text()).to_owned()))
+                .map(|(id, buffer)| (id.clone(), note_title(&buffer.read(cx).text()).to_owned()))
                 .collect::<HashMap<_, _>>();
-            for heading in source
-                .nodes
-                .iter()
-                .filter(|node| node.kind == rho_desk::cells::NodeKind::Note)
-            {
+            for heading in source.nodes.iter().filter(|node| node.is_note()) {
                 let terminal = heading.state != rho_desk::cells::State::Open;
-                let ancestor_deferred = std::iter::successors(heading.parent, |parent| {
-                    nodes.get(parent).and_then(|node| node.parent)
+                let ancestor_deferred = std::iter::successors(heading.parent.clone(), |parent| {
+                    nodes.get(parent).and_then(|node| node.parent.clone())
                 })
                 .filter_map(|parent| nodes.get(&parent))
                 .any(|node| desk_deferred(node, now.naive_local()));
@@ -464,13 +464,13 @@ impl Dashboard {
                     order += 1;
                     continue;
                 }
-                let breadcrumb = tree_breadcrumb(heading.id, &nodes, &titles);
+                let breadcrumb = tree_breadcrumb(&heading.id, &nodes, &titles);
                 let room = breadcrumb.split(" › ").next().map(str::to_owned);
                 let bindings = source
                     .nodes
                     .iter()
-                    .filter(|node| node.parent == Some(heading.id))
-                    .filter_map(|node| Some((node.id, node_agent(node)?)))
+                    .filter(|node| node.parent == Some(heading.id.clone()))
+                    .filter_map(|node| Some((node.id.clone(), node.agent()?)))
                     .collect::<Vec<_>>();
                 for (mark, at) in desk_marks(heading) {
                     let priority =
@@ -480,7 +480,7 @@ impl Dashboard {
                     }
                     let identity = DealCardId {
                         host: *host,
-                        node_id: heading.id,
+                        node_id: heading.id.clone(),
                     };
                     ranked.push(RankedDealCard {
                         priority,
@@ -491,7 +491,7 @@ impl Dashboard {
                             label: desk_mark_label(mark, at, now.naive_local()),
                             priority,
                             host: *host,
-                            topic_node_id: heading.id,
+                            topic_node_id: heading.id.clone(),
                             agent_id: bindings.first().map(|(_, id)| *id),
                             agent_tag: None,
                             breadcrumb: breadcrumb.clone(),
@@ -565,7 +565,7 @@ impl Dashboard {
                                     label,
                                     priority,
                                     host: *host,
-                                    topic_node_id: heading.id,
+                                    topic_node_id: heading.id.clone(),
                                     agent_id: Some(agent_id),
                                     agent_tag: None,
                                     breadcrumb: breadcrumb.clone(),
@@ -573,7 +573,7 @@ impl Dashboard {
                                     kind: DealCardKind::Agent,
                                     identity: DealCardId {
                                         host: *host,
-                                        node_id: machine_node_id,
+                                        node_id: machine_node_id.clone(),
                                     },
                                 },
                             });
@@ -589,7 +589,7 @@ impl Dashboard {
             for node in source
                 .nodes
                 .iter()
-                .filter(|node| node.kind == rho_desk::cells::NodeKind::Thread)
+                .filter(|node| node.slack().is_some_and(|unit| unit.thread.is_some()))
             {
                 if node.state != rho_desk::cells::State::Open
                     || desk_deferred(node, now.naive_local())
@@ -615,7 +615,7 @@ impl Dashboard {
                         label,
                         priority,
                         host: *host,
-                        topic_node_id: node.id,
+                        topic_node_id: node.id.clone(),
                         agent_id: None,
                         agent_tag: None,
                         breadcrumb: thread.title.clone(),
@@ -623,7 +623,7 @@ impl Dashboard {
                         kind: DealCardKind::Thread,
                         identity: DealCardId {
                             host: *host,
-                            node_id: node.id,
+                            node_id: node.id.clone(),
                         },
                     },
                 });
@@ -633,7 +633,7 @@ impl Dashboard {
         // One winning card per topic; a virtual reply wins an exact tie.
         let mut by_topic = HashMap::new();
         for candidate in ranked {
-            let topic = (candidate.card.host, candidate.card.topic_node_id);
+            let topic = (candidate.card.host, candidate.card.topic_node_id.clone());
             by_topic
                 .entry(topic)
                 .and_modify(|old: &mut RankedDealCard| {
@@ -683,38 +683,38 @@ impl Dashboard {
     fn breadcrumb_for_node(
         &self,
         host: HostId,
-        node_id: rho_desk::NodeId,
+        node_id: rho_desk::cells::Id,
         cx: &App,
     ) -> Option<String> {
         let source = self.tree_hosts.get(&host)?;
         let nodes = source
             .nodes
             .iter()
-            .map(|node| (node.id, node))
+            .map(|node| (node.id.clone(), node))
             .collect::<HashMap<_, _>>();
         let titles = source
             .buffers
             .iter()
-            .map(|(id, buffer)| (*id, note_title(&buffer.read(cx).text()).to_owned()))
+            .map(|(id, buffer)| (id.clone(), note_title(&buffer.read(cx).text()).to_owned()))
             .collect::<HashMap<_, _>>();
-        Some(tree_breadcrumb(node_id, &nodes, &titles))
+        Some(tree_breadcrumb(&node_id, &nodes, &titles))
     }
 
     fn room_for_node(
         &self,
         host: HostId,
-        mut node_id: rho_desk::NodeId,
+        mut node_id: rho_desk::cells::Id,
         cx: &App,
     ) -> Option<DeskRoom> {
         let source = self.tree_hosts.get(&host)?;
         loop {
             let node = source.nodes.iter().find(|node| node.id == node_id)?;
-            let Some(parent) = node.parent else { break };
-            let parent_node = source.nodes.iter().find(|node| node.id == parent)?;
-            if parent_node.kind != rho_desk::cells::NodeKind::Note {
+            let Some(ref parent) = node.parent else { break };
+            let parent_node = source.nodes.iter().find(|node| node.id == *parent)?;
+            if !parent_node.is_note() {
                 break;
             }
-            node_id = parent;
+            node_id = parent.clone();
         }
         let name = note_title(&source.buffers.get(&node_id)?.read(cx).text()).to_owned();
         Some(DeskRoom {
@@ -738,7 +738,7 @@ impl Dashboard {
         let (host, node_id) = self
             .tree_heading_agents
             .iter()
-            .find_map(|(topic, agents)| agents.contains(&agent_id).then_some(*topic))?;
+            .find_map(|(topic, agents)| agents.contains(&agent_id).then_some(topic.clone()))?;
         self.breadcrumb_for_node(host, node_id, cx)
     }
 
@@ -746,7 +746,7 @@ impl Dashboard {
         let (host, node_id) = self
             .tree_heading_pages
             .iter()
-            .find_map(|(topic, pages)| pages.contains(&page_id).then_some(*topic))?;
+            .find_map(|(topic, pages)| pages.contains(&page_id).then_some(topic.clone()))?;
         self.breadcrumb_for_node(host, node_id, cx)
     }
 
@@ -754,7 +754,7 @@ impl Dashboard {
         let (host, node_id) = self
             .tree_heading_agents
             .iter()
-            .find_map(|(topic, agents)| agents.contains(&agent_id).then_some(*topic))?;
+            .find_map(|(topic, agents)| agents.contains(&agent_id).then_some(topic.clone()))?;
         self.room_for_node(host, node_id, cx)
     }
 
@@ -762,7 +762,7 @@ impl Dashboard {
         let (host, node_id) = self
             .tree_heading_pages
             .iter()
-            .find_map(|(topic, pages)| pages.contains(&page_id).then_some(*topic))?;
+            .find_map(|(topic, pages)| pages.contains(&page_id).then_some(topic.clone()))?;
         self.room_for_node(host, node_id, cx)
     }
 
@@ -875,8 +875,8 @@ impl Dashboard {
     pub fn set_tree_source(
         &mut self,
         host: HostId,
-        nodes: Vec<rho_desk::cells::MaterializedNode>,
-        buffers: BTreeMap<rho_desk::NodeId, Entity<Buffer>>,
+        nodes: Vec<crate::desk_view::DeskNode>,
+        buffers: BTreeMap<rho_desk::cells::Id, Entity<Buffer>>,
         cx: &mut Context<Workspace>,
     ) {
         if self.pending_tree_cursor.is_none()
@@ -904,14 +904,14 @@ impl Dashboard {
         else {
             return CardTarget::Missing;
         };
-        match node.kind {
-            rho_desk::cells::NodeKind::Agent => {
-                node_agent(node).map_or(CardTarget::Missing, CardTarget::Agent)
+        match &node.id {
+            rho_desk::cells::Id::Agent(_) => {
+                node.agent().map_or(CardTarget::Missing, CardTarget::Agent)
             }
-            rho_desk::cells::NodeKind::Page => {
+            rho_desk::cells::Id::Page(_) => {
                 node_page(node).map_or(CardTarget::Missing, CardTarget::Page)
             }
-            rho_desk::cells::NodeKind::Thread => {
+            rho_desk::cells::Id::Slack(_) => {
                 node_thread(node).map_or(CardTarget::Missing, CardTarget::Thread)
             }
             _ => CardTarget::Note,
@@ -921,7 +921,7 @@ impl Dashboard {
     /// The card a thing on screen would be dealt as, so the dealer can stay
     /// quiet about what the user is already looking at.
     pub fn agent_card_id(&self, agent_id: AgentId) -> Option<DealCardId> {
-        self.node_card(|node| node_agent(node) == Some(agent_id))
+        self.node_card(|node| node.agent() == Some(agent_id))
     }
 
     pub fn page_card_id(&self, page: rho_browser::PageId) -> Option<DealCardId> {
@@ -957,7 +957,7 @@ impl Dashboard {
                         Some((
                             DealCardId {
                                 host: *host,
-                                node_id: node.id,
+                                node_id: node.id.clone(),
                             },
                             node_thread(node)?,
                         ))
@@ -977,7 +977,7 @@ impl Dashboard {
 
     fn node_card(
         &self,
-        matches: impl Fn(&rho_desk::cells::MaterializedNode) -> bool,
+        matches: impl Fn(&crate::desk_view::DeskNode) -> bool,
     ) -> Option<DealCardId> {
         self.tree_hosts.iter().find_map(|(host, source)| {
             source
@@ -986,7 +986,7 @@ impl Dashboard {
                 .find(|node| matches(node))
                 .map(|node| DealCardId {
                     host: *host,
-                    node_id: node.id,
+                    node_id: node.id.clone(),
                 })
         })
     }
@@ -994,7 +994,7 @@ impl Dashboard {
     pub fn tree_node_at_cursor(
         &self,
         cx: &mut Context<Workspace>,
-    ) -> Option<(HostId, rho_desk::NodeId)> {
+    ) -> Option<(HostId, rho_desk::cells::Id)> {
         self.tree_node_cursor_offset(cx)
             .map(|(host, node_id, _)| (host, node_id))
     }
@@ -1003,15 +1003,18 @@ impl Dashboard {
         &self,
         buffer_id: BufferId,
         cx: &App,
-    ) -> Option<(HostId, rho_desk::NodeId)> {
+    ) -> Option<(HostId, rho_desk::cells::Id)> {
         self.tree_hosts.iter().find_map(|(host, source)| {
             source.buffers.iter().find_map(|(node_id, buffer)| {
-                (buffer.read(cx).remote_id() == buffer_id).then_some((*host, *node_id))
+                (buffer.read(cx).remote_id() == buffer_id).then_some((*host, node_id.clone()))
             })
         })
     }
 
-    pub fn first_tree_agent_for_topic(&self, topic: (HostId, rho_desk::NodeId)) -> Option<AgentId> {
+    pub fn first_tree_agent_for_topic(
+        &self,
+        topic: (HostId, rho_desk::cells::Id),
+    ) -> Option<AgentId> {
         self.tree_heading_agents
             .get(&topic)
             .and_then(|agents| agents.first())
@@ -1021,7 +1024,7 @@ impl Dashboard {
     pub fn tree_node_cursor_offset(
         &self,
         cx: &mut Context<Workspace>,
-    ) -> Option<(HostId, rho_desk::NodeId, usize)> {
+    ) -> Option<(HostId, rho_desk::cells::Id, usize)> {
         let (buffer_id, offset) = self.editor.update(cx, |editor, cx| {
             let head = editor.selections.newest_anchor().head();
             let snapshot = editor.buffer().read(cx).snapshot(cx);
@@ -1031,19 +1034,23 @@ impl Dashboard {
         })?;
         self.tree_hosts.iter().find_map(|(host, source)| {
             source.buffers.iter().find_map(|(node_id, buffer)| {
-                (buffer.read(cx).remote_id() == buffer_id).then_some((*host, *node_id, offset))
+                (buffer.read(cx).remote_id() == buffer_id).then_some((
+                    *host,
+                    node_id.clone(),
+                    offset,
+                ))
             })
         })
     }
 
-    pub fn move_to_tree_node_when_ready(&mut self, host: HostId, node_id: rho_desk::NodeId) {
+    pub fn move_to_tree_node_when_ready(&mut self, host: HostId, node_id: rho_desk::cells::Id) {
         self.pending_tree_cursor = Some((host, node_id, 0));
     }
 
     pub fn move_to_tree_position_when_ready(
         &mut self,
         host: HostId,
-        node_id: rho_desk::NodeId,
+        node_id: rho_desk::cells::Id,
         offset: usize,
     ) {
         self.pending_tree_cursor = Some((host, node_id, offset));
@@ -1139,12 +1146,12 @@ impl Dashboard {
         self.raw_mode = false;
         self.deal_active = true;
         self.deal_empty_success = false;
-        self.pending_tree_cursor = Some((card.host, card.topic_node_id, 0));
+        self.pending_tree_cursor = Some((card.host, card.topic_node_id.clone(), 0));
         card
     }
 
     pub fn reopen_deal(&mut self, card: DealCard) {
-        self.pending_tree_cursor = Some((card.host, card.topic_node_id, 0));
+        self.pending_tree_cursor = Some((card.host, card.topic_node_id.clone(), 0));
         self.deal = Some(DealSession {
             card,
             fingerprint: DealFingerprint("verdict undo".to_owned()),
@@ -1216,7 +1223,7 @@ impl Dashboard {
         fn identity(card: &DealCardId) -> crate::journal::DealerCardIdentity {
             crate::journal::DealerCardIdentity {
                 host: card.host.0,
-                node_id: card.node_id.into(),
+                node_id: card.node_id.clone().into(),
             }
         }
         let kind = match event.kind {
@@ -1281,20 +1288,20 @@ impl Dashboard {
         Some(&self.deal.as_ref()?.card)
     }
 
-    pub fn current_tree_room_node(&self) -> Option<(HostId, rho_desk::NodeId)> {
+    pub fn current_tree_room_node(&self) -> Option<(HostId, rho_desk::cells::Id)> {
         let card = self.current_deal_card()?;
         let source = self.tree_hosts.get(&card.host)?;
-        let mut node_id = card.topic_node_id;
+        let mut node_id = card.topic_node_id.clone();
         loop {
             let node = source.nodes.iter().find(|node| node.id == node_id)?;
-            let Some(parent) = node.parent else {
+            let Some(ref parent) = node.parent else {
                 return Some((card.host, node_id));
             };
-            let parent_node = source.nodes.iter().find(|node| node.id == parent)?;
-            if parent_node.kind != rho_desk::cells::NodeKind::Note {
+            let parent_node = source.nodes.iter().find(|node| node.id == *parent)?;
+            if !parent_node.is_note() {
                 return Some((card.host, node_id));
             }
-            node_id = parent;
+            node_id = parent.clone();
         }
     }
 
@@ -1302,7 +1309,7 @@ impl Dashboard {
     /// draft it parks when left and survives refreshes.
     pub fn open_new_draft(
         &mut self,
-        topic: Option<(HostId, rho_desk::NodeId)>,
+        topic: Option<(HostId, rho_desk::cells::Id)>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
@@ -1314,13 +1321,13 @@ impl Dashboard {
                 }
             });
             self.buffers
-                .insert(LineKey::NewDraft(topic), buffer.clone());
-            self.new_draft = Some((topic, buffer, subscription));
+                .insert(LineKey::NewDraft(topic.clone()), buffer.clone());
+            self.new_draft = Some((topic.clone(), buffer, subscription));
         }
         let topic = self
             .new_draft
             .as_ref()
-            .map(|draft| draft.0)
+            .map(|draft| draft.0.clone())
             .unwrap_or(topic);
         self.pending_cursor = Some(LineKey::NewDraft(topic));
         cx.notify();
@@ -1328,11 +1335,11 @@ impl Dashboard {
 
     pub fn open_new_tree_draft(
         &mut self,
-        topic: (HostId, rho_desk::NodeId),
+        topic: (HostId, rho_desk::cells::Id),
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
-        self.tree_new_draft_parent = Some(topic);
+        self.tree_new_draft_parent = Some(topic.clone());
         self.open_new_draft(Some(topic), window, cx);
     }
 
@@ -1356,8 +1363,8 @@ impl Dashboard {
         true
     }
 
-    pub fn new_draft_topic(&self) -> Option<(HostId, rho_desk::NodeId)> {
-        self.new_draft.as_ref().and_then(|draft| draft.0)
+    pub fn new_draft_topic(&self) -> Option<(HostId, rho_desk::cells::Id)> {
+        self.new_draft.as_ref().and_then(|draft| draft.0.clone())
     }
 
     /// Renders the authoritative tree as one native editor composition. Each
@@ -1375,10 +1382,12 @@ impl Dashboard {
         self.referenced_pages.clear();
         for (host, source) in &self.tree_hosts {
             for node in &source.nodes {
-                let Some(parent) = node.parent else { continue };
-                if let Some(agent_id) = node_agent(node) {
+                let Some(parent) = node.parent.clone() else {
+                    continue;
+                };
+                if let Some(agent_id) = node.agent() {
                     self.tree_heading_agents
-                        .entry((*host, parent))
+                        .entry((*host, parent.clone()))
                         .or_default()
                         .push(agent_id);
                 }
@@ -1435,7 +1444,7 @@ impl Dashboard {
             .collect::<Vec<_>>();
         let semantic_rows = rows
             .iter()
-            .filter(|(_, node, _)| node.kind == rho_desk::cells::NodeKind::Note)
+            .filter(|(_, node, _)| node.is_note())
             .map(|(_, _, buffer)| buffer.read(cx).remote_id())
             .collect();
         self.editor.update(cx, |editor, _| {
@@ -1443,7 +1452,7 @@ impl Dashboard {
         });
         let mut spec = CompositionSpec::default();
         for (host, node, buffer) in &rows {
-            let key = (*host, node.id);
+            let key = (*host, node.id.clone());
             let id = *self.tree_element_keys.entry(key).or_insert_with(|| {
                 self.next_element_key += 1;
                 self.next_element_key
@@ -1452,17 +1461,19 @@ impl Dashboard {
                 id,
                 buffer: buffer.clone(),
             });
-            if self.tree_new_draft_parent == Some((*host, node.id))
+            if self.tree_new_draft_parent == Some((*host, node.id.clone()))
                 && let Some((_, draft, _)) = &self.new_draft
             {
-                let key = LineKey::NewDraft(Some((*host, node.id)));
+                let key = LineKey::NewDraft(Some((*host, node.id.clone())));
                 let id = *self.element_keys.entry(key.clone()).or_insert_with(|| {
                     self.next_element_key += 1;
                     self.next_element_key
                 });
                 self.buffers.insert(key.clone(), draft.clone());
-                self.targets
-                    .insert(key.clone(), RowTarget::NewTreeDraft((*host, node.id)));
+                self.targets.insert(
+                    key.clone(),
+                    RowTarget::NewTreeDraft((*host, node.id.clone())),
+                );
                 spec.tail.push(RowSpec {
                     id,
                     buffer: draft.clone(),
@@ -1492,7 +1503,7 @@ impl Dashboard {
         {
             self.select_buffer_anchor(anchor, None, window, cx);
         }
-        if let Some((host, node_id, offset)) = self.pending_tree_cursor {
+        if let Some((host, ref node_id, offset)) = self.pending_tree_cursor {
             if let Some(buffer) = self
                 .tree_hosts
                 .get(&host)
@@ -1541,22 +1552,25 @@ impl Dashboard {
         for (host, node, _) in &rows {
             let tree_depth = node
                 .parent
+                .clone()
                 .and_then(|parent| tree_depths.get(&(*host, parent)).copied())
                 .unwrap_or(0usize)
                 + usize::from(node.parent.is_some());
             let depth = node
                 .parent
+                .clone()
                 .and_then(|parent| depths.get(&(*host, parent)).copied())
                 .unwrap_or(0usize)
-                + usize::from(node.kind == rho_desk::cells::NodeKind::Note);
+                + usize::from(node.is_note());
             let card_depth = node
                 .parent
+                .clone()
                 .and_then(|parent| card_depths.get(&(*host, parent)).copied())
                 .unwrap_or(0usize)
-                + usize::from(node.kind != rho_desk::cells::NodeKind::Note);
-            depths.insert((*host, node.id), depth);
-            tree_depths.insert((*host, node.id), tree_depth);
-            card_depths.insert((*host, node.id), card_depth);
+                + usize::from(!node.is_note());
+            depths.insert((*host, node.id.clone()), depth);
+            tree_depths.insert((*host, node.id.clone()), tree_depth);
+            card_depths.insert((*host, node.id.clone()), card_depth);
         }
         for (index, (host, node, buffer)) in rows.iter().enumerate() {
             let buffer_snapshot = buffer.read(cx).snapshot();
@@ -1573,32 +1587,33 @@ impl Dashboard {
                 continue;
             };
             let hidden_by_fold = self.tree_hosts.get(host).is_some_and(|source| {
-                let mut parent = node.parent;
+                let mut parent = node.parent.clone();
                 while let Some(parent_id) = parent {
-                    if self.tree_collapsed.contains(&(*host, parent_id)) {
+                    if self.tree_collapsed.contains(&(*host, parent_id.clone())) {
                         return true;
                     }
                     parent = source
                         .nodes
                         .iter()
                         .find(|candidate| candidate.id == parent_id)
-                        .and_then(|candidate| candidate.parent);
+                        .and_then(|candidate| candidate.parent.clone());
                 }
                 false
             });
-            let prefix = match node.kind {
-                rho_desk::cells::NodeKind::Note => {
+            let prefix = match &node.id {
+                rho_desk::cells::Id::Note(_) => {
                     // A note under a card is indented past the card's marker
                     // and words. At the left edge its `*` read as the next
                     // root rather than as something belonging to the card.
                     format!(
                         "{}{} ",
-                        "    ".repeat(card_depths[&(*host, node.id)]),
-                        "*".repeat(depths[&(*host, node.id)].max(1))
+                        "    ".repeat(card_depths[&(*host, node.id.clone())]),
+                        "*".repeat(depths[&(*host, node.id.clone())].max(1))
                     )
                 }
-                rho_desk::cells::NodeKind::Agent => {
-                    let label = node_agent(node)
+                rho_desk::cells::Id::Agent(_) => {
+                    let label = node
+                        .agent()
                         .map(|agent_id| {
                             format!(
                                 "{} {} ",
@@ -1616,9 +1631,9 @@ impl Dashboard {
                 }
                 _ => "  ◦ ".to_owned(),
             };
-            let class = match node.kind {
-                rho_desk::cells::NodeKind::Note => {
-                    Some(DashClass::for_depth(depths[&(*host, node.id)]))
+            let class = match &node.id {
+                rho_desk::cells::Id::Note(_) => {
+                    Some(DashClass::for_depth(depths[&(*host, node.id.clone())]))
                 }
                 _ => Some(DashClass::Muted),
             };
@@ -1667,10 +1682,11 @@ impl Dashboard {
             if let Some(at) = node.deadline {
                 hints.push(format!("due {} · {}d", desk_date(at), node.pace_days));
             }
-            if node.kind == rho_desk::cells::NodeKind::Page {
+            if node.page().is_some() {
                 hints.push("page".to_owned());
             }
-            if let Some(path) = node_path(node) {
+            if let Some(path) = node.path() {
+                let path = path.to_string();
                 hints.push(path);
             }
             if !hidden_by_fold && !hints.is_empty() {
@@ -1703,8 +1719,8 @@ impl Dashboard {
 
     fn apply_tree_folds(
         &self,
-        rows: &[(HostId, rho_desk::cells::MaterializedNode, Entity<Buffer>)],
-        depths: &HashMap<(HostId, rho_desk::NodeId), usize>,
+        rows: &[(HostId, crate::desk_view::DeskNode, Entity<Buffer>)],
+        depths: &HashMap<(HostId, rho_desk::cells::Id), usize>,
         cx: &mut Context<Workspace>,
     ) {
         struct TreeSubtreeFold;
@@ -1712,14 +1728,15 @@ impl Dashboard {
         let snapshot = self.multi_buffer.read(cx).snapshot(cx);
         let mut creases = Vec::new();
         for (index, (host, node, _)) in rows.iter().enumerate() {
-            if !self.tree_collapsed.contains(&(*host, node.id)) {
+            if !self.tree_collapsed.contains(&(*host, node.id.clone())) {
                 continue;
             }
-            let depth = depths[&(*host, node.id)];
+            let depth = depths[&(*host, node.id.clone())];
             let end_index = rows[index + 1..]
                 .iter()
                 .position(|(candidate_host, candidate, _)| {
-                    *candidate_host != *host || depths[&(*candidate_host, candidate.id)] <= depth
+                    *candidate_host != *host
+                        || depths[&(*candidate_host, candidate.id.clone())] <= depth
                 })
                 .map_or(rows.len(), |offset| index + 1 + offset);
             if end_index == index + 1 {
@@ -1817,7 +1834,7 @@ impl Dashboard {
     ) -> Option<CursorPlace> {
         for (host, source) in &self.tree_hosts {
             if let Some(node_id) = source.buffers.iter().find_map(|(node_id, buffer)| {
-                (buffer.read(cx).remote_id() == buffer_id).then_some(*node_id)
+                (buffer.read(cx).remote_id() == buffer_id).then_some(node_id.clone())
             }) {
                 return Some(CursorPlace::Tree(*host, node_id, offset));
             }
@@ -1865,13 +1882,13 @@ impl Dashboard {
             CursorPlace::Tree(host, node_id, _) => {
                 let source = self.tree_hosts.get(&host)?;
                 let node = source.nodes.iter().find(|node| node.id == node_id)?;
-                let topic = if node.kind == rho_desk::cells::NodeKind::Note {
-                    Some(node.id)
+                let topic = if node.is_note() {
+                    Some(node.id.clone())
                 } else {
-                    nearest_tree_heading(source, node.parent)
+                    nearest_tree_heading(source, node.parent.clone())
                 };
-                match node.kind {
-                    rho_desk::cells::NodeKind::Agent => match node_agent(node) {
+                match &node.id {
+                    rho_desk::cells::Id::Agent(_) => match node.agent() {
                         Some(agent_id) => Some(RowTarget::TreeAgent {
                             host,
                             node_id,
@@ -1880,7 +1897,7 @@ impl Dashboard {
                         }),
                         None => Some(RowTarget::None),
                     },
-                    rho_desk::cells::NodeKind::Page => match node_page(node) {
+                    rho_desk::cells::Id::Page(_) => match node_page(node) {
                         Some(page_id) => Some(RowTarget::TreePage {
                             host,
                             node_id,
@@ -1893,7 +1910,7 @@ impl Dashboard {
                         let topic = topic?;
                         let first_attention = self
                             .tree_heading_agents
-                            .get(&(host, topic))
+                            .get(&(host, topic.clone()))
                             .into_iter()
                             .flatten()
                             .copied()
@@ -1902,7 +1919,7 @@ impl Dashboard {
                             host,
                             node_id: topic,
                             first_attention,
-                            on_heading_line: node.kind == rho_desk::cells::NodeKind::Note,
+                            on_heading_line: node.is_note(),
                         })
                     }
                 }
@@ -1912,15 +1929,18 @@ impl Dashboard {
 
     /// The heading that owns the cursor position: the containing heading
     /// for document positions, the bound heading for agent rows.
-    pub fn cursor_topic(&self, cx: &mut Context<Workspace>) -> Option<(HostId, rho_desk::NodeId)> {
+    pub fn cursor_topic(
+        &self,
+        cx: &mut Context<Workspace>,
+    ) -> Option<(HostId, rho_desk::cells::Id)> {
         match self.cursor_place(cx)? {
             CursorPlace::Tree(host, node_id, _) => {
                 let source = self.tree_hosts.get(&host)?;
                 let node = source.nodes.iter().find(|node| node.id == node_id)?;
-                let topic = if node.kind == rho_desk::cells::NodeKind::Note {
-                    node.id
+                let topic = if node.is_note() {
+                    node.id.clone()
                 } else {
-                    nearest_tree_heading(source, node.parent)?
+                    nearest_tree_heading(source, node.parent.clone())?
                 };
                 Some((host, topic))
             }
@@ -1934,9 +1954,9 @@ impl Dashboard {
     pub fn capture_position(
         &self,
         cx: &mut Context<Workspace>,
-    ) -> Option<(HostId, rho_desk::NodeId, String)> {
+    ) -> Option<(HostId, rho_desk::cells::Id, String)> {
         let (host, node_id) = self.cursor_topic(cx)?;
-        let room = self.room_for_node(host, node_id, cx)?;
+        let room = self.room_for_node(host, node_id.clone(), cx)?;
         Some((host, node_id, room.name))
     }
 
@@ -1956,7 +1976,7 @@ impl Dashboard {
                 source
                     .nodes
                     .iter()
-                    .any(|node| node.id == node_id && node.kind == rho_desk::cells::NodeKind::Note)
+                    .any(|node| node.id == node_id && node.is_note())
             })
         })
     }
@@ -1970,12 +1990,12 @@ impl Dashboard {
             source
                 .nodes
                 .iter()
-                .any(|node| node.id == node_id && node.kind == rho_desk::cells::NodeKind::Note)
+                .any(|node| node.id == node_id && node.is_note())
         });
         if !is_heading {
             return false;
         }
-        if !self.tree_collapsed.insert((host, node_id)) {
+        if !self.tree_collapsed.insert((host, node_id.clone())) {
             self.tree_collapsed.remove(&(host, node_id));
         }
         cx.notify();
@@ -2191,9 +2211,7 @@ fn desk_elapsed(at: rho_desk::cells::Timestamp, now: chrono::NaiveDateTime) -> O
 
 /// The dated marks a node carries. An Open node with neither is a note, not
 /// a card: the desk is where you write, and writing is not a queue.
-fn desk_marks(
-    node: &rho_desk::cells::MaterializedNode,
-) -> Vec<(DeskMark, rho_desk::cells::Timestamp)> {
+fn desk_marks(node: &crate::desk_view::DeskNode) -> Vec<(DeskMark, rho_desk::cells::Timestamp)> {
     if node.state != rho_desk::cells::State::Open {
         return Vec::new();
     }
@@ -2209,7 +2227,7 @@ fn desk_marks(
 
 /// Whether a node is still waiting for its date, which hides it and every
 /// card under it.
-fn desk_deferred(node: &rho_desk::cells::MaterializedNode, now: chrono::NaiveDateTime) -> bool {
+fn desk_deferred(node: &crate::desk_view::DeskNode, now: chrono::NaiveDateTime) -> bool {
     node.defer_until
         .and_then(|at| desk_elapsed(at, now))
         .is_some_and(|elapsed| elapsed < 0.0)
@@ -2255,109 +2273,87 @@ fn desk_mark_label(
     }
 }
 
-/// The agent a machine row is bound to.
-pub(crate) fn node_agent(node: &rho_desk::cells::MaterializedNode) -> Option<AgentId> {
-    match node.fields.get(&rho_desk::cells::Field::AgentId) {
-        Some(rho_desk::cells::Value::AgentId(agent_id)) => Some(*agent_id),
-        _ => None,
-    }
+/// The agent an agent row is: the id is the agent, so there is nothing to
+/// look up.
+pub(crate) fn node_agent(node: &crate::desk_view::DeskNode) -> Option<AgentId> {
+    node.agent()
 }
 
-/// The Slack thread a thread node stands for.
-pub(crate) fn node_thread(node: &rho_desk::cells::MaterializedNode) -> Option<ThreadRef> {
-    let text = |field| match node.fields.get(&field) {
-        Some(rho_desk::cells::Value::Text(value)) => Some(value.clone()),
-        _ => None,
-    };
+/// The Slack thread a row stands for.
+pub(crate) fn node_thread(node: &crate::desk_view::DeskNode) -> Option<ThreadRef> {
+    let unit = node.slack()?;
     Some(ThreadRef {
-        workspace: text(rho_desk::cells::Field::Workspace)?,
-        channel: text(rho_desk::cells::Field::Channel)?,
-        thread_ts: text(rho_desk::cells::Field::ThreadTs)?,
+        workspace: unit.workspace.clone(),
+        channel: unit.channel.clone(),
+        thread_ts: unit.thread.clone()?,
     })
 }
 
-fn node_page(node: &rho_desk::cells::MaterializedNode) -> Option<rho_browser::PageId> {
-    match node.fields.get(&rho_desk::cells::Field::PageRef) {
-        Some(rho_desk::cells::Value::PageRef(page_id)) => {
-            Some(rho_browser::PageId(uuid::Uuid::from_bytes(page_id.0)))
-        }
-        _ => None,
-    }
+fn node_page(node: &crate::desk_view::DeskNode) -> Option<rho_browser::PageId> {
+    node.page()
+        .map(|page| rho_browser::PageId(uuid::Uuid::from_bytes(page.0)))
 }
 
-/// A note's workdir lives on its machine-owned `File` child rather than on
-/// the note itself, so callers look one level down.
+/// A note's workdir is a `File` filed under it, so callers look one level
+/// down; an agent's own workdir comes from the registry instead.
 pub(crate) fn node_file_path(
-    nodes: &[rho_desk::cells::MaterializedNode],
-    node_id: rho_desk::NodeId,
+    nodes: &[crate::desk_view::DeskNode],
+    id: &rho_desk::cells::Id,
 ) -> Option<camino::Utf8PathBuf> {
     nodes
         .iter()
-        .filter(|node| node.parent == Some(node_id) && node.kind == rho_desk::cells::NodeKind::File)
-        .find_map(
-            |node| match node.fields.get(&rho_desk::cells::Field::Path) {
-                Some(rho_desk::cells::Value::Path(path)) => Some(path.clone()),
-                _ => None,
-            },
-        )
+        .filter(|node| node.parent.as_ref() == Some(id))
+        .find_map(|node| node.path().map(ToOwned::to_owned))
 }
 
-fn node_path(node: &rho_desk::cells::MaterializedNode) -> Option<String> {
-    match node.fields.get(&rho_desk::cells::Field::Path) {
-        Some(rho_desk::cells::Value::Path(path)) => Some(path.to_string()),
-        _ => None,
-    }
-}
-
-/// What a machine row says. Agent rows carry their name in the row prefix
-/// already, so their buffer stays empty rather than repeating it.
+/// What a row that is not a note says. Agent rows carry their name in the
+/// row prefix already, so their buffer stays empty rather than repeating it.
 fn derived_title(
-    node: &rho_desk::cells::MaterializedNode,
+    node: &crate::desk_view::DeskNode,
     _registry: &AgentRegistry,
     threads: &HashMap<ThreadRef, DealerThread>,
 ) -> String {
-    use rho_desk::cells::{Field, NodeKind, Value};
+    use rho_desk::cells::Id;
 
-    let text = |field| match node.fields.get(&field) {
-        Some(Value::Text(text)) => Some(text.clone()),
-        _ => None,
-    };
-    match node.kind {
-        NodeKind::Agent | NodeKind::Note => String::new(),
-        NodeKind::Page => node_page(node)
+    match &node.id {
+        Id::Agent(_) | Id::Note(_) => String::new(),
+        Id::Label(_) => node.name.clone().unwrap_or_else(|| "label".to_owned()),
+        Id::Host(_) => "this host".to_owned(),
+        Id::Page(_) => node_page(node)
             .and_then(rho_browser::live_page_name)
-            .or_else(|| text(Field::Url))
             .unwrap_or_else(|| "page".to_owned()),
-        NodeKind::File => node_path(node).unwrap_or_default(),
-        // The tree holds the thread's identity, which is ids and a
+        Id::File { path, .. } => path.to_string(),
+        // The store holds the unit's identity, which is ids and a
         // timestamp; what it is called lives in the mirror. A thread rho
         // has not caught up with yet says so rather than showing its keys.
-        NodeKind::Thread => match node_thread(node).and_then(|key| threads.get(&key)) {
+        Id::Slack(unit) => match node_thread(node).and_then(|key| threads.get(&key)) {
             Some(thread) => format!("{} · {}", thread.conversation, thread.title),
-            None => "thread".to_owned(),
+            // The conversation row is named by the mirror too: any thread
+            // in it knows what Slack calls it, and its ids are never shown.
+            None => threads
+                .iter()
+                .find(|(key, _)| key.workspace == unit.workspace && key.channel == unit.channel)
+                .map(|(_, thread)| thread.conversation.clone())
+                .unwrap_or_else(|| "conversation".to_owned()),
         },
-        NodeKind::PullRequest => match (
-            text(Field::Repo),
-            node.fields.get(&Field::PullRequestNumber),
-        ) {
-            (Some(repo), Some(Value::Number(number))) => format!("{repo}#{number}"),
-            (Some(repo), _) => repo,
-            _ => "pull request".to_owned(),
-        },
+        Id::PullRequest { repo, number } => format!("{repo}#{number}"),
     }
 }
 
 /// What an area row calls itself in the picker.
-fn area_kind(kind: rho_desk::cells::NodeKind) -> &'static str {
-    use rho_desk::cells::NodeKind;
+fn area_kind(id: &rho_desk::cells::Id) -> &'static str {
+    use rho_desk::cells::Id;
 
-    match kind {
-        NodeKind::Note => "note",
-        NodeKind::Agent => "agent",
-        NodeKind::Page => "page",
-        NodeKind::Thread => "thread",
-        NodeKind::File => "file",
-        NodeKind::PullRequest => "pull request",
+    match id {
+        Id::Note(_) => "note",
+        Id::Label(_) => "label",
+        Id::Agent(_) => "agent",
+        Id::Host(_) => "host",
+        Id::Page(_) => "page",
+        Id::Slack(unit) if unit.thread.is_some() => "thread",
+        Id::Slack(_) => "conversation",
+        Id::File { .. } => "file",
+        Id::PullRequest { .. } => "pull request",
     }
 }
 
@@ -2369,25 +2365,25 @@ pub(crate) fn note_title(text: &str) -> &str {
 }
 
 /// A note is the user's to write in; every other kind is the machine's row.
-fn is_note(node: &rho_desk::cells::MaterializedNode) -> bool {
-    node.kind == rho_desk::cells::NodeKind::Note
+fn is_note(node: &crate::desk_view::DeskNode) -> bool {
+    node.is_note()
 }
 
 fn tree_breadcrumb(
-    node_id: rho_desk::NodeId,
-    nodes: &HashMap<rho_desk::NodeId, &rho_desk::cells::MaterializedNode>,
-    titles: &HashMap<rho_desk::NodeId, String>,
+    id: &rho_desk::cells::Id,
+    nodes: &HashMap<rho_desk::cells::Id, &crate::desk_view::DeskNode>,
+    titles: &HashMap<rho_desk::cells::Id, String>,
 ) -> String {
     let mut path = Vec::new();
-    let mut cursor = Some(node_id);
-    while let Some(node_id) = cursor {
-        let Some(node) = nodes.get(&node_id) else {
+    let mut cursor = Some(id.clone());
+    while let Some(id) = cursor {
+        let Some(node) = nodes.get(&id) else {
             break;
         };
-        if node.kind == rho_desk::cells::NodeKind::Note {
-            path.push(titles.get(&node_id).map_or("", String::as_str));
+        if node.is_note() {
+            path.push(titles.get(&id).map_or("", String::as_str));
         }
-        cursor = node.parent;
+        cursor = node.parent.clone();
     }
     path.reverse();
     path.join(" › ")
@@ -2410,21 +2406,21 @@ impl Dashboard {
     pub fn heading_destination_candidates(
         &self,
         cx: &App,
-    ) -> Vec<(String, String, HostId, rho_desk::NodeId)> {
+    ) -> Vec<(String, String, HostId, rho_desk::cells::Id)> {
         self.tree_hosts
             .iter()
             .flat_map(|(host, source)| {
                 source.nodes.iter().filter_map(move |node| {
-                    if node.kind != rho_desk::cells::NodeKind::Note {
+                    if !node.is_note() {
                         return None;
                     }
                     let title =
                         note_title(&source.buffers.get(&node.id)?.read(cx).text()).to_owned();
                     Some((
                         title.clone(),
-                        self.breadcrumb_for_node_for_source(node.id, source, cx)?,
+                        self.breadcrumb_for_node_for_source(node.id.clone(), source, cx)?,
                         *host,
-                        node.id,
+                        node.id.clone(),
                     ))
                 })
             })
@@ -2440,21 +2436,21 @@ impl Dashboard {
         registry: &AgentRegistry,
         threads: &HashMap<ThreadRef, DealerThread>,
         cx: &App,
-    ) -> Vec<(String, &'static str, HostId, rho_desk::NodeId)> {
+    ) -> Vec<(String, &'static str, HostId, rho_desk::cells::Id)> {
         let mut areas = Vec::new();
         for (host, source) in &self.tree_hosts {
             let nodes = source
                 .nodes
                 .iter()
-                .map(|node| (node.id, node))
+                .map(|node| (node.id.clone(), node))
                 .collect::<HashMap<_, _>>();
             let titles = source
                 .buffers
                 .iter()
-                .map(|(id, buffer)| (*id, note_title(&buffer.read(cx).text()).to_owned()))
+                .map(|(id, buffer)| (id.clone(), note_title(&buffer.read(cx).text()).to_owned()))
                 .collect::<HashMap<_, _>>();
             for node in &source.nodes {
-                let breadcrumb = tree_breadcrumb(node.id, &nodes, &titles);
+                let breadcrumb = tree_breadcrumb(&node.id, &nodes, &titles);
                 // A note's breadcrumb already ends with the note itself;
                 // every other kind hangs its title under its parent's.
                 let path = if is_note(node) {
@@ -2467,7 +2463,8 @@ impl Dashboard {
                         .filter(|text| !text.is_empty())
                         .map(str::to_owned)
                         .or_else(|| {
-                            node_agent(node).map(|agent_id| registry.agent_human_name(agent_id))
+                            node.agent()
+                                .map(|agent_id| registry.agent_human_name(agent_id))
                         })
                         .unwrap_or_else(|| derived_title(node, registry, threads));
                     if breadcrumb.is_empty() {
@@ -2479,7 +2476,7 @@ impl Dashboard {
                 if path.trim().is_empty() {
                     continue;
                 }
-                areas.push((path, area_kind(node.kind), *host, node.id));
+                areas.push((path, area_kind(&node.id), *host, node.id.clone()));
             }
         }
         areas
@@ -2500,14 +2497,14 @@ impl Dashboard {
             let nodes = source
                 .nodes
                 .iter()
-                .map(|node| (node.id, node))
+                .map(|node| (node.id.clone(), node))
                 .collect::<HashMap<_, _>>();
             let titles = source
                 .buffers
                 .iter()
-                .map(|(id, buffer)| (*id, note_title(&buffer.read(cx).text()).to_owned()))
+                .map(|(id, buffer)| (id.clone(), note_title(&buffer.read(cx).text()).to_owned()))
                 .collect::<HashMap<_, _>>();
-            let title_of = |node_id: rho_desk::NodeId| {
+            let title_of = |node_id: rho_desk::cells::Id| {
                 titles
                     .get(&node_id)
                     .and_then(|text| text.lines().next())
@@ -2516,7 +2513,7 @@ impl Dashboard {
                     .map(str::to_owned)
             };
             for node in &source.nodes {
-                let breadcrumb = tree_breadcrumb(node.id, &nodes, &titles);
+                let breadcrumb = tree_breadcrumb(&node.id, &nodes, &titles);
                 let under = |title: String| {
                     if breadcrumb.is_empty() {
                         title
@@ -2524,8 +2521,8 @@ impl Dashboard {
                         format!("{breadcrumb} › {title}")
                     }
                 };
-                let candidate = match node.kind {
-                    rho_desk::cells::NodeKind::Note => {
+                let candidate = match &node.id {
+                    rho_desk::cells::Id::Note(_) => {
                         if breadcrumb.is_empty() {
                             continue;
                         }
@@ -2534,11 +2531,11 @@ impl Dashboard {
                             kind: "topic",
                             target: FindTarget::Topic {
                                 host: *host,
-                                node_id: node.id,
+                                node_id: node.id.clone(),
                             },
                             recency: self
                                 .tree_heading_agents
-                                .get(&(*host, node.id))
+                                .get(&(*host, node.id.clone()))
                                 .into_iter()
                                 .flatten()
                                 .filter_map(|agent_id| registry.agent_last_active(*agent_id))
@@ -2547,13 +2544,13 @@ impl Dashboard {
                                 .unwrap_or_default(),
                         }
                     }
-                    rho_desk::cells::NodeKind::Agent => {
-                        let Some(agent_id) = node_agent(node) else {
+                    rho_desk::cells::Id::Agent(_) => {
+                        let Some(agent_id) = node.agent() else {
                             continue;
                         };
                         FindCandidate {
                             path: under(
-                                title_of(node.id)
+                                title_of(node.id.clone())
                                     .unwrap_or_else(|| registry.agent_human_name(agent_id)),
                             ),
                             kind: "agent",
@@ -2563,11 +2560,11 @@ impl Dashboard {
                                 .map_or(0, |active| active.0 as i64),
                         }
                     }
-                    rho_desk::cells::NodeKind::Page => {
+                    rho_desk::cells::Id::Page(_) => {
                         let Some(page_id) = node_page(node) else {
                             continue;
                         };
-                        let Some(title) = title_of(node.id) else {
+                        let Some(title) = title_of(node.id.clone()) else {
                             continue;
                         };
                         FindCandidate {
@@ -2598,14 +2595,14 @@ impl Dashboard {
                 source
                     .nodes
                     .iter()
-                    .filter(|node| node.kind == rho_desk::cells::NodeKind::Note)
+                    .filter(|node| node.is_note())
                     .filter_map(|node| {
                         let title =
                             note_title(&source.buffers.get(&node.id)?.read(cx).text()).to_owned();
                         title.to_lowercase().contains(&needle).then(|| {
                             (
                                 title.clone(),
-                                self.breadcrumb_for_node_for_source(node.id, source, cx)
+                                self.breadcrumb_for_node_for_source(node.id.clone(), source, cx)
                                     .unwrap_or(title),
                             )
                         })
@@ -2616,21 +2613,21 @@ impl Dashboard {
 
     fn breadcrumb_for_node_for_source(
         &self,
-        node_id: rho_desk::NodeId,
+        node_id: rho_desk::cells::Id,
         source: &TreeHostSource,
         cx: &App,
     ) -> Option<String> {
         let nodes = source
             .nodes
             .iter()
-            .map(|node| (node.id, node))
+            .map(|node| (node.id.clone(), node))
             .collect::<HashMap<_, _>>();
         let titles = source
             .buffers
             .iter()
-            .map(|(id, buffer)| (*id, note_title(&buffer.read(cx).text()).to_owned()))
+            .map(|(id, buffer)| (id.clone(), note_title(&buffer.read(cx).text()).to_owned()))
             .collect::<HashMap<_, _>>();
-        Some(tree_breadcrumb(node_id, &nodes, &titles))
+        Some(tree_breadcrumb(&node_id, &nodes, &titles))
     }
 
     pub fn jump_to_heading(
@@ -2666,9 +2663,9 @@ impl Dashboard {
 
     pub fn staffing_target_for(
         &self,
-        topic: (HostId, rho_desk::NodeId),
+        topic: (HostId, rho_desk::cells::Id),
         cx: &App,
-    ) -> Result<(HostId, rho_desk::NodeId, String, Option<String>), &'static str> {
+    ) -> Result<(HostId, rho_desk::cells::Id, String, Option<String>), &'static str> {
         let (host, node_id) = topic;
         let source = self.tree_hosts.get(&host).ok_or("Desk host unavailable")?;
         let node = source
@@ -2682,7 +2679,7 @@ impl Dashboard {
             .ok_or("Desk text unavailable")?
             .read(cx)
             .text();
-        let project = node_file_path(&source.nodes, node.id).map(|path| path.to_string());
+        let project = node_file_path(&source.nodes, &node.id).map(|path| path.to_string());
         Ok((host, node_id, text, project))
     }
 
@@ -2700,7 +2697,7 @@ impl Dashboard {
                         .iter()
                         .copied()
                         .find(|id| registry.attention(*id) >= UiAttention::Pending)
-                        .map(|agent| (*topic, agent))
+                        .map(|agent| (topic.clone(), agent))
                 })?;
         self.move_to_tree_node_when_ready(host, node_id);
         Some(agent_id)
@@ -2719,7 +2716,7 @@ impl Dashboard {
             .tree_hosts
             .get(&host)
             .and_then(|source| source.nodes.iter().find(|node| node.id == node_id))
-            .and_then(|node| node.parent)
+            .and_then(|node| node.parent.clone())
         else {
             return false;
         };
@@ -2735,8 +2732,8 @@ impl Dashboard {
                 source
                     .nodes
                     .iter()
-                    .filter(|node| node.kind == rho_desk::cells::NodeKind::Note)
-                    .map(move |node| (*host, node.id))
+                    .filter(|node| node.is_note())
+                    .map(move |node| (*host, node.id.clone()))
             })
             .collect::<HashSet<_>>();
         if headings.is_empty() {
@@ -2755,14 +2752,16 @@ impl Dashboard {
         let Some(key) = self.tree_node_at_cursor(cx) else {
             return false;
         };
-        let has_children = self
-            .tree_hosts
-            .get(&key.0)
-            .is_some_and(|source| source.nodes.iter().any(|node| node.parent == Some(key.1)));
+        let has_children = self.tree_hosts.get(&key.0).is_some_and(|source| {
+            source
+                .nodes
+                .iter()
+                .any(|node| node.parent == Some(key.1.clone()))
+        });
         if !has_children {
             return false;
         }
-        if !self.tree_collapsed.insert(key) {
+        if !self.tree_collapsed.insert(key.clone()) {
             self.tree_collapsed.remove(&key);
         }
         cx.notify();

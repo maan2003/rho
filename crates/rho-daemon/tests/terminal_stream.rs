@@ -58,7 +58,6 @@ async fn terminal_survives_detach_and_echoes() -> anyhow::Result<()> {
                 repo: camino::Utf8PathBuf::from_path_buf(repo_dir.path().to_owned()).unwrap(),
             }),
             content: None,
-            desk_parent: None,
         },
     )
     .await?;

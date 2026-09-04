@@ -451,7 +451,7 @@ mod tests {
             label: format!("needs reply · {priority}"),
             priority,
             host: HostId::default(),
-            topic_node_id: rho_desk::NodeId::default(),
+            topic_node_id: rho_desk::cells::Id::Note(rho_desk::cells::Uuid([0; 16])),
             agent_id: None,
             agent_tag: None,
             breadcrumb: title.to_owned(),
@@ -459,7 +459,7 @@ mod tests {
             kind: DealCardKind::Desk,
             identity: DealCardId {
                 host: HostId::default(),
-                node_id: rho_desk::NodeId::default(),
+                node_id: rho_desk::cells::Id::Note(rho_desk::cells::Uuid([0; 16])),
             },
         }
     }

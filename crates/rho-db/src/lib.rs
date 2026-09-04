@@ -170,6 +170,67 @@ where
     }
 }
 
+/// The name redb recorded for a table's key or value type. A migration
+/// reads rows the old code wrote, and redb checks the name the table was
+/// created with, so the reader has to answer to a name its own types no
+/// longer have.
+pub trait RecordedTypeName {
+    const NAME: &'static str;
+}
+
+/// A [`Sen`] that answers to a recorded name rather than to `T`'s own. It
+/// encodes and decodes exactly as `Sen<T>` does; only the name differs.
+#[derive(Debug)]
+pub struct SenAs<T, N>(std::marker::PhantomData<(T, N)>);
+
+impl<T, N> redb::Value for SenAs<T, N>
+where
+    T: senax_encoder::Encoder + senax_encoder::Decoder + Debug,
+    N: RecordedTypeName + Debug,
+{
+    type SelfType<'a>
+        = SenValue<'a, T>
+    where
+        Self: 'a;
+
+    type AsBytes<'a>
+        = BytesMut
+    where
+        Self: 'a;
+
+    fn fixed_width() -> Option<usize> {
+        None
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
+    where
+        Self: 'a,
+    {
+        <Sen<T> as redb::Value>::from_bytes(data)
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
+    where
+        Self: 'b,
+    {
+        <Sen<T> as redb::Value>::as_bytes(value)
+    }
+
+    fn type_name() -> TypeName {
+        TypeName::new(N::NAME)
+    }
+}
+
+impl<T, N> redb::Key for SenAs<T, N>
+where
+    T: senax_encoder::Encoder + senax_encoder::Decoder + Debug,
+    N: RecordedTypeName + Debug,
+{
+    fn compare(data1: &[u8], data2: &[u8]) -> Ordering {
+        data1.cmp(data2)
+    }
+}
+
 impl RhoDb {
     pub fn open(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref();

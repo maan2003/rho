@@ -689,7 +689,7 @@ impl Workspace {
         let Some(card) = self.dashboard.thread_card_id(&thread_ref(key)) else {
             return;
         };
-        if !self.dashboard.node_is_open(card) {
+        if !self.dashboard.node_is_open(card.clone()) {
             return;
         }
         let thread = self
@@ -867,14 +867,11 @@ impl Workspace {
             }
             SessionEvent::Changed(changes) => {
                 for change in changes {
-                    // A thread that starts to matter becomes a node, and the
-                    // dealer deals the node. The daemon answers with the node
-                    // it already had when the thread was raised before, so a
-                    // reconnect never makes a second one.
+                    // A thread that starts to matter needs nothing written:
+                    // it is addressable as its unit, and the view shows it
+                    // because the mirror says it is open.
                     match change {
-                        Change::Raised(key) | Change::Updated(key) => {
-                            self.bind_slack_thread(key, cx)
-                        }
+                        Change::Raised(_) | Change::Updated(_) => {}
                         // Slack said the thread is not the user's any more.
                         // That is a verdict made in another client, so the
                         // card closes here without asking.
@@ -938,48 +935,6 @@ fn journal_thread_labelled(model: &Model, key: &ThreadKey) -> crate::journal::Sl
 }
 
 impl Workspace {
-    /// Asks the daemon for this thread's node. Nothing is stored here: the
-    /// tree holds the thread, and the daemon's answer is idempotent.
-    pub(crate) fn bind_slack_thread(&mut self, key: &ThreadKey, cx: &mut gpui::Context<Self>) {
-        let Some(host) = self.hosts.primary() else {
-            return;
-        };
-        // A thread already dealt as an open node needs nothing; one that a
-        // verdict quieted is re-bound, and the daemon reopens it.
-        if self
-            .dashboard
-            .thread_card_id(&thread_ref(key))
-            .is_some_and(|card| self.dashboard.node_is_open(card))
-        {
-            return;
-        }
-        let conversation = self.slack.as_ref().map_or_else(String::new, |session| {
-            session.read(cx).model().label(&key.channel)
-        });
-        let request_id = self.next_binding_request_id;
-        self.next_binding_request_id = self.next_binding_request_id.wrapping_add(1);
-        self.pending_bindings.insert(
-            (host, request_id),
-            crate::workspace::PendingBinding::SlackThread {
-                thread: crate::journal::SlackThread {
-                    workspace: key.workspace.0.clone(),
-                    conversation,
-                    thread: key.thread_ts.0.clone(),
-                },
-            },
-        );
-        self.send_to_host(
-            host,
-            rho_ui_proto::ClientMessage::DeskThreadBind {
-                request_id,
-                parent: None,
-                workspace: key.workspace.0.clone(),
-                channel: key.channel.0.clone(),
-                thread_ts: key.thread_ts.0.clone(),
-            },
-        );
-    }
-
     /// What every tracked thread is currently about. The dealer reads this
     /// live from the mirror rather than storing any of it in the tree.
     pub(crate) fn slack_thread_facts(
@@ -1027,7 +982,7 @@ fn cards_before(
     facts: &std::collections::HashMap<ThreadRef, DealerThread>,
     host: Option<crate::registry::HostId>,
     before: f64,
-) -> Vec<rho_desk::NodeId> {
+) -> Vec<rho_desk::cells::Id> {
     cards
         .into_iter()
         .filter(|(card, thread)| {
@@ -1144,10 +1099,7 @@ mod tests {
     #[test]
     fn only_cards_older_than_the_cutoff_are_closed() {
         let host = crate::registry::HostId::default();
-        let node = |counter| rho_desk::NodeId {
-            replica_id: 1,
-            counter,
-        };
+        let node = |counter: u8| rho_desk::cells::Id::Note(rho_desk::cells::Uuid([counter; 16]));
         let card = |node_id| crate::dashboard::DealCardId { host, node_id };
         let cards = vec![
             (card(node(1)), thread_ref_of("100.0")),

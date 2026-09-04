@@ -42,16 +42,59 @@ pub struct Entry {
     senax_encoder::Encode,
     senax_encoder::Decode,
 )]
-pub struct NodeIdentity {
-    pub replica_id: u16,
-    pub counter: u64,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NodeIdentity {
+    Note {
+        uuid: [u8; 16],
+    },
+    Label {
+        uuid: [u8; 16],
+    },
+    Agent {
+        agent: String,
+    },
+    Host {
+        seed: u64,
+    },
+    Page {
+        uuid: [u8; 16],
+    },
+    Slack {
+        workspace: String,
+        channel: String,
+        thread: Option<String>,
+    },
+    PullRequest {
+        repo: String,
+        number: u64,
+    },
+    File {
+        host: u64,
+        path: String,
+    },
 }
 
-impl From<rho_desk::NodeId> for NodeIdentity {
-    fn from(id: rho_desk::NodeId) -> Self {
-        Self {
-            replica_id: id.replica_id,
-            counter: id.counter,
+impl From<rho_desk::cells::Id> for NodeIdentity {
+    fn from(id: rho_desk::cells::Id) -> Self {
+        use rho_desk::cells::Id;
+        match id {
+            Id::Note(uuid) => Self::Note { uuid: uuid.0 },
+            Id::Label(uuid) => Self::Label { uuid: uuid.0 },
+            Id::Agent(agent) => Self::Agent {
+                agent: agent.encoded(),
+            },
+            Id::Host(seed) => Self::Host { seed },
+            Id::Page(page) => Self::Page { uuid: page.0 },
+            Id::Slack(unit) => Self::Slack {
+                workspace: unit.workspace,
+                channel: unit.channel,
+                thread: unit.thread,
+            },
+            Id::PullRequest { repo, number } => Self::PullRequest { repo, number },
+            Id::File { host, path } => Self::File {
+                host,
+                path: path.to_string(),
+            },
         }
     }
 }
@@ -872,10 +915,7 @@ mod tests {
     fn signal_events_round_trip_the_top_card() {
         let card = DealerCardIdentity {
             host: 1,
-            node_id: NodeIdentity {
-                replica_id: 2,
-                counter: 3,
-            },
+            node_id: NodeIdentity::Note { uuid: [3; 16] },
         };
         for event in [
             Event::LampTransition {
@@ -943,10 +983,7 @@ mod tests {
         let event = Event::Dealer {
             card: DealerCardIdentity {
                 host: 1,
-                node_id: NodeIdentity {
-                    replica_id: 2,
-                    counter: 7,
-                },
+                node_id: NodeIdentity::Note { uuid: [7; 16] },
             },
             kind: DealerCardKind::Thread,
             verdict: DealerVerdict::Defer,
@@ -955,10 +992,7 @@ mod tests {
             time_to_verdict_ms: 4200,
             considered_not_dealt: vec![DealerCardIdentity {
                 host: 1,
-                node_id: NodeIdentity {
-                    replica_id: 2,
-                    counter: 9,
-                },
+                node_id: NodeIdentity::Note { uuid: [9; 16] },
             }],
         };
         let encoded = serde_json::to_string(&event).unwrap();

@@ -48,7 +48,7 @@ struct Area {
     path: String,
     kind: &'static str,
     /// `None` files at the root.
-    target: Option<(HostId, rho_desk::NodeId)>,
+    target: Option<(HostId, rho_desk::cells::Id)>,
     recency: i64,
 }
 
@@ -58,7 +58,7 @@ impl Workspace {
     pub(crate) fn context_area(
         &mut self,
         cx: &mut Context<Self>,
-    ) -> Option<(HostId, rho_desk::NodeId)> {
+    ) -> Option<(HostId, rho_desk::cells::Id)> {
         // Home is a window onto the same nodes, so its cursor names an
         // area exactly as the desk's does.
         if self.active_pane().surface.key == crate::pane::SurfaceKey::Home
@@ -81,7 +81,7 @@ impl Workspace {
             crate::pane::SurfaceKey::DeskNode { host, node_id } => {
                 Some(crate::dashboard::DealCardId {
                     host: *host,
-                    node_id: *node_id,
+                    node_id: node_id.clone(),
                 })
             }
             crate::pane::SurfaceKey::Transcript(agent_id)
@@ -101,7 +101,7 @@ impl Workspace {
         Some((card.host, card.node_id))
     }
 
-    fn areas(&self, context: Option<(HostId, rho_desk::NodeId)>, cx: &App) -> Vec<Area> {
+    fn areas(&self, context: Option<(HostId, rho_desk::cells::Id)>, cx: &App) -> Vec<Area> {
         let mut areas = vec![Area {
             path: ROOT_ROW.to_owned(),
             kind: "root",
@@ -112,7 +112,7 @@ impl Workspace {
         for (path, kind, host, node_id) in
             self.dashboard.area_candidates(&self.registry, &threads, cx)
         {
-            let recency = if context == Some((host, node_id)) {
+            let recency = if context == Some((host, node_id.clone())) {
                 CONTEXT_RECENCY
             } else {
                 0
@@ -130,8 +130,9 @@ impl Workspace {
     /// `n a`, `n p`, `n n`: ask for the area, then make the thing.
     pub(crate) fn begin_new(&mut self, kind: NewKind, window: &mut Window, cx: &mut Context<Self>) {
         let context = self.context_area(cx);
+        let submit_context = context.clone();
         let complete = Rc::new(move |workspace: &Workspace, input: &str, cx: &App| {
-            let areas = workspace.areas(context, cx);
+            let areas = workspace.areas(context.clone(), cx);
             let paths = areas
                 .iter()
                 .map(|area| (area.path.clone(), area.recency))
@@ -151,7 +152,7 @@ impl Workspace {
                   input: String,
                   window: &mut Window,
                   cx: &mut Context<Workspace>| {
-                workspace.new_in_area(kind, context, &input, window, cx);
+                workspace.new_in_area(kind, submit_context.clone(), &input, window, cx);
             },
         );
         self.open_prompt(kind.prompt(), complete, on_submit, window, cx);
@@ -167,7 +168,7 @@ impl Workspace {
     fn new_in_area(
         &mut self,
         kind: NewKind,
-        context: Option<(HostId, rho_desk::NodeId)>,
+        context: Option<(HostId, rho_desk::cells::Id)>,
         input: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -191,7 +192,7 @@ impl Workspace {
             );
             return;
         };
-        let area = areas[index].target;
+        let area = areas[index].target.clone();
         match kind {
             NewKind::Agent => self.new_agent_in_area(area, window, cx),
             NewKind::Page => self.prompt_new_page(area, window, cx),
@@ -201,7 +202,7 @@ impl Workspace {
 
     fn prompt_new_page(
         &mut self,
-        area: Option<(HostId, rho_desk::NodeId)>,
+        area: Option<(HostId, rho_desk::cells::Id)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -219,7 +220,7 @@ impl Workspace {
                 } else {
                     format!("https://{input}")
                 };
-                workspace.create_browser_page(url, area, window, cx);
+                workspace.create_browser_page(url, area.clone(), window, cx);
             },
         );
         self.open_prompt(
@@ -233,11 +234,15 @@ impl Workspace {
 
     fn new_note_in_area(
         &mut self,
-        area: Option<(HostId, rho_desk::NodeId)>,
+        area: Option<(HostId, rho_desk::cells::Id)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(host) = area.map(|(host, _)| host).or_else(|| self.hosts.primary()) else {
+        let Some(host) = area
+            .as_ref()
+            .map(|(host, _)| *host)
+            .or_else(|| self.hosts.primary())
+        else {
             self.notice_on(
                 None,
                 "new note: no daemon is connected",
@@ -248,16 +253,16 @@ impl Workspace {
         };
         let Some((created, writes)) = self
             .desk_cells
-            .create_note_writes(host, area.map(|(_, node_id)| node_id))
+            .create_note_writes(host, area.as_ref().map(|(_, node_id)| node_id.clone()))
         else {
             return;
         };
-        let undo = self.desk_cells.delete_writes(created);
+        let undo = self.desk_cells.delete_writes(created.clone());
         let Some(stamp) = self.apply_desk_writes(host, writes, None, window, cx) else {
             return;
         };
         crate::journal::record(crate::journal::Event::Created {
-            node_id: created.into(),
+            node_id: created.clone().into(),
             kind: crate::journal::CreatedKind::Note,
             method: crate::journal::CreateMethod::New,
             at_root: area.is_none(),

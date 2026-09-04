@@ -421,9 +421,10 @@ impl Workspace {
                 node_id,
                 first_attention,
                 ..
-            }) => match first_attention
-                .or_else(|| self.dashboard.first_tree_agent_for_topic((host, node_id)))
-            {
+            }) => match first_attention.or_else(|| {
+                self.dashboard
+                    .first_tree_agent_for_topic((host, node_id.clone()))
+            }) {
                 Some(agent_id) => self.open_agent(agent_id, window, cx),
                 None => {
                     self.dashboard.move_to_tree_node_when_ready(host, node_id);

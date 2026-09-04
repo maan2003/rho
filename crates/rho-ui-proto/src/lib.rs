@@ -40,7 +40,7 @@ pub const MAX_GUI_TELEMETRY_BYTES: usize = 8 * 1024 * 1024;
 /// ALPN identifying this protocol on iroh connections to the daemon.
 pub const IROH_ALPN: &[u8] = b"rho/ui/7";
 #[cfg(not(target_family = "wasm"))]
-const PROTOCOL_LOG_MAGIC: &[u8; 4] = b"RUP6";
+const PROTOCOL_LOG_MAGIC: &[u8; 4] = b"RUP7";
 
 #[cfg(not(target_family = "wasm"))]
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -135,8 +135,9 @@ pub enum ClientMessage {
     DeskMutationApply {
         mutation: desk_tree::cells::CellMutation,
     },
+    /// An edit to a note's body, which is the only text the store holds.
     DeskTextApply {
-        node_id: desk_tree::NodeId,
+        id: desk_tree::cells::Id,
         operation: desk_tree::TextOperation,
         transaction: Option<desk_tree::TextTransaction>,
     },
@@ -155,36 +156,12 @@ pub enum ClientMessage {
     DeskTreeBatchApply {
         batch: desk_tree::OperationBatch,
     },
-    DeskPageBind {
-        request_id: u64,
-        /// `None` files the page at the root.
-        parent: Option<desk_tree::NodeId>,
-        page_id: desk_tree::PageId,
-        url: String,
-    },
-    /// Create the `thread` node for a Slack thread that has started to matter.
-    /// Idempotent: a second bind of the same thread reuses its node.
-    DeskThreadBind {
-        request_id: u64,
-        /// `None` files the thread at the root.
-        parent: Option<desk_tree::NodeId>,
-        workspace: String,
-        channel: String,
-        thread_ts: String,
-    },
-    DeskPageUnbind {
-        request_id: u64,
-        node_id: desk_tree::NodeId,
-    },
     NewAgent {
         role: AgentRole,
         /// Where the agent's working copy starts (including which repo, for
         /// the modes that need one).
         start: StartMode,
         content: Option<Vec<ContentPart>>,
-        /// User heading under which the daemon creates the agent's
-        /// machine-owned Desk row.
-        desk_parent: Option<desk_tree::NodeId>,
     },
     SubscribeAgent {
         agent_id: AgentId,
@@ -621,7 +598,7 @@ pub enum ServerMessage {
     DeskSynced {
         node_namespace: u16,
         delta: desk_tree::cells::Snapshot,
-        texts: Vec<desk_tree::NodeTextSnapshot>,
+        bodies: Vec<desk_tree::cells::BodySnapshot>,
     },
     DeskMutationAccepted {
         stamp: desk_tree::cells::Stamp,
@@ -634,7 +611,7 @@ pub enum ServerMessage {
         frontier: desk_tree::cells::Version,
     },
     DeskTextApplied {
-        node_id: desk_tree::NodeId,
+        id: desk_tree::cells::Id,
         operation: desk_tree::TextOperation,
         transaction: Option<desk_tree::TextTransaction>,
     },
@@ -657,13 +634,6 @@ pub enum ServerMessage {
         retryable: bool,
         reason: String,
         snapshot: desk_tree::Snapshot,
-    },
-    /// Result of `DeskPageBind`, `DeskPageUnbind`, or `DeskThreadBind`.
-    DeskBindingResult {
-        request_id: u64,
-        /// The bound node, when the request created or found one.
-        node_id: Option<desk_tree::NodeId>,
-        error: Option<String>,
     },
     /// The daemon's broadcast receiver lagged; request a new tree snapshot.
     DeskTreeResyncRequired,
@@ -1359,28 +1329,29 @@ mod tests {
 
     #[test]
     fn protocol_log_rejects_previous_wire_epoch() {
-        let mut old = &b"RUP5"[..];
+        let mut old = &b"RUP6"[..];
         assert!(read_protocol_log_record(&mut old).is_err());
     }
 
     #[test]
     fn desk_cells_messages_round_trip() {
-        use desk_tree::cells::{CellMutation, CellWrite, DeviceId, Field, Stamp, Value, Version};
+        use desk_tree::cells::{
+            CellMutation, CellWrite, DeviceId, Id, Relation, Stamp, Uuid, Version,
+        };
 
         let device = DeviceId([7; 16]);
-        let node = desk_tree::NodeId {
-            replica_id: 4,
-            counter: 9,
-        };
+        let id = Id::Note(Uuid([9; 16]));
         let mutation = CellMutation {
             stamp: Stamp {
                 device,
                 version: 12,
             },
             writes: vec![CellWrite {
-                node,
-                field: Field::Tag("next".into()),
-                value: Value::Bool(true),
+                id: id.clone(),
+                relation: Relation::Labeled {
+                    label: Id::Label(Uuid([3; 16])),
+                    present: true,
+                },
             }],
             verdict: None,
         };
@@ -1400,7 +1371,7 @@ mod tests {
             },
             ClientMessage::DeskMutationApply { mutation },
             ClientMessage::DeskTextApply {
-                node_id: node,
+                id: id.clone(),
                 operation: text_operation.clone(),
                 transaction: None,
             },
@@ -1413,7 +1384,7 @@ mod tests {
         let message = ServerMessage::DeskSynced {
             node_namespace: 4,
             delta: desk_tree::cells::Snapshot::default(),
-            texts: Vec::new(),
+            bodies: Vec::new(),
         };
         let bytes = senax_encoder::pack(&message).unwrap();
         let mut slice: &[u8] = &bytes;
@@ -1421,7 +1392,7 @@ mod tests {
         assert_eq!(decoded, message);
 
         let message = ServerMessage::DeskTextApplied {
-            node_id: node,
+            id,
             operation: text_operation,
             transaction: None,
         };

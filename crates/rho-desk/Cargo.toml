@@ -12,9 +12,9 @@ bytes.workspace = true
 camino.workspace = true
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 clock.workspace = true
+rand.workspace = true
 rho-core.workspace = true
 senax-encoder.workspace = true
 text.workspace = true
 
 [dev-dependencies]
-rand.workspace = true

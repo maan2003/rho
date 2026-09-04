@@ -53,7 +53,7 @@ pub(crate) enum FindTarget {
     /// `enter` on the dashboard row does.
     Topic {
         host: HostId,
-        node_id: rho_desk::NodeId,
+        node_id: rho_desk::cells::Id,
     },
     Slack(rho_slack::session::Source),
 }
@@ -305,7 +305,7 @@ impl Workspace {
             // note: the staffed-heading shortcut belonged to the desk,
             // where a heading had nowhere else to go.
             FindTarget::Topic { host, node_id } => {
-                if !self.open_note(host, node_id, window, cx) {
+                if !self.open_note(host, node_id.clone(), window, cx) {
                     self.dashboard.move_to_tree_node_when_ready(host, node_id);
                     self.open_overview(window, cx);
                 }

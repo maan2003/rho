@@ -146,24 +146,13 @@ impl DealView {
     #[cfg(test)]
     fn identity(&self) -> crate::dashboard::DealCardId {
         match self {
-            Self::Desk { identity, .. } | Self::Surface { identity, .. } => *identity,
+            Self::Desk { identity, .. } | Self::Surface { identity, .. } => identity.clone(),
         }
     }
 }
 
 /// A bind request waiting for the daemon's answer, and what the journal
 /// should say when it comes back.
-pub(crate) enum PendingBinding {
-    Created {
-        kind: crate::journal::CreatedKind,
-        method: crate::journal::CreateMethod,
-        at_root: bool,
-    },
-    SlackThread {
-        thread: crate::journal::SlackThread,
-    },
-}
-
 struct PendingGitApproval {
     request_id: u64,
     prompt: String,
@@ -408,7 +397,7 @@ enum VerdictUndoState {
         card: crate::dashboard::DealCard,
         verdict: crate::dashboard::DealerVerdict,
         host: HostId,
-        node: rho_desk::NodeId,
+        node: rho_desk::cells::Id,
         at: rho_desk::cells::Stamp,
     },
     /// The done verdicts one `mark read before` wrote. It closed a backlog
@@ -416,7 +405,7 @@ enum VerdictUndoState {
     /// node it touched, not the last of them.
     MarkedReadBefore {
         host: HostId,
-        nodes: Vec<(rho_desk::NodeId, rho_desk::cells::Stamp)>,
+        nodes: Vec<(rho_desk::cells::Id, rho_desk::cells::Stamp)>,
     },
 }
 
@@ -477,13 +466,17 @@ pub struct Workspace {
     /// transient edits these; the writable dashboard row owns the message.
     /// Where `n a` files the agent the draft page is composing. `None`
     /// is the root, which is also what an ordinary draft sends.
-    draft_area: Option<(HostId, rho_desk::NodeId)>,
+    draft_area: Option<(HostId, rho_desk::cells::Id)>,
     /// A NewAgent request from the draft is in flight; the draft buffer is
     /// kept intact until the daemon confirms creation, so a rejected request
     /// (bad working directory, say) never loses the message.
     /// Which host the pending draft agent was sent to, so its confirmation
     /// can be recognized and the compose surface reset.
     awaiting_draft_agent: Option<HostId>,
+    /// The area the next agent this client asks for is filed under. The
+    /// daemon never writes it: the agent exists because the registry says
+    /// so, and where it is shown is the user's own fact.
+    pending_agent_filing: Option<(HostId, rho_desk::cells::Id)>,
     /// Hosts that have delivered at least one `Ready`. A host attaches
     /// blind; until it answers, its agents do not exist for this client.
     ready_hosts: HashSet<HostId>,
@@ -545,24 +538,24 @@ pub struct Workspace {
     pub(crate) desk_cells: DeskCells,
     /// One note surface per node the reader has opened, kept so the body's
     /// cursor and scroll survive leaving and coming back.
-    note_views: HashMap<(HostId, rho_desk::NodeId), crate::note_view::NoteView>,
+    note_views: HashMap<(HostId, rho_desk::cells::Id), crate::note_view::NoteView>,
     /// Set by `InputHandled` and consumed by the following buffer edit. The
     /// editor announces input before mutating its buffer, while heading
     /// recognition must run immediately after that mutation so subsequent
     /// typing lands in the newly-created node buffer.
-    pending_heading_recognition: Option<(HostId, rho_desk::NodeId, usize)>,
+    pending_heading_recognition: Option<(HostId, rho_desk::cells::Id, usize)>,
     pending_heading_undo: Option<clock::Lamport>,
     pending_tree_verdicts: BTreeMap<(HostId, rho_desk::cells::Stamp), PendingTreeVerdict>,
     pending_tree_undos: BTreeMap<(HostId, rho_desk::cells::Stamp), PendingTreeUndo>,
     /// Text a paste owes its new notes, held until the daemon accepts the
     /// creation those notes came from.
     pub(crate) pending_desk_texts:
-        BTreeMap<(HostId, rho_desk::cells::Stamp), Vec<(rho_desk::NodeId, String)>>,
+        BTreeMap<(HostId, rho_desk::cells::Stamp), Vec<(rho_desk::cells::Id, String)>>,
     verdict_undo: Vec<VerdictUndo>,
     next_verdict_undo_sequence: u64,
     desk_semantic_clipboard: Option<crate::desk_view::DeskCapture>,
     /// One-shot recovery for `p` while Vim still holds the removed excerpt.
-    desk_semantic_paste_target: Option<(HostId, rho_desk::NodeId)>,
+    desk_semantic_paste_target: Option<(HostId, rho_desk::cells::Id)>,
     desk_semantic_undo: BTreeMap<clock::Lamport, DeskSemanticUndo>,
     pending_semantic_batches: BTreeMap<(HostId, rho_desk::cells::Stamp), clock::Lamport>,
     pub(crate) pending_semantic_group: Option<clock::Lamport>,
@@ -596,11 +589,8 @@ pub struct Workspace {
     /// One per open conversation surface, for what a conversation asks the
     /// frame to show: a picture full-window, so far.
     pub(crate) _slack_view_subscriptions: Vec<gpui::Subscription>,
-    pending_filing_destinations: Vec<(String, String, HostId, rho_desk::NodeId)>,
-    pending_filing_selected: Option<(HostId, rho_desk::NodeId)>,
-    pub(crate) next_binding_request_id: u64,
-    /// Bind requests in flight, so their answer can be journalled.
-    pub(crate) pending_bindings: BTreeMap<(HostId, u64), PendingBinding>,
+    pending_filing_destinations: Vec<(String, String, HostId, rho_desk::cells::Id)>,
+    pending_filing_selected: Option<(HostId, rho_desk::cells::Id)>,
     scroll_journal_task: Option<Task<()>>,
     /// The completing-read strip at the bottom of the window, when open.
     pub(crate) minibuffer: Option<Minibuffer>,
@@ -1073,6 +1063,7 @@ impl Workspace {
             workdirs: Vec::new(),
             draft_area: None,
             awaiting_draft_agent: None,
+            pending_agent_filing: None,
             ready_hosts: HashSet::new(),
             replay_hosts: HashSet::new(),
             quota_summaries: HashMap::new(),
@@ -1138,8 +1129,6 @@ impl Workspace {
             _slack_view_subscriptions: Vec::new(),
             pending_filing_destinations: Vec::new(),
             pending_filing_selected: None,
-            next_binding_request_id: 1,
-            pending_bindings: BTreeMap::new(),
             scroll_journal_task: None,
             minibuffer: None,
             transient: None,
@@ -1769,7 +1758,7 @@ impl Workspace {
     ) -> crate::journal::DealerCardIdentity {
         crate::journal::DealerCardIdentity {
             host: identity.host.0,
-            node_id: identity.node_id.into(),
+            node_id: identity.node_id.clone().into(),
         }
     }
 
@@ -1803,10 +1792,10 @@ impl Workspace {
             }
             match &self.active_pane().surface.key {
                 SurfaceKey::Transcript(agent_id) => {
-                    Some(card.identity) != self.dashboard.agent_card_id(*agent_id)
+                    Some(card.identity.clone()) != self.dashboard.agent_card_id(*agent_id)
                 }
                 SurfaceKey::Browser(page) => {
-                    Some(card.identity) != self.dashboard.page_card_id(*page)
+                    Some(card.identity.clone()) != self.dashboard.page_card_id(*page)
                 }
                 _ => true,
             }
@@ -2078,11 +2067,11 @@ impl Workspace {
             ConnEvent::DeskSynced {
                 node_namespace,
                 delta,
-                texts,
+                bodies,
             } => {
                 if let Some(again) = self
                     .desk_cells
-                    .synced(host, node_namespace, delta, texts, cx)
+                    .synced(host, node_namespace, delta, bodies, cx)
                 {
                     self.send_to_host(host, again);
                 }
@@ -2109,16 +2098,9 @@ impl Workspace {
                 self.sync_tree_dashboard(host, window, cx);
                 self.notice_on(None, &format!("desk: {reason}"), StyleClass::SystemInfo, cx);
             }
-            ConnEvent::DeskTextApplied { node_id, operation } => {
-                self.desk_cells.text_applied(host, node_id, operation, cx);
+            ConnEvent::DeskTextApplied { id, operation } => {
+                self.desk_cells.text_applied(host, id, operation, cx);
                 self.sync_tree_dashboard(host, window, cx);
-            }
-            ConnEvent::DeskBindingResult {
-                request_id,
-                node_id,
-                error,
-            } => {
-                self.complete_binding(host, request_id, node_id, error, window, cx);
             }
             ConnEvent::Ready {
                 agents,
@@ -2188,6 +2170,15 @@ impl Workspace {
             }
             ConnEvent::AgentCreated { agent_id } => {
                 self.note_agent_created(host, agent_id);
+                if let Some((filing_host, parent)) = self.pending_agent_filing.take()
+                    && filing_host == host
+                {
+                    let writes = vec![rho_desk::cells::CellWrite {
+                        id: rho_desk::cells::Id::Agent(agent_id),
+                        relation: rho_desk::cells::Relation::Parent(Some(parent)),
+                    }];
+                    self.apply_desk_writes(host, writes, None, window, cx);
+                }
                 if self.awaiting_draft_agent == Some(host) {
                     self.awaiting_draft_agent = None;
                     self.subscribe_agent(agent_id, cx);
@@ -3010,17 +3001,16 @@ impl Workspace {
         self.awaiting_draft_agent = Some(host);
         // `n a` chose an area, and that is where the agent is filed; an
         // ordinary draft has none and starts at the root.
-        let desk_parent = self
+        self.pending_agent_filing = self
             .draft_area
             .take()
-            .and_then(|(area_host, node_id)| (area_host == host).then_some(node_id));
+            .and_then(|(area_host, node_id)| (area_host == host).then_some((host, node_id)));
         self.hosts.send(
             host,
             ClientMessage::NewAgent {
                 role,
                 start,
                 content: Some(content),
-                desk_parent,
             },
         );
     }
@@ -3492,9 +3482,8 @@ impl Workspace {
                 rho_desk::cells::State::Done
             };
             let writes = vec![rho_desk::cells::CellWrite {
-                node: node_id,
-                field: rho_desk::cells::Field::State,
-                value: rho_desk::cells::Value::State(state),
+                id: node_id,
+                relation: rho_desk::cells::Relation::State(state),
             }];
             self.apply_desk_writes(host, writes, None, window, cx);
             return;
@@ -3743,7 +3732,7 @@ impl Workspace {
     pub(crate) fn create_browser_page(
         &mut self,
         url: String,
-        parent: Option<(HostId, rho_desk::NodeId)>,
+        parent: Option<(HostId, rho_desk::cells::Id)>,
         window: &Window,
         cx: &mut Context<Self>,
     ) {
@@ -3762,11 +3751,11 @@ impl Workspace {
                     }
                 };
                 let id = record.id;
-                this.bind_page_node(
+                this.file_page(
                     id,
-                    record.launch_url,
                     parent,
                     crate::journal::CreateMethod::TabBirth,
+                    window,
                     cx,
                 );
                 this.preview_browser_page(id, window, cx);
@@ -3776,18 +3765,20 @@ impl Workspace {
         .detach();
     }
 
-    /// Asks the daemon for the page's node. The node id comes back on
-    /// `DeskBindingResult`, which is where the journal entry is written.
-    pub(crate) fn bind_page_node(
+    /// Files a page the user just opened. A page is not created here: it
+    /// exists because the browser opened it, and the store only hears where
+    /// the user put it.
+    pub(crate) fn file_page(
         &mut self,
         page: rho_browser::PageId,
-        url: String,
-        parent: Option<(HostId, rho_desk::NodeId)>,
+        parent: Option<(HostId, rho_desk::cells::Id)>,
         method: crate::journal::CreateMethod,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(host) = parent
-            .map(|(host, _)| host)
+            .as_ref()
+            .map(|(host, _)| *host)
             .or_else(|| self.hosts.primary())
         else {
             self.notice_on(
@@ -3798,69 +3789,30 @@ impl Workspace {
             );
             return;
         };
-        let request_id = self.next_binding_request_id;
-        self.next_binding_request_id = self.next_binding_request_id.wrapping_add(1);
-        self.pending_bindings.insert(
-            (host, request_id),
-            PendingBinding::Created {
-                kind: crate::journal::CreatedKind::Page,
-                method,
-                at_root: parent.is_none(),
+        let id = rho_desk::cells::Id::Page(rho_desk::PageId(*page.0.as_bytes()));
+        let at_root = parent.is_none();
+        let writes = vec![
+            rho_desk::cells::CellWrite {
+                id: id.clone(),
+                relation: rho_desk::cells::Relation::Parent(parent.map(|(_, parent)| parent)),
             },
-        );
-        self.send_to_host(
-            host,
-            ClientMessage::DeskPageBind {
-                request_id,
-                parent: parent.map(|(_, node_id)| node_id),
-                page_id: rho_desk::PageId(*page.0.as_bytes()),
-                url,
+            rho_desk::cells::CellWrite {
+                id: id.clone(),
+                relation: rho_desk::cells::Relation::CreatedAt(crate::desk_view::now_timestamp()),
             },
-        );
-    }
-
-    /// A bind request came back. Threads are bound by the machine and are
-    /// silent; a page the user asked for is journalled and echoed.
-    fn complete_binding(
-        &mut self,
-        host: HostId,
-        request_id: u64,
-        node_id: Option<rho_desk::NodeId>,
-        error: Option<String>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let pending = self.pending_bindings.remove(&(host, request_id));
-        if let Some(reason) = error {
-            if pending.is_some() {
-                self.notice_on(None, &format!("new: {reason}"), StyleClass::SystemInfo, cx);
-            } else {
-                tracing::warn!(%reason, "desk binding rejected");
-            }
+        ];
+        if self
+            .apply_desk_writes(host, writes, None, window, cx)
+            .is_none()
+        {
             return;
         }
-        let Some(node_id) = node_id else {
-            return;
-        };
-        match pending {
-            Some(PendingBinding::Created {
-                kind,
-                method,
-                at_root,
-            }) => crate::journal::record(crate::journal::Event::Created {
-                node_id: node_id.into(),
-                kind,
-                method,
-                at_root,
-            }),
-            Some(PendingBinding::SlackThread { thread }) => {
-                crate::journal::record(crate::journal::Event::SlackThreadBound {
-                    thread,
-                    node_id: node_id.into(),
-                })
-            }
-            None => {}
-        }
+        crate::journal::record(crate::journal::Event::Created {
+            node_id: id.into(),
+            kind: crate::journal::CreatedKind::Page,
+            method,
+            at_root,
+        });
         self.invalidate_dealer_signals(cx);
         self.refresh_dashboard(window, cx);
     }
@@ -4850,7 +4802,7 @@ impl Workspace {
     pub(crate) fn desk_cells_snapshot_for_test(
         &self,
         host: HostId,
-    ) -> Vec<rho_desk::cells::MaterializedNode> {
+    ) -> Vec<crate::desk_view::DeskNode> {
         self.desk_cells
             .tree_source(host)
             .map(|(nodes, _)| nodes)
@@ -5245,7 +5197,7 @@ impl Workspace {
             SurfaceKey::Messages => SurfaceIdentity::Messages,
             SurfaceKey::DeskNode { host, node_id } => SurfaceIdentity::DeskNode {
                 host: host.0,
-                node_id: (*node_id).into(),
+                node_id: node_id.clone().into(),
             },
             SurfaceKey::Transcript(agent_id) => SurfaceIdentity::Transcript {
                 agent_id: agent_id.into(),
@@ -5848,7 +5800,7 @@ impl Workspace {
     pub(crate) fn tree_cursor_for_test(
         &self,
         cx: &mut Context<Self>,
-    ) -> Option<(HostId, rho_desk::NodeId, usize)> {
+    ) -> Option<(HostId, rho_desk::cells::Id, usize)> {
         self.dashboard.tree_node_cursor_offset(cx)
     }
 
@@ -5856,9 +5808,9 @@ impl Workspace {
     pub(crate) fn tree_buffer_for_test(
         &self,
         host: HostId,
-        node_id: rho_desk::NodeId,
+        node_id: rho_desk::cells::Id,
     ) -> Option<Entity<language::Buffer>> {
-        self.desk_cells.buffer(host, node_id).cloned()
+        self.desk_cells.buffer(host, &node_id).cloned()
     }
 
     #[cfg(test)]
@@ -5866,19 +5818,14 @@ impl Workspace {
         &self,
         host: HostId,
         cx: &App,
-    ) -> Vec<(
-        rho_desk::NodeId,
-        rho_desk::cells::NodeKind,
-        Option<rho_desk::NodeId>,
-        String,
-    )> {
+    ) -> Vec<(rho_desk::cells::Id, Option<rho_desk::cells::Id>, String)> {
         self.desk_cells
             .tree_source(host)
             .into_iter()
             .flat_map(|(nodes, buffers)| {
                 nodes.into_iter().filter_map(move |node| {
                     let text = buffers.get(&node.id)?.read(cx).text();
-                    Some((node.id, node.kind, node.parent, text))
+                    Some((node.id, node.parent, text))
                 })
             })
             .collect()
@@ -5888,13 +5835,18 @@ impl Workspace {
     pub(crate) fn focus_tree_node_for_test(
         &mut self,
         host: HostId,
-        node_id: rho_desk::NodeId,
+        node_id: rho_desk::cells::Id,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.dashboard.move_to_tree_node_when_ready(host, node_id);
         self.refresh_dashboard(window, cx);
         window.focus(&self.dashboard.focus_handle(cx), cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_agent_filing_for_test(&self) -> Option<(HostId, rho_desk::cells::Id)> {
+        self.pending_agent_filing.clone()
     }
 
     #[cfg(test)]
@@ -5913,8 +5865,8 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn draft_area_for_test(&self) -> Option<(HostId, rho_desk::NodeId)> {
-        self.draft_area
+    pub(crate) fn draft_area_for_test(&self) -> Option<(HostId, rho_desk::cells::Id)> {
+        self.draft_area.clone()
     }
 
     #[cfg(test)]
@@ -5985,8 +5937,8 @@ impl Workspace {
     pub(crate) fn note_children_for_test(
         &self,
         host: HostId,
-        node_id: rho_desk::NodeId,
-    ) -> Vec<rho_desk::NodeId> {
+        node_id: rho_desk::cells::Id,
+    ) -> Vec<rho_desk::cells::Id> {
         self.note_views
             .get(&(host, node_id))
             .map(|view| view.children())
@@ -6175,7 +6127,7 @@ impl Workspace {
             crate::dashboard::DealCardKind::Agent if card.agent_id.is_some() => {}
             _ => return None,
         }
-        Some((card.identity, card.kind))
+        Some((card.identity.clone(), card.kind))
     }
 
     #[cfg(test)]
@@ -6256,11 +6208,56 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.refresh_desk_sources(host, cx);
         if let Some((nodes, buffers)) = self.desk_cells.tree_source(host) {
             self.dashboard.set_tree_source(host, nodes, buffers, cx);
             self.refresh_dashboard(window, cx);
             self.sync_note_views(host, cx);
         }
+    }
+
+    /// What the sources say right now, handed to the store's views. None
+    /// of it is written: an agent's spawner is the registry's fact and a
+    /// thread's conversation is the mirror's, and a copy could only go
+    /// stale.
+    fn refresh_desk_sources(&mut self, host: HostId, cx: &Context<Self>) {
+        let agents = self
+            .registry
+            .known_agents()
+            .copied()
+            .filter(|agent| self.registry.host_of_agent(*agent) == Some(host))
+            .filter(|agent| !self.registry.agent_hidden(*agent))
+            .map(|agent| crate::desk_view::AgentSource {
+                agent,
+                spawned_by: self.registry.agent_parent(agent),
+                workdir: self.registry.working_directory(agent),
+                open: self.registry.attention(agent) >= rho_ui_proto::UiAttention::Pending,
+            })
+            .collect::<Vec<_>>();
+        // The Slack mirror lives on this client, and its conversations are
+        // the primary host's desk.
+        let slack = if self.hosts.primary() == Some(host) {
+            self.slack_thread_facts(cx)
+                .into_iter()
+                .map(|(thread, facts)| crate::desk_view::SlackSource {
+                    unit: rho_desk::cells::SlackUnit {
+                        workspace: thread.workspace,
+                        channel: thread.channel,
+                        thread: Some(thread.thread_ts),
+                    },
+                    title: facts.title,
+                    open: true,
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let sources = crate::desk_view::Sources {
+            host: self.registry.host_machine_seed(host),
+            agents,
+            slack,
+        };
+        self.desk_cells.set_sources(host, sources);
     }
 
     /// Rebuilds every open note surface against the tree, so a child
@@ -6278,7 +6275,7 @@ impl Workspace {
             .iter()
             .map(|(id, buffer)| {
                 (
-                    *id,
+                    id.clone(),
                     crate::dashboard::note_title(&buffer.read(cx).text()).to_owned(),
                 )
             })
@@ -6299,23 +6296,23 @@ impl Workspace {
     fn note_view_for(
         &mut self,
         host: HostId,
-        node_id: rho_desk::NodeId,
+        node_id: rho_desk::cells::Id,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<&crate::note_view::NoteView> {
-        let body = self.desk_cells.buffer(host, node_id)?.clone();
+        let body = self.desk_cells.buffer(host, &node_id)?.clone();
         // A resync can hand out a fresh buffer for the same node; the old
         // surface is then over text nothing writes to any more.
         if self
             .note_views
-            .get(&(host, node_id))
+            .get(&(host, node_id.clone()))
             .is_some_and(|view| view.body() != &body)
         {
-            self.note_views.remove(&(host, node_id));
+            self.note_views.remove(&(host, node_id.clone()));
         }
-        if !self.note_views.contains_key(&(host, node_id)) {
-            let view = crate::note_view::NoteView::new(host, node_id, body, window, cx);
-            self.note_views.insert((host, node_id), view);
+        if !self.note_views.contains_key(&(host, node_id.clone())) {
+            let view = crate::note_view::NoteView::new(host, node_id.clone(), body, window, cx);
+            self.note_views.insert((host, node_id.clone()), view);
         }
         self.sync_note_views(host, cx);
         self.note_views.get(&(host, node_id))
@@ -6326,11 +6323,14 @@ impl Workspace {
     pub(crate) fn open_tree_node(
         &mut self,
         host: HostId,
-        node_id: rho_desk::NodeId,
+        node_id: rho_desk::cells::Id,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let card = crate::dashboard::DealCardId { host, node_id };
+        let card = crate::dashboard::DealCardId {
+            host,
+            node_id: node_id.clone(),
+        };
         match self.dashboard.card_target(card) {
             crate::dashboard::CardTarget::Agent(agent_id) => {
                 self.open_agent(agent_id, window, cx);
@@ -6358,11 +6358,14 @@ impl Workspace {
     pub(crate) fn open_note(
         &mut self,
         host: HostId,
-        node_id: rho_desk::NodeId,
+        node_id: rho_desk::cells::Id,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if self.note_view_for(host, node_id, window, cx).is_none() {
+        if self
+            .note_view_for(host, node_id.clone(), window, cx)
+            .is_none()
+        {
             return false;
         }
         let surface = self.make_surface(SurfaceKey::DeskNode { host, node_id }, window, cx);
@@ -6386,8 +6389,8 @@ impl Workspace {
         };
         if self
             .desk_cells
-            .node(host, node_id)
-            .is_some_and(|node| node.kind == rho_desk::cells::NodeKind::Note)
+            .node(host, &node_id)
+            .is_some_and(|node| node.is_note())
         {
             self.open_note(host, node_id, window, cx);
             return;
@@ -6397,9 +6400,7 @@ impl Workspace {
             .tree_source(host)
             .into_iter()
             .flat_map(|(nodes, _)| nodes)
-            .find(|node| {
-                node.parent == Some(node_id) && node.kind == rho_desk::cells::NodeKind::Note
-            })
+            .find(|node| node.parent == Some(node_id.clone()) && node.is_note())
             .map(|node| node.id);
         if let Some(existing) = existing {
             self.open_note(host, existing, window, cx);
@@ -6439,9 +6440,9 @@ impl Workspace {
 
     /// The node the current surface is about: the thing a note would be
     /// filed under. Every kind that has a row in the tree answers.
-    fn surface_node(&self) -> Option<(HostId, rho_desk::NodeId)> {
+    fn surface_node(&self) -> Option<(HostId, rho_desk::cells::Id)> {
         let card = match &self.active_pane().surface.key {
-            SurfaceKey::DeskNode { host, node_id } => return Some((*host, *node_id)),
+            SurfaceKey::DeskNode { host, node_id } => return Some((*host, node_id.clone())),
             SurfaceKey::Transcript(agent_id)
             | SurfaceKey::Shell(agent_id)
             | SurfaceKey::Diff { agent_id }
@@ -6471,7 +6472,7 @@ impl Workspace {
     pub(crate) fn send_desk_text(
         &mut self,
         host: HostId,
-        node_id: rho_desk::NodeId,
+        id: rho_desk::cells::Id,
         operation: rho_desk::TextOperation,
         transaction: rho_desk::TextTransaction,
         _cx: &mut Context<Self>,
@@ -6479,7 +6480,7 @@ impl Workspace {
         self.send_to_host(
             host,
             ClientMessage::DeskTextApply {
-                node_id,
+                id,
                 operation,
                 transaction: Some(transaction),
             },
@@ -6492,7 +6493,7 @@ impl Workspace {
         &mut self,
         host: HostId,
         writes: Vec<rho_desk::cells::CellWrite>,
-        verdict: Option<(rho_desk::NodeId, rho_desk::cells::VerdictEvent)>,
+        verdict: Option<(rho_desk::cells::Id, rho_desk::cells::VerdictEvent)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<rho_desk::cells::Stamp> {
@@ -6526,7 +6527,7 @@ impl Workspace {
             .remove(&(host, stamp))
             .unwrap_or_default()
         {
-            let Some(buffer) = self.desk_cells.buffer(host, node_id).cloned() else {
+            let Some(buffer) = self.desk_cells.buffer(host, &node_id).cloned() else {
                 continue;
             };
             buffer.update(cx, |buffer, cx| {
@@ -6600,13 +6601,13 @@ impl Workspace {
     fn recognize_desk_note_after_edit(
         &mut self,
         host: HostId,
-        node_id: rho_desk::NodeId,
+        node_id: rho_desk::cells::Id,
         line_end: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.pending_heading_undo.take();
-        let Some(buffer) = self.desk_cells.buffer(host, node_id).cloned() else {
+        let Some(buffer) = self.desk_cells.buffer(host, &node_id).cloned() else {
             return;
         };
         let text = buffer.read(cx).text();
@@ -6619,7 +6620,7 @@ impl Workspace {
             .find('\n')
             .map_or(text.len(), |index| line_start + index);
         let body = text[line_start + 2..line_end_offset].to_owned();
-        let Some((created, writes)) = self.desk_cells.new_note_writes(host, node_id, false) else {
+        let Some((created, writes)) = self.desk_cells.new_note_writes(host, &node_id, false) else {
             return;
         };
         // The recognized line leaves the source note; the star is a
@@ -6632,13 +6633,13 @@ impl Workspace {
         buffer.update(cx, |buffer, cx| {
             buffer.edit([(removed, "")], None, cx);
         });
-        let undo = self.desk_cells.delete_writes(created);
+        let undo = self.desk_cells.delete_writes(created.clone());
         let Some(stamp) = self.apply_desk_writes(host, writes, None, window, cx) else {
             return;
         };
         if !body.is_empty() {
             self.pending_desk_texts
-                .insert((host, stamp), vec![(created, body)]);
+                .insert((host, stamp), vec![(created.clone(), body)]);
         }
         self.record_desk_semantic_undo(host, stamp, undo, cx);
         self.dashboard.move_to_tree_node_when_ready(host, created);
@@ -6878,7 +6879,7 @@ impl Workspace {
             }
             SurfaceKey::Messages => SurfaceView::Messages(self.messages_editor.clone()),
             SurfaceKey::DeskNode { host, node_id } => {
-                let (host, node_id) = (*host, *node_id);
+                let (host, node_id) = (*host, node_id.clone());
                 match self.note_view_for(host, node_id, window, cx) {
                     Some(view) => SurfaceView::DeskNode(view.editor().clone()),
                     // Nothing opens a node whose body has not arrived; the
@@ -7361,10 +7362,11 @@ impl Workspace {
         self.deal_current_interacted = false;
         self.deal_view = None;
         let host = card.identity.host;
-        let node_id = card.identity.node_id;
-        let surface = match self.dashboard.card_target(card.identity) {
+        let node_id = card.identity.node_id.clone();
+        let surface = match self.dashboard.card_target(card.identity.clone()) {
             crate::dashboard::CardTarget::Note | crate::dashboard::CardTarget::Missing => {
-                self.dashboard.move_to_tree_node_when_ready(host, node_id);
+                self.dashboard
+                    .move_to_tree_node_when_ready(host, node_id.clone());
                 Self::wrap_surface(
                     SurfaceKey::DeskNode { host, node_id },
                     SurfaceView::DeskNode(self.dashboard.editor().clone()),
@@ -7403,7 +7405,8 @@ impl Workspace {
                     self.finish_presenting_deal(window, cx);
                     return true;
                 }
-                self.dashboard.move_to_tree_node_when_ready(host, node_id);
+                self.dashboard
+                    .move_to_tree_node_when_ready(host, node_id.clone());
                 Self::wrap_surface(
                     SurfaceKey::DeskNode { host, node_id },
                     SurfaceView::DeskNode(self.dashboard.editor().clone()),
@@ -7417,7 +7420,8 @@ impl Workspace {
                         Self::wrap_surface(SurfaceKey::Browser(page), SurfaceView::Browser(view))
                     }
                     _ => {
-                        self.dashboard.move_to_tree_node_when_ready(host, node_id);
+                        self.dashboard
+                            .move_to_tree_node_when_ready(host, node_id.clone());
                         Self::wrap_surface(
                             SurfaceKey::DeskNode { host, node_id },
                             SurfaceView::DeskNode(self.dashboard.editor().clone()),
@@ -7638,7 +7642,7 @@ impl Workspace {
                     .pending_filing_destinations
                     .iter()
                     .find(|(value, ..)| *value == heading)
-                    .map(|(_, _, _, node_id)| *node_id)
+                    .map(|(_, _, _, node_id)| node_id.clone())
                 else {
                     workspace.notice_on(None, "file: choose a heading", StyleClass::SystemInfo, cx);
                     return;
@@ -7703,7 +7707,7 @@ impl Workspace {
         // back means following it again there; the card is dealt as before
         // once it is the user's again.
         if matches!(verdict, crate::dashboard::DealerVerdict::Dismiss)
-            && let Some(thread) = self.dashboard.card_thread(card.identity)
+            && let Some(thread) = self.dashboard.card_thread(card.identity.clone())
         {
             self.slack_follow_thread(&thread, cx);
         }
@@ -7734,7 +7738,7 @@ impl Workspace {
     ) {
         let Some((writes, verdict)) = self.desk_cells.verdict_writes(
             card.host,
-            card.node_id,
+            &card.node_id,
             crate::desk_view::DeskVerdict::Dismiss,
         ) else {
             return;
@@ -7750,7 +7754,7 @@ impl Workspace {
     pub(crate) fn mark_cards_done(
         &mut self,
         host: HostId,
-        nodes: Vec<rho_desk::NodeId>,
+        nodes: Vec<rho_desk::cells::Id>,
         verb: String,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -7759,7 +7763,7 @@ impl Workspace {
         for node in nodes {
             let Some((writes, event)) =
                 self.desk_cells
-                    .verdict_writes(host, node, crate::desk_view::DeskVerdict::Done)
+                    .verdict_writes(host, &node, crate::desk_view::DeskVerdict::Done)
             else {
                 continue;
             };
@@ -7786,13 +7790,13 @@ impl Workspace {
         &mut self,
         entry: VerdictUndo,
         host: HostId,
-        nodes: Vec<(rho_desk::NodeId, rho_desk::cells::Stamp)>,
+        nodes: Vec<(rho_desk::cells::Id, rho_desk::cells::Stamp)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let mut undone = 0;
         for (node, at) in nodes {
-            let Some((writes, verdict)) = self.desk_cells.undo_verdict_writes(host, node, at)
+            let Some((writes, verdict)) = self.desk_cells.undo_verdict_writes(host, &node, at)
             else {
                 continue;
             };
@@ -7855,7 +7859,7 @@ impl Workspace {
             VerdictUndoState::DeskVerdict { host, node, at, .. } => {
                 // Undo is the log's own inverse: the daemon accepts `Undone`
                 // only while the cells still hold what the verdict wrote.
-                let Some((writes, verdict)) = self.desk_cells.undo_verdict_writes(host, node, at)
+                let Some((writes, verdict)) = self.desk_cells.undo_verdict_writes(host, &node, at)
                 else {
                     self.restore_verdict_undo(entry);
                     self.echo("undo: the note is unavailable", StyleClass::SystemInfo, cx);
@@ -7875,7 +7879,7 @@ impl Workspace {
 
     fn submit_tree_verdict(
         &mut self,
-        target_node: Option<rho_desk::NodeId>,
+        target_node: Option<rho_desk::cells::Id>,
         dealt: crate::desk_view::DeskVerdict,
         verdict: crate::dashboard::DealerVerdict,
         verb: String,
@@ -7899,7 +7903,9 @@ impl Workspace {
         // The verdict lands on the card's own node: an agent card marks the
         // agent, a thread card marks the thread. `target_node` is the room
         // snooze, which deliberately files one level up.
-        let node_id = target_node.unwrap_or(card.identity.node_id);
+        let node_id = target_node
+            .clone()
+            .unwrap_or_else(|| card.identity.node_id.clone());
         let phone_verdict = self.phone.enabled.then(|| match dealt {
             crate::desk_view::DeskVerdict::Done => crate::journal::PhoneVerdict::Done,
             crate::desk_view::DeskVerdict::Dismiss => crate::journal::PhoneVerdict::Dismiss,
@@ -7911,11 +7917,11 @@ impl Workspace {
         // that closes the card here stops Slack raising it anywhere else.
         if matches!(dealt, crate::desk_view::DeskVerdict::Dismiss)
             && target_node.is_none()
-            && let Some(thread) = self.dashboard.card_thread(card.identity)
+            && let Some(thread) = self.dashboard.card_thread(card.identity.clone())
         {
             self.slack_ignore_thread(&thread, cx);
         }
-        let Some((writes, applied)) = self.desk_cells.verdict_writes(card.host, node_id, dealt)
+        let Some((writes, applied)) = self.desk_cells.verdict_writes(card.host, &node_id, dealt)
         else {
             return false;
         };
@@ -7926,7 +7932,7 @@ impl Workspace {
             rho_desk::cells::VerdictEvent::Applied {
                 verdict: rho_desk::cells::Verdict::Todo { note },
                 ..
-            } => Some(*note),
+            } => Some(note.clone()),
             _ => None,
         };
         let Some(stamp) = self.apply_desk_writes(card.host, writes, Some(applied), window, cx)
@@ -7959,8 +7965,7 @@ impl Workspace {
         true
     }
 
-    /// Sets a field on a row outside the dealer: no verdict, no undo entry.
-    /// Sibling order is derived from `(CreatedAt, NodeId)`, so moving a row
+    /// Sibling order is derived from `(CreatedAt, Id)`, so moving a row
     /// among its siblings has no cell to write in this slice.
     fn reordering_unavailable(&mut self, cx: &mut Context<Self>) {
         self.notice_on(
@@ -7971,20 +7976,16 @@ impl Workspace {
         );
     }
 
-    fn set_node_field(
+    /// Writes one fact outside the dealer: no verdict, no undo entry.
+    fn set_node_fact(
         &mut self,
         host: HostId,
-        node_id: rho_desk::NodeId,
-        field: rho_desk::cells::Field,
-        value: rho_desk::cells::Value,
+        id: rho_desk::cells::Id,
+        relation: rho_desk::cells::Relation,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let writes = vec![rho_desk::cells::CellWrite {
-            node: node_id,
-            field,
-            value,
-        }];
+        let writes = vec![rho_desk::cells::CellWrite { id, relation }];
         self.apply_desk_writes(host, writes, None, window, cx)
             .is_some()
     }
@@ -8022,11 +8023,12 @@ impl Workspace {
     /// so typing composes the first message straight away.
     pub(crate) fn new_agent_in_area(
         &mut self,
-        area: Option<(HostId, rho_desk::NodeId)>,
+        area: Option<(HostId, rho_desk::cells::Id)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let workdir = area
+            .clone()
             .and_then(|(host, node_id)| self.area_workdir(host, node_id))
             .or_else(|| self.only_workdir());
         let label = workdir
@@ -8061,11 +8063,11 @@ impl Workspace {
     /// file, the nearest ancestor with one, then the agent that owns the
     /// area (or the area itself when it is an agent node). The caller
     /// falls back to the host's only workdir.
-    fn area_workdir(&self, host: HostId, node_id: rho_desk::NodeId) -> Option<HostPath> {
-        if let Some(path) = self.desk_cells.inherited_file_path(host, node_id) {
+    fn area_workdir(&self, host: HostId, node_id: rho_desk::cells::Id) -> Option<HostPath> {
+        if let Some(path) = self.desk_cells.inherited_file_path(host, &node_id) {
             return Some(HostPath { host, path });
         }
-        let agent_id = self.desk_cells.nearest_agent(host, node_id)?;
+        let agent_id = self.desk_cells.nearest_agent(host, &node_id)?;
         self.agent_workdir(agent_id)
     }
 
@@ -8149,7 +8151,7 @@ impl Workspace {
     fn launch_for_area(
         &self,
         host: HostId,
-        node_id: rho_desk::NodeId,
+        node_id: rho_desk::cells::Id,
     ) -> Result<(HostId, rho_ui_proto::StartMode, AgentRole), String> {
         let workdir = self
             .area_workdir(host, node_id)
@@ -8182,10 +8184,11 @@ impl Workspace {
                 first_attention,
                 ..
             }) => {
-                if !self.open_note(host, node_id, window, cx) {
-                    match first_attention
-                        .or_else(|| self.dashboard.first_tree_agent_for_topic((host, node_id)))
-                    {
+                if !self.open_note(host, node_id.clone(), window, cx) {
+                    match first_attention.or_else(|| {
+                        self.dashboard
+                            .first_tree_agent_for_topic((host, node_id.clone()))
+                    }) {
                         Some(agent_id) => self.open_agent(agent_id, window, cx),
                         None => {
                             self.dashboard
@@ -8202,20 +8205,20 @@ impl Workspace {
                 let Some(body) = self.dashboard.take_new_draft(cx) else {
                     return;
                 };
-                let (host, start, role) = match self.launch_for_area(topic_host, node_id) {
+                let (host, start, role) = match self.launch_for_area(topic_host, node_id.clone()) {
                     Ok(launch) => launch,
                     Err(message) => {
                         self.notice_on(None, &message, StyleClass::SystemInfo, cx);
                         return;
                     }
                 };
+                self.pending_agent_filing = Some((host, node_id));
                 self.send_to_host(
                     host,
                     ClientMessage::NewAgent {
                         role,
                         start,
                         content: Some(vec![ContentPart::Text { text: body }]),
-                        desk_parent: Some(node_id),
                     },
                 );
                 self.refresh_dashboard(window, cx);
@@ -8259,9 +8262,10 @@ impl Workspace {
                 node_id,
                 first_attention,
                 ..
-            }) => match first_attention
-                .or_else(|| self.dashboard.first_tree_agent_for_topic((host, node_id)))
-            {
+            }) => match first_attention.or_else(|| {
+                self.dashboard
+                    .first_tree_agent_for_topic((host, node_id.clone()))
+            }) {
                 Some(agent_id) => self.open_agent(agent_id, window, cx),
                 None => {
                     self.dashboard
@@ -8341,7 +8345,7 @@ impl Workspace {
         let (host, relative) = match self.dashboard.tree_node_at_cursor(cx) {
             Some((host, node_id)) => (
                 host,
-                self.desk_cells.node(host, node_id).map(|node| node.id),
+                self.desk_cells.node(host, &node_id).map(|node| node.id),
             ),
             None => match self.hosts.primary() {
                 Some(host) if self.desk_cells.is_synced(host) => (host, None),
@@ -8349,13 +8353,13 @@ impl Workspace {
             },
         };
         let created = match relative {
-            Some(relative) => self.desk_cells.new_note_writes(host, relative, child),
+            Some(relative) => self.desk_cells.new_note_writes(host, &relative, child),
             None => self.desk_cells.create_note_writes(host, None),
         };
         let Some((created, writes)) = created else {
             return;
         };
-        let undo = self.desk_cells.delete_writes(created);
+        let undo = self.desk_cells.delete_writes(created.clone());
         let Some(stamp) = self.apply_desk_writes(host, writes, None, window, cx) else {
             return;
         };
@@ -8372,19 +8376,20 @@ impl Workspace {
     fn paste_desk_semantic_subtree(
         &mut self,
         host: HostId,
-        node_id: rho_desk::NodeId,
+        node_id: rho_desk::cells::Id,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(capture) = self.desk_semantic_clipboard.clone() else {
             return;
         };
-        let Some((root, writes, texts)) = self.desk_cells.paste_writes(host, node_id, &capture)
+        let Some((root, writes, texts)) = self.desk_cells.paste_writes(host, &node_id, &capture)
         else {
             return;
         };
-        let undo = self.desk_cells.delete_writes(root);
-        self.dashboard.move_to_tree_node_when_ready(host, root);
+        let undo = self.desk_cells.delete_writes(root.clone());
+        self.dashboard
+            .move_to_tree_node_when_ready(host, root.clone());
         let Some(stamp) = self.apply_desk_writes(host, writes, None, window, cx) else {
             return;
         };
@@ -8411,17 +8416,17 @@ impl Workspace {
         };
         match action {
             editor::SemanticRowAction::Yank => {
-                self.desk_semantic_clipboard = self.desk_cells.capture(host, node_id, cx);
+                self.desk_semantic_clipboard = self.desk_cells.capture(host, &node_id, cx);
             }
             editor::SemanticRowAction::Delete => {
-                let Some(capture) = self.desk_cells.capture(host, node_id, cx) else {
+                let Some(capture) = self.desk_cells.capture(host, &node_id, cx) else {
                     return;
                 };
-                let writes = self.desk_cells.delete_writes(node_id);
+                let writes = self.desk_cells.delete_writes(node_id.clone());
                 let undo = self.desk_cells.inverse_writes(host, &writes);
                 self.desk_semantic_clipboard = Some(capture);
-                let focus = self.desk_cells.row_after_delete(host, node_id);
-                self.desk_semantic_paste_target = focus.map(|focus| (host, focus));
+                let focus = self.desk_cells.row_after_delete(host, &node_id);
+                self.desk_semantic_paste_target = focus.clone().map(|focus| (host, focus));
                 let Some(stamp) = self.apply_desk_writes(host, writes, None, window, cx) else {
                     return;
                 };
@@ -8455,11 +8460,12 @@ impl Workspace {
                         cx,
                     );
                 }
-                let Some((created, writes)) = self.desk_cells.new_note_writes(host, node_id, false)
+                let Some((created, writes)) =
+                    self.desk_cells.new_note_writes(host, &node_id, false)
                 else {
                     return;
                 };
-                let undo = self.desk_cells.delete_writes(created);
+                let undo = self.desk_cells.delete_writes(created.clone());
                 self.dashboard.move_to_tree_node_when_ready(host, created);
                 let Some(stamp) = self.apply_desk_writes(host, writes, None, window, cx) else {
                     return;
@@ -8471,7 +8477,7 @@ impl Workspace {
             editor::SemanticRowAction::Indent { outdent } => {
                 let Some(writes) = self
                     .desk_cells
-                    .structure_move_writes(host, node_id, !outdent)
+                    .structure_move_writes(host, &node_id, !outdent)
                 else {
                     return;
                 };
@@ -8499,36 +8505,29 @@ impl Workspace {
     fn append_tree_heading(
         &mut self,
         host: HostId,
-        relative: rho_desk::NodeId,
+        relative: rho_desk::cells::Id,
         child: bool,
         _above: bool,
         title: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        self.append_tree_heading_tagged(host, relative, child, title, &[], window, cx)
+        self.append_tree_heading_at(host, relative, child, title, window, cx)
             .is_some()
     }
 
-    fn append_tree_heading_tagged(
+    fn append_tree_heading_at(
         &mut self,
         host: HostId,
-        relative: rho_desk::NodeId,
+        relative: rho_desk::cells::Id,
         child: bool,
         title: &str,
-        tags: &[&str],
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> Option<rho_desk::NodeId> {
-        let (created, mut writes) = self.desk_cells.new_note_writes(host, relative, child)?;
-        for tag in tags {
-            writes.push(rho_desk::cells::CellWrite {
-                node: created,
-                field: rho_desk::cells::Field::Tag((*tag).to_owned()),
-                value: rho_desk::cells::Value::Bool(true),
-            });
-        }
-        self.dashboard.move_to_tree_node_when_ready(host, created);
+    ) -> Option<rho_desk::cells::Id> {
+        let (created, writes) = self.desk_cells.new_note_writes(host, &relative, child)?;
+        self.dashboard
+            .move_to_tree_node_when_ready(host, created.clone());
         self.apply_desk_writes(host, writes, None, window, cx)?;
         self.sync_tree_dashboard(host, window, cx);
         self.dashboard
@@ -8542,7 +8541,7 @@ impl Workspace {
         };
         let empty = self
             .desk_cells
-            .buffer(host, node_id)
+            .buffer(host, &node_id)
             .is_some_and(|buffer| buffer.read(cx).is_empty());
         if !empty {
             self.notice_on(
@@ -8553,7 +8552,7 @@ impl Workspace {
             );
             return;
         }
-        let focus = self.desk_cells.row_above(host, node_id);
+        let focus = self.desk_cells.row_above(host, &node_id);
         let writes = self.desk_cells.delete_writes(node_id);
         let undo = self.desk_cells.inverse_writes(host, &writes);
         if let Some(focus) = focus {
@@ -8877,7 +8876,7 @@ impl Workspace {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let path = match self.dashboard.card_target(card.identity) {
+        let path = match self.dashboard.card_target(card.identity.clone()) {
             crate::dashboard::CardTarget::Page(page) => {
                 let leaf = rho_browser::live_page_name(page).unwrap_or_else(|| "page".to_owned());
                 format!("{} / {leaf}", card.breadcrumb.replace(" › ", " / "))
@@ -9557,17 +9556,17 @@ impl Workspace {
 }
 
 pub(crate) fn resolve_filing_destination(
-    destinations: &[(String, String, HostId, rho_desk::NodeId)],
+    destinations: &[(String, String, HostId, rho_desk::cells::Id)],
     candidate: &crate::minibuffer::Candidate,
     occurrence: usize,
-) -> Option<(HostId, rho_desk::NodeId)> {
+) -> Option<(HostId, rho_desk::cells::Id)> {
     destinations
         .iter()
         .filter(|(value, description, _, _)| {
             *value == candidate.value && *description == candidate.description
         })
         .nth(occurrence)
-        .map(|(_, _, host, node_id)| (*host, *node_id))
+        .map(|(_, _, host, node_id)| (*host, node_id.clone()))
 }
 
 fn parse_agent_role(text: &str) -> Result<AgentRole, String> {
@@ -10258,11 +10257,10 @@ impl Render for Workspace {
                     this.dashboard
                         .tree_node_at_cursor(cx)
                         .is_some_and(|(host, node_id)| {
-                            this.set_node_field(
+                            this.set_node_fact(
                                 host,
                                 node_id,
-                                rho_desk::cells::Field::State,
-                                rho_desk::cells::Value::State(rho_desk::cells::State::Dismissed),
+                                rho_desk::cells::Relation::State(rho_desk::cells::State::Dismissed),
                                 window,
                                 cx,
                             )

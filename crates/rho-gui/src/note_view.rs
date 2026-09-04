@@ -30,7 +30,7 @@ fn next_row_buffer_id() -> BufferId {
 
 pub struct NoteView {
     host: HostId,
-    node_id: rho_desk::NodeId,
+    node_id: rho_desk::cells::Id,
     multi_buffer: Entity<MultiBuffer>,
     editor: Entity<Editor>,
     composition: Composition,
@@ -38,14 +38,14 @@ pub struct NoteView {
     /// out a new buffer for the node rebuilds the surface.
     body: Entity<Buffer>,
     /// One generated line per child, in the order the children are shown.
-    rows: Vec<(rho_desk::NodeId, Entity<Buffer>)>,
+    rows: Vec<(rho_desk::cells::Id, Entity<Buffer>)>,
     headers_disabled: std::collections::HashSet<BufferId>,
 }
 
 impl NoteView {
     pub fn new(
         host: HostId,
-        node_id: rho_desk::NodeId,
+        node_id: rho_desk::cells::Id,
         body: Entity<Buffer>,
         window: &mut gpui::Window,
         cx: &mut Context<Workspace>,
@@ -87,8 +87,8 @@ impl NoteView {
         self.host
     }
 
-    pub fn node_id(&self) -> rho_desk::NodeId {
-        self.node_id
+    pub fn node_id(&self) -> rho_desk::cells::Id {
+        self.node_id.clone()
     }
 
     pub fn editor(&self) -> &Entity<Editor> {
@@ -105,12 +105,15 @@ impl NoteView {
     }
 
     /// The children shown under the body, as of the last sync.
-    pub fn children(&self) -> Vec<rho_desk::NodeId> {
-        self.rows.iter().map(|(node_id, _)| *node_id).collect()
+    pub fn children(&self) -> Vec<rho_desk::cells::Id> {
+        self.rows
+            .iter()
+            .map(|(node_id, _)| node_id.clone())
+            .collect()
     }
 
     /// What the cursor is on: a child row, or `None` when it is in the body.
-    pub fn child_at_cursor(&self, cx: &gpui::App) -> Option<rho_desk::NodeId> {
+    pub fn child_at_cursor(&self, cx: &gpui::App) -> Option<rho_desk::cells::Id> {
         let editor = self.editor.read(cx);
         let head = editor.selections.newest_anchor().head();
         let snapshot = editor.buffer().read(cx).snapshot(cx);
@@ -119,7 +122,7 @@ impl NoteView {
         self.rows
             .iter()
             .find(|(_, row)| row.read(cx).remote_id() == id)
-            .map(|(node_id, _)| *node_id)
+            .map(|(node_id, _)| node_id.clone())
     }
 
     /// Rebuilds the child rows against the tree. Cheap and idempotent: a
@@ -127,22 +130,19 @@ impl NoteView {
     /// cursor and the scroll position.
     pub fn sync(
         &mut self,
-        nodes: &[rho_desk::cells::MaterializedNode],
-        titles: &BTreeMap<rho_desk::NodeId, String>,
+        nodes: &[crate::desk_view::DeskNode],
+        titles: &BTreeMap<rho_desk::cells::Id, String>,
         cx: &mut Context<Workspace>,
     ) {
         let children = nodes
             .iter()
-            .filter(|node| node.parent == Some(self.node_id))
+            .filter(|node| node.parent.as_ref() == Some(&self.node_id))
             .map(|node| {
                 (
-                    node.id,
+                    node.id.clone(),
                     format!(
                         "  {} {}",
-                        match node.kind {
-                            rho_desk::cells::NodeKind::Note => "*",
-                            _ => "◦",
-                        },
+                        if node.is_note() { "*" } else { "◦" },
                         titles.get(&node.id).map_or("", String::as_str)
                     ),
                 )

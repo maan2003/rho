@@ -77,7 +77,7 @@ pub enum ConnEvent {
     DeskSynced {
         node_namespace: u16,
         delta: rho_desk::cells::Snapshot,
-        texts: Vec<rho_desk::NodeTextSnapshot>,
+        bodies: Vec<rho_desk::cells::BodySnapshot>,
     },
     DeskMutationAccepted {
         stamp: rho_desk::cells::Stamp,
@@ -90,15 +90,10 @@ pub enum ConnEvent {
         frontier: rho_desk::cells::Version,
     },
     DeskTextApplied {
-        node_id: rho_desk::NodeId,
+        id: rho_desk::cells::Id,
         operation: rho_desk::TextOperation,
     },
     DeskResyncRequired,
-    DeskBindingResult {
-        request_id: u64,
-        node_id: Option<rho_desk::NodeId>,
-        error: Option<String>,
-    },
     Ready {
         agents: Vec<UiAgentSummary>,
         iris_agent: Option<AgentId>,
@@ -1224,11 +1219,11 @@ async fn run(
             ServerMessage::DeskSynced {
                 node_namespace,
                 delta,
-                texts,
+                bodies,
             } => Some(ConnEvent::DeskSynced {
                 node_namespace,
                 delta,
-                texts,
+                bodies,
             }),
             ServerMessage::DeskMutationAccepted { stamp } => {
                 Some(ConnEvent::DeskMutationAccepted { stamp })
@@ -1240,10 +1235,10 @@ async fn run(
                 Some(ConnEvent::DeskCellsAvailable { frontier })
             }
             ServerMessage::DeskTextApplied {
-                node_id,
+                id,
                 operation,
                 transaction: _,
-            } => Some(ConnEvent::DeskTextApplied { node_id, operation }),
+            } => Some(ConnEvent::DeskTextApplied { id, operation }),
             ServerMessage::DeskResyncRequired => Some(ConnEvent::DeskResyncRequired),
             // The old tree stream is dead weight until 5pha's side drops
             // it from the protocol; nothing here listens.
@@ -1253,15 +1248,6 @@ async fn run(
             | ServerMessage::DeskTreeBatchApplied { .. }
             | ServerMessage::DeskTreeBatchRejected { .. }
             | ServerMessage::DeskTreeResyncRequired => None,
-            ServerMessage::DeskBindingResult {
-                request_id,
-                node_id,
-                error,
-            } => Some(ConnEvent::DeskBindingResult {
-                request_id,
-                node_id,
-                error,
-            }),
             // Read-only CLI reply; the GUI subscribes instead.
             ServerMessage::DeskTreeDocument { .. } => None,
             ServerMessage::Ready {
