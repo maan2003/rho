@@ -286,9 +286,13 @@ else is built on. The transient lands after slice 2.
    Sep (f31fdbd9): wire RUP7; `desk_migration.rs` runs once and drops
    the old tables; on a read-only copy of the user's real store it kept
    223 notes, 109 agents, 7 pages, 1 label, 221 bodies, 2381 facts, 6
-   verdicts, and dropped 194 machine-made thread nodes, 12 nodes it
-   could not identify, and 101 verdicts on them; no Slack unit survived
-   because none had been filed. Two bugs found on the way: undo of a
+   verdicts, and dropped 194 machine-made thread nodes and the 101
+   verdicts on them; no Slack unit survived because none had been filed.
+   The first run also dropped 12 file nodes that had a path and no host;
+   fixed the same day (e0f86ac7) before the user restarted: a host-less
+   file is on the daemon that stored it, and the 12 nodes are 7 files
+   (five were second nodes for a path that already had one, merged by
+   the id), all live and filed under notes. Two bugs found on the way: undo of a
    fact nobody had written read its before-value as none, fixed by one
    `unwritten()` definition shared by writer and checker; and redb
    records the Rust type names a table was created with, so the legacy
