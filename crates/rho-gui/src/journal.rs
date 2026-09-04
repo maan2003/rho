@@ -22,6 +22,44 @@ pub const FILE_NAME: &str = "action-journal.redb";
 const LOCK_FILE_NAME: &str = "action-journal.lock";
 
 const EVENTS: TableDefinition<u64, Sen<Entry>> = TableDefinition::new("gui_action_journal_v3");
+/// The same table read as bytes. A row an older build wrote can name a
+/// variant this one no longer has (the discard verdict became mute), and
+/// the history of everything else is worth more than that one row, so the
+/// dump decodes leniently and skips what it cannot read.
+const STORED_EVENTS: TableDefinition<u64, StoredEntry> =
+    TableDefinition::new("gui_action_journal_v3");
+
+#[derive(Debug)]
+struct StoredEntry;
+
+impl redb::Value for StoredEntry {
+    type SelfType<'a> = &'a [u8];
+    type AsBytes<'a> = &'a [u8];
+
+    fn fixed_width() -> Option<usize> {
+        None
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> &'a [u8]
+    where
+        Self: 'a,
+    {
+        data
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a &'b [u8]) -> &'a [u8]
+    where
+        Self: 'b,
+    {
+        value
+    }
+
+    /// redb records the name a table was created with, so this has to
+    /// answer to `Sen<Entry>`'s.
+    fn type_name() -> redb::TypeName {
+        <Sen<Entry> as redb::Value>::type_name()
+    }
+}
 
 #[derive(
     Clone, Debug, Serialize, Deserialize, PartialEq, senax_encoder::Encode, senax_encoder::Decode,
@@ -829,9 +867,14 @@ fn dump_db(db: &RhoDb, kind: Option<&str>, mut output: impl std::io::Write) -> a
     if !read.has_table(EVENTS.name()) {
         return Ok(());
     }
-    for (sequence, value) in read.open_table(EVENTS).iter() {
+    let mut skipped = 0u64;
+    for (sequence, value) in read.open_table(STORED_EVENTS).iter() {
         let sequence = sequence.value();
-        let entry = value.value().into_owned();
+        let mut bytes = value.value();
+        let Ok(entry) = <Entry as senax_encoder::Decoder>::decode(&mut bytes) else {
+            skipped += 1;
+            continue;
+        };
         if kind.is_none_or(|kind| entry.event.kind() == kind) {
             serde_json::to_writer(
                 &mut output,
@@ -844,12 +887,51 @@ fn dump_db(db: &RhoDb, kind: Option<&str>, mut output: impl std::io::Write) -> a
             writeln!(output)?;
         }
     }
+    if skipped > 0 {
+        // On stderr, so the dump's own lines stay machine-readable.
+        eprintln!("skipped {skipped} journal rows this build cannot read");
+    }
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A row from a build whose vocabulary has moved on, the discard
+    /// verdict being the first, is one row lost and not a lost journal.
+    #[test]
+    fn a_row_this_build_cannot_read_is_skipped_and_the_rest_still_dumps() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = Journal::open(dir.path()).unwrap();
+        journal.record(Event::UserResumed);
+        journal.flush().unwrap();
+        futures::executor::block_on(async {
+            let mut write = journal.db.write().await;
+            write
+                .open_table(STORED_EVENTS)
+                // Past the writer's own sequence, so recording the next
+                // event cannot quietly overwrite it.
+                .insert(&999, &b"not an entry this build knows".as_slice());
+            write.commit();
+        });
+        journal.record(Event::DeskRawModeToggled { enabled: true });
+        journal.flush().unwrap();
+
+        let mut output = Vec::new();
+        journal.dump(None, &mut output).unwrap();
+        let events = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["event"]["type"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(events, vec!["user_resumed", "desk_raw_mode_toggled"]);
+    }
 
     #[test]
     fn persists_events_and_dumps_filtered_json_lines() {

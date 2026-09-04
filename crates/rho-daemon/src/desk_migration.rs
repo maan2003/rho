@@ -101,6 +101,26 @@ enum OldField {
     Path,
 }
 
+/// The state as it was written. `Dismissed` is today's `Muted`: senax keys
+/// a variant by its name, so the old name has to stay here for the old rows
+/// to decode at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Encode, Decode)]
+enum OldState {
+    Open,
+    Done,
+    Dismissed,
+}
+
+impl OldState {
+    fn state(self) -> State {
+        match self {
+            OldState::Open => State::Open,
+            OldState::Done => State::Done,
+            OldState::Dismissed => State::Muted,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode)]
 enum OldValue {
     Kind(OldNodeKind),
@@ -108,7 +128,7 @@ enum OldValue {
     Bool(bool),
     Timestamp(Timestamp),
     OptionalTimestamp(Option<Timestamp>),
-    State(State),
+    State(OldState),
     AgentId(AgentId),
     Host(u64),
     PageRef(PageId),
@@ -417,9 +437,12 @@ pub(crate) fn migrate(
                 (OldField::CreatedAt, OldValue::Timestamp(at)) => {
                     put(&mut cells, id.clone(), Property::CreatedAt(*at), stamp)
                 }
-                (OldField::State, OldValue::State(state)) => {
-                    put(&mut cells, id.clone(), Property::State(*state), stamp)
-                }
+                (OldField::State, OldValue::State(state)) => put(
+                    &mut cells,
+                    id.clone(),
+                    Property::State(state.state()),
+                    stamp,
+                ),
                 (OldField::DeferUntil, OldValue::OptionalTimestamp(at)) => {
                     put(&mut cells, id.clone(), Property::DeferUntil(*at), stamp)
                 }
@@ -578,7 +601,7 @@ fn property(field: &OldField, value: &OldValue, ids: &BTreeMap<NodeId, Id>) -> O
         }),
         (OldField::Deleted, OldValue::Bool(deleted)) => Property::Deleted(*deleted),
         (OldField::CreatedAt, OldValue::Timestamp(at)) => Property::CreatedAt(*at),
-        (OldField::State, OldValue::State(state)) => Property::State(*state),
+        (OldField::State, OldValue::State(state)) => Property::State(state.state()),
         (OldField::DeferUntil, OldValue::OptionalTimestamp(at)) => Property::DeferUntil(*at),
         (OldField::Deadline, OldValue::OptionalTimestamp(at)) => Property::Deadline(*at),
         (OldField::PaceDays, OldValue::Days(days)) => Property::PaceDays(*days),
@@ -687,7 +710,13 @@ mod tests {
                 }),
                 1,
             ),
-            cell(heading, OldField::State, OldValue::State(State::Open), 1),
+            // The verdict was called discard when this was written.
+            cell(
+                heading,
+                OldField::State,
+                OldValue::State(OldState::Dismissed),
+                1,
+            ),
             cell(
                 heading,
                 OldField::Tag("rho".into()),
@@ -716,7 +745,7 @@ mod tests {
             cell(
                 filed_agent,
                 OldField::State,
-                OldValue::State(State::Done),
+                OldValue::State(OldState::Done),
                 2,
             ),
             cell(
@@ -797,8 +826,8 @@ mod tests {
                         changes: vec![OldFieldChange {
                             node,
                             field: OldField::State,
-                            before: Some(OldValue::State(State::Open)),
-                            after: Some(OldValue::State(State::Done)),
+                            before: Some(OldValue::State(OldState::Open)),
+                            after: Some(OldValue::State(OldState::Done)),
                         }],
                     }),
                 );
@@ -829,6 +858,8 @@ mod tests {
         };
 
         assert_eq!(facts.facts(&note).parent, None);
+        // A row the user discarded before the rename is muted now.
+        assert_eq!(facts.facts(&note).state, State::Muted);
         assert!(
             facts
                 .facts(&note)
