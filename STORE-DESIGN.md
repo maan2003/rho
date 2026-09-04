@@ -178,6 +178,29 @@ one interface whose one implementation today talks to the daemon, and
 whose next one is local. The wire protocol carries cells, not desk
 commands.
 
+### Sync, later: the daemon as a holding relay
+
+The user's read on 4 Sep, not built and not part of any slice yet. The
+daemon should not need to read the graph, which may hold sensitive
+text, and the clients are rarely online at the same time, so sync is
+store-and-forward through the one always-on party the user already
+runs. The daemon becomes an iroh relay that holds: two operations,
+append an encrypted batch tagged (device, version), and read every batch
+since a (device, version) per device. Clients coalesce cell writes for a
+few hundred milliseconds, encrypt the batch with a key only the clients
+hold (entered once per device, or passed by QR), and append; a client
+that is up receives the other's batches on the socket as they land, and
+one that was away reads the log on connect. The daemon sees device ids,
+versions, sizes, and timing, never contents. Losing the key loses sync,
+not data; every client holds its own full copy. Consequence to decide
+then: agents cannot read the graph either, so anything they should know
+from notes is handed to them by the GUI on purpose. Chosen over an S3
+log (no push, a request per batch) and over a git repo of batches
+(fine for sessions, wrong for keystrokes); either is a second
+implementation of the same two operations if the log should ever
+outlive the host. Slice 1's store interface is what makes this a swap:
+its one implementation today talks to the daemon in the clear.
+
 ## Browser tabs
 
 A tab is `Page(PageId)`; it is never created in the store. Its place is
