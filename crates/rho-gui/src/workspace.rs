@@ -517,6 +517,10 @@ pub struct Workspace {
     overview_open: bool,
     navigation_skips: HashMap<SurfaceKey, crate::dashboard::DealCardId>,
     last_shift_tap: Option<std::time::Instant>,
+    /// When `shift` went down on its own, if it is still down and still a
+    /// candidate for a tap. Cleared the moment another key or modifier
+    /// joins it, which is what makes holding it for a chord silent.
+    shift_down_at: Option<std::time::Instant>,
     shell_touches: HashMap<TouchId, ShellTouchContact>,
     shell_touch_was_multi: bool,
     shell_touch_committed: bool,
@@ -1019,35 +1023,27 @@ impl Workspace {
             {
                 this.mark_deal_interacted();
             }
+            // A key arriving while `shift` is down means it was being held
+            // for that key, so it was never a tap.
             if event.keystroke.key == "shift"
                 && !event.keystroke.modifiers.control
                 && !event.keystroke.modifiers.alt
                 && !event.keystroke.modifiers.platform
             {
-                let now = std::time::Instant::now();
-                // The second tap is Home, whether it comes quickly on a
-                // surface that is not a card or as the `shift` row of the
-                // verdict transient the first tap opened. There is no timer
-                // on the second one: the menu is on screen saying so.
-                if this.verdict_transient_open() {
-                    this.last_shift_tap = None;
-                    this.close_transient(window, cx);
-                    this.toggle_overview(window, cx);
-                } else if this.has_modal_overlay() {
-                    // A menu or a prompt is already holding the keyboard:
-                    // shift belongs to whatever the reader is typing there.
-                    this.last_shift_tap = None;
-                } else if this
-                    .last_shift_tap
-                    .is_some_and(|last| now.duration_since(last) <= Duration::from_millis(300))
-                {
-                    this.last_shift_tap = None;
-                    this.toggle_overview(window, cx);
+                if event.keystroke.modifiers.shift {
+                    // Shift is still down: the release decides.
+                    this.shift_down_at
+                        .get_or_insert_with(std::time::Instant::now);
                 } else {
-                    this.last_shift_tap = Some(now);
-                    this.open_verdict_transient(window, cx);
+                    // Shift is already back up by the time its own keystroke
+                    // arrives, so press and release collapsed into this one
+                    // event and the tap is complete. A virtual keyboard that
+                    // types the modifier as a plain key looks like this.
+                    this.shift_down_at = None;
+                    this.shift_tapped(window, cx);
                 }
             } else {
+                this.shift_down_at = None;
                 this.last_shift_tap = None;
             }
         });
@@ -1105,6 +1101,7 @@ impl Workspace {
             overview_open: false,
             navigation_skips: HashMap::new(),
             last_shift_tap: None,
+            shift_down_at: None,
             shell_touches: HashMap::new(),
             shell_touch_was_multi: false,
             shell_touch_committed: false,
@@ -7311,6 +7308,66 @@ impl Workspace {
         cx.notify();
     }
 
+    /// How long `shift` may be held and still count as a tap. Longer than
+    /// this and the reader is holding it for something, even if the
+    /// something never arrived.
+    const SHIFT_TAP_HOLD: Duration = Duration::from_millis(300);
+
+    /// The `shift` tap, decided on release. Opening the menu on the press
+    /// put it under the reader's uppercase letter, which then landed in it;
+    /// a tap is `shift` down and up with nothing in between.
+    fn shift_modifiers_changed(
+        &mut self,
+        event: &gpui::ModifiersChangedEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let modifiers = event.modifiers;
+        if modifiers.shift {
+            // Down. Only `shift` on its own can still become a tap: with
+            // another modifier already held this is a chord being built.
+            self.shift_down_at = (!modifiers.control
+                && !modifiers.alt
+                && !modifiers.platform
+                && !modifiers.function)
+                .then(std::time::Instant::now);
+            return;
+        }
+        let Some(down) = self.shift_down_at.take() else {
+            return;
+        };
+        if down.elapsed() > Self::SHIFT_TAP_HOLD {
+            return;
+        }
+        self.shift_tapped(window, cx);
+    }
+
+    fn shift_tapped(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let now = std::time::Instant::now();
+        // The second tap is Home, whether it comes quickly on a surface that
+        // is not a card or as the `shift` row of the verdict transient the
+        // first tap opened. There is no timer on the second one: the menu is
+        // on screen saying so.
+        if self.verdict_transient_open() {
+            self.last_shift_tap = None;
+            self.close_transient(window, cx);
+            self.toggle_overview(window, cx);
+        } else if self.has_modal_overlay() {
+            // A menu or a prompt is already holding the keyboard: shift
+            // belongs to whatever the reader is typing there.
+            self.last_shift_tap = None;
+        } else if self
+            .last_shift_tap
+            .is_some_and(|last| now.duration_since(last) <= Self::SHIFT_TAP_HOLD)
+        {
+            self.last_shift_tap = None;
+            self.toggle_overview(window, cx);
+        } else {
+            self.last_shift_tap = Some(now);
+            self.open_verdict_transient(window, cx);
+        }
+    }
+
     /// One tap of `shift`: the verdicts, over whatever card is in view. The
     /// card is the surface the reader is on (or the row under the cursor on
     /// Home), so a verdict follows the eye rather than a mode. Returns
@@ -10154,6 +10211,7 @@ impl Render for Workspace {
             .bg(cx.theme().colors().editor_background)
             .key_context("RhoGui")
             .capture_touch(cx.listener(Self::shell_touch))
+            .on_modifiers_changed(cx.listener(Self::shift_modifiers_changed))
             .on_scroll_wheel(cx.listener(Self::journal_scroll))
             .on_linux_pointer_axis(cx.listener(Self::journal_linux_scroll))
             .on_action(cx.listener(Self::submit_prompt))

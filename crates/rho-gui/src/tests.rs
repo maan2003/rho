@@ -1068,6 +1068,61 @@ fn overview_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace> {
     workspace
 }
 
+/// The `shift` tap as the platform delivers it: the modifier down, then up,
+/// with nothing in between. The tap fires on the release, so a test that
+/// only sent the keystroke would be testing a press that no longer opens
+/// anything.
+fn tap_shift(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) {
+    hold_shift(workspace, true, cx);
+    hold_shift(workspace, false, cx);
+}
+
+/// The `shift` key arriving as a keystroke of its own while it is held. Some
+/// platforms report the modifier this way, and it is what the old press-time
+/// tap fired on.
+fn press_held_shift_key(workspace: &WindowHandle<Workspace>, cx: &mut TestAppContext) {
+    cx.update_window(**workspace, |_, window, cx| {
+        window.dispatch_event(
+            gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke {
+                    modifiers: gpui::Modifiers {
+                        shift: true,
+                        ..Default::default()
+                    },
+                    key: "shift".into(),
+                    key_char: None,
+                },
+                is_held: false,
+                prefer_character_input: false,
+            }),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
+/// One half of the tap: `shift` going down, or coming back up.
+fn hold_shift(workspace: &WindowHandle<Workspace>, down: bool, cx: &mut TestAppContext) {
+    let modifiers = gpui::Modifiers {
+        shift: down,
+        ..Default::default()
+    };
+    // Outside an entity update: the listener is the workspace's own, and it
+    // cannot borrow itself twice.
+    cx.update_window(**workspace, |_, window, cx| {
+        window.dispatch_event(
+            gpui::PlatformInput::ModifiersChanged(gpui::ModifiersChangedEvent {
+                modifiers,
+                capslock: Default::default(),
+            }),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
 fn test_workspace(cx: &mut TestAppContext) -> WindowHandle<Workspace> {
     cx.update(init_test_app);
     let target = AttachTarget::Unix(std::env::temp_dir().join("rho-gui-test-nonexistent.sock"));
@@ -4405,6 +4460,63 @@ fn deal_file_bare_enter_files_the_dealt_node_under_the_offered_heading(cx: &mut 
         .unwrap();
 }
 
+/// `shift` held for an uppercase letter is a modifier, not a tap. Opening
+/// the menu on the press put it under the letter the reader was in the
+/// middle of typing, which then landed in the menu instead of the buffer.
+#[gpui::test]
+fn shift_held_for_a_letter_never_opens_the_verdicts(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    desk.due_note(None, "Card in view");
+
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.open_deal_mode(window, cx);
+            workspace.take_host_messages_for_test(HostId::default());
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // Down, the letter, up: what typing `G` looks like from here. The
+    // platform sends the modifier as a keystroke of its own as well, with
+    // shift already held, which is what the old press-time tap fired on.
+    hold_shift(&workspace, true, cx);
+    press_held_shift_key(&workspace, cx);
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                !workspace.verdict_transient_open(),
+                "the press alone opens nothing: it may still be a chord"
+            );
+        })
+        .unwrap();
+    cx.simulate_keystrokes(*workspace, "shift-g");
+    hold_shift(&workspace, false, cx);
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                !workspace.verdict_transient_open(),
+                "a held shift is a modifier, so the release opens nothing"
+            );
+        })
+        .unwrap();
+
+    // And the tap that follows still works: the cancelled hold left nothing
+    // behind that swallows the next one.
+    tap_shift(&workspace, cx);
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                workspace.verdict_transient_open(),
+                "the next bare tap still opens the verdicts"
+            );
+        })
+        .unwrap();
+}
+
 /// One tap of `shift` is the verdicts, over the card in view, and the
 /// letters they used to steal stay vim's. This is the whole of the change:
 /// the tap opens a menu that says what the keys are, and `d` in it writes
@@ -4425,7 +4537,7 @@ fn a_tap_of_shift_opens_the_verdicts_over_the_card_in_view(cx: &mut TestAppConte
         .unwrap();
     cx.run_until_parked();
 
-    cx.simulate_keystrokes(*workspace, "shift");
+    tap_shift(&workspace, cx);
     cx.run_until_parked();
     workspace
         .update(cx, |workspace, _, _| {
@@ -4461,9 +4573,9 @@ fn a_snooze_goes_through_the_transient_with_its_count(cx: &mut TestAppContext) {
     // The keys as fingers type them, and the time the same span lands on
     // when the workspace works it out for itself.
     for (keys, unit, count) in [
-        ("shift s s", SnoozeUnit::Days, 1usize),
-        ("shift s 7 d", SnoozeUnit::Days, 7),
-        ("shift s 4 5 m", SnoozeUnit::Minutes, 45),
+        ("s s", SnoozeUnit::Days, 1usize),
+        ("s 7 d", SnoozeUnit::Days, 7),
+        ("s 4 5 m", SnoozeUnit::Minutes, 45),
     ] {
         // A card apiece: a verdict waits on the daemon before the deal
         // moves on, so one desk cannot hold three of them.
@@ -4480,6 +4592,7 @@ fn a_snooze_goes_through_the_transient_with_its_count(cx: &mut TestAppContext) {
         cx.run_until_parked();
 
         let (expected, said) = snooze_target(unit, count as i64, chrono::Local::now());
+        tap_shift(&workspace, cx);
         cx.simulate_keystrokes(*workspace, keys);
         cx.run_until_parked();
         workspace
@@ -4535,7 +4648,7 @@ fn a_second_tap_of_shift_leaves_the_card_for_home(cx: &mut TestAppContext) {
         .unwrap();
     cx.run_until_parked();
 
-    cx.simulate_keystrokes(*workspace, "shift");
+    tap_shift(&workspace, cx);
     cx.run_until_parked();
     workspace
         .update(cx, |workspace, _, _| {
@@ -4544,7 +4657,7 @@ fn a_second_tap_of_shift_leaves_the_card_for_home(cx: &mut TestAppContext) {
         })
         .unwrap();
 
-    cx.simulate_keystrokes(*workspace, "shift");
+    tap_shift(&workspace, cx);
     cx.run_until_parked();
     workspace
         .update(cx, |workspace, _, _| {
@@ -4810,14 +4923,16 @@ fn double_shift_opens_home(cx: &mut TestAppContext) {
             assert_eq!(workspace.current_surface_name_for_test(), "current");
         })
         .unwrap();
-    cx.simulate_keystrokes(*workspace, "shift shift");
+    tap_shift(&workspace, cx);
+    tap_shift(&workspace, cx);
     workspace
         .update(cx, |workspace, _, _| {
             assert_eq!(workspace.current_surface_name_for_test(), "home");
         })
         .unwrap();
     // Pressing it again is the way back to what the reader was reading.
-    cx.simulate_keystrokes(*workspace, "shift shift");
+    tap_shift(&workspace, cx);
+    tap_shift(&workspace, cx);
     workspace
         .update(cx, |workspace, _, _| {
             assert_eq!(workspace.current_surface_name_for_test(), "current");
