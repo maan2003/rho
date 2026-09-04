@@ -152,6 +152,27 @@ nothing in storage.
 you convert it to visual with a set of rules". Every "where does this
 live" question becomes a rule that can change without a migration.
 
+### Labels are the filing; parent is for things
+
+The user's call, 4 Sep, after slice 3 landed. A thing is filed by
+labels: `f` on anything opens the picker, a label path (`rho/agent`)
+adds that label to the thing (a thing can carry several; naming the
+same path again takes it off), and the label's own `parent` chain
+makes `rho/agent` count as `rho` too, transitively. There is no
+separate label key. `parent` on a thing is set only when the thing
+hangs under another thing: a note under a Slack thread (notes for
+this), an agent under the thread or page it was spawned from, or `f`
+picking a thing instead of a label; one value, replaced. Find ranks a
+thing over its label paths and its parent path alike. The map shows
+the label tree with things under their labels, things under their
+parent thing, and the rest at the root. Workdir inheritance walks the
+parent chain as before; a label may carry a `Project(Id::File)`
+property so an agent made "in" `rho` inherits that project's workdir,
+the way a heading used to own one. The `Labeled` property, the
+picker, and the map's label axis from slice 3 stay as built; what
+changes is that `f` writes `Labeled` for a label and `Parent` only for
+a thing, and the unbound label key is deleted rather than left waiting.
+
 ### Labels are ids, not strings
 
 `Label(uuid)` with a `name`, nested with its own `parent`. In the picker
@@ -179,9 +200,9 @@ plus `state := muted` so the thing stays out of Home even when it
 speaks again until the user opens it, plus the
 source's own silence where it has one (a thread unfollowed, a
 conversation marked read). `s` snooze:
-`defer_until`. `t` todo: as today, plus for Slack the cursor. `f` file:
-`parent := the chosen id`, any id, picked with Find. `l` label:
-`labeled += the chosen label`, created if new. `u` undo: the log entry
+`defer_until`. `t` todo: as today, plus for Slack the cursor. `f` file: a
+label path adds `Labeled(label)`, created if new, or takes it off if
+already there; a thing picked with Find sets `parent := that thing`. `u` undo: the log entry
 names the facts it changed and their old values; undo writes them back.
 Every verdict is a log entry first.
 
