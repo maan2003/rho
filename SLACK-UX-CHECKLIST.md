@@ -2,6 +2,8 @@
 
 Reconciled against main on 3 Sep. Genuinely open, in order:
 
+- 2.17 a done thread comes back on an older message, and mark-read-before
+  leaves cards standing (reported from real use, 4 Sep). Highest priority.
 - 1.13 avatars (waits on the editor's inline-image inlay), 1.22 rough edges
   (b) soft-wrap column waits on the vendored editor.
 
@@ -537,6 +539,26 @@ done right after the transcript primitive (2.4) and before 2.10:
       no-op, not a drop. Comes right after 2.14, since 2.14 removes the
       third way this card could have gone quiet (a `channel_marked` from
       the phone).
+- [ ] 2.17 A done thread comes back on an older message. Reported by the
+      user on 4 Sep from real use, on the latest GUI and daemon: a thread
+      marked done is dealt again on an older message of the same thread,
+      and `mark read before` (2.13) leaves cards standing for the same
+      reason. First QA it on the real client against the fake, and
+      reproduce rather than guess: done on a thread, then each of (a) a
+      history page loading under it (`load_older`, `prefetch_ping`,
+      `ensure_thread_loaded`), (b) a reconnect with the follow list and
+      `client.counts` re-fetched, (c) an `activity.feed` poll naming the
+      thread with `latest_ts` at or below the verdict, (d) a restart with
+      the mirror holding the thread. None of these may rebind or
+      re-raise: only a message strictly newer than the verdict's
+      timestamp reopens a node, and `latest` never moves backwards. Fix
+      wherever the comparison is missing (`note_message`/`record` on
+      loaded pages, `bind_machine` reopening on rebind, `note_activity`).
+      Tests for all four, and a rig run: done, scroll up two pages,
+      reconnect, restart; the card stays closed. Same QA pass covers
+      snooze end to end (`ss`, `2sd`, `45sm`): the node's defer_until and
+      pace, the card leaving the queue, the echo, and any `desk:` notice
+      from a rejection.
 - [x] 2.10 No inbox in between, decided. Today a Slack obligation is copied
       into the rho inbox (`SlackItems`, `InboxKind::Slack`,
       `SourceReference::SlackThread`) and dealt from there. Rho: the dealer
