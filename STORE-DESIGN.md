@@ -38,31 +38,42 @@ rebind, reopen, and duplicate-card bug this week came from.
 
 ### The store holds facts, and only the user's
 
-A fact is `(subject: Id, relation, object)`. `Relation` is a typed enum,
-and each variant declares its object type, its cardinality, and its merge
-rule:
+A fact is `(subject: Id, relation)`, and the relation is a typed enum
+whose variant carries whatever data that relation needs: an id, several
+ids, a timestamp, text, or an id plus detail the id itself is too coarse
+for. There is no separate object column; the payload is the object.
 
-- `parent` → `Id`, one, last-writer-wins. The user's filing. Any id may be
-  a parent: an agent under a Slack thread, a note under a page, a label
-  under a label.
-- `labeled` → `Id::Label`, many, one boolean LWW cell per pair (the tag
-  rule as today: opposing writes at the same version choose add).
-- `name` (label) → text, one, LWW.
-- `body` (note) → text, the text CRDT.
-- `state` → open, done, dismissed; one, LWW.
-- `defer_until`, `deadline` → timestamp, one, LWW; `pace_days` → days.
-- `handled_through` (Slack) → ts, one, LWW. The verdict cursor
-  (`SLACK-DESIGN.md`).
-- `deleted` → bool, one, LWW; `created_at` → timestamp.
+Two shapes of relation, decided per variant:
+
+- One per subject, last-writer-wins: the store key is the subject and
+  the variant; a newer stamp replaces the payload. `Parent(Option<Id>)`,
+  `Name(String)`, `State(State)`, `DeferUntil(Timestamp)`,
+  `Deadline(Timestamp)`, `PaceDays(u32)`, `HandledThrough(Ts)` (Slack,
+  the verdict cursor), `Deleted(bool)`, `CreatedAt(Timestamp)`.
+- Many per subject, one boolean LWW cell per payload: the store key is the
+  subject, the variant, and the payload; the cell says present or absent.
+  `Labeled(Id::Label)` (the tag rule as today: opposing writes at the
+  same version choose add). Any future relation the user can have several
+  of is this shape.
+- `Body` (note) is the text CRDT, keyed by subject.
 - The verdict log: `(Id, stamp) → VerdictEvent`, grow-only, merged by
   union. History and undo.
+
+The payload is where detail lives that the id does not carry. Ids stop at
+the unit (a Slack thread, an agent, a page), but a relation can name the
+exact thing inside it: `From { unit: SlackUnit, message: Ts }` on an
+agent records the very message that led to spawning it, though no id
+exists for a message; a relation may carry several ids where one fact
+genuinely joins several things. The same rule bounds it: a payload is
+typed, never a string that means something.
 
 Gone from the cell vocabulary: `kind`, `agent_id`, `host`, `page_ref`,
 `url`, `workspace`, `channel`, `thread_ts`, `repo`, `number`, `path`. Each
 was either the identity (now in the id) or a source fact (now derived).
 The merge rules, stamps, device ids, and sync-since-version are exactly
-today's; what changes is the key: `(Id, Relation)` instead of `(NodeId,
-Field)`, with `Id` typed.
+today's; what changes is the key: `(Id, relation variant[, payload])`
+instead of `(NodeId, Field)`, with `Id` typed and the value folded into
+the relation.
 
 The machine writes nothing here. Not a reference node, not a parent, not
 a title. The only writer is a user's key, through a verdict or an edit.
@@ -76,7 +87,7 @@ it never repeats one.
 
 ### Source facts are derived, never stored
 
-The same vocabulary, computed at read time from the system that owns it,
+The same shape, a relation with its payload on a subject, computed at read time from the system that owns it,
 in the GUI, where the sources already live:
 
 - `spawned_by` (agent → agent), `on_host` (agent → host), `in_workdir`
