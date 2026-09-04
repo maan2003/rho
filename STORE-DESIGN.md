@@ -257,6 +257,25 @@ address exchange the punch needs, and the fallback for the rare pair of
 networks that will not punch; it is not the data path. The daemon's
 lasting sync role is the peer that holds while one side is away.
 
+### Direction: what the daemon stores in the end
+
+Recommended 4 Sep, not built. Per agent, only what running a turn needs
+and the record of what happened: the run config (workdirs, role,
+runtime, created at, current lineage, the rewind marker, spawned by),
+the raw event log, and the lineage table. Daemon-wide: the machine
+identity and iroh secret, the trust list, provider secrets, quota
+observations from providers, the counters and format markers, and,
+later, the held sync segments. Nothing else. Gone from the daemon:
+every `rho_desk_*` table once the user has restarted on the slice 1
+build; the agent record's name, parent, activity, last user message and
+its text, last turn ended, updated at (name and parent are store facts,
+the rest are derived from the log); the presentation cache (the
+projection is recomputed, cached only if measured slow); the per-agent
+usage aggregates (sums over the log's cost events, done on the client);
+`view_config` and `projects` (client settings, store facts). A
+generated title is a model output and belongs in the event log as an
+event, not in a column.
+
 ### Direction: agent transcripts are logs too, and the client decides attention
 
 The user's read on 4 Sep, not built and not a slice yet. An agent's
