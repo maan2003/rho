@@ -229,7 +229,11 @@ listener accepts two ALPNs instead of one; and the relay both sides use
 for NAT traversal (`presets::N0`, n0's public servers today) can be the
 vendored `iroh-relay` run by the daemon on its host, so no third party
 sees even the metadata. Local discovery for the near path is iroh's own;
-bluetooth is not, and waits.
+bluetooth is not, and waits. Assumed (the user, 4 Sep): two peers that
+are both up can hole punch, so the relay's job is rendezvous, the
+address exchange the punch needs, and the fallback for the rare pair of
+networks that will not punch; it is not the data path. The daemon's
+lasting sync role is the peer that holds while one side is away.
 
 ## Browser tabs
 
