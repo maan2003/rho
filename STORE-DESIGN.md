@@ -471,7 +471,19 @@ else is built on. The transient lands after slice 2.
    `SlackSnoozedAt(ts)`, written by snooze beside `DeferUntil`, because
    "a message newer than the snooze" needs a Slack position to compare
    against and the store has no wall clock; the cursor stays untouched.
-3. Labels: the `l` key, the picker with `rho/agent`, the map's label axis.
+3. Labels: the label key, the picker with `rho/agent`, the map's label
+   axis. Found while starting it (b8os, 4 Sep): a GUI that writes a
+   verdict variant the running daemon does not know aborts that daemon
+   at its next start (senax `UnknownVariantId` on the verdict log is a
+   panic, not a skip). So any new verdict or property variant lands in
+   two steps, the daemon first with the variant known and unknown
+   variants made to fail soft (skip and log), then the GUI writing it;
+   and a downgrade of the daemon under a newer GUI is not supported.
+   Also open: a thing shown in two places on the map is one buffer in
+   two excerpts, and anchors resolve to the first, so the second row
+   needs per-excerpt anchors; and the key, since `l` on the map is
+   vim's right motion (the user picks; the verdict transient is the
+   natural home).
 4. Browser: `opened_from` from the embedded browser, tabs under their
    origin.
 
