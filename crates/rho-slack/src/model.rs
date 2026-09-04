@@ -693,6 +693,13 @@ impl Model {
         self.units.remove(&unit_of(&key)).is_some()
     }
 
+    /// The threads the user follows, for a caller that has to walk them:
+    /// they are units in their own right, so anything re-deriving units from
+    /// history needs to know which threads to look in.
+    pub fn followed(&self) -> Vec<ThreadKey> {
+        self.followed.iter().cloned().collect()
+    }
+
     pub fn follows(&self, key: &ThreadKey) -> bool {
         self.followed.contains(key)
     }

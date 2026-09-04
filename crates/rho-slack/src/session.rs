@@ -422,6 +422,25 @@ impl Session {
         if let Some(id) = mirror.self_id(&workspace) {
             self.model.set_self(id);
         }
+        self.derive_units_from_mirror();
+    }
+
+    /// A restart is another source of the same messages, and like every
+    /// other source it may only raise facts. The activity feed is a cursor:
+    /// a mention it has already passed is never reported again, so a unit
+    /// raised only by a live mention would be gone after a restart even
+    /// though rho still holds the message. The units are therefore derived
+    /// from the mirror's own history: every DM with messages, every channel
+    /// with a mention, every followed thread. `note_message` is what decides
+    /// which of those a message is, and its `seen` set makes a repeat a
+    /// no-op, so this runs again once Slack has said which threads are
+    /// followed and the replies in them are classified then rather than as
+    /// channel traffic. Nothing here is a request: the mirror is on disk.
+    fn derive_units_from_mirror(&mut self) {
+        let Some(mirror) = self.mirror.clone() else {
+            return;
+        };
+        derive_units(&mut self.model, &mirror, now_ms());
     }
 
     /// Users, conversations, and unread counts: everything the list surface
@@ -478,6 +497,9 @@ impl Session {
                             .map(|thread| (thread.channel, thread.thread_ts)),
                     );
                 }
+                // Now that the followed list is in, the replies in those
+                // threads are thread units rather than channel traffic.
+                session.derive_units_from_mirror();
                 // A DM that arrived while rho was off is in the counts and
                 // nowhere else: the feed never carries one. Raised here,
                 // once the conversations are known, because whether a
@@ -1957,7 +1979,37 @@ const PING_WINDOW: usize = 20;
 /// than paging the whole history to find its floor.
 const LANDING_WINDOW: usize = 200;
 
+/// How far back a restart looks in one conversation for a message that
+/// still concerns the user. A unit is at most one card, so what matters is
+/// finding the newest such message rather than every one of them, and a
+/// window keeps the cost of a start flat in a workspace with a long
+/// history.
+const STARTUP_WINDOW: usize = 200;
+
 /// Which mirror scope holds a unit's messages.
+/// The units the mirror's own history implies, raised into the model.
+/// Every conversation the mirror knows and every followed thread is walked,
+/// and the model decides which messages are the user's business.
+fn derive_units(model: &mut Model, mirror: &Mirror, now_ms: i64) {
+    let workspace = model.workspace().0.clone();
+    let mut scopes = mirror
+        .conversations(&workspace)
+        .into_iter()
+        .map(|conversation| Scope::conversation(&workspace, &conversation.id))
+        .collect::<Vec<_>>();
+    scopes.extend(
+        model
+            .followed()
+            .iter()
+            .map(|key| Scope::thread(&workspace, &key.channel, &key.thread_ts)),
+    );
+    for scope in scopes {
+        for message in mirror.newest_chunk(&scope, STARTUP_WINDOW) {
+            model.note_message(&message, now_ms);
+        }
+    }
+}
+
 fn unit_scope(model: &Model, unit: &Unit) -> Scope {
     let workspace = &model.workspace().0;
     match &unit.thread {
@@ -2084,6 +2136,96 @@ mod tests {
             members: Vec::new(),
         }]);
         (dir, mirror, model)
+    }
+
+    /// A restart is another source of the same messages and may only raise
+    /// facts. The activity feed is a cursor: the mention it has already
+    /// passed is never reported again, so without this the card would be
+    /// gone the next morning. The mirror still holds the message, and the
+    /// unit comes back from there: one card, whatever else is in the
+    /// channel, and none at all for a channel nobody was mentioned in.
+    #[test]
+    fn a_mention_the_feed_has_passed_is_still_a_card_after_a_restart() {
+        let (_dir, mirror, mut model) = seeded();
+        let quiet = crate::types::Conversation {
+            id: ChannelId("C2".into()),
+            kind: crate::types::ConversationKind::Channel,
+            name: "random".into(),
+            user: None,
+            members: Vec::new(),
+        };
+        let direct = crate::types::Conversation {
+            id: ChannelId("D1".into()),
+            kind: crate::types::ConversationKind::DirectMessage,
+            user: Some(UserId("U1".into())),
+            name: "D1".into(),
+            members: Vec::new(),
+        };
+        model.add_conversations([quiet.clone(), direct.clone()]);
+        mirror.put_conversations(
+            "T1",
+            &[
+                crate::types::Conversation {
+                    id: ChannelId("C1".into()),
+                    kind: crate::types::ConversationKind::Channel,
+                    name: "design".into(),
+                    user: None,
+                    members: Vec::new(),
+                },
+                quiet,
+                direct,
+            ],
+        );
+        // What the last run left on disk: a mention with traffic on both
+        // sides of it, a channel with only traffic, and a direct message.
+        mirror.insert_messages(
+            &Scope::conversation("T1", &ChannelId("C1".into())),
+            &[
+                message("100.0", "morning"),
+                mentioning("200.0", "U1", "<@ME> can you look?"),
+                message("300.0", "unrelated"),
+            ],
+        );
+        mirror.insert_messages(
+            &Scope::conversation("T1", &ChannelId("C2".into())),
+            &[message("150.0", "nobody is talking to you")],
+        );
+        mirror.insert_messages(
+            &Scope::conversation("T1", &ChannelId("D1".into())),
+            &[crate::api::parse_message(
+                &json!({"ts": "250.0", "user": "U1", "text": "lunch?"}),
+                &ChannelId("D1".into()),
+            )
+            .unwrap()],
+        );
+
+        derive_units(&mut model, &mirror, 0);
+        assert_eq!(
+            model.tracked(),
+            vec![
+                Unit::conversation(&ChannelId("C1".into())),
+                Unit::conversation(&ChannelId("D1".into())),
+            ],
+            "the mentioned channel and the direct message, and nothing for the quiet one"
+        );
+        let mentioned = model
+            .unit(&Unit::conversation(&ChannelId("C1".into())))
+            .unwrap();
+        assert_eq!(mentioned.reason, crate::types::Reason::Mention);
+        assert_eq!(
+            mentioned.newest,
+            Ts("200.0".into()),
+            "the traffic after the mention is not about the user, so the card waits from the mention"
+        );
+
+        // A second pass is what the roster's followed list triggers, and it
+        // is a no-op on everything already derived.
+        let before = model.card(&Unit::conversation(&ChannelId("C1".into())), 0);
+        derive_units(&mut model, &mirror, 60_000);
+        assert_eq!(
+            model.card(&Unit::conversation(&ChannelId("C1".into())), 0),
+            before
+        );
     }
 
     /// The card's words are rendered when the card is drawn, never kept

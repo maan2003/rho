@@ -2,8 +2,6 @@
 
 Reconciled against main on 3 Sep. Genuinely open, in order:
 
-- 2.19 a unit raised only by a live mention is gone after a restart
-  once the feed cursor passed it; derive units from the mirror at startup.
 - then the verdict transient (`HOME-DESIGN.md`, no deal mode), the
   user's next UX priority now that the store (slices 1 and 2) is in.
 - 1.13 avatars (waits on the editor's inline-image inlay), 1.22 rough edges
@@ -582,7 +580,19 @@ done right after the transcript primitive (2.4) and before 2.10:
       same as `d`; align it. Tests: a muted DM that gets a new message
       stays off Home until opened; a muted thread is unfollowed in Slack
       and undo follows it again.
-- [ ] 2.19 A unit raised only by a live mention is gone after a restart
+- [x] 2.19 A unit raised only by a live mention is gone after a restart.
+      Landed 4 Sep (b8os, screens 219-*): `derive_units` walks the mirror's
+      own history at startup, every conversation it knows plus every
+      followed thread, and lets `note_message` decide which messages are the
+      user's; `note_message`'s `seen` set makes a repeat a no-op, so it runs
+      again once the roster's followed list is in and the replies in those
+      threads are classified as thread units rather than channel traffic.
+      No request: the mirror is on disk, and the window is the newest 200
+      messages per conversation, since a unit is one card whatever else is
+      in it. Test:
+      `a_mention_the_feed_has_passed_is_still_a_card_after_a_restart`. In
+      the rig all four cards survive a daemon and GUI restart against a
+      fake whose feed cursor is past both mentions. Original text: gone after a restart
       when the activity-feed cursor has already passed that message: the
       store keeps the cursor, the mirror never re-reports the mention.
       Found by b8os in the 2.18 rig (the seeded `#random` mention).

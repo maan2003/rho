@@ -171,6 +171,16 @@ odd websocket event types, rho handles `hello`, `reconnect_url`, `pong`,
 matter, so a missed websocket frame is never a missed mention. The
 websocket exists only so the lamp lights within a second.
 
+A restart is a third source of the same messages, and like the other two it
+may only raise facts. The feed is a cursor, so a mention it has already
+passed is never reported again; the mirror still holds the message, so at
+startup the units are derived from the mirror's own history (checklist
+2.19): every conversation it knows and every followed thread is walked and
+the model decides which messages are the user's. It costs no request. The
+walk runs twice, once before the network answers and once after the
+followed list is in, because a reply in a thread nobody has yet said is
+followed is channel traffic; the dedup makes the second pass free.
+
 ### Slack deals straight from the mirror; there is no inbox and no node in between
 
 The dealer takes Slack cards the way it takes agent cards: the mirror
