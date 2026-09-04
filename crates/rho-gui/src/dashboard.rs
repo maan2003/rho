@@ -1625,6 +1625,10 @@ impl Dashboard {
                 }
                 false
             });
+            // A card hangs under the card above it, so its marker starts
+            // past that one's. Its own depth counts itself, which is the
+            // indent a root card has: none.
+            let indent = "    ".repeat(row_depths[index].card.saturating_sub(1));
             let prefix = match &node.id {
                 rho_desk::cells::Id::Note(_) => {
                     // A note under a card is indented past the card's marker
@@ -1652,9 +1656,9 @@ impl Dashboard {
                             )
                         })
                         .unwrap_or_default();
-                    format!("  • {label}")
+                    format!("{indent}  • {label}")
                 }
-                _ => "  ◦ ".to_owned(),
+                _ => format!("{indent}  ◦ "),
             };
             let class = match &node.id {
                 rho_desk::cells::Id::Note(_) => Some(DashClass::for_depth(row_depths[index].note)),

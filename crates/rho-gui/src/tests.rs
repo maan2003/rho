@@ -8461,15 +8461,12 @@ fn a_label_is_named_by_path_and_puts_the_thing_in_a_second_place(cx: &mut TestAp
             workspace.dashboard_display_text_for_test(cx)
         })
         .unwrap();
+    // Each place carries its own bullet, and each row starts past the row
+    // it hangs under: the label `agent` under `rho`, and the note under
+    // `agent` past that. A label nests the way a note does.
     assert_eq!(
-        map.matches("Deal QA note").count(),
-        2,
-        "the note is filed in its area and carried by the label: {map:?}"
-    );
-    assert_eq!(
-        map.matches("* Deal QA note").count(),
-        2,
-        "both places carry the bullet, not just the one drawn first: {map:?}"
+        map,
+        "* Verdict agent\n** Deal QA note\n  ◦ rho\n      ◦ agent\n        * Deal QA note"
     );
 
     // The same path a second time is the same two labels, not two more, and
