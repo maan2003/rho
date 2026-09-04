@@ -337,7 +337,7 @@ touch daemon code. The client side of the same crate is what the GUI
 uses, and, later, what a GUI-to-GUI direct path uses unchanged. Agent
 log replication is not this crate: it is the daemon's own protocol
 over its own stream, since the daemon owns those logs and reads them
-in the clear; the two share only the idea of positions and tails.
+in the clear; the two share nothing.
 
 ### Direction: agent transcripts are logs too, and the client decides attention
 
