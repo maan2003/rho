@@ -271,9 +271,15 @@ impl Workspace {
         self.sync_tree_dashboard(host, window, cx);
         let transaction_id = self.record_desk_semantic_undo(host, stamp, undo, cx);
         self.pending_semantic_group = Some(transaction_id);
+        // A new note is a row on the map, so the map is where the reader
+        // has to be to type it. From Home — the front door, and where `n`
+        // is usually pressed — the row and the insert cursor were both
+        // behind a surface that never came into view, so the title went
+        // into nothing and the note read as "nothing happened".
+        self.open_overview(window, cx);
         // The note is ready for its first line immediately, rather than
         // reading the title's characters as normal-mode commands.
-        self.dashboard_enter_insert(window, cx);
+        self.enter_insert_when_shown(window, cx);
     }
 }
 

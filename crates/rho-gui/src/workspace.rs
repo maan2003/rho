@@ -473,6 +473,11 @@ pub struct Workspace {
     /// Which host the pending draft agent was sent to, so its confirmation
     /// can be recognized and the compose surface reset.
     awaiting_draft_agent: Option<HostId>,
+    /// A surface was opened to be written in and is waiting for the
+    /// frame its focus lands in to enter insert. The action goes to the
+    /// focused node of the frame already on screen, so dispatching
+    /// before that frame types into the surface the reader is leaving.
+    insert_when_shown: bool,
     /// The area the next agent this client asks for is filed under. The
     /// daemon never writes it: the agent exists because the registry says
     /// so, and where it is shown is the user's own fact.
@@ -1063,6 +1068,7 @@ impl Workspace {
             workdirs: Vec::new(),
             draft_area: None,
             awaiting_draft_agent: None,
+            insert_when_shown: false,
             pending_agent_filing: None,
             ready_hosts: HashSet::new(),
             replay_hosts: HashSet::new(),
@@ -8072,6 +8078,8 @@ impl Workspace {
             view.set_start_text(crate::draft_view::DEFAULT_START, cx);
             view.seed(&label, true, editor.as_ref(), window, cx);
         });
+        // The draft exists to be written in, so it opens ready to type.
+        self.enter_insert_when_shown(window, cx);
     }
 
     /// The workdir to fall back on when nothing else names one: a single
@@ -8305,9 +8313,40 @@ impl Workspace {
     }
 
     pub(crate) fn dashboard_enter_insert(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.enter_insert_mode(window, cx);
+    }
+
+    /// Vim's insert, for a surface that was opened to be written in. It is
+    /// dispatched to whatever the window has focused, so a caller that just
+    /// changed surfaces has to wait for the frame that focus lands in.
+    pub(crate) fn enter_insert_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Ok(action) = cx.build_action("vim::InsertBefore", None) {
             window.dispatch_action(action, cx);
         }
+    }
+
+    /// Enters insert once the surface just shown is on screen. Anything
+    /// opened for the reader to type in wants this: dispatched in the same
+    /// breath as the surface change, the insert reaches the old surface and
+    /// the first characters of what they write are read as commands.
+    pub(crate) fn enter_insert_when_shown(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.insert_when_shown = true;
+        let workspace = cx.entity().downgrade();
+        window.on_next_frame(move |window, cx| {
+            let Some(workspace) = workspace.upgrade() else {
+                return;
+            };
+            workspace.update(cx, |workspace, cx| {
+                if std::mem::take(&mut workspace.insert_when_shown) {
+                    workspace.enter_insert_mode(window, cx);
+                }
+            });
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn insert_when_shown_for_test(&self) -> bool {
+        self.insert_when_shown
     }
 
     /// A freshly opened draft row only exists on screen after a sync:

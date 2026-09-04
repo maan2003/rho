@@ -8292,3 +8292,88 @@ fn enter_writes_a_newline_into_a_note_body(cx: &mut TestAppContext) {
         })
         .unwrap();
 }
+
+/// `n n` from Home. A new note is a row on the map, so the map has to come
+/// into view: with Home as the landing surface the row and its insert
+/// cursor were both behind a surface that never appeared, and the title
+/// the reader typed went nowhere.
+#[gpui::test]
+fn a_new_note_from_home_brings_the_map_into_view(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let mut desk = DeskFixture::new();
+    let area = desk.note(None, "the area in view");
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.take_host_messages_for_test(HostId::default());
+            assert_eq!(workspace.current_surface_name_for_test(), "home");
+            assert!(!workspace.overview_open_for_test());
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes(*workspace, "space n n");
+    cx.run_until_parked();
+    cx.dispatch_action(*workspace, crate::MinibufferConfirm);
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            let mutation =
+                take_desk_mutation(workspace, HostId::default()).expect("new note mutation");
+            assert!(mutation.writes.iter().any(
+                |write| write.property == rho_desk::cells::Property::Parent(Some(area.clone()))
+            ));
+            assert!(
+                workspace.overview_open_for_test(),
+                "the map is what the new row is on, so the map is what the reader sees"
+            );
+            assert!(
+                workspace.insert_when_shown_for_test(),
+                "the row is ready for its title rather than reading it as commands"
+            );
+        })
+        .unwrap();
+}
+
+/// `n a` from Home: the draft opens ready to type. It used to open in
+/// normal mode, so the first characters of the message were read as vim
+/// commands and the reader watched the start of their sentence vanish.
+#[gpui::test]
+fn the_new_agent_draft_opens_ready_to_type(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let mut desk = DeskFixture::new();
+    desk.note(None, "the area in view");
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes(*workspace, "space n a");
+    cx.run_until_parked();
+    cx.dispatch_action(*workspace, crate::MinibufferConfirm);
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(workspace.current_surface_name_for_test(), "draft");
+        })
+        .unwrap();
+
+    // The insert itself lands on the frame the page is drawn in, which the
+    // headless test window never asks for; what is asserted here is that
+    // the draft asked for it. The typing was checked in the rig.
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                workspace.insert_when_shown_for_test(),
+                "the draft opened in normal mode, so the message loses its first characters"
+            );
+        })
+        .unwrap();
+}
