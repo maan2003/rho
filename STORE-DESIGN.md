@@ -163,6 +163,21 @@ has one (a thread unfollowed, a conversation marked read). `s` snooze:
 names the facts it changed and their old values; undo writes them back.
 Every verdict is a log entry first.
 
+## Direction: the daemon shrinks to coordinator and agent runner
+
+Not a decision yet, the user's read on 4 Sep, recorded so slice 1 does
+not build against it. Once the store holds only the user's facts and
+every source fact is derived where the source lives (Slack and the
+browser already in the GUI, agent activity in the registry), the daemon
+is left with two jobs: running agents on a host, and being the peer the
+other devices sync the store through. Nothing about the store needs a
+daemon: it is a set of cells with stamps and a version, and a GUI can
+hold one and sync it peer to peer. So the store's API is written as a
+store, not as "ask the daemon": the GUI reads and writes facts through
+one interface whose one implementation today talks to the daemon, and
+whose next one is local. The wire protocol carries cells, not desk
+commands.
+
 ## Browser tabs
 
 A tab is `Page(PageId)`; it is never created in the store. Its place is
