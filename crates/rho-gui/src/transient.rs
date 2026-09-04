@@ -658,7 +658,7 @@ pub fn verdict_menu() -> Transient {
             workspace.undo_verdict(window, cx);
         })
         .item("j", "open the top card", |workspace, window, cx| {
-            workspace.cmd_surface_forward_or_deal(window, cx);
+            workspace.pull_card(window, cx);
         })
         .counted()
 }
@@ -732,8 +732,8 @@ pub fn root_menu() -> Transient {
         .item("k", "surface back", |workspace, window, cx| {
             workspace.cmd_surface_back(window, cx);
         })
-        .item("j", "surface forward · deal", |workspace, window, cx| {
-            workspace.cmd_surface_forward_or_deal(window, cx);
+        .item("j", "open the top card", |workspace, window, cx| {
+            workspace.pull_card(window, cx);
         })
         .item("shift-j", "close · deal", |workspace, window, cx| {
             workspace.cmd_close_and_deal(window, cx);

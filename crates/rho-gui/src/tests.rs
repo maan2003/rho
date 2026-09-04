@@ -3600,8 +3600,6 @@ fn first_messages_open_joins_surface_history(cx: &mut TestAppContext) {
 
     cx.simulate_keystrokes(*workspace, "f21");
     assert!(buffer_text(&workspace, cx).contains("agent transcript"));
-    cx.simulate_keystrokes(*workspace, "f20");
-    assert!(buffer_text(&workspace, cx).contains("message log"));
 }
 
 #[gpui::test]
@@ -6208,39 +6206,6 @@ fn f21_steps_through_three_surfaces(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn history_back_twice_then_forward_once_lands_on_the_middle_entry(cx: &mut TestAppContext) {
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.configure_surface_history_for_test(&["one", "two", "three"], window, cx);
-            workspace.step_surface_back_for_test(window, cx);
-            workspace.step_surface_back_for_test(window, cx);
-            assert!(workspace.step_surface_forward_for_test(window, cx));
-            assert_eq!(workspace.current_surface_name_for_test(), "two");
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn history_forward_entries_do_not_reappear_as_backward_duplicates(cx: &mut TestAppContext) {
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.configure_surface_history_for_test(&["one", "two", "three"], window, cx);
-            workspace.step_surface_back_for_test(window, cx);
-            workspace.step_surface_back_for_test(window, cx);
-            workspace.step_surface_forward_for_test(window, cx);
-            workspace.step_surface_back_for_test(window, cx);
-            assert_eq!(workspace.current_surface_name_for_test(), "three");
-            assert_eq!(
-                workspace.surface_history_for_test(),
-                (vec!["three".into(), "two".into(), "one".into()], 0)
-            );
-        })
-        .unwrap();
-}
-
-#[gpui::test]
 fn ordinary_open_of_recorded_surface_moves_the_history_cursor_without_reordering(
     cx: &mut TestAppContext,
 ) {
@@ -6250,9 +6215,11 @@ fn ordinary_open_of_recorded_surface_moves_the_history_cursor_without_reordering
             workspace.configure_surface_history_for_test(&["one", "two", "three"], window, cx);
             workspace.open_history_index_for_test(0, cx);
             assert_eq!(workspace.current_surface_name_for_test(), "three");
-            assert_eq!(workspace.surface_history_for_test().1, 0);
-            assert!(workspace.step_surface_forward_for_test(window, cx));
-            assert_eq!(workspace.current_surface_name_for_test(), "two");
+            assert_eq!(
+                workspace.surface_history_for_test(),
+                (vec!["three".into(), "two".into(), "one".into()], 0),
+                "opening a recorded surface moves the cursor and leaves the order alone"
+            );
         })
         .unwrap();
 }
@@ -6413,10 +6380,14 @@ fn q_mid_list_removes_current_and_keeps_newer_entries_forward(cx: &mut TestAppCo
     cx.simulate_keystrokes(*workspace, "q");
 
     workspace
-        .update(cx, |workspace, window, cx| {
+        .update(cx, |workspace, _, _| {
             assert_eq!(workspace.current_surface_name_for_test(), "three");
-            assert!(workspace.step_surface_forward_for_test(window, cx));
-            assert_eq!(workspace.current_surface_name_for_test(), "one");
+            // The entry the reader had stepped past is still in the list:
+            // only the one they closed is gone.
+            assert_eq!(
+                workspace.surface_history_for_test(),
+                (vec!["three".into(), "one".into()], 0)
+            );
         })
         .unwrap();
 }
@@ -7556,6 +7527,91 @@ fn a_skipped_card_is_marked_on_home_and_comes_back_when_its_source_moves(cx: &mu
                     node_id: note,
                 }),
                 "the skip is void once the card's own position moves past it"
+            );
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn space_j_pulls_a_card_even_with_a_surface_ahead_in_history(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let mut desk = DeskFixture::new();
+    desk.due_note(None, "Ship the release");
+    desk.due_note(None, "Book the venue");
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            // Two surfaces recorded and one step back, so there is something
+            // ahead of the reader for a forward step to land on.
+            workspace.configure_surface_history_for_test(&["one", "two"], window, cx);
+            workspace.step_surface_back_for_test(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let ahead = workspace
+        .update(cx, |workspace, _, _| {
+            workspace.surface_history_for_test().0[0].clone()
+        })
+        .unwrap();
+
+    cx.dispatch_action(*workspace, crate::DealOpen);
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, cx| {
+            assert_ne!(
+                workspace.current_surface_name_for_test(),
+                ahead,
+                "space j gives the most important thing, never the surface ahead"
+            );
+            assert!(
+                workspace.current_deal_card_for_test(cx).is_some(),
+                "it opened a card: {:?}",
+                workspace.current_surface_name_for_test()
+            );
+        })
+        .unwrap();
+}
+#[gpui::test]
+fn a_verdict_on_a_home_row_closes_that_card_and_stays_on_home(cx: &mut TestAppContext) {
+    cx.update(bind_test_keymaps);
+    let mut desk = DeskFixture::new();
+    let top = desk.due_note(None, "Ship the release");
+    desk.due_note(None, "Book the venue");
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.take_host_messages_for_test(HostId::default());
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert_eq!(workspace.current_surface_name_for_test(), "home");
+            // The row under Home's cursor is the card a verdict is about,
+            // the same rule as the row under the map's cursor.
+            assert!(workspace.open_verdict_transient(window, cx));
+        })
+        .unwrap();
+    cx.dispatch_action(*workspace, crate::DashboardDealDone);
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            let mutation = take_desk_mutation(workspace, HostId::default()).expect("verdict");
+            assert!(
+                mutation.writes.iter().any(|write| write.id == top
+                    && write.property
+                        == rho_desk::cells::Property::State(rho_desk::cells::State::Done)),
+                "the row under the cursor is what closes"
+            );
+            assert_eq!(
+                workspace.current_surface_name_for_test(),
+                "home",
+                "and the reader is left on the list they were reading"
             );
         })
         .unwrap();

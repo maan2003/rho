@@ -1644,27 +1644,6 @@ impl Workspace {
         cx.notify();
     }
 
-    fn step_surface_forward(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.overview_open || self.history_cursor + 1 >= self.surface_history.len() {
-            return false;
-        }
-        self.history_cursor += 1;
-        let target = self.surface_history[self.history_cursor].clone();
-        self.show_warm_surface(
-            target.clone(),
-            crate::journal::SurfaceShowMethod::Mru,
-            window,
-            cx,
-        );
-        crate::journal::record(crate::journal::Event::HistoryStepped {
-            direction: crate::journal::HistoryDirection::Forward,
-            position: self.history_cursor + 1,
-            len: self.surface_history.len(),
-        });
-        cx.notify();
-        true
-    }
-
     fn journal_card_identity(
         identity: &crate::dashboard::DealCardId,
     ) -> crate::journal::DealerCardIdentity {
@@ -5942,7 +5921,7 @@ impl Workspace {
 
     #[cfg(test)]
     pub(crate) fn dashboard_deal_mode_for_test(&mut self, cx: &mut Context<Self>) -> bool {
-        self.card_in_view(cx).is_some()
+        self.open_card_in_view(cx).is_some()
     }
 
     #[cfg(test)]
@@ -6017,15 +5996,6 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.step_surface_back(window, cx);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn step_surface_forward_for_test(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        self.step_surface_forward(window, cx)
     }
 
     #[cfg(test)]
@@ -6137,7 +6107,8 @@ impl Workspace {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Option<(crate::dashboard::DealCardId, crate::dashboard::DealCardKind)> {
-        self.card_in_view(cx).map(|card| (card.identity, card.kind))
+        self.open_card_in_view(cx)
+            .map(|card| (card.identity, card.kind))
     }
 
     #[cfg(test)]
@@ -6148,7 +6119,10 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> bool {
         for _ in 0..8 {
-            if self.card_in_view(cx).is_some_and(|card| wanted(card.kind)) {
+            if self
+                .open_card_in_view(cx)
+                .is_some_and(|card| wanted(card.kind))
+            {
                 return true;
             }
             self.pull_card(window, cx);
@@ -6161,7 +6135,7 @@ impl Workspace {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Option<crate::dashboard::DealCard> {
-        self.card_in_view(cx)
+        self.open_card_in_view(cx)
     }
 
     /// The state a cold start used to leave behind before Home took the
@@ -6190,7 +6164,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let card = self.card_in_view(cx);
+        let card = self.open_card_in_view(cx);
         if let Some(card) = &card
             && matches!(card.kind, crate::dashboard::DealCardKind::Agent)
             && let Some(agent_id) = card.agent_id
@@ -6607,7 +6581,7 @@ impl Workspace {
         }
         if let Some(verdict) = self.pending_tree_verdicts.remove(&(host, stamp)) {
             let submitted_card_is_current = self
-                .card_in_view(cx)
+                .open_card_in_view(cx)
                 .is_some_and(|card| card.identity == verdict.event.card);
             let undo_sequence = verdict.undo.sequence;
             self.restore_verdict_undo(verdict.undo);
@@ -7496,18 +7470,6 @@ impl Workspace {
     }
 
     /// `j` in the verdict transient, and `ctrl-j`: one pull.
-    /// Forward through the history if the reader has stepped back, a pull
-    /// otherwise: `space j` only deals when there is nothing ahead of it.
-    pub(crate) fn cmd_surface_forward_or_deal(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.step_surface_forward(window, cx) {
-            self.pull_card(window, cx);
-        }
-    }
-
     pub(crate) fn cmd_close_and_deal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_current_surface(window, cx);
         self.pull_card(window, cx);
@@ -7606,7 +7568,7 @@ impl Workspace {
             return;
         }
         let now = chrono::Local::now().fixed_offset();
-        let in_view = self.card_in_view(cx);
+        let in_view = self.open_card_in_view(cx);
         let hand = self.hand(cx);
         // Reading a card and pulling again is what a skip is: the card is
         // still owed, it is just not what to look at next.
@@ -7676,18 +7638,13 @@ impl Workspace {
     }
 
     /// The card the reader is on: the one behind the surface in view, or
-    /// the row under the map's cursor. When the ranking holds no card for
-    /// that node the node itself is the card, because reading a thing can
-    /// be what quiets it and it is still what is on screen.
+    /// the row under Home's or the map's cursor. When the ranking holds no
+    /// card for that node the node itself is the card, because reading a
+    /// thing can be what quiets it and it is still what is on screen.
     pub(crate) fn card_in_view(
         &mut self,
         cx: &mut Context<Self>,
     ) -> Option<crate::dashboard::DealCard> {
-        // Home is a list of cards rather than a card: a pull from it opens
-        // the most important one instead of passing over it.
-        if !self.overview_open && self.active_pane().surface.key == SurfaceKey::Home {
-            return None;
-        }
         let (host, node_id) = self.label_target(cx)?;
         let hand = self.hand(cx);
         hand.card(&crate::dashboard::DealCardId {
@@ -7696,6 +7653,25 @@ impl Workspace {
         })
         .cloned()
         .or_else(|| self.dashboard.card_for_node(host, node_id, cx))
+    }
+
+    /// Whether Home itself is what the reader has open. Its cursor row is a
+    /// card like the map's is, but Home is a list rather than a card: a pull
+    /// from it opens the top card instead of passing over the row, and the
+    /// bar still says "home".
+    pub(crate) fn home_in_view(&self) -> bool {
+        !self.overview_open && self.active_pane().surface.key == SurfaceKey::Home
+    }
+
+    /// The card a surface in view stands for, which is nothing on Home.
+    pub(crate) fn open_card_in_view(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<crate::dashboard::DealCard> {
+        match self.home_in_view() {
+            true => None,
+            false => self.card_in_view(cx),
+        }
     }
 
     fn deal_card_is_target(&mut self, cx: &mut Context<Self>) -> bool {
@@ -7866,10 +7842,16 @@ impl Workspace {
     }
 
     fn finish_deal_verdict(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // A verdict from Home is a row leaving the list. The reader is
+        // looking at the list, so nothing is opened for them.
+        if self.home_in_view() {
+            self.refresh_dashboard(window, cx);
+            return;
+        }
         // The card was read as an ordinary surface, so a verdict just closes
         // it; what comes next is the next pull, not a queue step.
         self.close_current_surface(window, cx);
-        self.cmd_surface_forward_or_deal(window, cx);
+        self.pull_card(window, cx);
     }
 
     fn journal_dealer_verdict(
@@ -9296,9 +9278,7 @@ impl Workspace {
         // The label is about whatever is in view: with a card behind the
         // surface it says which card and why, with the map open it is the
         // map's own breadcrumb.
-        if !self.overview_open
-            && let Some(card) = self.card_in_view(cx)
-        {
+        if let Some(card) = self.open_card_in_view(cx) {
             return self.render_deal_why(&card, text_style, window, cx);
         }
         let path = if self.overview_open {
@@ -9862,7 +9842,7 @@ impl Render for Workspace {
                 this.step_surface_back(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DealOpen, window, cx| {
-                this.cmd_surface_forward_or_deal(window, cx);
+                this.pull_card(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DealCloseAndNext, window, cx| {
                 this.close_current_surface(window, cx);

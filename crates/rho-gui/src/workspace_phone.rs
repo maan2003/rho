@@ -292,7 +292,7 @@ impl Workspace {
             self.phone.stack.clear();
             self.phone.transitions.clear();
             self.phone.root = PhoneRoot::Feed;
-            if self.card_in_view(cx).is_some() {
+            if self.open_card_in_view(cx).is_some() {
                 self.phone
                     .show_feed(self.active_context, self.active_pane().surface.key.clone());
             } else {
@@ -316,7 +316,7 @@ impl Workspace {
             && std::mem::take(&mut self.phone.feed_retry)
             && self.phone.root == PhoneRoot::Feed
             && self.phone.stack.is_empty()
-            && self.card_in_view(cx).is_none()
+            && self.open_card_in_view(cx).is_none()
         {
             cx.defer_in(window, |this, window, cx| this.pull_card(window, cx));
         }
@@ -440,7 +440,7 @@ impl Workspace {
 
     #[cfg(test)]
     pub(crate) fn phone_feed_for_test(&mut self, cx: &mut Context<Self>) -> bool {
-        self.phone.enabled && self.phone.stack.is_empty() && self.card_in_view(cx).is_some()
+        self.phone.enabled && self.phone.stack.is_empty() && self.open_card_in_view(cx).is_some()
     }
 
     #[cfg(test)]
@@ -549,7 +549,7 @@ impl Workspace {
             return;
         }
 
-        if self.phone.stack.is_empty() && self.card_in_view(cx).is_some() {
+        if self.phone.stack.is_empty() && self.open_card_in_view(cx).is_some() {
             self.phone.root = PhoneRoot::Feed;
             self.restore_phone_feed(window, cx);
             cx.notify();
@@ -577,7 +577,7 @@ impl Workspace {
         };
         let Some((context, key)) = next else {
             self.phone.root = PhoneRoot::Feed;
-            if self.card_in_view(cx).is_some() {
+            if self.open_card_in_view(cx).is_some() {
                 self.restore_phone_feed(window, cx);
                 cx.notify();
             } else {
@@ -670,11 +670,11 @@ impl Workspace {
                     && self.phone.root == PhoneRoot::Feed
                     && self.phone.stack.is_empty()
                     && !self.phone_current_deal_has_pending_tree_verdict(cx)
-                    && (self.card_in_view(cx).is_some() || !self.phone.transitions.is_empty())
+                    && (self.open_card_in_view(cx).is_some() || !self.phone.transitions.is_empty())
                     && self.transient.is_none()
                     && self.minibuffer.is_none()
                 {
-                    let edge = if self.card_in_view(cx).is_some() {
+                    let edge = if self.open_card_in_view(cx).is_some() {
                         self.phone_deal_scroll_edge(cx)
                     } else {
                         PhoneScrollEdge::Both
@@ -728,7 +728,7 @@ impl Workspace {
                 if let Some(direction) = direction {
                     window.prevent_default();
                     cx.stop_propagation();
-                    if self.card_in_view(cx).is_some() {
+                    if self.open_card_in_view(cx).is_some() {
                         let to = match direction {
                             crate::journal::PhoneFlickDirection::Up => {
                                 -window.viewport_size().height
@@ -757,7 +757,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let source = direction.and_then(|_| self.card_in_view(cx).map(|card| card.identity));
+        let source = direction.and_then(|_| self.open_card_in_view(cx).map(|card| card.identity));
         let generation = self.phone.next_snap_generation;
         self.phone.next_snap_generation = self.phone.next_snap_generation.wrapping_add(1);
         self.phone.snap = Some(PhoneSnap {
@@ -799,7 +799,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let before = self.card_in_view(cx);
+        let before = self.open_card_in_view(cx);
         match direction {
             crate::journal::PhoneFlickDirection::Up => self.pull_card(window, cx),
             crate::journal::PhoneFlickDirection::Down => match self.phone.transitions.pop() {
@@ -818,7 +818,7 @@ impl Workspace {
                 Some(PhoneTransition::Verdict(_)) | None => {}
             },
         }
-        let after = self.card_in_view(cx);
+        let after = self.open_card_in_view(cx);
         let moved_card =
             before.as_ref().map(|card| &card.identity) != after.as_ref().map(|card| &card.identity);
         if direction == crate::journal::PhoneFlickDirection::Up
@@ -879,7 +879,7 @@ impl Workspace {
     ) -> AnyElement {
         if self.phone.root == PhoneRoot::Feed
             && self.phone.stack.is_empty()
-            && let Some(card) = self.card_in_view(cx)
+            && let Some(card) = self.open_card_in_view(cx)
         {
             let colors = cx.theme().colors();
             let (breadcrumb, label) = {
@@ -1073,7 +1073,7 @@ impl Workspace {
         &mut self,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(card) = self.card_in_view(cx) else {
+        let Some(card) = self.open_card_in_view(cx) else {
             return false;
         };
         self.pending_tree_verdicts
@@ -1113,12 +1113,12 @@ impl Workspace {
         if self.phone.snap.is_some() || self.phone_current_deal_has_pending_tree_verdict(cx) {
             return;
         }
-        let before = self.card_in_view(cx).map(|card| card.identity);
+        let before = self.open_card_in_view(cx).map(|card| card.identity);
         let pending_before = self.pending_tree_verdicts.len();
         let undo_before = self.verdict_undo.last().map(|entry| entry.sequence);
         run(self, window, cx);
         cx.defer_in(window, move |this, _window, cx| {
-            let after = this.card_in_view(cx).map(|card| card.identity);
+            let after = this.open_card_in_view(cx).map(|card| card.identity);
             let submitted = this.pending_tree_verdicts.len() > pending_before;
             if before.is_some() && (before != after || submitted) {
                 if !submitted
