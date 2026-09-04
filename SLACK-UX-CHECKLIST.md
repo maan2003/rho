@@ -2,9 +2,6 @@
 
 Reconciled against main on 3 Sep. Genuinely open, in order:
 
-- 2.17 a done thread comes back on an older message, and mark-read-before
-  leaves cards standing (reported from real use, 4 Sep). QA report only;
-  the fix is 2.18.
 - 2.18 Slack out of the tree, the unit model (decided 4 Sep). Comes after
   1.25 and the verdict transient (`HOME-DESIGN.md`, no deal mode), and
   folds in the native tree store deletion (`rho desk cat/checkout`).
@@ -576,11 +573,27 @@ done right after the transcript primitive (2.4) and before 2.10:
       mentions is one card landing on the oldest; a DM with five messages
       is one card; the user's reply flips the word and not the cursor;
       snooze is voided by a newer message from someone else; mark read
-      before moves every cursor. Rig run of the 2.17 sequence, and
+      before moves every cursor; the card text is rendered from the
+      model at display time, never cached at record time, so a mention
+      reads `@Manmeet` on a cold start. Rig run of the 2.17 sequence
+      (done, restart with the mirror, the card stays gone), and
       screenshots of a DM, a channel, and a thread card.
-- [ ] 2.17 A done thread comes back on an older message. Superseded by
-      2.18 for the fix: the QA report is still owed (what reproduces,
-      which of a-d), no patch on the old model. Original text: reported
+- [x] 2.17 A done thread comes back on an older message. QA report landed
+      4 Sep (b8os, screens 217-*), fix is 2.18. Findings: (d) restart
+      with the mirror reproduces, every done card is back on Home; (b)
+      reconnect does not; (c) not drivable from the GUI, the feed is only
+      read on the activity page; a second DM message made a second
+      @David card (217-17), which is the message-keyed model. Snooze is
+      dead in all three forms (`ss`, `sd`, `45sm`): no echo, no
+      rejection, the keystroke never reaches the binding because `s` is
+      the vim operator; the verdict transient removes that clash, so the
+      transient's tests must cover snooze end to end. Two more: after
+      `d` the dealer advances onto the next card's conversation and
+      neither `ctrl-k` nor `f21` reaches Home (history cursor 0), which
+      the transient's "shift again = Home" must fix; and the cached
+      summary still reads `@someone` before the roster loads, which 2.18
+      fixes by rendering the card text at display time (pin it with a
+      test). Original text: reported
       by the user on 4 Sep from real use, on the latest GUI and daemon: a
       thread marked done is dealt again on an older message of the same
       thread, and `mark read before` (2.13) leaves cards standing for the
