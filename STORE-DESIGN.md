@@ -537,6 +537,19 @@ else is built on. The transient lands after slice 2.
    via `RHO_CUSTOM_BRAVE_BIN`) is queued as its own task. A latent GUI
    panic when the browser was never set up (`list_pages_if_running`)
    was found and fixed on the way.
+   The fake browser landed 4 Sep (b7630f85, `crates/rho-browser/
+   examples/fake_browser.rs`, driven over `RHO_FAKE_BROWSER_CONTROL`)
+   and found three client bugs, fixed the same day (5bcc3241,
+   2f92d952): page metadata only notified and never reconciled the map,
+   so a burst stayed invisible until an unrelated event; a row that
+   exists only because a source says so had no buffer and drew nothing;
+   and `f` and the shift tap adopted whatever card Home held, so over a
+   page row they filed a Slack channel. The rule now: with the map open
+   the map cursor row is the target, else the surface's own node, never
+   a card from another source. And the map draws a thing under its
+   label with its subtree and drops it from the root (a label hanging
+   under the thing it labels keeps the root row, or nothing would reach
+   it). Screens: `br-12-burst.png`, `br-26-map-filed.png`.
 
 Each slice lands on its own with the tests of the slices before it green.
 
