@@ -123,6 +123,43 @@ verdicts, reads as a menu, and leaves vim alone. `shift` is the one key
 that is free on every surface, in every mode, and already means "rho,
 not the editor" through the Home double-tap.
 
+## No hand: every pull ranks fresh, and skip is a cursor in memory
+
+Decided with the user on 4 Sep, after the store landed and the GUI
+"went down a ton": there is no deal session, no deal queue, and no
+hand object anything reads from. Each `space-j` (and `ctrl-j`) is one
+pull: rank everything open now by the rules and open the single most
+important card as an ordinary surface. A pull taken while a card
+surface is in view skips that card first, which is what keeps a pull
+from returning the same card. A verdict acts on the card of the surface
+in view, or the map cursor row when the map is open, and is a fact write
+plus the journal; every view re-derives from the facts after it. The
+status label derives from the card in view. The phone sheet derives the
+same way.
+
+Skip is modelled like the done cursor, in memory: `(id, cursor, at)`,
+the cursor being the source's own position, the same one `d` writes (the
+Slack unit's newest ts, the agent's event position, a mark's time). A
+card is skipped while nothing on it is past that cursor and the cooldown
+(15 minutes, one named constant) has not run out; the "past the cursor"
+test is the one the Slack card already uses. Not synced, not stored;
+there is no fingerprint. Home renders the same fresh ranking with
+skipped rows shown and marked, never hidden, so Home is the truth and
+never reads the dealer's filtered output.
+
+Mark-read-before an age (`space shift-s m`) also writes
+`SlackHandledThrough` at the cutoff for every unit it covers, one
+verdict each, undone as one (the user: no Slack read cursor in dealing,
+"handle mark read on our side"). Landed 4 Sep (d84ab832).
+
+**Why:** the user's words: "each pull with space-j should give the most
+important thing based on rules", "no extra in-deal-mode state, no deal
+queue, everything is fresh", and "skip semantics were pretty useful".
+What was found on the way (b8os, 4 Sep): Home did redraw on every
+change; what made it read as empty was that it rendered the hand with
+skipped cards filtered out for the cooldown, so a few pulls emptied Home
+while the dealer kept handing the same backlog around.
+
 ## Snooze takes a unit
 
 Decided with the user on 3 Sep (first recorded in DESK-DESIGN, which is
