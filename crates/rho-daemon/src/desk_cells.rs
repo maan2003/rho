@@ -3,7 +3,7 @@
 #![allow(dead_code)]
 
 use redb::TableDefinition;
-use rho_db::{RhoDb, Sen, SenValue, WriteTxn};
+use rho_db::{Lenient, RhoDb, Sen, SenValue, WriteTxn};
 use rho_desk::cells::{
     BodySnapshot, Cell, CellMutation, DeviceId, Id, Property, PropertyKey, Snapshot, Stamp, Store,
     VerdictEvent, Version,
@@ -18,6 +18,23 @@ const BODIES: TableDefinition<Sen<Id>, Sen<BodySnapshot>> =
     TableDefinition::new("rho_desk_note_body_v1");
 const META: TableDefinition<(), Sen<CellMeta>> = TableDefinition::new("rho_desk_cell_meta_v2");
 const MUTATIONS: TableDefinition<Sen<Stamp>, Sen<CellMutation>> =
+    TableDefinition::new("rho_desk_fact_mutations_v1");
+
+/// The same two tables, read without trusting every row to decode. A newer
+/// build on another device can write a property or a verdict this one has
+/// never heard of; through `Sen` that row aborts the daemon on the way in,
+/// so the rows the store is loaded from come through these instead and an
+/// unreadable one is skipped rather than fatal. Writes still go through the
+/// definitions above, and skipping never deletes: the row stays in the
+/// table for a build that understands it.
+const CELLS_READ: TableDefinition<Lenient<CellAddress>, Lenient<Cell>> =
+    TableDefinition::new("rho_desk_facts_v1");
+const VERDICTS_READ: TableDefinition<Lenient<VerdictKey>, Lenient<VerdictEvent>> =
+    TableDefinition::new("rho_desk_fact_verdicts_v1");
+/// The replay-dedup log, read the same way: a retry of a mutation this
+/// build cannot read is not the mutation it is holding, and saying so is
+/// an error the client sees rather than a dead daemon.
+const MUTATIONS_READ: TableDefinition<Sen<Stamp>, Lenient<CellMutation>> =
     TableDefinition::new("rho_desk_fact_mutations_v1");
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
@@ -195,10 +212,10 @@ impl DeskCellStore {
         let accepted = meta.frontier.get(&session_device).copied().unwrap_or(0);
         if mutation.stamp.version <= accepted {
             return match write
-                .open_table(MUTATIONS)
+                .open_table(MUTATIONS_READ)
                 .get(SenValue::borrowed(&mutation.stamp))
             {
-                Some(old) if old.value().as_ref() == &mutation => Ok(()),
+                Some(old) if old.value().as_ref() == Some(&mutation) => Ok(()),
                 _ => Err("Desk mutation version is not newer than its device frontier".into()),
             };
         }
@@ -580,19 +597,8 @@ fn read_snapshot(read: &rho_db::ReadTxn) -> Result<Snapshot, String> {
         .frontier
         .clone();
     Ok(Snapshot {
-        cells: read
-            .open_table(CELLS)
-            .iter()
-            .map(|(_, value)| value.value().into_owned())
-            .collect(),
-        verdicts: read
-            .open_table(VERDICTS)
-            .iter()
-            .map(|(key, value)| {
-                let key = key.value().into_owned();
-                (key.id, key.stamp, value.value().into_owned())
-            })
-            .collect(),
+        cells: readable_cells(read.open_table(CELLS_READ).iter()),
+        verdicts: readable_verdicts(read.open_table(VERDICTS_READ).iter()),
         version,
     })
 }
@@ -606,24 +612,67 @@ fn read_snapshot_from_write(write: &mut WriteTxn) -> Result<Snapshot, String> {
         .as_ref()
         .frontier
         .clone();
-    let cells = write
-        .open_table(CELLS)
-        .iter()
-        .map(|(_, value)| value.value().into_owned())
-        .collect();
-    let verdicts = write
-        .open_table(VERDICTS)
-        .iter()
-        .map(|(key, value)| {
-            let key = key.value().into_owned();
-            (key.id, key.stamp, value.value().into_owned())
-        })
-        .collect();
+    let cells = readable_cells(write.open_table(CELLS_READ).iter());
+    let verdicts = readable_verdicts(write.open_table(VERDICTS_READ).iter());
     Ok(Snapshot {
         cells,
         verdicts,
         version,
     })
+}
+
+/// The cells this build can read. One it cannot is left where it is and
+/// counted in the log: the reader loses that fact for now rather than the
+/// whole desk.
+fn readable_cells<'a>(
+    rows: impl Iterator<
+        Item = (
+            redb::AccessGuard<'a, Lenient<CellAddress>>,
+            redb::AccessGuard<'a, Lenient<Cell>>,
+        ),
+    >,
+) -> Vec<Cell> {
+    let mut skipped = 0usize;
+    let cells: Vec<Cell> = rows
+        .filter_map(|(_, value)| match value.value() {
+            Some(cell) => Some(cell),
+            None => {
+                skipped += 1;
+                None
+            }
+        })
+        .collect();
+    if skipped > 0 {
+        tracing::warn!("desk: skipped {skipped} cells this build cannot read");
+    }
+    cells
+}
+
+/// The verdict log entries this build can read, on the same terms as the
+/// cells: an entry naming a verdict it has never heard of is skipped, so
+/// undo loses that step and nothing else.
+fn readable_verdicts<'a>(
+    rows: impl Iterator<
+        Item = (
+            redb::AccessGuard<'a, Lenient<VerdictKey>>,
+            redb::AccessGuard<'a, Lenient<VerdictEvent>>,
+        ),
+    >,
+) -> Vec<(Id, Stamp, VerdictEvent)> {
+    let mut skipped = 0usize;
+    let verdicts: Vec<(Id, Stamp, VerdictEvent)> = rows
+        .filter_map(|(key, value)| match (key.value(), value.value()) {
+            (Some(key), Some(event)) => Some((key.id, key.stamp, event)),
+            _ => {
+                skipped += 1;
+                None
+            }
+        })
+        .collect();
+    if skipped > 0 {
+        tracing::warn!("desk: skipped {skipped} verdict log entries this build cannot read");
+    }
+    verdicts
 }
 
 fn persist_cells_and_verdicts(write: &mut WriteTxn, snapshot: &Snapshot) -> Result<(), String> {
@@ -1069,6 +1118,193 @@ mod tests {
         .facts(&id);
         assert_eq!(facts.defer_until, Some(wake));
         assert_eq!(facts.pace_days, 0);
+    }
+
+    #[tokio::test]
+    async fn a_label_verdict_puts_a_label_on_and_takes_it_off() {
+        let store = fixture_store().await;
+        let device = DeviceId([17; 16]);
+        let namespace = store.node_namespace(device).await.unwrap();
+        let id = seed_note(&store, device).await;
+        let label = Id::Label(Uuid::random());
+
+        let label_verdict = |present: bool, before: bool| {
+            let stamp = Stamp {
+                device,
+                version: next_version(&store),
+            };
+            let after = Property::Labeled {
+                label: label.clone(),
+                present,
+            };
+            let changes = vec![FactChange {
+                id: id.clone(),
+                key: PropertyKey::Labeled(label.clone()),
+                before: Some(Property::Labeled {
+                    label: label.clone(),
+                    present: before,
+                }),
+                after: Some(after.clone()),
+            }];
+            CellMutation {
+                stamp,
+                writes: vec![CellWrite {
+                    id: id.clone(),
+                    property: after,
+                }],
+                verdict: Some((
+                    id.clone(),
+                    VerdictEvent::Applied {
+                        verdict: Verdict::Label {
+                            label: label.clone(),
+                            present,
+                        },
+                        at: stamp,
+                        changes,
+                    },
+                )),
+            }
+        };
+
+        store
+            .apply_mutation(device, namespace, label_verdict(true, false))
+            .await
+            .unwrap();
+        let labels = |store: &DeskCellStore| {
+            Store::from_snapshot(
+                DeviceId([0; 16]),
+                store.sync_since(&Version::new()).unwrap(),
+            )
+            .unwrap()
+            .facts(&id)
+            .labels
+            .into_iter()
+            .collect::<Vec<_>>()
+        };
+        assert_eq!(labels(&store), vec![label.clone()]);
+
+        // Taking the label off is the same verdict, so it goes through the
+        // same check rather than around it.
+        store
+            .apply_mutation(device, namespace, label_verdict(false, true))
+            .await
+            .unwrap();
+        assert!(labels(&store).is_empty());
+
+        // A thing is labelled with labels: anything else is not a claim
+        // the store takes, whatever the entry says about it.
+        let mut nonsense = label_verdict(true, false);
+        nonsense.writes[0].property = Property::Labeled {
+            label: id.clone(),
+            present: true,
+        };
+        assert!(
+            store
+                .apply_mutation(device, namespace, nonsense)
+                .await
+                .is_err()
+        );
+    }
+
+    /// A row a newer build wrote, in this build's tables, encoded exactly
+    /// as senax encodes the real thing. The variant names are what the ids
+    /// are hashed from, so a name this build has never heard of is the
+    /// same thing on the wire as a variant it does not have yet.
+    #[derive(Debug, Encode, Decode)]
+    enum LaterProperty {
+        Haunted(bool),
+    }
+
+    #[derive(Debug, Encode, Decode)]
+    struct LaterCell {
+        id: Id,
+        property: LaterProperty,
+        stamp: Stamp,
+    }
+
+    #[derive(Debug, Encode, Decode)]
+    enum LaterVerdict {
+        Haunt,
+    }
+
+    #[derive(Debug, Encode, Decode)]
+    enum LaterVerdictEvent {
+        Applied {
+            verdict: LaterVerdict,
+            at: Stamp,
+            changes: Vec<FactChange>,
+        },
+    }
+
+    #[derive(Debug)]
+    struct CellName;
+
+    impl rho_db::RecordedTypeName for CellName {
+        const NAME: &'static str = "rho-db::Sen<rho_desk::cells::Cell>";
+    }
+
+    #[derive(Debug)]
+    struct VerdictEventName;
+
+    impl rho_db::RecordedTypeName for VerdictEventName {
+        const NAME: &'static str = "rho-db::Sen<rho_desk::cells::VerdictEvent>";
+    }
+
+    const LATER_CELLS: TableDefinition<Sen<CellAddress>, rho_db::SenAs<LaterCell, CellName>> =
+        TableDefinition::new("rho_desk_facts_v1");
+    const LATER_VERDICTS: TableDefinition<
+        Sen<VerdictKey>,
+        rho_db::SenAs<LaterVerdictEvent, VerdictEventName>,
+    > = TableDefinition::new("rho_desk_fact_verdicts_v1");
+
+    #[tokio::test]
+    async fn a_row_this_build_cannot_read_is_skipped_rather_than_fatal() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = RhoDb::open(directory.path().join("rho.redb"));
+        let store = DeskCellStore::new(db.clone(), 42).await.unwrap();
+        let device = DeviceId([19; 16]);
+        let id = seed_note(&store, device).await;
+
+        // What a device on a newer build syncs over: a property and a
+        // verdict named in a vocabulary this build does not have.
+        let later = Id::Note(Uuid::random());
+        let stamp = Stamp {
+            device: DeviceId([20; 16]),
+            version: 1,
+        };
+        let mut write = db.write().await;
+        write.open_table(LATER_CELLS).insert(
+            SenValue::owned(CellAddress {
+                id: later.clone(),
+                key: PropertyKey::Name,
+            }),
+            SenValue::owned(LaterCell {
+                id: later.clone(),
+                property: LaterProperty::Haunted(true),
+                stamp,
+            }),
+        );
+        write.open_table(LATER_VERDICTS).insert(
+            SenValue::owned(VerdictKey {
+                id: later.clone(),
+                stamp,
+            }),
+            SenValue::owned(LaterVerdictEvent::Applied {
+                verdict: LaterVerdict::Haunt,
+                at: stamp,
+                changes: Vec::new(),
+            }),
+        );
+        write.commit();
+
+        // The desk still opens, and everything this build does understand
+        // is still there. The unreadable rows keep their places for the
+        // build that understands them, so nothing is lost by skipping.
+        let snapshot = store.sync_since(&Version::new()).unwrap();
+        assert!(snapshot.cells.iter().any(|cell| cell.id == id));
+        assert!(snapshot.cells.iter().all(|cell| cell.id != later));
+        assert!(snapshot.verdicts.is_empty());
+        assert_eq!(db.read().open_table(LATER_CELLS).iter().count(), 3);
     }
 
     #[tokio::test]

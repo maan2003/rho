@@ -231,6 +231,69 @@ where
     }
 }
 
+/// A [`Sen`] read without trusting the bytes to decode. A row a newer
+/// build wrote can name an enum variant this one has never heard of, and
+/// decoding it through [`Sen`] aborts the process inside redb; read
+/// through this and the row comes back as `None` for the caller to skip.
+/// Read-only by construction: encoding is what the up-to-date type is for.
+#[derive(Debug)]
+pub struct Lenient<T>(std::marker::PhantomData<T>);
+
+impl<T> redb::Value for Lenient<T>
+where
+    T: senax_encoder::Encoder + senax_encoder::Decoder + Debug,
+{
+    type SelfType<'a>
+        = Option<T>
+    where
+        Self: 'a;
+
+    type AsBytes<'a>
+        = BytesMut
+    where
+        Self: 'a;
+
+    fn fixed_width() -> Option<usize> {
+        None
+    }
+
+    fn from_bytes<'a>(data: &'a [u8]) -> Self::SelfType<'a>
+    where
+        Self: 'a,
+    {
+        let mut data = data;
+        T::decode(&mut data).ok()
+    }
+
+    fn as_bytes<'a, 'b: 'a>(value: &'a Self::SelfType<'b>) -> Self::AsBytes<'a>
+    where
+        Self: 'b,
+    {
+        let mut bytes = BytesMut::new();
+        value
+            .as_ref()
+            .expect("a lenient table is read through, never written to")
+            .encode(&mut bytes)
+            .expect("senax encode rho-db value");
+        bytes
+    }
+
+    /// The name [`Sen<T>`] records, so the same table can be opened either
+    /// way.
+    fn type_name() -> TypeName {
+        <Sen<T> as redb::Value>::type_name()
+    }
+}
+
+impl<T> redb::Key for Lenient<T>
+where
+    T: senax_encoder::Encoder + senax_encoder::Decoder + Debug,
+{
+    fn compare(data1: &[u8], data2: &[u8]) -> Ordering {
+        data1.cmp(data2)
+    }
+}
+
 impl RhoDb {
     pub fn open(path: impl AsRef<Path>) -> Self {
         let path = path.as_ref();

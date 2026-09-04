@@ -343,9 +343,22 @@ impl BodySnapshot {
 pub enum Verdict {
     Done,
     Mute,
-    Defer { until: Timestamp },
-    Todo { note: Id },
-    File { parent: Id },
+    Defer {
+        until: Timestamp,
+    },
+    Todo {
+        note: Id,
+    },
+    File {
+        parent: Id,
+    },
+    /// `l`: the thing carries this label, or stops carrying it. Taking a
+    /// label off is a decision like putting one on, so it is the same
+    /// verdict with `present: false` rather than a write nothing records.
+    Label {
+        label: Id,
+        present: bool,
+    },
 }
 
 /// One fact a verdict changed, with what stood there before, which is the
@@ -414,6 +427,15 @@ pub fn verdict_changes(
         after: Some(after),
     };
     let one = |after: Property| Ok(vec![change(after)]);
+    // A label is a second axis, not a close: it says nothing about whether
+    // the thing is still owed, so it is the same one cell on every kind of
+    // id, a Slack unit included.
+    if let Verdict::Label { label, present } = verdict {
+        return one(Property::Labeled {
+            label: label.clone(),
+            present: *present,
+        });
+    }
     // A Slack unit is closed by moving its cursor, not by a state: whatever
     // Slack sends afterwards, the only question the card asks is "is there
     // something from them past the cursor", and a history page cannot make
@@ -440,6 +462,8 @@ pub fn verdict_changes(
                 change(Property::SlackSnoozedAt(slack.newest.clone())),
             ]),
             Verdict::File { parent } => one(Property::Parent(Some(parent.clone()))),
+            // Handled above: a label is the same cell on every kind of id.
+            Verdict::Label { .. } => unreachable!(),
             Verdict::Todo { note } => {
                 let cadence = cadence.ok_or("a todo verdict needs its cadence")?;
                 let fresh = |before: Property, after: Property| FactChange {
@@ -462,6 +486,7 @@ pub fn verdict_changes(
     }
     match verdict {
         Verdict::Done => one(Property::State(State::Done)),
+        Verdict::Label { .. } => unreachable!("a label verdict is written above"),
         Verdict::Mute => one(Property::State(State::Muted)),
         // A snooze puts the card back at zero: `elapsed - pace` is the todo
         // curve when a pace is set and the defer curve when it is not, so a
