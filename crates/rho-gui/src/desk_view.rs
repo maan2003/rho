@@ -1348,6 +1348,34 @@ impl DeskCells {
         // What a verdict on a Slack unit writes is a message timestamp, and
         // that timestamp is the mirror's rather than the store's.
         let slack = self.slack_verdict(host, id);
+        self.verdict_writes_with_cursor(host, id, verdict, slack)
+    }
+
+    /// Done on a Slack unit at a cursor the caller names instead of the
+    /// mirror's newest. `mark read before` needs this: what it handles is
+    /// everything up to an age, so the cursor lands on the newest message at
+    /// or before that age and anything newer stays the user's.
+    pub fn slack_done_writes(
+        &mut self,
+        host: HostId,
+        unit: &rho_desk::cells::SlackUnit,
+        newest: rho_desk::cells::SlackTs,
+    ) -> Option<(Vec<CellWrite>, (Id, VerdictEvent))> {
+        self.verdict_writes_with_cursor(
+            host,
+            &Id::Slack(unit.clone()),
+            DeskVerdict::Done,
+            Some(rho_desk::cells::SlackVerdict { newest }),
+        )
+    }
+
+    fn verdict_writes_with_cursor(
+        &mut self,
+        host: HostId,
+        id: &Id,
+        verdict: DeskVerdict,
+        slack: Option<rho_desk::cells::SlackVerdict>,
+    ) -> Option<(Vec<CellWrite>, (Id, VerdictEvent))> {
         let (verdict, mut writes): (Verdict, Vec<CellWrite>) = match verdict {
             DeskVerdict::Done => (Verdict::Done, Vec::new()),
             DeskVerdict::Mute => (Verdict::Mute, Vec::new()),

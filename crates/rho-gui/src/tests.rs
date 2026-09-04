@@ -7916,13 +7916,16 @@ fn shift_r_no_longer_writes_a_desk_draft(cx: &mut TestAppContext) {
 
 /// `mark read before` closes a backlog of threads in one keystroke, so it
 /// comes back in one: `shift-u` reopens every node it closed, not the last
-/// of them. Entered below the prompt, whose other half (the marking) is
-/// tested against the fake Slack server.
+/// of them. The cursor each unit lands on is the caller's, not the mirror's
+/// newest, which is what "before an age" means: a conversation with
+/// something newer than the cutoff keeps its card. Entered below the prompt,
+/// whose other half (the marking) is tested against the fake Slack server.
 #[gpui::test]
-fn marking_the_backlog_closes_every_old_card_and_undoes_as_one(cx: &mut TestAppContext) {
+fn marking_the_backlog_moves_every_cursor_and_undoes_as_one(cx: &mut TestAppContext) {
     let mut desk = DeskFixture::new();
     let old = desk.thread_row(None, "C1", "100.0");
     let older = desk.thread_row(None, "C1", "50.0");
+    let direct = desk.conversation_row(None, "D1", "300.0");
 
     let workspace = test_workspace(cx);
     workspace
@@ -7934,33 +7937,39 @@ fn marking_the_backlog_closes_every_old_card_and_undoes_as_one(cx: &mut TestAppC
                 window,
                 cx,
             );
+            let cursor = |ts: &str| rho_desk::cells::SlackTs(ts.to_owned());
             let closed = workspace.mark_cards_done(
                 HostId::default(),
-                vec![old.clone(), older.clone()],
+                vec![
+                    (old.clone(), cursor("100.0")),
+                    (older.clone(), cursor("50.0")),
+                    // The direct message has a reply from after the cutoff,
+                    // so the mark covers it only up to `200.0`.
+                    (direct.clone(), cursor("200.0")),
+                ],
                 "mark read before".to_owned(),
                 window,
                 cx,
             );
-            assert_eq!(closed, 2);
+            assert_eq!(closed, 3);
             // Every unit's cursor moved, which is what "read before" means
             // for a Slack card: nothing is a state, and a page loading
             // under either of them cannot bring it back.
-            for (channel, thread_ts) in [("C1", "100.0"), ("C1", "50.0")] {
+            let unit = |channel: &str, thread: Option<&str>| rho_desk::cells::SlackUnit {
+                workspace: "acme".to_owned(),
+                channel: channel.to_owned(),
+                thread: thread.map(str::to_owned),
+            };
+            for (channel, thread, at) in [
+                ("C1", Some("100.0"), "100.0"),
+                ("C1", Some("50.0"), "50.0"),
+                ("D1", None, "200.0"),
+            ] {
                 let facts = workspace
                     .desk_cells
-                    .facts_of_slack_unit(
-                        Some(HostId::default()),
-                        &rho_desk::cells::SlackUnit {
-                            workspace: "acme".to_owned(),
-                            channel: channel.to_owned(),
-                            thread: Some(thread_ts.to_owned()),
-                        },
-                    )
+                    .facts_of_slack_unit(Some(HostId::default()), &unit(channel, thread))
                     .unwrap();
-                assert_eq!(
-                    facts.slack_handled_through,
-                    Some(rho_desk::cells::SlackTs(thread_ts.to_owned()))
-                );
+                assert_eq!(facts.slack_handled_through, Some(cursor(at)));
             }
             for node_id in [old.clone(), older.clone()] {
                 assert!(
@@ -7973,6 +7982,15 @@ fn marking_the_backlog_closes_every_old_card_and_undoes_as_one(cx: &mut TestAppC
                     "every old card is closed"
                 );
             }
+            assert!(
+                workspace
+                    .dashboard
+                    .node_is_open(crate::dashboard::DealCardId {
+                        host: HostId::default(),
+                        node_id: direct.clone(),
+                    }),
+                "what arrived after the cutoff is still the user's"
+            );
             assert_eq!(
                 workspace.verdict_undo_count_for_test(),
                 1,
@@ -7991,6 +8009,17 @@ fn marking_the_backlog_closes_every_old_card_and_undoes_as_one(cx: &mut TestAppC
                     "the undo reopens the whole batch"
                 );
             }
+            assert_eq!(
+                workspace
+                    .desk_cells
+                    .facts_of_slack_unit(Some(HostId::default()), &unit("D1", None))
+                    .unwrap()
+                    .slack_handled_through,
+                // The empty cursor is how an unwritten one reads back, which
+                // is what the undo puts there: nothing is handled again.
+                Some(cursor("")),
+                "the undo takes every cursor back, card or no card"
+            );
             assert_eq!(workspace.verdict_undo_count_for_test(), 0);
         })
         .unwrap();

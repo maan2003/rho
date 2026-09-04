@@ -8202,17 +8202,26 @@ impl Workspace {
     pub(crate) fn mark_cards_done(
         &mut self,
         host: HostId,
-        nodes: Vec<rho_desk::cells::Id>,
+        nodes: Vec<(rho_desk::cells::Id, rho_desk::cells::SlackTs)>,
         verb: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
         let mut applied = Vec::new();
-        for node in nodes {
-            let Some((writes, event)) =
-                self.desk_cells
-                    .verdict_writes(host, &node, crate::desk_view::DeskVerdict::Done)
-            else {
+        for (node, cursor) in nodes {
+            // Each unit gets its own log entry, so `shift-u` puts the whole
+            // batch back and the daemon checks each cursor against the one
+            // that was there.
+            let writes = match &node {
+                rho_desk::cells::Id::Slack(unit) => {
+                    self.desk_cells.slack_done_writes(host, unit, cursor)
+                }
+                _ => {
+                    self.desk_cells
+                        .verdict_writes(host, &node, crate::desk_view::DeskVerdict::Done)
+                }
+            };
+            let Some((writes, event)) = writes else {
                 continue;
             };
             let Some(stamp) = self.apply_desk_writes(host, writes, Some(event), window, cx) else {

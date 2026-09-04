@@ -831,16 +831,46 @@ impl Workspace {
         let plan = session.read(cx).model().mark_plan(before);
         let conversations = plan.conversations.len();
         let threads = plan.threads.len();
-        // Reading is not a verdict, so the cards have to be closed as well
-        // as marked: an open card older than the cutoff is exactly the
-        // backlog the user just said they are done with.
+        // Reading is not a verdict, so the cursor has to move as well as the
+        // marking being sent: what the user just said they are done with is
+        // handled here too, and without the cursor the backlog is dealt
+        // again on the next start. Every unit the plan covers gets one, at
+        // the newest message at or before the cutoff, so anything that
+        // arrived since is still theirs.
         let host = self.hosts.primary();
-        let nodes = cards_before(
+        let workspace_name = session.read(cx).model().workspace().clone();
+        let mut nodes: Vec<(rho_desk::cells::Id, rho_desk::cells::SlackTs)> = plan
+            .conversations
+            .iter()
+            .map(|(channel, ts)| {
+                (
+                    rho_desk::cells::Id::Slack(SlackUnit {
+                        workspace: workspace_name.0.clone(),
+                        channel: channel.0.clone(),
+                        thread: None,
+                    }),
+                    rho_desk::cells::SlackTs(ts.0.clone()),
+                )
+            })
+            .chain(plan.threads.iter().map(|(key, ts)| {
+                (
+                    rho_desk::cells::Id::Slack(store_unit_of(key)),
+                    rho_desk::cells::SlackTs(ts.0.clone()),
+                )
+            }))
+            .collect();
+        // A card older than the cutoff whose unit Slack has nothing unread
+        // for is backlog just the same, closed at its own newest.
+        for (node, cursor) in cards_before(
             self.dashboard.open_thread_cards(),
             &self.slack_thread_facts(cx),
             host,
             before,
-        );
+        ) {
+            if !nodes.iter().any(|(known, _)| known == &node) {
+                nodes.push((node, cursor));
+            }
+        }
         if conversations == 0 && threads == 0 && nodes.is_empty() {
             self.echo(
                 &format!("mark read before {text}: nothing that old"),
@@ -1049,16 +1079,14 @@ fn cards_before(
     facts: &std::collections::HashMap<SlackUnit, SlackFacts>,
     host: Option<crate::registry::HostId>,
     before: f64,
-) -> Vec<rho_desk::cells::Id> {
+) -> Vec<(rho_desk::cells::Id, rho_desk::cells::SlackTs)> {
     cards
         .into_iter()
-        .filter(|(card, thread)| {
-            Some(card.host) == host
-                && facts
-                    .get(thread)
-                    .is_some_and(|facts| Ts(facts.latest.clone()).epoch_seconds() < before)
+        .filter_map(|(card, thread)| {
+            let facts = facts.get(&thread)?;
+            (Some(card.host) == host && Ts(facts.latest.clone()).epoch_seconds() < before)
+                .then(|| (card.node_id, rho_desk::cells::SlackTs(facts.latest.clone())))
         })
-        .map(|(card, _)| card.node_id)
         .collect()
 }
 
@@ -1226,7 +1254,7 @@ mod tests {
 
         assert_eq!(
             cards_before(cards, &facts, Some(host), 500.0),
-            vec![node(1)],
+            vec![(node(1), rho_desk::cells::SlackTs("100.0".to_owned()))],
             "the newer thread stays, and one the mirror has nothing on is left alone"
         );
     }
