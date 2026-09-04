@@ -483,7 +483,15 @@ else is built on. The transient lands after slice 2.
    two excerpts, and anchors resolve to the first, so the second row
    needs per-excerpt anchors; and the key, since `l` on the map is
    vim's right motion (the user picks; the verdict transient is the
-   natural home).
+   natural home). Landed 4 Sep: the daemon half (bfe30d9d, 406081ea:
+   the Label verdict, `Lenient<T>` reads of cells, the verdict log, the
+   mutation replay, and note bodies, an edit to an unreadable body
+   refused) and the GUI half (1fc7535a: the Labeled property, the
+   `rho/agent` picker minting outer then inner, naming the same path
+   again takes the label off, filing offers labels, the map's label
+   axis with per-excerpt anchors from the public boundary API and depth
+   per row rather than per id). The key is unbound until the user
+   picks one.
 4. Browser: `opened_from` from the embedded browser, tabs under their
    origin.
 
