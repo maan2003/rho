@@ -252,9 +252,13 @@ and takes commands (create, send, cancel, rewind, continue, compact)
 and decides nothing about attention; Home for agents works offline from
 the mirror; and there is one sync engine for store logs and agent logs
 instead of a store protocol and a separate agent stream. The log is
-not the raw transcript: the daemon projects what happens into a small
-typed event log per agent, the story a person reads, and only that is
-mirrored. Turn started and ended; the user's message; the agent's
+not the raw transcript: the daemon projects the persisted `AgentEvent`
+log (`rho-agent`, positions `AgentEventPos`) into a small typed event
+log per agent, the story a person reads, and only that is mirrored. The
+projection is a pure function of (position, event), so it can be
+rebuilt from the raw log at any time, and a projected segment's version
+is the `AgentEventPos` it reached, so "since" means the same thing on
+both sides. Turn started and ended; the user's message; the agent's
 visible reply; a tool call as its name and one typed line of what it
 did (the file, the command, the search), never its output; an
 agent-wants tag; cancelled, rewound, compacted, renamed; cost per turn.
