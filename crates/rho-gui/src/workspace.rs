@@ -61,18 +61,18 @@ use crate::{
     DashboardDealMute, DashboardDealNext, DashboardDealOpenLine, DashboardDealRefresh,
     DashboardDealReply, DashboardDealRoomSnooze, DashboardDealSnooze, DashboardDealTodo,
     DashboardDeleteEmpty, DashboardDeleteRow, DashboardDemote, DashboardGoto,
-    DashboardHeadingAbove, DashboardHeadingBelow, DashboardJump, DashboardMoveSubtreeDown,
-    DashboardMoveSubtreeUp, DashboardNewChild, DashboardNewSibling, DashboardNow,
-    DashboardPasteRow, DashboardPasteRowBefore, DashboardPromote, DashboardRenameTopic,
-    DashboardReply, DashboardSubmit, DashboardToggleAgentTree, DashboardToggleSubagents,
-    DashboardUndo, DashboardYankRow, DealCloseAndNext, DealLeave, DealOpen, FindNode,
-    GitApprovalAllow, GitApprovalDeny, HomeOpenRow, MessagesOpen, MinibufferCancel,
-    MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious, OverviewToggle,
-    PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt,
-    ShellPagerAll, ShellPagerMore, ShellPagerQuit, SlackCancelEdit, SlackCompose, SlackEditLast,
-    SlackEditMessage, SlackMarkReadBefore, SlackNextUnread, SlackOpenRow, SlackSearch,
-    SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, UndoVerdict, UploadGuiTelemetry,
-    VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
+    DashboardHeadingAbove, DashboardHeadingBelow, DashboardJump, DashboardLabel,
+    DashboardMoveSubtreeDown, DashboardMoveSubtreeUp, DashboardNewChild, DashboardNewSibling,
+    DashboardNow, DashboardPasteRow, DashboardPasteRowBefore, DashboardPromote,
+    DashboardRenameTopic, DashboardReply, DashboardSubmit, DashboardToggleAgentTree,
+    DashboardToggleSubagents, DashboardUndo, DashboardYankRow, DealCloseAndNext, DealLeave,
+    DealOpen, FindNode, GitApprovalAllow, GitApprovalDeny, HomeOpenRow, MessagesOpen,
+    MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious,
+    OverviewToggle, PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof,
+    ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit, SlackCancelEdit, SlackCompose,
+    SlackEditLast, SlackEditMessage, SlackMarkReadBefore, SlackNextUnread, SlackOpenRow,
+    SlackSearch, SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, UndoVerdict,
+    UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
 };
 
 pub(crate) const MESSAGE_LOG_CAP: usize = 4096;
@@ -4816,6 +4816,13 @@ impl Workspace {
     }
 
     #[cfg(test)]
+    pub(crate) fn filing_destinations_for_test(
+        &self,
+    ) -> &[(String, String, HostId, rho_desk::cells::Id)] {
+        &self.pending_filing_destinations
+    }
+
+    #[cfg(test)]
     pub(crate) fn semantic_undo_count_for_test(&self) -> usize {
         self.desk_semantic_undo.len()
     }
@@ -5835,6 +5842,14 @@ impl Workspace {
                 })
             })
             .collect()
+    }
+
+    /// The map exactly as it is drawn, prefixes included, which is where a
+    /// row's place shows up: two rows of one thing must each carry their
+    /// own bullet.
+    #[cfg(test)]
+    pub(crate) fn dashboard_display_text_for_test(&self, cx: &mut App) -> String {
+        self.dashboard.display_text_for_test(cx)
     }
 
     #[cfg(test)]
@@ -7643,13 +7658,128 @@ impl Workspace {
         self.refresh_dashboard(window, cx);
     }
 
-    /// `f` on a deal: choose the note the card's node moves under. Filing is
-    /// a verdict like any other, so it goes through the tree's verdict log.
+    /// `l`: the label picker. The user types a path, `rho/agent`, and gets
+    /// the label it names, made on the spot if it is new. Typing a label the
+    /// thing already carries takes it off again: one key both ways, because
+    /// the question the user is answering is "is this thing a rho agent
+    /// thing", and the answer is yes or no.
+    pub(crate) fn prompt_label_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((host, id)) = self.label_target(cx) else {
+            self.echo(
+                "label: nothing under the cursor",
+                StyleClass::SystemInfo,
+                cx,
+            );
+            return;
+        };
+        let carried = self
+            .desk_cells
+            .facts(host, &id)
+            .map(|facts| facts.labels)
+            .unwrap_or_default();
+        let on_submit = std::rc::Rc::new(
+            move |workspace: &mut Workspace,
+                  input: String,
+                  window: &mut Window,
+                  cx: &mut Context<Workspace>| {
+                workspace.label_card(host, id.clone(), &input, window, cx);
+            },
+        );
+        self.open_prompt(
+            "label:",
+            std::rc::Rc::new(
+                move |workspace: &Workspace, needle: &str, _cx: &gpui::App| {
+                    let needle = needle.trim().to_lowercase();
+                    workspace
+                        .desk_cells
+                        .label_paths(host)
+                        .into_iter()
+                        .filter(|(_, path)| path.to_lowercase().contains(&needle))
+                        .map(|(label, path)| crate::minibuffer::Candidate {
+                            description: match carried.contains(&label) {
+                                true => "on this · enter removes".to_owned(),
+                                false => "label".to_owned(),
+                            },
+                            value: path,
+                        })
+                        .collect()
+                },
+            ),
+            on_submit,
+            window,
+            cx,
+        );
+        if let Some(minibuffer) = &mut self.minibuffer {
+            // A path has a slash in it and is one value, so completion
+            // replaces the whole input rather than the last word.
+            minibuffer.set_complete_whole_input();
+        }
+    }
+
+    /// The thing a label goes on: the card in front of the reader, else the
+    /// row under the cursor on the map.
+    pub(crate) fn label_target(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<(HostId, rho_desk::cells::Id)> {
+        if let Some(card) = self.dashboard.current_deal_card() {
+            return Some((card.identity.host, card.identity.node_id.clone()));
+        }
+        self.dashboard.tree_node_at_cursor(cx)
+    }
+
+    pub(crate) fn label_card(
+        &mut self,
+        host: HostId,
+        id: rho_desk::cells::Id,
+        path: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let path = path.trim();
+        if path.is_empty() {
+            return;
+        }
+        let Some((writes, event)) = self.desk_cells.label_writes(host, &id, path) else {
+            self.echo("label: nothing to label", StyleClass::SystemInfo, cx);
+            return;
+        };
+        let removed = matches!(
+            &event.1,
+            rho_desk::cells::VerdictEvent::Applied {
+                verdict: rho_desk::cells::Verdict::Label { present: false, .. },
+                ..
+            }
+        );
+        // `u` on the map takes a label back the same way it takes any other
+        // structure verb back: the inverse writes, not replayed text.
+        let undo = self.desk_cells.inverse_writes(host, &writes);
+        let Some(stamp) = self.apply_desk_writes(host, writes, Some(event), window, cx) else {
+            return;
+        };
+        self.record_desk_semantic_undo(host, stamp, undo, cx);
+        let said = match removed {
+            true => format!("label removed: {path}"),
+            false => format!("label: {path}"),
+        };
+        self.echo(&said, StyleClass::SystemInfo, cx);
+    }
+
+    /// `f` on a deal: choose what the card's node moves under. Any id is a
+    /// place, a label as much as a note, so the picker offers the same set
+    /// the finder does. Filing is a verdict like any other, so it goes
+    /// through the tree's verdict log.
     pub(crate) fn prompt_file_deal_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.dashboard.current_deal_card().is_none() {
             return;
         }
-        self.pending_filing_destinations = self.dashboard.heading_destination_candidates(cx);
+        let threads = self.slack_thread_facts(cx);
+        self.pending_filing_destinations = self
+            .dashboard
+            .area_candidates(&self.registry, &threads, cx)
+            .into_iter()
+            .map(|(path, kind, host, node_id)| (path, kind.to_owned(), host, node_id))
+            .collect();
         self.pending_filing_selected = None;
         self.open_prompt(
             "file under:",
@@ -10421,6 +10551,10 @@ impl Render for Workspace {
             )
             .on_action(cx.listener(|this, _: &DashboardUndo, window, cx| {
                 this.dashboard_undo(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DashboardLabel, window, cx| {
+                vim::take_count(cx);
+                this.prompt_label_card(window, cx);
             }))
             .on_action(cx.listener(|this, _: &TaskBoard, _window, cx| {
                 this.notice_on(

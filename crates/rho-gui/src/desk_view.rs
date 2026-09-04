@@ -127,6 +127,11 @@ pub struct DeskNode {
     /// Where it is shown: the user's filing, else the edge into its source
     /// context, else the root.
     pub parent: Option<Id>,
+    /// The place this row hangs under. The same as `parent` for the row a
+    /// thing has in its own place, and the label for the extra row every
+    /// label it carries gives it: labels are a second axis, so the map is a
+    /// DAG drawn as a tree and a thing in two places appears twice.
+    pub under: Option<Id>,
     pub state: State,
     pub defer_until: Option<Timestamp>,
     pub deadline: Option<Timestamp>,
@@ -538,6 +543,7 @@ impl DeskCells {
                 id.clone(),
                 DeskNode {
                     id: id.clone(),
+                    under: parent.clone(),
                     parent,
                     state: slack.map_or(fact.state, |card| card.state),
                     defer_until: match slack {
@@ -571,6 +577,7 @@ impl DeskCells {
                 id.clone(),
                 DeskNode {
                     id,
+                    under: parent.clone(),
                     parent,
                     state: fact.state,
                     defer_until: fact.defer_until,
@@ -711,18 +718,65 @@ fn order(nodes: BTreeMap<Id, DeskNode>) -> Vec<DeskNode> {
             .filter(|parent| nodes.contains_key(parent) && reaches_root(&nodes, node));
         children.entry(parent).or_default().push(node);
     }
+    // The second axis. A label lists what carries it, under the label's own
+    // row, wherever that row is: the listing is flat, because what is under
+    // the thing belongs to the thing's place rather than to the label.
+    let mut members: BTreeMap<Id, Vec<&DeskNode>> = BTreeMap::new();
+    for node in nodes.values() {
+        for label in &node.labels {
+            if nodes.contains_key(label) && label != &node.id {
+                members.entry(label.clone()).or_default().push(node);
+            }
+        }
+    }
+    let by_age = |left: &&DeskNode, right: &&DeskNode| {
+        (left.created_at, &left.id).cmp(&(right.created_at, &right.id))
+    };
     for row in children.values_mut() {
-        row.sort_by(|left, right| (left.created_at, &left.id).cmp(&(right.created_at, &right.id)));
+        row.sort_by(by_age);
+    }
+    for row in members.values_mut() {
+        row.sort_by(by_age);
     }
     let mut ordered = Vec::new();
+    // One row per place a thing is in. A label filed under something it
+    // labels would otherwise walk forever; a place is only ever drawn once,
+    // which ends it without a depth limit.
+    let mut drawn: std::collections::HashSet<(Option<Id>, Id)> = std::collections::HashSet::new();
     let mut stack = children
         .get(&None)
-        .map(|roots| roots.iter().rev().copied().collect::<Vec<_>>())
+        .map(|roots| {
+            roots
+                .iter()
+                .rev()
+                .map(|node| (None, *node))
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
-    while let Some(node) = stack.pop() {
-        ordered.push(node.clone());
-        if let Some(row) = children.get(&Some(node.id.clone())) {
-            stack.extend(row.iter().rev().copied());
+    while let Some((under, node)) = stack.pop() {
+        if !drawn.insert((under.clone(), node.id.clone())) {
+            continue;
+        }
+        let in_its_place = under == node.parent;
+        ordered.push(DeskNode {
+            under,
+            ..node.clone()
+        });
+        if let Some(row) = members.get(&node.id) {
+            stack.extend(
+                row.iter()
+                    .rev()
+                    .map(|member| (Some(node.id.clone()), *member)),
+            );
+        }
+        // Only the row in a thing's own place carries its subtree: a label
+        // lists the things themselves, not everything filed under them.
+        if in_its_place && let Some(row) = children.get(&Some(node.id.clone())) {
+            stack.extend(
+                row.iter()
+                    .rev()
+                    .map(|child| (Some(node.id.clone()), *child)),
+            );
         }
     }
     ordered
@@ -769,6 +823,139 @@ pub struct DeskCaptureNode {
 /// mutation.
 impl DeskCells {
     /// A new note under `parent`.
+    /// The label a path names, minting what is missing on the way down:
+    /// `rho/agent` is the label `agent` under the label `rho`. Names are
+    /// matched without case so `rho` and `Rho` cannot become two labels,
+    /// and a new one keeps the case the user typed. The id never reaches
+    /// the user; the path is the whole interface.
+    pub fn label_path_writes(&mut self, host: HostId, path: &str) -> Option<(Id, Vec<CellWrite>)> {
+        let names = path
+            .split('/')
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            return None;
+        }
+        let nodes = self.nodes(host);
+        let mut writes = Vec::new();
+        let mut parent: Option<Id> = None;
+        for name in names {
+            let existing = nodes.iter().find(|node| {
+                matches!(node.id, Id::Label(_))
+                    && node.parent == parent
+                    && node
+                        .name
+                        .as_ref()
+                        .is_some_and(|written| written.eq_ignore_ascii_case(name))
+            });
+            let id = match existing {
+                Some(node) => node.id.clone(),
+                None => {
+                    let id = Id::Label(Uuid::random());
+                    writes.push(CellWrite {
+                        id: id.clone(),
+                        property: Property::Name(name.to_owned()),
+                    });
+                    writes.push(CellWrite {
+                        id: id.clone(),
+                        property: Property::Parent(parent.clone()),
+                    });
+                    writes.push(CellWrite {
+                        id: id.clone(),
+                        property: Property::CreatedAt(now_timestamp()),
+                    });
+                    id
+                }
+            };
+            parent = Some(id);
+        }
+        parent.map(|id| (id, writes))
+    }
+
+    /// Every label the store holds, as the path a person would type. What
+    /// the picker completes over, and what a label row is called.
+    pub fn label_paths(&self, host: HostId) -> Vec<(Id, String)> {
+        let nodes = self.nodes(host);
+        let name_of = |id: &Id| {
+            nodes
+                .iter()
+                .find(|node| &node.id == id)
+                .and_then(|node| node.name.clone())
+        };
+        let mut paths = Vec::new();
+        for node in nodes.iter().filter(|node| matches!(node.id, Id::Label(_))) {
+            let Some(name) = node.name.clone() else {
+                continue;
+            };
+            let mut segments = vec![name];
+            let mut parent = node.parent.clone();
+            // A label nested under something that is not a label is named by
+            // its own name alone: the path is the label axis, not the place.
+            while let Some(id) = parent.filter(|id| matches!(id, Id::Label(_))) {
+                match name_of(&id) {
+                    Some(name) => segments.push(name),
+                    None => break,
+                }
+                parent = nodes
+                    .iter()
+                    .find(|node| node.id == id)
+                    .and_then(|node| node.parent.clone());
+            }
+            segments.reverse();
+            paths.push((node.id.clone(), segments.join("/")));
+        }
+        paths.sort_by(|left, right| left.1.cmp(&right.1));
+        paths.dedup_by(|left, right| left.1 == right.1);
+        paths
+    }
+
+    /// `l`: the thing carries the label the path names, or stops carrying
+    /// it when it already does. The label is minted if the path is new, in
+    /// the same mutation, so a label never exists without something on it.
+    pub fn label_writes(
+        &mut self,
+        host: HostId,
+        id: &Id,
+        path: &str,
+    ) -> Option<(Vec<CellWrite>, (Id, VerdictEvent))> {
+        let (label, mut writes) = self.label_path_writes(host, path)?;
+        let present = !self.facts(host, id)?.labels.contains(&label);
+        let verdict = Verdict::Label {
+            label: label.clone(),
+            present,
+        };
+        let view = &self.hosts.get(&host)?.view;
+        let changes = rho_desk::cells::verdict_changes(
+            id,
+            &verdict,
+            &|key| view.property(id, key).cloned(),
+            None,
+            None,
+        )
+        .ok()?;
+        writes.extend(changes.iter().filter_map(|change| {
+            Some(CellWrite {
+                id: change.id.clone(),
+                property: change.after.clone()?,
+            })
+        }));
+        Some((
+            writes,
+            (
+                id.clone(),
+                VerdictEvent::Applied {
+                    verdict,
+                    at: Stamp {
+                        device: self.device,
+                        version: 0,
+                    },
+                    changes,
+                },
+            ),
+        ))
+    }
+
     pub fn create_note_writes(
         &mut self,
         _host: HostId,
@@ -1309,5 +1496,85 @@ pub fn desk_device() -> DeviceId {
             }
         }
         device
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(id: Id, parent: Option<Id>, labels: &[Id]) -> DeskNode {
+        DeskNode {
+            id,
+            parent,
+            under: None,
+            state: State::Open,
+            defer_until: None,
+            deadline: None,
+            pace_days: 0,
+            labels: labels.iter().cloned().collect(),
+            name: None,
+            created_at: None,
+        }
+    }
+
+    /// A label is a second axis, so the map is a DAG drawn as a tree: the
+    /// same thing is under its place and under every label it carries, and
+    /// both rows are the truth rather than one of them being a duplicate.
+    #[test]
+    fn a_labelled_thing_is_on_the_map_in_its_place_and_under_the_label() {
+        let area = Id::Note(Uuid([1; 16]));
+        let label = Id::Label(Uuid([2; 16]));
+        let thing = Id::Note(Uuid([3; 16]));
+        let child = Id::Note(Uuid([4; 16]));
+        let nodes = BTreeMap::from([
+            (area.clone(), node(area.clone(), None, &[])),
+            (label.clone(), node(label.clone(), None, &[])),
+            (
+                thing.clone(),
+                node(thing.clone(), Some(area.clone()), &[label.clone()]),
+            ),
+            (child.clone(), node(child.clone(), Some(thing.clone()), &[])),
+        ]);
+
+        let ordered = order(nodes);
+        let places = |id: &Id| {
+            ordered
+                .iter()
+                .filter(|row| &row.id == id)
+                .map(|row| row.under.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            places(&thing),
+            vec![Some(area.clone()), Some(label.clone())],
+            "the thing is in its place and under the label it carries"
+        );
+        // The label lists the things themselves. What is filed under a
+        // labelled thing belongs to that thing's place, not to the label.
+        assert_eq!(places(&child), vec![Some(thing.clone())]);
+    }
+
+    /// A label filed under something it labels is a cycle in the drawing,
+    /// not in the store. Each place is drawn once, which ends the walk.
+    #[test]
+    fn a_label_filed_under_what_it_labels_still_draws() {
+        let thing = Id::Note(Uuid([1; 16]));
+        let label = Id::Label(Uuid([2; 16]));
+        let nodes = BTreeMap::from([
+            (thing.clone(), node(thing.clone(), None, &[label.clone()])),
+            (label.clone(), node(label.clone(), Some(thing.clone()), &[])),
+        ]);
+
+        let ordered = order(nodes);
+        assert_eq!(
+            ordered.iter().filter(|row| row.id == thing).count(),
+            2,
+            "the thing is at the root and under its own label"
+        );
+        // The label itself is in one place, under the thing it was filed
+        // under; the second pass through it is the same place, so it is not
+        // drawn again.
+        assert_eq!(ordered.iter().filter(|row| row.id == label).count(), 1);
     }
 }

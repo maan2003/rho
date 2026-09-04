@@ -8377,3 +8377,180 @@ fn the_new_agent_draft_opens_ready_to_type(cx: &mut TestAppContext) {
         })
         .unwrap();
 }
+
+/// `l` names a label by path: `rho/agent` is the label `agent` under the
+/// label `rho`, both minted on the spot if they are new, and the thing then
+/// hangs on the map in its place and under the label as well.
+#[gpui::test]
+fn a_label_is_named_by_path_and_puts_the_thing_in_a_second_place(cx: &mut TestAppContext) {
+    use rho_desk::cells::{Id, Property};
+
+    let mut desk = DeskFixture::new();
+    let area = desk.note(None, "Verdict agent");
+    let thing = desk.note(Some(area.clone()), "Deal QA note");
+
+    cx.update(bind_test_keymaps);
+    let workspace = overview_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.take_host_messages_for_test(HostId::default());
+            workspace.label_card(HostId::default(), thing.clone(), "rho/agent", window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let label = workspace
+        .update(cx, |workspace, _, _| {
+            let mutation =
+                take_desk_mutation(workspace, HostId::default()).expect("label mutation");
+            // Two labels are minted, the outer one first, and the inner one
+            // hangs under it. Nothing the reader sees is an id.
+            let names = mutation
+                .writes
+                .iter()
+                .filter_map(|write| match &write.property {
+                    Property::Name(name) => Some((write.id.clone(), name.clone())),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(names.len(), 2);
+            assert_eq!(names[0].1, "rho");
+            assert_eq!(names[1].1, "agent");
+            assert!(matches!(names[0].0, Id::Label(_)));
+            assert!(mutation.writes.iter().any(|write| write.id == names[1].0
+                && write.property == Property::Parent(Some(names[0].0.clone()))));
+            assert!(mutation.writes.iter().any(|write| {
+                write.id == thing
+                    && write.property
+                        == Property::Labeled {
+                            label: names[1].0.clone(),
+                            present: true,
+                        }
+            }));
+            assert_eq!(workspace.echo_text_for_test(), Some("label: rho/agent"));
+            names[1].0.clone()
+        })
+        .unwrap();
+
+    // The map is a DAG drawn as a tree: the note is under the area it was
+    // filed in and under the label it now carries, and both rows are real.
+    workspace
+        .update(cx, |workspace, _, _| {
+            let places = workspace
+                .desk_cells_snapshot_for_test(HostId::default())
+                .into_iter()
+                .filter(|node| node.id == thing)
+                .map(|node| node.under)
+                .collect::<Vec<_>>();
+            assert_eq!(places, vec![Some(area.clone()), Some(label.clone())]);
+        })
+        .unwrap();
+
+    // Both places are drawn, each with its own bullet. One buffer in two
+    // excerpts is the thing that used to go wrong here: the prefix is
+    // positioned per excerpt, so the second row is not left bare.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_overview(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+    let map = workspace
+        .update(cx, |workspace, _, cx| {
+            workspace.dashboard_display_text_for_test(cx)
+        })
+        .unwrap();
+    assert_eq!(
+        map.matches("Deal QA note").count(),
+        2,
+        "the note is filed in its area and carried by the label: {map:?}"
+    );
+    assert_eq!(
+        map.matches("* Deal QA note").count(),
+        2,
+        "both places carry the bullet, not just the one drawn first: {map:?}"
+    );
+
+    // The same path a second time is the same two labels, not two more, and
+    // naming a label the thing already carries takes it off.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.label_card(HostId::default(), thing.clone(), "rho/agent", window, cx);
+            let mutation = take_desk_mutation(workspace, HostId::default()).expect("label removal");
+            assert!(
+                !mutation
+                    .writes
+                    .iter()
+                    .any(|write| matches!(write.property, Property::Name(_))),
+                "the labels already exist"
+            );
+            assert!(mutation.writes.iter().any(|write| {
+                write.id == thing
+                    && write.property
+                        == Property::Labeled {
+                            label: label.clone(),
+                            present: false,
+                        }
+            }));
+            assert_eq!(
+                workspace.echo_text_for_test(),
+                Some("label removed: rho/agent")
+            );
+            assert_eq!(
+                workspace
+                    .desk_cells_snapshot_for_test(HostId::default())
+                    .into_iter()
+                    .filter(|node| node.id == thing)
+                    .count(),
+                1,
+                "the thing is back in one place"
+            );
+        })
+        .unwrap();
+}
+
+/// `f` files under any id, a label as much as a note, so a thing can be put
+/// where a label already gathers its kind.
+#[gpui::test]
+fn filing_offers_labels_as_well_as_notes(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    let area = desk.note(None, "Verdict agent");
+    let dealt = desk.due_note(None, "Deal QA note");
+
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.label_card(HostId::default(), area.clone(), "rho", window, cx);
+            workspace.open_deal_mode(window, cx);
+            workspace.take_host_messages_for_test(HostId::default());
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    cx.dispatch_action(*workspace, crate::DashboardDealFile);
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                workspace
+                    .filing_destinations_for_test()
+                    .iter()
+                    .any(|(path, kind, _, id)| path == "rho"
+                        && *kind == "label"
+                        && matches!(id, rho_desk::cells::Id::Label(_))),
+                "the label is a place to file under"
+            );
+            assert!(
+                workspace
+                    .filing_destinations_for_test()
+                    .iter()
+                    .any(|(path, ..)| path == "Verdict agent"),
+                "notes are still offered"
+            );
+            let _ = &dealt;
+        })
+        .unwrap();
+}

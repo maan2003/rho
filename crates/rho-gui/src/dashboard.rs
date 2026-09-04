@@ -17,9 +17,9 @@ use editor::scroll::Autoscroll;
 use editor::{Editor, EditorMode, HighlightKey, Inlay, SelectionEffects, SizingBehavior};
 use gpui::prelude::*;
 use gpui::{App, Context, Entity, Focusable as _, HighlightStyle, Window};
-use language::{Buffer, Capability, InlayId};
-use multi_buffer::MultiBuffer;
+use language::{Buffer, Capability, InlayId, Point};
 use multi_buffer::composition::{Composition, CompositionSpec, RowSpec};
+use multi_buffer::{MultiBuffer, MultiBufferRow};
 pub use rho_desk::cells::SlackUnit;
 use rho_ui_proto::{AgentId, UiAttention};
 use text::{Bias, BufferId, ToOffset as _};
@@ -288,7 +288,9 @@ pub struct Dashboard {
     composition: Composition,
     /// Stable composition keys per line, allocated once and never reused.
     element_keys: HashMap<LineKey, u64>,
-    tree_element_keys: HashMap<(HostId, rho_desk::cells::Id), u64>,
+    /// One key per row, and a row is a thing in one of its places: a
+    /// labelled thing has a row in its own place and one under each label.
+    tree_element_keys: HashMap<(HostId, rho_desk::cells::Id, Option<rho_desk::cells::Id>), u64>,
     tree_heading_agents: HashMap<(HostId, rho_desk::cells::Id), Vec<AgentId>>,
     tree_heading_pages: HashMap<(HostId, rho_desk::cells::Id), Vec<rho_browser::PageId>>,
     next_element_key: u64,
@@ -1432,7 +1434,7 @@ impl Dashboard {
         let old = std::mem::take(&mut self.tree_inlay_ids);
         self.editor
             .update(cx, |editor, cx| editor.splice_inlays(&old, Vec::new(), cx));
-        self.apply_tree_folds(&[], &HashMap::new(), cx);
+        self.apply_tree_folds(&[], &[], cx);
         let raw_mode = self.raw_mode;
         let rows = self
             .tree_hosts
@@ -1456,7 +1458,7 @@ impl Dashboard {
         });
         let mut spec = CompositionSpec::default();
         for (host, node, buffer) in &rows {
-            let key = (*host, node.id.clone());
+            let key = (*host, node.id.clone(), node.under.clone());
             let id = *self.tree_element_keys.entry(key).or_insert_with(|| {
                 self.next_element_key += 1;
                 self.next_element_key
@@ -1539,7 +1541,7 @@ impl Dashboard {
                     editor.highlight_text(class.key(), Vec::new(), class.style(cx), cx);
                 }
             });
-            self.apply_tree_folds(&[], &HashMap::new(), cx);
+            self.apply_tree_folds(&[], &[], cx);
             return;
         }
         let mut inlays = Vec::new();
@@ -1548,50 +1550,69 @@ impl Dashboard {
             .into_iter()
             .map(|class| (class, Vec::new()))
             .collect::<Vec<_>>();
-        let mut depths = HashMap::new();
-        let mut tree_depths = HashMap::new();
-        // How many cards a row hangs under: a card's marker is two columns
-        // in, so anything below it starts past those columns.
-        let mut card_depths = HashMap::new();
+        // Depth belongs to the row, not to the thing the row is of: a
+        // labelled thing is drawn where it is filed and again under its
+        // label, and the two places sit at different depths. The rows come
+        // in the order the tree walks them, so the row a row hangs under is
+        // the nearest one above it with that id, which is a stack rather
+        // than a lookup.
+        let mut row_depths: Vec<RowDepth> = Vec::with_capacity(rows.len());
+        let mut open: Vec<(HostId, rho_desk::cells::Id, RowDepth)> = Vec::new();
         for (host, node, _) in &rows {
-            let tree_depth = node
-                .parent
-                .clone()
-                .and_then(|parent| tree_depths.get(&(*host, parent)).copied())
-                .unwrap_or(0usize)
-                + usize::from(node.parent.is_some());
-            let depth = node
-                .parent
-                .clone()
-                .and_then(|parent| depths.get(&(*host, parent)).copied())
-                .unwrap_or(0usize)
-                + usize::from(node.is_note());
-            let card_depth = node
-                .parent
-                .clone()
-                .and_then(|parent| card_depths.get(&(*host, parent)).copied())
-                .unwrap_or(0usize)
-                + usize::from(!node.is_note());
-            depths.insert((*host, node.id.clone()), depth);
-            tree_depths.insert((*host, node.id.clone()), tree_depth);
-            card_depths.insert((*host, node.id.clone()), card_depth);
-        }
-        for (index, (host, node, buffer)) in rows.iter().enumerate() {
-            let buffer_snapshot = buffer.read(cx).snapshot();
-            // The visible heading prefix belongs to this row. A left-biased
-            // zero anchor resolves to the preceding excerpt at a row
-            // boundary, which made commands issued on `*` edit that previous
-            // row instead (notably `dd`, `O`, `R`, and subtree toggles).
-            let Some(start) = snapshot.anchor_in_excerpt(buffer_snapshot.anchor_after(0)) else {
-                continue;
+            match &node.under {
+                None => open.clear(),
+                Some(parent) => {
+                    while open
+                        .last()
+                        .is_some_and(|(open_host, id, _)| open_host != host || id != parent)
+                    {
+                        open.pop();
+                    }
+                }
+            }
+            let above = open.last().map(|(_, _, depth)| *depth).unwrap_or_default();
+            let depth = RowDepth {
+                tree: above.tree + usize::from(node.under.is_some()),
+                note: above.note + usize::from(node.is_note()),
+                card: above.card + usize::from(!node.is_note()),
             };
-            let Some(end) =
-                snapshot.anchor_in_excerpt(buffer_snapshot.anchor_after(buffer_snapshot.len()))
+            row_depths.push(depth);
+            open.push((*host, node.id.clone(), depth));
+        }
+        // Where each row starts and ends in the map, found once. A thing
+        // drawn in two places is one buffer in two excerpts, and asking the
+        // buffer for its anchor lands in whichever excerpt came first, so
+        // the second row would take the first one's prefix and highlight.
+        // The excerpt boundaries name each excerpt's own rows, and the
+        // composition names the path a row was put at, which pairs them.
+        let mut rows_by_path: HashMap<multi_buffer::PathKey, (MultiBufferRow, MultiBufferRow)> =
+            HashMap::new();
+        for boundary in snapshot.excerpt_boundaries_in_range(multi_buffer::MultiBufferOffset(0)..) {
+            if let multi_buffer::Anchor::Excerpt(excerpt) = boundary.next.start_anchor {
+                rows_by_path
+                    .entry(snapshot.path_for_anchor(excerpt).clone())
+                    .or_insert((boundary.row, boundary.next.end_row));
+            }
+        }
+        for (index, (host, node, _)) in rows.iter().enumerate() {
+            // The visible heading prefix belongs to this row. Right-biased
+            // at the row's first column, because a left-biased anchor sits
+            // at the end of the row above instead, which made commands
+            // issued on `*` edit that previous row (notably `dd`, `O`, `R`,
+            // and subtree toggles).
+            let key = (*host, node.id.clone(), node.under.clone());
+            let Some((start_row, end_row)) = self
+                .tree_element_keys
+                .get(&key)
+                .and_then(|id| self.composition.path_for_row(*id))
+                .and_then(|path| rows_by_path.get(&path).copied())
             else {
                 continue;
             };
+            let start = snapshot.anchor_after(Point::new(start_row.0, 0));
+            let end = snapshot.anchor_before(Point::new(end_row.0, snapshot.line_len(end_row)));
             let hidden_by_fold = self.tree_hosts.get(host).is_some_and(|source| {
-                let mut parent = node.parent.clone();
+                let mut parent = node.under.clone();
                 while let Some(parent_id) = parent {
                     if self.tree_collapsed.contains(&(*host, parent_id.clone())) {
                         return true;
@@ -1600,7 +1621,7 @@ impl Dashboard {
                         .nodes
                         .iter()
                         .find(|candidate| candidate.id == parent_id)
-                        .and_then(|candidate| candidate.parent.clone());
+                        .and_then(|candidate| candidate.under.clone());
                 }
                 false
             });
@@ -1611,8 +1632,8 @@ impl Dashboard {
                     // root rather than as something belonging to the card.
                     format!(
                         "{}{} ",
-                        "    ".repeat(card_depths[&(*host, node.id.clone())]),
-                        "*".repeat(depths[&(*host, node.id.clone())].max(1))
+                        "    ".repeat(row_depths[index].card),
+                        "*".repeat(row_depths[index].note.max(1))
                     )
                 }
                 rho_desk::cells::Id::Agent(_) => {
@@ -1636,9 +1657,7 @@ impl Dashboard {
                 _ => "  ◦ ".to_owned(),
             };
             let class = match &node.id {
-                rho_desk::cells::Id::Note(_) => {
-                    Some(DashClass::for_depth(depths[&(*host, node.id.clone())]))
-                }
+                rho_desk::cells::Id::Note(_) => Some(DashClass::for_depth(row_depths[index].note)),
                 _ => Some(DashClass::Muted),
             };
             if let Some(class) = class
@@ -1654,17 +1673,8 @@ impl Dashboard {
                 let inlay = Inlay::custom(TREE_INLAY_ID_BASE + index * 2, start, prefix);
                 self.tree_inlay_ids.push(inlay.id);
                 inlays.push(inlay);
-                let text = buffer_snapshot.text();
-                for (line, offset) in text
-                    .match_indices('\n')
-                    .enumerate()
-                    .map(|(line, (offset, _))| (line, offset + 1))
-                {
-                    let Some(anchor) =
-                        snapshot.anchor_in_excerpt(buffer_snapshot.anchor_after(offset))
-                    else {
-                        continue;
-                    };
+                for (line, row) in (start_row.0 + 1..=end_row.0).enumerate() {
+                    let anchor = snapshot.anchor_after(Point::new(row, 0));
                     let inlay = Inlay::custom(
                         CONTINUATION_INLAY_ID_BASE + index * 256 + line,
                         anchor,
@@ -1718,13 +1728,18 @@ impl Dashboard {
                 editor.highlight_text(class.key(), ranges, class.style(cx), cx);
             }
         });
-        self.apply_tree_folds(rows.as_slice(), &tree_depths, cx);
+        self.apply_tree_folds(rows.as_slice(), &row_depths, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn display_text_for_test(&self, cx: &mut App) -> String {
+        self.editor.update(cx, |editor, cx| editor.display_text(cx))
     }
 
     fn apply_tree_folds(
         &self,
         rows: &[(HostId, crate::desk_view::DeskNode, Entity<Buffer>)],
-        depths: &HashMap<(HostId, rho_desk::cells::Id), usize>,
+        depths: &[RowDepth],
         cx: &mut Context<Workspace>,
     ) {
         struct TreeSubtreeFold;
@@ -1735,12 +1750,12 @@ impl Dashboard {
             if !self.tree_collapsed.contains(&(*host, node.id.clone())) {
                 continue;
             }
-            let depth = depths[&(*host, node.id.clone())];
+            let depth = depths[index].tree;
             let end_index = rows[index + 1..]
                 .iter()
-                .position(|(candidate_host, candidate, _)| {
-                    *candidate_host != *host
-                        || depths[&(*candidate_host, candidate.id.clone())] <= depth
+                .enumerate()
+                .position(|(offset, (candidate_host, _, _))| {
+                    *candidate_host != *host || depths[index + 1 + offset].tree <= depth
                 })
                 .map_or(rows.len(), |offset| index + 1 + offset);
             if end_index == index + 1 {
@@ -2823,6 +2838,7 @@ mod tests {
         let node = |name: Option<&str>| crate::desk_view::DeskNode {
             id: rho_desk::cells::Id::Slack(unit.clone()),
             parent: None,
+            under: None,
             state: rho_desk::cells::State::Open,
             defer_until: None,
             deadline: None,
@@ -2925,4 +2941,18 @@ fn desk_date(at: rho_desk::cells::Timestamp) -> String {
         || "unknown".to_owned(),
         |time| time.format(format).to_string(),
     )
+}
+
+/// How far in one row is drawn, in the three counts the map indents by.
+/// It is per row rather than per thing, because a labelled thing is drawn
+/// in more than one place and the places are at different depths.
+#[derive(Clone, Copy, Default)]
+struct RowDepth {
+    /// Rows above it in the tree, whatever they are: what a fold spans.
+    tree: usize,
+    /// Notes above it, which is how many `*` its bullet carries.
+    note: usize,
+    /// Cards above it: a card's marker is two columns in, so anything
+    /// below it starts past those columns.
+    card: usize,
 }

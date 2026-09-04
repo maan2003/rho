@@ -96,6 +96,7 @@ actions!(
         DashboardDealAppend,
         DashboardDealOpenLine,
         DashboardDealFile,
+        DashboardLabel,
         RoleCycle,
         RoleCycleGroup,
         TaskBoard,
