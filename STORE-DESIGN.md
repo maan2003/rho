@@ -209,6 +209,28 @@ implementation of the same two operations if the log should ever
 outlive the host. Slice 1's store interface is what makes this a swap:
 its one implementation today talks to the daemon in the clear.
 
+What the vendored stack needs for it (explored 4 Sep; `iroh` 1.0 and
+`noq`, its QUIC, are under `vendor/`): no change to QUIC. Holding at the
+packet level was looked at and rejected: the relay server
+(`iroh-relay`, `server/clients.rs`) forwards QUIC datagrams of a live
+connection between two connected endpoints, and a datagram held for
+days belongs to a connection whose other end has long since restarted;
+making that work means persisting connection state, keys, and loss
+recovery across process restarts on both clients, a fork of the
+protocol for no gain. The hold is an application protocol over a
+second ALPN (`rho/sync/1`) on the daemon's existing endpoint: sealed
+segments on streams, a redb table keyed (device, version), and the same
+protocol served by each client so the direct path is the same code.
+Three things change in the network layer: the GUI's iroh key becomes
+stable (today `bind_ephemeral_iroh_client` generates one per process
+and trusts it over SSH each launch), because segments are indexed by
+device and clients must be able to reach each other; the daemon's
+listener accepts two ALPNs instead of one; and the relay both sides use
+for NAT traversal (`presets::N0`, n0's public servers today) can be the
+vendored `iroh-relay` run by the daemon on its host, so no third party
+sees even the metadata. Local discovery for the near path is iroh's own;
+bluetooth is not, and waits.
+
 ## Browser tabs
 
 A tab is `Page(PageId)`; it is never created in the store. Its place is
