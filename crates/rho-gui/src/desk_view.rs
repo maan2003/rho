@@ -764,8 +764,7 @@ fn order(nodes: BTreeMap<Id, DeskNode>) -> Vec<DeskNode> {
         children.entry(parent).or_default().push(node);
     }
     // The second axis. A label lists what carries it, under the label's own
-    // row, wherever that row is: the listing is flat, because what is under
-    // the thing belongs to the thing's place rather than to the label.
+    // row, wherever that row is.
     let mut members: BTreeMap<Id, Vec<&DeskNode>> = BTreeMap::new();
     for node in nodes.values() {
         for label in &node.labels {
@@ -788,12 +787,22 @@ fn order(nodes: BTreeMap<Id, DeskNode>) -> Vec<DeskNode> {
     // labels would otherwise walk forever; a place is only ever drawn once,
     // which ends it without a depth limit.
     let mut drawn: std::collections::HashSet<(Option<Id>, Id)> = std::collections::HashSet::new();
+    // The root is what is nowhere else: a thing filed under a label is
+    // drawn there, so it does not line up at the top as well. A label that
+    // hangs under the very thing it labels is the exception, since dropping
+    // the root row would leave nothing to reach either of them from.
+    let filed = |node: &DeskNode| {
+        node.labels.iter().any(|label| {
+            nodes.contains_key(label) && label != &node.id && !hangs_under(&nodes, label, &node.id)
+        })
+    };
     let mut stack = children
         .get(&None)
         .map(|roots| {
             roots
                 .iter()
                 .rev()
+                .filter(|node| !filed(node))
                 .map(|node| (None, *node))
                 .collect::<Vec<_>>()
         })
@@ -802,7 +811,6 @@ fn order(nodes: BTreeMap<Id, DeskNode>) -> Vec<DeskNode> {
         if !drawn.insert((under.clone(), node.id.clone())) {
             continue;
         }
-        let in_its_place = under == node.parent;
         ordered.push(DeskNode {
             under,
             ..node.clone()
@@ -814,9 +822,9 @@ fn order(nodes: BTreeMap<Id, DeskNode>) -> Vec<DeskNode> {
                     .map(|member| (Some(node.id.clone()), *member)),
             );
         }
-        // Only the row in a thing's own place carries its subtree: a label
-        // lists the things themselves, not everything filed under them.
-        if in_its_place && let Some(row) = children.get(&Some(node.id.clone())) {
+        // A thing carries its subtree wherever it is drawn: filing the
+        // origin of a burst under a label takes the burst with it.
+        if let Some(row) = children.get(&Some(node.id.clone())) {
             stack.extend(
                 row.iter()
                     .rev()
@@ -829,6 +837,23 @@ fn order(nodes: BTreeMap<Id, DeskNode>) -> Vec<DeskNode> {
 
 /// How far an ancestry walk goes before it decides it is in a cycle.
 const MAX_ANCESTRY: usize = 256;
+
+/// Whether `id` hangs somewhere under `ancestor`. A label filed under the
+/// thing it labels is only reachable through that thing, which is what keeps
+/// the thing's root row.
+fn hangs_under(nodes: &BTreeMap<Id, DeskNode>, id: &Id, ancestor: &Id) -> bool {
+    let mut cursor = nodes.get(id).and_then(|node| node.parent.clone());
+    for _ in 0..MAX_ANCESTRY {
+        let Some(current) = cursor else {
+            return false;
+        };
+        if &current == ancestor {
+            return true;
+        }
+        cursor = nodes.get(&current).and_then(|node| node.parent.clone());
+    }
+    false
+}
 
 fn reaches_root(nodes: &BTreeMap<Id, DeskNode>, node: &DeskNode) -> bool {
     let mut cursor = node.parent.clone();
@@ -1623,9 +1648,43 @@ mod tests {
             vec![Some(area.clone()), Some(label.clone())],
             "the thing is in its place and under the label it carries"
         );
-        // The label lists the things themselves. What is filed under a
-        // labelled thing belongs to that thing's place, not to the label.
+        // The child hangs off the thing, and a row is one place: the two
+        // thing rows share the same child row rather than drawing it twice.
         assert_eq!(places(&child), vec![Some(thing.clone())]);
+    }
+
+    /// The map rule: things under their labels, things under their parent
+    /// thing, and the rest at the root. Filing the origin of a burst under a
+    /// label takes the burst with it and takes the origin off the root.
+    #[test]
+    fn a_thing_filed_under_a_label_brings_its_subtree_and_leaves_the_root() {
+        let label = Id::Label(Uuid([1; 16]));
+        let origin = Id::Page(rho_desk::PageId([2; 16]));
+        let tab = Id::Page(rho_desk::PageId([3; 16]));
+        let nodes = BTreeMap::from([
+            (label.clone(), node(label.clone(), None, &[])),
+            (origin.clone(), node(origin.clone(), None, &[label.clone()])),
+            (tab.clone(), node(tab.clone(), Some(origin.clone()), &[])),
+        ]);
+
+        let ordered = order(nodes);
+        let places = |id: &Id| {
+            ordered
+                .iter()
+                .filter(|row| &row.id == id)
+                .map(|row| row.under.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            places(&origin),
+            vec![Some(label.clone())],
+            "the origin is under the label it carries, and nowhere else"
+        );
+        assert_eq!(
+            places(&tab),
+            vec![Some(origin.clone())],
+            "and the tab comes with it"
+        );
     }
 
     /// A label filed under something it labels is a cycle in the drawing,

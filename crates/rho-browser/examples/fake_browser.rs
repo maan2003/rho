@@ -247,21 +247,39 @@ fn main() -> Result<()> {
     let _ = std::fs::remove_file(&control_path);
     let control = UnixListener::bind(&control_path).context("bind the fake browser control")?;
     for stream in control.incoming() {
-        let stream = stream?;
-        let mut writer = stream.try_clone()?;
-        for line in BufReader::new(stream).lines() {
-            let line = line?;
-            let reply = match serde_json::from_str(&line).map_err(anyhow::Error::from) {
-                Ok(command) => browser.control(&command),
-                Err(error) => Err(error),
-            };
-            let reply = match reply {
-                Ok(value) => json!({"ok": true, "result": value}),
-                Err(error) => json!({"ok": false, "error": error.to_string()}),
-            };
-            writeln!(writer, "{reply}")?;
-            writer.flush()?;
+        let stream = match stream {
+            Ok(stream) => stream,
+            Err(error) => {
+                eprintln!("fake browser: control accept failed: {error}");
+                continue;
+            }
+        };
+        // A rig client that takes its reply and hangs up is a normal close,
+        // including when it leaves the trailing newline unread and the
+        // hangup reaches us as a reset. The browser this stands in for would
+        // keep running, and a dead browser costs a whole re-shoot.
+        if let Err(error) = serve_control(browser, stream) {
+            eprintln!("fake browser: control client gone: {error}");
         }
+    }
+    Ok(())
+}
+
+/// One control connection, until the client hangs up.
+fn serve_control(browser: &Browser, stream: UnixStream) -> Result<()> {
+    let mut writer = stream.try_clone()?;
+    for line in BufReader::new(stream).lines() {
+        let line = line?;
+        let reply = match serde_json::from_str(&line).map_err(anyhow::Error::from) {
+            Ok(command) => browser.control(&command),
+            Err(error) => Err(error),
+        };
+        let reply = match reply {
+            Ok(value) => json!({"ok": true, "result": value}),
+            Err(error) => json!({"ok": false, "error": error.to_string()}),
+        };
+        writeln!(writer, "{reply}")?;
+        writer.flush()?;
     }
     Ok(())
 }
