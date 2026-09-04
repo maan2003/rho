@@ -70,8 +70,9 @@ Rho state, per unit, in the Slack store: `handled_through`, a timestamp
 cursor; `defer_until`; `pace_days`. Nothing but a verdict key moves them.
 
 - `d` done: `handled_through := newest`.
-- `t` todo: done, and a `note` with a link to the unit is created in the
-  tree, deferred and paced the way todo notes are today.
+- `t` todo: done, and a `slack` node for the unit is created in the tree
+  at the area asked, deferred and paced the way todo notes are today, so
+  the tree deals it as a todo and `j` on it opens the conversation.
 - `x` discard: done, and the unit is silenced where Slack has a place
   for it: a thread is unfollowed (`subscriptions.thread.remove`), a
   conversation is marked read up to `newest`. Undo follows the thread
@@ -79,9 +80,9 @@ cursor; `defer_until`; `pace_days`. Nothing but a verdict key moves them.
 - `s` snooze: `defer_until` set, cursor untouched. A message from someone
   else newer than the snooze voids `defer_until`; the card is back as
   "needs reply".
-- `f` file: a `note` linked to the unit is created under the heading the
-  user picks; the cursor is untouched, the card keeps being dealt. Filing
-  is a place, not a close.
+- `f` file: a `slack` node for the unit is created under the heading the
+  user picks (or the existing one moved there); the cursor is untouched,
+  the card keeps being dealt. Filing is a place, not a close.
 - mark read before a cutoff (2.13): every unit's `handled_through :=
   max(handled_through, cutoff)`, plus Slack's own read cursors as today.
 - `u` undo: the previous cursor and defer are restored from the unit's
@@ -176,22 +177,27 @@ with the same curves. Nothing about a unit lives in the tree. There is no
 of Slack. Card identity in the dealer, its skips, undo, and the journal is
 therefore an enum, a node or a Slack unit, not a node id.
 
-The tree meets Slack in one place, by the user's hand: a `note` may carry
-a typed `link` to a unit. Todo and file create such notes; "notes for
-this" from a conversation surface does too. The note is user-owned like
-any note: its title is its own first line, or the unit's subject while the
-body is empty; opening the link from the note opens the conversation. The
-Slack card and the note never touch each other after creation: done on
-the card moves the cursor, closing the note is the user's own act, and a
-thread gone from Slack leaves the note with a link that opens nothing.
+The tree meets Slack in one place, by the user's hand: a `slack` node, a
+reference node like `agent` and `page`, carrying the unit's identity and
+nothing else. Todo and file create one; "notes for this" from a
+conversation surface creates one and puts the note under it. At most one
+per unit: filing again moves it. The machine never creates one on its own:
+a ping, a reply, a mark, or a restart never makes a node. Its title is the
+unit's subject from the mirror, `j` opens the conversation, and children
+under it are notes for that thread. The Slack card and the node never
+touch each other after creation: done on the card moves the cursor,
+closing the node is the user's own act, and a thread gone from Slack
+leaves a node whose `j` opens nothing.
 
 **Why:** the inbox was a redirection, and the thread node was the same
 redirection one level up: a second identity with its own lifetime for a
 thing Slack already identifies. Slack keeps the truth of what is waiting
 and what was answered; rho keeps one cursor per unit and nothing else. A
 heading with a Slack thread under it is useful and rare (the user, 4
-Sep); a linked note gives exactly that without making the tree hold
-anything the machine created.
+Sep); a user-made `slack` node gives exactly that, with parents and
+children like any node, without the tree holding anything the machine
+created. A note with a link field was considered and rejected the same
+day: a Slack thread in the tree is its own kind, not a note hack.
 
 ### A local mirror in rho-db, so reading never waits on Slack
 
@@ -382,8 +388,8 @@ the thread identity. No strings where an enum will do.
 ## What stays the same for the human
 
 - The dealer, verdict keys, deal history, filing.
-- The tree owns structure; a Slack unit appears in it only as a note the
-  user made, linked to it.
+- The tree owns structure; a Slack unit appears in it only as a `slack`
+  node the user made.
 
 ## Deliberately deferred
 

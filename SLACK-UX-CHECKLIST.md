@@ -565,9 +565,11 @@ done right after the transcript primitive (2.4) and before 2.10:
       source. One `handled_through` cursor per unit, plus `defer_until`
       and `pace_days`, in the Slack store, moved only by verdict keys as
       the design lists them; the card is derived. Cards come from the
-      Slack store; no `thread` node, no `DeskThreadBind`, card identity an
-      enum of node or unit; `note.link` for todo, file, and notes-for-this;
-      the daemon's one-shot deletes thread nodes and links their notes.
+      Slack store; no `DeskThreadBind`, no machine-made node, card
+      identity an enum of node or unit; the `thread` kind becomes the
+      user-made `slack` kind (optional `ts`, at most one per unit) for
+      todo, file, and notes-for-this; the daemon's one-shot deletes the
+      root, childless thread nodes and keeps the filed ones.
       Tests pin: a history page, a reconnect, a feed poll at or below the
       cursor, and a restart never reopen a done unit; a channel with three
       mentions is one card landing on the oldest; a DM with five messages

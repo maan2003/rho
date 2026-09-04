@@ -18,8 +18,8 @@ device-local. And the desk, which was home, is really a notes store.
 ### One tree of nodes; a node is a kind, a place, and attention state
 
 A node is `id`, `kind`, `parent`, `deleted`, and typed fields. The parent is
-the filing: a node's parent is its context. A note linked to a Slack thread
-is "notes for this thread"; an agent under a pull request is the engineer on
+the filing: a node's parent is its context. A note under a Slack thread is
+"notes for this thread"; an agent under a pull request is the engineer on
 it; a room is nothing special, only a node with children. `parent = none`
 means the root, which is also what "unfiled" means. There is no stored
 sibling order: every view sorts children by its own rule (score on Home,
@@ -28,11 +28,12 @@ time in notes, name on the map).
 Kinds, and the fields each adds to the common ones:
 
 - `note`: `body`, free-form text. The only kind with user-written text.
-  Optionally `link`, a typed reference to a Slack unit (a conversation or
-  a followed thread), set when the note was made from a Slack card or
-  surface. Slack itself has no node kind: its units are dealt from the
-  Slack store (`SLACK-DESIGN.md`, 4 Sep), and a linked note is the only
-  way a Slack thread sits under a heading.
+- `slack`: `workspace`, `channel`, optional `ts` (a followed thread; a
+  conversation or channel when absent). Made only by the user's hand
+  (todo, file, notes-for-this from a Slack card or surface), at most one
+  per unit, never by a ping, a reply, a mark, or a restart. Dealing and
+  verdicts for the unit itself live in the Slack store
+  (`SLACK-DESIGN.md`, 4 Sep); the node is the user's place for it.
 - `agent`: `agent_id`, `host` (the machine seed, u64, the durable machine
   identity; never a GUI attachment index).
 - `page`: `page` (browser reference), `url`.
@@ -40,7 +41,8 @@ Kinds, and the fields each adds to the common ones:
 
 Common fields: `created_at`, `state` (`open`, `done`, `dismissed`),
 `defer_until`, `deadline`, `tags`. Titles are derived per kind (a note's
-first line, the agent's name, the page's title), never
+first line, the agent's name, the page's title, the Slack unit's subject
+from the mirror), never
 stored, so the structure store holds no free text but note bodies.
 
 ### Fields merge by CRDT, chosen per field
@@ -91,7 +93,8 @@ peer-to-peer future swaps the transport, not the model.
 ### The membrane
 
 The machine creates reference nodes (`agent`, `page`, `pull_request`),
-moves them when a verdict files them, and sets `state`.
+moves them when a verdict files them, and sets `state`. A `slack` node is
+the exception: only a verdict key or notes-for-this creates one.
 It never writes a `body`. "The desk is 100% user-written" becomes "note
 text is 100% user-written".
 
@@ -113,8 +116,8 @@ restores the fields it changed. Capture is "create a note at the root";
 the inbox stops existing as a concept.
 
 Node volume rule: the machine never makes a node for a Slack message,
-thread, or conversation. The `thread` kind existed for one day (slices 2
-and 3) and was removed by slice 5.
+thread, or conversation on its own. The `thread` kind, made per ping for
+one day (slices 2 and 3), became the user-made `slack` kind in slice 5.
 
 ### Views
 
@@ -203,16 +206,16 @@ and it is the user's call which.
    node whatever Slack still says, and is still findable so a newer
    message can rebind it.
 5. Slack out of the tree (decided 4 Sep, queued for b8os after the verdict
-   transient): the `thread` kind, `DeskThreadBind`, and every path that
-   made or reopened a thread node go; Slack cards come from the Slack
-   store's per-unit record (`SLACK-DESIGN.md`, "A Slack unit is a
+   transient): `DeskThreadBind` and every path that made or reopened a
+   thread node on the machine's behalf go; Slack cards come from the
+   Slack store's per-unit record (`SLACK-DESIGN.md`, "A Slack unit is a
    conversation or a followed thread"); card identity becomes the enum
-   above; `note.link` arrives. One shot at daemon start flags every
-   `thread` node deleted and, for each note that was filed under one,
-   sets the note's `link` to that thread and its parent to the root, so
-   "notes for this thread" keep their meaning. Cells of a kind the code no
-   longer knows are skipped at materialization. Daemon change, so the
-   profile is upgraded and the user restarts.
+   above; the `thread` kind is renamed `slack`, `ts` made optional, and
+   created only by todo, file, and notes-for-this. One shot at daemon
+   start flags deleted every thread node at the root with no children,
+   which is every one the machine made and the user never filed; filed
+   ones and ones with notes under them stay as `slack` nodes. Daemon
+   change, so the profile is upgraded and the user restarts.
 4. Notes: multi-line `body` on the text CRDT, the note surface, "notes for
    this" from any surface, the map over the tree; `DESK-DESIGN.md` retired
    to notes-and-filing. Landed 3 Sep. The body was already multi-line in
@@ -245,7 +248,8 @@ Each slice lands on its own with the tests of the slices before it green.
 
 - A field stored as text that should be typed.
 - A title stored rather than derived.
-- A `thread` node at all, or any node the machine made for Slack.
+- A `slack` node the machine made: one per ping, per reply, or per
+  restart.
 - A verdict that changes fields without a log entry.
 - Any code path that repairs a cycle in storage.
 
