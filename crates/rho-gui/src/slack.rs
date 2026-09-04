@@ -648,10 +648,10 @@ impl Workspace {
 
     /// `s`: narrow the listing to what the user types. The prompt is the
     /// search, so there is nothing extra to dismiss afterwards.
-    /// `x` on a thread card is Slack's ignore thread: rho's discard is the
+    /// `x` on a thread card is Slack's ignore thread: rho's mute is the
     /// verdict on the node, and the same keystroke tells Slack, so no other
     /// client raises the thread either. Rho keeps no subscription state; if
-    /// the call fails the discard still stands and the notice says the
+    /// the call fails the mute still stands and the notice says the
     /// thread is still followed in Slack.
     pub(crate) fn slack_ignore_thread(&mut self, thread: &ThreadRef, cx: &mut gpui::Context<Self>) {
         let Some(session) = self.slack.clone() else {
@@ -665,7 +665,7 @@ impl Workspace {
         session.update(cx, |session, cx| session.ignore_thread(&key, cx));
     }
 
-    /// `shift-u` after `x`: the discard was an unfollow in Slack, so the
+    /// `shift-u` after `x`: the mute was an unfollow in Slack, so the
     /// undo is a follow there. Nothing else brings the card back, since the
     /// follow list is what says the thread is the user's.
     pub(crate) fn slack_follow_thread(&mut self, thread: &ThreadRef, cx: &mut gpui::Context<Self>) {
@@ -677,10 +677,10 @@ impl Workspace {
     }
 
     /// The other direction: Slack says the thread was unfollowed, here or
-    /// anywhere else, so the card is discarded. An already closed card has
+    /// anywhere else, so the card is muted. An already closed card has
     /// nothing to do, which is also what stops rho's own `x` from writing
     /// the verdict twice when the socket echoes it back.
-    pub(crate) fn slack_thread_discarded(
+    pub(crate) fn slack_thread_muted(
         &mut self,
         key: &ThreadKey,
         window: &mut gpui::Window,
@@ -701,7 +701,7 @@ impl Workspace {
             thread,
             by: crate::journal::IgnoredBy::Slack,
         });
-        self.discard_thread_card(card, window, cx);
+        self.mute_thread_card(card, window, cx);
     }
 
     /// `mark read before`: the backlog older than a cutoff, marked read in
@@ -875,9 +875,9 @@ impl Workspace {
                         // Slack said the thread is not the user's any more.
                         // That is a verdict made in another client, so the
                         // card closes here without asking.
-                        Change::Discarded(key) => {
+                        Change::Muted(key) => {
                             let key = key.clone();
-                            self.slack_thread_discarded(&key, window, cx);
+                            self.slack_thread_muted(&key, window, cx);
                         }
                         Change::Replied(_) => {}
                     }
@@ -1167,7 +1167,7 @@ mod tests {
             .iter()
             .filter_map(|change| match change {
                 Change::Raised(key) | Change::Updated(key) => Some(thread_ref(key)),
-                Change::Replied(_) | Change::Discarded(_) => None,
+                Change::Replied(_) | Change::Muted(_) => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(binds.len(), 2, "a raise and an update both bind");

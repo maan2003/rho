@@ -560,7 +560,7 @@ impl Client {
     }
 
     /// Stops following a thread: Slack's "ignore thread", which is what a
-    /// discard here means everywhere else the user reads Slack. One request;
+    /// mute here means everywhere else the user reads Slack. One request;
     /// Slack owns the list, so there is nothing to remember locally.
     pub async fn ignore_thread(&self, channel: &ChannelId, thread_ts: &Ts) -> anyhow::Result<()> {
         self.post_form(
@@ -574,7 +574,7 @@ impl Client {
         Ok(())
     }
 
-    /// Follows a thread again, which is how undoing a discard puts it back:
+    /// Follows a thread again, which is how undoing a mute puts it back:
     /// Slack's list is the truth, so the undo has to be made there too.
     pub async fn follow_thread(&self, channel: &ChannelId, thread_ts: &Ts) -> anyhow::Result<()> {
         self.post_form(

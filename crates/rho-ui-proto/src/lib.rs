@@ -1336,7 +1336,7 @@ mod tests {
     #[test]
     fn desk_cells_messages_round_trip() {
         use desk_tree::cells::{
-            CellMutation, CellWrite, DeviceId, Id, Relation, Stamp, Uuid, Version,
+            CellMutation, CellWrite, DeviceId, Id, Property, Stamp, Uuid, Version,
         };
 
         let device = DeviceId([7; 16]);
@@ -1348,7 +1348,7 @@ mod tests {
             },
             writes: vec![CellWrite {
                 id: id.clone(),
-                relation: Relation::Labeled {
+                property: Property::Labeled {
                     label: Id::Label(Uuid([3; 16])),
                     present: true,
                 },

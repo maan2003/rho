@@ -1,9 +1,9 @@
 //! Cell-based convergent storage for the Desk.
 //!
 //! The store holds the user's facts and only those. A fact is
-//! `(subject: Id, relation, object)`: the subject names a thing in the
-//! system that owns it, the relation says what is being claimed, and each
-//! relation declares its object type, its cardinality, and how two writes
+//! `(subject: Id, property, object)`: the subject names a thing in the
+//! system that owns it, the property says what is being claimed, and each
+//! property declares its object type, its cardinality, and how two writes
 //! merge. Anything a source already knows — an agent's spawner, a thread's
 //! channel, a page's title — is derived at read time and never lands here,
 //! so the store can never disagree with a source it never repeats.
@@ -98,7 +98,7 @@ pub enum State {
     #[default]
     Open,
     Done,
-    Dismissed,
+    Muted,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Encode, Decode, Pack, Unpack)]
@@ -123,7 +123,7 @@ pub struct SlackTs(pub String);
 /// needs more detail than an id carries says so in its own payload rather
 /// than in a string somewhere else.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
-pub enum Relation {
+pub enum Property {
     /// Where the user filed it. Any id may be a parent: an agent under a
     /// Slack thread, a note under a page, a label under a label. `None` is
     /// the root, written rather than deleted, so un-filing is a fact like
@@ -141,17 +141,19 @@ pub enum Relation {
     DeferUntil(Option<Timestamp>),
     Deadline(Option<Timestamp>),
     PaceDays(u32),
-    /// The Slack verdict cursor: everything up to here has been dealt with.
-    HandledThrough(SlackTs),
+    /// The Slack verdict cursor: everything up to here has been dealt
+    /// with. The cursor is per source, at that source's own position, so
+    /// an agent's will sit beside this one rather than share it.
+    SlackHandledThrough(SlackTs),
     Deleted(bool),
     CreatedAt(Timestamp),
 }
 
-/// What makes a fact the same fact. For one-per-subject relations that is
+/// What makes a fact the same fact. For one-per-subject properties that is
 /// the variant alone, so a later write replaces an earlier one; for a set
 /// it is the variant and its member, so each member settles on its own.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode, Pack, Unpack)]
-pub enum RelationKey {
+pub enum PropertyKey {
     Parent,
     Labeled(Id),
     Name,
@@ -159,12 +161,12 @@ pub enum RelationKey {
     DeferUntil,
     Deadline,
     PaceDays,
-    HandledThrough,
+    SlackHandledThrough,
     Deleted,
     CreatedAt,
 }
 
-/// How many claims of one relation a subject may hold at once.
+/// How many claims of one property a subject may hold at once.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cardinality {
     One,
@@ -180,19 +182,19 @@ pub enum Merge {
     AddWins,
 }
 
-impl Relation {
-    pub fn key(&self) -> RelationKey {
+impl Property {
+    pub fn key(&self) -> PropertyKey {
         match self {
-            Relation::Parent(_) => RelationKey::Parent,
-            Relation::Labeled { label, .. } => RelationKey::Labeled(label.clone()),
-            Relation::Name(_) => RelationKey::Name,
-            Relation::State(_) => RelationKey::State,
-            Relation::DeferUntil(_) => RelationKey::DeferUntil,
-            Relation::Deadline(_) => RelationKey::Deadline,
-            Relation::PaceDays(_) => RelationKey::PaceDays,
-            Relation::HandledThrough(_) => RelationKey::HandledThrough,
-            Relation::Deleted(_) => RelationKey::Deleted,
-            Relation::CreatedAt(_) => RelationKey::CreatedAt,
+            Property::Parent(_) => PropertyKey::Parent,
+            Property::Labeled { label, .. } => PropertyKey::Labeled(label.clone()),
+            Property::Name(_) => PropertyKey::Name,
+            Property::State(_) => PropertyKey::State,
+            Property::DeferUntil(_) => PropertyKey::DeferUntil,
+            Property::Deadline(_) => PropertyKey::Deadline,
+            Property::PaceDays(_) => PropertyKey::PaceDays,
+            Property::SlackHandledThrough(_) => PropertyKey::SlackHandledThrough,
+            Property::Deleted(_) => PropertyKey::Deleted,
+            Property::CreatedAt(_) => PropertyKey::CreatedAt,
         }
     }
 
@@ -208,45 +210,45 @@ impl Relation {
     /// labelled with labels and nothing else.
     pub fn is_valid(&self) -> bool {
         match self {
-            Relation::Labeled { label, .. } => matches!(label, Id::Label(_)),
+            Property::Labeled { label, .. } => matches!(label, Id::Label(_)),
             _ => true,
         }
     }
 }
 
-impl RelationKey {
+impl PropertyKey {
     pub fn cardinality(&self) -> Cardinality {
         match self {
-            RelationKey::Labeled(_) => Cardinality::Set,
+            PropertyKey::Labeled(_) => Cardinality::Set,
             _ => Cardinality::One,
         }
     }
 
     pub fn merge(&self) -> Merge {
         match self {
-            RelationKey::Labeled(_) => Merge::AddWins,
+            PropertyKey::Labeled(_) => Merge::AddWins,
             _ => Merge::LastWriterWins,
         }
     }
 
     /// The claim that holds when nobody has written this fact. Undo needs
     /// it: putting a cell back where there was none is writing the state
-    /// the reader saw, and that state is this. The relations left out are
+    /// the reader saw, and that state is this. The properties left out are
     /// the ones with no unwritten reading — a name, a Slack cursor, a
     /// creation time either exist or the thing is not that thing.
-    pub fn unwritten(&self) -> Option<Relation> {
+    pub fn unwritten(&self) -> Option<Property> {
         match self {
-            RelationKey::Parent => Some(Relation::Parent(None)),
-            RelationKey::Labeled(label) => Some(Relation::Labeled {
+            PropertyKey::Parent => Some(Property::Parent(None)),
+            PropertyKey::Labeled(label) => Some(Property::Labeled {
                 label: label.clone(),
                 present: false,
             }),
-            RelationKey::State => Some(Relation::State(State::Open)),
-            RelationKey::DeferUntil => Some(Relation::DeferUntil(None)),
-            RelationKey::Deadline => Some(Relation::Deadline(None)),
-            RelationKey::PaceDays => Some(Relation::PaceDays(0)),
-            RelationKey::Deleted => Some(Relation::Deleted(false)),
-            RelationKey::Name | RelationKey::HandledThrough | RelationKey::CreatedAt => None,
+            PropertyKey::State => Some(Property::State(State::Open)),
+            PropertyKey::DeferUntil => Some(Property::DeferUntil(None)),
+            PropertyKey::Deadline => Some(Property::Deadline(None)),
+            PropertyKey::PaceDays => Some(Property::PaceDays(0)),
+            PropertyKey::Deleted => Some(Property::Deleted(false)),
+            PropertyKey::Name | PropertyKey::SlackHandledThrough | PropertyKey::CreatedAt => None,
         }
     }
 }
@@ -256,30 +258,30 @@ impl RelationKey {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct Cell {
     pub id: Id,
-    pub relation: Relation,
+    pub property: Property,
     pub stamp: Stamp,
 }
 
 impl Cell {
-    pub fn new(id: Id, relation: Relation, stamp: Stamp) -> Result<Self, String> {
-        if !relation.is_valid() {
-            return Err("Desk relation payload is not one the store takes".into());
+    pub fn new(id: Id, property: Property, stamp: Stamp) -> Result<Self, String> {
+        if !property.is_valid() {
+            return Err("Desk property payload is not one the store takes".into());
         }
         Ok(Self {
             id,
-            relation,
+            property,
             stamp,
         })
     }
 
-    pub fn key(&self) -> (Id, RelationKey) {
-        (self.id.clone(), self.relation.key())
+    pub fn key(&self) -> (Id, PropertyKey) {
+        (self.id.clone(), self.property.key())
     }
 }
 
 /// A note's body: the text CRDT under the id the note is known by. It is
 /// not a cell, because the words are not a claim that can be last-writer
-/// merged; the relation vocabulary names it so the store's fact list is
+/// merged; the property vocabulary names it so the store's fact list is
 /// complete, and this is where it actually lives.
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct BodySnapshot {
@@ -311,7 +313,7 @@ impl BodySnapshot {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub enum Verdict {
     Done,
-    Dismiss,
+    Mute,
     Defer { until: Timestamp },
     Todo { note: Id },
     File { parent: Id },
@@ -322,9 +324,9 @@ pub enum Verdict {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct FactChange {
     pub id: Id,
-    pub key: RelationKey,
-    pub before: Option<Relation>,
-    pub after: Option<Relation>,
+    pub key: PropertyKey,
+    pub before: Option<Property>,
+    pub after: Option<Property>,
 }
 
 /// The cadence a `todo` verdict gives the note it creates.
@@ -338,16 +340,16 @@ pub struct TodoCadence {
 ///
 /// One definition for both sides: the GUI logs exactly this, and the daemon
 /// checks a submitted entry against it, so the two can never drift.
-/// `before` is what the relation held, which only the writer knows;
+/// `before` is what the property held, which only the writer knows;
 /// `cadence` is required for `todo`, whose changes describe the note the
 /// verdict creates rather than the thing it was dealt on.
 pub fn verdict_changes(
     id: &Id,
     verdict: &Verdict,
-    before: &dyn Fn(&RelationKey) -> Option<Relation>,
+    before: &dyn Fn(&PropertyKey) -> Option<Property>,
     cadence: Option<TodoCadence>,
 ) -> Result<Vec<FactChange>, String> {
-    let change = |after: Relation| FactChange {
+    let change = |after: Property| FactChange {
         id: id.clone(),
         key: after.key(),
         // A fact nobody has written still reads as something, and undo has
@@ -356,18 +358,18 @@ pub fn verdict_changes(
         before: before(&after.key()).or_else(|| after.key().unwritten()),
         after: Some(after),
     };
-    let one = |after: Relation| Ok(vec![change(after)]);
+    let one = |after: Property| Ok(vec![change(after)]);
     match verdict {
-        Verdict::Done => one(Relation::State(State::Done)),
-        Verdict::Dismiss => one(Relation::State(State::Dismissed)),
+        Verdict::Done => one(Property::State(State::Done)),
+        Verdict::Mute => one(Property::State(State::Muted)),
         // A snooze puts the card back at zero: `elapsed - pace` is the todo
         // curve when a pace is set and the defer curve when it is not, so a
         // deferred todo that kept its old pace would come back climbing.
         Verdict::Defer { until } => Ok(vec![
-            change(Relation::DeferUntil(Some(*until))),
-            change(Relation::PaceDays(0)),
+            change(Property::DeferUntil(Some(*until))),
+            change(Property::PaceDays(0)),
         ]),
-        Verdict::File { parent } => one(Relation::Parent(Some(parent.clone()))),
+        Verdict::File { parent } => one(Property::Parent(Some(parent.clone()))),
         // A todo is the one verdict that writes a whole new note, so its
         // entry carries all three facts that make that note a live cadence,
         // against what a note that never existed reads as holding. The
@@ -375,7 +377,7 @@ pub fn verdict_changes(
         // dealer offers it again the moment the todo is written.
         Verdict::Todo { note } => {
             let cadence = cadence.ok_or("a todo verdict needs its cadence")?;
-            let fresh = |before: Relation, after: Relation| FactChange {
+            let fresh = |before: Property, after: Property| FactChange {
                 id: note.clone(),
                 key: after.key(),
                 before: Some(before),
@@ -384,16 +386,16 @@ pub fn verdict_changes(
             Ok(vec![
                 FactChange {
                     id: id.clone(),
-                    key: RelationKey::State,
-                    before: before(&RelationKey::State).or_else(|| RelationKey::State.unwritten()),
-                    after: Some(Relation::State(State::Done)),
+                    key: PropertyKey::State,
+                    before: before(&PropertyKey::State).or_else(|| PropertyKey::State.unwritten()),
+                    after: Some(Property::State(State::Done)),
                 },
-                fresh(Relation::Deleted(true), Relation::Deleted(false)),
+                fresh(Property::Deleted(true), Property::Deleted(false)),
                 fresh(
-                    Relation::DeferUntil(None),
-                    Relation::DeferUntil(Some(cadence.defer_until)),
+                    Property::DeferUntil(None),
+                    Property::DeferUntil(Some(cadence.defer_until)),
                 ),
-                fresh(Relation::PaceDays(0), Relation::PaceDays(cadence.pace_days)),
+                fresh(Property::PaceDays(0), Property::PaceDays(cadence.pace_days)),
             ])
         }
     }
@@ -401,16 +403,16 @@ pub fn verdict_changes(
 
 /// The cadence a submitted `todo` entry claims, read back out of its changes.
 pub fn todo_cadence(changes: &[FactChange]) -> Option<TodoCadence> {
-    let after = |key: RelationKey| {
+    let after = |key: PropertyKey| {
         changes
             .iter()
             .find(|change| change.key == key)
             .and_then(|change| change.after.clone())
     };
-    let Some(Relation::DeferUntil(Some(defer_until))) = after(RelationKey::DeferUntil) else {
+    let Some(Property::DeferUntil(Some(defer_until))) = after(PropertyKey::DeferUntil) else {
         return None;
     };
-    let Some(Relation::PaceDays(pace_days)) = after(RelationKey::PaceDays) else {
+    let Some(Property::PaceDays(pace_days)) = after(PropertyKey::PaceDays) else {
         return None;
     };
     Some(TodoCadence {
@@ -434,7 +436,7 @@ pub enum VerdictEvent {
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
 pub struct CellWrite {
     pub id: Id,
-    pub relation: Relation,
+    pub property: Property,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Encode, Decode, Pack, Unpack)]
@@ -468,7 +470,7 @@ pub struct Facts {
     pub defer_until: Option<Timestamp>,
     pub deadline: Option<Timestamp>,
     pub pace_days: u32,
-    pub handled_through: Option<SlackTs>,
+    pub slack_handled_through: Option<SlackTs>,
     pub deleted: bool,
     pub created_at: Option<Timestamp>,
 }
@@ -485,7 +487,7 @@ impl Facts {
             || self.defer_until.is_some()
             || self.deadline.is_some()
             || self.pace_days != 0
-            || self.handled_through.is_some()
+            || self.slack_handled_through.is_some()
             || self.created_at.is_some()
     }
 }
@@ -494,7 +496,7 @@ impl Facts {
 pub struct Store {
     device: DeviceId,
     clock: u64,
-    cells: BTreeMap<(Id, RelationKey), Cell>,
+    cells: BTreeMap<(Id, PropertyKey), Cell>,
     verdicts: BTreeMap<(Id, Stamp), VerdictEvent>,
     version: Version,
 }
@@ -538,7 +540,7 @@ impl Store {
             cells: mutation
                 .writes
                 .iter()
-                .map(|write| Cell::new(write.id.clone(), write.relation.clone(), mutation.stamp))
+                .map(|write| Cell::new(write.id.clone(), write.property.clone(), mutation.stamp))
                 .collect::<Result<Vec<_>, _>>()?,
             verdicts: mutation
                 .verdict
@@ -550,14 +552,14 @@ impl Store {
         self.merge(delta)
     }
 
-    pub fn write(&mut self, id: Id, relation: Relation) -> Result<Cell, String> {
+    pub fn write(&mut self, id: Id, property: Property) -> Result<Cell, String> {
         self.clock = self
             .clock
             .checked_add(1)
             .ok_or("Desk device version exhausted")?;
         let cell = Cell::new(
             id,
-            relation,
+            property,
             Stamp {
                 device: self.device,
                 version: self.clock,
@@ -670,8 +672,8 @@ impl Store {
     }
 
     fn merge_cell(&mut self, cell: Cell) -> Result<(), String> {
-        if !cell.relation.is_valid() {
-            return Err("Desk relation payload is not one the store takes".into());
+        if !cell.property.is_valid() {
+            return Err("Desk property payload is not one the store takes".into());
         }
         let key = cell.key();
         if let Some(old) = self.cells.get(&key)
@@ -704,40 +706,40 @@ impl Store {
         self.cells.keys().map(|(id, _)| id.clone()).collect()
     }
 
-    pub fn relation(&self, id: &Id, key: &RelationKey) -> Option<&Relation> {
+    pub fn property(&self, id: &Id, key: &PropertyKey) -> Option<&Property> {
         self.cells
             .get(&(id.clone(), key.clone()))
-            .map(|cell| &cell.relation)
+            .map(|cell| &cell.property)
     }
 
     /// What the user has said about one thing. No place, no title, no
     /// dealability: those are rules over this joined with the sources.
     pub fn facts(&self, id: &Id) -> Facts {
         let mut facts = Facts::default();
-        for ((subject, _), cell) in self.cells.range((id.clone(), RelationKey::Parent)..) {
+        for ((subject, _), cell) in self.cells.range((id.clone(), PropertyKey::Parent)..) {
             if subject != id {
                 break;
             }
-            match &cell.relation {
-                Relation::Parent(parent) => {
+            match &cell.property {
+                Property::Parent(parent) => {
                     facts.parent = parent.clone();
                     facts.filed = true;
                 }
-                Relation::Labeled {
+                Property::Labeled {
                     label,
                     present: true,
                 } => {
                     facts.labels.insert(label.clone());
                 }
-                Relation::Labeled { .. } => {}
-                Relation::Name(name) => facts.name = Some(name.clone()),
-                Relation::State(state) => facts.state = *state,
-                Relation::DeferUntil(at) => facts.defer_until = *at,
-                Relation::Deadline(at) => facts.deadline = *at,
-                Relation::PaceDays(days) => facts.pace_days = *days,
-                Relation::HandledThrough(ts) => facts.handled_through = Some(ts.clone()),
-                Relation::Deleted(deleted) => facts.deleted = *deleted,
-                Relation::CreatedAt(at) => facts.created_at = Some(*at),
+                Property::Labeled { .. } => {}
+                Property::Name(name) => facts.name = Some(name.clone()),
+                Property::State(state) => facts.state = *state,
+                Property::DeferUntil(at) => facts.defer_until = *at,
+                Property::Deadline(at) => facts.deadline = *at,
+                Property::PaceDays(days) => facts.pace_days = *days,
+                Property::SlackHandledThrough(ts) => facts.slack_handled_through = Some(ts.clone()),
+                Property::Deleted(deleted) => facts.deleted = *deleted,
+                Property::CreatedAt(at) => facts.created_at = Some(*at),
             }
         }
         facts
@@ -761,12 +763,12 @@ impl Store {
 }
 
 fn wins(new: &Cell, old: &Cell) -> bool {
-    if new.relation.merge() == Merge::AddWins && new.stamp.version == old.stamp.version {
-        match (&new.relation, &old.relation) {
-            (Relation::Labeled { present: true, .. }, Relation::Labeled { present: false, .. }) => {
+    if new.property.merge() == Merge::AddWins && new.stamp.version == old.stamp.version {
+        match (&new.property, &old.property) {
+            (Property::Labeled { present: true, .. }, Property::Labeled { present: false, .. }) => {
                 return true;
             }
-            (Relation::Labeled { present: false, .. }, Relation::Labeled { present: true, .. }) => {
+            (Property::Labeled { present: false, .. }, Property::Labeled { present: true, .. }) => {
                 return false;
             }
             _ => {}
@@ -813,45 +815,45 @@ mod tests {
         }
     }
 
-    /// One of every relation, with two claims that disagree.
-    fn variants() -> Vec<(Relation, Relation)> {
+    /// One of every property, with two claims that disagree.
+    fn variants() -> Vec<(Property, Property)> {
         vec![
-            (Relation::Parent(None), Relation::Parent(Some(note(9)))),
+            (Property::Parent(None), Property::Parent(Some(note(9)))),
             (
-                Relation::Labeled {
+                Property::Labeled {
                     label: label(1),
                     present: false,
                 },
-                Relation::Labeled {
+                Property::Labeled {
                     label: label(1),
                     present: true,
                 },
             ),
-            (Relation::Name("a".into()), Relation::Name("b".into())),
-            (Relation::State(State::Open), Relation::State(State::Done)),
+            (Property::Name("a".into()), Property::Name("b".into())),
+            (Property::State(State::Open), Property::State(State::Done)),
             (
-                Relation::DeferUntil(None),
-                Relation::DeferUntil(Some(timestamp(2))),
+                Property::DeferUntil(None),
+                Property::DeferUntil(Some(timestamp(2))),
             ),
             (
-                Relation::Deadline(None),
-                Relation::Deadline(Some(timestamp(3))),
+                Property::Deadline(None),
+                Property::Deadline(Some(timestamp(3))),
             ),
-            (Relation::PaceDays(1), Relation::PaceDays(2)),
+            (Property::PaceDays(1), Property::PaceDays(2)),
             (
-                Relation::HandledThrough(SlackTs("1.0".into())),
-                Relation::HandledThrough(SlackTs("2.0".into())),
+                Property::SlackHandledThrough(SlackTs("1.0".into())),
+                Property::SlackHandledThrough(SlackTs("2.0".into())),
             ),
-            (Relation::Deleted(false), Relation::Deleted(true)),
+            (Property::Deleted(false), Property::Deleted(true)),
             (
-                Relation::CreatedAt(timestamp(1)),
-                Relation::CreatedAt(timestamp(2)),
+                Property::CreatedAt(timestamp(1)),
+                Property::CreatedAt(timestamp(2)),
             ),
         ]
     }
 
     #[test]
-    fn every_relation_merge_is_commutative_and_idempotent() {
+    fn every_property_merge_is_commutative_and_idempotent() {
         for (left_claim, right_claim) in variants() {
             let left = Cell::new(note(1), left_claim, stamp(1, 3)).unwrap();
             let right = Cell::new(note(1), right_claim, stamp(2, 4)).unwrap();
@@ -871,39 +873,39 @@ mod tests {
     }
 
     #[test]
-    fn a_relation_key_is_the_variant_and_a_set_member_is_the_variant_and_its_member() {
+    fn a_property_key_is_the_variant_and_a_set_member_is_the_variant_and_its_member() {
         // Two labels are two facts; two parents are one fact written twice.
         assert_ne!(
-            Relation::Labeled {
+            Property::Labeled {
                 label: label(1),
                 present: true,
             }
             .key(),
-            Relation::Labeled {
+            Property::Labeled {
                 label: label(2),
                 present: true,
             }
             .key()
         );
         assert_eq!(
-            Relation::Parent(None).key(),
-            Relation::Parent(Some(note(1))).key()
+            Property::Parent(None).key(),
+            Property::Parent(Some(note(1))).key()
         );
         let mut store = Store::new(device(1));
         for member in [label(1), label(2)] {
             store
                 .write(
                     note(1),
-                    Relation::Labeled {
+                    Property::Labeled {
                         label: member,
                         present: true,
                     },
                 )
                 .unwrap();
         }
-        store.write(note(1), Relation::Parent(None)).unwrap();
+        store.write(note(1), Property::Parent(None)).unwrap();
         store
-            .write(note(1), Relation::Parent(Some(note(2))))
+            .write(note(1), Property::Parent(Some(note(2))))
             .unwrap();
         let facts = store.facts(&note(1));
         assert_eq!(facts.labels, BTreeSet::from([label(1), label(2)]));
@@ -917,7 +919,7 @@ mod tests {
             store
                 .write(
                     note(1),
-                    Relation::Labeled {
+                    Property::Labeled {
                         label: note(2),
                         present: true,
                     },
@@ -932,7 +934,7 @@ mod tests {
         let off = |at: Stamp| {
             Cell::new(
                 note(1),
-                Relation::Labeled {
+                Property::Labeled {
                     label: member(),
                     present: false,
                 },
@@ -943,7 +945,7 @@ mod tests {
         let on = |at: Stamp| {
             Cell::new(
                 note(1),
-                Relation::Labeled {
+                Property::Labeled {
                     label: member(),
                     present: true,
                 },
@@ -974,8 +976,8 @@ mod tests {
         let mut store = Store::new(device(1));
         store
             .merge(snapshot(vec![
-                Cell::new(note(1), Relation::State(State::Done), stamp(2, 8)).unwrap(),
-                Cell::new(note(1), Relation::State(State::Open), stamp(3, 7)).unwrap(),
+                Cell::new(note(1), Property::State(State::Done), stamp(2, 8)).unwrap(),
+                Cell::new(note(1), Property::State(State::Open), stamp(3, 7)).unwrap(),
             ]))
             .unwrap();
         assert_eq!(store.version().get(&device(3)), Some(&7));
@@ -993,9 +995,9 @@ mod tests {
             at: applied_stamp,
             changes: vec![FactChange {
                 id: note(1),
-                key: RelationKey::State,
-                before: Some(Relation::State(State::Open)),
-                after: Some(Relation::State(State::Done)),
+                key: PropertyKey::State,
+                before: Some(Property::State(State::Open)),
+                after: Some(Property::State(State::Done)),
             }],
         };
         let undone = VerdictEvent::Undone { of: applied_stamp };
@@ -1032,7 +1034,7 @@ mod tests {
         let store = Store::new(device(1));
         assert!(!store.facts(&note(1)).any());
         let mut store = store;
-        store.write(note(1), Relation::Parent(None)).unwrap();
+        store.write(note(1), Property::Parent(None)).unwrap();
         // Filing at the root is still the user saying something.
         assert!(store.facts(&note(1)).any());
     }
@@ -1040,8 +1042,8 @@ mod tests {
     #[test]
     fn deleted_subjects_are_left_out_of_the_facts_the_store_offers() {
         let mut store = Store::new(device(1));
-        store.write(note(1), Relation::Deleted(true)).unwrap();
-        store.write(note(2), Relation::State(State::Done)).unwrap();
+        store.write(note(1), Property::Deleted(true)).unwrap();
+        store.write(note(2), Property::State(State::Done)).unwrap();
         assert_eq!(
             store
                 .all_facts()
@@ -1060,23 +1062,23 @@ mod tests {
         let changes = verdict_changes(
             &note(1),
             &Verdict::Done,
-            &|key| store.relation(&note(1), key).cloned(),
+            &|key| store.property(&note(1), key).cloned(),
             None,
         )
         .unwrap();
-        assert_eq!(changes[0].before, Some(Relation::State(State::Open)));
+        assert_eq!(changes[0].before, Some(Property::State(State::Open)));
     }
 
     #[test]
     fn daemon_and_gui_round_trip_only_cells_since_the_peer_version() {
         let mut daemon = Store::new(device(1));
         let mut gui = Store::new(device(2));
-        gui.write(note(1), Relation::CreatedAt(timestamp(10)))
+        gui.write(note(1), Property::CreatedAt(timestamp(10)))
             .unwrap();
         let daemon_version = daemon.version().clone();
         daemon.merge(gui.since(&daemon_version)).unwrap();
         let gui_version = gui.version().clone();
-        daemon.write(note(1), Relation::State(State::Done)).unwrap();
+        daemon.write(note(1), Property::State(State::Done)).unwrap();
         let delta = daemon.since(&gui_version);
         assert_eq!(delta.cells.len(), 1);
         gui.merge(delta).unwrap();
@@ -1089,15 +1091,15 @@ mod tests {
         let mut first = Store::new(device(2));
         let mut second = Store::new(device(3));
         first
-            .write(note(1), Relation::CreatedAt(timestamp(10)))
+            .write(note(1), Property::CreatedAt(timestamp(10)))
             .unwrap();
         daemon.merge(first.since(daemon.version())).unwrap();
         second.merge(daemon.since(second.version())).unwrap();
         first
-            .write(note(1), Relation::Deadline(Some(timestamp(20))))
+            .write(note(1), Property::Deadline(Some(timestamp(20))))
             .unwrap();
         second
-            .write(note(1), Relation::DeferUntil(Some(timestamp(15))))
+            .write(note(1), Property::DeferUntil(Some(timestamp(15))))
             .unwrap();
         daemon.merge(first.since(daemon.version())).unwrap();
         daemon.merge(second.since(daemon.version())).unwrap();

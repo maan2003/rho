@@ -153,7 +153,7 @@ pub enum DealerCardKind {
 pub enum DealerVerdict {
     Skip,
     Done,
-    Dismiss,
+    Mute,
     Defer,
     Open,
     File,
@@ -188,7 +188,7 @@ pub enum PhoneFlickDirection {
 #[serde(rename_all = "snake_case")]
 pub enum PhoneVerdict {
     Done,
-    Dismiss,
+    Mute,
     Defer,
     Todo,
     File,

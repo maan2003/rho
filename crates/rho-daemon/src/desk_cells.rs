@@ -5,7 +5,7 @@
 use redb::TableDefinition;
 use rho_db::{RhoDb, Sen, SenValue, WriteTxn};
 use rho_desk::cells::{
-    BodySnapshot, Cell, CellMutation, DeviceId, Id, Relation, RelationKey, Snapshot, Stamp, Store,
+    BodySnapshot, Cell, CellMutation, DeviceId, Id, Property, PropertyKey, Snapshot, Stamp, Store,
     VerdictEvent, Version,
 };
 use senax_encoder::{Decode, Encode};
@@ -23,7 +23,7 @@ const MUTATIONS: TableDefinition<Sen<Stamp>, Sen<CellMutation>> =
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
 struct CellAddress {
     id: Id,
-    key: RelationKey,
+    key: PropertyKey,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Encode, Decode)]
@@ -374,13 +374,13 @@ fn persist_accepted_mutation(
 fn validate_mutation_bounds(mutation: &CellMutation) -> Result<(), String> {
     for write in &mutation.writes {
         subject_bounds(&write.id)?;
-        match &write.relation {
-            Relation::Parent(Some(parent)) => subject_bounds(parent)?,
-            Relation::Labeled { label, .. } => subject_bounds(label)?,
-            Relation::Name(name) if name.len() > 64 * 1024 => {
+        match &write.property {
+            Property::Parent(Some(parent)) => subject_bounds(parent)?,
+            Property::Labeled { label, .. } => subject_bounds(label)?,
+            Property::Name(name) if name.len() > 64 * 1024 => {
                 return Err("Desk name exceeds 65536 bytes".into());
             }
-            Relation::HandledThrough(ts) if ts.0.len() > 64 => {
+            Property::SlackHandledThrough(ts) if ts.0.len() > 64 => {
                 return Err("Desk Slack timestamp exceeds 64 bytes".into());
             }
             _ => {}
@@ -414,7 +414,7 @@ fn subject_bounds(id: &Id) -> Result<(), String> {
 /// What the daemon will accept from a client.
 ///
 /// The store holds the user's facts and only those, so there is no
-/// machine-owned row to protect and no kind to police: every relation is
+/// machine-owned row to protect and no kind to police: every property is
 /// the user's to write about any subject. What is left to check is that a
 /// verdict entry says the truth, because undo is built on it — the facts it
 /// claims to have changed must be the facts the mutation actually writes,
@@ -453,15 +453,15 @@ fn validate_user_mutation(store: &Store, mutation: &CellMutation) -> Result<(), 
             && !store.facts(&change.id).any()
             && matches!(
                 expected_current,
-                Some(Relation::Deleted(true))
-                    | Some(Relation::DeferUntil(None))
-                    | Some(Relation::PaceDays(0))
+                Some(Property::Deleted(true))
+                    | Some(Property::DeferUntil(None))
+                    | Some(Property::PaceDays(0))
             );
         // A fact nobody has written reads as its unwritten claim, and that
         // is what the entry states, so the store's missing cell answers to
         // the same reading rather than to `None`.
         let current = store
-            .relation(&change.id, &change.key)
+            .property(&change.id, &change.key)
             .cloned()
             .or_else(|| change.key.unwritten());
         if !unwritten_note && current.as_ref() != expected_current.as_ref() {
@@ -473,7 +473,7 @@ fn validate_user_mutation(store: &Store, mutation: &CellMutation) -> Result<(), 
         if !mutation
             .writes
             .iter()
-            .any(|write| write.id == change.id && &write.relation == expected_write)
+            .any(|write| write.id == change.id && &write.property == expected_write)
         {
             return Err("Desk verdict change is not applied by its mutation".into());
         }
@@ -516,7 +516,7 @@ fn validate_verdict_shape(
                 !applied
                     || mutation.writes.iter().any(|write| {
                         write.id == *note
-                            && write.relation == Relation::Parent(Some(verdict_id.clone()))
+                            && write.property == Property::Parent(Some(verdict_id.clone()))
                     })
             }
             _ => true,
@@ -631,7 +631,7 @@ fn persist_cells_and_verdicts(write: &mut WriteTxn, snapshot: &Snapshot) -> Resu
         cells.insert(
             SenValue::owned(CellAddress {
                 id: cell.id.clone(),
-                key: cell.relation.key(),
+                key: cell.property.key(),
             }),
             SenValue::borrowed(cell),
         );
@@ -660,7 +660,7 @@ fn persist_snapshot(
         cells.insert(
             SenValue::owned(CellAddress {
                 id: cell.id.clone(),
-                key: cell.relation.key(),
+                key: cell.property.key(),
             }),
             SenValue::borrowed(cell),
         );
@@ -734,11 +734,11 @@ mod tests {
                     writes: vec![
                         CellWrite {
                             id: id.clone(),
-                            relation: Relation::Parent(None),
+                            property: Property::Parent(None),
                         },
                         CellWrite {
                             id: id.clone(),
-                            relation: Relation::CreatedAt(at(1)),
+                            property: Property::CreatedAt(at(1)),
                         },
                     ],
                     verdict: None,
@@ -774,7 +774,7 @@ mod tests {
             stamp: Stamp { device, version },
             writes: vec![CellWrite {
                 id: id.clone(),
-                relation: Relation::Labeled {
+                property: Property::Labeled {
                     label: label.clone(),
                     present: true,
                 },
@@ -794,7 +794,7 @@ mod tests {
         assert_eq!(delta.version.get(&device), Some(&version));
 
         let mut conflict = mutation.clone();
-        conflict.writes[0].relation = Relation::Labeled {
+        conflict.writes[0].property = Property::Labeled {
             label,
             present: false,
         };
@@ -817,7 +817,7 @@ mod tests {
         let offline_namespace = store.node_namespace(offline).await.unwrap();
         let name = |id: &Id, text: &str| CellWrite {
             id: id.clone(),
-            relation: Relation::Name(text.into()),
+            property: Property::Name(text.into()),
         };
         store
             .apply_mutation(
@@ -871,27 +871,27 @@ mod tests {
         let changes = vec![
             FactChange {
                 id: unit.clone(),
-                key: RelationKey::State,
-                before: Some(Relation::State(State::Open)),
-                after: Some(Relation::State(State::Done)),
+                key: PropertyKey::State,
+                before: Some(Property::State(State::Open)),
+                after: Some(Property::State(State::Done)),
             },
             FactChange {
                 id: note.clone(),
-                key: RelationKey::Deleted,
-                before: Some(Relation::Deleted(true)),
-                after: Some(Relation::Deleted(false)),
+                key: PropertyKey::Deleted,
+                before: Some(Property::Deleted(true)),
+                after: Some(Property::Deleted(false)),
             },
             FactChange {
                 id: note.clone(),
-                key: RelationKey::DeferUntil,
-                before: Some(Relation::DeferUntil(None)),
-                after: Some(Relation::DeferUntil(Some(wake))),
+                key: PropertyKey::DeferUntil,
+                before: Some(Property::DeferUntil(None)),
+                after: Some(Property::DeferUntil(Some(wake))),
             },
             FactChange {
                 id: note.clone(),
-                key: RelationKey::PaceDays,
-                before: Some(Relation::PaceDays(0)),
-                after: Some(Relation::PaceDays(7)),
+                key: PropertyKey::PaceDays,
+                before: Some(Property::PaceDays(0)),
+                after: Some(Property::PaceDays(7)),
             },
         ];
         let stamp = Stamp {
@@ -902,25 +902,25 @@ mod tests {
             let mut writes = vec![
                 CellWrite {
                     id: unit.clone(),
-                    relation: Relation::State(State::Done),
+                    property: Property::State(State::Done),
                 },
                 CellWrite {
                     id: note.clone(),
-                    relation: Relation::Deleted(false),
+                    property: Property::Deleted(false),
                 },
                 CellWrite {
                     id: note.clone(),
-                    relation: Relation::DeferUntil(Some(wake)),
+                    property: Property::DeferUntil(Some(wake)),
                 },
                 CellWrite {
                     id: note.clone(),
-                    relation: Relation::PaceDays(7),
+                    property: Property::PaceDays(7),
                 },
             ];
             if let Some(parent) = parent {
                 writes.push(CellWrite {
                     id: note.clone(),
-                    relation: Relation::Parent(Some(parent)),
+                    property: Property::Parent(Some(parent)),
                 });
             }
             writes
@@ -994,7 +994,7 @@ mod tests {
                     },
                     writes: vec![CellWrite {
                         id: id.clone(),
-                        relation: Relation::PaceDays(7),
+                        property: Property::PaceDays(7),
                     }],
                     verdict: None,
                 },
@@ -1005,15 +1005,15 @@ mod tests {
         let wake = at(9);
         let wakes = FactChange {
             id: id.clone(),
-            key: RelationKey::DeferUntil,
-            before: Some(Relation::DeferUntil(None)),
-            after: Some(Relation::DeferUntil(Some(wake))),
+            key: PropertyKey::DeferUntil,
+            before: Some(Property::DeferUntil(None)),
+            after: Some(Property::DeferUntil(Some(wake))),
         };
         let paced_to_zero = FactChange {
             id: id.clone(),
-            key: RelationKey::PaceDays,
-            before: Some(Relation::PaceDays(7)),
-            after: Some(Relation::PaceDays(0)),
+            key: PropertyKey::PaceDays,
+            before: Some(Property::PaceDays(7)),
+            after: Some(Property::PaceDays(0)),
         };
         let defer = |version: u64, changes: Vec<FactChange>| {
             let stamp = Stamp { device, version };
@@ -1023,7 +1023,7 @@ mod tests {
                     .iter()
                     .map(|change| CellWrite {
                         id: change.id.clone(),
-                        relation: change.after.clone().unwrap(),
+                        property: change.after.clone().unwrap(),
                     })
                     .collect(),
                 verdict: Some((

@@ -13,7 +13,7 @@ use redb::TableDefinition;
 use rho_core::AgentId;
 use rho_db::{RecordedTypeName, Sen, SenAs, SenValue, WriteTxn};
 use rho_desk::cells::{
-    Cell, DeviceId, Id, Relation, SlackUnit, Stamp, State, Timestamp, Uuid, Verdict, VerdictEvent,
+    Cell, DeviceId, Id, Property, SlackUnit, Stamp, State, Timestamp, Uuid, Verdict, VerdictEvent,
     Version,
 };
 use rho_desk::{NodeId, PageId};
@@ -376,10 +376,10 @@ pub(crate) fn migrate(
         }
     }
 
-    let mut cells: BTreeMap<(Id, rho_desk::cells::RelationKey), Cell> = BTreeMap::new();
+    let mut cells: BTreeMap<(Id, rho_desk::cells::PropertyKey), Cell> = BTreeMap::new();
     let mut labels: BTreeMap<String, (Id, Stamp)> = BTreeMap::new();
-    let mut put = |cells: &mut BTreeMap<_, _>, id: Id, relation: Relation, stamp: Stamp| {
-        if let Ok(cell) = Cell::new(id, relation, stamp) {
+    let mut put = |cells: &mut BTreeMap<_, _>, id: Id, property: Property, stamp: Stamp| {
+        if let Ok(cell) = Cell::new(id, property, stamp) {
             cells.insert(cell.key(), cell);
         }
     };
@@ -408,26 +408,26 @@ pub(crate) fn migrate(
                             .flatten()
                     });
                     if old.kind == OldNodeKind::Note || parent.is_some() {
-                        put(&mut cells, id.clone(), Relation::Parent(parent), stamp);
+                        put(&mut cells, id.clone(), Property::Parent(parent), stamp);
                     }
                 }
                 (OldField::Deleted, OldValue::Bool(deleted)) => {
-                    put(&mut cells, id.clone(), Relation::Deleted(*deleted), stamp)
+                    put(&mut cells, id.clone(), Property::Deleted(*deleted), stamp)
                 }
                 (OldField::CreatedAt, OldValue::Timestamp(at)) => {
-                    put(&mut cells, id.clone(), Relation::CreatedAt(*at), stamp)
+                    put(&mut cells, id.clone(), Property::CreatedAt(*at), stamp)
                 }
                 (OldField::State, OldValue::State(state)) => {
-                    put(&mut cells, id.clone(), Relation::State(*state), stamp)
+                    put(&mut cells, id.clone(), Property::State(*state), stamp)
                 }
                 (OldField::DeferUntil, OldValue::OptionalTimestamp(at)) => {
-                    put(&mut cells, id.clone(), Relation::DeferUntil(*at), stamp)
+                    put(&mut cells, id.clone(), Property::DeferUntil(*at), stamp)
                 }
                 (OldField::Deadline, OldValue::OptionalTimestamp(at)) => {
-                    put(&mut cells, id.clone(), Relation::Deadline(*at), stamp)
+                    put(&mut cells, id.clone(), Property::Deadline(*at), stamp)
                 }
                 (OldField::PaceDays, OldValue::Days(days)) => {
-                    put(&mut cells, id.clone(), Relation::PaceDays(*days), stamp)
+                    put(&mut cells, id.clone(), Property::PaceDays(*days), stamp)
                 }
                 (OldField::Tag(name), OldValue::Bool(present)) => {
                     let entry = labels
@@ -440,7 +440,7 @@ pub(crate) fn migrate(
                     put(
                         &mut cells,
                         id.clone(),
-                        Relation::Labeled {
+                        Property::Labeled {
                             label,
                             present: *present,
                         },
@@ -456,10 +456,10 @@ pub(crate) fn migrate(
         put(
             &mut cells,
             label.clone(),
-            Relation::Name(name.clone()),
+            Property::Name(name.clone()),
             *stamp,
         );
-        put(&mut cells, label.clone(), Relation::Parent(None), *stamp);
+        put(&mut cells, label.clone(), Property::Parent(None), *stamp);
     }
 
     let mut verdicts = Vec::new();
@@ -534,7 +534,7 @@ fn convert_verdict(ids: &BTreeMap<NodeId, Id>, event: OldVerdictEvent) -> Option
     };
     let verdict = match verdict {
         OldVerdict::Done => Verdict::Done,
-        OldVerdict::Dismiss => Verdict::Dismiss,
+        OldVerdict::Dismiss => Verdict::Mute,
         OldVerdict::Defer { until } => Verdict::Defer { until },
         OldVerdict::Todo { note } => Verdict::Todo {
             note: ids.get(&note).cloned()?,
@@ -548,12 +548,12 @@ fn convert_verdict(ids: &BTreeMap<NodeId, Id>, event: OldVerdictEvent) -> Option
         let id = ids.get(&change.node).cloned()?;
         let before = change
             .before
-            .and_then(|value| relation(&change.field, &value, ids));
+            .and_then(|value| property(&change.field, &value, ids));
         let after = change
             .after
-            .and_then(|value| relation(&change.field, &value, ids));
+            .and_then(|value| property(&change.field, &value, ids));
         let key = match after.as_ref().or(before.as_ref()) {
-            Some(relation) => relation.key(),
+            Some(property) => property.key(),
             None => continue,
         };
         converted.push(rho_desk::cells::FactChange {
@@ -570,19 +570,19 @@ fn convert_verdict(ids: &BTreeMap<NodeId, Id>, event: OldVerdictEvent) -> Option
     })
 }
 
-fn relation(field: &OldField, value: &OldValue, ids: &BTreeMap<NodeId, Id>) -> Option<Relation> {
+fn property(field: &OldField, value: &OldValue, ids: &BTreeMap<NodeId, Id>) -> Option<Property> {
     Some(match (field, value) {
-        (OldField::Parent, OldValue::Parent(parent)) => Relation::Parent(match parent {
+        (OldField::Parent, OldValue::Parent(parent)) => Property::Parent(match parent {
             Some(parent) => Some(ids.get(parent).cloned()?),
             None => None,
         }),
-        (OldField::Deleted, OldValue::Bool(deleted)) => Relation::Deleted(*deleted),
-        (OldField::CreatedAt, OldValue::Timestamp(at)) => Relation::CreatedAt(*at),
-        (OldField::State, OldValue::State(state)) => Relation::State(*state),
-        (OldField::DeferUntil, OldValue::OptionalTimestamp(at)) => Relation::DeferUntil(*at),
-        (OldField::Deadline, OldValue::OptionalTimestamp(at)) => Relation::Deadline(*at),
-        (OldField::PaceDays, OldValue::Days(days)) => Relation::PaceDays(*days),
-        (OldField::Tag(name), OldValue::Bool(present)) => Relation::Labeled {
+        (OldField::Deleted, OldValue::Bool(deleted)) => Property::Deleted(*deleted),
+        (OldField::CreatedAt, OldValue::Timestamp(at)) => Property::CreatedAt(*at),
+        (OldField::State, OldValue::State(state)) => Property::State(*state),
+        (OldField::DeferUntil, OldValue::OptionalTimestamp(at)) => Property::DeferUntil(*at),
+        (OldField::Deadline, OldValue::OptionalTimestamp(at)) => Property::Deadline(*at),
+        (OldField::PaceDays, OldValue::Days(days)) => Property::PaceDays(*days),
+        (OldField::Tag(name), OldValue::Bool(present)) => Property::Labeled {
             label: Id::Label(label_uuid(name)),
             present: *present,
         },
@@ -600,7 +600,7 @@ fn drop_old_tables(write: &mut WriteTxn) {
 #[cfg(test)]
 mod tests {
     use rho_db::RhoDb;
-    use rho_desk::cells::{Id, RelationKey, State, TimestampPrecision, Version};
+    use rho_desk::cells::{Id, PropertyKey, State, TimestampPrecision, Version};
 
     use super::*;
     use crate::desk_cells::DeskCellStore;
@@ -836,8 +836,8 @@ mod tests {
                 .contains(&Id::Label(label_uuid("rho")))
         );
         assert_eq!(
-            facts.relation(&Id::Label(label_uuid("rho")), &RelationKey::Name),
-            Some(&Relation::Name("rho".into()))
+            facts.property(&Id::Label(label_uuid("rho")), &PropertyKey::Name),
+            Some(&Property::Name("rho".into()))
         );
         // The agent the user filed keeps its heading and its state; the one
         // that only sat under its spawner keeps neither.

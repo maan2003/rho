@@ -167,7 +167,7 @@ pub struct ThreadRef {
 pub enum DealerVerdict {
     Skip,
     Done,
-    Dismiss,
+    Mute,
     Defer,
     Open,
     File,
@@ -1234,7 +1234,7 @@ impl Dashboard {
         let verdict = match event.verdict {
             DealerVerdict::Skip => crate::journal::DealerVerdict::Skip,
             DealerVerdict::Done => crate::journal::DealerVerdict::Done,
-            DealerVerdict::Dismiss => crate::journal::DealerVerdict::Dismiss,
+            DealerVerdict::Mute => crate::journal::DealerVerdict::Mute,
             DealerVerdict::Defer => crate::journal::DealerVerdict::Defer,
             DealerVerdict::Open => crate::journal::DealerVerdict::Open,
             DealerVerdict::File => crate::journal::DealerVerdict::File,
@@ -1673,7 +1673,7 @@ impl Dashboard {
             let mut hints = Vec::new();
             match node.state {
                 rho_desk::cells::State::Done => hints.push("done".to_owned()),
-                rho_desk::cells::State::Dismissed => hints.push("discarded".to_owned()),
+                rho_desk::cells::State::Muted => hints.push("muted".to_owned()),
                 rho_desk::cells::State::Open => {}
             }
             if let Some(at) = node.defer_until {

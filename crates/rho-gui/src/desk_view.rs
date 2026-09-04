@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use gpui::{AppContext as _, Context, Entity};
 use language::{Buffer, BufferEvent, Capability};
 use rho_desk::cells::{
-    BodySnapshot, CellMutation, CellWrite, DeviceId, Facts, Id, Relation, RelationKey, SlackUnit,
+    BodySnapshot, CellMutation, CellWrite, DeviceId, Facts, Id, Property, PropertyKey, SlackUnit,
     Snapshot, Stamp, State, Store, Timestamp, TimestampPrecision, Uuid, Verdict, VerdictEvent,
     Version,
 };
@@ -615,8 +615,8 @@ impl DeskCells {
         Some(self.hosts.get(&host)?.namespace)
     }
 
-    pub fn relation(&self, host: HostId, id: &Id, key: &RelationKey) -> Option<Relation> {
-        self.hosts.get(&host)?.view.relation(id, key).cloned()
+    pub fn property(&self, host: HostId, id: &Id, key: &PropertyKey) -> Option<Property> {
+        self.hosts.get(&host)?.view.property(id, key).cloned()
     }
 
     pub fn verdict_event(&self, host: HostId, id: &Id, stamp: Stamp) -> Option<VerdictEvent> {
@@ -755,7 +755,7 @@ impl DeskCells {
     pub fn delete_writes(&self, id: Id) -> Vec<CellWrite> {
         vec![CellWrite {
             id,
-            relation: Relation::Deleted(true),
+            property: Property::Deleted(true),
         }]
     }
 
@@ -955,7 +955,7 @@ impl DeskCells {
     }
 
     /// The writes that put back whatever these writes are about to replace.
-    /// A relation with no current cell cannot be unset, so undoing a
+    /// A property with no current cell cannot be unset, so undoing a
     /// creation is a delete rather than an inverse (see
     /// `dashboard_new_heading`).
     pub fn inverse_writes(&self, host: HostId, writes: &[CellWrite]) -> Vec<CellWrite> {
@@ -965,15 +965,15 @@ impl DeskCells {
         writes
             .iter()
             .filter_map(|write| {
-                let key = write.relation.key();
-                let relation = desk
+                let key = write.property.key();
+                let property = desk
                     .view
-                    .relation(&write.id, &key)
+                    .property(&write.id, &key)
                     .cloned()
                     .or_else(|| key.unwritten())?;
-                (relation != write.relation).then_some(CellWrite {
+                (property != write.property).then_some(CellWrite {
                     id: write.id.clone(),
-                    relation,
+                    property,
                 })
             })
             .collect()
@@ -989,22 +989,22 @@ impl DeskCells {
     ) -> Option<(Vec<CellWrite>, (Id, VerdictEvent))> {
         let (verdict, mut writes): (Verdict, Vec<CellWrite>) = match verdict {
             DeskVerdict::Done => (Verdict::Done, Vec::new()),
-            DeskVerdict::Dismiss => (Verdict::Dismiss, Vec::new()),
+            DeskVerdict::Mute => (Verdict::Mute, Vec::new()),
             DeskVerdict::Defer { until } => (Verdict::Defer { until }, Vec::new()),
             DeskVerdict::File { parent } => (Verdict::File { parent }, Vec::new()),
             DeskVerdict::Todo { defer_until, pace } => {
                 let (note, mut writes) = self.create_note_writes(host, Some(id.clone()))?;
                 writes.push(CellWrite {
                     id: note.clone(),
-                    relation: Relation::Deleted(false),
+                    property: Property::Deleted(false),
                 });
                 writes.push(CellWrite {
                     id: note.clone(),
-                    relation: Relation::DeferUntil(Some(defer_until)),
+                    property: Property::DeferUntil(Some(defer_until)),
                 });
                 writes.push(CellWrite {
                     id: note.clone(),
-                    relation: Relation::PaceDays(pace),
+                    property: Property::PaceDays(pace),
                 });
                 // The entry is built by the same constructor the daemon
                 // checks it against, so the writer and the checker cannot
@@ -1016,7 +1016,7 @@ impl DeskCells {
                 let changes = rho_desk::cells::verdict_changes(
                     id,
                     &verdict,
-                    &|key| view.relation(id, key).cloned(),
+                    &|key| view.property(id, key).cloned(),
                     Some(rho_desk::cells::TodoCadence {
                         defer_until,
                         pace_days: pace,
@@ -1025,7 +1025,7 @@ impl DeskCells {
                 .ok()?;
                 writes.push(CellWrite {
                     id: id.clone(),
-                    relation: Relation::State(State::Done),
+                    property: Property::State(State::Done),
                 });
                 let event = VerdictEvent::Applied {
                     verdict,
@@ -1045,7 +1045,7 @@ impl DeskCells {
         let changes = rho_desk::cells::verdict_changes(
             id,
             &verdict,
-            &|key| view.relation(id, key).cloned(),
+            &|key| view.property(id, key).cloned(),
             None,
         )
         .ok()?;
@@ -1061,12 +1061,12 @@ impl DeskCells {
             };
             match writes
                 .iter_mut()
-                .find(|write| write.id == change.id && write.relation.key() == change.key)
+                .find(|write| write.id == change.id && write.property.key() == change.key)
             {
-                Some(write) => write.relation = after,
+                Some(write) => write.property = after,
                 None => writes.push(CellWrite {
                     id: change.id.clone(),
-                    relation: after,
+                    property: after,
                 }),
             }
         }
@@ -1097,7 +1097,7 @@ impl DeskCells {
             .filter_map(|change| {
                 Some(CellWrite {
                     id: change.id.clone(),
-                    relation: change.before.clone()?,
+                    property: change.before.clone()?,
                 })
             })
             .collect::<Vec<_>>();
@@ -1109,7 +1109,7 @@ impl DeskCells {
 #[derive(Clone, Debug)]
 pub enum DeskVerdict {
     Done,
-    Dismiss,
+    Mute,
     Defer { until: Timestamp },
     File { parent: Id },
     Todo { defer_until: Timestamp, pace: u32 },
@@ -1134,7 +1134,7 @@ pub fn day_timestamp(date: chrono::NaiveDate) -> Timestamp {
 fn parent_write(id: Id, parent: Option<Id>) -> CellWrite {
     CellWrite {
         id,
-        relation: Relation::Parent(parent),
+        property: Property::Parent(parent),
     }
 }
 
@@ -1145,7 +1145,7 @@ fn create_note_writes(id: Id, parent: Option<Id>, created_at: Timestamp) -> Vec<
         parent_write(id.clone(), parent),
         CellWrite {
             id,
-            relation: Relation::CreatedAt(created_at),
+            property: Property::CreatedAt(created_at),
         },
     ]
 }

@@ -57,8 +57,8 @@ use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
     AgentDone, AgentHide, AgentNew, AgentNext, AgentPrevious, BrowserExit, DashboardArchive,
     DashboardBack, DashboardCancelDraft, DashboardCycleGlobal, DashboardDealAppend,
-    DashboardDealDiscard, DashboardDealDone, DashboardDealExit, DashboardDealFile,
-    DashboardDealInsert, DashboardDealNext, DashboardDealOpenLine, DashboardDealRefresh,
+    DashboardDealDone, DashboardDealExit, DashboardDealFile, DashboardDealInsert,
+    DashboardDealMute, DashboardDealNext, DashboardDealOpenLine, DashboardDealRefresh,
     DashboardDealReply, DashboardDealRoomSnooze, DashboardDealSnooze, DashboardDealTodo,
     DashboardDeleteEmpty, DashboardDeleteRow, DashboardDemote, DashboardGoto,
     DashboardHeadingAbove, DashboardHeadingBelow, DashboardJump, DashboardMoveSubtreeDown,
@@ -2175,7 +2175,7 @@ impl Workspace {
                 {
                     let writes = vec![rho_desk::cells::CellWrite {
                         id: rho_desk::cells::Id::Agent(agent_id),
-                        relation: rho_desk::cells::Relation::Parent(Some(parent)),
+                        property: rho_desk::cells::Property::Parent(Some(parent)),
                     }];
                     self.apply_desk_writes(host, writes, None, window, cx);
                 }
@@ -3477,13 +3477,13 @@ impl Workspace {
                 self.dashboard.cursor_target(&self.registry, cx)
         {
             let state = if hide {
-                rho_desk::cells::State::Dismissed
+                rho_desk::cells::State::Muted
             } else {
                 rho_desk::cells::State::Done
             };
             let writes = vec![rho_desk::cells::CellWrite {
                 id: node_id,
-                relation: rho_desk::cells::Relation::State(state),
+                property: rho_desk::cells::Property::State(state),
             }];
             self.apply_desk_writes(host, writes, None, window, cx);
             return;
@@ -3794,11 +3794,11 @@ impl Workspace {
         let writes = vec![
             rho_desk::cells::CellWrite {
                 id: id.clone(),
-                relation: rho_desk::cells::Relation::Parent(parent.map(|(_, parent)| parent)),
+                property: rho_desk::cells::Property::Parent(parent.map(|(_, parent)| parent)),
             },
             rho_desk::cells::CellWrite {
                 id: id.clone(),
-                relation: rho_desk::cells::Relation::CreatedAt(crate::desk_view::now_timestamp()),
+                property: rho_desk::cells::Property::CreatedAt(crate::desk_view::now_timestamp()),
             },
         ];
         if self
@@ -7686,7 +7686,7 @@ impl Workspace {
         match verdict {
             crate::dashboard::DealerVerdict::Skip => crate::journal::DealerVerdict::Skip,
             crate::dashboard::DealerVerdict::Done => crate::journal::DealerVerdict::Done,
-            crate::dashboard::DealerVerdict::Dismiss => crate::journal::DealerVerdict::Dismiss,
+            crate::dashboard::DealerVerdict::Mute => crate::journal::DealerVerdict::Mute,
             crate::dashboard::DealerVerdict::Defer => crate::journal::DealerVerdict::Defer,
             crate::dashboard::DealerVerdict::Open => crate::journal::DealerVerdict::Open,
             crate::dashboard::DealerVerdict::File => crate::journal::DealerVerdict::File,
@@ -7706,7 +7706,7 @@ impl Workspace {
         // A discarded thread was ignored in Slack, so taking the verdict
         // back means following it again there; the card is dealt as before
         // once it is the user's again.
-        if matches!(verdict, crate::dashboard::DealerVerdict::Dismiss)
+        if matches!(verdict, crate::dashboard::DealerVerdict::Mute)
             && let Some(thread) = self.dashboard.card_thread(card.identity.clone())
         {
             self.slack_follow_thread(&thread, cx);
@@ -7730,7 +7730,7 @@ impl Workspace {
     /// Closes a thread card because Slack said the thread is not the user's
     /// any more. No undo entry: the verdict was made in another client, and
     /// `shift-u` here could not take it back there.
-    pub(crate) fn discard_thread_card(
+    pub(crate) fn mute_thread_card(
         &mut self,
         card: crate::dashboard::DealCardId,
         window: &mut Window,
@@ -7739,7 +7739,7 @@ impl Workspace {
         let Some((writes, verdict)) = self.desk_cells.verdict_writes(
             card.host,
             &card.node_id,
-            crate::desk_view::DeskVerdict::Dismiss,
+            crate::desk_view::DeskVerdict::Mute,
         ) else {
             return;
         };
@@ -7908,14 +7908,14 @@ impl Workspace {
             .unwrap_or_else(|| card.identity.node_id.clone());
         let phone_verdict = self.phone.enabled.then(|| match dealt {
             crate::desk_view::DeskVerdict::Done => crate::journal::PhoneVerdict::Done,
-            crate::desk_view::DeskVerdict::Dismiss => crate::journal::PhoneVerdict::Dismiss,
+            crate::desk_view::DeskVerdict::Mute => crate::journal::PhoneVerdict::Mute,
             crate::desk_view::DeskVerdict::Defer { .. } => crate::journal::PhoneVerdict::Defer,
             crate::desk_view::DeskVerdict::Todo { .. } => crate::journal::PhoneVerdict::Todo,
             crate::desk_view::DeskVerdict::File { .. } => crate::journal::PhoneVerdict::File,
         });
         // `x` on a thread card is Slack's ignore thread: the same keystroke
         // that closes the card here stops Slack raising it anywhere else.
-        if matches!(dealt, crate::desk_view::DeskVerdict::Dismiss)
+        if matches!(dealt, crate::desk_view::DeskVerdict::Mute)
             && target_node.is_none()
             && let Some(thread) = self.dashboard.card_thread(card.identity.clone())
         {
@@ -7981,11 +7981,11 @@ impl Workspace {
         &mut self,
         host: HostId,
         id: rho_desk::cells::Id,
-        relation: rho_desk::cells::Relation,
+        property: rho_desk::cells::Property,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let writes = vec![rho_desk::cells::CellWrite { id, relation }];
+        let writes = vec![rho_desk::cells::CellWrite { id, property }];
         self.apply_desk_writes(host, writes, None, window, cx)
             .is_some()
     }
@@ -8941,11 +8941,11 @@ impl Workspace {
                 )
                 .child(
                     div()
-                        .id("deal-touch-dismiss")
+                        .id("deal-touch-mute")
                         .on_click(|_, window, cx| {
-                            window.dispatch_action(Box::new(DashboardDealDiscard), cx)
+                            window.dispatch_action(Box::new(DashboardDealMute), cx)
                         })
-                        .child("dismiss"),
+                        .child("mute"),
                 )
                 .child(
                     div()
@@ -9942,30 +9942,22 @@ impl Render for Workspace {
                 }
                 this.echo("done: nothing under the deal", StyleClass::SystemInfo, cx);
             }))
-            .on_action(cx.listener(|this, _: &DashboardDealDiscard, window, cx| {
+            .on_action(cx.listener(|this, _: &DashboardDealMute, window, cx| {
                 vim::take_count(cx);
                 if this.dashboard.current_deal_card().is_some() {
                     if !this.submit_tree_verdict(
                         None,
-                        crate::desk_view::DeskVerdict::Dismiss,
-                        crate::dashboard::DealerVerdict::Dismiss,
-                        "discard".to_owned(),
+                        crate::desk_view::DeskVerdict::Mute,
+                        crate::dashboard::DealerVerdict::Mute,
+                        "mute".to_owned(),
                         window,
                         cx,
                     ) {
-                        this.echo(
-                            "discard: the note is unavailable",
-                            StyleClass::SystemInfo,
-                            cx,
-                        );
+                        this.echo("mute: the note is unavailable", StyleClass::SystemInfo, cx);
                     }
                     return;
                 }
-                this.echo(
-                    "discard: nothing under the deal",
-                    StyleClass::SystemInfo,
-                    cx,
-                );
+                this.echo("mute: nothing under the deal", StyleClass::SystemInfo, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardDealSnooze, window, cx| {
                 let count = vim::take_count(cx);
@@ -10260,7 +10252,7 @@ impl Render for Workspace {
                             this.set_node_fact(
                                 host,
                                 node_id,
-                                rho_desk::cells::Relation::State(rho_desk::cells::State::Dismissed),
+                                rho_desk::cells::Property::State(rho_desk::cells::State::Muted),
                                 window,
                                 cx,
                             )

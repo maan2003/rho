@@ -82,7 +82,7 @@ actions!(
         DashboardDealExit,
         DashboardDealNext,
         DashboardDealDone,
-        DashboardDealDiscard,
+        DashboardDealMute,
         DashboardDealSnooze,
         DashboardDealSnoozeMinutes,
         DashboardDealSnoozeHours,
@@ -575,7 +575,7 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             KeyBinding::new("escape", DealLeave, Some(context)),
             KeyBinding::new("q", SurfaceClose, Some(context)),
             KeyBinding::new("d", DashboardDealDone, Some(context)),
-            KeyBinding::new("x", DashboardDealDiscard, Some(context)),
+            KeyBinding::new("x", DashboardDealMute, Some(context)),
             // Snooze is an operator: `s` waits for its unit, vim style, so
             // `45sm` is 45 minutes and `sw` a week. `ss` is the default day,
             // which is what the bare key used to do.

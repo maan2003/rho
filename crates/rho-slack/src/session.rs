@@ -504,7 +504,7 @@ impl Session {
                     .into_iter()
                     .filter(|key| !fresh.contains(key))
                     .map(Change::Updated)
-                    .chain(dropped.into_iter().map(Change::Discarded))
+                    .chain(dropped.into_iter().map(Change::Muted))
                     .chain(raised)
                     .collect();
                 session.announce(known, cx);
@@ -553,7 +553,7 @@ impl Session {
                 // with it.
                 let key = self.model.key(&channel, &thread_ts);
                 if self.model.unfollow(&channel, &thread_ts) {
-                    self.announce(vec![Change::Discarded(key)], cx);
+                    self.announce(vec![Change::Muted(key)], cx);
                 }
             }
             Wire::Frame(WsEvent::Reacted {
@@ -1472,11 +1472,11 @@ impl Session {
         }));
     }
 
-    /// Slack's ignore thread: the discard the user just made here, made
+    /// Slack's ignore thread: the mute the user just made here, made
     /// everywhere they read Slack. One request, and rho keeps no
     /// subscription state of its own, so the socket's `thread_unsubscribed`
     /// that follows is the confirmation rather than a second source of
-    /// truth. A failure is reported and changes nothing local: the discard
+    /// truth. A failure is reported and changes nothing local: the mute
     /// already stands.
     pub fn ignore_thread(&mut self, key: &ThreadKey, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else {
@@ -1508,8 +1508,8 @@ impl Session {
         }));
     }
 
-    /// Undoing a discard: the thread is the user's again, in Slack, because
-    /// that is where the discard was made. The card comes back with it.
+    /// Undoing a mute: the thread is the user's again, in Slack, because
+    /// that is where the mute was made. The card comes back with it.
     pub fn follow_thread(&mut self, key: &ThreadKey, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else {
             return;

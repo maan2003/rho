@@ -67,7 +67,7 @@ pub enum Change {
     /// The thread stopped being the user's, because they ignored it here or
     /// unfollowed it in another client. Slack's own verdict, so the card
     /// goes; nothing rho stores says otherwise.
-    Discarded(ThreadKey),
+    Muted(ThreadKey),
 }
 
 /// A dealer card's worth of a thread, with no ids and no raw timestamps.
@@ -636,14 +636,14 @@ impl Model {
     /// card it raised is left to the verdict that closes it; what goes is
     /// the standing claim that its next reply is theirs.
     /// rho's own ignore: the follow goes, the thread stays. Undoing the
-    /// discard follows it again and the card comes back exactly as it was,
+    /// mute follows it again and the card comes back exactly as it was,
     /// which an unfollow from Slack's side cannot promise.
     pub fn ignore(&mut self, key: &ThreadKey) {
         self.followed.remove(key);
     }
 
     /// Returns whether rho is tracking the thread, which is the difference
-    /// between an unfollow that discards a card and one that changes
+    /// between an unfollow that mutes a card and one that changes
     /// nothing the user can see.
     pub fn unfollow(&mut self, channel: &ChannelId, thread_ts: &Ts) -> bool {
         let key = self.key(channel, thread_ts);

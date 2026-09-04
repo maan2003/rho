@@ -249,7 +249,7 @@ impl PhoneUi {
     fn record_verdict(&mut self, verdict: crate::journal::PhoneVerdict) {
         let verdict = match verdict {
             crate::journal::PhoneVerdict::Done => "done",
-            crate::journal::PhoneVerdict::Dismiss => "dismiss",
+            crate::journal::PhoneVerdict::Mute => "mute",
             crate::journal::PhoneVerdict::Defer => "defer",
             crate::journal::PhoneVerdict::Todo => "todo",
             crate::journal::PhoneVerdict::File => "file",
@@ -1188,11 +1188,11 @@ impl Workspace {
                 )),
             )
             .child(
-                item("phone-verdict-dismiss", "×", "dismiss").on_click(cx.listener(
+                item("phone-verdict-mute", "×", "mute").on_click(cx.listener(
                     |this, _, window, cx| {
                         this.dispatch_phone_verdict(
-                            crate::journal::PhoneVerdict::Dismiss,
-                            Box::new(crate::DashboardDealDiscard),
+                            crate::journal::PhoneVerdict::Mute,
+                            Box::new(crate::DashboardDealMute),
                             window,
                             cx,
                         );
