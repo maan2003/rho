@@ -201,9 +201,9 @@ fn phone_entry_opens_the_feed_and_one_finger_flicks_to_the_next_card(cx: &mut Te
         .unwrap();
     cx.run_until_parked();
     let first = workspace
-        .update(cx, |workspace, _, _| {
-            assert!(workspace.phone_feed_for_test());
-            workspace.current_deal_card_for_test().unwrap().0
+        .update(cx, |workspace, _, cx| {
+            assert!(workspace.phone_feed_for_test(cx));
+            workspace.current_deal_card_for_test(cx).unwrap().0
         })
         .unwrap();
 
@@ -260,9 +260,9 @@ fn phone_entry_opens_the_feed_and_one_finger_flicks_to_the_next_card(cx: &mut Te
     cx.run_until_parked();
 
     workspace
-        .update(cx, |workspace, _, _| {
-            assert!(workspace.phone_feed_for_test());
-            assert_ne!(workspace.current_deal_card_for_test().unwrap().0, first);
+        .update(cx, |workspace, _, cx| {
+            assert!(workspace.phone_feed_for_test(cx));
+            assert_ne!(workspace.current_deal_card_for_test(cx).unwrap().0, first);
             assert_eq!(
                 workspace.phone_last_gesture_for_test(),
                 Some("flick up · moved")
@@ -282,8 +282,8 @@ fn the_phone_feed_opens_when_the_first_card_arrives_after_it_did(cx: &mut TestAp
         .unwrap();
     cx.run_until_parked();
     workspace
-        .update(cx, |workspace, _, _| {
-            assert!(workspace.current_deal_card_for_test().is_none());
+        .update(cx, |workspace, _, cx| {
+            assert!(workspace.current_deal_card_for_test(cx).is_none());
         })
         .unwrap();
 
@@ -299,8 +299,8 @@ fn the_phone_feed_opens_when_the_first_card_arrives_after_it_did(cx: &mut TestAp
         .unwrap();
     cx.run_until_parked();
     workspace
-        .update(cx, |workspace, _, _| {
-            assert!(workspace.current_deal_card_for_test().is_some());
+        .update(cx, |workspace, _, cx| {
+            assert!(workspace.current_deal_card_for_test(cx).is_some());
         })
         .unwrap();
 }
@@ -325,7 +325,7 @@ fn leaving_phone_mode_cancels_a_delayed_flick_commit(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let first = workspace
         .update(cx, |workspace, window, cx| {
-            let identity = workspace.current_deal_card_for_test().unwrap().0;
+            let identity = workspace.current_deal_card_for_test(cx).unwrap().0;
             workspace.phone_start_snap_for_test(window, cx);
             identity
         })
@@ -338,8 +338,8 @@ fn leaving_phone_mode_cancels_a_delayed_flick_commit(cx: &mut TestAppContext) {
         .advance_clock(std::time::Duration::from_millis(200));
     cx.run_until_parked();
     workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(workspace.current_deal_card_for_test().unwrap().0, first);
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(workspace.current_deal_card_for_test(cx).unwrap().0, first);
             assert_eq!(workspace.phone_last_gesture_for_test(), None);
         })
         .unwrap();
@@ -372,9 +372,9 @@ fn cancelling_phone_file_keeps_the_current_feed_card(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     workspace
-        .update(cx, |workspace, _, _| {
-            assert!(workspace.phone_feed_for_test());
-            assert_eq!(workspace.current_deal_card_for_test().unwrap().0, id);
+        .update(cx, |workspace, _, cx| {
+            assert!(workspace.phone_feed_for_test(cx));
+            assert_eq!(workspace.current_deal_card_for_test(cx).unwrap().0, id);
         })
         .unwrap();
 }
@@ -405,9 +405,12 @@ fn phone_back_from_a_surface_reveals_the_hidden_feed_card(cx: &mut TestAppContex
         .update(cx, |workspace, window, cx| {
             workspace.enter_draft(None, window, cx);
             workspace.phone_back_for_test(window, cx);
-            assert!(workspace.phone_feed_for_test());
+            assert!(workspace.phone_feed_for_test(cx));
             assert!(workspace.phone_feed_is_active_for_test());
-            assert_eq!(workspace.current_deal_card_for_test().unwrap().0, expected);
+            assert_eq!(
+                workspace.current_deal_card_for_test(cx).unwrap().0,
+                expected
+            );
         })
         .unwrap();
 }
@@ -452,8 +455,8 @@ fn phone_empty_feed_flick_down_undoes_the_last_verdict(cx: &mut TestAppContext) 
         .unwrap();
     cx.run_until_parked();
     workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(workspace.current_deal_card_for_test(), None);
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(workspace.current_deal_card_for_test(cx), None);
             workspace.phone_remember_last_verdict_for_test();
         })
         .unwrap();
@@ -504,8 +507,11 @@ fn phone_empty_feed_flick_down_undoes_the_last_verdict(cx: &mut TestAppContext) 
         .unwrap();
     cx.run_until_parked();
     workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(workspace.current_deal_card_for_test().unwrap().0, expected);
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace.current_deal_card_for_test(cx).unwrap().0,
+                expected
+            );
             assert!(workspace.phone_feed_is_active_for_test());
         })
         .unwrap();
@@ -563,8 +569,8 @@ fn phone_blocks_navigation_while_a_tree_verdict_is_pending(cx: &mut TestAppConte
     cx.run_until_parked();
 
     let identity = workspace
-        .update(cx, |workspace, _, _| {
-            workspace.current_deal_card_for_test().unwrap().0
+        .update(cx, |workspace, _, cx| {
+            workspace.current_deal_card_for_test(cx).unwrap().0
         })
         .unwrap();
     cx.dispatch_action(*workspace, crate::DashboardDealDone);
@@ -611,8 +617,11 @@ fn phone_blocks_navigation_while_a_tree_verdict_is_pending(cx: &mut TestAppConte
     .unwrap();
     cx.run_until_parked();
     workspace
-        .update(cx, |workspace, _, _| {
-            assert_eq!(workspace.current_deal_card_for_test().unwrap().0, identity);
+        .update(cx, |workspace, _, cx| {
+            assert_eq!(
+                workspace.current_deal_card_for_test(cx).unwrap().0,
+                identity
+            );
             assert!(
                 workspace
                     .take_host_messages_for_test(HostId::default())
@@ -682,7 +691,10 @@ fn phone_blocks_navigation_while_a_tree_verdict_is_pending(cx: &mut TestAppConte
                 window,
                 cx,
             );
-            assert_eq!(workspace.current_deal_card_for_test().unwrap().0, identity);
+            assert_eq!(
+                workspace.current_deal_card_for_test(cx).unwrap().0,
+                identity
+            );
         })
         .unwrap();
 }
@@ -898,7 +910,7 @@ fn a_todo_verdict_logs_every_cell_that_makes_the_new_note_a_cadence(cx: &mut Tes
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(HostId::default(), desk.synced(), window, cx);
-            workspace.open_deal_mode(window, cx);
+            workspace.pull_card(window, cx);
             workspace.take_host_messages_for_test(HostId::default());
         })
         .unwrap();
@@ -4401,15 +4413,15 @@ fn deal_file_bare_enter_files_the_dealt_node_under_the_offered_heading(cx: &mut 
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(HostId::default(), desk.synced(), window, cx);
-            workspace.open_deal_mode(window, cx);
+            workspace.pull_card(window, cx);
             workspace.take_host_messages_for_test(HostId::default());
         })
         .unwrap();
     cx.run_until_parked();
     workspace
-        .update(cx, |workspace, _, _| {
+        .update(cx, |workspace, _, cx| {
             assert_eq!(
-                workspace.current_deal_card_for_test().map(|card| card.0),
+                workspace.current_deal_card_for_test(cx).map(|card| card.0),
                 Some(crate::dashboard::DealCardId {
                     host: HostId::default(),
                     node_id: dealt.clone(),
@@ -4473,7 +4485,7 @@ fn shift_held_for_a_letter_never_opens_the_verdicts(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(HostId::default(), desk.synced(), window, cx);
-            workspace.open_deal_mode(window, cx);
+            workspace.pull_card(window, cx);
             workspace.take_host_messages_for_test(HostId::default());
         })
         .unwrap();
@@ -4531,7 +4543,7 @@ fn a_tap_of_shift_opens_the_verdicts_over_the_card_in_view(cx: &mut TestAppConte
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(HostId::default(), desk.synced(), window, cx);
-            workspace.open_deal_mode(window, cx);
+            workspace.pull_card(window, cx);
             workspace.take_host_messages_for_test(HostId::default());
         })
         .unwrap();
@@ -4585,7 +4597,7 @@ fn a_snooze_goes_through_the_transient_with_its_count(cx: &mut TestAppContext) {
         workspace
             .update(cx, |workspace, window, cx| {
                 workspace.handle_event(HostId::default(), desk.synced(), window, cx);
-                workspace.open_deal_mode(window, cx);
+                workspace.pull_card(window, cx);
                 workspace.take_host_messages_for_test(HostId::default());
             })
             .unwrap();
@@ -4643,7 +4655,7 @@ fn a_second_tap_of_shift_leaves_the_card_for_home(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(HostId::default(), desk.synced(), window, cx);
-            workspace.open_deal_mode(window, cx);
+            workspace.pull_card(window, cx);
         })
         .unwrap();
     cx.run_until_parked();
@@ -4687,7 +4699,7 @@ fn a_snooze_zeroes_the_pace_it_was_climbing_at(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(HostId::default(), desk.synced(), window, cx);
-            workspace.open_deal_mode(window, cx);
+            workspace.pull_card(window, cx);
             workspace.take_host_messages_for_test(HostId::default());
         })
         .unwrap();
@@ -4728,7 +4740,7 @@ fn cancelling_the_file_prompt_writes_nothing_and_keeps_the_card(cx: &mut TestApp
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(HostId::default(), desk.synced(), window, cx);
-            workspace.open_deal_mode(window, cx);
+            workspace.pull_card(window, cx);
             workspace.take_host_messages_for_test(HostId::default());
         })
         .unwrap();
@@ -4739,13 +4751,13 @@ fn cancelling_the_file_prompt_writes_nothing_and_keeps_the_card(cx: &mut TestApp
     cx.run_until_parked();
 
     workspace
-        .update(cx, |workspace, _, _| {
+        .update(cx, |workspace, _, cx| {
             assert!(
                 take_desk_mutation(workspace, HostId::default()).is_none(),
                 "a cancelled prompt files nothing"
             );
             assert_eq!(
-                workspace.current_deal_card_for_test().map(|card| card.0),
+                workspace.current_deal_card_for_test(cx).map(|card| card.0),
                 Some(crate::dashboard::DealCardId {
                     host: HostId::default(),
                     node_id: dealt,
@@ -4787,7 +4799,7 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(HostId::default(), desk.synced(), window, cx);
-            workspace.open_deal_mode(window, cx);
+            workspace.pull_card(window, cx);
             workspace.take_host_messages_for_test(HostId::default());
         })
         .unwrap();
@@ -4848,17 +4860,13 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
                         cx,
                     );
                     assert_eq!(
-                        workspace.current_deal_card_for_test().map(|card| card.0),
+                        workspace.current_deal_card_for_test(cx).map(|card| card.0),
                         Some(crate::dashboard::DealCardId {
                             host: HostId::default(),
                             node_id: note.clone(),
                         })
                     );
-                    assert_eq!(
-                        workspace.rendered_deal_card_for_test(),
-                        workspace.current_deal_card_for_test()
-                    );
-                    assert!(workspace.dashboard_deal_mode_for_test());
+                    assert!(workspace.dashboard_deal_mode_for_test(cx));
                 })
                 .unwrap();
         }};
@@ -4887,28 +4895,14 @@ fn tree_verdict_echoes_name_and_undo_restores_temporal_state(cx: &mut TestAppCon
         .unwrap();
     workspace
         .update(cx, |workspace, window, cx| {
-            let mut replacement = workspace.current_deal_card_value_for_test().unwrap();
-            let other = rho_desk::cells::Id::Note(rho_desk::cells::Uuid([231; 16]));
-            replacement.identity = crate::dashboard::DealCardId {
-                host: HostId::default(),
-                node_id: other.clone(),
-            };
-            replacement.topic_node_id = other.clone();
-            replacement.agent_id = None;
-            workspace.reopen_deal_for_test(replacement);
             workspace.handle_event(
                 HostId::default(),
                 ConnEvent::DeskMutationAccepted { stamp: delayed },
                 window,
                 cx,
             );
-            assert_eq!(
-                workspace.current_deal_card_for_test().map(|card| card.0),
-                Some(crate::dashboard::DealCardId {
-                    host: HostId::default(),
-                    node_id: other,
-                })
-            );
+            // The echo names the card the verdict was about, not whatever
+            // the reader has moved on to.
             assert_eq!(workspace.echo_text_for_test(), Some("done: Named card"));
         })
         .unwrap();
@@ -6087,7 +6081,7 @@ fn a_verdict_on_one_device_reaches_the_other_after_cells_available(cx: &mut Test
         workspace
             .update(cx, |workspace, window, cx| {
                 workspace.handle_event(HostId::default(), desk.synced(), window, cx);
-                workspace.open_deal_mode(window, cx);
+                workspace.pull_card(window, cx);
                 workspace.take_host_messages_for_test(HostId::default());
             })
             .unwrap();
@@ -6151,27 +6145,6 @@ fn a_verdict_on_one_device_reaches_the_other_after_cells_available(cx: &mut Test
             );
         })
         .unwrap();
-}
-
-fn assert_rendered_deal_matches_current(
-    workspace: &WindowHandle<Workspace>,
-    cx: &mut TestAppContext,
-) -> crate::dashboard::DealCardKind {
-    workspace
-        .update(cx, |workspace, _, _| {
-            let current = workspace
-                .current_deal_card_for_test()
-                .expect("current deal card");
-            let rendered = workspace
-                .rendered_deal_card_for_test()
-                .expect("rendered deal body");
-            assert_eq!(
-                rendered, current,
-                "rendered body diverged from verdict target"
-            );
-            current.1
-        })
-        .unwrap()
 }
 
 #[gpui::test]
@@ -6729,13 +6702,13 @@ fn a_verdict_ends_the_deal_even_when_the_node_went_quiet(cx: &mut TestAppContext
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(HostId::default(), desk.synced(), window, cx);
-            workspace.open_deal_mode(window, cx);
+            workspace.pull_card(window, cx);
         })
         .unwrap();
     cx.run_until_parked();
     workspace
         .update(cx, |workspace, window, cx| {
-            assert!(workspace.dashboard_deal_mode_for_test());
+            assert!(workspace.dashboard_deal_mode_for_test(cx));
             desk.set(dealt, rho_desk::cells::Property::DeferUntil(None));
             workspace.handle_event(HostId::default(), desk.synced(), window, cx);
         })
@@ -6759,9 +6732,9 @@ fn a_verdict_ends_the_deal_even_when_the_node_went_quiet(cx: &mut TestAppContext
     cx.run_until_parked();
 
     workspace
-        .update(cx, |workspace, _, _| {
+        .update(cx, |workspace, _, cx| {
             assert!(
-                !workspace.dashboard_deal_mode_for_test(),
+                !workspace.dashboard_deal_mode_for_test(cx),
                 "a verdict on a card that went quiet still ends the deal"
             );
         })
@@ -6781,14 +6754,14 @@ fn a_thread_node_without_its_mirror_is_not_dealt(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(HostId::default(), desk.synced(), window, cx);
-            workspace.open_deal_mode(window, cx);
+            workspace.pull_card(window, cx);
         })
         .unwrap();
     cx.run_until_parked();
     workspace
-        .update(cx, |workspace, _, _| {
+        .update(cx, |workspace, _, cx| {
             assert_eq!(
-                workspace.current_deal_card_for_test().map(|card| card.0),
+                workspace.current_deal_card_for_test(cx).map(|card| card.0),
                 Some(crate::dashboard::DealCardId {
                     host: HostId::default(),
                     node_id: dealable,
@@ -7434,6 +7407,7 @@ fn home_reads_as_next_running_and_later(cx: &mut TestAppContext) {
             title: "#design › release date".to_owned(),
             label: "needs reply · 1.9h".to_owned(),
             card: card(1),
+            skipped: false,
         }],
         running: vec![crate::home::RunningRow {
             agent_id: agent(1),
@@ -7446,6 +7420,7 @@ fn home_reads_as_next_running_and_later(cx: &mut TestAppContext) {
             title: "#random".to_owned(),
             label: "quiet · 5.4d".to_owned(),
             card: card(2),
+            skipped: false,
         }],
     };
     let text = home
@@ -7482,10 +7457,10 @@ fn a_cold_start_lands_on_home_and_says_what_is_waiting(cx: &mut TestAppContext) 
     cx.run_until_parked();
 
     workspace
-        .update(cx, |workspace, _, _| {
+        .update(cx, |workspace, _, cx| {
             assert_eq!(workspace.current_surface_name_for_test(), "home");
             assert!(
-                workspace.current_deal_card_for_test().is_none(),
+                workspace.current_deal_card_for_test(cx).is_none(),
                 "sitting down deals nothing"
             );
         })
@@ -7495,6 +7470,95 @@ fn a_cold_start_lands_on_home_and_says_what_is_waiting(cx: &mut TestAppContext) 
     assert!(text.contains("Ship the release"), "home text: {text:?}");
     // The same words the deal bar uses for the same card.
     assert!(text.contains("deferred · woke"), "home text: {text:?}");
+}
+
+#[gpui::test]
+fn a_pull_opens_the_top_card_and_the_next_pull_passes_over_it(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    let first = desk.due_note(None, "Ship the release");
+    let second = desk.due_note(None, "Book the venue");
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.pull_card(window, cx);
+            assert_eq!(
+                workspace.current_deal_card_for_test(cx).map(|card| card.0),
+                Some(crate::dashboard::DealCardId {
+                    host: HostId::default(),
+                    node_id: first.clone(),
+                }),
+                "one pull opens the most important card"
+            );
+            // The second pull is a fresh ranking of the same world: the card
+            // just read is passed over, so the next one comes up.
+            workspace.pull_card(window, cx);
+            assert_eq!(
+                workspace.current_deal_card_for_test(cx).map(|card| card.0),
+                Some(crate::dashboard::DealCardId {
+                    host: HostId::default(),
+                    node_id: second,
+                }),
+                "the second pull moves on rather than cycling on one card"
+            );
+            // Both cards have been passed over now, so there is nothing left
+            // to open and the glance is the answer.
+            workspace.pull_card(window, cx);
+            assert_eq!(workspace.current_surface_name_for_test(), "home");
+        })
+        .unwrap();
+}
+
+#[gpui::test]
+fn a_skipped_card_is_marked_on_home_and_comes_back_when_its_source_moves(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    let note = desk.due_note(None, "Ship the release");
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.pull_card(window, cx);
+            // Nothing else is waiting, so passing over the only card lands
+            // on Home.
+            workspace.pull_card(window, cx);
+            assert_eq!(workspace.current_surface_name_for_test(), "home");
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let text = buffer_text(&workspace, cx);
+    assert!(
+        text.contains("Ship the release"),
+        "a skipped card is still open, so Home still shows it: {text:?}"
+    );
+    assert!(
+        text.contains("skipped"),
+        "and Home says the reader has passed over it: {text:?}"
+    );
+
+    // The note wakes again at a new time: the skip was against the position
+    // the card had, and that position has moved.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            desk.set(
+                note.clone(),
+                rho_desk::cells::Property::DeferUntil(Some(rho_desk::cells::Timestamp {
+                    unix_ms: 1_600_086_400_000,
+                    precision: rho_desk::cells::TimestampPrecision::Day,
+                })),
+            );
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.pull_card(window, cx);
+            assert_eq!(
+                workspace.current_deal_card_for_test(cx).map(|card| card.0),
+                Some(crate::dashboard::DealCardId {
+                    host: HostId::default(),
+                    node_id: note,
+                }),
+                "the skip is void once the card's own position moves past it"
+            );
+        })
+        .unwrap();
 }
 
 #[gpui::test]
@@ -7538,13 +7602,13 @@ fn enter_on_a_home_row_deals_that_card(cx: &mut TestAppContext) {
     cx.run_until_parked();
 
     workspace
-        .update(cx, |workspace, _, _| {
+        .update(cx, |workspace, _, cx| {
             assert!(
-                workspace.dashboard_deal_mode_for_test(),
+                workspace.dashboard_deal_mode_for_test(cx),
                 "a row opens as a deal in every respect"
             );
             let (identity, _) = workspace
-                .current_deal_card_for_test()
+                .current_deal_card_for_test(cx)
                 .expect("the row was dealt");
             assert_eq!(
                 identity,
@@ -7674,7 +7738,7 @@ fn an_empty_queue_lands_on_home(cx: &mut TestAppContext) {
         .update(cx, |workspace, window, cx| {
             workspace.configure_surface_history_for_test(&["current"], window, cx);
             assert_eq!(workspace.current_surface_name_for_test(), "current");
-            workspace.open_deal_mode(window, cx);
+            workspace.pull_card(window, cx);
         })
         .unwrap();
     cx.run_until_parked();
@@ -7724,8 +7788,8 @@ fn the_phone_feed_is_home_when_there_is_nothing_to_deal(cx: &mut TestAppContext)
     cx.run_until_parked();
 
     workspace
-        .update(cx, |workspace, _, _| {
-            assert!(workspace.current_deal_card_for_test().is_none());
+        .update(cx, |workspace, _, cx| {
+            assert!(workspace.current_deal_card_for_test(cx).is_none());
             assert_eq!(workspace.current_surface_name_for_test(), "home");
             assert!(
                 !workspace.phone_has_surface_for_test(&crate::pane::SurfaceKey::Home),
@@ -7758,9 +7822,9 @@ fn home_starts_with_the_cursor_on_the_first_row(cx: &mut TestAppContext) {
     cx.dispatch_action(*workspace, crate::HomeOpenRow);
     cx.run_until_parked();
     workspace
-        .update(cx, |workspace, _, _| {
+        .update(cx, |workspace, _, cx| {
             let (identity, _) = workspace
-                .current_deal_card_for_test()
+                .current_deal_card_for_test(cx)
                 .expect("the top row was dealt");
             assert_eq!(
                 identity,
@@ -8711,7 +8775,7 @@ fn filing_offers_labels_as_well_as_notes(cx: &mut TestAppContext) {
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(HostId::default(), desk.synced(), window, cx);
             workspace.label_card(HostId::default(), area.clone(), "rho", window, cx);
-            workspace.open_deal_mode(window, cx);
+            workspace.pull_card(window, cx);
             workspace.take_host_messages_for_test(HostId::default());
         })
         .unwrap();
@@ -8757,7 +8821,7 @@ fn filing_under_a_label_puts_it_on_and_the_same_path_takes_it_off(cx: &mut TestA
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(HostId::default(), desk.synced(), window, cx);
-            workspace.open_deal_mode(window, cx);
+            workspace.pull_card(window, cx);
             workspace.take_host_messages_for_test(HostId::default());
         })
         .unwrap();
@@ -9117,8 +9181,7 @@ fn a_verdict_follows_the_thing_in_view_not_the_card_in_hand(cx: &mut TestAppCont
     cx.update(bind_test_keymaps);
     let mut desk = DeskFixture::new();
     let dealt = desk.due_note(None, "Deal QA note");
-    // A second card so the queue is not emptied by the skip that leaving the
-    // deal for Home performs: Home needs a cursor of its own for this.
+    // A second card, so Home has a list rather than a single row.
     let queued = desk.due_note(None, "Queued QA note");
     let workspace = test_workspace(cx);
     workspace
@@ -9134,7 +9197,7 @@ fn a_verdict_follows_the_thing_in_view_not_the_card_in_hand(cx: &mut TestAppCont
                 cx,
             );
             workspace.sync_tree_dashboard(HostId::default(), window, cx);
-            workspace.open_deal_mode(window, cx);
+            workspace.pull_card(window, cx);
             // The cursor is left on the page row while the card is dealt:
             // the surface in view still decides, in both directions.
             workspace.focus_tree_node_for_test(HostId::default(), desk_page(origin), window, cx);
@@ -9159,16 +9222,16 @@ fn a_verdict_follows_the_thing_in_view_not_the_card_in_hand(cx: &mut TestAppCont
 
     workspace
         .update(cx, |workspace, window, cx| {
-            // Home puts its own cursor on the top of the queue, which is the
-            // trap: the map is what the reader is looking at.
+            // Home puts its own cursor on the most important card, which is
+            // the trap: the map is what the reader is looking at.
             let home = workspace.home_view().expect("Home is the surface");
             assert_eq!(
                 home.update(cx, |home, cx| home.cursor_target(cx)),
                 crate::home::HomeTarget::Card(crate::dashboard::DealCardId {
                     host: HostId::default(),
-                    node_id: queued.clone(),
+                    node_id: dealt.clone(),
                 }),
-                "Home is left holding the queue's top card"
+                "Home ranks fresh, so the card just read is still on top"
             );
             workspace.open_overview(window, cx);
             workspace.focus_tree_node_for_test(HostId::default(), desk_page(origin), window, cx);
@@ -9226,7 +9289,7 @@ fn a_verdict_follows_the_thing_in_view_not_the_card_in_hand(cx: &mut TestAppCont
                     .writes
                     .iter()
                     .any(|write| write.id == dealt || write.id == queued),
-                "and the cards the dealer and Home held are left alone"
+                "and the cards on Home are left alone"
             );
             // The tab is not written anywhere: it hangs under the origin
             // because the browser says so, wherever the origin is filed.

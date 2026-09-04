@@ -587,16 +587,15 @@ pub enum Event {
         target: String,
         found: bool,
     },
-    /// Complete event emitted by the dealer seam. `considered_not_dealt`
-    /// is intentionally retained for counterfactual replay.
+    /// What one card was told to do. There is no session behind it: the
+    /// verdict is about the card the reader had in front of them, so what
+    /// else was ranked at the time is not the seam's to claim.
     Dealer {
         card: DealerCardIdentity,
         kind: DealerCardKind,
         verdict: DealerVerdict,
         skip_until: Option<String>,
         occurred_at: String,
-        time_to_verdict_ms: u64,
-        considered_not_dealt: Vec<DealerCardIdentity>,
     },
     /// A local verdict reversal. External effects initiated by the original
     /// verdict (for example, marking a Slack thread read) are not reversed.
@@ -1061,7 +1060,7 @@ mod tests {
     }
 
     #[test]
-    fn dealer_event_round_trips_considered_cards() {
+    fn dealer_event_round_trips() {
         let event = Event::Dealer {
             card: DealerCardIdentity {
                 host: 1,
@@ -1071,11 +1070,6 @@ mod tests {
             verdict: DealerVerdict::Defer,
             skip_until: None,
             occurred_at: "2026-09-01T20:00:00+00:00".into(),
-            time_to_verdict_ms: 4200,
-            considered_not_dealt: vec![DealerCardIdentity {
-                host: 1,
-                node_id: NodeIdentity::Note { uuid: [9; 16] },
-            }],
         };
         let encoded = serde_json::to_string(&event).unwrap();
         assert_eq!(serde_json::from_str::<Event>(&encoded).unwrap(), event);

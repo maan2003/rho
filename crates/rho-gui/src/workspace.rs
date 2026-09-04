@@ -56,11 +56,10 @@ use crate::style::StyleClass;
 use crate::zed_remote::{FileView, RemoteProject};
 use crate::{
     AgentDone, AgentHide, AgentNew, AgentNext, AgentPrevious, BrowserExit, DashboardArchive,
-    DashboardBack, DashboardCancelDraft, DashboardCycleGlobal, DashboardDealAppend,
-    DashboardDealDone, DashboardDealExit, DashboardDealFile, DashboardDealInsert,
-    DashboardDealMute, DashboardDealNext, DashboardDealOpenLine, DashboardDealRefresh,
-    DashboardDealReply, DashboardDealRoomSnooze, DashboardDealSnooze, DashboardDealTodo,
-    DashboardDeleteEmpty, DashboardDeleteRow, DashboardDemote, DashboardGoto,
+    DashboardBack, DashboardCancelDraft, DashboardCycleGlobal, DashboardDealDone,
+    DashboardDealExit, DashboardDealFile, DashboardDealMute, DashboardDealNext,
+    DashboardDealRefresh, DashboardDealReply, DashboardDealRoomSnooze, DashboardDealSnooze,
+    DashboardDealTodo, DashboardDeleteEmpty, DashboardDeleteRow, DashboardDemote, DashboardGoto,
     DashboardHeadingAbove, DashboardHeadingBelow, DashboardJump, DashboardMoveSubtreeDown,
     DashboardMoveSubtreeUp, DashboardNewChild, DashboardNewSibling, DashboardNow,
     DashboardPasteRow, DashboardPasteRowBefore, DashboardPromote, DashboardRenameTopic,
@@ -118,37 +117,6 @@ struct ShellTouchContact {
 pub struct Surface {
     pub(crate) key: SurfaceKey,
     pub(crate) view: SurfaceView,
-}
-
-enum DealView {
-    Desk {
-        identity: crate::dashboard::DealCardId,
-        editor: Entity<editor::Editor>,
-    },
-    Surface {
-        identity: crate::dashboard::DealCardId,
-        surface: Surface,
-    },
-}
-
-impl DealView {
-    fn matches(&self, identity: &crate::dashboard::DealCardId) -> bool {
-        match self {
-            Self::Desk {
-                identity: current, ..
-            }
-            | Self::Surface {
-                identity: current, ..
-            } => current == identity,
-        }
-    }
-
-    #[cfg(test)]
-    fn identity(&self) -> crate::dashboard::DealCardId {
-        match self {
-            Self::Desk { identity, .. } | Self::Surface { identity, .. } => identity.clone(),
-        }
-    }
 }
 
 /// A bind request waiting for the daemon's answer, and what the journal
@@ -515,7 +483,6 @@ pub struct Workspace {
     surface_history: Vec<WarmSurface>,
     history_cursor: usize,
     overview_open: bool,
-    navigation_skips: HashMap<SurfaceKey, crate::dashboard::DealCardId>,
     last_shift_tap: Option<std::time::Instant>,
     /// When `shift` went down on its own, if it is still down and still a
     /// candidate for a tap. Cleared the moment another key or modifier
@@ -525,10 +492,6 @@ pub struct Workspace {
     shell_touch_was_multi: bool,
     shell_touch_committed: bool,
     deal_gesture_active: bool,
-    deal_session_open: bool,
-    deal_current_interacted: bool,
-    deal_view: Option<DealView>,
-    deal_focus_pending: bool,
     deal_controls_visible: bool,
     agent_last_interaction: HashMap<AgentId, i64>,
     dealer_signal_eval_scheduled: bool,
@@ -999,30 +962,6 @@ impl Workspace {
             {
                 this.desk_semantic_paste_target = None;
             }
-            if this.dashboard.deal_mode()
-                && !matches!(
-                    event.keystroke.key.as_str(),
-                    "shift"
-                        | "control"
-                        | "alt"
-                        | "platform"
-                        | "function"
-                        | "q"
-                        | "d"
-                        | "x"
-                        | "s"
-                        | "t"
-                        | "f"
-                        | "i"
-                        | "a"
-                        | "o"
-                        | "tab"
-                        | "f16"
-                        | "f20"
-                )
-            {
-                this.mark_deal_interacted();
-            }
             // A key arriving while `shift` is down means it was being held
             // for that key, so it was never a tap.
             if event.keystroke.key == "shift"
@@ -1099,17 +1038,12 @@ impl Workspace {
             surface_history: Vec::new(),
             history_cursor: 0,
             overview_open: false,
-            navigation_skips: HashMap::new(),
             last_shift_tap: None,
             shift_down_at: None,
             shell_touches: HashMap::new(),
             shell_touch_was_multi: false,
             shell_touch_committed: false,
             deal_gesture_active: false,
-            deal_session_open: false,
-            deal_current_interacted: false,
-            deal_view: None,
-            deal_focus_pending: false,
             deal_controls_visible: false,
             agent_last_interaction: HashMap::new(),
             dealer_signal_eval_scheduled: false,
@@ -1402,20 +1336,14 @@ impl Workspace {
         if self.overview_open || self.active_pane().surface.key == SurfaceKey::Home {
             return;
         }
-        let was_dealing = self.dashboard.deal_mode();
-        let dealt_untouched = was_dealing && !self.deal_current_interacted;
-        if was_dealing {
-            self.skip_and_end_deal(window, cx);
-        }
         let key = self.active_pane().surface.key.clone();
         let removed = self
             .surface_history
             .iter()
             .position(|warm| warm.surface.key == key);
-        self.navigation_skips.remove(&key);
         crate::journal::record(crate::journal::Event::SurfaceClosed {
             surface: Self::journal_surface(&key),
-            dealt_untouched,
+            dealt_untouched: false,
         });
         let Some(removed) = removed else {
             if key == SurfaceKey::Draft {
@@ -1453,7 +1381,6 @@ impl Workspace {
     fn forget_discarded_draft(&mut self, cx: &mut Context<Self>) {
         self.draft_area = None;
         let key = SurfaceKey::Draft;
-        self.navigation_skips.remove(&key);
         crate::journal::record(crate::journal::Event::SurfaceClosed {
             surface: Self::journal_surface(&key),
             dealt_untouched: false,
@@ -1480,9 +1407,6 @@ impl Workspace {
     /// Home is the front door: a cold start, an emptied queue, and the
     /// overview key all land here.
     pub(crate) fn open_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dashboard.deal_mode() {
-            self.skip_and_end_deal(window, cx);
-        }
         self.overview_open = false;
         let surface = self.make_surface(SurfaceKey::Home, window, cx);
         self.display_surface(surface, cx);
@@ -1560,15 +1484,14 @@ impl Workspace {
         rows
     }
 
-    /// Enter on a Home row. Any row opens as a deal through the dealer, so
-    /// the surface, the verdict keys, undo and the timeline behave exactly
-    /// as if the card had been dealt from the top.
+    /// Enter on a Home row: the card it stands for opens, the same way a
+    /// pull opens one. Home chooses which; nothing else about it differs.
     fn home_open_row(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(view) = self.home_view() else {
             return;
         };
         let target = view.update(cx, |view, cx| view.cursor_target(cx));
-        let card = match target {
+        let wanted = match target {
             crate::home::HomeTarget::Card(card) => card,
             // A running agent is not a card: its row opens the agent.
             crate::home::HomeTarget::Agent(agent_id) => {
@@ -1577,33 +1500,14 @@ impl Workspace {
             }
             crate::home::HomeTarget::None => return,
         };
-        if self.dashboard.deal_mode() {
-            self.skip_and_end_deal(window, cx);
-        }
-        let now = chrono::Local::now().fixed_offset();
-        let threads = self.slack_thread_facts(cx);
-        if self
-            .dashboard
-            .deal_chosen(
-                &self.registry,
-                &threads,
-                now,
-                &card,
-                &self.agent_last_interaction,
-                cx,
-            )
-            .is_some()
-        {
-            self.deal_session_open = true;
-            self.present_current_deal(window, cx);
-            self.refresh_dashboard(window, cx);
-        }
+        let Some(card) = self.hand(cx).card(&wanted).cloned() else {
+            return;
+        };
+        self.open_card(card, window, cx);
+        self.refresh_dashboard(window, cx);
     }
 
     pub(crate) fn open_overview(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dashboard.deal_mode() {
-            self.skip_and_end_deal(window, cx);
-        }
         self.overview_open = true;
         self.refresh_dashboard(window, cx);
         window.focus(&self.dashboard.focus_handle(cx), cx);
@@ -1679,10 +1583,8 @@ impl Workspace {
                             {
                                 if dy < 0. {
                                     Some(Box::new(DealOpen) as Box<dyn gpui::Action>)
-                                } else if !self.dashboard.deal_mode() {
-                                    Some(Box::new(OverviewToggle) as Box<dyn gpui::Action>)
                                 } else {
-                                    None
+                                    Some(Box::new(OverviewToggle) as Box<dyn gpui::Action>)
                                 }
                             } else {
                                 None
@@ -1726,13 +1628,6 @@ impl Workspace {
         if self.overview_open || self.history_cursor == 0 {
             return;
         }
-        if self.dashboard.deal_mode()
-            && let Some(card) = self.dashboard.current_deal_card().cloned()
-        {
-            let key = self.active_pane().surface.key.clone();
-            self.navigation_skips.insert(key, card.identity.clone());
-            self.skip_and_end_deal(window, cx);
-        }
         self.history_cursor -= 1;
         let target = self.surface_history[self.history_cursor].clone();
         self.show_warm_surface(
@@ -1755,9 +1650,6 @@ impl Workspace {
         }
         self.history_cursor += 1;
         let target = self.surface_history[self.history_cursor].clone();
-        if let Some(identity) = self.navigation_skips.remove(&target.surface.key) {
-            self.dashboard.clear_skip(&identity);
-        }
         self.show_warm_surface(
             target.clone(),
             crate::journal::SurfaceShowMethod::Mru,
@@ -1806,11 +1698,11 @@ impl Workspace {
             &self.agent_last_interaction,
             cx,
         );
-        candidates.cards.retain(|card| {
-            if let Some(current) = self.dashboard.current_deal_card() {
-                return card.identity != current.identity;
-            }
-            match &self.active_pane().surface.key {
+        // What the lamp is about is what is *not* in front of the reader:
+        // the card they are already reading is not news.
+        candidates
+            .cards
+            .retain(|card| match &self.active_pane().surface.key {
                 SurfaceKey::Transcript(agent_id) => {
                     Some(card.identity.clone()) != self.dashboard.agent_card_id(*agent_id)
                 }
@@ -1818,8 +1710,7 @@ impl Workspace {
                     Some(card.identity.clone()) != self.dashboard.page_card_id(*page)
                 }
                 _ => true,
-            }
-        });
+            });
         let warm_agents = candidates
             .cards
             .iter()
@@ -1837,7 +1728,7 @@ impl Workspace {
         // the dealer is invalidated and never on a timer.
         self.refresh_home(cx);
         let top = candidates.cards.first();
-        if self.phone.enabled && top.is_some() && !self.dashboard.deal_mode() {
+        if self.phone.enabled && top.is_some() {
             self.phone.feed_retry = true;
         }
         let max_priority = top.map(|card| card.priority);
@@ -3609,7 +3500,11 @@ impl Workspace {
     ) {
         let days = count.unwrap_or(1).max(1) as i64;
         let today = chrono::Local::now().date_naive();
-        let Some((_host, room_node)) = self.dashboard.current_tree_room_node() else {
+        let Some(card) = self.card_in_view(cx) else {
+            self.echo("snooze: nothing under the deal", StyleClass::SystemInfo, cx);
+            return;
+        };
+        let Some((_host, room_node)) = self.dashboard.tree_room_node(&card) else {
             return;
         };
         if !self.submit_tree_verdict(
@@ -5396,7 +5291,7 @@ impl Workspace {
             self.deal_gesture_active = false;
         } else if event.delta.precise() && !self.deal_gesture_active {
             let delta = event.delta.pixel_delta(px(20.));
-            if self.dashboard.deal_mode() && delta.y > px(12.) && delta.y.abs() > delta.x.abs() {
+            if delta.y > px(12.) && delta.y.abs() > delta.x.abs() {
                 self.deal_gesture_active = true;
                 window.dispatch_action(Box::new(DealOpen), cx);
             }
@@ -6046,8 +5941,8 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn dashboard_deal_mode_for_test(&self) -> bool {
-        self.dashboard.deal_mode()
+    pub(crate) fn dashboard_deal_mode_for_test(&mut self, cx: &mut Context<Self>) -> bool {
+        self.card_in_view(cx).is_some()
     }
 
     #[cfg(test)]
@@ -6214,9 +6109,6 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.dashboard.end_deal(cx);
-        self.end_deal_session();
-        self.deal_view = None;
         let transcript = self.make_surface(SurfaceKey::Transcript(agent_id), window, cx);
         self.display_surface_with_method(
             transcript,
@@ -6242,11 +6134,10 @@ impl Workspace {
 
     #[cfg(test)]
     pub(crate) fn current_deal_card_for_test(
-        &self,
+        &mut self,
+        cx: &mut Context<Self>,
     ) -> Option<(crate::dashboard::DealCardId, crate::dashboard::DealCardKind)> {
-        self.dashboard
-            .current_deal_card()
-            .map(|card| (card.identity.clone(), card.kind))
+        self.card_in_view(cx).map(|card| (card.identity, card.kind))
     }
 
     #[cfg(test)]
@@ -6257,42 +6148,20 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> bool {
         for _ in 0..8 {
-            if self
-                .dashboard
-                .current_deal_card()
-                .is_some_and(|card| wanted(card.kind))
-            {
+            if self.card_in_view(cx).is_some_and(|card| wanted(card.kind)) {
                 return true;
             }
-            self.deal_next(window, cx);
+            self.pull_card(window, cx);
         }
         false
     }
 
     #[cfg(test)]
-    pub(crate) fn rendered_deal_card_for_test(
-        &self,
-    ) -> Option<(crate::dashboard::DealCardId, crate::dashboard::DealCardKind)> {
-        let card = self.dashboard.current_deal_card()?;
-        if let Some(view) = &self.deal_view {
-            return Some((view.identity(), card.kind));
-        }
-        match card.kind {
-            crate::dashboard::DealCardKind::Desk | crate::dashboard::DealCardKind::Thread => {}
-            crate::dashboard::DealCardKind::Agent if card.agent_id.is_some() => {}
-            _ => return None,
-        }
-        Some((card.identity.clone(), card.kind))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn current_deal_card_value_for_test(&self) -> Option<crate::dashboard::DealCard> {
-        self.dashboard.current_deal_card().cloned()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reopen_deal_for_test(&mut self, card: crate::dashboard::DealCard) {
-        self.dashboard.reopen_deal(card);
+    pub(crate) fn current_deal_card_value_for_test(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<crate::dashboard::DealCard> {
+        self.card_in_view(cx)
     }
 
     /// The state a cold start used to leave behind before Home took the
@@ -6321,27 +6190,19 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let card = self.dashboard.current_deal_card().cloned();
-        if let Some(card) = &card {
-            match card.kind {
-                crate::dashboard::DealCardKind::Agent => {
-                    if let Some(agent_id) = card.agent_id {
-                        self.select_agent_inner(Some(agent_id), true, window, cx);
-                        return;
-                    }
-                }
-                crate::dashboard::DealCardKind::Desk | crate::dashboard::DealCardKind::Thread => {}
-            }
+        let card = self.card_in_view(cx);
+        if let Some(card) = &card
+            && matches!(card.kind, crate::dashboard::DealCardKind::Agent)
+            && let Some(agent_id) = card.agent_id
+        {
+            self.select_agent_inner(Some(agent_id), true, window, cx);
+            return;
         }
-        let focus = match self.deal_view.as_ref() {
-            Some(DealView::Desk { editor, .. }) => editor.focus_handle(cx),
-            Some(DealView::Surface { surface, .. }) => match &surface.view {
-                SurfaceView::DeskNode(editor) => editor.focus_handle(cx),
-                SurfaceView::Transcript { editor, .. } => editor.focus_handle(cx),
-                SurfaceView::Browser(view) => view.read(cx).focus_handle(cx),
-                _ => return,
-            },
-            None => self.dashboard.editor().read(cx).focus_handle(cx),
+        let focus = match &self.active_pane().surface.view {
+            SurfaceView::DeskNode(editor) => editor.focus_handle(cx),
+            SurfaceView::Transcript { editor, .. } => editor.focus_handle(cx),
+            SurfaceView::Browser(view) => view.read(cx).focus_handle(cx),
+            _ => self.dashboard.editor().read(cx).focus_handle(cx),
         };
         window.focus(&focus, cx);
     }
@@ -6746,8 +6607,7 @@ impl Workspace {
         }
         if let Some(verdict) = self.pending_tree_verdicts.remove(&(host, stamp)) {
             let submitted_card_is_current = self
-                .dashboard
-                .current_deal_card()
+                .card_in_view(cx)
                 .is_some_and(|card| card.identity == verdict.event.card);
             let undo_sequence = verdict.undo.sequence;
             self.restore_verdict_undo(verdict.undo);
@@ -7378,46 +7238,11 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        let Some(target) = self.label_target(cx) else {
+        if self.label_target(cx).is_none() {
             return false;
-        };
-        // Dealing it makes the verdicts land as verdicts, so the dealer and
-        // the journal see them. Nothing in the queue for this thing is fine:
-        // the menu still opens, and the items that need a card say so.
-        self.adopt_surface_card(target, window, cx);
+        }
         self.open_transient(crate::transient::verdict_menu(), window, cx);
         true
-    }
-
-    /// Makes the card in view the one the verdicts write to. A card that is
-    /// not in the dealer's hand is one nothing is owed on, so there is no
-    /// verdict to make and the tap falls through.
-    fn adopt_surface_card(
-        &mut self,
-        target: (HostId, rho_desk::cells::Id),
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        let (host, node_id) = target;
-        let wanted = crate::dashboard::DealCardId { host, node_id };
-        if self
-            .dashboard
-            .current_deal_card()
-            .is_some_and(|card| card.identity == wanted)
-        {
-            return true;
-        }
-        let threads = self.slack_thread_facts(cx);
-        self.dashboard
-            .deal_chosen(
-                &self.registry,
-                &threads,
-                chrono::Local::now().fixed_offset(),
-                &wanted,
-                &self.agent_last_interaction,
-                cx,
-            )
-            .is_some()
     }
 
     /// The count an item was given, if any. Taken rather than read: a count
@@ -7670,19 +7495,22 @@ impl Workspace {
         self.step_surface_back(window, cx);
     }
 
+    /// `j` in the verdict transient, and `ctrl-j`: one pull.
+    /// Forward through the history if the reader has stepped back, a pull
+    /// otherwise: `space j` only deals when there is nothing ahead of it.
     pub(crate) fn cmd_surface_forward_or_deal(
         &mut self,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if !self.step_surface_forward(window, cx) {
-            self.deal_next(window, cx);
+            self.pull_card(window, cx);
         }
     }
 
     pub(crate) fn cmd_close_and_deal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.close_current_surface(window, cx);
-        self.deal_next(window, cx);
+        self.pull_card(window, cx);
     }
 
     pub(crate) fn cmd_toggle_raw_desk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -7693,40 +7521,17 @@ impl Workspace {
         self.refresh_dashboard(window, cx);
     }
 
-    pub(crate) fn open_deal_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.deal_next(window, cx);
-        cx.notify();
-    }
-
-    fn end_deal_session(&mut self) {
-        if std::mem::take(&mut self.deal_session_open) {
-            crate::journal::record(crate::journal::Event::DealMode {
-                action: crate::journal::DealModeAction::Exit,
-                card: None,
-            });
-        }
-    }
-
-    fn mark_deal_interacted(&mut self) {
-        if !self.dashboard.deal_mode() || self.deal_current_interacted {
-            return;
-        }
-        self.deal_current_interacted = true;
-        crate::journal::record(crate::journal::Event::DealMode {
-            action: crate::journal::DealModeAction::Interacted,
-            card: self
-                .dashboard
-                .current_deal_card()
-                .map(|card| Self::journal_card_identity(&card.identity)),
-        });
-    }
-
-    fn present_current_deal(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some(card) = self.dashboard.current_deal_card().cloned() else {
-            return false;
-        };
-        self.deal_current_interacted = false;
-        self.deal_view = None;
+    /// Opens a card as an ordinary surface: the note, the transcript, the
+    /// conversation. Nothing about it is a mode; the verdict keys reach it
+    /// because it is what the reader is on.
+    pub(crate) fn open_card(
+        &mut self,
+        card: crate::dashboard::DealCard,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.dashboard
+            .move_to_tree_node_when_ready(card.host, card.topic_node_id.clone());
         let host = card.identity.host;
         let node_id = card.identity.node_id.clone();
         let surface = match self.dashboard.card_target(card.identity.clone()) {
@@ -7753,11 +7558,6 @@ impl Workspace {
             // message that raised the card on screen.
             crate::dashboard::CardTarget::Thread(unit) => {
                 if self.open_slack_deal(&unit, window, cx) {
-                    self.deal_view = Some(DealView::Surface {
-                        identity: card.identity,
-                        surface: self.active_pane().surface.clone(),
-                    });
-                    self.finish_presenting_deal(window, cx);
                     return true;
                 }
                 self.dashboard
@@ -7785,94 +7585,40 @@ impl Workspace {
                 }
             }
         };
-        self.deal_view = Some(DealView::Surface {
-            identity: card.identity,
-            surface: surface.clone(),
-        });
         self.display_surface_with_method(surface, crate::journal::SurfaceShowMethod::Deal, cx);
         if self.phone.enabled {
             window.focus(&self.phone.dashboard_focus, cx);
         } else {
             self.focus_active_surface(window, cx);
         }
-        self.finish_presenting_deal(window, cx);
+        cx.notify();
         true
     }
 
-    /// The editor the current deal is being read in, when the dealt surface
-    /// has one. A browser page and a picture do not.
-    fn deal_editor(&self, cx: &App) -> Option<Entity<editor::Editor>> {
-        Self::surface_editor(&self.active_pane().surface.view, cx)
-    }
-
-    /// The editor a surface is read in, if it has one. Deal mode is entered
-    /// and left on this editor directly, so every surface kind that can be
-    /// dealt must be listed here or its keyboard never enters DEAL.
-    fn surface_editor(view: &SurfaceView, cx: &App) -> Option<Entity<editor::Editor>> {
-        match view {
-            SurfaceView::DeskNode(editor) => Some(editor.clone()),
-            SurfaceView::Transcript { editor, .. } => Some(editor.clone()),
-            SurfaceView::SlackConversation(view) => Some(view.read(cx).editor().clone()),
-            _ => None,
-        }
-    }
-
-    /// Ends the deal session. There is no keyboard mode to leave with it:
-    /// the surface was read in ordinary vim throughout, which is the point
-    /// of the verdict transient.
-    fn leave_deal_mode(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        self.deal_view = None;
-        self.deal_controls_visible = false;
-        self.deal_current_interacted = false;
-        self.end_deal_session();
-        cx.notify();
-    }
-
-    fn finish_presenting_deal(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        crate::journal::record(crate::journal::Event::DealMode {
-            action: crate::journal::DealModeAction::Enter,
-            card: self
-                .dashboard
-                .current_deal_card()
-                .map(|card| Self::journal_card_identity(&card.identity)),
-        });
-        if self.phone.enabled {
-            self.deal_focus_pending = false;
-            cx.notify();
-            return;
-        }
-        self.deal_focus_pending = true;
-        cx.notify();
-    }
-
-    fn deal_next(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// One pull: rank everything that is open, pass over the card in view,
+    /// and open the most important of the rest. Nothing is retained, so two
+    /// pulls in a row see the same world and the skip is what moves them on.
+    pub(crate) fn pull_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.phone.enabled
-            && (self.phone_snap_in_progress() || self.phone_current_deal_has_pending_tree_verdict())
+            && (self.phone_snap_in_progress()
+                || self.phone_current_deal_has_pending_tree_verdict(cx))
         {
             return;
         }
-        if self.dashboard.deal_mode() {
-            self.skip_and_end_deal(window, cx);
-        }
-        let exclude = self.displayed_deal_identity();
         let now = chrono::Local::now().fixed_offset();
-        let threads = self.slack_thread_facts(cx);
-        if self
-            .dashboard
-            .pull_deal(
-                &self.registry,
-                &threads,
-                now,
-                exclude.as_ref(),
-                &self.agent_last_interaction,
-                cx,
-            )
-            .is_some()
+        let in_view = self.card_in_view(cx);
+        let hand = self.hand(cx);
+        // Reading a card and pulling again is what a skip is: the card is
+        // still owed, it is just not what to look at next.
+        if let Some(card) = &in_view
+            && let Some(cursor) = hand.cursor(&card.identity).cloned()
         {
-            self.deal_session_open = true;
-            self.present_current_deal(window, cx);
-            self.refresh_dashboard(window, cx);
-        } else {
+            self.dashboard.skip_card(card, cursor, now);
+        }
+        let Some(card) = hand
+            .top(in_view.as_ref().map(|card| &card.identity))
+            .cloned()
+        else {
             // Empty lands on Home rather than on whatever was last open:
             // there is nothing to deal, so the glance is the answer. Home
             // says so in the buffer, so the echo area is left alone and the
@@ -7883,36 +7629,9 @@ impl Workspace {
                 cx,
             );
             self.open_home(window, cx);
-        }
-    }
-
-    fn displayed_deal_identity(&self) -> Option<crate::dashboard::DealCardId> {
-        match &self.active_pane().surface.key {
-            SurfaceKey::Transcript(agent_id) => self.dashboard.agent_card_id(*agent_id),
-            _ => self
-                .dashboard
-                .current_deal_card()
-                .map(|card| card.identity.clone()),
-        }
-    }
-
-    fn skip_and_end_deal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(card) = self.dashboard.current_deal_card().cloned() {
-            self.dashboard
-                .skip_card(card.identity, chrono::Local::now().fixed_offset(), cx);
-        }
-        self.dashboard.end_deal(cx);
-        self.leave_deal_mode(window, cx);
-    }
-
-    fn finish_dashboard_deal_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.deal_view = None;
-        self.deal_controls_visible = false;
-        if self.dashboard.deal_mode() {
-            self.present_current_deal(window, cx);
-        } else {
-            self.leave_deal_mode(window, cx);
-        }
+            return;
+        };
+        self.open_card(card, window, cx);
         self.refresh_dashboard(window, cx);
     }
 
@@ -7942,16 +7661,45 @@ impl Workspace {
         self.context_area(cx)
     }
 
-    /// Whether the card in hand is the thing the reader is on. The verdicts
-    /// only a card can take ask this first: with the eye on a page row, `d`
-    /// is not about the card the queue happens to hold.
+    /// The ranking as it stands. Nothing is kept between two of these: a
+    /// pull, Home, and a verdict all ask again and all see the same facts.
+    pub(crate) fn hand(&mut self, cx: &mut Context<Self>) -> crate::dashboard::DealQueue {
+        let now = chrono::Local::now().fixed_offset();
+        let threads = self.slack_thread_facts(cx);
+        self.dashboard.dealer_hand(
+            &self.registry,
+            &threads,
+            now,
+            &self.agent_last_interaction,
+            cx,
+        )
+    }
+
+    /// The card the reader is on: the one behind the surface in view, or
+    /// the row under the map's cursor. When the ranking holds no card for
+    /// that node the node itself is the card, because reading a thing can
+    /// be what quiets it and it is still what is on screen.
+    pub(crate) fn card_in_view(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Option<crate::dashboard::DealCard> {
+        // Home is a list of cards rather than a card: a pull from it opens
+        // the most important one instead of passing over it.
+        if !self.overview_open && self.active_pane().surface.key == SurfaceKey::Home {
+            return None;
+        }
+        let (host, node_id) = self.label_target(cx)?;
+        let hand = self.hand(cx);
+        hand.card(&crate::dashboard::DealCardId {
+            host,
+            node_id: node_id.clone(),
+        })
+        .cloned()
+        .or_else(|| self.dashboard.card_for_node(host, node_id, cx))
+    }
+
     fn deal_card_is_target(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some((host, node_id)) = self.label_target(cx) else {
-            return false;
-        };
-        self.dashboard
-            .current_deal_card()
-            .is_some_and(|card| card.identity.host == host && card.identity.node_id == node_id)
+        self.card_in_view(cx).is_some()
     }
 
     pub(crate) fn label_card(
@@ -8086,8 +7834,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let dealt = self
-            .dashboard
-            .current_deal_card()
+            .card_in_view(cx)
             .is_some_and(|card| card.identity.node_id == target);
         if dealt {
             if !self.submit_tree_verdict(
@@ -8119,11 +7866,8 @@ impl Workspace {
     }
 
     fn finish_deal_verdict(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.dashboard.end_deal(cx);
-        // Exit the dealt editor while it is still focused. GPUI captures the
-        // focus target when dispatching, so doing this after close would send
-        // ExitDealMode to the replacement surface instead.
-        self.finish_dashboard_deal_action(window, cx);
+        // The card was read as an ordinary surface, so a verdict just closes
+        // it; what comes next is the next pull, not a queue step.
         self.close_current_surface(window, cx);
         self.cmd_surface_forward_or_deal(window, cx);
     }
@@ -8169,9 +7913,7 @@ impl Workspace {
             StyleClass::SystemInfo,
             cx,
         );
-        self.dashboard.reopen_deal(card);
-        self.deal_session_open = true;
-        self.present_current_deal(window, cx);
+        self.open_card(card, window, cx);
         self.refresh_dashboard(window, cx);
     }
 
@@ -8301,7 +8043,8 @@ impl Workspace {
 
     pub(crate) fn undo_verdict(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.phone.enabled
-            && (self.phone_snap_in_progress() || self.phone_current_deal_has_pending_tree_verdict())
+            && (self.phone_snap_in_progress()
+                || self.phone_current_deal_has_pending_tree_verdict(cx))
         {
             return;
         }
@@ -8344,18 +8087,20 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> bool {
         if self.phone.enabled
-            && (self.phone_snap_in_progress() || self.phone_current_deal_has_pending_tree_verdict())
+            && (self.phone_snap_in_progress()
+                || self.phone_current_deal_has_pending_tree_verdict(cx))
         {
             return false;
         }
-        let Some(card) = self.dashboard.current_deal_card().cloned() else {
+        let Some(card) = self.card_in_view(cx) else {
             return false;
         };
-        let Some(event) = self
-            .dashboard
-            .prepare_deal_verdict(verdict, chrono::Local::now().fixed_offset())
-        else {
-            return false;
+        let event = crate::dashboard::DealerEvent {
+            card: card.identity.clone(),
+            kind: card.kind,
+            verdict,
+            at: chrono::Local::now().fixed_offset(),
+            skip_until: None,
         };
         // The verdict lands on the card's own node: an agent card marks the
         // agent, a thread card marks the thread. `target_node` is the room
@@ -8447,33 +8192,6 @@ impl Workspace {
         let writes = vec![rho_desk::cells::CellWrite { id, property }];
         self.apply_desk_writes(host, writes, None, window, cx)
             .is_some()
-    }
-
-    fn defer_deal_edit(
-        &mut self,
-        action_name: &'static str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        cx.defer_in(window, move |_, window, cx| {
-            if let Ok(action) = cx.build_action("vim::EnterDealMode", None) {
-                window.dispatch_action(action, cx);
-            }
-            cx.defer_in(window, move |_, window, cx| {
-                if let Ok(action) = cx.build_action(action_name, None) {
-                    window.dispatch_action(action, cx);
-                }
-            });
-        });
-    }
-
-    fn focus_taken_agent_prompt(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let SurfaceView::Transcript { model, editor } = &self.active_pane().surface.view else {
-            return;
-        };
-        let model = model.clone();
-        let editor = editor.clone();
-        model.update(cx, |model, cx| model.focus_prompt(&editor, window, cx));
     }
 
     /// `n a` with an area chosen: the draft page carries the fields, so
@@ -9282,83 +9000,6 @@ impl Workspace {
             })
     }
 
-    fn deal_body(
-        &mut self,
-        card: &crate::dashboard::DealCard,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let created = self
-            .deal_view
-            .as_ref()
-            .is_none_or(|view| !view.matches(&card.identity));
-        if created {
-            let view = if matches!(card.kind, crate::dashboard::DealCardKind::Desk) {
-                Some(DealView::Desk {
-                    identity: card.identity.clone(),
-                    editor: self.dashboard.editor().clone(),
-                })
-            } else if matches!(card.kind, crate::dashboard::DealCardKind::Agent) {
-                card.agent_id.map(|agent_id| {
-                    let surface = self.make_surface(SurfaceKey::Transcript(agent_id), window, cx);
-                    DealView::Surface {
-                        identity: card.identity.clone(),
-                        surface,
-                    }
-                })
-            } else {
-                // A thread deals as its conversation surface, which the deal
-                // presenter opens; nothing to build here.
-                None
-            };
-            self.deal_view = view;
-        }
-
-        if created && !self.phone.enabled {
-            let focus = match self.deal_view.as_ref() {
-                Some(DealView::Desk { editor, .. }) => Some(editor.focus_handle(cx)),
-                Some(DealView::Surface { surface, .. }) => {
-                    Self::surface_editor(&surface.view, cx).map(|editor| editor.focus_handle(cx))
-                }
-                None => None,
-            };
-            if let Some(focus) = focus {
-                let identity = card.identity.clone();
-                cx.defer_in(window, move |this, window, cx| {
-                    if !this.dashboard.deal_mode()
-                        || this
-                            .dashboard
-                            .current_deal_card()
-                            .is_none_or(|card| card.identity != identity)
-                    {
-                        return;
-                    }
-                    window.focus(&focus, cx);
-                });
-            }
-        }
-
-        if std::mem::take(&mut self.deal_focus_pending) && !self.phone.enabled {
-            cx.defer_in(window, |this, window, cx| {
-                if !this.dashboard.deal_mode() {
-                    return;
-                }
-                this.focus_active_surface(window, cx);
-            });
-        }
-
-        match self.deal_view.as_ref() {
-            Some(DealView::Desk { editor, .. }) => div()
-                .size_full()
-                .key_context("RhoDashboard")
-                .overflow_hidden()
-                .child(editor.clone())
-                .into_any_element(),
-            Some(DealView::Surface { surface, .. }) => self.render_surface(surface),
-            None => div().size_full().into_any_element(),
-        }
-    }
-
     fn render_deal_why(
         &self,
         card: &crate::dashboard::DealCard,
@@ -9535,9 +9176,7 @@ impl Workspace {
             .read(cx)
             .plain_mode(cx)
             .unwrap_or_else(|| "normal".to_owned());
-        let mode_color = if self.dashboard.deal_mode() {
-            colors.terminal_ansi_bright_magenta
-        } else if mode.contains("insert") {
+        let mode_color = if mode.contains("insert") {
             status.warning
         } else {
             colors.terminal_ansi_bright_cyan
@@ -9654,10 +9293,13 @@ impl Workspace {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        if self.dashboard.deal_mode()
-            && let Some(card) = self.dashboard.current_deal_card()
+        // The label is about whatever is in view: with a card behind the
+        // surface it says which card and why, with the map open it is the
+        // map's own breadcrumb.
+        if !self.overview_open
+            && let Some(card) = self.card_in_view(cx)
         {
-            return self.render_deal_why(card, text_style, window, cx);
+            return self.render_deal_why(&card, text_style, window, cx);
         }
         let path = if self.overview_open {
             let path = self
@@ -9723,15 +9365,6 @@ impl Workspace {
         text_style: &gpui::TextStyle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        if self.dashboard.deal_mode()
-            && let Some(card) = self.dashboard.current_deal_card().cloned()
-        {
-            return div()
-                .size_full()
-                .key_context("RhoGuiDeal")
-                .child(self.deal_body(&card, window, cx))
-                .into_any_element();
-        }
         // Home mode: the dashboard owns the keyboard, so it owns the frame;
         // the surface area is its preview. With nothing selected there is
         // nothing to preview — the dashboard takes the whole frame.
@@ -10229,13 +9862,11 @@ impl Render for Workspace {
                 this.step_surface_back(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DealOpen, window, cx| {
-                if !this.step_surface_forward(window, cx) {
-                    this.deal_next(window, cx);
-                }
+                this.cmd_surface_forward_or_deal(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DealCloseAndNext, window, cx| {
                 this.close_current_surface(window, cx);
-                this.deal_next(window, cx);
+                this.pull_card(window, cx);
             }))
             .on_action(cx.listener(|this, _: &OverviewToggle, window, cx| {
                 this.toggle_overview(window, cx);
@@ -10386,15 +10017,11 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &DashboardDealExit, window, cx| {
                 vim::take_count(cx);
-                if this.dashboard.deal_mode() {
-                    this.close_current_surface(window, cx);
-                } else {
-                    cx.propagate();
-                }
+                this.close_current_surface(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardDealNext, window, cx| {
                 vim::take_count(cx);
-                this.deal_next(window, cx);
+                this.pull_card(window, cx);
             }))
             .on_action(cx.listener(|this, _: &UndoVerdict, window, cx| {
                 vim::take_count(cx);
@@ -10402,37 +10029,11 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &DashboardDealDone, window, cx| {
                 vim::take_count(cx);
-                if this.dashboard.current_deal_card().is_some() {
-                    if !this.submit_tree_verdict(
-                        None,
-                        crate::desk_view::DeskVerdict::Done,
-                        crate::dashboard::DealerVerdict::Done,
-                        "done".to_owned(),
-                        window,
-                        cx,
-                    ) {
-                        this.echo("done: the note is unavailable", StyleClass::SystemInfo, cx);
-                    }
-                    return;
-                }
-                this.echo("done: nothing under the deal", StyleClass::SystemInfo, cx);
+                this.verdict_done(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardDealMute, window, cx| {
                 vim::take_count(cx);
-                if this.dashboard.current_deal_card().is_some() {
-                    if !this.submit_tree_verdict(
-                        None,
-                        crate::desk_view::DeskVerdict::Mute,
-                        crate::dashboard::DealerVerdict::Mute,
-                        "mute".to_owned(),
-                        window,
-                        cx,
-                    ) {
-                        this.echo("mute: the note is unavailable", StyleClass::SystemInfo, cx);
-                    }
-                    return;
-                }
-                this.echo("mute: nothing under the deal", StyleClass::SystemInfo, cx);
+                this.verdict_mute(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardDealSnooze, window, cx| {
                 let count = vim::take_count(cx);
@@ -10458,160 +10059,17 @@ impl Render for Workspace {
             )
             .on_action(
                 cx.listener(|this, _: &DashboardDealRoomSnooze, window, cx| {
-                    let count = vim::take_count(cx).unwrap_or(1) as u32;
-                    let today = chrono::Local::now().date_naive();
-                    if let Some((_host, room_node)) = this.dashboard.current_tree_room_node() {
-                        let days = count.max(1);
-                        if !this.submit_tree_verdict(
-                            Some(room_node),
-                            crate::desk_view::DeskVerdict::Defer {
-                                until: crate::desk_view::day_timestamp(
-                                    today + chrono::Duration::days(i64::from(days)),
-                                ),
-                            },
-                            crate::dashboard::DealerVerdict::Defer,
-                            format!("snooze {days}d"),
-                            window,
-                            cx,
-                        ) {
-                            this.echo(
-                                "room snooze: the room is unavailable",
-                                StyleClass::SystemInfo,
-                                cx,
-                            );
-                        }
-                        return;
-                    }
+                    let count = vim::take_count(cx);
+                    this.verdict_room_snooze(count, window, cx);
                 }),
             )
             .on_action(cx.listener(|this, _: &DashboardDealTodo, window, cx| {
-                let count = vim::take_count(cx).unwrap_or(7) as u32;
-                let today = chrono::Local::now().date_naive();
-                if this.dashboard.current_deal_card().is_some() {
-                    let days = count.max(1);
-                    if !this.submit_tree_verdict(
-                        None,
-                        crate::desk_view::DeskVerdict::Todo {
-                            defer_until: crate::desk_view::day_timestamp(today),
-                            pace: days,
-                        },
-                        crate::dashboard::DealerVerdict::Done,
-                        "todo".to_owned(),
-                        window,
-                        cx,
-                    ) {
-                        this.echo("todo: the note is unavailable", StyleClass::SystemInfo, cx);
-                    }
-                    return;
-                }
-                let result: Result<(), &'static str> = Err("the dealt item has no node");
-                let handled = result.is_ok();
-                if handled {
-                    this.dashboard.record_deal_verdict_as(
-                        crate::dashboard::DealerVerdict::Done,
-                        chrono::Local::now().fixed_offset(),
-                    );
-                    this.finish_deal_verdict(window, cx);
-                }
-                if let Err(reason) = result {
-                    this.echo(&format!("todo: {reason}"), StyleClass::SystemInfo, cx);
-                } else {
-                    this.echo(
-                        &format!("todo: {}d", count.max(1)),
-                        StyleClass::SystemInfo,
-                        cx,
-                    );
-                }
+                let count = vim::take_count(cx);
+                this.verdict_todo(count, window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardDealRefresh, window, cx| {
                 vim::take_count(cx);
-                if !this.dashboard.deal_mode() {
-                    cx.propagate();
-                    return;
-                }
-                this.deal_next(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &DashboardDealInsert, window, cx| {
-                vim::take_count(cx);
-                let deal_agent = this
-                    .dashboard
-                    .current_deal_card()
-                    .and_then(|card| card.agent_id);
-                let edits_agent = deal_agent.is_some();
-                this.mark_deal_interacted();
-                if let Some(agent_id) = deal_agent {
-                    this.dashboard.end_deal(cx);
-                    this.end_deal_session();
-                    this.deal_view = None;
-                    this.overview_open = false;
-                    this.select_agent_inner(Some(agent_id), true, window, cx);
-                    // The transcript surface is still hidden behind the
-                    // focused Desk preview until the next render. Blurring
-                    // lets that render mount the selected surface; the
-                    // deferred focus below can then enter its composer.
-                    window.blur();
-                    cx.defer_in(window, move |_this, window, cx| {
-                        cx.defer_in(window, move |this, window, cx| {
-                            let Some(surface) = this
-                                .find_surface(|surface| {
-                                    surface.key == SurfaceKey::Transcript(agent_id)
-                                })
-                                .cloned()
-                            else {
-                                return;
-                            };
-                            let SurfaceView::Transcript { model, editor } = surface.view else {
-                                return;
-                            };
-                            model.update(cx, |model, cx| model.focus_prompt(&editor, window, cx));
-                            vim::enter_deal_insert_mode(&editor, window, cx);
-                        });
-                    });
-                }
-                let edits_desk = matches!(
-                    this.dashboard.current_deal_card().map(|card| card.kind),
-                    Some(crate::dashboard::DealCardKind::Desk)
-                );
-                if edits_desk {
-                    this.dashboard.prepare_taken_deal_edit(cx);
-                    this.refresh_dashboard(window, cx);
-                }
-                if !edits_agent {
-                    this.focus_taken_agent_prompt(window, cx);
-                }
-                if edits_desk {
-                    if let Ok(action) = cx.build_action("vim::DealInsert", None) {
-                        window.dispatch_action(action, cx);
-                    }
-                } else if !edits_agent {
-                    this.defer_deal_edit("vim::DealInsert", window, cx);
-                }
-            }))
-            .on_action(cx.listener(|this, _: &DashboardDealAppend, window, cx| {
-                vim::take_count(cx);
-                this.mark_deal_interacted();
-                if matches!(
-                    this.dashboard.current_deal_card().map(|card| card.kind),
-                    Some(crate::dashboard::DealCardKind::Desk)
-                ) {
-                    this.dashboard.prepare_taken_deal_edit(cx);
-                    this.refresh_dashboard(window, cx);
-                }
-                this.focus_taken_agent_prompt(window, cx);
-                this.defer_deal_edit("vim::DealAppend", window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &DashboardDealOpenLine, window, cx| {
-                vim::take_count(cx);
-                this.mark_deal_interacted();
-                if matches!(
-                    this.dashboard.current_deal_card().map(|card| card.kind),
-                    Some(crate::dashboard::DealCardKind::Desk)
-                ) {
-                    this.dashboard.prepare_taken_deal_edit(cx);
-                    this.refresh_dashboard(window, cx);
-                }
-                this.focus_taken_agent_prompt(window, cx);
-                this.defer_deal_edit("vim::DealOpenLine", window, cx);
+                this.pull_card(window, cx);
             }))
             .on_action(cx.listener(|this, _: &DashboardDealFile, window, cx| {
                 vim::take_count(cx);
@@ -10619,10 +10077,10 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &DashboardDealReply, window, cx| {
                 vim::take_count(cx);
-                let Some(card) = this.dashboard.current_deal_card().cloned() else {
+                let Some(card) = this.card_in_view(cx) else {
                     return;
                 };
-                let target = this.dashboard.card_target(card.identity);
+                let target = this.dashboard.card_target(card.identity.clone());
                 let opens_page = matches!(target, crate::dashboard::CardTarget::Page(_));
                 let opens_slack =
                     this.phone.enabled && matches!(target, crate::dashboard::CardTarget::Thread(_));
@@ -10633,14 +10091,11 @@ impl Render for Workspace {
                 {
                     return;
                 }
-                this.dashboard.record_deal_verdict_as(
+                this.dashboard.record_verdict(
+                    &card,
                     crate::dashboard::DealerVerdict::Open,
                     chrono::Local::now().fixed_offset(),
                 );
-                if !this.dashboard.end_deal(cx) {
-                    return;
-                }
-                this.leave_deal_mode(window, cx);
                 match target {
                     crate::dashboard::CardTarget::Page(page) => {
                         this.open_browser_page(page, window, cx);

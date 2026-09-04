@@ -11,7 +11,6 @@
 //! but can never eat what the user typed.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::time::Instant;
 
 use editor::scroll::Autoscroll;
 use editor::{Editor, EditorMode, HighlightKey, Inlay, SelectionEffects, SizingBehavior};
@@ -43,7 +42,9 @@ type DraftState = (DraftTopic, Entity<Buffer>, gpui::Subscription);
 // Dealer curve tuning. These are deliberately all in one place: rho has one
 // user, so policy changes are edits, not a configuration system.
 const DEAL_QUEUE_FLOOR: f64 = -1.0;
-const SKIP_COOLDOWN_MINUTES: i64 = 15;
+/// How long a skipped card stays out of the next pull. Nothing else times
+/// out: the card is still open the whole time and Home still shows it.
+const SKIP_COOLDOWN: chrono::TimeDelta = chrono::TimeDelta::minutes(15);
 const BLOCKED_REPLY_HEAD_START: f64 = 1.0;
 const BLOCKED_REPLY_SLOPE_PER_DAY: f64 = 12.0;
 const FYI_REPLY_PACE_DAYS: f64 = 3.0;
@@ -74,7 +75,7 @@ const AGENT_RECENCY_WINDOW_MS: i64 = 60 * 60 * 1_000;
 pub(crate) fn dealer_policy_snapshot() -> crate::journal::DealerPolicySnapshot {
     crate::journal::DealerPolicySnapshot {
         queue_floor: DEAL_QUEUE_FLOOR,
-        skip_cooldown_minutes: SKIP_COOLDOWN_MINUTES,
+        skip_cooldown_minutes: SKIP_COOLDOWN.num_minutes(),
         blocked_reply_head_start: BLOCKED_REPLY_HEAD_START,
         blocked_reply_slope_per_day: BLOCKED_REPLY_SLOPE_PER_DAY,
         fyi_reply_pace_days: FYI_REPLY_PACE_DAYS,
@@ -104,6 +105,10 @@ pub struct DealCard {
     pub room: Option<String>,
     pub kind: DealCardKind,
     pub identity: DealCardId,
+    /// Passed over by a pull and still inside the cooldown, with nothing new
+    /// on its source since. It is still owed, so Home shows it and says so;
+    /// only the next pull skips over it.
+    pub skipped: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -176,8 +181,6 @@ pub struct DealerEvent {
     pub kind: DealCardKind,
     pub verdict: DealerVerdict,
     pub at: chrono::DateTime<chrono::FixedOffset>,
-    pub time_to_verdict_ms: u64,
-    pub considered_not_dealt: Vec<DealCardId>,
     pub skip_until: Option<chrono::DateTime<chrono::FixedOffset>>,
 }
 
@@ -188,8 +191,28 @@ pub struct DealQueue {
     pub total_alive: usize,
     /// Number selected by global priority.
     pub dealt_count: usize,
-    considered_not_dealt: Vec<DealCardId>,
-    fingerprints: HashMap<DealCardId, DealFingerprint>,
+    /// Where each card's source stands, which is what a skip records.
+    cursors: HashMap<DealCardId, CardCursor>,
+}
+
+impl DealQueue {
+    /// The card a pull opens: the top of the ranking that is not skipped and
+    /// is not the one already in view.
+    pub fn top(&self, exclude: Option<&DealCardId>) -> Option<&DealCard> {
+        self.cards
+            .iter()
+            .filter(|card| !card.skipped)
+            .find(|card| exclude.is_none_or(|excluded| card.identity != *excluded))
+    }
+
+    pub fn card(&self, identity: &DealCardId) -> Option<&DealCard> {
+        self.cards.iter().find(|card| &card.identity == identity)
+    }
+
+    /// Where the card's source stands, which is what a skip holds on to.
+    pub fn cursor(&self, identity: &DealCardId) -> Option<&CardCursor> {
+        self.cursors.get(identity)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -198,21 +221,23 @@ pub struct DealQueueDepth {
     pub total_alive: usize,
 }
 
-#[derive(Clone, Debug)]
-struct DealSession {
-    card: DealCard,
-    fingerprint: DealFingerprint,
-    started_at: Instant,
-    considered_not_dealt: Vec<DealCardId>,
-}
-
+/// Where a card's source stood. A skip holds one, and the source moving
+/// past it is what voids the skip: it is the same position a verdict cursor
+/// is compared against, per source, and never a rendering of one.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct DealFingerprint(String);
+pub enum CardCursor {
+    /// The newest message in the unit, which is what a Slack verdict writes.
+    Slack(rho_desk::cells::SlackTs),
+    /// The agent's own chronology and what it is asking for.
+    Agent(rho_ui_proto::UiAgentFacts, rho_ui_proto::UiAttention),
+    /// The dated mark the card stands on.
+    Desk(DeskMark, rho_desk::cells::Timestamp),
+}
 
 #[derive(Clone, Debug)]
 struct SkippedCard {
     at: chrono::DateTime<chrono::FixedOffset>,
-    fingerprint: DealFingerprint,
+    cursor: CardCursor,
 }
 
 #[derive(Clone, Copy)]
@@ -326,10 +351,7 @@ pub struct Dashboard {
     /// Phone-only composed Desk presentation: bound-agent chips collapse
     /// into colored heading bullets while desktop chrome stays unchanged.
     phone_browse_mode: bool,
-    deal_active: bool,
-    deal: Option<DealSession>,
     skipped: HashMap<DealCardId, SkippedCard>,
-    deal_empty_success: bool,
     queue_depth: DealQueueDepth,
     /// Portal occurrences whose complete runtime subtree is visible.
     /// This is transient display state and is never written to Desk.
@@ -485,7 +507,7 @@ impl Dashboard {
                         priority,
                         virtual_reply: false,
                         order,
-                        fingerprint: DealFingerprint(format!("{mark:?}:{at:?}")),
+                        cursor: CardCursor::Desk(mark, at),
                         card: DealCard {
                             label: desk_mark_label(mark, at, now.naive_local()),
                             priority,
@@ -497,6 +519,7 @@ impl Dashboard {
                             room: room.clone(),
                             kind: DealCardKind::Desk,
                             identity,
+                            skipped: false,
                         },
                     });
                 }
@@ -556,10 +579,7 @@ impl Dashboard {
                                 priority,
                                 virtual_reply: true,
                                 order,
-                                fingerprint: DealFingerprint(format!(
-                                    "{:?}:{:?}",
-                                    agent.facts, agent.attention
-                                )),
+                                cursor: CardCursor::Agent(agent.facts, agent.attention),
                                 card: DealCard {
                                     label,
                                     priority,
@@ -570,6 +590,7 @@ impl Dashboard {
                                     breadcrumb: breadcrumb.clone(),
                                     room: room.clone(),
                                     kind: DealCardKind::Agent,
+                                    skipped: false,
                                     identity: DealCardId {
                                         host: *host,
                                         node_id: machine_node_id.clone(),
@@ -607,7 +628,7 @@ impl Dashboard {
                     priority,
                     virtual_reply: false,
                     order,
-                    fingerprint: DealFingerprint(thread.latest.clone()),
+                    cursor: CardCursor::Slack(rho_desk::cells::SlackTs(thread.latest.clone())),
                     card: DealCard {
                         label,
                         priority,
@@ -618,6 +639,7 @@ impl Dashboard {
                         breadcrumb: thread.title.clone(),
                         room: Some(thread.conversation.clone()),
                         kind: DealCardKind::Thread,
+                        skipped: false,
                         identity: DealCardId {
                             host: *host,
                             node_id: node.id.clone(),
@@ -644,13 +666,15 @@ impl Dashboard {
                 })
                 .or_insert(candidate);
         }
+        // A skipped card is marked, never dropped: it is still open, so
+        // Home shows it and says so, and only the next pull passes over it.
         let mut ranked = by_topic
             .into_values()
-            .filter(|ranked| {
-                self.skipped.get(&ranked.card.identity).is_none_or(|skip| {
-                    now >= skip.at + chrono::Duration::minutes(SKIP_COOLDOWN_MINUTES)
-                        || skip.fingerprint != ranked.fingerprint
-                })
+            .map(|mut ranked| {
+                ranked.card.skipped = self.skipped.get(&ranked.card.identity).is_some_and(|skip| {
+                    now < skip.at + SKIP_COOLDOWN && skip.cursor == ranked.cursor
+                });
+                ranked
             })
             .collect::<Vec<_>>();
         ranked.sort_by(|a, b| {
@@ -659,22 +683,48 @@ impl Dashboard {
                 .then_with(|| b.virtual_reply.cmp(&a.virtual_reply))
                 .then_with(|| a.order.cmp(&b.order))
         });
-        let queue = DealQueue {
+        DealQueue {
             total_alive: ranked.len(),
             dealt_count: usize::from(!ranked.is_empty()),
-            considered_not_dealt: ranked
+            cursors: ranked
                 .iter()
-                .skip(1)
-                .take(5)
-                .map(|ranked| ranked.card.identity.clone())
-                .collect(),
-            fingerprints: ranked
-                .iter()
-                .map(|ranked| (ranked.card.identity.clone(), ranked.fingerprint.clone()))
+                .map(|ranked| (ranked.card.identity.clone(), ranked.cursor.clone()))
                 .collect(),
             cards: ranked.into_iter().map(|ranked| ranked.card).collect(),
+        }
+    }
+
+    /// A card for a node the ranking no longer holds. Reading a thing can
+    /// quiet it, and the verdict on what is still on screen has to land
+    /// anyway; it is the same node, so it is the same card.
+    pub fn card_for_node(
+        &self,
+        host: HostId,
+        node_id: rho_desk::cells::Id,
+        cx: &App,
+    ) -> Option<DealCard> {
+        let source = self.tree_hosts.get(&host)?;
+        let node = source.nodes.iter().find(|node| node.id == node_id)?;
+        let kind = match (node.slack().is_some(), node_agent(node)) {
+            (true, _) => DealCardKind::Thread,
+            (false, Some(_)) => DealCardKind::Agent,
+            (false, None) => DealCardKind::Desk,
         };
-        queue
+        Some(DealCard {
+            label: String::new(),
+            priority: 0.,
+            host,
+            topic_node_id: node_id.clone(),
+            agent_id: node_agent(node),
+            agent_tag: None,
+            breadcrumb: self.breadcrumb_for_node(host, node_id.clone(), cx)?,
+            room: self
+                .room_for_node(host, node_id.clone(), cx)
+                .map(|room| room.name),
+            kind,
+            skipped: false,
+            identity: DealCardId { host, node_id },
+        })
     }
 
     fn breadcrumb_for_node(
@@ -806,10 +856,7 @@ impl Dashboard {
             tree_new_draft_parent: None,
             raw_mode: false,
             phone_browse_mode: false,
-            deal_active: false,
-            deal: None,
             skipped: HashMap::new(),
-            deal_empty_success: false,
             queue_depth: DealQueueDepth::default(),
             pending_cursor: None,
             tree_inlay_ids: Vec::new(),
@@ -1062,14 +1109,6 @@ impl Dashboard {
         self.pending_tree_cursor = Some((host, node_id, offset));
     }
 
-    pub fn deal_mode(&self) -> bool {
-        self.deal_active
-    }
-
-    pub fn deal_waiting(&self) -> usize {
-        usize::from(self.deal.is_some())
-    }
-
     #[cfg(test)]
     pub fn deal_highlight_active_for_test(&self, cx: &App) -> bool {
         self.editor
@@ -1090,135 +1129,22 @@ impl Dashboard {
         self.tree_dealer_queue(registry, threads, now, agent_interactions, cx)
     }
 
-    /// Re-evaluates the complete dealer world and presents its highest-scoring
-    /// claim. There is deliberately no retained hand: each pull sees current
-    /// Desk text, agent facts, inbox state, and cooldowns.
-    pub fn pull_deal(
+    /// What the timeline records about a verdict. There is no session to
+    /// ask: the card is the one the reader was on, and the caller has it.
+    pub fn record_verdict(
         &mut self,
-        registry: &AgentRegistry,
-        threads: &HashMap<SlackUnit, SlackFacts>,
-        now: chrono::DateTime<chrono::FixedOffset>,
-        exclude: Option<&DealCardId>,
-        agent_interactions: &HashMap<AgentId, i64>,
-        cx: &mut Context<Workspace>,
-    ) -> Option<DealCard> {
-        let hand = self.dealer_hand(registry, threads, now, agent_interactions, cx);
-        let (card, fingerprint, considered_not_dealt) = select_deal(&hand, exclude)?;
-        Some(self.begin_deal(card, fingerprint, considered_not_dealt))
-    }
-
-    /// Deals a card the user picked out of the hand — a Home row — instead
-    /// of the top of it. Everything else about the session is the same:
-    /// the surface, the verdict keys, undo and the timeline cannot tell
-    /// the two apart.
-    pub fn deal_chosen(
-        &mut self,
-        registry: &AgentRegistry,
-        threads: &HashMap<SlackUnit, SlackFacts>,
-        now: chrono::DateTime<chrono::FixedOffset>,
-        wanted: &DealCardId,
-        agent_interactions: &HashMap<AgentId, i64>,
-        cx: &mut Context<Workspace>,
-    ) -> Option<DealCard> {
-        let hand = self.dealer_hand(registry, threads, now, agent_interactions, cx);
-        let at = hand
-            .cards
-            .iter()
-            .position(|card| card.identity == *wanted)?;
-        let card = hand.cards[at].clone();
-        let fingerprint = hand.fingerprints.get(&card.identity)?.clone();
-        let considered_not_dealt = hand
-            .cards
-            .iter()
-            .skip(at + 1)
-            .take(5)
-            .map(|card| card.identity.clone())
-            .collect();
-        Some(self.begin_deal(card, fingerprint, considered_not_dealt))
-    }
-
-    fn begin_deal(
-        &mut self,
-        card: DealCard,
-        fingerprint: DealFingerprint,
-        considered_not_dealt: Vec<DealCardId>,
-    ) -> DealCard {
-        self.deal = Some(DealSession {
-            card: card.clone(),
-            fingerprint,
-            started_at: Instant::now(),
-            considered_not_dealt,
-        });
-        self.raw_mode = false;
-        self.deal_active = true;
-        self.deal_empty_success = false;
-        self.pending_tree_cursor = Some((card.host, card.topic_node_id.clone(), 0));
-        card
-    }
-
-    pub fn reopen_deal(&mut self, card: DealCard) {
-        self.pending_tree_cursor = Some((card.host, card.topic_node_id.clone(), 0));
-        self.deal = Some(DealSession {
-            card,
-            fingerprint: DealFingerprint("verdict undo".to_owned()),
-            started_at: Instant::now(),
-            considered_not_dealt: Vec::new(),
-        });
-        self.raw_mode = false;
-        self.deal_active = true;
-        self.deal_empty_success = false;
-    }
-
-    pub fn end_deal(&mut self, cx: &mut Context<Workspace>) -> bool {
-        self.deal = None;
-        self.exit_deal_mode(cx)
-    }
-
-    pub fn exit_deal_mode(&mut self, _cx: &mut Context<Workspace>) -> bool {
-        self.deal = None;
-        std::mem::take(&mut self.deal_active)
-    }
-
-    pub fn discard_deal_session(&mut self, cx: &mut Context<Workspace>) {
-        self.end_deal(cx);
-    }
-
-    pub fn deal_accepts_verdict(&self) -> bool {
-        self.deal_active && self.deal.is_some()
-    }
-
-    pub fn record_deal_verdict_as(
-        &mut self,
+        card: &DealCard,
         verdict: DealerVerdict,
         now: chrono::DateTime<chrono::FixedOffset>,
     ) {
-        let Some(event) = self.prepare_deal_verdict(verdict, now) else {
-            return;
-        };
-        self.record_dealer_event(event);
-    }
-
-    pub fn prepare_deal_verdict(
-        &self,
-        verdict: DealerVerdict,
-        now: chrono::DateTime<chrono::FixedOffset>,
-    ) -> Option<DealerEvent> {
-        let deal = self.deal.as_ref()?;
-        let skip_until = (verdict == DealerVerdict::Skip)
-            .then(|| now + chrono::Duration::minutes(SKIP_COOLDOWN_MINUTES));
-        Some(DealerEvent {
-            card: deal.card.identity.clone(),
-            kind: deal.card.kind,
+        let skip_until = (verdict == DealerVerdict::Skip).then(|| now + SKIP_COOLDOWN);
+        self.record_dealer_event(DealerEvent {
+            card: card.identity.clone(),
+            kind: card.kind,
             verdict,
             at: now,
-            time_to_verdict_ms: deal
-                .started_at
-                .elapsed()
-                .as_millis()
-                .min(u128::from(u64::MAX)) as u64,
-            considered_not_dealt: deal.considered_not_dealt.clone(),
             skip_until,
-        })
+        });
     }
 
     pub fn record_dealer_event(&mut self, event: DealerEvent) {
@@ -1250,35 +1176,22 @@ impl Dashboard {
             kind,
             verdict,
             occurred_at: event.at.to_rfc3339(),
-            time_to_verdict_ms: event.time_to_verdict_ms,
-            considered_not_dealt: event.considered_not_dealt.iter().map(identity).collect(),
             skip_until: event.skip_until.map(|until| until.to_rfc3339()),
         });
     }
 
+    /// Passes over a card: the next pull opens something else until the
+    /// cooldown runs out or the card's source moves past where it stood.
+    /// The card stays open the whole time, and Home says it was skipped.
     pub fn skip_card(
         &mut self,
-        identity: DealCardId,
+        card: &DealCard,
+        cursor: CardCursor,
         now: chrono::DateTime<chrono::FixedOffset>,
-        _cx: &mut Context<Workspace>,
-    ) -> bool {
-        let Some(fingerprint) = self
-            .deal
-            .as_ref()
-            .filter(|deal| deal.card.identity == identity)
-            .map(|deal| deal.fingerprint.clone())
-        else {
-            return false;
-        };
-        self.skipped.insert(
-            identity,
-            SkippedCard {
-                at: now,
-                fingerprint,
-            },
-        );
-        self.record_deal_verdict_as(DealerVerdict::Skip, now);
-        true
+    ) {
+        self.skipped
+            .insert(card.identity.clone(), SkippedCard { at: now, cursor });
+        self.record_verdict(card, DealerVerdict::Skip, now);
     }
 
     pub fn clear_skip(&mut self, identity: &DealCardId) -> bool {
@@ -1290,12 +1203,9 @@ impl Dashboard {
         self.skipped.contains_key(identity)
     }
 
-    pub fn current_deal_card(&self) -> Option<&DealCard> {
-        Some(&self.deal.as_ref()?.card)
-    }
-
-    pub fn current_tree_room_node(&self) -> Option<(HostId, rho_desk::cells::Id)> {
-        let card = self.current_deal_card()?;
+    /// The room a card belongs to: the note it hangs under, walked up to
+    /// the outermost note, which is what `shift-s` snoozes.
+    pub fn tree_room_node(&self, card: &DealCard) -> Option<(HostId, rho_desk::cells::Id)> {
         let source = self.tree_hosts.get(&card.host)?;
         let mut node_id = card.topic_node_id.clone();
         loop {
@@ -2033,33 +1943,11 @@ impl Dashboard {
     }
 
     pub fn hint(&self, _cx: &mut Context<Workspace>) -> String {
-        if self.deal_active
-            && let Some(deal) = &self.deal
-        {
-            return deal_hint(deal);
-        }
-        if self.deal_empty_success {
-            return "nothing needs attention".to_owned();
-        }
         format!(
             "{} dealt · {} waiting",
             self.queue_depth.dealt_count, self.queue_depth.total_alive
         )
     }
-}
-
-fn select_deal(
-    hand: &DealQueue,
-    exclude: Option<&DealCardId>,
-) -> Option<(DealCard, DealFingerprint, Vec<DealCardId>)> {
-    let mut cards = hand
-        .cards
-        .iter()
-        .filter(|card| exclude.is_none_or(|excluded| card.identity != *excluded));
-    let card = cards.next()?.clone();
-    let fingerprint = hand.fingerprints.get(&card.identity)?.clone();
-    let considered_not_dealt = cards.take(5).map(|card| card.identity.clone()).collect();
-    Some((card, fingerprint, considered_not_dealt))
 }
 
 /// Gutter highlight marker type for reply drafts.
@@ -2209,7 +2097,7 @@ pub(crate) fn age_label(days: f64) -> String {
 
 /// A dated mark on a Desk node, as the dealer reads it: a field, never text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DeskMark {
+pub enum DeskMark {
     /// `DeferUntil`: nothing until the date, then it ages. A migrated todo
     /// keeps its cadence in `PaceDays`; a migrated defer has none.
     Wakes,
@@ -2453,12 +2341,8 @@ struct RankedDealCard {
     priority: f64,
     virtual_reply: bool,
     order: usize,
-    fingerprint: DealFingerprint,
+    cursor: CardCursor,
     card: DealCard,
-}
-
-fn deal_hint(deal: &DealSession) -> String {
-    format!("DEAL · {} · {}", deal.card.breadcrumb, deal.card.label)
 }
 
 impl Dashboard {
@@ -2837,9 +2721,6 @@ impl Dashboard {
         }
         cx.notify();
         true
-    }
-    pub fn prepare_taken_deal_edit(&mut self, _cx: &mut Context<Workspace>) -> bool {
-        self.current_deal_card().is_some()
     }
 }
 

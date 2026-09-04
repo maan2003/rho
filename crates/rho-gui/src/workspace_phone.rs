@@ -292,12 +292,12 @@ impl Workspace {
             self.phone.stack.clear();
             self.phone.transitions.clear();
             self.phone.root = PhoneRoot::Feed;
-            if self.dashboard.deal_mode() {
+            if self.card_in_view(cx).is_some() {
                 self.phone
                     .show_feed(self.active_context, self.active_pane().surface.key.clone());
             } else {
                 self.phone.feed_surface = None;
-                cx.defer_in(window, |this, window, cx| this.open_deal_mode(window, cx));
+                cx.defer_in(window, |this, window, cx| this.pull_card(window, cx));
             }
             self.update_statuses(cx);
             // Deferred: adjusting fonts and settings notifies observers,
@@ -316,15 +316,14 @@ impl Workspace {
             && std::mem::take(&mut self.phone.feed_retry)
             && self.phone.root == PhoneRoot::Feed
             && self.phone.stack.is_empty()
-            && !self.dashboard.deal_mode()
+            && self.card_in_view(cx).is_none()
         {
-            cx.defer_in(window, |this, window, cx| this.open_deal_mode(window, cx));
+            cx.defer_in(window, |this, window, cx| this.pull_card(window, cx));
         }
         if change.exited {
             self.phone.flick = None;
             self.phone.drag_offset = Pixels::ZERO;
             self.phone.snap = None;
-            self.deal_focus_pending = self.dashboard.deal_mode();
             self.update_statuses(cx);
             if self.dashboard.set_phone_browse_mode(false) {
                 cx.defer_in(window, |this, window, cx| {
@@ -440,8 +439,8 @@ impl Workspace {
     }
 
     #[cfg(test)]
-    pub(crate) fn phone_feed_for_test(&self) -> bool {
-        self.phone.enabled && self.phone.stack.is_empty() && self.dashboard.deal_mode()
+    pub(crate) fn phone_feed_for_test(&mut self, cx: &mut Context<Self>) -> bool {
+        self.phone.enabled && self.phone.stack.is_empty() && self.card_in_view(cx).is_some()
     }
 
     #[cfg(test)]
@@ -550,7 +549,7 @@ impl Workspace {
             return;
         }
 
-        if self.phone.stack.is_empty() && self.dashboard.deal_mode() {
+        if self.phone.stack.is_empty() && self.card_in_view(cx).is_some() {
             self.phone.root = PhoneRoot::Feed;
             self.restore_phone_feed(window, cx);
             cx.notify();
@@ -578,11 +577,11 @@ impl Workspace {
         };
         let Some((context, key)) = next else {
             self.phone.root = PhoneRoot::Feed;
-            if self.dashboard.deal_mode() {
+            if self.card_in_view(cx).is_some() {
                 self.restore_phone_feed(window, cx);
                 cx.notify();
             } else {
-                self.open_deal_mode(window, cx);
+                self.pull_card(window, cx);
             }
             return;
         };
@@ -603,14 +602,10 @@ impl Workspace {
     }
 
     fn phone_deal_scroll_edge(&mut self, cx: &mut Context<Self>) -> PhoneScrollEdge {
-        let editor = match self.deal_view.as_ref() {
-            Some(super::DealView::Desk { editor, .. }) => Some(editor.clone()),
-            Some(super::DealView::Surface { surface, .. }) => match &surface.view {
-                super::SurfaceView::DeskNode(editor)
-                | super::SurfaceView::Transcript { editor, .. } => Some(editor.clone()),
-                _ => None,
-            },
-            None => None,
+        let editor = match &self.active_pane().surface.view {
+            super::SurfaceView::DeskNode(editor)
+            | super::SurfaceView::Transcript { editor, .. } => Some(editor.clone()),
+            _ => None,
         };
         let Some(editor) = editor else {
             return PhoneScrollEdge::Middle;
@@ -674,12 +669,12 @@ impl Workspace {
                     && self.phone.snap.is_none()
                     && self.phone.root == PhoneRoot::Feed
                     && self.phone.stack.is_empty()
-                    && !self.phone_current_deal_has_pending_tree_verdict()
-                    && (self.dashboard.deal_mode() || !self.phone.transitions.is_empty())
+                    && !self.phone_current_deal_has_pending_tree_verdict(cx)
+                    && (self.card_in_view(cx).is_some() || !self.phone.transitions.is_empty())
                     && self.transient.is_none()
                     && self.minibuffer.is_none()
                 {
-                    let edge = if self.dashboard.deal_mode() {
+                    let edge = if self.card_in_view(cx).is_some() {
                         self.phone_deal_scroll_edge(cx)
                     } else {
                         PhoneScrollEdge::Both
@@ -733,7 +728,7 @@ impl Workspace {
                 if let Some(direction) = direction {
                     window.prevent_default();
                     cx.stop_propagation();
-                    if self.dashboard.current_deal_card().is_some() {
+                    if self.card_in_view(cx).is_some() {
                         let to = match direction {
                             crate::journal::PhoneFlickDirection::Up => {
                                 -window.viewport_size().height
@@ -762,11 +757,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let source = direction.and_then(|_| {
-            self.dashboard
-                .current_deal_card()
-                .map(|card| card.identity.clone())
-        });
+        let source = direction.and_then(|_| self.card_in_view(cx).map(|card| card.identity));
         let generation = self.phone.next_snap_generation;
         self.phone.next_snap_generation = self.phone.next_snap_generation.wrapping_add(1);
         self.phone.snap = Some(PhoneSnap {
@@ -790,8 +781,7 @@ impl Workspace {
                     && this.phone.root == PhoneRoot::Feed
                     && this.phone.stack.is_empty()
                     && this
-                        .dashboard
-                        .current_deal_card()
+                        .card_in_view(cx)
                         .is_some_and(|card| Some(&card.identity) == source.as_ref())
                 {
                     this.commit_phone_flick(direction, window, cx);
@@ -809,15 +799,15 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let before = self.dashboard.current_deal_card().cloned();
+        let before = self.card_in_view(cx);
         match direction {
-            crate::journal::PhoneFlickDirection::Up => self.deal_next(window, cx),
+            crate::journal::PhoneFlickDirection::Up => self.pull_card(window, cx),
             crate::journal::PhoneFlickDirection::Down => match self.phone.transitions.pop() {
                 Some(PhoneTransition::Flick(card)) => {
+                    // Flicking back is taking the skip back: the card is the
+                    // one to look at again, so it opens as it was.
                     self.dashboard.clear_skip(&card.identity);
-                    self.dashboard.reopen_deal(card);
-                    self.deal_session_open = true;
-                    self.present_current_deal(window, cx);
+                    self.open_card(card, window, cx);
                     self.refresh_dashboard(window, cx);
                 }
                 Some(PhoneTransition::Verdict(sequence))
@@ -828,7 +818,7 @@ impl Workspace {
                 Some(PhoneTransition::Verdict(_)) | None => {}
             },
         }
-        let after = self.dashboard.current_deal_card().cloned();
+        let after = self.card_in_view(cx);
         let moved_card =
             before.as_ref().map(|card| &card.identity) != after.as_ref().map(|card| &card.identity);
         if direction == crate::journal::PhoneFlickDirection::Up
@@ -889,7 +879,7 @@ impl Workspace {
     ) -> AnyElement {
         if self.phone.root == PhoneRoot::Feed
             && self.phone.stack.is_empty()
-            && let Some(card) = self.dashboard.current_deal_card().cloned()
+            && let Some(card) = self.card_in_view(cx)
         {
             let colors = cx.theme().colors();
             let (breadcrumb, label) = {
@@ -942,7 +932,7 @@ impl Workspace {
                         .child(breadcrumb),
                 )
                 .child(div().flex_none().ml_2().whitespace_nowrap().child(label));
-            let body = self.deal_body(&card, window, cx);
+            let body = self.render_surface(&self.active_pane().surface.clone());
             let card = div()
                 .id("phone-deal-card")
                 .track_focus(&self.phone.dashboard_focus)
@@ -1079,8 +1069,11 @@ impl Workspace {
             .push(PhoneTransition::Verdict(sequence));
     }
 
-    pub(super) fn phone_current_deal_has_pending_tree_verdict(&self) -> bool {
-        let Some(card) = self.dashboard.current_deal_card() else {
+    pub(super) fn phone_current_deal_has_pending_tree_verdict(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(card) = self.card_in_view(cx) else {
             return false;
         };
         self.pending_tree_verdicts
@@ -1117,21 +1110,15 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.phone.snap.is_some() || self.phone_current_deal_has_pending_tree_verdict() {
+        if self.phone.snap.is_some() || self.phone_current_deal_has_pending_tree_verdict(cx) {
             return;
         }
-        let before = self
-            .dashboard
-            .current_deal_card()
-            .map(|card| card.identity.clone());
+        let before = self.card_in_view(cx).map(|card| card.identity);
         let pending_before = self.pending_tree_verdicts.len();
         let undo_before = self.verdict_undo.last().map(|entry| entry.sequence);
         run(self, window, cx);
         cx.defer_in(window, move |this, _window, cx| {
-            let after = this
-                .dashboard
-                .current_deal_card()
-                .map(|card| card.identity.clone());
+            let after = this.card_in_view(cx).map(|card| card.identity);
             let submitted = this.pending_tree_verdicts.len() > pending_before;
             if before.is_some() && (before != after || submitted) {
                 if !submitted
@@ -1306,12 +1293,6 @@ impl Workspace {
     }
 
     pub(crate) fn phone_open_desk(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dashboard.deal_mode() {
-            self.dashboard.end_deal(cx);
-            self.end_deal_session();
-            self.deal_view = None;
-            self.deal_current_interacted = false;
-        }
         self.phone.stack.clear();
         self.phone.root = PhoneRoot::Desk;
         self.phone.feed_surface = None;

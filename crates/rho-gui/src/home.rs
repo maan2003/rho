@@ -40,6 +40,9 @@ pub(crate) struct HomeRow {
     pub title: String,
     pub label: String,
     pub card: DealCardId,
+    /// Passed over by a pull. The card is still open and still ranked here;
+    /// the word is how Home says the reader has already seen it.
+    pub skipped: bool,
 }
 
 /// One live agent: name, what it is on, how long it has been on it, and the
@@ -76,6 +79,7 @@ pub(crate) fn split_hand(cards: &[DealCard], title: impl Fn(&DealCard) -> String
         title: title(card),
         label: card.label.clone(),
         card: card.identity.clone(),
+        skipped: card.skipped,
     };
     HomeRows {
         next: cards
@@ -385,9 +389,14 @@ fn card_line(
     column: usize,
     title_class: HomeClass,
 ) -> Item<HomeKey, HomeClass, HomeTarget> {
+    let label = match (row.skipped, row.label.is_empty()) {
+        (false, _) => row.label.clone(),
+        (true, true) => "skipped".to_owned(),
+        (true, false) => format!("{} · skipped", row.label),
+    };
     let (text, styles) = columns(&[
         (row.title.as_str(), title_class, column),
-        (row.label.as_str(), HomeClass::Label, 0),
+        (label.as_str(), HomeClass::Label, 0),
     ]);
     Item::new(HomeKey::Card(row.card.clone()), text)
         .with_styles(styles)
@@ -448,6 +457,7 @@ mod tests {
 
     fn card(title: &str, priority: f64) -> DealCard {
         DealCard {
+            skipped: false,
             label: format!("needs reply · {priority}"),
             priority,
             host: HostId::default(),
@@ -494,6 +504,7 @@ mod tests {
             breadcrumb: "can you look at the deploy?".to_owned(),
             kind: DealCardKind::Thread,
             label: "needs reply · 1.9h".to_owned(),
+            skipped: false,
             ..card("", 2.0)
         };
         let rows = split_hand(&[thread.clone()], |card| {
