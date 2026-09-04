@@ -175,6 +175,15 @@ picker, and the map's label axis from slice 3 stay as built; what
 changes is that `f` writes `Labeled` for a label and `Parent` only for
 a thing, and the unbound label key is deleted rather than left waiting.
 
+Built and landed as d8625568 (GUI plus the `Project` property in
+rho-desk, so the daemon's profile moved there too): one picker on `f`,
+label rows first ("label · enter takes it off" when the thing already
+carries it), then things; `DashboardLabel` and `prompt_label_card`
+gone; Find ranks over label paths (`rho/agent › title`); a Slack room
+is findable because Slack says it exists, and its desk labels are
+joined on by the room's unit; `area_workdir` inherits `Project` up the
+parent chain.
+
 ### Labels are ids, not strings
 
 `Label(uuid)` with a `name`, nested with its own `parent`. In the picker
