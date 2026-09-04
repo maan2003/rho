@@ -288,6 +288,34 @@ ids: a project is `Id::File { host, path }` with a `Name` and a
 not stored anywhere because the client learns it from which daemon
 published the agent.
 
+### Direction: the agent API is log replication plus one focus stream
+
+Decided 4 Sep with the user, not built. Today the daemon must load an
+agent's runtime to render it, which is why the wire has per-agent
+subscribe and unsubscribe, idle unload, attention broadcasts, and turn
+reports. In their place: `Ready` carries every agent's head (position,
+generated title, usage totals); one request carries the client's
+position for every agent it knows, and the daemon streams only the
+tails past those positions, agents the client has never seen whole,
+served as range reads from the persisted log with no runtime loaded;
+one connection-wide follow pushes new projected events for all agents
+as they land; and `AgentStreamFocus` stays as the only per-agent thing,
+the one agent on screen getting streaming deltas (partial text, a tool
+in flight) ahead of the log, replaced by the log's tail when the turn
+completes, so nothing durable travels only on the focus stream. Missing
+data is found with a version vector, one position per agent, because
+every log is append-only and totally ordered; the same vector, one
+position per device, is how the store syncs. A tree of hashes over the
+vector is the escalation if the vector itself ever costs something, not
+before. Rewind is an appended event ("rewound to P"), never a
+truncation, so positions only grow and the client drops its view past
+P. The projected event carries today's `UiBlock` shapes, so client
+rendering does not change; the projection is "which blocks did this
+raw event produce". Gone from the wire: `SubscribeAgents`,
+`UnsubscribeAgents`, `AgentSubscribed`, `AgentUnloaded`,
+`AgentAttention`, `AgentTurnReport`, and the summary's attention, facts,
+updated-at, and last-active fields.
+
 ### Direction: agent transcripts are logs too, and the client decides attention
 
 The user's read on 4 Sep, not built and not a slice yet. An agent's
