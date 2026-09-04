@@ -282,7 +282,18 @@ else is built on. The transient lands after slice 2.
    creation gone. `body` is the cells store's own text table re-keyed;
    the native tree's text and `Document`/`TreeOperation` wait for slice
    2. `parent` keeps an explicit none (un-filing is a write, not a
-   delete); none and absent both read as root. Daemon change.
+   delete); none and absent both read as root. Daemon change. Landed 4
+   Sep (f31fdbd9): wire RUP7; `desk_migration.rs` runs once and drops
+   the old tables; on a read-only copy of the user's real store it kept
+   223 notes, 109 agents, 7 pages, 1 label, 221 bodies, 2381 facts, 6
+   verdicts, and dropped 194 machine-made thread nodes, 12 nodes it
+   could not identify, and 101 verdicts on them; no Slack unit survived
+   because none had been filed. Two bugs found on the way: undo of a
+   fact nobody had written read its before-value as none, fixed by one
+   `unwritten()` definition shared by writer and checker; and redb
+   records the Rust type names a table was created with, so the legacy
+   decode needed `SenAs<T, N>` to answer to the recorded name, which no
+   fresh-db test could have caught.
 2. Slack on the store (checklist 2.18): the unit model, `handled_through`
    as a fact, cards from the join, `DeskThreadBind` gone, the native tree
    store and `rho desk cat/checkout` gone.
