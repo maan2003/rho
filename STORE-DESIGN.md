@@ -235,6 +235,28 @@ address exchange the punch needs, and the fallback for the rare pair of
 networks that will not punch; it is not the data path. The daemon's
 lasting sync role is the peer that holds while one side is away.
 
+### Direction: agent transcripts are logs too, and the client decides attention
+
+The user's read on 4 Sep, not built and not a slice yet. An agent's
+transcript is an append-only log owned by the daemon that runs it, the
+same shape as a device's store log: segments tagged (agent, version),
+copied to clients by the same paths, mirrored on the client the way
+Slack is (tail first, older pages on demand, chunks with gap records,
+never a background walk), so the transcript reads from disk before the
+daemon answers and reads offline. "Waiting on you" stops being a fact
+the daemon computes: the client derives it from the mirror, the way it
+derives a Slack unit's state from the mirror, from the last event and
+the agent-wants tags the transcript already carries (`<ask-human/>`
+and the rest, `AGENT-WANTS-DESIGN.md`). The daemon then emits events
+and takes commands (create, send, cancel, rewind, continue, compact)
+and decides nothing about attention; Home for agents works offline from
+the mirror; and there is one sync engine for store logs and agent logs
+instead of a store protocol and a separate agent stream. Cost: the
+per-agent subscribe and stream messages become "segments since", and
+transcripts carry tool output and diffs, so the on-demand rule matters
+more than it does for Slack. Every host is then a peer that publishes
+its agents' logs, and a GUI is a peer that publishes its device log.
+
 ## Browser tabs
 
 A tab is `Page(PageId)`; it is never created in the store. Its place is
