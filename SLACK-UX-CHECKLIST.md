@@ -2,12 +2,12 @@
 
 Reconciled against main on 3 Sep. Genuinely open, in order:
 
-- 2.18 Slack on the store, the unit model (decided 4 Sep, re-scoped the
-  same day to `STORE-DESIGN.md` slice 2). The user's order, 4 Sep: the
-  store comes first, before any short-term bug; so store slice 1, then
-  2.18 (which folds in the native tree store deletion, `rho desk
-  cat/checkout`), then the verdict transient (`HOME-DESIGN.md`, no deal
-  mode).
+- 2.20 mute on a Slack unit is cursor + muted state + source silence
+  (2.18 landed it as the cursor only).
+- 2.19 a unit raised only by a live mention is gone after a restart
+  once the feed cursor passed it; derive units from the mirror at startup.
+- then the verdict transient (`HOME-DESIGN.md`, no deal mode), the
+  user's next UX priority now that the store (slices 1 and 2) is in.
 - 1.13 avatars (waits on the editor's inline-image inlay), 1.22 rough edges
   (b) soft-wrap column waits on the vendored editor.
 
@@ -569,7 +569,33 @@ done right after the transcript primitive (2.4) and before 2.10:
       no-op, not a drop. Comes right after 2.14, since 2.14 removes the
       third way this card could have gone quiet (a `channel_marked` from
       the phone).
-- [ ] 2.18 Slack on the store, the unit model. Decided 4 Sep after the
+- [ ] 2.20 Mute on a Slack unit is a cursor plus `State(Muted)` plus the
+      source's own silence (a thread unfollowed, a conversation marked
+      read), and opening the unit clears the muted state (STORE-DESIGN
+      "Verdicts write facts"). 2.18 landed `x` as the cursor only, the
+      same as `d`; align it. Tests: a muted DM that gets a new message
+      stays off Home until opened; a muted thread is unfollowed in Slack
+      and undo follows it again.
+- [ ] 2.19 A unit raised only by a live mention is gone after a restart
+      when the activity-feed cursor has already passed that message: the
+      store keeps the cursor, the mirror never re-reports the mention.
+      Found by b8os in the 2.18 rig (the seeded `#random` mention).
+      Rule: at startup the model derives its units from the mirror's own
+      history (every DM with messages, every channel with a mention,
+      every followed thread), so a restart is just another source that
+      can only raise facts. Test: a mention that the feed cursor is past
+      is still one card after a restart.
+- [x] 2.18 Slack on the store, the unit model. Landed 4 Sep (b8os,
+      screens s218-*): `Unit{channel, thread}` and monotonic `UnitFacts`
+      replace the per-message thread key; the card line is rendered from
+      the mirror at display time; `d`, `t` write `SlackHandledThrough :=
+      newest`; snooze records `SlackSnoozedAt(newest)` beside
+      `DeferUntil` and is voided when `newest_from_other` passes it, the
+      cursor untouched; `Name` beats the derived title on any id but a
+      note; the dealer deals DMs and mentioned channels, not only threads;
+      the 2.17 sequence passes in the rig, three mentions are one card
+      landing on the first new one, and a restart keeps a done unit
+      closed. Original text: decided 4 Sep after the
       user asked why Slack was in the tree at all; re-scoped the same day
       to `STORE-DESIGN.md` slice 2 once the store design replaced the
       tree. Design: `SLACK-DESIGN.md`, "A Slack unit is a conversation or

@@ -20,6 +20,7 @@ use gpui::{App, Context, Entity, Focusable as _, HighlightStyle, Window};
 use language::{Buffer, Capability, InlayId};
 use multi_buffer::MultiBuffer;
 use multi_buffer::composition::{Composition, CompositionSpec, RowSpec};
+pub use rho_desk::cells::SlackUnit;
 use rho_ui_proto::{AgentId, UiAttention};
 use text::{Bias, BufferId, ToOffset as _};
 use theme::ActiveTheme as _;
@@ -118,7 +119,7 @@ pub enum CardTarget {
     Note,
     Agent(AgentId),
     Page(rho_browser::PageId),
-    Thread(ThreadRef),
+    Thread(SlackUnit),
     /// The node is gone, or lacks the fields its kind needs.
     Missing,
 }
@@ -137,11 +138,12 @@ pub enum DealCardKind {
     Thread,
 }
 
-/// What a Slack thread node is currently about, read live from the mirror.
-/// The tree holds the thread's identity and its verdicts; the words, the
-/// wait, and the newest message stay in Slack.
+/// What a Slack unit is currently about, read live from the mirror. The
+/// store holds the unit's identity and its verdicts; the words, the wait,
+/// and the newest message stay in Slack, and the title here is rendered
+/// fresh every time this is built rather than kept from when it landed.
 #[derive(Clone, Debug, PartialEq)]
-pub struct DealerThread {
+pub struct SlackFacts {
     pub title: String,
     pub conversation: String,
     pub raised_at: chrono::DateTime<chrono::FixedOffset>,
@@ -151,16 +153,11 @@ pub struct DealerThread {
     pub wait_days: f64,
     /// Who the ball is with, when it is not the user.
     pub waiting_on: Option<String>,
-    /// The newest message in the thread: a new one voids a skip.
+    /// The newest message in the unit: a new one voids a skip.
     pub latest: String,
-}
-
-/// A Slack thread's address, as the tree stores it.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct ThreadRef {
-    pub workspace: String,
-    pub channel: String,
-    pub thread_ts: String,
+    /// The newest message from someone else, which is what a verdict cursor
+    /// is compared against. `None` when only the user has written here.
+    pub newest_from_other: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -429,7 +426,7 @@ impl Dashboard {
     fn tree_dealer_queue(
         &self,
         registry: &AgentRegistry,
-        threads: &HashMap<ThreadRef, DealerThread>,
+        threads: &HashMap<SlackUnit, SlackFacts>,
         now: chrono::DateTime<chrono::FixedOffset>,
         agent_interactions: &HashMap<AgentId, i64>,
         cx: &App,
@@ -582,22 +579,20 @@ impl Dashboard {
                 }
                 order += 1;
             }
-            // Slack threads that started to matter are nodes like any other,
-            // so they rank in the same queue. What the card says comes from
-            // the mirror: the tree holds the thread's identity and verdicts,
-            // never its words.
-            for node in source
-                .nodes
-                .iter()
-                .filter(|node| node.slack().is_some_and(|unit| unit.thread.is_some()))
-            {
+            // Slack units that started to matter are rows like any other, so
+            // they rank in the same queue. A conversation is a unit as much
+            // as a followed thread is: a direct message and a channel
+            // somebody named the user in each deal as one card. What the
+            // card says comes from the mirror; the store holds the unit's
+            // identity and its verdicts, never its words.
+            for node in source.nodes.iter().filter(|node| node.slack().is_some()) {
                 if node.state != rho_desk::cells::State::Open
                     || desk_deferred(node, now.naive_local())
                 {
                     order += 1;
                     continue;
                 }
-                let Some(thread) = node_thread(node).and_then(|key| threads.get(&key)) else {
+                let Some(thread) = node.slack().and_then(|unit| threads.get(unit)) else {
                     order += 1;
                     continue;
                 };
@@ -912,7 +907,7 @@ impl Dashboard {
                 node_page(node).map_or(CardTarget::Missing, CardTarget::Page)
             }
             rho_desk::cells::Id::Slack(_) => {
-                node_thread(node).map_or(CardTarget::Missing, CardTarget::Thread)
+                node_unit(node).map_or(CardTarget::Missing, CardTarget::Thread)
             }
             _ => CardTarget::Note,
         }
@@ -928,24 +923,24 @@ impl Dashboard {
         self.node_card(|node| node_page(node) == Some(page))
     }
 
-    pub fn thread_card_id(&self, thread: &ThreadRef) -> Option<DealCardId> {
-        self.node_card(|node| node_thread(node).as_ref() == Some(thread))
+    pub fn thread_card_id(&self, thread: &SlackUnit) -> Option<DealCardId> {
+        self.node_card(|node| node_unit(node).as_ref() == Some(thread))
     }
 
     /// The thread a card stands for, if it is a thread card at all.
-    pub fn card_thread(&self, card: DealCardId) -> Option<ThreadRef> {
+    pub fn card_thread(&self, card: DealCardId) -> Option<SlackUnit> {
         self.tree_hosts
             .get(&card.host)?
             .nodes
             .iter()
             .find(|node| node.id == card.node_id)
-            .and_then(node_thread)
+            .and_then(node_unit)
     }
 
     /// Every open Slack thread node, with the thread it stands for. The
     /// backlog command needs them all at once rather than the one the
     /// cursor is on.
-    pub fn open_thread_cards(&self) -> Vec<(DealCardId, ThreadRef)> {
+    pub fn open_thread_cards(&self) -> Vec<(DealCardId, SlackUnit)> {
         self.tree_hosts
             .iter()
             .flat_map(|(host, source)| {
@@ -959,7 +954,7 @@ impl Dashboard {
                                 host: *host,
                                 node_id: node.id.clone(),
                             },
-                            node_thread(node)?,
+                            node_unit(node)?,
                         ))
                     })
             })
@@ -973,6 +968,15 @@ impl Dashboard {
             .get(&card.host)
             .and_then(|source| source.nodes.iter().find(|node| node.id == card.node_id))
             .is_some_and(|node| node.state == rho_desk::cells::State::Open)
+    }
+
+    /// When a card is put down until, as the view derives it: a snooze a
+    /// newer message has voided reads as no snooze at all.
+    pub fn node_defer_until(&self, card: DealCardId) -> Option<rho_desk::cells::Timestamp> {
+        self.tree_hosts
+            .get(&card.host)
+            .and_then(|source| source.nodes.iter().find(|node| node.id == card.node_id))
+            .and_then(|node| node.defer_until)
     }
 
     fn node_card(
@@ -1076,7 +1080,7 @@ impl Dashboard {
     pub fn dealer_hand(
         &self,
         registry: &AgentRegistry,
-        threads: &HashMap<ThreadRef, DealerThread>,
+        threads: &HashMap<SlackUnit, SlackFacts>,
         now: chrono::DateTime<chrono::FixedOffset>,
         agent_interactions: &HashMap<AgentId, i64>,
         cx: &App,
@@ -1090,7 +1094,7 @@ impl Dashboard {
     pub fn pull_deal(
         &mut self,
         registry: &AgentRegistry,
-        threads: &HashMap<ThreadRef, DealerThread>,
+        threads: &HashMap<SlackUnit, SlackFacts>,
         now: chrono::DateTime<chrono::FixedOffset>,
         exclude: Option<&DealCardId>,
         agent_interactions: &HashMap<AgentId, i64>,
@@ -1108,7 +1112,7 @@ impl Dashboard {
     pub fn deal_chosen(
         &mut self,
         registry: &AgentRegistry,
-        threads: &HashMap<ThreadRef, DealerThread>,
+        threads: &HashMap<SlackUnit, SlackFacts>,
         now: chrono::DateTime<chrono::FixedOffset>,
         wanted: &DealCardId,
         agent_interactions: &HashMap<AgentId, i64>,
@@ -1373,7 +1377,7 @@ impl Dashboard {
     fn sync_tree(
         &mut self,
         registry: &AgentRegistry,
-        threads: &HashMap<ThreadRef, DealerThread>,
+        threads: &HashMap<SlackUnit, SlackFacts>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
@@ -1778,7 +1782,7 @@ impl Dashboard {
     pub fn sync(
         &mut self,
         registry: &AgentRegistry,
-        threads: &HashMap<ThreadRef, DealerThread>,
+        threads: &HashMap<SlackUnit, SlackFacts>,
         window: &mut Window,
         cx: &mut Context<Workspace>,
     ) {
@@ -2279,14 +2283,9 @@ pub(crate) fn node_agent(node: &crate::desk_view::DeskNode) -> Option<AgentId> {
     node.agent()
 }
 
-/// The Slack thread a row stands for.
-pub(crate) fn node_thread(node: &crate::desk_view::DeskNode) -> Option<ThreadRef> {
-    let unit = node.slack()?;
-    Some(ThreadRef {
-        workspace: unit.workspace.clone(),
-        channel: unit.channel.clone(),
-        thread_ts: unit.thread.clone()?,
-    })
+/// The Slack unit a row stands for.
+pub(crate) fn node_unit(node: &crate::desk_view::DeskNode) -> Option<SlackUnit> {
+    node.slack().cloned()
 }
 
 fn node_page(node: &crate::desk_view::DeskNode) -> Option<rho_browser::PageId> {
@@ -2311,13 +2310,22 @@ pub(crate) fn node_file_path(
 fn derived_title(
     node: &crate::desk_view::DeskNode,
     _registry: &AgentRegistry,
-    threads: &HashMap<ThreadRef, DealerThread>,
+    threads: &HashMap<SlackUnit, SlackFacts>,
 ) -> String {
     use rho_desk::cells::Id;
 
+    // A name the user wrote wins over anything derived, whatever the row
+    // is: a Slack conversation they renamed reads as what they called it,
+    // not as what Slack calls it. A note is the exception, because its
+    // title is the first line of its body.
+    if let Some(name) = node.name.as_ref().filter(|name| !name.trim().is_empty())
+        && !matches!(node.id, Id::Note(_))
+    {
+        return name.clone();
+    }
     match &node.id {
         Id::Agent(_) | Id::Note(_) => String::new(),
-        Id::Label(_) => node.name.clone().unwrap_or_else(|| "label".to_owned()),
+        Id::Label(_) => "label".to_owned(),
         Id::Host(_) => "this host".to_owned(),
         Id::Page(_) => node_page(node)
             .and_then(rho_browser::live_page_name)
@@ -2326,14 +2334,16 @@ fn derived_title(
         // The store holds the unit's identity, which is ids and a
         // timestamp; what it is called lives in the mirror. A thread rho
         // has not caught up with yet says so rather than showing its keys.
-        Id::Slack(unit) => match node_thread(node).and_then(|key| threads.get(&key)) {
-            Some(thread) => format!("{} · {}", thread.conversation, thread.title),
-            // The conversation row is named by the mirror too: any thread
-            // in it knows what Slack calls it, and its ids are never shown.
+        Id::Slack(unit) => match threads.get(unit) {
+            Some(facts) if facts.title.is_empty() => facts.conversation.clone(),
+            Some(facts) => format!("{} · {}", facts.conversation, facts.title),
+            // A unit rho has not caught up with yet is named by any sibling
+            // that knows what Slack calls the conversation, so its ids are
+            // never shown.
             None => threads
                 .iter()
                 .find(|(key, _)| key.workspace == unit.workspace && key.channel == unit.channel)
-                .map(|(_, thread)| thread.conversation.clone())
+                .map(|(_, facts)| facts.conversation.clone())
                 .unwrap_or_else(|| "conversation".to_owned()),
         },
         Id::PullRequest { repo, number } => format!("{repo}#{number}"),
@@ -2434,7 +2444,7 @@ impl Dashboard {
     pub(crate) fn area_candidates(
         &self,
         registry: &AgentRegistry,
-        threads: &HashMap<ThreadRef, DealerThread>,
+        threads: &HashMap<SlackUnit, SlackFacts>,
         cx: &App,
     ) -> Vec<(String, &'static str, HostId, rho_desk::cells::Id)> {
         let mut areas = Vec::new();
@@ -2777,7 +2787,7 @@ impl Dashboard {
 /// thread's card says. Somebody waiting outranks a note of the same age,
 /// the way a blocked agent outranks an FYI.
 fn thread_card_facts(
-    thread: &DealerThread,
+    thread: &SlackFacts,
     now: chrono::DateTime<chrono::FixedOffset>,
 ) -> (String, f64) {
     let _ = now;
@@ -2800,6 +2810,50 @@ fn thread_card_facts(
 mod tests {
     use super::*;
 
+    /// A name the user wrote wins over the name the source gave, on any
+    /// id: a Slack conversation they renamed reads as what they called it,
+    /// and one they have not is still named by the mirror.
+    #[test]
+    fn a_name_the_user_wrote_beats_the_one_the_source_gave() {
+        let unit = rho_desk::cells::SlackUnit {
+            workspace: "acme".to_owned(),
+            channel: "C1".to_owned(),
+            thread: None,
+        };
+        let node = |name: Option<&str>| crate::desk_view::DeskNode {
+            id: rho_desk::cells::Id::Slack(unit.clone()),
+            parent: None,
+            state: rho_desk::cells::State::Open,
+            defer_until: None,
+            deadline: None,
+            pace_days: 0,
+            labels: Default::default(),
+            name: name.map(str::to_owned),
+            created_at: None,
+        };
+        let registry = AgentRegistry::default();
+        let facts = HashMap::from([(
+            unit.clone(),
+            SlackFacts {
+                title: "any update?".to_owned(),
+                conversation: "#design".to_owned(),
+                raised_at: chrono::Local::now().fixed_offset(),
+                wait_days: 0.0,
+                waiting_on: None,
+                latest: "500.0".to_owned(),
+                newest_from_other: Some("500.0".to_owned()),
+            },
+        )]);
+        assert_eq!(
+            derived_title(&node(None), &registry, &facts),
+            "#design · any update?"
+        );
+        assert_eq!(
+            derived_title(&node(Some("the release room")), &registry, &facts),
+            "the release room"
+        );
+    }
+
     #[test]
     fn a_slack_thread_deals_like_an_agent_waiting_on_a_reply() {
         let now = chrono::NaiveDate::from_ymd_opt(2026, 8, 23)
@@ -2808,13 +2862,14 @@ mod tests {
             .unwrap()
             .and_utc()
             .fixed_offset();
-        let thread = |waiting_on: Option<&str>, wait_days: f64| DealerThread {
+        let thread = |waiting_on: Option<&str>, wait_days: f64| SlackFacts {
             title: "can you look at the deploy?".into(),
             conversation: "#design".into(),
             raised_at: now - chrono::Duration::days(2),
             wait_days,
             waiting_on: waiting_on.map(str::to_owned),
             latest: "500.0".into(),
+            newest_from_other: Some("500.0".into()),
         };
 
         let (label, priority) = thread_card_facts(&thread(None, 2.0), now);

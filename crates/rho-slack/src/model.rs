@@ -28,25 +28,59 @@ pub enum Waiting {
     OnThem,
 }
 
-/// One thread rho is tracking.
+/// The thing rho deals: a conversation or a followed thread, never a
+/// message. Slack keeps the identity, so rho only has to say which ones
+/// matter. One card per unit at most, so a channel with three unhandled
+/// mentions is one card rather than three.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Unit {
+    pub channel: ChannelId,
+    /// `None` for a conversation: a direct or group message, or a channel
+    /// the user was mentioned in. A followed thread carries its root.
+    pub thread: Option<Ts>,
+}
+
+impl Unit {
+    pub fn conversation(channel: &ChannelId) -> Self {
+        Self {
+            channel: channel.clone(),
+            thread: None,
+        }
+    }
+
+    pub fn thread(channel: &ChannelId, root: &Ts) -> Self {
+        Self {
+            channel: channel.clone(),
+            thread: Some(root.clone()),
+        }
+    }
+}
+
+/// What the mirror says about one unit.
+///
+/// Every timestamp here only ever rises. A live frame, a feed poll, a
+/// history page, a reconnect and a restart are all the same kind of
+/// evidence, and none of them may lower a fact, which is what keeps a card
+/// the user closed from coming back on an older message.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Thread {
+pub struct UnitFacts {
     pub reason: Reason,
-    /// The newest message in the thread. The tree keys a thread node's
-    /// verdicts on it: a newer one voids a skip or a done, exactly like an
-    /// agent's reply.
-    pub latest: Ts,
-    pub latest_from_you: bool,
-    /// First line of the newest message, for the card.
-    pub summary: String,
-    /// When rho first saw this thread, so a card's age is rho's own clock
-    /// and cannot be moved by a doctored message timestamp.
+    /// The newest message in the unit, whoever wrote it.
+    pub newest: Ts,
+    /// The newest message from someone else that concerns the user: any
+    /// message in a direct message, a mention in a channel, a reply in a
+    /// followed thread. This is what a verdict cursor is compared against.
+    pub newest_from_other: Option<Ts>,
+    /// Who wrote `newest`. The word on the card, and which curve it takes.
+    pub newest_from_you: bool,
+    /// When rho first saw this unit, so a card's age is rho's own clock and
+    /// cannot be moved by a doctored message timestamp.
     pub first_seen_ms: i64,
 }
 
-impl Thread {
+impl UnitFacts {
     pub fn waiting(&self) -> Waiting {
-        match self.latest_from_you {
+        match self.newest_from_you {
             true => Waiting::OnThem,
             false => Waiting::OnYou,
         }
@@ -57,30 +91,32 @@ impl Thread {
 /// into appends, updates, and retirements; the model never touches storage.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Change {
-    /// A thread that owes the user an answer, and was not owing one before.
-    Raised(ThreadKey),
-    /// A thread already raised whose newest message changed.
-    Updated(ThreadKey),
+    /// A unit that owes the user an answer, and was not owing one before.
+    Raised(Unit),
+    /// A unit already raised whose newest message changed.
+    Updated(Unit),
     /// The user answered. The card stays and says `replied`: verdicts are
     /// the user's keys only, so nothing here closes it and nothing binds.
-    Replied(ThreadKey),
+    Replied(Unit),
     /// The thread stopped being the user's, because they ignored it here or
     /// unfollowed it in another client. Slack's own verdict, so the card
     /// goes; nothing rho stores says otherwise.
-    Muted(ThreadKey),
+    Muted(Unit),
 }
 
 /// A dealer card's worth of a thread, with no ids and no raw timestamps.
 #[derive(Clone, Debug, PartialEq)]
-pub struct ThreadCard {
-    pub key: ThreadKey,
+pub struct UnitCard {
+    pub unit: Unit,
     /// `#design` or `@ada`.
     pub conversation: String,
-    pub summary: String,
     pub waiting: Waiting,
     pub wait_days: f64,
     /// The newest message; a change here is what re-raises the card.
-    pub latest: Ts,
+    pub newest: Ts,
+    /// Where a dealt card lands the reader: the oldest message from someone
+    /// else the user has not handled, or the newest when there is none.
+    pub newest_from_other: Option<Ts>,
 }
 
 /// Everything one `mark read before` touches: the conversations to mark and
@@ -136,7 +172,7 @@ pub struct Model {
     counts: BTreeMap<ChannelId, ConversationCount>,
     /// The workspace's own emoji names, which stay shortcodes on screen.
     custom_emoji: BTreeSet<String>,
-    threads: BTreeMap<ThreadKey, Thread>,
+    units: BTreeMap<Unit, UnitFacts>,
     /// Every (channel, timestamp) the model has already accounted for. This
     /// is the whole of the deduplication between the feed and the socket.
     seen: BTreeSet<(ChannelId, Ts)>,
@@ -187,7 +223,7 @@ impl Model {
             conversations: BTreeMap::new(),
             counts: BTreeMap::new(),
             custom_emoji: BTreeSet::new(),
-            threads: BTreeMap::new(),
+            units: BTreeMap::new(),
             seen: BTreeSet::new(),
             followed: BTreeSet::new(),
             muted: BTreeSet::new(),
@@ -588,11 +624,14 @@ impl Model {
             })
             .collect();
         let threads = self
-            .threads
+            .units
             .iter()
+            .filter_map(|(unit, facts)| {
+                Some((self.key(&unit.channel, unit.thread.as_ref()?), facts))
+            })
             .filter(|(key, _)| self.followed.contains(key))
-            .filter(|(_, thread)| thread.latest.epoch_seconds() < before)
-            .map(|(key, thread)| (key.clone(), thread.latest.clone()))
+            .filter(|(_, facts)| facts.newest.epoch_seconds() < before)
+            .map(|(key, facts)| (key, facts.newest.clone()))
             .collect();
         MarkPlan {
             conversations,
@@ -617,12 +656,12 @@ impl Model {
         let dropped = self
             .followed
             .difference(&now)
-            .filter(|key| self.threads.contains_key(key))
+            .filter(|key| self.units.contains_key(&unit_of(key)))
             .cloned()
             .collect::<Vec<_>>();
         self.followed = now;
         for key in &dropped {
-            self.threads.remove(key);
+            self.units.remove(&unit_of(key));
         }
         dropped
     }
@@ -651,7 +690,7 @@ impl Model {
         // The thread goes with the follow. Nothing here remembers that it
         // was ever raised, so following it again in Slack raises it only
         // when somebody writes in it.
-        self.threads.remove(&key).is_some()
+        self.units.remove(&unit_of(&key)).is_some()
     }
 
     pub fn follows(&self, key: &ThreadKey) -> bool {
@@ -679,34 +718,47 @@ impl Model {
         self.counts.get(channel)?.last_read.as_ref()
     }
 
-    /// Fills in the body of a message rho already knows about. The feed
-    /// raises a thread before any body exists, and the message that then
-    /// arrives is a duplicate by timestamp, so without this the card would
-    /// keep the blank summary the feed gave it.
+    /// Fills in the author of a message rho already knows about. The feed
+    /// says a message landed without saying who wrote it, so the body that
+    /// arrives afterwards is what settles whose turn it is. The words are
+    /// never stored: a card renders them from the mirror when it is drawn.
     pub fn note_loaded(&mut self, message: &Message) -> Option<Change> {
-        let key = self.key(&message.channel, &message.thread_root());
-        let summary = summarize(&self.render(message));
-        let thread = self.threads.get_mut(&key)?;
-        if summary.is_empty() || thread.latest != message.ts || thread.summary == summary {
+        let from_you = message.user.as_ref() == Some(&self.self_id);
+        let unit = self.unit_for(&message.channel, message.thread_ts.as_ref());
+        let facts = self.units.get_mut(&unit)?;
+        if facts.newest != message.ts || facts.newest_from_you == from_you {
             return None;
         }
-        thread.summary = summary;
-        thread.latest_from_you = message.user.as_ref() == Some(&self.self_id);
-        Some(match thread.waiting() {
-            Waiting::OnYou => Change::Updated(key),
-            Waiting::OnThem => Change::Replied(key),
+        facts.newest_from_you = from_you;
+        Some(match facts.waiting() {
+            Waiting::OnYou => Change::Updated(unit),
+            Waiting::OnThem => Change::Replied(unit),
         })
     }
 
-    /// Every thread rho is tracking, for a caller that has to revisit them
+    /// Every unit rho is tracking, for a caller that has to revisit them
     /// all — the roster arriving is the case: names known late change what a
     /// card says.
-    pub fn tracked(&self) -> Vec<ThreadKey> {
-        self.threads.keys().cloned().collect()
+    pub fn tracked(&self) -> Vec<Unit> {
+        self.units.keys().cloned().collect()
     }
 
-    pub fn thread(&self, key: &ThreadKey) -> Option<&Thread> {
-        self.threads.get(key)
+    pub fn unit(&self, unit: &Unit) -> Option<&UnitFacts> {
+        self.units.get(unit)
+    }
+
+    /// The unit a message belongs to: a followed thread when Slack says the
+    /// message is a reply in one, and the conversation otherwise. A reply in
+    /// a thread nobody follows is traffic in the conversation, not a unit of
+    /// its own, which is what keeps a channel with three mentions to one
+    /// card.
+    pub fn unit_for(&self, channel: &ChannelId, thread_ts: Option<&Ts>) -> Unit {
+        match thread_ts {
+            Some(root) if self.followed.contains(&self.key(channel, root)) => {
+                Unit::thread(channel, root)
+            }
+            _ => Unit::conversation(channel),
+        }
     }
 
     pub fn key(&self, channel: &ChannelId, thread_ts: &Ts) -> ThreadKey {
@@ -764,20 +816,20 @@ impl Model {
     /// Takes one message, from either source. Returns what it changed, or
     /// nothing at all when it is channel traffic or a duplicate.
     pub fn note_message(&mut self, message: &Message, now_ms: i64) -> Option<Change> {
-        let key = self.key(&message.channel, &message.thread_root());
+        let unit = self.unit_for(&message.channel, message.thread_ts.as_ref());
         let from_you = message.user.as_ref() == Some(&self.self_id);
         // The reason is decided before the message is marked seen: channel
         // traffic is never "seen", so a live message rho drops cannot poison
         // the dedup and swallow the feed item for the same `ts` that would
         // have raised it.
-        let reason = self.reason_for(message, &key, from_you)?;
+        let reason = self.reason_for(message, &unit, from_you)?;
         if !self
             .seen
             .insert((message.channel.clone(), message.ts.clone()))
         {
             return None;
         }
-        self.record(key, reason, message, from_you, now_ms)
+        self.record(unit, reason, &message.ts, from_you, now_ms)
     }
 
     /// Takes one activity-feed entry. The feed says *that* something
@@ -793,46 +845,43 @@ impl Model {
         if !self.seen.insert((item.channel.clone(), item.ts.clone())) {
             return None;
         }
-        let thread_ts = item.thread_ts.clone().unwrap_or_else(|| item.ts.clone());
-        let key = self.key(&item.channel, &thread_ts);
-        let message = Message {
-            ts: item.ts.clone(),
-            thread_ts: item.thread_ts.clone(),
-            channel: item.channel.clone(),
-            user: None,
-            bot_name: None,
-            blocks: Vec::new(),
-            text: String::new(),
-            attachments: Vec::new(),
-            files: Vec::new(),
-            subtype: None,
-            reply_count: 0,
-            latest_reply: None,
-            edited: false,
-            reactions: Vec::new(),
-        };
-        self.record(key, reason, &message, false, now_ms)
+        let unit = self.unit_for(&item.channel, item.thread_ts.as_ref());
+        self.record(unit, reason, &item.ts, false, now_ms)
     }
 
-    /// Why this message obliges the user, or `None` for channel traffic.
-    fn reason_for(&self, message: &Message, key: &ThreadKey, from_you: bool) -> Option<Reason> {
-        // A thread rho already tracks stays rho's business whoever spoke: a
-        // follow-up moves the verdict key, and the user's own reply is the
-        // message that flips whose turn it is.
-        if let Some(thread) = self.threads.get(key) {
-            return Some(thread.reason);
+    /// Why this message obliges the user, or `None` when it is traffic.
+    ///
+    /// A channel the user was mentioned in is a unit, but the twenty
+    /// unrelated messages that follow the mention are not about them: they
+    /// move nothing on the card, or the wait would reset every time anyone
+    /// said anything. What counts is a message addressed to them, a reply
+    /// in a thread they follow, and their own answer.
+    fn reason_for(&self, message: &Message, unit: &Unit, from_you: bool) -> Option<Reason> {
+        let reason = if self.is_dm(&message.channel) {
+            Some(Reason::DirectMessage)
+        } else if self.mentions_you(message) {
+            Some(Reason::Mention)
+        } else if unit.thread.is_some() {
+            Some(Reason::Thread)
+        } else {
+            None
+        };
+        // The user's own message counts in any unit rho already tracks: it
+        // is what flips whose turn it is, whatever it says.
+        let existing = self.units.get(unit).map(|facts| facts.reason);
+        match from_you {
+            true => existing.or(reason),
+            false => reason.and(existing.or(reason)),
         }
-        let followed = self.followed.contains(key);
-        if from_you {
-            return followed.then_some(Reason::Thread);
-        }
-        if self.is_dm(&message.channel) {
-            return Some(Reason::DirectMessage);
-        }
-        if self.mentions_you(message) {
-            return Some(Reason::Mention);
-        }
-        followed.then_some(Reason::Thread)
+    }
+
+    /// Whether a message is one the user is meant to answer: any message
+    /// in a direct message, a mention in a channel, a reply in a thread they
+    /// follow. This is what `newest_from_other` counts, so it is also what a
+    /// dealt card lands on: the ordinary chatter in a channel is not what
+    /// the reader was brought here for.
+    pub fn concerns_you(&self, message: &Message, unit: &Unit) -> bool {
+        unit.thread.is_some() || self.is_dm(&message.channel) || self.mentions_you(message)
     }
 
     /// Whether the conversation is a DM: one person or a group of them.
@@ -861,76 +910,78 @@ impl Model {
             .any(|block| mentions_in(block, &self.self_id))
     }
 
+    /// Folds one message into a unit's facts.
+    ///
+    /// Nothing here ever goes backwards. A history page, a reconnect, a feed
+    /// poll and a restart all replay messages the model has already seen, and
+    /// any of them lowering `newest_from_other` would reopen a card the user
+    /// has closed. So every timestamp is raised by `max` and never assigned.
     fn record(
         &mut self,
-        key: ThreadKey,
+        unit: Unit,
         reason: Reason,
-        message: &Message,
+        ts: &Ts,
         from_you: bool,
         now_ms: i64,
     ) -> Option<Change> {
-        let summary = summarize(&self.render(message));
-        let existing = self.threads.get(&key);
+        let existing = self.units.get(&unit);
         // An out-of-order arrival (a feed page after the socket already had
-        // the newer reply) must not walk the thread backwards.
-        if existing.is_some_and(|thread| thread.latest.is_newer_than(&message.ts)) {
+        // the newer reply) is evidence about the past, not news.
+        if existing.is_some_and(|facts| facts.newest.is_newer_than(ts)) {
             return None;
         }
-        let was_waiting = existing.map(Thread::waiting);
-        let first_seen_ms = existing.map_or(now_ms, |thread| thread.first_seen_ms);
-        let summary = match summary.is_empty() {
-            true => existing
-                .map(|thread| thread.summary.clone())
-                .unwrap_or_default(),
-            false => summary,
+        let was_waiting = existing.map(UnitFacts::waiting);
+        let first_seen_ms = existing.map_or(now_ms, |facts| facts.first_seen_ms);
+        let newest_from_other = match from_you {
+            true => existing.and_then(|facts| facts.newest_from_other.clone()),
+            false => Some(ts.clone()),
         };
-        self.threads.insert(
-            key.clone(),
-            Thread {
+        self.units.insert(
+            unit.clone(),
+            UnitFacts {
                 reason,
-                latest: message.ts.clone(),
-                latest_from_you: from_you,
-                summary,
+                newest: ts.clone(),
+                newest_from_other,
+                newest_from_you: from_you,
                 first_seen_ms,
             },
         );
         Some(match (was_waiting, from_you) {
             // Answering is not closing. The card keeps its place in the tree
             // and drops onto the fyi curve; only the user's own `d` ends it.
-            (_, true) => Change::Replied(key),
-            (Some(Waiting::OnYou), false) => Change::Updated(key),
+            (_, true) => Change::Replied(unit),
+            (Some(Waiting::OnYou), false) => Change::Updated(unit),
             // Either brand new, or answered-then-answered-again: both are a
             // fresh obligation, which is what re-raises a card after a done.
-            (_, false) => Change::Raised(key),
+            (_, false) => Change::Raised(unit),
         })
     }
 
-    pub fn card(&self, key: &ThreadKey, now_ms: i64) -> Option<ThreadCard> {
-        let thread = self.threads.get(key)?;
-        Some(ThreadCard {
-            key: key.clone(),
-            conversation: self.label(&key.channel),
-            summary: thread.summary.clone(),
-            waiting: thread.waiting(),
-            wait_days: wait_days(thread, now_ms),
-            latest: thread.latest.clone(),
+    /// What a unit looks like right now. The words are not in here: a card's
+    /// text is rendered from the mirror when it is drawn, so a name learned
+    /// after the message landed shows as `@ada` rather than `<@U123>`.
+    pub fn card(&self, unit: &Unit, now_ms: i64) -> Option<UnitCard> {
+        let facts = self.units.get(unit)?;
+        Some(UnitCard {
+            unit: unit.clone(),
+            conversation: self.label(&unit.channel),
+            waiting: facts.waiting(),
+            wait_days: wait_days(facts, now_ms),
+            newest: facts.newest.clone(),
+            newest_from_other: facts.newest_from_other.clone(),
         })
     }
 }
 
-/// How long the thread has been waiting, counted from the newest message.
-fn wait_days(thread: &Thread, now_ms: i64) -> f64 {
-    let since = now_ms.saturating_sub(thread.latest.millis().max(thread.first_seen_ms.min(now_ms)));
+/// The unit a followed thread's key names.
+fn unit_of(key: &ThreadKey) -> Unit {
+    Unit::thread(&key.channel, &key.thread_ts)
+}
+
+/// How long the unit has been waiting, counted from the newest message.
+fn wait_days(facts: &UnitFacts, now_ms: i64) -> f64 {
+    let since = now_ms.saturating_sub(facts.newest.millis().max(facts.first_seen_ms.min(now_ms)));
     (since as f64 / 86_400_000.0).max(0.0)
-}
-
-fn summarize(rendered: &str) -> String {
-    rendered
-        .lines()
-        .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or_default()
-        .to_owned()
 }
 
 fn mentions_in(block: &Value, self_id: &UserId) -> bool {
@@ -952,14 +1003,14 @@ fn mentions_in(block: &Value, self_id: &UserId) -> bool {
 mod tests {
     use super::*;
 
-    /// The cards a thread node would be raised for: what the dealer used to
-    /// ask the model for directly, now derived here because the tree is what
+    /// The cards a unit would be raised for: what the dealer used to ask
+    /// the model for directly, now derived here because the store is what
     /// deals.
-    fn owed(model: &Model, now_ms: i64) -> Vec<ThreadCard> {
+    fn owed(model: &Model, now_ms: i64) -> Vec<UnitCard> {
         let mut cards = model
             .tracked()
             .into_iter()
-            .filter_map(|key| model.card(&key, now_ms))
+            .filter_map(|unit| model.card(&unit, now_ms))
             .filter(|card| card.waiting == Waiting::OnYou)
             .collect::<Vec<_>>();
         cards.sort_by(|left, right| right.wait_days.total_cmp(&left.wait_days));
@@ -967,7 +1018,7 @@ mod tests {
     }
 
     #[test]
-    fn a_thread_raised_by_the_feed_gains_its_summary_when_it_is_loaded() {
+    fn a_unit_raised_by_the_feed_learns_its_author_when_the_body_lands() {
         let mut model = model();
         let item = ActivityItem {
             channel: ChannelId("C1".into()),
@@ -980,11 +1031,13 @@ mod tests {
             model.note_activity(&item, 0),
             Some(Change::Raised(_))
         ));
-        let key = model.key(&ChannelId("C1".into()), &Ts("100.0".into()));
-        assert_eq!(model.thread(&key).unwrap().summary, "");
+        let unit = Unit::conversation(&ChannelId("C1".into()));
+        assert_eq!(model.unit(&unit).unwrap().newest, Ts("100.0".into()));
 
+        // The feed says only that something landed. The body arriving is a
+        // duplicate by timestamp, and what it settles is who wrote it.
         let message = crate::api::parse_message(
-            &serde_json::json!({"ts": "100.0", "user": "U1", "text": "look at the deploy"}),
+            &serde_json::json!({"ts": "100.0", "user": "ME", "text": "look at the deploy"}),
             &ChannelId("C1".into()),
         )
         .unwrap();
@@ -995,9 +1048,9 @@ mod tests {
         );
         assert!(matches!(
             model.note_loaded(&message),
-            Some(Change::Updated(_))
+            Some(Change::Replied(_))
         ));
-        assert_eq!(model.thread(&key).unwrap().summary, "look at the deploy");
+        assert_eq!(model.unit(&unit).unwrap().waiting(), Waiting::OnThem);
     }
 
     use serde_json::json;
@@ -1075,9 +1128,7 @@ mod tests {
         // A mention is.
         assert_eq!(
             model.note_message(&message("C1", "101", "U1", "hey <@ME> look"), 0),
-            Some(Change::Raised(
-                model.key(&ChannelId("C1".into()), &Ts("101".into()))
-            ))
+            Some(Change::Raised(Unit::conversation(&ChannelId("C1".into()))))
         );
         // A DM is.
         assert!(matches!(
@@ -1213,8 +1264,8 @@ mod tests {
             model.note_message(&message("D1", "400", "U1", "any update?"), now),
             Some(Change::Raised(_))
         ));
-        let key = model.key(&ChannelId("D1".into()), &Ts("400".into()));
-        assert_eq!(model.thread(&key).unwrap().waiting(), Waiting::OnYou);
+        let key = Unit::conversation(&ChannelId("D1".into()));
+        assert_eq!(model.unit(&key).unwrap().waiting(), Waiting::OnYou);
         assert_eq!(owed(&model, now).len(), 1);
 
         // Answering is not a verdict: the thread is still tracked, the ball
@@ -1223,7 +1274,7 @@ mod tests {
             model.note_message(&reply("D1", "401", "400", "ME", "tomorrow"), now),
             Some(Change::Replied(key.clone()))
         );
-        assert_eq!(model.thread(&key).unwrap().waiting(), Waiting::OnThem);
+        assert_eq!(model.unit(&key).unwrap().waiting(), Waiting::OnThem);
         assert_eq!(model.card(&key, now).unwrap().waiting, Waiting::OnThem);
 
         // Their answer brings it back, keyed on the newer message.
@@ -1233,9 +1284,99 @@ mod tests {
         );
         let card = model.card(&key, now).unwrap();
         assert_eq!(card.waiting, Waiting::OnYou);
-        assert_eq!(card.latest, Ts("402".into()));
-        assert_eq!(card.summary, "thanks!");
+        assert_eq!(card.newest, Ts("402".into()));
         assert_eq!(card.conversation, "@ada");
+    }
+
+    /// One card per unit. Three mentions in `#design` are one row on the
+    /// desk, not three, and five messages in a direct message are one card
+    /// that says how long it has been waiting.
+    #[test]
+    fn a_channel_of_mentions_and_a_busy_dm_are_each_one_card() {
+        let mut model = model();
+        for ts in ["100", "101", "102"] {
+            model.note_message(&message("C1", ts, "U1", "hey <@ME> look"), 0);
+        }
+        for ts in ["200", "201", "202", "203", "204"] {
+            model.note_message(&message("D1", ts, "U1", "ping"), 0);
+        }
+        assert_eq!(
+            model.tracked(),
+            vec![
+                Unit::conversation(&ChannelId("C1".into())),
+                Unit::conversation(&ChannelId("D1".into())),
+            ],
+            "eight messages, two units"
+        );
+        assert_eq!(owed(&model, 0).len(), 2);
+        // The card stands for the whole unit, so what it reports is where
+        // the unit is, not where the message that made it was.
+        let channel = model
+            .card(&Unit::conversation(&ChannelId("C1".into())), 0)
+            .unwrap();
+        assert_eq!(channel.newest, Ts("102".into()));
+        assert_eq!(channel.newest_from_other, Some(Ts("102".into())));
+    }
+
+    /// Every source is evidence about the same unit, and none of them may
+    /// take back what another said: the live socket, a feed poll, a history
+    /// page and the roster read at startup all only raise the facts.
+    #[test]
+    fn no_source_can_lower_what_the_mirror_has_already_said() {
+        let mut model = model();
+        model.note_message(&message("D1", "500", "U1", "the newest"), 0);
+
+        // A history page loading under the card.
+        assert_eq!(
+            model.note_message(&message("D1", "300", "U1", "older"), 0),
+            None
+        );
+        // A feed poll repeating an older item after a reconnect.
+        let stale = ActivityItem {
+            channel: ChannelId("D1".into()),
+            ts: Ts("400".into()),
+            thread_ts: None,
+            kind: ActivityKind::DirectMessage,
+            unread: true,
+        };
+        assert_eq!(model.note_activity(&stale, 0), None);
+        // And what Slack says is unread when rho starts again.
+        model.set_counts([ConversationCount {
+            channel: ChannelId("D1".into()),
+            has_unreads: true,
+            mention_count: 0,
+            unread_count: 0,
+            latest: Some(Ts("450".into())),
+            last_read: None,
+        }]);
+        assert!(model.unread_dms(0).is_empty());
+
+        let facts = model
+            .unit(&Unit::conversation(&ChannelId("D1".into())))
+            .unwrap();
+        assert_eq!(facts.newest, Ts("500".into()));
+        assert_eq!(facts.newest_from_other, Some(Ts("500".into())));
+    }
+
+    /// Answering flips the word on the card and the curve it takes. It is
+    /// not a verdict: what closes a unit is the cursor, and a reply leaves
+    /// the newest message from someone else exactly where it was.
+    #[test]
+    fn your_reply_flips_the_word_and_not_what_closes_the_card() {
+        let mut model = model();
+        model.note_message(&message("D1", "600", "U1", "any update?"), 0);
+        let unit = Unit::conversation(&ChannelId("D1".into()));
+        assert_eq!(model.unit(&unit).unwrap().waiting(), Waiting::OnYou);
+
+        model.note_message(&message("D1", "601", "ME", "tomorrow"), 0);
+        let facts = model.unit(&unit).unwrap();
+        assert_eq!(facts.waiting(), Waiting::OnThem);
+        assert_eq!(facts.newest, Ts("601".into()));
+        assert_eq!(
+            facts.newest_from_other,
+            Some(Ts("600".into())),
+            "the card is still open on their message until the user closes it"
+        );
     }
 
     #[test]
@@ -1267,8 +1408,8 @@ mod tests {
             unread: true,
         };
         assert_eq!(model.note_activity(&stale, 0), None);
-        let key = model.key(&ChannelId("D1".into()), &Ts("500".into()));
-        assert_eq!(model.thread(&key).unwrap().waiting(), Waiting::OnThem);
+        let key = Unit::conversation(&ChannelId("D1".into()));
+        assert_eq!(model.unit(&key).unwrap().waiting(), Waiting::OnThem);
     }
 
     #[test]
@@ -1277,9 +1418,9 @@ mod tests {
         // unread badge is stale, nothing more: the ping still owes an answer.
         let mut model = model();
         model.note_message(&message("D1", "600", "U1", "ping"), 0);
-        let key = model.key(&ChannelId("D1".into()), &Ts("600".into()));
+        let key = Unit::conversation(&ChannelId("D1".into()));
         model.mark_read(&ChannelId("D1".into()), &Ts("600".into()));
-        assert_eq!(model.thread(&key).unwrap().waiting(), Waiting::OnYou);
+        assert_eq!(model.unit(&key).unwrap().waiting(), Waiting::OnYou);
         assert_eq!(owed(&model, 0).len(), 1);
     }
 
@@ -1453,12 +1594,12 @@ mod tests {
         }]);
         // A group DM is a room the user was put in by name: a message in it
         // is addressed to them, the way a one-to-one is.
-        let key = model.key(&ChannelId("G1".into()), &Ts("200".into()));
+        let key = Unit::conversation(&ChannelId("G1".into()));
         assert_eq!(
             model.note_message(&message("G1", "200", "U1", "are you both free?"), 0),
             Some(Change::Raised(key.clone()))
         );
-        assert_eq!(model.thread(&key).unwrap().reason, Reason::DirectMessage);
+        assert_eq!(model.unit(&key).unwrap().reason, Reason::DirectMessage);
 
         // What Slack says is unread when rho starts: a DM that arrived while
         // it was off, which the feed never carries.
@@ -1484,9 +1625,7 @@ mod tests {
         let raised = model.unread_dms(0);
         assert_eq!(
             raised,
-            vec![Change::Raised(
-                model.key(&ChannelId("D1".into()), &Ts("300".into()))
-            )],
+            vec![Change::Raised(Unit::conversation(&ChannelId("D1".into())))],
             "the DM is raised and the channel is not"
         );
         assert!(

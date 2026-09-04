@@ -94,7 +94,7 @@ impl Workspace {
             crate::pane::SurfaceKey::Browser(page) => self.dashboard.page_card_id(*page),
             crate::pane::SurfaceKey::SlackConversation(rho_slack::session::Source::Thread(key)) => {
                 self.dashboard
-                    .thread_card_id(&crate::slack::thread_ref(key))
+                    .thread_card_id(&crate::slack::store_unit_of(key))
             }
             _ => None,
         }?;

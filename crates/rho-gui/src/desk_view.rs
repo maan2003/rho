@@ -3,9 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use gpui::{AppContext as _, Context, Entity};
 use language::{Buffer, BufferEvent, Capability};
 use rho_desk::cells::{
-    BodySnapshot, CellMutation, CellWrite, DeviceId, Facts, Id, Property, PropertyKey, SlackUnit,
-    Snapshot, Stamp, State, Store, Timestamp, TimestampPrecision, Uuid, Verdict, VerdictEvent,
-    Version,
+    BodySnapshot, CellMutation, CellWrite, DeviceId, Facts, Id, Property, PropertyKey, SlackTs,
+    SlackUnit, Snapshot, Stamp, State, Store, Timestamp, TimestampPrecision, Uuid, Verdict,
+    VerdictEvent, Version,
 };
 use rho_ui_proto::ClientMessage;
 use text::{BufferId, ReplicaId};
@@ -89,11 +89,18 @@ pub struct AgentSource {
 }
 
 /// What the Slack mirror says about a conversation or a followed thread.
+/// All of it only ever rises, so a history page or a reconnect can add to
+/// what a card knows and never take it back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SlackSource {
     pub unit: SlackUnit,
     pub title: String,
-    pub open: bool,
+    /// The newest message in the unit, whoever wrote it: what a `d` writes
+    /// as the cursor.
+    pub newest: SlackTs,
+    /// The newest message from someone else that concerns the user. The
+    /// card is open exactly while this is past the cursor.
+    pub newest_from_other: Option<SlackTs>,
 }
 
 /// The source facts a view joins the store with. Recomputed by the
@@ -161,6 +168,40 @@ impl DeskNode {
             _ => None,
         }
     }
+}
+
+/// What the join of a Slack unit's cursor and its mirror facts says: the
+/// card's state, and whether a message arriving during a snooze has voided
+/// it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SlackCard {
+    state: State,
+    voided: bool,
+}
+
+/// A Slack unit's card, derived and never stored. It is open exactly while
+/// someone else has written past the cursor the user's last verdict left,
+/// which is the one comparison a replayed history page cannot change.
+fn slack_card(id: &Id, facts: &Facts, sources: &Sources) -> Option<SlackCard> {
+    let Id::Slack(unit) = id else {
+        return None;
+    };
+    let source = sources.slack.iter().find(|source| &source.unit == unit)?;
+    let past = |cursor: Option<&SlackTs>| match (source.newest_from_other.as_ref(), cursor) {
+        (Some(newest), Some(cursor)) => newest.is_after(cursor),
+        (Some(_), None) => true,
+        (None, _) => false,
+    };
+    Some(SlackCard {
+        state: match past(facts.slack_handled_through.as_ref()) {
+            true => State::Open,
+            false => State::Done,
+        },
+        // The snooze recorded where the unit stood; anything from someone
+        // else past that arrived while it was snoozed, and that is what
+        // brings the card straight back.
+        voided: facts.defer_until.is_some() && past(facts.slack_snoozed_at.as_ref()),
+    })
 }
 
 /// Whether `frontier` covers every device version in `poke`.
@@ -480,9 +521,7 @@ impl DeskCells {
             }
         }
         for unit in &sources.slack {
-            if unit.open {
-                facts.entry(Id::Slack(unit.unit.clone())).or_default();
-            }
+            facts.entry(Id::Slack(unit.unit.clone())).or_default();
         }
         let mut nodes = BTreeMap::new();
         for (id, fact) in &facts {
@@ -490,13 +529,17 @@ impl DeskCells {
             // the row whose place has gone is shown at the root, and undoing
             // the one cell puts the hierarchy back.
             let parent = place(id, fact, sources).filter(|parent| !desk.view.facts(parent).deleted);
+            let slack = slack_card(id, fact, sources);
             nodes.insert(
                 id.clone(),
                 DeskNode {
                     id: id.clone(),
                     parent,
-                    state: fact.state,
-                    defer_until: fact.defer_until,
+                    state: slack.map_or(fact.state, |card| card.state),
+                    defer_until: match slack {
+                        Some(card) if card.voided => None,
+                        _ => fact.defer_until,
+                    },
                     deadline: fact.deadline,
                     pace_days: fact.pace_days,
                     labels: fact.labels.clone(),
@@ -979,6 +1022,32 @@ impl DeskCells {
             .collect()
     }
 
+    /// What the user has said about one Slack unit. The cursor a card was
+    /// closed on is a fact like any other, and opening the card needs it to
+    /// know where to land the reader.
+    pub fn facts_of_slack_unit(&self, host: Option<HostId>, unit: &SlackUnit) -> Option<Facts> {
+        Some(self.hosts.get(&host?)?.view.facts(&Id::Slack(unit.clone())))
+    }
+
+    /// What the mirror says a Slack unit's newest message is, for a verdict
+    /// about to write a cursor. `None` for everything that is not a Slack
+    /// unit, and for a unit no source knows about, which is a verdict on a
+    /// card that cannot be dealt.
+    fn slack_verdict(&self, host: HostId, id: &Id) -> Option<rho_desk::cells::SlackVerdict> {
+        let Id::Slack(unit) = id else {
+            return None;
+        };
+        self.hosts
+            .get(&host)?
+            .sources
+            .slack
+            .iter()
+            .find(|source| &source.unit == unit)
+            .map(|source| rho_desk::cells::SlackVerdict {
+                newest: source.newest.clone(),
+            })
+    }
+
     /// A dealt verdict: the facts it changes, plus the log entry recording
     /// exactly what it changed so an undo can be validated against it.
     pub fn verdict_writes(
@@ -987,6 +1056,9 @@ impl DeskCells {
         id: &Id,
         verdict: DeskVerdict,
     ) -> Option<(Vec<CellWrite>, (Id, VerdictEvent))> {
+        // What a verdict on a Slack unit writes is a message timestamp, and
+        // that timestamp is the mirror's rather than the store's.
+        let slack = self.slack_verdict(host, id);
         let (verdict, mut writes): (Verdict, Vec<CellWrite>) = match verdict {
             DeskVerdict::Done => (Verdict::Done, Vec::new()),
             DeskVerdict::Mute => (Verdict::Mute, Vec::new()),
@@ -1021,12 +1093,17 @@ impl DeskCells {
                         defer_until,
                         pace_days: pace,
                     }),
+                    slack.clone(),
                 )
                 .ok()?;
-                writes.push(CellWrite {
-                    id: id.clone(),
-                    property: Property::State(State::Done),
-                });
+                // A Slack unit is handled by its cursor, which the changes
+                // above already carry; everything else is handled by a state.
+                if slack.is_none() {
+                    writes.push(CellWrite {
+                        id: id.clone(),
+                        property: Property::State(State::Done),
+                    });
+                }
                 let event = VerdictEvent::Applied {
                     verdict,
                     at: Stamp {
@@ -1047,6 +1124,7 @@ impl DeskCells {
             &verdict,
             &|key| view.property(id, key).cloned(),
             None,
+            slack,
         )
         .ok()?;
         // A verdict that changes nothing about what it is for is not one:

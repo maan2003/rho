@@ -503,6 +503,7 @@ fn validate_verdict_shape(
                 .and_then(|change| change.before.clone())
         },
         rho_desk::cells::todo_cadence(changes),
+        rho_desk::cells::slack_verdict(verdict_id, changes),
     )?;
     let sorted = |mut changes: Vec<rho_desk::cells::FactChange>| {
         changes.sort_by(|left, right| (&left.id, &left.key).cmp(&(&right.id, &right.key)));
@@ -871,9 +872,13 @@ mod tests {
         let changes = vec![
             FactChange {
                 id: unit.clone(),
-                key: PropertyKey::State,
-                before: Some(Property::State(State::Open)),
-                after: Some(Property::State(State::Done)),
+                key: PropertyKey::SlackHandledThrough,
+                before: Some(Property::SlackHandledThrough(rho_desk::cells::SlackTs(
+                    String::new(),
+                ))),
+                after: Some(Property::SlackHandledThrough(rho_desk::cells::SlackTs(
+                    "2.0".into(),
+                ))),
             },
             FactChange {
                 id: note.clone(),
@@ -902,7 +907,7 @@ mod tests {
             let mut writes = vec![
                 CellWrite {
                     id: unit.clone(),
-                    property: Property::State(State::Done),
+                    property: Property::SlackHandledThrough(rho_desk::cells::SlackTs("2.0".into())),
                 },
                 CellWrite {
                     id: note.clone(),
@@ -971,7 +976,13 @@ mod tests {
             store.sync_since(&Version::new()).unwrap(),
         )
         .unwrap();
-        assert_eq!(store.facts(&unit).state, State::Done);
+        // The unit is closed by its cursor, never by a state: a history page
+        // replaying an older message cannot make it open again.
+        assert_eq!(store.facts(&unit).state, State::Open);
+        assert_eq!(
+            store.facts(&unit).slack_handled_through,
+            Some(rho_desk::cells::SlackTs("2.0".into()))
+        );
         assert_eq!(store.facts(&note).parent, Some(unit));
     }
 

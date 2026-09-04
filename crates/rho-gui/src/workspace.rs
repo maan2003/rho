@@ -6236,17 +6236,22 @@ impl Workspace {
             .collect::<Vec<_>>();
         // The Slack mirror lives on this client, and its conversations are
         // the primary host's desk.
-        let slack = if self.hosts.primary() == Some(host) {
+        // With no session there is nothing new to say about Slack, which is
+        // not the same as saying every unit went quiet: the facts already
+        // read from the mirror stand until a session replaces them.
+        let slack = if self.slack.is_none() {
+            self.desk_cells
+                .sources(host)
+                .map(|sources| sources.slack.clone())
+                .unwrap_or_default()
+        } else if self.hosts.primary() == Some(host) {
             self.slack_thread_facts(cx)
                 .into_iter()
-                .map(|(thread, facts)| crate::desk_view::SlackSource {
-                    unit: rho_desk::cells::SlackUnit {
-                        workspace: thread.workspace,
-                        channel: thread.channel,
-                        thread: Some(thread.thread_ts),
-                    },
+                .map(|(unit, facts)| crate::desk_view::SlackSource {
+                    unit,
                     title: facts.title,
-                    open: true,
+                    newest: rho_desk::cells::SlackTs(facts.latest),
+                    newest_from_other: facts.newest_from_other.map(rho_desk::cells::SlackTs),
                 })
                 .collect()
         } else {
@@ -6258,6 +6263,41 @@ impl Workspace {
             slack,
         };
         self.desk_cells.set_sources(host, sources);
+    }
+
+    /// One verdict, applied the way the dealer applies it, for a test that
+    /// is about what the verdict writes rather than about the keystroke.
+    #[cfg(test)]
+    pub(crate) fn apply_verdict_for_test(
+        &mut self,
+        host: HostId,
+        id: &rho_desk::cells::Id,
+        verdict: crate::desk_view::DeskVerdict,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((writes, event)) = self.desk_cells.verdict_writes(host, id, verdict) else {
+            return false;
+        };
+        self.apply_desk_writes(host, writes, Some(event), window, cx)
+            .is_some()
+    }
+
+    /// What the mirror would say, for a test with no Slack session: the
+    /// join a card is derived from needs the unit's timestamps, and they are
+    /// the one thing no store fixture can hold.
+    #[cfg(test)]
+    pub(crate) fn set_slack_sources_for_test(
+        &mut self,
+        host: HostId,
+        slack: Vec<crate::desk_view::SlackSource>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut sources = self.desk_cells.sources(host).cloned().unwrap_or_default();
+        sources.slack = slack;
+        self.desk_cells.set_sources(host, sources);
+        self.sync_tree_dashboard(host, window, cx);
     }
 
     /// Rebuilds every open note surface against the tree, so a child
@@ -6341,11 +6381,7 @@ impl Workspace {
                 true
             }
             crate::dashboard::CardTarget::Thread(thread) => {
-                self.open_slack_source(
-                    rho_slack::session::Source::Thread(crate::slack::thread_key(&thread)),
-                    window,
-                    cx,
-                );
+                self.open_slack_source(crate::slack::unit_source(&thread), window, cx);
                 true
             }
             crate::dashboard::CardTarget::Note | crate::dashboard::CardTarget::Missing => {
@@ -6451,7 +6487,7 @@ impl Workspace {
             SurfaceKey::Browser(page) => self.dashboard.page_card_id(*page),
             SurfaceKey::SlackConversation(rho_slack::session::Source::Thread(key)) => self
                 .dashboard
-                .thread_card_id(&crate::slack::thread_ref(key)),
+                .thread_card_id(&crate::slack::store_unit_of(key)),
             // A channel surface is dealt for one of its messages, and that
             // message is what has a node. With several open in the same
             // channel, the newest is the one the reader was sent to.
@@ -6459,8 +6495,8 @@ impl Workspace {
                 self.dashboard
                     .open_thread_cards()
                     .into_iter()
-                    .filter(|(_, thread)| thread.channel == channel.0)
-                    .max_by(|(_, left), (_, right)| left.thread_ts.cmp(&right.thread_ts))
+                    .filter(|(_, unit)| unit.channel == channel.0)
+                    .max_by(|(_, left), (_, right)| left.thread.cmp(&right.thread))
                     .map(|(card, _)| card)
             }
             _ => None,
@@ -7385,19 +7421,8 @@ impl Workspace {
             // A thread is a conversation: the deal view is the conversation
             // surface itself, opened the way `enter` opens it, with the
             // message that raised the card on screen.
-            crate::dashboard::CardTarget::Thread(thread) => {
-                let latest = self
-                    .slack_thread_facts(cx)
-                    .get(&thread)
-                    .map_or_else(|| thread.thread_ts.clone(), |facts| facts.latest.clone());
-                if self.open_slack_deal(
-                    &thread.workspace,
-                    &thread.channel,
-                    &thread.thread_ts,
-                    &latest,
-                    window,
-                    cx,
-                ) {
+            crate::dashboard::CardTarget::Thread(unit) => {
+                if self.open_slack_deal(&unit, window, cx) {
                     self.deal_view = Some(DealView::Surface {
                         identity: card.identity,
                         surface: self.active_pane().surface.clone(),
@@ -8884,15 +8909,11 @@ impl Workspace {
             // A Slack deal shows the conversation and nothing else: the
             // words are on screen already, and the state segment says whose
             // turn it is.
-            crate::dashboard::CardTarget::Thread(thread) => {
+            crate::dashboard::CardTarget::Thread(unit) => {
                 let conversation = card.room.clone().unwrap_or_else(|| "slack".to_owned());
-                let latest = self
-                    .slack_thread_facts(cx)
-                    .get(&thread)
-                    .map(|facts| facts.latest.clone());
-                match latest.as_ref() == Some(&thread.thread_ts) || latest.is_none() {
-                    true => conversation,
-                    false => format!("{conversation} / thread"),
+                match unit.thread.is_some() {
+                    true => format!("{conversation} / thread"),
+                    false => conversation,
                 }
             }
             _ => card.breadcrumb.replace(" › ", " / "),
@@ -10170,18 +10191,8 @@ impl Render for Workspace {
                     crate::dashboard::CardTarget::Page(page) => {
                         this.open_browser_page(page, window, cx);
                     }
-                    crate::dashboard::CardTarget::Thread(thread) if this.phone.enabled => {
-                        let latest = this
-                            .slack_thread_facts(cx)
-                            .get(&thread)
-                            .map_or_else(|| thread.thread_ts.clone(), |facts| facts.latest.clone());
-                        let source = Self::slack_deal_source(
-                            &thread.workspace,
-                            &thread.channel,
-                            &thread.thread_ts,
-                            &latest,
-                        );
-                        this.open_slack_source(source, window, cx);
+                    crate::dashboard::CardTarget::Thread(unit) if this.phone.enabled => {
+                        this.open_slack_source(crate::slack::unit_source(&unit), window, cx);
                         if let SurfaceView::SlackConversation(view) =
                             &this.active_pane().surface.view
                         {

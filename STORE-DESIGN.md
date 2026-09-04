@@ -465,7 +465,12 @@ else is built on. The transient lands after slice 2.
    fresh-db test could have caught.
 2. Slack on the store (checklist 2.18): the unit model, `handled_through`
    as a fact, cards from the join, `DeskThreadBind` gone, the native tree
-   store and `rho desk cat/checkout` gone.
+   store and `rho desk cat/checkout` gone. Landed 4 Sep in two commits:
+   a4fda1ce (the deletion, 5,124 lines, ALPN `rho/ui/8`, log epoch
+   RUP8) and the Slack half after it. One property added on the way:
+   `SlackSnoozedAt(ts)`, written by snooze beside `DeferUntil`, because
+   "a message newer than the snooze" needs a Slack position to compare
+   against and the store has no wall clock; the cursor stays untouched.
 3. Labels: the `l` key, the picker with `rho/agent`, the map's label axis.
 4. Browser: `opened_from` from the embedded browser, tabs under their
    origin.

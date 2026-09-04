@@ -118,6 +118,22 @@ pub struct Timestamp {
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Encode, Decode, Pack, Unpack)]
 pub struct SlackTs(pub String);
 
+impl SlackTs {
+    /// Whether this message is strictly after another. Slack's timestamps
+    /// are `seconds.microseconds` and compare as numbers; a string compare
+    /// would put `1000.0` before `999.0` the day the epoch gains a digit.
+    pub fn is_after(&self, other: &SlackTs) -> bool {
+        match (self.epoch_seconds(), other.epoch_seconds()) {
+            (Some(mine), Some(theirs)) => mine > theirs,
+            _ => self.0 > other.0,
+        }
+    }
+
+    fn epoch_seconds(&self) -> Option<f64> {
+        self.0.parse().ok()
+    }
+}
+
 /// What the user can claim about a thing. The claim is the variant and its
 /// payload together; there is no separate value column, so a fact that
 /// needs more detail than an id carries says so in its own payload rather
@@ -145,6 +161,11 @@ pub enum Property {
     /// with. The cursor is per source, at that source's own position, so
     /// an agent's will sit beside this one rather than share it.
     SlackHandledThrough(SlackTs),
+    /// What the newest message was when the user snoozed the unit. A
+    /// snooze does not move the cursor, so this is the only way to tell a
+    /// message that arrived during the snooze from one that was already
+    /// there: the first voids the snooze, the second must not.
+    SlackSnoozedAt(SlackTs),
     Deleted(bool),
     CreatedAt(Timestamp),
 }
@@ -162,6 +183,7 @@ pub enum PropertyKey {
     Deadline,
     PaceDays,
     SlackHandledThrough,
+    SlackSnoozedAt,
     Deleted,
     CreatedAt,
 }
@@ -193,6 +215,7 @@ impl Property {
             Property::Deadline(_) => PropertyKey::Deadline,
             Property::PaceDays(_) => PropertyKey::PaceDays,
             Property::SlackHandledThrough(_) => PropertyKey::SlackHandledThrough,
+            Property::SlackSnoozedAt(_) => PropertyKey::SlackSnoozedAt,
             Property::Deleted(_) => PropertyKey::Deleted,
             Property::CreatedAt(_) => PropertyKey::CreatedAt,
         }
@@ -234,8 +257,10 @@ impl PropertyKey {
     /// The claim that holds when nobody has written this fact. Undo needs
     /// it: putting a cell back where there was none is writing the state
     /// the reader saw, and that state is this. The properties left out are
-    /// the ones with no unwritten reading — a name, a Slack cursor, a
-    /// creation time either exist or the thing is not that thing.
+    /// the ones with no unwritten reading — a name and a creation time
+    /// either exist or the thing is not that thing. A Slack cursor does
+    /// have one: nothing handled is the empty cursor, which every real
+    /// message is past, and undo needs it to put a card back.
     pub fn unwritten(&self) -> Option<Property> {
         match self {
             PropertyKey::Parent => Some(Property::Parent(None)),
@@ -248,7 +273,11 @@ impl PropertyKey {
             PropertyKey::Deadline => Some(Property::Deadline(None)),
             PropertyKey::PaceDays => Some(Property::PaceDays(0)),
             PropertyKey::Deleted => Some(Property::Deleted(false)),
-            PropertyKey::Name | PropertyKey::SlackHandledThrough | PropertyKey::CreatedAt => None,
+            PropertyKey::SlackHandledThrough => {
+                Some(Property::SlackHandledThrough(SlackTs(String::new())))
+            }
+            PropertyKey::SlackSnoozedAt => Some(Property::SlackSnoozedAt(SlackTs(String::new()))),
+            PropertyKey::Name | PropertyKey::CreatedAt => None,
         }
     }
 }
@@ -343,11 +372,37 @@ pub struct TodoCadence {
 /// `before` is what the property held, which only the writer knows;
 /// `cadence` is required for `todo`, whose changes describe the note the
 /// verdict creates rather than the thing it was dealt on.
+/// What the mirror said about a Slack unit at the moment a verdict was
+/// made. A verdict on a unit writes a message timestamp rather than a
+/// state, and that timestamp is not in the store, so the caller brings it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SlackVerdict {
+    pub newest: SlackTs,
+}
+
+/// The Slack facts a verdict entry claims, read back out of its changes,
+/// so a checker can rebuild the same shape the writer built.
+pub fn slack_verdict(id: &Id, changes: &[FactChange]) -> Option<SlackVerdict> {
+    if !matches!(id, Id::Slack(_)) {
+        return None;
+    }
+    changes
+        .iter()
+        .filter(|change| &change.id == id)
+        .find_map(|change| match change.after.as_ref()? {
+            Property::SlackHandledThrough(ts) | Property::SlackSnoozedAt(ts) => {
+                Some(SlackVerdict { newest: ts.clone() })
+            }
+            _ => None,
+        })
+}
+
 pub fn verdict_changes(
     id: &Id,
     verdict: &Verdict,
     before: &dyn Fn(&PropertyKey) -> Option<Property>,
     cadence: Option<TodoCadence>,
+    slack: Option<SlackVerdict>,
 ) -> Result<Vec<FactChange>, String> {
     let change = |after: Property| FactChange {
         id: id.clone(),
@@ -359,6 +414,48 @@ pub fn verdict_changes(
         after: Some(after),
     };
     let one = |after: Property| Ok(vec![change(after)]);
+    // A Slack unit is closed by moving its cursor, not by a state: whatever
+    // Slack sends afterwards, the only question the card asks is "is there
+    // something from them past the cursor", and a history page cannot make
+    // that true again.
+    if let Id::Slack(_) = id {
+        let slack = slack.ok_or("a verdict on a Slack unit needs its newest message")?;
+        let handled = || change(Property::SlackHandledThrough(slack.newest.clone()));
+        return match verdict {
+            // Mute is done plus the unfollow rho makes in Slack, which is
+            // the caller's to send: nothing here says a card can never come
+            // back, because following the thread again must bring it back.
+            Verdict::Done | Verdict::Mute => Ok(vec![handled()]),
+            // The cursor stays where it is, so the messages the user has not
+            // handled are still theirs when the snooze ends. What is
+            // recorded is where the unit stood, which is what makes a reply
+            // arriving during the snooze void it.
+            Verdict::Defer { until } => Ok(vec![
+                change(Property::DeferUntil(Some(*until))),
+                change(Property::PaceDays(0)),
+                change(Property::SlackSnoozedAt(slack.newest.clone())),
+            ]),
+            Verdict::File { parent } => one(Property::Parent(Some(parent.clone()))),
+            Verdict::Todo { note } => {
+                let cadence = cadence.ok_or("a todo verdict needs its cadence")?;
+                let fresh = |before: Property, after: Property| FactChange {
+                    id: note.clone(),
+                    key: after.key(),
+                    before: Some(before),
+                    after: Some(after),
+                };
+                Ok(vec![
+                    handled(),
+                    fresh(Property::Deleted(true), Property::Deleted(false)),
+                    fresh(
+                        Property::DeferUntil(None),
+                        Property::DeferUntil(Some(cadence.defer_until)),
+                    ),
+                    fresh(Property::PaceDays(0), Property::PaceDays(cadence.pace_days)),
+                ])
+            }
+        };
+    }
     match verdict {
         Verdict::Done => one(Property::State(State::Done)),
         Verdict::Mute => one(Property::State(State::Muted)),
@@ -471,6 +568,7 @@ pub struct Facts {
     pub deadline: Option<Timestamp>,
     pub pace_days: u32,
     pub slack_handled_through: Option<SlackTs>,
+    pub slack_snoozed_at: Option<SlackTs>,
     pub deleted: bool,
     pub created_at: Option<Timestamp>,
 }
@@ -738,6 +836,7 @@ impl Store {
                 Property::Deadline(at) => facts.deadline = *at,
                 Property::PaceDays(days) => facts.pace_days = *days,
                 Property::SlackHandledThrough(ts) => facts.slack_handled_through = Some(ts.clone()),
+                Property::SlackSnoozedAt(ts) => facts.slack_snoozed_at = Some(ts.clone()),
                 Property::Deleted(deleted) => facts.deleted = *deleted,
                 Property::CreatedAt(at) => facts.created_at = Some(*at),
             }
@@ -1064,9 +1163,69 @@ mod tests {
             &Verdict::Done,
             &|key| store.property(&note(1), key).cloned(),
             None,
+            None,
         )
         .unwrap();
         assert_eq!(changes[0].before, Some(Property::State(State::Open)));
+    }
+
+    /// A Slack unit is closed by moving a cursor, not by a state, so that
+    /// whatever Slack replays afterwards, the only question is whether
+    /// there is something from them past the cursor.
+    #[test]
+    fn a_verdict_on_a_slack_unit_writes_a_cursor_rather_than_a_state() {
+        let store = Store::new(device(1));
+        let unit = Id::Slack(SlackUnit {
+            workspace: "acme".to_owned(),
+            channel: "C1".to_owned(),
+            thread: None,
+        });
+        let newest = SlackTs("300.0".to_owned());
+        let changes = |verdict| {
+            verdict_changes(
+                &unit,
+                &verdict,
+                &|key| store.property(&unit, key).cloned(),
+                None,
+                Some(SlackVerdict {
+                    newest: newest.clone(),
+                }),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            changes(Verdict::Done),
+            vec![FactChange {
+                id: unit.clone(),
+                key: PropertyKey::SlackHandledThrough,
+                before: Some(Property::SlackHandledThrough(SlackTs(String::new()))),
+                after: Some(Property::SlackHandledThrough(newest.clone())),
+            }]
+        );
+        // Mute is done plus an unfollow in Slack; nothing here says the card
+        // can never come back, because following the thread again must.
+        assert_eq!(changes(Verdict::Mute), changes(Verdict::Done));
+        // A snooze leaves the cursor alone, so the messages the user has not
+        // handled are still theirs when it ends, and records where the unit
+        // stood so a reply arriving during the snooze voids it.
+        let snoozed = changes(Verdict::Defer {
+            until: timestamp(10),
+        });
+        assert_eq!(
+            snoozed.last().unwrap().after,
+            Some(Property::SlackSnoozedAt(newest.clone()))
+        );
+        assert!(
+            !snoozed
+                .iter()
+                .any(|change| change.key == PropertyKey::SlackHandledThrough)
+        );
+        // A verdict on a unit whose newest message nobody supplied is a
+        // verdict that would write an empty cursor, so it is refused.
+        assert!(
+            verdict_changes(&unit, &Verdict::Done, &|_| None, None, None).is_err(),
+            "a cursor cannot be invented"
+        );
     }
 
     #[test]

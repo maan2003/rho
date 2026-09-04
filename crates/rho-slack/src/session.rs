@@ -21,7 +21,7 @@ use crate::config::Credentials;
 use crate::events::WsEvent;
 use crate::health::{Health, Signal};
 use crate::mirror::{Mirror, Scope};
-use crate::model::{Change, ConversationRow, Model};
+use crate::model::{Change, ConversationRow, Model, Unit};
 use crate::socket::{Timings, Wire, poll_feed, run_feed, run_socket};
 use crate::types::{ChannelId, Message, Reaction, ThreadKey, Ts, UserId};
 
@@ -504,7 +504,11 @@ impl Session {
                     .into_iter()
                     .filter(|key| !fresh.contains(key))
                     .map(Change::Updated)
-                    .chain(dropped.into_iter().map(Change::Muted))
+                    .chain(
+                        dropped
+                            .into_iter()
+                            .map(|key| Change::Muted(Unit::thread(&key.channel, &key.thread_ts))),
+                    )
                     .chain(raised)
                     .collect();
                 session.announce(known, cx);
@@ -551,9 +555,9 @@ impl Session {
                 // Ignored here or in another client: either way Slack has
                 // said the thread is no longer the user's, and the card goes
                 // with it.
-                let key = self.model.key(&channel, &thread_ts);
+                let unit = Unit::thread(&channel, &thread_ts);
                 if self.model.unfollow(&channel, &thread_ts) {
-                    self.announce(vec![Change::Muted(key)], cx);
+                    self.announce(vec![Change::Muted(unit)], cx);
                 }
             }
             Wire::Frame(WsEvent::Reacted {
@@ -826,6 +830,24 @@ impl Session {
 
     pub fn model(&self) -> &Model {
         &self.model
+    }
+
+    /// Where a dealt card lands the reader: the oldest message from someone
+    /// else past the cursor their last verdict left. Three mentions in a
+    /// channel are one card, and this is the first of the three.
+    pub fn oldest_from_other_after(&self, unit: &Unit, cursor: Option<&Ts>) -> Option<Ts> {
+        oldest_from_other_after(&self.model, self.mirror.as_deref()?, unit, cursor)
+    }
+
+    /// The line a card shows for a unit, rendered from the mirror now
+    /// rather than kept from when the message landed. A name the roster
+    /// only supplied on the second connection is why: a summary frozen at
+    /// ingest says `<@U123>` on every cold start, and this says `@ada`.
+    pub fn unit_summary(&self, unit: &Unit) -> String {
+        match self.mirror.as_deref() {
+            Some(mirror) => unit_summary(&self.model, mirror, unit),
+            None => String::new(),
+        }
     }
 
     pub fn health_reason(&self) -> Option<&str> {
@@ -1121,21 +1143,29 @@ impl Session {
     /// all when the mirror already holds the message. This is what the web
     /// client fetches when the notification is clicked; rho does it a moment
     /// earlier.
-    fn prefetch_ping(&mut self, key: &ThreadKey, cx: &mut Context<Self>) {
+    fn prefetch_ping(&mut self, unit: &Unit, cx: &mut Context<Self>) {
         let Some(client) = self.client.clone() else {
             return;
         };
-        let scope = Scope::conversation(&self.model.workspace().0, &key.channel);
+        // The message that pinged is the unit's newest; a followed thread's
+        // window opens around its root, which is where its replies hang.
+        let Some(ts) = unit
+            .thread
+            .clone()
+            .or_else(|| Some(self.model.unit(unit)?.newest.clone()))
+        else {
+            return;
+        };
+        let scope = Scope::conversation(&self.model.workspace().0, &unit.channel);
         if self
             .mirror
             .as_ref()
-            .is_none_or(|mirror| mirror.holds(&scope, &key.thread_ts))
+            .is_none_or(|mirror| mirror.holds(&scope, &ts))
         {
             return;
         }
-        let source = Source::Conversation(key.channel.clone());
-        let channel = key.channel.clone();
-        let ts = key.thread_ts.clone();
+        let source = Source::Conversation(unit.channel.clone());
+        let channel = unit.channel.clone();
         let scope = scope.clone();
         let task = gpui_tokio::Tokio::spawn(cx, async move {
             client
@@ -1162,8 +1192,14 @@ impl Session {
     /// only *that* a thread changed, so without this the card would carry no
     /// summary and the conversation would have no name. Reading it here must
     /// not mark it read: nobody has seen it yet.
-    fn ensure_thread_loaded(&mut self, key: &ThreadKey, cx: &mut Context<Self>) {
-        let source = Source::Thread(key.clone());
+    fn ensure_thread_loaded(&mut self, unit: &Unit, cx: &mut Context<Self>) {
+        // Only a followed thread has replies of its own to load. A
+        // conversation's window came from the ping prefetch, and asking for
+        // it again would be a request the web client never makes.
+        let Some(root) = unit.thread.clone() else {
+            return;
+        };
+        let source = Source::Thread(self.model.key(&unit.channel, &root));
         if self.loaded.contains_key(&source) {
             return;
         }
@@ -1890,6 +1926,61 @@ const MIRROR_PAGE: usize = 50;
 /// enough to be two ordinary requests.
 const PING_WINDOW: usize = 20;
 
+/// How far back a dealt card looks for the oldest message it owes an
+/// answer to. A unit with more unhandled mentions than this is a backlog,
+/// not a card, and the reader is better served landing inside the window
+/// than paging the whole history to find its floor.
+const LANDING_WINDOW: usize = 200;
+
+/// Which mirror scope holds a unit's messages.
+fn unit_scope(model: &Model, unit: &Unit) -> Scope {
+    let workspace = &model.workspace().0;
+    match &unit.thread {
+        Some(root) => Scope::thread(workspace, &unit.channel, root),
+        None => Scope::conversation(workspace, &unit.channel),
+    }
+}
+
+fn oldest_from_other_after(
+    model: &Model,
+    mirror: &Mirror,
+    unit: &Unit,
+    cursor: Option<&Ts>,
+) -> Option<Ts> {
+    let self_id = model.self_id().clone();
+    mirror
+        .newest_chunk(&unit_scope(model, unit), LANDING_WINDOW)
+        .into_iter()
+        .filter(|message| message.user.as_ref() != Some(&self_id))
+        .filter(|message| model.concerns_you(message, unit))
+        .filter(|message| cursor.is_none_or(|cursor| message.ts.is_newer_than(cursor)))
+        .map(|message| message.ts)
+        .min_by(|left, right| {
+            left.epoch_seconds()
+                .partial_cmp(&right.epoch_seconds())
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .or_else(|| model.unit(unit).map(|facts| facts.newest.clone()))
+}
+
+fn unit_summary(model: &Model, mirror: &Mirror, unit: &Unit) -> String {
+    let scope = unit_scope(model, unit);
+    let message = model
+        .unit(unit)
+        .map(|facts| facts.newest.clone())
+        .and_then(|ts| mirror.chunk_containing(&scope, &ts, 1).pop())
+        .or_else(|| mirror.newest_chunk(&scope, 1).pop());
+    message
+        .map(|message| model.render(&message))
+        .as_deref()
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default()
+        .to_owned()
+}
+
 /// The mirror lives beside rho's other state. A machine without a state
 /// directory simply runs without one: the client still works, it just has
 /// nothing to show before the first response.
@@ -1945,6 +2036,86 @@ mod tests {
             &ChannelId("C1".into()),
         )
         .unwrap()
+    }
+
+    fn mentioning(ts: &str, user: &str, text: &str) -> Message {
+        crate::api::parse_message(
+            &json!({"ts": ts, "user": user, "text": text}),
+            &ChannelId("C1".into()),
+        )
+        .unwrap()
+    }
+
+    fn seeded() -> (tempfile::TempDir, Mirror, Model) {
+        let dir = tempfile::tempdir().unwrap();
+        let mirror = Mirror::open(dir.path().join("slack.redb")).unwrap();
+        let mut model = Model::new(crate::config::WorkspaceName("T1".into()));
+        model.set_self(UserId("ME".into()));
+        model.add_conversations([crate::types::Conversation {
+            id: ChannelId("C1".into()),
+            kind: crate::types::ConversationKind::Channel,
+            name: "design".into(),
+            user: None,
+            members: Vec::new(),
+        }]);
+        (dir, mirror, model)
+    }
+
+    /// The card's words are rendered when the card is drawn, never kept
+    /// from when the message landed. This is the cold start: the mention
+    /// arrives before the roster does, and the card still reads `@ada`
+    /// rather than the id Slack sent.
+    #[test]
+    fn a_cards_words_are_rendered_now_and_not_when_the_message_landed() {
+        let (_dir, mirror, mut model) = seeded();
+        let scope = Scope::conversation("T1", &ChannelId("C1".into()));
+        let mention = mentioning("100.0", "U1", "<@U9> can you look?");
+        mirror.insert_messages(&scope, &[mention.clone()]);
+        model.note_message(&mentioning("100.0", "U1", "hey <@ME> look"), 0);
+        let unit = Unit::conversation(&ChannelId("C1".into()));
+
+        assert_eq!(
+            unit_summary(&model, &mirror, &unit),
+            "@someone can you look?",
+            "with no roster there is no name to put on it"
+        );
+        model.add_users([crate::types::User {
+            id: UserId("U9".into()),
+            name: "ada".into(),
+            handle: "ada".into(),
+        }]);
+        assert_eq!(
+            unit_summary(&model, &mirror, &unit),
+            "@ada can you look?",
+            "the same message, re-rendered with what is known now"
+        );
+    }
+
+    /// A channel with three unhandled mentions is one card, and the reader
+    /// is put on the first of them rather than the last: the cursor says
+    /// what has been dealt with, and everything past it is still theirs.
+    #[test]
+    fn a_dealt_card_lands_on_the_oldest_message_past_the_cursor() {
+        let (_dir, mirror, mut model) = seeded();
+        let scope = Scope::conversation("T1", &ChannelId("C1".into()));
+        for ts in ["100.0", "200.0", "300.0"] {
+            let message = mentioning(ts, "U1", "hey <@ME> look");
+            mirror.insert_messages(&scope, &[message.clone()]);
+            model.note_message(&message, 0);
+        }
+        mirror.insert_messages(&scope, &[mentioning("250.0", "ME", "on it")]);
+        let unit = Unit::conversation(&ChannelId("C1".into()));
+
+        assert_eq!(
+            oldest_from_other_after(&model, &mirror, &unit, None),
+            Some(Ts("100.0".into())),
+            "nothing handled yet, so the card opens on the first mention"
+        );
+        assert_eq!(
+            oldest_from_other_after(&model, &mirror, &unit, Some(&Ts("100.0".into()))),
+            Some(Ts("200.0".into())),
+            "past the cursor, and the user's own message is never the landing"
+        );
     }
 
     #[test]

@@ -185,7 +185,11 @@ pub(crate) fn rank(candidates: &[(String, i64)], query: &str) -> Vec<usize> {
 /// under the conversation it is in, which is how the reader names it.
 fn slack_candidates(
     rows: Vec<rho_slack::model::ConversationRow>,
-    threads: Vec<(rho_slack::types::ThreadKey, rho_slack::model::ThreadCard)>,
+    threads: Vec<(
+        rho_slack::types::ThreadKey,
+        rho_slack::model::UnitCard,
+        String,
+    )>,
 ) -> Vec<FindCandidate> {
     let millis = |ts: &rho_slack::types::Ts| (ts.epoch_seconds() * 1000.0) as i64;
     let mut candidates = Vec::new();
@@ -197,11 +201,11 @@ fn slack_candidates(
             target: FindTarget::Slack(rho_slack::session::Source::Conversation(row.id)),
         });
     }
-    for (key, card) in threads {
+    for (key, card, title) in threads {
         candidates.push(FindCandidate {
-            path: format!("slack › {} › {}", card.conversation, card.summary),
+            path: format!("slack › {} › {title}", card.conversation),
             kind: "thread",
-            recency: millis(&card.latest),
+            recency: millis(&card.newest),
             target: FindTarget::Slack(rho_slack::session::Source::Thread(key)),
         });
     }
@@ -227,12 +231,17 @@ impl Workspace {
         let session = session.read(cx);
         let model = session.model();
         let now = chrono::Utc::now().timestamp_millis();
+        // Only followed threads are paths of their own here: a conversation
+        // is already one row above, and listing its unit again would put the
+        // same room in the finder twice.
         let threads = model
             .tracked()
             .into_iter()
-            .filter_map(|key| {
-                let card = model.card(&key, now)?;
-                Some((key, card))
+            .filter_map(|unit| {
+                let root = unit.thread.clone()?;
+                let card = model.card(&unit, now)?;
+                let title = session.unit_summary(&unit);
+                Some((model.key(&unit.channel, &root), card, title))
             })
             .collect::<Vec<_>>();
         slack_candidates(session.rows(), threads)
@@ -396,7 +405,7 @@ mod tests {
 
     #[test]
     fn slack_conversations_and_threads_are_paths_like_any_other_node() {
-        use rho_slack::model::{ConversationRow, ThreadCard, Waiting};
+        use rho_slack::model::{ConversationRow, Unit, UnitCard, Waiting};
         use rho_slack::types::{ChannelId, ThreadKey, Ts};
 
         let key = ThreadKey {
@@ -416,14 +425,15 @@ mod tests {
             }],
             vec![(
                 key.clone(),
-                ThreadCard {
-                    key: key.clone(),
+                UnitCard {
+                    unit: Unit::thread(&key.channel, &key.thread_ts),
                     conversation: "#design".to_owned(),
-                    summary: "release date".to_owned(),
                     waiting: Waiting::OnYou,
                     wait_days: 0.0,
-                    latest: Ts::from("140.000000"),
+                    newest: Ts::from("140.000000"),
+                    newest_from_other: None,
                 },
+                "release date".to_owned(),
             )],
         );
         let paths = candidates

@@ -6638,24 +6638,32 @@ fn a_thread_node_without_its_mirror_is_not_dealt(cx: &mut TestAppContext) {
         .unwrap();
 }
 
-/// Where a Slack thread's verdict lives: on the node, not beside the
-/// mirror. A thread the user is done with is closed in the tree, and the
-/// backlog command, which is the one place that acts on every thread card
-/// at once, sees only what the tree still calls open.
+/// Where a Slack unit's verdict lives: on the unit in the store, not
+/// beside the mirror. A unit the user is done with has a cursor past
+/// everything Slack has to say, and the backlog command, which is the one
+/// place that acts on every card at once, sees only what is still open.
 #[gpui::test]
-fn a_thread_verdict_is_read_from_the_node_not_from_slack(cx: &mut TestAppContext) {
+fn a_slack_verdict_is_read_from_the_store_not_from_slack(cx: &mut TestAppContext) {
     let mut desk = DeskFixture::new();
     let open = desk.thread_row(None, "C1", "500.0");
     let settled = desk.thread_row(None, "C1", "600.0");
     desk.set(
         settled.clone(),
-        rho_desk::cells::Property::State(rho_desk::cells::State::Done),
+        rho_desk::cells::Property::SlackHandledThrough(rho_desk::cells::SlackTs(
+            "600.0".to_owned(),
+        )),
     );
 
     let workspace = test_workspace(cx);
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.set_slack_sources_for_test(
+                HostId::default(),
+                desk.slack_sources(),
+                window,
+                cx,
+            );
             let cards = workspace.dashboard.open_thread_cards();
             assert_eq!(
                 cards
@@ -6670,10 +6678,10 @@ fn a_thread_verdict_is_read_from_the_node_not_from_slack(cx: &mut TestAppContext
             assert_eq!(
                 workspace
                     .dashboard
-                    .thread_card_id(&crate::dashboard::ThreadRef {
+                    .thread_card_id(&crate::dashboard::SlackUnit {
                         workspace: "acme".to_owned(),
                         channel: "C1".to_owned(),
-                        thread_ts: "600.0".to_owned(),
+                        thread: Some("600.0".to_owned()),
                     })
                     .map(|card| card.node_id),
                 Some(settled)
@@ -7078,6 +7086,9 @@ struct DeskFixture {
     store: rho_desk::cells::Store,
     bodies: Vec<rho_desk::cells::BodySnapshot>,
     next_node: u64,
+    /// The Slack units the fixture made rows for, with the newest message
+    /// the mirror would report for each.
+    slack_units: Vec<(rho_desk::cells::SlackUnit, String)>,
 }
 
 impl DeskFixture {
@@ -7092,6 +7103,7 @@ impl DeskFixture {
             store: rho_desk::cells::Store::new(device),
             bodies: Vec::new(),
             next_node: 0,
+            slack_units: Vec::new(),
         }
     }
 
@@ -7137,13 +7149,30 @@ impl DeskFixture {
         channel: &str,
         thread_ts: &str,
     ) -> rho_desk::cells::Id {
-        let id = rho_desk::cells::Id::Slack(rho_desk::cells::SlackUnit {
+        let unit = rho_desk::cells::SlackUnit {
             workspace: "acme".to_owned(),
             channel: channel.to_owned(),
             thread: Some(thread_ts.to_owned()),
-        });
+        };
+        self.slack_units.push((unit.clone(), thread_ts.to_owned()));
+        let id = rho_desk::cells::Id::Slack(unit);
         self.file(id.clone(), parent);
         id
+    }
+
+    /// What the mirror says about the rows `thread_row` made: every unit
+    /// has one message from someone else and nothing handled yet, which is
+    /// the state a card is dealt in.
+    fn slack_sources(&self) -> Vec<crate::desk_view::SlackSource> {
+        self.slack_units
+            .iter()
+            .map(|(unit, newest)| crate::desk_view::SlackSource {
+                unit: unit.clone(),
+                title: "any update?".to_owned(),
+                newest: rho_desk::cells::SlackTs(newest.clone()),
+                newest_from_other: Some(rho_desk::cells::SlackTs(newest.clone())),
+            })
+            .collect()
     }
 
     /// An agent the user filed under a note.
@@ -7719,6 +7748,12 @@ fn marking_the_backlog_closes_every_old_card_and_undoes_as_one(cx: &mut TestAppC
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.set_slack_sources_for_test(
+                HostId::default(),
+                desk.slack_sources(),
+                window,
+                cx,
+            );
             let closed = workspace.mark_cards_done(
                 HostId::default(),
                 vec![old.clone(), older.clone()],
@@ -7727,6 +7762,26 @@ fn marking_the_backlog_closes_every_old_card_and_undoes_as_one(cx: &mut TestAppC
                 cx,
             );
             assert_eq!(closed, 2);
+            // Every unit's cursor moved, which is what "read before" means
+            // for a Slack card: nothing is a state, and a page loading
+            // under either of them cannot bring it back.
+            for (channel, thread_ts) in [("C1", "100.0"), ("C1", "50.0")] {
+                let facts = workspace
+                    .desk_cells
+                    .facts_of_slack_unit(
+                        Some(HostId::default()),
+                        &rho_desk::cells::SlackUnit {
+                            workspace: "acme".to_owned(),
+                            channel: channel.to_owned(),
+                            thread: Some(thread_ts.to_owned()),
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(
+                    facts.slack_handled_through,
+                    Some(rho_desk::cells::SlackTs(thread_ts.to_owned()))
+                );
+            }
             for node_id in [old.clone(), older.clone()] {
                 assert!(
                     !workspace
@@ -7761,6 +7816,212 @@ fn marking_the_backlog_closes_every_old_card_and_undoes_as_one(cx: &mut TestAppC
         .unwrap();
 }
 
+/// The whole point of the unit model: a card the user closed stays closed
+/// whatever Slack sends next. A history page, a reconnect, a feed poll and
+/// a restart all replay messages that were already there, and the only
+/// question the card asks is whether there is something from them past the
+/// cursor.
+#[gpui::test]
+fn a_done_slack_unit_is_not_reopened_by_anything_slack_replays(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    let node = desk.thread_row(None, "C1", "500.0");
+    let unit = rho_desk::cells::SlackUnit {
+        workspace: "acme".to_owned(),
+        channel: "C1".to_owned(),
+        thread: Some("500.0".to_owned()),
+    };
+    let card = crate::dashboard::DealCardId {
+        host: HostId::default(),
+        node_id: node.clone(),
+    };
+    let source = |newest: &str, from_other: &str| {
+        vec![crate::desk_view::SlackSource {
+            unit: unit.clone(),
+            title: "any update?".to_owned(),
+            newest: rho_desk::cells::SlackTs(newest.to_owned()),
+            newest_from_other: Some(rho_desk::cells::SlackTs(from_other.to_owned())),
+        }]
+    };
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.set_slack_sources_for_test(
+                HostId::default(),
+                source("600.0", "600.0"),
+                window,
+                cx,
+            );
+            assert!(workspace.dashboard.node_is_open(card.clone()));
+
+            assert!(workspace.apply_verdict_for_test(
+                HostId::default(),
+                &node,
+                crate::desk_view::DeskVerdict::Done,
+                window,
+                cx,
+            ));
+            assert!(
+                !workspace.dashboard.node_is_open(card.clone()),
+                "done closes the card"
+            );
+            // The cursor is what closed it, and the cursor is what a restart
+            // reads back: no state was written on the unit at all.
+            let facts = workspace
+                .desk_cells
+                .facts_of_slack_unit(Some(HostId::default()), &unit)
+                .unwrap();
+            assert_eq!(
+                facts.slack_handled_through,
+                Some(rho_desk::cells::SlackTs("600.0".to_owned()))
+            );
+            assert_eq!(facts.state, rho_desk::cells::State::Open);
+
+            // A history page arriving under the card, and a feed poll
+            // repeating an item at the cursor. Neither is news.
+            workspace.set_slack_sources_for_test(
+                HostId::default(),
+                source("600.0", "300.0"),
+                window,
+                cx,
+            );
+            assert!(!workspace.dashboard.node_is_open(card.clone()));
+            workspace.set_slack_sources_for_test(
+                HostId::default(),
+                source("600.0", "600.0"),
+                window,
+                cx,
+            );
+            assert!(!workspace.dashboard.node_is_open(card.clone()));
+
+            // Someone writing past the cursor is news, and only that.
+            workspace.set_slack_sources_for_test(
+                HostId::default(),
+                source("700.0", "700.0"),
+                window,
+                cx,
+            );
+            assert!(
+                workspace.dashboard.node_is_open(card),
+                "a message past the cursor raises the card again"
+            );
+        })
+        .unwrap();
+}
+
+/// A snooze leaves the cursor alone, so the messages the user has not
+/// handled are still theirs when it ends. What voids it is somebody writing
+/// during the snooze: the card comes straight back.
+#[gpui::test]
+fn a_snooze_is_voided_by_a_newer_message_from_someone_else(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    let node = desk.thread_row(None, "C1", "500.0");
+    let unit = rho_desk::cells::SlackUnit {
+        workspace: "acme".to_owned(),
+        channel: "C1".to_owned(),
+        thread: Some("500.0".to_owned()),
+    };
+    let card = crate::dashboard::DealCardId {
+        host: HostId::default(),
+        node_id: node.clone(),
+    };
+    let source = |from_other: &str| {
+        vec![crate::desk_view::SlackSource {
+            unit: unit.clone(),
+            title: "any update?".to_owned(),
+            newest: rho_desk::cells::SlackTs("600.0".to_owned()),
+            newest_from_other: Some(rho_desk::cells::SlackTs(from_other.to_owned())),
+        }]
+    };
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.set_slack_sources_for_test(HostId::default(), source("600.0"), window, cx);
+            assert!(workspace.apply_verdict_for_test(
+                HostId::default(),
+                &node,
+                crate::desk_view::DeskVerdict::Defer {
+                    until: rho_desk::cells::Timestamp {
+                        unix_ms: 4_000_000_000_000,
+                        precision: rho_desk::cells::TimestampPrecision::Day,
+                    },
+                },
+                window,
+                cx,
+            ));
+            let facts = workspace
+                .desk_cells
+                .facts_of_slack_unit(Some(HostId::default()), &unit)
+                .unwrap();
+            assert_eq!(
+                facts.slack_handled_through, None,
+                "a snooze is not a close: what was unhandled is still theirs"
+            );
+            assert_eq!(
+                facts.slack_snoozed_at,
+                Some(rho_desk::cells::SlackTs("600.0".to_owned())),
+                "and where the unit stood is what tells a new reply from an old one"
+            );
+            assert!(
+                workspace.dashboard.node_defer_until(card.clone()).is_some(),
+                "the card is put down until the snooze ends"
+            );
+
+            workspace.set_slack_sources_for_test(HostId::default(), source("700.0"), window, cx);
+            assert!(
+                workspace.dashboard.node_defer_until(card).is_none(),
+                "somebody writing during the snooze voids it"
+            );
+        })
+        .unwrap();
+}
+
+/// The store is one store: a done on the phone closes the card on the
+/// laptop when the cells arrive, with no keystroke here.
+#[gpui::test]
+fn a_done_on_another_device_closes_the_card_here(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    let node = desk.thread_row(None, "C1", "500.0");
+    let card = crate::dashboard::DealCardId {
+        host: HostId::default(),
+        node_id: node.clone(),
+    };
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.set_slack_sources_for_test(
+                HostId::default(),
+                desk.slack_sources(),
+                window,
+                cx,
+            );
+            assert!(workspace.dashboard.node_is_open(card.clone()));
+        })
+        .unwrap();
+
+    // The other device moved the cursor past everything the mirror holds.
+    desk.set(
+        node,
+        rho_desk::cells::Property::SlackHandledThrough(rho_desk::cells::SlackTs(
+            "900.0".to_owned(),
+        )),
+    );
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            assert!(
+                !workspace.dashboard.node_is_open(card),
+                "the cursor arrived, so the card is gone here too"
+            );
+        })
+        .unwrap();
+}
+
 /// A thread ignored in another client stops being the user's everywhere:
 /// Slack says so on the socket, and the card closes here without a keystroke
 /// and without an undo entry, because `shift-u` could not take it back in
@@ -7771,11 +8032,11 @@ fn a_thread_unfollowed_in_slack_closes_its_card(cx: &mut TestAppContext) {
 
     let mut desk = DeskFixture::new();
     let thread = desk.thread_row(None, "C1", "500.0");
-    let key = rho_slack::ThreadKey {
+    let unit = crate::slack::store_unit_of(&rho_slack::ThreadKey {
         workspace: WorkspaceName("acme".to_owned()),
         channel: ChannelId("C1".to_owned()),
         thread_ts: Ts("500.0".to_owned()),
-    };
+    });
     let card = crate::dashboard::DealCardId {
         host: HostId::default(),
         node_id: thread,
@@ -7785,9 +8046,15 @@ fn a_thread_unfollowed_in_slack_closes_its_card(cx: &mut TestAppContext) {
     workspace
         .update(cx, |workspace, window, cx| {
             workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.set_slack_sources_for_test(
+                HostId::default(),
+                desk.slack_sources(),
+                window,
+                cx,
+            );
             assert!(workspace.dashboard.node_is_open(card.clone()));
 
-            workspace.slack_thread_muted(&key, window, cx);
+            workspace.slack_thread_muted(&unit, window, cx);
             assert!(
                 !workspace.dashboard.node_is_open(card),
                 "the card closes on Slack's word"

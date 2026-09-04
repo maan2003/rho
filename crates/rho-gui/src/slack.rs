@@ -5,14 +5,15 @@
 //! seam where it meets the workspace, the inbox, and the journal.
 
 use gpui::AppContext as _;
+use rho_desk::cells::SlackUnit;
 use rho_slack::config::{CredentialStore, Credentials, WorkspaceName};
 use rho_slack::health::Signal;
-use rho_slack::model::{Change, Model, Waiting};
+use rho_slack::model::{Change, Model, Unit, Waiting};
 use rho_slack::session::{Session, SessionEvent, Source};
 use rho_slack::types::{ChannelId, ThreadKey, Ts, human_size};
 use rho_slack::ui::conversation::EditStart;
 
-use crate::dashboard::{DealerThread, ThreadRef};
+use crate::dashboard::SlackFacts;
 use crate::minibuffer::Candidate;
 use crate::pane::SurfaceKey;
 use crate::style::StyleClass;
@@ -195,49 +196,36 @@ impl Workspace {
         }
     }
 
-    /// Where a Slack card's message lives. A thread only when someone has
-    /// replied under the root: a mention in a channel with nothing under it
-    /// is a channel message, and opening a one-message "thread" for it would
-    /// hide the room it was said in.
-    pub(crate) fn slack_deal_source(
-        workspace: &str,
-        channel: &str,
-        thread_ts: &str,
-        latest_ts: &str,
-    ) -> Source {
-        if latest_ts == thread_ts {
-            return Source::Conversation(ChannelId(channel.to_owned()));
-        }
-        Source::Thread(ThreadKey {
-            workspace: WorkspaceName(workspace.to_owned()),
-            channel: ChannelId(channel.to_owned()),
-            thread_ts: Ts(thread_ts.to_owned()),
-        })
-    }
-
     /// Opens the conversation a Slack card is about and puts the reader on
-    /// the message that raised it: the deal is the conversation, so the
-    /// surface is the ordinary one, opened the ordinary way.
+    /// the oldest message from someone else they have not handled: three
+    /// mentions in a channel are one card, and the reader starts at the
+    /// first of them rather than the last.
     pub(crate) fn open_slack_deal(
         &mut self,
-        workspace: &str,
-        channel: &str,
-        thread_ts: &str,
-        latest_ts: &str,
+        unit: &SlackUnit,
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) -> bool {
-        if self.slack_session(window, cx).is_none() {
+        let Some(session) = self.slack_session(window, cx) else {
             return false;
-        }
-        let source = Self::slack_deal_source(workspace, channel, thread_ts, latest_ts);
-        self.open_slack_source(source, window, cx);
+        };
+        let cursor = self
+            .desk_cells
+            .facts_of_slack_unit(self.hosts.primary(), unit)
+            .and_then(|facts| facts.slack_handled_through)
+            .map(|ts| Ts(ts.0));
+        let unit_of = model_unit(unit);
+        let land = session
+            .read(cx)
+            .oldest_from_other_after(&unit_of, cursor.as_ref());
+        self.open_slack_source(unit_source(unit), window, cx);
         let SurfaceView::SlackConversation(view) = &self.active_pane().surface.view else {
             return false;
         };
-        let latest = Ts(latest_ts.to_owned());
-        view.clone()
-            .update(cx, |view, cx| view.reveal(latest, window, cx));
+        if let Some(land) = land {
+            view.clone()
+                .update(cx, |view, cx| view.reveal(land, window, cx));
+        }
         true
     }
 
@@ -653,11 +641,13 @@ impl Workspace {
     /// client raises the thread either. Rho keeps no subscription state; if
     /// the call fails the mute still stands and the notice says the
     /// thread is still followed in Slack.
-    pub(crate) fn slack_ignore_thread(&mut self, thread: &ThreadRef, cx: &mut gpui::Context<Self>) {
+    pub(crate) fn slack_ignore_thread(&mut self, thread: &SlackUnit, cx: &mut gpui::Context<Self>) {
         let Some(session) = self.slack.clone() else {
             return;
         };
-        let key = thread_key(thread);
+        let Some(key) = thread_key(thread) else {
+            return;
+        };
         crate::journal::record(crate::journal::Event::SlackThreadIgnored {
             thread: journal_thread_labelled(session.read(cx).model(), &key),
             by: crate::journal::IgnoredBy::Rho,
@@ -668,11 +658,13 @@ impl Workspace {
     /// `shift-u` after `x`: the mute was an unfollow in Slack, so the
     /// undo is a follow there. Nothing else brings the card back, since the
     /// follow list is what says the thread is the user's.
-    pub(crate) fn slack_follow_thread(&mut self, thread: &ThreadRef, cx: &mut gpui::Context<Self>) {
+    pub(crate) fn slack_follow_thread(&mut self, thread: &SlackUnit, cx: &mut gpui::Context<Self>) {
         let Some(session) = self.slack.clone() else {
             return;
         };
-        let key = thread_key(thread);
+        let Some(key) = thread_key(thread) else {
+            return;
+        };
         session.update(cx, |session, cx| session.follow_thread(&key, cx));
     }
 
@@ -682,11 +674,15 @@ impl Workspace {
     /// the verdict twice when the socket echoes it back.
     pub(crate) fn slack_thread_muted(
         &mut self,
-        key: &ThreadKey,
+        unit: &SlackUnit,
         window: &mut gpui::Window,
         cx: &mut gpui::Context<Self>,
     ) {
-        let Some(card) = self.dashboard.thread_card_id(&thread_ref(key)) else {
+        let Some(key) = thread_key(unit) else {
+            return;
+        };
+        let key = &key;
+        let Some(card) = self.dashboard.thread_card_id(unit) else {
             return;
         };
         if !self.dashboard.node_is_open(card.clone()) {
@@ -875,12 +871,18 @@ impl Workspace {
                         // Slack said the thread is not the user's any more.
                         // That is a verdict made in another client, so the
                         // card closes here without asking.
-                        Change::Muted(key) => {
-                            let key = key.clone();
-                            self.slack_thread_muted(&key, window, cx);
+                        Change::Muted(unit) => {
+                            let unit = store_unit(session.read(cx).model().workspace(), unit);
+                            self.slack_thread_muted(&unit, window, cx);
                         }
                         Change::Replied(_) => {}
                     }
+                }
+                // The mirror moved, so the join every Slack card is derived
+                // from has to be rebuilt: a unit that started to matter is a
+                // row the moment the message lands, with nothing written.
+                if let Some(host) = self.hosts.primary() {
+                    self.sync_tree_dashboard(host, window, cx);
                 }
                 self.invalidate_dealer_signals(cx);
             }
@@ -940,25 +942,29 @@ impl Workspace {
     pub(crate) fn slack_thread_facts(
         &self,
         cx: &gpui::App,
-    ) -> std::collections::HashMap<ThreadRef, DealerThread> {
+    ) -> std::collections::HashMap<SlackUnit, SlackFacts> {
         let Some(session) = self.slack.as_ref() else {
             return std::collections::HashMap::new();
         };
         let now = chrono::Local::now();
-        let model = session.read(cx).model();
+        let session = session.read(cx);
+        let model = session.model();
         model
             .tracked()
             .into_iter()
-            .filter_map(|key| {
-                let card = model.card(&key, now.timestamp_millis())?;
-                let thread = model.thread(&key)?;
-                let raised_at = chrono::DateTime::from_timestamp_millis(thread.first_seen_ms)?
+            .filter_map(|unit| {
+                let card = model.card(&unit, now.timestamp_millis())?;
+                let facts = model.unit(&unit)?;
+                let raised_at = chrono::DateTime::from_timestamp_millis(facts.first_seen_ms)?
                     .with_timezone(&now.timezone())
                     .fixed_offset();
                 Some((
-                    thread_ref(&key),
-                    DealerThread {
-                        title: card.summary,
+                    store_unit(model.workspace(), &unit),
+                    SlackFacts {
+                        // Rendered here, every time the view is built, so a
+                        // name the roster only supplied after the message
+                        // landed shows as `@ada` rather than `<@U123>`.
+                        title: session.unit_summary(&unit),
                         conversation: card.conversation.clone(),
                         raised_at,
                         wait_days: card.wait_days,
@@ -966,7 +972,8 @@ impl Workspace {
                             Waiting::OnThem => Some(card.conversation),
                             Waiting::OnYou => None,
                         },
-                        latest: card.latest.0,
+                        latest: card.newest.0,
+                        newest_from_other: card.newest_from_other.map(|ts| ts.0),
                     },
                 ))
             })
@@ -978,8 +985,8 @@ impl Workspace {
 /// is older than it. A card the mirror has nothing to say about is left
 /// alone, and nothing newer than the cutoff is ever in here.
 fn cards_before(
-    cards: Vec<(crate::dashboard::DealCardId, ThreadRef)>,
-    facts: &std::collections::HashMap<ThreadRef, DealerThread>,
+    cards: Vec<(crate::dashboard::DealCardId, SlackUnit)>,
+    facts: &std::collections::HashMap<SlackUnit, SlackFacts>,
     host: Option<crate::registry::HostId>,
     before: f64,
 ) -> Vec<rho_desk::cells::Id> {
@@ -1033,19 +1040,50 @@ fn parse_mark_cutoff(
     now.checked_sub_signed(chrono::TimeDelta::try_milliseconds(milliseconds as i64)?)
 }
 
-pub(crate) fn thread_key(thread: &ThreadRef) -> ThreadKey {
-    ThreadKey {
-        workspace: rho_slack::config::WorkspaceName(thread.workspace.clone()),
-        channel: ChannelId(thread.channel.clone()),
-        thread_ts: Ts(thread.thread_ts.clone()),
+/// The Slack subscription a unit stands for, or `None` when the unit is a
+/// conversation: following and unfollowing are things Slack only knows how
+/// to do to a thread.
+pub(crate) fn thread_key(unit: &SlackUnit) -> Option<ThreadKey> {
+    Some(ThreadKey {
+        workspace: rho_slack::config::WorkspaceName(unit.workspace.clone()),
+        channel: ChannelId(unit.channel.clone()),
+        thread_ts: Ts(unit.thread.clone()?),
+    })
+}
+
+/// The store's id for a unit the model named.
+pub(crate) fn store_unit(workspace: &WorkspaceName, unit: &Unit) -> SlackUnit {
+    SlackUnit {
+        workspace: workspace.0.clone(),
+        channel: unit.channel.0.clone(),
+        thread: unit.thread.as_ref().map(|ts| ts.0.clone()),
     }
 }
 
-pub(crate) fn thread_ref(key: &ThreadKey) -> ThreadRef {
-    ThreadRef {
+/// Which surface a unit opens: a followed thread has its own, and a
+/// conversation, whether it is a direct message or a channel someone
+/// mentioned the user in, opens as the room it is.
+pub(crate) fn unit_source(unit: &SlackUnit) -> Source {
+    match thread_key(unit) {
+        Some(key) => Source::Thread(key),
+        None => Source::Conversation(ChannelId(unit.channel.clone())),
+    }
+}
+
+/// The store's id for a thread surface.
+pub(crate) fn store_unit_of(key: &ThreadKey) -> SlackUnit {
+    SlackUnit {
         workspace: key.workspace.0.clone(),
         channel: key.channel.0.clone(),
-        thread_ts: key.thread_ts.0.clone(),
+        thread: Some(key.thread_ts.0.clone()),
+    }
+}
+
+/// The model's unit for a store id.
+pub(crate) fn model_unit(unit: &SlackUnit) -> Unit {
+    Unit {
+        channel: ChannelId(unit.channel.clone()),
+        thread: unit.thread.clone().map(Ts),
     }
 }
 
@@ -1075,22 +1113,23 @@ mod tests {
         model
     }
 
-    fn thread_ref_of(thread_ts: &str) -> ThreadRef {
-        ThreadRef {
+    fn thread_ref_of(thread_ts: &str) -> SlackUnit {
+        SlackUnit {
             workspace: "acme".to_owned(),
             channel: "C1".to_owned(),
-            thread_ts: thread_ts.to_owned(),
+            thread: Some(thread_ts.to_owned()),
         }
     }
 
-    fn facts(latest: &str) -> DealerThread {
-        DealerThread {
+    fn facts(latest: &str) -> SlackFacts {
+        SlackFacts {
             title: "any update?".to_owned(),
             conversation: "#design".to_owned(),
             raised_at: chrono::Local::now().fixed_offset(),
             wait_days: 1.0,
             waiting_on: None,
             latest: latest.to_owned(),
+            newest_from_other: None,
         }
     }
 
@@ -1152,49 +1191,61 @@ mod tests {
     }
 
     #[test]
-    fn a_mention_and_its_follow_ups_name_one_thread_to_bind() {
-        // The tree holds one node per thread, so every change the client
-        // acts on has to name the same thread: the mention that raised it
-        // and the reply that keeps it alive are one `thread` node.
+    fn a_mention_and_its_follow_ups_name_one_unit_to_bind() {
+        // One card per unit: the mention that raised the channel and the
+        // reply that keeps it alive are the same unit, so the client acts on
+        // one row rather than one per message.
         let mut model = model();
         let raised = model
             .note_message(&message("100.0", None, "U1", "hey <@ME> look"), 0)
             .expect("a mention raises");
+        // A second mention in the same channel is the same card, which is
+        // the whole point of a unit: three mentions are one row, not three.
         let updated = model
-            .note_message(&message("101.0", Some("100.0"), "U1", "still stuck"), 0)
-            .expect("a newer reply updates");
+            .note_message(&message("101.0", None, "U1", "<@ME> still stuck"), 0)
+            .expect("a newer mention updates");
         let binds = [raised, updated]
             .iter()
             .filter_map(|change| match change {
-                Change::Raised(key) | Change::Updated(key) => Some(thread_ref(key)),
+                Change::Raised(unit) | Change::Updated(unit) => {
+                    Some(store_unit(model.workspace(), unit))
+                }
                 Change::Replied(_) | Change::Muted(_) => None,
             })
             .collect::<Vec<_>>();
         assert_eq!(binds.len(), 2, "a raise and an update both bind");
-        assert_eq!(binds[0], binds[1], "one thread is one node");
-        assert_eq!(binds[0].thread_ts, "100.0");
+        assert_eq!(binds[0], binds[1], "one unit is one row");
+        assert_eq!(binds[0].channel, "C1");
+        assert_eq!(
+            binds[0].thread, None,
+            "a reply in a thread nobody follows is traffic in the channel"
+        );
 
         // Your own reply is not a verdict, and it binds nothing: the node
         // already exists, and a thread you closed stays closed until they
         // write again.
         let replied = model
-            .note_message(&message("102.0", Some("100.0"), "ME", "on it"), 0)
+            .note_message(&message("102.0", None, "ME", "on it"), 0)
             .expect("your own reply is announced");
         assert!(matches!(replied, Change::Replied(_)));
     }
 
     #[test]
-    fn a_slack_deal_opens_the_thread_only_when_the_reply_is_in_one() {
-        // The card carries the message that raised it. A card whose latest
-        // message is the root is a channel message with no thread under it,
-        // so the deal opens the channel, not a thread of one.
+    fn a_slack_deal_opens_the_thread_only_when_the_unit_is_one() {
+        // The unit says which surface it is. A conversation unit is the room
+        // it names, whether the message in it was a mention or a direct
+        // message; only a followed thread opens as a thread.
+        let conversation = SlackUnit {
+            workspace: "acme".to_owned(),
+            channel: "C1".to_owned(),
+            thread: None,
+        };
         assert!(matches!(
-            Workspace::slack_deal_source("acme", "C1", "500.0", "500.0"),
+            unit_source(&conversation),
             Source::Conversation(ChannelId(channel)) if channel == "C1"
         ));
-        let Source::Thread(key) = Workspace::slack_deal_source("acme", "C1", "500.0", "700.0")
-        else {
-            panic!("a reply under a root must deal in its thread");
+        let Source::Thread(key) = unit_source(&thread_ref_of("500.0")) else {
+            panic!("a followed thread must deal in its thread");
         };
         assert_eq!(key.channel.0, "C1");
         assert_eq!(key.thread_ts.0, "500.0");

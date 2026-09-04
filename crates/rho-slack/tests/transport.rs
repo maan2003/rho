@@ -26,13 +26,13 @@ fn timings() -> Timings {
     }
 }
 
-/// The threads that owe the user an answer: what a thread node is created
-/// for. The model raises them; the tree deals them.
-fn owed(model: &Model, now_ms: i64) -> Vec<rho_slack::model::ThreadCard> {
+/// The units that owe the user an answer: what a card is dealt for. The
+/// model raises them; the store deals them.
+fn owed(model: &Model, now_ms: i64) -> Vec<rho_slack::model::UnitCard> {
     model
         .tracked()
         .into_iter()
-        .filter_map(|key| model.card(&key, now_ms))
+        .filter_map(|unit| model.card(&unit, now_ms))
         .filter(|card| card.waiting == rho_slack::model::Waiting::OnYou)
         .collect()
 }
@@ -269,8 +269,8 @@ async fn a_thread_loads_and_a_reply_is_sent_into_it() {
     {
         model.note_message(&message, 0);
     }
-    let key = model.key(&ChannelId("C1".into()), &Ts("500.0".into()));
-    assert_eq!(model.thread(&key).unwrap().waiting(), Waiting::OnThem);
+    let unit = rho_slack::model::Unit::thread(&ChannelId("C1".into()), &Ts("500.0".into()));
+    assert_eq!(model.unit(&unit).unwrap().waiting(), Waiting::OnThem);
 }
 
 #[tokio::test]
@@ -966,9 +966,12 @@ async fn undoing_a_discard_follows_the_thread_again() {
         vec![Ts("500.0".into())]
     );
     let card = model
-        .card(&key, 0)
+        .card(
+            &rho_slack::model::Unit::thread(&ChannelId("C1".into()), &Ts("500.0".into())),
+            0,
+        )
         .expect("the thread is still rho's to deal");
-    assert_eq!(card.summary, "any update?");
+    assert_eq!(card.conversation, "#design");
     assert_eq!(owed(&model, 0).len(), 1);
 }
 

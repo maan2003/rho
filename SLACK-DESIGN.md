@@ -68,7 +68,8 @@ channel, a reply in a followed thread); `newest_author`, who wrote
 
 Rho state, per unit, as facts on the unit's id in the store
 (`STORE-DESIGN.md`): `handled_through`, a timestamp cursor; `defer_until`;
-`pace_days`. Nothing but a verdict key moves them.
+`snoozed_at`, where the unit stood when the snooze was made; `pace_days`.
+Nothing but a verdict key moves them.
 
 - `d` done: `handled_through := newest`.
 - `t` todo: done, and a note whose `parent` is the unit is created at the
@@ -78,9 +79,12 @@ Rho state, per unit, as facts on the unit's id in the store
   for it: a thread is unfollowed (`subscriptions.thread.remove`), a
   conversation is marked read up to `newest`. Undo follows the thread
   again (`subscriptions.thread.add`).
-- `s` snooze: `defer_until` set, cursor untouched. A message from someone
-  else newer than the snooze voids `defer_until`; the card is back as
-  "needs reply".
+- `s` snooze: `defer_until` set and `snoozed_at := newest`, cursor
+  untouched, so the messages the user has not handled are still theirs when
+  the snooze ends. A message from someone else newer than `snoozed_at`
+  arrived during the snooze and voids `defer_until`; the card is back as
+  "needs reply". Without `snoozed_at` the view cannot tell that message
+  from one that was already sitting there when the snooze was made.
 - `f` file: the unit's `parent` is set to the id the user picks (a label
   or any thing); the cursor is untouched, the card keeps being dealt.
   Filing is a place, not a close.
