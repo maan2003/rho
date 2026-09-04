@@ -1,4 +1,4 @@
-# The store: ids, relations, views
+# The store: ids, properties, views
 
 Status: decided with the user on 2026-09-04, building. Replaces
 `TREE-DESIGN.md`, which is kept only as the record of what its slices
@@ -38,35 +38,42 @@ rebind, reopen, and duplicate-card bug this week came from.
 
 ### The store holds facts, and only the user's
 
-A fact is `(subject: Id, relation)`, and the relation is a typed enum
-whose variant carries whatever data that relation needs: an id, several
+A fact is `(subject: Id, property)`: an id has properties, some of which
+point at other ids (`parent`, `labeled`, `from_slack`) and some of which
+are values (`state`, `handled_through`). The word is "property", not
+"relation" (the user, 4 Sep): a cursor is a property of a thread, not a
+relation to anything. The property is a typed enum whose variant carries
+whatever data that property needs: an id, several
 ids, a timestamp, text, or an id plus detail the id itself is too coarse
 for. There is no separate object column; the payload is the object.
 
-Two shapes of relation, decided per variant:
+Two shapes of property, decided per variant:
 
 - One per subject, last-writer-wins: the store key is the subject and
   the variant; a newer stamp replaces the payload. `Parent(Option<Id>)`,
-  `Name(String)`, `State(State)`, `DeferUntil(Timestamp)`,
+  `Name(String)` (a label's name; on any other id the user's override of
+  the derived title, so renaming an agent, a Slack unit, or a page is a
+  store write that syncs, not a request to the daemon), `State(State)`,
+  `DeferUntil(Timestamp)`,
   `Deadline(Timestamp)`, `PaceDays(u32)`, `HandledThrough(Ts)` (Slack,
   the verdict cursor), `Deleted(bool)`, `CreatedAt(Timestamp)`.
 - Many per subject, one boolean LWW cell per payload: the store key is the
   subject, the variant, and the payload; the cell says present or absent.
   `Labeled(Id::Label)` (the tag rule as today: opposing writes at the
-  same version choose add). Any future relation the user can have several
+  same version choose add). Any future property the user can have several
   of is this shape.
 - `Body` (note) is the text CRDT, keyed by subject.
 - The verdict log: `(Id, stamp) → VerdictEvent`, grow-only, merged by
   union. History and undo.
 
 The payload is where detail lives that the id does not carry. Ids stop at
-the unit (a Slack thread, an agent, a page), but a relation can name the
+the unit (a Slack thread, an agent, a page), but a property can name the
 exact thing inside it, and the variant is as specific as the fact:
 `FromSlack { unit: SlackUnit, message: Ts }` on an agent records the very
 message that led to spawning it, though no id exists for a message;
 `FromPage { page: PageId, url: Url }` records the page and the exact
 address that led to it. One variant per source, never a generic `From`
-with an id that could be anything; a relation may carry several ids where
+with an id that could be anything; a property may carry several ids where
 one fact genuinely joins several things. The same rule bounds it: a
 payload is typed, never a string that means something. The enum is the
 whole schema: modelling a new fact is adding a variant that says exactly
@@ -77,9 +84,9 @@ Gone from the cell vocabulary: `kind`, `agent_id`, `host`, `page_ref`,
 `url`, `workspace`, `channel`, `thread_ts`, `repo`, `number`, `path`. Each
 was either the identity (now in the id) or a source fact (now derived).
 The merge rules, stamps, device ids, and sync-since-version are exactly
-today's; what changes is the key: `(Id, relation variant[, payload])`
+today's; what changes is the key: `(Id, property variant[, payload])`
 instead of `(NodeId, Field)`, with `Id` typed and the value folded into
-the relation.
+the property.
 
 The machine writes nothing here. Not a reference node, not a parent, not
 a title. The only writer is a user's key, through a verdict or an edit.
@@ -93,7 +100,7 @@ it never repeats one.
 
 ### Source facts are derived, never stored
 
-The same shape, a relation with its payload on a subject, computed at read time from the system that owns it,
+The same shape, a property with its payload on a subject, computed at read time from the system that owns it,
 in the GUI, where the sources already live:
 
 - `spawned_by` (agent → agent), `on_host` (agent → host), `in_workdir`
@@ -104,7 +111,8 @@ in the GUI, where the sources already live:
 - `opened_from` (page → page): the browser. A `ctrl-click` that opens a
   tab records where it came from, so the tab lands under its origin.
 - `title`, everywhere: a note's first line, a label's name, the agent's
-  label, the page's title, the Slack unit's subject.
+  label, the page's title, the Slack unit's subject; a stored `Name`
+  overrides any of the derived ones.
 
 The daemon holds the store and syncs it; it never hears about Slack, the
 browser, or agent activity. The join of store and sources happens in the
@@ -295,7 +303,7 @@ One shot at daemon start, and then the code goes (the standing rule):
   that has notes under it becomes `Slack(unit)` with `parent` and
   `defer_until` kept and its notes re-parented. Every other thread node
   was machine-made and leaves nothing behind, verdicts included: the
-  cursor is slice 2's relation, and done-ness on the old model was
+  cursor is slice 2's property, and done-ness on the old model was
   already lost on every restart (Slack checklist 2.17), so nothing the
   user still has is dropped. `DeskThreadBind` goes in slice 1 with them;
   between slices 1 and 2 a Slack card has no verdict state, which is the
@@ -310,7 +318,7 @@ The user's call, 4 Sep: this comes first, ahead of every short-term bug
 and ahead of the verdict transient, because it changes what everything
 else is built on. The transient lands after slice 2.
 
-1. Store: `Id`, `Relation`, the cell key change, the migration, the
+1. Store: `Id`, `Property`, the cell key change, the migration, the
    views (map, Home, Find, notes-for-this, paths) reading through the join
    of store and sources, `DeskPageBind`, `DeskThreadBind`, and agent-node
    creation gone. `body` is the cells store's own text table re-keyed;
