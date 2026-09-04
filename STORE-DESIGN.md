@@ -260,11 +260,15 @@ lasting sync role is the peer that holds while one side is away.
 ### Direction: what the daemon stores in the end
 
 Recommended 4 Sep, corrected the same day by the user, not built. Per
-agent, three things: the run config (workdirs, role, runtime, created
-at, current lineage, the rewind marker, spawned by, and the name given
-at spawn when one was, so no title is generated for it), the raw event
-log, and a head: the latest position, the generated title, and the
-usage totals, nothing the daemon had to judge. Whether an agent wants
+agent, two things: the raw event log, and a head. The run config lives
+in the log too (the user, 4 Sep): creation is the first event, carrying
+role, runtime, workdirs, spawned by, and the name given at spawn when
+one was (so no title is generated for it); a role change, a workdir
+added, a rewind, a compaction are events after it. There is no agent
+record. The head is the daemon's cache of the fold over the log: the
+latest position, the current config, the generated title, and the
+usage totals, nothing the daemon had to judge, rebuilt from the log if
+ever lost. Whether an agent wants
 the user is the client's derivation from the projected log's tail, and
 the client keeps it in a cache of its own per agent (the user, 4 Sep),
 so the daemon never computes attention; the head is what the old
@@ -275,7 +279,8 @@ projected log as "segments since the position you hold"; a client that
 has never seen an agent takes its whole projected log in the background
 (the user, 4 Sep: a one-time cost, and increments after that are tiny),
 so the mirror is complete and nothing loads on open. A title or a cost
-total never waits on a log. The lineage table stays. Daemon-wide: the machine identity
+total never waits on a log. The lineage table folds into the log as well, since rewind is an
+appended event. Daemon-wide: the machine identity
 and iroh secret, the trust list, provider secrets, quota observations
 from providers, the counters and format markers, and, later, the held
 sync segments. Gone from the daemon: every `rho_desk_*` table once the
