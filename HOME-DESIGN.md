@@ -90,6 +90,30 @@ channel, or a repository, opened from that thing with one key, and the tree
 as the store that agents file into. That is a smaller design and gets its
 own pass once Home exists; until then the map stays reachable from Home.
 
+## No deal mode: one key opens the verdict transient
+
+Decided with the user on 4 Sep. Deal mode goes away entirely: no `VimDeal`
+context, no `DEAL` status word, no single-letter verdict keys on a surface,
+and `escape` means nothing to the dealer. Vim is vim on every surface, so
+a card can be read, searched and yanked like any buffer.
+
+The verdicts live in one transient. A single tap of `shift` opens it on
+any surface that is a card (an agent, a Slack conversation or thread, a
+note, a page): `d` done, `x` discard, `s` snooze then a count and a unit
+(`s 7 d` is seven days, `s 45 m`, `s 3 h`, `s w`, `s s` a day), `t` todo,
+`f` file…, `u` undo the last verdict, `j` open the top card (what `ctrl-j`
+does), and `shift` again for Home, so the old double-shift still lands on
+Home. `escape` closes the transient and nothing else. The writes, undo,
+journal and the status-line label (`needs reply · 2h`) are exactly what
+deal mode did; only the keys moved. `ctrl-j` keeps opening the top card
+as an ordinary surface. The phone keeps its buttons and sheet.
+
+**Why:** the user's words: deal mode stole letters from reading, made
+`escape` a verdict, and hid what the keys were. One transient shows the
+verdicts, reads as a menu, and leaves vim alone. `shift` is the one key
+that is free on every surface, in every mode, and already means "rho,
+not the editor" through the Home double-tap.
+
 ## Snooze takes a unit
 
 Decided with the user on 3 Sep (first recorded in DESK-DESIGN, which is
