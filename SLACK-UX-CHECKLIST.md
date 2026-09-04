@@ -4,6 +4,8 @@ Reconciled against main on 3 Sep. Genuinely open, in order:
 
 - 2.17 a done thread comes back on an older message, and mark-read-before
   leaves cards standing (reported from real use, 4 Sep). Highest priority.
+- 1.25 a picture paints over the messages under it in a real DM, and the
+  file name and size line goes (reported from real use, 4 Sep, screenshot).
 - 1.13 avatars (waits on the editor's inline-image inlay), 1.22 rough edges
   (b) soft-wrap column waits on the vendored editor.
 
@@ -229,6 +231,19 @@ done right after the transcript primitive (2.4) and before 2.10:
       `name: body`, so there is no client-side lever to make it two columns.
       It wants a minimum soft-wrap indent per editor; b8os does not touch
       the vendored editor.
+- [ ] 1.25 A picture paints over the messages under it. Reported by the
+      user on 4 Sep from a real DM on the latest GUI (screenshot): a
+      192 KB `image.png` is drawn about fifteen rows tall while its block
+      reserves far fewer, so the next four messages and the composer
+      render under the picture. Find why the drawn size and the block's
+      row count disagree on a real file (missing `original_w`/`_h`? a
+      thumbnail-only path? the twelve-row cap applied to one and not the
+      other?) and make the block the only thing that decides the size,
+      with a test on a file that carries no dimensions. Second, the user
+      does not want the `image.png · 192 KB` line at all: a picture is
+      just the picture; a non-image file keeps its name as the thing to
+      open. Rig: the fake serves one file without dimensions and one
+      with; screenshot both, rows below the picture untouched.
 - [x] 1.23 Images load without flicker. Landed 3 Sep as a fixed-size
       block filled by Slack's thumbnail, not an inlay and not a blur filter
       (gpui has none for images). Original: Seen by the user on 3 Sep: an
