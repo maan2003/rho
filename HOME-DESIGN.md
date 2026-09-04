@@ -151,9 +151,12 @@ Built 4 Sep (367ce0fb, b8os): `DealSession`, the hand, `deal_mode`,
 fingerprint string are gone; skip is `(id, CardCursor, at)` with a typed
 cursor per source; status label, desktop frame, phone sheet, feed and
 flick all read the card in view. The journal's `DealMode` variants stay
-so old journals still decode. Follow-up in flight: space-j never steps
-forward through history, and a Home row under the cursor is the card in
-view for every verdict.
+so old journals still decode. Landed after it (0707dff5): space-j never
+steps forward through history (the forward step and its two tests are
+retired; reopening is the buffer picker or the list), and a Home row
+under the cursor is the card in view for every verdict, with Home
+refreshed in place rather than closed, while a pull from Home opens the
+top card without passing over the row.
 
 Mark-read-before an age (`space shift-s m`) also writes
 `SlackHandledThrough` at the cutoff for every unit it covers, one
