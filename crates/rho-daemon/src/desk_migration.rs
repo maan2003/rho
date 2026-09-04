@@ -257,6 +257,7 @@ impl OldNode {
 pub(crate) fn migrate(
     write: &mut WriteTxn,
     daemon_device: DeviceId,
+    machine_seed: u64,
 ) -> Result<
     Option<(
         Vec<Cell>,
@@ -323,9 +324,14 @@ pub(crate) fn migrate(
                 Some(OldValue::PageRef(page)) => Some(Id::Page(*page)),
                 _ => None,
             },
-            OldNodeKind::File => match (old.value(&OldField::Host), old.value(&OldField::Path)) {
-                (Some(OldValue::Host(host)), Some(OldValue::Path(path))) => Some(Id::File {
-                    host: *host,
+            // A file row written before the host cell existed is a file on
+            // the daemon that stored it, which is this one.
+            OldNodeKind::File => match old.value(&OldField::Path) {
+                Some(OldValue::Path(path)) => Some(Id::File {
+                    host: match old.value(&OldField::Host) {
+                        Some(OldValue::Host(host)) => *host,
+                        _ => machine_seed,
+                    },
                     path: path.clone(),
                 }),
                 _ => None,
@@ -599,6 +605,9 @@ mod tests {
     use super::*;
     use crate::desk_cells::DeskCellStore;
 
+    /// The daemon that stored the rows, which is the one converting them.
+    const MACHINE_SEED: u64 = 42;
+
     fn node(counter: u64) -> NodeId {
         NodeId {
             replica_id: 1,
@@ -620,7 +629,8 @@ mod tests {
 
     /// The whole conversion in one state: a note with a tag, an agent the
     /// user filed under it, an agent filed nowhere, a thread the user
-    /// filed, and a thread the mirror made.
+    /// filed, a thread the mirror made, and a file row from before the
+    /// host cell existed.
     #[tokio::test]
     async fn converting_node_cells_keeps_what_the_user_said_and_drops_the_rest() {
         let directory = tempfile::tempdir().unwrap();
@@ -631,6 +641,7 @@ mod tests {
         let loose_agent = node(3);
         let filed_thread = node(4);
         let mirror_thread = node(5);
+        let hostless_file = node(6);
         let agent = |counter: u64| {
             rho_core::AgentId::from_counter(counter, &rho_core::AgentIdDomain(42)).unwrap()
         };
@@ -730,6 +741,26 @@ mod tests {
             ),
             cell(loose_agent, OldField::Host, OldValue::Host(42), 3),
         ];
+        cells.extend([
+            cell(
+                hostless_file,
+                OldField::Kind,
+                OldValue::Kind(OldNodeKind::File),
+                8,
+            ),
+            cell(
+                hostless_file,
+                OldField::Parent,
+                OldValue::Parent(Some(heading)),
+                8,
+            ),
+            cell(
+                hostless_file,
+                OldField::Path,
+                OldValue::Path("/src/rho/README.md".into()),
+                8,
+            ),
+        ]);
         cells.extend(thread(filed_thread, "1.0", Some(heading), 4));
         cells.extend(thread(mirror_thread, "2.0", None, 5));
 
@@ -784,7 +815,7 @@ mod tests {
             write.commit();
         }
 
-        let store = DeskCellStore::new(db.clone()).await.unwrap();
+        let store = DeskCellStore::new(db.clone(), MACHINE_SEED).await.unwrap();
         let snapshot = store.sync_since(&Version::new()).unwrap();
         let facts =
             rho_desk::cells::Store::from_snapshot(DeviceId([0; 16]), snapshot.clone()).unwrap();
@@ -822,6 +853,14 @@ mod tests {
         assert_eq!(snapshot.verdicts[0].0, unit("1.0"));
         assert_eq!(store.bodies().len(), 1);
         assert_eq!(store.bodies()[0].id, note);
+
+        // A file row written before the host cell existed is kept, on the
+        // daemon that stored it.
+        let file = Id::File {
+            host: MACHINE_SEED,
+            path: "/src/rho/README.md".into(),
+        };
+        assert_eq!(facts.facts(&file).parent, Some(note.clone()));
 
         // The old tables are gone, so the conversion never runs twice.
         assert!(!db.read().has_table("rho_desk_cells_v2"));

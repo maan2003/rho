@@ -1047,7 +1047,7 @@ impl AgentRegistry {
         })
         .await
         .map_err(anyhow::Error::msg)?;
-        let desk_cells = desk_cells::DeskCellStore::new(db.clone())
+        let desk_cells = desk_cells::DeskCellStore::new(db.clone(), machine_seed)
             .await
             .map_err(anyhow::Error::msg)?;
         let registry = Self {

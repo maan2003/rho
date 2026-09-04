@@ -46,9 +46,9 @@ pub(crate) struct DeskCellStore {
 }
 
 impl DeskCellStore {
-    pub(crate) async fn new(db: RhoDb) -> Result<Self, String> {
+    pub(crate) async fn new(db: RhoDb, machine_seed: u64) -> Result<Self, String> {
         let mut write = db.write().await;
-        initialize(&mut write)?;
+        initialize(&mut write, machine_seed)?;
         write.open_table(MUTATIONS);
         write.commit();
         Ok(Self { db })
@@ -531,7 +531,7 @@ fn validate_verdict_shape(
 /// none, and converting node cells to fact cells the one time there are
 /// any. The native-tree V1 conversion that used to run here is gone: it
 /// ran once on every daemon it was ever going to run on.
-pub(crate) fn initialize(write: &mut WriteTxn) -> Result<(), String> {
+pub(crate) fn initialize(write: &mut WriteTxn, machine_seed: u64) -> Result<(), String> {
     let mut meta = match write.open_table(META).get(&()) {
         Some(meta) => meta.value().into_owned(),
         None => {
@@ -548,7 +548,7 @@ pub(crate) fn initialize(write: &mut WriteTxn) -> Result<(), String> {
     write.open_table(VERDICTS);
     write.open_table(BODIES);
     if let Some((cells, verdicts, bodies, report)) =
-        crate::desk_migration::migrate(write, meta.daemon_device)?
+        crate::desk_migration::migrate(write, meta.daemon_device, machine_seed)?
     {
         // The converted cells keep the stamps they were written with, so
         // the frontier already covers them and peers still sync from the
@@ -698,7 +698,7 @@ mod tests {
         let path = directory.path().join("rho.redb");
         let db = RhoDb::open(path);
         // RhoDb owns the open file after the temporary directory handle drops.
-        DeskCellStore::new(db).await.unwrap()
+        DeskCellStore::new(db, 42).await.unwrap()
     }
 
     fn at(unix_ms: i64) -> Timestamp {
