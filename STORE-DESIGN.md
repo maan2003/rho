@@ -259,22 +259,30 @@ lasting sync role is the peer that holds while one side is away.
 
 ### Direction: what the daemon stores in the end
 
-Recommended 4 Sep, not built. Per agent, only what running a turn needs
-and the record of what happened: the run config (workdirs, role,
-runtime, created at, current lineage, the rewind marker, spawned by),
-the raw event log, and the lineage table. Daemon-wide: the machine
-identity and iroh secret, the trust list, provider secrets, quota
-observations from providers, the counters and format markers, and,
-later, the held sync segments. Nothing else. Gone from the daemon:
-every `rho_desk_*` table once the user has restarted on the slice 1
-build; the agent record's name, parent, activity, last user message and
-its text, last turn ended, updated at (name and parent are store facts,
-the rest are derived from the log); the presentation cache (the
-projection is recomputed, cached only if measured slow); the per-agent
-usage aggregates (sums over the log's cost events, done on the client);
-`view_config` and `projects` (client settings, store facts). A
-generated title is a model output and belongs in the event log as an
-event, not in a column.
+Recommended 4 Sep, corrected the same day by the user, not built. Per
+agent, three things: the run config (workdirs, role, runtime, created
+at, current lineage, the rewind marker, spawned by, and the name given
+at spawn when one was, so no title is generated for it), the raw event
+log, and a head: a small derived summary the daemon keeps current as
+events land, the latest position, what the last event was and whether
+it wants the user, the generated title, and the usage totals. The head
+is what the old record's activity, updated at, and last-message columns
+were for, computing attention without loading a log, and the client
+needs exactly the same thing, so the daemon publishes every agent's
+head eagerly (that is the agents list) and the projected log lazily,
+on open or on demand. A title or a cost total therefore never waits on
+a log sync. The lineage table stays. Daemon-wide: the machine identity
+and iroh secret, the trust list, provider secrets, quota observations
+from providers, the counters and format markers, and, later, the held
+sync segments. Gone from the daemon: every `rho_desk_*` table once the
+user has restarted on the slice 1 build; the agent record's display
+name and parent (store facts: `Name`, `Parent`); the presentation
+cache in its current form (the head and the projection replace it);
+`view_config` (a client setting, store facts); `projects`, which become
+ids: a project is `Id::File { host, path }` with a `Name` and a
+`Project(true)` property, no new kind, and the host an agent runs on is
+not stored anywhere because the client learns it from which daemon
+published the agent.
 
 ### Direction: agent transcripts are logs too, and the client decides attention
 
@@ -305,8 +313,9 @@ did (the file, the command, the search), never its output; an
 agent-wants tag; cancelled, rewound, compacted, renamed; cost per turn.
 Tool output, diffs, and the model's raw exchange stay on the host and
 are fetched on demand when the user opens that call, the way a Slack
-picture's bytes are. A projected log is small enough to mirror whole,
-so the on-demand rule is only for what it points at. Every host is
+picture's bytes are. A projected log is small, but it is still one per
+agent, so it syncs lazily, on open or on demand, and the eager part is
+the head above: Home, Find, and the map read heads and never a log. Every host is
 then a peer that publishes its agents' event logs, and a GUI is a peer
 that publishes its device log.
 
