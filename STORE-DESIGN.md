@@ -251,11 +251,19 @@ and the rest, `AGENT-WANTS-DESIGN.md`). The daemon then emits events
 and takes commands (create, send, cancel, rewind, continue, compact)
 and decides nothing about attention; Home for agents works offline from
 the mirror; and there is one sync engine for store logs and agent logs
-instead of a store protocol and a separate agent stream. Cost: the
-per-agent subscribe and stream messages become "segments since", and
-transcripts carry tool output and diffs, so the on-demand rule matters
-more than it does for Slack. Every host is then a peer that publishes
-its agents' logs, and a GUI is a peer that publishes its device log.
+instead of a store protocol and a separate agent stream. The log is
+not the raw transcript: the daemon projects what happens into a small
+typed event log per agent, the story a person reads, and only that is
+mirrored. Turn started and ended; the user's message; the agent's
+visible reply; a tool call as its name and one typed line of what it
+did (the file, the command, the search), never its output; an
+agent-wants tag; cancelled, rewound, compacted, renamed; cost per turn.
+Tool output, diffs, and the model's raw exchange stay on the host and
+are fetched on demand when the user opens that call, the way a Slack
+picture's bytes are. A projected log is small enough to mirror whole,
+so the on-demand rule is only for what it points at. Every host is
+then a peer that publishes its agents' event logs, and a GUI is a peer
+that publishes its device log.
 
 ## Browser tabs
 
