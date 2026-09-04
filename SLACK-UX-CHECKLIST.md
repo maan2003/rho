@@ -3,7 +3,11 @@
 Reconciled against main on 3 Sep. Genuinely open, in order:
 
 - 2.17 a done thread comes back on an older message, and mark-read-before
-  leaves cards standing (reported from real use, 4 Sep). Highest priority.
+  leaves cards standing (reported from real use, 4 Sep). QA report only;
+  the fix is 2.18.
+- 2.18 Slack out of the tree, the unit model (decided 4 Sep). Comes after
+  1.25 and the verdict transient (`HOME-DESIGN.md`, no deal mode), and
+  folds in the native tree store deletion (`rho desk cat/checkout`).
 - 1.25 a picture paints over the messages under it in a real DM, and the
   file name and size line goes (reported from real use, 4 Sep, screenshot).
 - 1.13 avatars (waits on the editor's inline-image inlay), 1.22 rough edges
@@ -554,26 +558,41 @@ done right after the transcript primitive (2.4) and before 2.10:
       no-op, not a drop. Comes right after 2.14, since 2.14 removes the
       third way this card could have gone quiet (a `channel_marked` from
       the phone).
-- [ ] 2.17 A done thread comes back on an older message. Reported by the
-      user on 4 Sep from real use, on the latest GUI and daemon: a thread
-      marked done is dealt again on an older message of the same thread,
-      and `mark read before` (2.13) leaves cards standing for the same
-      reason. First QA it on the real client against the fake, and
+- [ ] 2.18 Slack out of the tree, the unit model. Decided 4 Sep after the
+      user asked why Slack was in the tree at all. Design:
+      `SLACK-DESIGN.md`, "A Slack unit is a conversation or a followed
+      thread, never a message", and TREE-DESIGN slice 5. Units are a
+      direct or group message conversation, a mentioned channel, or a
+      followed thread; never a message. Facts (`newest`,
+      `newest_from_other`, `newest_author`) are monotonic from every
+      source. One `handled_through` cursor per unit, plus `defer_until`
+      and `pace_days`, in the Slack store, moved only by verdict keys as
+      the design lists them; the card is derived. Cards come from the
+      Slack store; no `thread` node, no `DeskThreadBind`, card identity an
+      enum of node or unit; `note.link` for todo, file, and notes-for-this;
+      the daemon's one-shot deletes thread nodes and links their notes.
+      Tests pin: a history page, a reconnect, a feed poll at or below the
+      cursor, and a restart never reopen a done unit; a channel with three
+      mentions is one card landing on the oldest; a DM with five messages
+      is one card; the user's reply flips the word and not the cursor;
+      snooze is voided by a newer message from someone else; mark read
+      before moves every cursor. Rig run of the 2.17 sequence, and
+      screenshots of a DM, a channel, and a thread card.
+- [ ] 2.17 A done thread comes back on an older message. Superseded by
+      2.18 for the fix: the QA report is still owed (what reproduces,
+      which of a-d), no patch on the old model. Original text: reported
+      by the user on 4 Sep from real use, on the latest GUI and daemon: a
+      thread marked done is dealt again on an older message of the same
+      thread, and `mark read before` (2.13) leaves cards standing for the
+      same reason. First QA it on the real client against the fake, and
       reproduce rather than guess: done on a thread, then each of (a) a
       history page loading under it (`load_older`, `prefetch_ping`,
       `ensure_thread_loaded`), (b) a reconnect with the follow list and
       `client.counts` re-fetched, (c) an `activity.feed` poll naming the
       thread with `latest_ts` at or below the verdict, (d) a restart with
-      the mirror holding the thread. None of these may rebind or
-      re-raise: only a message strictly newer than the verdict's
-      timestamp reopens a node, and `latest` never moves backwards. Fix
-      wherever the comparison is missing (`note_message`/`record` on
-      loaded pages, `bind_machine` reopening on rebind, `note_activity`).
-      Tests for all four, and a rig run: done, scroll up two pages,
-      reconnect, restart; the card stays closed. Same QA pass covers
-      snooze end to end (`ss`, `2sd`, `45sm`): the node's defer_until and
-      pace, the card leaving the queue, the echo, and any `desk:` notice
-      from a rejection.
+      the mirror holding the thread. Same QA pass covers snooze end to end
+      (`ss`, `2sd`, `45sm`): the defer_until and pace, the card leaving
+      the queue, the echo, and any `desk:` notice from a rejection.
 - [x] 2.10 No inbox in between, decided. Today a Slack obligation is copied
       into the rho inbox (`SlackItems`, `InboxKind::Slack`,
       `SourceReference::SlackThread`) and dealt from there. Rho: the dealer

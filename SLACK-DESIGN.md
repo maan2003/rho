@@ -48,34 +48,64 @@ Several workspaces can be registered. Nothing scrapes the browser yet.
 **Why:** extraction can be automated later once the rest works; a manual
 prompt is enough to use it today and keeps the first version small.
 
-### A Slack thread is shaped like an agent
+### A Slack unit is a conversation or a followed thread, never a message
 
-Identity is (workspace, channel, thread timestamp). A thread is "waiting on
-you" when the last message is not yours, and "waiting on them" once you
-replied. The state word and the curve follow from that; verdicts do not.
-Only the user's keys set a verdict (done, discard, snooze, todo, filed).
-The user's own reply is not a verdict: it flips the card to "replied" and
-lets its priority fall, but the card stays open until the user closes it.
-Reading is not a verdict either, in rho or on another client: it clears
-unread and nothing more. A newer message from someone else after any
-verdict brings the thread back, keyed on the latest message timestamp,
-the same way an agent reply voids a skip.
+The thing rho deals is a unit with a stable identity that Slack itself
+keeps: a direct or group message conversation (workspace, channel), a
+channel the user was mentioned in (workspace, channel), or a followed
+thread (workspace, channel, thread timestamp). A message is never a unit
+and never a card: a message timestamp is a fact about a unit, not an
+identity. One card per unit at most, so a channel with three unhandled
+mentions is one card that lands the reader on the oldest of them.
 
-Discard is also Slack's "ignore thread": `x` on a thread card unfollows it
-in Slack (`subscriptions.thread.remove`), and a thread unfollowed in Slack
-(`thread_unsubscribed` on the socket, or absent from the feed) is
-discarded in rho. Rho keeps no subscription state of its own; Slack's
-follow list is the truth and the two clients agree. Undoing a discard is
-made in the same place: `shift-u` follows the thread again
-(`subscriptions.thread.add`) and the card is dealt as before. An undo that
-reopened the node but left the thread ignored would be worse than none.
+Facts, all read from the mirror and all monotonic (every source, a live
+frame, a feed poll, a history page, a reconnect, a restart, can only raise
+them by `max`, never lower or reset them): `newest`, the newest message
+timestamp; `newest_from_other`, the newest message from someone else that
+concerns the user (any message in a direct message, a mention in a
+channel, a reply in a followed thread); `newest_author`, who wrote
+`newest`, the user or someone else.
 
-**Why:** the dealer, its curves, verdict keys, deal history, and journal
-already model exactly this for agents. Slack adds no new concept; it adds
-another source of the same card. Reading and replying used to count as
-done; the user rejected both (3 Sep): a reply is a move in a conversation,
-not the end of it, and a thread read on the phone is still owed an answer.
-Closing a thread is a decision only the user makes.
+Rho state, per unit, in the Slack store: `handled_through`, a timestamp
+cursor; `defer_until`; `pace_days`. Nothing but a verdict key moves them.
+
+- `d` done: `handled_through := newest`.
+- `t` todo: done, and a `note` with a link to the unit is created in the
+  tree, deferred and paced the way todo notes are today.
+- `x` discard: done, and the unit is silenced where Slack has a place
+  for it: a thread is unfollowed (`subscriptions.thread.remove`), a
+  conversation is marked read up to `newest`. Undo follows the thread
+  again (`subscriptions.thread.add`).
+- `s` snooze: `defer_until` set, cursor untouched. A message from someone
+  else newer than the snooze voids `defer_until`; the card is back as
+  "needs reply".
+- `f` file: a `note` linked to the unit is created under the heading the
+  user picks; the cursor is untouched, the card keeps being dealt. Filing
+  is a place, not a close.
+- mark read before a cutoff (2.13): every unit's `handled_through :=
+  max(handled_through, cutoff)`, plus Slack's own read cursors as today.
+- `u` undo: the previous cursor and defer are restored from the unit's
+  verdict log, a local grow-only log that exists for undo and the journal.
+
+The card is derived, never stored: a unit is open iff
+`newest_from_other > handled_through` and `defer_until` is unset,
+reached, or voided. It reads "needs reply" when `newest_author` is
+someone else and "replied" when it is the user; the wait is measured from
+`newest_from_other` in the first case and from the user's reply in the
+second. The user's own reply is not a verdict: it flips the word and the
+curve and the card stays open until the user closes it. Reading is not a
+verdict either, in rho or on another client. A dealt card lands the
+reader on the oldest message from someone else after `handled_through`.
+
+**Why:** the first model keyed every card on a message timestamp and, for
+a direct message, made every top-level message its own thread. A history
+page loading under a done card could then raise an older message as a new
+card, and mark-read-before left cards standing for the same reason
+(checklist 2.17, 4 Sep, real use). A unit with one cursor cannot regress:
+whatever Slack sends, the only comparison is "is there something from
+them past the cursor", and the cursor only ever moves by the user's hand.
+The dealer, its curves, and its verdict keys stay exactly what they are
+for agents; Slack is another source of the same card.
 
 ### A Slack card outranks an agent of the same wait
 
@@ -102,15 +132,25 @@ Which threads are the user's is Slack's follow list
 per conversation and per thread (`subscriptions.thread.mark`,
 `thread_marked`). Ignoring a thread is Slack's unfollow. Rho keeps no
 private copy of any of these; the mirror caches them and Slack corrects
-it. Only what Slack has no place for, the dealer's verdicts, lives in rho,
-on the thread node, where the tree already syncs it between rho devices.
-Verdicts are not mirrored into Slack's Later (saved items) either: the
-user's call, 3 Sep; the tree's CRDT is the only sync for them.
+it. Only what Slack has no place for, the dealer's cursor, defer, and
+pace per unit, lives in rho, in the Slack store beside the mirror, on
+the device that made the verdict. Verdicts are not mirrored into Slack's
+Later (saved items): the user's call, 3 Sep.
+
+Between rho devices this state does not sync yet: a done on the laptop
+does not close the card on the phone until the phone's user closes it
+too. Accepted on 4 Sep as a later decision; the shape of the store (three
+typed cells per unit key) does not change when a sync is chosen.
 
 **Why:** the user's rule, 3 Sep. Slack's own clients on the phone and the
 desktop share this state already; a private copy in rho would drift the
 moment the user touched another client, which is exactly what made a
-thread reply vanish (checklist 2.16).
+thread reply vanish (checklist 2.16). Slack was in the tree for one day
+(slices 2 and 3) so its verdicts would ride the tree's CRDT; the user
+asked on 4 Sep why Slack was in the tree at all, and the answer was only
+that sync. A per-unit record does not need to be a node to sync, and a
+node per thread cost a machine-owned identity next to Slack's own, a
+bind round trip, and rows the user never filed.
 
 ### Ingest: the activity feed for truth, the websocket for latency
 
@@ -127,24 +167,31 @@ odd websocket event types, rho handles `hello`, `reconnect_url`, `pong`,
 matter, so a missed websocket frame is never a missed mention. The
 websocket exists only so the lamp lights within a second.
 
-### Slack deals straight from the session; there is no inbox in between
+### Slack deals straight from the Slack store; there is no inbox and no node in between
 
-A mention, a DM, or a reply to a thread the user is in makes the thread
-matter, and a `thread` node is created for it in the tree; the dealer
-deals the node, the way it deals an agent's. The Slack side carries no
-decisions at all: the node holds the thread's identity and its verdict
-log, and the session supplies the words, the wait, and the newest
-timestamp, read live and never stored beside the mirror. A verdict is
-keyed on the newest message, so a verdicted thread stays quiet until a
-newer message from someone else voids it; the user's own messages never
-touch the verdict. Filing (`f`) moves the node under a heading like any
-other. The rho inbox is not involved; it no longer exists.
+The dealer takes Slack cards from the Slack store the way it takes agent
+cards from the registry: it asks the model for open units and ranks them
+with the same curves. Nothing about a unit lives in the tree. There is no
+`thread` node, no bind request to the daemon, and the daemon never hears
+of Slack. Card identity in the dealer, its skips, undo, and the journal is
+therefore an enum, a node or a Slack unit, not a node id.
 
-**Why:** the inbox was a redirection. Slack already keeps the truth of what
-is waiting and what has been answered; copying it into an inbox item meant
-a second identity, a second lifetime, and a surface that showed a message
-body with no conversation around it. Human-entered items may want an inbox
-of their own later; Slack does not.
+The tree meets Slack in one place, by the user's hand: a `note` may carry
+a typed `link` to a unit. Todo and file create such notes; "notes for
+this" from a conversation surface does too. The note is user-owned like
+any note: its title is its own first line, or the unit's subject while the
+body is empty; opening the link from the note opens the conversation. The
+Slack card and the note never touch each other after creation: done on
+the card moves the cursor, closing the note is the user's own act, and a
+thread gone from Slack leaves the note with a link that opens nothing.
+
+**Why:** the inbox was a redirection, and the thread node was the same
+redirection one level up: a second identity with its own lifetime for a
+thing Slack already identifies. Slack keeps the truth of what is waiting
+and what was answered; rho keeps one cursor per unit and nothing else. A
+heading with a Slack thread under it is useful and rare (the user, 4
+Sep); a linked note gives exactly that without making the tree hold
+anything the machine created.
 
 ### A local mirror in rho-db, so reading never waits on Slack
 
@@ -153,8 +200,9 @@ file owned by the GUI, `~/.local/state/rho/slack.redb`, owner-only: users
 and their avatar hashes, conversations and their labels, messages per
 conversation in timestamp order with reactions, edits, and deletions
 applied, thread replies under their parent, the activity cursor, per
-conversation `last_read`. Verdicts are not here: they are the tree's, on
-the thread node.
+conversation `last_read`; and the dealer's per-unit record
+(`handled_through`, `defer_until`, `pace_days`) with its verdict log,
+keyed by unit, in tables of its own.
 Every surface renders from the mirror first and refreshes behind it: the
 list and any conversation open instantly from disk, then the session
 fetches only what is newer than the mirror's newest timestamp for that
@@ -223,7 +271,7 @@ source of truth. The beginning of history is recorded when a page returns
 boot is instant and history scrolls without a round trip). Rho's promise
 is that the UI never waits on a remote, and the GitHub design already
 takes the same shape. Read positions cache here too, one file and one
-identity per thread; verdicts do not, they are the tree's.
+identity per unit; the dealer's per-unit record lives beside them.
 
 ### Channels, direct messages, and threads are all the same surface
 
@@ -334,7 +382,8 @@ the thread identity. No strings where an enum will do.
 ## What stays the same for the human
 
 - The dealer, verdict keys, deal history, filing.
-- The desk owns structure; Slack rows appear only where the user filed them.
+- The tree owns structure; a Slack unit appears in it only as a note the
+  user made, linked to it.
 
 ## Deliberately deferred
 
@@ -350,6 +399,9 @@ the thread identity. No strings where an enum will do.
 - A thread dealt twice because the feed and the websocket disagreed.
 - Ids or raw timestamps visible anywhere.
 - A dark connection with no lamp.
+- A card keyed on a message timestamp, or a card per message.
+- A fact (`newest`, `newest_from_other`) that moved backwards.
+- A tree node the machine created for Slack.
 
 ## What done means
 
