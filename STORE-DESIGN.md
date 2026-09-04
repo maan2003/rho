@@ -344,9 +344,9 @@ in the clear; the two share nothing.
 The user's calls, 4 Sep, on the simplification pass:
 
 - Transports: the Unix socket is for the CLI in production; the GUI
-  uses iroh in production and the Unix socket only in tests. With
-  stable client keys the per-launch SSH trust step goes and trust is one
-  list with one enrollment and one revoke.
+  uses iroh in production and the Unix socket only in tests. Trust
+  (enrollment codes, SSH trust-in-memory, approve and revoke) stays as
+  it is for now; folding it into one list waits.
 - Usage: the graphs stay, and the data behind them lives on the client,
   derived from the cost events in the mirrored agent logs; the per-agent
   and global usage requests go. Quota observations from providers stay a
