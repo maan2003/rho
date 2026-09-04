@@ -74,7 +74,7 @@ Rho state, per unit, as facts on the unit's id in the store
 - `t` todo: done, and a note whose `parent` is the unit is created at the
   area asked, deferred and paced the way todo notes are today; `j` on the
   unit opens the conversation.
-- `x` discard: done, and the unit is silenced where Slack has a place
+- `x` mute (was discard): done, and the unit is silenced where Slack has a place
   for it: a thread is unfollowed (`subscriptions.thread.remove`), a
   conversation is marked read up to `newest`. Undo follows the thread
   again (`subscriptions.thread.add`).

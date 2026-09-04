@@ -99,7 +99,7 @@ a card can be read, searched and yanked like any buffer.
 
 The verdicts live in one transient. A single tap of `shift` opens it on
 any surface that is a card (an agent, a Slack conversation or thread, a
-note, a page): `d` done, `x` discard, `s` snooze then a count and a unit
+note, a page): `d` done, `x` mute, `s` snooze then a count and a unit
 (`s 7 d` is seven days, `s 45 m`, `s 3 h`, `s w`, `s s` a day), `t` todo,
 `f` file…, `u` undo the last verdict, `j` open the top card (what `ctrl-j`
 does), and `shift` again for Home, so the old double-shift still lands on

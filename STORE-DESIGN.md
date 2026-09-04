@@ -173,8 +173,10 @@ the cursor (a reply from them, an agent turn ending on a question or a
 tag), with a fresh wait; the user's own message to either never reopens
 anything. No wall clock from one system is ever compared with another's.
 `State(Done)` is for what nothing external can reopen: notes and labels.
-`x` discard: the cursor, plus `state := dismissed` so the thing stays out
-of Home even when it speaks again until the user opens it, plus the
+`x` mute (the verdict formerly called discard; renamed 4 Sep because
+what it does is stop the thing from raising its hand): the cursor,
+plus `state := muted` so the thing stays out of Home even when it
+speaks again until the user opens it, plus the
 source's own silence where it has one (a thread unfollowed, a
 conversation marked read). `s` snooze:
 `defer_until`. `t` todo: as today, plus for Slack the cursor. `f` file:
