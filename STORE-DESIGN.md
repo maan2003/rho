@@ -339,6 +339,30 @@ log replication is not this crate: it is the daemon's own protocol
 over its own stream, since the daemon owns those logs and reads them
 in the clear; the two share nothing.
 
+### Direction: what the daemon offers, as capabilities
+
+The user's calls, 4 Sep, on the simplification pass:
+
+- Transports: the Unix socket is for the CLI in production; the GUI
+  uses iroh in production and the Unix socket only in tests. With
+  stable client keys the per-launch SSH trust step goes and trust is one
+  list with one enrollment and one revoke.
+- Usage: the graphs stay, and the data behind them lives on the client,
+  derived from the cost events in the mirrored agent logs; the per-agent
+  and global usage requests go. Quota observations from providers stay a
+  daemon request.
+- Telemetry stays, as its own crate and capability mounted on its own
+  stream the way store sync is, not intermingled with daemon code.
+- Visualizations stay server-side: they are part of the agent
+  capability, on their own path if that reads cleaner.
+- Iris, the hidden coordinator agent, is disabled: its code stays in
+  `rho-agent` but is not integrated at the protocol level; when
+  coordination comes back it belongs on the client.
+- Realtime (WebRTC) stays as client code, kept for later, out of the
+  daemon protocol for now.
+- Terminal and shell: one "process on the host" stream with a kind.
+- Kept as they are: the land lease, git transport, diffs, PR commands.
+
 ### Direction: agent transcripts are logs too, and the client decides attention
 
 The user's read on 4 Sep, not built and not a slice yet. An agent's
