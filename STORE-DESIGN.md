@@ -61,11 +61,14 @@ Two shapes of relation, decided per variant:
 
 The payload is where detail lives that the id does not carry. Ids stop at
 the unit (a Slack thread, an agent, a page), but a relation can name the
-exact thing inside it: `From { unit: SlackUnit, message: Ts }` on an
-agent records the very message that led to spawning it, though no id
-exists for a message; a relation may carry several ids where one fact
-genuinely joins several things. The same rule bounds it: a payload is
-typed, never a string that means something.
+exact thing inside it, and the variant is as specific as the fact:
+`FromSlack { unit: SlackUnit, message: Ts }` on an agent records the very
+message that led to spawning it, though no id exists for a message;
+`FromPage { page: PageId, url: Url }` records the page and the exact
+address that led to it. One variant per source, never a generic `From`
+with an id that could be anything; a relation may carry several ids where
+one fact genuinely joins several things. The same rule bounds it: a
+payload is typed, never a string that means something.
 
 Gone from the cell vocabulary: `kind`, `agent_id`, `host`, `page_ref`,
 `url`, `workspace`, `channel`, `thread_ts`, `repo`, `number`, `path`. Each
