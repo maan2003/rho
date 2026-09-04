@@ -68,7 +68,10 @@ message that led to spawning it, though no id exists for a message;
 address that led to it. One variant per source, never a generic `From`
 with an id that could be anything; a relation may carry several ids where
 one fact genuinely joins several things. The same rule bounds it: a
-payload is typed, never a string that means something.
+payload is typed, never a string that means something. The enum is the
+whole schema: modelling a new fact is adding a variant that says exactly
+what happened, with exactly the data it needs, and nothing has to be
+generalised to fit an existing shape.
 
 Gone from the cell vocabulary: `kind`, `agent_id`, `host`, `page_ref`,
 `url`, `workspace`, `channel`, `thread_ts`, `repo`, `number`, `path`. Each
