@@ -1,6 +1,6 @@
 # Creating things
 
-Status: decided with the user on 2026-09-03. Sits on `TREE-DESIGN.md`;
+Status: decided with the user on 2026-09-03. Sits on `STORE-DESIGN.md` (formerly `TREE-DESIGN.md`);
 replaces the desk-only `shift-r`, staff, quick-spawn, and `browser › new
 page` entry points. Rho has exactly one user.
 

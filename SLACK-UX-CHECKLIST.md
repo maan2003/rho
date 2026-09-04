@@ -2,9 +2,12 @@
 
 Reconciled against main on 3 Sep. Genuinely open, in order:
 
-- 2.18 Slack out of the tree, the unit model (decided 4 Sep). Comes after
-  the verdict transient (`HOME-DESIGN.md`, no deal mode), and folds in the
-  native tree store deletion (`rho desk cat/checkout`).
+- 2.18 Slack on the store, the unit model (decided 4 Sep, re-scoped the
+  same day to `STORE-DESIGN.md` slice 2). The user's order, 4 Sep: the
+  store comes first, before any short-term bug; so store slice 1, then
+  2.18 (which folds in the native tree store deletion, `rho desk
+  cat/checkout`), then the verdict transient (`HOME-DESIGN.md`, no deal
+  mode).
 - 1.13 avatars (waits on the editor's inline-image inlay), 1.22 rough edges
   (b) soft-wrap column waits on the vendored editor.
 
@@ -566,31 +569,32 @@ done right after the transcript primitive (2.4) and before 2.10:
       no-op, not a drop. Comes right after 2.14, since 2.14 removes the
       third way this card could have gone quiet (a `channel_marked` from
       the phone).
-- [ ] 2.18 Slack out of the tree, the unit model. Decided 4 Sep after the
-      user asked why Slack was in the tree at all. Design:
-      `SLACK-DESIGN.md`, "A Slack unit is a conversation or a followed
-      thread, never a message", and TREE-DESIGN slice 5. Units are a
-      direct or group message conversation, a mentioned channel, or a
-      followed thread; never a message. Facts (`newest`,
-      `newest_from_other`, `newest_author`) are monotonic from every
-      source. One `handled_through` cursor per unit, plus `defer_until`
-      and `pace_days`, in the Slack store, moved only by verdict keys as
-      the design lists them; the card is derived. Cards come from the
-      Slack store; no `DeskThreadBind`, no machine-made node, card
-      identity an enum of node or unit; the `thread` kind becomes the
-      user-made `slack` kind (optional `ts`, at most one per unit) for
-      todo, file, and notes-for-this; the daemon's one-shot deletes the
-      root, childless thread nodes and keeps the filed ones.
-      Tests pin: a history page, a reconnect, a feed poll at or below the
-      cursor, and a restart never reopen a done unit; a channel with three
-      mentions is one card landing on the oldest; a DM with five messages
-      is one card; the user's reply flips the word and not the cursor;
-      snooze is voided by a newer message from someone else; mark read
-      before moves every cursor; the card text is rendered from the
-      model at display time, never cached at record time, so a mention
-      reads `@Manmeet` on a cold start. Rig run of the 2.17 sequence
-      (done, restart with the mirror, the card stays gone), and
-      screenshots of a DM, a channel, and a thread card.
+- [ ] 2.18 Slack on the store, the unit model. Decided 4 Sep after the
+      user asked why Slack was in the tree at all; re-scoped the same day
+      to `STORE-DESIGN.md` slice 2 once the store design replaced the
+      tree. Design: `SLACK-DESIGN.md`, "A Slack unit is a conversation or
+      a followed thread, never a message", and "Slack deals straight from
+      the mirror". Units are a direct or group message conversation, a
+      mentioned channel, or a followed thread; never a message; the unit
+      is an `Id::Slack`. Facts (`newest`, `newest_from_other`,
+      `newest_author`) are monotonic from every source. One
+      `handled_through` cursor per unit, plus `defer_until` and
+      `pace_days`, as facts on the id in the store, moved only by verdict
+      keys as the design lists them; the card is derived from the join.
+      No `DeskThreadBind`, no node made by the machine, the `thread` kind
+      gone with the migration; the native tree store and `rho desk
+      cat/checkout` deleted in the same change. Tests pin: a history page,
+      a reconnect, a feed poll at or below the cursor, and a restart never
+      reopen a done unit; a channel with three mentions is one card
+      landing on the oldest; a DM with five messages is one card; the
+      user's reply flips the word and not the cursor; snooze is voided by
+      a newer message from someone else; mark read before moves every
+      cursor; the card text is rendered from the model at display time,
+      never cached at record time, so a mention reads `@Manmeet` on a cold
+      start; a done on one device closes the card on another after sync.
+      Rig run of the 2.17 sequence (done, restart with the mirror, the
+      card stays gone), and screenshots of a DM, a channel, and a thread
+      card.
 - [x] 2.17 A done thread comes back on an older message. QA report landed
       4 Sep (b8os, screens 217-*), fix is 2.18. Findings: (d) restart
       with the mirror reproduces, every done card is back on Home; (b)

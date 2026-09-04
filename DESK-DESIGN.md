@@ -2,7 +2,7 @@
 
 Status: retired to its notes-and-filing half on 2026-09-03 (tree slice 4).
 What used to live here has moved: the store and the shape of a node are
-`TREE-DESIGN.md`, the dealer and what it ranks are `HOME-DESIGN.md`, the
+`STORE-DESIGN.md` (formerly `TREE-DESIGN.md`), the dealer and what it ranks are `HOME-DESIGN.md`, the
 surface timeline and the deal are `HOME-DESIGN.md` too. The desk, the
 inbox, and rooms are gone as concepts; this is what survives them, which is
 how notes are written and how things get filed.

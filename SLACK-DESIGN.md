@@ -66,13 +66,14 @@ concerns the user (any message in a direct message, a mention in a
 channel, a reply in a followed thread); `newest_author`, who wrote
 `newest`, the user or someone else.
 
-Rho state, per unit, in the Slack store: `handled_through`, a timestamp
-cursor; `defer_until`; `pace_days`. Nothing but a verdict key moves them.
+Rho state, per unit, as facts on the unit's id in the store
+(`STORE-DESIGN.md`): `handled_through`, a timestamp cursor; `defer_until`;
+`pace_days`. Nothing but a verdict key moves them.
 
 - `d` done: `handled_through := newest`.
-- `t` todo: done, and a `slack` node for the unit is created in the tree
-  at the area asked, deferred and paced the way todo notes are today, so
-  the tree deals it as a todo and `j` on it opens the conversation.
+- `t` todo: done, and a note whose `parent` is the unit is created at the
+  area asked, deferred and paced the way todo notes are today; `j` on the
+  unit opens the conversation.
 - `x` discard: done, and the unit is silenced where Slack has a place
   for it: a thread is unfollowed (`subscriptions.thread.remove`), a
   conversation is marked read up to `newest`. Undo follows the thread
@@ -80,13 +81,13 @@ cursor; `defer_until`; `pace_days`. Nothing but a verdict key moves them.
 - `s` snooze: `defer_until` set, cursor untouched. A message from someone
   else newer than the snooze voids `defer_until`; the card is back as
   "needs reply".
-- `f` file: a `slack` node for the unit is created under the heading the
-  user picks (or the existing one moved there); the cursor is untouched,
-  the card keeps being dealt. Filing is a place, not a close.
+- `f` file: the unit's `parent` is set to the id the user picks (a label
+  or any thing); the cursor is untouched, the card keeps being dealt.
+  Filing is a place, not a close.
 - mark read before a cutoff (2.13): every unit's `handled_through :=
   max(handled_through, cutoff)`, plus Slack's own read cursors as today.
-- `u` undo: the previous cursor and defer are restored from the unit's
-  verdict log, a local grow-only log that exists for undo and the journal.
+- `u` undo: the previous cursor and defer are restored from the verdict
+  log entry, as for any id.
 
 The card is derived, never stored: a unit is open iff
 `newest_from_other > handled_through` and `defer_until` is unset,
@@ -134,14 +135,9 @@ per conversation and per thread (`subscriptions.thread.mark`,
 `thread_marked`). Ignoring a thread is Slack's unfollow. Rho keeps no
 private copy of any of these; the mirror caches them and Slack corrects
 it. Only what Slack has no place for, the dealer's cursor, defer, and
-pace per unit, lives in rho, in the Slack store beside the mirror, on
-the device that made the verdict. Verdicts are not mirrored into Slack's
-Later (saved items): the user's call, 3 Sep.
-
-Between rho devices this state does not sync yet: a done on the laptop
-does not close the card on the phone until the phone's user closes it
-too. Accepted on 4 Sep as a later decision; the shape of the store (three
-typed cells per unit key) does not change when a sync is chosen.
+pace per unit, lives in rho, as facts on the unit's id in the store,
+which already syncs between rho devices. Verdicts are not mirrored into
+Slack's Later (saved items): the user's call, 3 Sep.
 
 **Why:** the user's rule, 3 Sep. Slack's own clients on the phone and the
 desktop share this state already; a private copy in rho would drift the
@@ -149,9 +145,8 @@ moment the user touched another client, which is exactly what made a
 thread reply vanish (checklist 2.16). Slack was in the tree for one day
 (slices 2 and 3) so its verdicts would ride the tree's CRDT; the user
 asked on 4 Sep why Slack was in the tree at all, and the answer was only
-that sync. A per-unit record does not need to be a node to sync, and a
-node per thread cost a machine-owned identity next to Slack's own, a
-bind round trip, and rows the user never filed.
+that sync. The store design keeps the sync and drops the node: the unit's
+own identity is the id, and the cursor is a fact on it.
 
 ### Ingest: the activity feed for truth, the websocket for latency
 
@@ -168,36 +163,33 @@ odd websocket event types, rho handles `hello`, `reconnect_url`, `pong`,
 matter, so a missed websocket frame is never a missed mention. The
 websocket exists only so the lamp lights within a second.
 
-### Slack deals straight from the Slack store; there is no inbox and no node in between
+### Slack deals straight from the mirror; there is no inbox and no node in between
 
-The dealer takes Slack cards from the Slack store the way it takes agent
-cards from the registry: it asks the model for open units and ranks them
-with the same curves. Nothing about a unit lives in the tree. There is no
-`thread` node, no bind request to the daemon, and the daemon never hears
-of Slack. Card identity in the dealer, its skips, undo, and the journal is
-therefore an enum, a node or a Slack unit, not a node id.
+The dealer takes Slack cards the way it takes agent cards: the mirror
+supplies the open units and their facts, the store supplies the user's
+facts on the same ids, and the join is ranked with the same curves. No
+node is ever created for a unit, there is no bind request to the daemon,
+and the daemon never hears of Slack. Card identity in the dealer, its
+skips, undo, and the journal is the typed `Id`.
 
-The tree meets Slack in one place, by the user's hand: a `slack` node, a
-reference node like `agent` and `page`, carrying the unit's identity and
-nothing else. Todo and file create one; "notes for this" from a
-conversation surface creates one and puts the note under it. At most one
-per unit: filing again moves it. The machine never creates one on its own:
-a ping, a reply, a mark, or a restart never makes a node. Its title is the
-unit's subject from the mirror, `j` opens the conversation, and children
-under it are notes for that thread. The Slack card and the node never
-touch each other after creation: done on the card moves the cursor,
-closing the node is the user's own act, and a thread gone from Slack
-leaves a node whose `j` opens nothing.
+The unit's id is a place like any other: a note with `parent` = the unit
+is "notes for this thread"; the unit filed under a label or a project is
+its `parent`; on the map it sits under its channel and workspace by the
+derived edges until the user files it. None of that makes the machine
+write anything: a ping, a reply, a mark, or a restart never touches the
+store. Done on the card moves the cursor and nothing else; a note under
+the thread is closed by the user's own act; a thread gone from Slack
+leaves an id whose `j` opens nothing.
 
 **Why:** the inbox was a redirection, and the thread node was the same
 redirection one level up: a second identity with its own lifetime for a
 thing Slack already identifies. Slack keeps the truth of what is waiting
 and what was answered; rho keeps one cursor per unit and nothing else. A
 heading with a Slack thread under it is useful and rare (the user, 4
-Sep); a user-made `slack` node gives exactly that, with parents and
-children like any node, without the tree holding anything the machine
-created. A note with a link field was considered and rejected the same
-day: a Slack thread in the tree is its own kind, not a note hack.
+Sep); the unit's own id as a place gives exactly that, with parents and
+children like anything else, without the store holding anything the
+machine wrote. A note with a link field and a user-made `slack` node kind
+were both considered and rejected the same day, for the store design.
 
 ### A local mirror in rho-db, so reading never waits on Slack
 
@@ -206,9 +198,8 @@ file owned by the GUI, `~/.local/state/rho/slack.redb`, owner-only: users
 and their avatar hashes, conversations and their labels, messages per
 conversation in timestamp order with reactions, edits, and deletions
 applied, thread replies under their parent, the activity cursor, per
-conversation `last_read`; and the dealer's per-unit record
-(`handled_through`, `defer_until`, `pace_days`) with its verdict log,
-keyed by unit, in tables of its own.
+conversation `last_read`. The dealer's cursor, defer, and pace are not
+here: they are facts on the unit's id in the store.
 Every surface renders from the mirror first and refreshes behind it: the
 list and any conversation open instantly from disk, then the session
 fetches only what is newer than the mirror's newest timestamp for that
@@ -277,7 +268,7 @@ source of truth. The beginning of history is recorded when a page returns
 boot is instant and history scrolls without a round trip). Rho's promise
 is that the UI never waits on a remote, and the GitHub design already
 takes the same shape. Read positions cache here too, one file and one
-identity per unit; the dealer's per-unit record lives beside them.
+identity per unit; the dealer's facts do not, they are the store's.
 
 ### Channels, direct messages, and threads are all the same surface
 
@@ -388,8 +379,8 @@ the thread identity. No strings where an enum will do.
 ## What stays the same for the human
 
 - The dealer, verdict keys, deal history, filing.
-- The tree owns structure; a Slack unit appears in it only as a `slack`
-  node the user made.
+- The store owns the user's facts; a Slack unit is a place in it only
+  where the user filed something there or filed it somewhere.
 
 ## Deliberately deferred
 
@@ -407,7 +398,7 @@ the thread identity. No strings where an enum will do.
 - A dark connection with no lamp.
 - A card keyed on a message timestamp, or a card per message.
 - A fact (`newest`, `newest_from_other`) that moved backwards.
-- A tree node the machine created for Slack.
+- Anything written to the store by a ping, a reply, a mark, or a restart.
 
 ## What done means
 

@@ -1,174 +1,14 @@
-# The tree: everything in rho is a node
+# The tree: everything in rho is a node (retired 4 Sep)
 
-Status: decided with the user on 2026-09-03, building. Supersedes the
-storage half of `DESK-TREE-DESIGN.md` and the inbox and desk-as-home parts of
-`DESK-DESIGN.md`. `HOME-DESIGN.md` and `SLACK-DESIGN.md` sit on top of it.
-
-## The problem
-
-Rho has three stores for "things that can need attention": the desk tree
-(daemon, CRDT), the inbox (GUI, redb), and per-source verdict tables (the
-Slack mirror). Each has its own identity type, and the dealer, undo, the
-journal, and the deal views carry an enum to bridge them. Verdicts on the
-phone are invisible on the desktop because two of the three stores are
-device-local. And the desk, which was home, is really a notes store.
-
-## Decisions
-
-### One tree of nodes; a node is a kind, a place, and attention state
-
-A node is `id`, `kind`, `parent`, `deleted`, and typed fields. The parent is
-the filing: a node's parent is its context. A note under a Slack thread is
-"notes for this thread"; an agent under a pull request is the engineer on
-it; a room is nothing special, only a node with children. `parent = none`
-means the root, which is also what "unfiled" means. There is no stored
-sibling order: every view sorts children by its own rule (score on Home,
-time in notes, name on the map).
-
-Kinds, and the fields each adds to the common ones:
-
-- `note`: `body`, free-form text. The only kind with user-written text.
-- `slack`: `workspace`, `channel`, optional `ts` (a followed thread; a
-  conversation or channel when absent). Made only by the user's hand
-  (todo, file, notes-for-this from a Slack card or surface), at most one
-  per unit, never by a ping, a reply, a mark, or a restart. Dealing and
-  verdicts for the unit itself live in the Slack store
-  (`SLACK-DESIGN.md`, 4 Sep); the node is the user's place for it.
-- `agent`: `agent_id`, `host` (the machine seed, u64, the durable machine
-  identity; never a GUI attachment index).
-- `page`: `page` (browser reference), `url`.
-- `pull_request`: `repo`, `number` (arrives with the GitHub work).
-
-Common fields: `created_at`, `state` (`open`, `done`, `dismissed`),
-`defer_until`, `deadline`, `tags`. Titles are derived per kind (a note's
-first line, the agent's name, the page's title, the Slack unit's subject
-from the mirror), never
-stored, so the structure store holds no free text but note bodies.
-
-### Fields merge by CRDT, chosen per field
-
-Modelled on cr-sqlite's "a row is a map of CRDTs" and Figma's multiplayer:
-
-- Last-writer-wins register for `parent`, `kind`, `deleted`, `state`,
-  `defer_until`, `deadline`, and every reference field. Each cell carries a
-  stamp `(device, version)`; newest wins, device id breaks ties.
-- One boolean LWW cell per tag. Opposing writes at the same numeric version
-  choose add (`true`) regardless of the device tie-breaker; writes with
-  different versions follow ordinary LWW. This is not a causal add-wins set.
-- Grow-only log for verdicts: `(node, stamp) → VerdictEvent`, merged by
-  union. `state` is the current value; the log is history and undo.
-- Text CRDT for `body`: the editor's buffer already is one; its operations
-  persist keyed by node. This is the one field two devices genuinely edit
-  concurrently, so LWW is not acceptable there.
-
-Known and accepted: LWW silently drops one of two concurrent writes to the
-same field of the same node. For one user that is the right trade
-everywhere except `body`.
-
-### Cycles are handled in rendering, never fixed in storage
-
-Two devices moving A under B and B under A offline produce a cycle after
-merge. It is rare enough that the handling is the dumbest thing that loses
-nothing: when materializing, a node whose parent chain never reaches the
-root is shown at the root. The stored cells are not touched; the user
-refiles when they notice. No move algorithm, no edge maps.
-
-### Deletes are a flag
-
-`deleted` is an LWW boolean. A live child of a deleted parent is shown at
-the root. Undelete is setting it back. Nothing is ever removed from the
-store by the machine.
-
-### Sync is "cells since your version"
-
-Every device keeps a version counter; every cell records the stamp that
-wrote it; every device remembers the last version it saw from each peer.
-Sync is the set of cells newer than that, in either direction, over any
-channel. For now the daemon is mandatory and is the hub: every GUI syncs
-with the daemon only, never with another GUI, and the daemon's store is
-the one every device converges to. The GUI talks to it through the
-existing protocol carrying cells instead of tree operations. The planned
-peer-to-peer future swaps the transport, not the model.
-
-### The membrane
-
-The machine creates reference nodes (`agent`, `page`, `pull_request`),
-moves them when a verdict files them, and sets `state`. A `slack` node is
-the exception: only a verdict key or notes-for-this creates one.
-It never writes a `body`. "The desk is 100% user-written" becomes "note
-text is 100% user-written".
-
-### The dealer deals nodes
-
-Card identity is one enum everywhere (dealer, skips, undo, journal, deal
-views): a `NodeId`, or a Slack unit key for cards the Slack store deals. Curves are per kind as today; `defer_until` and `deadline` are the
-tuning knobs, typed. An `open` node is dealable only if `defer_until` (once
-reached) or `deadline` is set; a note with neither is a plain note and is
-never dealt. After `defer_until` the curve is `elapsed - pace_days`, which
-is today's todo curve, and today's defer curve when `pace_days` is 0. The
-old todo and defer marks both become `defer_until` (todo keeps its pace,
-defer gets 0), so every existing card ranks exactly as before; the one
-loss, accepted on 3 Sep, is the word: a woken todo and a woken defer read
-the same in the bar. There is no `todo_at` field and no `todo` tag. A verdict appends to the log and sets fields:
-`done`/`dismiss` set `state`; `defer` sets `defer_until`; `file` sets
-`parent`; `todo` creates a `note` child. Undo reads the log entry and
-restores the fields it changed. Capture is "create a note at the root";
-the inbox stops existing as a concept.
-
-Node volume rule: the machine never makes a node for a Slack message,
-thread, or conversation on its own. The `thread` kind, made per ping for
-one day (slices 2 and 3), became the user-made `slack` kind in slice 5.
-
-### Views
-
-- Home (`HOME-DESIGN.md`): the dealer's ranking of nodes.
-- The map: the tree by kind and children, replacing the desk view; the
-  same editor over an outline, ordering derived.
-- The note surface: an editor over `body`, with the node's children below.
-- One key on any surface opens or creates the note under that node.
-- Every other kind keeps its surface.
-- Find: a minibuffer over every node, matched fuzzily against its full
-  path (`nixos › poco on linux`, `#design › release date`, an agent's
-  label under its parent). Matching is subsequence with word-boundary and
-  path-segment bonuses, fzf-style, so `nixpoco` finds it; ranking by match
-  quality, then recency of use. `enter` opens the node's surface as a
-  normal open (transcript, page, conversation, note). Asked for by the
-  user on 2026-09-03 for agents first; built over the desk tree's paths
-  now, behind one function that yields `(path, target)`, and moved onto
-  `NodeId` in slice 2 without changing the prompt. Built 3 Sep: `ctrl-shift-f`
-  anywhere (or `shift-f` on the root transient), scorer in
-  `crates/rho-gui/src/find.rs`, recency from what already records a use
-  (agent activity, conversation latest, thread verdict key) until the tree
-  carries a per-node last-opened field.
-
-## Migration
-
-One shot at daemon start, like the desk cutover: desk headings become
-`note` nodes (heading text as the first line of `body`, children kept,
-marks to `state`/`defer_until`/`deadline`); inbox items become `note`
-nodes at the root or `thread` nodes; the Slack verdict table becomes
-verdict log entries on `thread` nodes. The old stores are read once and
-left in place until the next release.
-
-Once the user's daemon has run the migration, the migration goes: the
-frozen V1 decoder, the V1 tables and their fixture, the rollback text, and
-the migrated marker, all deleted in one change so nothing carries a
-compatibility facade (the user's standing rule, 3 Sep). Queued for 5pha
-the moment the upgrade is confirmed.
-
-Deleted 3 Sep, after confirming read-only that the live daemon had run it:
-the daemon binary the running process was started from carries the
-conversion, and `initialize` runs on every start, so a daemon that is up
-and answering has cell state and had written the marker. Gone with it:
-`desk_tree_v1.rs`, the `desk-tree-v1-real.redb` fixture (the cell tests
-now seed their own note), the `MigrationReport` and its marker table, and
-the rollback paragraph in SECURITY. A database with no cell state now
-starts empty instead of converting one. What is left of V1 is the native
-tree store itself (`desk_tree.rs`, the `DeskTree*` protocol messages, and
-`desk_org_migration*`, which only it uses): nothing writes to it, and the
-one reader is `rho desk cat`/`checkout`, the agent-facing skill, which
-still shows the pre-cutover tree. That view has to move onto cells or go,
-and it is the user's call which.
+Status: retired on 2026-09-04, superseded by `STORE-DESIGN.md`. Slices 1
+to 4 below landed and stay landed; the store, the merge rules, the
+verdict log, and sync-since-version carry over unchanged. What the store
+design replaces is the rest: node kinds and machine-made reference nodes
+become typed ids that are the sources' own; the `parent` copy of a
+source's structure becomes a derived edge; the fields that named a source
+(`agent_id`, `workspace`, `channel`, `url`, ...) become the id itself;
+and where a thing is shown becomes a view rule. Slice 5 (Slack out of the
+tree) was folded into `STORE-DESIGN.md` slice 2 before it was built.
 
 ## Slices, in landing order
 
@@ -205,17 +45,6 @@ and it is the user's call which.
    for verdict state. A test pins the rule: a done thread is closed by its
    node whatever Slack still says, and is still findable so a newer
    message can rebind it.
-5. Slack out of the tree (decided 4 Sep, queued for b8os after the verdict
-   transient): `DeskThreadBind` and every path that made or reopened a
-   thread node on the machine's behalf go; Slack cards come from the
-   Slack store's per-unit record (`SLACK-DESIGN.md`, "A Slack unit is a
-   conversation or a followed thread"); card identity becomes the enum
-   above; the `thread` kind is renamed `slack`, `ts` made optional, and
-   created only by todo, file, and notes-for-this. One shot at daemon
-   start flags deleted every thread node at the root with no children,
-   which is every one the machine made and the user never filed; filed
-   ones and ones with notes under them stay as `slack` nodes. Daemon
-   change, so the profile is upgraded and the user restarts.
 4. Notes: multi-line `body` on the text CRDT, the note surface, "notes for
    this" from any surface, the map over the tree; `DESK-DESIGN.md` retired
    to notes-and-filing. Landed 3 Sep. The body was already multi-line in
@@ -240,21 +69,6 @@ and it is the user's call which.
    reads as one block. No daemon change: the GUI already creates notes in
    its own namespace, the 4 MiB cap and the text path were there from
    slice 1, and the daemon never derived a title.
-5. Home on the tree.
 
 Each slice lands on its own with the tests of the slices before it green.
 
-## Symptoms to watch for
-
-- A field stored as text that should be typed.
-- A title stored rather than derived.
-- A `slack` node the machine made: one per ping, per reply, or per
-  restart.
-- A verdict that changes fields without a log entry.
-- Any code path that repairs a cycle in storage.
-
-## What done means
-
-One store, one identity, verdicts visible on every device, a note under
-anything, the desk gone as a concept, Home and the phone feed dealing from
-the same tree.

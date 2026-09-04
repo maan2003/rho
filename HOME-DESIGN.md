@@ -124,7 +124,7 @@ one week, `ss` the default of one day. No prompt, no minibuffer; the deal
 bar echoes the resulting time. On the phone the sheet offers chips:
 `30m · 2h · tonight (18:00) · tomorrow (09:00) · 3d · next week`. The
 agent snooze prompt goes away; agents take the same operator. Snoozing
-writes `defer_until` with pace 0 (TREE-DESIGN), so the card comes back
+writes `defer_until` with pace 0 (STORE-DESIGN), so the card comes back
 exactly then and rises from zero.
 
 **Why:** snoozing is done dozens of times a day and most of them are

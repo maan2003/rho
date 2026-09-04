@@ -1,7 +1,7 @@
 # What an agent wants from the human
 
 Status: idea, the user's, noted 2026-09-03 for a later pass. Not decided,
-not being built. Sits on `TREE-DESIGN.md` (fields on the agent node) and
+not being built. Sits on `STORE-DESIGN.md` (facts on the agent id) and
 `HOME-DESIGN.md` (the words in the row).
 
 ## The problem
