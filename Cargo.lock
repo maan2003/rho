@@ -13660,6 +13660,8 @@ dependencies = [
  "tracing",
  "url",
  "uuid",
+ "wayland-client",
+ "wayland-protocols",
 ]
 
 [[package]]

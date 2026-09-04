@@ -26,3 +26,7 @@ uuid.workspace = true
 [dev-dependencies]
 futures-lite = "2"
 tempfile.workspace = true
+# The fake browser example is a Wayland client: rho's browser compositor
+# tears a page down if no top-level window ever binds.
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client"] }
