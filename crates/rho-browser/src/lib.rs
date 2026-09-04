@@ -143,8 +143,11 @@ fn close_page_with_runtime(
     })
 }
 
+/// The name says it: nothing running, nothing to list. That now includes
+/// "the browser was never set up in this process", which a page row on the
+/// map can reach before anyone opens a tab.
 pub fn list_pages_if_running(cx: &mut App) -> Option<Task<Result<Vec<PageRecord>>>> {
-    let runtime = cx.global::<WebState>().runtime.clone()?;
+    let runtime = cx.try_global::<WebState>()?.runtime.clone()?;
     Some(cx.background_spawn(async move { runtime.list_pages() }))
 }
 
@@ -169,6 +172,37 @@ pub fn live_page_name(id: PageId) -> Option<String> {
     url::Url::parse(&metadata.url)
         .ok()
         .and_then(|url| url.host_str().map(str::to_owned))
+}
+
+/// Whether this process has a browser at all. No browser means no tabs,
+/// which is not the same answer as a browser with none open.
+pub fn is_configured(cx: &App) -> bool {
+    cx.has_global::<WebState>()
+}
+
+/// Every tab the browser has open, with where each was opened from. The
+/// map joins this in: a tab is never created in the store, so this is the
+/// only thing that says a burst of tabs belongs under one page.
+pub fn live_pages() -> Vec<(PageId, Option<PageId>)> {
+    native_host::page_metadata_entries()
+        .into_iter()
+        .filter_map(|(id, metadata)| {
+            Some((
+                id.parse().ok()?,
+                metadata.opened_from.and_then(|origin| origin.parse().ok()),
+            ))
+        })
+        .collect()
+}
+
+/// Where a live tab came from, when the browser opened it from another
+/// page. The browser is the only thing that knows this and it knows it
+/// only while the tab is open, which is why nothing stores it.
+pub fn live_page_opened_from(id: PageId) -> Option<PageId> {
+    native_host::page_metadata(&id.to_string())?
+        .opened_from?
+        .parse()
+        .ok()
 }
 
 pub fn live_page_url(id: PageId) -> Option<String> {

@@ -6278,10 +6278,24 @@ impl Workspace {
         } else {
             Vec::new()
         };
+        // The browser runs on this client, so its tabs are the primary
+        // host's desk, the same way the Slack mirror's units are.
+        let pages = if self.hosts.primary() == Some(host) && rho_browser::is_configured(cx) {
+            rho_browser::live_pages()
+                .into_iter()
+                .map(|(page, opened_from)| crate::desk_view::PageSource {
+                    page: rho_desk::PageId(*page.0.as_bytes()),
+                    opened_from: opened_from.map(|id| rho_desk::PageId(*id.0.as_bytes())),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         let sources = crate::desk_view::Sources {
             host: self.registry.host_machine_seed(host),
             agents,
             slack,
+            pages,
         };
         self.desk_cells.set_sources(host, sources);
     }

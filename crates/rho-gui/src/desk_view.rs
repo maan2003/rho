@@ -103,6 +103,16 @@ pub struct SlackSource {
     pub newest_from_other: Option<SlackTs>,
 }
 
+/// What the browser says about one open tab. A tab is never created in
+/// the store, so everything about where it sits comes from here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PageSource {
+    pub page: rho_desk::PageId,
+    /// The page the reader opened this tab from: a ctrl-click, or a link
+    /// that asked for a new tab. `None` for a tab opened for its own sake.
+    pub opened_from: Option<rho_desk::PageId>,
+}
+
 /// The source facts a view joins the store with. Recomputed by the
 /// workspace whenever a source changes; never written anywhere.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -110,11 +120,16 @@ pub struct Sources {
     pub host: u64,
     pub agents: Vec<AgentSource>,
     pub slack: Vec<SlackSource>,
+    pub pages: Vec<PageSource>,
 }
 
 impl Sources {
     fn agent(&self, agent: rho_core::AgentId) -> Option<&AgentSource> {
         self.agents.iter().find(|source| source.agent == agent)
+    }
+
+    fn page(&self, page: rho_desk::PageId) -> Option<&PageSource> {
+        self.pages.iter().find(|source| source.page == page)
     }
 }
 
@@ -532,6 +547,29 @@ impl DeskCells {
         for unit in &sources.slack {
             facts.entry(Id::Slack(unit.unit.clone())).or_default();
         }
+        // A tab the reader opened from a page is where they deliberately
+        // went, so it is on the map even before they say anything about
+        // it. A tab opened for its own sake is not: that is the "not every
+        // tab" line. The origin comes along whether it matters on its own
+        // or not, or the burst would draw at the root instead of under the
+        // page it came from.
+        let mut origins = Vec::new();
+        for page in &sources.pages {
+            if let Some(origin) = page.opened_from {
+                facts.entry(Id::Page(page.page)).or_default();
+                origins.push(origin);
+            }
+        }
+        let mut walked = std::collections::BTreeSet::new();
+        while let Some(origin) = origins.pop() {
+            if !walked.insert(origin) {
+                continue;
+            }
+            facts.entry(Id::Page(origin)).or_default();
+            if let Some(next) = sources.page(origin).and_then(|source| source.opened_from) {
+                origins.push(next);
+            }
+        }
         let mut nodes = BTreeMap::new();
         for (id, fact) in &facts {
             // Deleting one thing does not delete what was filed under it:
@@ -696,6 +734,13 @@ fn place(id: &Id, facts: &Facts, sources: &Sources) -> Option<Id> {
                 .or(Some(Id::Host(sources.host))),
             None => None,
         },
+        // A tab sits under the page it was opened from, until the user
+        // files it somewhere. Filing the origin carries the burst with it,
+        // because the children's place still derives from the origin.
+        Id::Page(page) => sources
+            .page(*page)
+            .and_then(|source| source.opened_from)
+            .map(Id::Page),
         // A followed thread sits in its conversation; the conversation is
         // at the root until a workspace is a thing the store can name.
         Id::Slack(unit) if unit.thread.is_some() => Some(Id::Slack(SlackUnit {

@@ -8551,3 +8551,138 @@ fn filing_offers_labels_as_well_as_notes(cx: &mut TestAppContext) {
         })
         .unwrap();
 }
+
+/// A tab opened from a page belongs under that page. The browser is the
+/// only thing that knows where a tab came from, so the map joins it in
+/// live; nothing about a tab is ever written to the store.
+#[gpui::test]
+fn tabs_opened_from_a_page_hang_under_it(cx: &mut TestAppContext) {
+    use rho_desk::cells::Id;
+
+    let page = |last: u8| {
+        rho_browser::PageId(uuid::Uuid::from_bytes([
+            1, 2, 3, 4, 5, 6, 0x47, 8, 0x89, 10, 11, 12, 13, 14, 15, last,
+        ]))
+    };
+    let desk_page = |id: rho_browser::PageId| Id::Page(rho_desk::PageId(*id.0.as_bytes()));
+    let origin = page(1);
+    let burst = [page(2), page(3), page(4)];
+    let alone = page(5);
+
+    // The messages the extension really sends, through the native host's
+    // own entry point: a search page, three tabs ctrl-clicked out of it,
+    // and one tab the reader opened for its own sake.
+    let announce = |id: rho_browser::PageId, opened_from: Option<rho_browser::PageId>| {
+        rho_browser::native_host::record_page_metadata(&serde_json::json!({
+            "event": "page-metadata",
+            "page_id": id.to_string(),
+            "title": format!("tab {}", id.0.as_bytes()[15]),
+            "url": "https://example.com/",
+            "opened_from": opened_from.map(|id| id.to_string()).unwrap_or_default(),
+        }));
+    };
+    announce(origin, None);
+    for tab in burst {
+        announce(tab, Some(origin));
+    }
+    announce(alone, None);
+
+    // The browser has to exist in this process for its tabs to mean
+    // anything; with none there are no tabs, which is what every other
+    // test sees.
+    let browser_dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| {
+        rho_browser::init(
+            browser_dir.path(),
+            browser_dir.path().join("browser.sock"),
+            cx,
+        )
+    });
+
+    let mut desk = DeskFixture::new();
+    let project = desk.note(None, "Release research");
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.sync_tree_dashboard(HostId::default(), window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    let places = |workspace: &Workspace, id: &Id| {
+        workspace
+            .desk_cells_snapshot_for_test(HostId::default())
+            .into_iter()
+            .filter(|node| &node.id == id)
+            .map(|node| node.under)
+            .collect::<Vec<_>>()
+    };
+    workspace
+        .update(cx, |workspace, _, _| {
+            for tab in burst {
+                assert_eq!(
+                    places(workspace, &desk_page(tab)),
+                    vec![Some(desk_page(origin))],
+                    "a ctrl-clicked tab reads as a group under the page it came from"
+                );
+            }
+            // The origin is drawn even though the reader has said nothing
+            // about it, or the burst would land at the root instead.
+            assert_eq!(places(workspace, &desk_page(origin)), vec![None]);
+            // A tab opened for its own sake belongs to nothing, and the
+            // map does not show every tab.
+            assert!(places(workspace, &desk_page(alone)).is_empty());
+        })
+        .unwrap();
+
+    // Filing the origin carries the group with it: the tabs still derive
+    // their place from the origin, wherever the reader puts it.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.file_page(
+                origin,
+                Some((HostId::default(), project.clone())),
+                crate::journal::CreateMethod::New,
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(
+                places(workspace, &desk_page(origin)),
+                vec![Some(project.clone())]
+            );
+            for tab in burst {
+                assert_eq!(
+                    places(workspace, &desk_page(tab)),
+                    vec![Some(desk_page(origin))],
+                    "the group moved with the page it hangs under"
+                );
+            }
+        })
+        .unwrap();
+
+    // A tab the reader files themselves stops deriving its place: the
+    // origin is where it sits until they say otherwise, not after.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.file_page(
+                burst[0],
+                Some((HostId::default(), project.clone())),
+                crate::journal::CreateMethod::New,
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(places(workspace, &desk_page(burst[0])), vec![Some(project)]);
+        })
+        .unwrap();
+}

@@ -331,6 +331,9 @@ pub fn snapshot_extension_command_stats() -> Vec<ExtensionCommandStats> {
 pub struct PageMetadata {
     pub title: String,
     pub url: String,
+    /// The page this tab was opened from, when the reader opened it from
+    /// one: a ctrl-click, or a link that asked for a new tab.
+    pub opened_from: Option<String>,
 }
 
 static PAGE_METADATA: LazyLock<Mutex<HashMap<String, PageMetadata>>> =
@@ -341,11 +344,26 @@ pub fn page_metadata(page_id: &str) -> Option<PageMetadata> {
     PAGE_METADATA.lock().unwrap().get(page_id).cloned()
 }
 
+/// Every page the browser has told us about, which is every tab it has
+/// open. Nothing here is stored: the map holds it only while the browser
+/// is running.
+pub fn page_metadata_entries() -> Vec<(String, PageMetadata)> {
+    PAGE_METADATA
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(id, metadata)| (id.clone(), metadata.clone()))
+        .collect()
+}
+
 pub fn page_metadata_revision() -> u64 {
     PAGE_METADATA_REVISION.load(Ordering::Acquire)
 }
 
-pub(crate) fn record_page_metadata(message: &Value) -> bool {
+/// Takes one message from the extension. Public because it is the seam
+/// the browser talks through: a test drives the browser side by sending
+/// the events the extension really sends, rather than reaching past it.
+pub fn record_page_metadata(message: &Value) -> bool {
     if message.get("event").and_then(Value::as_str) == Some("page-metadata-removed") {
         if let Some(page_id) = message
             .get("page_id")
@@ -377,6 +395,7 @@ pub(crate) fn record_page_metadata(message: &Value) -> bool {
         PageMetadata {
             title: bounded("title", 1024),
             url: bounded("url", 4096),
+            opened_from: Some(bounded("opened_from", 64)).filter(|id| !id.is_empty()),
         },
     );
     PAGE_METADATA_REVISION.fetch_add(1, Ordering::Release);
@@ -589,7 +608,21 @@ mod tests {
             Some(PageMetadata {
                 title: "Second".into(),
                 url: "https://example.com/two".into(),
+                opened_from: None,
             })
+        );
+        // A tab the reader opened from another one says so, and the
+        // origin survives the next metadata event for the same page.
+        assert!(record_page_metadata(&json!({
+            "event": "page-metadata",
+            "page_id": "web-b",
+            "title": "Opened from a link",
+            "url": "https://example.com/three",
+            "opened_from": "web-a",
+        })));
+        assert_eq!(
+            page_metadata("web-b").unwrap().opened_from.as_deref(),
+            Some("web-a")
         );
         assert!(record_page_metadata(&json!({
             "event": "page-metadata",

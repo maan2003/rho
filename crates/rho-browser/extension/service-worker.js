@@ -1,6 +1,11 @@
 const HOST = "dev.rho.browser";
 const pageTabs = new Map();
 const tabPages = new Map();
+// Page id -> the page id of the tab it was opened from. A ctrl-click and
+// a link that targets a new tab both come through as an opener, which is
+// the only moment the relation exists: Chrome forgets it, and the tab
+// itself carries nothing that says where the reader came from.
+const pageOrigins = new Map();
 let port;
 let reconnectTimer;
 let operations = Promise.resolve();
@@ -42,6 +47,10 @@ function reportPageMetadata(tab, pageId = tabPages.get(tab?.id)) {
       page_id: pageId,
       title: tab?.title || "",
       url: tab?.url || "",
+      // Where the reader was when they opened this tab. Reported every
+      // time, because the metadata event replaces what Rho holds for the
+      // page and dropping the field would drop the origin with it.
+      opened_from: pageOrigins.get(pageId) || "",
     });
   } catch (_) {}
 }
@@ -65,7 +74,7 @@ function reportTabState(state, tab, pageId = tabPages.get(tab?.id), reason = "")
   } catch (_) {}
 }
 
-async function rememberPage(id, tab, createdAt = Date.now(), launchUrl = tab.url || "") {
+async function rememberPage(id, tab, createdAt = Date.now(), launchUrl = tab.url || "", openedFrom = "") {
   // Re-emit the session command after restore so the browser-owned UUID is
   // part of both the restored tab and the newly recording session.
   await setPageId(tab.id, id);
@@ -77,28 +86,36 @@ async function rememberPage(id, tab, createdAt = Date.now(), launchUrl = tab.url
   }
   pageTabs.set(id, tab.id);
   tabPages.set(tab.id, id);
-  reportTabState("registered", tab, id);
-  reportPageMetadata(tab, id);
   const key = pageKey(id);
   const old = (await chrome.storage.local.get(key))[key];
+  // The origin is stored with the page, because the service worker is
+  // restarted at Chrome's convenience and Chrome cannot be asked again
+  // where a tab came from.
+  const origin = openedFrom || old?.opened_from || "";
+  if (origin) pageOrigins.set(id, origin);
+  reportTabState("registered", tab, id);
+  reportPageMetadata(tab, id);
   await chrome.storage.local.set({
     [key]: {
       id,
       launch_url: old?.launch_url || launchUrl,
       created_at_ms: old?.created_at_ms || createdAt,
       closing: old?.closing || false,
+      opened_from: origin,
     },
   });
 }
 
-async function makePage(tab, id = crypto.randomUUID()) {
-  await rememberPage(id, await chrome.tabs.get(tab.id));
+async function makePage(tab, id = crypto.randomUUID(), openedFrom = "") {
+  const current = await chrome.tabs.get(tab.id);
+  await rememberPage(id, current, Date.now(), current.url || "", openedFrom);
   return id;
 }
 
 async function reconcile() {
   pageTabs.clear();
   tabPages.clear();
+  pageOrigins.clear();
   let tabs = await chrome.tabs.query({ windowType: "normal" });
   const windows = await chrome.windows.getAll({ windowTypes: ["normal"] });
   if (!windows.some((window) => window.id === canonicalWindowId)) {
@@ -303,6 +320,19 @@ function connect() {
   });
 }
 
+// A tab opened from a page Rho knows becomes a page itself, and remembers
+// where it came from. Only tabs with an opener: a fresh tab the reader
+// opened for its own sake belongs to nothing and stays out of the store.
+chrome.tabs.onCreated.addListener((tab) => {
+  const origin = tab.openerTabId !== undefined && tabPages.get(tab.openerTabId);
+  if (!origin) return;
+  enqueue(async () => {
+    try {
+      await makePage(await chrome.tabs.get(tab.id), crypto.randomUUID(), origin);
+    } catch (_) {}
+  });
+});
+
 chrome.tabs.onActivated.addListener(async ({ tabId }) => {
   const id = tabPages.get(tabId);
   if (!id) return;
@@ -319,6 +349,7 @@ chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
   removePageMetadata(id);
   tabPages.delete(tabId);
   pageTabs.delete(id);
+  pageOrigins.delete(id);
   chrome.storage.local.remove(pageKey(id));
 });
 

@@ -493,7 +493,19 @@ else is built on. The transient lands after slice 2.
    per row rather than per id). The key is unbound until the user
    picks one.
 4. Browser: `opened_from` from the embedded browser, tabs under their
-   origin.
+   origin. Landed 4 Sep (GUI and extension): the extension adopts a tab
+   that has an opener rho knows and carries the origin in the page's
+   record, re-sent on every metadata event because the service worker
+   restarts at Chrome's whim; a tab's place is its origin until filed,
+   filing the origin carries the group in the view, nothing is written
+   to the store. Which tabs matter (b8os's reading, accepted): a tab
+   opened from a page, plus its origin transitively; a tab opened for
+   its own sake stays off the map, which is what keeps ctrl-t from
+   filling it. No rig screenshots: the rig host has no browser; a fake
+   browser speaking the native-host protocol (the fake Slack pattern,
+   via `RHO_CUSTOM_BRAVE_BIN`) is queued as its own task. A latent GUI
+   panic when the browser was never set up (`list_pages_if_running`)
+   was found and fixed on the way.
 
 Each slice lands on its own with the tests of the slices before it green.
 
