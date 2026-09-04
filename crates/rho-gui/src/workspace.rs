@@ -3538,7 +3538,7 @@ impl Workspace {
     /// `d` in the verdict transient. The verdict lands on the card the
     /// transient was opened over, which is the surface in view.
     pub(crate) fn verdict_done(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dashboard.current_deal_card().is_none() {
+        if !self.deal_card_is_target(cx) {
             self.echo("done: nothing under the deal", StyleClass::SystemInfo, cx);
             return;
         }
@@ -3556,7 +3556,7 @@ impl Workspace {
 
     /// `x`: done, plus the silence the source has a place for.
     pub(crate) fn verdict_mute(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dashboard.current_deal_card().is_none() {
+        if !self.deal_card_is_target(cx) {
             self.echo("mute: nothing under the deal", StyleClass::SystemInfo, cx);
             return;
         }
@@ -3582,7 +3582,7 @@ impl Workspace {
     ) {
         let days = count.unwrap_or(7).max(1) as u32;
         let today = chrono::Local::now().date_naive();
-        if self.dashboard.current_deal_card().is_none() {
+        if !self.deal_card_is_target(cx) {
             self.echo("todo: nothing under the deal", StyleClass::SystemInfo, cx);
             return;
         }
@@ -3667,7 +3667,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.dashboard.current_deal_card().is_none() {
+        if !self.deal_card_is_target(cx) {
             self.echo("snooze: nothing under the deal", StyleClass::SystemInfo, cx);
             return;
         }
@@ -3826,7 +3826,7 @@ impl Workspace {
             return;
         };
         self.scan_browser_pages_for_gc(cx);
-        self.observe_browser_metadata(&model, cx);
+        self.observe_browser_metadata(&model, window, cx);
         let view = cx.new(|cx| rho_browser::PageView::new(model, id, cx));
         let surface = Self::wrap_surface(SurfaceKey::Browser(id), SurfaceView::Browser(view));
         self.display_surface(surface, cx);
@@ -3837,14 +3837,25 @@ impl Workspace {
     fn observe_browser_metadata(
         &mut self,
         model: &Entity<rho_browser::PageModel>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self.browser_metadata_subscription.is_none() {
-            self.browser_metadata_subscription = Some(
-                cx.subscribe(model, |_, _, _: &rho_browser::PageMetadataChanged, cx| {
-                    cx.notify()
-                }),
-            );
+            // A tab the reader opened from a page is a row on the map, so
+            // the browser moving is the same kind of news as the Slack
+            // mirror moving: the join has to be rebuilt, not just redrawn.
+            // The model polls the metadata revision, so a burst of
+            // ctrl-clicks arrives as one event and costs one reconcile.
+            self.browser_metadata_subscription = Some(cx.subscribe_in(
+                model,
+                window,
+                |workspace, _, _: &rho_browser::PageMetadataChanged, window, cx| {
+                    if let Some(host) = workspace.hosts.primary() {
+                        workspace.sync_tree_dashboard(host, window, cx);
+                    }
+                    cx.notify();
+                },
+            ));
         }
     }
 
@@ -4991,7 +5002,7 @@ impl Workspace {
     fn preview_browser_page(
         &mut self,
         id: rho_browser::PageId,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if self
@@ -5005,7 +5016,7 @@ impl Workspace {
             return;
         };
         self.scan_browser_pages_for_gc(cx);
-        self.observe_browser_metadata(&model, cx);
+        self.observe_browser_metadata(&model, window, cx);
         let view = cx.new(|cx| rho_browser::PageView::new(model, id, cx));
         self.dashboard_preview = None;
         self.hosts.focus_agent(None);
@@ -6356,6 +6367,11 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.refresh_desk_sources(host, cx);
+        // A row that exists only because a source says so — a tab the
+        // browser has just opened, a unit the mirror has just raised — has
+        // nothing written, so no store event will ever give it the buffer
+        // the map draws it from. It gets one here.
+        self.desk_cells.reconcile_buffers(host, cx);
         if let Some((nodes, buffers)) = self.desk_cells.tree_source(host) {
             self.dashboard.set_tree_source(host, nodes, buffers, cx);
             self.refresh_dashboard(window, cx);
@@ -7305,9 +7321,13 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if !self.adopt_surface_card(window, cx) {
+        let Some(target) = self.label_target(cx) else {
             return false;
-        }
+        };
+        // Dealing it makes the verdicts land as verdicts, so the dealer and
+        // the journal see them. Nothing in the queue for this thing is fine:
+        // the menu still opens, and the items that need a card say so.
+        self.adopt_surface_card(target, window, cx);
         self.open_transient(crate::transient::verdict_menu(), window, cx);
         true
     }
@@ -7315,10 +7335,13 @@ impl Workspace {
     /// Makes the card in view the one the verdicts write to. A card that is
     /// not in the dealer's hand is one nothing is owed on, so there is no
     /// verdict to make and the tap falls through.
-    fn adopt_surface_card(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let Some((host, node_id)) = self.context_area(cx) else {
-            return false;
-        };
+    fn adopt_surface_card(
+        &mut self,
+        target: (HostId, rho_desk::cells::Id),
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let (host, node_id) = target;
         let wanted = crate::dashboard::DealCardId { host, node_id };
         if self
             .dashboard
@@ -7690,7 +7713,7 @@ impl Workspace {
             crate::dashboard::CardTarget::Page(page) => {
                 match (self.phone.enabled, rho_browser::open_page(page, cx)) {
                     (false, Some(model)) => {
-                        self.observe_browser_metadata(&model, cx);
+                        self.observe_browser_metadata(&model, window, cx);
                         let view = cx.new(|cx| rho_browser::PageView::new(model, page, cx));
                         Self::wrap_surface(SurfaceKey::Browser(page), SurfaceView::Browser(view))
                     }
@@ -7842,10 +7865,36 @@ impl Workspace {
         &mut self,
         cx: &mut Context<Self>,
     ) -> Option<(HostId, rho_desk::cells::Id)> {
-        if let Some(card) = self.dashboard.current_deal_card() {
-            return Some((card.identity.host, card.identity.node_id.clone()));
+        // What the reader is on: the thing behind the surface in view, or
+        // the row under the cursor when the map is what they are reading.
+        // The card in hand is the target only when it is that thing, so
+        // filing a page while a Slack card sits in the queue files the page.
+        if !self.overview_open
+            && let Some(node) = self.surface_node()
+        {
+            return Some(node);
         }
-        self.dashboard.tree_node_at_cursor(cx)
+        // The map is the overlay in front, so its cursor row is what the
+        // reader is on even when Home is the surface underneath with a
+        // cursor of its own on some other card.
+        if self.overview_open
+            && let Some(node) = self.dashboard.tree_node_at_cursor(cx)
+        {
+            return Some(node);
+        }
+        self.context_area(cx)
+    }
+
+    /// Whether the card in hand is the thing the reader is on. The verdicts
+    /// only a card can take ask this first: with the eye on a page row, `d`
+    /// is not about the card the queue happens to hold.
+    fn deal_card_is_target(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some((host, node_id)) = self.label_target(cx) else {
+            return false;
+        };
+        self.dashboard
+            .current_deal_card()
+            .is_some_and(|card| card.identity.host == host && card.identity.node_id == node_id)
     }
 
     pub(crate) fn label_card(

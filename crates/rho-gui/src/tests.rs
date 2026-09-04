@@ -8934,3 +8934,168 @@ fn tabs_opened_from_a_page_hang_under_it(cx: &mut TestAppContext) {
         })
         .unwrap();
 }
+
+/// A verdict is about the thing the reader is on. The tap opens over a
+/// page row the dealer has no card for, `f` files that page, and the card a
+/// dealt surface holds is never taken by a cursor sitting somewhere else.
+#[gpui::test]
+fn a_verdict_follows_the_thing_in_view_not_the_card_in_hand(cx: &mut TestAppContext) {
+    use rho_desk::cells::{Id, Property};
+
+    let page = |last: u8| {
+        rho_browser::PageId(uuid::Uuid::from_bytes([
+            2, 3, 4, 5, 6, 7, 0x47, 9, 0x8a, 11, 12, 13, 14, 15, 16, last,
+        ]))
+    };
+    let desk_page = |id: rho_browser::PageId| Id::Page(rho_desk::PageId(*id.0.as_bytes()));
+    let origin = page(1);
+    let tab = page(2);
+    let announce = |id: rho_browser::PageId, opened_from: Option<rho_browser::PageId>| {
+        rho_browser::native_host::record_page_metadata(&serde_json::json!({
+            "event": "page-metadata",
+            "page_id": id.to_string(),
+            "title": format!("tab {}", id.0.as_bytes()[15]),
+            "url": "https://example.com/",
+            "opened_from": opened_from.map(|id| id.to_string()).unwrap_or_default(),
+        }));
+    };
+    announce(origin, None);
+    announce(tab, Some(origin));
+    let browser_dir = tempfile::tempdir().unwrap();
+    cx.update(|cx| {
+        rho_browser::init(
+            browser_dir.path(),
+            browser_dir.path().join("browser.sock"),
+            cx,
+        )
+    });
+
+    cx.update(bind_test_keymaps);
+    let mut desk = DeskFixture::new();
+    let dealt = desk.due_note(None, "Deal QA note");
+    // A second card so the queue is not emptied by the skip that leaving the
+    // deal for Home performs: Home needs a cursor of its own for this.
+    let queued = desk.due_note(None, "Queued QA note");
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            // The reader opened the search page, which is what puts it on
+            // the map; the tab ctrl-clicked out of it needs nothing written.
+            workspace.file_page(
+                origin,
+                None,
+                crate::journal::CreateMethod::TabBirth,
+                window,
+                cx,
+            );
+            workspace.sync_tree_dashboard(HostId::default(), window, cx);
+            workspace.open_deal_mode(window, cx);
+            // The cursor is left on the page row while the card is dealt:
+            // the surface in view still decides, in both directions.
+            workspace.focus_tree_node_for_test(HostId::default(), desk_page(origin), window, cx);
+            assert_eq!(
+                workspace.label_target(cx),
+                Some((HostId::default(), dealt.clone())),
+                "the dealt surface keeps its own card"
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    // The reader leaves the deal for Home and opens the map over it. Home
+    // keeps a cursor of its own on the queue; the map is the overlay in
+    // front, so the row under its cursor is what the reader is looking at.
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.open_home(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            // Home puts its own cursor on the top of the queue, which is the
+            // trap: the map is what the reader is looking at.
+            let home = workspace.home_view().expect("Home is the surface");
+            assert_eq!(
+                home.update(cx, |home, cx| home.cursor_target(cx)),
+                crate::home::HomeTarget::Card(crate::dashboard::DealCardId {
+                    host: HostId::default(),
+                    node_id: queued.clone(),
+                }),
+                "Home is left holding the queue's top card"
+            );
+            workspace.open_overview(window, cx);
+            workspace.focus_tree_node_for_test(HostId::default(), desk_page(origin), window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, window, cx| {
+            assert_eq!(
+                workspace.label_target(cx),
+                Some((HostId::default(), desk_page(origin))),
+                "the row under the cursor is what a verdict is about"
+            );
+            assert!(
+                workspace.open_verdict_transient(window, cx),
+                "the tap opens over a row the dealer has no card for"
+            );
+            workspace.take_host_messages_for_test(HostId::default());
+        })
+        .unwrap();
+
+    cx.dispatch_action(*workspace, crate::DashboardDealFile);
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "r h o");
+    cx.dispatch_action(*workspace, crate::MinibufferConfirm);
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            let mutation =
+                take_desk_mutation(workspace, HostId::default()).expect("label mutation");
+            let label = mutation
+                .writes
+                .iter()
+                .find_map(|write| match &write.property {
+                    Property::Name(name) if name == "rho" => Some(write.id.clone()),
+                    _ => None,
+                })
+                .expect("the path mints the label it names");
+            assert!(
+                mutation
+                    .writes
+                    .iter()
+                    .any(|write| write.id == desk_page(origin)
+                        && write.property
+                            == Property::Labeled {
+                                label: label.clone(),
+                                present: true,
+                            }),
+                "the page the reader is on is what gets labelled"
+            );
+            assert!(
+                !mutation
+                    .writes
+                    .iter()
+                    .any(|write| write.id == dealt || write.id == queued),
+                "and the cards the dealer and Home held are left alone"
+            );
+            // The tab is not written anywhere: it hangs under the origin
+            // because the browser says so, wherever the origin is filed.
+            assert_eq!(
+                workspace
+                    .desk_cells_snapshot_for_test(HostId::default())
+                    .into_iter()
+                    .filter(|node| node.id == desk_page(tab))
+                    .map(|node| node.under)
+                    .collect::<Vec<_>>(),
+                vec![Some(desk_page(origin))],
+                "the group the page carries comes with it"
+            );
+        })
+        .unwrap();
+}
