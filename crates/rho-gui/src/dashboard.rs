@@ -2370,6 +2370,36 @@ fn derived_title(
 }
 
 /// What an area row calls itself in the picker.
+/// Every label as the path a person would type, `rho/agent`. The label
+/// axis only: a label filed under something that is not a label is named
+/// by its own name, because the path is the filing rather than the place.
+fn label_paths(
+    nodes: &HashMap<rho_desk::cells::Id, &crate::desk_view::DeskNode>,
+) -> HashMap<rho_desk::cells::Id, String> {
+    let mut paths = HashMap::new();
+    for (id, node) in nodes {
+        if !matches!(id, rho_desk::cells::Id::Label(_)) {
+            continue;
+        }
+        let Some(name) = node.name.clone() else {
+            continue;
+        };
+        let mut segments = vec![name];
+        let mut parent = node.parent.clone();
+        while let Some(above) =
+            parent.filter(|above| matches!(above, rho_desk::cells::Id::Label(_)))
+        {
+            let Some(node) = nodes.get(&above) else { break };
+            let Some(name) = node.name.clone() else { break };
+            segments.push(name);
+            parent = node.parent.clone();
+        }
+        segments.reverse();
+        paths.insert(id.clone(), segments.join("/"));
+    }
+    paths
+}
+
 fn area_kind(id: &rho_desk::cells::Id) -> &'static str {
     use rho_desk::cells::Id;
 
@@ -2541,6 +2571,7 @@ impl Dashboard {
                     .filter(|text| !text.is_empty())
                     .map(str::to_owned)
             };
+            let label_paths = label_paths(&nodes);
             for node in &source.nodes {
                 let breadcrumb = tree_breadcrumb(&node.id, &nodes, &titles);
                 let under = |title: String| {
@@ -2550,12 +2581,22 @@ impl Dashboard {
                         format!("{breadcrumb} › {title}")
                     }
                 };
+                // A thing is as often remembered by what it is filed under
+                // as by where it sits, so each label names it too.
+                let labelled = |title: &str| {
+                    node.labels
+                        .iter()
+                        .filter_map(|label| label_paths.get(label))
+                        .map(|path| format!("{path} › {title}"))
+                        .collect::<Vec<_>>()
+                };
                 let candidate = match &node.id {
                     rho_desk::cells::Id::Note(_) => {
                         if breadcrumb.is_empty() {
                             continue;
                         }
                         FindCandidate {
+                            labels: labelled(&breadcrumb),
                             path: breadcrumb.clone(),
                             kind: "topic",
                             target: FindTarget::Topic {
@@ -2577,11 +2618,11 @@ impl Dashboard {
                         let Some(agent_id) = node.agent() else {
                             continue;
                         };
+                        let title = title_of(node.id.clone())
+                            .unwrap_or_else(|| registry.agent_human_name(agent_id));
                         FindCandidate {
-                            path: under(
-                                title_of(node.id.clone())
-                                    .unwrap_or_else(|| registry.agent_human_name(agent_id)),
-                            ),
+                            labels: labelled(&title),
+                            path: under(title.clone()),
                             kind: "agent",
                             target: FindTarget::Agent(agent_id),
                             recency: registry
@@ -2597,6 +2638,7 @@ impl Dashboard {
                             continue;
                         };
                         FindCandidate {
+                            labels: labelled(&title),
                             path: under(title),
                             kind: "page",
                             target: FindTarget::Page(page_id),

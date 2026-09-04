@@ -64,9 +64,27 @@ pub(crate) struct FindCandidate {
     pub path: String,
     pub kind: &'static str,
     pub target: FindTarget,
+    /// The same thing named by each label it carries, `rho/agent › name`.
+    /// The reader remembers the filing as often as the place, so a label
+    /// path finds a thing exactly as its parent path does.
+    pub labels: Vec<String>,
     /// Unix milliseconds of the last use, for ranking equal matches. Zero
     /// where nothing records a use.
     pub recency: i64,
+}
+
+impl FindCandidate {
+    #[cfg(test)]
+    pub(crate) fn names_for_test(&self) -> Vec<String> {
+        self.names()
+    }
+
+    /// Every name the query is matched against, the shown path first.
+    fn names(&self) -> Vec<String> {
+        let mut names = vec![self.path.clone()];
+        names.extend(self.labels.iter().cloned());
+        names
+    }
 }
 
 /// The bonus a match at `index` earns from what precedes it.
@@ -166,10 +184,25 @@ fn lower(character: char) -> char {
 /// most recently used among equals, returning indices into the input.
 /// Paths the query does not match are dropped.
 pub(crate) fn rank(candidates: &[(String, i64)], query: &str) -> Vec<usize> {
+    let names = candidates
+        .iter()
+        .map(|(path, recency)| (vec![path.clone()], *recency))
+        .collect::<Vec<_>>();
+    rank_names(&names, query)
+}
+
+/// `rank` where a thing has more than one name: the best-scoring name is
+/// the thing's score, so a label path competes with the parent path rather
+/// than replacing it. Ties break on the first name, which is the path the
+/// row shows.
+pub(crate) fn rank_names(candidates: &[(Vec<String>, i64)], query: &str) -> Vec<usize> {
     let mut scored = candidates
         .iter()
         .enumerate()
-        .filter_map(|(index, (path, recency))| Some((index, score(path, query)?, *recency)))
+        .filter_map(|(index, (names, recency))| {
+            let best = names.iter().filter_map(|name| score(name, query)).max()?;
+            Some((index, best, *recency))
+        })
         .collect::<Vec<_>>();
     scored.sort_by(|left, right| {
         right
@@ -199,6 +232,7 @@ fn slack_candidates(
             kind: "conversation",
             recency: row.latest.as_ref().map_or(0, millis),
             target: FindTarget::Slack(rho_slack::session::Source::Conversation(row.id)),
+            labels: Vec::new(),
         });
     }
     for (key, card, title) in threads {
@@ -207,6 +241,7 @@ fn slack_candidates(
             kind: "thread",
             recency: millis(&card.newest),
             target: FindTarget::Slack(rho_slack::session::Source::Thread(key)),
+            labels: Vec::new(),
         });
     }
     candidates
@@ -218,7 +253,44 @@ impl Workspace {
     /// carries, not the prompt.
     pub(crate) fn find_candidates(&self, cx: &App) -> Vec<FindCandidate> {
         let mut candidates = self.dashboard.find_candidates(&self.registry, cx);
-        candidates.extend(self.slack_find_candidates(cx));
+        let mut slack = self.slack_find_candidates(cx);
+        // A Slack room is findable because Slack says it exists rather than
+        // because the tree holds a row for it, so its labels are joined on
+        // here instead of coming down with the node.
+        if let Some(host) = self.hosts.primary() {
+            let paths = self
+                .desk_cells
+                .label_paths(host)
+                .into_iter()
+                .collect::<std::collections::HashMap<_, _>>();
+            let workspace_name = self
+                .slack
+                .as_ref()
+                .map(|session| session.read(cx).model().workspace().clone());
+            for candidate in &mut slack {
+                let FindTarget::Slack(source) = &candidate.target else {
+                    continue;
+                };
+                let Some(name) = &workspace_name else {
+                    continue;
+                };
+                let unit = crate::slack::unit_of_source(name, source);
+                let Some(facts) = self
+                    .desk_cells
+                    .facts(host, &rho_desk::cells::Id::Slack(unit))
+                else {
+                    continue;
+                };
+                let title = candidate.path.clone();
+                candidate.labels = facts
+                    .labels
+                    .iter()
+                    .filter_map(|label| paths.get(label))
+                    .map(|path| format!("{path} › {title}"))
+                    .collect();
+            }
+        }
+        candidates.extend(slack);
         candidates
     }
 
@@ -253,9 +325,9 @@ impl Workspace {
             let candidates = workspace.find_candidates(cx);
             let paths = candidates
                 .iter()
-                .map(|candidate| (candidate.path.clone(), candidate.recency))
+                .map(|candidate| (candidate.names(), candidate.recency))
                 .collect::<Vec<_>>();
-            rank(&paths, input)
+            rank_names(&paths, input)
                 .into_iter()
                 .filter_map(|index| candidates.get(index))
                 .take(FIND_LIMIT)
@@ -293,12 +365,12 @@ impl Workspace {
         // row, so the best-ranked match is what they asked for.
         let paths = candidates
             .iter()
-            .map(|candidate| (candidate.path.clone(), candidate.recency))
+            .map(|candidate| (candidate.names(), candidate.recency))
             .collect::<Vec<_>>();
         let exact = candidates
             .iter()
             .position(|candidate| candidate.path == path);
-        let Some(index) = exact.or_else(|| rank(&paths, path).first().copied()) else {
+        let Some(index) = exact.or_else(|| rank_names(&paths, path).first().copied()) else {
             self.notice_on(
                 None,
                 &format!("nothing matching `{path}`"),

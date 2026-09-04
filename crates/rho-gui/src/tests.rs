@@ -8424,7 +8424,7 @@ fn the_new_agent_draft_opens_ready_to_type(cx: &mut TestAppContext) {
         .unwrap();
 }
 
-/// `l` names a label by path: `rho/agent` is the label `agent` under the
+/// `f` names a label by path: `rho/agent` is the label `agent` under the
 /// label `rho`, both minted on the spot if they are new, and the thing then
 /// hangs on the map in its place and under the label as well.
 #[gpui::test]
@@ -8553,8 +8553,8 @@ fn a_label_is_named_by_path_and_puts_the_thing_in_a_second_place(cx: &mut TestAp
         .unwrap();
 }
 
-/// `f` files under any id, a label as much as a note, so a thing can be put
-/// where a label already gathers its kind.
+/// The one picker offers both axes: the labels a thing can carry and the
+/// places it can sit in, so `f` is the only filing key there is.
 #[gpui::test]
 fn filing_offers_labels_as_well_as_notes(cx: &mut TestAppContext) {
     let mut desk = DeskFixture::new();
@@ -8594,6 +8594,208 @@ fn filing_offers_labels_as_well_as_notes(cx: &mut TestAppContext) {
                 "notes are still offered"
             );
             let _ = &dealt;
+        })
+        .unwrap();
+}
+
+/// `f` is the one filing key: a label path in the picker puts that label
+/// on the thing, and the same path again takes it off, so a thing carries
+/// as many labels as the user says while sitting in one place.
+#[gpui::test]
+fn filing_under_a_label_puts_it_on_and_the_same_path_takes_it_off(cx: &mut TestAppContext) {
+    use rho_desk::cells::{Id, Property};
+
+    let mut desk = DeskFixture::new();
+    let dealt = desk.due_note(None, "Deal QA note");
+
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.open_deal_mode(window, cx);
+            workspace.take_host_messages_for_test(HostId::default());
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    cx.dispatch_action(*workspace, crate::DashboardDealFile);
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "r h o");
+    cx.dispatch_action(*workspace, crate::MinibufferConfirm);
+    cx.run_until_parked();
+
+    let (label, stamp) = workspace
+        .update(cx, |workspace, _, _| {
+            let mutation =
+                take_desk_mutation(workspace, HostId::default()).expect("label mutation");
+            let label = mutation
+                .writes
+                .iter()
+                .find_map(|write| match &write.property {
+                    Property::Name(name) if name == "rho" => Some(write.id.clone()),
+                    _ => None,
+                })
+                .expect("the path mints the label it names");
+            assert!(matches!(label, Id::Label(_)));
+            assert!(
+                mutation.writes.iter().any(|write| write.id == dealt
+                    && write.property
+                        == Property::Labeled {
+                            label: label.clone(),
+                            present: true,
+                        }),
+                "picking a label path labels the thing"
+            );
+            assert!(
+                !mutation
+                    .writes
+                    .iter()
+                    .any(|write| write.id == dealt && write.property == Property::Parent(None)),
+                "and leaves its place alone"
+            );
+            (label, mutation.stamp)
+        })
+        .unwrap();
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(
+                HostId::default(),
+                ConnEvent::DeskMutationAccepted { stamp },
+                window,
+                cx,
+            );
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    cx.dispatch_action(*workspace, crate::DashboardDealFile);
+    cx.run_until_parked();
+    cx.simulate_keystrokes(*workspace, "r h o");
+    cx.dispatch_action(*workspace, crate::MinibufferConfirm);
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            let mutation =
+                take_desk_mutation(workspace, HostId::default()).expect("unlabel mutation");
+            assert!(
+                mutation.writes.iter().any(|write| write.id == dealt
+                    && write.property
+                        == Property::Labeled {
+                            label: label.clone(),
+                            present: false,
+                        }),
+                "the same path again takes the label off"
+            );
+        })
+        .unwrap();
+}
+
+/// A label is what a project is: it carries the workdir itself, and a
+/// thing made in the label is made in that workdir. There is no project
+/// row in between, so the path a new agent inherits is the label's own.
+#[gpui::test]
+fn a_thing_in_a_label_with_a_project_inherits_its_workdir(cx: &mut TestAppContext) {
+    use rho_desk::cells::{Id, Project, Property, Uuid};
+
+    let mut desk = DeskFixture::new();
+    let label = Id::Label(Uuid([7; 16]));
+    desk.file(label.clone(), None);
+    desk.set(label.clone(), Property::Name("rho".to_owned()));
+    desk.set(
+        label.clone(),
+        Property::Project(Some(Project {
+            host: 0,
+            path: "/src/rho".into(),
+        })),
+    );
+    let area = desk.note(None, "Verdict agent");
+    desk.set(
+        area.clone(),
+        Property::Labeled {
+            label: label.clone(),
+            present: true,
+        },
+    );
+    let under = desk.note(Some(area.clone()), "Deal QA note");
+
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert_eq!(
+                workspace
+                    .area_workdir_for_test(HostId::default(), area.clone())
+                    .map(|workdir| workdir.path.to_string()),
+                Some("/src/rho".to_owned()),
+                "the label the area carries names the workdir"
+            );
+            assert_eq!(
+                workspace
+                    .area_workdir_for_test(HostId::default(), under.clone())
+                    .map(|workdir| workdir.path.to_string()),
+                Some("/src/rho".to_owned()),
+                "and it carries down the ancestry like any other inheritance"
+            );
+        })
+        .unwrap();
+}
+
+/// Find ranks over the label paths as well as the place: the reader
+/// remembers `rho/agent` as readily as where the thing sits, so `rhoag`
+/// reaches it.
+#[gpui::test]
+fn find_matches_a_thing_by_the_label_it_carries(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    let area = desk.note(None, "Verdict agent");
+    let thing = desk.note(Some(area.clone()), "Deal QA note");
+    let elsewhere = desk.note(None, "Backlog");
+    let _ = desk.note(Some(elsewhere.clone()), "something else entirely");
+
+    cx.update(bind_test_keymaps);
+    let workspace = overview_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.label_card(HostId::default(), thing.clone(), "rho/agent", window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    workspace
+        .update(cx, |workspace, _, cx| {
+            let candidates = workspace.find_candidates(cx);
+            let labelled = candidates
+                .iter()
+                .find(|candidate| candidate.path.ends_with("Deal QA note"))
+                .expect("the labelled thing is findable");
+            assert!(
+                labelled
+                    .labels
+                    .iter()
+                    .any(|name| name.starts_with("rho/agent")),
+                "the label path is one of its names, got {:?}",
+                labelled.labels
+            );
+            let names = candidates
+                .iter()
+                .map(|candidate| (candidate.names_for_test(), candidate.recency))
+                .collect::<Vec<_>>();
+            let best = crate::find::rank_names(&names, "rhoag")
+                .first()
+                .copied()
+                .expect("rhoag matches the label path");
+            assert!(
+                candidates[best].path.ends_with("Deal QA note"),
+                "the label path is what `rhoag` names, got {:?}",
+                candidates[best].path
+            );
         })
         .unwrap();
 }

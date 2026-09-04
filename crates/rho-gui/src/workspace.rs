@@ -61,18 +61,18 @@ use crate::{
     DashboardDealMute, DashboardDealNext, DashboardDealOpenLine, DashboardDealRefresh,
     DashboardDealReply, DashboardDealRoomSnooze, DashboardDealSnooze, DashboardDealTodo,
     DashboardDeleteEmpty, DashboardDeleteRow, DashboardDemote, DashboardGoto,
-    DashboardHeadingAbove, DashboardHeadingBelow, DashboardJump, DashboardLabel,
-    DashboardMoveSubtreeDown, DashboardMoveSubtreeUp, DashboardNewChild, DashboardNewSibling,
-    DashboardNow, DashboardPasteRow, DashboardPasteRowBefore, DashboardPromote,
-    DashboardRenameTopic, DashboardReply, DashboardSubmit, DashboardToggleAgentTree,
-    DashboardToggleSubagents, DashboardUndo, DashboardYankRow, DealCloseAndNext, DealOpen,
-    FindNode, GitApprovalAllow, GitApprovalDeny, HomeOpenRow, MessagesOpen, MinibufferCancel,
-    MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious, OverviewToggle,
-    PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt,
-    ShellPagerAll, ShellPagerMore, ShellPagerQuit, SlackCancelEdit, SlackCompose, SlackEditLast,
-    SlackEditMessage, SlackMarkReadBefore, SlackNextUnread, SlackOpenRow, SlackSearch,
-    SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, UndoVerdict, UploadGuiTelemetry,
-    VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
+    DashboardHeadingAbove, DashboardHeadingBelow, DashboardJump, DashboardMoveSubtreeDown,
+    DashboardMoveSubtreeUp, DashboardNewChild, DashboardNewSibling, DashboardNow,
+    DashboardPasteRow, DashboardPasteRowBefore, DashboardPromote, DashboardRenameTopic,
+    DashboardReply, DashboardSubmit, DashboardToggleAgentTree, DashboardToggleSubagents,
+    DashboardUndo, DashboardYankRow, DealCloseAndNext, DealOpen, FindNode, GitApprovalAllow,
+    GitApprovalDeny, HomeOpenRow, MessagesOpen, MinibufferCancel, MinibufferComplete,
+    MinibufferConfirm, MinibufferNext, MinibufferPrevious, OverviewToggle, PastePrompt, RailFocus,
+    RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt, ShellPagerAll, ShellPagerMore,
+    ShellPagerQuit, SlackCancelEdit, SlackCompose, SlackEditLast, SlackEditMessage,
+    SlackMarkReadBefore, SlackNextUnread, SlackOpenRow, SlackSearch, SubmitPrompt, SurfaceBack,
+    SurfaceClose, TaskBoard, UndoVerdict, UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder,
+    ZulipNextUnread, ZulipOpenRow,
 };
 
 pub(crate) const MESSAGE_LOG_CAP: usize = 4096;
@@ -4937,6 +4937,17 @@ impl Workspace {
         &self.pending_filing_destinations
     }
 
+    /// The workdir a new thing under an area inherits, which is what
+    /// `n a` puts in the draft.
+    #[cfg(test)]
+    pub(crate) fn area_workdir_for_test(
+        &self,
+        host: HostId,
+        node_id: rho_desk::cells::Id,
+    ) -> Option<HostPath> {
+        self.area_workdir(host, node_id)
+    }
+
     #[cfg(test)]
     pub(crate) fn semantic_undo_count_for_test(&self) -> usize {
         self.desk_semantic_undo.len()
@@ -7825,66 +7836,8 @@ impl Workspace {
         self.refresh_dashboard(window, cx);
     }
 
-    /// `l`: the label picker. The user types a path, `rho/agent`, and gets
-    /// the label it names, made on the spot if it is new. Typing a label the
-    /// thing already carries takes it off again: one key both ways, because
-    /// the question the user is answering is "is this thing a rho agent
-    /// thing", and the answer is yes or no.
-    pub(crate) fn prompt_label_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((host, id)) = self.label_target(cx) else {
-            self.echo(
-                "label: nothing under the cursor",
-                StyleClass::SystemInfo,
-                cx,
-            );
-            return;
-        };
-        let carried = self
-            .desk_cells
-            .facts(host, &id)
-            .map(|facts| facts.labels)
-            .unwrap_or_default();
-        let on_submit = std::rc::Rc::new(
-            move |workspace: &mut Workspace,
-                  input: String,
-                  window: &mut Window,
-                  cx: &mut Context<Workspace>| {
-                workspace.label_card(host, id.clone(), &input, window, cx);
-            },
-        );
-        self.open_prompt(
-            "label:",
-            std::rc::Rc::new(
-                move |workspace: &Workspace, needle: &str, _cx: &gpui::App| {
-                    let needle = needle.trim().to_lowercase();
-                    workspace
-                        .desk_cells
-                        .label_paths(host)
-                        .into_iter()
-                        .filter(|(_, path)| path.to_lowercase().contains(&needle))
-                        .map(|(label, path)| crate::minibuffer::Candidate {
-                            description: match carried.contains(&label) {
-                                true => "on this · enter removes".to_owned(),
-                                false => "label".to_owned(),
-                            },
-                            value: path,
-                        })
-                        .collect()
-                },
-            ),
-            on_submit,
-            window,
-            cx,
-        );
-        if let Some(minibuffer) = &mut self.minibuffer {
-            // A path has a slash in it and is one value, so completion
-            // replaces the whole input rather than the last word.
-            minibuffer.set_complete_whole_input();
-        }
-    }
-
-    /// The thing a label goes on: the card in front of the reader, else the
-    /// row under the cursor on the map.
+    /// What `f` files: the card in front of the reader, else the row under
+    /// the cursor on the map.
     pub(crate) fn label_target(
         &mut self,
         cx: &mut Context<Self>,
@@ -7932,21 +7885,44 @@ impl Workspace {
         self.echo(&said, StyleClass::SystemInfo, cx);
     }
 
-    /// `f` on a deal: choose what the card's node moves under. Any id is a
-    /// place, a label as much as a note, so the picker offers the same set
-    /// the finder does. Filing is a verdict like any other, so it goes
-    /// through the tree's verdict log.
+    /// `f`: the one filing key, over the card in view or the row under the
+    /// cursor. A label path in the picker puts that label on the thing, and
+    /// the same path again takes it off, so a thing carries as many labels
+    /// as the user says. Anything else picked is a place, and a thing is in
+    /// one place: it sets the parent, replacing whatever it was under.
     pub(crate) fn prompt_file_deal_card(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.dashboard.current_deal_card().is_none() {
+        let Some((host, target)) = self.label_target(cx) else {
+            self.echo("file: nothing under the cursor", StyleClass::SystemInfo, cx);
             return;
-        }
-        let threads = self.slack_thread_facts(cx);
-        self.pending_filing_destinations = self
-            .dashboard
-            .area_candidates(&self.registry, &threads, cx)
+        };
+        let carried = self
+            .desk_cells
+            .facts(host, &target)
+            .map(|facts| facts.labels)
+            .unwrap_or_default();
+        let mut destinations = self
+            .desk_cells
+            .label_paths(host)
             .into_iter()
-            .map(|(path, kind, host, node_id)| (path, kind.to_owned(), host, node_id))
-            .collect();
+            .map(|(label, path)| {
+                let description = match carried.contains(&label) {
+                    true => "label · enter takes it off",
+                    false => "label",
+                };
+                (path, description.to_owned(), host, label)
+            })
+            .collect::<Vec<_>>();
+        let threads = self.slack_thread_facts(cx);
+        // Labels are offered as their own paths, above, so the places are
+        // everything else: one row per label, not two.
+        destinations.extend(
+            self.dashboard
+                .area_candidates(&self.registry, &threads, cx)
+                .into_iter()
+                .filter(|(_, _, _, node_id)| !matches!(node_id, rho_desk::cells::Id::Label(_)))
+                .map(|(path, kind, host, node_id)| (path, kind.to_owned(), host, node_id)),
+        );
+        self.pending_filing_destinations = destinations;
         self.pending_filing_selected = None;
         self.open_prompt(
             "file under:",
@@ -7965,30 +7941,23 @@ impl Workspace {
                     })
                     .collect()
             }),
-            std::rc::Rc::new(|workspace, heading, window, cx| {
-                let Some(parent) = workspace
+            std::rc::Rc::new(move |workspace, heading, window, cx| {
+                let Some((_, node_id)) = workspace
                     .pending_filing_destinations
                     .iter()
                     .find(|(value, ..)| *value == heading)
-                    .map(|(_, _, _, node_id)| node_id.clone())
+                    .map(|(_, _, host, node_id)| (*host, node_id.clone()))
                 else {
-                    workspace.notice_on(None, "file: choose a heading", StyleClass::SystemInfo, cx);
+                    // An unknown path is a label the user is naming as they
+                    // type it: labelling mints what the path names.
+                    workspace.label_card(host, target.clone(), &heading, window, cx);
                     return;
                 };
-                if !workspace.submit_tree_verdict(
-                    None,
-                    crate::desk_view::DeskVerdict::File { parent },
-                    crate::dashboard::DealerVerdict::File,
-                    format!("file under {heading}"),
-                    window,
-                    cx,
-                ) {
-                    workspace.echo(
-                        "file: the deal card disappeared",
-                        StyleClass::SystemInfo,
-                        cx,
-                    );
+                if matches!(node_id, rho_desk::cells::Id::Label(_)) {
+                    workspace.label_card(host, target.clone(), &heading, window, cx);
+                    return;
                 }
+                workspace.file_under(host, target.clone(), node_id, &heading, window, cx);
             }),
             window,
             cx,
@@ -7996,6 +7965,51 @@ impl Workspace {
         if let Some(minibuffer) = &mut self.minibuffer {
             minibuffer.set_complete_whole_input();
         }
+    }
+
+    /// Puts a thing under a place. On a dealt card it is a verdict like any
+    /// other, so the dealer sees it and the journal records it; on a map row
+    /// it is the one parent cell and its undo.
+    fn file_under(
+        &mut self,
+        host: HostId,
+        target: rho_desk::cells::Id,
+        parent: rho_desk::cells::Id,
+        heading: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dealt = self
+            .dashboard
+            .current_deal_card()
+            .is_some_and(|card| card.identity.node_id == target);
+        if dealt {
+            if !self.submit_tree_verdict(
+                None,
+                crate::desk_view::DeskVerdict::File { parent },
+                crate::dashboard::DealerVerdict::File,
+                format!("file under {heading}"),
+                window,
+                cx,
+            ) {
+                self.echo(
+                    "file: the deal card disappeared",
+                    StyleClass::SystemInfo,
+                    cx,
+                );
+            }
+            return;
+        }
+        let writes = vec![rho_desk::cells::CellWrite {
+            id: target,
+            property: rho_desk::cells::Property::Parent(Some(parent)),
+        }];
+        let undo = self.desk_cells.inverse_writes(host, &writes);
+        let Some(stamp) = self.apply_desk_writes(host, writes, None, window, cx) else {
+            return;
+        };
+        self.record_desk_semantic_undo(host, stamp, undo, cx);
+        self.echo(&format!("file under {heading}"), StyleClass::SystemInfo, cx);
     }
 
     fn finish_deal_verdict(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -8396,8 +8410,19 @@ impl Workspace {
     /// area (or the area itself when it is an agent node). The caller
     /// falls back to the host's only workdir.
     fn area_workdir(&self, host: HostId, node_id: rho_desk::cells::Id) -> Option<HostPath> {
-        if let Some(path) = self.desk_cells.inherited_file_path(host, &node_id) {
-            return Some(HostPath { host, path });
+        if let Some(project) = self.desk_cells.inherited_workdir(host, &node_id) {
+            // A label's project names its own machine, which is usually
+            // the one the area is on and need not be.
+            let host = self
+                .registry
+                .hosts()
+                .map(|(id, _)| id)
+                .find(|id| self.registry.host_machine_seed(*id) == project.host)
+                .unwrap_or(host);
+            return Some(HostPath {
+                host,
+                path: project.path,
+            });
         }
         let agent_id = self.desk_cells.nearest_agent(host, &node_id)?;
         self.agent_workdir(agent_id)
@@ -10693,10 +10718,6 @@ impl Render for Workspace {
             )
             .on_action(cx.listener(|this, _: &DashboardUndo, window, cx| {
                 this.dashboard_undo(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &DashboardLabel, window, cx| {
-                vim::take_count(cx);
-                this.prompt_label_card(window, cx);
             }))
             .on_action(cx.listener(|this, _: &TaskBoard, _window, cx| {
                 this.notice_on(

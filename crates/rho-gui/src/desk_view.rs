@@ -3,9 +3,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use gpui::{AppContext as _, Context, Entity};
 use language::{Buffer, BufferEvent, Capability};
 use rho_desk::cells::{
-    BodySnapshot, CellMutation, CellWrite, DeviceId, Facts, Id, Property, PropertyKey, SlackTs,
-    SlackUnit, Snapshot, Stamp, State, Store, Timestamp, TimestampPrecision, Uuid, Verdict,
-    VerdictEvent, Version,
+    BodySnapshot, CellMutation, CellWrite, DeviceId, Facts, Id, Project, Property, PropertyKey,
+    SlackTs, SlackUnit, Snapshot, Stamp, State, Store, Timestamp, TimestampPrecision, Uuid,
+    Verdict, VerdictEvent, Version,
 };
 use rho_ui_proto::ClientMessage;
 use text::{BufferId, ReplicaId};
@@ -955,7 +955,7 @@ impl DeskCells {
         paths
     }
 
-    /// `l`: the thing carries the label the path names, or stops carrying
+    /// `f`: the thing carries the label the path names, or stops carrying
     /// it when it already does. The label is minted if the path is new, in
     /// the same mutation, so a label never exists without something on it.
     pub fn label_writes(
@@ -1141,16 +1141,44 @@ impl DeskCells {
     /// root rather than repaired, so the walk stops at the depth no real
     /// tree reaches.
     pub fn inherited_file_path(&self, host: HostId, id: &Id) -> Option<camino::Utf8PathBuf> {
+        self.inherited_workdir(host, id).map(|project| project.path)
+    }
+
+    /// The workdir a new thing under `id` inherits, walking the same
+    /// ancestry: the thing's own file, then the projects of the labels it
+    /// carries, then its parent's. A label with a project is what a
+    /// project is, so a thing made in one is made in that workdir.
+    pub fn inherited_workdir(&self, host: HostId, id: &Id) -> Option<Project> {
         let nodes = self.nodes(host);
+        let seed = self.hosts.get(&host).map(|desk| desk.sources.host);
         let mut cursor = Some(id.clone());
         for _ in 0..MAX_ANCESTRY {
             let id = cursor?;
             if let Some(path) = self.file_path(host, &id) {
-                return Some(path);
+                return Some(Project {
+                    host: seed.unwrap_or_default(),
+                    path,
+                });
             }
-            cursor = nodes.iter().find(|node| node.id == id)?.parent.clone();
+            let node = nodes.iter().find(|node| node.id == id)?;
+            if let Some(project) = self.project(host, &id) {
+                return Some(project);
+            }
+            if let Some(project) = node
+                .labels
+                .iter()
+                .find_map(|label| self.project(host, label))
+            {
+                return Some(project);
+            }
+            cursor = node.parent.clone();
         }
         None
+    }
+
+    /// The workdir a label stands for, if it stands for one.
+    pub fn project(&self, host: HostId, id: &Id) -> Option<Project> {
+        self.facts(host, id)?.project
     }
 
     /// The agent that owns an area: the thing itself when it is an agent,
