@@ -92,6 +92,15 @@ own pass once Home exists; until then the map stays reachable from Home.
 
 ## No deal mode: one key opens the verdict transient
 
+Built 4 Sep (b8os): one tap of `shift` opens the verdict menu over any
+card surface, a second tap is Home, snooze takes its count and unit
+inside the transient with the pending count drawn beside the title, and
+`context_area` now delegates to `surface_node` so a Slack channel or
+conversation surface answers the tap (it had only answered on threads).
+The rig sends the bare tap as `rho wayland input key:shift`. Label is
+not in the transient; filing by label is `f`.
+
+
 Decided with the user on 4 Sep. Deal mode goes away entirely: no `VimDeal`
 context, no `DEAL` status word, no single-letter verdict keys on a surface,
 and `escape` means nothing to the dealer. Vim is vim on every surface, so

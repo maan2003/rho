@@ -592,14 +592,7 @@ fn append_wtype_chord(args: &mut Vec<OsString>, chord: &str) -> Result<()> {
         .context("key chord is empty")?;
     let mut modifiers = Vec::new();
     for modifier in parts {
-        let modifier = match modifier.to_ascii_lowercase().as_str() {
-            "ctrl" | "control" => "ctrl",
-            "alt" => "alt",
-            "shift" => "shift",
-            "super" | "logo" | "meta" => "logo",
-            _ => bail!("unsupported key modifier {modifier:?}"),
-        };
-        modifiers.push(modifier);
+        modifiers.push(wtype_modifier(modifier)?);
     }
     let key = match key.to_ascii_lowercase().as_str() {
         "enter" | "return" => "Return".to_owned(),
@@ -608,6 +601,13 @@ fn append_wtype_chord(args: &mut Vec<OsString>, chord: &str) -> Result<()> {
         "backspace" => "BackSpace".to_owned(),
         "delete" | "del" => "Delete".to_owned(),
         "space" => "space".to_owned(),
+        // A modifier as the last part of a chord is pressed as a key of its
+        // own: `-M shift` only sets the modifier bit, which sends no key
+        // event, and a bare `shift` tap is a key event the app listens for.
+        "shift" => "Shift_L".to_owned(),
+        "ctrl" | "control" => "Control_L".to_owned(),
+        "alt" => "Alt_L".to_owned(),
+        "super" | "logo" | "meta" => "Super_L".to_owned(),
         "up" => "Up".to_owned(),
         "down" => "Down".to_owned(),
         "left" => "Left".to_owned(),
@@ -627,6 +627,17 @@ fn append_wtype_chord(args: &mut Vec<OsString>, chord: &str) -> Result<()> {
         args.extend([OsString::from("-m"), OsString::from(modifier)]);
     }
     Ok(())
+}
+
+/// wtype's name for a modifier, or an error for anything that is a key.
+fn wtype_modifier(name: &str) -> Result<&'static str> {
+    Ok(match name.to_ascii_lowercase().as_str() {
+        "ctrl" | "control" => "ctrl",
+        "alt" => "alt",
+        "shift" => "shift",
+        "super" | "logo" | "meta" => "logo",
+        other => bail!("unsupported key modifier {other:?}"),
+    })
 }
 
 fn wtype_text_args(text: String) -> Vec<OsString> {
@@ -830,6 +841,13 @@ mod tests {
                 "ctrl", "-s", "50"
             ]
         );
+    }
+
+    #[test]
+    fn a_lone_modifier_is_pressed_as_a_key_of_its_own() {
+        let args = wtype_key_args("shift").unwrap();
+        let args: Vec<_> = args.iter().map(|arg| arg.to_string_lossy()).collect();
+        assert_eq!(args, ["-s", "50", "-k", "Shift_L", "-s", "50"]);
     }
 
     #[test]

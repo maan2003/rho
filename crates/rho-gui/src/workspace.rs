@@ -65,14 +65,14 @@ use crate::{
     DashboardMoveSubtreeDown, DashboardMoveSubtreeUp, DashboardNewChild, DashboardNewSibling,
     DashboardNow, DashboardPasteRow, DashboardPasteRowBefore, DashboardPromote,
     DashboardRenameTopic, DashboardReply, DashboardSubmit, DashboardToggleAgentTree,
-    DashboardToggleSubagents, DashboardUndo, DashboardYankRow, DealCloseAndNext, DealLeave,
-    DealOpen, FindNode, GitApprovalAllow, GitApprovalDeny, HomeOpenRow, MessagesOpen,
-    MinibufferCancel, MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious,
-    OverviewToggle, PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof,
-    ShellInterrupt, ShellPagerAll, ShellPagerMore, ShellPagerQuit, SlackCancelEdit, SlackCompose,
-    SlackEditLast, SlackEditMessage, SlackMarkReadBefore, SlackNextUnread, SlackOpenRow,
-    SlackSearch, SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, UndoVerdict,
-    UploadGuiTelemetry, VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
+    DashboardToggleSubagents, DashboardUndo, DashboardYankRow, DealCloseAndNext, DealOpen,
+    FindNode, GitApprovalAllow, GitApprovalDeny, HomeOpenRow, MessagesOpen, MinibufferCancel,
+    MinibufferComplete, MinibufferConfirm, MinibufferNext, MinibufferPrevious, OverviewToggle,
+    PastePrompt, RailFocus, RailOpen, RoleCycle, RoleCycleGroup, ShellEof, ShellInterrupt,
+    ShellPagerAll, ShellPagerMore, ShellPagerQuit, SlackCancelEdit, SlackCompose, SlackEditLast,
+    SlackEditMessage, SlackMarkReadBefore, SlackNextUnread, SlackOpenRow, SlackSearch,
+    SubmitPrompt, SurfaceBack, SurfaceClose, TaskBoard, UndoVerdict, UploadGuiTelemetry,
+    VoiceToggle, ZulipLoadOlder, ZulipNextUnread, ZulipOpenRow,
 };
 
 pub(crate) const MESSAGE_LOG_CAP: usize = 4096;
@@ -606,6 +606,9 @@ pub struct Workspace {
     /// quit-one) before a final escape closes the strip.
     transient_stack: Vec<crate::transient::Transient>,
     transient_focus: gpui::FocusHandle,
+    /// The digits typed inside a counted transient, waiting for the item
+    /// they qualify: `45` then `m` is forty-five minutes.
+    transient_count: Option<usize>,
     /// Evil's one-shot `SPC u` prefix. The next supported Desk command
     /// consumes it; every other non-modifier key clears it.
     git_approval_focus: gpui::FocusHandle,
@@ -1022,7 +1025,19 @@ impl Workspace {
                 && !event.keystroke.modifiers.platform
             {
                 let now = std::time::Instant::now();
-                if this
+                // The second tap is Home, whether it comes quickly on a
+                // surface that is not a card or as the `shift` row of the
+                // verdict transient the first tap opened. There is no timer
+                // on the second one: the menu is on screen saying so.
+                if this.verdict_transient_open() {
+                    this.last_shift_tap = None;
+                    this.close_transient(window, cx);
+                    this.toggle_overview(window, cx);
+                } else if this.has_modal_overlay() {
+                    // A menu or a prompt is already holding the keyboard:
+                    // shift belongs to whatever the reader is typing there.
+                    this.last_shift_tap = None;
+                } else if this
                     .last_shift_tap
                     .is_some_and(|last| now.duration_since(last) <= Duration::from_millis(300))
                 {
@@ -1030,6 +1045,7 @@ impl Workspace {
                     this.toggle_overview(window, cx);
                 } else {
                     this.last_shift_tap = Some(now);
+                    this.open_verdict_transient(window, cx);
                 }
             } else {
                 this.last_shift_tap = None;
@@ -1140,6 +1156,7 @@ impl Workspace {
             transient: None,
             transient_stack: Vec::new(),
             transient_focus: cx.focus_handle(),
+            transient_count: None,
             git_approval_focus: cx.focus_handle(),
             overlay_return_focus: None,
             echo: None,
@@ -3518,6 +3535,104 @@ impl Workspace {
     /// The snooze operator: `s` and a unit, with vim's count in front, so
     /// `45sm` is 45 minutes, `3sh` three hours, `2sd` two days, `sw` a week
     /// and `ss` the default day. The deal bar echoes the time it comes back.
+    /// `d` in the verdict transient. The verdict lands on the card the
+    /// transient was opened over, which is the surface in view.
+    pub(crate) fn verdict_done(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dashboard.current_deal_card().is_none() {
+            self.echo("done: nothing under the deal", StyleClass::SystemInfo, cx);
+            return;
+        }
+        if !self.submit_tree_verdict(
+            None,
+            crate::desk_view::DeskVerdict::Done,
+            crate::dashboard::DealerVerdict::Done,
+            "done".to_owned(),
+            window,
+            cx,
+        ) {
+            self.echo("done: the note is unavailable", StyleClass::SystemInfo, cx);
+        }
+    }
+
+    /// `x`: done, plus the silence the source has a place for.
+    pub(crate) fn verdict_mute(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.dashboard.current_deal_card().is_none() {
+            self.echo("mute: nothing under the deal", StyleClass::SystemInfo, cx);
+            return;
+        }
+        if !self.submit_tree_verdict(
+            None,
+            crate::desk_view::DeskVerdict::Mute,
+            crate::dashboard::DealerVerdict::Mute,
+            "mute".to_owned(),
+            window,
+            cx,
+        ) {
+            self.echo("mute: the note is unavailable", StyleClass::SystemInfo, cx);
+        }
+    }
+
+    /// `t`: the card is handled by a note that comes back on a pace, in
+    /// days, defaulting to a week.
+    pub(crate) fn verdict_todo(
+        &mut self,
+        count: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let days = count.unwrap_or(7).max(1) as u32;
+        let today = chrono::Local::now().date_naive();
+        if self.dashboard.current_deal_card().is_none() {
+            self.echo("todo: nothing under the deal", StyleClass::SystemInfo, cx);
+            return;
+        }
+        if !self.submit_tree_verdict(
+            None,
+            crate::desk_view::DeskVerdict::Todo {
+                defer_until: crate::desk_view::day_timestamp(today),
+                pace: days,
+            },
+            crate::dashboard::DealerVerdict::Done,
+            "todo".to_owned(),
+            window,
+            cx,
+        ) {
+            self.echo("todo: the note is unavailable", StyleClass::SystemInfo, cx);
+            return;
+        }
+        self.echo(&format!("todo: {days}d"), StyleClass::SystemInfo, cx);
+    }
+
+    /// `shift-s`: the room the card sits in goes quiet, not the card.
+    pub(crate) fn verdict_room_snooze(
+        &mut self,
+        count: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let days = count.unwrap_or(1).max(1) as i64;
+        let today = chrono::Local::now().date_naive();
+        let Some((_host, room_node)) = self.dashboard.current_tree_room_node() else {
+            return;
+        };
+        if !self.submit_tree_verdict(
+            Some(room_node),
+            crate::desk_view::DeskVerdict::Defer {
+                until: crate::desk_view::day_timestamp(today + chrono::Duration::days(days)),
+            },
+            crate::dashboard::DealerVerdict::Defer,
+            format!("snooze {days}d"),
+            window,
+            cx,
+        ) {
+            self.echo(
+                "room snooze: the room is unavailable",
+                StyleClass::SystemInfo,
+                cx,
+            );
+        }
+    }
+
     pub(crate) fn deal_snooze(
         &mut self,
         unit: SnoozeUnit,
@@ -6511,7 +6626,7 @@ impl Workspace {
 
     /// The node the current surface is about: the thing a note would be
     /// filed under. Every kind that has a row in the tree answers.
-    fn surface_node(&self) -> Option<(HostId, rho_desk::cells::Id)> {
+    pub(crate) fn surface_node(&self) -> Option<(HostId, rho_desk::cells::Id)> {
         let card = match &self.active_pane().surface.key {
             SurfaceKey::DeskNode { host, node_id } => return Some((*host, node_id.clone())),
             SurfaceKey::Transcript(agent_id)
@@ -7169,6 +7284,82 @@ impl Workspace {
         cx.notify();
     }
 
+    /// One tap of `shift`: the verdicts, over whatever card is in view. The
+    /// card is the surface the reader is on (or the row under the cursor on
+    /// Home), so a verdict follows the eye rather than a mode. Returns
+    /// whether there was a card to open it over; with none, the tap is left
+    /// to the double tap that reaches Home.
+    pub(crate) fn open_verdict_transient(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.adopt_surface_card(window, cx) {
+            return false;
+        }
+        self.open_transient(crate::transient::verdict_menu(), window, cx);
+        true
+    }
+
+    /// Makes the card in view the one the verdicts write to. A card that is
+    /// not in the dealer's hand is one nothing is owed on, so there is no
+    /// verdict to make and the tap falls through.
+    fn adopt_surface_card(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some((host, node_id)) = self.context_area(cx) else {
+            return false;
+        };
+        let wanted = crate::dashboard::DealCardId { host, node_id };
+        if self
+            .dashboard
+            .current_deal_card()
+            .is_some_and(|card| card.identity == wanted)
+        {
+            return true;
+        }
+        let threads = self.slack_thread_facts(cx);
+        self.dashboard
+            .deal_chosen(
+                &self.registry,
+                &threads,
+                chrono::Local::now().fixed_offset(),
+                &wanted,
+                &self.agent_last_interaction,
+                cx,
+            )
+            .is_some()
+    }
+
+    /// The count an item was given, if any. Taken rather than read: a count
+    /// belongs to one keystroke, and leaving it behind would silently
+    /// qualify the next one.
+    pub(crate) fn take_transient_count(&mut self) -> Option<usize> {
+        self.transient_count.take()
+    }
+
+    /// Whether the strip is showing the verdicts, which is what makes the
+    /// next `shift` Home rather than another open.
+    pub(crate) fn verdict_transient_open(&self) -> bool {
+        self.transient
+            .as_ref()
+            .is_some_and(|transient| transient.title() == "verdict")
+    }
+
+    /// What the bar will say once the daemon takes the verdict. The echo
+    /// waits for that, so a test that stops at the mutation has to look
+    /// here to see the words the reader is promised.
+    #[cfg(test)]
+    pub(crate) fn pending_verdict_echo_for_test(&self) -> Option<&str> {
+        self.pending_tree_verdicts
+            .values()
+            .next_back()
+            .map(|pending| pending.echo.as_str())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn transient_title_for_test(&self) -> Option<&'static str> {
+        self.transient.as_ref().map(|transient| transient.title())
+    }
+
     fn has_modal_overlay(&self) -> bool {
         self.minibuffer.is_some() || self.transient.is_some() || self.pending_git_approval.is_some()
     }
@@ -7199,6 +7390,7 @@ impl Workspace {
     /// Clears the menu without touching focus.
     fn drop_transient(&mut self) {
         self.transient = None;
+        self.transient_count = None;
         self.transient_stack.clear();
     }
 
@@ -7231,6 +7423,18 @@ impl Workspace {
         let Some(transient) = &self.transient else {
             return;
         };
+        if transient.takes_count()
+            && let Some(digit) = keystroke.key.parse::<usize>().ok().filter(|_| {
+                keystroke.key.len() == 1
+                    && !keystroke.modifiers.shift
+                    && !keystroke.modifiers.control
+            })
+        {
+            self.transient_count = Some(self.transient_count.unwrap_or(0) * 10 + digit);
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
         if keystroke.key == "escape" {
             match self.transient_stack.pop() {
                 Some(parent) => {
@@ -7522,60 +7726,18 @@ impl Workspace {
         }
     }
 
-    /// The one way out of deal mode. Vim's Deal refuses ordinary mode
-    /// switches and the dashboard keeps deal state of its own, so both are
-    /// ended here: anywhere else they can disagree and the reader is left in
-    /// a mode nothing will take them out of. The surface stays where it is.
-    fn leave_deal_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Ends the deal session. There is no keyboard mode to leave with it:
+    /// the surface was read in ordinary vim throughout, which is the point
+    /// of the verdict transient.
+    fn leave_deal_mode(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.deal_view = None;
         self.deal_controls_visible = false;
         self.deal_current_interacted = false;
         self.end_deal_session();
-        match self.deal_editor(cx) {
-            // The dealt editor is not always what holds focus by now, and
-            // Deal mode ignores anything but a direct ask.
-            Some(editor) => {
-                vim::exit_deal_mode(&editor, window, cx);
-            }
-            // The phone has no vim to leave; the dealer's own state is all
-            // there is to end there.
-            None if self.phone.enabled => {}
-            None => {
-                if let Ok(action) = cx.build_action("vim::ExitDealMode", None) {
-                    window.dispatch_action(action, cx);
-                }
-            }
-        }
         cx.notify();
     }
 
-    /// `escape` on a dealt surface: the deal is over, the surface stays, and
-    /// the keyboard is back to normal. Recorded as an open, which is what
-    /// looking at something and moving on is.
-    fn deal_leave(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.dashboard.deal_mode() {
-            cx.propagate();
-            return;
-        }
-        // Escape out of insert inside a deal belongs to the editor, which
-        // returns to DEAL. Only escape in DEAL itself leaves.
-        if self
-            .deal_editor(cx)
-            .is_some_and(|editor| !vim::editor_in_deal_mode(&editor, cx))
-        {
-            cx.propagate();
-            return;
-        }
-        self.dashboard.record_deal_verdict_as(
-            crate::dashboard::DealerVerdict::Open,
-            chrono::Local::now().fixed_offset(),
-        );
-        self.dashboard.end_deal(cx);
-        self.leave_deal_mode(window, cx);
-        self.refresh_dashboard(window, cx);
-    }
-
-    fn finish_presenting_deal(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn finish_presenting_deal(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         crate::journal::record(crate::journal::Event::DealMode {
             action: crate::journal::DealModeAction::Enter,
             card: self
@@ -7587,15 +7749,6 @@ impl Workspace {
             self.deal_focus_pending = false;
             cx.notify();
             return;
-        }
-        let editor = self.deal_editor(cx);
-        if let Some(editor) = editor {
-            // Surface promotion happens before the new editor is mounted in
-            // GPUI's action dispatch tree, so enter the owned Vim instance
-            // directly instead of dispatching EnterDealMode to the old focus.
-            vim::enter_deal_mode(&editor, window, cx);
-        } else if let Ok(action) = cx.build_action("vim::EnterDealMode", None) {
-            window.dispatch_action(action, cx);
         }
         self.deal_focus_pending = true;
         cx.notify();
@@ -9041,14 +9194,6 @@ impl Workspace {
                         return;
                     }
                     window.focus(&focus, cx);
-                    cx.defer_in(window, |this, window, cx| {
-                        if !this.dashboard.deal_mode() {
-                            return;
-                        }
-                        if let Ok(action) = cx.build_action("vim::EnterDealMode", None) {
-                            window.dispatch_action(action, cx);
-                        }
-                    });
                 });
             }
         }
@@ -9059,11 +9204,6 @@ impl Workspace {
                     return;
                 }
                 this.focus_active_surface(window, cx);
-                if let Some(editor) = this.deal_editor(cx) {
-                    vim::enter_deal_mode(&editor, window, cx);
-                } else if let Ok(action) = cx.build_action("vim::EnterDealMode", None) {
-                    window.dispatch_action(action, cx);
-                }
             });
         }
 
@@ -9244,7 +9384,6 @@ impl Workspace {
                 "visual line" => "V-LINE",
                 "visual block" => "V-BLOCK",
                 "select" => "SEL",
-                "deal" => "DEAL",
                 other => return other.to_uppercase(),
             }
             .to_owned()
@@ -9304,15 +9443,7 @@ impl Workspace {
                     .rounded_full()
                     .bg(status.error)
             }))
-            .child(
-                div()
-                    .text_color(mode_color)
-                    .child(if self.dashboard.deal_mode() {
-                        "DEAL".to_owned()
-                    } else {
-                        mode_word(&mode)
-                    }),
-            )
+            .child(div().text_color(mode_color).child(mode_word(&mode)))
             .into_any_element()
     }
 
@@ -9970,9 +10101,6 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &SurfaceClose, window, cx| {
                 this.close_current_surface(window, cx);
-            }))
-            .on_action(cx.listener(|this, _: &DealLeave, window, cx| {
-                this.deal_leave(window, cx);
             }))
             .on_action(cx.listener(|this, _: &MessagesOpen, window, cx| {
                 this.cmd_messages(window, cx);
@@ -10724,7 +10852,7 @@ impl Render for Workspace {
                                 div()
                                     .track_focus(&self.transient_focus)
                                     .on_key_down(cx.listener(Self::transient_key))
-                                    .child(transient.render(&text_style, cx))
+                                    .child(transient.render(self.transient_count, &text_style, cx))
                                     .into_any_element(),
                             )
                         }

@@ -799,44 +799,52 @@ fn a_snooze_lands_on_its_unit_and_says_the_time() {
     assert_eq!(said, "snooze until Thu 10 Sep");
 }
 
+/// Deal mode took `d`, `x`, `s`, `t` and `f` from every card, so a card
+/// could not be read like the buffer it is. The verdicts moved into the
+/// transient a tap of `shift` opens, and the letters belong to vim again on
+/// every surface. `shift-u` is the exception: undoing a verdict is the same
+/// verb wherever the card is.
 #[gpui::test]
-fn native_page_deal_context_routes_verdict_keys(cx: &mut TestAppContext) {
+fn the_verdict_letters_belong_to_vim_on_a_card(cx: &mut TestAppContext) {
     use gpui::{KeyContext, Keystroke};
 
     cx.update(bind_test_keymaps);
     cx.update(|cx| {
         let keymap = cx.key_bindings();
         let keymap = keymap.borrow();
-        let contexts = [
-            KeyContext::parse("RhoGuiDeal").unwrap(),
-            KeyContext::parse("RhoBrowser").unwrap(),
+        let editor = [
+            KeyContext::parse("RhoGui").unwrap(),
+            KeyContext::parse("Editor vim_mode=normal vim_operator=none").unwrap(),
         ];
-        macro_rules! assert_route {
-            ($key:literal, $action:expr) => {{
-                let (bindings, pending) =
-                    keymap.bindings_for_input(&[Keystroke::parse($key).unwrap()], &contexts);
-                assert!(!pending);
-                assert!(
-                    bindings
-                        .first()
-                        .is_some_and(|binding| binding.action().partial_eq(&$action)),
-                    "{} did not route to {} in a dealt browser page: {bindings:?}",
-                    $key,
-                    gpui::Action::name(&$action),
-                );
-            }};
+        let verdicts: [&dyn gpui::Action; 4] = [
+            &crate::DashboardDealDone,
+            &crate::DashboardDealMute,
+            &crate::DashboardDealTodo,
+            &crate::DashboardDealFile,
+        ];
+        for key in ["d", "x", "s", "t", "f"] {
+            let (bindings, _) =
+                keymap.bindings_for_input(&[Keystroke::parse(key).unwrap()], &editor);
+            assert!(
+                !bindings.iter().any(|binding| verdicts
+                    .iter()
+                    .any(|verdict| binding.action().partial_eq(*verdict))),
+                "{key} still makes a verdict on a card: {bindings:?}"
+            );
         }
-        assert_route!("q", crate::SurfaceClose);
-        assert_route!("d", crate::DashboardDealDone);
-        assert_route!("x", crate::DashboardDealMute);
-        assert_snooze_operator(&keymap, &contexts);
-        assert_route!("t", crate::DashboardDealTodo);
-        assert_route!("shift-u", crate::UndoVerdict);
+        let (bindings, _) =
+            keymap.bindings_for_input(&[Keystroke::parse("shift-u").unwrap()], &editor);
+        assert!(
+            bindings
+                .first()
+                .is_some_and(|binding| binding.action().partial_eq(&crate::UndoVerdict)),
+            "shift-u still undoes the last verdict: {bindings:?}"
+        );
     });
 }
 
 #[gpui::test]
-fn undo_verdict_binding_is_confined_to_deal_normal_mode(cx: &mut TestAppContext) {
+fn undo_verdict_binding_is_confined_to_normal_mode(cx: &mut TestAppContext) {
     use gpui::{KeyContext, Keystroke};
 
     cx.update(bind_test_keymaps);
@@ -853,19 +861,19 @@ fn undo_verdict_binding_is_confined_to_deal_normal_mode(cx: &mut TestAppContext)
         };
         assert!(resolves(&[
             KeyContext::parse("RhoGui").unwrap(),
-            KeyContext::parse("Editor VimDeal vim_mode=normal vim_operator=none").unwrap(),
+            KeyContext::parse("Editor vim_mode=normal vim_operator=none").unwrap(),
         ]));
         assert!(resolves(&[
             KeyContext::parse("RhoGui").unwrap(),
-            KeyContext::parse("Editor VimDeal vim_mode=helix_normal vim_operator=none").unwrap(),
+            KeyContext::parse("Editor vim_mode=helix_normal vim_operator=none").unwrap(),
         ]));
         assert!(!resolves(&[
             KeyContext::parse("RhoDashboard").unwrap(),
-            KeyContext::parse("Editor VimDeal vim_mode=insert vim_operator=none").unwrap(),
+            KeyContext::parse("Editor vim_mode=insert vim_operator=none").unwrap(),
         ]));
         assert!(!resolves(&[
             KeyContext::parse("RhoGui").unwrap(),
-            KeyContext::parse("Editor VimDeal vim_mode=normal vim_operator=delete").unwrap(),
+            KeyContext::parse("Editor vim_mode=normal vim_operator=delete").unwrap(),
         ]));
     });
 }
@@ -1042,101 +1050,6 @@ fn the_first_heading_can_be_written_on_an_empty_desk(cx: &mut TestAppContext) {
                     .iter()
                     .any(|write| write.property == rho_desk::cells::Property::Parent(None)),
                 "the first row on an empty desk is not a root"
-            );
-        })
-        .unwrap();
-}
-
-#[gpui::test]
-fn escape_leaves_deal_mode_on_every_dealt_surface(cx: &mut TestAppContext) {
-    use gpui::{KeyContext, Keystroke};
-
-    cx.update(bind_test_keymaps);
-    cx.update(|cx| {
-        let keymap = cx.key_bindings();
-        let keymap = keymap.borrow();
-        let stroke = Keystroke::parse("escape").unwrap();
-        let routes_to_leave = |contexts: &[KeyContext]| {
-            keymap
-                .bindings_for_input(&[stroke.clone()], contexts)
-                .0
-                .first()
-                .is_some_and(|binding| binding.action().partial_eq(&crate::DealLeave))
-        };
-        // A dealt editor, whatever surface it belongs to.
-        assert!(routes_to_leave(&[
-            KeyContext::parse("RhoGui").unwrap(),
-            KeyContext::parse("Editor VimDeal vim_mode=normal vim_operator=none").unwrap(),
-        ]));
-        // A dealt surface with no editor at all.
-        assert!(routes_to_leave(&[
-            KeyContext::parse("RhoGuiDeal").unwrap(),
-            KeyContext::parse("RhoBrowser").unwrap(),
-        ]));
-        // Insert inside a deal belongs to the editor: escape there returns
-        // to DEAL rather than ending the deal.
-        assert!(!routes_to_leave(&[
-            KeyContext::parse("RhoGuiDeal").unwrap(),
-            KeyContext::parse("Editor VimControl vim_mode=insert vim_operator=none").unwrap(),
-        ]));
-    });
-}
-
-#[gpui::test]
-fn escape_ends_the_deal_and_leaves_the_surface_where_it_is(cx: &mut TestAppContext) {
-    cx.update(bind_test_keymaps);
-    let mut desk = DeskFixture::new();
-    desk.due_note(None, "Deal QA note");
-    desk.due_note(None, "Deal QA second note");
-
-    let workspace = test_workspace(cx);
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
-            workspace.open_deal_mode(window, cx);
-        })
-        .unwrap();
-    cx.run_until_parked();
-    let dealt = workspace
-        .update(cx, |workspace, _, _| {
-            assert!(workspace.dashboard_deal_mode_for_test());
-            workspace.current_surface_name_for_test()
-        })
-        .unwrap();
-    let editor = active_editor(&workspace, cx);
-    assert!(
-        cx.update(|cx| vim::editor_in_deal_mode(&editor, cx)),
-        "the dealt editor is in DEAL before escape"
-    );
-
-    cx.dispatch_action(*workspace, crate::DealLeave);
-    cx.run_until_parked();
-
-    assert!(
-        !cx.update(|cx| vim::editor_in_deal_mode(&editor, cx)),
-        "escape leaves DEAL for normal"
-    );
-    workspace
-        .update(cx, |workspace, _, _| {
-            assert!(
-                !workspace.dashboard_deal_mode_for_test(),
-                "the dealer's own state ends with the mode"
-            );
-            assert_eq!(
-                workspace.current_surface_name_for_test(),
-                dealt,
-                "the surface stays where the reader left it"
-            );
-        })
-        .unwrap();
-
-    // And the next deal is a fresh one rather than a mode that never ended.
-    workspace
-        .update(cx, |workspace, window, cx| {
-            workspace.open_deal_mode(window, cx);
-            assert!(
-                workspace.dashboard_deal_mode_for_test(),
-                "ctrl-j after escape deals the next card, not a stuck mode"
             );
         })
         .unwrap();
@@ -4492,6 +4405,162 @@ fn deal_file_bare_enter_files_the_dealt_node_under_the_offered_heading(cx: &mut 
         .unwrap();
 }
 
+/// One tap of `shift` is the verdicts, over the card in view, and the
+/// letters they used to steal stay vim's. This is the whole of the change:
+/// the tap opens a menu that says what the keys are, and `d` in it writes
+/// exactly what deal mode's `d` wrote.
+#[gpui::test]
+fn a_tap_of_shift_opens_the_verdicts_over_the_card_in_view(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    let dealt = desk.due_note(None, "Card in view");
+
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.open_deal_mode(window, cx);
+            workspace.take_host_messages_for_test(HostId::default());
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes(*workspace, "shift");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                workspace.verdict_transient_open(),
+                "a tap of shift over a card opens the verdicts"
+            );
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "d");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(!workspace.verdict_transient_open(), "the menu closes on d");
+            let mutation = take_desk_mutation(workspace, HostId::default()).expect("done mutation");
+            assert!(mutation.writes.iter().any(|write| write.id == dealt
+                && write.property
+                    == rho_desk::cells::Property::State(rho_desk::cells::State::Done)));
+        })
+        .unwrap();
+}
+
+/// Snooze end to end through the transient. It was an operator in deal
+/// mode, `ss` for a day and `45sm` for forty-five minutes; the count now
+/// goes inside the menu, where the units are written down, and lands on
+/// exactly the same time.
+#[gpui::test]
+fn a_snooze_goes_through_the_transient_with_its_count(cx: &mut TestAppContext) {
+    use crate::workspace::{SnoozeUnit, snooze_target};
+
+    cx.update(bind_test_keymaps);
+    // The keys as fingers type them, and the time the same span lands on
+    // when the workspace works it out for itself.
+    for (keys, unit, count) in [
+        ("shift s s", SnoozeUnit::Days, 1usize),
+        ("shift s 7 d", SnoozeUnit::Days, 7),
+        ("shift s 4 5 m", SnoozeUnit::Minutes, 45),
+    ] {
+        // A card apiece: a verdict waits on the daemon before the deal
+        // moves on, so one desk cannot hold three of them.
+        let mut desk = DeskFixture::new();
+        desk.due_note(None, "Card to snooze");
+        let workspace = test_workspace(cx);
+        workspace
+            .update(cx, |workspace, window, cx| {
+                workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+                workspace.open_deal_mode(window, cx);
+                workspace.take_host_messages_for_test(HostId::default());
+            })
+            .unwrap();
+        cx.run_until_parked();
+
+        let (expected, said) = snooze_target(unit, count as i64, chrono::Local::now());
+        cx.simulate_keystrokes(*workspace, keys);
+        cx.run_until_parked();
+        workspace
+            .update(cx, |workspace, _, _| {
+                assert!(
+                    !workspace.verdict_transient_open(),
+                    "{keys}: the menu closes once the unit lands"
+                );
+                let mutation = take_desk_mutation(workspace, HostId::default())
+                    .unwrap_or_else(|| panic!("{keys}: snooze mutation"));
+                let wrote = mutation
+                    .writes
+                    .iter()
+                    .find_map(|write| match &write.property {
+                        rho_desk::cells::Property::DeferUntil(Some(at)) => Some(*at),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| panic!("{keys}: a snooze writes a wake time"));
+                assert_eq!(wrote.precision, expected.precision, "{keys}");
+                // A minute count is worked out twice a moment apart, so the
+                // two answers differ by the time the test itself took.
+                assert!(
+                    (wrote.unix_ms - expected.unix_ms).abs() < 5_000,
+                    "{keys}: woke at {wrote:?}, expected about {expected:?}"
+                );
+                // The words the bar will say once the daemon takes it.
+                assert_eq!(
+                    workspace.pending_verdict_echo_for_test(),
+                    Some(format!("{said}: Card to snooze").as_str()),
+                    "{keys}"
+                );
+            })
+            .unwrap();
+    }
+}
+
+/// The second tap of `shift` is Home: the first tap put the verdicts on
+/// screen and the menu's own `shift` row says the next one leaves. There
+/// is no timer on it, unlike the old double tap, because the menu is on
+/// screen saying what it does.
+#[gpui::test]
+fn a_second_tap_of_shift_leaves_the_card_for_home(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    desk.due_note(None, "Card in view");
+
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.open_deal_mode(window, cx);
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes(*workspace, "shift");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(workspace.verdict_transient_open());
+            assert_ne!(workspace.current_surface_name_for_test(), "home");
+        })
+        .unwrap();
+
+    cx.simulate_keystrokes(*workspace, "shift");
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                !workspace.verdict_transient_open(),
+                "the second tap closes the verdicts"
+            );
+            assert_eq!(
+                workspace.current_surface_name_for_test(),
+                "home",
+                "and leaves the card for Home"
+            );
+        })
+        .unwrap();
+}
+
 /// A snoozed todo comes back from zero: the pace it climbed at before goes
 /// with the verdict, or the card would return already halfway up the curve.
 #[gpui::test]
@@ -6450,7 +6519,7 @@ fn every_key_in_the_slack_table_is_bound(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn deal_keys_reach_a_dealt_slack_conversation(cx: &mut TestAppContext) {
+fn a_slack_card_is_read_with_the_conversations_own_keys(cx: &mut TestAppContext) {
     use gpui::{KeyContext, Keystroke};
 
     cx.update(bind_test_keymaps);
@@ -6477,32 +6546,9 @@ fn deal_keys_reach_a_dealt_slack_conversation(cx: &mut TestAppContext) {
                 .first()
                 .map(|binding| binding.action().name())
         };
-        // A conversation puts its editor a level deeper than the deal keys'
-        // plain `Editor` context, and the bundled vim keymap binds `d` and
-        // `s` up there: without a binding at this depth the deal keys are
-        // lost on a dealt conversation.
-        let dealt = [
-            KeyContext::parse("RhoGui").unwrap(),
-            KeyContext::parse("RhoGuiDeal").unwrap(),
-            KeyContext::parse("RhoSlackConversation").unwrap(),
-            KeyContext::parse("Editor VimDeal VimControl vim_mode=normal vim_operator=none")
-                .unwrap(),
-        ];
-        assert_eq!(routes("d", &dealt), Some("rho_gui::DashboardDealDone"));
-        // `s` waits for its unit here too, so the vim keymap's own `s` never
-        // gets the key on a dealt conversation.
-        assert_eq!(
-            routes_all("s d", &dealt),
-            Some("rho_gui::DashboardDealSnooze")
-        );
-        assert_eq!(
-            routes_all("s h", &dealt),
-            Some("rho_gui::DashboardDealSnoozeHours")
-        );
-        assert_eq!(routes("i", &dealt), Some("rho_gui::DashboardDealInsert"));
-        assert_eq!(routes("escape", &dealt), Some("rho_gui::DealLeave"));
-
-        // Outside a deal the conversation keeps its own keys.
+        // A Slack card is read with the conversation's own keys: deal mode
+        // used to take `d`, `s` and `i` from it, and the verdicts are in the
+        // transient now.
         let reading = [
             KeyContext::parse("RhoGui").unwrap(),
             KeyContext::parse("RhoSlackConversation").unwrap(),

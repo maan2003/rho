@@ -132,7 +132,6 @@ actions!(
         SurfaceBack,
         DealOpen,
         DealCloseAndNext,
-        DealLeave,
         OverviewToggle,
         SurfaceClose,
         ZulipNextUnread,
@@ -554,63 +553,20 @@ pub fn bind_rho_key_overrides(cx: &mut App) {
             KeyBinding::new("shift-u", UndoVerdict, Some(context)),
         ]);
     }
-    // A surface with a key context of its own puts the dealt editor deeper
-    // than `Editor`, and the bundled vim keymap binds these same keys one
-    // level up: without a binding at the surface's own depth vim wins and
-    // the deal keys do nothing there.
+    // Vim is vim on every surface: a card is read, searched and yanked like
+    // any buffer, and the verdicts live in the transient one tap of `shift`
+    // opens. `shift-u` stays a key of its own because undoing a verdict is
+    // the same verb whether or not the card is still on screen.
     for context in [
-        "RhoGuiDeal > RhoBrowser",
-        "RhoGui > Editor && VimDeal && vim_operator == none",
-        "RhoGui > RhoDashboard > Editor && VimDeal && vim_operator == none",
-        "RhoDashboard > Editor && VimDeal && vim_operator == none",
-        "RhoSlackConversation > Editor && VimDeal && vim_operator == none",
-        "RhoSlackList > Editor && VimDeal && vim_operator == none",
-        "Editor && VimDeal && vim_operator == none",
-        "VimDeal && vim_operator == none",
+        "RhoGui > Editor",
+        "RhoGui > RhoDashboard > Editor",
+        "RhoDashboard > Editor",
+        "RhoSlackConversation > Editor",
+        "RhoSlackList > Editor",
     ] {
-        cx.bind_keys([
-            // Deal mode refuses ordinary mode switches, so vim's own escape
-            // is dropped inside it: this is the deliberate way out, and it
-            // is the workspace's, not vim's, because a dealt surface is not
-            // always an editor.
-            KeyBinding::new("escape", DealLeave, Some(context)),
-            KeyBinding::new("q", SurfaceClose, Some(context)),
-            KeyBinding::new("d", DashboardDealDone, Some(context)),
-            KeyBinding::new("x", DashboardDealMute, Some(context)),
-            // Snooze is an operator: `s` waits for its unit, vim style, so
-            // `45sm` is 45 minutes and `sw` a week. `ss` is the default day,
-            // which is what the bare key used to do.
-            KeyBinding::new("s m", DashboardDealSnoozeMinutes, Some(context)),
-            KeyBinding::new("s h", DashboardDealSnoozeHours, Some(context)),
-            KeyBinding::new("s d", DashboardDealSnooze, Some(context)),
-            KeyBinding::new("s s", DashboardDealSnooze, Some(context)),
-            KeyBinding::new("s w", DashboardDealSnoozeWeeks, Some(context)),
-            KeyBinding::new("shift-s", DashboardDealRoomSnooze, Some(context)),
-            KeyBinding::new("t", DashboardDealTodo, Some(context)),
-            KeyBinding::new("i", DashboardDealInsert, Some(context)),
-            KeyBinding::new("a", DashboardDealAppend, Some(context)),
-            KeyBinding::new("o", DashboardDealOpenLine, Some(context)),
-            KeyBinding::new("f", DashboardDealFile, Some(context)),
-        ]);
-    }
-    // Every dealt surface, whatever it is: a browser page and a picture have
-    // no vim mode to leave, and escape must still end the deal.
-    cx.bind_keys([KeyBinding::new("escape", DealLeave, Some("RhoGuiDeal"))]);
-    cx.bind_keys([KeyBinding::new(
-        "shift-u",
-        UndoVerdict,
-        Some("RhoGuiDeal > RhoBrowser"),
-    )]);
-    for context in [
-        "RhoGui > Editor && VimDeal && vim_operator == none",
-        "RhoGui > RhoDashboard > Editor && VimDeal && vim_operator == none",
-        "RhoDashboard > Editor && VimDeal && vim_operator == none",
-        "RhoSlackConversation > Editor && VimDeal && vim_operator == none",
-        "RhoSlackList > Editor && VimDeal && vim_operator == none",
-        "Editor && VimDeal && vim_operator == none",
-        "VimDeal && vim_operator == none",
-    ] {
-        let context = format!("{context} && (vim_mode == normal || vim_mode == helix_normal)");
+        let context = format!(
+            "{context} && vim_operator == none && (vim_mode == normal || vim_mode == helix_normal)"
+        );
         cx.bind_keys([KeyBinding::new("shift-u", UndoVerdict, Some(&context))]);
     }
 }

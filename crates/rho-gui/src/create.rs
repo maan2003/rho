@@ -77,28 +77,7 @@ impl Workspace {
         if let Some(node) = self.dashboard.tree_node_at_cursor(cx) {
             return Some(node);
         }
-        let card = match &self.active_pane().surface.key {
-            crate::pane::SurfaceKey::DeskNode { host, node_id } => {
-                Some(crate::dashboard::DealCardId {
-                    host: *host,
-                    node_id: node_id.clone(),
-                })
-            }
-            crate::pane::SurfaceKey::Transcript(agent_id)
-            | crate::pane::SurfaceKey::Shell(agent_id)
-            | crate::pane::SurfaceKey::Diff { agent_id }
-            | crate::pane::SurfaceKey::File { agent_id, .. }
-            | crate::pane::SurfaceKey::Terminal { agent_id, .. } => {
-                self.dashboard.agent_card_id(*agent_id)
-            }
-            crate::pane::SurfaceKey::Browser(page) => self.dashboard.page_card_id(*page),
-            crate::pane::SurfaceKey::SlackConversation(rho_slack::session::Source::Thread(key)) => {
-                self.dashboard
-                    .thread_card_id(&crate::slack::store_unit_of(key))
-            }
-            _ => None,
-        }?;
-        Some((card.host, card.node_id))
+        self.surface_node()
     }
 
     fn areas(&self, context: Option<(HostId, rho_desk::cells::Id)>, cx: &App) -> Vec<Area> {

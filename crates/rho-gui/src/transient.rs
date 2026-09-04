@@ -40,6 +40,9 @@ pub struct TransientItem {
 pub struct Transient {
     title: &'static str,
     items: Vec<TransientItem>,
+    /// Digits typed here are a count for the next item rather than keys of
+    /// their own, vim style: `45 m` is forty-five minutes.
+    counted: bool,
     quota_usage: Option<Vec<rho_ui_proto::QuotaSeries>>,
     active_auth_namespaces: Vec<String>,
     global_usage: Option<Vec<rho_ui_proto::AgentUsageSeries>>,
@@ -52,6 +55,7 @@ impl Transient {
         Self {
             title,
             items: Vec::new(),
+            counted: false,
             quota_usage: None,
             active_auth_namespaces: Vec::new(),
             global_usage: None,
@@ -62,6 +66,16 @@ impl Transient {
 
     pub fn title(&self) -> &'static str {
         self.title
+    }
+
+    /// Digits are counts in this menu, not items.
+    fn counted(mut self) -> Self {
+        self.counted = true;
+        self
+    }
+
+    pub(crate) fn takes_count(&self) -> bool {
+        self.counted
     }
 
     pub(crate) fn phone_rows(&self) -> Vec<(String, String, Option<String>)> {
@@ -141,7 +155,12 @@ impl Transient {
 
     /// Magit's layout: a title line, then items flowing down short columns
     /// so the eye scans vertically. Keys align in their own sub-column.
-    pub fn render(&self, text_style: &gpui::TextStyle, cx: &Context<Workspace>) -> AnyElement {
+    pub fn render(
+        &self,
+        count: Option<usize>,
+        text_style: &gpui::TextStyle,
+        cx: &Context<Workspace>,
+    ) -> AnyElement {
         const COLUMN_ROWS: usize = 4;
         let colors = cx.theme().colors();
         let accent = colors.text_accent;
@@ -564,8 +583,17 @@ impl Transient {
             .child(
                 div()
                     .px_2()
-                    .font_weight(gpui::FontWeight::BOLD)
-                    .child(self.title),
+                    .flex()
+                    .gap_2()
+                    .child(div().font_weight(gpui::FontWeight::BOLD).child(self.title))
+                    // Digits typed for the next item are otherwise invisible:
+                    // `45 m` looks the same as `m` until the snooze lands.
+                    .children(count.map(|count| {
+                        div()
+                            .text_color(accent)
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child(count.to_string())
+                    })),
             )
             .child(
                 div()
@@ -597,6 +625,69 @@ fn display_key(spec: &str) -> String {
         Some(rest) => rest.to_uppercase(),
         None => spec.to_owned(),
     }
+}
+
+/// One tap of `shift` — the verdicts, on the card in view. Deal mode used
+/// to take `d`, `x`, `s`, `t` and `f` from every dealt surface, so a card
+/// could not be read, searched or yanked like the buffer it is; the keys
+/// live here instead and vim keeps its own everywhere. `shift` again is
+/// Home, which is what the old double tap did.
+pub fn verdict_menu() -> Transient {
+    Transient::new("verdict")
+        .item("d", "done", |workspace, window, cx| {
+            workspace.verdict_done(window, cx);
+        })
+        .item("x", "mute", |workspace, window, cx| {
+            workspace.verdict_mute(window, cx);
+        })
+        .item("s", "snooze…", |workspace, window, cx| {
+            workspace.open_transient(verdict_snooze_menu(), window, cx);
+        })
+        .item("shift-s", "snooze the room…", |workspace, window, cx| {
+            let count = workspace.take_transient_count();
+            workspace.verdict_room_snooze(count, window, cx);
+        })
+        .item("t", "todo", |workspace, window, cx| {
+            let count = workspace.take_transient_count();
+            workspace.verdict_todo(count, window, cx);
+        })
+        .item("f", "file…", |workspace, window, cx| {
+            workspace.prompt_file_deal_card(window, cx);
+        })
+        .item("u", "undo the last verdict", |workspace, window, cx| {
+            workspace.undo_verdict(window, cx);
+        })
+        .item("j", "open the top card", |workspace, window, cx| {
+            workspace.cmd_surface_forward_or_deal(window, cx);
+        })
+        .counted()
+}
+
+/// The snooze unit, after a count: `45 m`, `3 h`, `7 d`, `w`, and `s` for
+/// the day the bare key used to mean.
+fn verdict_snooze_menu() -> Transient {
+    Transient::new("snooze")
+        .item("s", "a day", |workspace, window, cx| {
+            workspace.take_transient_count();
+            workspace.deal_snooze(crate::workspace::SnoozeUnit::Days, None, window, cx);
+        })
+        .item("m", "minutes", |workspace, window, cx| {
+            let count = workspace.take_transient_count();
+            workspace.deal_snooze(crate::workspace::SnoozeUnit::Minutes, count, window, cx);
+        })
+        .item("h", "hours", |workspace, window, cx| {
+            let count = workspace.take_transient_count();
+            workspace.deal_snooze(crate::workspace::SnoozeUnit::Hours, count, window, cx);
+        })
+        .item("d", "days", |workspace, window, cx| {
+            let count = workspace.take_transient_count();
+            workspace.deal_snooze(crate::workspace::SnoozeUnit::Days, count, window, cx);
+        })
+        .item("w", "weeks", |workspace, window, cx| {
+            let count = workspace.take_transient_count();
+            workspace.deal_snooze(crate::workspace::SnoozeUnit::Weeks, count, window, cx);
+        })
+        .counted()
 }
 
 /// `space` — the root menu: every leader chord lives here (or one level
