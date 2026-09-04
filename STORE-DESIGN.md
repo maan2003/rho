@@ -263,15 +263,18 @@ Recommended 4 Sep, corrected the same day by the user, not built. Per
 agent, three things: the run config (workdirs, role, runtime, created
 at, current lineage, the rewind marker, spawned by, and the name given
 at spawn when one was, so no title is generated for it), the raw event
-log, and a head: a small derived summary the daemon keeps current as
-events land, the latest position, what the last event was and whether
-it wants the user, the generated title, and the usage totals. The head
-is what the old record's activity, updated at, and last-message columns
-were for, computing attention without loading a log, and the client
-needs exactly the same thing, so the daemon publishes every agent's
-head eagerly (that is the agents list) and the projected log lazily,
-on open or on demand. A title or a cost total therefore never waits on
-a log sync. The lineage table stays. Daemon-wide: the machine identity
+log, and a head: the latest position, the generated title, and the
+usage totals, nothing the daemon had to judge. Whether an agent wants
+the user is the client's derivation from the projected log's tail, and
+the client keeps it in a cache of its own per agent (the user, 4 Sep),
+so the daemon never computes attention; the head is what the old
+record's activity, updated at, and last-message columns were for,
+knowing where an agent is without loading its log. The daemon
+publishes every head eagerly (that is the agents list) and the
+projected log as "segments since the position you hold", which for an
+idle agent is nothing and for a busy one is its new tail, so the
+client's cache is current on connect without a whole-log sync; older
+history loads on open. A title or a cost total never waits on a log. The lineage table stays. Daemon-wide: the machine identity
 and iroh secret, the trust list, provider secrets, quota observations
 from providers, the counters and format markers, and, later, the held
 sync segments. Gone from the daemon: every `rho_desk_*` table once the
@@ -314,8 +317,10 @@ agent-wants tag; cancelled, rewound, compacted, renamed; cost per turn.
 Tool output, diffs, and the model's raw exchange stay on the host and
 are fetched on demand when the user opens that call, the way a Slack
 picture's bytes are. A projected log is small, but it is still one per
-agent, so it syncs lazily, on open or on demand, and the eager part is
-the head above: Home, Find, and the map read heads and never a log. Every host is
+agent, so only its new tail past the client's position moves on
+connect and older history loads on open; the eager part is the head
+above plus the client's own per-agent cache of what it derived (wants
+the user, last speaker, wait), which Home, Find, and the map read. Every host is
 then a peer that publishes its agents' event logs, and a GUI is a peer
 that publishes its device log.
 
