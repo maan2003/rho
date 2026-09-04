@@ -55,8 +55,10 @@ Two shapes of property, decided per variant:
   the derived title, so renaming an agent, a Slack unit, or a page is a
   store write that syncs, not a request to the daemon), `State(State)`,
   `DeferUntil(Timestamp)`,
-  `Deadline(Timestamp)`, `PaceDays(u32)`, `HandledThrough(Ts)` (Slack,
-  the verdict cursor), `Deleted(bool)`, `CreatedAt(Timestamp)`.
+  `Deadline(Timestamp)`, `PaceDays(u32)`, `SlackHandledThrough(Ts)` and
+  `AgentHandledThrough(AgentEventPos)` (the verdict cursors, one per
+  source, at that source's own position), `Deleted(bool)`,
+  `CreatedAt(Timestamp)`.
 - Many per subject, one boolean LWW cell per payload: the store key is the
   subject, the variant, and the payload; the cell says present or absent.
   `Labeled(Id::Label)` (the tag rule as today: opposing writes at the
@@ -162,9 +164,19 @@ never sees the id.
 
 ### Verdicts write facts
 
-`d` done: `state := done`; for a Slack unit, `handled_through := newest`.
-`x` discard: `state := dismissed`, plus the source's own silence where it
-has one (a thread unfollowed, a conversation marked read). `s` snooze:
+Anything backed by a source is closed by a cursor at that source's own
+position, never by a state: `d` on a Slack unit writes
+`SlackHandledThrough(newest)`, `d` on an agent writes
+`AgentHandledThrough(the position of its latest event)`. The card is
+open again the moment the source has an event that wants the user past
+the cursor (a reply from them, an agent turn ending on a question or a
+tag), with a fresh wait; the user's own message to either never reopens
+anything. No wall clock from one system is ever compared with another's.
+`State(Done)` is for what nothing external can reopen: notes and labels.
+`x` discard: the cursor, plus `state := dismissed` so the thing stays out
+of Home even when it speaks again until the user opens it, plus the
+source's own silence where it has one (a thread unfollowed, a
+conversation marked read). `s` snooze:
 `defer_until`. `t` todo: as today, plus for Slack the cursor. `f` file:
 `parent := the chosen id`, any id, picked with Find. `l` label:
 `labeled += the chosen label`, created if new. `u` undo: the log entry
