@@ -112,6 +112,10 @@ fn seed_reference_group(fake: &Fake, at: &dyn Fn(i64, i64, i64) -> String) {
         "{}/thumbs/image.png",
         fake.api_base().trim_end_matches("/api")
     );
+    let tall = format!(
+        "{}/files/tall.png",
+        fake.api_base().trim_end_matches("/api")
+    );
     let say = |ts: String, user: &str, text: &str| {
         fake.add_message(GROUP, json!({"ts": ts, "user": user, "text": text}))
     };
@@ -230,6 +234,27 @@ fn seed_reference_group(fake: &Fake, at: &dyn Fn(i64, i64, i64) -> String) {
                 "original_w": 320,
                 "original_h": 200,
                 "thumb_64": thumb.clone(),
+            }],
+        }),
+    );
+
+    // The same, but a picture Slack never measured: no `original_w`, no
+    // `original_h`, no thumbnail. What a real DM upload often looks like,
+    // and what 1.25 is about.
+    fake.add_message(
+        GROUP,
+        json!({
+            "ts": at(3, 9, 44),
+            "user": "UD",
+            "text": "and one it never measured",
+            "files": [{
+                "id": "F2",
+                "name": "tall.png",
+                "title": "tall.png",
+                "mimetype": "image/png",
+                "filetype": "png",
+                "size": 196_608,
+                "url_private": tall.clone(),
             }],
         }),
     );

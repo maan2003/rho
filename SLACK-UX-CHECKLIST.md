@@ -3,10 +3,8 @@
 Reconciled against main on 3 Sep. Genuinely open, in order:
 
 - 2.18 Slack out of the tree, the unit model (decided 4 Sep). Comes after
-  1.25 and the verdict transient (`HOME-DESIGN.md`, no deal mode), and
-  folds in the native tree store deletion (`rho desk cat/checkout`).
-- 1.25 a picture paints over the messages under it in a real DM, and the
-  file name and size line goes (reported from real use, 4 Sep, screenshot).
+  the verdict transient (`HOME-DESIGN.md`, no deal mode), and folds in the
+  native tree store deletion (`rho desk cat/checkout`).
 - 1.13 avatars (waits on the editor's inline-image inlay), 1.22 rough edges
   (b) soft-wrap column waits on the vendored editor.
 
@@ -232,7 +230,7 @@ done right after the transcript primitive (2.4) and before 2.10:
       `name: body`, so there is no client-side lever to make it two columns.
       It wants a minimum soft-wrap indent per editor; b8os does not touch
       the vendored editor.
-- [ ] 1.25 A picture paints over the messages under it. Reported by the
+- [x] 1.25 A picture paints over the messages under it. Reported by the
       user on 4 Sep from a real DM on the latest GUI (screenshot): a
       192 KB `image.png` is drawn about fifteen rows tall while its block
       reserves far fewer, so the next four messages and the composer
@@ -245,6 +243,19 @@ done right after the transcript primitive (2.4) and before 2.10:
       just the picture; a non-image file keeps its name as the thing to
       open. Rig: the fake serves one file without dimensions and one
       with; screenshot both, rows below the picture untouched.
+      Landed 4 Sep. The cause: gpui reads the aspect ratio off the bytes
+      and lets it override a height that disagrees, so a picture Slack
+      never measured, asked for at the box's own shape, painted its full
+      height over everything under it. A measured picture is still asked
+      for at the size the box was built from, which is its own shape and
+      so agrees; an unmeasured one is asked for by height alone, with the
+      width left to the bytes and capped at the box, and the block clips
+      whatever is left. Rows below cannot move either way. The name and
+      size line is gone for pictures: the box hangs under what the message
+      said rather than under a caption, and a picture is opened by
+      clicking it. A file that is not a picture keeps its line as the
+      thing to open. Screens `125-05` (unmeasured, whole, rows intact) and
+      `125-06` (measured).
 - [x] 1.23 Images load without flicker. Landed 3 Sep as a fixed-size
       block filled by Slack's thumbnail, not an inlay and not a blur filter
       (gpui has none for images). Original: Seen by the user on 3 Sep: an

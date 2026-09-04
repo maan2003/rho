@@ -26,7 +26,7 @@ use theme::ActiveTheme as _;
 
 use crate::model::Model;
 use crate::session::{Session, Source, Update};
-use crate::types::{CELL_ASPECT, FileSummary, IMAGE_COLUMNS, Message, ThreadKey, Ts};
+use crate::types::{CELL_ASPECT, FileSummary, IMAGE_COLUMNS, IMAGE_ROWS, Message, ThreadKey, Ts};
 use crate::ui::{Class, Hooks, Span, clock_time, crosses_day, day_label, lay_out};
 
 /// The composer's placeholder, which is the only custom inlay this surface
@@ -226,6 +226,10 @@ struct LineMeta {
     /// The URL the line stands for. The text shows a link's label alone, so
     /// this is the only place the address survives for `enter` to open.
     link: Option<String>,
+    /// The pictures that hang under this line. A picture has no line of its
+    /// own — it is the whole of what it has to say — so the message's last
+    /// line before its reactions carries them.
+    images: Vec<FileSummary>,
 }
 
 type Rendered = Item<Row, Class, LineMeta>;
@@ -1305,7 +1309,7 @@ impl ConversationView {
         }
         self.awaiting_images
             .retain(|(waiting, _)| waiting != &message.ts);
-        for (line, file) in images {
+        for (order, (line, file)) in images.into_iter().enumerate() {
             let ready = self.session.update(cx, |session, cx| {
                 // The thumbnail is asked for alongside the picture: it is
                 // what stands in the box until the picture lands.
@@ -1323,6 +1327,7 @@ impl ConversationView {
             }
             item.blocks.push(image_block(
                 line,
+                order,
                 file,
                 self.session.downgrade(),
                 cx.entity().downgrade(),
@@ -1646,10 +1651,7 @@ fn image_boxes(item: &Rendered) -> Vec<(u32, &FileSummary)> {
     item.lines
         .iter()
         .enumerate()
-        .filter_map(|(line, meta)| {
-            let file = meta.file.as_ref().filter(|file| file.is_image())?;
-            Some((line as u32, file))
-        })
+        .flat_map(|(line, meta)| meta.images.iter().map(move |file| (line as u32, file)))
         .collect()
 }
 
@@ -1681,6 +1683,7 @@ fn drawn_size(
 /// the cache each time it draws, so the surface only asks for a redraw.
 fn image_block(
     line: u32,
+    order: usize,
     file: FileSummary,
     session: gpui::WeakEntity<Session>,
     view: gpui::WeakEntity<ConversationView>,
@@ -1714,8 +1717,23 @@ fn image_block(
             // it to what it drew, so a thumbnail allowed to be its own tiny
             // self would shrink the box and move every row under it.
             let (width, height) = drawn_size(&file, box_width, box_height);
+            let measured = file.original_w > 0 && file.original_h > 0;
             let inside = match picture {
-                Some(path) => gpui::img(path).w(width).h(height).into_any_element(),
+                // A picture Slack measured is asked for at the size the box
+                // was built from, which is its own shape, so what is asked
+                // for and what the bytes turn out to be agree.
+                //
+                // One Slack never measured is asked for by height alone.
+                // gpui takes the aspect ratio from the bytes and lets it
+                // override a width or height that disagrees, so a tall
+                // picture given the box's own shape paints past the block
+                // and over the messages under it. Height is the side that
+                // must not give, so it is the side that is spelled out.
+                Some(path) if measured => gpui::img(path).w(width).h(height).into_any_element(),
+                Some(path) => gpui::img(path)
+                    .h(box_height)
+                    .max_w(box_width)
+                    .into_any_element(),
                 // Nothing cached yet, not even the thumbnail: an empty box
                 // of the right size, which still holds the rows below it.
                 None => div()
@@ -1728,6 +1746,8 @@ fn image_block(
                 .flex()
                 .items_start()
                 .h(box_height)
+                // Nothing a picture does may reach the rows under it.
+                .overflow_hidden()
                 .font_family(style.font_family.clone())
                 .text_size(style.font_size)
                 .child(" ".repeat(BODY_INDENT))
@@ -1743,7 +1763,7 @@ fn image_block(
                 )
                 .into_any_element()
         }),
-        priority: 0,
+        priority: order,
     }
 }
 
@@ -1770,6 +1790,7 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
             thread,
             file: None,
             link: None,
+            images: Vec::new(),
         });
         return item(Row::Message(message.ts.clone()), spans, lines);
     }
@@ -1808,6 +1829,7 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
             .find(|file| line.trim() == file.line())
             .cloned(),
         link: link_on(line, &links),
+        images: Vec::new(),
     };
     lines.extend(said.split('\n').map(&meta));
     if !chrome.is_empty() {
@@ -1820,6 +1842,17 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
         spans.push(Span::plain("\n"));
         lines.extend(text.split('\n').map(&meta));
     }
+    // The pictures hang under everything the message said and named, and
+    // above its reactions and its thread line: those are about the message,
+    // and a picture is part of it.
+    if let Some(last) = lines.last_mut() {
+        last.images = message
+            .files
+            .iter()
+            .filter(|file| file.is_image())
+            .cloned()
+            .collect();
+    }
 
     if !message.reactions.is_empty() {
         spans.push(Span::plain(indent.clone()));
@@ -1828,6 +1861,7 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
             thread: thread.clone(),
             file: None,
             link: None,
+            images: Vec::new(),
         });
     }
     if !in_thread && message.is_broadcast() {
@@ -1841,6 +1875,7 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
             thread: thread.clone(),
             file: None,
             link: None,
+            images: Vec::new(),
         });
     }
     // The thread under a message is one line, not a fold-out: the reader
@@ -1854,6 +1889,7 @@ fn message_item(message: &Message, model: &Model, in_thread: bool) -> Rendered {
             thread,
             file: None,
             link: None,
+            images: Vec::new(),
         });
     }
     item(Row::Message(message.ts.clone()), spans, lines)
@@ -2987,14 +3023,14 @@ mod tests {
         let with_file = parsed(json!({
             "ts": "1700000000.0",
             "user": "U1",
-            "text": "here is the mock",
+            "text": "here is the deck",
             "files": [{
                 "id": "F1",
-                "name": "image.png",
-                "title": "image.png",
-                "filetype": "png",
+                "name": "deck.pdf",
+                "title": "deck.pdf",
+                "filetype": "pdf",
                 "size": 225_280,
-                "url_private": "https://files.example.com/image.png",
+                "url_private": "https://files.example.com/deck.pdf",
             }],
         }));
         let (text, _, _) = render_messages(&[with_file], &model(), false);
@@ -3004,11 +3040,11 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(timed.len(), 1, "one time, on one line: {text}");
         assert!(
-            timed[0].contains("here is the mock"),
+            timed[0].contains("here is the deck"),
             "the time trails what was said: {text}"
         );
         assert!(
-            text.lines().any(|line| line.trim() == "image.png · 220 KB"),
+            text.lines().any(|line| line.trim() == "deck.pdf · 220 KB"),
             "the file line carries no time of its own: {text}"
         );
     }
@@ -3032,15 +3068,58 @@ mod tests {
         }));
         let item = message_item(&with_file, &model(), false);
         let boxes = image_boxes(&item);
-        assert_eq!(boxes.len(), 1, "one box, under the line that names it");
+        assert_eq!(boxes.len(), 1, "one box, under what the message said");
         let (line, file) = boxes[0];
-        assert_eq!(
-            item.text.lines().nth(line as usize).map(str::trim),
-            Some("image.png · 220 KB")
+        // A picture is just the picture: no name, no size, nothing but the
+        // words it was sent with for it to hang under.
+        assert!(
+            !item.text.contains("image.png"),
+            "a picture names itself nowhere: {}",
+            item.text
+        );
+        assert!(
+            item.text
+                .lines()
+                .nth(line as usize)
+                .is_some_and(|line| line.contains("here is the mock")),
+            "the box hangs under the message: {}",
+            item.text
         );
         // Nothing here consulted the cache, which is why the arrival of the
         // bytes cannot change the height and cannot move the rows below.
         assert_eq!(file.image_rows(), 4);
+    }
+
+    /// 1.25: a picture Slack never measured. The block still decides the
+    /// size on its own, and the drawn picture is held inside it whatever
+    /// shape the bytes turn out to be.
+    #[test]
+    fn a_picture_with_no_dimensions_is_held_inside_its_block() {
+        let unmeasured = parsed(json!({
+            "ts": "1700000000.0",
+            "user": "U1",
+            "text": "and one it never measured",
+            "files": [{
+                "id": "F2",
+                "name": "tall.png",
+                "title": "tall.png",
+                "filetype": "png",
+                "size": 196_608,
+                "url_private": "https://files.example.com/tall.png",
+            }],
+        }));
+        let item = message_item(&unmeasured, &model(), false);
+        let boxes = image_boxes(&item);
+        assert_eq!(boxes.len(), 1);
+        let file = boxes[0].1;
+        // No numbers from Slack, so the box is the cap and nothing else.
+        assert_eq!(file.image_rows(), IMAGE_ROWS);
+        let (box_width, box_height) = (gpui::px(480.), gpui::px(240.));
+        let (width, height) = drawn_size(file, box_width, box_height);
+        assert!(
+            width <= box_width && height <= box_height,
+            "the picture is asked for no larger than its box: {width:?} {height:?}"
+        );
     }
 
     #[test]
@@ -3048,21 +3127,21 @@ mod tests {
         let with_file = parsed(json!({
             "ts": "1700000000.0",
             "user": "U1",
-            "text": "here is the mock",
+            "text": "here is the deck",
             "files": [{
                 "id": "F1",
-                "name": "image.png",
-                "title": "image.png",
-                "filetype": "png",
+                "name": "deck.pdf",
+                "title": "deck.pdf",
+                "filetype": "pdf",
                 "size": 225_280,
-                "url_private": "https://files.example.com/image.png",
+                "url_private": "https://files.example.com/deck.pdf",
             }],
         }));
         let (text, styles, _) = render_messages(&[with_file], &model(), false);
         assert!(
             classed(&text, &styles, Class::Muted)
                 .iter()
-                .any(|span| span.trim() == "image.png · 220 KB"),
+                .any(|span| span.trim() == "deck.pdf · 220 KB"),
             "the name and size read as chrome, not as words someone said: {text}"
         );
     }

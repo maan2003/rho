@@ -77,9 +77,13 @@ pub fn render_parts(
         chrome.extend(render_attachment(attachment, names));
     }
     for file in files {
-        // A file is a thing the reader can open, named the way it would be
-        // in a shell: no placeholder, no id.
-        chrome.push(file.line());
+        // A picture is just the picture: its name and size say nothing the
+        // reader wanted, and the box under the message is the file. Anything
+        // else is a thing to open, named the way it would be in a shell: no
+        // placeholder, no id.
+        if !file.is_image() {
+            chrome.push(file.line());
+        }
     }
     // Shortcodes become glyphs last, so it happens once for blocks, plain
     // text, and attachment lines alike.

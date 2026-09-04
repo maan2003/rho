@@ -589,7 +589,14 @@ fn binary_route(path: &str, state: &Arc<Mutex<State>>) -> Option<Vec<u8>> {
             return Some(bytes.clone());
         }
         // A file is what a preview is judged on, so it is big enough to
-        // look at rather than a 16-pixel square.
+        // look at rather than a 16-pixel square. `tall.png` is the one a
+        // client is told nothing about: its bytes are a tall picture, so a
+        // box sized from the cap alone shows up as a box the picture does
+        // not fit.
+        if id == "tall.png" {
+            static TALL: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+            return Some(TALL.get_or_init(|| preview_png(400, 1000)).clone());
+        }
         static PREVIEW: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
         return Some(PREVIEW.get_or_init(|| preview_png(320, 200)).clone());
     }
@@ -748,6 +755,30 @@ fn apply_live(state: &mut State, frames: &broadcast::Sender<Frame>, request: &Va
             if request["mute"].as_bool().unwrap_or(true) {
                 state.muted.push(channel);
             }
+            return json!({"ok": true});
+        }
+        // A network blip: every socket closes and the client has to come
+        // back on its own. Nothing else about the workspace changes, which
+        // is what makes it a clean test of what a reconnect re-raises.
+        "drop_sockets" => {
+            let _ = frames.send(Frame::Close(None));
+            return json!({"ok": true});
+        }
+        // A feed entry for a thread, with the timestamps the caller chooses.
+        // Slack's feed can name a thread whose newest message is older than
+        // what rho already has, and that must not raise anything.
+        "feed" => {
+            let thread_ts = field("thread_ts");
+            let latest = match field("latest_ts").as_str() {
+                "" => thread_ts.clone(),
+                latest => latest.to_owned(),
+            };
+            state.feed.push(json!({
+                "is_unread": true,
+                "item": {"type": "thread_v2", "bundle_info": {"payload": {"thread_entry": {
+                    "channel_id": channel, "thread_ts": thread_ts, "latest_ts": latest,
+                }}}},
+            }));
             return json!({"ok": true});
         }
         "send_fail" => {
