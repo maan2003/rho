@@ -166,9 +166,11 @@ picking a thing instead of a label; one value, replaced. Find ranks a
 thing over its label paths and its parent path alike. The map shows
 the label tree with things under their labels, things under their
 parent thing, and the rest at the root. Workdir inheritance walks the
-parent chain as before; a label may carry a `Project(Id::File)`
-property so an agent made "in" `rho` inherits that project's workdir,
-the way a heading used to own one. The `Labeled` property, the
+parent chain as before; a label may carry a `Project { host, path }`
+property, the workdir itself, so an agent made "in" `rho` inherits it
+the way a heading used to own one. There is no separate project
+concept and no project id: a project is a label with a `Project`
+property (the user, 4 Sep). The `Labeled` property, the
 picker, and the map's label axis from slice 3 stay as built; what
 changes is that `f` writes `Labeled` for a label and `Parent` only for
 a thing, and the unbound label key is deleted rather than left waiting.
@@ -308,11 +310,10 @@ sync segments. Gone from the daemon: every `rho_desk_*` table once the
 user has restarted on the slice 1 build; the agent record's display
 name and parent (store facts: `Name`, `Parent`); the presentation
 cache in its current form (the head and the projection replace it);
-`view_config` (a client setting, store facts); `projects`, which become
-ids: a project is `Id::File { host, path }` with a `Name` and a
-`Project(true)` property, no new kind, and the host an agent runs on is
-not stored anywhere because the client learns it from which daemon
-published the agent.
+`view_config` (a client setting, store facts); `projects`, which become a
+`Project { host, path }` property on a label, no project id and no
+new kind, and the host an agent runs on is not stored anywhere because
+the client learns it from which daemon published the agent.
 
 ### Direction: the agent API is log replication plus one focus stream
 
