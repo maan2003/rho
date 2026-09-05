@@ -289,68 +289,13 @@ address exchange the punch needs, and the fallback for the rare pair of
 networks that will not punch; it is not the data path. The daemon's
 lasting sync role is the peer that holds while one side is away.
 
-### Direction: what the daemon stores in the end
+### Direction: agents as logs
 
-Recommended 4 Sep, corrected the same day by the user, not built. Per
-agent, two things: the raw event log, and a head. The run config lives
-in the log too (the user, 4 Sep): creation is the first event, carrying
-role, runtime, workdirs, spawned by, and the name given at spawn when
-one was (so no title is generated for it); a role change, a workdir
-added, a rewind, a compaction are events after it. There is no agent
-record. The head is the daemon's cache of the fold over the log: the
-latest position, the current config, the generated title, and the
-usage totals, nothing the daemon had to judge, rebuilt from the log if
-ever lost. Whether an agent wants
-the user is the client's derivation from the projected log's tail, and
-the client keeps it in a cache of its own per agent (the user, 4 Sep),
-so the daemon never computes attention; the head is what the old
-record's activity, updated at, and last-message columns were for,
-knowing where an agent is without loading its log. The daemon
-publishes every head eagerly (that is the agents list) and the
-projected log as "segments since the position you hold"; a client that
-has never seen an agent takes its whole projected log in the background
-(the user, 4 Sep: a one-time cost, and increments after that are tiny),
-so the mirror is complete and nothing loads on open. A title or a cost
-total never waits on a log. The lineage table folds into the log as well, since rewind is an
-appended event. Daemon-wide: the machine identity
-and iroh secret, the trust list, provider secrets, quota observations
-from providers, the counters and format markers, and, later, the held
-sync segments. Gone from the daemon: every `rho_desk_*` table once the
-user has restarted on the slice 1 build; the agent record's display
-name and parent (store facts: `Name`, `Parent`); the presentation
-cache in its current form (the head and the projection replace it);
-`view_config` (a client setting, store facts); `projects`, which become a
-`Project { host, path }` property on a label, no project id and no
-new kind, and the host an agent runs on is not stored anywhere because
-the client learns it from which daemon published the agent.
-
-### Direction: the agent API is log replication plus one focus stream
-
-Decided 4 Sep with the user, not built. Today the daemon must load an
-agent's runtime to render it, which is why the wire has per-agent
-subscribe and unsubscribe, idle unload, attention broadcasts, and turn
-reports. In their place: `Ready` carries every agent's head (position,
-generated title, usage totals); one request carries the client's
-position for every agent it knows, and the daemon streams only the
-tails past those positions, agents the client has never seen whole,
-served as range reads from the persisted log with no runtime loaded;
-one connection-wide follow pushes new projected events for all agents
-as they land; and `AgentStreamFocus` stays as the only per-agent thing,
-the one agent on screen getting streaming deltas (partial text, a tool
-in flight) ahead of the log, replaced by the log's tail when the turn
-completes, so nothing durable travels only on the focus stream. Missing
-data is found with a version vector, one position per agent, because
-every log is append-only and totally ordered; the same vector, one
-position per device, is how the store syncs. A tree of hashes over the
-vector is the escalation if the vector itself ever costs something, not
-before. Rewind is an appended event ("rewound to P"), never a
-truncation, so positions only grow and the client drops its view past
-P. The projected event carries today's `UiBlock` shapes, so client
-rendering does not change; the projection is "which blocks did this
-raw event produce". Gone from the wire: `SubscribeAgents`,
-`UnsubscribeAgents`, `AgentSubscribed`, `AgentUnloaded`,
-`AgentAttention`, `AgentTurnReport`, and the summary's attention, facts,
-updated-at, and last-active fields.
+Moved to `AGENT-LOG-DESIGN.md` on 5 Sep, when the user chose to build
+it: what the daemon stores per agent, the agent API as log replication
+plus one focus stream, and transcripts as projected logs with attention
+decided on the client. That document is the record; nothing about
+agents is decided here.
 
 ### Direction: store sync is its own crate, mounted on a stream
 
@@ -393,43 +338,6 @@ The user's calls, 4 Sep, on the simplification pass:
   daemon protocol for now.
 - Terminal and shell: one "process on the host" stream with a kind.
 - Kept as they are: the land lease, git transport, diffs, PR commands.
-
-### Direction: agent transcripts are logs too, and the client decides attention
-
-The user's read on 4 Sep, not built and not a slice yet. An agent's
-transcript is an append-only log owned by the daemon that runs it, the
-same shape as a device's store log: segments tagged (agent, version),
-copied to clients by the same paths, mirrored on the client the way
-Slack is (tail first, older pages on demand, chunks with gap records,
-never a background walk), so the transcript reads from disk before the
-daemon answers and reads offline. "Waiting on you" stops being a fact
-the daemon computes: the client derives it from the mirror, the way it
-derives a Slack unit's state from the mirror, from the last event and
-the agent-wants tags the transcript already carries (`<ask-human/>`
-and the rest, `AGENT-WANTS-DESIGN.md`). The daemon then emits events
-and takes commands (create, send, cancel, rewind, continue, compact)
-and decides nothing about attention; Home for agents works offline from
-the mirror; and there is one sync engine for store logs and agent logs
-instead of a store protocol and a separate agent stream. The log is
-not the raw transcript: the daemon projects the persisted `AgentEvent`
-log (`rho-agent`, positions `AgentEventPos`) into a small typed event
-log per agent, the story a person reads, and only that is mirrored. The
-projection is a pure function of (position, event), so it can be
-rebuilt from the raw log at any time, and a projected segment's version
-is the `AgentEventPos` it reached, so "since" means the same thing on
-both sides. Turn started and ended; the user's message; the agent's
-visible reply; a tool call as its name and one typed line of what it
-did (the file, the command, the search), never its output; an
-agent-wants tag; cancelled, rewound, compacted, renamed; cost per turn.
-Tool output, diffs, and the model's raw exchange stay on the host and
-are fetched on demand when the user opens that call, the way a Slack
-picture's bytes are. A projected log is small, so the client mirrors every
-agent's whole projected log, in the background, once, and then only
-increments; the head above and the client's own per-agent cache of
-what it derived (wants the user, last speaker, wait) are what Home,
-Find, and the map read. Every host is
-then a peer that publishes its agents' event logs, and a GUI is a peer
-that publishes its device log.
 
 ## Browser tabs
 
