@@ -156,6 +156,35 @@ for that call, from the raw log, no runtime loaded.
 Every wire change here bumps the epoch and the iroh ALPN, so an old GUI
 fails to connect rather than to decode.
 
+### Where the wire shape met the code (b8os, 5 Sep; all accepted)
+
+- Live frames are a set, not one agent: `AgentStreamFocus { agent_ids }`
+  replaces `SubscribeAgents` / `UnsubscribeAgents` (a split shows two
+  agent panes) as well as the singular subscribe.
+- `Wants` has a producer from day one: `StoryEvent::Wants { want, summary,
+  at }` written by the Luna turn-report sidecar that exists today
+  (`report_needs_you` → `Ask`, `report_fyi` → `Show`); `AgentWant` is
+  named after the tags in `AGENT-WANTS-DESIGN.md` so the tag parser
+  replaces the producer later without a client change. Without this,
+  deleting the turn report would have left Home nothing to rank agents
+  on (131 agents carried a report on the copy).
+- Hidden and snoozed are the user's verdicts and live only in the
+  transitional table: a one-time daemon conversion writes them into the
+  desk store as verdict-log entries on the agent id (hidden →
+  `State::Muted`, snoozed → `DeferUntil`; 151 and 379 on the copy),
+  counts printed on the migrating start, the table dropped after, the
+  conversion code deleted after the user's restart. This is the one
+  case of the daemon writing to the store, and it is a migration of the
+  user's own data, like store slice 1.
+- Offline, a `ToolCall` shows its one line and no result until slice D;
+  the live frame still has results for a focused agent.
+- `StoryEvent` is a daemon type; the wire carries `UiStoryEvent`, a twin
+  converted in the daemon the way `UiBlock` and `AgentUsageBucket` are,
+  because `rho-ui-proto` builds for wasm and does not depend on
+  `rho-agent`.
+- `AgentUsage` and the global usage requests stay until slice C, or
+  Home's cost column would go blank in between.
+
 ### The client mirrors the story and decides attention
 
 The GUI keeps every agent's story log in its own redb, the way it keeps
