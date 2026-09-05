@@ -18,14 +18,15 @@ use rho_db::RhoDb;
 use rho_inference::{Inference, InferenceSession, PromptCacheKey};
 use rho_tool_shell::{DEFAULT_TIMEOUT_SECS, ShellTools};
 use rho_web_search::WebSearchTools;
-use rho_workspaces::{Repo, View, Workspace};
+use rho_workspaces::{Repo, View, Workspace, WorkspaceInfo};
 use senax_encoder::{Decode, Encode, Pack, Unpack};
 use tokio::sync::{Notify, mpsc, oneshot};
 
 use crate::db::{
     AgentEventPos, AgentId, AgentPresentationCache, AgentPresentationUpdate,
-    AgentProfileWriteTxnExt, AgentReadTxnExt, AgentRoleSessionProfile as _, AgentRuntime,
-    AgentWriteTxnExt, InferenceModel, InferenceProfile, SessionBinding, UnixMillis,
+    AgentProfileWriteTxnExt, AgentReadTxnExt, AgentRole, AgentRoleSessionProfile as _,
+    AgentRuntime, AgentSpawnedBy, AgentWriteTxnExt, ClaudeRewind, InferenceModel, InferenceProfile,
+    SessionBinding, UnixMillis,
 };
 use crate::lazy::Lazy;
 use crate::multi_agent_tools::MultiAgentTools;
@@ -132,6 +133,45 @@ pub enum AgentEvent<'a> {
         speaker: PresentationSpeaker,
         text: Cow<'a, str>,
     },
+    /// The agent coming into being: the first event of every agent's log,
+    /// and the base the head's config is folded from. A spawn name given
+    /// here is why no title is generated for that agent.
+    Created {
+        role: AgentRole,
+        binding: SessionBinding,
+        runtime: AgentRuntime,
+        workdirs: Vec<WorkspaceInfo>,
+        spawned_by: AgentSpawnedBy,
+        spawn_name: Option<String>,
+        created_at: rho_core::UnixMs,
+    },
+    RoleChanged {
+        role: AgentRole,
+        /// `None` when only the role moved and the session binding stands.
+        binding: Option<SessionBinding>,
+    },
+    WorkdirAdded {
+        workdir: WorkspaceInfo,
+    },
+    /// The runtime itself changing under the agent: a Claude rewind before
+    /// and after its destination transcript is verified, or a new prompt
+    /// cache key for the Rho runtime.
+    RuntimeRebound {
+        change: RuntimeChange,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Encode, Decode)]
+pub enum RuntimeChange {
+    /// A message-only Claude rewind whose destination transcript has not
+    /// been materialized and verified yet; `None` withdraws one. The old
+    /// runtime stays authoritative until it is confirmed.
+    ClaudeRewindPending(Option<ClaudeRewind>),
+    /// The rewind landed: this session is the runtime now.
+    ClaudeRewound {
+        session_id: uuid::Uuid,
+    },
+    PromptCacheKey(PromptCacheKey),
 }
 
 /// Stable identity for an accepted user input in an agent's persisted event
@@ -488,8 +528,13 @@ fn restore_events(events: Vec<AgentEvent<'static>>) -> RestoredAgent {
                 }
             }
             AgentEvent::QueueCleared => queue.clear(),
+            // Config and creation are the head's business, never context.
             AgentEvent::PresentationUpdated { .. }
-            | AgentEvent::ClaudePresentationSource { .. } => {}
+            | AgentEvent::ClaudePresentationSource { .. }
+            | AgentEvent::Created { .. }
+            | AgentEvent::RoleChanged { .. }
+            | AgentEvent::WorkdirAdded { .. }
+            | AgentEvent::RuntimeRebound { .. } => {}
         }
     }
     let kind = match turn {
@@ -624,11 +669,11 @@ impl Agent {
                 .iter()
                 .map(|workspace| workspace.info().clone())
                 .collect(),
+            role,
             mode,
             AgentRuntime::Rho { prompt_cache_key },
             parent,
         );
-        write.set_agent_role(agent_id, role);
         write.commit();
         let agent = Self::new(
             db,
@@ -667,32 +712,35 @@ impl Agent {
         pool: std::sync::Weak<pool::AgentPool>,
     ) -> Self {
         let record = db.read().get_agent(agent_id);
+        let parent_agent = db.read().agent_attention(agent_id).parent_agent;
         let (next_event, events) = db.read().agent_events(agent_id);
         let restored = restore_events(events);
-        let AgentRuntime::Rho { prompt_cache_key } = record.runtime else {
+        let AgentRuntime::Rho { prompt_cache_key } = record.config.runtime else {
             panic!("cannot load Claude agent with the Rho agent runtime");
         };
         let config = record
+            .config
             .binding
             .deep_config()
             .expect("Rho runtime stored with non-Rho agent mode");
         let model = record
+            .config
             .binding
             .deep_model()
             .expect("Rho runtime stored with non-Rho agent mode");
-        // The record, not the caller, is the source of truth for the parent
+        // The store, not the caller, is the source of truth for the parent
         // edge of an existing agent.
         Self::new(
             db,
             inference,
             config,
             model,
-            record.role,
+            record.config.role,
             prompt_cache_key,
             agent_id,
             next_event,
             view,
-            record.parent_agent,
+            parent_agent,
             pool,
             restored,
         )
@@ -1352,6 +1400,7 @@ impl AgentLoop {
             .db
             .read()
             .get_agent(self.persistence.agent_id)
+            .config
             .role;
         let role = match current {
             db::AgentRole::Engineer {
@@ -2712,7 +2761,11 @@ pub(crate) fn presentation_sources(
             | AgentEvent::Queued(_)
             | AgentEvent::Dequeued { .. }
             | AgentEvent::QueueCleared
-            | AgentEvent::PresentationUpdated { .. } => None,
+            | AgentEvent::PresentationUpdated { .. }
+            | AgentEvent::Created { .. }
+            | AgentEvent::RoleChanged { .. }
+            | AgentEvent::WorkdirAdded { .. }
+            | AgentEvent::RuntimeRebound { .. } => None,
         })
         .collect()
 }

@@ -156,13 +156,10 @@ impl AgentRegistry {
             .read()
             .list_agents()
             .into_iter()
-            .find(|(_, record)| {
-                record.role == AgentRole::Iris
-                    || record.labels.iter().any(|label| label == IRIS_LABEL)
-            })
+            .find(|(_, record)| record.config.role == AgentRole::Iris)
             .map(|(agent_id, _)| agent_id);
         let agent_id = if let Some(agent_id) = existing {
-            if self.db.read().get_agent(agent_id).role != AgentRole::Iris {
+            if self.db.read().get_agent(agent_id).config.role != AgentRole::Iris {
                 let mut write = self.db.write().await;
                 write.set_agent_role(agent_id, AgentRole::Iris);
                 write.commit();
@@ -174,7 +171,7 @@ impl AgentRegistry {
                 let read = self.db.read();
                 read.list_agents()
                     .into_iter()
-                    .find(|(_, record)| !record.labels.iter().any(|label| label == IRIS_LABEL))
+                    .find(|(_, record)| record.config.role != AgentRole::Iris)
                     .map(|(_, record)| record.primary_workdir().clone())
             };
 
@@ -198,7 +195,6 @@ impl AgentRegistry {
                 )
                 .await?;
             let mut write = self.db.write().await;
-            write.agent_label(rho_core::UnixMs::now(), agent_id, IRIS_LABEL, true);
             write.set_agent_disposition(agent_id, AgentDisposition::Hidden);
             write.commit();
             agent_id
@@ -289,13 +285,6 @@ async fn call_iris_tool(registry: &Arc<AgentRegistry>, call: ToolCall) -> anyhow
                     None,
                 )
                 .await?;
-            {
-                let mut write = registry.db.write().await;
-                if let Some(name) = args.task_name {
-                    write.set_agent_display_name(rho_core::UnixMs::now(), agent_id, name);
-                }
-                write.commit();
-            }
             refresh_clients(registry).await;
             Ok(format!("Started {}.", registry.display_agent_id(agent_id)))
         }
@@ -478,7 +467,7 @@ fn escape_xml(text: &str) -> String {
 
 fn is_iris(registry: &AgentRegistry, agent_id: AgentId) -> bool {
     let agent = registry.db.read().get_agent(agent_id);
-    agent.role == AgentRole::Iris || agent.labels.iter().any(|label| label == IRIS_LABEL)
+    agent.config.role == AgentRole::Iris
 }
 
 /// The daemon-side equivalent of pressing Done or Snooze on an agent row:
@@ -489,17 +478,22 @@ fn visible_agent_subtree(
     registry: &AgentRegistry,
     agent_id: AgentId,
 ) -> anyhow::Result<Vec<AgentId>> {
-    let agents = registry.db.read().list_agents();
-    let (_, root) = agents
+    let read = registry.db.read();
+    let agents = read
+        .list_agents()
+        .into_iter()
+        .map(|(id, head)| (id, head, read.agent_attention(id)))
+        .collect::<Vec<_>>();
+    let (_, root, root_attention) = agents
         .iter()
-        .find(|(candidate, _)| *candidate == agent_id)
+        .find(|(candidate, _, _)| *candidate == agent_id)
         .ok_or_else(|| anyhow::anyhow!("agent is not known"))?;
     anyhow::ensure!(
-        root.role != AgentRole::Iris && !root.labels.iter().any(|label| label == IRIS_LABEL),
+        root.config.role != AgentRole::Iris,
         "cannot triage Iris through a fleet tool"
     );
     anyhow::ensure!(
-        root.disposition != AgentDisposition::Hidden,
+        root_attention.disposition != AgentDisposition::Hidden,
         "agent is hidden; show it before marking it done or snoozing it"
     );
     Ok(spawn_subtree(&agents, agent_id)
@@ -507,21 +501,25 @@ fn visible_agent_subtree(
         .filter(|member| {
             agents
                 .iter()
-                .find(|(candidate, _)| candidate == member)
-                .is_some_and(|(_, record)| record.disposition != AgentDisposition::Hidden)
+                .find(|(candidate, _, _)| candidate == member)
+                .is_some_and(|(_, _, attention)| attention.disposition != AgentDisposition::Hidden)
         })
         .collect())
 }
 
 fn spawn_subtree(
-    agents: &[(AgentId, rho_agent::db::AgentRecord)],
+    agents: &[(
+        AgentId,
+        rho_agent::db::AgentHead,
+        rho_agent::db::AgentAttention,
+    )],
     agent_id: AgentId,
 ) -> Vec<AgentId> {
     let mut members = vec![agent_id];
     let mut frontier = vec![agent_id];
     while let Some(parent) = frontier.pop() {
-        for (child, record) in agents {
-            if record.parent_agent == Some(parent) && !members.contains(child) {
+        for (child, _, attention) in agents {
+            if attention.parent_agent == Some(parent) && !members.contains(child) {
                 members.push(*child);
                 frontier.push(*child);
             }
@@ -573,9 +571,7 @@ pub(crate) async fn active_iris_id(registry: &AgentRegistry) -> anyhow::Result<A
         .read()
         .list_agents()
         .into_iter()
-        .find(|(_, agent)| {
-            agent.role == AgentRole::Iris || agent.labels.iter().any(|label| label == IRIS_LABEL)
-        })
+        .find(|(_, agent)| agent.config.role == AgentRole::Iris)
         .map(|(agent_id, _)| agent_id)
         .ok_or_else(|| anyhow::anyhow!("Iris coordinator does not exist"))
 }
@@ -632,7 +628,6 @@ fn parse_role(role: &str) -> anyhow::Result<AgentRole> {
 #[derive(Deserialize)]
 struct StartAgentArgs {
     prompt: String,
-    task_name: Option<String>,
     project: Option<String>,
     role: Option<String>,
 }

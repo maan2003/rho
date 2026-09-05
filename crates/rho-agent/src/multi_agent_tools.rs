@@ -61,6 +61,7 @@ impl MultiAgentTools {
             .db()
             .read()
             .get_agent(self.self_id)
+            .config
             .spawned_by
     }
 
@@ -71,6 +72,7 @@ impl MultiAgentTools {
             .db()
             .read()
             .get_agent(self.self_id)
+            .config
             .role
     }
 
@@ -394,6 +396,7 @@ async fn ask_advisor(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Result
         .db()
         .read()
         .get_agent(tools.self_id)
+        .config
         .workdirs
         .into_iter()
         .map(|info| SpawnWorkdir {
@@ -519,7 +522,12 @@ async fn message_agent(tools: &MultiAgentTools, call: &ToolCall) -> anyhow::Resu
         anyhow::bail!("no agent with id {handle}");
     }
     anyhow::ensure!(
-        pool.db().read().get_agent(recipient).role.handle_prefix()
+        pool.db()
+            .read()
+            .get_agent(recipient)
+            .config
+            .role
+            .handle_prefix()
             == handle.split('-').next().unwrap(),
         "agent handle role prefix does not match target"
     );
@@ -562,7 +570,7 @@ async fn interrupt_engineer(tools: &MultiAgentTools, call: &ToolCall) -> anyhow:
         anyhow::bail!("no agent with id {}", args.engineer_id);
     }
     anyhow::ensure!(
-        pool.db().read().get_agent(target).role.is_engineer(),
+        pool.db().read().get_agent(target).config.role.is_engineer(),
         "target is not an Engineer"
     );
     if target == tools.self_id {

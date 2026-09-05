@@ -173,33 +173,22 @@ async fn print_agents(db_path: Option<PathBuf>) -> anyhow::Result<()> {
     for (agent_id, agent) in agents {
         writeln!(output)?;
         writeln!(output, "{agent_id:?}")?;
-        if let Some(name) = &agent.display_name {
+        if let Some(name) = agent.title() {
             writeln!(output, "  name: {name}")?;
         }
-        if let Some(parent) = agent.parent_agent {
-            writeln!(output, "  parent: {parent:?}")?;
-        }
-        if !agent.labels.is_empty() {
-            writeln!(output, "  labels: {}", agent.labels.join(", "))?;
-        }
-        writeln!(
-            output,
-            "  disposition: {}",
-            disposition_name(agent.disposition)
-        )?;
-        writeln!(output, "  last_user_message: {}", agent.last_user_message.0)?;
         writeln!(output, "  mode: {}", config_name(agent.config()))?;
         writeln!(
             output,
             "  workdirs: {}",
             agent
+                .config
                 .workdirs
                 .iter()
                 .map(workspace_name)
                 .collect::<Vec<_>>()
                 .join(", ")
         )?;
-        match agent.runtime {
+        match agent.config.runtime {
             AgentRuntime::Rho { prompt_cache_key } => {
                 writeln!(output, "  runtime: rho")?;
                 writeln!(output, "  prompt_cache_key: {prompt_cache_key:?}")?;
@@ -239,9 +228,9 @@ async fn print_context(db_path: Option<PathBuf>) -> anyhow::Result<()> {
         writeln!(
             output,
             "{agent_id:?} ({})",
-            agent.display_name.as_deref().unwrap_or("unnamed")
+            agent.title().unwrap_or("unnamed")
         )?;
-        match agent.runtime {
+        match agent.config.runtime {
             AgentRuntime::Rho { .. } => {
                 let (_, events) = read.agent_events(agent_id);
                 let mut context_used = None;
@@ -345,16 +334,6 @@ async fn migrate_snapshot(db: &RhoDb) -> anyhow::Result<()> {
     write.init_agent_tables();
     write.commit();
     Ok(())
-}
-
-fn disposition_name(disposition: rho_agent::db::AgentDisposition) -> String {
-    use rho_agent::db::AgentDisposition;
-    match disposition {
-        AgentDisposition::Pending => "pending".to_owned(),
-        AgentDisposition::Done => "done".to_owned(),
-        AgentDisposition::Snoozed { until } => format!("snoozed until {}", until.0),
-        AgentDisposition::Hidden => "hidden".to_owned(),
-    }
 }
 
 fn config_name(config: rho_agent::db::AgentRole) -> String {

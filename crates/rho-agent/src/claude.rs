@@ -112,11 +112,11 @@ impl ClaudeAgent {
                 .iter()
                 .map(|workspace| workspace.info().clone())
                 .collect(),
+            role,
             mode,
             AgentRuntime::Claude { session_id },
             parent,
         );
-        write.set_agent_role(agent_id, role);
         write.commit();
 
         let pool_events = pool.clone();
@@ -166,20 +166,21 @@ impl ClaudeAgent {
         pool: std::sync::Weak<crate::pool::AgentPool>,
     ) -> anyhow::Result<Self> {
         let record = db.read().get_agent(agent_id);
-        let AgentRuntime::Claude { session_id } = record.runtime else {
+        let parent_agent = db.read().agent_attention(agent_id).parent_agent;
+        let AgentRuntime::Claude { session_id } = record.config.runtime else {
             anyhow::bail!("cannot load Rho agent with the Claude agent runtime");
         };
-        let model = record
-            .binding
-            .claude_model()
-            .ok_or_else(|| anyhow::anyhow!("Claude runtime stored with non-Claude agent mode"))?;
-        let effort = record
-            .binding
-            .claude_effort()
-            .ok_or_else(|| anyhow::anyhow!("Claude runtime stored with non-Claude agent mode"))?;
+        let model =
+            record.config.binding.claude_model().ok_or_else(|| {
+                anyhow::anyhow!("Claude runtime stored with non-Claude agent mode")
+            })?;
+        let effort =
+            record.config.binding.claude_effort().ok_or_else(|| {
+                anyhow::anyhow!("Claude runtime stored with non-Claude agent mode")
+            })?;
         let primary_repo = record.primary_workdir().repo().to_owned();
         let (session_id, messages, start_mode, pending_rewind, context_used) = if let Some(rewind) =
-            record.claude_rewind
+            record.config.claude_rewind
         {
             let resumed = rho_claude::read_session_messages_by_id(
                 rewind.session_id,
@@ -293,9 +294,9 @@ impl ClaudeAgent {
             start_mode,
             pending_rewind,
             pool.upgrade()
-                .map(|_| MultiAgentTools::new(pool, agent_id, record.parent_agent)),
+                .map(|_| MultiAgentTools::new(pool, agent_id, parent_agent)),
             pool_events,
-            record.role,
+            record.config.role,
             next_event,
             known_presentation_sources,
         ))
@@ -2174,7 +2175,7 @@ mod tests {
     #[tokio::test]
     async fn legacy_record_is_backfilled_from_transcript_ground_truth() {
         let (_temp, db, agent_id) = presentation_test_agent().await;
-        assert_eq!(db.read().get_agent(agent_id).last_turn_ended, None);
+        assert_eq!(db.read().agent_attention(agent_id).last_turn_ended, None);
         let messages = [rho_claude::SessionMessage {
             kind: rho_claude::SessionMessageKind::Assistant,
             uuid: Uuid::new_v4(),
@@ -2192,7 +2193,7 @@ mod tests {
             .unwrap()
             .timestamp_millis() as u64;
         assert_eq!(
-            db.read().get_agent(agent_id).last_turn_ended,
+            db.read().agent_attention(agent_id).last_turn_ended,
             Some(rho_core::UnixMs(expected))
         );
     }
@@ -2211,6 +2212,7 @@ mod tests {
                 repo: "/home/user/src/rho".into(),
                 id: WorkspaceId::from_counter(1, &WorkspaceIdDomain(0)).unwrap(),
             }],
+            crate::db::AgentRole::PM,
             SessionBinding::ResponsesSol(crate::db::InferenceProfile::default()),
             AgentRuntime::Rho {
                 prompt_cache_key: PromptCacheKey::generate(),

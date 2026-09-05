@@ -67,9 +67,9 @@ pub(crate) struct DeskCellStore {
 }
 
 impl DeskCellStore {
-    pub(crate) async fn new(db: RhoDb, machine_seed: u64) -> Result<Self, String> {
+    pub(crate) async fn new(db: RhoDb) -> Result<Self, String> {
         let mut write = db.write().await;
-        initialize(&mut write, machine_seed)?;
+        initialize(&mut write)?;
         write.open_table(MUTATIONS);
         write.commit();
         Ok(Self { db })
@@ -569,11 +569,10 @@ fn validate_verdict_shape(
 }
 
 /// Opens the cell tables, making the empty state on a database that has
-/// none, and converting node cells to fact cells the one time there are
-/// any. The native-tree V1 conversion that used to run here is gone: it
-/// ran once on every daemon it was ever going to run on.
-pub(crate) fn initialize(write: &mut WriteTxn, machine_seed: u64) -> Result<(), String> {
-    let mut meta = match write.open_table(META).get(&()) {
+/// none. The conversions that used to run here are gone: each ran once on
+/// every daemon it was ever going to run on.
+pub(crate) fn initialize(write: &mut WriteTxn) -> Result<(), String> {
+    let meta = match write.open_table(META).get(&()) {
         Some(meta) => meta.value().into_owned(),
         None => {
             let daemon_device = DeviceId(*uuid::Uuid::new_v4().as_bytes());
@@ -588,24 +587,6 @@ pub(crate) fn initialize(write: &mut WriteTxn, machine_seed: u64) -> Result<(), 
     write.open_table(CELLS);
     write.open_table(VERDICTS);
     write.open_table(BODIES);
-    if let Some((cells, verdicts, bodies, report)) =
-        crate::desk_migration::migrate(write, meta.daemon_device, machine_seed)?
-    {
-        // The converted cells keep the stamps they were written with, so
-        // the frontier already covers them and peers still sync from the
-        // version they know.
-        for (device, version) in crate::desk_migration::frontier(&cells, &verdicts) {
-            let entry = meta.frontier.entry(device).or_insert(0);
-            *entry = (*entry).max(version);
-        }
-        let snapshot = Snapshot {
-            cells,
-            verdicts,
-            version: meta.frontier.clone(),
-        };
-        persist_snapshot(write, &snapshot, bodies)?;
-        tracing::info!("{}", report.line());
-    }
     write.open_table(META).insert(&(), SenValue::owned(meta));
     Ok(())
 }
@@ -771,7 +752,7 @@ mod tests {
         let path = directory.path().join("rho.redb");
         let db = RhoDb::open(path);
         // RhoDb owns the open file after the temporary directory handle drops.
-        DeskCellStore::new(db, 42).await.unwrap()
+        DeskCellStore::new(db).await.unwrap()
     }
 
     fn at(unix_ms: i64) -> Timestamp {
@@ -1305,7 +1286,7 @@ mod tests {
     async fn a_row_this_build_cannot_read_is_skipped_rather_than_fatal() {
         let directory = tempfile::tempdir().unwrap();
         let db = RhoDb::open(directory.path().join("rho.redb"));
-        let store = DeskCellStore::new(db.clone(), 42).await.unwrap();
+        let store = DeskCellStore::new(db.clone()).await.unwrap();
         let device = DeviceId([19; 16]);
         let id = seed_note(&store, device).await;
 

@@ -449,7 +449,12 @@ impl PrMonitor {
     fn ensure_engineer(&self, subscriber: AgentId) -> anyhow::Result<()> {
         anyhow::ensure!(self.pool.agent_exists(subscriber), "agent no longer exists");
         anyhow::ensure!(
-            self.db.read().get_agent(subscriber).role.is_engineer(),
+            self.db
+                .read()
+                .get_agent(subscriber)
+                .config
+                .role
+                .is_engineer(),
             "PR subscriptions are owned by Engineers"
         );
         Ok(())

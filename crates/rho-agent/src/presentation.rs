@@ -148,13 +148,12 @@ pub(crate) fn spawn_turn_report(
     }
     // Sub-agent turns are the parent's court unless the user has personally
     // messaged the agent, and Iris is not a rail row; neither gets a report.
-    let record = db.read().get_agent(agent_id);
-    if (record.parent_agent.is_some() && !record.user_interacted)
-        || record.role == AgentRole::Iris
-        || record
-            .labels
-            .iter()
-            .any(|label| label == crate::iris_tools::LABEL)
+    let read = db.read();
+    let record = read.get_agent(agent_id);
+    let attention = read.agent_attention(agent_id);
+    drop(read);
+    if (attention.parent_agent.is_some() && !attention.user_interacted)
+        || record.config.role == AgentRole::Iris
     {
         return;
     }
@@ -180,7 +179,7 @@ pub(crate) fn spawn_turn_report(
         // resurface this row, summary and all. A Done row keeps showing its
         // settled summary, so a raced ack persists too; only Hidden means
         // the user does not want the row at all.
-        match db.read().get_agent(agent_id).disposition {
+        match db.read().agent_attention(agent_id).disposition {
             AgentDisposition::Pending
             | AgentDisposition::Snoozed { .. }
             | AgentDisposition::Done => {}
@@ -209,10 +208,12 @@ fn presentation_context(db: &RhoDb, agent_id: AgentId) -> (Seed, Vec<Presentatio
     (
         Seed {
             title: record
-                .display_name
+                .config
+                .spawn_name
+                .clone()
                 .map(|title| (title, true))
-                .or_else(|| record.generated_title.map(|title| (title, false))),
-            activity: record.activity,
+                .or_else(|| record.generated_title.clone().map(|title| (title, false))),
+            activity: record.activity.clone(),
         },
         presentation_sources(agent_id, &records),
     )

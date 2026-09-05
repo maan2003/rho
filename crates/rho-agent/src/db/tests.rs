@@ -43,6 +43,7 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
         agent_id,
         None,
         vec![test_workspace()],
+        AgentRole::PM,
         SessionBinding::ResponsesSol(InferenceProfile::default()),
         AgentRuntime::Rho {
             prompt_cache_key: PromptCacheKey::generate(),
@@ -68,6 +69,7 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
         claude_id,
         None,
         vec![test_workspace()],
+        AgentRole::PM,
         SessionBinding::ClaudeFable {
             effort: ClaudeEffort::High,
         },
@@ -89,6 +91,7 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
         opus_id,
         None,
         vec![test_workspace()],
+        AgentRole::PM,
         SessionBinding::ClaudeOpus {
             effort: ClaudeEffort::Medium,
         },
@@ -110,6 +113,7 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
         terra_id,
         None,
         vec![test_workspace()],
+        AgentRole::PM,
         SessionBinding::ResponsesTerra(InferenceProfile::default()),
         AgentRuntime::Rho {
             prompt_cache_key: PromptCacheKey::generate(),
@@ -129,6 +133,7 @@ async fn agent_usage_accumulates_in_five_minute_buckets() {
         luna_id,
         None,
         vec![test_workspace()],
+        AgentRole::PM,
         SessionBinding::ResponsesLuna(InferenceProfile::default()),
         AgentRuntime::Rho {
             prompt_cache_key: PromptCacheKey::generate(),
@@ -413,6 +418,8 @@ fn event_text(event: &AgentEvent<'_>) -> String {
             ContentPart::Text { text } => text.clone(),
             ContentPart::Image { .. } => panic!("expected text content"),
         },
+        // Every agent's log opens with its creation.
+        AgentEvent::Created { .. } => "created".to_owned(),
         _ => unreachable!(),
     }
 }
@@ -446,6 +453,7 @@ async fn claude_rewind_descriptor_round_trips_and_completes() {
         agent_id,
         None,
         vec![test_workspace()],
+        AgentRole::PM,
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         AgentRuntime::Claude {
             session_id: source_session_id,
@@ -460,40 +468,17 @@ async fn claude_rewind_descriptor_round_trips_and_completes() {
     write.set_agent_claude_rewind(agent_id, Some(rewind.clone()));
     write.commit();
 
-    assert_eq!(db.read().get_agent(agent_id).claude_rewind, Some(rewind));
+    assert_eq!(
+        db.read().get_agent(agent_id).config.claude_rewind,
+        Some(rewind)
+    );
 
     let mut write = db.write().await;
     write.complete_agent_claude_rewind(agent_id, session_id);
     write.commit();
     let record = db.read().get_agent(agent_id);
-    assert_eq!(record.runtime, AgentRuntime::Claude { session_id });
-    assert_eq!(record.claude_rewind, None);
-}
-
-#[tokio::test]
-async fn labels_toggle_without_duplicates() {
-    let temp = tempfile::tempdir().unwrap();
-    let db = RhoDb::open(temp.path().join("rho.redb"));
-    let mut write = db.write().await;
-    write.init_agent_tables();
-    let agent_id = write.alloc_agent_id();
-    write.create_agent(
-        UnixMs(1),
-        agent_id,
-        None,
-        vec![test_workspace()],
-        SessionBinding::ResponsesGpt55(InferenceProfile::default()),
-        test_agent_runtime(),
-        None,
-    );
-    write.agent_label(UnixMs(5), agent_id, "urgent", true);
-    write.agent_label(UnixMs(6), agent_id, "urgent", true);
-    write.agent_label(UnixMs(7), agent_id, "review", true);
-    write.agent_label(UnixMs(8), agent_id, "urgent", false);
-    write.commit();
-
-    let read = db.read();
-    assert_eq!(read.get_agent(agent_id).labels, ["review"]);
+    assert_eq!(record.config.runtime, AgentRuntime::Claude { session_id });
+    assert_eq!(record.config.claude_rewind, None);
 }
 
 #[tokio::test]
@@ -508,6 +493,7 @@ async fn agent_spawned_by_is_stored_at_creation() {
         pm,
         None,
         vec![test_workspace()],
+        AgentRole::pm(),
         AgentRole::pm().session_profile().unwrap(),
         test_agent_runtime(),
         None,
@@ -518,14 +504,21 @@ async fn agent_spawned_by_is_stored_at_creation() {
         engineer,
         None,
         vec![test_workspace()],
+        AgentRole::default(),
         AgentRole::default().session_profile().unwrap(),
         test_agent_runtime(),
         Some(pm),
     );
     write.commit();
 
-    assert_eq!(db.read().get_agent(pm).spawned_by, AgentSpawnedBy::Direct);
-    assert_eq!(db.read().get_agent(engineer).spawned_by, AgentSpawnedBy::PM);
+    assert_eq!(
+        db.read().get_agent(pm).config.spawned_by,
+        AgentSpawnedBy::Direct
+    );
+    assert_eq!(
+        db.read().get_agent(engineer).config.spawned_by,
+        AgentSpawnedBy::PM
+    );
 }
 
 #[test]
@@ -611,6 +604,7 @@ async fn create_agent_and_append_events_with_cursor() {
         agent_id,
         Some("main".to_owned()),
         vec![test_workspace()],
+        AgentRole::PM,
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         test_agent_runtime(),
         None,
@@ -621,12 +615,13 @@ async fn create_agent_and_append_events_with_cursor() {
 
     let read = db.read();
     let agent = read.get_agent(agent_id);
-    assert_eq!(agent.display_name.as_deref(), Some("main"));
+    assert_eq!(agent.config.spawn_name.as_deref(), Some("main"));
 
     let (next, events) = read.agent_events(agent_id);
-    assert_eq!(next.seq, 2);
-    assert_eq!(events.len(), 2);
-    assert_eq!(events[0], user_event("hello"));
+    assert_eq!(next.seq, 3);
+    assert_eq!(events.len(), 3);
+    assert!(matches!(events[0], AgentEvent::Created { .. }));
+    assert_eq!(events[1], user_event("hello"));
 }
 
 #[tokio::test]
@@ -642,6 +637,7 @@ async fn agent_events_read_lineage_parents() {
         agent_id,
         Some("main".to_owned()),
         vec![test_workspace()],
+        AgentRole::PM,
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         test_agent_runtime(),
         None,
@@ -649,30 +645,19 @@ async fn agent_events_read_lineage_parents() {
     let fork_at = write.append_agent_event(next, &user_event("parent"));
     write.append_agent_event(fork_at, &user_event("sibling"));
 
-    let child_lineage = AgentLineageId(99);
-    {
-        write
-            .open_table(LINEAGE_PARENTS)
-            .insert(&child_lineage, &fork_at);
-    }
-    {
-        let mut agents = write.open_table(AGENTS);
-        let mut agent = agents.get(&agent_id).unwrap().value().into_owned();
-        agent.current_lineage = child_lineage;
-        agents.insert(&agent_id, SenValue::borrowed(&agent));
-    }
-    write.append_agent_event(AgentEventPos::root(child_lineage), &user_event("child"));
+    let child_root = write.fork_agent_lineage(UnixMs(2), agent_id, fork_at);
+    write.append_agent_event(child_root, &user_event("child"));
     write.commit();
 
     let read = db.read();
     let (next, events) = read.agent_events(agent_id);
-    assert_eq!(next.lineage_id, child_lineage);
+    assert_eq!(next.lineage_id, child_root.lineage_id);
     assert_eq!(next.seq, 1);
     let texts = events
         .into_iter()
         .map(|event| event_text(&event))
         .collect::<Vec<_>>();
-    assert_eq!(texts, ["parent", "child"]);
+    assert_eq!(texts, ["created", "parent", "child"]);
 }
 
 #[tokio::test]
@@ -688,6 +673,7 @@ async fn fork_agent_lineage_repoints_current_branch() {
         agent_id,
         Some("main".to_owned()),
         vec![test_workspace()],
+        AgentRole::PM,
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         test_agent_runtime(),
         None,
@@ -704,7 +690,7 @@ async fn fork_agent_lineage_repoints_current_branch() {
         .into_iter()
         .map(|event| event_text(&event))
         .collect::<Vec<_>>();
-    assert_eq!(texts, ["parent", "new branch"]);
+    assert_eq!(texts, ["created", "parent", "new branch"]);
 }
 
 #[tokio::test]
@@ -719,6 +705,7 @@ async fn presentation_history_folds_by_source_reachability_after_rewind() {
         agent_id,
         None,
         vec![test_workspace()],
+        AgentRole::PM,
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         test_agent_runtime(),
         None,
@@ -781,6 +768,7 @@ async fn legacy_turn_end_backfill_is_one_way_and_durable() {
         agent_id,
         None,
         vec![test_workspace()],
+        AgentRole::PM,
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         test_agent_runtime(),
         None,
@@ -789,7 +777,7 @@ async fn legacy_turn_end_backfill_is_one_way_and_durable() {
     assert!(!write.backfill_agent_last_turn_ended(agent_id, UnixMs(30)));
     write.commit();
     assert_eq!(
-        db.read().get_agent(agent_id).last_turn_ended,
+        db.read().agent_attention(agent_id).last_turn_ended,
         Some(UnixMs(20))
     );
 }
@@ -807,6 +795,7 @@ async fn turn_end_and_user_message_set_dispositions() {
         agent_id,
         None,
         vec![test_workspace()],
+        AgentRole::PM,
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         test_agent_runtime(),
         None,
@@ -814,18 +803,18 @@ async fn turn_end_and_user_message_set_dispositions() {
     write.record_agent_turn_end(UnixMs(2), agent_id);
     write.commit();
     assert_eq!(
-        db.read().get_agent(agent_id).disposition,
+        db.read().agent_attention(agent_id).disposition,
         AgentDisposition::Pending
     );
     assert_eq!(
-        db.read().get_agent(agent_id).last_turn_ended,
+        db.read().agent_attention(agent_id).last_turn_ended,
         Some(UnixMs(2))
     );
 
     let mut write = db.write().await;
     write.record_agent_user_message(UnixMs(5), agent_id, "  please\ncheck the   claims  ");
     write.commit();
-    let agent = db.read().get_agent(agent_id);
+    let agent = db.read().agent_attention(agent_id);
     assert_eq!(agent.disposition, AgentDisposition::Done);
     assert_eq!(agent.last_user_message, UnixMs(5));
     assert_eq!(agent.last_user_message_text, "please check the claims");
@@ -837,18 +826,18 @@ async fn turn_end_and_user_message_set_dispositions() {
     write.record_agent_turn_end(UnixMs(50), agent_id);
     write.commit();
     assert_eq!(
-        db.read().get_agent(agent_id).disposition,
+        db.read().agent_attention(agent_id).disposition,
         AgentDisposition::Snoozed { until: UnixMs(100) }
     );
     let mut write = db.write().await;
     write.record_agent_turn_end(UnixMs(150), agent_id);
     write.commit();
     assert_eq!(
-        db.read().get_agent(agent_id).disposition,
+        db.read().agent_attention(agent_id).disposition,
         AgentDisposition::Pending
     );
     assert_eq!(
-        db.read().get_agent(agent_id).last_turn_ended,
+        db.read().agent_attention(agent_id).last_turn_ended,
         Some(UnixMs(150))
     );
 
@@ -864,7 +853,7 @@ async fn turn_end_and_user_message_set_dispositions() {
     );
     write.commit();
     assert_eq!(
-        db.read().get_agent(agent_id).disposition,
+        db.read().agent_attention(agent_id).disposition,
         AgentDisposition::Pending
     );
     let mut write = db.write().await;
@@ -876,7 +865,7 @@ async fn turn_end_and_user_message_set_dispositions() {
         },
     );
     write.commit();
-    let agent = db.read().get_agent(agent_id);
+    let agent = db.read().agent_attention(agent_id);
     assert_eq!(agent.disposition, AgentDisposition::Done);
     assert!(agent.turn_report.is_some());
 
@@ -898,7 +887,7 @@ async fn turn_end_and_user_message_set_dispositions() {
     );
     write.record_agent_user_message(UnixMs(200), agent_id, "next task");
     write.commit();
-    let agent = db.read().get_agent(agent_id);
+    let agent = db.read().agent_attention(agent_id);
     assert_eq!(agent.disposition, AgentDisposition::Done);
     assert_eq!(agent.turn_report, None);
 }
@@ -980,6 +969,7 @@ async fn agent_ids_allocate_before_records_exist() {
         agent_id,
         None,
         vec![test_workspace()],
+        AgentRole::PM,
         SessionBinding::ResponsesGpt55(InferenceProfile::default()),
         test_agent_runtime(),
         None,
@@ -987,7 +977,10 @@ async fn agent_ids_allocate_before_records_exist() {
     write.commit();
 
     let read = db.read();
-    assert_eq!(read.get_agent(agent_id).workdirs, vec![test_workspace()]);
+    assert_eq!(
+        read.get_agent(agent_id).config.workdirs,
+        vec![test_workspace()]
+    );
     assert_eq!(read.list_agents().len(), 1);
 }
 

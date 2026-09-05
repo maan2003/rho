@@ -349,8 +349,8 @@ impl AgentPool {
     /// parent's court unless the user has personally engaged the agent.
     pub async fn settle_turn(&self, agent_id: AgentId) {
         self.flush_agent_usage(Some(agent_id)).await;
-        let record = self.db.read().get_agent(agent_id);
-        if record.parent_agent.is_none() || record.user_interacted {
+        let attention = self.db.read().agent_attention(agent_id);
+        if attention.parent_agent.is_none() || attention.user_interacted {
             let mut write = self.db.write().await;
             write.record_agent_turn_end(crate::db::UnixMillis::now(), agent_id);
             write.commit();
@@ -523,7 +523,7 @@ impl AgentPool {
         let (parent_workdirs, parent_role) = {
             let read = self.db.read();
             let record = read.get_agent(parent);
-            (record.workdirs, record.role)
+            (record.config.workdirs, record.config.role)
         };
         let workdirs = if workdirs.is_empty() {
             parent_workdirs
@@ -617,13 +617,14 @@ impl AgentPool {
                 if depth > MAX_SPAWN_DEPTH {
                     anyhow::bail!("spawn depth limit ({MAX_SPAWN_DEPTH}) reached");
                 }
-                cursor = read.get_agent(id).parent_agent;
+                cursor = read.agent_attention(id).parent_agent;
             }
             read.list_agents()
                 .into_iter()
-                .filter(|(_, record)| {
-                    record.parent_agent == Some(parent)
-                        && record.disposition != AgentDisposition::Hidden
+                .map(|(id, _)| (id, read.agent_attention(id)))
+                .filter(|(_, attention)| {
+                    attention.parent_agent == Some(parent)
+                        && attention.disposition != AgentDisposition::Hidden
                 })
                 .map(|(id, _)| id)
                 .collect::<Vec<_>>()
@@ -655,7 +656,7 @@ impl AgentPool {
         let (_, agent, _) = self.load(to).await?;
         let sender_label = self.agent_handle(from);
         if matches!(
-            self.db.read().get_agent(from).role,
+            self.db.read().get_agent(from).config.role,
             AgentRole::Advisor { .. }
         ) {
             body.push_str(&format!(
@@ -699,7 +700,7 @@ impl AgentPool {
     }
 
     pub fn agent_handle(&self, agent_id: AgentId) -> String {
-        let role = self.db.read().get_agent(agent_id).role;
+        let role = self.db.read().get_agent(agent_id).config.role;
         format!(
             "{}-{}",
             role.handle_prefix(),
@@ -795,8 +796,8 @@ impl AgentPool {
             return Ok((agent_id, agent, false));
         }
         let record = self.db.read().get_agent(agent_id);
-        let view = self.lazy_view(agent_id, record.workdirs.clone());
-        let agent = match record.runtime {
+        let view = self.lazy_view(agent_id, record.config.workdirs.clone());
+        let agent = match record.config.runtime {
             AgentRuntime::Rho { .. } => RunningAgent::Rho(Agent::load_lazy(
                 self.db.clone(),
                 self.inference.clone(),

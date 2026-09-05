@@ -32,7 +32,9 @@ use tokio::sync::{Mutex, Mutex as TokioMutex, OwnedMutexGuard, broadcast, mpsc, 
 mod agent_ui;
 pub mod debug;
 mod desk_cells;
-mod desk_migration;
+#[cfg(test)]
+mod record_to_log_proof;
+
 mod iris;
 mod realtime;
 mod secret_store;
@@ -462,8 +464,9 @@ pub async fn run(args: DaemonArgs) -> anyhow::Result<()> {
         activation_observer(agent_id, agent).await;
     }
     // Re-arm snooze wake-ups that were pending when the daemon last stopped.
-    for (agent_id, agent) in agents.db.read().list_agents() {
-        if let AgentDisposition::Snoozed { until } = agent.disposition
+    for (agent_id, _) in agents.db.read().list_agents() {
+        if let AgentDisposition::Snoozed { until } =
+            agents.db.read().agent_attention(agent_id).disposition
             && until > rho_core::UnixMs::now()
         {
             spawn_snooze_timer(
@@ -1038,7 +1041,7 @@ impl AgentRegistry {
         let pr_monitor =
             rho_pr_monitor::PrMonitor::new(pool.clone(), db.clone(), octo_socket).await?;
         let visualizations = rho_visualizations::VisualizationStore::new(db.clone()).await;
-        let desk_cells = desk_cells::DeskCellStore::new(db.clone(), machine_seed)
+        let desk_cells = desk_cells::DeskCellStore::new(db.clone())
             .await
             .map_err(anyhow::Error::msg)?;
         let registry = Self {
@@ -1104,46 +1107,49 @@ impl AgentRegistry {
             let _ = self.events.send(ServerMessage::AgentAttention {
                 agent_id: *agent_id,
                 attention: attention_level(kinds.get(agent_id), disposition),
-                facts: agent_facts(&self.db.read().get_agent(*agent_id), kinds.get(agent_id)),
+                facts: agent_facts(
+                    &self.db.read().agent_attention(*agent_id),
+                    kinds.get(agent_id),
+                ),
             });
         }
     }
 
     fn ui_agents(&self, kinds: &HashMap<AgentId, AgentStateKind>) -> Vec<UiAgentSummary> {
-        let mut records = self.db.read().list_agents();
-        records.sort_by_key(|(_, agent)| agent.created_at);
-        records
+        let read = self.db.read();
+        let mut heads = read.list_agents();
+        heads.sort_by_key(|(_, agent)| agent.config.created_at);
+        heads
             .into_iter()
-            .filter(|(_, agent)| {
-                agent.role != AgentRole::Iris
-                    && !agent
-                        .labels
-                        .iter()
-                        .any(|label| label == rho_agent::iris_tools::LABEL)
-            })
-            .map(|(agent_id, agent)| UiAgentSummary {
-                agent_id,
-                parent_agent: agent.parent_agent,
-                role: agent.config(),
-                created_at: agent.created_at,
-                updated_at: agent.updated_at,
-                workspace: agent.primary_workdir().clone(),
-                facts: agent_facts(&agent, kinds.get(&agent_id)),
-                display_name: agent.display_name.or(agent.generated_title),
-                attention: attention_level(kinds.get(&agent_id), agent.disposition),
-                last_active: agent
-                    .last_turn_ended
-                    .unwrap_or(agent.last_user_message)
-                    .max(agent.created_at),
-                hidden: agent.disposition == AgentDisposition::Hidden,
-                disposition: agent.disposition,
-                last_user_message_text: agent.last_user_message_text,
-                activity: agent.activity,
-                turn_report: agent.turn_report.map(|report| UiTurnReport {
-                    needs_you: report.needs_you,
-                    summary: report.summary,
-                }),
-                labels: agent.labels,
+            .filter(|(_, agent)| agent.config.role != AgentRole::Iris)
+            .map(|(agent_id, agent)| {
+                let attention = read.agent_attention(agent_id);
+                UiAgentSummary {
+                    agent_id,
+                    parent_agent: attention.parent_agent,
+                    role: agent.config(),
+                    created_at: agent.config.created_at,
+                    updated_at: attention.updated_at,
+                    workspace: agent.primary_workdir().clone(),
+                    facts: agent_facts(&attention, kinds.get(&agent_id)),
+                    display_name: agent.title().map(str::to_owned),
+                    attention: attention_level(kinds.get(&agent_id), attention.disposition),
+                    last_active: attention
+                        .last_turn_ended
+                        .unwrap_or(attention.last_user_message)
+                        .max(agent.config.created_at),
+                    hidden: attention.disposition == AgentDisposition::Hidden,
+                    disposition: attention.disposition,
+                    last_user_message_text: attention.last_user_message_text,
+                    activity: agent.activity,
+                    turn_report: attention.turn_report.map(|report| UiTurnReport {
+                        needs_you: report.needs_you,
+                        summary: report.summary,
+                    }),
+                    // Labels are the store's `Labeled` facts; the client
+                    // reads them there (`AGENT-LOG-DESIGN.md`).
+                    labels: Vec::new(),
+                }
             })
             .collect()
     }
@@ -1153,13 +1159,7 @@ impl AgentRegistry {
             .read()
             .list_agents()
             .into_iter()
-            .find(|(_, agent)| {
-                agent.role == AgentRole::Iris
-                    || agent
-                        .labels
-                        .iter()
-                        .any(|label| label == rho_agent::iris_tools::LABEL)
-            })
+            .find(|(_, agent)| agent.config.role == AgentRole::Iris)
             .map(|(agent_id, _)| agent_id)
     }
 
@@ -1289,7 +1289,7 @@ impl AgentRegistry {
         if !self.pool.agent_exists(self_agent_id) {
             anyhow::bail!("agent is not known: {self_agent_id:?}");
         }
-        let role = self.db.read().get_agent(self_agent_id).role;
+        let role = self.db.read().get_agent(self_agent_id).config.role;
         if matches!(role, AgentRole::Advisor { .. })
             && !matches!(
                 &request,
@@ -1406,6 +1406,7 @@ impl AgentRegistry {
                     .db
                     .read()
                     .get_agent(self_agent_id)
+                    .config
                     .workdirs
                     .into_iter()
                     .map(|info| rho_agent::pool::SpawnWorkdir {
@@ -1437,11 +1438,11 @@ impl AgentRegistry {
                 let advisor = self.resolve_display_agent_id(&advisor_id)?;
                 let record = self.db.read().get_agent(advisor);
                 anyhow::ensure!(
-                    matches!(record.role, AgentRole::Advisor { .. }),
+                    matches!(record.config.role, AgentRole::Advisor { .. }),
                     "target is not an Advisor"
                 );
                 anyhow::ensure!(
-                    record.parent_agent == Some(self_agent_id),
+                    self.db.read().agent_attention(advisor).parent_agent == Some(self_agent_id),
                     "Advisor belongs to another agent"
                 );
                 self.pool
@@ -1476,7 +1477,13 @@ impl AgentRegistry {
             anyhow::bail!("no agent with id {agent_id}");
         }
         if let Some(prefix) = prefix {
-            let expected = self.db.read().get_agent(resolved).role.handle_prefix();
+            let expected = self
+                .db
+                .read()
+                .get_agent(resolved)
+                .config
+                .role
+                .handle_prefix();
             anyhow::ensure!(
                 prefix == expected,
                 "agent handle prefix does not match its role"
@@ -1491,9 +1498,10 @@ impl AgentRegistry {
 
     async fn agent_label(&self, agent_id: AgentId, label: String, add: bool) -> anyhow::Result<()> {
         validate_label(&label)?;
-        let mut write = self.db.write().await;
-        write.agent_label(rho_core::UnixMs::now(), agent_id, &label, add);
-        write.commit();
+        // A label is the store's `Labeled` fact, written by the client
+        // that set it; the daemon keeps none (`AGENT-LOG-DESIGN.md`). The
+        // message leaves the wire in slice B.
+        let _ = (agent_id, label, add);
         Ok(())
     }
 
@@ -1501,9 +1509,10 @@ impl AgentRegistry {
         if name.trim().is_empty() {
             anyhow::bail!("agent name cannot be empty");
         }
-        let mut write = self.db.write().await;
-        write.set_agent_display_name(rho_core::UnixMs::now(), agent_id, name);
-        write.commit();
+        // A name is the store's `Name` fact now, and the client writes it
+        // there; a summary's display name is the spawn name or the
+        // generated title. The message leaves the wire in slice B.
+        let _ = (agent_id, name);
         Ok(())
     }
 
@@ -1930,22 +1939,21 @@ async fn selected_claude_messages_for_backfill(
 /// deliberately remain unknown rather than receiving an invented value.
 async fn backfill_legacy_turn_end_times(agents: &AgentRegistry) {
     let kinds = agents.agent_state_kinds().await;
-    let candidates = agents
-        .db
-        .read()
+    let read = agents.db.read();
+    let candidates = read
         .list_agents()
         .into_iter()
         .filter_map(|(agent_id, agent)| {
-            if agent.last_turn_ended.is_some()
+            if read.agent_attention(agent_id).last_turn_ended.is_some()
                 || kinds.get(&agent_id).is_some_and(AgentStateKind::is_working)
             {
                 return None;
             }
-            let AgentRuntime::Claude { session_id } = agent.runtime else {
+            let AgentRuntime::Claude { session_id } = agent.config.runtime else {
                 return None;
             };
             let cwd = agent.primary_workdir().repo().to_owned();
-            Some((agent_id, session_id, agent.claude_rewind, cwd))
+            Some((agent_id, session_id, agent.config.claude_rewind, cwd))
         })
         .collect::<Vec<_>>();
 
@@ -1979,12 +1987,15 @@ fn is_blocked(kind: &AgentStateKind) -> bool {
 /// sub-agent turn ends only set it to Pending once the user has personally
 /// engaged the agent (see `settle_turn`), so untouched children stay quiet
 /// by construction.
-fn agent_facts(record: &rho_agent::db::AgentRecord, kind: Option<&AgentStateKind>) -> UiAgentFacts {
+fn agent_facts(
+    attention: &rho_agent::db::AgentAttention,
+    kind: Option<&AgentStateKind>,
+) -> UiAgentFacts {
     UiAgentFacts {
         turn_running: kind.is_some_and(AgentStateKind::is_working),
-        last_turn_ended: record.last_turn_ended,
-        last_user_message_at: record.last_user_message,
-        needs_you_hint: record
+        last_turn_ended: attention.last_turn_ended,
+        last_user_message_at: attention.last_user_message,
+        needs_you_hint: attention
             .turn_report
             .as_ref()
             .is_some_and(|report| report.needs_you),
@@ -2078,7 +2089,7 @@ fn spawn_turn_report_projection(agents: Arc<AgentRegistry>) {
                     agent_id: reported.agent_id,
                     attention: attention_level(kind.as_ref(), AgentDisposition::Done),
                     facts: agent_facts(
-                        &agents.db.read().get_agent(reported.agent_id),
+                        &agents.db.read().agent_attention(reported.agent_id),
                         kind.as_ref(),
                     ),
                 });
@@ -2123,9 +2134,9 @@ async fn spawn_attention_watcher(
                 pool.flush_agent_usage(Some(agent_id)).await;
             }
             was_working = working;
-            let record = db.read().get_agent(agent_id);
-            let attention = attention_level(Some(&state.kind), record.disposition);
-            let facts = agent_facts(&record, Some(&state.kind));
+            let stored = db.read().agent_attention(agent_id);
+            let attention = attention_level(Some(&state.kind), stored.disposition);
+            let facts = agent_facts(&stored, Some(&state.kind));
             if last_sent != Some((attention, facts)) {
                 let _ = events.send(ServerMessage::AgentAttention {
                     agent_id,
@@ -2481,11 +2492,11 @@ fn spawn_snooze_timer(
         let delay = until.saturating_duration_since(rho_core::UnixMs::now());
         tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
         let kind = pool.get(agent_id).await.map(|agent| agent.state().kind);
-        let disposition = db.read().get_agent(agent_id).disposition;
+        let disposition = db.read().agent_attention(agent_id).disposition;
         let _ = events.send(ServerMessage::AgentAttention {
             agent_id,
             attention: attention_level(kind.as_ref(), disposition),
-            facts: agent_facts(&db.read().get_agent(agent_id), kind.as_ref()),
+            facts: agent_facts(&db.read().agent_attention(agent_id), kind.as_ref()),
         });
     });
 }
@@ -2616,7 +2627,7 @@ async fn handle_message(
         ClientMessage::AgentUsage { agent_id, since_ms } => {
             agents.pool.flush_agent_usage(Some(agent_id)).await;
             let read = agents.db.read();
-            let model = match read.get_agent(agent_id).runtime {
+            let model = match read.get_agent(agent_id).config.runtime {
                 AgentRuntime::Rho { .. } => "gpt-5.6-sol",
                 AgentRuntime::Claude { .. } => "claude-fable-5",
             };
@@ -3302,10 +3313,10 @@ where
 async fn shell_start(agents: &Arc<AgentRegistry>, agent: &str) -> anyhow::Result<()> {
     let agent_id = agents.resolve_display_agent_id(agent)?;
     let record = agents.db.read().get_agent(agent_id);
-    shell::ensure_supported_workdirs(&record.workdirs)?;
+    shell::ensure_supported_workdirs(&record.config.workdirs)?;
     let view = agents
         .pool
-        .materialize_view(&record.workdirs)
+        .materialize_view(&record.config.workdirs)
         .await
         .context("materialize agent view")?;
     agents
@@ -3657,6 +3668,7 @@ async fn terminal_attach(
     let record = agents.db.read().get_agent(agent_id);
     anyhow::ensure!(
         !record
+            .config
             .workdirs
             .iter()
             .any(|workdir| matches!(workdir, WorkspaceInfo::Sandbox { .. })),
@@ -3664,7 +3676,7 @@ async fn terminal_attach(
     );
     let view = agents
         .pool
-        .materialize_view(&record.workdirs)
+        .materialize_view(&record.config.workdirs)
         .await
         .context("materialize agent view")?;
     let shell = agents
