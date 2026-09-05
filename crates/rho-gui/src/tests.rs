@@ -1114,6 +1114,30 @@ fn press_held_shift_key(workspace: &WindowHandle<Workspace>, cx: &mut TestAppCon
     cx.run_until_parked();
 }
 
+/// The `shift` keystroke as a platform delivers it when the modifier state
+/// has not caught up yet: the key is shift and the modifiers read clear.
+fn press_shift_key_with_modifiers_clear(
+    workspace: &WindowHandle<Workspace>,
+    cx: &mut TestAppContext,
+) {
+    cx.update_window(**workspace, |_, window, cx| {
+        window.dispatch_event(
+            gpui::PlatformInput::KeyDown(gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke {
+                    modifiers: gpui::Modifiers::default(),
+                    key: "shift".into(),
+                    key_char: None,
+                },
+                is_held: false,
+                prefer_character_input: false,
+            }),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+}
+
 /// One half of the tap: `shift` going down, or coming back up.
 fn hold_shift(workspace: &WindowHandle<Workspace>, down: bool, cx: &mut TestAppContext) {
     let modifiers = gpui::Modifiers {
@@ -4567,6 +4591,50 @@ fn a_tap_of_shift_opens_the_verdicts_over_the_card_in_view(cx: &mut TestAppConte
             assert!(mutation.writes.iter().any(|write| write.id == dealt
                 && write.property
                     == rho_desk::cells::Property::State(rho_desk::cells::State::Done)));
+        })
+        .unwrap();
+}
+
+/// A `shift` keystroke that reports shift already up is not a tap. On a
+/// platform that delivers the keystroke before it updates the modifier
+/// state, every press looks like that, and treating it as a completed tap
+/// opened the verdicts on every press of shift. Only modifiers-changed
+/// decides.
+#[gpui::test]
+fn a_bare_shift_keystroke_opens_nothing(cx: &mut TestAppContext) {
+    let mut desk = DeskFixture::new();
+    desk.due_note(None, "Card in view");
+
+    cx.update(bind_test_keymaps);
+    let workspace = test_workspace(cx);
+    workspace
+        .update(cx, |workspace, window, cx| {
+            workspace.handle_event(HostId::default(), desk.synced(), window, cx);
+            workspace.pull_card(window, cx);
+            workspace.take_host_messages_for_test(HostId::default());
+        })
+        .unwrap();
+    cx.run_until_parked();
+
+    press_shift_key_with_modifiers_clear(&workspace, cx);
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                !workspace.verdict_transient_open(),
+                "the keystroke alone is not a tap"
+            );
+        })
+        .unwrap();
+
+    // The real press and release that follows it still taps.
+    tap_shift(&workspace, cx);
+    cx.run_until_parked();
+    workspace
+        .update(cx, |workspace, _, _| {
+            assert!(
+                workspace.verdict_transient_open(),
+                "down and up with nothing between is the tap"
+            );
         })
         .unwrap();
 }

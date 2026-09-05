@@ -91,7 +91,9 @@ enum DriverCommand {
     /// Type literal text through the virtual keyboard protocol.
     Type { text: String },
     /// Run key, text, and wait steps through one persistent virtual keyboard.
-    /// Steps use `key:CHORD`, `text:TEXT`, or `wait:MILLISECONDS`.
+    /// Steps use `key:CHORD`, `text:TEXT`, `down:MODIFIER`, `up:MODIFIER`,
+    /// or `wait:MILLISECONDS`. `down:`/`up:` hold a modifier across the
+    /// steps between them, which is how a held `shift` is driven.
     Input { steps: Vec<String> },
     /// Send keys or chords in one keyboard session, for example `enter`,
     /// `ctrl+shift+p`, or `escape g g`.
@@ -594,6 +596,20 @@ fn append_wtype_chord(args: &mut Vec<OsString>, chord: &str) -> Result<()> {
     for modifier in parts {
         modifiers.push(wtype_modifier(modifier)?);
     }
+    // A bare modifier is pressed and released as a modifier, not typed as a
+    // keysym: an app that decides a tap from the modifier state has to see
+    // it go down and come back up, which `-k Shift_L` never does.
+    if modifiers.is_empty()
+        && let Ok(modifier) = wtype_modifier(key)
+    {
+        args.extend([
+            OsString::from("-M"),
+            OsString::from(modifier),
+            OsString::from("-m"),
+            OsString::from(modifier),
+        ]);
+        return Ok(());
+    }
     let key = match key.to_ascii_lowercase().as_str() {
         "enter" | "return" => "Return".to_owned(),
         "esc" | "escape" => "Escape".to_owned(),
@@ -601,9 +617,8 @@ fn append_wtype_chord(args: &mut Vec<OsString>, chord: &str) -> Result<()> {
         "backspace" => "BackSpace".to_owned(),
         "delete" | "del" => "Delete".to_owned(),
         "space" => "space".to_owned(),
-        // A modifier as the last part of a chord is pressed as a key of its
-        // own: `-M shift` only sets the modifier bit, which sends no key
-        // event, and a bare `shift` tap is a key event the app listens for.
+        // A modifier inside a chord is the chord's own last key, so it is
+        // typed as a keysym.
         "shift" => "Shift_L".to_owned(),
         "ctrl" | "control" => "Control_L".to_owned(),
         "alt" => "Alt_L".to_owned(),
@@ -671,6 +686,16 @@ fn wtype_input_args(steps: &[String]) -> Result<Vec<OsString>> {
                 bail!("input text beginning with '-' is not supported by wtype step mode");
             }
             args.push(OsString::from(text));
+        } else if let Some(modifier) = step.strip_prefix("down:") {
+            args.extend([
+                OsString::from("-M"),
+                OsString::from(wtype_modifier(modifier)?),
+            ]);
+        } else if let Some(modifier) = step.strip_prefix("up:") {
+            args.extend([
+                OsString::from("-m"),
+                OsString::from(wtype_modifier(modifier)?),
+            ]);
         } else if let Some(milliseconds) = step.strip_prefix("wait:") {
             let milliseconds = milliseconds
                 .parse::<u32>()
@@ -680,7 +705,7 @@ fn wtype_input_args(steps: &[String]) -> Result<Vec<OsString>> {
                 OsString::from(milliseconds.to_string()),
             ]);
         } else {
-            bail!("input step must begin with key:, text:, or wait:");
+            bail!("input step must begin with key:, text:, down:, up:, or wait:");
         }
     }
     args.extend([
@@ -844,10 +869,24 @@ mod tests {
     }
 
     #[test]
-    fn a_lone_modifier_is_pressed_as_a_key_of_its_own() {
+    fn a_lone_modifier_is_pressed_and_released_as_a_modifier() {
         let args = wtype_key_args("shift").unwrap();
         let args: Vec<_> = args.iter().map(|arg| arg.to_string_lossy()).collect();
-        assert_eq!(args, ["-s", "50", "-k", "Shift_L", "-s", "50"]);
+        assert_eq!(args, ["-s", "50", "-M", "shift", "-m", "shift", "-s", "50"]);
+    }
+
+    #[test]
+    fn down_and_up_steps_hold_a_modifier_across_the_steps_between_them() {
+        let steps = ["down:shift", "key:a", "wait:400", "up:shift"].map(str::to_owned);
+        let args = wtype_input_args(&steps).unwrap();
+        let args: Vec<_> = args.iter().map(|arg| arg.to_string_lossy()).collect();
+        assert_eq!(
+            args,
+            [
+                "-s", "50", "-M", "shift", "-s", "30", "-k", "a", "-s", "30", "-s", "400", "-s",
+                "30", "-m", "shift", "-s", "50"
+            ]
+        );
     }
 
     #[test]

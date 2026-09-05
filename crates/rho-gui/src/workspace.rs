@@ -952,7 +952,7 @@ impl Workspace {
                 _ => {}
             },
         );
-        let keystroke_subscription = cx.observe_keystrokes(|this, event, window, cx| {
+        let keystroke_subscription = cx.observe_keystrokes(|this, event, _window, _cx| {
             if this.desk_semantic_paste_target.is_some()
                 && !event.keystroke.key.eq_ignore_ascii_case("p")
                 && !matches!(
@@ -962,26 +962,26 @@ impl Workspace {
             {
                 this.desk_semantic_paste_target = None;
             }
+            tracing::debug!(
+                key = %event.keystroke.key,
+                shift = event.keystroke.modifiers.shift,
+                control = event.keystroke.modifiers.control,
+                alt = event.keystroke.modifiers.alt,
+                platform = event.keystroke.modifiers.platform,
+                shift_down = this.shift_down_at.is_some(),
+                "keystroke"
+            );
             // A key arriving while `shift` is down means it was being held
-            // for that key, so it was never a tap.
-            if event.keystroke.key == "shift"
+            // for that key, so it was never a tap. `shift`'s own keystroke
+            // is not such a key and never decides anything: a platform may
+            // deliver it before it updates the modifier state, and deciding
+            // here opened the menu on every press. Only modifiers-changed
+            // decides a tap.
+            let bare_shift = event.keystroke.key == "shift"
                 && !event.keystroke.modifiers.control
                 && !event.keystroke.modifiers.alt
-                && !event.keystroke.modifiers.platform
-            {
-                if event.keystroke.modifiers.shift {
-                    // Shift is still down: the release decides.
-                    this.shift_down_at
-                        .get_or_insert_with(std::time::Instant::now);
-                } else {
-                    // Shift is already back up by the time its own keystroke
-                    // arrives, so press and release collapsed into this one
-                    // event and the tap is complete. A virtual keyboard that
-                    // types the modifier as a plain key looks like this.
-                    this.shift_down_at = None;
-                    this.shift_tapped(window, cx);
-                }
-            } else {
+                && !event.keystroke.modifiers.platform;
+            if !bare_shift {
                 this.shift_down_at = None;
                 this.last_shift_tap = None;
             }
@@ -7157,6 +7157,14 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let modifiers = event.modifiers;
+        tracing::debug!(
+            shift = modifiers.shift,
+            control = modifiers.control,
+            alt = modifiers.alt,
+            platform = modifiers.platform,
+            held_ms = self.shift_down_at.map(|down| down.elapsed().as_millis()),
+            "modifiers changed"
+        );
         if modifiers.shift {
             // Down. Only `shift` on its own can still become a tap: with
             // another modifier already held this is a chord being built.
